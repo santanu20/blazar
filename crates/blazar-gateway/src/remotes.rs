@@ -40,7 +40,7 @@ pub struct RemoteHealth {
     pub ttft_ewma_ms: Option<f64>,
 }
 
-fn health_key(remote: &Remote) -> String {
+pub(crate) fn health_key(remote: &Remote) -> String {
     format!("{}|{}", remote.name, remote.url)
 }
 
@@ -606,9 +606,9 @@ const REMOTE_TIER_COLD: u8 = 2;
 /// hand-written comparator to get wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PeerScore {
-    tier: u8,
-    est_wait_ms: u64,
-    free_vram: std::cmp::Reverse<u64>,
+    pub(crate) tier: u8,
+    pub(crate) est_wait_ms: u64,
+    pub(crate) free_vram: std::cmp::Reverse<u64>,
 }
 
 /// Score one peer for serving `model`. Pure over its signal snapshots
@@ -893,7 +893,7 @@ pub enum FallbackLane<'a> {
 /// Rank already-filtered peers by capacity score. Health and capacity
 /// snapshots are cloned before any comparison (R4: no lock held during
 /// scoring); the stable sort preserves config order as tiebreak.
-fn rank_peers_by_capacity<'a>(
+pub(crate) fn rank_peers_by_capacity<'a>(
     state: &'a AppState,
     model: &str,
     peers: &[&'a Remote],

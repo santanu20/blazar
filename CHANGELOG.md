@@ -4,18 +4,19 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
-## [0.15.1] - 2026-10-02
+## [0.17.0] - 2026-10-02
 
-Patch release — defects found by live validation of 0.15.0, fixed on main.
+Theme: **federation completion** — the control plane gets verbs: warm,
+replicate, route.
 
-### Fixed
+### Added
 
-- **Model doctor: streaming probe now accepts both stream dialects.** The judge required `text/event-stream`, but the Ollama lane streams `application/x-ndjson`, so every real stream probe on that lane FAILed against a working stream. Both dialects pass; a buffered `application/json` response still fails.
-- **Durable jobs: zombie `running` rows can no longer outlive the grace window.** A job whose gateway died less than 5 s before the next boot fell outside the one-time boot sweep and stayed `running` forever. The sweep now takes an absolute cutoff and a delayed second pass reaps any row last updated before this daemon started — live work in the current process is never touched.
-- **`scripts/compat/compat_check.sh`: summary line printed a literal `s`** instead of the pass count (printf format-string bug).
-- **Workspace `cargo fmt` + `clippy -D warnings` clean** across all new 0.15.0 surfaces (the 0.15.0 tag was cut before CI enforced this on the new code).
-=======
+- `POST /api/warm` gained `"wait": true` — synchronous warm through admission with a resident-state report (default stays the detached pull-notify contract). CLI: `blazar warm <model>`.
+- `POST /api/replicate` + `blazar replicate <model> [--peers a,b] [--timeout-secs N]` — remote replication: concurrent warm fan-out to peers with verbatim per-peer outcomes; Blazar peers only (non-Blazar peers are named as such).
+- `GET /api/route/{model}` + `blazar route <model>` — cross-node scheduling explainer: local residency, per-peer tier / wait estimate / free VRAM / breaker state, and the decision the gateway would take.
+
 ## [0.16.0] - 2026-10-02
+
 
 Theme: **capacity-aware federation** — peers selected by measurement, not
 guesswork.
@@ -34,6 +35,17 @@ guesswork.
   Sticky conversation affinity and the failure circuit are unchanged.
 - `/api/ps` remotes carry the cached `capacity` summary (absent field =
   no snapshot).
+
+## [0.15.1] - 2026-10-02
+
+Patch release — defects found by live validation of 0.15.0, fixed on main.
+
+### Fixed
+
+- **Model doctor: streaming probe now accepts both stream dialects.** The judge required `text/event-stream`, but the Ollama lane streams `application/x-ndjson`, so every real stream probe on that lane FAILed against a working stream. Both dialects pass; a buffered `application/json` response still fails.
+- **Durable jobs: zombie `running` rows can no longer outlive the grace window.** A job whose gateway died less than 5 s before the next boot fell outside the one-time boot sweep and stayed `running` forever. The sweep now takes an absolute cutoff and a delayed second pass reaps any row last updated before this daemon started — live work in the current process is never touched.
+- **`scripts/compat/compat_check.sh`: summary line printed a literal `s`** instead of the pass count (printf format-string bug).
+- **Workspace `cargo fmt` + `clippy -D warnings` clean** across all new 0.15.0 surfaces (the 0.15.0 tag was cut before CI enforced this on the new code).
 
 ## [0.15.0] - 2026-10-02
 
@@ -54,8 +66,10 @@ itself. No new inference engines; depth over breadth.
 - **Semantic-cache tool-result gate.** Requests carrying `role=tool` messages bypass the semantic cache in BOTH directions: tool outputs are not part of the serving fingerprint, so a prompt-similarity hit could serve an answer computed against different tool results. Tool-free turns of the same conversation still cache. New `blazar_semantic_cache_tool_bypasses_total` counter in `/metrics`.
 - **Client-compat matrix runner (`scripts/compat/`)** — wire-shape fixtures for the OpenAI SDK, Codex-style Responses chaining, Anthropic SDK, ollama CLI, and Continue/Cline tool-call shapes, asserting response contracts against a live daemon; plus GitHub issue templates (bug / workload / feature) so demand data lands in the repo instead of staying anecdotal.
 - **Download speed cap — `download_speed_limit_mb` (0 = unlimited).** One knob throttles every pull lane: model pulls (parallel chunk and classic streams), ollama-registry pulls, TTS/whisper voice fetches, and engine-binary asset downloads. A shared token bucket (1 s burst allowance) paces reads after write/hash accounting, progress bars name the active cap (`pull x (cap 12 MB/s)`), and the registry lane inherits the HF lane's cap so no path bypasses the contract. Env: `BLAZAR_DOWNLOAD_SPEED_LIMIT_MB`. Negative/NaN values fail config validation with a teaching error. Ollama parity: complaint #2006 (104 upvotes).
+- **Doctor warns on EVERY stale engine lane, not just the active one.** Engine-currency rows now cover all installed lanes: each non-active lane (llamacpp / mistral.rs / sglang / sdcpp) gets the same live warn-only upstream probe as the active lane, judged on the kind's newest install so retained rollback rows never nag; the sdcpp lane (previously an unconditional ok with no upstream comparison) now compares against the newest master-tagged stable-diffusion.cpp release. Observed before the fix: sglang 0.5.20 installed with 0.5.21 on PyPI and doctor all-green. After: `engine currency warn 0.5.21 available on PyPI (active: sglang-0.5.20) — run: blazar engine update --kind sglang 0.5.21`. Whisper stays covered by its dedicated currency row regardless of the active lane.
 - **Whisper streaming transcriptions — `stream=true` on `/v1/audio/transcriptions` + `/translations`.** Progressive SSE decoding: the uploaded WAV is split at PCM frame boundaries into `whisper_stream_chunk_ms` windows (default 30 s, 1-120 s) and transcribed in order on the same lazy child; `chunk.completed` events carry rebased segments while later audio is still decoding, `transcript.completed` closes with the merged transcript. `stream` + `async` on one body is a 400 request-shape error; window-shaping fields that would corrupt per-chunk decode are dropped; client hangup stops at the next chunk boundary. Upstream whisper.cpp has no streaming surface (batch /inference only) — the community's headline ask. Audit F6.
 - **Windows: whisper model paths pass through a short-path (8.3) guard** before reaching the child argv — upstream aborts (0xC0000409) on non-ASCII model paths; best-effort `GetShortPathNameW`, identity off-Windows. Audit W1.
+- **`blazar engine update --all` — one-shot update across every installed lane.** Walks llamacpp / mistralrs / sglang / sdcpp / whisper in a fixed order: absent lanes are skipped (install stays an explicit decision), lanes already at their channel target no-op, and a failing lane is named in the summary while the rest of the walk continues (non-zero exit if any lane failed). Mutually exclusive with a pinned tag; composes with `--check` (per-lane dry-run) and `--no-gate`.
 
 ### Fixed
 

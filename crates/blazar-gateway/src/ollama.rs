@@ -3114,33 +3114,6 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
     }
 }
 
-/// POST /api/warm {"model": name} — blazar-internal: intent-time warm
-/// notification for pulls that ran OUTSIDE the daemon. `blazar pull`
-/// performs the download in the CLI process (its `ModelPulled` event
-/// fires on a bus the daemon cannot see), so the CLI pings this
-/// endpoint after a fresh pull and the daemon applies the same
-/// `warm_on_pull` policy it applies to its own bus events: knob + AC
-/// power + spawn admission belts, warn-not-fail.
-pub async fn warm(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    let v: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return api_error(400, &e.to_string()),
-    };
-    let Some(model) = v["model"].as_str().map(str::to_string) else {
-        return api_error(400, "missing 'model'");
-    };
-    // Detached: the spawn outlives this request. The CLI's notify has a
-    // 2s timeout — tying the spawn to the handler let the client
-    // disconnect cancel it mid-load (receipt: warm spawn died exactly
-    // +2.0s after the routing line, no completion log, first request
-    // cold-started anyway).
-    let sup = Arc::clone(&state.sup);
-    tokio::spawn(async move {
-        sup.warm_on_pull_if_enabled(&model).await;
-    });
-    axum::Json(json!({"status": "ok"})).into_response()
-}
-
 /// A session checkpoint filename: alphanumerics, dot, underscore, dash.
 /// Mirrors upstream `fs_validate_filename` — no path separators, ever.
 fn valid_session_name(name: &str) -> bool {

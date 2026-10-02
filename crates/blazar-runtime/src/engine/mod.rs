@@ -22,7 +22,7 @@ use blazar_core::store::{EngineRow, Store};
 use blazar_core::BlazarDirs;
 
 use crate::events::{BlazarEvent, EventBus};
-use gh::{GhClient, GhRelease};
+use gh::{same_build, GhClient, GhRelease};
 use manifest::Manifest;
 
 /// Retention for engine dirs: the newest 2 survive auto-prune — the
@@ -656,7 +656,10 @@ impl EngineManager {
         let Some(active) = Store::open(&self.dirs)?.active_engine()? else {
             return Ok(None);
         };
-        Ok((active.tag == tag).then_some(active))
+        // Asset lanes stamp suffixes onto installed tags (b11339-cuda
+        // from the b11339 channel release): compare by build number so
+        // an already-current engine is skipped instead of re-downloaded.
+        Ok(same_build(&active.tag, tag).then_some(active))
     }
 
     /// Direct install of an overlay `bNNNN-cuda` tag the user pinned

@@ -450,6 +450,35 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Load a model now so the next request is warm (synchronous —
+    /// reports the resident child state when the load completes)
+    Warm {
+        /// Model name as the store knows it (`blazar ls`)
+        model: String,
+    },
+    /// Warm a model on peer gateways (remote replication): fan a warm
+    /// out to the named peers — or every configured remote — and report
+    /// each peer's outcome
+    Replicate {
+        /// Model name as the store knows it (`blazar ls`)
+        model: String,
+        /// Comma-separated peer names (default: every configured remote)
+        #[arg(long, value_delimiter = ',')]
+        peers: Option<Vec<String>>,
+        /// Per-peer timeout in seconds (default 300, max 900)
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
+    /// Show where a request for this model would be served — local
+    /// residency vs per-peer tier, wait estimate and free VRAM — and
+    /// the decision the gateway would take
+    Route {
+        /// Model name (any form the gateway resolves)
+        model: String,
+        /// Print the raw decision JSON instead of the card
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask why a request misbehaved: sentinel detections for a trace id
     /// (or the most recent observations) with fix hints
     Why {
@@ -540,6 +569,14 @@ enum EngineCmd {
         /// installed, or written
         #[arg(long)]
         check: bool,
+        /// Update every INSTALLED lane in one walk: llamacpp,
+        /// mistralrs, sglang, sdcpp, whisper. Lanes without an install
+        /// are skipped, current lanes no-op, and a failed lane does
+        /// not stop the rest (named in the summary). Mutually
+        /// exclusive with a pinned tag; composes with --check and
+        /// --no-gate.
+        #[arg(long)]
+        all: bool,
     },
     /// List installed engines with capability summaries
     List {
@@ -785,8 +822,20 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Model Management",
         &[
-            "pull", "import", "cp", "create", "rm", "list", "show", "quantize", "mmproj", "search",
-            "fit", "lora",
+            "pull",
+            "import",
+            "cp",
+            "create",
+            "rm",
+            "list",
+            "show",
+            "quantize",
+            "mmproj",
+            "search",
+            "fit",
+            "lora",
+            "warm",
+            "replicate",
         ],
     ),
     (
@@ -810,7 +859,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Observability",
-        &["why", "explain", "model-doctor", "watch"],
+        &["why", "explain", "model-doctor", "route", "watch"],
     ),
     (
         "Refused by design (local-only)",
@@ -1667,6 +1716,13 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Session { cmd } => session_cmd(cmd).await,
         Cmd::Doctor { flat, json } => doctor(flat, json).await,
         Cmd::ModelDoctor { model, json } => model_doctor_cmd(&model, json).await,
+        Cmd::Warm { model } => warm_cmd(&model).await,
+        Cmd::Replicate {
+            model,
+            peers,
+            timeout_secs,
+        } => replicate_cmd(&model, peers.as_deref(), timeout_secs).await,
+        Cmd::Route { model, json } => route_cmd(&model, json).await,
         Cmd::Why {
             trace,
             watch: live,
@@ -2339,6 +2395,13 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
     }
 
     checks.extend(doctor_engine(&d).await);
+    // Non-active installed lanes get the same live upstream probe — the
+    // active-lane rows above only cover one kind.
+    let active_kind = blazar_core::Store::open(&d)
+        .ok()
+        .and_then(|s| s.active_engine().ok().flatten())
+        .map(|r| r.kind);
+    checks.extend(doctor_lane_currency(&d, active_kind).await);
     checks.extend(doctor_gpu(&d).await);
     checks.extend(doctor_engines(&d));
     checks.extend(doctor_routing(&d));
@@ -4048,26 +4111,9 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
             checks.push(live_sglang_currency(&active).await);
             return checks;
         }
-        Some(EngineKind::MistralRs) => {
-            let active = active_tag.as_deref().unwrap_or("?");
-            checks.push(Check::ok(
-                "engine currency",
-                format!(
-                    "{active} (mistral.rs prebuilt lane) — update with: \
-                     blazar engine update --kind mistralrs"
-                ),
-            ));
-            return checks;
-        }
         Some(EngineKind::SdCpp) => {
             let active = active_tag.as_deref().unwrap_or("?");
-            checks.push(Check::ok(
-                "engine currency",
-                format!(
-                    "{active} (sdcpp prebuilt lane) — update with: \
-                     blazar engine update --kind sdcpp"
-                ),
-            ));
+            checks.push(live_sdcpp_currency(active).await);
             return checks;
         }
         Some(EngineKind::Whisper) => {
@@ -4389,6 +4435,84 @@ async fn live_mistralrs_currency(active: &str) -> Check {
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
         ),
     }
+}
+
+/// sdcpp engine currency: live warn-only probe of the newest
+/// master-tagged stable-diffusion.cpp release. The master channel is
+/// mutable (no ordering between shas), so any tag difference is an
+/// update — same verdict shape the mistral.rs lane uses.
+async fn live_sdcpp_currency(active: &str) -> Check {
+    let token = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok();
+    let Ok(gh) = GhClient::new(token) else {
+        return Check::warn("engine currency", "cannot build GitHub client");
+    };
+    match gh.latest_sdcpp_release().await {
+        Ok(rel) if rel.tag_name == active => {
+            Check::ok("engine currency", format!("up to date ({active}, sdcpp)"))
+        }
+        Ok(rel) => Check::warn(
+            "engine currency",
+            format!(
+                "update available: {} (active: {}, sdcpp) — run: \
+                 blazar engine update --kind sdcpp",
+                rel.tag_name, active
+            ),
+        ),
+        Err(e) => Check::warn(
+            "engine currency",
+            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+        ),
+    }
+}
+
+/// Per-lane engine currency for NON-active installed lanes. The active
+/// lane's row comes from the reconcile/live path in doctor_engine; every
+/// other installed lane gets the same live warn-only upstream probe, so
+/// a stale lane cannot hide behind an all-green doctor (observed live:
+/// sglang 0.5.20 installed, 0.5.21 on PyPI, no row said a word). One
+/// row per KIND, judged on the kind's newest install — retained
+/// rollback rows must not nag. Whisper is covered by
+/// doctor_whisper_currency regardless of which lane is active.
+async fn doctor_lane_currency(d: &BlazarDirs, active_kind: Option<EngineKind>) -> Vec<Check> {
+    let mut out = Vec::new();
+    let Ok(store) = Store::open(d) else {
+        return out;
+    };
+    let Ok(engines) = store.list_engines() else {
+        return out;
+    };
+    for kind in [
+        EngineKind::LlamaCpp,
+        EngineKind::MistralRs,
+        EngineKind::Sglang,
+        EngineKind::SdCpp,
+    ] {
+        if active_kind == Some(kind) {
+            continue;
+        }
+        // The kind's newest install is what an update would act on.
+        let Some(row) = engines
+            .iter()
+            .filter(|e| e.kind == kind)
+            .max_by_key(|e| e.installed_at)
+        else {
+            continue;
+        };
+        if row.tag == blazar_runtime::LOCAL_TAG {
+            // Source builds are not upstream-tracked (same policy as the
+            // active-lane path).
+            continue;
+        }
+        match kind {
+            EngineKind::Sglang => out.push(live_sglang_currency(&row.tag).await),
+            EngineKind::MistralRs => out.push(live_mistralrs_currency(&row.tag).await),
+            EngineKind::SdCpp => out.push(live_sdcpp_currency(&row.tag).await),
+            _ => out.push(live_engine_currency(&row.tag, &row.asset).await),
+        }
+    }
+    out
 }
 
 /// CUDA-opportunity + toolchain-readiness rows for doctor. Pure: GPU
@@ -6647,6 +6771,190 @@ async fn explain(model: &str, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
         print!("{}", render_explain_card(&v));
+    }
+    Ok(())
+}
+
+/// `blazar warm <model>`: synchronous warm through the gateway's
+/// admission path; prints the resident child state once loaded.
+async fn warm_cmd(model: &str) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let resp = cli_http()
+        .post(format!("{base}/api/warm"))
+        .timeout(std::time::Duration::from_secs(600))
+        .json(&serde_json::json!({ "model": model, "wait": true }))
+        .send()
+        .await?;
+    let text = resp.text().await?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))?;
+    let r = &v["resident"];
+    println!(
+        "model     {}\nlane      {}\nengine    {}\nstate     {}\nctx       {}\nslots     {}\nload      {} ms",
+        v["model"].as_str().unwrap_or("unknown"),
+        v["lane"].as_str().unwrap_or("unknown"),
+        v["engine"].as_str().unwrap_or("unknown"),
+        r["state"].as_str().unwrap_or("unknown"),
+        r["ctx"].as_u64().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()),
+        match r["slots"].as_u64() {
+            Some(s) => s.to_string(),
+            None => r["slots_configured"].as_u64().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into()),
+        },
+        v["load_ms"].as_u64().unwrap_or(0),
+    );
+    if let Some(note) = v["note"].as_str() {
+        println!("note      {note}");
+    }
+    Ok(())
+}
+
+/// `blazar replicate <model> --peers a,b`: fan a warm out to peers and
+/// report every outcome verbatim.
+async fn replicate_cmd(
+    model: &str,
+    peers: Option<&[String]>,
+    timeout_secs: Option<u64>,
+) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let mut body = serde_json::json!({ "model": model, "wait": true });
+    if let Some(names) = peers {
+        body["peers"] = serde_json::json!(names);
+    }
+    if let Some(secs) = timeout_secs {
+        body["timeout_secs"] = serde_json::json!(secs);
+    }
+    let per_peer = timeout_secs.unwrap_or(300);
+    let resp = cli_http()
+        .post(format!("{base}/api/replicate"))
+        .timeout(std::time::Duration::from_secs(per_peer + 30))
+        .json(&body)
+        .send()
+        .await?;
+    let ok = resp.status().is_success();
+    let text = resp.text().await?;
+    if !ok {
+        anyhow::bail!("daemon: {text}");
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))?;
+    println!(
+        "replicated {} of {} peer(s) for {}",
+        v["warmed"].as_u64().unwrap_or(0),
+        v["of"].as_u64().unwrap_or(0),
+        v["model"].as_str().unwrap_or(model),
+    );
+    let rows: Vec<Vec<String>> = v["results"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|r| {
+                    let detail = if r["ok"].as_bool().unwrap_or(false) {
+                        format!(
+                            "{} ({} ms)",
+                            r["state"].as_str().unwrap_or("warm"),
+                            r["load_ms"].as_u64().unwrap_or(0)
+                        )
+                    } else if let Some(note) = r["note"].as_str() {
+                        note.to_string()
+                    } else {
+                        r["error"].as_str().unwrap_or("unknown failure").to_string()
+                    };
+                    vec![
+                        r["peer"].as_str().unwrap_or("?").to_string(),
+                        r["url"].as_str().unwrap_or("?").to_string(),
+                        if r["ok"].as_bool().unwrap_or(false) {
+                            "ok"
+                        } else {
+                            "FAIL"
+                        }
+                        .to_string(),
+                        detail,
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !rows.is_empty() {
+        println!();
+        render_table(&["PEER", "URL", "RESULT", "DETAIL"], &rows, &[2]);
+    }
+    Ok(())
+}
+
+/// `blazar route <model>`: the scheduling decision the gateway would
+/// take for this model, with the signals behind it.
+async fn route_cmd(model: &str, json: bool) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let resp = cli_http()
+        .get(format!("{base}/api/route/{}", encode_path_segment(model)))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?;
+    let ok = resp.status().is_success();
+    let text = resp.text().await?;
+    if !ok {
+        anyhow::bail!("daemon: {text}");
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!("model     {}", v["model"].as_str().unwrap_or("unknown"));
+    println!(
+        "decision  {}",
+        v["decision"]["target"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "reason    {}",
+        v["decision"]["reason"].as_str().unwrap_or("unknown")
+    );
+    let resident = &v["local"]["resident"];
+    if resident.is_object() {
+        println!(
+            "local     resident, state {} ({} slots, in_flight {})",
+            resident["state"].as_str().unwrap_or("unknown"),
+            resident["slots"].as_u64().unwrap_or(0),
+            resident["in_flight"].as_u64().unwrap_or(0),
+        );
+    } else {
+        println!("local     not resident");
+    }
+    let rows: Vec<Vec<String>> = v["peers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|p| {
+                    vec![
+                        p["name"].as_str().unwrap_or("?").to_string(),
+                        p["tier"].as_str().unwrap_or("?").to_string(),
+                        format!("{} ms", p["est_wait_ms"].as_u64().unwrap_or(0)),
+                        humansize(p["free_vram_bytes"].as_i64().unwrap_or(0)),
+                        if p["serves_model"].as_bool().unwrap_or(false) {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                        .to_string(),
+                        if p["marked_down"].as_bool().unwrap_or(false) {
+                            "down"
+                        } else {
+                            "-"
+                        }
+                        .to_string(),
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !rows.is_empty() {
+        println!();
+        render_table(
+            &["PEER", "TIER", "EST WAIT", "FREE VRAM", "SERVES", "BREAKER"],
+            &rows,
+            &[2, 3],
+        );
     }
     Ok(())
 }
@@ -10431,16 +10739,27 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             tag,
             no_gate,
             check,
+            all,
         } => {
-            let engine_kind: EngineKind = kind
-                .parse()
-                .map_err(|e| anyhow!("engine update --kind {kind:?}: {e}"))?;
-            match engine_kind {
-                EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
-                EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
-                EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
-                EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
-                EngineKind::Whisper => engine_update_whisper(&d, tag, check).await?,
+            if all {
+                if tag.is_some() {
+                    anyhow::bail!(
+                        "engine update --all walks every installed lane — drop the pinned tag \
+                         (or drop --all)"
+                    );
+                }
+                engine_update_all(&d, no_gate, check).await?;
+            } else {
+                let engine_kind: EngineKind = kind
+                    .parse()
+                    .map_err(|e| anyhow!("engine update --kind {kind:?}: {e}"))?;
+                match engine_kind {
+                    EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
+                    EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
+                    EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
+                    EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
+                    EngineKind::Whisper => engine_update_whisper(&d, tag, check).await?,
+                }
             }
         }
         EngineCmd::List { json } => {
@@ -11290,6 +11609,119 @@ async fn route_update_to_build(
 }
 
 #[allow(clippy::too_many_lines)] // lane chain: resolve, download, install, register, prune
+/// Installed lanes for `engine update --all`, in the fixed walk order:
+/// llamacpp first (the GGUF default lane), whisper last (lazy
+/// side-lane). Pure so the walk order is pinned by a unit test.
+fn installed_engine_kinds(rows: &[blazar_core::EngineRow]) -> Vec<EngineKind> {
+    [
+        EngineKind::LlamaCpp,
+        EngineKind::MistralRs,
+        EngineKind::Sglang,
+        EngineKind::SdCpp,
+        EngineKind::Whisper,
+    ]
+    .into_iter()
+    .filter(|k| rows.iter().any(|r| r.kind == *k))
+    .collect()
+}
+
+/// Which tag `engine update --all` must leave active after the walk.
+///
+/// The pre-walk lane stays the user's lane: if a lane install switched
+/// the active tag to another kind, the walk restores the snapshot kind
+/// — at its NEWEST build when the update pruned the exact snapshot tag
+/// (same semantics as `engine use --kind`). A same-kind change is the
+/// lane's own update and stays. With no pre-walk active engine, the
+/// default llamacpp lane wins when installed. `None` = leave the store
+/// as-is. `rows` is `list_engines()` order (newest-first).
+fn restore_active_tag(
+    rows: &[blazar_core::EngineRow],
+    before: Option<(String, EngineKind)>,
+    after_kind: Option<EngineKind>,
+) -> Option<String> {
+    match before {
+        None => rows
+            .iter()
+            .find(|r| r.kind == EngineKind::LlamaCpp && r.tag != blazar_runtime::LOCAL_TAG)
+            .map(|r| r.tag.clone()),
+        Some((tag, kind)) => {
+            if after_kind == Some(kind) {
+                return None;
+            }
+            if rows.iter().any(|r| r.tag == tag) {
+                return Some(tag);
+            }
+            rows.iter()
+                .find(|r| r.kind == kind && r.tag != blazar_runtime::LOCAL_TAG)
+                .map(|r| r.tag.clone())
+        }
+    }
+}
+
+/// `engine update --all`: one-shot currency sweep over every installed
+/// lane. Absent lanes are skipped (installing a lane is a separate
+/// decision), current lanes no-op inside their own update path, and a
+/// failing lane is recorded while the walk continues — the summary
+/// names the failures and the exit code stays non-zero. The user's
+/// active lane is preserved: a lane install that flips the active tag
+/// to its own kind is restored to the pre-walk lane (newest build of
+/// that kind) after the walk.
+async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result<()> {
+    let store = Store::open(d)?;
+    let kinds = installed_engine_kinds(&store.list_engines()?);
+    if kinds.is_empty() {
+        anyhow::bail!("no engines installed — `blazar engine update` installs the llama.cpp lane");
+    }
+    // Snapshot BEFORE any lane can flip the active tag: (tag, kind).
+    let before = store.active_engine()?.map(|r| (r.tag, r.kind));
+    drop(store);
+    let mut failed: Vec<&'static str> = Vec::new();
+    for kind in &kinds {
+        println!(
+            "== {} {}==",
+            kind.as_str(),
+            if check { "(dry-run) " } else { "" }
+        );
+        let result = match kind {
+            EngineKind::LlamaCpp => engine_update(d, None, no_gate, check).await,
+            EngineKind::Sglang => engine_update_sglang(d, None, check).await,
+            EngineKind::MistralRs => engine_update_mistralrs(d, None, check).await,
+            EngineKind::SdCpp => engine_update_sdcpp(d, None, check).await,
+            EngineKind::Whisper => engine_update_whisper(d, None, check).await,
+        };
+        if let Err(e) = result {
+            eprintln!("lane {} failed: {e:#}", kind.as_str());
+            failed.push(kind.as_str());
+        }
+    }
+    if !check {
+        // Lane installs activate their own kind; undo any cross-lane
+        // flip so --all never changes which engine serves the box.
+        let store = Store::open(d)?;
+        let after_kind = store.active_engine()?.map(|r| r.kind);
+        let restore = restore_active_tag(&store.list_engines()?, before, after_kind);
+        drop(store);
+        if let Some(tag) = restore {
+            let mgr = local_engine_manager(d)?;
+            let prior = blazar_core::store::Store::open(d)?
+                .active_engine()?
+                .map(|r| r.tag);
+            let row = mgr.use_tag(&tag)?;
+            println!("active lane restored: {}", row.tag);
+            restart_daemon_if_active_changed(prior, Some(row.tag.clone())).await;
+        }
+    }
+    println!(
+        "engine update --all: {} lane(s) walked, {} failed",
+        kinds.len(),
+        failed.len()
+    );
+    if !failed.is_empty() {
+        anyhow::bail!("failed lanes: {}", failed.join(", "));
+    }
+    Ok(())
+}
+
 async fn engine_update(
     d: &BlazarDirs,
     tag: Option<String>,
@@ -11345,7 +11777,10 @@ async fn engine_update(
             cfg.update_channel
         );
         match active_tag.as_deref() {
-            Some(a) if a == target_tag => println!("up to date: {a} active"),
+            // Lane-suffixed active tags (b11339-cuda) are the same
+            // build as the channel target (b11339) — raw string
+            // equality would report an update forever on CUDA boxes.
+            Some(a) if same_build(a, &target_tag) => println!("up to date: {a} active"),
             Some(a) => println!(
                 "update available: {a} -> {target_tag}{}",
                 if downgrade {
@@ -13190,6 +13625,99 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["latest"], "b2");
         assert!(!dirs.run_dir().join("engine-check.json.tmp").exists());
+    }
+
+    #[test]
+    fn unit__installed_engine_kinds__fixed_walk_order_dedup_and_skip_absent() {
+        let row = |tag: &str, kind: EngineKind| blazar_core::EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at: 1,
+            active: false,
+            manifest: String::new(),
+            kind,
+        };
+        // Out-of-order + duplicated rows: the walk order stays fixed
+        // (llamacpp first, whisper last) and absent lanes drop out.
+        let rows = vec![
+            row("sglang-0.5.20", EngineKind::Sglang),
+            row("b11338-cuda", EngineKind::LlamaCpp),
+            row("sglang-0.5.19", EngineKind::Sglang),
+            row("b5130", EngineKind::Whisper),
+        ];
+        let kinds = installed_engine_kinds(&rows);
+        assert!(matches!(
+            kinds.as_slice(),
+            [
+                EngineKind::LlamaCpp,
+                EngineKind::Sglang,
+                EngineKind::Whisper
+            ]
+        ));
+        assert!(installed_engine_kinds(&[]).is_empty());
+    }
+
+    #[test]
+    fn unit__restore_active_tag__switched_lane_restores_newest_of_pre_walk_kind() {
+        let row = |tag: &str, kind: EngineKind| blazar_core::EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at: 1,
+            active: false,
+            manifest: String::new(),
+            kind,
+        };
+        // list_engines order: newest-first. The walk updated llamacpp
+        // AND retention pruned b11338, then sglang flipped itself
+        // active: restore the user's llamacpp lane at its NEWEST build.
+        let rows = vec![
+            row("sglang-0.5.21", EngineKind::Sglang),
+            row("b11339-cuda", EngineKind::LlamaCpp),
+        ];
+        let restore = restore_active_tag(
+            &rows,
+            Some(("b11338-cuda".to_string(), EngineKind::LlamaCpp)),
+            Some(EngineKind::Sglang),
+        );
+        assert_eq!(restore.as_deref(), Some("b11339-cuda"));
+
+        // Exact snapshot tag still present (retention kept it — e.g. a
+        // user pin): restore the exact tag, not just any of the kind.
+        let retained = vec![
+            row("sglang-0.5.21", EngineKind::Sglang),
+            row("b11339-cuda", EngineKind::LlamaCpp),
+            row("b11338-cuda", EngineKind::LlamaCpp),
+        ];
+        let restore_exact = restore_active_tag(
+            &retained,
+            Some(("b11338-cuda".to_string(), EngineKind::LlamaCpp)),
+            Some(EngineKind::SdCpp),
+        );
+        assert_eq!(restore_exact.as_deref(), Some("b11338-cuda"));
+
+        // Same-kind change = the lane's own update: leave as-is.
+        assert_eq!(
+            restore_active_tag(
+                &rows,
+                Some(("b11338-cuda".to_string(), EngineKind::LlamaCpp)),
+                Some(EngineKind::LlamaCpp),
+            ),
+            None
+        );
+
+        // No pre-walk active: the default llamacpp lane wins.
+        assert_eq!(
+            restore_active_tag(&rows, None, Some(EngineKind::Sglang)).as_deref(),
+            Some("b11339-cuda")
+        );
+        // No pre-walk active and no llamacpp installed: leave as-is.
+        let no_llamacpp = vec![row("sglang-0.5.21", EngineKind::Sglang)];
+        assert_eq!(
+            restore_active_tag(&no_llamacpp, None, Some(EngineKind::Sglang)),
+            None
+        );
     }
 
     #[test]
