@@ -120,6 +120,9 @@ BUCKETS: dict[str, list[tuple[str, str]]] = {
         ("decoding quality", r"beam|best|temperature|entropy|logprob|fallback"),
         ("segmentation/timing", r"timestamp|offset|duration|split|context|max.len|word"),
     ],
+    # mlx lane ships knob-less: extra mlx_lm.server flags pass via
+    # model_overrides argv (see knob_hint_block's None arm in the CLI).
+    "mlx": [],
 }
 
 

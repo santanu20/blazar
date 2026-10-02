@@ -370,12 +370,13 @@ token quality are surfaced as drift.
 | max_concurrent | — | gateway-http + cli | `blazar-gateway/src/lib.rs:82` in `auth`; `blazar-gateway/src/lib.rs:576` in `keys_list`; `blazar-cli/src/main.rs:6378` in `create_cmd`; `blazar-cli/src/main.rs:6464` in `keys_cmd` |
 | weight | — | gateway-http | `blazar-gateway/src/lib.rs:89` in `auth`; `blazar-gateway/src/lib.rs:99` in `auth` |
 
-## WarmPeg ([warm_peg]) — 3 fields, 0 dead
+## WarmPeg ([warm_peg]) — 4 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
 | default | true | other + gateway-http + engine-argv + runtime/gateway + cli | `blazar-core/examples/slots_probe.rs:65` in `main`; `blazar-core/examples/slots_probe.rs:66` in `main`; `blazar-gateway/src/otlp.rs:200` in `unit__encode__strict_export_shape`; `blazar-gateway/src/otlp.rs:228` in `unit__flusher__posts_batches_to_collector`; `blazar-core/src/profile.rs:2346` in `derive_pa_fraction`; `blazar-core/src/profile.rs:2360` in `derive_pa_fraction`; `blazar-runtime/src/probe.rs:488` in `unit__probe_hardware__merges_sysinfo_and_devices`; `blazar-runtime/src/probe.rs:491` in `unit__probe_hardware__merges_sysinfo_and_devices`; `blazar-cli/tests/upgrade.rs:27` in `make_tarball`; `blazar-cli/src/main.rs:734` in `?` |
 | sglang | None | runtime/gateway + gateway-http + engine-argv + other + cli | `blazar-runtime/src/engine_impl.rs:1090` in `spawn`; `blazar-runtime/src/engine_impl.rs:1100` in `health_check`; `blazar-gateway/src/lib.rs:1224` in `unit__supervision_error__unsupported_model_maps_to_400_with_remedy`; `blazar-gateway/src/lib.rs:1236` in `unit__supervision_error__unsupported_model_maps_to_400_with_remedy`; `blazar-core/src/profile.rs:233` in `compile`; `blazar-core/src/profile.rs:234` in `compile`; `blazar-core/src/engine_kind.rs:41` in `as_str`; `blazar-core/src/engine_kind.rs:195` in `fmt`; `blazar-cli/src/main.rs:737` in `?`; `blazar-cli/src/main.rs:738` in `?` |
+| mlx | None | runtime/gateway + engine-argv | `blazar-core/src/config.rs` in `WarmPeg::enabled_for` (Mlx arm — JIT venv class, same peg as sglang); threaded via `serving_lane` mlx axis |
 | llamacpp | None | other + gateway-http + engine-argv + runtime/gateway + cli | `blazar-core/src/engine_kind.rs:39` in `as_str`; `blazar-core/src/engine_kind.rs:201` in `fmt`; `blazar-gateway/src/lib.rs:993` in `serve`; `blazar-gateway/src/lib.rs:994` in `serve`; `blazar-core/src/profile.rs:232` in `compile`; `blazar-core/src/profile.rs:3395` in `compile_sglang`; `blazar-runtime/tests/engine_manager.rs:568` in `integration__prune_retention_is_scoped_per_kind`; `blazar-runtime/tests/engine_manager.rs:569` in `integration__prune_retention_is_scoped_per_kind`; `blazar-cli/src/main.rs:511` in `?`; `blazar-cli/src/main.rs:2009` in `engine_offer_line` |
 
 ## EngineRouting ([engine_routing]) — 2 fields, 0 dead
