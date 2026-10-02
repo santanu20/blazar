@@ -2045,8 +2045,17 @@ impl EngineManager {
     }
 
     /// Activate an installed tag by name.
+    ///
+    /// A miss returns a teaching error naming the installed set and the
+    /// nearest tags by edit distance instead of the raw store "no rows"
+    /// failure — dead tags are routine after `engine update --all`
+    /// prunes a superseded build, and the raw error gives no way back.
     pub fn use_tag(&self, tag: &str) -> Result<EngineRow> {
         let store = Store::open(&self.dirs)?;
+        let engines = store.list_engines()?;
+        if !engines.iter().any(|e| e.tag == tag) {
+            return Err(dead_tag_error(tag, &engines));
+        }
         store.set_active_engine(tag)?;
         self.bus.publish(BlazarEvent::EngineUpdated {
             tag: tag.to_string(),
@@ -3191,6 +3200,59 @@ pub fn verify_engine_binary(
 /// serving (live incident 2026-09-26: `engine rollback` crossed into
 /// `b5130/whisper` while the user expected a llama.cpp step).
 #[must_use]
+/// Classic Levenshtein edit distance (two-row DP). Local copy because the
+/// runtime crate cannot depend on the gateway's resolver copy.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b_chars.len()]
+}
+
+/// Nearest installed tags by edit distance, same kind as nothing in
+/// particular — closest wins, ties broken by list order (newest first).
+fn nearest_tags(tag: &str, engines: &[EngineRow], limit: usize) -> Vec<String> {
+    let mut ranked: Vec<(usize, &str)> = engines
+        .iter()
+        .map(|e| (edit_distance(tag, &e.tag), e.tag.as_str()))
+        .collect();
+    ranked.sort_by_key(|(d, _)| *d);
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, t)| t.to_string())
+        .collect()
+}
+
+/// Teaching error for `engine use <tag>` on a tag that is not installed.
+fn dead_tag_error(tag: &str, engines: &[EngineRow]) -> anyhow::Error {
+    if engines.is_empty() {
+        return anyhow::anyhow!(
+            "engine tag {tag:?} is not installed and no engines are installed yet \
+             (start with `blazar engine install`)"
+        );
+    }
+    let nearest = nearest_tags(tag, engines, 3);
+    anyhow::anyhow!(
+        "engine tag {tag:?} is not installed (pruned by an update, or never pulled). \
+         Nearest installed tags: {}. Installed: {}. \
+         Hint: `blazar engine list` shows every lane.",
+        nearest.join(", "),
+        engines
+            .iter()
+            .map(|e| e.tag.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 pub fn rollback_candidate(engines: &[EngineRow]) -> Option<&EngineRow> {
     let active = engines.iter().find(|e| e.active)?;
     engines
@@ -3215,6 +3277,58 @@ mod rollback_tests {
             manifest: String::new(),
             kind,
         }
+    }
+
+    #[test]
+    fn unit__edit_distance__sanity_matrix() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("kit", "kat"), 1);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("b11339-cuda", "b11344-cuda"), 2);
+    }
+
+    #[test]
+    fn unit__nearest_tags__ranks_by_distance_and_keeps_list_order_on_ties() {
+        // Newest-first, exactly the order list_engines returns.
+        let engines = vec![
+            row("b11344-cuda", 400, true, EngineKind::LlamaCpp),
+            row("sglang-0.5.21", 350, false, EngineKind::Sglang),
+            row("b5130", 300, false, EngineKind::Whisper),
+        ];
+        let nearest = nearest_tags("b11339-cuda", &engines, 3);
+        assert_eq!(nearest.first().map(String::as_str), Some("b11344-cuda"));
+        assert_eq!(nearest.len(), 3, "limit must bound the hint list");
+        // Ties resolve in list order (newest first), never scrambled.
+        let tie = nearest_tags("b5131", &engines, 2);
+        assert_eq!(tie.first().map(String::as_str), Some("b5130"));
+    }
+
+    #[test]
+    fn unit__dead_tag_error__teaches_with_nearest_and_full_list() {
+        let engines = vec![
+            row("b11344-cuda", 400, true, EngineKind::LlamaCpp),
+            row("sglang-0.5.21", 350, false, EngineKind::Sglang),
+        ];
+        let msg = dead_tag_error("b11339-cuda", &engines).to_string();
+        assert!(msg.contains("b11339-cuda"), "must name the requested tag");
+        assert!(
+            msg.contains("Nearest installed tags:"),
+            "must offer the hint"
+        );
+        assert!(msg.contains("b11344-cuda"), "nearest hint must be present");
+        assert!(
+            msg.contains("sglang-0.5.21"),
+            "installed list must be complete"
+        );
+        assert!(
+            msg.contains("engine list"),
+            "must point at the listing command"
+        );
+
+        // Empty store: a different teaching arm, not a nearest-tags
+        // list over zero rows.
+        let empty = dead_tag_error("anything", &[]).to_string();
+        assert!(empty.contains("no engines are installed"), "got {empty}");
     }
 
     /// 2026-09-26 incident pin: a text-lane rollback stepped onto the

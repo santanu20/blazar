@@ -39,6 +39,8 @@ guesswork.
 ## [0.15.0] - 2026-10-02
 - feat(gateway): OpenAI `n` choices — strict 1..=8 validation (400 before admission), passthrough, non-stream count-verify (teaching 502 when a lane ignores `n`), per-key token charge multiplied by `n` on llamacpp lanes
 - fix(cli+runtime): `engine update --check` verdict uses the CUDA asset walk-back target (channel release without a driver-runnable ubuntu-cuda asset no longer prints a phantom 'update available')
+- fix(runtime): `engine use <unknown-tag>` teaches instead of surfacing the raw store error — names the three nearest installed tags (edit-distance ranked) plus the full lane list and a `engine list` hint
+- feat(gateway): `n` choices are checked against the serving lane's own ceiling before admission (llama.cpp lane = 2, live-probed b11339+b11344; unprobed lanes keep 8) — the engine's raw "Value must be between 1 <= value <= 2" no longer leaks to API callers
 - fix(runtime+core): orphan scan shard-sibling reconstruction missed the `-` separator (every sharded GGUF shard 2+ read as orphan — prune bait); fresh-DB `last_used_at` backfill now applies in upsert (was migration-only); disk-verdict and unused-rows test constants corrected
 
 Theme: **the reliability layer** — local AI that behaves like infrastructure.

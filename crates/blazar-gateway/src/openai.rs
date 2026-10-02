@@ -386,6 +386,29 @@ pub async fn openai_proxy(
     let Some(model) = model else {
         return openai_error(400, "missing `model` field in request body");
     };
+    // Lane-aware `n` ceiling: the plane-wide bound is the promise, but the
+    // serving engine may cap lower (llama-server: 2). Reject in our voice,
+    // before admission bills a request the engine would refuse anyway.
+    // Only runs when the caller actually asked for extra choices.
+    if let Some(body) = parsed_body.as_ref() {
+        if let Ok(Some(n)) = crate::proxy::requested_choices(uri.path(), body) {
+            if n > 1 {
+                if let Some(kind) = crate::proxy::routed_kind_for(&state, &model) {
+                    let cap = crate::proxy::lane_max_n(kind);
+                    if n > cap {
+                        return openai_error(
+                            400,
+                            &format!(
+                                "n = {n} exceeds this lane's ceiling: {kind} serves at most \
+                                 {cap} choices per request (plane-wide limit is {})",
+                                crate::proxy::MAX_N_CHOICES
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Per-key admission: model scope + rate limits + request accounting.
     if let Some(key) = key_ext.as_ref().map(|Extension(k)| k) {
         if let Some(entry) = state.keys.entry(&key.name) {

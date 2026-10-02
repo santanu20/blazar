@@ -330,7 +330,8 @@ async fn e2e__num_ctx_header_resolves_the_tags_rendered_name() {
 async fn e2e__n_choices_engine_ignoring_n_gets_a_teaching_502() {
     // Default stub returns ONE choice no matter what was asked: the
     // gateway must detect "lane ignored n" and refuse loudly instead of
-    // letting a silent 1-of-N answer through.
+    // letting a silent 1-of-N answer through. n=2 is the llamacpp lane
+    // ceiling, so this is the largest n that still reaches the engine.
     let ts = start(Config::default()).await;
     let c = client();
     let resp = c
@@ -338,7 +339,7 @@ async fn e2e__n_choices_engine_ignoring_n_gets_a_teaching_502() {
         .json(&serde_json::json!({
             "model": "m1",
             "messages": [{"role": "user", "content": "pick one"}],
-            "n": 3,
+            "n": 2,
         }))
         .send()
         .await
@@ -347,7 +348,7 @@ async fn e2e__n_choices_engine_ignoring_n_gets_a_teaching_502() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let msg = body.to_string();
     assert!(
-        msg.contains("asked n=3 choices") && msg.contains("engine returned 1"),
+        msg.contains("asked n=2 choices") && msg.contains("engine returned 1"),
         "under-count teaching must name both numbers, got {msg}"
     );
     ts.state.sup.shutdown_all().await.unwrap();
@@ -356,7 +357,7 @@ async fn e2e__n_choices_engine_ignoring_n_gets_a_teaching_502() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__n_choices_honored_passes_through_with_all_choices() {
-    std::env::set_var("STUB_CHOICE_COUNT", "3");
+    std::env::set_var("STUB_CHOICE_COUNT", "2");
     let ts = start(Config::default()).await;
     let c = client();
     let r: serde_json::Value = c
@@ -364,7 +365,7 @@ async fn e2e__n_choices_honored_passes_through_with_all_choices() {
         .json(&serde_json::json!({
             "model": "m1",
             "messages": [{"role": "user", "content": "variants"}],
-            "n": 3,
+            "n": 2,
         }))
         .send()
         .await
@@ -373,12 +374,12 @@ async fn e2e__n_choices_honored_passes_through_with_all_choices() {
         .await
         .unwrap();
     let choices = r["choices"].as_array().expect("choices array");
-    assert_eq!(choices.len(), 3, "all three choices must arrive");
+    assert_eq!(choices.len(), 2, "both choices must arrive");
     let indexes: Vec<i64> = choices
         .iter()
         .map(|ch| ch["index"].as_i64().unwrap())
         .collect();
-    assert_eq!(indexes, vec![0, 1, 2]);
+    assert_eq!(indexes, vec![0, 1]);
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -419,6 +420,38 @@ async fn e2e__n_choices_out_of_range_fails_fast_unbilled() {
             .unwrap();
         assert_eq!(resp.status(), 400, "n={bad} must be rejected");
     }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__n_choices_lane_ceiling_teaches_before_the_engine_can() {
+    // The plane-wide range admits n=3, but the llamacpp lane (the stub)
+    // serves at most 2. The gateway must 400 in its own voice before
+    // the engine's raw "Value must be between 1 <= value <= 2" leaks.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "three ways"}],
+            "n": 3,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body.to_string();
+    assert!(
+        msg.contains("exceeds this lane's ceiling"),
+        "lane teaching must be the gateway's own voice, got {msg}"
+    );
+    assert!(
+        msg.contains("at most 2 choices"),
+        "must name the llamacpp cap, got {msg}"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

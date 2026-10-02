@@ -1370,6 +1370,19 @@ pub(crate) struct LaneResolution {
 /// when no engines, mirroring the old gate-skip). Err lanes resolve to
 /// the global kind inside [`resolve_serving`] — the spawn delivers the
 /// real teaching error.
+/// Per-lane ceiling on OpenAI `n` (choices per request). The plane-wide
+/// contract is `1..=MAX_N_CHOICES`, but the serving engine may cap lower:
+/// llama-server accepts `n <= 2` (live-probed on b11339 and b11344).
+/// Lanes not yet probed keep the plane-wide ceiling so this never
+/// under-promises what a lane will do.
+pub(crate) fn lane_max_n(kind: blazar_core::engine_kind::EngineKind) -> u64 {
+    use blazar_core::engine_kind::EngineKind;
+    match kind {
+        EngineKind::LlamaCpp => 2,
+        _ => MAX_N_CHOICES,
+    }
+}
+
 pub(crate) fn routed_kind_for(
     state: &Arc<AppState>,
     model: &str,
@@ -2095,6 +2108,18 @@ mod affinity_tests {
             requested_choices("/v1/completions?api-version=1", &body(serde_json::json!(4))),
             Ok(Some(4))
         );
+    }
+
+    #[test]
+    fn unit__lane_max_n__llamacpp_caps_two_others_keep_plane_ceiling() {
+        // Live-probed b11339 + b11344: llama-server rejects n > 2 at the
+        // engine edge. Unprobed lanes keep the plane-wide 8 so the
+        // gateway never under-promises what a lane might serve.
+        assert_eq!(lane_max_n(EngineKind::LlamaCpp), 2);
+        assert_eq!(lane_max_n(EngineKind::Sglang), MAX_N_CHOICES);
+        assert_eq!(lane_max_n(EngineKind::MistralRs), MAX_N_CHOICES);
+        assert_eq!(lane_max_n(EngineKind::SdCpp), MAX_N_CHOICES);
+        assert_eq!(lane_max_n(EngineKind::Whisper), MAX_N_CHOICES);
     }
 
     #[test]
