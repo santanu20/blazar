@@ -229,6 +229,13 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     if input.engine_kind == crate::engine_kind::EngineKind::SdCpp {
         return compile_sdcpp(input, tuning);
     }
+    // Dialect fork: mlx_lm.server owns its whole launch grammar
+    // (--model/--host/--port) the same way the sglang fork does — no ctx
+    // ladder and no KV math (mlx manages context and memory inside its
+    // own runtime), so none of the llama-server rules below apply.
+    if input.engine_kind == crate::engine_kind::EngineKind::Mlx {
+        return compile_mlx(input);
+    }
     // The llama-server grammar below is GGUF-only: every rule reads GGUF
     // tensor metadata. A safetensors row on a GGUF engine is a routing
     // mistake — teach instead of crashing deep in a rule.
@@ -3502,6 +3509,58 @@ fn push_tuned_list(
 ///
 /// No GPU at all → `--device cpu` lane with a loud warning.
 #[allow(clippy::too_many_lines)]
+/// mlx-lm launch profile: the connection quintet (--model/--host/--port)
+/// is owned by `MlxEngine::build_argv` (same split as the sglang fork);
+/// mlx manages context and memory inside its own runtime, so this profile
+/// carries no ctx/KV numbers — only the strict manifest-gated
+/// `extra_args` passthrough with the launch pins reserved.
+fn compile_mlx(input: &ProfileInput<'_>) -> Result<Profile, String> {
+    match input.meta {
+        ModelMeta::Hf(_) => {}
+        ModelMeta::Gguf(g) => {
+            return Err(format!(
+                "model {} is a GGUF file (arch {}) — the mlx engine consumes MLX                  safetensors directories (mlx-community repos); run it on the                  llamacpp engine (default) or pull an MLX quant repo",
+                input.model_name, g.architecture
+            ));
+        }
+    }
+    let argv = mlx_extra_args(input)?;
+    Ok(Profile {
+        argv,
+        warnings: Vec::new(),
+        ctx: 0,
+        gpu: "auto",
+        kv_est_bytes: None,
+        ctx_autofit: None,
+    })
+}
+
+/// Strict manifest-gated `extra_args` passthrough for the mlx dialect:
+/// the launch pins are reserved (blazar sets them from the quintet), and
+/// unknown flags refuse instead of dying at child boot.
+fn mlx_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
+    const RESERVED: &[&str] = &["--model", "--host", "--port"];
+    let Some(extra) = &input.overlay.extra_args else {
+        return Ok(Vec::new());
+    };
+    for tok in extra {
+        if !tok.starts_with('-') {
+            continue; // value token riding its preceding flag
+        }
+        if RESERVED.contains(&tok.as_str()) {
+            return Err(format!(
+                "extra_args {tok} is reserved — blazar owns it on the mlx engine                  (model + loopback listen pins); remove it from the override"
+            ));
+        }
+        if !input.supported_flags.contains(tok.as_str()) {
+            return Err(format!(
+                "extra_args {tok} is not a flag of this mlx-lm build; remove it or                  run: blazar engine update"
+            ));
+        }
+    }
+    Ok(extra.clone())
+}
+
 fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Profile, String> {
     let mut argv: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
