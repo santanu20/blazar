@@ -33,6 +33,7 @@ pub fn lane_reason(
     diffusion: bool,
     safetensors: bool,
     quantized: bool,
+    mlx: bool,
     policy: RoutingPolicy,
 ) -> String {
     if matches!(mode, RoutingMode::Manual) {
@@ -43,6 +44,13 @@ pub fn lane_reason(
     }
     if diffusion {
         return "diffusion component set routes to the sdcpp lane".into();
+    }
+    if mlx {
+        // Checked before the quantized-safetensors arm, mirroring
+        // route_format: only mlx-lm decodes MLX dirs, so the format
+        // forces the lane ahead of any policy preference.
+        return "MLX quant dir — the mlx lane is the only decoder, format-forced ahead of policy"
+            .into();
     }
     if safetensors && quantized {
         return format!(
@@ -74,6 +82,30 @@ pub fn requested_ctx_source(overlay_ctx_set: bool, model: &str, default_ctx: u32
 #[must_use]
 pub fn cold_ctx_note() -> &'static str {
     "config estimate — model not resident; the spawn-time planner may shrink it to fit VRAM"
+}
+
+/// The honest quant label for an MLX dir: the quantization block in
+/// config.json carries the real bits/group_size. The store's `quant`
+/// column only records tensor storage dtype (e.g. BF16), which says
+/// nothing about the MLX quant strength shown to the user.
+#[must_use]
+pub fn mlx_quant_display(path: &str) -> String {
+    let block = std::fs::read(std::path::Path::new(path).join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|c| c.get("quantization").cloned());
+    match block {
+        Some(q) => {
+            let bits = q.get("bits").and_then(|v| v.as_u64());
+            let group = q.get("group_size").and_then(|v| v.as_u64());
+            match (bits, group) {
+                (Some(b), Some(g)) => format!("MLX {b}-bit (group {g})"),
+                (Some(b), None) => format!("MLX {b}-bit"),
+                _ => "MLX (config.json quantization block unrecognized)".into(),
+            }
+        }
+        None => "MLX (unquantized f16/bf16 weights)".into(),
+    }
 }
 
 /// `GET /api/explain/{model}` — the effective-config card.
@@ -165,6 +197,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
                 diffusion,
                 safetensors,
                 quantized,
+                mlx,
                 state.config.engine_routing.policy,
             ),
         }),
@@ -200,24 +233,37 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         .into_iter()
         .find(|p| p.name == resolved && p.ctx > 0)
         .map(|p| p.ctx);
-    let (effective, effective_source, limitation) = match resident_ctx {
-        Some(c) => {
-            let lim = if c < requested {
-                "live child holds less ctx than requested (auto-fit divided it across slots, or a VRAM-budget respawn)"
-            } else {
-                "none observed"
-            };
-            (c, "live child argv", lim)
-        }
-        None => (requested, cold_ctx_note(), "unknown until first spawn"),
+    let context = if mlx {
+        // mlx_lm owns the context window: the gateway passes no ctx flag
+        // (compile_mlx ships ctx 0) — the shrink-to-fit ladder is a
+        // llama.cpp concept that does not govern this lane.
+        json!({
+            "requested": "runtime-managed",
+            "requested_source": "mlx_lm owns the context window — no gateway ctx knob for this lane",
+            "effective": "runtime-managed",
+            "effective_source": "mlx_lm",
+            "limitation": "kv-bits / kv-group-size / prompt-cache flags pass through model_overrides argv",
+        })
+    } else {
+        let (effective, effective_source, limitation) = match resident_ctx {
+            Some(c) => {
+                let lim = if c < requested {
+                    "live child holds less ctx than requested (auto-fit divided it across slots, or a VRAM-budget respawn)"
+                } else {
+                    "none observed"
+                };
+                (c, "live child argv", lim)
+            }
+            None => (requested, cold_ctx_note(), "unknown until first spawn"),
+        };
+        json!({
+            "requested": requested,
+            "requested_source": requested_ctx_source(overlay.ctx.is_some(), &resolved, state.config.default_ctx),
+            "effective": effective,
+            "effective_source": effective_source,
+            "limitation": limitation,
+        })
     };
-    let context = json!({
-        "requested": requested,
-        "requested_source": requested_ctx_source(overlay.ctx.is_some(), &resolved, state.config.default_ctx),
-        "effective": effective,
-        "effective_source": effective_source,
-        "limitation": limitation,
-    });
 
     // Slots: live census when resident; honest "sized at spawn" otherwise.
     // PsRow slot fields are Option (mid-reshape / slot-less engines) — the
@@ -296,9 +342,21 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     // Cache: KV quant grades (empty = the engine's auto ladder decides)
     // and the semantic cache config surface.
     let (kv_k, kv_v) = state.config.effective_cache_type_kv(&resolved);
+    // The KV ladder is a llama.cpp concept; on the mlx lane the runtime
+    // manages KV and shaping flags ride argv passthrough.
+    let (kv_k_disp, kv_v_disp) = if mlx {
+        (
+            "mlx runtime".to_string(),
+            "kv-bits / kv-group-size via model_overrides argv".to_string(),
+        )
+    } else if kv_k.is_empty() {
+        ("auto ladder".to_string(), "auto ladder".to_string())
+    } else {
+        (kv_k.clone(), kv_v.clone())
+    };
     let cache = json!({
-        "kv_k": if kv_k.is_empty() { "auto ladder".into() } else { kv_k },
-        "kv_v": if kv_v.is_empty() { "auto ladder".into() } else { kv_v },
+        "kv_k": kv_k_disp,
+        "kv_v": kv_v_disp,
         "semantic_cache": {
             "enabled": state.config.semantic_cache.enabled,
             "model": state.config.semantic_cache.model,
@@ -316,13 +374,19 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         "model": {
             "name": row.name,
             "repo": row.repo,
-            "quant": row.quant,
+            "quant": if mlx { mlx_quant_display(&row.path) } else { row.quant },
             "bytes": row.bytes,
             "arch": row.arch,
             "params_b": row.params,
             "ctx_train": row.ctx_train,
             "shards": row.shards,
-            "format": if safetensors { "safetensors-dir" } else { "gguf" },
+            "format": if mlx {
+                "mlx-dir"
+            } else if safetensors {
+                "safetensors-dir"
+            } else {
+                "gguf"
+            },
             "mmproj": row.mmproj_path.is_some(),
             "path": row.path,
         },
@@ -343,11 +407,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unit__mlx_quant_display__reads_the_quantization_block() {
+        let dir = std::env::temp_dir().join(format!("mlxq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // quantized dir: bits + group_size
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64, "version": 2}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mlx_quant_display(dir.to_str().unwrap()),
+            "MLX 4-bit (group 64)"
+        );
+        // unquantized dir: no quantization block
+        std::fs::write(dir.join("config.json"), r#"{"model_type": "qwen2"}"#).unwrap();
+        assert_eq!(
+            mlx_quant_display(dir.to_str().unwrap()),
+            "MLX (unquantized f16/bf16 weights)"
+        );
+        // missing config.json entirely
+        std::fs::remove_file(dir.join("config.json")).unwrap();
+        assert_eq!(
+            mlx_quant_display(dir.to_str().unwrap()),
+            "MLX (unquantized f16/bf16 weights)"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unit__lane_reason__mlx_dir_is_format_forced_before_policy() {
+        use blazar_core::config::{RoutingMode, RoutingPolicy as P};
+        // MLX arm must fire even when the quantized-safetensors shape would
+        // otherwise claim the row for policy-based sglang routing — the
+        // router checks the mlx axis first and so does this string.
+        assert_eq!(
+            lane_reason(RoutingMode::Auto, None, false, true, true, true, P::Quality),
+            "MLX quant dir — the mlx lane is the only decoder, format-forced ahead of policy"
+        );
+    }
+
+    #[test]
     fn unit__lane_reason__states_input_facts_per_branch() {
         use blazar_core::config::{RoutingMode, RoutingPolicy as P};
-        let r = |mode, pin, d, s, q, p| lane_reason(mode, pin, d, s, q, p);
+        let r = |mode, pin, d, s, q, m, p| lane_reason(mode, pin, d, s, q, m, p);
         assert_eq!(
-            r(RoutingMode::Manual, None, false, false, false, P::Quality),
+            r(
+                RoutingMode::Manual,
+                None,
+                false,
+                false,
+                false,
+                false,
+                P::Quality
+            ),
             "engine_routing.mode = manual — the active engine serves every model"
         );
         assert_eq!(
@@ -357,20 +470,53 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 P::Quality
             ),
             "model_overrides.<model>.engine pins the lane"
         );
         assert_eq!(
-            r(RoutingMode::Auto, None, true, false, false, P::Quality),
+            r(
+                RoutingMode::Auto,
+                None,
+                true,
+                false,
+                false,
+                false,
+                P::Quality
+            ),
             "diffusion component set routes to the sdcpp lane"
         );
-        let s = r(RoutingMode::Auto, None, false, true, true, P::Quality);
+        let s = r(
+            RoutingMode::Auto,
+            None,
+            false,
+            true,
+            true,
+            false,
+            P::Quality,
+        );
         assert!(s.starts_with("quantized safetensors dir under"));
-        let s = r(RoutingMode::Auto, None, false, true, false, P::Latency);
+        let s = r(
+            RoutingMode::Auto,
+            None,
+            false,
+            true,
+            false,
+            false,
+            P::Latency,
+        );
         assert!(s.starts_with("HF safetensors dir under"));
         assert_eq!(
-            r(RoutingMode::Auto, None, false, false, false, P::Quality),
+            r(
+                RoutingMode::Auto,
+                None,
+                false,
+                false,
+                false,
+                false,
+                P::Quality
+            ),
             "GGUF file with no overlay pin — the global active lane serves it"
         );
     }
