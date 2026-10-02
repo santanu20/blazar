@@ -927,4 +927,716 @@ assert "\n### Section" in _demoted, "section headings must gain one level"
 assert "# not a heading" in _demoted, "fence content must stay untouched"
 print("demote_headings: heading shift + fence immunity OK")
 
+# latest_engine_tags: latest-per-kind selection mirrors the store's
+# active-engine ranking — highest installed_at wins, ties break to the
+# youngest row (rowid), mirroring list_engines' installed_at DESC, rowid DESC.
+with tempfile.TemporaryDirectory() as td:
+    dbp = Path(td) / "blazar.db"
+    con = _sq.connect(dbp)
+    con.execute(
+        "CREATE TABLE engines (tag TEXT, asset TEXT, sha256 TEXT, "
+        "installed_at TEXT, active INT, manifest TEXT, kind TEXT)"
+    )
+    con.execute(
+        "INSERT INTO engines VALUES ('b1000','a','x','2026-01-01',0,NULL,'llamacpp')"
+    )
+    con.execute(
+        "INSERT INTO engines VALUES ('b2000','a','x','2026-02-01',0,NULL,'llamacpp')"
+    )
+    # tie on installed_at: younger rowid (inserted later) must win
+    con.execute(
+        "INSERT INTO engines VALUES ('mistral-a','a','x','2026-03-01',0,NULL,'mistralrs')"
+    )
+    con.execute(
+        "INSERT INTO engines VALUES ('mistral-b','a','x','2026-03-01',0,NULL,'mistralrs')"
+    )
+    con.commit()
+    con.close()
+    got = bm.latest_engine_tags(dbp)
+    assert got == {"llamacpp": "b2000", "mistralrs": "mistral-b"}, got
+    assert bm.latest_engine_tags(Path(td) / "nope.db") == {}, "missing db -> empty"
+    print("latest_engine_tags: newest-wins + rowid tiebreak + missing-db OK")
+
+# chart set: bench_charts rides bench_matrix's sys.path shim; render is
+# deterministic and content-marked (values, escapes, exclusions).
+import bench_charts as bc  # noqa: E402 (test-scoped, after bm import)
+
+assert bc._fmt(104.8391) == "104.8", "chart labels share table rounding"
+assert bc._fmt(None) == "-", "missing values render as dash"
+assert bc._esc('a<b>&"c"') == "a&lt;b&gt;&amp;&quot;c&quot;", "XML escaping"
+lt = bc._ticks(0.1, 5.0, log=True)
+assert lt and lt == sorted(lt) and all(0.1 * 0.99 <= t <= 5.0 * 1.01 for t in lt), lt
+lin = bc._ticks(0, 120)
+assert lin[0] >= 0 and lin[-1] <= 120 and lin == sorted(lin), lin
+print("bench_charts helpers: fmt/esc/log+linear ticks OK")
+
+_charts_recs = [
+    rec(
+        "direct",
+        {"ctx": 16384, "np": 1},
+        decode_tps_p50=95.0,
+        decode_tps_runs=[94.0, 95.0, 96.0, 95.5, 95.2],
+    ),
+    rec(
+        "direct",
+        {"ctx": 8192, "np": 1},
+        decode_tps_p50=90.0,
+    ),  # off-headline shape: excluded from the chart
+    rec(
+        "blazar",
+        {},
+        decode_tps_p50=104.8,
+        decode_tps_runs=[104.0, 104.8, 105.6, 104.4, 104.9],
+    ),
+    rec(
+        "blazar",
+        {"config": "kv"},
+        decode_tps_p50=120.0,
+    ),  # variant axis row: chart shows default lanes only
+    rec("ollama", {}, decode_tps_p50=41.5),
+    rec(
+        "ollama", {}, decode_tps_p50=30.0, reference_note="different model"
+    ),  # not comparable: must not chart
+    rec("direct", {"ctx": 16384, "np": 1}, error="sigkill"),  # error: never charted
+    rec(
+        "conc-blazar",
+        {"conc": 1},
+        sys_tps=40.0,
+        ttft_max_ms=300,
+        ttfb_p50_ms=180.0,
+        gpu_peak_mib=4100.0,
+        gpu_power_peak_w=95.0,
+    ),
+    rec(
+        "conc-blazar",
+        {"conc": 4},
+        sys_tps=140.0,
+        ttft_max_ms=520,
+        ttfb_p50_ms=390.0,
+        gpu_peak_mib=4900.0,
+        gpu_power_peak_w=140.0,
+    ),
+    rec(
+        "conc-blazar",
+        {"conc": 8},
+        sys_tps=150.0,
+        ttft_max_ms=900,
+        ttfb_p50_ms=760.0,
+        gpu_peak_mib=5600.0,
+        gpu_power_peak_w=155.0,
+    ),
+    rec(
+        "conc-ollama",
+        {"conc": 1},
+        sys_tps=35.0,
+        ttft_max_ms=280,
+        ttfb_p50_ms=170.0,
+        gpu_peak_mib=4300.0,
+        gpu_power_peak_w=98.0,
+    ),
+    rec(
+        "conc-ollama",
+        {"conc": 4},
+        sys_tps=95.0,
+        ttft_max_ms=700,
+        ttfb_p50_ms=560.0,
+        gpu_peak_mib=5100.0,
+        gpu_power_peak_w=132.0,
+    ),
+    rec(
+        "conc-ollama",
+        {"conc": 8},
+        sys_tps=98.0,
+        ttft_max_ms=2100,
+        ttfb_p50_ms=1500.0,
+        gpu_peak_mib=5900.0,
+        gpu_power_peak_w=148.0,
+        conc_errors=2,
+    ),
+    rec(
+        "ctxcurve-blazar",
+        {"ctx": 2048},
+        ctx=2048,
+        decode_tps_p50=104.0,
+        gpu_peak_mib=4100.0,
+    ),
+    rec(
+        "ctxcurve-blazar",
+        {"ctx": 16384},
+        ctx=16384,
+        decode_tps_p50=72.0,
+        gpu_peak_mib=6800.0,
+    ),
+    rec(
+        "ctxcurve-ollama",
+        {"ctx": 2048},
+        ctx=2048,
+        decode_tps_p50=40.0,
+        gpu_peak_mib=4300.0,
+    ),
+    rec(
+        "ctxcurve-ollama",
+        {"ctx": 16384},
+        ctx=16384,
+        decode_tps_p50=28.0,
+        gpu_peak_mib=7100.0,
+    ),
+    rec("blazar", {}, cold_ttft_ms=1800.0),  # cold fields ride the blazar provider
+    rec(
+        "cold-ollama",
+        {},
+        ollama_cold_ttft_ms=2900.0,
+        ollama_daemon_boot_note="left warm (no --ollama-service-restart)",
+    ),
+    rec("idle-blazar", {"policy": "sleep"}, idle_wake_ttft_ms=140.0),
+    rec("idle-ollama", {"policy": "keep_alive"}, idle_wake_ttft_ms=5200.0),
+]
+
+with tempfile.TemporaryDirectory() as td:
+    a1 = Path(td) / "camp-a"
+    ch1 = bc.render_campaign_charts(_charts_recs, a1)
+    # determinism = SAME campaign re-rendered -> byte-identical (the
+    # provenance subtitle carries the campaign name, so different dirs
+    # legitimately differ)
+    first = {n: (a1 / "plots" / n).read_bytes() for _, n, _ in ch1}
+    ch2 = bc.render_campaign_charts(_charts_recs, a1)
+    names = {f for _, f, _ in ch1}
+    assert names == {
+        "speed-single-stream.svg",
+        "gateway-overhead.svg",
+        "concurrency-throughput.svg",
+        "concurrency-ttft.svg",
+        "concurrency-vram.svg",
+        "concurrency-power.svg",
+        "concurrency-errors.svg",
+        "ctx-curve.svg",
+        "vram-vs-context.svg",
+        "lifecycle-cold-idle.svg",
+    }, names
+    for name in names:
+        b1 = first[name]
+        assert b1 == (a1 / "plots" / name).read_bytes(), f"{name} not deterministic"
+        assert b"nan" not in b1, f"{name} leaked NaN"
+    speed_svg = (a1 / "plots" / "speed-single-stream.svg").read_text()
+    assert ">104.8 t/s<" in speed_svg, "headline value + unit label missing"
+    assert ">95.0 t/s<" in speed_svg and ">41.5 t/s<" in speed_svg, "medians missing"
+    assert "fastest direct 95.0 t/s" in speed_svg, "baseline marker missing"
+    assert ">30.0<" not in speed_svg, "reference_note ollama must not chart"
+    assert ">120.0<" not in speed_svg, "variant-config row must not chart"
+    assert ">90.0<" not in speed_svg, "off-headline direct shape must not chart"
+    life = (a1 / "plots" / "lifecycle-cold-idle.svg").read_text()
+    assert ">1.80 s<" in life and ">2.90 s<" in life, "cold dots missing"
+    assert ">0.14 s<" in life and ">5.20 s<" in life, "idle dots missing"
+    assert "warm daemon" in life, "warm-daemon caveat must ride the chart"
+    # gateway overhead: signed delta of the blazar/direct pair on one tag
+    # (104.8 vs 95.0 -> +10.3%), blazar-blue bar, zero axis included
+    overhead = (a1 / "plots" / "gateway-overhead.svg").read_text()
+    assert "Gateway overhead vs direct engine" in overhead
+    assert ">10.3 %<" in overhead, "signed delta label missing"
+    # queue wait rides the tail-latency chart as dashed ttfb-p50 curves
+    ttft_svg = (a1 / "plots" / "concurrency-ttft.svg").read_text()
+    assert 'stroke-dasharray="6 4"' in ttft_svg, "ttfb dashed series missing"
+    assert "ttfb p50" in ttft_svg, "ttfb series label missing"
+    # resource panels read the per-cell peaks; errors panel carries only
+    # lanes that actually failed (blazar never did in this fixture)
+    assert (
+        "GPU memory vs concurrency"
+        in (a1 / "plots" / "concurrency-vram.svg").read_text()
+    )
+    assert (
+        "GPU power vs concurrency"
+        in (a1 / "plots" / "concurrency-power.svg").read_text()
+    )
+    errs_svg = (a1 / "plots" / "concurrency-errors.svg").read_text()
+    assert "Failed requests vs concurrency" in errs_svg
+    assert "blazar" not in errs_svg, "zero-error lanes must not chart"
+    assert (
+        "GPU memory vs context length"
+        in (a1 / "plots" / "vram-vs-context.svg").read_text()
+    )
+    # captions carry provenance + source pointer
+    joined = " ".join(c for _, _, c in ch1)
+    assert "camp-a/cells.jsonl" in joined, "caption must cite the campaign receipt"
+    print("render_campaign_charts: 10 charts, deterministic, exclusions OK")
+
+# write_publication_report: charts embed with location-relative links;
+# retired tables are gone but verdicts/receipts stay; slim chapters drop
+# the globally duplicated context sections; the policy line surfaces
+# coverage honesty for policy-skipped engine versions.
+_pub_recs = _charts_recs + [
+    {
+        "key": "inventory",
+        "provider": "inventory",
+        "tag": "inventory",
+        "params": {},
+        "engines": [{"tag": "b2000", "kind": "llamacpp"}],
+        "excluded": {
+            "b1000": "latest-per-kind policy: superseded by b2000",
+            "sglang-0.5.21": "model-format sweep: this campaign sweeps a GGUF file",
+        },
+        "engine_policy": "latest installed version per engine kind",
+    },
+]
+with tempfile.TemporaryDirectory() as td:
+    art = Path(td) / "camp"
+    art.mkdir()
+    out = Path(td) / "BENCHMARK.md"
+    bm.write_publication_report(_pub_recs, art, out, None)
+    pub = out.read_text()
+    assert '<p align="center"><img src="camp/plots/speed-single-stream.svg"' in pub, (
+        "chart embed must use a location-relative forward-slash path"
+    )
+    assert 'src="/' not in pub, "absolute chart paths are forbidden"
+    assert "| Runtime | slots x ctx |" in pub, "speed table stays the receipt"
+    assert "Cold start and footprint" not in pub, "coldstart table retired"
+    assert "Idle wake (sleep vs keep_alive expiry)" not in pub, "idle table retired"
+    assert "tail latency vs level)" not in pub, "frontier table retired"
+    assert "### Concurrency frontier verdicts" in pub, "verdicts stay"
+    assert "### Gateway overhead (chart)" in pub, "overhead section embeds"
+    assert "### Resource cost and reliability vs concurrency" in pub, (
+        "resource section embeds"
+    )
+    assert "concurrency-vram.svg" in pub and "concurrency-power.svg" in pub
+    assert "concurrency-errors.svg" in pub, "errors panel rides resource section"
+    assert "vram-vs-context.svg" in pub, "vram ladder rides the ctx section"
+    assert "_Engine selection policy: latest installed version per engine kind._" in pub
+    assert "superseded by b2000" in pub, "policy-skipped tags stay auditable"
+    assert "## Test bed" in pub and "## Caveats" in pub and "## Reproduce" in pub
+    # receipt tables collapse behind click-to-open blocks (charts-first page)
+    assert "<summary><b>Receipt table - single-stream decode</b></summary>" in pub, (
+        "measured receipt tables collapse behind a details block"
+    )
+    assert "<summary><b>Receipt table - quality suites</b></summary>" not in pub, (
+        "lane-absent bodies stay plain, not hidden behind a toggle"
+    )
+    for i, ln in enumerate(pub.splitlines()):
+        if ln == "</details>":
+            assert i > 0 and pub.splitlines()[i - 1] == "", (
+                "blank line before </details> (GitHub renders tables inside details)"
+            )
+    slim_out = Path(td) / "CHAPTER.md"
+    bm.write_publication_report(_pub_recs, art, slim_out, None, slim=True)
+    slim = slim_out.read_text()
+    assert "<img src=" in slim, "slim chapters keep the charts"
+    assert "## Test bed" not in slim and "## Caveats" not in slim
+    assert "## Reproduce" not in slim, "slim chapters drop global sections"
+    assert "| Runtime | slots x ctx |" in slim, "receipt tables stay in chapters"
+    assert "### Quality suites" in pub, "quality heading follows lane convention"
+    assert "quality suites lane not run" in pub, (
+        "legacy receipts scope the quality body to not-measured"
+    )
+    assert '<img src="camp/plots/quality-' not in pub, (
+        "legacy receipts must not embed quality charts"
+    )
+    print("write_publication_report: embeds + retirements + slim mode OK")
+
+# Quality publication lane: same fixtures as the chart pins, retagged to the
+# inventory engine so the parity chart finds its direct-vs-blazar pair, and
+# rendered through write_publication_report to pin section embeds end to end.
+with tempfile.TemporaryDirectory() as td:
+    art = Path(td) / "camp"
+    art.mkdir()
+
+    _qfull = {
+        "reason": 12,
+        "instruct": 10,
+        "code": 5,
+        "schema": 6,
+        "niah": 6,
+        "multilingual": 8,
+        "safety": 12,
+        "embed": 6,
+    }
+
+    def _qpub_cell(provider, config, misses):
+        fields = {}
+        for s, total in _qfull.items():
+            passed = total - misses.get(s, 0)
+            fields[f"quality_{s}_pass"] = passed
+            fields[f"quality_{s}_total"] = total
+            fields[f"quality_{s}_rate"] = round(passed / total, 3)
+        return rec(
+            provider,
+            {"config": config},
+            tag="b2000",
+            kind="llamacpp",
+            quality_seed=1337,
+            **fields,
+        )
+
+    _qblazar = dict(
+        _qpub_cell("quality", "default", {"reason": 2}),
+        quality_conc_level=4,
+        quality_conc_pass=14,
+        quality_conc_total=18,
+        quality_conc_rate=0.778,
+        quality_conc_errors=0,
+    )
+    _qpub_recs = _pub_recs + [
+        _qpub_cell("quality-direct", "direct", {"reason": 1}),
+        _qblazar,
+        _qpub_cell("quality-ollama", "ollama", {"reason": 3, "schema": 1})
+        | {"ollama_model": "qwen3.5:9b"},
+    ]
+    out = Path(td) / "BENCHQ.md"
+    bm.write_publication_report(_qpub_recs, art, out, None)
+    pubq = out.read_text()
+    assert "### Quality suites (checker-verified, seeded, greedy)" in pubq
+    assert "<summary><b>Receipt table - quality suites</b></summary>" in pubq, (
+        "quality receipt table collapses like every other measured table"
+    )
+    assert '<img src="camp/plots/quality-suites.svg"' in pubq
+    assert '<img src="camp/plots/quality-parity.svg"' in pubq, "pair present"
+    assert "14/18 @C=4" in pubq, "quality-under-load column renders"
+    assert "qwen3.5:9b" in pubq, "ollama reference caveat surfaces"
+    assert "seed 1337" in pubq or "1337" in pubq, "seed provenance surfaces"
+    print("write_publication_report: quality section embeds OK")
+
+# idle_wake_table: retired from the publication (chart carries the lane)
+# but pinned here as the per-run detail renderer.
+_idle_tab = bm.idle_wake_table(
+    [
+        rec(
+            "idle-blazar",
+            {"policy": "sleep"},
+            idle_wake_ttft_ms=140.0,
+            idle_policy="sleep after 300s idle",
+        ),
+        rec(
+            "idle-ollama",
+            {"policy": "keep_alive"},
+            idle_wake_ttft_ms=5200.0,
+            idle_reload_s=8.1,
+            idle_policy="keep_alive expiry",
+        ),
+    ]
+)
+assert "140" in _idle_tab and "5200" in _idle_tab, "idle rows must render"
+print("idle_wake_table: detail renderer pin OK")
+
+
+# ttfb capture: stamped at first response byte, surfaced by both suites as
+# the queue-wait window. fn resolves at call time from module globals, so a
+# monkeypatched stream function flows through unchanged (no server needed).
+def _fake_stream(port, body, timeout=None):
+    return {
+        "ttft_ms": 300.0,
+        "ttfb_ms": 120.0,
+        "decode_tps": 50.0,
+        "itls_ms": [20.0, 21.0],
+        "tokens": 32,
+        "prompt_tokens": 512,
+        "tokens_source": "chunks",
+    }
+
+
+_orig_stream, _orig_sized = bm.openai_stream_timed, bm.sized_prompt
+bm.openai_stream_timed = _fake_stream
+bm.sized_prompt = lambda port, pp, ollama, model: "prefill probe"
+try:
+    _m = bm.median_run_suite(0, "m", runs=3, pp=64, tg=32)
+    assert _m["ttfb_ms_p50"] == 120.0 and _m["ttfb_ms_p99"] == 120.0, _m
+    _c = bm.conc_suite(0, "m", level=4, tg=32)
+    assert _c["ttfb_p50_ms"] == 120.0 and _c["ttfb_p99_ms"] == 120.0, _c
+
+    # legacy receipts (ttfb absent from every run) leave the keys None
+    def _no_ttfb(port, body, timeout=None):
+        d = dict(_fake_stream(port, body, timeout))
+        del d["ttfb_ms"]
+        return d
+
+    bm.openai_stream_timed = _no_ttfb
+    _m2 = bm.median_run_suite(0, "m", runs=2, pp=64, tg=32)
+    assert _m2["ttfb_ms_p50"] is None and _m2["ttfb_ms_p99"] is None, _m2
+finally:
+    bm.openai_stream_timed = _orig_stream
+    bm.sized_prompt = _orig_sized
+print("ttfb capture: suites surface queue-wait window, legacy stays None OK")
+
+# cpu busy accounting: /proc/stat deltas (busy = total - idle - iowait);
+# first tick primes, missing /proc/stat reports unmeasured (0.0), and
+# finalize_power folds cpu_busy_pct only when measured.
+with tempfile.TemporaryDirectory() as td:
+    fake_stat = Path(td) / "stat"
+    # tick1: user 250, sys 250, idle 490, iowait 10 -> busy 500 / total 1000
+    fake_stat.write_text("cpu  250 0 250 490 10 0 0 0 0 0\n")
+    st = bm.Sampler(None)  # thread not started; methods ticked directly
+    saved_stat = bm._PROC_STAT
+    bm._PROC_STAT = fake_stat
+    try:
+        st._stat_tick()  # primes counters
+        # tick2 doubles every counter: busy delta 500 / total delta 1000
+        fake_stat.write_text("cpu  500 0 500 980 20 0 0 0 0 0\n")
+        st._stat_tick()
+        assert abs(st.cpu_busy_stats() - 50.0) < 1e-9, st.cpu_busy_stats()
+        busy_rec: dict = {}
+        bm.finalize_power(busy_rec, st)
+        assert busy_rec.get("cpu_busy_pct") == 50.0, busy_rec
+        # absent /proc/stat (non-Linux): unmeasured, not idle
+        bm._PROC_STAT = Path(td) / "nope"
+        st2 = bm.Sampler(None)
+        st2._stat_tick()
+        assert st2.cpu_busy_stats() == 0.0
+        legacy_rec: dict = {}
+        bm.finalize_power(legacy_rec, st2)
+        assert "cpu_busy_pct" not in legacy_rec, "unmeasured must stay absent"
+    finally:
+        bm._PROC_STAT = saved_stat
+print("cpu busy: delta math + fold gating + non-Linux absence OK")
+
+# --- quality lane: adversarial checker pins (models emit decorated
+# numbers, fenced JSON, accented text), code-suite reference impls,
+# seeded determinism, table/verdict/gate renderers, and the four
+# quality charts incl. determinism + honest skips.
+_tasks = bm.build_quality_tasks(1337, bm.QUALITY_SUITES)
+assert sum(len(v) for v in _tasks.values()) == 59, "suite sizes drifted"
+_t2 = bm.build_quality_tasks(1337, bm.QUALITY_SUITES)
+assert json.dumps(_tasks, sort_keys=True) == json.dumps(_t2, sort_keys=True)
+assert bm.build_quality_tasks(7, bm.QUALITY_SUITES) != _tasks, "seed ignored"
+
+# numeric: LAST number wins, commas/decorations stripped
+assert bm.score_quality_task(
+    {"checker": "numeric", "expected": 47}, "The answer is **4,7**.", {}
+)
+assert not bm.score_quality_task(
+    {"checker": "numeric", "expected": 48}, "47 then 51", {}
+)
+# schema: fenced JSON, bool-vs-int ladder, exact field set
+assert bm.score_quality_task(
+    {"checker": "schema", "schema": {"n": "int"}}, '```json\n{"n": 3}\n```', {}
+)
+assert not bm.score_quality_task(
+    {"checker": "schema", "schema": {"n": "int"}}, '{"n": true}', {}
+)
+assert not bm.score_quality_task(
+    {"checker": "schema", "schema": {"n": "int"}}, '{"n": 3, "x": 1}', {}
+)
+# contains: NFKD accent folding both directions
+assert bm.score_quality_task(
+    {"checker": "contains", "expected": "Paris"}, "voy a París mañana", {}
+)
+assert bm.score_quality_task(
+    {"checker": "contains", "expected": "berlín"}, "BERLIN ist kalt", {}
+)
+# refusal markers vs benign pass-through
+assert bm.score_quality_task(
+    {"checker": "refusal", "must_refuse": True},
+    "I can't help with that request.",
+    {},
+)
+assert bm.score_quality_task(
+    {"checker": "refusal", "must_refuse": False},
+    "Sure, here is a harmless answer.",
+    {},
+)
+assert not bm.score_quality_task({"checker": "refusal", "must_refuse": False}, "no", {})
+# instruct: exact shape discipline
+assert bm.score_quality_task(
+    {"checker": "instruct", "check": {"shape": "bullets3", "count": 3}},
+    "- one\n- two\n- three",
+    {},
+)
+assert not bm.score_quality_task(
+    {"checker": "instruct", "check": {"shape": "bullets3", "count": 3}},
+    "- one\n- two\n- three\nintro",
+    {},
+)
+# code: a correct fenced implementation passes, a broken one fails
+_IMPLS = {
+    "add_digits": "def add_digits(n):\n    return sum(int(d) for d in str(abs(n)))",
+    "count_vowels": (
+        "def count_vowels(s):\n    return sum(1 for c in s.lower() if c in 'aeiou')"
+    ),
+    "is_prime": (
+        "def is_prime(n):\n"
+        "    return n > 1 and all(n % i for i in range(2, int(n**0.5) + 1))"
+    ),
+    "rev_words": "def rev_words(s):\n    return ' '.join(reversed(s.split()))",
+    "max_run": (
+        "def max_run(s):\n"
+        "    best = cur = 0\n"
+        "    prev = None\n"
+        "    for c in s:\n"
+        "        cur = cur + 1 if c == prev else 1\n"
+        "        prev, best = c, max(best, cur)\n"
+        "    return best"
+    ),
+    "fizz": ("def fizz(n):\n    return 'fizz' if n % 3 == 0 else n"),
+}
+for _spec in bm.quality_code_tasks(1337, n=6):
+    _good = f"```python\n{_IMPLS[_spec['fn']]}\n```"
+    assert bm.check_code(_good, _spec), (_spec["fn"], _spec["tests"])
+    _bad = f"```python\ndef {_spec['fn']}(*a):\n    return None\n```"
+    assert not bm.check_code(_bad, _spec), _spec["fn"]
+# niah: deterministic round-trip, needle findable, decoys not
+_np = bm.quality_niah_probes(1337)[0]
+_p = bm.niah_build_prompt(_np, 1337)
+assert _p.count(_np["needle_code"]) == 1 and len(_p) >= 1800, len(_p)
+assert _np["needle_value"] in _p and _np["needle_value"] in _p[-200:], (
+    "needle value must ride both the sentence and the question"
+)
+print("quality checkers: adversarial pins + reference impls OK")
+
+
+def _qcell(provider, tag, cfg, **kw):
+    base = {"params": {"config": cfg}, "tag": tag}
+    base.update(kw)
+    return rec(
+        provider,
+        base["params"],
+        tag=tag,
+        **{k: v for k, v in kw.items() if k != "params"},
+    )
+
+
+_qdirect = _qcell(
+    "quality-direct",
+    "b2000",
+    "direct",
+    **{
+        "quality_reason_pass": 11,
+        "quality_reason_total": 12,
+        "quality_reason_rate": 0.917,
+        "quality_schema_pass": 6,
+        "quality_schema_total": 6,
+        "quality_schema_rate": 1.0,
+    },
+)
+_qblazar = _qcell(
+    "quality",
+    "b2000",
+    "default",
+    **{
+        "quality_reason_pass": 10,
+        "quality_reason_total": 12,
+        "quality_reason_rate": 0.833,
+        "quality_schema_pass": 6,
+        "quality_schema_total": 6,
+        "quality_schema_rate": 1.0,
+        "quality_conc_pass": 14,
+        "quality_conc_total": 18,
+        "quality_conc_level": 4,
+    },
+)
+_qbad_knob = _qcell(
+    "quality",
+    "b2000",
+    "kv_unified_off",
+    **{
+        "quality_reason_pass": 5,
+        "quality_reason_total": 12,
+        "quality_reason_rate": 0.417,
+        "quality_schema_pass": 6,
+        "quality_schema_total": 6,
+        "quality_schema_rate": 1.0,
+    },
+)
+_qollama = _qcell(
+    "quality-ollama",
+    "ollama-host",
+    "ollama",
+    **{
+        "quality_reason_pass": 9,
+        "quality_reason_total": 12,
+        "quality_reason_rate": 0.75,
+        "quality_schema_pass": 5,
+        "quality_schema_total": 6,
+        "quality_schema_rate": 0.833,
+        "ollama_model": "qwen3.5:9b",
+    },
+)
+_qrecs = [_qdirect, _qblazar, _qbad_knob, _qollama]
+
+_qtbl = bm.quality_table(_qrecs)
+assert "| Runtime | Engine | config |" in _qtbl
+assert "10/12" in _qtbl and "14/18 @C=4" in _qtbl and "kv_unified_off" in _qtbl
+_qv = bm.quality_verdicts(_qrecs)
+assert any("Gateway parity on" in v and "+0.0 pp" not in v for v in _qv), _qv
+assert any("Quality under load" in v for v in _qv)
+assert any("ollama reference" in v and "qwen3.5:9b" in v for v in _qv)
+_gate = bm.qc_drift_gate(_qrecs)
+assert any("suite pass-rate dropped" in o and "kv_unified_off" in o for o in _gate), (
+    _gate
+)
+assert abs(bm.quality_overall_rate(_qdirect) - 94.444444) < 1e-4
+print("quality table/verdicts/gate: parity prose + tolerance flag OK")
+
+with tempfile.TemporaryDirectory() as td:
+    _qdir = Path(td)
+    _qnames = bc.render_campaign_charts(list(_qrecs), _qdir)
+    _qfiles = {f for _, f, _ in _qnames}
+    assert "quality-suites.svg" in _qfiles, _qfiles
+    assert "quality-parity.svg" in _qfiles
+    assert "quality-config.svg" in _qfiles
+    _qs = (_qdir / "plots" / "quality-suites.svg").read_text()
+    assert "91.7 %" in _qs, "reason rate direct missing"
+    assert "83.3 %" in _qs, "reason rate blazar missing"
+    _qp = (_qdir / "plots" / "quality-parity.svg").read_text()
+    assert "-8.4 pp" in _qp, _qp[:400]
+    # determinism: re-render byte-identical in the same dir
+    _qnames2 = bc.render_campaign_charts(list(_qrecs), _qdir)
+    assert (_qdir / "plots" / "quality-parity.svg").read_text() == _qp
+    # tradeoff chart needs joined speed cells - absent here, honest skip
+    assert "quality-tradeoff.svg" not in _qfiles
+print("quality charts: suites/parity/config svg + determinism + skip OK")
+
+# probe_tools_once: transport failure (daemon down) must surface as an
+# OUTCOME (contract), never an exception — pinned after a down-daemon run
+# crashed the whole campaign at the tools-ollama lane.
+_dead = bm.probe_tools_once(bm.free_port(), "qwen3.5:9b", "ping")
+assert _dead.get("status") is None and str(_dead.get("error_body", "")).startswith(
+    "transport:"
+), f"dead daemon must return a transport outcome, got {_dead}"
+_scored_dead = bm.score_tools_scenario({"expected_fn": "get_weather"}, _dead)
+assert _scored_dead.get("transport_error"), (
+    "transport outcome must score as a truthy transport_error"
+)
+
+# reasoning pin: quality probes must disable thinking so a lane measures
+# task ability, not <think> consuming the token budget (verified live:
+# qwen3.5 on ollama OpenAI-compat burns 128 tokens reasoning -> empty
+# content; native /api/chat think=false answers immediately).
+_seen_bodies = []
+_orig_http_json = bm.http_json
+
+
+def _spy_http_json(url, body=None, timeout=30.0):
+    _seen_bodies.append((url, body))
+    if url.endswith("/api/chat"):
+        return {"message": {"content": "42"}}
+    return {"choices": [{"message": {"content": "42"}}]}
+
+
+bm.http_json = _spy_http_json
+try:
+    _txt, _ = bm.chat_greedy(1, "m", "q", 64)
+    assert _txt == "42"
+    _u, _b = _seen_bodies[-1]
+    assert _b["chat_template_kwargs"] == {"enable_thinking": False}, (
+        "OpenAI-compat probe must pin enable_thinking=false"
+    )
+    _txt, _ = bm.ollama_chat_greedy(1, "m", "q", 64)
+    assert _txt == "42"
+    _u, _b = _seen_bodies[-1]
+    assert _u.endswith("/api/chat") and _b["think"] is False, (
+        "ollama probe must use native /api/chat with think=false"
+    )
+    assert _b["options"]["temperature"] == 0
+finally:
+    bm.http_json = _orig_http_json
+
+# stale-chart sweep: a re-render whose lane went away must delete the
+# owned SVG (a publication could otherwise embed data that matches no
+# receipt), while foreign files in plots/ stay untouched.
+with tempfile.TemporaryDirectory() as td:
+    _sw_dir = Path(td) / "camp"
+    (_sw_dir / "plots").mkdir(parents=True)
+    (_sw_dir / "plots" / "quality-tradeoff.svg").write_text("stale")
+    (_sw_dir / "plots" / "notes.svg").write_text("foreign")
+    bm.render_campaign_charts([], _sw_dir)
+    assert not (_sw_dir / "plots" / "quality-tradeoff.svg").exists(), (
+        "owned stale chart must be swept"
+    )
+    assert (_sw_dir / "plots" / "notes.svg").exists(), "foreign file kept"
+
 print("ALL FIXTURE CHECKS GREEN")
