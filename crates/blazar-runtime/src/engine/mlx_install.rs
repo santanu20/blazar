@@ -45,6 +45,15 @@ pub const MLX_LM_DEFAULT_VERSION: &str = "0.32.0";
 /// the newest drivers only — one tested surface.
 pub const MLX_CUDA_PIN: &str = "mlx[cuda12]==0.32.2";
 
+/// Kernel-compile surface for the CUDA backend: mlx JIT-compiles its
+/// kernels at generation time through NVRTC and needs a CUDA_HOME with
+/// modern headers — the fp8 types mlx 0.32's bundled CCCL requires postdate
+/// CUDA 12.0, and system toolkits are routinely that old. These two wheels
+/// carry the headers (runtime + crt) and libs the engine-local cuda-home
+/// farm links; live-proven 2026-10-02 on a CUDA 12.0 apt box.
+pub const MLX_CUDA_RUNTIME_PIN: &str = "nvidia-cuda-runtime-cu12";
+pub const MLX_CUDA_NVCC_PIN: &str = "nvidia-cuda-nvcc-cu12";
+
 /// The venv is lighter than sglang's (no torch wheel): the CUDA libs
 /// (cublas/cudnn/nccl via the extra) plus transformers land between 2
 /// and 3 GiB. Refuse installs with less than 4 GiB free instead of
@@ -79,7 +88,21 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
                  installs natively; on this host pick another engine kind"
             );
         }
-        install_platform(dir, version, &[MLX_CUDA_PIN.to_string()]).await
+        let venv = install_platform(
+            dir,
+            version,
+            &[
+                MLX_CUDA_PIN.to_string(),
+                MLX_CUDA_RUNTIME_PIN.to_string(),
+                MLX_CUDA_NVCC_PIN.to_string(),
+            ],
+        )
+        .await?;
+        // The farm must exist before the row can ever serve: JIT kernel
+        // compiles happen at generation time, so a missing farm is an
+        // instant broken lane, not a degraded one.
+        link_cuda_home(dir)?;
+        Ok(venv)
     } else {
         anyhow::bail!(
             "mlx upstream supports macOS (Metal) and Linux (CUDA); {} installs \
@@ -240,4 +263,97 @@ pub async fn pypi_latest_mlx_lm() -> Result<String> {
 /// back to the leading core).
 pub fn version_tuple(v: &str) -> Option<(u64, u64, u64)> {
     super::sglang_install::version_tuple(v)
+}
+
+/// Build the engine-local `cuda-home` the mlx CUDA backend compiles
+/// against: `include/` merges the cuda_runtime and cuda_nvcc (crt)
+/// headers, `lib64/` merges the cuda_runtime and cuda_nvrtc libs, and
+/// `bin`/`nvvm` symlink the nvcc wheel's ptxas + nvvm tree. No nvcc
+/// binary ships in these wheels — mlx JIT-compiles through NVRTC, which
+/// the farm's lib64 satisfies. Keeps the lane self-contained on hosts
+/// whose system CUDA toolkit is older than the headers mlx requires.
+/// Idempotent: an existing farm is removed and rebuilt.
+#[cfg(target_os = "linux")]
+pub fn link_cuda_home(engine_dir: &Path) -> Result<PathBuf> {
+    let venv_lib = engine_dir.join("venv").join("lib");
+    let python_dir = std::fs::read_dir(&venv_lib)
+        .map_err(|e| anyhow::anyhow!("mlx venv missing lib/ ({venv_lib:?}): {e}"))?
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().starts_with("python3"))
+        .map(|e| e.path())
+        .ok_or_else(|| anyhow::anyhow!("mlx venv has no python3.* dir under {venv_lib:?}"))?;
+    let nvidia = python_dir.join("site-packages").join("nvidia");
+    let farm = engine_dir.join("cuda-home");
+
+    // rm-first: a stale farm from an older pin set would shadow the
+    // headers pip just laid down.
+    if farm.exists() {
+        std::fs::remove_dir_all(&farm)?;
+    }
+    let include = farm.join("include");
+    let lib64 = farm.join("lib64");
+    std::fs::create_dir_all(&include)?;
+    std::fs::create_dir_all(&lib64)?;
+
+    let link_in = |dst: &Path, src_dir: &Path| -> Result<()> {
+        for entry in std::fs::read_dir(src_dir)? {
+            let entry = entry?;
+            let src = entry.path();
+            let name = entry.file_name();
+            let dst_entry = dst.join(&name);
+            if dst_entry.exists() {
+                continue;
+            }
+            std::os::unix::fs::symlink(&src, &dst_entry)?;
+        }
+        Ok(())
+    };
+
+    link_in(&include, &nvidia.join("cuda_runtime").join("include"))?;
+    link_in(&include, &nvidia.join("cuda_nvcc").join("include"))?;
+    link_in(&lib64, &nvidia.join("cuda_runtime").join("lib"))?;
+    link_in(&lib64, &nvidia.join("cuda_nvrtc").join("lib"))?;
+    std::os::unix::fs::symlink(&nvidia.join("cuda_nvcc").join("bin"), farm.join("bin"))?;
+    std::os::unix::fs::symlink(&nvidia.join("cuda_nvcc").join("nvvm"), farm.join("nvvm"))?;
+    Ok(farm)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #![allow(non_snake_case)]
+    use super::*;
+
+    fn touch(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    fn fake_venv(root: &Path) {
+        let nvidia = root.join("venv/lib/python3.12/site-packages/nvidia");
+        touch(&nvidia.join("cuda_runtime/include/cuda_fp8.h"));
+        touch(&nvidia.join("cuda_runtime/lib/libcudart.so.12"));
+        touch(&nvidia.join("cuda_nvcc/include/crt/host_defines.h"));
+        touch(&nvidia.join("cuda_nvcc/bin/ptxas"));
+        touch(&nvidia.join("cuda_nvcc/nvvm/lib/libnvvm.so"));
+        touch(&nvidia.join("cuda_nvrtc/lib/libnvrtc.so.12"));
+    }
+
+    #[tokio::test]
+    async fn unit__link_cuda_home__builds_the_merged_farm_and_is_idempotent() {
+        let root = std::env::temp_dir().join(format!("mlx-farm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        fake_venv(&root);
+        let farm = link_cuda_home(&root).unwrap();
+        assert!(farm.join("include/cuda_fp8.h").exists());
+        assert!(farm.join("include/crt/host_defines.h").exists());
+        assert!(farm.join("lib64/libcudart.so.12").exists());
+        assert!(farm.join("lib64/libnvrtc.so.12").exists());
+        assert!(farm.join("bin/ptxas").exists());
+        assert!(farm.join("nvvm/lib/libnvvm.so").exists());
+        // idempotent rebuild keeps the same shape
+        link_cuda_home(&root).unwrap();
+        assert!(farm.join("include/cuda_fp8.h").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

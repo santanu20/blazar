@@ -1327,11 +1327,7 @@ impl MlxEngine {
 /// installed mlx-lm build supports `--api-key` — probed at install) is
 /// appended by the supervisor's child-auth mint, same as the other
 /// lanes: one choke point, not engine business.
-fn mlx_argv(
-    model: &blazar_core::ModelRow,
-    profile: &Profile,
-    endpoint: &Endpoint,
-) -> Vec<String> {
+fn mlx_argv(model: &blazar_core::ModelRow, profile: &Profile, endpoint: &Endpoint) -> Vec<String> {
     let port = match endpoint {
         Endpoint::Tcp { port, .. } => *port,
         // Supervisor rejects unix endpoints for mlx engines before
@@ -1414,6 +1410,34 @@ impl Engine for MlxEngine {
             let merged = entries.join(":");
             env.retain(|(k, _)| k != LD_LIB);
             env.push((LD_LIB.to_string(), merged));
+        }
+        // mlx's CUDA backend JIT-compiles kernels at generation time via
+        // NVRTC and resolves headers through CUDA_HOME/CUDA_PATH. System
+        // toolkits are routinely older than the headers mlx 0.32's CCCL
+        // needs (fp8 types), so the lane installs an engine-local
+        // cuda-home farm (mlx_install::link_cuda_home) — point an unset
+        // CUDA_HOME at it. A user-provided CUDA_HOME/CUDA_PATH always
+        // wins. Live-proven 2026-10-02: without this the first chat dies
+        // with "generation thread died" on a CUDA 12.0 apt host.
+        #[cfg(target_os = "linux")]
+        {
+            const CUDA_HOME: &str = "CUDA_HOME";
+            let have_user = env.iter().any(|(k, _)| k == CUDA_HOME || k == "CUDA_PATH")
+                || std::env::var(CUDA_HOME).is_ok()
+                || std::env::var("CUDA_PATH").is_ok();
+            if !have_user {
+                if let Some(engine_dir) = std::path::Path::new(&self.manifest.server_path).parent()
+                {
+                    let farm = engine_dir.join("cuda-home");
+                    if farm.is_dir() {
+                        let farm_str = farm.to_string_lossy().into_owned();
+                        env.retain(|(k, _)| k != CUDA_HOME && k != "CUDA_PATH");
+                        env.push((CUDA_HOME.to_string(), farm_str.clone()));
+                        env.push(("CUDA_PATH".to_string(), farm_str));
+                        tracing::debug!("mlx spawn: CUDA_HOME -> engine-local cuda-home");
+                    }
+                }
+            }
         }
         // spawn_env applies last: a pinned CUDA_VISIBLE_DEVICES pair
         // survives the LD_LIBRARY_PATH surgery above.
