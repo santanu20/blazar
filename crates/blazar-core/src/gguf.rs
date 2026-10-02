@@ -12,6 +12,15 @@ use std::path::Path;
 
 use crate::error::{CoreError, CoreResult};
 
+/// GGUF architectures from the block-diffusion LLM family. llama.cpp's
+/// loader accepts them (so `llama-server` boots the model without the
+/// unknown-architecture error the capability rescue keys on), but no
+/// HTTP server in the family runs the diffusion decode loop — the
+/// autoregressive loop would emit garbage while appearing healthy.
+/// `llada`/`llada-moe` are mainline today; `llada2` (PR 17454) and
+/// `diffusion-gemma` (PR 24423) are the in-flight additions.
+pub const DIFFUSION_PARADIGM_ARCHS: &[&str] = &["llada", "llada-moe", "llada2", "diffusion-gemma"];
+
 /// GGUF metadata Blazar consumes, resolved against the file's `{arch}.*`
 /// prefix.
 #[derive(Debug, Clone, PartialEq, Default)]
