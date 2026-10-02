@@ -225,6 +225,7 @@ pub async fn pypi_latest_mlx_lm() -> Result<String> {
     }
     // The client-level timeout is the per-attempt cap: each retry issues
     // a fresh request on a clone of this client.
+    blazar_core::tls::ensure_tls_provider();
     let http = reqwest::Client::builder()
         .timeout(crate::engine::net_probe::PROBE_ATTEMPT_CAP)
         .user_agent(concat!("blazar/", env!("CARGO_PKG_VERSION")))

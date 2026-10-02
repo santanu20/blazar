@@ -149,6 +149,7 @@ impl GhClient {
         if token.is_some() {
             headers.insert("x-github-api-version", "2022-11-28".parse()?);
         }
+        blazar_core::tls::ensure_tls_provider();
         let http = reqwest::Client::builder()
             .default_headers(headers)
             // Release assets are 30-400 MB: connect/read timeouts, no total cap.
@@ -646,7 +647,7 @@ impl GhClient {
                 .strip_prefix("sha256:")
                 .unwrap_or(digest)
                 .to_lowercase();
-            let got = format!("{:x}", Sha256::digest(&bytes));
+            let got = hex::encode(Sha256::digest(&bytes));
             if got != expected {
                 return Err(anyhow!(
                     "sha256 mismatch for {}: expected {expected}, got {got}",
@@ -892,7 +893,7 @@ impl GhClient {
                 .strip_prefix("sha256:")
                 .unwrap_or(digest)
                 .to_lowercase();
-            let got = format!("{:x}", hasher.finalize());
+            let got = hex::encode(hasher.finalize());
             if got != expected {
                 let _ = std::fs::remove_file(dest);
                 return Err(anyhow!(
@@ -2560,7 +2561,7 @@ mod tests {
         let body: &'static [u8] = Box::leak(vec![7u8; 300_000].into_boxed_slice());
         let url = serve_once(body);
         let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
-        let digest = format!("sha256:{:x}", Sha256::digest(body));
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(body)));
         let dest = std::env::temp_dir().join("blazar-gh-dl-pin.bin");
         let wrote = client
             .download_asset_file(&asset(&url, Some(&digest)), &dest)
@@ -2837,7 +2838,7 @@ mod tests {
         let body = patterned(PARALLEL_BODY_BYTES);
         let (url, ranges) = serve_ranges(body);
         let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
-        let digest = format!("sha256:{:x}", Sha256::digest(body));
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(body)));
         let mut a = asset(&url, Some(&digest));
         a.size = Some(body.len() as u64);
         let dest = std::env::temp_dir().join("blazar-gh-dl-pin-parallel.bin");
@@ -2849,7 +2850,7 @@ mod tests {
         let on_disk = std::fs::read(&dest).expect("read back");
         assert_eq!(on_disk.len(), body.len(), "file length");
         assert_eq!(
-            format!("{:x}", Sha256::digest(&on_disk)),
+            hex::encode(Sha256::digest(&on_disk)),
             digest.strip_prefix("sha256:").unwrap(),
             "finalized file hashes to the release digest"
         );
@@ -2878,7 +2879,7 @@ mod tests {
         let body = patterned(PARALLEL_BODY_BYTES);
         let url = serve_200_loop(body);
         let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
-        let digest = format!("sha256:{:x}", Sha256::digest(body));
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(body)));
         let mut a = asset(&url, Some(&digest));
         a.size = Some(body.len() as u64);
         let dest = std::env::temp_dir().join("blazar-gh-dl-pin-fallback.bin");

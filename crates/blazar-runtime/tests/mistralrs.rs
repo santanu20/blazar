@@ -355,7 +355,7 @@ fn host_port(uri: &str) -> (String, u16) {
 // ---- install e2e (wiremock GitHub + real tar.gz + stub binary) ----
 
 fn sha256_hex(b: &[u8]) -> String {
-    format!("{:x}", sha2::Sha256::digest(b))
+    hex::encode(sha2::Sha256::digest(b))
 }
 
 /// mistral.rs-style release tar.gz: `mistralrs` executable at the root

@@ -18,6 +18,9 @@ dirs = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sha2 = { workspace = true }
+# Ring-only rustls: powers the process-wide TLS provider bootstrap in
+# `tls` (see the workspace axum-server entry for why provider-less).
+rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

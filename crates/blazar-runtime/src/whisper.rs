@@ -820,6 +820,7 @@ impl WhisperRuntime {
                     // F94: bounded client — this POST runs under the
                     // instance mutex; a hung whisper-server would pin
                     // every later transcription behind it.
+                    blazar_core::tls::ensure_tls_provider();
                     let http = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_mins(2))
                         .build()?;

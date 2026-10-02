@@ -710,7 +710,7 @@ impl Store {
 
     /// Job events, oldest-first (the story reads in order).
     pub fn job_events(&self, job_id: &str, limit: u64) -> CoreResult<Vec<JobEventRow>> {
-        let limit = limit.clamp(1, 1000);
+        let limit = i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000);
         let mut stmt = self.conn.prepare(
             "SELECT seq, job_id, ts, kind, data_json FROM (
                 SELECT * FROM job_events WHERE job_id = ?1 ORDER BY seq DESC LIMIT ?2

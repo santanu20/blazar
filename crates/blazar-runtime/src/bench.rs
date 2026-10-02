@@ -810,7 +810,7 @@ pub fn args_hash(input: &ProfileInput<'_>, profile: &Profile) -> String {
     );
     h.update(mtime.to_le_bytes());
     h.update(profile.argv.join("\x1f").as_bytes());
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 fn now_secs() -> i64 {

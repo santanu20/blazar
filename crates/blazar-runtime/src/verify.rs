@@ -127,7 +127,7 @@ fn sha256_file(path: &Path) -> std::io::Result<(u64, String)> {
         hasher.update(&buf[..n]);
         bytes += n as u64;
     }
-    Ok((bytes, format!("{:x}", hasher.finalize())))
+    Ok((bytes, hex::encode(hasher.finalize())))
 }
 
 // Test names use the project's `unit__area__behavior` convention.
@@ -170,9 +170,9 @@ mod tests {
         let f = tmp.path().join("m.gguf");
         let payload = b"gguf-bytes";
         std::fs::write(&f, payload).unwrap();
-        let mut hex = Sha256::new();
-        hex.update(payload);
-        let digest = format!("{:x}", hex.finalize());
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let digest = hex::encode(hasher.finalize());
 
         let store = Store::open(&dirs).unwrap();
         store.upsert_model(&row_for(&f, Some(digest))).unwrap();

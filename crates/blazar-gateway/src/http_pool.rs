@@ -18,8 +18,11 @@ const POOL_MAX_IDLE_PER_HOST: usize = 16;
 /// TCP keepalive interval so half-open connections are detected early.
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
-/// Apply the shared pool policy to a client builder.
+/// Apply the shared pool policy to a client builder. Also installs the
+/// process-default rustls provider: every gateway client funnels through
+/// here, so in-process tests (no `main()` ran) are covered too.
 pub fn tuned(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    blazar_core::tls::ensure_tls_provider();
     builder
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)

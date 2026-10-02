@@ -154,6 +154,7 @@ async fn start(config: Config, stub_env: &[(&str, &str)], bare_template: bool) -
 }
 
 fn client() -> reqwest::Client {
+    blazar_core::tls::ensure_tls_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_mins(1))
         .build()

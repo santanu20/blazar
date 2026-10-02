@@ -181,6 +181,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
 }
 
 fn client() -> reqwest::Client {
+    blazar_core::tls::ensure_tls_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -1298,6 +1299,7 @@ async fn e2e__tls_serves_https_and_cors_headers() {
         .unwrap();
     });
     // Wait for the TLS listener to accept.
+    blazar_core::tls::ensure_tls_provider();
     let c = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -3219,6 +3221,7 @@ async fn e2e__child_auth__gateway_stamps_and_direct_rejected() {
         .as_str()
         .expect("ps endpoint")
         .to_string();
+    blazar_core::tls::ensure_tls_provider();
     let direct = reqwest::Client::new();
     let no_key = direct
         .get(format!("http://{endpoint}/v1/models"))
@@ -3330,6 +3333,7 @@ async fn e2e__child_auth__disabled_keeps_children_open() {
         .as_str()
         .unwrap()
         .to_string();
+    blazar_core::tls::ensure_tls_provider();
     let resp = reqwest::Client::new()
         .get(format!("http://{endpoint}/v1/models"))
         .send()

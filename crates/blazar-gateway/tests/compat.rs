@@ -398,6 +398,7 @@ async fn client__ollama_native__env_dialect_untouched() {
 async fn client__well_known__capability_discovery() {
     let cfg = support::config_with_keys();
     let ts = start(cfg).await;
+    blazar_core::tls::ensure_tls_provider();
     let v: serde_json::Value = reqwest::Client::new()
         .get(format!("{}/.well-known/blazar", ts.base))
         .bearer_auth("plm_admin")
@@ -452,6 +453,7 @@ async fn client__well_known__capability_discovery() {
     // Audit MM16: the non-/v1 audio aliases are real routes, not just
     // census entries — they must route (auth refusal, not 404).
     for path in ["/audio/transcriptions", "/audio/translations"] {
+        blazar_core::tls::ensure_tls_provider();
         let r = reqwest::Client::new()
             .post(format!("{}{}", ts.base, path))
             .send()
@@ -465,6 +467,7 @@ async fn client__well_known__capability_discovery() {
         .iter()
         .any(|h| h == "x-blazar-num-ctx"));
     // Auth applies: anonymous discovery is refused when keys exist.
+    blazar_core::tls::ensure_tls_provider();
     let anon = reqwest::Client::new()
         .get(format!("{}/.well-known/blazar", ts.base))
         .send()

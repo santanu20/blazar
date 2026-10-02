@@ -153,6 +153,7 @@ async fn integration__ensure_ready__health_and_argv_flags() {
         blazar_core::Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
         blazar_core::Endpoint::Unix { .. } => unreachable!(),
     };
+    blazar_core::tls::ensure_tls_provider();
     let body: serde_json::Value = reqwest::Client::new()
         .get(format!("{url}/health"))
         .send()
@@ -252,6 +253,7 @@ async fn regression__dropped_loader_future_does_not_wedge_next_ensure() {
         blazar_core::Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
         blazar_core::Endpoint::Unix { .. } => unreachable!(),
     };
+    blazar_core::tls::ensure_tls_provider();
     let body: serde_json::Value = reqwest::Client::new()
         .get(format!("{url}/health"))
         .send()

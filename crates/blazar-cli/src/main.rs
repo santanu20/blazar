@@ -996,6 +996,10 @@ fn reset_sigpipe_default() {}
 
 fn main() {
     reset_sigpipe_default();
+    // First statement with a side effect by design: every reqwest client
+    // in the process (engine lanes, HF, upgrade, federation) needs the
+    // rustls ring provider installed before construction.
+    blazar_core::tls::ensure_tls_provider();
     // Grouped help intercept: clap renders an ungrouped 38-command wall.
     // Only the TOP-level listing is replaced; `blazar help <cmd>`,
     // `blazar <cmd> --help` and error usage stay clap-native.
@@ -5428,7 +5432,7 @@ fn file_sha256(path: &Path) -> Option<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// Size-indexed referenced files with model attribution, for

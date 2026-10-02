@@ -56,6 +56,7 @@ pub fn validate_socket_path(socket: &str) -> Result<(), String> {
 pub fn client(socket: &str) -> reqwest::Client {
     #[cfg(unix)]
     {
+        blazar_core::tls::ensure_tls_provider();
         reqwest::Client::builder()
             .unix_socket(PathBuf::from(socket))
             .build()
@@ -68,6 +69,7 @@ pub fn client(socket: &str) -> reqwest::Client {
         // endpoint can carry a socket. Loud, not silent: a default
         // client cannot dial the socket and requests fail visibly.
         tracing::error!(socket, "unix sockets unavailable on this platform");
+        blazar_core::tls::ensure_tls_provider();
         reqwest::Client::new()
     }
 }

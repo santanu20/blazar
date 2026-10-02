@@ -70,7 +70,7 @@ fn fixture_zip(tag: &str) -> Vec<u8> {
 }
 
 fn sha256_hex(b: &[u8]) -> String {
-    format!("{:x}", sha2::Sha256::digest(b))
+    hex::encode(sha2::Sha256::digest(b))
 }
 
 /// Mount a b-tag release with the given asset body + digest.
@@ -1849,7 +1849,11 @@ async fn unit__remove_engine_row_and_tree__lazy_pins_reconciled_on_removal() {
         "pin naming the removed tag is cleared"
     );
     assert!(
-        dirs.data_dir.join("whisper").join("bin").join("pin").exists(),
+        dirs.data_dir
+            .join("whisper")
+            .join("bin")
+            .join("pin")
+            .exists(),
         "a pin naming another tag survives"
     );
 }

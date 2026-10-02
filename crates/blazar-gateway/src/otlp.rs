@@ -232,7 +232,10 @@ mod tests {
         otlp.record(span(200));
         let task = tokio::spawn({
             let otlp = std::sync::Arc::clone(&otlp);
-            async move { otlp.run(reqwest::Client::new()).await }
+            async move {
+                blazar_core::tls::ensure_tls_provider();
+                otlp.run(reqwest::Client::new()).await
+            }
         });
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut sock, _) = listener.accept().await.unwrap();

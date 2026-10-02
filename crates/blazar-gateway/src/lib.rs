@@ -1253,7 +1253,10 @@ pub async fn serve(
         let std_listener = listener
             .into_std()
             .map_err(|e| anyhow::anyhow!("tls listener handoff: {e}"))?;
+        // axum-server 0.8 made from_tcp_rustls fallible (its internal
+        // acceptor wiring can reject the listener state up front).
         axum_server::from_tcp_rustls(std_listener, rustls_config)
+            .map_err(|e| anyhow::anyhow!("tls acceptor init: {e}"))?
             .handle(handle)
             .serve(app.into_make_service())
             .await

@@ -262,6 +262,7 @@ async fn start(think_wrap: &str) -> TestServer {
 }
 
 fn client() -> reqwest::Client {
+    blazar_core::tls::ensure_tls_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()

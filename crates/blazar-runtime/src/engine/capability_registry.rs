@@ -83,6 +83,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
+        blazar_core::tls::ensure_tls_provider();
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .build()

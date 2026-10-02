@@ -524,7 +524,7 @@ async fn finalize_parallel(part: &Path, dest: &Path, plan: &FilePlan) -> Result<
             }
             hasher.update(&buf[..n]);
         }
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(hex::encode(hasher.finalize()))
     })
     .await??;
     if let Some(expected) = &plan.sha256 {
@@ -994,6 +994,7 @@ mod tests {
     }
 
     fn http_client() -> reqwest::Client {
+        blazar_core::tls::ensure_tls_provider();
         reqwest::Client::builder().build().unwrap()
     }
 

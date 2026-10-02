@@ -182,6 +182,7 @@ pub async fn start(config: Config) -> TestServer {
 }
 
 pub fn client() -> reqwest::Client {
+    blazar_core::tls::ensure_tls_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -227,12 +228,15 @@ pub async fn spawn_remote_stub() -> RemoteStub {
         .expect("spawn remote stub");
     let base = format!("http://127.0.0.1:{port}");
     for _ in 0..100 {
-        if reqwest::Client::new()
-            .get(format!("{base}/health"))
-            .timeout(Duration::from_secs(1))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
+        if {
+            blazar_core::tls::ensure_tls_provider();
+            reqwest::Client::new()
+        }
+        .get(format!("{base}/health"))
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success())
         {
             return RemoteStub { base, child };
         }

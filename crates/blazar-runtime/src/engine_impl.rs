@@ -149,6 +149,7 @@ impl LlamaCppEngine {
         manifest: crate::engine::manifest::Manifest,
         env: Vec<(String, String)>,
     ) -> Self {
+        blazar_core::tls::ensure_tls_provider();
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
             .build()
@@ -462,6 +463,7 @@ impl MistralRsEngine {
         env: Vec<(String, String)>,
         staging_root: Option<std::path::PathBuf>,
     ) -> Self {
+        blazar_core::tls::ensure_tls_provider();
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
             .build()
@@ -909,6 +911,7 @@ impl SdCppEngine {
         manifest: crate::engine::manifest::Manifest,
         env: Vec<(String, String)>,
     ) -> Self {
+        blazar_core::tls::ensure_tls_provider();
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
             .build()
@@ -1070,6 +1073,7 @@ impl SglangEngine {
         // a healthy child as dead for the whole model_load_timeout window
         // (seen live: uvicorn access log full of 200s the daemon never
         // received within budget).
+        blazar_core::tls::ensure_tls_provider();
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -1309,6 +1313,7 @@ impl MlxEngine {
         // interpreter itself is torch-class slow to import — a 2s
         // timeout risks eating the first (or only) successful response
         // during boot.
+        blazar_core::tls::ensure_tls_provider();
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()

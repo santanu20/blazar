@@ -1292,7 +1292,7 @@ fn install_built_binaries(
         use sha2::{Digest as _, Sha256};
         let bytes =
             std::fs::read(inner.join(server_name)).context("read built llama-server for sha256")?;
-        format!("{:x}", Sha256::digest(bytes))
+        hex::encode(Sha256::digest(bytes))
     };
     Ok((dir, digest))
 }

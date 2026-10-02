@@ -16,6 +16,7 @@ pub mod profile;
 pub mod session_identity;
 pub mod store;
 pub mod telemetry;
+pub mod tls;
 
 pub use catalog::{catalog, pair_for_spec_mode, resolve, spec_pair_for, spec_pair_for_typed};
 pub use config::{

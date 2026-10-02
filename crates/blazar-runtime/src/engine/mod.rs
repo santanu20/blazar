@@ -3212,10 +3212,20 @@ impl EngineManager {
 /// already-extracted trees).
 fn legacy_tree_digest(bin: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
+    use std::io::Read as _;
     let mut hasher = Sha256::new();
     let mut file = std::fs::File::open(bin).with_context(|| format!("open {}", bin.display()))?;
-    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hash {}", bin.display()))?;
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("hash {}", bin.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn now_secs() -> i64 {

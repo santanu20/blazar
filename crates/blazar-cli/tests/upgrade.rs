@@ -31,7 +31,7 @@ fn make_tarball(payload: &[u8]) -> Vec<u8> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
-    format!("{:x}", sha2::Sha256::digest(bytes))
+    hex::encode(sha2::Sha256::digest(bytes))
 }
 
 fn release_json(tag: &str, asset: &str, digest: &str, base: &str) -> Vec<u8> {

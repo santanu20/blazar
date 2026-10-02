@@ -20,28 +20,47 @@ blazar-gateway = { path = "crates/blazar-gateway" }
 
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-tower-http = { version = "0.6", features = ["cors"] }
-rustls = { version = "0.23", features = ["ring"] }
+# Provider-less TLS: the workspace pins ONE rustls crypto provider (ring,
+# via the rustls entry below). axum-server's tls-rustls feature would force
+# rustls/aws-lc-rs into the graph (ambiguous dual providers at runtime, plus
+# aws-lc-sys cmake/nasm build deps on release targets) — so the no-provider
+# flavor is used and ring is installed process-wide via
+# blazar_core::tls::ensure_tls_provider().
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+tower-http = { version = "0.7", features = ["cors"] }
+# default-features = false: rustls's default feature set enables its
+# aws-lc-rs provider, which drags aws-lc-sys (cmake/nasm build deps)
+# into every release target and makes the provider choice ambiguous
+# with ring. Everything else the defaults carry is re-declared below,
+# except prefer-post-quantum: it hard-depends on the aws-lc-rs provider
+# (ring has no ML-KEM yet), so PQ key exchange is traded away for
+# ring's portability. Revisit when ring ships post-quantum.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "gzip", "multipart"] }
+# rustls-no-provider: the ring provider rides the workspace `rustls`
+# dependency (features = ["ring"]); this keeps exactly one crypto provider
+# in the tree and avoids aws-lc-sys build requirements on release targets.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream", "json", "gzip", "multipart"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.3"
-toml = "0.9"
+toml = "1"
 thiserror = "2"
 anyhow = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 sysinfo = "0.33"
-dirs = "6"
-rustyline = "15"
-indicatif = "0.17"
+dirs = "7"
+rustyline = "18"
+indicatif = "0.18"
 flate2 = "1"
 tar = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
+# sha2 0.11 (digest 0.11) dropped its LowerHex impl on digest output;
+# hex is the canonical encoder for sha256 strings repo-wide.
+hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"

@@ -580,7 +580,7 @@ fn revision_digest(files: &[FilePlan]) -> String {
         h.update(l.as_bytes());
         h.update(b"\n");
     }
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 /// Is the pulled dir complete? Every planned file present with the
@@ -751,6 +751,7 @@ impl HfClient {
                 ))
             }
         });
+        blazar_core::tls::ensure_tls_provider();
         let http = reqwest::Client::builder()
             .redirect(policy)
             // Downloads are multi-hundred-MB: no total cap, bounded stalls.
@@ -961,7 +962,7 @@ impl HfClient {
         drop(file);
 
         if let Some(expected) = &plan.sha256 {
-            let got = format!("{:x}", hasher.finalize());
+            let got = hex::encode(hasher.finalize());
             if !got.eq_ignore_ascii_case(expected) {
                 let _ = tokio::fs::remove_file(&part).await;
                 return Err(anyhow!(
@@ -2961,8 +2962,17 @@ fn reuse_byte_exact(candidate: &Path, plan: &FilePlan) -> Option<PathBuf> {
         Some(expected) if !expected.is_empty() => {
             let mut f = std::fs::File::open(candidate).ok()?;
             let mut h = Sha256::new();
-            std::io::copy(&mut f, &mut h).ok()?;
-            if format!("{:x}", h.finalize()).eq_ignore_ascii_case(expected) {
+            // digest 0.11 dropped the io::Write impl on hashers, so the
+            // stream is fed explicitly instead of via io::copy.
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = std::io::Read::read(&mut f, &mut buf).ok()?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+            if hex::encode(h.finalize()).eq_ignore_ascii_case(expected) {
                 Some(candidate.to_path_buf())
             } else {
                 None
@@ -3108,7 +3118,7 @@ mod tests {
             use sha2::Digest;
             let mut h = sha2::Sha256::new();
             h.update(&body);
-            format!("{:x}", h.finalize())
+            hex::encode(h.finalize())
         };
         let plan = |bytes: u64, sha: Option<&str>| FilePlan {
             filename: "te.gguf".into(),
@@ -3125,7 +3135,7 @@ mod tests {
             use sha2::Digest;
             let mut h = sha2::Sha256::new();
             h.update(b"other");
-            format!("{:x}", h.finalize())
+            hex::encode(h.finalize())
         };
         assert_eq!(
             reuse_byte_exact(&f, &plan(body.len() as u64, Some(&wrong))),
@@ -4049,7 +4059,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn payload(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+        hex::encode(Sha256::digest(bytes))
     }
 
     /// Minimal valid GGUF v3 file (header + one string kv) — passes
