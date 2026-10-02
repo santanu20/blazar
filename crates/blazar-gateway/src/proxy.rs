@@ -1518,6 +1518,9 @@ pub(crate) fn child_model_stamp_predicted(
         EngineKind::Sglang => Some(blazar_core::engine_kind::sglang_child_model_name(
             model_name,
         )),
+        // same mlx contract as `child_model_stamp` — the spawn-time
+        // prediction must equal what the running child registers.
+        EngineKind::Mlx => Some(model_path.to_string()),
         _ => None,
     }
 }
@@ -1547,6 +1550,10 @@ pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<String> {
         EngineKind::Sglang => Some(blazar_core::engine_kind::sglang_child_model_name(
             &engine.name,
         )),
+        // mlx_lm serves the model under its FULL path (it has no
+        // --served-model-name flag, probe-verified) — anything else in
+        // the body falls through to its HF-hub resolution and 401s.
+        EngineKind::Mlx => Some(engine.model_path.clone()),
         _ => None,
     }
 }
@@ -2818,6 +2825,7 @@ mod resolve_model_tests {
                 port: 1,
             },
             auth: None,
+            model_path: "/models/qwen2.5-0.5b-instruct-4bit.d".to_string(),
         };
         let ref_named = |kind: EngineKind, name: &str| blazar_runtime::EngineRef {
             name: name.to_string(),
@@ -2828,6 +2836,7 @@ mod resolve_model_tests {
                 port: 1,
             },
             auth: None,
+            model_path: "/models/qwen2.5-0.5b-instruct-4bit.d".to_string(),
         };
         // mistral.rs: stable per-child id, never the row name.
         assert_eq!(
@@ -2840,6 +2849,11 @@ mod resolve_model_tests {
         assert_eq!(
             child_model_stamp(&ref_for(EngineKind::Sglang)),
             Some("qwen2.5-0.5b-instruct-awq".to_string())
+        );
+        // mlx: the child registers the FULL dir path as its served id.
+        assert_eq!(
+            child_model_stamp(&ref_for(EngineKind::Mlx)),
+            Some("/models/qwen2.5-0.5b-instruct-4bit.d".to_string())
         );
         // ...so a quant-tagged row name is mapped colon-free, and the
         // stamp must stay byte-identical to what sglang_argv registers

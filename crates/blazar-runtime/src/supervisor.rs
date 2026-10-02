@@ -1762,6 +1762,11 @@ pub struct EngineRef {
     /// child (`proxy::child_auth` is the single choke point). Never
     /// serialized into `ps`/API output.
     pub auth: Option<String>,
+    /// Path of the model row this child serves. mlx_lm reports the FULL
+    /// path as its served model id (no `--served-model-name` flag exists
+    /// — probe-verified), so the gateway's body stamp for the mlx lane
+    /// reads it from here.
+    pub model_path: String,
 }
 
 /// Minted child-auth bundle from [`Supervisor::mint_child_auth`].
@@ -2743,6 +2748,7 @@ impl Supervisor {
             kind: inst.kind,
             endpoint: inst.endpoint.clone(),
             auth: inst.auth.clone(),
+            model_path: inst.model.path.clone(),
         }
     }
 
@@ -3362,9 +3368,7 @@ impl Supervisor {
                 EngineKind::Sglang => {
                     Arc::new(crate::engine_impl::SglangEngine::with_env(manifest, env))
                 }
-                EngineKind::Mlx => {
-                    Arc::new(crate::engine_impl::MlxEngine::with_env(manifest, env))
-                }
+                EngineKind::Mlx => Arc::new(crate::engine_impl::MlxEngine::with_env(manifest, env)),
                 EngineKind::LlamaCpp => {
                     Arc::new(crate::engine_impl::LlamaCppEngine::with_env(manifest, env))
                 }
