@@ -341,6 +341,12 @@ pub struct LaneCheck {
     /// the target release itself (lane 1); `None` when the release
     /// ships no driver-runnable upstream CUDA asset.
     pub upstream_cuda: Option<gh::AssetPick>,
+    /// Release tag `upstream_cuda` was picked from. Differs from
+    /// `target_tag` exactly when the install lane's scan-back walked to
+    /// an older release that ships a driver-runnable asset — the
+    /// dry-run verdict must name the build the update would really
+    /// install, not the channel label.
+    pub upstream_cuda_tag: Option<String>,
     /// Derived overlay tag an NVIDIA/linux box would install
     /// (`b10985-cuda`); `None` when the CUDA lane does not apply
     /// (asset pin, non-NVIDIA, or pre-CUDA-12 driver).
@@ -524,6 +530,7 @@ impl EngineManager {
         let mut out = LaneCheck {
             target_tag: release.tag_name.clone(),
             upstream_cuda: None,
+            upstream_cuda_tag: None,
             overlay_tag: None,
             cuda_asset: None,
             newest_cuda: None,
@@ -564,10 +571,12 @@ impl EngineManager {
             arch,
             number,
         };
-        out.upstream_cuda = self
-            .upstream_cuda_pick(release, &lane, exact_pin)
-            .await
-            .map(|(_, p)| p);
+        if let Some((asset_release, pick)) =
+            self.upstream_cuda_pick(release, &lane, exact_pin).await
+        {
+            out.upstream_cuda = Some(pick);
+            out.upstream_cuda_tag = Some(asset_release.tag_name.clone());
+        }
         // Overlay lanes are self-hosted-only (BLAZAR_ENGINE_REPO); with
         // no overlay configured the report stops at the upstream pick.
         if let Some(repo) = gh::engine_overlay_repo() {
