@@ -180,6 +180,7 @@ mod tests {
                     params: None,
                     ctx_train: None,
                     pulled_at: 1,
+                    last_used_at: 1,
                 })
                 .unwrap();
             (tmp, store)

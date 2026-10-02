@@ -46,7 +46,7 @@ use axum::extract::{Extension, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::serve::ListenerExt;
 use axum::Router;
 
@@ -287,6 +287,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/files/{id}/content", get(batch::get_file_content))
         .route("/responses", post(openai::responses_api))
         .route("/v1/responses/{id}", get(openai::responses_get))
+        .route("/v1/conversations/{id}", get(openai::conversations_get))
+        .route(
+            "/v1/conversations/{id}",
+            delete(openai::conversations_delete),
+        )
         .route(
             "/v1/audio/transcriptions",
             post(whisper::audio_transcriptions),
@@ -849,7 +854,8 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
             "openai": ["/v1/chat/completions", "/v1/chat/completions/control",
                        "/v1/chat/completions/input_tokens",
                        "/v1/completions", "/v1/embeddings", "/v1/rerank", "/v1/reranking",
-                       "/v1/responses", "/v1/responses/{id}", "/v1/responses/input_tokens",
+                       "/v1/responses", "/v1/responses/{id}", "/v1/conversations/{id}",
+                       "/v1/responses/input_tokens",
                        "/v1/messages", "/v1/messages/count_tokens", "/v1/models",
                        "/v1/adapters", "/v1/batches", "/v1/batches/{id}",
                        "/v1/batches/{id}/cancel", "/v1/files", "/v1/files/{id}",

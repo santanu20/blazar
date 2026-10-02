@@ -237,7 +237,41 @@ The three lanes never individually audited. Sources: leejet/stable-diffusion.cpp
   (best-effort `GetShortPathNameW`, identity off-Windows) before the whisper
   child sees a non-ASCII model path (whisper.cpp #4018 abort class).
 
-## 10. Sources (selection)
+## 10. Round-4 intensive ollama sweep (2026-10-02, community-axis research)
+
+Method: GitHub top-reacted refresh (list unchanged vs round 1; #10792 Gemma 3n
+195+, #9387 phi4 multimodal 165+ are engine-level model-support, arrive via
+`engine update`) + NEW axes: Reddit r/LocalLLaMA, troubleshooting-article
+corpus (insiderllm/mrsaynothing/llmcheck 2026), GitHub Discussions, enterprise
+logging guides, OpenAI-parity audits, ollama 0.30-0.35 engine-churn reports.
+
+| Round-4 complaint class | Verdict (evidence) |
+|---|---|
+| Silent GPU→CPU fallback ("tok/s tanks", "ollama ps says CPU", Docker GPU loss over days) — the most-written 2026 troubleshooting article class | FIXED-BY-ARCH: placement is posture-decided pre-flight (teaching 400s carry the numbers), `/api/ps` returns `blazar_device` + `blazar_device_id` per instance (ollama.rs:432-433), per-GPU `/api/capacity`, `blazar explain`, boot-smoke gate at spawn — no runtime silent-fallback path exists |
+| Stateful Responses API (ollama compat = non-stateful only, no `previous_response_id`) | FIXED-BETTER: full `previous_response_id` chaining, durable across restarts (store v8 responses registry, responses.rs, openai.rs:836) |
+| `n` variants from one prompt (OpenAI chat `n` param) — open ollama compat complaint | GAP → **F7** (proposed): fan-out `n>1` in openai.rs (engines sample per-choice; needs gateway fan + response reshape) |
+| MLX engine on Apple Silicon (ollama ships MLX lane for SOTA Mac perf) | ROADMAP → **F8** (doc note): our Mac lanes = llamacpp Metal + mistral.rs Metal; MLX lane = future wave, not silent |
+| Engine-churn regressions (#18373 load slower, 0.33.x 5x tok/s drop) | IMMUNE-BY-ARCH: engines pinned per install, updates explicit + F7 boot-smoke gated + benchmarks receipt; no auto-churn |
+| Docker GPU/OOM/networking complaint class (whole troubleshooting genre) | N/A-BY-DESIGN: native binaries + engine manager, no containers |
+| Logs record full request/response content by default (PII warnings in ollama guides) | FIXED-BY-DESIGN: gateway logs metadata only — no body/prompt/message content logging anywhere in src/ (grep-verified) |
+| Enterprise audit ("who said what", multi-user) | FIXED-BETTER: scoped keys named in 403s (keys.rs:53), KeyUsageRow accounting, durable responses/jobs rows correlate identity+request |
+| `think: false` timeouts on non-interactive paths (suggestion engines) | FIXED: think-gates (Wave K O2) |
+| Grammar/GBNF exposure (ollama declined the PRs) | FIXED: GBNF passthrough (256 KiB cap) |
+| Windows GUI stuck-loading / macOS Ventura-Sequoia-Tahoe runner crashes | UPSTREAM-LANE: no GUI surface to break; engine crashes arrive via `engine update`, caught by boot-smoke + doctor currency rows |
+| Perf gap vs raw llama-server (5x prompt-eval reports) | FIXED: posture defaults + FA-on default + admission receipts (2x t/s vs ollama measured) |
+
+Round-4 net: two new actionable items — **F7** (`n` choices) and **F8** (MLX
+roadmap row). Everything else verified fixed, better, or immune by
+architecture.
+
+Round-4 close-out (same day): **F7 DONE** — strict `n` validation (1..=8,
+fail-fast before admission), passthrough, non-stream count-verify with
+teaching 502, per-key charge ×n on llamacpp lanes (live-probed accounting
+quirk); e2e + unit pinned; live receipts on the production daemon.
+**F8 delivered as spec** — docs/research/mlx-lane-spec.md (implementation
+staged until Mac hardware is available for live validation).
+
+## 11. Sources (selection)
 
 - GitHub Search API top-reacted open issues: ollama/ollama,
   sgl-project/sglang, ggml-org/llama.cpp (2026-10-02 snapshots).

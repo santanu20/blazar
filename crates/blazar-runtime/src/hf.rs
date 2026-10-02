@@ -845,8 +845,7 @@ impl HfClient {
     /// verify, atomic rename. The URL arrives prebuilt by the caller (HF
     /// resolve path, ollama-registry blob path, ...), so this client's
     /// redirect allowlist and token policy apply uniformly.
-    // args mirror the pull plan one-to-one; grouping would just relocate names
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // resume+verify+rename is one audited flow
+    #[allow(clippy::too_many_lines)] // one download cycle: resume, range, verify, atomic rename
     pub(crate) async fn download_to(
         &self,
         url: reqwest::Url,
@@ -1888,6 +1887,8 @@ fn safetensors_model_row(
         ctx_train: meta.ctx_train.and_then(|c| i64::try_from(c).ok()),
         pulled_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
             .unwrap_or(i64::MAX),
+        last_used_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+            .unwrap_or(i64::MAX),
     })
 }
 
@@ -2063,6 +2064,11 @@ impl Puller {
         std::fs::create_dir_all(&dir)?;
 
         let total_bytes: u64 = sel.files.iter().map(|f| f.bytes).sum();
+        crate::storage::gate_disk(
+            &self.dirs,
+            total_bytes,
+            &format!("{name} (safetensors lane)"),
+        )?;
         let bar = indicatif::ProgressBar::new(total_bytes);
         bar.set_style(
             indicatif::ProgressStyle::default_bar()
@@ -2193,6 +2199,11 @@ impl Puller {
 
         let total_bytes: u64 = selected.shards.iter().map(|s| s.bytes).sum::<u64>()
             + selected.mmproj.as_ref().map_or(0, |m| m.bytes);
+        crate::storage::gate_disk(
+            &self.dirs,
+            total_bytes,
+            &format!("{name}:{}", selected.quant),
+        )?;
         let bar = indicatif::ProgressBar::new(total_bytes);
         bar.set_style(
             indicatif::ProgressStyle::default_bar()
@@ -2386,6 +2397,7 @@ impl Puller {
                 params: None,
                 ctx_train: None,
                 pulled_at: 0,
+                last_used_at: 0,
             };
             self.attach_diffusion_set(target, name, &target.quant, &mut row, &mut pull_warning)
                 .await?;
@@ -2409,6 +2421,8 @@ impl Puller {
             params: None,
             ctx_train: None,
             pulled_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+                .unwrap_or(i64::MAX),
+            last_used_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
                 .unwrap_or(i64::MAX),
         };
         store.upsert_model(&row)?;
@@ -2509,6 +2523,7 @@ impl Puller {
         }
 
         let total_bytes: u64 = plans.iter().map(|(_, p, _)| p.bytes).sum();
+        crate::storage::gate_disk(&self.dirs, total_bytes, "diffusion component set")?;
         let bar = indicatif::ProgressBar::new(total_bytes);
         bar.set_style(
             indicatif::ProgressStyle::default_bar()
@@ -2861,6 +2876,8 @@ fn build_model_row(
             ctx_train: ctx_train.and_then(|c| i64::try_from(c).ok()),
             pulled_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
                 .unwrap_or(i64::MAX),
+            last_used_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+                .unwrap_or(i64::MAX),
         },
         pull_warning,
     ))
@@ -3063,7 +3080,6 @@ fn reuse_on_disk(
 
 #[cfg(test)]
 #[allow(non_snake_case)]
-#[allow(clippy::cast_possible_truncation)] // byte counts are test-sized
 mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
@@ -4076,6 +4092,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 
@@ -4947,7 +4964,7 @@ mod tests {
             .await
             .unwrap();
         let control_elapsed = t0.elapsed();
-        assert_eq!(n as usize, full.len());
+        assert_eq!(usize::try_from(n).unwrap(), full.len());
         assert_eq!(std::fs::read(&control_dest).unwrap(), full);
 
         // Capped at 0.001 MB/s = 1000 B/s.
@@ -4958,7 +4975,11 @@ mod tests {
             .await
             .unwrap();
         let paced_elapsed = t0.elapsed();
-        assert_eq!(n as usize, full.len(), "cap paces, never truncates");
+        assert_eq!(
+            usize::try_from(n).unwrap(),
+            full.len(),
+            "cap paces, never truncates"
+        );
         assert_eq!(std::fs::read(&dest).unwrap(), full);
 
         assert!(

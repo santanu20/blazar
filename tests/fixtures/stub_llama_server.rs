@@ -530,6 +530,9 @@ fn stub_knob_text(state: &AppState, messages: &[ChatMessage]) -> String {
     }
 }
 
+// One handler per wire dialect this stub emulates; the body mirrors the
+// real openai lane's branch order so e2e pins exercise the same paths.
+#[allow(clippy::too_many_lines)]
 async fn chat_completions(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<ChatRequest>,
@@ -569,22 +572,42 @@ async fn chat_completions(
     };
 
     if !req.stream {
+        // Choice fan-out for the n-choices contract: the gateway verifies
+        // the engine honored `n`. Tests select the returned count via
+        // STUB_CHOICE_COUNT (default 1 = "engine ignored n", the failure
+        // direction the gateway must catch). A single choice stays
+        // byte-identical to the historical shape.
+        let choice_count: usize = std::env::var("STUB_CHOICE_COUNT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 8);
+        let choices: Vec<serde_json::Value> = (0..choice_count)
+            .map(|i| {
+                let content = if choice_count == 1 {
+                    text.clone()
+                } else {
+                    format!("{text} #{i}")
+                };
+                serde_json::json!({
+                    "index": i,
+                    "message": if env_flag("STUB_BAD_TOOL_ARGS") {
+                        serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
+                            {"id": "t1", "type": "function", "function": {"name": "echo", "arguments": "{\"broken"}}
+                        ]})
+                    } else {
+                        serde_json::json!({"role": "assistant", "content": content})
+                    },
+                    "finish_reason": finish,
+                })
+            })
+            .collect();
         let body = serde_json::json!({
             "id": format!("chatcmpl-stub-{}", std::process::id()),
             "object": "chat.completion",
             "created": 0_u64,
             "model": model,
-            "choices": [{
-                "index": 0,
-                "message": if env_flag("STUB_BAD_TOOL_ARGS") {
-                    serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
-                        {"id": "t1", "type": "function", "function": {"name": "echo", "arguments": "{\"broken"}}
-                    ]})
-                } else {
-                    serde_json::json!({"role": "assistant", "content": text})
-                },
-                "finish_reason": finish,
-            }],
+            "choices": choices,
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,

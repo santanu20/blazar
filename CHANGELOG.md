@@ -10,8 +10,19 @@ Theme: **federation completion** — the control plane gets verbs: warm,
 replicate, route.
 
 ### Added
+<<<<<<< HEAD
 
+=======
+- Disk intelligence. `blazar fit` gains a DISK section (largest variant + 64 MiB slack vs available, verdict FIT/TIGHT/NO) and per-row `disk_fits`/`disk_free_bytes` in JSONL mode; pulls are gated at submit time with a teaching error that names the numbers and points at `blazar storage` / `blazar prune`.
+- `blazar storage` — the disk-side counterpart of `fit`: models/engines/sessions/cache footprints, disk headroom, and reclaim candidates (orphan files, stale `.part` downloads, hardlink twins, unused models), plus report-only out-of-tree engine caches.
+- `blazar prune [--orphans] [--unused] [--since-days N] [--yes]` — dry-run by default; `--orphans` deletes unowned files and stale partials, `--unused` removes models idle beyond the window (residents are fetched from a live daemon and never proposed; twins are report-only).
+- Model usage tracking (schema v9): `models.last_used_at`, backfilled from `pulled_at` on upgrade and stamped on cold spawns (residents are fresh by definition — the hot path never pays the write).
+- `blazar connect <client>` — one-command integration: detects the install, prints the exact config change, and with `--write` applies it (backup first, rolled back if the dialect-correct test request fails). Clients: `codex` (config.toml provider, `wire_api = "responses"`), `claude` (settings.json env merge), `continue` (config.yaml; snippet-only when hand-tuned), `cline` / `openwebui` (printed instructions — their config lives in a UI / startup env).
+>>>>>>> feat/v0.16-federation
 - `POST /api/warm` gained `"wait": true` — synchronous warm through admission with a resident-state report (default stays the detached pull-notify contract). CLI: `blazar warm <model>`.
+- Responses background mode: `POST /v1/responses` with `"background": true` (requires `store: true`, non-streaming) returns `202 {status: queued}` immediately and runs the roundtrip as a durable job — poll `GET /v1/responses/{id}` (`in_progress` → the verbatim stored body) or watch the `responses`-kind job at `/v1/jobs/{id}`; cancellable through the job plane.
+- Conversations (schema v10): name a thread with `"conversation": "..."` on `POST /v1/responses`; chained responses inherit the name from their `previous_response_id`. `GET /v1/conversations/{id}` lists the thread chronologically, `DELETE` clears it.
+- Cloud-builtin tool types (`web_search`, `file_search`, `computer_use`, `code_interpreter`, `image_generation`, `mcp`, `tool_search`, …) in a Responses request now fail fast with a teaching 400 naming the local substitute (list your tools as `{"type": "function"}` entries; client-side MCP discovery should materialize its tools as function definitions) instead of silently forwarding an unsatisfiable request.
 - `POST /api/replicate` + `blazar replicate <model> [--peers a,b] [--timeout-secs N]` — remote replication: concurrent warm fan-out to peers with verbatim per-peer outcomes; Blazar peers only (non-Blazar peers are named as such).
 - `GET /api/route/{model}` + `blazar route <model>` — cross-node scheduling explainer: local residency, per-peer tier / wait estimate / free VRAM / breaker state, and the decision the gateway would take.
 
@@ -48,6 +59,11 @@ Patch release — defects found by live validation of 0.15.0, fixed on main.
 - **Workspace `cargo fmt` + `clippy -D warnings` clean** across all new 0.15.0 surfaces (the 0.15.0 tag was cut before CI enforced this on the new code).
 
 ## [0.15.0] - 2026-10-02
+- feat(gateway): OpenAI `n` choices — strict 1..=8 validation (400 before admission), passthrough, non-stream count-verify (teaching 502 when a lane ignores `n`), per-key token charge multiplied by `n` on llamacpp lanes
+- fix(cli+runtime): `engine update --check` verdict uses the CUDA asset walk-back target (channel release without a driver-runnable ubuntu-cuda asset no longer prints a phantom 'update available')
+- fix(runtime): `engine use <unknown-tag>` teaches instead of surfacing the raw store error — names the three nearest installed tags (edit-distance ranked) plus the full lane list and a `engine list` hint
+- feat(gateway): `n` choices are checked against the serving lane's own ceiling before admission (llama.cpp lane = 2, live-probed b11339+b11344; unprobed lanes keep 8) — the engine's raw "Value must be between 1 <= value <= 2" no longer leaks to API callers
+- fix(runtime+core): orphan scan shard-sibling reconstruction missed the `-` separator (every sharded GGUF shard 2+ read as orphan — prune bait); fresh-DB `last_used_at` backfill now applies in upsert (was migration-only); disk-verdict and unused-rows test constants corrected
 
 Theme: **the reliability layer** — local AI that behaves like infrastructure.
 Jobs, requests, responses, and capability certificates survive restarts;

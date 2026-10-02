@@ -376,9 +376,39 @@ pub async fn openai_proxy(
     if let Some(resp) = llamacpp_only_gate(&state, &uri, model.as_deref()) {
         return resp;
     }
+    // F7: strict `n` validation at the plane edge — an invalid choice
+    // count fails fast, BEFORE admission bills the request.
+    if let Some(body) = parsed_body.as_ref() {
+        if let Err(msg) = crate::proxy::requested_choices(uri.path(), body) {
+            return openai_error(400, &msg);
+        }
+    }
     let Some(model) = model else {
         return openai_error(400, "missing `model` field in request body");
     };
+    // Lane-aware `n` ceiling: the plane-wide bound is the promise, but the
+    // serving engine may cap lower (llama-server: 2). Reject in our voice,
+    // before admission bills a request the engine would refuse anyway.
+    // Only runs when the caller actually asked for extra choices.
+    if let Some(body) = parsed_body.as_ref() {
+        if let Ok(Some(n)) = crate::proxy::requested_choices(uri.path(), body) {
+            if n > 1 {
+                if let Some(kind) = crate::proxy::routed_kind_for(&state, &model) {
+                    let cap = crate::proxy::lane_max_n(kind);
+                    if n > cap {
+                        return openai_error(
+                            400,
+                            &format!(
+                                "n = {n} exceeds this lane's ceiling: {kind} serves at most \
+                                 {cap} choices per request (plane-wide limit is {})",
+                                crate::proxy::MAX_N_CHOICES
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Per-key admission: model scope + rate limits + request accounting.
     if let Some(key) = key_ext.as_ref().map(|Extension(k)| k) {
         if let Some(entry) = state.keys.entry(&key.name) {
@@ -612,15 +642,175 @@ pub async fn openai_proxy(
     .await
 }
 
+/// Tool types that need a cloud-side catalog or sandbox this local
+/// gateway cannot honor. Named here so the request fails fast with the
+/// fix in the message instead of drifting downstream into a child 500.
+const CLOUD_BUILTIN_TOOL_TYPES: &[&str] = &[
+    "web_search",
+    "web_search_preview",
+    "file_search",
+    "computer_use",
+    "computer_use_preview",
+    "code_interpreter",
+    "image_generation",
+    "mcp",
+    "tool_search",
+];
+
+/// Teaching gate for cloud builtin tool entries: a local gateway has no
+/// tool catalog to search and no cloud sandbox to drive. `None` = the
+/// request's tools (if any) are all locally servable `function` entries.
+pub(crate) fn cloud_tool_gate(parsed: &serde_json::Value) -> Option<String> {
+    let tools = parsed.get("tools")?.as_array()?;
+    for t in tools {
+        let Some(ty) = t.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if CLOUD_BUILTIN_TOOL_TYPES.contains(&ty) {
+            return Some(format!(
+                "tool type {ty:?} is a cloud-side mechanism a local gateway cannot honor — list the tools you control as {{\"type\":\"function\"}} entries (client-side MCP discovery should materialize its tools as function definitions on the next turn)"
+            ));
+        }
+    }
+    None
+}
+
+/// `GET /v1/conversations/{id}` — list the stored responses grouped
+/// under one conversation handle (ledger-backed, survives restarts).
+pub async fn conversations_get(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if id.is_empty() || id.len() > 128 {
+        return openai_error(400, "invalid conversation id");
+    }
+    let rows = state
+        .with_store(|s| s.list_conversation(&id).ok())
+        .flatten()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return openai_error(
+            404,
+            "conversation not found — conversations exist once a stored response names one (pass \"conversation\": \"...\" on POST /v1/responses)",
+        );
+    }
+    let responses: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "model": r.model,
+                "status": "completed",
+                "created_at": r.ts,
+            })
+        })
+        .collect();
+    let count = responses.len();
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "object": "conversation",
+            "id": id,
+            "count": count,
+            "responses": responses,
+        })),
+    )
+        .into_response()
+}
+
+/// `DELETE /v1/conversations/{id}` — prune every response in the
+/// conversation (the in-memory registry re-populates on demand from
+/// remaining ledger rows; here there are none, so chains into this
+/// conversation now 404 with the standard teaching message).
+pub async fn conversations_delete(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if id.is_empty() || id.len() > 128 {
+        return openai_error(400, "invalid conversation id");
+    }
+    match state.with_store(|s| s.delete_conversation(&id)) {
+        Some(Ok(n)) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "object": "conversation",
+                "id": id,
+                "deleted": n,
+            })),
+        )
+            .into_response(),
+        Some(Err(e)) => openai_error(500, &format!("conversation delete failed: {e}")),
+        None => openai_error(
+            503,
+            "store unavailable — the conversation list lives in the ledger; retry shortly",
+        ),
+    }
+}
+
 /// `GET /v1/responses/{id}` — retrieve a stored (chained) response:
 /// `OpenAI` retrieval surface over the gateway registry (memory-first,
 /// SQLite ledger fallback — stored responses survive restarts). Expired
 /// or streamed (never stored) ids 404 with the same teaching message as
-/// the chaining path.
+/// the chaining path. v10 rows carry the exact completed body
+/// (`body_json`) — returned verbatim; background-mode ids still running
+/// answer through the job plane's state machine instead.
 pub async fn responses_get(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    // Exact-body fidelity first (background always, foreground since v10).
+    let row = state
+        .with_store(|s| s.get_response(&id).ok().flatten())
+        .flatten();
+    if let Some(r) = &row {
+        if let Some(bj) = &r.body_json {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(bj) {
+                return (StatusCode::OK, axum::Json(v)).into_response();
+            }
+        }
+    }
+    // Background lifecycle: no stored body yet — the job row says where
+    // the run is (same id namespace by construction).
+    if row.is_none() {
+        if let Some(job) = state
+            .with_store(|s| s.get_job(&id).ok().flatten())
+            .flatten()
+        {
+            return match job.state.as_str() {
+                "queued" | "running" => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "id": id,
+                        "object": "response",
+                        "status": "in_progress",
+                        "background": true,
+                    })),
+                )
+                    .into_response(),
+                "failed" => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "id": id,
+                        "object": "response",
+                        "status": "failed",
+                        "background": true,
+                        "error": job.error,
+                    })),
+                )
+                    .into_response(),
+                _ => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "id": id,
+                        "object": "response",
+                        "status": job.state,
+                        "background": true,
+                    })),
+                )
+                    .into_response(),
+            };
+        }
+    }
     let found = state.stored_response(&id).map(|s| {
         serde_json::json!({
             "id": id,
@@ -901,6 +1091,28 @@ pub async fn responses_api(
         .get("store")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
+    // v0.18 depth: background mode (polled, job-backed), conversation
+    // grouping, and the cloud-tool honesty gate.
+    let background = parsed
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if background && (stream || !store) {
+        return openai_error(
+            400,
+            "background requires store=true and stream=false — a background response is polled via GET /v1/responses/{id}, never streamed",
+        );
+    }
+    if let Some(msg) = cloud_tool_gate(&parsed) {
+        return openai_error(400, &msg);
+    }
+    let conversation_named = parsed
+        .get("conversation")
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    // The child never sees the conversation handle (unknown fields are
+    // how stale upstreams 500): strip it the same way the chain id is
+    // stripped, after inheritance is resolved below.
     let previous = parsed
         .get("previous_response_id")
         .and_then(|p| p.as_str())
@@ -911,14 +1123,16 @@ pub async fn responses_api(
     // reject stale ids). The lookup is memory-first with the SQLite
     // ledger as restart fallback — a chain survives a gateway restart.
     let mut inherited_model = None;
+    let mut inherited_conversation = None;
     if let Some(pid) = previous {
         let found = state.stored_response(&pid).map(|s| {
             (
                 crate::responses::ResponsesRegistry::chain_input(&s, &parsed["input"]),
                 s.model.clone(),
+                s.conversation.clone(),
             )
         });
-        let Some((chained, prev_model)) = found else {
+        let Some((chained, prev_model, prev_conversation)) = found else {
             return openai_error(
                 404,
                 &format!(
@@ -928,10 +1142,17 @@ pub async fn responses_api(
         };
         parsed["input"] = chained;
         inherited_model = Some(prev_model);
+        inherited_conversation = Some(prev_conversation);
         parsed
             .as_object_mut()
             .map(|o| o.remove("previous_response_id"));
     }
+    // Conversation: named > inherited-from-chain > none. A chained turn
+    // without its own handle stays in the thread it replies to.
+    let conversation = conversation_named
+        .or(inherited_conversation)
+        .unwrap_or_default();
+    parsed.as_object_mut().map(|o| o.remove("conversation"));
     // Model: explicit > inherited-from-chain > named-400 (every OpenAI
     // route's contract on a missing model).
     let model = parsed
@@ -1023,151 +1244,102 @@ pub async fn responses_api(
     // (child_send owns the header-timeout evict), then exactly one
     // in-band retry on a respawned child so single-shot clients don't
     // eat a 502/504 for a child that died mid-request.
-    let t0 = std::time::Instant::now();
-    let url = format!(
-        "{}/v1/responses",
-        crate::proxy::child_base(&engine.endpoint)
-    );
-    let req = crate::proxy::child_auth(
-        crate::state::child_client(&state, &engine.endpoint)
-            .post(&url)
-            .header("content-type", "application/json"),
-        &engine,
-    )
-    .body(new_body.clone());
-    // Best-of-N: judge N candidates, return the winner as a normal child
-    // response (usage summed across candidates). Skip/Degraded (knob
-    // off, guard collapse, first-copy transport failure) takes the
-    // single-send path below with its respawn-retry contract intact; a
-    // guard degrade still stamps the reason header.
-    let mut bestof_hdr: Option<String> = None;
-    let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
-        crate::bestof::fan_out(&state, &engine, &url, &new_body, want).await
-    } else {
-        crate::bestof::FanOut::Skip
-    };
-    if let crate::bestof::FanOut::Degraded(h) = &fan {
-        bestof_hdr = Some(h.clone());
-    }
-    let resp = match fan {
-        crate::bestof::FanOut::Ran(outcome) => {
-            state.ttft.observe_secs(outcome.elapsed.as_secs_f64());
-            bestof_hdr = Some(outcome.hdr);
-            outcome.resp
-        }
-        _ => match crate::proxy::child_send(&state, &engine, req.send()).await {
-            Ok(r) => {
-                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
-                r
-            }
-            Err(e) => {
-                tracing::warn!(
-                    model = %model_name,
-                    "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"
-                );
-                match crate::proxy::respawn_lane(&state, &engine.key).await {
-                    Ok(fresh) => {
-                        let fresh_url =
-                            format!("{}/v1/responses", crate::proxy::child_base(&fresh.endpoint));
-                        let fresh_req = crate::proxy::child_auth(
-                            crate::state::child_client(&state, &fresh.endpoint)
-                                .post(&fresh_url)
-                                .header("content-type", "application/json"),
-                            &fresh,
-                        )
-                        .body(new_body.clone());
-                        match crate::proxy::child_send(&state, &fresh, fresh_req.send()).await {
-                            Ok(r) => {
-                                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
-                                r
-                            }
-                            Err(e2) => {
-                                return openai_error(
-                                    e2.status_u16(),
-                                    &format!(
-                                    "engine request failed: {e}; retry on respawned child: {e2}"
-                                ),
-                                );
-                            }
-                        }
-                    }
-                    Err(re) => {
-                        return openai_error(
-                            e.status_u16(),
-                            &format!("engine request failed: {e}; respawn: {re:#}"),
-                        );
-                    }
-                }
-            }
-        },
-    };
-    let status = resp.status().as_u16();
-    if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        let mut r = openai_error(status, &format!("engine error: {text}"));
-        crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
-        return r;
-    }
-    let mut out: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => return openai_error(502, &format!("bad engine response: {e}")),
-    };
-    // Sentinel observation: the buffered branch bypasses proxy_request,
-    // so the feed is driven here (same as the ollama translate path).
-    {
-        let (feed, _) = crate::sentinel::begin_chat_observation(
-            &state,
-            "openai-responses",
-            &model_name,
-            &new_body,
-            trace_ext.clone().map(|Extension(t)| t.0),
-            status,
-            false,
-        );
-        feed.value(out.clone());
-        drop(feed); // Drop fires End: analyzer finalizes off the path
-    }
-    // Store under OUR id and rewrite the body's id so the client chains
-    // through the gateway (the engine's own id carries no storage).
     let id = crate::responses::new_response_id();
-    let usage = out.get("usage").cloned().unwrap_or(serde_json::Value::Null);
-    let in_tok = usage["input_tokens"].as_u64();
-    let out_tok = usage["output_tokens"].as_u64();
-    // A2: blend the completion's decode rate into the model's EWMA
-    // (t0 predates the fan/single send on this branch).
-    if let Some(n) = out_tok {
-        state
-            .sup
-            .note_model_throughput(&model_name, n, t0.elapsed().as_secs_f64());
-    }
-    // FIX6: this buffered branch bypasses proxy_request's sniffer —
-    // charge token budgets directly from the parsed usage.
-    if let Some(Extension(k)) = key_ext.as_ref() {
-        let total = in_tok.unwrap_or(0).saturating_add(out_tok.unwrap_or(0));
-        state.keys.charge_tokens(&k.name, total);
-    }
     let input_items = parsed
         .get("input")
         .cloned()
         .unwrap_or(serde_json::Value::Array(vec![]));
-    let output_items = out
-        .get("output")
-        .cloned()
-        .unwrap_or(serde_json::Value::Array(vec![]));
-    if let Some(obj) = out.as_object_mut() {
-        obj.insert("id".into(), serde_json::json!(id));
+    let input_items_bg = input_items.clone();
+    // Background mode: same buffered roundtrip, polled instead of held.
+    // The response id doubles as the job id — one namespace, both planes
+    // (/v1/jobs/{id} shows the run, /v1/responses/{id} shows the result).
+    if background {
+        let id = crate::responses::new_response_id();
+        state.jobs.record_created(
+            &state,
+            &id,
+            "responses",
+            Some(model_name.as_str()),
+            serde_json::json!({
+                "model": model_name,
+                "conversation": conversation,
+                "background": true,
+            }),
+        );
+        let st = Arc::clone(&state);
+        let eng = engine.clone();
+        let model_owned = model_name.clone();
+        let body_owned = new_body.clone();
+        let keys = key_ext.clone();
+        let trace = trace_ext.clone();
+        let rid = id.clone();
+        let conv = conversation.clone();
+        tokio::spawn(async move {
+            st.jobs.record_running(&st, &rid);
+            match buffered_response_roundtrip(
+                &st,
+                &eng,
+                &model_owned,
+                &body_owned,
+                best_of,
+                keys,
+                trace,
+                &rid,
+                &conv,
+                input_items_bg,
+            )
+            .await
+            {
+                Ok((out, _, _)) => {
+                    let bytes = serde_json::to_vec(&out).unwrap_or_default();
+                    st.jobs
+                        .record_completed(&st, &rid, &bytes, "application/json");
+                }
+                Err(resp) => {
+                    let status = resp.status().as_u16();
+                    let msg = match axum::body::to_bytes(resp.into_body(), 64 * 1024).await {
+                        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                        Err(_) => format!("background response failed (HTTP {status})"),
+                    };
+                    st.jobs.record_failed(&st, &rid, &msg);
+                }
+            }
+        });
+        drop(guard);
+        let queued = serde_json::json!({
+            "id": id,
+            "object": "response",
+            "status": "queued",
+            "model": model_name,
+            "conversation": conversation,
+            "created_at": crate::responses::unix_now(),
+            "background": true,
+        });
+        return (
+            StatusCode::ACCEPTED,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_vec(&queued).unwrap_or_default(),
+        )
+            .into_response();
     }
-    state.store_response(
+
+    let (out, bestof_hdr, status) = match buffered_response_roundtrip(
+        &state,
+        &engine,
+        &model_name,
+        &new_body,
+        best_of,
+        key_ext.clone(),
+        trace_ext.clone(),
         &id,
-        &crate::responses::StoredResponse {
-            model: model_name.clone(),
-            input_items,
-            output_items,
-            input_tokens: in_tok,
-            output_tokens: out_tok,
-            ts: crate::responses::unix_now(),
-        },
-    );
+        &conversation,
+        input_items,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     drop(guard);
     let mut builder = Response::builder().status(status);
     if load_ms > 100 {
@@ -1192,6 +1364,189 @@ pub async fn responses_api(
                 r
             },
         )
+}
+
+// Local shorthand: every failure path in the roundtrip is a shaped
+// openai_error; the axum `Response` error currency this file already uses.
+#[allow(clippy::result_large_err)]
+fn roundtrip_fail(
+    status: u16,
+    msg: &str,
+) -> Result<(serde_json::Value, Option<String>, u16), Response> {
+    Err(openai_error(status, msg))
+}
+
+/// Buffered (non-stream, stored) responses roundtrip shared by the
+/// foreground call and background mode: forward to the child (best-of-N
+/// or single send with the respawn-retry contract), observe, store under
+/// OUR id, rewrite the body id, and hand back the finished value. The
+/// admission guard stays with the caller — background holds it for the
+/// whole run, the foreground drops it after this returns.
+// Ten params is the extraction boundary talking, not sprawl: the roundtrip
+// owns exactly what responses_api owns (request context + store identity),
+// and a params struct would just mirror this list one-to-one.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::result_large_err
+)]
+async fn buffered_response_roundtrip(
+    state: &Arc<AppState>,
+    engine: &blazar_runtime::EngineRef,
+    model_name: &str,
+    new_body: &[u8],
+    best_of: Option<u64>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+    trace_ext: Option<Extension<TraceId>>,
+    id: &str,
+    conversation: &str,
+    input_items: serde_json::Value,
+) -> Result<(serde_json::Value, Option<String>, u16), Response> {
+    let t0 = std::time::Instant::now();
+    let url = format!(
+        "{}/v1/responses",
+        crate::proxy::child_base(&engine.endpoint)
+    );
+    let req = crate::proxy::child_auth(
+        crate::state::child_client(state, &engine.endpoint)
+            .post(&url)
+            .header("content-type", "application/json"),
+        engine,
+    )
+    .body(new_body.to_vec());
+    // Best-of-N: judge N candidates, return the winner as a normal child
+    // response (usage summed across candidates). Skip/Degraded (knob
+    // off, guard collapse, first-copy transport failure) takes the
+    // single-send path below with its respawn-retry contract intact; a
+    // guard degrade still stamps the reason header.
+    let mut bestof_hdr: Option<String> = None;
+    let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
+        crate::bestof::fan_out(state, engine, &url, new_body, want).await
+    } else {
+        crate::bestof::FanOut::Skip
+    };
+    if let crate::bestof::FanOut::Degraded(h) = &fan {
+        bestof_hdr = Some(h.clone());
+    }
+    let resp = match fan {
+        crate::bestof::FanOut::Ran(outcome) => {
+            state.ttft.observe_secs(outcome.elapsed.as_secs_f64());
+            bestof_hdr = Some(outcome.hdr);
+            outcome.resp
+        }
+        _ => match crate::proxy::child_send(state, engine, req.send()).await {
+            Ok(r) => {
+                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+                r
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %model_name,
+                    "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"
+                );
+                match crate::proxy::respawn_lane(state, &engine.key).await {
+                    Ok(fresh) => {
+                        let fresh_url =
+                            format!("{}/v1/responses", crate::proxy::child_base(&fresh.endpoint));
+                        let fresh_req = crate::proxy::child_auth(
+                            crate::state::child_client(state, &fresh.endpoint)
+                                .post(&fresh_url)
+                                .header("content-type", "application/json"),
+                            &fresh,
+                        )
+                        .body(new_body.to_vec());
+                        match crate::proxy::child_send(state, &fresh, fresh_req.send()).await {
+                            Ok(r) => {
+                                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+                                r
+                            }
+                            Err(e2) => {
+                                return roundtrip_fail(
+                                    e2.status_u16(),
+                                    &format!(
+                                    "engine request failed: {e}; retry on respawned child: {e2}"
+                                ),
+                                );
+                            }
+                        }
+                    }
+                    Err(re) => {
+                        return roundtrip_fail(
+                            e.status_u16(),
+                            &format!("engine request failed: {e}; respawn: {re:#}"),
+                        );
+                    }
+                }
+            }
+        },
+    };
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let mut r = openai_error(status, &format!("engine error: {text}"));
+        crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+        return Err(r);
+    }
+    let mut out: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return roundtrip_fail(502, &format!("bad engine response: {e}")),
+    };
+    // Sentinel observation: the buffered branch bypasses proxy_request,
+    // so the feed is driven here (same as the ollama translate path).
+    {
+        let (feed, _) = crate::sentinel::begin_chat_observation(
+            state,
+            "openai-responses",
+            model_name,
+            new_body,
+            trace_ext.clone().map(|Extension(t)| t.0),
+            status,
+            false,
+        );
+        feed.value(out.clone());
+        drop(feed); // Drop fires End: analyzer finalizes off the path
+    }
+    // Store under OUR id and rewrite the body's id so the client chains
+    // through the gateway (the engine's own id carries no storage). The id
+    // comes from the caller so background mode's job row and stored response
+    // share it — polling the 202'd id serves this body once completed.
+    let usage = out.get("usage").cloned().unwrap_or(serde_json::Value::Null);
+    let in_tok = usage["input_tokens"].as_u64();
+    let out_tok = usage["output_tokens"].as_u64();
+    // A2: blend the completion's decode rate into the model's EWMA
+    // (t0 predates the fan/single send on this branch).
+    if let Some(n) = out_tok {
+        state
+            .sup
+            .note_model_throughput(model_name, n, t0.elapsed().as_secs_f64());
+    }
+    // FIX6: this buffered branch bypasses proxy_request's sniffer —
+    // charge token budgets directly from the parsed usage.
+    if let Some(Extension(k)) = key_ext.as_ref() {
+        let total = in_tok.unwrap_or(0).saturating_add(out_tok.unwrap_or(0));
+        state.keys.charge_tokens(&k.name, total);
+    }
+    let output_items = out
+        .get("output")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("id".into(), serde_json::json!(id));
+    }
+    state.store_response(
+        id,
+        &crate::responses::StoredResponse {
+            model: model_name.to_string(),
+            input_items,
+            output_items,
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            ts: crate::responses::unix_now(),
+            conversation: conversation.to_string(),
+            body_json: serde_json::to_string(&out).ok(),
+        },
+    );
+    Ok((out, bestof_hdr, status))
 }
 
 /// Extract the `model` field from a multipart/form-data body (audio
@@ -1452,6 +1807,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
         let mut v = json!({"model": "m", "messages": []});
         assert!(inject_default_think_off_row(Some(&row), &mut v));
@@ -1516,5 +1872,44 @@ mod tests {
         assert!(!inject_reasoning_effort_kwarg(&mut empty));
         let mut absent = json!({"model": "m1"});
         assert!(!inject_reasoning_effort_kwarg(&mut absent));
+    }
+
+    #[test]
+    fn unit__cloud_tool_gate__cloud_builtins_teach_local_functions_pass() {
+        let pass = serde_json::json!({
+            "model": "m",
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+        });
+        assert!(cloud_tool_gate(&pass).is_none());
+
+        for t in [
+            "web_search",
+            "mcp",
+            "tool_search",
+            "file_search",
+            "computer_use",
+        ] {
+            let body = serde_json::json!({
+                "model": "m",
+                "tools": [{"type": t}]
+            });
+            let msg =
+                cloud_tool_gate(&body).unwrap_or_else(|| panic!("cloud tool {t} must be gated"));
+            assert!(
+                msg.contains(t),
+                "teaching message names the rejected type: {msg}"
+            );
+            assert!(
+                msg.contains("function"),
+                "teaching message points at the function-tool alternative: {msg}"
+            );
+        }
+
+        // tools that are not an array, or entries without a type, pass through:
+        // translation/validation downstream handles those shapes.
+        assert!(cloud_tool_gate(&serde_json::json!({"tools": "nope"})).is_none());
+        assert!(
+            cloud_tool_gate(&serde_json::json!({"tools": [{"function": {"name": "x"}}]})).is_none()
+        );
     }
 }

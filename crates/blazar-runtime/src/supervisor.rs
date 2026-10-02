@@ -2981,6 +2981,7 @@ impl Supervisor {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
 
         let mut auth_keyfile: Option<std::path::PathBuf> = None;
@@ -7578,6 +7579,7 @@ mod routing_tests {
                 params: None,
                 ctx_train: None,
                 pulled_at: 0,
+                last_used_at: 0,
             },
             profile_ctx: 8,
             gpu: "full".into(),
@@ -8569,6 +8571,7 @@ mod routing_tests {
                 params: None,
                 ctx_train: None,
                 pulled_at: 0,
+                last_used_at: 0,
             },
             profile_ctx: 8,
             gpu: "cpu".into(),
@@ -8866,6 +8869,7 @@ mod routing_tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
         // Dir row with a stale frozen size: planning sees the disk truth.
         let dir_row = row("stale.d", root.display().to_string(), 1024);
@@ -8941,6 +8945,7 @@ mod routing_tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
         store
             .upsert_model(&row("qwen3-0.6b", "/models/qwen3-0.6b-q4_0.gguf"))
@@ -9219,6 +9224,7 @@ mod routing_tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
         let overlay = blazar_core::config::ModelOverride::default();
 
@@ -9287,6 +9293,7 @@ mod routing_tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
         sup.capability_pins
             .lock()
@@ -9652,6 +9659,7 @@ mod routing_tests {
                 params: None,
                 ctx_train: None,
                 pulled_at: 0,
+                last_used_at: 0,
             })
             .unwrap();
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);

@@ -405,6 +405,50 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Point a client at this Blazar daemon: detect the install, print the
+    /// exact config change, optionally write it (backup + rollback), then
+    /// fire a test request. Bare `blazar connect` lists every known client
+    Connect {
+        /// Client id: codex, claude, continue, cline, openwebui (bare
+        /// `blazar connect` lists every known client)
+        #[arg(default_value_t = String::new())]
+        client: String,
+        /// Model the test request should use (default: first local model)
+        #[arg(long)]
+        model: Option<String>,
+        /// Write the config change (default: print only); backs up first,
+        /// rolls back if the test request fails
+        #[arg(long)]
+        write: bool,
+        /// One JSON object instead of the human report
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disk-space intelligence: what Blazar stores, where it lives, and
+    /// what can be reclaimed (orphans, stale partials, unused models)
+    Storage {
+        /// One JSON object for the whole report; suppresses the tables
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim disk: dry-run by default, `--yes` executes
+    Prune {
+        /// Remove orphan files + stale .part downloads
+        #[arg(long)]
+        orphans: bool,
+        /// Remove models not used within --since-days (residents excluded)
+        #[arg(long)]
+        unused: bool,
+        /// Idle window for --unused (default 30 days)
+        #[arg(long, default_value_t = 30)]
+        since_days: u64,
+        /// Execute (default is a dry-run preview)
+        #[arg(long)]
+        yes: bool,
+        /// One JSON object per reclaimed item
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect and edit config.toml knobs (set / get / unset / defaults)
     #[command(after_help = CONFIG_EXAMPLES)]
     Config {
@@ -833,6 +877,8 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "mmproj",
             "search",
             "fit",
+            "storage",
+            "prune",
             "lora",
             "warm",
             "replicate",
@@ -865,7 +911,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         "Refused by design (local-only)",
         &["push", "signin", "login", "signout", "logout"],
     ),
-    ("General", &["help"]),
+    ("General", &["connect", "help"]),
 ];
 
 /// Render the top-level help with commands grouped by category. clap has
@@ -1633,6 +1679,20 @@ async fn run(cmd: Cmd) -> Result<()> {
             json,
         } => search(&query.join(" "), &format, quant.as_deref(), json).await,
         Cmd::Fit { target, json } => fit(&target, json).await,
+        Cmd::Storage { json } => storage_cmd(json).await,
+        Cmd::Connect {
+            client,
+            model,
+            write,
+            json,
+        } => connect_cmd(&client, model, write, json).await,
+        Cmd::Prune {
+            orphans,
+            unused,
+            since_days,
+            yes,
+            json,
+        } => prune_cmd(orphans, unused, since_days, yes, json).await,
         Cmd::Config { cmd } => config_cmd(cmd),
         Cmd::Upgrade { version, dry_run } => upgrade(version, dry_run).await,
         Cmd::Cp {
@@ -6020,6 +6080,13 @@ fn import(
                 .as_secs(),
         )
         .unwrap_or(i64::MAX),
+        last_used_at: i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+        .unwrap_or(i64::MAX),
     };
     let store = Store::open(&d)?;
     store.upsert_model(&row)?;
@@ -7828,6 +7895,13 @@ fn quantize_cmd(
         params: Some(blazar_runtime::hf::est_params(out_bytes, qtype)),
         ctx_train: meta.context_length.and_then(|c| i64::try_from(c).ok()),
         pulled_at: i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+        .unwrap_or(0),
+        last_used_at: i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -13225,6 +13299,7 @@ fn collapse_tokens(tokens: &[String]) -> String {
 }
 
 async fn fit(target: &str, json: bool) -> Result<()> {
+    use blazar_runtime::storage;
     let parsed = blazar_runtime::parse_pull_target(target)?;
     let token = std::env::var("HF_TOKEN").ok();
     let client = blazar_runtime::hf::HfClient::new(token)?;
@@ -13242,14 +13317,22 @@ async fn fit(target: &str, json: bool) -> Result<()> {
     };
     let vram_bytes = blazar_core::Hardware::bytes(vram);
     let rows = blazar_runtime::hf::fit_rows(&info.siblings, vram_bytes, cfg.default_ctx);
+    let models_path = dirs().models_dir();
+    let disk_free = storage::disk_free_bytes(&models_path);
     if json {
         // One object per row (JSONL contract). vram_bytes and repo ride on
         // every row like doctor's group field — `fits_vram` is meaningless
-        // without the machine context that produced it.
+        // without the machine context that produced it. Disk context rides
+        // the same way: a row that fits VRAM can still fail the pull gate.
         for r in &rows {
             let mut v = serde_json::to_value(r).map_err(|e| anyhow!("serialize fit row: {e}"))?;
             v["repo"] = serde_json::json!(parsed.repo);
             v["vram_bytes"] = serde_json::json!(vram_bytes);
+            v["disk_free_bytes"] = serde_json::json!(disk_free);
+            v["disk_fits"] = serde_json::json!(storage::disk_verdict(
+                r.bytes + storage::REQUIRED_SLACK_BYTES,
+                disk_free,
+            ));
             println!("{v}");
         }
         return Ok(());
@@ -13274,6 +13357,33 @@ async fn fit(target: &str, json: bool) -> Result<()> {
             r.file
         );
     }
+    // Disk section: the largest variant is the honest preview of what a
+    // pull of this repo could ask for; the pull gate re-checks the exact
+    // selection at submit time.
+    if let Some(biggest) = rows.iter().map(|r| r.bytes).max() {
+        println!("\nDISK");
+        println!(
+            "  largest variant:  {}",
+            humansize(i64::try_from(biggest).unwrap_or(i64::MAX))
+        );
+        println!(
+            "  + slack:          {}",
+            humansize(i64::try_from(blazar_runtime::storage::REQUIRED_SLACK_BYTES).unwrap_or(0))
+        );
+        match disk_free {
+            Some(free) => {
+                println!(
+                    "  available:        {}",
+                    humansize(i64::try_from(free).unwrap_or(i64::MAX))
+                );
+                println!(
+                    "  verdict:          {}",
+                    storage::disk_verdict(biggest + storage::REQUIRED_SLACK_BYTES, disk_free)
+                );
+            }
+            None => println!("  available:        unknown ({})", models_path.display()),
+        }
+    }
     if rows.first().is_some_and(|r| r.quant == "safetensors") {
         println!(
             "\n# safetensors lane: serves via sglang/mistralrs (`blazar engine install --kind sglang`) — llamacpp cannot load it; SIZE is the full shard set and KV is arch-dependent, measured at serve"
@@ -13282,6 +13392,755 @@ async fn fit(target: &str, json: bool) -> Result<()> {
         println!("\n# no sized GGUF or safetensors weights in this repo — nothing to preview");
     }
     Ok(())
+}
+
+/// Resident model names from a live daemon, so `prune --unused` and the
+/// storage report never propose deleting a model a child is serving.
+/// Daemon-down degrades to an empty list with a warning — pruning still
+/// works offline, just without the resident guard.
+async fn resident_models() -> (Vec<String>, bool) {
+    let base = match config() {
+        Ok(cfg) => daemon_base(&cfg),
+        Err(_) => return (Vec::new(), false),
+    };
+    let probe = cli_http()
+        .get(format!("{base}/api/ps"))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await;
+    match probe {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => {
+                let names = v["models"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|m| {
+                                m.get("model")
+                                    .or_else(|| m.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .map(str::to_string)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (names, true)
+            }
+            Err(_) => (Vec::new(), true),
+        },
+        _ => (Vec::new(), false),
+    }
+}
+
+/// `blazar storage` — the disk-side counterpart of `fit`: what Blazar
+/// stores, where it lives, and what can be reclaimed.
+// One report walked top-to-bottom (stores -> disk -> reclaim -> external);
+// splitting it hides the report order it exists to show.
+#[allow(clippy::too_many_lines)]
+async fn storage_cmd(json: bool) -> Result<()> {
+    use blazar_runtime::storage;
+
+    let d = dirs();
+    let rows = Store::open(&d)
+        .ok()
+        .and_then(|s| s.list_models().ok())
+        .unwrap_or_default();
+    let (residents, daemon_up) = resident_models().await;
+    let models_bytes = storage::du(&d.models_dir());
+    let engines_bytes = storage::du(&d.engines_dir());
+    let sessions_bytes = storage::du(&d.sessions_dir());
+    let speccache_bytes = storage::du(&d.speccache_dir());
+    let voices_bytes = storage::du(&d.voices_dir());
+    let run_bytes = storage::du(&d.run_dir());
+    let free = storage::disk_free_bytes(&d.models_dir());
+    let total = storage::disk_total_bytes(&d.models_dir());
+    let orphans = storage::orphan_scan(&d.models_dir(), &rows);
+    let orphan_bytes: u64 = orphans.orphan_files.iter().map(|(_, b)| b).sum();
+    let partial_bytes: u64 = orphans.stale_partials.iter().map(|(_, b)| b).sum();
+    let twin_bytes: u64 = orphans.twins.iter().map(|(_, b)| b).sum();
+    let now = blazar_core::store::unix_now();
+    let unused = storage::unused_rows(&rows, 30 * 86_400, &residents, now);
+    let unused_bytes: u64 = unused
+        .iter()
+        .map(|r| u64::try_from(r.bytes).unwrap_or(0))
+        .sum();
+    let hs = |b: u64| humansize(i64::try_from(b).unwrap_or(i64::MAX));
+    if json {
+        let v = serde_json::json!({
+            "object": "blazar.storage",
+            "models": { "count": rows.len(), "bytes": models_bytes },
+            "engines": { "bytes": engines_bytes },
+            "sessions": { "bytes": sessions_bytes },
+            "caches": {
+                "speccache_bytes": speccache_bytes,
+                "voices_bytes": voices_bytes,
+                "run_bytes": run_bytes,
+            },
+            "disk": {
+                "free_bytes": free,
+                "total_bytes": total,
+                "path": d.models_dir(),
+            },
+            "reclaim": {
+                "orphan_files": orphans.orphan_files.len(),
+                "orphan_bytes": orphan_bytes,
+                "stale_partial_bytes": partial_bytes,
+                "twin_bytes": twin_bytes,
+                "unused": unused
+                    .iter()
+                    .map(|r| serde_json::json!({
+                        "name": r.name, "bytes": r.bytes, "last_used_at": r.last_used_at,
+                    }))
+                    .collect::<Vec<_>>(),
+            },
+            "daemon_up": daemon_up,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!(
+        "STORAGE  ({})",
+        d.models_dir().parent().map_or_else(
+            || d.models_dir().display().to_string(),
+            |p| p.display().to_string()
+        )
+    );
+    println!(
+        "  models:      {}  ({} models)",
+        hs(models_bytes),
+        rows.len()
+    );
+    println!("  engines:     {}", hs(engines_bytes));
+    println!("  sessions:    {}", hs(sessions_bytes));
+    println!(
+        "  caches:      speccache {} + voices {} + run {}",
+        hs(speccache_bytes),
+        hs(voices_bytes),
+        hs(run_bytes)
+    );
+    println!("\nDISK");
+    match (free, total) {
+        (Some(f), Some(t)) => println!("  available:   {} of {}", hs(f), hs(t)),
+        _ => println!("  available:   unknown ({})", d.models_dir().display()),
+    }
+    println!("\nRECLAIM CANDIDATES");
+    println!(
+        "  orphan files:     {} files, {}",
+        orphans.orphan_files.len(),
+        hs(orphan_bytes)
+    );
+    println!(
+        "  stale partials:   {} files, {}",
+        orphans.stale_partials.len(),
+        hs(partial_bytes)
+    );
+    println!(
+        "  hardlink twins:   {} files, {} (report-only — same inode as owned files)",
+        orphans.twins.len(),
+        hs(twin_bytes)
+    );
+    println!(
+        "  unused models:    {} models, {} (idle > 30 days{})",
+        unused.len(),
+        hs(unused_bytes),
+        if daemon_up {
+            String::new()
+        } else {
+            ", daemon down — residents not checked".to_string()
+        }
+    );
+    for r in &unused {
+        println!(
+            "    - {} ({})",
+            r.name,
+            hs(u64::try_from(r.bytes).unwrap_or(0))
+        );
+    }
+    println!("\n  → `blazar prune --orphans --unused --yes` reclaims orphans + partials + unused");
+    if orphans.twins.is_empty()
+        && orphans.orphan_files.is_empty()
+        && orphans.stale_partials.is_empty()
+        && unused.is_empty()
+    {
+        println!("  none — nothing to reclaim");
+    }
+    // Engine-managed caches outside the data dir are reported, never
+    // touched: deleting them is the engine's business, not ours.
+    let sglang_cache = std::env::var_os("HOME").map(|h| {
+        let mut p = std::path::PathBuf::from(h);
+        p.push(".cache");
+        p.push("sglang");
+        p
+    });
+    if let Some(p) = sglang_cache.filter(|p| p.is_dir()) {
+        println!(
+            "\nOUT-OF-TREE\n  {}: {} (engine-managed; reported, never deleted by blazar)",
+            p.display(),
+            hs(storage::du(&p))
+        );
+    }
+    Ok(())
+}
+
+/// `blazar prune` — reclaim disk. Dry-run by default; `--yes` executes.
+/// Twins are never deleted (they ARE owned files, just hardlinked).
+// Flags mirror the CLI surface one-to-one; a struct would just move them.
+#[allow(clippy::fn_params_excessive_bools)]
+// Preview + execute share one walk so the dry-run IS the plan of record.
+#[allow(clippy::too_many_lines)]
+async fn prune_cmd(
+    orphans: bool,
+    unused: bool,
+    since_days: u64,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    use blazar_runtime::storage;
+
+    let d = dirs();
+    let rows = Store::open(&d)
+        .ok()
+        .and_then(|s| s.list_models().ok())
+        .unwrap_or_default();
+    let (residents, daemon_up) = resident_models().await;
+    if !daemon_up {
+        eprintln!("warning: daemon not reachable — resident models are not guarded; a model mid-serve could be deleted");
+    }
+    let scan = storage::orphan_scan(&d.models_dir(), &rows);
+    let now = blazar_core::store::unix_now();
+    let unused_rows_sel = if unused {
+        storage::unused_rows(&rows, since_days * 86_400, &residents, now)
+    } else {
+        Vec::new()
+    };
+    let orphans_sel: Vec<&(std::path::PathBuf, u64)> = if orphans {
+        scan.orphan_files
+            .iter()
+            .chain(scan.stale_partials.iter())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !orphans && !unused {
+        // Bare `blazar prune` = preview everything it could do.
+        println!(
+            "prune preview — {} orphan/partial file(s), {} unused model(s) (idle > {since_days} days)",
+            scan.orphan_files.len() + scan.stale_partials.len(),
+            storage::unused_rows(&rows, since_days * 86_400, &residents, now).len()
+        );
+        println!("pass --orphans and/or --unused (plus --yes to execute); hardlink twins are report-only");
+        return Ok(());
+    }
+    let hs = |b: u64| humansize(i64::try_from(b).unwrap_or(i64::MAX));
+    if !yes {
+        let mut total = 0u64;
+        for (p, b) in &orphans_sel {
+            println!("would delete {} ({})", p.display(), hs(*b));
+            total += *b;
+        }
+        for r in &unused_rows_sel {
+            println!(
+                "would remove model {} ({})",
+                r.name,
+                hs(u64::try_from(r.bytes).unwrap_or(0))
+            );
+            total += u64::try_from(r.bytes).unwrap_or(0);
+        }
+        println!("dry run — {total} bytes reclaimable; pass --yes to execute");
+        return Ok(());
+    }
+    let mut reclaimed = 0u64;
+    let mut failures = 0u64;
+    for (p, b) in &orphans_sel {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"action": "unlink", "path": p, "bytes": b, "ok": true})
+            );
+        }
+        match std::fs::remove_file(p) {
+            Ok(()) => {
+                reclaimed += *b;
+                if !json {
+                    println!("{}", ok_line(&format!("deleted {}", p.display())));
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                if !json {
+                    eprintln!("rm {}: {e}", p.display());
+                }
+            }
+        }
+    }
+    for r in &unused_rows_sel {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"action": "remove_model", "model": r.name, "bytes": r.bytes, "ok": true})
+            );
+        }
+        match blazar_runtime::models::remove_model(&d, &r.name) {
+            Ok(()) => {
+                reclaimed += u64::try_from(r.bytes).unwrap_or(0);
+                if !json {
+                    println!("{}", ok_line(&format!("removed {}", r.name)));
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                if !json {
+                    eprintln!("rm {}: {e:#}", r.name);
+                }
+            }
+        }
+    }
+    if failures > 0 {
+        return Err(anyhow!(
+            "prune finished with {failures} failure(s) — {reclaimed} bytes reclaimed anyway"
+        ));
+    }
+    if !json {
+        println!("reclaimed {}", hs(reclaimed));
+    }
+    Ok(())
+}
+
+// --- blazar connect ---------------------------------------------------------
+//
+// One command per client: detect the install, show the exact configuration
+// change Blazar needs, optionally write it (backup first, roll back if the
+// live test request fails). Config shapes verified against each client's
+// current docs (2026-10): Codex user-level config.toml [model_providers.<id>]
+// with wire_api = "responses"; Claude Code ~/.claude/settings.json env block;
+// Continue config.yaml (config.json is the deprecated shape); Cline and
+// Open WebUI are configured through their own UI/env, so they get printed
+// instructions instead of a written file.
+
+const CONNECT_CLIENTS: &[&str] = &["codex", "claude", "continue", "cline", "openwebui"];
+
+/// What `connect` will do for one client.
+#[derive(Debug, Clone, PartialEq)]
+enum ConnectAction {
+    /// File absent — --write would create it with this content
+    Create(String),
+    /// File exists — --write would merge into it (JSON only; backup first)
+    Merge,
+    /// Writing would risk breaking a hand-tuned config — snippet only
+    Snippet,
+    /// The client has no writable config (UI or env vars at startup)
+    Instructions,
+}
+
+#[derive(Debug)]
+struct ConnectPlan {
+    client: &'static str,
+    display: &'static str,
+    installed: bool,
+    config_path: std::path::PathBuf,
+    action: ConnectAction,
+    /// Human instructions when action is Snippet/Instructions
+    detail: String,
+}
+
+fn codex_provider_block(base: &str) -> String {
+    format!(
+        "[model_providers.blazar]\nname = \"Blazar\"\nbase_url = \"{base}/v1\"\nenv_key = \"BLAZAR_API_KEY\"\nwire_api = \"responses\"\n"
+    )
+}
+
+fn codex_full_config(base: &str, model: &str) -> String {
+    format!(
+        "{}\nmodel_provider = \"blazar\"\nmodel = \"{model}\"\n",
+        codex_provider_block(base)
+    )
+}
+
+fn claude_settings_merge(existing: &serde_json::Value, base: &str) -> serde_json::Value {
+    let mut v = existing.clone();
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    let obj = v.as_object_mut().expect("just made an object");
+    let env = obj
+        .entry("env".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(e) = env.as_object_mut() {
+        e.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::json!(base));
+        // Claude Code refuses to start against a custom base without some
+        // token present; Blazar ignores it entirely when keys are disabled.
+        e.entry("ANTHROPIC_AUTH_TOKEN".to_string())
+            .or_insert_with(|| serde_json::json!("blazar-local"));
+    }
+    v
+}
+
+fn continue_model_block(base: &str, model: &str) -> String {
+    format!(
+        "name: Blazar local assistant\nversion: 0.0.1\nschema: v1\nmodels:\n  - name: {model}\n    provider: openai\n    model: {model}\n    apiBase: {base}/v1\n    roles:\n      - chat\n"
+    )
+}
+
+// One branch per client, in CONNECT_CLIENTS order — the table this file
+// already navigates by; a struct-per-client split would scatter it.
+#[allow(clippy::too_many_lines)]
+fn connect_plan(
+    client: &str,
+    home: &std::path::Path,
+    base: &str,
+    model: &str,
+) -> Result<ConnectPlan> {
+    let read = |rel: &[&str]| {
+        let mut p = home.to_path_buf();
+        for part in rel {
+            p.push(part);
+        }
+        std::fs::read_to_string(&p).ok()
+    };
+    let exists = |rel: &[&str]| {
+        let mut p = home.to_path_buf();
+        for part in rel {
+            p.push(part);
+        }
+        p.exists()
+    };
+    let path = |rel: &[&str]| {
+        let mut p = home.to_path_buf();
+        for part in rel {
+            p.push(part);
+        }
+        p
+    };
+    match client {
+        "codex" => {
+            let dir = exists(&[".codex"]);
+            let cfg = read(&[".codex", "config.toml"]);
+            let action = if cfg.is_none() {
+                ConnectAction::Create(codex_full_config(base, model))
+            } else if cfg.as_deref().is_some_and(|c| c.contains("model_providers.blazar"))
+                || cfg.as_deref().is_some_and(|c| c.contains("model_provider ="))
+            {
+                ConnectAction::Snippet
+            } else {
+                // A config without provider selection can gain the table by
+                // append, but hand-tuned TOML deserves eyes first.
+                ConnectAction::Snippet
+            };
+            Ok(ConnectPlan {
+                client: "codex",
+                display: "Codex CLI",
+                installed: dir,
+                config_path: path(&[".codex", "config.toml"]),
+                action,
+                detail: format!(
+                    "add to ~/.codex/config.toml (then `model_provider = \"blazar\"` and `model = \"{model}\"` at the top level):\n{}",
+                    codex_provider_block(base)
+                ),
+            })
+        }
+        "claude" => {
+            let dir = exists(&[".claude"]);
+            let cfg = read(&[".claude", "settings.json"]);
+            let action = if cfg.is_none() {
+                ConnectAction::Create(
+                    serde_json::to_string_pretty(&claude_settings_merge(&serde_json::json!({}), base))
+                        .expect("serializing a plain object cannot fail")
+                        + "\n",
+                )
+            } else {
+                ConnectAction::Merge
+            };
+            Ok(ConnectPlan {
+                client: "claude",
+                display: "Claude Code",
+                installed: dir,
+                config_path: path(&[".claude", "settings.json"]),
+                action,
+                detail: format!(
+                    "merge into ~/.claude/settings.json:\n{}",
+                    serde_json::to_string_pretty(&claude_settings_merge(&serde_json::json!({}), base))
+                        .expect("serializing a plain object cannot fail")
+                ),
+            })
+        }
+        "continue" => {
+            let dir = exists(&[".continue"]);
+            let cfg = read(&[".continue", "config.yaml"]).or(read(&[".continue", "config.json"]));
+            let action = if cfg.is_none() {
+                ConnectAction::Create(continue_model_block(base, model))
+            } else {
+                // YAML has no safe mechanical merge; existing configs are
+                // usually hand-tuned (rules, context providers).
+                ConnectAction::Snippet
+            };
+            Ok(ConnectPlan {
+                client: "continue",
+                display: "Continue",
+                installed: dir,
+                config_path: path(&[".continue", "config.yaml"]),
+                action,
+                detail: format!(
+                    "merge into ~/.continue/config.yaml (config.json is the deprecated shape):\n{}",
+                    continue_model_block(base, model)
+                ),
+            })
+        }
+        "cline" => Ok(ConnectPlan {
+            client: "cline",
+            display: "Cline (VS Code)",
+            installed: exists(&[".vscode"]) || exists(&[".config", "Code"]),
+            config_path: path(&[".config", "Code", "User", "settings.json"]),
+            action: ConnectAction::Instructions,
+            detail: format!(
+                "Cline stores its API config inside the VS Code UI, not a file Blazar can safely edit:\n  1. open Cline settings → API Provider → OpenAI Compatible\n  2. base URL: {base}/v1\n  3. model: {model}\n  4. any API key value (ignored when Blazar keys are off)"
+            ),
+        }),
+        "openwebui" => {
+            let installed = exists(&[".config", "open-webui"])
+                || std::process::Command::new("docker")
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok();
+            Ok(ConnectPlan {
+                client: "openwebui",
+                display: "Open WebUI",
+                installed,
+                config_path: path(&[".config", "open-webui"]),
+                action: ConnectAction::Instructions,
+                detail: format!(
+                    "Open WebUI reads its backend URLs from the environment at startup:\n  OPENAI_API_BASE_URL={base}/v1\n  OLLAMA_API_BASE_URL={base}\n(restart the container/process after setting them)"
+                ),
+            })
+        }
+        other => Err(anyhow!(
+            "unknown client '{other}' — supported: {} (bare `blazar connect` lists them)",
+            CONNECT_CLIENTS.join(", ")
+        )),
+    }
+}
+
+/// Dialect-correct smoke request against the daemon, proving the exact
+/// endpoint shape the client will use.
+async fn connect_test_request(client: &str, base: &str, model: &str) -> Result<bool> {
+    let http = crate::cli_http();
+    let (url, body) = match client {
+        "codex" => (
+            format!("{base}/v1/responses"),
+            serde_json::json!({"model": model, "input": "Reply with the single word: ok", "store": false}),
+        ),
+        "claude" => (
+            format!("{base}/v1/messages"),
+            serde_json::json!({"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]}),
+        ),
+        "cline" | "continue" => (
+            format!("{base}/v1/chat/completions"),
+            serde_json::json!({"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]}),
+        ),
+        "openwebui" => (
+            format!("{base}/api/chat"),
+            serde_json::json!({"model": model, "stream": false, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]}),
+        ),
+        _ => return Err(anyhow::anyhow!("unreachable: validated earlier")),
+    };
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await;
+    Ok(matches!(resp, Ok(r) if r.status().is_success()))
+}
+
+async fn default_test_model(explicit: Option<String>) -> Result<String> {
+    if let Some(m) = explicit {
+        return Ok(m);
+    }
+    let cfg = config()?;
+    let base = daemon_base(&cfg);
+    let tags = match crate::cli_http()
+        .get(format!("{base}/api/tags"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+        _ => None,
+    };
+    let name = tags
+        .as_ref()
+        .and_then(|v| v["models"].as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| {
+            m["model"]
+                .as_str()
+                .or_else(|| m["name"].as_str())
+                .map(str::to_string)
+        });
+    name.ok_or_else(|| {
+        anyhow!("no local model to test with — pass --model, or `blazar pull` one first")
+    })
+}
+
+// Linear client-integration script: plan -> (write) -> test -> rollback.
+#[allow(clippy::too_many_lines)]
+async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: bool) -> Result<()> {
+    if client.is_empty() {
+        let rows: Vec<Vec<String>> = CONNECT_CLIENTS
+            .iter()
+            .map(|c| {
+                vec![
+                    (*c).to_string(),
+                    match *c {
+                        "codex" => "~/.codex/config.toml",
+                        "claude" => "~/.claude/settings.json",
+                        "continue" => "~/.continue/config.yaml",
+                        "cline" => "VS Code UI",
+                        "openwebui" => "env at startup",
+                        _ => "?",
+                    }
+                    .to_string(),
+                ]
+            })
+            .collect();
+        println!("known clients (blazar connect <client>):");
+        print!("{}", render_table(&["CLIENT", "CONFIG"], &rows, &[]));
+        return Ok(());
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow!("cannot resolve the user home directory"))?;
+    let cfg = config()?;
+    let base = daemon_base(&cfg);
+    let model = default_test_model(model).await?;
+    let plan = connect_plan(client, &home, &base, &model)?;
+
+    let action_label = match &plan.action {
+        ConnectAction::Create(_) => "create",
+        ConnectAction::Merge => "merge (backup first)",
+        ConnectAction::Snippet => "snippet (manual merge)",
+        ConnectAction::Instructions => "instructions",
+    };
+    let mut wrote_path: Option<std::path::PathBuf> = None;
+    let mut backup: Option<std::path::PathBuf> = None;
+
+    if write {
+        match &plan.action {
+            ConnectAction::Create(content) => {
+                if let Some(parent) = plan.config_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&plan.config_path, content)?;
+                wrote_path = Some(plan.config_path.clone());
+            }
+            ConnectAction::Merge => {
+                let existing =
+                    std::fs::read_to_string(&plan.config_path).unwrap_or_else(|_| "{}".to_string());
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
+                let bak = plan.config_path.with_extension("json.blazar-bak");
+                std::fs::write(&bak, &existing)?;
+                backup = Some(bak);
+                let merged = claude_settings_merge(&parsed, &base);
+                std::fs::write(
+                    &plan.config_path,
+                    serde_json::to_string_pretty(&merged)
+                        .expect("serializing a plain object cannot fail")
+                        + "\n",
+                )?;
+                wrote_path = Some(plan.config_path.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // The test request proves the client's exact dialect works against this
+    // daemon; a failure after a write rolls the file back.
+    let daemon_up = crate::cli_http()
+        .get(format!("{base}/api/version"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success());
+    let (test_ok, test_note) = if daemon_up {
+        (
+            connect_test_request(client, &base, &model).await?,
+            String::new(),
+        )
+    } else {
+        (
+            false,
+            "skipped — daemon not reachable (blazar serve)".to_string(),
+        )
+    };
+
+    let mut rolled_back = false;
+    if wrote_path.is_some() && !test_ok && daemon_up {
+        if let (Some(bak), Some(_)) = (&backup, &wrote_path) {
+            std::fs::copy(bak, &plan.config_path)?;
+            rolled_back = true;
+        } else if let Some(p) = &wrote_path {
+            std::fs::remove_file(p)?;
+            rolled_back = true;
+        }
+    }
+
+    if json {
+        let v = serde_json::json!({
+            "object": "blazar.connect",
+            "client": plan.client,
+            "display": plan.display,
+            "installed": plan.installed,
+            "config_path": plan.config_path,
+            "action": action_label,
+            "wrote": wrote_path.is_some(),
+            "rolled_back": rolled_back,
+            "test": if daemon_up { serde_json::json!({"ok": test_ok, "model": model}) } else { serde_json::json!({"ok": false, "skipped": true}) },
+            "detail": plan.detail,
+        });
+        println!("{v:#}");
+        return Ok(());
+    }
+
+    println!("client:      {} ({})", plan.display, plan.client);
+    println!("installed:   {}", yes_no(plan.installed));
+    println!("config:      {}", plan.config_path.display());
+    println!("action:      {action_label}");
+    if write && wrote_path.is_some() {
+        if rolled_back {
+            println!(
+                "{}",
+                warn_line("written, then ROLLED BACK — the test request failed")
+            );
+        } else if daemon_up && test_ok {
+            println!("{}", ok_line("written + test request PASS"));
+        } else {
+            println!("written (test {test_note})");
+        }
+    } else if !write {
+        println!("dry run — pass --write to apply");
+    }
+    if matches!(
+        plan.action,
+        ConnectAction::Snippet | ConnectAction::Instructions
+    ) || !write
+    {
+        println!();
+        for line in plan.detail.lines() {
+            println!("  {line}");
+        }
+    }
+    Ok(())
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 #[allow(clippy::too_many_lines)] // command dispatch: one arm per config subcommand
@@ -13847,6 +14706,92 @@ mod tests {
         assert!(out.contains("(no capabilities recorded)"));
     }
 
+    #[test]
+    fn unit__connect_builders__codex_and_continue_shapes() {
+        let toml = codex_provider_block("http://localhost:11435");
+        assert!(toml.contains("[model_providers.blazar]"));
+        assert!(toml.contains("base_url = \"http://localhost:11435/v1\""));
+        assert!(toml.contains("wire_api = \"responses\""));
+        let full = codex_full_config("http://localhost:11435", "qwen3-0.6b");
+        assert!(full.contains("model_provider = \"blazar\""));
+        assert!(full.contains("model = \"qwen3-0.6b\""));
+        let yaml = continue_model_block("http://localhost:11435", "qwen3-0.6b");
+        assert!(yaml.contains("provider: openai"));
+        assert!(yaml.contains("apiBase: http://localhost:11435/v1"));
+        assert!(yaml.contains("roles:"));
+    }
+
+    #[test]
+    fn unit__claude_settings_merge__preserves_and_defaults() {
+        let existing = serde_json::json!({
+            "permissions": {"allow": ["Bash"]},
+            "env": {"ANTHROPIC_LOG": "debug"}
+        });
+        let merged = claude_settings_merge(&existing, "http://localhost:11435");
+        assert_eq!(merged["permissions"]["allow"][0], "Bash");
+        assert_eq!(merged["env"]["ANTHROPIC_LOG"], "debug");
+        assert_eq!(
+            merged["env"]["ANTHROPIC_BASE_URL"],
+            "http://localhost:11435"
+        );
+        assert_eq!(merged["env"]["ANTHROPIC_AUTH_TOKEN"], "blazar-local");
+        // An explicit token is never overwritten.
+        let custom = claude_settings_merge(
+            &serde_json::json!({"env": {"ANTHROPIC_AUTH_TOKEN": "sk-real"}}),
+            "http://localhost:11435",
+        );
+        assert_eq!(custom["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-real");
+        // A non-object file degrades to a fresh object rather than failing.
+        let fresh = claude_settings_merge(&serde_json::json!("junk"), "http://x");
+        assert_eq!(fresh["env"]["ANTHROPIC_BASE_URL"], "http://x");
+    }
+
+    #[test]
+    fn unit__connect_plan__actions_and_unknown_client() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let base = "http://localhost:11435";
+        // codex: absent config → Create with the full TOML.
+        let plan = connect_plan("codex", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.client, "codex");
+        assert!(!plan.installed);
+        assert!(matches!(plan.action, ConnectAction::Create(_)));
+        // codex: existing config with a provider already pinned → Snippet.
+        std::fs::create_dir_all(home.path().join(".codex")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("write");
+        let plan = connect_plan("codex", home.path(), base, "m1").expect("plan");
+        assert!(plan.installed);
+        assert_eq!(plan.action, ConnectAction::Snippet);
+        // claude: existing settings.json → Merge; detail stays a JSON snippet.
+        std::fs::create_dir_all(home.path().join(".claude")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            "{\"model\": \"sonnet\"}\n",
+        )
+        .expect("write");
+        let plan = connect_plan("claude", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.action, ConnectAction::Merge);
+        // continue: hand-tuned YAML → Snippet, never a blind merge.
+        std::fs::create_dir_all(home.path().join(".continue")).expect("mkdir");
+        std::fs::write(home.path().join(".continue/config.yaml"), "name: mine\n").expect("write");
+        let plan = connect_plan("continue", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.action, ConnectAction::Snippet);
+        // cline/openwebui are instructions-only.
+        let plan = connect_plan("cline", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.action, ConnectAction::Instructions);
+        let plan = connect_plan("openwebui", home.path(), base, "m1").expect("plan");
+        assert_eq!(plan.action, ConnectAction::Instructions);
+        // Unknown client teaches the list.
+        let err = connect_plan("vscode", home.path(), base, "m1").expect_err("teaches");
+        assert!(err.to_string().contains("unknown client 'vscode'"));
+        assert!(err
+            .to_string()
+            .contains("codex, claude, continue, cline, openwebui"));
+    }
+
     /// Minimal model row for lora-attach admission tests: only `path`
     /// steers the lane split (dir = sglang, file = llamacpp/mistralrs);
     /// every other field is inert filler.
@@ -13865,6 +14810,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 
@@ -14053,6 +14999,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         };
         // Text rows (no component set) stay on the chat REPL.
         assert!(matches!(run_lane(&base()), RunLane::Text));
@@ -14235,6 +15182,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 
@@ -16131,6 +17079,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 
@@ -17240,6 +18189,7 @@ mod tests {
             params: None,
             ctx_train: None,
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 

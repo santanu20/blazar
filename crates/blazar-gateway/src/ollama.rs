@@ -3875,6 +3875,7 @@ mod tests {
             params: None,
             ctx_train: Some(40960),
             pulled_at: 0,
+            last_used_at: 0,
         }
     }
 

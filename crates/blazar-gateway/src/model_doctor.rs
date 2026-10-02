@@ -1,7 +1,7 @@
 //! POST /api/model-doctor — per-model capability certificate.
 //!
 //! Every probe runs through the REAL gateway path (admission queue,
-//! dialect translation, `child_send`, sentinel) by invoking the ollama
+//! dialect translation, `child_send`, `sentinel`) by invoking the ollama
 //! handlers directly as functions. Auth is a middleware concern, so an
 //! in-daemon call carries no key — the run is operator-initiated. No
 //! self-HTTP loop: that would re-enter the body limit and lifecycle
@@ -322,7 +322,7 @@ pub async fn run(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         &id,
         "doctor",
         Some(&model),
-        &json!({ "model": model }),
+        json!({ "model": model }),
     );
     tokio::spawn(run_probes(
         Arc::clone(&state),
@@ -375,7 +375,9 @@ pub async fn cert(
     .into_response()
 }
 
-#[allow(clippy::too_many_lines)] // bounded probe sequence read top-to-bottom: one block per probe, verdicts inline
+// Sequential probe ladder with per-probe cancel checks and deadlines:
+// splitting it hides the order it exists to show.
+#[allow(clippy::too_many_lines)]
 async fn run_probes(
     state: Arc<AppState>,
     id: String,
@@ -445,7 +447,7 @@ async fn run_probes(
         &state,
         &id,
         "probe:chat",
-        &json!({"status": v_chat.status, "receipt": v_chat.receipt}),
+        json!({"status": v_chat.status, "receipt": v_chat.receipt}),
     );
     caps.insert("chat".into(), verdict_json(&v_chat));
 
@@ -475,7 +477,7 @@ async fn run_probes(
         &state,
         &id,
         "probe:stream",
-        &json!({"status": v_stream.status, "receipt": v_stream.receipt}),
+        json!({"status": v_stream.status, "receipt": v_stream.receipt}),
     );
     caps.insert("stream".into(), verdict_json(&v_stream));
 
@@ -511,7 +513,7 @@ async fn run_probes(
         &state,
         &id,
         "probe:json",
-        &json!({"status": v_json.status, "receipt": v_json.receipt}),
+        json!({"status": v_json.status, "receipt": v_json.receipt}),
     );
     caps.insert("json".into(), verdict_json(&v_json));
 
@@ -553,7 +555,7 @@ async fn run_probes(
         &state,
         &id,
         "probe:tools",
-        &json!({"status": v_tools.status, "receipt": v_tools.receipt}),
+        json!({"status": v_tools.status, "receipt": v_tools.receipt}),
     );
     caps.insert("tools".into(), verdict_json(&v_tools));
 
@@ -581,7 +583,7 @@ async fn run_probes(
         &state,
         &id,
         "probe:embeddings",
-        &json!({"status": v_embed.status, "receipt": v_embed.receipt}),
+        json!({"status": v_embed.status, "receipt": v_embed.receipt}),
     );
     caps.insert("embeddings".into(), verdict_json(&v_embed));
 

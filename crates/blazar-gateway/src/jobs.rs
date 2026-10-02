@@ -127,13 +127,14 @@ impl JobRuntime {
     /// Insert the job row at submit time. `request_json` must carry
     /// everything a cancel needs to redispatch (engine name for
     /// child-owned lanes) and everything a resubmit needs to teach.
+    #[allow(clippy::needless_pass_by_value)] // stored verbatim into the ledger row
     pub fn record_created(
         &self,
         state: &AppState,
         id: &str,
         kind: &str,
         model: Option<&str>,
-        request_json: &serde_json::Value,
+        request_json: serde_json::Value,
     ) {
         let now = blazar_core::store::unix_now();
         let row = JobRow {
@@ -247,8 +248,8 @@ impl JobRuntime {
     /// Append a progress event without a state transition — doctor probe
     /// verdicts today, lane milestones later. The row must already exist;
     /// a missing row is a debug-level note (the lane stays authoritative).
-    #[allow(clippy::unused_self)] // ledger writers go through AppState; method form keeps the JobRuntime namespace
-    pub fn record_event(&self, state: &AppState, id: &str, kind: &str, data: &serde_json::Value) {
+    #[allow(clippy::needless_pass_by_value)] // serialized into the event row
+    pub fn record_event(&self, state: &AppState, id: &str, kind: &str, data: serde_json::Value) {
         let data = serde_json::to_string(&data).ok();
         let outcome = state.with_store(|s| s.append_job_event(id, kind, data.as_deref()));
         match outcome {
@@ -262,7 +263,7 @@ impl JobRuntime {
         }
     }
 
-    #[allow(clippy::unused_self)] // ledger writers go through AppState; method form keeps the JobRuntime namespace
+    #[allow(clippy::unused_self)] // sibling record_* methods take &self; symmetry reads better
     fn transition(
         &self,
         state: &AppState,
@@ -368,6 +369,7 @@ pub async fn jobs_list(State(state): State<Arc<AppState>>, Query(q): Query<ListQ
 /// GET /v1/jobs/{id} — terminal rows answer from the ledger; live ones
 /// dispatch to their lane for fresh state (audio registry, live child
 /// poll for image/video), mirroring whatever terminal state comes back.
+#[allow(clippy::single_match_else)] // two response-shaped arms read clearer than if-let-else across 20 lines
 pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<String>) -> Response {
     if !job_id
         .chars()
@@ -393,24 +395,27 @@ pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<Str
             }
             axum::Json(row_payload(&row)).into_response()
         }
-        // Doctor: a gateway-owned probe task writes its progress through
-        // this ledger itself — the row IS the live truth (events carry
-        // per-probe verdicts as they land).
-        "doctor" => axum::Json(row_payload(&row)).into_response(),
+        // Doctor and background responses: gateway-owned tasks write
+        // their progress through this ledger itself — the row IS the live
+        // truth (doctor events carry per-probe verdicts; a background
+        // response flips queued→running→completed on the same row the
+        // client polls).
+        "doctor" | "responses" => axum::Json(row_payload(&row)).into_response(),
         // Image/video: the owning child is the only live truth. A poll
         // that finds a terminal state mirrors it into the ledger; a child
         // that is gone closes the row honestly instead of 404-ing.
-        "image" | "video" => {
-            if let Some(child_job) = crate::images::poll_live_child(&state, None, &job_id).await {
+        "image" | "video" => match crate::images::poll_live_child(&state, None, &job_id).await {
+            Some(child_job) => {
                 mirror_child_terminal(&state, &job_id, &child_job);
                 let mut payload = child_job;
                 if let Some(obj) = payload.as_object_mut() {
                     obj.insert("kind".into(), serde_json::json!(row.kind));
                 }
                 axum::Json(payload).into_response()
-            } else {
+            }
+            None => {
                 let msg = "job's engine child is gone (eviction, crash or restart) — \
-                       resubmit the generation";
+                           resubmit the generation";
                 state.jobs.record_failed(&state, &job_id, msg);
                 let closed = state
                     .with_store(|s| s.get_job(&job_id).ok().flatten())
@@ -420,7 +425,7 @@ pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<Str
                     None => not_found(&job_id),
                 }
             }
-        }
+        },
         other => crate::proxy::openai_error(
             500,
             &format!("job {job_id} has unknown kind {other:?} — ledger corruption?"),
@@ -481,8 +486,10 @@ pub async fn jobs_cancel(
             state.jobs.record_cancelled(&state, &job_id);
         }
         // Doctor probes check the row between probes and stop once it is
-        // terminal; the one-way close guarantees this flip is final.
-        "doctor" => {
+        // terminal; background responses simply stop being polled (any late
+        // completion cannot resurrect the row — the one-way close guarantees
+        // this flip is final).
+        "doctor" | "responses" => {
             state.jobs.record_cancelled(&state, &job_id);
         }
         "image" | "video" => {

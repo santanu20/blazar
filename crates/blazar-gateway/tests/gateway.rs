@@ -109,6 +109,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
             params: Some(0.5),
             ctx_train: Some(40_960),
             pulled_at: 1,
+            last_used_at: 1,
         })
         .unwrap();
     // Second model for router-mode tests (unused by single-model tests).
@@ -129,6 +130,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
             params: Some(0.5),
             ctx_train: Some(40_960),
             pulled_at: 1,
+            last_used_at: 1,
         })
         .unwrap();
 
@@ -320,6 +322,136 @@ async fn e2e__num_ctx_header_resolves_the_tags_rendered_name() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__n_choices_engine_ignoring_n_gets_a_teaching_502() {
+    // Default stub returns ONE choice no matter what was asked: the
+    // gateway must detect "lane ignored n" and refuse loudly instead of
+    // letting a silent 1-of-N answer through. n=2 is the llamacpp lane
+    // ceiling, so this is the largest n that still reaches the engine.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "pick one"}],
+            "n": 2,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body.to_string();
+    assert!(
+        msg.contains("asked n=2 choices") && msg.contains("engine returned 1"),
+        "under-count teaching must name both numbers, got {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__n_choices_honored_passes_through_with_all_choices() {
+    std::env::set_var("STUB_CHOICE_COUNT", "2");
+    let ts = start(Config::default()).await;
+    let c = client();
+    let r: serde_json::Value = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "variants"}],
+            "n": 2,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let choices = r["choices"].as_array().expect("choices array");
+    assert_eq!(choices.len(), 2, "both choices must arrive");
+    let indexes: Vec<i64> = choices
+        .iter()
+        .map(|ch| ch["index"].as_i64().unwrap())
+        .collect();
+    assert_eq!(indexes, vec![0, 1]);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__n_choices_out_of_range_fails_fast_unbilled() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "too many"}],
+            "n": 9,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body.to_string();
+    assert!(
+        msg.contains("n must be an integer in 2..=8") || msg.contains("1..=8"),
+        "range teaching must name the cap, got {msg}"
+    );
+    // Strictness: a float or string n is a contract violation, not a
+    // silent default-to-1.
+    for bad in [serde_json::json!(2.0), serde_json::json!("2")] {
+        let resp = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .json(&serde_json::json!({
+                "model": "m1",
+                "messages": [{"role": "user", "content": "strict"}],
+                "n": bad,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "n={bad} must be rejected");
+    }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__n_choices_lane_ceiling_teaches_before_the_engine_can() {
+    // The plane-wide range admits n=3, but the llamacpp lane (the stub)
+    // serves at most 2. The gateway must 400 in its own voice before
+    // the engine's raw "Value must be between 1 <= value <= 2" leaks.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "three ways"}],
+            "n": 3,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body.to_string();
+    assert!(
+        msg.contains("exceeds this lane's ceiling"),
+        "lane teaching must be the gateway's own voice, got {msg}"
+    );
+    assert!(
+        msg.contains("at most 2 choices"),
+        "must name the llamacpp cap, got {msg}"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -1248,6 +1380,168 @@ async fn e2e__responses_chaining_and_store() {
     assert_eq!(gone.status(), 404);
     ts.state.sup.shutdown_all().await.unwrap();
 }
+#[tokio::test]
+#[allow(non_snake_case)]
+// One end-to-end contract per feature surface, in wire order.
+#[allow(clippy::too_many_lines)]
+async fn e2e__responses__background_conversations_and_cloud_tools() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // Background mode: 202 + queued, then polls to the completed body.
+    let queued = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "input": "in the background",
+            "store": true,
+            "background": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), 202);
+    let q: serde_json::Value = queued.json().await.unwrap();
+    assert_eq!(q["status"], "queued");
+    assert_eq!(q["background"], true);
+    let bg_id = q["id"].as_str().unwrap().to_string();
+
+    // The job plane carries the same id (kind=responses).
+    let job: serde_json::Value = c
+        .get(format!("{}/v1/jobs/{}", ts.base, bg_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(job["kind"], "responses");
+
+    // Poll until terminal (stub completes immediately; bound anyway).
+    let mut final_body = serde_json::Value::Null;
+    for _ in 0..100 {
+        let r: serde_json::Value = c
+            .get(format!("{}/v1/responses/{}", ts.base, bg_id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if matches!(r["status"].as_str(), Some("queued" | "in_progress")) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        } else {
+            final_body = r;
+            break;
+        }
+    }
+    assert_eq!(
+        final_body["status"], "completed",
+        "background response completes: {final_body}"
+    );
+    assert_eq!(final_body["id"].as_str().unwrap(), bg_id);
+    // Body tier, not just the job tier: the verbatim stored body must be
+    // served under the SAME id the 202 returned (guards against a shadowed
+    // re-mint storing it under an unreachable id).
+    assert!(
+        final_body.get("output").is_some(),
+        "polled body is the stored engine body: {final_body}"
+    );
+
+    // Background + stream is a contract error, not a surprise.
+    let bad = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "input": "x", "store": true,
+            "background": true, "stream": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let b: serde_json::Value = bad.json().await.unwrap();
+    assert!(b["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("background"));
+
+    // Cloud builtin tools teach, never silently pretend.
+    let cloud = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "input": "x",
+            "tools": [{"type": "web_search"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cloud.status(), 400);
+    let b: serde_json::Value = cloud.json().await.unwrap();
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("web_search"),
+        "{}",
+        b
+    );
+
+    // Conversations: two stored responses in conv-e2e, the second via
+    // previous_response_id inheriting the conversation.
+    let c1: serde_json::Value = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "input": "first", "store": true,
+            "conversation": "conv-e2e",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_id = c1["id"].as_str().unwrap().to_string();
+    let _c2: serde_json::Value = c
+        .post(format!("{}/v1/responses", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "input": "second", "store": true,
+            "previous_response_id": first_id,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let conv: serde_json::Value = c
+        .get(format!("{}/v1/conversations/conv-e2e", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(conv["count"], 2, "both responses stamped/inherited: {conv}");
+    assert_eq!(conv["object"], "conversation");
+
+    let del: serde_json::Value = c
+        .delete(format!("{}/v1/conversations/conv-e2e", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(del["deleted"], 2);
+
+    let gone = c
+        .get(format!("{}/v1/conversations/conv-e2e", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404);
+}
 
 #[tokio::test]
 #[allow(non_snake_case)]
@@ -1717,6 +2011,7 @@ async fn e2e__audio_jobs__unknown_404_and_invalid_id_400() {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 400);
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -3369,6 +3664,7 @@ async fn e2e__llamacpp_only_gates__routed_lane_beats_active_row() {
             params: None,
             ctx_train: None,
             pulled_at: 1,
+            last_used_at: 1,
         })
         .unwrap();
     });

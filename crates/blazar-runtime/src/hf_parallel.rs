@@ -209,9 +209,7 @@ enum WorkerMsg {
 /// when the caller should fall back to the classic single-stream lane
 /// (no Range support, tiny file, `connections < 2`, or a legacy `.part`
 /// without a sidecar that only the classic lane can tail-resume).
-// parameters mirror the pull call-site one-to-one; a struct would just
-// move the same eight names next door
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // one param per wire concern; a bundle would hide the range contract
 pub(crate) async fn try_parallel(
     http: &reqwest::Client,
     token: Option<&str>,

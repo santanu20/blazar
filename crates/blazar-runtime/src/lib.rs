@@ -27,6 +27,7 @@ pub mod probe;
 pub mod quantize;
 pub mod registry;
 pub mod sessionreg;
+pub mod storage;
 pub mod supervisor;
 pub mod throttle;
 pub mod uds;
