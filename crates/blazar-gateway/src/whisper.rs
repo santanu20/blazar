@@ -249,6 +249,7 @@ fn sse_frame(event: &str, data: &serde_json::Value) -> Vec<u8> {
 /// recording's timeline (`start`/`end` are chunk-relative seconds in
 /// upstream's `verbose_json`). Non-numeric or missing fields pass through
 /// untouched — the event carries what the decoder reported.
+#[allow(clippy::cast_precision_loss)] // offsets are far below 2^52
 fn rebase_segments(segments: &mut serde_json::Value, offset_ms: u64) {
     let Some(list) = segments.as_array_mut() else {
         return;

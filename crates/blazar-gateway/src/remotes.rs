@@ -617,7 +617,11 @@ pub struct PeerScore {
 #[must_use]
 // wave counts (< 2^52 by construction) and ceiling results are exact in f64;
 // the ranking math reads clearest in float waves x ttft
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // in_flight clamped >= 0; wave counts exact in f64
 pub fn score_peer(model: &str, h: &RemoteHealth, cap: Option<&PeerCapacity>) -> PeerScore {
     let ttft_ms = h.ttft_ewma_ms.unwrap_or(REMOTE_TTFT_DEFAULT_MS).max(1.0);
     let (tier, slots, peer_in_flight, free_vram) = match cap {
@@ -631,12 +635,7 @@ pub fn score_peer(model: &str, h: &RemoteHealth, cap: Option<&PeerCapacity>) -> 
                 .unwrap_or(0);
             match c.residents.iter().find(|r| r.model == model) {
                 Some(r) => {
-                    let slots = r
-                        .slots_configured
-                        .or(r.slots)
-                        .map(u64::from)
-                        .unwrap_or(1)
-                        .max(1);
+                    let slots = u64::from(r.slots_configured.or(r.slots).unwrap_or(1)).max(1);
                     let busy = r.in_flight.max(0) as u64;
                     (REMOTE_TIER_WARM, slots, busy, free)
                 }
