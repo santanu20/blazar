@@ -540,6 +540,14 @@ enum EngineCmd {
         /// installed, or written
         #[arg(long)]
         check: bool,
+        /// Update every INSTALLED lane in one walk: llamacpp,
+        /// mistralrs, sglang, sdcpp, whisper. Lanes without an install
+        /// are skipped, current lanes no-op, and a failed lane does
+        /// not stop the rest (named in the summary). Mutually
+        /// exclusive with a pinned tag; composes with --check and
+        /// --no-gate.
+        #[arg(long)]
+        all: bool,
     },
     /// List installed engines with capability summaries
     List {
@@ -10496,16 +10504,27 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             tag,
             no_gate,
             check,
+            all,
         } => {
-            let engine_kind: EngineKind = kind
-                .parse()
-                .map_err(|e| anyhow!("engine update --kind {kind:?}: {e}"))?;
-            match engine_kind {
-                EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
-                EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
-                EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
-                EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
-                EngineKind::Whisper => engine_update_whisper(&d, tag, check).await?,
+            if all {
+                if tag.is_some() {
+                    anyhow::bail!(
+                        "engine update --all walks every installed lane — drop the pinned tag \
+                         (or drop --all)"
+                    );
+                }
+                engine_update_all(&d, no_gate, check).await?;
+            } else {
+                let engine_kind: EngineKind = kind
+                    .parse()
+                    .map_err(|e| anyhow!("engine update --kind {kind:?}: {e}"))?;
+                match engine_kind {
+                    EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
+                    EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
+                    EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
+                    EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
+                    EngineKind::Whisper => engine_update_whisper(&d, tag, check).await?,
+                }
             }
         }
         EngineCmd::List { json } => {
@@ -11355,6 +11374,119 @@ async fn route_update_to_build(
 }
 
 #[allow(clippy::too_many_lines)] // lane chain: resolve, download, install, register, prune
+/// Installed lanes for `engine update --all`, in the fixed walk order:
+/// llamacpp first (the GGUF default lane), whisper last (lazy
+/// side-lane). Pure so the walk order is pinned by a unit test.
+fn installed_engine_kinds(rows: &[blazar_core::EngineRow]) -> Vec<EngineKind> {
+    [
+        EngineKind::LlamaCpp,
+        EngineKind::MistralRs,
+        EngineKind::Sglang,
+        EngineKind::SdCpp,
+        EngineKind::Whisper,
+    ]
+    .into_iter()
+    .filter(|k| rows.iter().any(|r| r.kind == *k))
+    .collect()
+}
+
+/// Which tag `engine update --all` must leave active after the walk.
+///
+/// The pre-walk lane stays the user's lane: if a lane install switched
+/// the active tag to another kind, the walk restores the snapshot kind
+/// — at its NEWEST build when the update pruned the exact snapshot tag
+/// (same semantics as `engine use --kind`). A same-kind change is the
+/// lane's own update and stays. With no pre-walk active engine, the
+/// default llamacpp lane wins when installed. `None` = leave the store
+/// as-is. `rows` is `list_engines()` order (newest-first).
+fn restore_active_tag(
+    rows: &[blazar_core::EngineRow],
+    before: Option<(String, EngineKind)>,
+    after_kind: Option<EngineKind>,
+) -> Option<String> {
+    match before {
+        None => rows
+            .iter()
+            .find(|r| r.kind == EngineKind::LlamaCpp && r.tag != blazar_runtime::LOCAL_TAG)
+            .map(|r| r.tag.clone()),
+        Some((tag, kind)) => {
+            if after_kind == Some(kind) {
+                return None;
+            }
+            if rows.iter().any(|r| r.tag == tag) {
+                return Some(tag);
+            }
+            rows.iter()
+                .find(|r| r.kind == kind && r.tag != blazar_runtime::LOCAL_TAG)
+                .map(|r| r.tag.clone())
+        }
+    }
+}
+
+/// `engine update --all`: one-shot currency sweep over every installed
+/// lane. Absent lanes are skipped (installing a lane is a separate
+/// decision), current lanes no-op inside their own update path, and a
+/// failing lane is recorded while the walk continues — the summary
+/// names the failures and the exit code stays non-zero. The user's
+/// active lane is preserved: a lane install that flips the active tag
+/// to its own kind is restored to the pre-walk lane (newest build of
+/// that kind) after the walk.
+async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result<()> {
+    let store = Store::open(d)?;
+    let kinds = installed_engine_kinds(&store.list_engines()?);
+    if kinds.is_empty() {
+        anyhow::bail!("no engines installed — `blazar engine update` installs the llama.cpp lane");
+    }
+    // Snapshot BEFORE any lane can flip the active tag: (tag, kind).
+    let before = store.active_engine()?.map(|r| (r.tag, r.kind));
+    drop(store);
+    let mut failed: Vec<&'static str> = Vec::new();
+    for kind in &kinds {
+        println!(
+            "== {} {}==",
+            kind.as_str(),
+            if check { "(dry-run) " } else { "" }
+        );
+        let result = match kind {
+            EngineKind::LlamaCpp => engine_update(d, None, no_gate, check).await,
+            EngineKind::Sglang => engine_update_sglang(d, None, check).await,
+            EngineKind::MistralRs => engine_update_mistralrs(d, None, check).await,
+            EngineKind::SdCpp => engine_update_sdcpp(d, None, check).await,
+            EngineKind::Whisper => engine_update_whisper(d, None, check).await,
+        };
+        if let Err(e) = result {
+            eprintln!("lane {} failed: {e:#}", kind.as_str());
+            failed.push(kind.as_str());
+        }
+    }
+    if !check {
+        // Lane installs activate their own kind; undo any cross-lane
+        // flip so --all never changes which engine serves the box.
+        let store = Store::open(d)?;
+        let after_kind = store.active_engine()?.map(|r| r.kind);
+        let restore = restore_active_tag(&store.list_engines()?, before, after_kind);
+        drop(store);
+        if let Some(tag) = restore {
+            let mgr = local_engine_manager(d)?;
+            let prior = blazar_core::store::Store::open(d)?
+                .active_engine()?
+                .map(|r| r.tag);
+            let row = mgr.use_tag(&tag)?;
+            println!("active lane restored: {}", row.tag);
+            restart_daemon_if_active_changed(prior, Some(row.tag.clone())).await;
+        }
+    }
+    println!(
+        "engine update --all: {} lane(s) walked, {} failed",
+        kinds.len(),
+        failed.len()
+    );
+    if !failed.is_empty() {
+        anyhow::bail!("failed lanes: {}", failed.join(", "));
+    }
+    Ok(())
+}
+
 async fn engine_update(
     d: &BlazarDirs,
     tag: Option<String>,
@@ -11410,7 +11542,10 @@ async fn engine_update(
             cfg.update_channel
         );
         match active_tag.as_deref() {
-            Some(a) if a == target_tag => println!("up to date: {a} active"),
+            // Lane-suffixed active tags (b11339-cuda) are the same
+            // build as the channel target (b11339) — raw string
+            // equality would report an update forever on CUDA boxes.
+            Some(a) if same_build(a, &target_tag) => println!("up to date: {a} active"),
             Some(a) => println!(
                 "update available: {a} -> {target_tag}{}",
                 if downgrade {
@@ -13255,6 +13390,99 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["latest"], "b2");
         assert!(!dirs.run_dir().join("engine-check.json.tmp").exists());
+    }
+
+    #[test]
+    fn unit__installed_engine_kinds__fixed_walk_order_dedup_and_skip_absent() {
+        let row = |tag: &str, kind: EngineKind| blazar_core::EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at: 1,
+            active: false,
+            manifest: String::new(),
+            kind,
+        };
+        // Out-of-order + duplicated rows: the walk order stays fixed
+        // (llamacpp first, whisper last) and absent lanes drop out.
+        let rows = vec![
+            row("sglang-0.5.20", EngineKind::Sglang),
+            row("b11338-cuda", EngineKind::LlamaCpp),
+            row("sglang-0.5.19", EngineKind::Sglang),
+            row("b5130", EngineKind::Whisper),
+        ];
+        let kinds = installed_engine_kinds(&rows);
+        assert!(matches!(
+            kinds.as_slice(),
+            [
+                EngineKind::LlamaCpp,
+                EngineKind::Sglang,
+                EngineKind::Whisper
+            ]
+        ));
+        assert!(installed_engine_kinds(&[]).is_empty());
+    }
+
+    #[test]
+    fn unit__restore_active_tag__switched_lane_restores_newest_of_pre_walk_kind() {
+        let row = |tag: &str, kind: EngineKind| blazar_core::EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at: 1,
+            active: false,
+            manifest: String::new(),
+            kind,
+        };
+        // list_engines order: newest-first. The walk updated llamacpp
+        // AND retention pruned b11338, then sglang flipped itself
+        // active: restore the user's llamacpp lane at its NEWEST build.
+        let rows = vec![
+            row("sglang-0.5.21", EngineKind::Sglang),
+            row("b11339-cuda", EngineKind::LlamaCpp),
+        ];
+        let restore = restore_active_tag(
+            &rows,
+            Some(("b11338-cuda".to_string(), EngineKind::LlamaCpp)),
+            Some(EngineKind::Sglang),
+        );
+        assert_eq!(restore.as_deref(), Some("b11339-cuda"));
+
+        // Exact snapshot tag still present (retention kept it — e.g. a
+        // user pin): restore the exact tag, not just any of the kind.
+        let retained = vec![
+            row("sglang-0.5.21", EngineKind::Sglang),
+            row("b11339-cuda", EngineKind::LlamaCpp),
+            row("b11338-cuda", EngineKind::LlamaCpp),
+        ];
+        let restore_exact = restore_active_tag(
+            &retained,
+            Some(("b11338-cuda".to_string(), EngineKind::LlamaCpp)),
+            Some(EngineKind::SdCpp),
+        );
+        assert_eq!(restore_exact.as_deref(), Some("b11338-cuda"));
+
+        // Same-kind change = the lane's own update: leave as-is.
+        assert_eq!(
+            restore_active_tag(
+                &rows,
+                Some(("b11338-cuda".to_string(), EngineKind::LlamaCpp)),
+                Some(EngineKind::LlamaCpp),
+            ),
+            None
+        );
+
+        // No pre-walk active: the default llamacpp lane wins.
+        assert_eq!(
+            restore_active_tag(&rows, None, Some(EngineKind::Sglang)).as_deref(),
+            Some("b11339-cuda")
+        );
+        // No pre-walk active and no llamacpp installed: leave as-is.
+        let no_llamacpp = vec![row("sglang-0.5.21", EngineKind::Sglang)];
+        assert_eq!(
+            restore_active_tag(&no_llamacpp, None, Some(EngineKind::Sglang)),
+            None
+        );
     }
 
     #[test]
