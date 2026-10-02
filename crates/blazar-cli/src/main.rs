@@ -15359,7 +15359,10 @@ mod tests {
                 EngineKind::Whisper
             ]
         ));
-        assert!(installed_engine_kinds(&[]).is_empty());
+        assert!(
+            installed_engine_kinds(&[]).is_empty(),
+            "no engines installed must yield no kinds"
+        );
     }
 
     #[test]
