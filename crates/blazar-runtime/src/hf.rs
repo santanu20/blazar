@@ -4964,7 +4964,7 @@ mod tests {
             .await
             .unwrap();
         let control_elapsed = t0.elapsed();
-        assert_eq!(usize::try_from(n).unwrap(), full.len());
+        assert_eq!(n as usize, full.len());
         assert_eq!(std::fs::read(&control_dest).unwrap(), full);
 
         // Capped at 0.001 MB/s = 1000 B/s.
@@ -4975,11 +4975,7 @@ mod tests {
             .await
             .unwrap();
         let paced_elapsed = t0.elapsed();
-        assert_eq!(
-            usize::try_from(n).unwrap(),
-            full.len(),
-            "cap paces, never truncates"
-        );
+        assert_eq!(n as usize, full.len(), "cap paces, never truncates");
         assert_eq!(std::fs::read(&dest).unwrap(), full);
 
         assert!(

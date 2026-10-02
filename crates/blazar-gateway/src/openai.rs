@@ -1239,6 +1239,180 @@ pub async fn responses_api(
         return r;
     }
 
+    /// Buffered (non-stream, stored) responses roundtrip shared by the
+    /// foreground call and background mode: forward to the child (best-of-N
+    /// or single send with the respawn-retry contract), observe, store under
+    /// OUR id, rewrite the body id, and hand back the finished value. The
+    /// admission guard stays with the caller — background holds it for the
+    /// whole run, the foreground drops it after this returns.
+    #[allow(clippy::too_many_lines)]
+    async fn buffered_response_roundtrip(
+        state: &Arc<AppState>,
+        engine: &blazar_runtime::EngineRef,
+        model_name: &str,
+        new_body: &[u8],
+        best_of: Option<u64>,
+        key_ext: Option<Extension<crate::keys::KeyCtx>>,
+        trace_ext: Option<Extension<TraceId>>,
+        id: &str,
+        conversation: &str,
+        input_items: serde_json::Value,
+    ) -> Result<(serde_json::Value, Option<String>, u16), Response> {
+        fn fail(
+            status: u16,
+            msg: &str,
+        ) -> Result<(serde_json::Value, Option<String>, u16), Response> {
+            Err(openai_error(status, msg))
+        }
+        let t0 = std::time::Instant::now();
+        let url = format!(
+            "{}/v1/responses",
+            crate::proxy::child_base(&engine.endpoint)
+        );
+        let req = crate::proxy::child_auth(
+            crate::state::child_client(&state, &engine.endpoint)
+                .post(&url)
+                .header("content-type", "application/json"),
+            &engine,
+        )
+        .body(new_body.to_vec());
+        // Best-of-N: judge N candidates, return the winner as a normal child
+        // response (usage summed across candidates). Skip/Degraded (knob
+        // off, guard collapse, first-copy transport failure) takes the
+        // single-send path below with its respawn-retry contract intact; a
+        // guard degrade still stamps the reason header.
+        let mut bestof_hdr: Option<String> = None;
+        let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
+            crate::bestof::fan_out(&state, &engine, &url, &new_body, want).await
+        } else {
+            crate::bestof::FanOut::Skip
+        };
+        if let crate::bestof::FanOut::Degraded(h) = &fan {
+            bestof_hdr = Some(h.clone());
+        }
+        let resp = match fan {
+            crate::bestof::FanOut::Ran(outcome) => {
+                state.ttft.observe_secs(outcome.elapsed.as_secs_f64());
+                bestof_hdr = Some(outcome.hdr);
+                outcome.resp
+            }
+            _ => match crate::proxy::child_send(&state, &engine, req.send()).await {
+                Ok(r) => {
+                    state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+                    r
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %model_name,
+                        "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"
+                    );
+                    match crate::proxy::respawn_lane(&state, &engine.key).await {
+                        Ok(fresh) => {
+                            let fresh_url = format!(
+                                "{}/v1/responses",
+                                crate::proxy::child_base(&fresh.endpoint)
+                            );
+                            let fresh_req = crate::proxy::child_auth(
+                                crate::state::child_client(&state, &fresh.endpoint)
+                                    .post(&fresh_url)
+                                    .header("content-type", "application/json"),
+                                &fresh,
+                            )
+                            .body(new_body.to_vec());
+                            match crate::proxy::child_send(&state, &fresh, fresh_req.send()).await {
+                                Ok(r) => {
+                                    state.ttft.observe_secs(t0.elapsed().as_secs_f64());
+                                    r
+                                }
+                                Err(e2) => {
+                                    return fail(
+                                        e2.status_u16(),
+                                        &format!(
+                                    "engine request failed: {e}; retry on respawned child: {e2}"
+                                ),
+                                    );
+                                }
+                            }
+                        }
+                        Err(re) => {
+                            return fail(
+                                e.status_u16(),
+                                &format!("engine request failed: {e}; respawn: {re:#}"),
+                            );
+                        }
+                    }
+                }
+            },
+        };
+        let status = resp.status().as_u16();
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let mut r = openai_error(status, &format!("engine error: {text}"));
+            crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+            return Err(r);
+        }
+        let mut out: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return fail(502, &format!("bad engine response: {e}")),
+        };
+        // Sentinel observation: the buffered branch bypasses proxy_request,
+        // so the feed is driven here (same as the ollama translate path).
+        {
+            let (feed, _) = crate::sentinel::begin_chat_observation(
+                &state,
+                "openai-responses",
+                &model_name,
+                &new_body,
+                trace_ext.clone().map(|Extension(t)| t.0),
+                status,
+                false,
+            );
+            feed.value(out.clone());
+            drop(feed); // Drop fires End: analyzer finalizes off the path
+        }
+        // Store under OUR id and rewrite the body's id so the client chains
+        // through the gateway (the engine's own id carries no storage). The id
+        // comes from the caller so background mode's job row and stored response
+        // share it — polling the 202'd id serves this body once completed.
+        let usage = out.get("usage").cloned().unwrap_or(serde_json::Value::Null);
+        let in_tok = usage["input_tokens"].as_u64();
+        let out_tok = usage["output_tokens"].as_u64();
+        // A2: blend the completion's decode rate into the model's EWMA
+        // (t0 predates the fan/single send on this branch).
+        if let Some(n) = out_tok {
+            state
+                .sup
+                .note_model_throughput(&model_name, n, t0.elapsed().as_secs_f64());
+        }
+        // FIX6: this buffered branch bypasses proxy_request's sniffer —
+        // charge token budgets directly from the parsed usage.
+        if let Some(Extension(k)) = key_ext.as_ref() {
+            let total = in_tok.unwrap_or(0).saturating_add(out_tok.unwrap_or(0));
+            state.keys.charge_tokens(&k.name, total);
+        }
+        let output_items = out
+            .get("output")
+            .cloned()
+            .unwrap_or(serde_json::Value::Array(vec![]));
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("id".into(), serde_json::json!(id));
+        }
+        state.store_response(
+            &id,
+            &crate::responses::StoredResponse {
+                model: model_name.to_string(),
+                input_items,
+                output_items,
+                input_tokens: in_tok,
+                output_tokens: out_tok,
+                ts: crate::responses::unix_now(),
+                conversation: conversation.to_string(),
+                body_json: serde_json::to_string(&out).ok(),
+            },
+        );
+        Ok((out, bestof_hdr, status))
+    }
+
     // Non-stream + store: buffered forward, store, re-id, return. Same
     // crash-recovery contract as every other child lane: bounded send
     // (child_send owns the header-timeout evict), then exactly one
@@ -1250,6 +1424,7 @@ pub async fn responses_api(
         .cloned()
         .unwrap_or(serde_json::Value::Array(vec![]));
     let input_items_bg = input_items.clone();
+    let input_items_fg = input_items;
     // Background mode: same buffered roundtrip, polled instead of held.
     // The response id doubles as the job id — one namespace, both planes
     // (/v1/jobs/{id} shows the run, /v1/responses/{id} shows the result).
@@ -1333,7 +1508,7 @@ pub async fn responses_api(
         trace_ext.clone(),
         &id,
         &conversation,
-        input_items,
+        input_items_fg,
     )
     .await
     {
@@ -1364,189 +1539,6 @@ pub async fn responses_api(
                 r
             },
         )
-}
-
-// Local shorthand: every failure path in the roundtrip is a shaped
-// openai_error; the axum `Response` error currency this file already uses.
-#[allow(clippy::result_large_err)]
-fn roundtrip_fail(
-    status: u16,
-    msg: &str,
-) -> Result<(serde_json::Value, Option<String>, u16), Response> {
-    Err(openai_error(status, msg))
-}
-
-/// Buffered (non-stream, stored) responses roundtrip shared by the
-/// foreground call and background mode: forward to the child (best-of-N
-/// or single send with the respawn-retry contract), observe, store under
-/// OUR id, rewrite the body id, and hand back the finished value. The
-/// admission guard stays with the caller — background holds it for the
-/// whole run, the foreground drops it after this returns.
-// Ten params is the extraction boundary talking, not sprawl: the roundtrip
-// owns exactly what responses_api owns (request context + store identity),
-// and a params struct would just mirror this list one-to-one.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::result_large_err
-)]
-async fn buffered_response_roundtrip(
-    state: &Arc<AppState>,
-    engine: &blazar_runtime::EngineRef,
-    model_name: &str,
-    new_body: &[u8],
-    best_of: Option<u64>,
-    key_ext: Option<Extension<crate::keys::KeyCtx>>,
-    trace_ext: Option<Extension<TraceId>>,
-    id: &str,
-    conversation: &str,
-    input_items: serde_json::Value,
-) -> Result<(serde_json::Value, Option<String>, u16), Response> {
-    let t0 = std::time::Instant::now();
-    let url = format!(
-        "{}/v1/responses",
-        crate::proxy::child_base(&engine.endpoint)
-    );
-    let req = crate::proxy::child_auth(
-        crate::state::child_client(state, &engine.endpoint)
-            .post(&url)
-            .header("content-type", "application/json"),
-        engine,
-    )
-    .body(new_body.to_vec());
-    // Best-of-N: judge N candidates, return the winner as a normal child
-    // response (usage summed across candidates). Skip/Degraded (knob
-    // off, guard collapse, first-copy transport failure) takes the
-    // single-send path below with its respawn-retry contract intact; a
-    // guard degrade still stamps the reason header.
-    let mut bestof_hdr: Option<String> = None;
-    let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
-        crate::bestof::fan_out(state, engine, &url, new_body, want).await
-    } else {
-        crate::bestof::FanOut::Skip
-    };
-    if let crate::bestof::FanOut::Degraded(h) = &fan {
-        bestof_hdr = Some(h.clone());
-    }
-    let resp = match fan {
-        crate::bestof::FanOut::Ran(outcome) => {
-            state.ttft.observe_secs(outcome.elapsed.as_secs_f64());
-            bestof_hdr = Some(outcome.hdr);
-            outcome.resp
-        }
-        _ => match crate::proxy::child_send(state, engine, req.send()).await {
-            Ok(r) => {
-                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
-                r
-            }
-            Err(e) => {
-                tracing::warn!(
-                    model = %model_name,
-                    "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"
-                );
-                match crate::proxy::respawn_lane(state, &engine.key).await {
-                    Ok(fresh) => {
-                        let fresh_url =
-                            format!("{}/v1/responses", crate::proxy::child_base(&fresh.endpoint));
-                        let fresh_req = crate::proxy::child_auth(
-                            crate::state::child_client(state, &fresh.endpoint)
-                                .post(&fresh_url)
-                                .header("content-type", "application/json"),
-                            &fresh,
-                        )
-                        .body(new_body.to_vec());
-                        match crate::proxy::child_send(state, &fresh, fresh_req.send()).await {
-                            Ok(r) => {
-                                state.ttft.observe_secs(t0.elapsed().as_secs_f64());
-                                r
-                            }
-                            Err(e2) => {
-                                return roundtrip_fail(
-                                    e2.status_u16(),
-                                    &format!(
-                                    "engine request failed: {e}; retry on respawned child: {e2}"
-                                ),
-                                );
-                            }
-                        }
-                    }
-                    Err(re) => {
-                        return roundtrip_fail(
-                            e.status_u16(),
-                            &format!("engine request failed: {e}; respawn: {re:#}"),
-                        );
-                    }
-                }
-            }
-        },
-    };
-    let status = resp.status().as_u16();
-    if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        let mut r = openai_error(status, &format!("engine error: {text}"));
-        crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
-        return Err(r);
-    }
-    let mut out: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => return roundtrip_fail(502, &format!("bad engine response: {e}")),
-    };
-    // Sentinel observation: the buffered branch bypasses proxy_request,
-    // so the feed is driven here (same as the ollama translate path).
-    {
-        let (feed, _) = crate::sentinel::begin_chat_observation(
-            state,
-            "openai-responses",
-            model_name,
-            new_body,
-            trace_ext.clone().map(|Extension(t)| t.0),
-            status,
-            false,
-        );
-        feed.value(out.clone());
-        drop(feed); // Drop fires End: analyzer finalizes off the path
-    }
-    // Store under OUR id and rewrite the body's id so the client chains
-    // through the gateway (the engine's own id carries no storage). The id
-    // comes from the caller so background mode's job row and stored response
-    // share it — polling the 202'd id serves this body once completed.
-    let usage = out.get("usage").cloned().unwrap_or(serde_json::Value::Null);
-    let in_tok = usage["input_tokens"].as_u64();
-    let out_tok = usage["output_tokens"].as_u64();
-    // A2: blend the completion's decode rate into the model's EWMA
-    // (t0 predates the fan/single send on this branch).
-    if let Some(n) = out_tok {
-        state
-            .sup
-            .note_model_throughput(model_name, n, t0.elapsed().as_secs_f64());
-    }
-    // FIX6: this buffered branch bypasses proxy_request's sniffer —
-    // charge token budgets directly from the parsed usage.
-    if let Some(Extension(k)) = key_ext.as_ref() {
-        let total = in_tok.unwrap_or(0).saturating_add(out_tok.unwrap_or(0));
-        state.keys.charge_tokens(&k.name, total);
-    }
-    let output_items = out
-        .get("output")
-        .cloned()
-        .unwrap_or(serde_json::Value::Array(vec![]));
-    if let Some(obj) = out.as_object_mut() {
-        obj.insert("id".into(), serde_json::json!(id));
-    }
-    state.store_response(
-        id,
-        &crate::responses::StoredResponse {
-            model: model_name.to_string(),
-            input_items,
-            output_items,
-            input_tokens: in_tok,
-            output_tokens: out_tok,
-            ts: crate::responses::unix_now(),
-            conversation: conversation.to_string(),
-            body_json: serde_json::to_string(&out).ok(),
-        },
-    );
-    Ok((out, bestof_hdr, status))
 }
 
 /// Extract the `model` field from a multipart/form-data body (audio

@@ -1302,11 +1302,11 @@ fn is_chat_route(path_query: &str) -> bool {
     p.ends_with("/chat/completions") || p.ends_with("/completions") || p.ends_with("/responses")
 }
 
-/// `OpenAI` `n` (choices per request) upper bound — cost scales with n,
+/// OpenAI `n` (choices per request) upper bound — cost scales with n,
 /// so one request must not fan into an unbounded bill.
 pub(crate) const MAX_N_CHOICES: u64 = 8;
 
-/// Routes that accept `OpenAI`'s `n` parameter: the completions family.
+/// Routes that accept OpenAI's `n` parameter: the completions family.
 /// `/v1/responses` uses `best_of` instead (judged N→1, different knob).
 fn accepts_n(path_query: &str) -> bool {
     let p = path_query.split('?').next().unwrap_or(path_query);
@@ -1314,7 +1314,7 @@ fn accepts_n(path_query: &str) -> bool {
 }
 
 /// Strict `n` extraction for the completions family: absent/null →
-/// `Ok(None)` (`OpenAI` default n=1), integer `1..=MAX_N_CHOICES` →
+/// `Ok(None)` (OpenAI default n=1), integer 1..=MAX_N_CHOICES →
 /// `Ok(Some(n))`, anything else → `Err(teaching)`. Strictness is the
 /// contract: a `"n": 2.0` that silently meant one choice would be a
 /// quiet capability lie. Pure; unit-pinned.
