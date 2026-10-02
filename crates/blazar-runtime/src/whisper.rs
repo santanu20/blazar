@@ -627,6 +627,9 @@ pub fn split_wav(data: &[u8], chunk_ms: u64) -> Option<Vec<WavChunk>> {
 /// its ASCII 8.3 short form first. Best-effort by design: volumes with
 /// 8dot3 naming disabled (or a conversion failure) keep the original
 /// path — the guard never introduces a failure mode of its own.
+// The one platform-gated unsafe use in the crate: Win32 FFI has no safe
+// wrapper, and CI carries `-D unsafe-code` for everything else.
+#[cfg_attr(windows, allow(unsafe_code))]
 #[must_use]
 pub fn argv_model_path(model_path: &Path) -> PathBuf {
     #[cfg(windows)]
@@ -645,6 +648,8 @@ pub fn argv_model_path(model_path: &Path) -> PathBuf {
         };
         if len > 0 {
             let mut out = vec![0u16; len as usize];
+            // SAFETY: `out` was sized from the probe's return value and
+            // `wide` is still the NUL-terminated input from above.
             let written = unsafe {
                 windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
                     wide.as_ptr(),
