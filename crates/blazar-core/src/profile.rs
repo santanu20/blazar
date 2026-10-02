@@ -956,6 +956,46 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 argv.push(n_max.to_string());
             }
         }
+    } else if spec_mode == "mtp-adaptive" {
+        // Adaptive MTP (llama.cpp PR27210, OPEN upstream): draft-mtp-
+        // adaptive re-scores draft candidates against target logits at
+        // verification time instead of trusting the head blindly — the
+        // acceptance bar climbs with the head's trained depth, so the
+        // recommended n-max is 8 (vs the fixed head's 2). Pre-wired: on
+        // engines without the type this is a teaching error, on GGUFs
+        // without an embedded head it stays dense with a warning.
+        if !input.supported_flags.contains("--spec-type")
+            || !input.spec_types.iter().any(|t| t == "draft-mtp-adaptive")
+        {
+            return Err(format!(
+                "spec = \"mtp-adaptive\" needs an engine advertising \
+                 draft-mtp-adaptive (llama.cpp PR27210); engine {} does not \
+                 — run: blazar engine update once shipped upstream",
+                input.engine_tag
+            ));
+        }
+        if let Some(n_layers) = gguf.mtp_layers {
+            argv.push("--spec-type".into());
+            argv.push("draft-mtp-adaptive".into());
+            // Upstream recommends n-max 8; the trained head depth is the
+            // hard ceiling — more would be pure verification overhead.
+            let n_max = n_layers.min(8);
+            if input.supported_flags.contains("--spec-draft-n-max") {
+                argv.push("--spec-draft-n-max".into());
+                argv.push(n_max.to_string());
+            }
+            warnings.push(format!(
+                "spec mtp-adaptive engaged (n-max {n_max} of {n_layers} \
+                 head layer(s)); bench before adopting at scale"
+            ));
+        } else {
+            warnings.push(
+                "spec = \"mtp-adaptive\" but this GGUF carries no MTP head \
+                 (no n_predict_layers metadata) — staying dense; pull an \
+                 MTP-bearing build (e.g. unsloth ...-MTP-GGUF)"
+                    .into(),
+            );
+        }
     } else if let Some(spec_val) = match spec_mode {
         "eagle3" => Some("draft-eagle3"),
         "dflash" => Some("draft-dflash"),
@@ -3147,6 +3187,48 @@ fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings:
             ));
         }
     }
+    // Qwen-Image-2.1 prefix-cache type (PR2045) rides --model-args, not
+    // a first-class flag: compose it into the user's model-args. An
+    // explicit user entry for the same key wins — blazar never
+    // overrides a named lever, it warns instead.
+    let merged_model_args = {
+        let user_args = cfg
+            .sdcpp_model_args
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match (&cfg.sdcpp_qwen_prefix_cache_type, user_args) {
+            (Some(cache_type), Some(user)) => {
+                let cache_type = cache_type.trim();
+                if cache_type.is_empty() {
+                    Some(user.to_string())
+                } else if user.split(',').any(|kv| {
+                    kv.split('=').next().unwrap_or("").trim() == "qwen_image_2_1_prefix_cache_type"
+                }) {
+                    warnings.push(
+                        "sdcpp_qwen_prefix_cache_type ignored: \
+                         sdcpp_model_args already sets \
+                         qwen_image_2_1_prefix_cache_type"
+                            .into(),
+                    );
+                    Some(user.to_string())
+                } else {
+                    Some(format!(
+                        "{user},qwen_image_2_1_prefix_cache_type={cache_type}"
+                    ))
+                }
+            }
+            (Some(cache_type), None) => {
+                let cache_type = cache_type.trim();
+                if cache_type.is_empty() {
+                    None
+                } else {
+                    Some(format!("qwen_image_2_1_prefix_cache_type={cache_type}"))
+                }
+            }
+            (None, user) => user.map(str::to_string),
+        }
+    };
     for (key, flag, value) in [
         (
             "cache_option",
@@ -3165,11 +3247,7 @@ fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings:
             cfg.sdcpp_split_mode.as_deref(),
         ),
         ("tae", "--tae", cfg.sdcpp_tae.as_deref()),
-        (
-            "model_args",
-            "--model-args",
-            cfg.sdcpp_model_args.as_deref(),
-        ),
+        ("model_args", "--model-args", merged_model_args.as_deref()),
         (
             "tensor_type_rules",
             "--tensor-type-rules",
@@ -12469,6 +12547,150 @@ mod tests {
             .any(|w| w == ["--cache-mode", "easycache"]));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__qwen_prefix_cache_type_composes_into_model_args() {
+        // The knob rides --model-args (no first-class upstream flag):
+        // alone it becomes the sole entry, beside user args it appends,
+        // and an explicit user entry for the same key wins with a
+        // warning — blazar never overrides a named lever.
+        let (dir, vae, llm) = sdcpp_tuning_fixture("prefix-cache");
+        let g = meta();
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let set = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+        ];
+        let sd_flags = sd_tuning_flags();
+        let run = |cfg: &Config| {
+            let mut inp = input(&g, &hw, cfg, &sd_flags);
+            inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+            inp.components = &set;
+            compile(&inp, &TuningOverrides::default()).unwrap()
+        };
+        let solo = run(&Config {
+            sdcpp_qwen_prefix_cache_type: Some("auto".to_string()),
+            ..Config::default()
+        });
+        assert!(
+            solo.argv
+                .windows(2)
+                .any(|w| w == ["--model-args", "qwen_image_2_1_prefix_cache_type=auto"]),
+            "{:?}",
+            solo.argv
+        );
+        let beside = run(&Config {
+            sdcpp_qwen_prefix_cache_type: Some("auto".to_string()),
+            sdcpp_model_args: Some("chroma_use_t5_mask=true".to_string()),
+            ..Config::default()
+        });
+        assert!(
+            beside.argv.windows(2).any(|w| w
+                == [
+                    "--model-args",
+                    "chroma_use_t5_mask=true,qwen_image_2_1_prefix_cache_type=auto"
+                ]),
+            "{:?}",
+            beside.argv
+        );
+        let clash = run(&Config {
+            sdcpp_qwen_prefix_cache_type: Some("auto".to_string()),
+            sdcpp_model_args: Some("qwen_image_2_1_prefix_cache_type=f16".to_string()),
+            ..Config::default()
+        });
+        assert!(
+            clash
+                .argv
+                .windows(2)
+                .any(|w| w == ["--model-args", "qwen_image_2_1_prefix_cache_type=f16"]),
+            "{:?}",
+            clash.argv
+        );
+        assert!(
+            clash
+                .warnings
+                .iter()
+                .any(|w| w.contains("sdcpp_qwen_prefix_cache_type ignored")),
+            "{:?}",
+            clash.warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__spec_mtp_adaptive__engages_with_n_max_capped_at_head() {
+        let cfg = Config {
+            spec: "mtp-adaptive".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta_with_mtp(10); // head deeper than the recommended 8
+        let types: Vec<String> = vec!["draft-mtp-adaptive".to_string()];
+        let p = compile(
+            &input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &types),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp-adaptive"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "8"),
+            "n-max clamps to the recommended 8 below the 10-layer head: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__spec_mtp_adaptive__engine_lacking_type__hard_error() {
+        let cfg = Config {
+            spec: "mtp-adaptive".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta_with_mtp(2);
+        let err = compile(
+            &input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &[]),
+            &TuningOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("draft-mtp-adaptive") && err.contains("PR27210"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__spec_mtp_adaptive__headless_gguf_stays_dense_with_warning() {
+        let cfg = Config {
+            spec: "mtp-adaptive".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta(); // no embedded MTP head
+        let types: Vec<String> = vec!["draft-mtp-adaptive".to_string()];
+        let p = compile(
+            &input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &types),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--spec-type"),
+            "no head, no speculation: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("no MTP head")),
+            "{:?}",
+            p.warnings
+        );
     }
 
     #[test]

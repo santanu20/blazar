@@ -420,6 +420,16 @@ pub struct Config {
     /// no streaming surface to relay). Range `1_000..=120_000` ms.
     #[serde(default = "default_whisper_stream_chunk_ms")]
     pub whisper_stream_chunk_ms: u64,
+    /// Audio lane (PR4083 era): Silero VAD model for the whisper-server
+    /// child (`--vad --vad-model`), a ggml file the user provides (e.g.
+    /// `silero-vad-v5.ggml`). VAD skips silence/noise segments before
+    /// decode — faster long-audio runs and fewer hallucinated spans.
+    /// Blazar never auto-pulls the VAD model: an unset file that exists
+    /// in the whisper engine dir is referenced by name; a missing file
+    /// is a teaching error at child spawn, not a silent no-op. Unset =
+    /// no VAD (upstream default; behavior unchanged).
+    #[serde(default)]
+    pub whisper_vad_model: Option<String>,
     /// Capability-lane registry URL (curated fork lanes for GGUF
     /// architectures mainline llama.cpp can't load yet). `None` = the
     /// default registry; `Some("")` disables registry lookups entirely
@@ -589,6 +599,15 @@ pub struct Config {
     /// engine default (4).
     #[serde(default)]
     pub sdcpp_conditioning_cache_size: Option<u64>,
+    /// Qwen-Image-2.1 prefix KV cache strategy for sd-server children:
+    /// sets the `qwen_image_2_1_prefix_cache_type` model-arg — `auto`
+    /// or a concrete type — enabling early prefix-cache scheduling
+    /// (upstream PR2045, master-929+). A large VRAM win on repeated
+    /// compositions; older engines ignore the key. Composes into
+    /// `sdcpp_model_args`; an explicit user entry for the same key wins
+    /// (with a warning). Unset = engine default.
+    #[serde(default)]
+    pub sdcpp_qwen_prefix_cache_type: Option<String>,
     /// Model-builder arguments for sd-server children (`--model-args`,
     /// upstream key=value list, e.g. `qwen_image_2_1_prefix_cache=true`):
     /// family-specific engine levers ahead of first-class knobs. Unset =
@@ -1037,6 +1056,7 @@ pub fn is_valid_spec_mode(mode: &str) -> bool {
             | "ngram-mod"
             | "ngram-cache"
             | "mtp"
+            | "mtp-adaptive"
             | "eagle3"
             | "dflash"
             | "dspark"
@@ -2016,8 +2036,11 @@ impl WarmPeg {
             // No peg lane exists for these servers: readiness publishes
             // when the health probe flips (mistralrs), /v1/models first
             // answers (sdcpp), or the lazy child first boots (whisper —
-            // never supervised at all).
-            EngineKind::MistralRs | EngineKind::SdCpp | EngineKind::Whisper => false,
+            // never supervised at all). Piper synthesizes one-shot per
+            // request through the CLI — nothing stays up to peg.
+            EngineKind::MistralRs | EngineKind::SdCpp | EngineKind::Whisper | EngineKind::Piper => {
+                false
+            }
         }
     }
 }
@@ -2151,6 +2174,8 @@ impl Default for Config {
             session_keep_secs: default_session_keep_secs(),
             whisper_idle_secs: default_whisper_idle_secs(),
             whisper_stream_chunk_ms: default_whisper_stream_chunk_ms(),
+            whisper_vad_model: None,
+            sdcpp_qwen_prefix_cache_type: None,
             capability_registry_url: None,
             fork_retire_days: default_fork_retire_days(),
             semantic_cache: SemanticCacheConfig::default(),
