@@ -1991,6 +1991,7 @@ fn routed_engine_lane(
     global: Option<&(String, blazar_core::engine_kind::EngineKind)>,
     engine_rows: &[blazar_core::EngineRow],
     name: &str,
+    repo: &str,
     arch: Option<&str>,
     diffusion: bool,
     path: &str,
@@ -2001,7 +2002,7 @@ fn routed_engine_lane(
     let overlay = cfg.overlay_for(name);
     let pin = overlay.engine.as_deref();
     let safetensors = std::path::Path::new(path).is_dir();
-    let quantized = blazar_core::store::quantized_safetensors_signal(name, "", path);
+    let quantized = blazar_core::store::quantized_safetensors_signal(name, repo, path);
     let installed: Vec<(
         String,
         blazar_core::engine_kind::EngineKind,
@@ -2017,7 +2018,7 @@ fn routed_engine_lane(
         diffusion,
         safetensors,
         quantized,
-        safetensors && blazar_core::store::mlx_signal(name, "", path),
+        safetensors && blazar_core::store::mlx_signal(name, repo, path),
         *g_kind,
         &installed,
     ) {
@@ -2679,6 +2680,7 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
             global.as_ref(),
             &engine_rows,
             &m.name,
+            &m.repo,
             m.arch.as_deref(),
             m.has_component_set(),
             &m.path,
@@ -6369,6 +6371,7 @@ fn list_json_row(
         global,
         engine_rows,
         &m.name,
+        &m.repo,
         m.arch.as_deref(),
         m.has_component_set(),
         &m.path,
@@ -6459,6 +6462,7 @@ fn list(json: bool) -> Result<()> {
                 global.as_ref(),
                 &engine_rows,
                 &m.name,
+                &m.repo,
                 m.arch.as_deref(),
                 m.has_component_set(),
                 &m.path,
@@ -9774,12 +9778,30 @@ async fn futures_lite_next(resp: &mut reqwest::Response) -> Result<Option<Vec<u8
     }
 }
 
+/// llama-bench reads GGUF files only; safetensors/MLX directories are
+/// served-plane models (sglang quants, mlx-community dirs). Handing a
+/// directory to llama-bench dies on `gguf_init_from_reader` — teach the
+/// lane's real measurement surface instead of leaking the loader error.
+fn dir_bench_refusal(name: &str, mlx: bool) -> String {
+    let lane = if mlx { "mlx" } else { "sglang" };
+    format!(
+        "bench drives llama-bench, which reads GGUF files only — '{name}' is a \
+safetensors directory served by the {lane} lane. Measure it warm through the \
+daemon instead (what a client actually sees): time a /v1/chat/completions \
+call and read tokens/s from the usage block, e.g. max_tokens 128 against \
+the running server."
+    )
+}
+
 fn bench(model: &str) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
     let row = store
         .get_model(model)?
         .ok_or_else(|| no_such_model(model))?;
+    if std::path::Path::new(&row.path).is_dir() {
+        anyhow::bail!(dir_bench_refusal(&row.name, row.is_mlx()));
+    }
     let bench_bin = blazar_runtime::bench::find_bench_bin(&d)?;
     let tuner = blazar_runtime::Tuner {
         dirs: &d,
@@ -16400,6 +16422,7 @@ mod tests {
                 Some(&global),
                 &engine_rows,
                 "m",
+                "",
                 Some("qwen2"),
                 false,
                 "/x/m.gguf"
@@ -16407,7 +16430,7 @@ mod tests {
             Ok("b-new".to_string())
         );
         // No engines at all: teaching error names the install command.
-        let err = routed_engine_lane(&cfg, None, &[], "m", Some("qwen2"), false, "/x/m.gguf")
+        let err = routed_engine_lane(&cfg, None, &[], "m", "", Some("qwen2"), false, "/x/m.gguf")
             .unwrap_err();
         assert!(err.contains("blazar engine install"), "{err}");
         // A per-model pin to an uninstalled lane teaches with the roster.
@@ -16419,6 +16442,7 @@ mod tests {
             Some(&global),
             &engine_rows,
             "m",
+            "",
             Some("qwen2"),
             false,
             "/x/m.gguf",
@@ -16435,6 +16459,7 @@ mod tests {
                 Some(&global),
                 &engine_rows,
                 "m",
+                "",
                 Some("Qwen2ForCausalLM"),
                 false,
                 &dir.to_string_lossy()
@@ -16460,6 +16485,7 @@ mod tests {
                 Some(&global),
                 &engine_rows,
                 "m",
+                "",
                 Some("instella-moe"),
                 false,
                 "/x/m.gguf"
@@ -16473,6 +16499,7 @@ mod tests {
                 Some(&global),
                 &engine_rows,
                 "m",
+                "",
                 Some("qwen2"),
                 false,
                 "/x/m.gguf"
@@ -16489,6 +16516,7 @@ mod tests {
                 Some(&global),
                 &engine_rows,
                 "m",
+                "",
                 Some("instella-moe"),
                 false,
                 "/x/m.gguf"
@@ -16503,6 +16531,7 @@ mod tests {
                 Some(&global),
                 &engine_rows,
                 "m",
+                "",
                 Some("mystery-arch"),
                 false,
                 "/x/m.gguf"
