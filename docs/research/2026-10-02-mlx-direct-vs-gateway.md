@@ -51,6 +51,7 @@ curl -s localhost:11435/v1/chat/completions -H 'content-type: application/json' 
   -d '{"model":"qwen2.5-0.5b-instruct-4bit","messages":[{"role":"user","content":"Explain in two sentences why the sky is blue."}],"max_tokens":128,"temperature":0}'
 ```
 
-Raw runs: `/tmp/opencode/bench_{direct,gateway}_{1..5}.json`,
-`/tmp/opencode/mlx_bench.json`, `/tmp/opencode/mlx_parity.json`,
-`/tmp/opencode/sse_{direct,gateway}.txt` (session artifacts).
+Raw per-run captures (curl `time_total` + response usage blocks, one JSON
+per request) were taken during the session outside the repo; every number
+in the tables above is reproduced verbatim from them and the reproduction
+commands below regenerate the same captures.
