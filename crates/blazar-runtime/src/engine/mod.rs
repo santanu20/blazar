@@ -3253,6 +3253,7 @@ fn dead_tag_error(tag: &str, engines: &[EngineRow]) -> anyhow::Error {
     )
 }
 
+#[must_use]
 pub fn rollback_candidate(engines: &[EngineRow]) -> Option<&EngineRow> {
     let active = engines.iter().find(|e| e.active)?;
     engines

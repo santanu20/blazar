@@ -1370,7 +1370,7 @@ pub(crate) struct LaneResolution {
 /// when no engines, mirroring the old gate-skip). Err lanes resolve to
 /// the global kind inside [`resolve_serving`] — the spawn delivers the
 /// real teaching error.
-/// Per-lane ceiling on OpenAI `n` (choices per request). The plane-wide
+/// Per-lane ceiling on the `OpenAI` `n` parameter (choices per request). The plane-wide
 /// contract is `1..=MAX_N_CHOICES`, but the serving engine may cap lower:
 /// llama-server accepts `n <= 2` (live-probed on b11339 and b11344).
 /// Lanes not yet probed keep the plane-wide ceiling so this never

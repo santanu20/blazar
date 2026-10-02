@@ -672,7 +672,7 @@ async fn deliver_native(
         job_id,
         if video { "video" } else { "image" },
         parsed.get("model").and_then(serde_json::Value::as_str),
-        &serde_json::json!({
+        serde_json::json!({
             "engine": engine.name,
             "native_path": native_path,
             "load_ms": load_ms,
