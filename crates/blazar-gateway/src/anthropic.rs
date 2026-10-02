@@ -78,7 +78,7 @@ pub async fn messages(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let openai_body = match translate_request(&parsed, stream) {
+    let mut openai_body = match translate_request(&parsed, stream) {
         Ok(b) => b,
         Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
     };
@@ -143,6 +143,10 @@ pub async fn messages(
     };
     let key_name = engine.name.clone();
     state.sup.note_prefix_hit(&key_name);
+    // Think-dialect bridge for mistral.rs children (see proxy.rs): the
+    // translated body speaks the kwargs dialect, which mistral.rs ignores
+    // — mirror the think state into the top-level fields it reads.
+    crate::proxy::normalize_think_in_value(engine.kind, &mut openai_body);
     let deadline_ms = headers
         .get("x-blazar-deadline-ms")
         .and_then(|v| v.to_str().ok())

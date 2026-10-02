@@ -750,6 +750,7 @@ pub async fn proxy_request(
     // Both consumers reuse the hot lane's single parse.
     let body = inject_include_usage(path_query, body, parsed.as_ref());
     let body = rewrite_child_model(engine, body, parsed.as_ref());
+    let body = normalize_think_for_engine(engine.kind, path_query, body, parsed.as_ref());
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
     // coalesce AT THE CHILD-CALL BOUNDARY. Two acquisition phases:
@@ -853,6 +854,8 @@ pub async fn proxy_request(
                     );
                     let retry_body =
                         rewrite_child_model(&fresh, body_snapshot.clone(), parsed.as_ref());
+                    let retry_body =
+                        normalize_think_for_engine(fresh.kind, path_query, retry_body, None);
                     body_snapshot = retry_body.clone();
                     match forward_once(state, &fresh, method, &fresh_url, headers, retry_body).await
                     {
@@ -973,20 +976,59 @@ pub async fn proxy_request(
     // Streaming and oversized bodies pass unverified (documented in
     // the API spec).
     let want_choice_verify = n_asked.is_some() && !sse && status.is_success() && !enforce_oversized;
-    if sentinel_active || want_choice_verify {
+    // Raw `<think>` suppression (openai chat lane; ollama-lane parity):
+    // when the effective request did not ask for thinking, a template
+    // that ignores the off-kwargs would leak reasoning into plain
+    // content. Gate mirrors the ollama lane's — only the not-asked case
+    // is touched; an already-split response passes through idempotently.
+    // Non-stream bodies ride the buffered branch below (the client waits
+    // for the full JSON anyway); SSE streams filter per-delta in the
+    // forwarding loop. Oversized declared bodies stream unfiltered (same
+    // cap contract as enforce).
+    let suppress_think = status.is_success()
+        && is_chat_path(path_query)
+        && !enforce_oversized
+        && !crate::translate::request_asks_thinking(&body_snapshot);
+    if sentinel_active || want_choice_verify || (suppress_think && !sse) {
         let ctx = if sentinel_active {
             let (ctx, warnings) = sentinel::request_ctx(
                 state,
                 route_name(path_query),
                 model,
                 &body_snapshot,
-                trace,
+                trace.clone(),
                 sse,
             );
             if !warnings.is_empty() {
                 builder = builder.header("x-blazar-warnings", warnings.join(","));
             }
             Some(ctx)
+        } else {
+            None
+        };
+        // The think-suppress buffered path takes requests the streaming
+        // path previously served — those got a sentinel observation
+        // (records + precheck warning header). Preserve that contract:
+        // begin the same observation here, feed it the RAW engine bytes
+        // (detections judge engine truth, not the suppressed view), and
+        // let the feed's Drop finalize the record. Only fires when THIS
+        // path's disjunct is the trigger — n-verify and sentinel-active
+        // requests keep their pre-existing observation behavior.
+        let mut suppress_feed = if suppress_think && !sse && !sentinel_active && !want_choice_verify
+        {
+            let (feed, warnings) = sentinel::begin_chat_observation(
+                state,
+                route_name(path_query),
+                model,
+                &body_snapshot,
+                trace.clone(),
+                status.as_u16(),
+                sse,
+            );
+            if !warnings.is_empty() {
+                builder = builder.header("x-blazar-warnings", warnings.join(","));
+            }
+            Some(feed)
         } else {
             None
         };
@@ -1081,7 +1123,27 @@ pub async fn proxy_request(
                 // R6: buffered non-stream chat — classify from the exact
                 // JSON (no substring heuristics on this path).
                 record_buffered_chat(&state.obs, model, &buf, began.elapsed().as_secs_f64());
+                if let Some(feed) = suppress_feed.take() {
+                    // RAW engine bytes (pre-suppression): sentinel
+                    // detections judge what the engine actually returned.
+                    // Drop finalizes the record (sends End).
+                    feed.bytes(buf.clone());
+                }
                 drop(sf); // F31: Drop removes the singleflight entry
+                          // Same contract as the ollama lanes: when the caller did not
+                          // ask for thinking, strip raw <think> blocks before the body
+                          // reaches the client. Parse failure fails open (original body).
+                let buf = if suppress_think {
+                    match serde_json::from_slice::<serde_json::Value>(&buf) {
+                        Ok(mut v) => {
+                            crate::translate::suppress_raw_think_response(&mut v);
+                            serde_json::to_vec(&v).unwrap_or_else(|_| buf.to_vec())
+                        }
+                        Err(_) => buf.to_vec(),
+                    }
+                } else {
+                    buf.to_vec()
+                };
                 let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(buf) })
                     .chain(futures::stream::unfold(body_guard, |g| async {
                         drop(g);
@@ -1134,6 +1196,16 @@ pub async fn proxy_request(
     });
     let model_owned = model.to_string();
     let path_owned = path_query.to_string();
+    // SSE counterpart of the buffered suppressor above: strip <think> blocks
+    // from delta frames while leaving accounting (sentinel/taps/sniffer)
+    // fed with the raw upstream bytes. Shared cell so the flush unfold
+    // below can drain any tail the child left un-terminated.
+    let think_filter_cell = std::sync::Arc::new(std::sync::Mutex::new(if suppress_think && sse {
+        Some(crate::translate::SseThinkFilter::new())
+    } else {
+        None
+    }));
+    let think_filter_stream = std::sync::Arc::clone(&think_filter_cell);
     let stream = resp.bytes_stream().flat_map(move |r| {
         match r {
             Ok(bytes) => {
@@ -1156,6 +1228,10 @@ pub async fn proxy_request(
                 if let Some(s) = sniffer_finisher.lock().expect("sniffer").0.as_mut() {
                     s.push(bytes.as_ref());
                 }
+                let bytes = match think_filter_stream.lock().expect("think filter").as_mut() {
+                    Some(f) => axum::body::Bytes::from(f.feed(&bytes)),
+                    None => bytes,
+                };
                 futures::stream::iter(vec![Ok(bytes)])
             }
             // Mid-body upstream failure (sentinel-evicted wedged child,
@@ -1185,6 +1261,23 @@ pub async fn proxy_request(
             }
         }
     });
+    // Flush any tail the think filter still holds (child ended the body
+    // without a `data: [DONE]` line); finish() is a drain, so a second
+    // poll returns empty and the unfold terminates.
+    let stream = stream.chain(futures::stream::unfold(
+        think_filter_cell,
+        |cell| async move {
+            let tail = match cell.lock().expect("think filter").as_mut() {
+                Some(f) => f.finish(),
+                None => Vec::new(),
+            };
+            if tail.is_empty() {
+                None
+            } else {
+                Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(tail)), cell))
+            }
+        },
+    ));
     // Hold in-flight accounting for the body's lifetime: the guard drops
     // when the client drains (or aborts) the stream.
     let stream = stream.chain(futures::stream::unfold(
@@ -1529,6 +1622,109 @@ pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) {
     if v.get("model").and_then(serde_json::Value::as_str).is_some() {
         v["model"] = serde_json::Value::String(stamp.to_string());
     }
+}
+
+/// Think-dialect bridge for mistral.rs children (chat lane only).
+/// mistral.rs reads TOP-LEVEL body fields — `enable_thinking` (bool) and
+/// `reasoning_effort` (`off|low|medium|high|xhigh`) — and enables
+/// thinking by DEFAULT when both are omitted; it does not read
+/// `chat_template_kwargs`, so the gateway's kwargs dialect silently
+/// no-ops there (upstream: docs.mistralrs.dev, OpenAI compatibility).
+/// This bridge mirrors the kwargs think state into the top-level fields:
+/// an explicit on-toggle becomes `enable_thinking: true`, an effort
+/// request rides natively (kwargs copy stays for the template), and a
+/// request with NO think controls gets the ollama-parity default-off
+/// (`enable_thinking: false`) — the same teaching stance the other lanes
+/// take against the reasoning-eats-the-budget spiral. Add-only: kwargs
+/// and user fields are never removed. Untouched bodies (non-mistral.rs
+/// kinds, other paths, unparseable) return byte-identical.
+pub(crate) fn normalize_think_for_engine(
+    kind: EngineKind,
+    path_query: &str,
+    body: axum::body::Bytes,
+    parsed: Option<&serde_json::Value>,
+) -> axum::body::Bytes {
+    if kind != EngineKind::MistralRs || !is_chat_path(path_query) {
+        return body;
+    }
+    let mut v = match parsed.cloned() {
+        Some(v) => v,
+        None => match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(v) => v,
+            Err(_) => return body, // fail-open: the child reports its own error
+        },
+    };
+    if !normalize_think_in_value(kind, &mut v) {
+        return body;
+    }
+    match serde_json::to_vec(&v) {
+        Ok(bytes) => axum::body::Bytes::from(bytes),
+        Err(_) => body,
+    }
+}
+
+/// Value-level core of the think-dialect bridge (see
+/// `normalize_think_for_engine`); lanes that already hold the parsed
+/// child body call this directly. Returns whether `v` changed.
+pub(crate) fn normalize_think_in_value(kind: EngineKind, v: &mut serde_json::Value) -> bool {
+    if kind != EngineKind::MistralRs || !v.is_object() {
+        return false;
+    }
+    // Blazar's effort vocabulary is wider than mistral.rs's tiers; map
+    // the out-of-range ends onto the nearest accepted level.
+    let effort = v
+        .get("reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let kwargs_on = v
+        .pointer("/chat_template_kwargs/thinking")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            v.pointer("/chat_template_kwargs/enable_thinking")
+                .and_then(serde_json::Value::as_bool)
+        });
+    let top_level = v
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool);
+    let mut changed = false;
+    if let Some(effort) = effort.filter(|e| !e.is_empty()) {
+        let mapped = match effort.as_str() {
+            "minimal" => "off".to_string(),
+            "max" => "xhigh".to_string(),
+            other => other.to_string(),
+        };
+        if v.get("enable_thinking").is_none() && kwargs_on != Some(false) {
+            v["enable_thinking"] = serde_json::Value::Bool(true);
+            changed = true;
+        }
+        if v["reasoning_effort"].as_str() != Some(mapped.as_str()) {
+            v["reasoning_effort"] = serde_json::Value::String(mapped);
+            changed = true;
+        }
+    } else if let Some(on) = kwargs_on.or(top_level) {
+        // Explicit toggle in either dialect: make the native one agree.
+        if top_level != Some(on) {
+            v["enable_thinking"] = serde_json::Value::Bool(on);
+            changed = true;
+        }
+    } else if top_level.is_none() {
+        // No think controls at all: mistral.rs defaults thinking ON —
+        // pin it OFF to match every other lane's default.
+        v["enable_thinking"] = serde_json::Value::Bool(false);
+        changed = true;
+    }
+    changed
+}
+
+/// Whether the child-facing path is the chat-completions lane (the only
+/// surface whose think dialect is defined here; `/responses` keeps its
+/// passthrough contract).
+fn is_chat_path(path_query: &str) -> bool {
+    path_query
+        .split('?')
+        .next()
+        .unwrap_or(path_query)
+        .ends_with("/v1/chat/completions")
 }
 
 /// The model string each child engine must see in request bodies.
@@ -2876,5 +3072,141 @@ mod resolve_model_tests {
         let mut v = serde_json::json!({"model": "caller-spelling"});
         set_child_model(&mut v, "default");
         assert_eq!(v["model"], "default");
+    }
+
+    // --- Think-dialect bridge (mistral.rs children) ----------------------
+
+    #[test]
+    fn unit__normalize_think_for_engine__mistralrs_matrix() {
+        use serde_json::json;
+        let chat = "/v1/chat/completions";
+        let bytes = |v: &serde_json::Value| axum::body::Bytes::from(v.to_string());
+
+        // No think controls: mistral.rs defaults thinking ON — pin OFF.
+        let out = normalize_think_for_engine(
+            EngineKind::MistralRs,
+            chat,
+            bytes(&json!({"model": "default"})),
+            None,
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap(),
+            json!({"model": "default", "enable_thinking": false})
+        );
+
+        // Kwargs on → mirrored top-level (kwargs preserved, add-only).
+        let out = normalize_think_for_engine(
+            EngineKind::MistralRs,
+            chat,
+            bytes(&json!({
+                "model": "default",
+                "chat_template_kwargs": {"thinking": true}
+            })),
+            None,
+        );
+        let v = serde_json::from_slice::<serde_json::Value>(&out).unwrap();
+        assert_eq!(v["enable_thinking"], json!(true));
+        assert_eq!(v["chat_template_kwargs"]["thinking"], json!(true));
+
+        // Kwargs off: already-off top-level stays untouched (no change →
+        // byte-identical body).
+        let src = json!({
+            "model": "default",
+            "enable_thinking": false,
+            "chat_template_kwargs": {"thinking": false}
+        });
+        let out = normalize_think_for_engine(EngineKind::MistralRs, chat, bytes(&src), None);
+        assert_eq!(&out[..], src.to_string().as_bytes());
+
+        // Effort vocabulary bridge: minimal → off, max → xhigh; an
+        // effort request implies thinking on unless explicitly off.
+        let out = normalize_think_for_engine(
+            EngineKind::MistralRs,
+            chat,
+            bytes(&json!({"model": "default", "reasoning_effort": "minimal"})),
+            None,
+        );
+        let v = serde_json::from_slice::<serde_json::Value>(&out).unwrap();
+        assert_eq!(v["reasoning_effort"], json!("off"));
+        assert_eq!(v["enable_thinking"], json!(true));
+
+        let out = normalize_think_for_engine(
+            EngineKind::MistralRs,
+            chat,
+            bytes(&json!({"model": "default", "reasoning_effort": "max"})),
+            None,
+        );
+        let v = serde_json::from_slice::<serde_json::Value>(&out).unwrap();
+        assert_eq!(v["reasoning_effort"], json!("xhigh"));
+
+        // Explicit top-level true survives (kwargs absent → none added).
+        let out = normalize_think_for_engine(
+            EngineKind::MistralRs,
+            chat,
+            bytes(&json!({"model": "default", "enable_thinking": true})),
+            None,
+        );
+        let v = serde_json::from_slice::<serde_json::Value>(&out).unwrap();
+        assert_eq!(v["enable_thinking"], json!(true));
+        assert!(v.get("chat_template_kwargs").is_none());
+
+        // Explicit top-level false survives too.
+        let out = normalize_think_for_engine(
+            EngineKind::MistralRs,
+            chat,
+            bytes(&json!({"model": "default", "enable_thinking": false})),
+            None,
+        );
+        let v = serde_json::from_slice::<serde_json::Value>(&out).unwrap();
+        assert_eq!(v["enable_thinking"], json!(false));
+    }
+
+    #[test]
+    fn unit__normalize_think_for_engine__scope_guards() {
+        use serde_json::json;
+        let chat = "/v1/chat/completions";
+        let bytes = |v: &serde_json::Value| axum::body::Bytes::from(v.to_string());
+        let no_controls = json!({"model": "default"});
+
+        // Non-mistral.rs kinds: byte-identical (llamacpp defaults are the
+        // template-sniffing lane's job, not this bridge's).
+        let out = normalize_think_for_engine(EngineKind::LlamaCpp, chat, bytes(&no_controls), None);
+        assert_eq!(&out[..], no_controls.to_string().as_bytes());
+        let out = normalize_think_for_engine(EngineKind::Sglang, chat, bytes(&no_controls), None);
+        assert_eq!(&out[..], no_controls.to_string().as_bytes());
+
+        // Non-chat paths (embeddings, tokenize) untouched.
+        let out = normalize_think_for_engine(
+            EngineKind::MistralRs,
+            "/v1/embeddings",
+            bytes(&no_controls),
+            None,
+        );
+        assert_eq!(&out[..], no_controls.to_string().as_bytes());
+
+        // Query-string suffix still counts as the chat path.
+        let out = normalize_think_for_engine(
+            EngineKind::MistralRs,
+            "/v1/chat/completions?api-key=x",
+            bytes(&no_controls),
+            None,
+        );
+        assert_ne!(&out[..], no_controls.to_string().as_bytes());
+
+        // Unparseable body passes through for the child to reject.
+        let junk = axum::body::Bytes::from_static(b"not json");
+        let out = normalize_think_for_engine(EngineKind::MistralRs, chat, junk.clone(), None);
+        assert_eq!(out, junk);
+
+        // Value-level core is the same contract for lane-held bodies.
+        let mut v = json!({"model": "default"});
+        assert!(normalize_think_in_value(EngineKind::MistralRs, &mut v));
+        assert_eq!(v["enable_thinking"], json!(false));
+        // Second pass on the normalized body: no change (idempotent).
+        assert!(!normalize_think_in_value(EngineKind::MistralRs, &mut v));
+        // Non-mistral.rs kinds never touch the value.
+        let mut other = json!({"model": "default"});
+        assert!(!normalize_think_in_value(EngineKind::LlamaCpp, &mut other));
+        assert!(other.get("enable_thinking").is_none());
     }
 }

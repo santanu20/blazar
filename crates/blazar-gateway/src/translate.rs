@@ -1080,6 +1080,162 @@ pub fn suppress_raw_think_response(v: &mut Value) {
     }
 }
 
+/// Whether a chat request asks for thinking in ANY dialect the gateway
+/// speaks: template kwargs (`thinking`/`enable_thinking`), the mistral.rs
+/// top-level `enable_thinking`, or an explicit `reasoning_effort`
+/// (deliberate reasoning steering). Suppression of raw `<think>` blocks
+/// must run only when this returns false — the caller did not ask for
+/// reasoning, so content is expected clean. Unparseable body = no
+/// suppression (fail-open passthrough, same rule as `request_think_on`).
+#[must_use]
+pub fn request_asks_thinking(body: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return true; // cannot prove "not asked" — do not touch content
+    };
+    let kwargs = v.get("chat_template_kwargs");
+    let kwargs_on = kwargs
+        .and_then(|k| k.get("thinking"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            kwargs
+                .and_then(|k| k.get("enable_thinking"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false);
+    let top_level_on = v
+        .get("enable_thinking")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let effort_on = v
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .is_some_and(|e| !e.is_empty() && e != "off" && e != "none");
+    kwargs_on || top_level_on || effort_on
+}
+
+/// Streaming `text/event-stream` filter that drops raw `<think>` blocks
+/// from `choices[].delta.content` frames. Frame-preserving: `data:` lines
+/// whose content survives untouched (the common case once thinking is
+/// off) re-emit byte-identical, so exotic clients see the child's own
+/// serialization. Only mutated frames re-serialize (compact JSON — the
+/// OpenAI wire format is JSON, spacing is not semantic). Per-choice
+/// state: each `choices[].index` gets its own [`ThinkSplitter`], so a
+/// multi-choice stream filters independently. Fail-open: a `data:` line
+/// that does not parse passes through verbatim; non-data lines (comments,
+/// `event:`, `id:`) always pass through.
+pub struct SseThinkFilter {
+    buf: String,
+    splitters: std::collections::HashMap<u64, ThinkSplitter>,
+}
+
+impl Default for SseThinkFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SseThinkFilter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            buf: String::new(),
+            splitters: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Feed one raw byte chunk from the child; returns the bytes to
+    /// forward (possibly empty when everything is held or suppressed).
+    /// Incomplete trailing lines stay buffered until the next chunk.
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.buf.push_str(&String::from_utf8_lossy(chunk));
+        let mut out = Vec::new();
+        while let Some(nl) = self.buf.find('\n') {
+            let line: String = self.buf.drain(..=nl).collect();
+            out.extend_from_slice(&self.filter_line(&line));
+        }
+        out
+    }
+
+    /// Stream ended without a `[DONE]` line (child abort): resolve held
+    /// partial markers the same way the ollama lane's splitter does —
+    /// literal tail text ships, an unterminated think block is dropped.
+    pub fn finish(&mut self) -> Vec<u8> {
+        let mut out = self.flush_splitters();
+        if !self.buf.is_empty() {
+            out.extend_from_slice(self.buf.as_bytes());
+            self.buf.clear();
+        }
+        out
+    }
+
+    fn filter_line(&mut self, line: &str) -> Vec<u8> {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let Some(payload) = trimmed.strip_prefix("data: ") else {
+            return line.as_bytes().to_vec();
+        };
+        if payload == "[DONE]" {
+            // Held partial-marker text must reach the client before the
+            // stream closes: emit it as a synthetic content delta.
+            let mut out = self.flush_splitters();
+            out.extend_from_slice(line.as_bytes());
+            return out;
+        }
+        let Ok(mut v) = serde_json::from_str::<Value>(payload) else {
+            return line.as_bytes().to_vec();
+        };
+        let Some(choices) = v.get_mut("choices").and_then(Value::as_array_mut) else {
+            return line.as_bytes().to_vec();
+        };
+        let mut touched = false;
+        for choice in choices.iter_mut() {
+            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let Some(delta) = choice.get_mut("delta") else {
+                continue;
+            };
+            let Some(Value::String(content)) = delta.get_mut("content") else {
+                continue;
+            };
+            let splitter = self
+                .splitters
+                .entry(index)
+                .or_insert_with(ThinkSplitter::new);
+            let filtered = splitter.feed(content);
+            if filtered != *content {
+                touched = true;
+                *content = filtered;
+            }
+        }
+        if touched {
+            // Line-for-line replacement: the original data line ends with
+            // \n (or \r\n) and the frame's blank-line separator follows as
+            // its own (unmodified) line — re-emit only the data line so
+            // framing stays byte-faithful.
+            let line_end = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+            format!("data: {v}{line_end}").into_bytes()
+        } else {
+            line.as_bytes().to_vec()
+        }
+    }
+
+    /// Emit each splitter's held literal tail as synthetic delta frames.
+    fn flush_splitters(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let indices: Vec<u64> = self.splitters.keys().copied().collect();
+        for index in indices {
+            if let Some(splitter) = self.splitters.get_mut(&index) {
+                let tail = splitter.finish();
+                if !tail.is_empty() {
+                    let frame = json!({
+                        "choices": [{"index": index, "delta": {"content": tail}}],
+                    });
+                    out.extend_from_slice(format!("data: {frame}\n\n").as_bytes());
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Final ollama generate line from usage/finish (stream path — gateway-
 /// measured durations, same contract as `ollama_final_chunk`).
 #[must_use]
@@ -2041,5 +2197,111 @@ mod tests {
         assert!(!request_think_on(off.to_string().as_bytes()));
         // Garbage bytes are not a think-on request.
         assert!(!request_think_on(b"not json"));
+    }
+
+    #[test]
+    fn unit__request_asks_thinking__kwargs_top_level_and_effort() {
+        // Kwargs dialect (the translator's output shape).
+        assert!(request_asks_thinking(
+            json!({"chat_template_kwargs": {"thinking": true}})
+                .to_string()
+                .as_bytes()
+        ));
+        assert!(!request_asks_thinking(
+            json!({"chat_template_kwargs": {"thinking": false}})
+                .to_string()
+                .as_bytes()
+        ));
+        assert!(!request_asks_thinking(br"{}"));
+        // mistral.rs top-level dialect (set by normalize_think_for_engine).
+        assert!(request_asks_thinking(br#"{"enable_thinking": true}"#));
+        assert!(!request_asks_thinking(br#"{"enable_thinking": false}"#));
+        // A non-empty reasoning_effort asks for thinking; explicit
+        // "off"/"none" is the caller pinning it off.
+        assert!(request_asks_thinking(br#"{"reasoning_effort": "high"}"#));
+        assert!(!request_asks_thinking(br#"{"reasoning_effort": "off"}"#));
+        assert!(!request_asks_thinking(br#"{"reasoning_effort": "none"}"#));
+        assert!(!request_asks_thinking(br#"{"reasoning_effort": ""}"#));
+        // Unparseable body: fail OPEN (never suppress on a body we could
+        // not read — the worst case is a leaked think block, not a
+        // mangled answer).
+        assert!(request_asks_thinking(b"not json"));
+    }
+
+    #[test]
+    fn unit__sse_think_filter__plain_stream_passthrough_byte_exact() {
+        let mut f = SseThinkFilter::new();
+        let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        assert_eq!(f.feed(raw.as_bytes()), raw.as_bytes());
+        assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_think_filter__suppresses_think_split_across_chunks() {
+        let mut f = SseThinkFilter::new();
+        // The think block arrives in three separate SSE chunks.
+        let c1 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<thi\"}}]}\n\n";
+        let c2 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"nk>secret \"}}]}\n\n";
+        let c3 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"</think>ans\"}}]}\n\n";
+        let out1 = String::from_utf8(f.feed(c1.as_bytes())).unwrap();
+        // c1 ends inside the marker → text held; the frame re-emits with
+        // empty content so framing stays line-faithful.
+        assert!(out1.contains("\"content\":\"\""), "held frame: {out1}");
+        let out2 = String::from_utf8(f.feed(c2.as_bytes())).unwrap();
+        assert!(
+            out2.contains("\"content\":\"\""),
+            "suppressed frame: {out2}"
+        );
+        assert!(!out2.contains("secret"), "think text never ships: {out2}");
+        let out3 = String::from_utf8(f.feed(c3.as_bytes())).unwrap();
+        // The suppressed chunk still re-emits an (empty-content) frame so
+        // framing and finish_reason flow stay line-faithful.
+        assert!(
+            out3.contains("\"content\":\"ans\""),
+            "answer tail must ship: {out3}"
+        );
+        let done = String::from_utf8(f.feed(b"data: [DONE]\n\n")).unwrap();
+        assert_eq!(done, "data: [DONE]\n\n");
+        assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_think_filter__done_flushes_held_literal_tail() {
+        let mut f = SseThinkFilter::new();
+        // Trailing '<' is a potential marker prefix → held back.
+        f.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer<\"}}]}\n\n");
+        let out = String::from_utf8(f.feed(b"data: [DONE]\n\n")).unwrap();
+        assert!(
+            out.contains("\"content\":\"<\""),
+            "held literal tail must ship as a synthetic delta before [DONE]: {out}"
+        );
+        assert!(out.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn unit__sse_think_filter__non_data_and_comments_verbatim() {
+        let mut f = SseThinkFilter::new();
+        let raw = ": keep-alive comment\ndata: [DONE]\r\n\r\n";
+        assert_eq!(f.feed(raw.as_bytes()), raw.as_bytes());
+        assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_think_filter__multi_choice_independent_and_unparseable_verbatim() {
+        let mut f = SseThinkFilter::new();
+        // Two choices with independent think state in one frame.
+        let frame = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>x\"}},{\"index\":1,\"delta\":{\"content\":\"B\"}}]}\n\n";
+        let out = String::from_utf8(f.feed(frame.as_bytes())).unwrap();
+        assert!(out.contains("\"index\":1"), "choice 1 frame ships: {out}");
+        assert!(
+            !out.contains("\"index\":0,\"delta\":{\"content\":\"<think>x\"}"),
+            "choice 0 think text suppressed: {out}"
+        );
+        // Unparseable data lines pass through untouched.
+        let junk = "data: {{{not json\n\n";
+        assert_eq!(f.feed(junk.as_bytes()), junk.as_bytes());
+        let fin = String::from_utf8(f.finish()).unwrap();
+        // Unterminated think on choice 0 drops at finish; nothing held.
+        assert_eq!(fin, "");
     }
 }

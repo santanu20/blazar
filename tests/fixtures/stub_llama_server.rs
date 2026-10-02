@@ -394,6 +394,15 @@ struct ChatRequest {
     pub stream_options: Option<serde_json::Value>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Think-control passthrough fields: the stub never interprets them,
+    /// but `STUB_THINK_WRAP=reflect` echoes them so tests can assert what
+    /// the gateway's dialect normalization actually forwarded.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -530,6 +539,49 @@ fn stub_knob_text(state: &AppState, messages: &[ChatMessage]) -> String {
     }
 }
 
+/// `STUB_THINK_WRAP` shapes the reply as a thinking-capable model would:
+///
+///   always  — prefix `<think>…</think>` to the normal reply (engines
+///             that burn reasoning tokens by default; the gateway
+///             suppressor must strip it unless the caller asked for
+///             thinking)
+///   reflect — replace the reply with the think controls the child
+///             RECEIVED (top-level `enable_thinking`, the kwargs pair,
+///             `reasoning_effort`) so a test asserts exactly what the
+///             gateway's engine-dialect normalization forwarded.
+fn stub_think_shape(text: String, req: &ChatRequest) -> String {
+    let mode = std::env::var("STUB_THINK_WRAP").unwrap_or_default();
+    if mode == "always" || mode == "always-reflect" {
+        let mut out = format!("<think>stub-plan</think>{text}");
+        if mode == "always-reflect" {
+            out.push(' ');
+            out.push_str(&think_reflect(req));
+        }
+        return out;
+    }
+    if mode == "reflect" {
+        return format!("{} {text}", think_reflect(req));
+    }
+    text
+}
+
+/// The think controls the child RECEIVED, as a compact reflected tag.
+fn think_reflect(req: &ChatRequest) -> String {
+    let et = match req.enable_thinking {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "unset",
+    };
+    let kwargs = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|k| k.get("enable_thinking"))
+        .and_then(serde_json::Value::as_bool)
+        .map_or("unset", |b| if b { "on" } else { "off" });
+    let effort = req.reasoning_effort.as_deref().unwrap_or("unset");
+    format!("[think-reflect et={et} kwargs={kwargs} effort={effort}]")
+}
+
 #[allow(clippy::too_many_lines)]
 async fn chat_completions(
     State(state): State<AppState>,
@@ -569,7 +621,7 @@ async fn chat_completions(
             .into_response();
     }
     // Sentinel test knobs: shape the response semantics, never the route.
-    let text = stub_knob_text(&state, &req.messages);
+    let text = stub_think_shape(stub_knob_text(&state, &req.messages), &req);
     let finish = std::env::var("STUB_FINISH").unwrap_or_else(|_| "stop".into());
     let prompt_tokens = count_tokens(
         &req.messages

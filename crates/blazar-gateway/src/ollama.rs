@@ -996,6 +996,12 @@ pub async fn chat(
     if let Some(stamp) = crate::proxy::child_model_stamp_predicted(&state, &row.name, &row.path) {
         crate::proxy::set_child_model(&mut openai_req, &stamp);
     }
+    // Think-dialect bridge for mistral.rs children: the translated body
+    // carries the kwargs dialect, which mistral.rs ignores — mirror it
+    // into the top-level fields it actually reads (chat lane only).
+    if let Some(lane) = crate::proxy::resolve_serving(&state, &row.name, &row.path) {
+        crate::proxy::normalize_think_in_value(lane.kind, &mut openai_req);
+    }
     // Strict tool-def lint (tools arrive in OpenAI shape after translate).
     if let Some(err) = state.sentinel.strict_tool_def_error_cached(&req) {
         return api_error(400, &format!("invalid tools: {err}"));
@@ -3025,6 +3031,9 @@ pub async fn generate(
     if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
         crate::proxy::set_child_model(&mut openai_req, &stamp);
     }
+    // Think-dialect bridge (see /api/chat): generate rides the same child
+    // chat-completions lane, so mistral.rs needs the top-level fields too.
+    crate::proxy::normalize_think_in_value(engine.kind, &mut openai_req);
     let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();
     // ollama defaults stream=true on generate; the chat bus mirrors it.
     let stream = req["stream"].as_bool().unwrap_or(true);
