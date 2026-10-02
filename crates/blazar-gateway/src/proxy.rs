@@ -296,9 +296,10 @@ pub async fn ensure_with_admission(
             }
             msg => Box::new(openai_error(500, msg)),
         })?;
-    // Usage tracking for `blazar prune --unused`: stamp last_used_at on
-    // cold spawns only — a resident row is fresh by definition, so the
-    // hot path never pays the write.
+    // Disk intelligence: stamp spawn activity so `blazar prune --unused`
+    // ages models by real use. Only cold starts touch the store — a
+    // resident model is fresh by definition, so the hot path never pays
+    // the write.
     if !state.sup.ps().iter().any(|r| r.name == row.name) {
         let _ = state.with_store(|s| s.touch_model_used(&row.name));
     }
@@ -912,11 +913,34 @@ pub async fn proxy_request(
     // pays nothing — the zero-tax contract holds for unlimited keys).
     // Dropped with the stream closure: clean drains AND client aborts
     // both charge (same lifetime trick as the sentinel feed).
+    // F7 (OpenAI `n`, multi-choice): derive the requested choice count
+    // once — reused by both the token-accounting multiplier below and
+    // the non-stream shape verify in the buffered branch. `parsed` (the
+    // hot lane's single body parse) is preferred; only when the caller
+    // had no parse does a cheap substring gate precede the fallback
+    // parse (zero tax for bodies that never mention "n").
+    let n_asked = match parsed.as_ref() {
+        Some(v) => requested_choices(path_query, v).ok().flatten(),
+        None => crate::keys::find_sub(&body_snapshot, b"\"n\"")
+            .and_then(|_| serde_json::from_slice::<serde_json::Value>(&body_snapshot).ok())
+            .and_then(|v| requested_choices(path_query, &v).ok().flatten()),
+    }
+    .filter(|n| *n > 1);
+    // llama-server accounts completion tokens per choice (live probe),
+    // so its sniffer multiplies the completion side by n. sglang sums
+    // natively; mistral.rs is unprobed and stays at honest 1x.
+    let completion_multiplier = match (n_asked, engine.kind) {
+        (Some(n), EngineKind::LlamaCpp) => n,
+        _ => 1,
+    };
     let mut sniffer = key
         .as_ref()
         .and_then(|k| state.keys.entry(&k.name))
         .filter(|e| e.tpm > 0 || e.daily_tokens > 0)
-        .map(|e| crate::keys::UsageSniffer::new(&e.name));
+        .map(|e| {
+            crate::keys::UsageSniffer::new(&e.name)
+                .with_completion_multiplier(completion_multiplier)
+        });
     // Enforce (opt-in): non-stream chat requests get judged BEFORE any
     // byte is released — the client waits for the full JSON anyway, so
     // buffering costs no extra round trip. F62: bodies whose declared
@@ -933,24 +957,39 @@ pub async fn proxy_request(
             "enforce skipped: declared body exceeds cap (streamed, not buffered)"
         );
     }
-    if state.config.sentinel
+    // Sentinel enforce is tracked separately from the F7 choice-count
+    // verify: the same buffered branch serves both, but each keeps its
+    // own conditions (verify never judges semantics; the judge never
+    // counts choices).
+    let sentinel_active = state.config.sentinel
         && !sse
         && status.is_success()
         && is_chat_route(path_query)
         && sentinel::enforce_enabled(&state.config, headers)
-        && !enforce_oversized
-    {
-        let (ctx, warnings) = sentinel::request_ctx(
-            state,
-            route_name(path_query),
-            model,
-            &body_snapshot,
-            trace,
-            sse,
-        );
-        if !warnings.is_empty() {
-            builder = builder.header("x-blazar-warnings", warnings.join(","));
-        }
+        && !enforce_oversized;
+    // F7: a non-stream multi-choice success response gets a shape
+    // check — an engine that ignored `n` (returned 1 choice for n=3)
+    // is a silent capability lie; fail loud with a teaching 502.
+    // Streaming and oversized bodies pass unverified (documented in
+    // the API spec).
+    let want_choice_verify = n_asked.is_some() && !sse && status.is_success() && !enforce_oversized;
+    if sentinel_active || want_choice_verify {
+        let ctx = if sentinel_active {
+            let (ctx, warnings) = sentinel::request_ctx(
+                state,
+                route_name(path_query),
+                model,
+                &body_snapshot,
+                trace,
+                sse,
+            );
+            if !warnings.is_empty() {
+                builder = builder.header("x-blazar-warnings", warnings.join(","));
+            }
+            Some(ctx)
+        } else {
+            None
+        };
         match resp.bytes().await {
             // F30: the buffered read failed — finish the sniffer (nothing
             // chargeable was generated) and release the single-flight
@@ -963,15 +1002,58 @@ pub async fn proxy_request(
                 return openai_error(502, &format!("engine body: {e}"));
             }
             Ok(buf) => {
+                if let Some(n) = n_asked {
+                    if buf.len() > sentinel::ENFORCE_BODY_CAP {
+                        tracing::warn!(
+                            target: "blazar::proxy",
+                            "n-verify skipped: body {} bytes exceeds cap",
+                            buf.len()
+                        );
+                    } else {
+                        let returned = serde_json::from_slice::<serde_json::Value>(&buf)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("choices")
+                                    .and_then(|c| c.as_array())
+                                    .map(|a| a.len() as u64)
+                            });
+                        match returned {
+                            Some(m) if m == n => {}
+                            Some(m) => {
+                                // Tokens were generated for the choices
+                                // that DID come back — charge before
+                                // failing (F30 pattern).
+                                if let Some(mut s) = sniffer.take() {
+                                    s.push(&buf);
+                                    s.finish(&state.keys);
+                                }
+                                drop(sf); // F31: Drop removes the singleflight entry
+                                return openai_error(
+                                    502,
+                                    &format!(
+                                        "asked n={n} choices, engine returned {m} \
+                                         — lane ignored n; report this, do not retry blindly"
+                                    ),
+                                );
+                            }
+                            None => tracing::warn!(
+                                target: "blazar::proxy",
+                                "n-verify skipped: response is not JSON with a choices array"
+                            ),
+                        }
+                    }
+                }
                 if buf.len() > sentinel::ENFORCE_BODY_CAP {
-                    tracing::warn!(
-                        target: "blazar::sentinel",
-                        trace = %ctx.trace,
-                        "enforce skipped: body {} bytes exceeds cap",
-                        buf.len()
-                    );
-                } else {
-                    let hard = state.sentinel.judge(&ctx, &buf, status.as_u16());
+                    if let Some(c) = ctx.as_ref() {
+                        tracing::warn!(
+                            target: "blazar::sentinel",
+                            trace = %c.trace,
+                            "enforce skipped: body {} bytes exceeds cap",
+                            buf.len()
+                        );
+                    }
+                } else if let Some(c) = ctx.as_ref() {
+                    let hard = state.sentinel.judge(c, &buf, status.as_u16());
                     if !hard.is_empty() {
                         let detail = hard
                             .iter()
@@ -1218,6 +1300,47 @@ impl Drop for SingleFlight {
 fn is_chat_route(path_query: &str) -> bool {
     let p = path_query.split('?').next().unwrap_or(path_query);
     p.ends_with("/chat/completions") || p.ends_with("/completions") || p.ends_with("/responses")
+}
+
+/// OpenAI `n` (choices per request) upper bound — cost scales with n,
+/// so one request must not fan into an unbounded bill.
+pub(crate) const MAX_N_CHOICES: u64 = 8;
+
+/// Routes that accept OpenAI's `n` parameter: the completions family.
+/// `/v1/responses` uses `best_of` instead (judged N→1, different knob).
+fn accepts_n(path_query: &str) -> bool {
+    let p = path_query.split('?').next().unwrap_or(path_query);
+    p.ends_with("/chat/completions") || p.ends_with("/completions")
+}
+
+/// Strict `n` extraction for the completions family: absent/null →
+/// `Ok(None)` (OpenAI default n=1), integer 1..=MAX_N_CHOICES →
+/// `Ok(Some(n))`, anything else → `Err(teaching)`. Strictness is the
+/// contract: a `"n": 2.0` that silently meant one choice would be a
+/// quiet capability lie. Pure; unit-pinned.
+pub(crate) fn requested_choices(
+    path_query: &str,
+    body: &serde_json::Value,
+) -> Result<Option<u64>, String> {
+    if !accepts_n(path_query) {
+        return Ok(None);
+    }
+    match body.get("n") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) if v.is_u64() => {
+            let n = v.as_u64().unwrap_or_default();
+            if (1..=MAX_N_CHOICES).contains(&n) {
+                Ok(Some(n))
+            } else {
+                Err(format!(
+                    "n must be an integer in 1..={MAX_N_CHOICES} (generation cost scales with n), got {n}"
+                ))
+            }
+        }
+        Some(v) => Err(format!(
+            "n must be an integer in 1..={MAX_N_CHOICES}, got {v}"
+        )),
+    }
 }
 
 /// Additive `stream_options.include_usage = true` on /v1 chat STREAM
@@ -1923,6 +2046,55 @@ mod affinity_tests {
         }
         messages.push(serde_json::json!({"role": "user", "content": user}));
         serde_json::json!({"messages": messages})
+    }
+
+    #[test]
+    fn unit__requested_choices__strict_matrix() {
+        let chat = "/v1/chat/completions";
+        let body = |n: serde_json::Value| {
+            let mut v = serde_json::json!({"model": "m1"});
+            v["n"] = n;
+            v
+        };
+        // Absent / null → None (OpenAI default n=1).
+        assert_eq!(
+            requested_choices(chat, &serde_json::json!({"model": "m1"})),
+            Ok(None)
+        );
+        assert_eq!(
+            requested_choices(chat, &body(serde_json::Value::Null)),
+            Ok(None)
+        );
+        // In-range integers pass, boundary included.
+        assert_eq!(
+            requested_choices(chat, &body(serde_json::json!(1))),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            requested_choices(chat, &body(serde_json::json!(8))),
+            Ok(Some(8))
+        );
+        // Out of range / wrong types teach.
+        assert!(requested_choices(chat, &body(serde_json::json!(9))).is_err());
+        assert!(requested_choices(chat, &body(serde_json::json!(0))).is_err());
+        assert!(requested_choices(chat, &body(serde_json::json!(-2))).is_err());
+        assert!(requested_choices(chat, &body(serde_json::json!(2.0))).is_err());
+        assert!(requested_choices(chat, &body(serde_json::json!("2"))).is_err());
+        // Non-n routes (query string included) never consult the field.
+        assert_eq!(
+            requested_choices("/v1/responses?x=1", &body(serde_json::json!(3))),
+            Ok(None),
+            "responses uses best_of, not n"
+        );
+        assert_eq!(
+            requested_choices("/v1/embeddings", &body(serde_json::json!(3))),
+            Ok(None)
+        );
+        // Both completions-family routes accept n, query tolerated.
+        assert_eq!(
+            requested_choices("/v1/completions?api-version=1", &body(serde_json::json!(4))),
+            Ok(Some(4))
+        );
     }
 
     #[test]

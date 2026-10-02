@@ -593,6 +593,12 @@ pub fn scope_matches(pattern: &str, model: &str) -> bool {
 pub struct UsageSniffer {
     tail: Vec<u8>,
     key: String,
+    // F7 (OpenAI `n`, multi-choice): llama-server reports completion
+    // tokens PER CHOICE (live probe: n=2 with ~30 tokens per choice
+    // reported completion_tokens=30), so the completion side is
+    // multiplied by n for llama.cpp children. sglang sums natively;
+    // mistral.rs is unprobed and stays at honest 1x.
+    completion_multiplier: u64,
 }
 
 const TAIL: usize = 8 * 1024;
@@ -603,7 +609,15 @@ impl UsageSniffer {
         Self {
             tail: Vec::with_capacity(TAIL),
             key: key.to_string(),
+            completion_multiplier: 1,
         }
+    }
+
+    /// Charge the completion side `mult`× (see field note). Default 1.
+    #[must_use]
+    pub fn with_completion_multiplier(mut self, mult: u64) -> Self {
+        self.completion_multiplier = mult.max(1);
+        self
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -621,7 +635,8 @@ impl UsageSniffer {
 
     /// Parse the tail + charge the key. Returns the token total found.
     pub fn finish(self, limiter: &KeysLimiter) -> u64 {
-        let total = sniff_usage(&self.tail);
+        let (prompt, completion) = sniff_usage_parts(&self.tail);
+        let total = scaled_total(prompt, completion, self.completion_multiplier);
         limiter.charge_tokens(&self.key, total);
         total
     }
@@ -630,13 +645,31 @@ impl UsageSniffer {
 /// Extract (prompt + completion) tokens from a response tail. Pure.
 #[must_use]
 pub fn sniff_usage(tail: &[u8]) -> u64 {
+    let (prompt, completion) = sniff_usage_parts(tail);
+    prompt.unwrap_or(0).saturating_add(completion.unwrap_or(0))
+}
+
+/// (prompt, completion) split of the usage tail — each side uses the
+/// first dialect that appears (OpenAI, Responses, ollama NDJSON).
+/// Pure; unit-pinned alongside `scaled_total`.
+#[must_use]
+pub fn sniff_usage_parts(tail: &[u8]) -> (Option<u64>, Option<u64>) {
     let prompt = last_int_after(tail, "\"prompt_tokens\"")
         .or_else(|| last_int_after(tail, "\"input_tokens\""))
         .or_else(|| last_int_after(tail, "\"prompt_eval_count\""));
     let completion = last_int_after(tail, "\"completion_tokens\"")
         .or_else(|| last_int_after(tail, "\"output_tokens\""))
         .or_else(|| last_int_after(tail, "\"eval_count\""));
-    prompt.unwrap_or(0).saturating_add(completion.unwrap_or(0))
+    (prompt, completion)
+}
+
+/// Multi-choice-aware total: prompt once + completion × mult, clamped
+/// at u64 so an oversized lie cannot wrap around into a small charge.
+#[must_use]
+pub fn scaled_total(prompt: Option<u64>, completion: Option<u64>, mult: u64) -> u64 {
+    prompt
+        .unwrap_or(0)
+        .saturating_add(completion.unwrap_or(0).saturating_mul(mult.max(1)))
 }
 
 /// Shared substring scan (gateway-internal): cheap gate before any JSON
@@ -732,6 +765,52 @@ mod tests {
             max_concurrent: 0,
             weight: 1,
         }
+    }
+
+    #[test]
+    fn unit__sniff_usage_parts__splits_prompt_and_completion_dialects() {
+        let openai = br#"{"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+        assert_eq!(
+            sniff_usage_parts(openai),
+            (Some(11), Some(7)),
+            "OpenAI dialect splits"
+        );
+        let responses = br#"{"usage":{"input_tokens":5,"output_tokens":9}}"#;
+        assert_eq!(
+            sniff_usage_parts(responses),
+            (Some(5), Some(9)),
+            "Responses dialect splits"
+        );
+        let ndjson = br#"{"prompt_eval_count":3,"eval_count":4}"#;
+        assert_eq!(
+            sniff_usage_parts(ndjson),
+            (Some(3), Some(4)),
+            "ollama NDJSON dialect splits"
+        );
+        let bare = br#"{"no_usage_here":true}"#;
+        assert_eq!(sniff_usage_parts(bare), (None, None));
+        assert_eq!(sniff_usage(&openai[..]), 18, "legacy total unchanged");
+    }
+
+    #[test]
+    fn unit__scaled_total__multiplies_completion_only_and_saturates() {
+        assert_eq!(scaled_total(Some(10), Some(20), 1), 30);
+        assert_eq!(
+            scaled_total(Some(10), Some(20), 3),
+            70,
+            "prompt once + n*completion"
+        );
+        assert_eq!(scaled_total(None, None, 3), 0);
+        assert_eq!(
+            scaled_total(None, Some(20), 0),
+            20,
+            "mult clamps to 1, not 0"
+        );
+        assert_eq!(
+            scaled_total(Some(u64::MAX), Some(u64::MAX), 8),
+            u64::MAX,
+            "saturating, never wraps into a small charge"
+        );
     }
 
     #[test]

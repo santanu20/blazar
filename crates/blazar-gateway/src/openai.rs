@@ -376,6 +376,13 @@ pub async fn openai_proxy(
     if let Some(resp) = llamacpp_only_gate(&state, &uri, model.as_deref()) {
         return resp;
     }
+    // F7: strict `n` validation at the plane edge — an invalid choice
+    // count fails fast, BEFORE admission bills the request.
+    if let Some(body) = parsed_body.as_ref() {
+        if let Err(msg) = crate::proxy::requested_choices(uri.path(), body) {
+            return openai_error(400, &msg);
+        }
+    }
     let Some(model) = model else {
         return openai_error(400, "missing `model` field in request body");
     };
