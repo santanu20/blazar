@@ -2339,6 +2339,13 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
     }
 
     checks.extend(doctor_engine(&d).await);
+    // Non-active installed lanes get the same live upstream probe — the
+    // active-lane rows above only cover one kind.
+    let active_kind = blazar_core::Store::open(&d)
+        .ok()
+        .and_then(|s| s.active_engine().ok().flatten())
+        .map(|r| r.kind);
+    checks.extend(doctor_lane_currency(&d, active_kind).await);
     checks.extend(doctor_gpu(&d).await);
     checks.extend(doctor_engines(&d));
     checks.extend(doctor_routing(&d));
@@ -4048,26 +4055,9 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
             checks.push(live_sglang_currency(&active).await);
             return checks;
         }
-        Some(EngineKind::MistralRs) => {
-            let active = active_tag.as_deref().unwrap_or("?");
-            checks.push(Check::ok(
-                "engine currency",
-                format!(
-                    "{active} (mistral.rs prebuilt lane) — update with: \
-                     blazar engine update --kind mistralrs"
-                ),
-            ));
-            return checks;
-        }
         Some(EngineKind::SdCpp) => {
             let active = active_tag.as_deref().unwrap_or("?");
-            checks.push(Check::ok(
-                "engine currency",
-                format!(
-                    "{active} (sdcpp prebuilt lane) — update with: \
-                     blazar engine update --kind sdcpp"
-                ),
-            ));
+            checks.push(live_sdcpp_currency(active).await);
             return checks;
         }
         Some(EngineKind::Whisper) => {
@@ -4389,6 +4379,84 @@ async fn live_mistralrs_currency(active: &str) -> Check {
             format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
         ),
     }
+}
+
+/// sdcpp engine currency: live warn-only probe of the newest
+/// master-tagged stable-diffusion.cpp release. The master channel is
+/// mutable (no ordering between shas), so any tag difference is an
+/// update — same verdict shape the mistral.rs lane uses.
+async fn live_sdcpp_currency(active: &str) -> Check {
+    let token = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok();
+    let Ok(gh) = GhClient::new(token) else {
+        return Check::warn("engine currency", "cannot build GitHub client");
+    };
+    match gh.latest_sdcpp_release().await {
+        Ok(rel) if rel.tag_name == active => {
+            Check::ok("engine currency", format!("up to date ({active}, sdcpp)"))
+        }
+        Ok(rel) => Check::warn(
+            "engine currency",
+            format!(
+                "update available: {} (active: {}, sdcpp) — run: \
+                 blazar engine update --kind sdcpp",
+                rel.tag_name, active
+            ),
+        ),
+        Err(e) => Check::warn(
+            "engine currency",
+            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+        ),
+    }
+}
+
+/// Per-lane engine currency for NON-active installed lanes. The active
+/// lane's row comes from the reconcile/live path in doctor_engine; every
+/// other installed lane gets the same live warn-only upstream probe, so
+/// a stale lane cannot hide behind an all-green doctor (observed live:
+/// sglang 0.5.20 installed, 0.5.21 on PyPI, no row said a word). One
+/// row per KIND, judged on the kind's newest install — retained
+/// rollback rows must not nag. Whisper is covered by
+/// doctor_whisper_currency regardless of which lane is active.
+async fn doctor_lane_currency(d: &BlazarDirs, active_kind: Option<EngineKind>) -> Vec<Check> {
+    let mut out = Vec::new();
+    let Ok(store) = Store::open(d) else {
+        return out;
+    };
+    let Ok(engines) = store.list_engines() else {
+        return out;
+    };
+    for kind in [
+        EngineKind::LlamaCpp,
+        EngineKind::MistralRs,
+        EngineKind::Sglang,
+        EngineKind::SdCpp,
+    ] {
+        if active_kind == Some(kind) {
+            continue;
+        }
+        // The kind's newest install is what an update would act on.
+        let Some(row) = engines
+            .iter()
+            .filter(|e| e.kind == kind)
+            .max_by_key(|e| e.installed_at)
+        else {
+            continue;
+        };
+        if row.tag == blazar_runtime::LOCAL_TAG {
+            // Source builds are not upstream-tracked (same policy as the
+            // active-lane path).
+            continue;
+        }
+        match kind {
+            EngineKind::Sglang => out.push(live_sglang_currency(&row.tag).await),
+            EngineKind::MistralRs => out.push(live_mistralrs_currency(&row.tag).await),
+            EngineKind::SdCpp => out.push(live_sdcpp_currency(&row.tag).await),
+            _ => out.push(live_engine_currency(&row.tag, &row.asset).await),
+        }
+    }
+    out
 }
 
 /// CUDA-opportunity + toolchain-readiness rows for doctor. Pure: GPU
