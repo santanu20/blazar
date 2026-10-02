@@ -7,9 +7,9 @@ pub mod build;
 pub mod capability_registry;
 pub mod gh;
 pub mod manifest;
+pub mod mlx_install;
 pub(crate) mod net_probe;
 pub mod sglang_install;
-pub mod mlx_install;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -321,6 +321,24 @@ pub fn remove_engine_row_and_tree(
         )));
     }
     discard_retired_engine(data_dir, aside.as_deref());
+    // Lazy-lane pin reconciliation: whisper and piper select their
+    // serving binary by pin file (lane-agnostic — the pin may name the
+    // engines row just removed), not by the active flag. A pin naming a
+    // removed tag dangles on every resolution (warn + newest
+    // fallback); clearing it here makes removal own the whole story.
+    // Retention cleanup of a formerly-protected legacy tag rides the
+    // lanes' existing prune pass.
+    for pin_file in [
+        crate::whisper::pin_path_in(data_dir),
+        crate::piper::pin_path_in(data_dir),
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(&pin_file) {
+            if raw.trim() == tag {
+                let _ = std::fs::remove_file(&pin_file);
+                tracing::info!("lazy-lane pin cleared (pinned tag {tag} was removed)");
+            }
+        }
+    }
     Ok(bytes)
 }
 
@@ -1515,9 +1533,7 @@ impl EngineManager {
             EngineKind::Mlx,
             |dir| async move {
                 std::fs::create_dir_all(&dir)?;
-                mlx_install::install_into(&dir, version)
-                    .await
-                    .map(|_| ())
+                mlx_install::install_into(&dir, version).await.map(|_| ())
             },
         )
         .await
@@ -1720,6 +1736,69 @@ impl EngineManager {
                 .join(", ")
         ))
     }
+    /// Install/refresh the piper lane (prebuilt `piper` TTS CLI).
+    /// Mirrors [`Self::update_whisper`]: tag pins, latest resolves the
+    /// newest asset-bearing release, the platform pick is CPU-shaped
+    /// (piper synthesizes on CPU), and the same asset-upload retry
+    /// applies.
+    pub async fn update_piper(&self, tag: Option<&str>) -> Result<EngineRow> {
+        let release = if let Some(t) = tag {
+            self.gh.release_by_tag_repo(gh::PIPER_REPO, t).await?
+        } else {
+            let latest = self.gh.latest_piper_release().await?;
+            self.gh
+                .release_by_tag_repo(gh::PIPER_REPO, &latest.tag_name)
+                .await?
+        };
+        let patterns = gh::piper_asset_patterns(std::env::consts::OS, std::env::consts::ARCH)?;
+
+        let mut last_missing: Option<Vec<gh::SdAssetPattern>> = None;
+        for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
+            if let Some((asset, pattern)) = gh::resolve_sdcpp_asset(&release, &patterns) {
+                tracing::debug!(tag = %release.tag_name, asset = %asset.name, "piper asset resolved");
+                return self
+                    .install_picked_asset(
+                        &release,
+                        asset,
+                        pattern.label,
+                        pattern.cpu_fallback,
+                        EngineKind::Piper,
+                    )
+                    .await;
+            }
+            last_missing = Some(patterns.clone());
+            if !release_is_fresh(&release) || attempt == ASSET_UPLOAD_RETRY_ATTEMPTS {
+                break;
+            }
+            tracing::info!(
+                "piper {} assets still uploading; retry {}/{} in {:?}",
+                release.tag_name,
+                attempt + 1,
+                ASSET_UPLOAD_RETRY_ATTEMPTS,
+                ASSET_UPLOAD_RETRY_DELAY
+            );
+            tokio::time::sleep(ASSET_UPLOAD_RETRY_DELAY).await;
+        }
+        Err(anyhow!(
+            "no usable piper asset in release {} (wanted one of: {}; available: {})",
+            release.tag_name,
+            last_missing.map_or_else(
+                || "n/a".into(),
+                |p| {
+                    p.iter()
+                        .map(|x| x.includes.join("+"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            ),
+            release
+                .assets
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
     /// Shared install tail for every engine source (release asset,
     /// source build): probe the binary, warn on GPU-asset-sees-no-GPU,
     /// store the row, activate it, publish, prune old tags.
@@ -1864,6 +1943,7 @@ impl EngineManager {
             EngineKind::Whisper => {
                 find_engine_binary(dir, &["whisper-server", "whisper-server.exe"])
             }
+            EngineKind::Piper => find_engine_binary(dir, &["piper", "piper.exe"]),
         }
         .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
         make_executable(&server);
@@ -1917,6 +1997,12 @@ impl EngineManager {
             EngineKind::Whisper => {
                 tracing::debug!(target: "blazar::engine", "registered whisper {tag} ({asset_label})");
             }
+            // piper synthesizes one-shot per request from the gateway
+            // TTS handler (no supervised spawn, no device enumeration —
+            // the CLI phonemizes through its bundled espeak-ng data).
+            EngineKind::Piper => {
+                tracing::debug!(target: "blazar::engine", "registered piper {tag} ({asset_label})");
+            }
         }
         // Storage invariant: rows carry data-dir-relative server paths
         // (out-of-tree paths pass through untouched).
@@ -1957,11 +2043,12 @@ impl EngineManager {
                 .iter()
                 .any(|e| e.kind == row.kind && e.active);
         // Lazy lanes never claim the serving-active flag either: the
-        // supervisor adapter backs model serving, while the audio lane
-        // boots on demand from the gateway. `serve` picks its adapter
-        // off the ACTIVE row, so a whisper install dethroning the
-        // serving engine left the daemon unable to boot at all.
-        let lazy_lane = row.kind == EngineKind::Whisper;
+        // supervisor adapter backs model serving, while the audio lanes
+        // (whisper transcription, piper synthesis) boot on demand from
+        // the gateway. `serve` picks its adapter off the ACTIVE row, so
+        // a lazy-lane install dethroning the serving engine left the
+        // daemon unable to boot at all.
+        let lazy_lane = row.kind.is_lazy_lane();
         let activated = !keep_cuda && !fork_additive && !lazy_lane;
         if activated {
             store.set_active_engine(tag)?;
@@ -2096,8 +2183,26 @@ impl EngineManager {
     pub fn use_tag(&self, tag: &str) -> Result<EngineRow> {
         let store = Store::open(&self.dirs)?;
         let engines = store.list_engines()?;
-        if !engines.iter().any(|e| e.tag == tag) {
+        let Some(row) = engines.iter().find(|e| e.tag == tag) else {
             return Err(dead_tag_error(tag, &engines));
+        };
+        // Lazy audio lanes never take the serving-active flag: `serve`
+        // boots its adapter off the ACTIVE row, and a transcription or
+        // synthesis lane there cannot back model traffic (a whisper
+        // `use` used to wedge the daemon into exactly that state, then
+        // every update dance resolved against the llamacpp channel and
+        // failed with "release not found"). Selection on those lanes
+        // rides the lane pin instead — teach the per-kind command.
+        if row.kind.is_lazy_lane() {
+            anyhow::bail!(
+                "{tag} is a {} lane — audio lanes serve lazily through /v1/audio and never \
+                 take the serving-active flag; pin the lane instead: {}",
+                row.kind,
+                match row.kind {
+                    EngineKind::Whisper => format!("blazar whisper --pin {tag}"),
+                    _ => format!("blazar tts --install --tag {tag}"),
+                }
+            );
         }
         store.set_active_engine(tag)?;
         self.bus.publish(BlazarEvent::EngineUpdated {
@@ -2422,7 +2527,11 @@ impl EngineManager {
                 continue;
             }
             let floor = manifest.floor_release;
-            if !manifest.architectures.iter().all(|arch| covers(arch, floor)) {
+            if !manifest
+                .architectures
+                .iter()
+                .all(|arch| covers(arch, floor))
+            {
                 continue;
             }
             // Graduation target: the newest mainstream lane covering
@@ -2966,6 +3075,136 @@ impl EngineManager {
             }
         }
     }
+
+    /// Adopt legacy `data/piper` tag dirs into the engines lane (the
+    /// TTS lane's pre-engines install tree). Same contract as the
+    /// whisper adoption: newest-first, probe-first, crash-safe; a tree
+    /// that cannot adopt stays serving from the legacy lane. After one
+    /// clean pass this is a no-op. Returns the adopted tags, newest
+    /// first.
+    pub fn adopt_piper_legacy_trees(&self) -> Vec<String> {
+        let engines_root = self.dirs.engines_dir();
+        let rows = Store::open(&self.dirs)
+            .and_then(|store| store.list_engines())
+            .unwrap_or_default();
+        let mut adopted = Vec::new();
+        for legacy_dir in crate::piper::sorted_tag_dirs(&self.dirs) {
+            let Some(tag) = legacy_dir
+                .file_name()
+                .and_then(|t| t.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            // Already adopted: a piper row for this tag whose anchored
+            // binary resolves (second boot after a first-pass adoption,
+            // or a tag the engines lane itself installed).
+            let already = rows.iter().any(|row| {
+                row.kind == EngineKind::Piper
+                    && row.tag == tag
+                    && serde_json::from_str::<manifest::Manifest>(&row.manifest).is_ok_and(
+                        |mut m| {
+                            m.anchor_server_path(&self.dirs.data_dir);
+                            PathBuf::from(&m.server_path).is_file()
+                        },
+                    )
+            });
+            if already {
+                continue;
+            }
+            match self.adopt_piper_tree(&legacy_dir, &tag, &engines_root) {
+                Ok(()) => adopted.push(tag),
+                Err(e) => {
+                    tracing::warn!(
+                        "piper legacy tree {} not adopted (left serving from the legacy lane): {e}",
+                        legacy_dir.display()
+                    );
+                }
+            }
+        }
+        adopted
+    }
+
+    /// Move one legacy piper tree into the engines lane and register
+    /// it. Ordering is zero-loss: probe before anything moves, retire
+    /// any stale target aside, rename, register, and on failure rescue
+    /// the tree back to its legacy path before restoring the aside.
+    fn adopt_piper_tree(&self, legacy_dir: &Path, tag: &str, engines_root: &Path) -> Result<()> {
+        // Adoption can be the first engines-lane writer in a fresh
+        // store — the rename target must exist.
+        std::fs::create_dir_all(engines_root)
+            .with_context(|| format!("mkdir {}", engines_root.display()))?;
+        let target = engines_root.join(tag);
+        // Probe at the legacy path FIRST: a tree without a runnable
+        // piper binary (corrupt extract, foreign content) must fail
+        // before anything moves.
+        let bin = find_engine_binary(legacy_dir, &["piper", "piper.exe"])?;
+        let label = bin
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|n| n.starts_with("piper"))
+            .unwrap_or("legacy");
+        let digest = legacy_tree_digest(&bin)?;
+        // A stale target dir (crash between rename and register, or a
+        // hand-dropped dir) retires aside so the rename lands on the
+        // final path; the aside stays recoverable until registration
+        // succeeds.
+        let aside = retire_engine_dir(&self.dirs.data_dir, &target)?;
+        if let Err(e) = std::fs::rename(legacy_dir, &target) {
+            restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &target);
+            return Err(anyhow!(
+                "move {} -> {}: {e}",
+                legacy_dir.display(),
+                target.display()
+            ));
+        }
+        match self.register_engine(target.as_path(), tag, label, &digest, EngineKind::Piper) {
+            Ok(row) => {
+                discard_retired_engine(&self.dirs.data_dir, aside.as_deref());
+                tracing::info!(
+                    "adopted legacy piper tree {tag} into the engines lane ({})",
+                    row.asset
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Registration failed after the move: drop any row the
+                // failed attempt left behind, rescue the tree back to
+                // the legacy lane, then put the aside back.
+                if let Ok(store) = Store::open(&self.dirs) {
+                    if let Err(del) = store.delete_engine(tag) {
+                        tracing::warn!("cannot drop failed adoption row for {tag}: {del}");
+                    }
+                }
+                if let Err(back) = std::fs::rename(&target, legacy_dir) {
+                    // The tree cannot go home: it already sits at the
+                    // final path, so registration is the only way
+                    // forward — retry once before giving up.
+                    tracing::error!(
+                        "cannot restore {} -> {} ({back}) — retrying registration",
+                        target.display(),
+                        legacy_dir.display()
+                    );
+                    let row = self.register_engine(
+                        target.as_path(),
+                        tag,
+                        label,
+                        &digest,
+                        EngineKind::Piper,
+                    )?;
+                    discard_retired_engine(&self.dirs.data_dir, aside.as_deref());
+                    tracing::info!(
+                        "adopted legacy piper tree {tag} into the engines lane ({})",
+                        row.asset
+                    );
+                    return Ok(());
+                }
+                restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &target);
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Content digest of a legacy tree's server binary — the honest value
@@ -2989,14 +3228,10 @@ fn now_secs() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-/// Extract tar.gz or zip into `dir` (strip nothing; roots are discovered).
+/// Extract a downloaded tar.gz / zip asset into `dir` (strip nothing;
+/// roots are discovered). File-backed so GiB-class archives (mistralrs
+/// CUDA) stream off disk instead of buffering.
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // exact upstream asset names
-pub(crate) fn extract_archive(bytes: &[u8], dir: &Path, asset_name: &str) -> Result<()> {
-    extract_reader(std::io::Cursor::new(bytes), dir, asset_name)
-}
-
-/// File-backed variant for assets too large to buffer (mistralrs CUDA
-/// archives are GiB-class); mirrors `extract_archive` semantics.
 pub(crate) fn extract_archive_file(path: &Path, dir: &Path, asset_name: &str) -> Result<()> {
     let f = std::fs::File::open(path)
         .with_context(|| format!("open downloaded archive {}", path.display()))?;
@@ -3208,9 +3443,10 @@ pub fn smoke_probe(
         // banner and exit 0 (verified v0.9.4 / master-890).
         EngineKind::MistralRs | EngineKind::SdCpp => native_version_probe(manifest),
         // whisper-server has no --version flag (unknown argument,
-        // verified b5130) — its cheap liveness probe is --help, which
-        // exits 0 with usage exactly like llama's.
-        EngineKind::Whisper => native_help_probe(manifest),
+        // verified b5130) and piper answers --help with its option
+        // table the same way — the shared lazy-lane liveness shape:
+        // usage on stdout/stderr, exit 0.
+        EngineKind::Whisper | EngineKind::Piper => native_help_probe(manifest),
     }
 }
 
@@ -4049,7 +4285,6 @@ mod debris_tests {
         );
     }
 }
-
 
 #[cfg(test)]
 mod supersede_floor_tests {

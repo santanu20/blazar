@@ -1370,8 +1370,11 @@ def media_family(
         real_data = Path.home() / ".local/share/blazar"
         if stage_voices:
             _hardlink_tree(real_data / "voices", Path(sb.data_dir) / "voices")
-            # the piper engine binary lives outside engines/ — stage it too,
-            # the gateway 404s with "piper is not installed" without it
+            # Piper resolution is pin -> engines row -> legacy data/piper
+            # tree. The sandbox hardlink-copies engines/ (Sandbox.__init__),
+            # covering the engines lane; this stages the legacy tree so a
+            # host still serving piper from data/piper (pre-lane install,
+            # or a pin into it) does not 404 with "piper is not installed".
             _hardlink_tree(real_data / "piper", Path(sb.data_dir) / "piper")
         if stage_whisper_models:
             src = real_data / "whisper" / "models"
@@ -8170,7 +8173,10 @@ ENGINE_LABELS = {
     "b11070-cuda": "llama.cpp b11070 (CUDA build)",
     "master-890-74988b2": "stable-diffusion.cpp master-890 (Vulkan)",
     "b5130": "whisper.cpp b5130",
-    "piper": "piper (gateway TTS lane)",
+    # The TTS lane's serving tag is a piper date tag once installed via
+    # the engines lane (`blazar tts --install` / `engine install --kind
+    # piper`); the bare "piper" key covers the pre-lane legacy label.
+    "piper": "piper TTS (engines lane)",
 }
 
 # Hardware rows describe the measuring host (this repo's reference box);

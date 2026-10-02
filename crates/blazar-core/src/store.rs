@@ -969,19 +969,39 @@ impl Store {
         Ok(())
     }
 
-    /// Boot-time self-heal for the zero-active state (the class F120's
-    /// transaction fixed mid-write; an update interrupted before its
-    /// activation step lands here): when no row holds the active flag
-    /// but serving-capable engines are installed, activate the best one
-    /// — llamacpp lanes first (router mode's native lane), newest
-    /// within the kind — so one stale flag can never brick `serve`
-    /// while good engines sit installed. Returns the activated tag, or
-    /// None when the store needs no healing. Lazy lanes (whisper,
-    /// sdcpp) never claim the slot: the active row is the serving
-    /// adapter and must stay a text lane.
+    /// Boot-time self-heal for the active flag. Two states heal:
+    ///
+    /// 1. Lazy-active: the flagged row is an audio lane (whisper, piper)
+    ///    that a pre-guard store flipped on — a text boot over that
+    ///    store picks no adapter and dies. Demote it, then fall through
+    ///    to the pick (an audio-only box lands at zero-active, its
+    ///    pre-lane state; serving through `/v1/audio` never read the
+    ///    flag and keeps working).
+    /// 2. Zero-active: no row holds the flag but serving-capable
+    ///    engines are installed (the class F120's transaction fixed
+    ///    mid-write; an update interrupted before its activation step
+    ///    lands here): activate the best one — llamacpp lanes first
+    ///    (router mode's native lane), newest within the kind — so one
+    ///    stale flag can never brick `serve` while good engines sit
+    ///    installed.
+    ///
+    /// Returns the activated tag, or None when the store needs no
+    /// healing. Lazy lanes (whisper, piper, sdcpp) never claim the slot:
+    /// the active row is the serving adapter and must stay a text lane.
     pub fn heal_active_engine(&self) -> CoreResult<Option<String>> {
-        if self.active_engine()?.is_some() {
-            return Ok(None);
+        if let Some(active) = self.active_engine()? {
+            if !active.kind.is_lazy_lane() {
+                return Ok(None);
+            }
+            self.conn.execute(
+                "UPDATE engines SET active = 0 WHERE tag = ?1",
+                params![active.tag],
+            )?;
+            tracing::info!(
+                "demoted lazy {} row {} off the serving-active slot",
+                active.kind.as_str(),
+                active.tag
+            );
         }
         let rank = |k: crate::engine_kind::EngineKind| match k {
             crate::engine_kind::EngineKind::LlamaCpp => 2,
@@ -1637,6 +1657,84 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM responses", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 3);
+    }
+
+    fn engine_row(tag: &str, at: i64, active: bool, kind: EngineKind) -> EngineRow {
+        EngineRow {
+            tag: tag.into(),
+            asset: "cpu".into(),
+            sha256: "x".into(),
+            installed_at: at,
+            active,
+            // Manifest JSON is opaque at this layer — the runtime layer
+            // parses it; heal only reads kind/active/installed_at.
+            manifest: "{}".into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn unit__heal_active_engine__demotes_lazy_active_and_picks_text_lane() {
+        let (_t, s) = tmp_store();
+        // The pre-guard incident shape: a whisper row holds the serving
+        // flag while text lanes sit installed — a text boot over this
+        // store would pick no adapter and die.
+        s.upsert_engine(&engine_row("b5130", 5000, true, EngineKind::Whisper))
+            .unwrap();
+        s.upsert_engine(&engine_row("m1", 4000, false, EngineKind::MistralRs))
+            .unwrap();
+        s.upsert_engine(&engine_row("b4000", 3000, false, EngineKind::LlamaCpp))
+            .unwrap();
+
+        let healed = s.heal_active_engine().unwrap();
+        assert_eq!(
+            healed,
+            Some("b4000".to_string()),
+            "llamacpp outranks a newer mistralrs row"
+        );
+        let active = s.active_engine().unwrap().expect("a text lane serves");
+        assert_eq!(
+            (active.tag.as_str(), active.kind),
+            ("b4000", EngineKind::LlamaCpp)
+        );
+        let whisper = s
+            .list_engines()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.tag == "b5130")
+            .unwrap();
+        assert!(
+            !whisper.active,
+            "the lazy row was demoted off the serving slot"
+        );
+    }
+
+    #[test]
+    fn unit__heal_active_engine__audio_only_box_lands_zero_active() {
+        let (_t, s) = tmp_store();
+        s.upsert_engine(&engine_row("2023.11.14-2", 5000, true, EngineKind::Piper))
+            .unwrap();
+        // Demotion with nothing to promote: the box rests at zero-active
+        // (its pre-lane state); /v1/audio serving never read the flag.
+        assert_eq!(s.heal_active_engine().unwrap(), None);
+        assert!(s.active_engine().unwrap().is_none());
+        // Idempotent: the second pass is a plain no-op.
+        assert_eq!(s.heal_active_engine().unwrap(), None);
+    }
+
+    #[test]
+    fn unit__heal_active_engine__healthy_active_untouched() {
+        let (_t, s) = tmp_store();
+        s.upsert_engine(&engine_row("b4000", 3000, true, EngineKind::LlamaCpp))
+            .unwrap();
+        s.upsert_engine(&engine_row("b5000", 5000, false, EngineKind::LlamaCpp))
+            .unwrap();
+        assert_eq!(s.heal_active_engine().unwrap(), None, "no healing to do");
+        assert_eq!(
+            s.active_engine().unwrap().map(|r| r.tag),
+            Some("b4000".to_string()),
+            "the newer inactive row did not steal the slot"
+        );
     }
 
     #[test]

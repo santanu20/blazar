@@ -4,17 +4,19 @@
 //! Unlike whisper-server, piper is a one-shot binary (stdin text, WAV on
 //! stdout via `--output_file -`), so this lane spawns per synthesis
 //! instead of holding a child: no runtime state, nothing to tear down.
-//! The install/pin/prune rails mirror the whisper lane exactly.
+//! Installs ride the engines lane (`blazar engine install --kind piper`
+//! / `blazar tts --install`) with rows, manifests, prune, and rollback
+//! like every other kind; a legacy `data/piper` tree predating that
+//! lane stays a read-only serving source until adopted.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::AsyncWriteExt as _;
 
-use crate::engine::gh::{GhClient, GhRelease};
 use blazar_core::BlazarDirs;
 
-pub const PIPER_REPO: &str = "rhasspy/piper";
+pub use crate::engine::gh::PIPER_REPO;
 pub const VOICES_REPO: &str = "rhasspy/piper-voices";
 
 /// Release asset for the running platform. Upstream ships six; anything
@@ -45,6 +47,14 @@ fn pin_path(dirs: &BlazarDirs) -> PathBuf {
     bin_root(dirs).join("pin")
 }
 
+/// Pin-file location from the bare data dir — engine-removal
+/// reconciliation (`engine rm` of a pinned tag) runs from the removal
+/// site, which owns the data dir but not a full `BlazarDirs`.
+#[must_use]
+pub fn pin_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("piper").join("pin")
+}
+
 fn valid_tag(tag: &str) -> bool {
     !tag.is_empty()
         && !tag.contains(std::path::MAIN_SEPARATOR)
@@ -56,9 +66,12 @@ fn valid_tag(tag: &str) -> bool {
 /// Sort key for a piper tag: the date shape `YYYY.MM.DD-N` (upstream
 /// has never shipped another form). Non-conforming tags order after
 /// date tags, alphabetically — newest installed still wins sanely.
-type TagKey = (u64, u64, u64, u64);
+/// `pub` mirrors `gh::btag_number`: the CLI currency lane ranks tags
+/// with it.
+pub type TagKey = (u64, u64, u64, u64);
 
-fn tag_key(tag: &str) -> Option<TagKey> {
+#[must_use]
+pub fn tag_key(tag: &str) -> Option<TagKey> {
     let mut parts = [0u64; 4];
     let mut saw = 0usize;
     for piece in tag.split(['.', '-']) {
@@ -76,7 +89,10 @@ fn tag_key(tag: &str) -> Option<TagKey> {
 
 type TagDirEntry = (Option<TagKey>, String, PathBuf);
 
-fn sorted_tag_dirs(dirs: &BlazarDirs) -> Vec<PathBuf> {
+/// Installed tag dirs, newest first — the LEGACY `data/piper` tree
+/// only. `pub(crate)`: the engines lane's legacy-tree adoption walks
+/// these same dirs, newest first (mirror of the whisper lane).
+pub(crate) fn sorted_tag_dirs(dirs: &BlazarDirs) -> Vec<PathBuf> {
     let mut dirs: Vec<TagDirEntry> = std::fs::read_dir(bin_root(dirs))
         .map(|rd| {
             rd.flatten()
@@ -117,110 +133,11 @@ fn piper_bin_in(dir: &Path) -> Option<PathBuf> {
     crate::whisper::walk_for_file(dir, name)
 }
 
-/// Newest release that actually ships `asset` (GitHub lists
-/// newest-first). Piper tags carry their assets on every release, but
-/// the guard keeps the lane honest if that ever changes.
-fn newest_with_asset<'a>(releases: &'a [GhRelease], asset: &str) -> Option<&'a GhRelease> {
-    releases
-        .iter()
-        .find(|r| r.assets.iter().any(|a| a.name == asset))
-}
-
-async fn release_for_channel(gh: &GhClient) -> Result<GhRelease> {
-    let asset_name = asset_name(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
-        anyhow!(
-            "piper releases ship no {}/{} binary — see \
-                 https://github.com/rhasspy/piper for source builds",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        )
-    })?;
-    let releases = gh.list_releases_repo(PIPER_REPO).await?;
-    newest_with_asset(&releases, asset_name)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "no {PIPER_REPO} release ships the {asset_name} asset \
-                 ({} checked) — upstream may have renamed assets",
-                releases.len()
-            )
-        })
-}
-
-/// Download + extract a piper release. `Some(tag)` installs that release
-/// (`pin = true` also pins it); `None` installs the newest and returns to
-/// tracking (clears any pin). Old tags prune to `KEEP_TAGS` (pinned
-/// always kept). Returns the installed tag.
-pub async fn install(
-    gh: &GhClient,
-    dirs: &BlazarDirs,
-    tag: Option<&str>,
-    pin: bool,
-) -> Result<String> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    let Some(asset_name) = asset_name(os, arch) else {
-        return Err(anyhow!(
-            "piper releases ship no {os}/{arch} binary — see \
-             https://github.com/rhasspy/piper for source builds"
-        ));
-    };
-    let release = match tag {
-        Some(t) => gh.release_by(PIPER_REPO, Some(t)).await?,
-        None => release_for_channel(gh).await?,
-    };
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == asset_name)
-        .ok_or_else(|| anyhow!("release {} has no asset {asset_name}", release.tag_name))?;
-    let bytes = gh.download_asset_bytes(asset).await?;
-    let dir = bin_root(dirs).join(&release.tag_name);
-    // Replace, don't merge — a re-install over an existing tag dir must
-    // not leave stale binaries from the old extract behind. A dir that
-    // resolves outside the data root (symlinked bin root) cannot be
-    // replaced in place, so the install refuses instead of merging.
-    if dir.exists() {
-        match blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir) {
-            Ok(
-                blazar_core::fs_safety::GuardedRemoval::Removed
-                | blazar_core::fs_safety::GuardedRemoval::Absent,
-            ) => {}
-            Ok(blazar_core::fs_safety::GuardedRemoval::Escaped) => {
-                return Err(anyhow!(
-                    "piper dir {} resolves outside the data root (symlinked \
-                     piper bin dir?) — unhook the link, then retry",
-                    dir.display()
-                ));
-            }
-            Err(e) => return Err(anyhow!("replace {}: {e}", dir.display())),
-        }
-    }
-    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-    crate::engine::extract_archive(&bytes, &dir, &asset.name)?;
-    piper_bin_in(&dir).ok_or_else(|| {
-        anyhow!(
-            "extracted {} but no piper binary found under {}",
-            asset.name,
-            dir.display()
-        )
-    })?;
-    match (tag, pin) {
-        (Some(_), true) => {
-            std::fs::write(pin_path(dirs), format!("{}\n", release.tag_name))
-                .with_context(|| format!("write pin {}", pin_path(dirs).display()))?;
-        }
-        (Some(_), false) => {}
-        (None, _) => {
-            let _ = std::fs::remove_file(pin_path(dirs));
-        }
-    }
-    prune(dirs)?;
-    Ok(release.tag_name)
-}
-
 /// Pin management, mirroring the whisper lane: pin an installed tag or
 /// `None` to clear; prune re-runs so a formerly-protected old tag drops.
+/// The tag may live in either lane — engines rows or the legacy tree —
+/// because the user has ONE `--pin` flag and cannot be expected to know
+/// which channel holds the tag.
 pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
     match tag {
         Some(t) => {
@@ -228,12 +145,21 @@ pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
             if !valid_tag(t) {
                 anyhow::bail!("invalid tag {t:?}: must be a plain tag name (no path separators)");
             }
-            if !installed_tags(dirs).iter().any(|installed| installed == t) {
+            let mut known = installed_tags(dirs);
+            known.extend(piper_engine_tags(dirs)?);
+            known.sort();
+            known.dedup();
+            if !known.iter().any(|installed| installed == t) {
                 anyhow::bail!(
                     "tag {t} is not installed (installed: {}) — run: blazar tts --install --tag {t}",
-                    installed_tags(dirs).join(", ")
+                    known.join(", ")
                 );
             }
+            // The engines lane never creates the legacy pin dir — a
+            // fresh install has no `data/piper` tree at all — so the
+            // pin site mkdirs its own home before the write.
+            std::fs::create_dir_all(bin_root(dirs))
+                .with_context(|| format!("mkdir {}", bin_root(dirs).display()))?;
             std::fs::write(pin_path(dirs), format!("{t}\n"))
                 .with_context(|| format!("write pin {}", pin_path(dirs).display()))?;
         }
@@ -243,6 +169,22 @@ pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
     }
     prune(dirs)?;
     Ok(())
+}
+
+/// Piper-kind engine row tags (the engines lane's install set), for
+/// `--pin` validation. Unlike the lane lookups this propagates a store
+/// failure: refusing a valid pin because the store could not be read
+/// would be a silent no-op of the user's explicit intent.
+fn piper_engine_tags(dirs: &BlazarDirs) -> Result<Vec<String>> {
+    let store =
+        blazar_core::Store::open(dirs).with_context(|| "open store to list piper engine tags")?;
+    let tags = store
+        .list_engines()?
+        .into_iter()
+        .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::Piper)
+        .map(|r| r.tag)
+        .collect();
+    Ok(tags)
 }
 
 fn prune(dirs: &BlazarDirs) -> Result<()> {
@@ -278,14 +220,32 @@ fn prune(dirs: &BlazarDirs) -> Result<()> {
 /// twice on Linux: `LD_LIBRARY_PATH` (the binary links sibling
 /// libonnxruntime/libespeak-ng) and the bundled `espeak-ng-data` passed
 /// as `--espeak_data` (piper resolves it relative to cwd otherwise).
+///
+/// Resolution mirrors the whisper lane: a pin is lane-agnostic (honored
+/// against the engines table first, then the legacy tree), then the
+/// engines lane's row, then the legacy `data/piper` tree newest-first —
+/// both stay working installs (the engines lane adopts legacy trees at
+/// serve preflight, doctor, and `engine prune`).
 #[must_use]
 pub fn server_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
     if let Some(tag) = pinned_tag(dirs) {
+        if let Some(row) = engines_lane_row(dirs) {
+            if row.tag == tag {
+                if let Some(bin) = engines_lane_server_bin(dirs, &row) {
+                    let lib = bin.parent()?.to_path_buf();
+                    return Some((bin, lib));
+                }
+            }
+        }
         let dir = bin_root(dirs).join(&tag);
         if let Some((bin, lib)) = bin_and_lib_in(&dir) {
             return Some((bin, lib));
         }
+        // Dangling pin (no row, no dir): fall through to the lanes' pick.
         tracing::warn!("piper pin {tag} has no binary; using newest installed tag");
+    }
+    if let Some(hit) = engines_lane_bin(dirs) {
+        return Some(hit);
     }
     for tag_dir in sorted_tag_dirs(dirs) {
         if let Some((bin, lib)) = bin_and_lib_in(&tag_dir) {
@@ -302,6 +262,98 @@ fn bin_and_lib_in(dir: &Path) -> Option<(PathBuf, PathBuf)> {
         .parent()
         .map_or_else(|| dir.to_path_buf(), Path::to_path_buf);
     Some((bin, lib))
+}
+
+/// The engines-table lane's piper row: a row matching the pin (see
+/// [`server_bin`] — pins are lane-agnostic) first, else the active row
+/// when one is flagged, else the newest installed. `None` when no piper
+/// row exists (the legacy tree decides) or the store cannot be read
+/// (warn, never mask).
+fn engines_lane_row(dirs: &BlazarDirs) -> Option<blazar_core::store::EngineRow> {
+    let store = match blazar_core::Store::open(dirs) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("piper engines-lane lookup could not open the store: {e:#}");
+            return None;
+        }
+    };
+    let rows = match store.list_engines() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("piper engines-lane listing failed: {e}");
+            return None;
+        }
+    };
+    if let Some(tag) = pinned_tag(dirs) {
+        if let Some(row) = rows
+            .iter()
+            .find(|r| r.kind == blazar_core::engine_kind::EngineKind::Piper && r.tag == tag)
+        {
+            return Some(row.clone());
+        }
+    }
+    // `list_engines` orders newest-installed first; the active row (if
+    // any) still wins so a flagged lane is honored. `installed_at`
+    // breaks ties explicitly — max_by_key on the active flag alone
+    // returns the LAST row among equal keys, i.e. the OLDEST.
+    rows.into_iter()
+        .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::Piper)
+        .max_by_key(|r| (i64::from(r.active), r.installed_at))
+}
+
+/// The engines-table lane: resolve the piper row's binary the same way
+/// register did. `None` when no piper row exists (legacy tree decides)
+/// or the store cannot be read (warn, never mask).
+fn engines_lane_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
+    let row = engines_lane_row(dirs)?;
+    let bin = engines_lane_server_bin(dirs, &row)?;
+    let lib = bin.parent()?.to_path_buf();
+    Some((bin, lib))
+}
+
+/// Row's binary: the install-time probed path when it still exists,
+/// otherwise re-derived from the tag dir (a relocated data dir must not
+/// brick the lane — same recovery register performs).
+fn engines_lane_server_bin(
+    dirs: &BlazarDirs,
+    row: &blazar_core::store::EngineRow,
+) -> Option<PathBuf> {
+    if let Ok(mut m) = serde_json::from_str::<crate::engine::manifest::Manifest>(&row.manifest) {
+        m.anchor_server_path(&dirs.data_dir);
+        let probed = PathBuf::from(&m.server_path);
+        if probed.is_file() {
+            return Some(probed);
+        }
+    }
+    crate::engine::find_engine_binary(&dirs.engines_dir().join(&row.tag), &["piper", "piper.exe"])
+        .ok()
+}
+
+/// The tag currency verdicts must compare against upstream: a mirror of
+/// [`server_bin`]'s pick (pin first — either lane — then the engines
+/// row, then the legacy tree). Update hints keyed on a bare lane listing
+/// would warn about a version the serving lane can never pick.
+#[must_use]
+pub fn installed_tag(dirs: &BlazarDirs) -> Option<String> {
+    if let Some(tag) = pinned_tag(dirs) {
+        let row_hit = engines_lane_row(dirs)
+            .filter(|r| r.tag == tag)
+            .is_some_and(|r| engines_lane_server_bin(dirs, &r).is_some());
+        let legacy_hit = bin_and_lib_in(&bin_root(dirs).join(&tag)).is_some();
+        if row_hit || legacy_hit {
+            return Some(tag);
+        }
+        // Dangling pin (no row with a binary, no dir): fall through.
+    }
+    if let Some(row) = engines_lane_row(dirs) {
+        if engines_lane_server_bin(dirs, &row).is_some() {
+            return Some(row.tag);
+        }
+    }
+    sorted_tag_dirs(dirs)
+        .into_iter()
+        .next()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
 }
 
 /// HF path stem for a piper voice id (`<locale>-<name>-<quality>`, e.g.

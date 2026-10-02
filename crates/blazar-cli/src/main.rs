@@ -276,7 +276,7 @@ enum Cmd {
         /// List installed whisper server tag + local models
         #[arg(long)]
         list: bool,
-        /// Search the upstream model catalog (ggerganov/whisper.cpp);
+        /// Search the upstream model catalog (ggerganov/whisper.cpp on
         /// bare --search lists every size, a substring filters (turbo,
         /// .en, q5). Sizes marked "pulled" are local already.
         #[arg(
@@ -2025,6 +2025,51 @@ fn routed_engine_lane(
     let Some((g_tag, g_kind)) = global else {
         return Err("no engine installed — blazar engine install --kind <kind>".to_string());
     };
+    // Block-diffusion LLM GGUFs: the arch loads in llama.cpp's loader
+    // but no HTTP server in the family runs the diffusion loop, so the
+    // text lane would decode garbage while appearing healthy. Mirror of
+    // the supervisor's route-time paradigm guard — the list ENGINE cell
+    // must agree with what the gateway would actually do at spawn.
+    // Only a FORK lane advertising the arch bypasses the guard:
+    // mainstream manifests mine loader-level support (llada is in the
+    // 150+ arch set of every overlay build), which is exactly the
+    // hazard — loading is not serving.
+    if let Some(arch) = arch {
+        if blazar_core::DIFFUSION_PARADIGM_ARCHS.contains(&arch) {
+            // Decoded manifests must outlive the borrowed lane views.
+            let decoded: Vec<(usize, blazar_runtime::Manifest)> = engine_rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+                .filter(|(_, r)| r.lane_class() == blazar_core::engine_kind::LaneClass::Fork)
+                .filter_map(|(i, r)| {
+                    serde_json::from_str::<blazar_runtime::Manifest>(&r.manifest)
+                        .ok()
+                        .map(|m| (i, m))
+                })
+                .collect();
+            let lanes: Vec<blazar_core::engine_kind::LaneArchView> = decoded
+                .iter()
+                .map(|(i, m)| {
+                    (
+                        engine_rows[*i].tag.as_str(),
+                        engine_rows[*i].lane_class(),
+                        m.advertised_archs(),
+                    )
+                })
+                .collect();
+            if blazar_core::engine_kind::advertising_lanes(arch, None, &lanes).is_empty() {
+                return Err(format!(
+                    "block-diffusion LLM (arch '{arch}') — no installed lane can serve it: \
+                     llama-server would decode it autoregressively into garbage, and llama.cpp \
+                     ships no HTTP diffusion server yet (upstream PR 24423 DiffusionGemma / \
+                     PR 17454 LLADA 2.0 tracking). Serve a transformer GGUF, or build a \
+                     capability lane once a diffusion-capable fork ships: \
+                     blazar engine build --fork <owner>/llama.cpp@<commit-sha>"
+                ));
+            }
+        }
+    }
     let overlay = cfg.overlay_for(name);
     let pin = overlay.engine.as_deref();
     let safetensors = std::path::Path::new(path).is_dir();
@@ -2245,6 +2290,9 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
         EngineKind::Whisper => {
             "whisper (~10 MiB, CPU) — audio transcription + translation (ggml models)".to_string()
         }
+        EngineKind::Piper => {
+            "piper (~5 MiB, CPU) — offline text-to-speech (rhasspy/piper voices)".to_string()
+        }
     }
 }
 
@@ -2259,6 +2307,7 @@ async fn install_missing_kind(
         EngineKind::MistralRs => engine_install_mistralrs(d, None).await,
         EngineKind::SdCpp => engine_install_sdcpp(d, None).await,
         EngineKind::Whisper => engine_install_whisper(d, None).await,
+        EngineKind::Piper => engine_install_piper(d, None).await,
         EngineKind::LlamaCpp => engine_update(d, None, false, false).await,
     }
 }
@@ -3651,6 +3700,50 @@ mod doctor_tests {
 
     #[test]
     #[allow(non_snake_case)]
+    fn unit__repl_lane_suffix__mirrors_list_routing_and_teaches() {
+        let row = |active: bool, tag: &str| blazar_core::store::EngineRow {
+            tag: tag.into(),
+            asset: "asset".into(),
+            sha256: "x".into(),
+            installed_at: 1,
+            active,
+            manifest: "{}".into(),
+            kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+        };
+        let engines = vec![row(true, "b11349-cuda")];
+        let global = engines
+            .iter()
+            .find(|r| r.active)
+            .map(|r| (r.tag.clone(), r.kind));
+        let cfg = blazar_core::Config::default();
+        let model = serde_json::from_value::<blazar_core::store::ModelRow>(serde_json::json!({
+            "name": "qwen3-8b-q4",
+            "repo": "qwen/qwen3-8b-gguf",
+            "quant": "Q4_K_M",
+            "path": "/models/qwen3-8b-q4.gguf",
+            "bytes": 1_i64,
+            "pulled_at": 1_i64,
+        }))
+        .expect("model row with serde defaults");
+        // Routed lane names kind + tag exactly like `blazar list`.
+        assert_eq!(
+            repl_lane_suffix_for(&cfg, &engines, global.as_ref(), Some(&model)),
+            "via llamacpp (b11349-cuda)"
+        );
+        // Unpulled model: the daemon stays the teacher — banner says so.
+        assert_eq!(
+            repl_lane_suffix_for(&cfg, &engines, global.as_ref(), None),
+            "(not pulled — engine lane resolves on first send)"
+        );
+        // Nothing installed: the routing lesson is carried verbatim.
+        assert_eq!(
+            repl_lane_suffix_for(&cfg, &[], None, Some(&model)),
+            "(engine lane: no engine installed — blazar engine install --kind <kind>)"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__versions_extras__older_count_and_active_mark_compose() {
         let row = |active: bool| blazar_core::store::EngineRow {
             tag: "b1".into(),
@@ -4148,16 +4241,18 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                     format!("{e} — run: blazar engine update"),
                 )),
             }
-            // Doctor is the discover-and-heal surface, so legacy whisper
-            // trees adopt here too. After a successful pass any ghost
-            // whisper row below is a genuinely dead tree (the adoption
-            // heals the masked-row shape by registering over it).
-            let adopted = mgr.adopt_whisper_legacy_trees();
+            // Doctor is the discover-and-heal surface, so legacy audio
+            // trees (whisper, piper) adopt here too. After a successful
+            // pass any ghost row below is a genuinely dead tree (the
+            // adoption heals the masked-row shape by registering over
+            // it).
+            let mut adopted = mgr.adopt_whisper_legacy_trees();
+            adopted.extend(mgr.adopt_piper_legacy_trees());
             if !adopted.is_empty() {
                 checks.push(Check::ok(
                     "engine",
                     format!(
-                        "adopted legacy whisper tree(s) {} into the engines lane",
+                        "adopted legacy audio tree(s) {} into the engines lane",
                         adopted.join(", ")
                     ),
                 ));
@@ -4596,6 +4691,9 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
         EngineKind::Sglang,
         EngineKind::SdCpp,
         EngineKind::Mlx,
+        // Whisper has its own dedicated currency check; piper rides
+        // this loop like any engines-lane citizen.
+        EngineKind::Piper,
     ] {
         let name = match kind {
             EngineKind::LlamaCpp => "versions llamacpp",
@@ -4604,6 +4702,7 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
             EngineKind::SdCpp => "versions sdcpp",
             EngineKind::Mlx => "versions mlx",
             EngineKind::Whisper => "versions whisper",
+            EngineKind::Piper => "versions piper",
         };
         // Rows arrive newest-first (installed_at DESC): the kind's newest
         // install is what an update would act on, retained rollback rows
@@ -4700,7 +4799,11 @@ async fn latest_engine_tag(kind: EngineKind) -> Option<String> {
         EngineKind::Mlx => blazar_runtime::engine::mlx_install::pypi_latest_mlx_lm()
             .await
             .ok(),
-        EngineKind::LlamaCpp | EngineKind::MistralRs | EngineKind::SdCpp | EngineKind::Whisper => {
+        EngineKind::LlamaCpp
+        | EngineKind::MistralRs
+        | EngineKind::SdCpp
+        | EngineKind::Whisper
+        | EngineKind::Piper => {
             let token = std::env::var("GH_TOKEN")
                 .or_else(|_| std::env::var("GITHUB_TOKEN"))
                 .ok();
@@ -4710,6 +4813,7 @@ async fn latest_engine_tag(kind: EngineKind) -> Option<String> {
                 EngineKind::LlamaCpp => gh.channel_b_release(channel).await,
                 EngineKind::MistralRs => gh.latest_mistralrs_release().await,
                 EngineKind::SdCpp => gh.latest_sdcpp_release().await,
+                EngineKind::Piper => gh.latest_piper_release().await,
                 _ => gh.latest_whisper_release().await,
             };
             fetched.ok().map(|rel| rel.tag_name)
@@ -5690,14 +5794,16 @@ async fn serve() -> Result<()> {
         mgr.use_tag(&row.tag)?;
         println!("BLAZAR_ENGINE_PATH: engine local active ({})", p.display());
     }
-    // Adopt legacy whisper trees into the engines lane before the
-    // serving pick: resolution already prefers rows, so the pick is
-    // identical — but the tree gains prune/verify coverage and ghost
-    // rows heal instead of being masked by the legacy tree.
-    let adopted = local_engine_manager(&d)?.adopt_whisper_legacy_trees();
+    // Adopt legacy audio trees (whisper, piper) into the engines lane
+    // before the serving pick: resolution already prefers rows, so the
+    // pick is identical — but the trees gain prune/verify coverage and
+    // ghost rows heal instead of being masked by the legacy trees.
+    let audio_mgr = local_engine_manager(&d)?;
+    let mut adopted = audio_mgr.adopt_whisper_legacy_trees();
+    adopted.extend(audio_mgr.adopt_piper_legacy_trees());
     if !adopted.is_empty() {
         println!(
-            "serve: adopted legacy whisper tree(s) {} into the engines lane",
+            "serve: adopted legacy audio tree(s) {} into the engines lane",
             adopted.join(", ")
         );
     }
@@ -5806,11 +5912,19 @@ async fn serve() -> Result<()> {
         // Defense: a lazy audio lane can never back the supervisor (it
         // has no model-serving surface). Installs never activate it, so
         // reaching this arm means a hand-edited store — name recovery.
-        blazar_core::engine_kind::EngineKind::Whisper => {
+        audio_kind @ (blazar_core::engine_kind::EngineKind::Whisper
+        | blazar_core::engine_kind::EngineKind::Piper) => {
+            let surface = match audio_kind {
+                blazar_core::engine_kind::EngineKind::Whisper => {
+                    "POST /v1/audio/transcriptions and /v1/audio/translations"
+                }
+                _ => "POST /v1/audio/speech",
+            };
             anyhow::bail!(
-                "the active engine row is the whisper audio lane — it serves only \
-                 POST /v1/audio/transcriptions and cannot back model serving; run \
-                 `blazar engine use <tag>` on a serving engine (see `blazar engine list`)"
+                "the active engine row is the {} audio lane — it serves only {surface} and \
+                 cannot back model serving; run `blazar engine use <tag>` on a serving engine \
+                 (see `blazar engine list`)",
+                audio_kind.as_str()
             )
         }
     };
@@ -6486,7 +6600,7 @@ fn list_json_row(
         .mmproj_path
         .as_ref()
         .map(|p| std::fs::metadata(p).map_or(0, |md| md.len()));
-    let engine = routed_engine_lane(
+    let lane = routed_engine_lane(
         cfg,
         global,
         engine_rows,
@@ -6495,9 +6609,14 @@ fn list_json_row(
         m.arch.as_deref(),
         m.has_component_set(),
         &m.path,
-    )
-    .ok()
-    .and_then(|lane| (!lane.is_empty()).then_some(lane));
+    );
+    let unservable = match &lane {
+        Err(teach) if teach.starts_with("block-diffusion LLM") => Some(teach.clone()),
+        _ => None,
+    };
+    let engine = lane
+        .ok()
+        .and_then(|lane| (!lane.is_empty()).then_some(lane));
     // Machine companion of the table's decorated ENGINE cell: the raw
     // tag stays the routing identity (gateway-consistent); `engine_kind`
     // is its typed form, no tag-prefix parsing required downstream.
@@ -6527,6 +6646,11 @@ fn list_json_row(
         )
     }) {
         row["engine_arch_gap"] = serde_json::json!(arch);
+    }
+    // Additive companion of the table footer: WHY the engine is null
+    // when the paradigm guard refuses (see routed_engine_lane).
+    if let Some(teach) = unservable {
+        row["engine_unservable"] = serde_json::json!(teach);
     }
     row
 }
@@ -6559,6 +6683,9 @@ fn list(json: bool) -> Result<()> {
     }
     let mut arch_gaps: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
+    // Paradigm-refused models keep the "-" cell; their teaching shows
+    // once under the table (same shape as the arch-gap footer).
+    let mut paradigm_notes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let rows: Vec<[String; 9]> = models
         .iter()
         .map(|m| {
@@ -6577,7 +6704,7 @@ fn list(json: bool) -> Result<()> {
                     }
                 },
             );
-            let engine = routed_engine_lane(
+            let engine = match routed_engine_lane(
                 &cfg,
                 global.as_ref(),
                 &engine_rows,
@@ -6586,8 +6713,15 @@ fn list(json: bool) -> Result<()> {
                 m.arch.as_deref(),
                 m.has_component_set(),
                 &m.path,
-            )
-            .unwrap_or_else(|_| "-".to_string());
+            ) {
+                Ok(lane) => lane,
+                Err(teach) => {
+                    if teach.starts_with("block-diffusion LLM") {
+                        paradigm_notes.insert(format!("{} ({})", teach, m.name));
+                    }
+                    "-".to_string()
+                }
+            };
             // Same marker the JSON lane carries: the routing lane cannot
             // load this arch — the cell gets a dagger and the footer
             // teaches the fork-lane rescue.
@@ -6613,6 +6747,9 @@ fn list(json: bool) -> Result<()> {
         )
     );
     print_arch_gap_footer(&arch_gaps);
+    for note in &paradigm_notes {
+        println!("\n  {note}");
+    }
     Ok(())
 }
 
@@ -8434,12 +8571,14 @@ async fn tts_cmd(
         return Ok(());
     }
     if install {
-        let pinned = tag.is_some();
-        let token = std::env::var("GH_TOKEN").ok();
-        let gh = GhClient::new(token)?;
-        let tag = blazar_runtime::piper::install(&gh, &d, tag.as_deref(), pinned).await?;
-        let pin = if pinned { " (pinned)" } else { "" };
-        println!("piper installed{pin}: {tag}");
+        // Engines lane (rows, manifest, prune, rollback) — the legacy
+        // data/piper tree is only a read-over source until adopted.
+        // `--tag X` keeps the historical UX: install X, then pin it.
+        engine_install_piper(&d, tag.clone()).await?;
+        if let Some(t) = &tag {
+            blazar_runtime::piper::set_pin(&d, Some(t))?;
+            println!("piper pinned to {}", t.trim());
+        }
         return Ok(());
     }
     if let Some(voice) = pull {
@@ -8737,7 +8876,8 @@ async fn whisper_cmd(
 }
 
 /// Catalog arm of `blazar whisper --search [substr]`: every ggml size
-/// the upstream `ggerganov/whisper.cpp` repo ships, filtered by size
+/// the upstream `ggerganov/whisper.cpp` HF repo ships (the model catalog
+/// did not move with the GitHub org migration), filtered by size
 /// substring, with pulled state per row.
 async fn whisper_search(d: &BlazarDirs, query: &str) -> Result<()> {
     let token = std::env::var("HF_TOKEN").ok();
@@ -9142,7 +9282,10 @@ async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
     let mut thinks = true;
     #[cfg(unix)]
     install_repl_sigint();
-    println!("blazar REPL — /help for commands");
+    println!(
+        "blazar REPL — {model} {} — /help for commands",
+        repl_lane_suffix(&model)?
+    );
     loop {
         let line = match rl.readline(">>> ") {
             Ok(l) => l,
@@ -9170,6 +9313,7 @@ async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
         } else {
             line
         };
+        let model_before = model.clone();
         match repl_local_command(
             &line,
             &mut history,
@@ -9179,7 +9323,14 @@ async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
             &mut thinks,
         ) {
             Some(true) => break,
-            Some(false) => continue,
+            Some(false) => {
+                // `/model` switched lanes: re-resolve so the session never
+                // carries a stale engine advertisement into later turns.
+                if model != model_before {
+                    println!("{}", repl_lane_suffix(&model)?);
+                }
+                continue;
+            }
             None => {}
         }
         match line.as_str() {
@@ -10731,6 +10882,7 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         EngineKind::Mlx => "mlx-lm",
         EngineKind::SdCpp => "sd-server",
         EngineKind::Whisper => "whisper-server",
+        EngineKind::Piper => "piper",
     };
     out.push(format!("# engine lane: {lane} ({tag})"));
     out.push(
@@ -10805,6 +10957,10 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
             // call), not config knobs — same discipline as the image
             // lane.
             EngineKind::Whisper => Some(("whisper", vec![])),
+            // TTS lane: voice/speed ride the /v1/audio/speech request
+            // body, not config knobs — same request-driven discipline
+            // as the other audio lane.
+            EngineKind::Piper => Some(("piper", vec![])),
             // MLX lane has no config table yet — extra flags ride the
             // generic model_overrides.argv passthrough, so no table
             // header is advertised here (a hinted-but-unsettable table
@@ -11265,6 +11421,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
                     EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
                     EngineKind::Whisper => engine_update_whisper(&d, tag, check).await?,
+                    EngineKind::Piper => engine_update_piper(&d, tag, check).await?,
                 }
             }
         }
@@ -11531,6 +11688,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                      --kind mlx        MLX quant dirs (mlx-community) — pip venv (CUDA linux + Apple Silicon)\n  \
                      --kind sdcpp      diffusion GGUF component sets — prebuilt sd-server (Vulkan/CPU/Metal)\n  \
                      --kind whisper    audio transcription/translation — prebuilt whisper-server (CPU)\n  \
+                     --kind piper      text-to-speech — prebuilt piper CLI, rhasspy voices (CPU)\n  \
                      capability lane   blazar engine offers + install --lane <id> (fork builds)"
                 ));
             };
@@ -11543,11 +11701,12 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 EngineKind::Mlx => engine_install_mlx(&d, tag).await?,
                 EngineKind::SdCpp => engine_install_sdcpp(&d, tag).await?,
                 EngineKind::Whisper => engine_install_whisper(&d, tag).await?,
+                EngineKind::Piper => engine_install_piper(&d, tag).await?,
                 EngineKind::LlamaCpp => {
                     return Err(anyhow!(
                         "llama.cpp engines install via `blazar engine update` / `blazar \
                          engine build` — `engine install --kind` serves mistralrs, sglang, \
-                         mlx, sdcpp and whisper"
+                         mlx, sdcpp, whisper and piper"
                     ));
                 }
             }
@@ -11757,7 +11916,7 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
 }
 
 /// `blazar engine install --kind whisper [tag]` — prebuilt
-/// whisper-server from ggerganov/whisper.cpp (b-tag releases; the v-tags
+/// whisper-server from ggml-org/whisper.cpp (b-tag releases; the v-tags
 /// are source-only). Serving is CPU-contract, so the asset pick is
 /// platform-shaped. The F7 decode-regression gate is llama-server-only:
 /// skipped, and SAID so.
@@ -11850,6 +12009,101 @@ async fn engine_update_whisper(d: &BlazarDirs, tag: Option<String>, check: bool)
     engine_install_whisper(d, Some(target)).await
 }
 
+/// `blazar engine install --kind piper [tag]` / `blazar tts --install
+/// [--tag]` — prebuilt piper CLI from rhasspy/piper (date-shaped tags,
+/// one CPU asset per platform). A lazy audio lane: the row never takes
+/// the serving-active flag — serving resolves pin-first through
+/// `/v1/audio/speech`. The F7 decode-regression gate is
+/// llama-server-only: skipped, and SAID so.
+async fn engine_install_piper(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
+    println!(
+        "{}",
+        dim_line(&format!(
+            "installing piper {wanted} (prebuilt upstream TTS CLI)"
+        ))
+    );
+    let row = mgr.update_piper(tag.as_deref()).await?;
+    let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} installed ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!(
+        "{}",
+        dim_line("note: decode-regression gate is llama-server-only — skipped for piper engines")
+    );
+    // Same one-build-per-lane contract as the other engine lanes.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::Piper.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
+        println!(
+            "removed superseded engine {tag} (freed {})",
+            humansize(freed)
+        );
+    }
+    Ok(())
+}
+
+/// `blazar engine update --kind piper [tag]` — currency lane parity:
+/// a bare call probes rhasspy/piper and installs the newest date-tagged
+/// release when one exists; an explicit tag force-installs it. The
+/// date tag is the ordering (see `piper::tag_key`). `--check` resolves
+/// and reports only.
+async fn engine_update_piper(d: &BlazarDirs, tag: Option<String>, check: bool) -> Result<()> {
+    let store = Store::open(d)?;
+    let Some(installed) = newest_piper_tag(&store)? else {
+        return Err(anyhow!(
+            "no piper engine installed — `blazar engine install --kind piper` (or `blazar \
+             tts --install`) first"
+        ));
+    };
+    let pinned = tag.is_some();
+    let target = if let Some(t) = tag {
+        t
+    } else {
+        // Currency probe: live latest-tag resolve under the shared
+        // bounded-retry policy (same policy as the whisper lane).
+        let mgr = local_engine_manager(d)?;
+        let fetched = mgr.gh.latest_piper_release().await;
+        match fetched {
+            Ok(rel) => rel.tag_name,
+            Err(e) => anyhow::bail!(
+                "cannot check rhasspy/piper releases: {e:#} — offline? set GH_TOKEN if rate limited"
+            ),
+        }
+    };
+    let newer = matches!(
+        (
+            blazar_runtime::piper::tag_key(&installed),
+            blazar_runtime::piper::tag_key(&target),
+        ),
+        (Some(a), Some(b)) if b > a
+    );
+    if check {
+        println!(
+            "{}",
+            dim_line("dry-run: nothing installed, nothing written")
+        );
+        if newer {
+            println!("would update piper {installed} -> {target}");
+            println!("  blazar engine update --kind piper {target}");
+        } else {
+            println!("piper {installed} stays (target: {target})");
+        }
+        return Ok(());
+    }
+    if !pinned && !newer {
+        println!("piper {installed} is current (upstream latest: {target}).");
+        return Ok(());
+    }
+    engine_install_piper(d, Some(target)).await
+}
+
 /// Newest installed mistral.rs tag (`vX.Y.Z`), the currency baseline for
 /// the update lane. `list_engines` is newest-first, but the explicit
 /// version compare keeps the pick honest if row order ever changes.
@@ -11881,6 +12135,18 @@ fn newest_whisper_tag(store: &Store) -> Result<Option<String>> {
         .into_iter()
         .filter(|e| e.kind == EngineKind::Whisper)
         .max_by_key(|e| blazar_runtime::engine::gh::btag_number(&e.tag).unwrap_or(0))
+        .map(|e| e.tag.clone()))
+}
+
+/// Newest installed piper tag (`YYYY.MM.DD-N` date shape) by date key —
+/// mirrors `newest_whisper_tag` for the piper lane. Non-conforming tags
+/// rank as zero, so a malformed row can never win the currency pick.
+fn newest_piper_tag(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::Piper)
+        .max_by_key(|e| blazar_runtime::piper::tag_key(&e.tag).unwrap_or((0, 0, 0, 0)))
         .map(|e| e.tag.clone()))
 }
 
@@ -12315,6 +12581,7 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
             EngineKind::MistralRs => engine_update_mistralrs(d, None, check).await,
             EngineKind::SdCpp => engine_update_sdcpp(d, None, check).await,
             EngineKind::Whisper => engine_update_whisper(d, None, check).await,
+            EngineKind::Piper => engine_update_piper(d, None, check).await,
         };
         if let Err(e) = result {
             eprintln!("lane {} failed: {e:#}", kind.as_str());
@@ -13175,11 +13442,12 @@ fn engine_prune(d: &BlazarDirs) -> Result<()> {
 fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
     let store = Store::open(d)?;
     let mgr = local_engine_manager(d)?;
-    // Adopt-before-prune: a legacy whisper tree that crashed between
+    // Adopt-before-prune: a legacy audio tree that crashed between
     // move and register is an unregistered engines/<tag> dir — exactly
     // what prune_orphan_dirs below deletes. Adopting first closes that
     // crash window; adopting any other leftover is a free heal.
-    let adopted = mgr.adopt_whisper_legacy_trees();
+    let mut adopted = mgr.adopt_whisper_legacy_trees();
+    adopted.extend(mgr.adopt_piper_legacy_trees());
     let freed = mgr.prune(&store, None)?;
     // Row-less dirs are invisible to the table sweep above yet eat disk;
     // reclaim them in the same manual pass.
@@ -13195,7 +13463,7 @@ fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
     let mut parts = Vec::new();
     if !adopted.is_empty() {
         parts.push(format!(
-            "adopted legacy whisper tree(s) {} into the engines lane",
+            "adopted legacy audio tree(s) {} into the engines lane",
             adopted.join(", ")
         ));
     }
@@ -16902,6 +17170,91 @@ mod tests {
                 "/x/m.gguf"
             ),
             Ok("b-main".to_string())
+        );
+    }
+
+    #[test]
+    fn unit__routed_engine_lane__diffusion_paradigm_archs_mirror_the_spawn_guard() {
+        use blazar_core::engine_kind::EngineKind;
+
+        let cfg = blazar_core::Config::default();
+        let engine_rows = vec![gap_engine_row("b-new", EngineKind::LlamaCpp, &["qwen2"])];
+        let global = ("b-new".to_string(), EngineKind::LlamaCpp);
+
+        // llada with no advertising lane: the ENGINE cell teaches the
+        // paradigm error — same words the gateway spawn guard emits.
+        let err = routed_engine_lane(
+            &cfg,
+            Some(&global),
+            &engine_rows,
+            "m",
+            "",
+            Some("llada"),
+            false,
+            "/x/m.gguf",
+        )
+        .unwrap_err();
+        assert!(err.contains("block-diffusion LLM"), "{err}");
+        assert!(err.contains("'llada'"), "{err}");
+        assert!(err.contains("PR 24423"), "{err}");
+
+        // A MAINSTREAM lane advertising the arch does NOT bypass the
+        // guard: overlay builds mine 150+ loader archs including llada,
+        // and loader support is precisely the hazard (loads, then
+        // decodes garbage). This is the live-overlay shape, pinned.
+        let mainstream_advertiser = vec![
+            gap_engine_row("b-new", EngineKind::LlamaCpp, &["qwen2"]),
+            gap_engine_row("b-overlay", EngineKind::LlamaCpp, &["llada"]),
+        ];
+        let err = routed_engine_lane(
+            &cfg,
+            Some(&global),
+            &mainstream_advertiser,
+            "m",
+            "",
+            Some("llada"),
+            false,
+            "/x/m.gguf",
+        )
+        .unwrap_err();
+        assert!(err.contains("block-diffusion LLM"), "{err}");
+
+        // A fork lane (manifest source "fork") advertising the arch
+        // bypasses the guard — the capability-rescue symmetry the
+        // spawn guard promises.
+        let mut fork_row = gap_engine_row("b-diff-fork", EngineKind::LlamaCpp, &["llada"]);
+        fork_row.manifest = fork_row.manifest.replace("{", "{\"source\":\"fork\",");
+        let with_fork = vec![
+            gap_engine_row("b-new", EngineKind::LlamaCpp, &["qwen2"]),
+            fork_row,
+        ];
+        assert_eq!(
+            routed_engine_lane(
+                &cfg,
+                Some(&global),
+                &with_fork,
+                "m",
+                "",
+                Some("llada"),
+                false,
+                "/x/m.gguf"
+            ),
+            Ok("b-diff-fork".to_string())
+        );
+
+        // Transformer arches flow through the mirror untouched.
+        assert_eq!(
+            routed_engine_lane(
+                &cfg,
+                Some(&global),
+                &engine_rows,
+                "m",
+                "",
+                Some("qwen2"),
+                false,
+                "/x/m.gguf"
+            ),
+            Ok("b-new".to_string())
         );
     }
 

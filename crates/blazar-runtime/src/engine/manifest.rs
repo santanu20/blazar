@@ -486,6 +486,7 @@ pub fn probe_kind(
         blazar_core::engine_kind::EngineKind::Sglang => probe_sglang(server_path, tag),
         blazar_core::engine_kind::EngineKind::SdCpp => probe_sdcpp(server_path, tag),
         blazar_core::engine_kind::EngineKind::Whisper => probe_whisper(server_path, tag),
+        blazar_core::engine_kind::EngineKind::Piper => probe_piper(server_path, tag),
         blazar_core::engine_kind::EngineKind::Mlx => probe_mlx(server_path, tag),
     }
 }
@@ -843,7 +844,7 @@ pub(crate) fn parse_sd_devices(text: &str) -> Vec<DeviceDesc> {
         .collect()
 }
 /// Probe a whisper-server binary. Divergences from llama-server
-/// (verified against ggerganov/whisper.cpp b5130): no `--version` flag
+/// (verified against ggml-org/whisper.cpp b5130): no `--version` flag
 /// at all (`error: unknown argument: --version`) — the b-tag is the
 /// identity; `-h`/`--help` exit 0 with usage on stdout in the same
 /// shape llama parses; no `--list-devices` (CPU-only serving contract).
@@ -875,6 +876,63 @@ fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
     if flags.is_empty() {
         return Err(anyhow!(
             "whisper-server --help parsed to zero flags (output format changed upstream?): {}",
+            err_help
+                .lines()
+                .chain(out_help.lines())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number,
+        version_raw,
+        devices: Vec::new(),
+        flags,
+        spec_types: Vec::new(),
+        server_path: server.to_string(),
+        ..Default::default()
+    })
+}
+
+/// Probe a piper binary. Lazy audio lane like whisper, with two tag
+/// divergences: releases are version tags (`v1.2.0`) or date tags
+/// (`2023.11.14-2`), never b-tags — the numeric identity is the
+/// concatenation of the tag's digit runs (`202311142`), monotonic
+/// within a scheme and used only for listings (rollback orders by
+/// installed rows, not build numbers). And the usage table's stream
+/// varies across builds, so whichever stream is non-empty is parsed
+/// (whisper-style tolerance); a zero-flag parse fails the probe
+/// loudly rather than degrading argv gating.
+fn probe_piper(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+
+    let build_number = tag
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(18)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    let version_raw = format!("piper {tag}");
+
+    let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
+        .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
+    let err_help = String::from_utf8_lossy(&help_out.stderr).to_string();
+    let out_help = String::from_utf8_lossy(&help_out.stdout).to_string();
+    let help_text = if out_help.trim().is_empty() {
+        &err_help
+    } else {
+        &out_help
+    };
+    let (flags, _) = parse_help(help_text);
+    if flags.is_empty() {
+        return Err(anyhow!(
+            "piper --help parsed to zero flags (output format changed upstream?): {}",
             err_help
                 .lines()
                 .chain(out_help.lines())

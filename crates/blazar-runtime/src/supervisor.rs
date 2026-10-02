@@ -3338,9 +3338,10 @@ impl Supervisor {
             // the supervised model-serving roster. A whisper row reaching
             // here means routing surfaced it — log the surface bug
             // loudly and treat the row as non-serving.
-            if row.kind == EngineKind::Whisper {
+            if row.kind.is_lazy_lane() {
                 tracing::error!(
-                    "whisper engine row reached the supervised-adapter path — the audio lane serves lazily through /v1/audio/transcriptions; treating it as non-serving"
+                    "{} engine row reached the supervised-adapter path — the audio lane serves lazily through the /v1/audio endpoints; treating it as non-serving",
+                    row.kind
                 );
                 return None;
             }
@@ -3375,8 +3376,9 @@ impl Supervisor {
                 EngineKind::SdCpp => {
                     Arc::new(crate::engine_impl::SdCppEngine::with_env(manifest, env))
                 }
-                // Unreachable: the whisper guard above returns early.
-                EngineKind::Whisper => return None,
+                // Unreachable: the lazy-lane guard above returns early
+                // (whisper transcription, piper synthesis).
+                EngineKind::Whisper | EngineKind::Piper => return None,
             })
         };
         let roster = || {
@@ -3647,6 +3649,25 @@ impl Supervisor {
                 e,
             ))
         })?;
+        // Block-diffusion LLM GGUFs: the arch is mainline in llama.cpp's
+        // loader, so llama-server boots the model instead of dying with
+        // the unknown-architecture error the capability rescue keys on —
+        // and its autoregressive loop then decodes garbage while the
+        // child looks healthy. Refuse at the route decision with the
+        // paradigm named. Only a FORK lane advertising the arch (when a
+        // diffusion-capable one ships) bypasses the guard — mainstream
+        // mined sets record loader support, which is the hazard itself.
+        if let blazar_core::hfmeta::ModelMeta::Gguf(g) = meta_box.borrow_meta() {
+            if let Some(teach) = Self::diffusion_paradigm_block(
+                &g.architecture,
+                &Self::fork_advertising_lanes(&g.architecture, &store),
+            ) {
+                return Err(SupervisionError::UnsupportedModel(format!(
+                    "{}: {teach}",
+                    model.path
+                )));
+            }
+        }
         let loras = Self::resolve_lora_lane(
             &store
                 .list_loras(Some(name))
@@ -4730,6 +4751,62 @@ impl Supervisor {
             .into_iter()
             .map(str::to_string)
             .collect()
+    }
+
+    /// Fork lanes advertising `arch` — the only lanes whose
+    /// advertisement can mean "serves this arch correctly". Mainstream
+    /// manifests mine loader-level support (every overlay build's set
+    /// carries llada), which for block-diffusion archs is exactly the
+    /// hazard: the loader accepts the file and the HTTP server then
+    /// decodes it autoregressively into garbage.
+    fn fork_advertising_lanes(arch: &str, store: &Store) -> Vec<String> {
+        let Ok(rows) = store.list_engines() else {
+            return Vec::new();
+        };
+        // Decoded manifests must outlive the borrowed lane views below.
+        let decoded: Vec<(&blazar_core::EngineRow, crate::engine::manifest::Manifest)> = rows
+            .iter()
+            .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+            .filter(|r| r.lane_class() == blazar_core::engine_kind::LaneClass::Fork)
+            .filter_map(|r| {
+                serde_json::from_str::<crate::engine::manifest::Manifest>(&r.manifest)
+                    .ok()
+                    .map(|m| (r, m))
+            })
+            .collect();
+        let lanes: Vec<blazar_core::engine_kind::LaneArchView> = decoded
+            .iter()
+            .map(|(r, m)| (r.tag.as_str(), r.lane_class(), m.advertised_archs()))
+            .collect();
+        blazar_core::engine_kind::advertising_lanes(arch, None, &lanes)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Route-time paradigm guard for block-diffusion LLM architectures
+    /// (see [`blazar_core::DIFFUSION_PARADIGM_ARCHS`]). The arch loads
+    /// in llama.cpp's loader — no unknown-architecture crash for the
+    /// capability rescue to key on — but no HTTP server in the family
+    /// runs the diffusion decode loop, so the text lane would decode
+    /// garbage while the child looks healthy. Returns the teaching
+    /// error when `arch` is diffusion-paradigm and no FORK lane
+    /// advertises it (callers pass [`Self::fork_advertising_lanes`]:
+    /// mainstream advertisement is loader support, not serving — a
+    /// diffusion-capable fork lane is the only honest bypass,
+    /// mirroring the rescue's lane-capability logic).
+    fn diffusion_paradigm_block(arch: &str, fork_advertisers: &[String]) -> Option<String> {
+        if !blazar_core::DIFFUSION_PARADIGM_ARCHS.contains(&arch) || !fork_advertisers.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "block-diffusion LLM (arch '{arch}') — no installed lane can serve it: \
+             llama-server would decode it autoregressively into garbage, and llama.cpp \
+             ships no HTTP diffusion server yet (upstream PR 24423 DiffusionGemma / \
+             PR 17454 LLADA 2.0 tracking). Serve a transformer GGUF, or build a \
+             capability lane once a diffusion-capable fork ships: \
+             blazar engine build --fork <owner>/llama.cpp@<commit-sha>"
+        ))
     }
 
     /// Classify a dead child's log tail as llama.cpp's
@@ -6893,6 +6970,118 @@ mod routing_tests {
                 assert!(e.contains("sdcpp"), "{e}");
                 assert!(e.contains("component set"), "{e}");
                 assert!(e.contains("blazar pull"), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn unit__diffusion_paradigm_block__teaches_only_when_no_lane_advertises() {
+        // llada/llada-moe are mainline-loadable in llama.cpp TODAY — the
+        // guard set must carry them; llada2/diffusion-gemma ride the set
+        // pre-merge so the merge day needs no blazar change.
+        assert_eq!(
+            blazar_core::DIFFUSION_PARADIGM_ARCHS,
+            &["llada", "llada-moe", "llada2", "diffusion-gemma"]
+        );
+        // No advertiser: teaching names the paradigm, the upstream
+        // tracking PRs, and the fork-lane escape hatch.
+        let teach = Supervisor::diffusion_paradigm_block("llada", &[])
+            .expect("llada with no advertising lane must teach");
+        assert!(teach.contains("block-diffusion LLM"), "{teach}");
+        assert!(teach.contains("'llada'"), "{teach}");
+        assert!(teach.contains("24423"), "{teach}");
+        assert!(teach.contains("17454"), "{teach}");
+        assert!(teach.contains("blazar engine build --fork"), "{teach}");
+        // A fork lane advertising the arch bypasses the guard.
+        assert_eq!(
+            Supervisor::diffusion_paradigm_block("llada", &["my-diffusion-fork".to_string()]),
+            None
+        );
+        // Transformer arches never trip the guard, advertisers or not.
+        assert_eq!(Supervisor::diffusion_paradigm_block("qwen3", &[]), None);
+    }
+
+    #[test]
+    fn unit__fork_advertising_lanes__mainstream_loader_ad_does_not_bypass() {
+        // Live-overlay shape, pinned: an overlay build's manifest mines
+        // 150+ loader archs INCLUDING llada, provenance upstream. The
+        // paradigm guard must ignore that advertisement — loading is
+        // not serving — while a fork lane advertising llada counts.
+        // Hermetic store: routing_sup's fixed /tmp dirs persist across
+        // runs, and this very test seeds a fork lane that would poison
+        // every later execution of the first assert.
+        let data_dir = std::env::temp_dir().join("blazar-fork-lanes-test-data");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let sup = Supervisor::new(
+            BlazarDirs {
+                config_dir: std::env::temp_dir().join("blazar-fork-lanes-test-cfg"),
+                data_dir,
+            },
+            Config::default(),
+            EventBus::default(),
+            Hardware {
+                physical_cores: 1,
+                total_ram_mib: 1024,
+                gpus: vec![],
+            },
+            Arc::new(FakeEngine(Manifest::default())),
+        );
+        let store = Store::open(&sup.dirs).unwrap();
+        let mainstream = blazar_core::EngineRow {
+            tag: "b-overlay-cuda".into(),
+            manifest: serde_json::to_string(&crate::engine::manifest::Manifest {
+                tag: "b-overlay-cuda".into(),
+                source: crate::engine::manifest::EngineSource::Upstream,
+                architectures: ["llada", "qwen3", "gemma3"]
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap(),
+            ..lane_row("b-overlay-cuda", &[], 1000)
+        };
+        store.upsert_engine(&mainstream).unwrap();
+        assert!(
+            Supervisor::fork_advertising_lanes("llada", &store).is_empty(),
+            "mainstream loader advertisement must not bypass the paradigm guard"
+        );
+        store
+            .upsert_engine(&lane_row("fork-diff/llama.cpp-4444-cpu", &["llada"], 9000))
+            .unwrap();
+        assert_eq!(
+            Supervisor::fork_advertising_lanes("llada", &store),
+            vec!["fork-diff/llama.cpp-4444-cpu".to_string()]
+        );
+    }
+
+    #[test]
+    fn unit__read_model_meta__llada_gguf_parses_so_only_the_paradigm_guard_catches_it() {
+        use blazar_core::engine_kind::EngineKind as K;
+        // The hazard premise, pinned: a GGUF carrying
+        // general.architecture=llada parses CLEANLY on the text lane —
+        // no shape error, no missing-arch teaching. The meta layer
+        // cannot catch it; only the route-time paradigm guard does.
+        let mut gguf = b"GGUF".to_vec();
+        gguf.extend_from_slice(&3u32.to_le_bytes());
+        gguf.extend_from_slice(&0u64.to_le_bytes()); // 0 tensors
+        gguf.extend_from_slice(&1u64.to_le_bytes()); // 1 KV
+        let key = b"general.architecture";
+        gguf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        gguf.extend_from_slice(key);
+        gguf.extend_from_slice(&8u32.to_le_bytes()); // GGUF v3 string
+        let val = b"llada";
+        gguf.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        gguf.extend_from_slice(val);
+        let file = std::env::temp_dir().join("blazar-llada.gguf");
+        std::fs::write(&file, &gguf).expect("write fixture");
+        let meta = read_model_meta(file.to_str().unwrap(), K::LlamaCpp)
+            .expect("llada GGUF parses on the text lane — that IS the hazard");
+        match meta.borrow_meta() {
+            blazar_core::hfmeta::ModelMeta::Gguf(g) => assert_eq!(g.architecture, "llada"),
+            other @ blazar_core::hfmeta::ModelMeta::Hf(_) => {
+                panic!("GGUF file must parse as GGUF meta, got {other:?}")
             }
         }
     }

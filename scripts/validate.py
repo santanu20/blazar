@@ -7075,12 +7075,14 @@ def _store_engine_tags() -> list[str]:
     real row is a valid dance partner for the use lanes; `engine
     rollback` is kind-scoped (2026-09-26 fix) and derives its own
     expectation from the sandbox store. The `local` pseudo-tag is
-    excluded — it is a path registration, not a store lane. Voice-lane
-    rows (kind whisper/piper) are excluded too: live-observed 2026-09-26
-    they dance and update-refuse ("release b5130 not found" — whisper
-    builds live in ggml-org/whisper.cpp, invisible to the llamacpp
-    updater), and `engine rm` of the whisper row breaks the later
-    transcribe lanes' "(pinned)" bookkeeping.
+    excluded — it is a path registration, not a store lane. Audio-lane
+    rows (kind whisper/piper) are excluded by DESIGN (2026-10-03
+    lazy-lane parity): `engine use` on a lazy lane refuses with a
+    per-kind pin hint (audio lanes serve via /v1/audio, never through
+    the serving-active flag), and `engine rm` now reconciles the lane
+    pin files — both live-observed behaviors before the fix; the
+    exclusion keeps the dance on lanes that can legally hold the
+    active flag.
     """
     try:
         db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))

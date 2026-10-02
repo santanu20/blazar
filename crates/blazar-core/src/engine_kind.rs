@@ -26,10 +26,15 @@ pub enum EngineKind {
     /// leejet/stable-diffusion.cpp `sd-server` (prebuilt assets +
     /// source build; diffusion/image component sets — never text).
     SdCpp,
-    /// ggerganov/whisper.cpp `whisper-server` (prebuilt assets; lazy
+    /// ggml-org/whisper.cpp `whisper-server` (prebuilt assets; lazy
     /// audio lane for transcription/translation — serves no model rows,
     /// so it never appears in format routing in either direction).
     Whisper,
+    /// rhasspy/piper neural TTS (prebuilt assets; lazy audio lane for
+    /// speech synthesis — the gateway synthesizes per request through
+    /// the one-shot `piper` CLI, so like Whisper it serves no model
+    /// rows and never appears in format routing in either direction).
+    Piper,
     /// ml-explore/mlx-lm `mlx_lm.server` (pip venv; MLX-format
     /// community dirs — safetensors + a `quantization` block in
     /// config.json. Backend matrix: `mlx-cuda` on Linux/NVIDIA,
@@ -47,8 +52,19 @@ impl EngineKind {
             EngineKind::Sglang => "sglang",
             EngineKind::SdCpp => "sdcpp",
             EngineKind::Whisper => "whisper",
+            EngineKind::Piper => "piper",
             EngineKind::Mlx => "mlx",
         }
+    }
+
+    /// Lazy audio lanes serve transcription/speech, not model rows:
+    /// they never claim the serving-active flag (see
+    /// [`EngineManager::use_tag`](crate::engine) guards), never join
+    /// format routing in either direction, and are selected by their
+    /// lane pin rather than the spawn router.
+    #[must_use]
+    pub fn is_lazy_lane(self) -> bool {
+        matches!(self, EngineKind::Whisper | EngineKind::Piper)
     }
 
     /// Format+policy-driven route for `[engine_routing] mode = "auto"`:
@@ -430,9 +446,10 @@ impl FromStr for EngineKind {
             "sglang" => Ok(EngineKind::Sglang),
             "sdcpp" => Ok(EngineKind::SdCpp),
             "whisper" => Ok(EngineKind::Whisper),
+            "piper" => Ok(EngineKind::Piper),
             "mlx" => Ok(EngineKind::Mlx),
             other => Err(format!(
-                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, mlx)"
+                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, piper, mlx)"
             )),
         }
     }
@@ -522,6 +539,7 @@ mod tests {
             EngineKind::Sglang,
             EngineKind::SdCpp,
             EngineKind::Whisper,
+            EngineKind::Piper,
             EngineKind::Mlx,
         ] {
             assert_eq!(EngineKind::from_str(k.as_str()), Ok(k));
@@ -530,7 +548,7 @@ mod tests {
         }
         assert_eq!(
             EngineKind::from_str("vllm").unwrap_err(),
-            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, mlx)"
+            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, piper, mlx)"
         );
         // serde default on missing field = llamacpp (old rows).
         assert_eq!(

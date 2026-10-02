@@ -1727,6 +1727,280 @@ async fn adopt__pin_honored_after_adoption() {
     );
 }
 
+/// A lazy audio row must never take the serving-active flag: `engine
+/// use` on a whisper or piper row refuses with the lane's own pin
+/// command instead (the pre-guard incident: `use <whisper-tag>` wedged
+/// `serve`, then every update dance resolved against the llamacpp
+/// channel and failed with "release not found"). A text-lane `use`
+/// keeps flipping the flag.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn unit__use_tag__lazy_lanes_refuse_and_teach_their_pin() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    {
+        let store = Store::open(&dirs).unwrap();
+        stage_mainstream_row(&store, &dirs, "b1-cuda", 2000, &["llama"]);
+        store.set_active_engine("b1-cuda").unwrap();
+        for (tag, kind) in [
+            ("b5130", blazar_core::engine_kind::EngineKind::Whisper),
+            ("2023.11.14-2", blazar_core::engine_kind::EngineKind::Piper),
+        ] {
+            let dir = dirs.engines_dir().join(tag);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("marker"), tag).unwrap();
+            store
+                .upsert_engine(&blazar_core::EngineRow {
+                    tag: tag.into(),
+                    asset: "cpu".into(),
+                    sha256: "x".into(),
+                    installed_at: 4000,
+                    active: false,
+                    manifest: serde_json::to_string(&Manifest::default()).unwrap(),
+                    kind,
+                })
+                .unwrap();
+        }
+    }
+
+    let err = mgr.use_tag("b5130").unwrap_err().to_string();
+    assert!(err.contains("whisper lane"), "names the lane: {err}");
+    assert!(
+        err.contains("blazar whisper --pin b5130"),
+        "teaches the whisper pin: {err}"
+    );
+    let err = mgr.use_tag("2023.11.14-2").unwrap_err().to_string();
+    assert!(err.contains("piper lane"), "names the lane: {err}");
+    assert!(
+        err.contains("blazar tts --install --tag 2023.11.14-2"),
+        "teaches the install+pin: {err}"
+    );
+
+    // The serving slot never moved, and text lanes keep the classic flip.
+    {
+        let store = Store::open(&dirs).unwrap();
+        assert_eq!(
+            store.active_engine().unwrap().map(|r| r.tag),
+            Some("b1-cuda".to_string())
+        );
+        stage_mainstream_row(&store, &dirs, "b2", 3000, &["llama"]);
+    }
+    let switched = mgr.use_tag("b2").unwrap();
+    assert!(switched.active, "text-lane use still claims the throne");
+}
+
+/// `engine rm` of a pinned lazy-lane tag clears that lane's pin file
+/// with it — a pin naming a removed tag dangled on every later
+/// resolution. A pin naming a different tag survives the removal.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn unit__remove_engine_row_and_tree__lazy_pins_reconciled_on_removal() {
+    let (_t, dirs) = tmp_dirs();
+    let store = Store::open(&dirs).unwrap();
+    for (tag, kind, bin_name) in [
+        (
+            "2023.11.14-2",
+            blazar_core::engine_kind::EngineKind::Piper,
+            "piper",
+        ),
+        (
+            "b5130",
+            blazar_core::engine_kind::EngineKind::Whisper,
+            "whisper-server",
+        ),
+    ] {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(bin_name), b"stub").unwrap();
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: tag.into(),
+                asset: "cpu".into(),
+                sha256: "x".into(),
+                installed_at: 1000,
+                active: false,
+                manifest: serde_json::to_string(&Manifest::default()).unwrap(),
+                kind,
+            })
+            .unwrap();
+    }
+    // Piper pin names the tag being removed; the whisper pin names a
+    // different tag and must ride through untouched.
+    std::fs::create_dir_all(dirs.data_dir.join("piper")).unwrap();
+    std::fs::write(dirs.data_dir.join("piper").join("pin"), "2023.11.14-2\n").unwrap();
+    std::fs::create_dir_all(dirs.data_dir.join("whisper").join("bin")).unwrap();
+    std::fs::write(
+        dirs.data_dir.join("whisper").join("bin").join("pin"),
+        "b9999\n",
+    )
+    .unwrap();
+
+    blazar_runtime::engine::remove_engine_row_and_tree(
+        &store,
+        "2023.11.14-2",
+        &dirs.engines_dir().join("2023.11.14-2"),
+        &dirs.data_dir,
+    )
+    .unwrap();
+
+    assert!(
+        !dirs.data_dir.join("piper").join("pin").exists(),
+        "pin naming the removed tag is cleared"
+    );
+    assert!(
+        dirs.data_dir.join("whisper").join("bin").join("pin").exists(),
+        "a pin naming another tag survives"
+    );
+}
+
+/// Piper legacy-tree adoption mirrors the whisper lane: the legacy
+/// `data/piper/<tag>` tree moves into the engines lane with a Piper-kind
+/// row that never claims the serving throne, and the second pass is a
+/// no-op.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn adopt__piper_tree_moves_legacy_dir_and_row_created() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let legacy = dirs
+        .data_dir
+        .join("piper")
+        .join("2023.11.14-2")
+        .join("piper-linux-x64");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::copy(stub_server_bin(), legacy.join("piper")).expect("copy stub");
+
+    let adopted = mgr.adopt_piper_legacy_trees();
+    assert_eq!(adopted, vec!["2023.11.14-2".to_string()]);
+    assert!(!legacy.exists(), "legacy tree left its lane");
+    let moved = dirs
+        .engines_dir()
+        .join("2023.11.14-2")
+        .join("piper-linux-x64")
+        .join("piper");
+    assert!(moved.is_file(), "tree lives in the engines lane now");
+    let store = Store::open(&dirs).unwrap();
+    let row = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.tag == "2023.11.14-2")
+        .expect("adoption registered a row");
+    assert_eq!(row.kind, blazar_core::engine_kind::EngineKind::Piper);
+    assert!(
+        store.active_engine().unwrap().is_none(),
+        "audio adoption never claims the serving throne"
+    );
+    assert!(
+        mgr.adopt_piper_legacy_trees().is_empty(),
+        "second pass adopts nothing"
+    );
+}
+
+/// The piper serving pick honors pin > engines row > legacy tree — the
+/// exact precedence whisper serves by — and `installed_tag` reports the
+/// same verdict the serving lane would pick (update hints key on it).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__piper_server_bin__pin_row_legacy_precedence() {
+    let (_t, dirs) = tmp_dirs();
+    let store = Store::open(&dirs).unwrap();
+    let row_dir = dirs.engines_dir().join("2024.6.10-0");
+    std::fs::create_dir_all(&row_dir).unwrap();
+    std::fs::copy(stub_server_bin(), row_dir.join("piper")).expect("copy stub");
+    store
+        .upsert_engine(&blazar_core::EngineRow {
+            tag: "2024.6.10-0".into(),
+            asset: "cpu".into(),
+            sha256: "x".into(),
+            installed_at: 3000,
+            active: false,
+            manifest: serde_json::to_string(&Manifest::default()).unwrap(),
+            kind: blazar_core::engine_kind::EngineKind::Piper,
+        })
+        .unwrap();
+    let legacy_dir = dirs.data_dir.join("piper").join("2023.11.14-2");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    std::fs::copy(stub_server_bin(), legacy_dir.join("piper")).expect("copy stub");
+
+    // No pin: the engines-lane row wins over the legacy tree.
+    let (bin, _) = blazar_runtime::piper::server_bin(&dirs).expect("row lane pick");
+    assert!(
+        bin.starts_with(&row_dir),
+        "unpinned pick is the engines row ({})",
+        bin.display()
+    );
+    assert_eq!(
+        blazar_runtime::piper::installed_tag(&dirs).as_deref(),
+        Some("2024.6.10-0")
+    );
+
+    // Pin to the legacy tag: lane-agnostic, the pin wins.
+    blazar_runtime::piper::set_pin(&dirs, Some("2023.11.14-2")).expect("legacy pin");
+    let (bin, _) = blazar_runtime::piper::server_bin(&dirs).expect("legacy pick");
+    assert!(
+        bin.starts_with(&legacy_dir),
+        "pin selects the legacy tree ({})",
+        bin.display()
+    );
+    assert_eq!(
+        blazar_runtime::piper::installed_tag(&dirs).as_deref(),
+        Some("2023.11.14-2")
+    );
+
+    // Pin to the row tag: back through the engines lane.
+    blazar_runtime::piper::set_pin(&dirs, Some("2024.6.10-0")).expect("row pin");
+    let (bin, _) = blazar_runtime::piper::server_bin(&dirs).expect("row pick");
+    assert!(bin.starts_with(&row_dir), "pin selects the engines row");
+
+    // Dangling pin: falls back to the newest real install, loudly.
+    std::fs::write(dirs.data_dir.join("piper").join("pin"), "1999.1.1-0\n").unwrap();
+    let (bin, _) = blazar_runtime::piper::server_bin(&dirs).expect("fallback pick");
+    assert!(
+        bin.starts_with(&row_dir),
+        "dangling pin falls to the engines row"
+    );
+    assert_eq!(
+        blazar_runtime::piper::installed_tag(&dirs).as_deref(),
+        Some("2024.6.10-0")
+    );
+}
+
+/// `tts --pin` validates against BOTH lanes' install sets — an unknown
+/// tag is refused with the combined known list, and either lane's tag
+/// pins cleanly (one `--pin` flag, two legal homes).
+#[test]
+#[allow(non_snake_case)]
+fn unit__piper_set_pin__validates_rows_and_legacy_union() {
+    let (_t, dirs) = tmp_dirs();
+    let legacy = dirs.data_dir.join("piper").join("2023.11.14-2");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("piper"), b"stub").unwrap();
+    let store = Store::open(&dirs).unwrap();
+    store
+        .upsert_engine(&blazar_core::EngineRow {
+            tag: "2024.6.10-0".into(),
+            asset: "cpu".into(),
+            sha256: "x".into(),
+            installed_at: 3000,
+            active: false,
+            manifest: serde_json::to_string(&Manifest::default()).unwrap(),
+            kind: blazar_core::engine_kind::EngineKind::Piper,
+        })
+        .unwrap();
+
+    let err = blazar_runtime::piper::set_pin(&dirs, Some("nope"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("2023.11.14-2"), "legacy tags teach: {err}");
+    assert!(err.contains("2024.6.10-0"), "row tags teach: {err}");
+
+    blazar_runtime::piper::set_pin(&dirs, Some("2024.6.10-0")).expect("row tag pins");
+    blazar_runtime::piper::set_pin(&dirs, Some("2023.11.14-2")).expect("legacy tag pins");
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {

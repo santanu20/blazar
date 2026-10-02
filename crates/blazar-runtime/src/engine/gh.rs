@@ -585,6 +585,29 @@ impl GhClient {
             .ok_or_else(|| anyhow!("no b-tagged whisper.cpp releases found"))
     }
 
+    /// Newest rhasspy/piper release that ships a prebuilt for this
+    /// platform. Piper tags are date-shaped (`2023.11.14-2`) and every
+    /// release carries all six platform assets so far, but currency is
+    /// defined by the asset actually existing — a release without the
+    /// platform tarball is not installable, so it is never the latest.
+    /// List trims `assets`; callers re-fetch the full release by tag.
+    pub async fn latest_piper_release(&self) -> Result<GhRelease> {
+        let asset = crate::piper::asset_name(std::env::consts::OS, std::env::consts::ARCH)
+            .ok_or_else(|| {
+                anyhow!(
+                    "piper publishes no {}/{} prebuilt — build the CLI from source \
+                     (github.com/rhasspy/piper) and place it under the engines dir",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )
+            })?;
+        let releases = self.list_releases_repo(PIPER_REPO).await?;
+        releases
+            .into_iter()
+            .find(|r| r.assets.iter().any(|a| a.name == asset))
+            .ok_or_else(|| anyhow!("no {PIPER_REPO} release ships the {asset} asset"))
+    }
+
     /// Download an asset fully into memory, verifying its sha256 digest
     /// when the release metadata provides one. Assets are ≤ ~400 MB.
     pub async fn download_asset_bytes(&self, asset: &GhAsset) -> Result<Vec<u8>> {
@@ -1069,6 +1092,7 @@ pub const MISTRALRS_REPO: &str = "EricLBuehler/mistral.rs";
 pub const SDCPP_REPO: &str = "leejet/stable-diffusion.cpp";
 
 pub const WHISPER_REPO: &str = "ggml-org/whisper.cpp";
+pub const PIPER_REPO: &str = "rhasspy/piper";
 
 /// Parse an sd.cpp `master-NNN-<sha8>` tag's build counter. sd.cpp does
 /// not cut semver releases; the counter is the currency, the sha is the
@@ -1217,6 +1241,42 @@ pub fn whisper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern
              from source and place it under the engines dir"
         )),
     }
+}
+
+/// Ordered piper asset preferences for this machine: exactly one
+/// platform tarball per release (the six-asset table lives in
+/// [`crate::piper::asset_name`], single owner), so the pattern list has
+/// one entry and reuses that table instead of duplicating the names.
+/// Piper synthesizes on CPU — the pick is platform-shaped, like
+/// whisper's.
+pub fn piper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>> {
+    // The const table hands out a `&'static` slice of the matched asset
+    // name — the pattern struct requires static lifetimes.
+    const PIPER_ASSETS: &[&str] = &[
+        "piper_linux_x86_64.tar.gz",
+        "piper_linux_aarch64.tar.gz",
+        "piper_linux_armv7l.tar.gz",
+        "piper_macos_x64.tar.gz",
+        "piper_macos_aarch64.tar.gz",
+        "piper_windows_amd64.zip",
+    ];
+    let asset = crate::piper::asset_name(os, arch).ok_or_else(|| {
+        anyhow!(
+            "piper publishes no {os}/{arch} prebuilt — build the CLI from source \
+             (github.com/rhasspy/piper) and place it under the engines dir"
+        )
+    })?;
+    let includes: &'static [&'static str] = PIPER_ASSETS
+        .iter()
+        .position(|a| *a == asset)
+        .and_then(|i| PIPER_ASSETS.get(i..i + 1))
+        .unwrap_or(&[]);
+    Ok(vec![SdAssetPattern {
+        includes,
+        excludes: &[],
+        label: "cpu",
+        cpu_fallback: false,
+    }])
 }
 
 /// Walk the pattern list against the release's actual assets, returning
