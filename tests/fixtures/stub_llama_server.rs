@@ -530,6 +530,9 @@ fn stub_knob_text(state: &AppState, messages: &[ChatMessage]) -> String {
     }
 }
 
+// One handler per wire dialect this stub emulates; the body mirrors the
+// real openai lane's branch order so e2e pins exercise the same paths.
+#[allow(clippy::too_many_lines)]
 async fn chat_completions(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<ChatRequest>,

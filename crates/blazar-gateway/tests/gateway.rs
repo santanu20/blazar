@@ -1348,6 +1348,9 @@ async fn e2e__responses_chaining_and_store() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 #[tokio::test]
+#[allow(non_snake_case)]
+// One end-to-end contract per feature surface, in wire order.
+#[allow(clippy::too_many_lines)]
 async fn e2e__responses__background_conversations_and_cloud_tools() {
     let ts = start(Config::default()).await;
     let c = client();
@@ -1392,12 +1395,11 @@ async fn e2e__responses__background_conversations_and_cloud_tools() {
             .json()
             .await
             .unwrap();
-        match r["status"].as_str() {
-            Some("queued") | Some("in_progress") => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-            _ => {
-                final_body = r;
-                break;
-            }
+        if matches!(r["status"].as_str(), Some("queued" | "in_progress")) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        } else {
+            final_body = r;
+            break;
         }
     }
     assert_eq!(
@@ -1425,7 +1427,10 @@ async fn e2e__responses__background_conversations_and_cloud_tools() {
         .unwrap();
     assert_eq!(bad.status(), 400);
     let b: serde_json::Value = bad.json().await.unwrap();
-    assert!(b["error"]["message"].as_str().unwrap().contains("background"));
+    assert!(b["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("background"));
 
     // Cloud builtin tools teach, never silently pretend.
     let cloud = c
@@ -1440,8 +1445,12 @@ async fn e2e__responses__background_conversations_and_cloud_tools() {
     assert_eq!(cloud.status(), 400);
     let b: serde_json::Value = cloud.json().await.unwrap();
     assert!(
-        b["error"]["message"].as_str().unwrap().contains("web_search"),
-        "{}", b
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("web_search"),
+        "{}",
+        b
     );
 
     // Conversations: two stored responses in conv-e2e, the second via

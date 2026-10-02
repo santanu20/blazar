@@ -288,7 +288,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/responses", post(openai::responses_api))
         .route("/v1/responses/{id}", get(openai::responses_get))
         .route("/v1/conversations/{id}", get(openai::conversations_get))
-        .route("/v1/conversations/{id}", delete(openai::conversations_delete))
+        .route(
+            "/v1/conversations/{id}",
+            delete(openai::conversations_delete),
+        )
         .route(
             "/v1/audio/transcriptions",
             post(whisper::audio_transcriptions),
