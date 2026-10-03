@@ -1285,6 +1285,63 @@ fn systemd_start_attempts() -> Vec<Vec<&'static str>> {
     ]
 }
 
+/// Same lane as a start attempt, as an `is-active` query (used to yield
+/// a poll that can never succeed — the unit is up but serves elsewhere).
+fn systemd_is_active_args<'a>(start_args: &[&'a str]) -> Vec<&'a str> {
+    start_args
+        .iter()
+        .filter(|a| **a != "--no-ask-password")
+        .map(|a| if *a == "start" { "is-active" } else { *a })
+        .collect()
+}
+
+/// Post-start health poll: how long to wait before asking the unit what
+/// it is doing, and the total budget when the answer stays "activating".
+const SYSTEMD_UNIT_GRACE: Duration = Duration::from_secs(5);
+const SYSTEMD_UNIT_POLL_BUDGET: Duration = Duration::from_secs(15);
+
+/// What `systemctl is-active` reported for the unit.
+#[derive(Debug, PartialEq, Eq)]
+enum SystemdUnitState {
+    Active,
+    Activating,
+    Failed,
+    Inactive,
+    Unknown,
+}
+
+fn parse_systemd_state(out: &str) -> SystemdUnitState {
+    match out.trim() {
+        "active" => SystemdUnitState::Active,
+        "activating" => SystemdUnitState::Activating,
+        "failed" => SystemdUnitState::Failed,
+        "inactive" => SystemdUnitState::Inactive,
+        _ => SystemdUnitState::Unknown,
+    }
+}
+
+/// After the grace period passes without health, only a unit still
+/// ACTIVATING can still become our daemon. Every other state means the
+/// start "succeeded" but the unit serves a different port (or died) —
+/// the rest of the poll budget is pure delay, so yield it to the
+/// detached fallback. A late unit daemon that binds after we yielded is
+/// handled by the detached boot's exit-watched retry.
+fn systemd_poll_decision(state: &SystemdUnitState) -> bool {
+    matches!(state, SystemdUnitState::Activating)
+}
+
+/// Query the unit state on one lane (3s cap). Any trouble maps to
+/// Unknown, which yields — the detached fallback plus its exit-watched
+/// retry converge safely even when the query itself was the problem.
+async fn systemd_unit_state(is_active_args: &[&str]) -> SystemdUnitState {
+    let mut query = tokio::process::Command::new("systemctl");
+    query.args(is_active_args);
+    match tokio::time::timeout(Duration::from_secs(3), query.output()).await {
+        Ok(Ok(out)) => parse_systemd_state(&String::from_utf8_lossy(&out.stdout)),
+        _ => SystemdUnitState::Unknown,
+    }
+}
+
 /// Auto-start (plan G): 1s probe; on refusal, detached self-exec `serve`
 /// (own session, logs to run/daemon.log), then poll /healthz.
 ///
@@ -1345,21 +1402,12 @@ fn detached_serve_command(log_file: &std::fs::File) -> std::io::Result<std::proc
     Ok(cmd)
 }
 
-async fn ensure_daemon() -> Result<String> {
-    let cfg = config()?;
-    let base = daemon_base(&cfg);
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()?;
-    if let Ok(r) = http.get(format!("{base}/healthz")).send().await {
-        if r.status().is_success() {
-            return Ok(base);
-        }
-    }
-    // Not running: prefer the service manager so the daemon lands in
-    // its OWN scope (survives the invoking terminal, logs to journald)
-    // instead of the caller's login session. Absent systemctl fails
-    // fast (3s cap per attempt); unhealthy units fall through too.
+/// Service-manager boot: preferred over a detached spawn so the daemon
+/// lands in its OWN scope (survives the invoking terminal, logs to
+/// journald). Absent systemctl fails fast (3s cap per attempt); units
+/// that are up but not serving this base yield via the grace check.
+/// Returns the base once healthy.
+async fn try_systemd_boot(base: &str, http: &reqwest::Client) -> Option<String> {
     for args in systemd_start_attempts() {
         let mut attempt = tokio::process::Command::new("systemctl");
         attempt.args(&args);
@@ -1367,15 +1415,47 @@ async fn ensure_daemon() -> Result<String> {
             Ok(Ok(out)) if out.status.success() => {}
             _ => continue,
         }
-        let deadline = tokio_deadline(Duration::from_secs(15));
+        let started = std::time::Instant::now();
+        let deadline = tokio_deadline(SYSTEMD_UNIT_POLL_BUDGET);
+        let mut grace_checked = false;
         while std::time::Instant::now() < deadline {
-            if let Ok(r) = http.get(format!("{base}/healthz")).send().await {
-                if r.status().is_success() {
-                    return Ok(base);
+            if daemon_healthy(base, http).await {
+                return Some(base.to_string());
+            }
+            // A start that "succeeded" while the unit serves another
+            // port (or already died) can never satisfy this poll: ask
+            // the unit once, at the grace boundary, and yield the rest.
+            if !grace_checked
+                && started.elapsed() >= SYSTEMD_UNIT_GRACE
+                && std::time::Instant::now() < deadline
+            {
+                grace_checked = true;
+                let state = systemd_unit_state(&systemd_is_active_args(&args)).await;
+                if !systemd_poll_decision(&state) {
+                    eprintln!(
+                        "systemd unit is up but not serving {base} — falling \
+                         through to a detached daemon"
+                    );
+                    break;
                 }
             }
             std::thread::sleep(Duration::from_millis(300));
         }
+    }
+    None
+}
+
+async fn ensure_daemon() -> Result<String> {
+    let cfg = config()?;
+    let base = daemon_base(&cfg);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    if daemon_healthy(&base, &http).await {
+        return Ok(base);
+    }
+    if let Some(base) = try_systemd_boot(&base, &http).await {
+        return Ok(base);
     }
     eprintln!("no healthy systemd unit — falling back to a detached daemon");
     let log = dirs().run_dir().join("daemon.log");
@@ -16045,6 +16125,39 @@ mod tests {
         assert!(next_boot_action(2, &exited));
         assert!(!next_boot_action(3, &exited));
         assert!(!next_boot_action(4, &exited));
+    }
+
+    #[test]
+    fn unit__systemd_poll_decision__only_activating_keeps_the_budget() {
+        // A unit still activating may yet become our daemon.
+        assert!(systemd_poll_decision(&SystemdUnitState::Activating));
+        // Up-but-elsewhere, dead, or unqueryable: the poll can never
+        // succeed — yield it to the detached fallback.
+        assert!(!systemd_poll_decision(&SystemdUnitState::Active));
+        assert!(!systemd_poll_decision(&SystemdUnitState::Failed));
+        assert!(!systemd_poll_decision(&SystemdUnitState::Inactive));
+        assert!(!systemd_poll_decision(&SystemdUnitState::Unknown));
+    }
+
+    #[test]
+    fn unit__systemd_is_active_args__start_lane_becomes_query_lane() {
+        let user = systemd_is_active_args(&["--user", "start", "blazar"]);
+        assert_eq!(user, vec!["--user", "is-active", "blazar"]);
+        // The password flag belongs to start, not to queries.
+        let system = systemd_is_active_args(&["start", "blazar", "--no-ask-password"]);
+        assert_eq!(system, vec!["is-active", "blazar"]);
+    }
+
+    #[test]
+    fn unit__parse_systemd_state__covers_is_active_vocabulary() {
+        assert_eq!(parse_systemd_state("active\n"), SystemdUnitState::Active);
+        assert_eq!(
+            parse_systemd_state(" activating "),
+            SystemdUnitState::Activating
+        );
+        assert_eq!(parse_systemd_state("failed"), SystemdUnitState::Failed);
+        assert_eq!(parse_systemd_state("inactive"), SystemdUnitState::Inactive);
+        assert_eq!(parse_systemd_state("reloading"), SystemdUnitState::Unknown);
     }
 
     #[test]
