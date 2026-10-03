@@ -606,7 +606,7 @@ mkdir -p "$BROKEN_CK/crates/blazar-cli/src"
 printf '[workspace]\nmembers = ["crates/blazar-cli"]\nresolver = "2"\n' > "$BROKEN_CK/Cargo.toml"
 cat > "$BROKEN_CK/crates/blazar-cli/Cargo.toml" <<'EOF'
 [package]
-name = "blazar-cli"
+name = "blazar"
 version = "0.0.0"
 edition = "2021"
 
@@ -664,7 +664,7 @@ mkdir -p "$GOOD_CK/crates/blazar-cli/src"
 printf '[workspace]\nmembers = ["crates/blazar-cli"]\nresolver = "2"\n' > "$GOOD_CK/Cargo.toml"
 cat > "$GOOD_CK/crates/blazar-cli/Cargo.toml" <<'EOF'
 [package]
-name = "blazar-cli"
+name = "blazar"
 version = "0.0.0"
 edition = "2021"
 
