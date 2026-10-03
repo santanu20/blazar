@@ -1,3 +1,10 @@
+---
+layout: doc
+title: "Diffusion-LLM Readiness"
+description: "Research note: convergence of diffusion models and LLM serving."
+doc_kind: "Research note"
+---
+
 # Diffusion-LLM Readiness Review — 2026-10-03
 
 Deep dive following the upstream engine radar's highest-signal item: block-diffusion

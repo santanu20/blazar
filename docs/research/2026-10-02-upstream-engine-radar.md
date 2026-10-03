@@ -1,3 +1,10 @@
+---
+layout: doc
+title: "Upstream Engine Radar"
+description: "Research note: upstream releases worth tracking per lane."
+doc_kind: "Research note"
+---
+
 # Upstream Engine Radar — 2026-10-02
 
 Harvest: merged PRs (last 2 weeks), top open issues by reactions, most-active

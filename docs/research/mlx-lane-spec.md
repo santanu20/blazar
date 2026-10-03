@@ -1,3 +1,10 @@
+---
+layout: doc
+title: "MLX Lane Spec"
+description: "Research note: the design spec for the MLX engine lane."
+doc_kind: "Research note"
+---
+
 # MLX lane (F8) — implemented design
 
 Status: **implemented on `feat/next-wave`** (2026-10-02). The original spec

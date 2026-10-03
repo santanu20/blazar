@@ -1,3 +1,10 @@
+---
+layout: doc
+title: "Configuration Code Paths"
+description: "Every configuration key traced to the code that reads it."
+doc_kind: "Documentation"
+---
+
 # Config code-path map (exhaustive)
 
 Generated 2026-09-27 against working tree `b0b0464`+ (blazar-core/src/config.rs).

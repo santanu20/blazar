@@ -1,3 +1,10 @@
+---
+layout: doc
+title: "Inference Frontier Scan"
+description: "Research note: survey of the local-inference engine landscape."
+doc_kind: "Research note"
+---
+
 # Inference Frontier Research Scan — Blazar Opportunity Map
 
 **Date:** 2026-09-26 · **Scope:** cutting-edge LLM-serving research + production practices (2024–2026) mapped to Blazar's position as a single-node, cross-platform, multi-engine inference gateway. · **Method:** web metasearch (4 batch waves, 24 queries) + direct arXiv abstract verification (27 IDs resolved via arxiv.org) + live llama.cpp README/releases fetch. No code changed.

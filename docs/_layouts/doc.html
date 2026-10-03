@@ -1,0 +1,59 @@
+---
+layout: default
+---
+{% assign flat = site.data.docs_nav | map: "items" | flatten %}
+{% assign idx = 0 %}
+{% for item in flat %}
+  {% if item.path == page.url %}{% assign idx = forloop.index0 %}{% endif %}
+{% endfor %}
+{% assign prev_i = idx | minus: 1 %}
+{% assign next_i = idx | plus: 1 %}
+{% assign prev = flat[prev_i] %}
+{% assign next = flat[next_i] %}
+
+<div class="doc-shell">
+  <aside class="doc-side" aria-label="Documentation">
+    <div class="doc-side-sticky">
+      <a class="doc-side-home" href="{{ '/' | relative_url }}">&larr; Blazar home</a>
+      {% for section in site.data.docs_nav %}
+        <div class="doc-side-section">{{ section.section }}</div>
+        {% for item in section.items %}
+          {% assign active = '' %}
+          {% if item.path == page.url %}{% assign active = ' active' %}{% endif %}
+          <a class="doc-side-link{{ active }}" href="{{ item.path | relative_url }}">{{ item.title }}</a>
+        {% endfor %}
+      {% endfor %}
+    </div>
+  </aside>
+
+  <article class="doc-body">
+    <header class="doc-header">
+      {% if page.doc_kind %}<div class="doc-eyebrow">{{ page.doc_kind }}</div>{% endif %}
+      <h1>{{ page.title }}</h1>
+      {% if page.description %}<p class="doc-lede">{{ page.description }}</p>{% endif %}
+    </header>
+
+    {{ content }}
+
+    <nav class="doc-pager" aria-label="Pagination">
+      {% if prev %}
+        <a class="pager-prev" href="{{ prev.path | relative_url }}">
+          <span class="pager-dir">Previous</span>
+          <span class="pager-title">{{ prev.title }}</span>
+        </a>
+      {% else %}
+        <span></span>
+      {% endif %}
+      {% if next %}
+        <a class="pager-next" href="{{ next.path | relative_url }}">
+          <span class="pager-dir">Next</span>
+          <span class="pager-title">{{ next.title }}</span>
+        </a>
+      {% endif %}
+    </nav>
+
+    <a class="doc-edit" href="https://github.com/santanu20/blazar/edit/main/docs{{ page.path }}">
+      Improve this page on GitHub
+    </a>
+  </article>
+</div>

@@ -1,0 +1,214 @@
+---
+layout: default
+title: "Blazar — the control plane for local AI inference"
+description: "One Rust binary. OpenAI-, Ollama- and Anthropic-compatible APIs over llama.cpp, mistral.rs, SGLang, MLX, whisper.cpp, Piper and stable-diffusion.cpp — with resource-aware scheduling, durable jobs and federation."
+permalink: /
+---
+
+<section class="hero">
+  <div class="hero-inner">
+    <div>
+      <span class="hero-eyebrow">v0.19.0 · one Rust binary · Apache-2.0 / MIT</span>
+      <h1>The control plane for <span class="grad">local AI inference</span>.</h1>
+      <p class="hero-lede">
+        Unified APIs. Intelligent routing. Resource-aware scheduling. Multi-engine serving.
+        Blazar manages the model store, picks or pins the right inference engine, fits
+        workloads to your hardware, and controls concurrency, lifecycle, and diagnostics.
+      </p>
+      <div class="hero-chips">
+        <span class="chip"><b>OpenAI</b> SDK</span>
+        <span class="chip"><b>Ollama</b> clients</span>
+        <span class="chip"><b>Anthropic</b> SDK</span>
+      </div>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#quickstart">Get started <span class="carrot">→</span></a>
+        <a class="btn btn-ghost" href="{{ '/1.SYSTEM_OVERVIEW.html' | relative_url }}">Read the docs</a>
+      </div>
+      <div class="hero-meta">llama.cpp · mistral.rs · SGLang · MLX-LM · sd.cpp · whisper.cpp · piper</div>
+    </div>
+    <figure class="hero-art">
+      <img src="{{ '/assets/blazar-demo.svg' | relative_url }}" alt="Blazar CLI session: run, ps, engine list and explain" width="1180" height="580">
+      <figcaption>live CLI session — generation, engine panel, lane inventory, routing decision</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="section" id="quickstart">
+  <div class="section-head">
+    <h2>Running in under a minute</h2>
+    <p>One install script, one command to find a model, one to serve. Your existing OpenAI, Ollama and Anthropic clients keep working — point them at the local gateway.</p>
+  </div>
+  <div class="term">
+    <div class="term-bar"><i></i><i></i><i></i><span class="term-title">sh — blazar quickstart</span></div>
+    <pre class="term-body"><span class="c"># install (macOS, Linux, WSL)</span>
+<span class="p">$</span> curl --proto '=https' --tlsv1.2 -fsSL \
+    https://raw.githubusercontent.com/santanu20/blazar/v0.19.0/scripts/install.sh | sh
+
+<span class="c"># windows powershell</span>
+<span class="p">$</span> irm https://raw.githubusercontent.com/santanu20/blazar/v0.19.0/scripts/install.ps1 | iex
+
+<span class="c"># find, pull, serve, run</span>
+<span class="p">$</span> blazar search qwen3 instruct   <span class="c"># find models on Hugging Face</span>
+<span class="p">$</span> blazar pull qwen3-0.6b         <span class="c"># registry shortname</span>
+<span class="p">$</span> blazar serve                   <span class="c"># gateway on http://127.0.0.1:11435</span>
+<span class="p">$</span> blazar run qwen3-0.6b          <span class="c"># interactive REPL</span>
+<span class="o">blazar 0.19.0 — powered by upstream llama.cpp, mistral.rs and SGLang</span></pre>
+  </div>
+  <p class="hero-meta" style="margin-top:14px">also available: <code>cargo install blazar</code></p>
+</section>
+
+<section class="section" id="features">
+  <div class="section-head">
+    <h2>Why Blazar</h2>
+    <p>A control plane, not another runtime. Blazar sits between your applications and every inference engine on your machine.</p>
+  </div>
+  <div class="grid-cards">
+    <div class="card">
+      <div class="glyph"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h10M4 17h7"/></svg></div>
+      <h3>Multi-engine serving</h3>
+      <p>llama.cpp, mistral.rs, SGLang and MLX serve text and embeddings; sd.cpp, whisper.cpp and Piper cover images, video, speech-to-text and TTS — all behind one endpoint.</p>
+    </div>
+    <div class="card">
+      <div class="glyph"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg></div>
+      <h3>Resource-aware scheduling</h3>
+      <p>VRAM and KV-budget planning decides what fits, what queues, and what evicts — measured per model and per engine before the first token.</p>
+    </div>
+    <div class="card">
+      <div class="glyph"><svg viewBox="0 0 24 24"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/></svg></div>
+      <h3>Reliability by default</h3>
+      <p>Durable jobs survive restarts, request cards can be cancelled or interrupted mid-stream, and response chains persist on disk.</p>
+    </div>
+    <div class="card">
+      <div class="glyph"><svg viewBox="0 0 24 24"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 11L15.8 7M8.2 13l7.6 4"/></svg></div>
+      <h3>Federation</h3>
+      <p>Peers share capacity signals; the gateway ranks warm models, replicates hot ones, and routes across a small fleet — explicit, operator-controlled.</p>
+    </div>
+    <div class="card">
+      <div class="glyph"><svg viewBox="0 0 24 24"><path d="M4 17l6-6 4 4 6-8"/><path d="M14 7h6v6"/></svg></div>
+      <h3>Multimodal in one place</h3>
+      <p>Image generation and upscaling, streaming transcription with Silero VAD, text-to-speech — same gateway, same API surface, same diagnostics.</p>
+    </div>
+    <div class="card">
+      <div class="glyph"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/><circle cx="19" cy="19" r="2.5"/></svg></div>
+      <h3>Diagnostics built in</h3>
+      <p><code>blazar explain</code> shows the routing decision for any model, <code>blazar doctor</code> audits the install, and per-request telemetry is first-class.</p>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="engines">
+  <div class="section-head">
+    <h2>Seven lanes, one binary</h2>
+    <p>Blazar never bundles engines — it manages official upstream builds, picks the right lane per model, and upgrades them independently.</p>
+  </div>
+  <div class="engine-strip">
+    <div class="engine-pill"><b>llama.cpp</b><span>GGUF text + embeddings</span></div>
+    <div class="engine-pill"><b>mistral.rs</b><span>GGUF + safetensors serving</span></div>
+    <div class="engine-pill"><b>SGLang</b><span>quantized safetensors</span></div>
+    <div class="engine-pill"><b>MLX-LM</b><span>Apple-Silicon + CUDA</span></div>
+    <div class="engine-pill"><b>sd.cpp</b><span>images + video</span></div>
+    <div class="engine-pill"><b>whisper.cpp</b><span>speech to text</span></div>
+    <div class="engine-pill"><b>piper</b><span>text to speech</span></div>
+  </div>
+</section>
+
+<section class="section" id="architecture">
+  <div class="section-head">
+    <h2>Architecture</h2>
+    <p>Applications speak OpenAI-, Ollama- or Anthropic-shaped HTTP. Blazar translates, admits, routes, and supervises the engine processes.</p>
+  </div>
+  <div class="term">
+    <div class="term-bar"><i></i><i></i><i></i><span class="term-title">request path</span></div>
+    <pre class="term-body">                           Applications
+      ┌───────────────────────┬────────────────────────┐
+      │                       │                        │
+  OpenAI SDK            Ollama clients         Anthropic SDK
+      │                       │                        │
+      └───────────────────────┴────────────────────────┘
+                              │
+                              ▼
+                    ┌───────────────────┐
+                    │      BLAZAR       │
+                    │───────────────────│
+                    │ API gateway       │
+                    │ Routing           │
+                    │ Admission/queue   │
+                    │ Model store       │
+                    │ VRAM/KV fit       │
+                    │ Sessions/cache    │
+                    │ Diagnostics       │
+                    │ Engine lifecycle  │
+                    └─────────┬─────────┘
+                              │
+      ┌───────────┬───────────┴───────────┬───────────┐
+      │           │           │           │           │
+        llama.cpp  mistral.rs    SGLang        MLX
+      │           │           │           │           │
+      └────────────── Text / Embeddings ──────────────┘
+                              │
+                 ┌────────────┼─────────────┐
+                 │            │             │
+              sd.cpp       whisper.cpp     piper
+               Images       Speech         TTS
+               Video        to text</pre>
+  </div>
+</section>
+
+<section class="section" id="benchmarks">
+  <div class="section-head">
+    <h2>Measured, not marketed</h2>
+    <p>Direct-engine parity at C=1, orchestration wins as concurrency grows. Reproduce every number with the commands in the benchmark report.</p>
+  </div>
+  <div class="stat-row">
+    <div class="stat">
+      <div class="n">2%</div>
+      <div class="l">gateway overhead at C=1 — 40.6 vs 41.5 t/s against a direct llama-server</div>
+      <div class="src">qwen3-0.6b · RTX 4070 laptop</div>
+    </div>
+    <div class="stat">
+      <div class="n">3.1×</div>
+      <div class="l">aggregate throughput at C=4 — 104.8 vs 33.6 t/s under adaptive scheduling</div>
+      <div class="src">same engine, same model, same hardware</div>
+    </div>
+    <div class="stat">
+      <div class="n">554ms</div>
+      <div class="l">p99 under saturation — down from 15.9s with queue admission control</div>
+      <div class="src">cancellation + adaptive slots</div>
+    </div>
+  </div>
+  <p class="hero-meta" style="margin-top:16px">
+    full methodology and raw numbers: <a href="https://github.com/santanu20/blazar/blob/main/BENCHMARK.md">BENCHMARK.md</a>
+  </p>
+</section>
+
+<section class="section" id="docs">
+  <div class="section-head">
+    <h2>Documentation</h2>
+    <p>Ten deep dives — concepts to schema to every HTTP surface — plus the research notes that shaped the engine lanes.</p>
+  </div>
+  <div class="grid-cards">
+    {% for item in site.data.docs_nav[0].items limit: 9 %}
+    <a class="card" href="{{ item.path | relative_url }}" style="display:block;color:inherit">
+      <h3 style="margin-top:0">{{ item.title }}</h3>
+      <p>{{ item.note }}</p>
+    </a>
+    {% endfor %}
+  </div>
+  <p class="hero-meta" style="margin-top:18px">
+    research notes: {% for item in site.data.docs_nav[1].items %}<a href="{{ item.path | relative_url }}">{{ item.title }}</a> · {% endfor %}
+    <a href="https://github.com/santanu20/blazar/blob/main/CHANGELOG.md">changelog</a>
+  </p>
+</section>
+
+<section class="section" style="padding-top:0">
+  <div class="card" style="display:flex;flex-wrap:wrap;gap:18px;align-items:center;justify-content:space-between">
+    <div>
+      <h3 style="margin-top:0">Star the repo, join the discussion</h3>
+      <p>Blazar is developed in the open. Issues, ideas and benchmarks welcome.</p>
+    </div>
+    <div class="hero-actions" style="margin:0">
+      <a class="btn btn-primary" href="https://github.com/santanu20/blazar">GitHub</a>
+      <a class="btn btn-ghost" href="https://github.com/santanu20/blazar/discussions">Discussions</a>
+    </div>
+  </div>
+</section>

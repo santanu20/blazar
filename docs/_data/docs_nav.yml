@@ -1,0 +1,48 @@
+# Ordered documentation navigation. `path` values are Jekyll page paths;
+# the doc layout links them with .html URLs.
+- section: Documentation
+  items:
+    - title: System Overview
+      path: /1.SYSTEM_OVERVIEW.html
+      note: What Blazar is and the problems it solves
+    - title: Architecture
+      path: /2.ARCHITECTURE.html
+      note: The modular monolith and its processes
+    - title: Data Model
+      path: /3.DATA_MODEL.html
+      note: SQLite schema v10, tables, migrations, invariants
+    - title: API Specification
+      path: /4.API_SPEC.html
+      note: OpenAI-, Ollama- and Anthropic-compatible surfaces
+    - title: Business Rules
+      path: /6.BUSINESS_RULES.html
+      note: Routing, admission and validation decisions
+    - title: Setup
+      path: /7.SETUP.html
+      note: Install, configuration, hardware, deployment
+    - title: Do Not Break
+      path: /8.DO_NOT_BREAK.html
+      note: Maintainer invariants and release contracts
+    - title: Usage
+      path: /9.USAGE.html
+      note: Operating Blazar day to day
+    - title: Engineering & Numerical Methods
+      path: /10.SCIENTIFIC.html
+      note: GGUF parsing, KV estimation, routing math
+    - title: Configuration Code Paths
+      path: /config-code-paths.html
+      note: Where every configuration knob lives in source
+- section: Research notes
+  items:
+    - title: Inference Frontier Scan
+      path: /research/2026-09-26-inference-frontier-scan.html
+    - title: Competitor Pain-Point Audit
+      path: /research/2026-10-02-competitor-pain-points-audit.html
+    - title: MLX Direct vs Gateway
+      path: /research/2026-10-02-mlx-direct-vs-gateway.html
+    - title: Upstream Engine Radar
+      path: /research/2026-10-02-upstream-engine-radar.html
+    - title: Diffusion-LLM Readiness
+      path: /research/2026-10-03-diffusion-llm-readiness.html
+    - title: MLX Lane Spec
+      path: /research/mlx-lane-spec.html

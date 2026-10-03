@@ -1,3 +1,10 @@
+---
+layout: doc
+title: "MLX Direct vs Gateway"
+description: "Research note: serving MLX directly versus through the gateway."
+doc_kind: "Research note"
+---
+
 # MLX lane: direct engine vs Blazar gateway (perf + quality receipt)
 
 Date: 2026-10-02 · Blazar 0.18.0 (feat/next-wave @ 6d5b582) · engine lane

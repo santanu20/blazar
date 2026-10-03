@@ -1,3 +1,10 @@
+---
+layout: doc
+title: "Competitor Pain-Point Audit"
+description: "Research note: recurring complaints about local AI servers."
+doc_kind: "Research note"
+---
+
 # Competitor Pain-Point Audit — ollama / SGLang / llama.cpp (2026-10-02)
 
 Method: live web research (ddgs metasearch across Reddit, HN, Stack Overflow,

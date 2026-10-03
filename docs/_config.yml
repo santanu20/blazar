@@ -6,4 +6,18 @@ description: >-
 url: "https://santanu20.github.io"
 baseurl: "/blazar"
 repository: "santanu20/blazar"
-theme: jekyll-theme-cayman
+
+# No theme gem: the site ships its own layouts (default/doc/home) and one
+# design system in assets/css/site.css. Both plugins below are on the GitHub
+# Pages dependency whitelist (pages.github.com/versions.json).
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+kramdown:
+  syntax_highlighter_opts:
+    # GitHub-dark code blocks to match the terminal art.
+    default_lang: sh
+    css_class: highlight
+    block:
+      line_numbers: false
