@@ -1,44 +1,82 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="596" role="img" aria-label="blazar run, ps and explain terminal session">
-<rect width="1180" height="596" fill="#010409"/>
-<rect x="24" y="44" width="640" height="225" rx="8" fill="#0d1117"/>
-<path d="M24,52 a8,8 0 0 1 8,-8 h624 a8,8 0 0 1 8,8 v16 h-640 z" fill="#161b22"/>
-<rect x="24.5" y="44.5" width="639" height="224" rx="8" fill="none" stroke="#30363d"/>
-<circle cx="42" cy="65" r="5.5" fill="#ff5f56"/><circle cx="62" cy="65" r="5.5" fill="#ffbd2e"/><circle cx="82" cy="65" r="5.5" fill="#27c93f"/>
-<text x="344.0" y="69" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#8b949e">blazar run — single-shot generation (llama.cpp lane)</text>
-<text x="48" y="98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e">blazar 0.19.0 — powered by upstream llama.cpp, mistral.rs and SGLang</text>
-<text x="48" y="136.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#3fb950">$ blazar run qwen3-0.6b &quot;Explain what a local inference engine does, in one</text>
-<text x="48" y="155.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  sentence.&quot; --verbose</text>
-<text x="48" y="193.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">A local inference engine is a system designed to process and analyze local</text>
-<text x="48" y="212.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">data to make decisions or provide solutions quickly.</text>
-<text x="48" y="250.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#a5d6ff">total duration: answer 23 tokens at 299.7 t/s; prompt 25 tokens</text>
-<rect x="684" y="44" width="472" height="187" rx="8" fill="#0d1117"/>
-<path d="M684,52 a8,8 0 0 1 8,-8 h456 a8,8 0 0 1 8,8 v16 h-472 z" fill="#161b22"/>
-<rect x="684.5" y="44.5" width="471" height="186" rx="8" fill="none" stroke="#30363d"/>
-<circle cx="702" cy="65" r="5.5" fill="#ff5f56"/><circle cx="722" cy="65" r="5.5" fill="#ffbd2e"/><circle cx="742" cy="65" r="5.5" fill="#27c93f"/>
-<text x="920.0" y="69" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#8b949e">blazar ps — live engine panel</text>
-<text x="708" y="98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#3fb950">blazar ps</text>
-<text x="708" y="117.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e">daemon pid 2945975 (/usr/local/bin/blazar)</text>
-<text x="708" y="155.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e">NAME          STATE    CTX     SLOTS  HIT  ENDPOINT</text>
-<text x="708" y="174.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">qwen3-0.6b    ready    16384   2      12%  127.0.0.1:45931</text>
-<text x="708" y="193.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e">GPU auto@NVIDIA GeForce RTX 4070 Laptop GPU</text>
-<text x="708" y="212.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8b949e">  auto+Qwen3-0.6B-Q4_0.gguf</text>
-<rect x="684" y="249" width="472" height="320" rx="8" fill="#0d1117"/>
-<path d="M684,257 a8,8 0 0 1 8,-8 h456 a8,8 0 0 1 8,8 v16 h-472 z" fill="#161b22"/>
-<rect x="684.5" y="249.5" width="471" height="319" rx="8" fill="none" stroke="#30363d"/>
-<circle cx="702" cy="270" r="5.5" fill="#ff5f56"/><circle cx="722" cy="270" r="5.5" fill="#ffbd2e"/><circle cx="742" cy="270" r="5.5" fill="#27c93f"/>
-<text x="920.0" y="274" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11.5" fill="#8b949e">blazar explain — routing decision for qwen3-0.6b</text>
-<text x="708" y="303" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#3fb950">blazar explain qwen3-0.6b</text>
-<text x="708" y="322.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">MODEL</text>
-<text x="708" y="341.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  name        qwen3-0.6b</text>
-<text x="708" y="360.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  size        409 MiB  quant=Q4_0  arch=qwen3  format=gguf</text>
-<text x="708" y="379.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">ENGINE</text>
-<text x="708" y="398.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  lane        b11351-cuda (unknown)</text>
-<text x="708" y="417.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  source      global</text>
-<text x="708" y="436.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  reason      no per-model lane resolved — the global</text>
-<text x="708" y="455.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">            active engine serves it</text>
-<text x="708" y="474.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">SLOTS</text>
-<text x="708" y="493.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  live        2</text>
-<text x="708" y="512.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  adaptive    true</text>
-<text x="708" y="531.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d29922">RESIDENTS</text>
-<text x="708" y="550.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#e6edf3">  b11351-cuda  state=ready slots=2 ctx=16384 in_flight=0</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="580" viewBox="0 0 1180 580" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace">
+<rect width="1180" height="580" fill="#010409"/>
+<rect x="16" y="16" width="566" height="266" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+<path d="M 16 26 a 10 10 0 0 1 10 -10 h 546 a 10 10 0 0 1 10 10 v 16 h -566 z" fill="#161b22"/>
+<line x1="16" y1="42" x2="582" y2="42" stroke="#30363d" stroke-width="1"/>
+<circle cx="32" cy="29" r="4.5" fill="#ff5f57"/>
+<circle cx="50" cy="29" r="4.5" fill="#febc2e"/>
+<circle cx="68" cy="29" r="4.5" fill="#28c840"/>
+<rect x="598" y="16" width="566" height="266" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+<path d="M 598 26 a 10 10 0 0 1 10 -10 h 546 a 10 10 0 0 1 10 10 v 16 h -566 z" fill="#161b22"/>
+<line x1="598" y1="42" x2="1164" y2="42" stroke="#30363d" stroke-width="1"/>
+<circle cx="614" cy="29" r="4.5" fill="#ff5f57"/>
+<circle cx="632" cy="29" r="4.5" fill="#febc2e"/>
+<circle cx="650" cy="29" r="4.5" fill="#28c840"/>
+<rect x="16" y="298" width="566" height="266" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+<path d="M 16 308 a 10 10 0 0 1 10 -10 h 546 a 10 10 0 0 1 10 10 v 16 h -566 z" fill="#161b22"/>
+<line x1="16" y1="324" x2="582" y2="324" stroke="#30363d" stroke-width="1"/>
+<circle cx="32" cy="311" r="4.5" fill="#ff5f57"/>
+<circle cx="50" cy="311" r="4.5" fill="#febc2e"/>
+<circle cx="68" cy="311" r="4.5" fill="#28c840"/>
+<rect x="598" y="298" width="566" height="266" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+<path d="M 598 308 a 10 10 0 0 1 10 -10 h 546 a 10 10 0 0 1 10 10 v 16 h -566 z" fill="#161b22"/>
+<line x1="598" y1="324" x2="1164" y2="324" stroke="#30363d" stroke-width="1"/>
+<circle cx="614" cy="311" r="4.5" fill="#ff5f57"/>
+<circle cx="632" cy="311" r="4.5" fill="#febc2e"/>
+<circle cx="650" cy="311" r="4.5" fill="#28c840"/>
+<text x="299.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar run — single-shot generation (llama.cpp lane)</text>
+<text x="299.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar run — single-shot generation (llama.cpp lane)</text>
+<text x="299.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar run — single-shot generation (llama.cpp lane)</text>
+<text x="30.0" y="65.0" font-size="12.5" fill="#8b949e" font-weight="400">blazar 0.19.0 — powered by upstream llama.cpp, mistral.rs and SGLang</text>
+<text x="30.0" y="84.0" font-size="12.5" fill="#e6edf3" font-weight="400"></text>
+<text x="30.0" y="103.0" font-size="12.5" fill="#3fb950" font-weight="400">$ blazar run qwen3-0.6b &quot;Explain what a local inference engine does, in</text>
+<text x="30.0" y="122.0" font-size="12.5" fill="#e6edf3" font-weight="400">one sentence.&quot; --max-tokens 60</text>
+<text x="30.0" y="141.0" font-size="12.5" fill="#e6edf3" font-weight="400"></text>
+<text x="30.0" y="160.0" font-size="12.5" fill="#e6edf3" font-weight="400">A local inference engine is a computing component that executes tasks</text>
+<text x="30.0" y="179.0" font-size="12.5" fill="#e6edf3" font-weight="400">on a specific local device, such as a personal computer or a</text>
+<text x="30.0" y="198.0" font-size="12.5" fill="#e6edf3" font-weight="400">smartphone, to improve the performance of applications or systems.</text>
+<text x="30.0" y="217.0" font-size="12.5" fill="#e6edf3" font-weight="400"></text>
+<text x="30.0" y="236.0" font-size="12.5" fill="#a5d6ff" font-weight="400">total duration: answer 36 tokens at 243.9 t/s; prompt 25 tokens</text>
+<text x="881.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar ps — live engine panel</text>
+<text x="881.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar ps — live engine panel</text>
+<text x="881.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar ps — live engine panel</text>
+<text x="612.0" y="65.0" font-size="12.5" fill="#8b949e" font-weight="400">daemon pid 3494691 (/usr/local/bin/blazar)</text>
+<text x="612.0" y="84.0" font-size="12.5" fill="#e6edf3" font-weight="400"></text>
+<text x="612.0" y="103.0" font-size="12.5" fill="#8b949e" font-weight="400">NAME         STATE   CTX    SLOTS  HIT   IN_FLIGHT  ENDPOINT</text>
+<text x="612.0" y="122.0" font-size="12.5" fill="#e6edf3" font-weight="400">qwen3-0.6b   ready   16384  2      12%   0          127.0.0.1:42533</text>
+<text x="627.0" y="141.0" font-size="12.5" fill="#8b949e" font-weight="400">GPU  auto@NVIDIA GeForce RTX 4070 Laptop GPU</text>
+<text x="627.0" y="160.0" font-size="12.5" fill="#8b949e" font-weight="400">     auto+Qwen3-0.6B-Q4_0.gguf</text>
+<text x="612.0" y="179.0" font-size="12.5" fill="#e6edf3" font-weight="400"></text>
+<text x="612.0" y="198.0" font-size="12.5" fill="#d29922" font-weight="400">warn  spec=auto: no usable draft pair for qwen3-0.6b — n-gram lookup</text>
+<text x="612.0" y="217.0" font-size="12.5" fill="#d29922" font-weight="400">      speculation engaged (self-drafting, no extra VRAM; warm across</text>
+<text x="612.0" y="236.0" font-size="12.5" fill="#d29922" font-weight="400">      restarts via spec_cache)</text>
+<text x="299.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar engine list — seven lanes, one binary</text>
+<text x="299.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar engine list — seven lanes, one binary</text>
+<text x="299.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar engine list — seven lanes, one binary</text>
+<text x="30.0" y="347.0" font-size="12.5" fill="#8b949e" font-weight="400">engine up to date: b11370-cuda (channel: latest)</text>
+<text x="30.0" y="366.0" font-size="12.5" fill="#e6edf3" font-weight="400"></text>
+<text x="30.0" y="385.0" font-size="12.5" fill="#8b949e" font-weight="400">TAG                KIND       ASSET                          STATE    SHA256</text>
+<text x="30.0" y="404.0" font-size="12.5" fill="#e6edf3" font-weight="400">b11370-cuda        llamacpp   ubuntu-cuda-12.8-x64           active   047089347a55</text>
+<text x="30.0" y="423.0" font-size="12.5" fill="#e6edf3" font-weight="400">2023.11.14-2       piper      piper                          -        sha256:12672</text>
+<text x="30.0" y="442.0" font-size="12.5" fill="#e6edf3" font-weight="400">b5130              whisper    cpu                            -        53e7fd8b5764</text>
+<text x="30.0" y="461.0" font-size="12.5" fill="#e6edf3" font-weight="400">mlx-0.32.0         mlx        pip:mlx-lm==0.32.0</text>
+<text x="30.0" y="480.0" font-size="12.5" fill="#e6edf3" font-weight="400">                              +mlx[cuda12]==0.32.2           -        unverified</text>
+<text x="30.0" y="499.0" font-size="12.5" fill="#e6edf3" font-weight="400">sglang-0.5.21      sglang     pip:sglang==0.5.21             -        unverified</text>
+<text x="30.0" y="518.0" font-size="12.5" fill="#e6edf3" font-weight="400">master-929-3f8527a sdcpp      vulkan                         -        e35cc73cf5ba</text>
+<text x="30.0" y="537.0" font-size="12.5" fill="#e6edf3" font-weight="400">v0.9.4             mistralrs  cuda132-sm89                   -        493a6b9bc53a</text>
+<text x="881.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar explain — routing decision for qwen3-0.6b</text>
+<text x="881.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar explain — routing decision for qwen3-0.6b</text>
+<text x="881.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar explain — routing decision for qwen3-0.6b</text>
+<text x="612.0" y="347.0" font-size="12.5" fill="#d29922" font-weight="400">MODEL</text>
+<text x="612.0" y="366.0" font-size="12.5" fill="#e6edf3" font-weight="400">  name      qwen3-0.6b</text>
+<text x="612.0" y="385.0" font-size="12.5" fill="#e6edf3" font-weight="400">  size      409 MiB  quant=Q4_0  arch=qwen3  format=gguf</text>
+<text x="612.0" y="404.0" font-size="12.5" fill="#d29922" font-weight="400">ENGINE</text>
+<text x="612.0" y="423.0" font-size="12.5" fill="#e6edf3" font-weight="400">  lane      b11370-cuda (unknown)</text>
+<text x="612.0" y="442.0" font-size="12.5" fill="#e6edf3" font-weight="400">  source    global</text>
+<text x="612.0" y="461.0" font-size="12.5" fill="#e6edf3" font-weight="400">  reason    no per-model lane resolved — the global active</text>
+<text x="612.0" y="480.0" font-size="12.5" fill="#e6edf3" font-weight="400">            engine serves it</text>
+<text x="612.0" y="499.0" font-size="12.5" fill="#d29922" font-weight="400">SLOTS</text>
+<text x="612.0" y="518.0" font-size="12.5" fill="#e6edf3" font-weight="400">  live 2    in_flight 0    adaptive true</text>
+<text x="612.0" y="537.0" font-size="12.5" fill="#d29922" font-weight="400">RESIDENTS</text>
+<text x="612.0" y="556.0" font-size="12.5" fill="#e6edf3" font-weight="400">  b11370-cuda  state=ready slots=2 ctx=16384 in_flight=0</text>
 </svg>

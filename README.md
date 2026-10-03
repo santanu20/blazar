@@ -16,7 +16,7 @@ Unified OpenAI · Ollama · Anthropic gateway &nbsp;·&nbsp; Multi-engine servin
 
 ![Blazar in action](docs/assets/blazar-demo.svg)
 
-*Live CLI session: model serving, resource decisions, and request diagnostics in one place.*
+*Live CLI session: single-shot generation, the engine panel with speculation state, the installed-lane inventory, and the routing decision for a model — all from one daemon.*
 
 **[Get started in 60 seconds](#60-second-quickstart)** &nbsp;·&nbsp; **[Why use Blazar](#why-use-blazar)** &nbsp;·&nbsp; **[Benchmark evidence](#benchmark-snapshot)** &nbsp;·&nbsp; **[API reference](docs/4.API_SPEC.md)**
 
