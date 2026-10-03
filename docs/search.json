@@ -2,7 +2,7 @@
 sitemap: false
 ---
 [
-{% assign pages = site.html_pages | where_exp: "p", "p.url != '/search.html' and p.url != '/404.html'" %}
+{% assign pages = site.html_pages | where_exp: "p", "p.url != '/search.html'" | where_exp: "p", "p.url != '/404.html'" %}
 {% for page in pages %}
   {
     "title": {{ page.title | default: page.name | jsonify }},
