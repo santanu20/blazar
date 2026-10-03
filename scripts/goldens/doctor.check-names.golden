@@ -11,11 +11,20 @@ exposure
 gpu driver
 gpu vram
 hardware
+inventory mlx
 keys
 model types
 models
 port
 routing
 sentinel
+sglang fit
 store
+systemd unit
 tempdir hygiene
+versions llamacpp
+versions mistralrs
+versions mlx
+versions piper
+versions sdcpp
+versions sglang

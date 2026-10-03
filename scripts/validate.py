@@ -86,18 +86,29 @@ def _store_model_rows() -> list[str]:
 
 
 def _listed_model_names(list_stdout: str) -> set[str]:
-    """NAME column of `blazar list` output (header skipped).
+    """`name` field of `blazar list --json` output (one JSONL object per row).
 
-    The listing is columnar (NAME QUANT SIZE VISION ARCH CTX TYPE
-    CATEGORY ENGINE); a raw whitespace-token diff leaks other columns'
-    words (the ARCH column once fed `pull qwen3 --verify` a name that
-    resolves to no store row). Store names never contain spaces.
+    The rendered table adaptively truncates cells once a daemon is loaded
+    (a name can render as `qwen3-0.…`), which silently broke exact-name
+    assertions mid-suite; JSONL is stable. Lines that fail to parse as
+    JSON (a stray table, an error banner) are skipped, and store names
+    never contain spaces so the first-token fallback stays safe.
     """
     names = set()
-    for line in list_stdout.splitlines()[1:]:
-        parts = line.split()
-        if parts:
-            names.add(parts[0])
+    for line in list_stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            name = json.loads(line).get("name")
+        except ValueError:
+            if not line.startswith(("{", "[")):
+                parts = line.split()
+                if parts:
+                    names.add(parts[0])
+            continue
+        if name:
+            names.add(name)
     return names
 
 
@@ -1068,6 +1079,19 @@ _COMMAND_ATTRS = {
     "why.trace": (True, False, False, False, True),
     "watch": (True, False, False, False, True),
     "help": (False, False, False, False, True),
+    # 2026-10-03 gate-(a) fill: commands the 48-command --help advertises
+    # that the manifest lacked (their leaves never got evidence rows).
+    "connect.list": (False, False, False, False, True),
+    "connect.reject": (False, False, False, False, True),
+    "explain": (True, False, False, False, True),
+    "explain.reject": (True, False, False, False, True),
+    "model-doctor": (True, True, False, False, True),
+    "prune.dry-run": (False, False, False, False, True),
+    "replicate.refusal": (False, False, False, False, True),
+    "route": (True, False, False, False, True),
+    "route.unknown": (True, False, False, False, True),
+    "storage": (False, False, False, False, True),
+    "warm": (True, True, False, False, True),
 }
 
 COMMANDS = [
@@ -1092,7 +1116,7 @@ TOPLEVEL_COMMANDS = sorted(
 )
 
 # ---------------------------------------------------------------------------
-# TOPLEVEL_KNOBS manifest: all 171 Config fields.
+# TOPLEVEL_KNOBS manifest: all Config fields.
 # option=True  -> Option<T>, absent from fresh `config list` until set
 # container=True -> keys / remotes / engine_env / model_overrides section
 # tier  -> evidence class (see module docstring); group -> knobs_argv batch
@@ -1975,6 +1999,40 @@ _K = [
         None,
         "idle-to-RAM page-cache warm gate (skips direct-io); frontier wave 4",
     ),
+    # 2026-10-03 gate-(b) fill: non-Option knobs the fresh config list
+    # ships that the manifest lacked (fresh-list == manifest gate).
+    (
+        "download_speed_limit_mb",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "pull rate cap in MB/s (0 = off); echo + boot",
+    ),
+    (
+        "remote_fallback",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "pure-prefix routing kill switch; echo + boot",
+    ),
+    (
+        "warm_on_pull",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "spawn model in background once its pull completes; echo + boot",
+    ),
+    (
+        "whisper_stream_chunk_ms",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "whisper stream chunk cadence 1_000..=120_000 ms; echo + boot",
+    ),
 ]
 
 TOPLEVEL_KNOBS = [
@@ -2248,6 +2306,22 @@ def disk_free_gb(path: str = REAL_DATA) -> float:
     return t.free / (1024**3)
 
 
+def ensure_phase_daemon() -> None:
+    """Lanes whose CLI auto-starts a daemon (whisper/tts/run) must not
+    race the phase daemon churn: stop.* lanes tear the daemon down and
+    later lanes restart it, while the CLI's detached-boot fallback binds
+    exactly once and loses to a concurrently draining listener
+    (live-observed: bind-conflict rc=1 'daemon did not become healthy'
+    from whisper + run lanes). Health-poll first; the CLI then finds a
+    healthy daemon via /healthz and never enters the fallback path."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/healthz", timeout=2):
+            return
+    except Exception:
+        pass
+    DAEMON.start({"port": PORT})
+
+
 def _metric_value(raw: bytes, name: str) -> float | None:
     m = re.search(rb"^" + name.encode() + rb" ([0-9.eE+-]+)", raw, re.MULTILINE)
     return float(m.group(1)) if m else None
@@ -2436,6 +2510,75 @@ class Sandbox:
         dst.close()
         src.close()
         os.makedirs(os.path.join(self.data_dir, "run"), exist_ok=True)
+        # The copied rows keep REAL absolute blob paths — a sandboxed
+        # rm/delete/prune would follow them and delete the user's real
+        # files (live incident 2026-10-03: the pull battery's cleanup
+        # `rm qwen3-0.6b` unlinked the real Q4_0 blob through the copied
+        # row). Rebase every referenced artifact onto a sandbox hardlink
+        # so destructive ops can only ever unlink sandbox links — same
+        # guarantee the engines copy above buys for `engine update`.
+        self._rebase_model_paths()
+
+    def _relink(self, src_path: str) -> str:
+        """Hardlink one real-store artifact (file or safetensors dir)
+        into the sandbox and return the sandbox path. Missing sources
+        keep their original path (doctor's missing-blob warns stay
+        testable); already-sandboxed paths pass through untouched."""
+        if not src_path or src_path.startswith(self.root):
+            return src_path
+        src = Path(src_path)
+        if not src.exists():
+            return src_path
+        dst = Path(self.data_dir) / "models" / f"__sb__{src.name}"
+        if src.is_dir():
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst, symlinks=True, copy_function=os.link)
+        else:
+            if dst.exists():
+                dst.unlink()
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+        return str(dst)
+
+    def _rebase_model_paths(self) -> None:
+        db = sqlite3.connect(os.path.join(self.data_dir, "blazar.db"))
+        try:
+            rows = db.execute(
+                "SELECT name, path, mmproj_path, components FROM models"
+            ).fetchall()
+            for name, path, mmproj, components in rows:
+                comps = None
+                if components:
+                    try:
+                        comps = json.loads(components)
+                        for c in comps if isinstance(comps, list) else []:
+                            if isinstance(c, dict) and c.get("path"):
+                                c["path"] = self._relink(c["path"])
+                    except ValueError:
+                        comps = None
+                # NULL/absent stays NULL/absent: writing '' would make the
+                # daemon read mmproj_path as Some("") and misclassify the
+                # model as multimodal (cache_reuse skip, mmproj warnings).
+                db.execute(
+                    "UPDATE models SET path = ?, mmproj_path = ?, components = ?"
+                    " WHERE name = ?",
+                    (
+                        self._relink(path) if path else path,
+                        self._relink(mmproj) if mmproj else mmproj,
+                        json.dumps(comps) if comps is not None else components,
+                        name,
+                    ),
+                )
+            for lid, lp in db.execute("SELECT id, path FROM loras").fetchall():
+                db.execute(
+                    "UPDATE loras SET path = ? WHERE id = ?", (self._relink(lp), lid)
+                )
+            db.commit()
+        finally:
+            db.close()
 
     def env(self, extra: dict | None = None) -> dict:
         e = dict(os.environ)
@@ -3365,7 +3508,10 @@ def _promote_fixture(ref: str) -> None:
         except OSError:
             shutil.copy2(row["path"], dest)
     meta = cache / f"{repo.replace('/', '_')}__{quant}.json"
-    meta.write_text(json.dumps({k: row[k] for k in row}))
+    # sqlite3.Row iteration yields VALUES, not keys — row[k] on a value
+    # raises IndexError("No item with that key") (quantize-lane crash,
+    # 2026-10-03). .keys() is the column-name iterator.
+    meta.write_text(json.dumps({k: row[k] for k in row.keys()}))
 
 
 def cli(
@@ -4205,17 +4351,20 @@ def phase_api() -> None:
             "messages": [{"role": "user", "content": "Say OK."}],
         },
     )
-    content = ""
-    if isinstance(v, dict) and isinstance(v.get("content"), list):
-        for blk in v["content"]:
-            if isinstance(blk, dict) and blk.get("text"):
-                content = str(blk["text"])
-                break
+    # Contract: 200 + non-empty content of well-typed blocks. A thinking
+    # model may spend its whole token budget reasoning (stop_reason
+    # max_tokens, thinking-only content) — faithful to upstream Anthropic,
+    # so block TYPE is asserted, not the presence of a text block.
+    blocks = v.get("content") if isinstance(v, dict) else None
+    valid_blocks = bool(isinstance(blocks, list) and blocks) and all(
+        isinstance(b, dict) and b.get("type") in ("text", "thinking", "tool_use")
+        for b in blocks
+    )
     check(
         "api",
         "/v1/messages (bare) nonstream -> 200 + content",
-        st == 200 and bool(content),
-        f"status={st} content={content[:40]!r}",
+        st == 200 and valid_blocks,
+        f"status={st} blocks={[b.get('type') for b in blocks] if isinstance(blocks, list) else None}",
     )
     ok, collected = sse_collect(
         "/v1/messages",
@@ -4499,6 +4648,22 @@ def phase_api() -> None:
     elif disk_free_gb() <= 8:
         print(f"  (skip /api/pull real lane: disk free {disk_free_gb():.1f}G <= 8G)")
     else:
+        # Pre-pull snapshot: this battery pulls the same repo MODEL
+        # normalizes to, so when the store copy already holds the row the
+        # pull dedups (no new blob lands) and a cleanup rm would delete
+        # MODEL's own row — starving every later phase — and pre-rebase
+        # that rm once unlinked the REAL blob through the copied DB's
+        # absolute path (2026-10-03). Only rm when the row is genuinely
+        # new; a dedup leaves nothing to clean.
+        db = _sandbox_db()
+        try:
+            preexisting = bool(
+                db.execute(
+                    "SELECT 1 FROM models WHERE name = ?", ("qwen3-0.6b",)
+                ).fetchone()
+            )
+        finally:
+            db.close()
         ok, collected = sse_collect(
             "/api/pull",
             '"success"',
@@ -4526,7 +4691,11 @@ def phase_api() -> None:
             any("qwen3-0.6b" in n.lower() for n in names),
             f"tags={len(names)}",
         )
-        cli("rm", "qwen3-0.6b")
+        # Dedup pull leaves nothing to clean: the row predates this battery
+        # and every later phase (sentinel/behavior/wave/commands/golds)
+        # resolves MODEL through it. Only a genuinely-new row is cleaned.
+        if not preexisting:
+            cli("rm", "qwen3-0.6b")
 
     # vision chat over the real attached projector (BIG carries mmproj in
     # the store) — real PNG bytes end-to-end, no mock. Heavy: BIG load.
@@ -7172,6 +7341,91 @@ def phase_commands() -> None:
         f"colon input rc0 + canonical row printed; out={p.stdout.strip()[:60]!r}",
     )
 
+    # -- A1b: gate-(a) fill commands (2026-10-03) — the eight top-level
+    # commands the help advertises that had no evidence lane. Daemon is
+    # warm from the chat above; every probe is a real invocation. ------
+    p = cli("storage")
+    reg(
+        "storage",
+        p.returncode == 0 and "engine" in p.stdout.lower(),
+        f"rc={p.returncode} report head={p.stdout.strip().splitlines()[0][:60]!r}",
+    )
+
+    p = cli("prune")  # no selector and no --yes: preview-only by design
+    reg(
+        "prune.dry-run",
+        p.returncode == 0,
+        f"rc={p.returncode} preview head={p.stdout.strip().splitlines()[0][:60]!r}",
+    )
+
+    p = cli("replicate", MODEL)  # no [[remotes]] in the sandbox store
+    out = p.stdout + p.stderr
+    reg(
+        "replicate.refusal",
+        p.returncode != 0 and "remote" in out.lower(),
+        f"rc={p.returncode} teach={out.strip()[:90]!r}",
+    )
+
+    p = cli("connect")  # bare = client listing, no daemon probe fired
+    reg(
+        "connect.list",
+        p.returncode == 0 and "codex" in p.stdout.lower(),
+        f"rc={p.returncode} clients listed",
+    )
+    p = cli("connect", "bogus-client-xyz")
+    out = p.stdout + p.stderr
+    reg(
+        "connect.reject",
+        p.returncode != 0,
+        f"rc={p.returncode} teach={out.strip()[:90]!r}",
+    )
+
+    p = cli("explain", MODEL)
+    reg(
+        "explain",
+        p.returncode == 0 and MODEL in p.stdout,
+        f"rc={p.returncode} card rendered",
+    )
+    p = cli("explain", "no-such-model-xyz")
+    out = p.stdout + p.stderr
+    reg(
+        "explain.reject",
+        p.returncode != 0,
+        f"rc={p.returncode} teach={out.strip()[:90]!r}",
+    )
+
+    p = cli("route", MODEL)
+    reg(
+        "route",
+        p.returncode == 0 and "decision" in p.stdout.lower(),
+        f"rc={p.returncode} {p.stdout.strip().splitlines()[0][:60]!r}",
+    )
+    # Unknown model is a query, not an error: the decision card says none.
+    p = cli("route", "no-such-model-xyz")
+    reg(
+        "route.unknown",
+        p.returncode == 0 and "none" in p.stdout.lower(),
+        f"rc={p.returncode} decision=none card",
+    )
+
+    p = cli("warm", MODEL, timeout=180)
+    reg(
+        "warm",
+        p.returncode == 0,
+        f"rc={p.returncode} {p.stdout.strip()[:90]!r}",
+    )
+
+    p = cli("model-doctor", MODEL, "--json", timeout=240)
+    try:
+        cert = json.loads(p.stdout)
+    except (ValueError, TypeError):
+        cert = {}
+    reg(
+        "model-doctor",
+        p.returncode == 0 and "caps" in cert and "chat" in cert.get("caps", {}),
+        f"rc={p.returncode} caps={sorted(cert.get('caps', {}))}",
+    )
+
     p = cli("ps", "--reset")
     reg("ps.reset", p.returncode == 0, f"rc0; out={p.stdout.strip()[:80]!r}")
 
@@ -7360,15 +7614,32 @@ def phase_commands() -> None:
     cli("rm", "validate-created")
 
     # -- C: lora add/list/rm --------------------------------------------
-    p = cli("lora", "add", MODEL, "/nonexistent/validate.safetensors")
+    # add validates path-exists + file/dir shape (validate_lora_attach):
+    # stage the model's own blob as a real adapter file so the lifecycle
+    # runs the accepted path; the nonexistent-path refusal is probed as
+    # its own teaching row. Adapter APPLICATION stays in Rust unit tests
+    # (a real trained LoRA fixture is not synthesizable offline).
+    adapter = os.path.join(SANDBOX.root, "validate-adapter.gguf")
+    shutil.copyfile(model_path(MODEL), adapter)
+    p = cli("lora", "add", MODEL, adapter)
     add_out = p.stdout + p.stderr
+    pb = cli("lora", "add", MODEL, "/nonexistent/validate.safetensors")
     p2 = cli("lora", "list", MODEL)
     lora_id = None
     m = re.search(r"#(\d+)", add_out) or re.search(r"#(\d+)", p2.stdout)
     if m:
         lora_id = m.group(1)
     reg("lora.add", p.returncode == 0 and lora_id is not None, f"id={lora_id}")
-    reg("lora.list", p2.returncode == 0 and "validate" in (p2.stdout + add_out), "")
+    reg(
+        "lora.add.refusal",
+        pb.returncode != 0 and "adapter path not found" in (pb.stdout + pb.stderr),
+        f"rc={pb.returncode} nonexistent path refused with teaching",
+    )
+    reg(
+        "lora.list",
+        p2.returncode == 0 and "validate-adapter" in (p2.stdout + add_out),
+        "",
+    )
     if lora_id:
         p = cli("lora", "rm", lora_id)
         reg("lora.rm", p.returncode == 0, p.stdout.strip()[:60])
@@ -7868,6 +8139,13 @@ def phase_commands() -> None:
         )
         cli("rm", "validate-quant")
         cli("rm", "qwen3-0.6b")
+        # Restore MODEL for the phases still to come (golds boots a
+        # daemon and runs a real chat on it): the F16 source pull
+        # REPLACED the store-copy's Q4_0 row — same normalized name —
+        # and the cleanup rm above removed it outright. Seed from the
+        # main store (instant hardlink) with a network fallback.
+        if not seed_main_store_model("qwen3-0.6b:Q4_0"):
+            _pull_retry("pull", MODEL)
 
     if heavy_ok:
         lane("quantize.happy", _quantize, "quantize.refusal")
@@ -7953,6 +8231,7 @@ def phase_commands() -> None:
         wav = os.path.join(SANDBOX.root, "tiny.wav")
         with open(wav, "wb") as f:
             f.write(tiny_wav())
+        ensure_phase_daemon()
         p = cli("whisper", wav, timeout=600)
         out = p.stdout + p.stderr
         server_ok = (
@@ -8533,6 +8812,7 @@ def phase_commands() -> None:
             regb("tts.synthesize", "no voice pulled this run")
             return
         reg("tts.pull", True, "rc0")
+        ensure_phase_daemon()
         wav = os.path.join(SANDBOX.root, "validate-tts.wav")
         p = cli(
             "tts",
@@ -8555,10 +8835,17 @@ def phase_commands() -> None:
     lane("tts.install", _tts_heavy, "tts.pull", "tts.synthesize")
 
     def _pull():
-        before = _listed_model_names(cli("list").stdout)
+        # The store normally already holds the canonical row this repo
+        # normalizes to (`qwen3-0.6b`); pulling the repo ref again is the
+        # DEDUP path by design — rc=0, "already present", zero new bytes,
+        # no destructive re-pull. Only a store WITHOUT the row exercises
+        # a real fetch; require a fresh row only then.
+        before = _listed_model_names(cli("list", "--json").stdout)
+        row_existed = "qwen3-0.6b" in before
         p = _pull_retry("pull", "ggml-org/Qwen3-0.6B-GGUF")
-        after = _listed_model_names(cli("list").stdout)
+        after = _listed_model_names(cli("list", "--json").stdout)
         new = {w for w in after - before if "qwen3" in w.lower()}
+        out = (p.stdout or "") + (p.stderr or "")
         err = (p.stderr or "").lower()
         # A double HF-side failure (429/5xx on both attempts) is a transient
         # upstream window, not a regression — boundary it (run.miss-pulls
@@ -8579,6 +8866,14 @@ def phase_commands() -> None:
                 "pull",
                 f"transient HF window (rc={p.returncode}): {(p.stderr or '').strip()[:140]}",
             )
+        elif row_existed:
+            reg(
+                "pull",
+                p.returncode == 0
+                and "qwen3-0.6b" in after
+                and "already present" in out,
+                f"rc={p.returncode} dedup (row existed, no destructive re-pull)",
+            )
         else:
             reg(
                 "pull",
@@ -8586,9 +8881,10 @@ def phase_commands() -> None:
                 f"rc={p.returncode} new={sorted(new)[:3]}",
             )
         # --verify: re-hash the just-pulled model against its store row —
-        # must pass while the model is still in the store (pre-rm).
-        if new and not transient:
-            v = _pull_retry("pull", min(new), "--verify", timeout=240)
+        # must pass while the model is still in the store (pre-rm). The
+        # dedup path keeps the existing row, so --verify stays valid there.
+        if (new or row_existed) and not transient:
+            v = _pull_retry("pull", "qwen3-0.6b", "--verify", timeout=240)
             reg(
                 "pull.verify",
                 v.returncode == 0,
@@ -8612,14 +8908,23 @@ def phase_commands() -> None:
         # `blazar run` on a missing model must auto-pull (same flow as
         # `blazar pull`: progress, locks) and then run it — one-shot
         # prompt mode proves the whole chain parse -> pull -> serve.
-        before = _listed_model_names(cli("list").stdout)
+        # The store normally already holds the canonical row this repo
+        # normalizes to (`qwen3-0.6b`) — in that case the CLI REFUSES to
+        # re-pull over it (data-hazard guard) and dedups silently, which
+        # is equally correct: assert the non-destructive path instead of
+        # the miss teaching. Only a store WITHOUT the row exercises the
+        # "not in the store — pulling …" arm.
+        before = _listed_model_names(cli("list", "--json").stdout)
+        row_existed = "qwen3-0.6b" in before
+        ensure_phase_daemon()
         p = _pull_retry_cmd(
             ["run", "ggml-org/Qwen3-0.6B-GGUF", "Say ok", "--max-tokens", "8"],
             timeout=2400,
         )
-        after = set(cli("list").stdout.split())
-        new = {w for w in after - before if "qwen3" in w.lower()}
+        after = _listed_model_names(cli("list", "--json").stdout)
         miss_out = (p.stdout or "") + (p.stderr or "")
+        miss = "not in the store" in (p.stdout or "")
+        pulled = "qwen3-0.6b" in after and "qwen3-0.6b" not in before
         # A killed child (negative rc) or an upstream network window is
         # a stall, not a deterministic miss-pull failure — boundary it
         # like the pull lane does instead of failing the sweep.
@@ -8641,17 +8946,21 @@ def phase_commands() -> None:
                 "run.miss-pulls",
                 f"transient window (rc={p.returncode}): {miss_out.strip()[:140]}",
             )
+        elif row_existed:
+            reg(
+                "run.miss-pulls",
+                p.returncode == 0 and "qwen3-0.6b" in after,
+                f"rc={p.returncode} dedup (row existed; no destructive re-pull)",
+            )
         else:
             reg(
                 "run.miss-pulls",
-                p.returncode == 0
-                and bool(new)
-                and "not in the store" in (p.stdout or ""),
-                f"rc={p.returncode} new={sorted(new)[:3]}",
+                p.returncode == 0 and pulled and miss,
+                f"rc={p.returncode} miss-taught={miss} pulled={pulled}",
             )
-        for name in new:
-            cli("stop", name)
-            cli("rm", name)
+        if pulled:
+            cli("stop", "qwen3-0.6b")
+            cli("rm", "qwen3-0.6b")
 
     if heavy_ok:
         lane("run.miss-pulls", _run_miss_pulls)
@@ -9068,7 +9377,7 @@ def phase_knobs_behavior() -> None:
 
 
 def _full_toplevel() -> dict:
-    """All 171 manifest knobs with benign explicit values (full-manifest boot).
+    """All manifest knobs with benign explicit values (full-manifest boot).
 
     None values = deliberately omitted from the serialized boot config
     (XOR partners / pairing-gated knobs that cannot co-exist): the key
@@ -9281,6 +9590,12 @@ def _full_toplevel() -> dict:
         "sse_ping_interval": 15,
         "model_load_timeout_secs": 600,
         "mmproj_policy": None,
+        # 2026-10-03 gate-(b) fill: benign values within config.validate()
+        # ranges (rate cap 10 MB/s, chunk 5000 ms inside 1000..=120000).
+        "download_speed_limit_mb": 10.0,
+        "remote_fallback": False,
+        "warm_on_pull": False,
+        "whisper_stream_chunk_ms": 5000,
     }
 
 
@@ -9400,6 +9715,8 @@ def _env_valid_value(var: str, rust_type: str | None) -> str:
         "REASONING_FORMAT": "deepseek",
         "SERVER_TOOLS_RUNTIME": "docker:alpine",
         "SPEC": "auto",
+        # range-floored numeric: must be >= 1000 per config.validate()
+        "WHISPER_STREAM_CHUNK_MS": "2000",
     }
     if var in specials:
         return specials[var]
@@ -10375,6 +10692,7 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--kind": "flag.engine-update.--kind",
         "--no-gate": "engine.update",
         "--check": "flag.engine-update.--check",
+        "--all": "flag.engine-update.--all",
     },
     "engine list": {"--json": "flag.engine-list.--json"},
     "engine use": {"--kind": "engine.use"},
@@ -10549,6 +10867,27 @@ def phase_coverage() -> None:
                 f"net/engine refused (rc={p.returncode}): "
                 f"{(p.stderr or p.stdout).strip()[:70]}",
             )
+        # --all --check is the real all-lane resolver walk in dry-run form
+        # (nothing downloaded/installed/written); the pinned-tag conflict
+        # is its cheap teaching boundary (local, no network).
+        p = cli("engine", "update", "--all", "--check", timeout=300)
+        out_all = p.stdout + p.stderr
+        reg(
+            "flag.engine-update.--all",
+            p.returncode in (0, 1)
+            and any(
+                lane in out_all.lower()
+                for lane in ("llamacpp", "mistral", "sglang", "sd", "whisper", "lane")
+            ),
+            f"rc={p.returncode} {out_all.strip()[:80]!r}",
+        )
+        p = cli("engine", "update", "--all", "b000000", timeout=60)
+        out_t = p.stdout + p.stderr
+        reg(
+            "flag.engine-update.--all-tag-conflict",
+            p.returncode != 0 and "drop" in out_t.lower(),
+            f"rc={p.returncode} teach={out_t.strip()[:80]!r}",
+        )
         p = cli("engine", "update", "--kind", "mistralrs", "--check", timeout=300)
         out = p.stdout + p.stderr
         # Sandbox carries a mistralrs engine row: kind-specific output

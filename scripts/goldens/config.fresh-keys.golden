@@ -27,8 +27,10 @@ ctx_extend
 decode_policy
 default_ctx
 deterministic
+deterministic_isolate
 devices
 download_connections
+download_speed_limit_mb
 embd_normalize
 engine_asset
 engine_check_secs
@@ -85,6 +87,7 @@ reasoning_budget
 reasoning_budget_message
 reasoning_effort
 reasoning_format
+remote_fallback
 remotes
 repack
 reuse_port
@@ -143,9 +146,11 @@ update_channel
 video_ffmpeg_dir
 video_fps
 video_timestamp_interval
+warm_on_pull
 warm_peg
 warmup
 whisper_idle_secs
+whisper_stream_chunk_ms
 yarn_attn_factor
 yarn_beta_fast
 yarn_beta_slow
