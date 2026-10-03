@@ -874,16 +874,34 @@ pub async fn edits(
 
 // ---- native job dialect bridge ------------------------------------
 
+/// Query-dialect match for child narrowing: `?model=` accepts both the
+/// canonical child name (engine registration, e.g.
+/// `wan_2.1_comfyui_repackaged`) and any caller spelling the store
+/// resolves onto that row (`wan_2.1`).
+fn child_matches_model(query: &str, canonical: Option<&str>, child: &str) -> bool {
+    child == query || canonical == Some(child)
+}
+
 /// Live `sd-server` children, optionally narrowed to one model. The
 /// job routes resolve against this snapshot ONLY — they never spawn:
 /// a job belongs to the child that accepted it and dies with it.
+/// `model` is caller-spelled (body name or `?model=`); children
+/// register under the canonical row name, so the store resolves the
+/// spelling before narrowing — the same resolution the spawn path
+/// (`ensure_with_admission` -> `lane = row.name`) performs.
 fn live_sdcpp_children(state: &AppState, model: Option<&str>) -> Vec<blazar_runtime::EngineRef> {
+    let canonical = model.and_then(|m| {
+        state
+            .with_store(|s| resolve_model(s, m).ok())
+            .flatten()
+            .map(|row| row.name)
+    });
     state
         .sup
         .live_http_endpoints()
         .into_iter()
         .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::SdCpp)
-        .filter(|e| model.is_none_or(|m| e.name == m))
+        .filter(|e| model.is_none_or(|m| child_matches_model(m, canonical.as_deref(), &e.name)))
         .collect()
 }
 
@@ -1576,7 +1594,8 @@ pub async fn capabilities(
         return openai_error(
             400,
             "no live diffusion child — POST /v1/images/generations boots one, \
-             then capabilities serve (pass ?model=NAME to pick a family's child)",
+             then capabilities serve (pass ?model=NAME — store name or \
+             canonical engine name — to pick a family's child)",
         );
     };
     let url = format!("{}/sdcpp/v1/capabilities", child_base(&engine.endpoint));
@@ -1609,6 +1628,25 @@ pub async fn capabilities(
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__child_matches_model__accepts_store_alias_via_canonical_row() {
+        let child = "wan_2.1_comfyui_repackaged";
+        // Canonical spelling: exact match, no store roundtrip needed.
+        assert!(child_matches_model(child, None, child));
+        // Caller-spelled store alias: matches once the store resolves it
+        // onto the canonical row name.
+        assert!(child_matches_model("wan_2.1", Some(child), child));
+        // Different family: never matches, resolved or not.
+        assert!(!child_matches_model(
+            "qwen-image-2.1",
+            Some("qwen_image21"),
+            child
+        ));
+        assert!(!child_matches_model("wan_2.1", None, child)); // unresolved alias
+                                                               // Store resolution landing elsewhere must not widen the match.
+        assert!(!child_matches_model("wan_2.1", Some("other_family"), child));
+    }
 
     fn row(vae: Option<&str>, vision: Option<&str>) -> blazar_core::store::ModelRow {
         // vae=None models a TEXT row: no components at all. With the
