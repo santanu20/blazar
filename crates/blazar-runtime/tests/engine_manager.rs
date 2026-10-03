@@ -21,6 +21,18 @@ fn stub_server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_stub-llama-server"))
 }
 
+/// Piper fixtures must carry the platform binary name: the serving lane
+/// probes for `piper.exe` on Windows (`piper::piper_bin_in`), so a
+/// literal "piper" copy dangles there and the pin silently loses to the
+/// engines row.
+fn piper_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "piper.exe"
+    } else {
+        "piper"
+    }
+}
+
 /// Build a llama.cpp-style release tar.gz: root dir `llama-<tag>/` with
 /// the stub binary named `llama-server` inside (matches release.yml
 /// `--transform s,^\.,llama-<tag>, -C ./build/bin .`).
@@ -1874,7 +1886,7 @@ async fn adopt__piper_tree_moves_legacy_dir_and_row_created() {
         .join("2023.11.14-2")
         .join("piper-linux-x64");
     std::fs::create_dir_all(&legacy).unwrap();
-    std::fs::copy(stub_server_bin(), legacy.join("piper")).expect("copy stub");
+    std::fs::copy(stub_server_bin(), legacy.join(piper_bin_name())).expect("copy stub");
 
     let adopted = mgr.adopt_piper_legacy_trees();
     assert_eq!(adopted, vec!["2023.11.14-2".to_string()]);
@@ -1913,7 +1925,7 @@ async fn integration__piper_server_bin__pin_row_legacy_precedence() {
     let store = Store::open(&dirs).unwrap();
     let row_dir = dirs.engines_dir().join("2024.6.10-0");
     std::fs::create_dir_all(&row_dir).unwrap();
-    std::fs::copy(stub_server_bin(), row_dir.join("piper")).expect("copy stub");
+    std::fs::copy(stub_server_bin(), row_dir.join(piper_bin_name())).expect("copy stub");
     store
         .upsert_engine(&blazar_core::EngineRow {
             tag: "2024.6.10-0".into(),
@@ -1927,7 +1939,7 @@ async fn integration__piper_server_bin__pin_row_legacy_precedence() {
         .unwrap();
     let legacy_dir = dirs.data_dir.join("piper").join("2023.11.14-2");
     std::fs::create_dir_all(&legacy_dir).unwrap();
-    std::fs::copy(stub_server_bin(), legacy_dir.join("piper")).expect("copy stub");
+    std::fs::copy(stub_server_bin(), legacy_dir.join(piper_bin_name())).expect("copy stub");
 
     // No pin: the engines-lane row wins over the legacy tree.
     let (bin, _) = blazar_runtime::piper::server_bin(&dirs).expect("row lane pick");
@@ -1981,7 +1993,7 @@ fn unit__piper_set_pin__validates_rows_and_legacy_union() {
     let (_t, dirs) = tmp_dirs();
     let legacy = dirs.data_dir.join("piper").join("2023.11.14-2");
     std::fs::create_dir_all(&legacy).unwrap();
-    std::fs::write(legacy.join("piper"), b"stub").unwrap();
+    std::fs::write(legacy.join(piper_bin_name()), b"stub").unwrap();
     let store = Store::open(&dirs).unwrap();
     store
         .upsert_engine(&blazar_core::EngineRow {
