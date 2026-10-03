@@ -97,7 +97,7 @@ impl EngineKind {
     /// quantized arm: MLX quants share the safetensors+quantized shape
     /// but only mlx-lm decodes the layout, so a present sglang must not
     /// shadow the mlx lane and an absent mlx lane teaches rather than
-    /// falling back into a lane that would emit garbage. Like SdCpp,
+    /// falling back into a lane that would emit garbage. Like `SdCpp`,
     /// Mlx is invisible to every other row's routing in reverse: GGUF
     /// and plain safetensors never land on it.
     ///
@@ -109,10 +109,7 @@ impl EngineKind {
     /// the model-domain layer where the component paths are known.
     #[must_use]
     pub fn route_format(
-        diffusion: bool,
-        safetensors: bool,
-        quantized: bool,
-        mlx: bool,
+        shape: FormatShape,
         installed: &[EngineKind],
         policy: crate::config::RoutingPolicy,
     ) -> Option<EngineKind> {
@@ -128,21 +125,25 @@ impl EngineKind {
         // the text lanes never see those rows; conversely the preference
         // orders below never name SdCpp, so text models can never land
         // on the image engine.
-        if diffusion {
+        if shape.diffusion {
             return installed.iter().copied().find(|k| *k == EngineKind::SdCpp);
         }
-        // MLX gate: same one-kind domain rule — an MLX-format dir has
-        // exactly one decoder, and no preference order names Mlx so
-        // other rows can never land on it. Checked before the quantized
-        // arm: MLX dirs are quantized-safetensors-shaped, and a present
-        // sglang must not shadow the only lane that decodes the layout.
-        if mlx {
-            return installed.iter().copied().find(|k| *k == EngineKind::Mlx);
+        match shape.shards {
+            // MLX gate: same one-kind domain rule — an MLX-format dir
+            // has exactly one decoder, and no preference order names
+            // Mlx so other rows can never land on it. Matched before
+            // the quantized arm: MLX dirs are quantized-safetensors-
+            // shaped, and a present sglang must not shadow the only
+            // lane that decodes the layout.
+            ShardFormat::MlxLayout => {
+                return installed.iter().copied().find(|k| *k == EngineKind::Mlx);
+            }
+            ShardFormat::QuantizedSafetensors => {
+                return installed.iter().copied().find(|k| *k == EngineKind::Sglang);
+            }
+            ShardFormat::SafetensorsDir | ShardFormat::GgufFile => {}
         }
-        if safetensors && quantized {
-            return installed.iter().copied().find(|k| *k == EngineKind::Sglang);
-        }
-        let [primary, fallback] = Self::format_preference_order(safetensors, policy);
+        let [primary, fallback] = Self::format_preference_order(shape.shards, policy);
         prefer(primary, fallback)
     }
 
@@ -151,11 +152,11 @@ impl EngineKind {
     /// order the CLI's just-in-time install offer recommends them in.
     #[must_use]
     pub fn format_preference_order(
-        safetensors: bool,
+        shards: ShardFormat,
         policy: crate::config::RoutingPolicy,
     ) -> [EngineKind; 2] {
         use crate::config::RoutingPolicy;
-        if safetensors {
+        if shards.is_dir() {
             match policy {
                 RoutingPolicy::Latency => [EngineKind::MistralRs, EngineKind::Sglang],
                 RoutingPolicy::Quality | RoutingPolicy::Throughput => {
@@ -178,14 +179,10 @@ pub enum LaneError {
     PinKindMissing { kind: EngineKind, roster: String },
     /// The model's engine pin matches no installed tag or kind.
     PinUnknown { pin: String, roster: String },
-    /// No installed engine serves the model's format. `quantized` =
-    /// AWQ/GPTQ/FP8 safetensors checkpoint — the teaching narrows to
+    /// No installed engine serves the model's format. A quantized
+    /// safetensors shape (AWQ/GPTQ/FP8) narrows the teaching to
     /// sglang, the only lane that serves those.
-    FormatUnserved {
-        safetensors: bool,
-        quantized: bool,
-        roster: String,
-    },
+    FormatUnserved { shape: FormatShape, roster: String },
     /// A diffusion component set (DiT+VAE+TE) with no sdcpp engine
     /// installed — text lanes cannot serve it, so the teaching narrows
     /// to the one lane that can.
@@ -206,15 +203,11 @@ impl LaneError {
             Self::PinUnknown { .. } => Vec::new(),
             Self::DiffusionUnserved { .. } => vec![EngineKind::SdCpp],
             Self::MlxUnserved { .. } => vec![EngineKind::Mlx],
-            Self::FormatUnserved {
-                safetensors,
-                quantized,
-                ..
-            } => {
-                if *safetensors && *quantized {
+            Self::FormatUnserved { shape, .. } => {
+                if shape.shards == ShardFormat::QuantizedSafetensors {
                     vec![EngineKind::Sglang]
                 } else {
-                    EngineKind::format_preference_order(*safetensors, policy).to_vec()
+                    EngineKind::format_preference_order(shape.shards, policy).to_vec()
                 }
             }
         }
@@ -232,20 +225,14 @@ impl fmt::Display for LaneError {
                 f,
                 "model engine pin \"{pin}\" matches no installed tag or kind — installed: {roster}"
             ),
-            Self::FormatUnserved {
-                safetensors,
-                quantized,
-                roster,
-            } if *safetensors && *quantized => write!(
+            Self::FormatUnserved { shape, roster } if shape.shards == ShardFormat::QuantizedSafetensors => write!(
                 f,
                 "no installed engine serves quantized safetensors (AWQ/GPTQ/FP8) — sglang is the lane for those; blazar engine install --kind sglang (installed: {roster})"
             ),
-            Self::FormatUnserved {
-                safetensors, roster, ..
-            } => write!(
+            Self::FormatUnserved { shape, roster } => write!(
                 f,
                 "no installed engine serves the {} format — install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: {roster}",
-                if *safetensors { "safetensors" } else { "GGUF" }
+                if shape.shards.is_dir() { "safetensors" } else { "GGUF" }
             ),
             Self::DiffusionUnserved { roster } => write!(
                 f,
@@ -282,50 +269,89 @@ pub enum LaneClass {
     Fork,
 }
 
+/// The model's shard shape on disk — what the router discriminates on,
+/// independent of how it is served. The variants are mutually exclusive
+/// by construction: a model is exactly one of these shapes, and each
+/// carries a different decoder contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShardFormat {
+    /// A single GGUF file (the llama.cpp-native shape).
+    #[default]
+    GgufFile,
+    /// A directory of plain HF safetensors shards.
+    SafetensorsDir,
+    /// Safetensors shards carrying a quantization block (AWQ/GPTQ/FP8)
+    /// — only sglang decodes those.
+    QuantizedSafetensors,
+    /// MLX `quantization` layout — only mlx-lm decodes it. Quant-
+    /// safetensors-shaped, but a different decoder contract, so it
+    /// outranks the quantized arm in every cascade.
+    MlxLayout,
+}
+
+impl ShardFormat {
+    /// Collapse the three raw detection signals into the one shape the
+    /// model actually is. Detection order mirrors the routing cascades:
+    /// MLX wins over plain quantized because an MLX dir is quant-shaped
+    /// yet only mlx-lm can decode it; quantization and MLX only count
+    /// inside a shard directory (a GGUF file is already its own shape).
+    #[must_use]
+    pub fn detect(is_dir: bool, quantized: bool, mlx: bool) -> Self {
+        if is_dir && mlx {
+            Self::MlxLayout
+        } else if is_dir && quantized {
+            Self::QuantizedSafetensors
+        } else if is_dir {
+            Self::SafetensorsDir
+        } else {
+            Self::GgufFile
+        }
+    }
+
+    /// Any of the directory-of-shards shapes (everything but GGUF).
+    #[must_use]
+    pub fn is_dir(self) -> bool {
+        !matches!(self, Self::GgufFile)
+    }
+}
+
+/// The format facts every routing verdict is made on: what the model
+/// IS, independent of how it is served. The axes travel as one struct
+/// so a call site cannot hand them over in the wrong order (bare bools
+/// read identically once shuffled, and the shuffle is the bug).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FormatShape {
+    /// Diffusion component set (DiT+VAE+TE) — the image domain gate,
+    /// orthogonal to the shard format: diffusion models ship as
+    /// safetensors dirs, and the domain, not the container, routes
+    /// them.
+    pub diffusion: bool,
+    /// The shard shape the router discriminates on.
+    pub shards: ShardFormat,
+}
+
 /// no routed adapter needed; `Ok(Some((tag, kind)))` = route this spawn
 /// to a local adapter of that row; `Err(teaching)` = nothing installed
 /// can serve the model (or the pin names something absent).
-// Nine scalars, every one a routing axis (the diffusion domain gate
-// joined with the sdcpp lane; the MLX format gate with the mlx lane)
-// — same shape allowance as the gateway proxy spawn helpers.
-#[allow(clippy::too_many_arguments)]
 pub fn serving_lane(
     mode: crate::config::RoutingMode,
     policy: crate::config::RoutingPolicy,
     pin: Option<&str>,
-    diffusion: bool,
-    safetensors: bool,
-    quantized: bool,
-    mlx: bool,
+    shape: FormatShape,
     global: EngineKind,
     installed: &[(String, EngineKind, LaneClass)],
 ) -> Result<Option<(String, EngineKind)>, String> {
-    serving_lane_typed(
-        mode,
-        policy,
-        pin,
-        diffusion,
-        safetensors,
-        quantized,
-        mlx,
-        global,
-        installed,
-    )
-    .map_err(|e| e.to_string())
+    serving_lane_typed(mode, policy, pin, shape, global, installed).map_err(|e| e.to_string())
 }
 
 /// [`serving_lane`] with the failure reason typed — callers that act on
 /// the reason (CLI just-in-time install offer) read the variant; every
 /// other caller keeps the string form.
-#[allow(clippy::too_many_arguments)] // see serving_lane: routing axes, not sprawl
 pub fn serving_lane_typed(
     mode: crate::config::RoutingMode,
     policy: crate::config::RoutingPolicy,
     pin: Option<&str>,
-    diffusion: bool,
-    safetensors: bool,
-    quantized: bool,
-    mlx: bool,
+    shape: FormatShape,
     global: EngineKind,
     installed: &[(String, EngineKind, LaneClass)],
 ) -> Result<Option<(String, EngineKind)>, LaneError> {
@@ -359,7 +385,7 @@ pub fn serving_lane_typed(
         return Ok(None);
     }
     let kinds: Vec<EngineKind> = installed.iter().map(|(_, k, _)| *k).collect();
-    match EngineKind::route_format(diffusion, safetensors, quantized, mlx, &kinds, policy) {
+    match EngineKind::route_format(shape, &kinds, policy) {
         Some(kind) if kind == global => Ok(None),
         // `kinds` is built from `installed`, so a matching lane always
         // exists; the None arm is pure type-shape. Among same-kind
@@ -373,11 +399,12 @@ pub fn serving_lane_typed(
             .filter(|(_, k, _)| *k == kind)
             .min_by_key(|(_, _, class)| u8::from(*class == LaneClass::Fork))
             .map(|(tag, _, _)| (tag.clone(), kind))),
-        None if diffusion => Err(LaneError::DiffusionUnserved { roster: roster() }),
-        None if mlx => Err(LaneError::MlxUnserved { roster: roster() }),
+        None if shape.diffusion => Err(LaneError::DiffusionUnserved { roster: roster() }),
+        None if shape.shards == ShardFormat::MlxLayout => {
+            Err(LaneError::MlxUnserved { roster: roster() })
+        }
         None => Err(LaneError::FormatUnserved {
-            safetensors,
-            quantized,
+            shape,
             roster: roster(),
         }),
     }
@@ -473,6 +500,15 @@ impl FromSql for EngineKind {
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
+    use super::FormatShape;
+    use super::ShardFormat::{GgufFile, QuantizedSafetensors, SafetensorsDir};
+
+    /// Positional sugar for the routing-axis struct: domain gate first,
+    /// shard shape second.
+    fn shape(diffusion: bool, shards: ShardFormat) -> FormatShape {
+        FormatShape { diffusion, shards }
+    }
+
     use super::*;
 
     #[test]
@@ -570,25 +606,25 @@ mod tests {
 
         let all = [LlamaCpp, MistralRs, Sglang];
         assert_eq!(
-            EngineKind::route_format(false, false, false, false, &all, Quality),
+            EngineKind::route_format(shape(false, GgufFile), &all, Quality),
             Some(LlamaCpp)
         );
         assert_eq!(
-            EngineKind::route_format(false, true, false, false, &all, Quality),
+            EngineKind::route_format(shape(false, SafetensorsDir), &all, Quality),
             Some(Sglang)
         );
         assert_eq!(
-            EngineKind::route_format(false, true, false, false, &all, Throughput),
+            EngineKind::route_format(shape(false, SafetensorsDir), &all, Throughput),
             Some(Sglang)
         );
         // Latency flips safetensors to mistral.rs on TTFT/cold evidence;
         // GGUF stays on llamacpp quant kernels regardless.
         assert_eq!(
-            EngineKind::route_format(false, true, false, false, &all, Latency),
+            EngineKind::route_format(shape(false, SafetensorsDir), &all, Latency),
             Some(MistralRs)
         );
         assert_eq!(
-            EngineKind::route_format(false, false, false, false, &all, Latency),
+            EngineKind::route_format(shape(false, GgufFile), &all, Latency),
             Some(LlamaCpp)
         );
 
@@ -597,48 +633,55 @@ mod tests {
         // (live-proven v0.9.3), so it must never be the fallback, and
         // a latency policy must not flip a quantized dir onto it.
         assert_eq!(
-            EngineKind::route_format(false, true, true, false, &all, Quality),
+            EngineKind::route_format(shape(false, QuantizedSafetensors), &all, Quality),
             Some(Sglang)
         );
         assert_eq!(
-            EngineKind::route_format(false, true, true, false, &all, Latency),
+            EngineKind::route_format(shape(false, QuantizedSafetensors), &all, Latency),
             Some(Sglang)
         );
         assert_eq!(
-            EngineKind::route_format(false, true, true, false, &[LlamaCpp, MistralRs], Quality),
+            EngineKind::route_format(
+                shape(false, QuantizedSafetensors),
+                &[LlamaCpp, MistralRs],
+                Quality
+            ),
             None,
             "quantized dir with no sglang = unservable (teach), never mistral.rs"
         );
         // GGUF ignores the quantized flag — GGUF quants are their own
-        // well-served lane.
-        assert_eq!(
-            EngineKind::route_format(false, false, true, false, &all, Quality),
-            Some(LlamaCpp)
-        );
+        // well-served lane. Under the enum that contract lives in
+        // detect(): a quant signal outside a shard directory maps to
+        // the GGUF shape, so the router never sees a "quantized GGUF".
+        assert_eq!(ShardFormat::detect(false, true, false), GgufFile);
 
         // Overlap fallbacks: GGUF without llamacpp, safetensors without
         // sglang — both land on mistral.rs.
         assert_eq!(
-            EngineKind::route_format(false, false, false, false, &[MistralRs, Sglang], Quality),
+            EngineKind::route_format(shape(false, GgufFile), &[MistralRs, Sglang], Quality),
             Some(MistralRs)
         );
         assert_eq!(
-            EngineKind::route_format(false, true, false, false, &[LlamaCpp, MistralRs], Quality),
+            EngineKind::route_format(
+                shape(false, SafetensorsDir),
+                &[LlamaCpp, MistralRs],
+                Quality
+            ),
             Some(MistralRs)
         );
         // Latency without mistral.rs falls back to sglang.
         assert_eq!(
-            EngineKind::route_format(false, true, false, false, &[LlamaCpp, Sglang], Latency),
+            EngineKind::route_format(shape(false, SafetensorsDir), &[LlamaCpp, Sglang], Latency),
             Some(Sglang)
         );
 
         // Unserved formats teach instead of guessing.
         assert_eq!(
-            EngineKind::route_format(false, true, false, false, &[LlamaCpp], Quality),
+            EngineKind::route_format(shape(false, SafetensorsDir), &[LlamaCpp], Quality),
             None
         );
         assert_eq!(
-            EngineKind::route_format(false, false, false, false, &[Sglang], Quality),
+            EngineKind::route_format(shape(false, GgufFile), &[Sglang], Quality),
             None
         );
 
@@ -646,7 +689,7 @@ mod tests {
         // image engine — an sdcpp-only box teaches FormatUnserved, and
         // an installed sdcpp lane is invisible beside text kinds.
         assert_eq!(
-            EngineKind::route_format(false, false, false, false, &[EngineKind::SdCpp], Quality),
+            EngineKind::route_format(shape(false, GgufFile), &[EngineKind::SdCpp], Quality),
             None,
             "GGUF with only an sdcpp lane = unservable (teach), never the image engine"
         );
@@ -655,10 +698,7 @@ mod tests {
         // mistral.rs teaches unserved rather than touching sdcpp.
         assert_eq!(
             EngineKind::route_format(
-                false,
-                false,
-                false,
-                false,
+                shape(false, GgufFile),
                 &[EngineKind::SdCpp, LlamaCpp],
                 Quality
             ),
@@ -666,10 +706,7 @@ mod tests {
         );
         assert_eq!(
             EngineKind::route_format(
-                false,
-                true,
-                false,
-                false,
+                shape(false, SafetensorsDir),
                 &[EngineKind::SdCpp, LlamaCpp],
                 Quality
             ),
@@ -690,24 +727,24 @@ mod tests {
         // installed (GGUF-format DiT would otherwise prefer llamacpp).
         let mixed = [SdCpp, LlamaCpp, Sglang];
         assert_eq!(
-            EngineKind::route_format(true, false, false, false, &mixed, Quality),
+            EngineKind::route_format(shape(true, GgufFile), &mixed, Quality),
             Some(SdCpp)
         );
         assert_eq!(
-            EngineKind::route_format(true, true, false, false, &mixed, Quality),
+            EngineKind::route_format(shape(true, SafetensorsDir), &mixed, Quality),
             Some(SdCpp)
         );
         // Reverse gate: text rows can never land on the image engine —
         // the preference orders do not name it (pinned in the sibling
         // test via [SdCpp, LlamaCpp] GGUF→LlamaCpp and safetensors→None).
         assert_eq!(
-            EngineKind::route_format(false, false, false, false, &[SdCpp], Quality),
+            EngineKind::route_format(shape(false, GgufFile), &[SdCpp], Quality),
             None
         );
         // No sdcpp installed: the set is unservable (caller teaches via
         // LaneError::DiffusionUnserved, not a silent text-lane fallback).
         assert_eq!(
-            EngineKind::route_format(true, false, false, false, &[LlamaCpp, Sglang], Quality),
+            EngineKind::route_format(shape(true, GgufFile), &[LlamaCpp, Sglang], Quality),
             None
         );
     }
@@ -750,8 +787,7 @@ mod tests {
         // first, latency wants mistral.rs first; GGUF is fixed.
         assert_eq!(
             LaneError::FormatUnserved {
-                safetensors: true,
-                quantized: false,
+                shape: shape(false, SafetensorsDir),
                 roster: roster.clone()
             }
             .missing_kinds(Quality),
@@ -759,8 +795,7 @@ mod tests {
         );
         assert_eq!(
             LaneError::FormatUnserved {
-                safetensors: true,
-                quantized: false,
+                shape: shape(false, SafetensorsDir),
                 roster: roster.clone()
             }
             .missing_kinds(Latency),
@@ -768,8 +803,7 @@ mod tests {
         );
         assert_eq!(
             LaneError::FormatUnserved {
-                safetensors: false,
-                quantized: false,
+                shape: shape(false, GgufFile),
                 roster
             }
             .missing_kinds(Quality),
@@ -779,8 +813,7 @@ mod tests {
         // JIT install menu must not recommend a known-broken lane.
         assert_eq!(
             LaneError::FormatUnserved {
-                safetensors: true,
-                quantized: true,
+                shape: shape(false, QuantizedSafetensors),
                 roster: "b1 (llamacpp)".to_string()
             }
             .missing_kinds(Latency),
@@ -788,8 +821,7 @@ mod tests {
         );
         assert_eq!(
             LaneError::FormatUnserved {
-                safetensors: true,
-                quantized: true,
+                shape: shape(false, QuantizedSafetensors),
                 roster: "b1 (llamacpp)".to_string()
             }
             .to_string(),
@@ -808,14 +840,16 @@ mod tests {
         let installed = vec![("b1".to_string(), LlamaCpp, LaneClass::Mainstream)];
         let cases = [("sglang", true), ("bogus-tag", true), (":irrelevant", true)];
         for (pin, safetensors) in cases {
+            let shards = if safetensors {
+                SafetensorsDir
+            } else {
+                GgufFile
+            };
             let typed = serving_lane_typed(
                 RoutingMode::Auto,
                 RoutingPolicy::Quality,
                 Some(pin),
-                false,
-                safetensors,
-                false,
-                false,
+                shape(false, shards),
                 LlamaCpp,
                 &installed,
             )
@@ -825,10 +859,7 @@ mod tests {
                 RoutingMode::Auto,
                 RoutingPolicy::Quality,
                 Some(pin),
-                false,
-                safetensors,
-                false,
-                false,
+                shape(false, shards),
                 LlamaCpp,
                 &installed,
             )
@@ -840,10 +871,7 @@ mod tests {
             RoutingMode::Auto,
             RoutingPolicy::Quality,
             None,
-            false,
-            true,
-            false,
-            false,
+            shape(false, SafetensorsDir),
             LlamaCpp,
             &installed,
         )
@@ -879,10 +907,7 @@ mod tests {
             Auto,
             Quality,
             None,
-            false,
-            false,
-            false,
-            false,
+            shape(false, GgufFile),
             EngineKind::Sglang,
             &installed,
         )
@@ -893,10 +918,7 @@ mod tests {
             Auto,
             Quality,
             Some("fork-acme_x-7c81a9f0-cuda"),
-            false,
-            false,
-            false,
-            false,
+            shape(false, GgufFile),
             EngineKind::Sglang,
             &installed,
         )
@@ -916,10 +938,7 @@ mod tests {
             Auto,
             Quality,
             None,
-            false,
-            false,
-            false,
-            false,
+            shape(false, GgufFile),
             EngineKind::Sglang,
             &fork_only,
         )
@@ -938,10 +957,7 @@ mod tests {
             Auto,
             Quality,
             None,
-            false,
-            false,
-            false,
-            false,
+            shape(false, GgufFile),
             EngineKind::Sglang,
             &two_mainstream,
         )

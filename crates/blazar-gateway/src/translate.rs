@@ -1118,7 +1118,7 @@ pub fn request_asks_thinking(body: &[u8]) -> bool {
 /// whose content survives untouched (the common case once thinking is
 /// off) re-emit byte-identical, so exotic clients see the child's own
 /// serialization. Only mutated frames re-serialize (compact JSON — the
-/// OpenAI wire format is JSON, spacing is not semantic). Per-choice
+/// `OpenAI` wire format is JSON, spacing is not semantic). Per-choice
 /// state: each `choices[].index` gets its own [`ThinkSplitter`], so a
 /// multi-choice stream filters independently. Fail-open: a `data:` line
 /// that does not parse passes through verbatim; non-data lines (comments,
@@ -1195,10 +1195,7 @@ impl SseThinkFilter {
             let Some(Value::String(content)) = delta.get_mut("content") else {
                 continue;
             };
-            let splitter = self
-                .splitters
-                .entry(index)
-                .or_insert_with(ThinkSplitter::new);
+            let splitter = self.splitters.entry(index).or_default();
             let filtered = splitter.feed(content);
             if filtered != *content {
                 touched = true;

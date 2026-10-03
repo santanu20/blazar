@@ -15,7 +15,7 @@
 //! deletable (`prune` does `remove_dir_all`), and a version pin must be
 //! exact. A shared venv would make rollback a mutation, not a switch.
 //!
-//! Backend matrix (mirrors how mlx-lm 0.32 itself distributes, PyPI
+//! Backend matrix (mirrors how mlx-lm 0.32 itself distributes, `PyPI`
 //! `requires_dist`): Linux/NVIDIA installs `mlx[cuda12]` — the CUDA
 //! backend rides the standard package as an extra (the separate
 //! `mlx-cuda` wheel was the pre-0.32 distribution and is no longer the
@@ -46,7 +46,7 @@ pub const MLX_LM_DEFAULT_VERSION: &str = "0.32.0";
 pub const MLX_CUDA_PIN: &str = "mlx[cuda12]==0.32.2";
 
 /// Kernel-compile surface for the CUDA backend: mlx JIT-compiles its
-/// kernels at generation time through NVRTC and needs a CUDA_HOME with
+/// kernels at generation time through NVRTC and needs a `CUDA_HOME` with
 /// modern headers — the fp8 types mlx 0.32's bundled CCCL requires postdate
 /// CUDA 12.0, and system toolkits are routinely that old. These two wheels
 /// carry the headers (runtime + crt) and libs the engine-local cuda-home
@@ -213,7 +213,7 @@ async fn install_platform(dir: &Path, version: &str, extra_pins: &[String]) -> R
     Ok(shim)
 }
 
-/// Latest mlx-lm release on PyPI, for the doctor currency row.
+/// Latest mlx-lm release on `PyPI`, for the doctor currency row.
 pub async fn pypi_latest_mlx_lm() -> Result<String> {
     #[derive(serde::Deserialize)]
     struct PypiInfo {
@@ -260,15 +260,16 @@ pub async fn pypi_latest_mlx_lm() -> Result<String> {
 }
 
 /// Same dotted-3 parse as the sglang lane: tags share the `<prefix>-X.Y.Z`
-/// shape and PyPI versions are plain `X.Y.Z` (pre-release suffixes fall
+/// shape and `PyPI` versions are plain `X.Y.Z` (pre-release suffixes fall
 /// back to the leading core).
+#[must_use]
 pub fn version_tuple(v: &str) -> Option<(u64, u64, u64)> {
     super::sglang_install::version_tuple(v)
 }
 
 /// Build the engine-local `cuda-home` the mlx CUDA backend compiles
-/// against: `include/` merges the cuda_runtime and cuda_nvcc (crt)
-/// headers, `lib64/` merges the cuda_runtime and cuda_nvrtc libs, and
+/// against: `include/` merges the `cuda_runtime` and `cuda_nvcc` (crt)
+/// headers, `lib64/` merges the `cuda_runtime` and `cuda_nvrtc` libs, and
 /// `bin`/`nvvm` symlink the nvcc wheel's ptxas + nvvm tree. No nvcc
 /// binary ships in these wheels — mlx JIT-compiles through NVRTC, which
 /// the farm's lib64 satisfies. Keeps the lane self-contained on hosts
@@ -278,11 +279,13 @@ pub fn version_tuple(v: &str) -> Option<(u64, u64, u64)> {
 pub fn link_cuda_home(engine_dir: &Path) -> Result<PathBuf> {
     let venv_lib = engine_dir.join("venv").join("lib");
     let python_dir = std::fs::read_dir(&venv_lib)
-        .map_err(|e| anyhow::anyhow!("mlx venv missing lib/ ({venv_lib:?}): {e}"))?
-        .filter_map(|e| e.ok())
+        .map_err(|e| anyhow::anyhow!("mlx venv missing lib/ ({}): {e}", venv_lib.display()))?
+        .filter_map(std::result::Result::ok)
         .find(|e| e.file_name().to_string_lossy().starts_with("python3"))
         .map(|e| e.path())
-        .ok_or_else(|| anyhow::anyhow!("mlx venv has no python3.* dir under {venv_lib:?}"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("mlx venv has no python3.* dir under {}", venv_lib.display())
+        })?;
     let nvidia = python_dir.join("site-packages").join("nvidia");
     let farm = engine_dir.join("cuda-home");
 
@@ -314,8 +317,8 @@ pub fn link_cuda_home(engine_dir: &Path) -> Result<PathBuf> {
     link_in(&include, &nvidia.join("cuda_nvcc").join("include"))?;
     link_in(&lib64, &nvidia.join("cuda_runtime").join("lib"))?;
     link_in(&lib64, &nvidia.join("cuda_nvrtc").join("lib"))?;
-    std::os::unix::fs::symlink(&nvidia.join("cuda_nvcc").join("bin"), farm.join("bin"))?;
-    std::os::unix::fs::symlink(&nvidia.join("cuda_nvcc").join("nvvm"), farm.join("nvvm"))?;
+    std::os::unix::fs::symlink(nvidia.join("cuda_nvcc").join("bin"), farm.join("bin"))?;
+    std::os::unix::fs::symlink(nvidia.join("cuda_nvcc").join("nvvm"), farm.join("nvvm"))?;
     Ok(farm)
 }
 

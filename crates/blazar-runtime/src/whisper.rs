@@ -55,7 +55,7 @@ fn pin_path(dirs: &BlazarDirs) -> PathBuf {
 
 /// Pin-file location from the bare data dir — engine-removal
 /// reconciliation (`engine rm` of a pinned tag) runs from the removal
-/// site, which owns the data dir but not a full BlazarDirs.
+/// site, which owns the data dir but not a full `BlazarDirs`.
 #[must_use]
 pub fn pin_path_in(data_dir: &Path) -> PathBuf {
     data_dir.join("whisper").join("bin").join("pin")

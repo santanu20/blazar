@@ -1765,7 +1765,7 @@ pub struct EngineRef {
     /// child (`proxy::child_auth` is the single choke point). Never
     /// serialized into `ps`/API output.
     pub auth: Option<String>,
-    /// Path of the model row this child serves. mlx_lm reports the FULL
+    /// Path of the model row this child serves. `mlx_lm` reports the FULL
     /// path as its served model id (no `--served-model-name` flag exists
     /// — probe-verified), so the gateway's body stamp for the mlx lane
     /// reads it from here.
@@ -3457,14 +3457,19 @@ impl Supervisor {
             .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
             .collect();
         let safetensors = std::path::Path::new(&model.path).is_dir();
+        let shape = blazar_core::engine_kind::FormatShape {
+            diffusion: model.has_component_set(),
+            shards: blazar_core::engine_kind::ShardFormat::detect(
+                safetensors,
+                model.is_quantized_safetensors(),
+                model.is_mlx(),
+            ),
+        };
         let Some((tag, _kind)) = blazar_core::engine_kind::serving_lane(
             self.config.engine_routing.mode,
             self.config.engine_routing.policy,
             overlay.engine.as_deref(),
-            model.has_component_set(),
-            safetensors,
-            model.is_quantized_safetensors(),
-            safetensors && model.is_mlx(),
+            shape,
             self.engine.kind(),
             &installed,
         )?

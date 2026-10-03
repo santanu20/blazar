@@ -1541,22 +1541,27 @@ pub(crate) fn resolve_serving(
                     kind,
                 )
             };
+            let shape = engine_kind::FormatShape {
+                diffusion: model_row
+                    .as_ref()
+                    .is_some_and(blazar_core::ModelRow::has_component_set),
+                // The three detection signals collapse in detect(): the
+                // MLX marker + dir gate is the same discriminator the
+                // supervisor threads; keeps the router and this
+                // rescue-path verdict on one axis.
+                shards: engine_kind::ShardFormat::detect(
+                    std::path::Path::new(model_path).is_dir(),
+                    blazar_core::store::quantized_safetensors_signal(&canonical, "", model_path),
+                    model_row
+                        .as_ref()
+                        .is_some_and(blazar_core::ModelRow::is_mlx),
+                ),
+            };
             let lane = engine_kind::serving_lane(
                 state.config.engine_routing.mode,
                 state.config.engine_routing.policy,
                 overlay.engine.as_deref(),
-                model_row
-                    .as_ref()
-                    .is_some_and(blazar_core::ModelRow::has_component_set),
-                std::path::Path::new(model_path).is_dir(),
-                blazar_core::store::quantized_safetensors_signal(&canonical, "", model_path),
-                // MLX marker + dir gate = the same discriminator the
-                // supervisor threads; keeps the router and this
-                // rescue-path verdict on one axis.
-                model_row
-                    .as_ref()
-                    .is_some_and(blazar_core::ModelRow::is_mlx)
-                    && std::path::Path::new(model_path).is_dir(),
+                shape,
                 global,
                 &installed,
             );
@@ -1629,7 +1634,7 @@ pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) {
 /// `reasoning_effort` (`off|low|medium|high|xhigh`) — and enables
 /// thinking by DEFAULT when both are omitted; it does not read
 /// `chat_template_kwargs`, so the gateway's kwargs dialect silently
-/// no-ops there (upstream: docs.mistralrs.dev, OpenAI compatibility).
+/// no-ops there (upstream: docs.mistralrs.dev, `OpenAI` compatibility).
 /// This bridge mirrors the kwargs think state into the top-level fields:
 /// an explicit on-toggle becomes `enable_thinking: true`, an effort
 /// request rides natively (kwargs copy stays for the template), and a

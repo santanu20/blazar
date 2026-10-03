@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 use blazar_core::config::{RoutingMode, RoutingPolicy};
+use blazar_core::engine_kind::ShardFormat;
 
 /// Reason the routing lane resolved the way it did, stated as facts about
 /// the inputs (never invented internals of `serving_lane`). Pure so the
@@ -30,10 +31,7 @@ use blazar_core::config::{RoutingMode, RoutingPolicy};
 pub fn lane_reason(
     mode: RoutingMode,
     pin: Option<&str>,
-    diffusion: bool,
-    safetensors: bool,
-    quantized: bool,
-    mlx: bool,
+    shape: blazar_core::engine_kind::FormatShape,
     policy: RoutingPolicy,
 ) -> String {
     if matches!(mode, RoutingMode::Manual) {
@@ -42,22 +40,22 @@ pub fn lane_reason(
     if pin.is_some() {
         return "model_overrides.<model>.engine pins the lane".into();
     }
-    if diffusion {
+    if shape.diffusion {
         return "diffusion component set routes to the sdcpp lane".into();
     }
-    if mlx {
+    if shape.shards == ShardFormat::MlxLayout {
         // Checked before the quantized-safetensors arm, mirroring
         // route_format: only mlx-lm decodes MLX dirs, so the format
         // forces the lane ahead of any policy preference.
         return "MLX quant dir — the mlx lane is the only decoder, format-forced ahead of policy"
             .into();
     }
-    if safetensors && quantized {
+    if shape.shards == ShardFormat::QuantizedSafetensors {
         return format!(
             "quantized safetensors dir under engine_routing.policy = {policy:?} picks the lane"
         );
     }
-    if safetensors {
+    if shape.shards.is_dir() {
         return format!(
             "HF safetensors dir under engine_routing.policy = {policy:?} picks the lane"
         );
@@ -85,7 +83,7 @@ pub fn cold_ctx_note() -> &'static str {
 }
 
 /// The honest quant label for an MLX dir: the quantization block in
-/// config.json carries the real bits/group_size. The store's `quant`
+/// config.json carries the real `bits/group_size`. The store's `quant`
 /// column only records tensor storage dtype (e.g. BF16), which says
 /// nothing about the MLX quant strength shown to the user.
 #[must_use]
@@ -96,8 +94,8 @@ pub fn mlx_quant_display(path: &str) -> String {
         .and_then(|c| c.get("quantization").cloned());
     match block {
         Some(q) => {
-            let bits = q.get("bits").and_then(|v| v.as_u64());
-            let group = q.get("group_size").and_then(|v| v.as_u64());
+            let bits = q.get("bits").and_then(serde_json::Value::as_u64);
+            let group = q.get("group_size").and_then(serde_json::Value::as_u64);
             match (bits, group) {
                 (Some(b), Some(g)) => format!("MLX {b}-bit (group {g})"),
                 (Some(b), None) => format!("MLX {b}-bit"),
@@ -143,11 +141,17 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
 
     let overlay = state.config.overlay_for(&resolved);
     let safetensors = std::path::Path::new(&row.path).is_dir();
-    let diffusion = row.has_component_set();
-    let quantized = blazar_core::store::quantized_safetensors_signal(&resolved, "", &row.path);
-    // MLX dirs are safetensors-shaped; the token marker plus the dir
-    // gate is the discriminator the router uses.
-    let mlx = row.is_mlx() && safetensors;
+    // MLX dirs are safetensors-shaped; the token marker plus the
+    // dir gate is the discriminator the router uses (folded inside
+    // detect, which keeps the MLX-beats-quantized cascade in one place).
+    let shape = blazar_core::engine_kind::FormatShape {
+        diffusion: row.has_component_set(),
+        shards: blazar_core::engine_kind::ShardFormat::detect(
+            safetensors,
+            blazar_core::store::quantized_safetensors_signal(&resolved, "", &row.path),
+            row.is_mlx(),
+        ),
+    };
 
     // Lane + kind via the same decision the CLI/router make. The reason
     // string is derived from the INPUTS (facts), not from inside
@@ -177,10 +181,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             state.config.engine_routing.mode,
             state.config.engine_routing.policy,
             overlay.engine.as_deref(),
-            diffusion,
-            safetensors,
-            quantized,
-            mlx,
+            shape,
             g_kind,
             &installed,
         );
@@ -194,10 +195,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             "reason": lane_reason(
                 state.config.engine_routing.mode,
                 overlay.engine.as_deref(),
-                diffusion,
-                safetensors,
-                quantized,
-                mlx,
+                shape,
                 state.config.engine_routing.policy,
             ),
         }),
@@ -233,7 +231,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         .into_iter()
         .find(|p| p.name == resolved && p.ctx > 0)
         .map(|p| p.ctx);
-    let context = if mlx {
+    let context = if shape.shards == ShardFormat::MlxLayout {
         // mlx_lm owns the context window: the gateway passes no ctx flag
         // (compile_mlx ships ctx 0) — the shrink-to-fit ladder is a
         // llama.cpp concept that does not govern this lane.
@@ -344,7 +342,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     let (kv_k, kv_v) = state.config.effective_cache_type_kv(&resolved);
     // The KV ladder is a llama.cpp concept; on the mlx lane the runtime
     // manages KV and shaping flags ride argv passthrough.
-    let (kv_k_disp, kv_v_disp) = if mlx {
+    let (kv_key_label, kv_value_label) = if shape.shards == ShardFormat::MlxLayout {
         (
             "mlx runtime".to_string(),
             "kv-bits / kv-group-size via model_overrides argv".to_string(),
@@ -355,8 +353,8 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         (kv_k.clone(), kv_v.clone())
     };
     let cache = json!({
-        "kv_k": kv_k_disp,
-        "kv_v": kv_v_disp,
+        "kv_k": kv_key_label,
+        "kv_v": kv_value_label,
         "semantic_cache": {
             "enabled": state.config.semantic_cache.enabled,
             "model": state.config.semantic_cache.model,
@@ -374,18 +372,18 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         "model": {
             "name": row.name,
             "repo": row.repo,
-            "quant": if mlx { mlx_quant_display(&row.path) } else { row.quant },
+            "quant": if shape.shards == ShardFormat::MlxLayout { mlx_quant_display(&row.path) } else { row.quant },
             "bytes": row.bytes,
             "arch": row.arch,
             "params_b": row.params,
             "ctx_train": row.ctx_train,
             "shards": row.shards,
-            "format": if mlx {
-                "mlx-dir"
-            } else if safetensors {
-                "safetensors-dir"
-            } else {
-                "gguf"
+            "format": match shape.shards {
+                ShardFormat::MlxLayout => "mlx-dir",
+                ShardFormat::GgufFile => "gguf",
+                ShardFormat::SafetensorsDir | ShardFormat::QuantizedSafetensors => {
+                    "safetensors-dir"
+                }
             },
             "mmproj": row.mmproj_path.is_some(),
             "path": row.path,
@@ -405,6 +403,14 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
 mod tests {
     #![allow(non_snake_case)]
     use super::*;
+
+    use blazar_core::engine_kind::ShardFormat;
+
+    /// Positional sugar for the routing-axis struct: domain gate
+    /// first, shard shape second.
+    fn fs(diffusion: bool, shards: ShardFormat) -> blazar_core::engine_kind::FormatShape {
+        blazar_core::engine_kind::FormatShape { diffusion, shards }
+    }
 
     #[test]
     fn unit__mlx_quant_display__reads_the_quantization_block() {
@@ -442,7 +448,12 @@ mod tests {
         // otherwise claim the row for policy-based sglang routing — the
         // router checks the mlx axis first and so does this string.
         assert_eq!(
-            lane_reason(RoutingMode::Auto, None, false, true, true, true, P::Quality),
+            lane_reason(
+                RoutingMode::Auto,
+                None,
+                fs(false, ShardFormat::MlxLayout),
+                P::Quality
+            ),
             "MLX quant dir — the mlx lane is the only decoder, format-forced ahead of policy"
         );
     }
@@ -450,15 +461,13 @@ mod tests {
     #[test]
     fn unit__lane_reason__states_input_facts_per_branch() {
         use blazar_core::config::{RoutingMode, RoutingPolicy as P};
-        let r = |mode, pin, d, s, q, m, p| lane_reason(mode, pin, d, s, q, m, p);
+        let r = |mode, pin, d, f, p| lane_reason(mode, pin, fs(d, f), p);
         assert_eq!(
             r(
                 RoutingMode::Manual,
                 None,
                 false,
-                false,
-                false,
-                false,
+                ShardFormat::GgufFile,
                 P::Quality
             ),
             "engine_routing.mode = manual — the active engine serves every model"
@@ -468,9 +477,7 @@ mod tests {
                 RoutingMode::Auto,
                 Some("x"),
                 false,
-                false,
-                false,
-                false,
+                ShardFormat::GgufFile,
                 P::Quality
             ),
             "model_overrides.<model>.engine pins the lane"
@@ -480,9 +487,7 @@ mod tests {
                 RoutingMode::Auto,
                 None,
                 true,
-                false,
-                false,
-                false,
+                ShardFormat::GgufFile,
                 P::Quality
             ),
             "diffusion component set routes to the sdcpp lane"
@@ -491,9 +496,7 @@ mod tests {
             RoutingMode::Auto,
             None,
             false,
-            true,
-            true,
-            false,
+            ShardFormat::QuantizedSafetensors,
             P::Quality,
         );
         assert!(s.starts_with("quantized safetensors dir under"));
@@ -501,9 +504,7 @@ mod tests {
             RoutingMode::Auto,
             None,
             false,
-            true,
-            false,
-            false,
+            ShardFormat::SafetensorsDir,
             P::Latency,
         );
         assert!(s.starts_with("HF safetensors dir under"));
@@ -512,9 +513,7 @@ mod tests {
                 RoutingMode::Auto,
                 None,
                 false,
-                false,
-                false,
-                false,
+                ShardFormat::GgufFile,
                 P::Quality
             ),
             "GGUF file with no overlay pin — the global active lane serves it"

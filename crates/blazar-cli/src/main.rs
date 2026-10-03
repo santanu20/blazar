@@ -1038,7 +1038,7 @@ fn main() {
         Some(explicit) => Some(explicit),
         None if !matches!(cli.cmd, Cmd::Serve)
             && std::env::var_os("RUST_LOG").is_none()
-            && std::io::IsTerminal::is_terminal(&mut std::io::stderr()) =>
+            && std::io::IsTerminal::is_terminal(&std::io::stderr()) =>
         {
             Some("blazar_runtime=warn,blazar_core=warn".to_string())
         }
@@ -2016,16 +2016,30 @@ fn dim_line(text: &str) -> String {
 /// /api/tags; both call `serving_lane`). `Ok(None)`-lanes (manual mode,
 /// pin-to-global) resolve to the global tag; unservable models return
 /// the teaching error verbatim.
+/// Model facts the lane router consumes: identity (name/repo), the
+/// parsed GGUF arch (paradigm guard + rescue prediction), the diffusion
+/// component-set flag, and the on-disk path (safetensors/mlx signals).
+struct LaneRouteQuery<'a> {
+    name: &'a str,
+    repo: &'a str,
+    arch: Option<&'a str>,
+    diffusion: bool,
+    path: &'a str,
+}
+
 fn routed_engine_lane(
     cfg: &blazar_core::Config,
     global: Option<&(String, blazar_core::engine_kind::EngineKind)>,
     engine_rows: &[blazar_core::EngineRow],
-    name: &str,
-    repo: &str,
-    arch: Option<&str>,
-    diffusion: bool,
-    path: &str,
+    model: &LaneRouteQuery<'_>,
 ) -> Result<String, String> {
+    let LaneRouteQuery {
+        name,
+        repo,
+        arch,
+        diffusion,
+        path,
+    } = *model;
     let Some((g_tag, g_kind)) = global else {
         return Err("no engine installed — blazar engine install --kind <kind>".to_string());
     };
@@ -2086,14 +2100,19 @@ fn routed_engine_lane(
         .iter()
         .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
         .collect();
+    let shape = blazar_core::engine_kind::FormatShape {
+        diffusion,
+        shards: blazar_core::engine_kind::ShardFormat::detect(
+            safetensors,
+            quantized,
+            blazar_core::store::mlx_signal(name, repo, path),
+        ),
+    };
     match blazar_core::engine_kind::serving_lane(
         cfg.engine_routing.mode,
         cfg.engine_routing.policy,
         pin,
-        diffusion,
-        safetensors,
-        quantized,
-        safetensors && blazar_core::store::mlx_signal(name, repo, path),
+        shape,
         *g_kind,
         &installed,
     ) {
@@ -2354,14 +2373,19 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
             let overlay = cfg.overlay_for(&row.name);
             let pin = overlay.engine.as_deref();
             let safetensors = std::path::Path::new(&row.path).is_dir();
+            let shape = blazar_core::engine_kind::FormatShape {
+                diffusion: row.has_component_set(),
+                shards: blazar_core::engine_kind::ShardFormat::detect(
+                    safetensors,
+                    row.is_quantized_safetensors(),
+                    row.is_mlx(),
+                ),
+            };
             match blazar_core::engine_kind::serving_lane_typed(
                 cfg.engine_routing.mode,
                 cfg.engine_routing.policy,
                 pin,
-                row.has_component_set(),
-                safetensors,
-                row.is_quantized_safetensors(),
-                row.is_mlx() && safetensors,
+                shape,
                 active.kind,
                 &installed,
             ) {
@@ -2756,11 +2780,13 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
             &cfg,
             global.as_ref(),
             &engine_rows,
-            &m.name,
-            &m.repo,
-            m.arch.as_deref(),
-            m.has_component_set(),
-            &m.path,
+            &LaneRouteQuery {
+                name: &m.name,
+                repo: &m.repo,
+                arch: m.arch.as_deref(),
+                diffusion: m.has_component_set(),
+                path: &m.path,
+            },
         ) {
             unservable += 1;
             checks.push(Check::warn("routing", format!("{}: {teach}", m.name)));
@@ -4791,7 +4817,7 @@ fn with_extras(extras: &str, detail: &str) -> String {
     }
 }
 
-/// The lane's newest upstream release tag: PyPI for the pip lanes
+/// The lane's newest upstream release tag: `PyPI` for the pip lanes
 /// (sglang, mlx), the configured b-build channel for llama.cpp, newest
 /// release for the GitHub lanes. `None` on probe failure — callers
 /// degrade to "latest unknown" with the command intact.
@@ -6608,11 +6634,13 @@ fn list_json_row(
         cfg,
         global,
         engine_rows,
-        &m.name,
-        &m.repo,
-        m.arch.as_deref(),
-        m.has_component_set(),
-        &m.path,
+        &LaneRouteQuery {
+            name: &m.name,
+            repo: &m.repo,
+            arch: m.arch.as_deref(),
+            diffusion: m.has_component_set(),
+            path: &m.path,
+        },
     );
     let unservable = match &lane {
         Err(teach) if teach.starts_with("block-diffusion LLM") => Some(teach.clone()),
@@ -6712,11 +6740,13 @@ fn list(json: bool) -> Result<()> {
                 &cfg,
                 global.as_ref(),
                 &engine_rows,
-                &m.name,
-                &m.repo,
-                m.arch.as_deref(),
-                m.has_component_set(),
-                &m.path,
+                &LaneRouteQuery {
+                    name: &m.name,
+                    repo: &m.repo,
+                    arch: m.arch.as_deref(),
+                    diffusion: m.has_component_set(),
+                    path: &m.path,
+                },
             ) {
                 Ok(lane) => lane,
                 Err(teach) => {
@@ -9069,11 +9099,13 @@ fn repl_lane_suffix_for(
         cfg,
         global,
         engine_rows,
-        &row.name,
-        &row.repo,
-        row.arch.as_deref(),
-        row.has_component_set(),
-        &row.path,
+        &LaneRouteQuery {
+            name: &row.name,
+            repo: &row.repo,
+            arch: row.arch.as_deref(),
+            diffusion: row.has_component_set(),
+            path: &row.path,
+        },
     ) {
         Ok(tag) => {
             let kind = engine_rows
@@ -9107,7 +9139,7 @@ fn repl_lane_suffix(model: &str) -> Result<String> {
 
 /// Decision-model carrier architectures: the System One family
 /// (laya, julia-1, lev, openjev, kev) rides GGUFs converted as
-/// ModernBert + decision metadata. Embedding-readers, not generators —
+/// `ModernBert` + decision metadata. Embedding-readers, not generators —
 /// the chat loop could only relay the child's "does not support logits
 /// computation" error.
 fn repl_is_decision_model(model: &str) -> Result<bool> {
@@ -9178,21 +9210,7 @@ async fn run_repl_systemone(base: &str, model: &str) -> Result<()> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("/state ") {
-            let mut block = rest.trim().to_string();
-            if block.ends_with('\\') {
-                block.pop();
-                loop {
-                    let cont = match rl.readline("... ") {
-                        Ok(l) => l,
-                        Err(_) => break,
-                    };
-                    if cont.trim() == "." {
-                        break;
-                    }
-                    block.push(' ');
-                    block.push_str(&cont);
-                }
-            }
+            let block = read_systemone_state(&mut rl, rest);
             if block.is_empty() {
                 println!("  (state cleared)");
                 state = None;
@@ -9206,72 +9224,105 @@ async fn run_repl_systemone(base: &str, model: &str) -> Result<()> {
             println!("  set the state first: /state <text>");
             continue;
         };
-        let (question, yes, no) = parse_systemone_question(&line);
-        let body = serde_json::json!({
-            "model": model,
-            "state": state_text,
-            "questions": {
-                "q1": {
-                    "type": "choice",
-                    "instructions": question,
-                    "criteria": { "yes": yes, "no": no },
-                }
-            }
-        });
-        let resp = client
-            .post(format!("{base}/v1/systemone"))
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(120))
-            .send()
-            .await?;
-        let status = resp.status();
-        let payload: serde_json::Value = resp.json().await?;
-        if !status.is_success() {
-            let msg = payload
-                .pointer("/error/message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("request failed");
-            println!("  error ({status}): {msg}");
-            if status.as_u16() == 501 {
-                println!("  this model is not a decision model — System One REPL is for laya/julia/lev/openjev/kev-class models");
-                break;
-            }
-            continue;
+        if ask_systemone(&client, base, model, state_text, &line).await? {
+            break;
         }
-        let Some(answer) = payload.pointer("/answers/q1").cloned() else {
-            println!("  unexpected response shape: {payload}");
-            continue;
-        };
-        let choice = answer.get("choice").and_then(|v| v.as_str()).unwrap_or("?");
-        let confidence = answer
-            .get("confidence")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let probs: Vec<String> = answer
-            .get("probabilities")
-            .and_then(|v| v.as_object())
-            .map(|m| {
-                let mut v: Vec<String> = m
-                    .iter()
-                    .map(|(k, p)| format!("{k} {:.2}", p.as_f64().unwrap_or(0.0)))
-                    .collect();
-                v.sort();
-                v
-            })
-            .unwrap_or_default();
-        println!(
-            "  => {choice}  ({})  confidence {confidence:.2}",
-            probs.join(" / ")
-        );
     }
     Ok(())
 }
 
+/// Read a `/state` block: a trailing backslash continues onto more
+/// lines (the `... ` prompt) until a lone `.` terminates; returns the
+/// assembled block (empty = cleared).
+fn read_systemone_state(rl: &mut rustyline::DefaultEditor, first: &str) -> String {
+    let mut block = first.trim().to_string();
+    if block.ends_with('\\') {
+        block.pop();
+        while let Ok(cont) = rl.readline("... ") {
+            if cont.trim() == "." {
+                break;
+            }
+            block.push(' ');
+            block.push_str(&cont);
+        }
+    }
+    block
+}
+
+/// Ask one System One choice question and render the answer (choice +
+/// probabilities + confidence). Returns true when the REPL should exit
+/// (the 501 not-a-decision-model case — staying would only repeat it).
+async fn ask_systemone(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    state_text: &str,
+    line: &str,
+) -> Result<bool> {
+    let (question, yes, no) = parse_systemone_question(line);
+    let body = serde_json::json!({
+        "model": model,
+        "state": state_text,
+        "questions": {
+            "q1": {
+                "type": "choice",
+                "instructions": question,
+                "criteria": { "yes": yes, "no": no },
+            }
+        }
+    });
+    let resp = client
+        .post(format!("{base}/v1/systemone"))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        let msg = payload
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("request failed");
+        println!("  error ({status}): {msg}");
+        if status.as_u16() == 501 {
+            println!("  this model is not a decision model — System One REPL is for laya/julia/lev/openjev/kev-class models");
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    let Some(answer) = payload.pointer("/answers/q1").cloned() else {
+        println!("  unexpected response shape: {payload}");
+        return Ok(false);
+    };
+    let choice = answer.get("choice").and_then(|v| v.as_str()).unwrap_or("?");
+    let confidence = answer
+        .get("confidence")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let probs: Vec<String> = answer
+        .get("probabilities")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            let mut v: Vec<String> = m
+                .iter()
+                .map(|(k, p)| format!("{k} {:.2}", p.as_f64().unwrap_or(0.0)))
+                .collect();
+            v.sort();
+            v
+        })
+        .unwrap_or_default();
+    println!(
+        "  => {choice}  ({})  confidence {confidence:.2}",
+        probs.join(" / ")
+    );
+    Ok(false)
+}
+
 async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
-    use rustyline::error::ReadlineError;
     let base = ensure_daemon().await?;
-    if repl_is_decision_model(&model)? {
-        return run_repl_systemone(&base, &model).await;
+    if repl_is_decision_model(model)? {
+        return run_repl_systemone(&base, model).await;
     }
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut model = model.to_string();
@@ -9291,31 +9342,10 @@ async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
         repl_lane_suffix(&model)?
     );
     loop {
-        let line = match rl.readline(">>> ") {
-            Ok(l) => l,
-            // Ctrl+C at the prompt is a nudge, not an exit — ollama REPL
-            // semantics keep the session alive.
-            Err(ReadlineError::Interrupted) => {
-                println!("^C (use /exit or Ctrl+D to quit)");
-                continue;
-            }
-            Err(_) => break,
-        };
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        rl.add_history_entry(&line).ok();
-        // Multi-line input: a `"""` opener reads continuation lines (with
-        // a `... ` prompt) until the closing `"""`; empty blocks are a
-        // no-op. Plain `"""` text is rare enough to repurpose cleanly.
-        let line = if line == "\"\"\"" {
-            match read_multiline(&mut rl) {
-                Some(block) => block,
-                None => continue,
-            }
-        } else {
-            line
+        let line = match repl_read_turn(&mut rl) {
+            ReplRead::Exit => break,
+            ReplRead::Skip => continue,
+            ReplRead::Line(line) => line,
         };
         let model_before = model.clone();
         match repl_local_command(
@@ -9349,41 +9379,79 @@ async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
             _ => {}
         }
         history.push(serde_json::json!({"role": "user", "content": line}));
-        // Capability negotiation, not a silent retry: the first turn per
-        // model asks for thinking; if the daemon's teaching 400 says the
-        // model has no thinking mode, remember that and re-send once
-        // without the knob. The notice keeps the fallback loud.
-        if let Err(e) = repl_turn(
+        repl_send_turn(
             &base,
             &model,
             &mut history,
             system_msg.as_deref(),
             verbose,
-            thinks,
+            &mut thinks,
             no_draft,
         )
-        .await
-        {
-            if thinks && is_unsupported_think_error(&e.to_string()) {
-                thinks = false;
-                println!("(this model has no thinking mode — answers only)");
-                repl_turn(
-                    &base,
-                    &model,
-                    &mut history,
-                    system_msg.as_deref(),
-                    verbose,
-                    thinks,
-                    no_draft,
-                )
-                .await?;
-            } else {
-                return Err(e);
-            }
-        }
+        .await?;
     }
     #[cfg(unix)]
     restore_repl_sigint();
+    Ok(())
+}
+
+/// One REPL prompt cycle. Ctrl-C at the prompt is a nudge (the session
+/// stays alive, ollama REPL semantics); Ctrl-D/EOF exits; blank input
+/// skips a turn; a `"""` opener reads a multiline block.
+enum ReplRead {
+    Exit,
+    Skip,
+    Line(String),
+}
+
+fn repl_read_turn(rl: &mut rustyline::DefaultEditor) -> ReplRead {
+    use rustyline::error::ReadlineError;
+    let line = match rl.readline(">>> ") {
+        Ok(l) => l,
+        Err(ReadlineError::Interrupted) => {
+            println!("^C (use /exit or Ctrl+D to quit)");
+            return ReplRead::Skip;
+        }
+        Err(_) => return ReplRead::Exit,
+    };
+    let line = line.trim().to_string();
+    if line.is_empty() {
+        return ReplRead::Skip;
+    }
+    rl.add_history_entry(&line).ok();
+    let line = if line == "\"\"\"" {
+        match read_multiline(rl) {
+            Some(block) => block,
+            None => return ReplRead::Skip,
+        }
+    } else {
+        line
+    };
+    ReplRead::Line(line)
+}
+
+/// One generation turn with capability negotiation, not a silent
+/// retry: the first turn per model asks for thinking; if the daemon's
+/// teaching 400 says the model has no thinking mode, remember that and
+/// re-send once without the knob. The notice keeps the fallback loud.
+async fn repl_send_turn(
+    base: &str,
+    model: &str,
+    history: &mut Vec<serde_json::Value>,
+    system_msg: Option<&str>,
+    verbose: bool,
+    thinks: &mut bool,
+    no_draft: bool,
+) -> Result<()> {
+    if let Err(e) = repl_turn(base, model, history, system_msg, verbose, *thinks, no_draft).await {
+        if *thinks && is_unsupported_think_error(&e.to_string()) {
+            *thinks = false;
+            println!("(this model has no thinking mode — answers only)");
+            repl_turn(base, model, history, system_msg, verbose, *thinks, no_draft).await?;
+        } else {
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
@@ -12273,7 +12341,7 @@ async fn engine_install_mlx(d: &BlazarDirs, version: Option<String>) -> Result<(
 }
 
 /// `engine update --kind mlx [version]` — explicit version installs
-/// directly; bare call resolves the PyPI latest and installs it, the
+/// directly; bare call resolves the `PyPI` latest and installs it, the
 /// same lane semantics as sglang. `--check` stays a dry-run currency
 /// report. The version pin (`MLX_LM_DEFAULT_VERSION`) anchors fresh
 /// `engine install`; unknown flags on newer mlx-lm are skipped with
@@ -17061,17 +17129,30 @@ mod tests {
                 &cfg,
                 Some(&global),
                 &engine_rows,
-                "m",
-                "",
-                Some("qwen2"),
-                false,
-                "/x/m.gguf"
+                &LaneRouteQuery {
+                    name: "m",
+                    repo: "",
+                    arch: Some("qwen2"),
+                    diffusion: false,
+                    path: "/x/m.gguf"
+                },
             ),
             Ok("b-new".to_string())
         );
         // No engines at all: teaching error names the install command.
-        let err = routed_engine_lane(&cfg, None, &[], "m", "", Some("qwen2"), false, "/x/m.gguf")
-            .unwrap_err();
+        let err = routed_engine_lane(
+            &cfg,
+            None,
+            &[],
+            &LaneRouteQuery {
+                name: "m",
+                repo: "",
+                arch: Some("qwen2"),
+                diffusion: false,
+                path: "/x/m.gguf",
+            },
+        )
+        .unwrap_err();
         assert!(err.contains("blazar engine install"), "{err}");
         // A per-model pin to an uninstalled lane teaches with the roster.
         let pinned =
@@ -17081,11 +17162,13 @@ mod tests {
             &pinned,
             Some(&global),
             &engine_rows,
-            "m",
-            "",
-            Some("qwen2"),
-            false,
-            "/x/m.gguf",
+            &LaneRouteQuery {
+                name: "m",
+                repo: "",
+                arch: Some("qwen2"),
+                diffusion: false,
+                path: "/x/m.gguf",
+            },
         )
         .unwrap_err();
         assert!(err.contains("no mistralrs engine installed"), "{err}");
@@ -17098,11 +17181,13 @@ mod tests {
                 &auto,
                 Some(&global),
                 &engine_rows,
-                "m",
-                "",
-                Some("Qwen2ForCausalLM"),
-                false,
-                &dir.to_string_lossy()
+                &LaneRouteQuery {
+                    name: "m",
+                    repo: "",
+                    arch: Some("Qwen2ForCausalLM"),
+                    diffusion: false,
+                    path: &dir.to_string_lossy()
+                },
             ),
             Ok("sg-1".to_string())
         );
@@ -17124,11 +17209,13 @@ mod tests {
                 &cfg,
                 Some(&global),
                 &engine_rows,
-                "m",
-                "",
-                Some("instella-moe"),
-                false,
-                "/x/m.gguf"
+                &LaneRouteQuery {
+                    name: "m",
+                    repo: "",
+                    arch: Some("instella-moe"),
+                    diffusion: false,
+                    path: "/x/m.gguf"
+                },
             ),
             Ok("b-adv".to_string())
         );
@@ -17138,11 +17225,13 @@ mod tests {
                 &cfg,
                 Some(&global),
                 &engine_rows,
-                "m",
-                "",
-                Some("qwen2"),
-                false,
-                "/x/m.gguf"
+                &LaneRouteQuery {
+                    name: "m",
+                    repo: "",
+                    arch: Some("qwen2"),
+                    diffusion: false,
+                    path: "/x/m.gguf"
+                },
             ),
             Ok("b-main".to_string())
         );
@@ -17155,11 +17244,13 @@ mod tests {
                 &pinned,
                 Some(&global),
                 &engine_rows,
-                "m",
-                "",
-                Some("instella-moe"),
-                false,
-                "/x/m.gguf"
+                &LaneRouteQuery {
+                    name: "m",
+                    repo: "",
+                    arch: Some("instella-moe"),
+                    diffusion: false,
+                    path: "/x/m.gguf"
+                },
             ),
             Ok("b-main".to_string())
         );
@@ -17170,11 +17261,13 @@ mod tests {
                 &cfg,
                 Some(&global),
                 &engine_rows,
-                "m",
-                "",
-                Some("mystery-arch"),
-                false,
-                "/x/m.gguf"
+                &LaneRouteQuery {
+                    name: "m",
+                    repo: "",
+                    arch: Some("mystery-arch"),
+                    diffusion: false,
+                    path: "/x/m.gguf"
+                },
             ),
             Ok("b-main".to_string())
         );
@@ -17194,11 +17287,13 @@ mod tests {
             &cfg,
             Some(&global),
             &engine_rows,
-            "m",
-            "",
-            Some("llada"),
-            false,
-            "/x/m.gguf",
+            &LaneRouteQuery {
+                name: "m",
+                repo: "",
+                arch: Some("llada"),
+                diffusion: false,
+                path: "/x/m.gguf",
+            },
         )
         .unwrap_err();
         assert!(err.contains("block-diffusion LLM"), "{err}");
@@ -17217,11 +17312,13 @@ mod tests {
             &cfg,
             Some(&global),
             &mainstream_advertiser,
-            "m",
-            "",
-            Some("llada"),
-            false,
-            "/x/m.gguf",
+            &LaneRouteQuery {
+                name: "m",
+                repo: "",
+                arch: Some("llada"),
+                diffusion: false,
+                path: "/x/m.gguf",
+            },
         )
         .unwrap_err();
         assert!(err.contains("block-diffusion LLM"), "{err}");
@@ -17230,7 +17327,7 @@ mod tests {
         // bypasses the guard — the capability-rescue symmetry the
         // spawn guard promises.
         let mut fork_row = gap_engine_row("b-diff-fork", EngineKind::LlamaCpp, &["llada"]);
-        fork_row.manifest = fork_row.manifest.replace("{", "{\"source\":\"fork\",");
+        fork_row.manifest = fork_row.manifest.replace('{', "{\"source\":\"fork\",");
         let with_fork = vec![
             gap_engine_row("b-new", EngineKind::LlamaCpp, &["qwen2"]),
             fork_row,
@@ -17240,11 +17337,13 @@ mod tests {
                 &cfg,
                 Some(&global),
                 &with_fork,
-                "m",
-                "",
-                Some("llada"),
-                false,
-                "/x/m.gguf"
+                &LaneRouteQuery {
+                    name: "m",
+                    repo: "",
+                    arch: Some("llada"),
+                    diffusion: false,
+                    path: "/x/m.gguf"
+                },
             ),
             Ok("b-diff-fork".to_string())
         );
@@ -17255,11 +17354,13 @@ mod tests {
                 &cfg,
                 Some(&global),
                 &engine_rows,
-                "m",
-                "",
-                Some("qwen2"),
-                false,
-                "/x/m.gguf"
+                &LaneRouteQuery {
+                    name: "m",
+                    repo: "",
+                    arch: Some("qwen2"),
+                    diffusion: false,
+                    path: "/x/m.gguf"
+                },
             ),
             Ok("b-new".to_string())
         );
@@ -19248,7 +19349,7 @@ mod systemone_repl_tests {
         assert_eq!(q, "ship 2x");
         assert_eq!(y, "speed doubles");
         assert_eq!(n, "latency grows");
-        let (q, y, n) = parse_systemone_question("a :: b :: c :: d");
+        let (_q, y, n) = parse_systemone_question("a :: b :: c :: d");
         assert_eq!(y, "b");
         assert_eq!(n, "c :: d");
     }

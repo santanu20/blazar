@@ -20,6 +20,8 @@ pub fn ensure_tls_provider() {
 }
 
 #[cfg(test)]
+// Test names use the project's unit__area__behavior convention.
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
 

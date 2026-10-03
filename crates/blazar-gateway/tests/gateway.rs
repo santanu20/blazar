@@ -483,6 +483,8 @@ async fn e2e__systemone_is_llamacpp_only_and_teaches_on_other_lanes() {
     );
 }
 
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__n_choices_lane_ceiling_teaches_before_the_engine_can() {
     // The plane-wide range admits n=3, but the llamacpp lane (the stub)
     // serves at most 2. The gateway must 400 in its own voice before

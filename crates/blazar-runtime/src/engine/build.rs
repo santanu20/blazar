@@ -762,92 +762,17 @@ impl EngineManager {
         // let a broken install pass its probe — exactly the live failure
         // of 2026-09-09. Probe-after-teardown keeps the install check
         // honest: the stored engine must stand on its own.
-        let built: Result<(String, Option<PathBuf>, BuiltLane)> = {
-            let build_root =
-                tempfile::TempDir::with_prefix("blazar-build-").context("create build tempdir")?;
-            let (src, full_sha) = fetch_source(build_root.path(), &tc, opts, &tag, on_line).await?;
-
-            // Mine the architecture set the source advertises — the
-            // capability currency the supervisor's unknown-arch re-route
-            // consumes — and pin the lane's identity from it.
-            let architectures = super::arch_miner::mine_architectures(&src);
-            let (engine_tag, mut provenance) = lane_identity(
-                &opts.source,
-                &tag,
-                full_sha.as_deref(),
-                architectures,
-                opts.backend,
-            );
-            // Stamp the supersede floor for forks: the newest upstream
-            // release known RIGHT NOW predates the pin, so no mainstream
-            // lane at or below it may later graduate this fork. Best
-            // effort — an offline build leaves it unstamped and the
-            // legacy arch-coverage rule applies.
-            if provenance.source == EngineSource::Fork {
-                provenance.floor_release =
-                    self.gh.list_releases().await.ok().and_then(|releases| {
-                        releases
-                            .iter()
-                            .filter_map(|r| gh::btag_number(&r.tag_name))
-                            .max()
-                    });
-            }
-            (on_line)(&format!(
-                "lane {engine_tag}: source advertises {} architectures",
-                provenance.architectures.len()
-            ));
-
-            let bld = build_root.path().join("build");
-            run_cmake_build(
+        // Scoped-tempdir compile + rollback-safe swap (see compile_source_lane).
+        let built = self
+            .compile_source_lane(
                 &tc,
                 opts,
-                &src,
-                &bld,
                 &tag,
                 arch.as_deref(),
                 host_compiler.as_deref(),
                 on_line,
             )
-            .await?;
-
-            // Rollback-safe swap (same contract as the release lanes'
-            // install_with_rollback): the old build is displaced only
-            // AFTER the new one compiled — restored on any later
-            // failure, discarded once the new row lands. Retire must
-            // precede the extraction: install_built_binaries refuses to
-            // merge into a live dir.
-            let engine_dir = self.dirs.engines_dir().join(&engine_tag);
-            let aside = retire_engine_dir(&self.dirs.data_dir, &engine_dir)?;
-            // Panic safety for the extract below (future cancellation
-            // cannot strike here — the region from retire to register is
-            // await-free; the guard is what keeps that invariant honest
-            // if an await ever sneaks in).
-            let mut guard = CancelledInstallGuard {
-                data_dir: self.dirs.data_dir.clone(),
-                dir: engine_dir.clone(),
-                aside: aside.clone(),
-                armed: true,
-            };
-            let installed = install_built_binaries(&self.dirs, &bld, &engine_tag, on_line);
-            // Registration owns the dir from here; a unwind past this
-            // point must not delete a dir the store may reference.
-            guard.disarm();
-            match installed {
-                Ok((_, digest)) => Ok((
-                    digest,
-                    aside,
-                    BuiltLane {
-                        tag: engine_tag,
-                        dir: engine_dir,
-                        provenance,
-                    },
-                )),
-                Err(e) => {
-                    restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &engine_dir);
-                    Err(e)
-                }
-            }
-        };
+            .await;
         let (digest, aside, lane) = built?;
         // The build tree is torn down above BEFORE registering so the
         // probe cannot resolve through it.
@@ -872,6 +797,97 @@ impl EngineManager {
             }
             Err(e) => {
                 restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &lane.dir);
+                Err(e)
+            }
+        }
+    }
+
+    /// The compile half of `build_and_install`: fetch + arch-mine +
+    /// cmake in a scoped tempdir, then a rollback-safe retire/extract/
+    /// restore swap into the engines dir. The tempdir teardown BEFORE
+    /// probing keeps an absolute build-dir RPATH from letting a broken
+    /// install pass (the live failure of 2026-09-09). Returns the
+    /// installed digest, the retired old dir (for the caller's
+    /// register/discard decision), and the lane identity.
+    async fn compile_source_lane(
+        &self,
+        tc: &Toolchain,
+        opts: &BuildOpts,
+        tag: &str,
+        arch: Option<&str>,
+        host_compiler: Option<&std::path::Path>,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(String, Option<PathBuf>, BuiltLane)> {
+        let build_root =
+            tempfile::TempDir::with_prefix("blazar-build-").context("create build tempdir")?;
+        let (src, full_sha) = fetch_source(build_root.path(), tc, opts, tag, on_line).await?;
+
+        // Mine the architecture set the source advertises — the
+        // capability currency the supervisor's unknown-arch re-route
+        // consumes — and pin the lane's identity from it.
+        let architectures = super::arch_miner::mine_architectures(&src);
+        let (engine_tag, mut provenance) = lane_identity(
+            &opts.source,
+            tag,
+            full_sha.as_deref(),
+            architectures,
+            opts.backend,
+        );
+        // Stamp the supersede floor for forks: the newest upstream
+        // release known RIGHT NOW predates the pin, so no mainstream
+        // lane at or below it may later graduate this fork. Best
+        // effort — an offline build leaves it unstamped and the
+        // legacy arch-coverage rule applies.
+        if provenance.source == EngineSource::Fork {
+            provenance.floor_release = self.gh.list_releases().await.ok().and_then(|releases| {
+                releases
+                    .iter()
+                    .filter_map(|r| gh::btag_number(&r.tag_name))
+                    .max()
+            });
+        }
+        (on_line)(&format!(
+            "lane {engine_tag}: source advertises {} architectures",
+            provenance.architectures.len()
+        ));
+
+        let bld = build_root.path().join("build");
+        run_cmake_build(tc, opts, &src, &bld, tag, arch, host_compiler, on_line).await?;
+
+        // Rollback-safe swap (same contract as the release lanes'
+        // install_with_rollback): the old build is displaced only
+        // AFTER the new one compiled — restored on any later
+        // failure, discarded once the new row lands. Retire must
+        // precede the extraction: install_built_binaries refuses to
+        // merge into a live dir.
+        let engine_dir = self.dirs.engines_dir().join(&engine_tag);
+        let aside = retire_engine_dir(&self.dirs.data_dir, &engine_dir)?;
+        // Panic safety for the extract below (future cancellation
+        // cannot strike here — the region from retire to register is
+        // await-free; the guard is what keeps that invariant honest
+        // if an await ever sneaks in).
+        let mut guard = CancelledInstallGuard {
+            data_dir: self.dirs.data_dir.clone(),
+            dir: engine_dir.clone(),
+            aside: aside.clone(),
+            armed: true,
+        };
+        let installed = install_built_binaries(&self.dirs, &bld, &engine_tag, on_line);
+        // Registration owns the dir from here; a unwind past this
+        // point must not delete a dir the store may reference.
+        guard.disarm();
+        match installed {
+            Ok((_, digest)) => Ok((
+                digest,
+                aside,
+                BuiltLane {
+                    tag: engine_tag,
+                    dir: engine_dir,
+                    provenance,
+                },
+            )),
+            Err(e) => {
+                restore_retired_engine(&self.dirs.data_dir, aside.as_deref(), &engine_dir);
                 Err(e)
             }
         }

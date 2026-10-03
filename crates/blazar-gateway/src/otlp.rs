@@ -234,7 +234,7 @@ mod tests {
             let otlp = std::sync::Arc::clone(&otlp);
             async move {
                 blazar_core::tls::ensure_tls_provider();
-                otlp.run(reqwest::Client::new()).await
+                otlp.run(reqwest::Client::new()).await;
             }
         });
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

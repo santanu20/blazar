@@ -4301,7 +4301,7 @@ mod supersede_floor_tests {
     use super::EngineManager;
 
     #[test]
-    #[allow(non_snakeCase)]
+    #[allow(non_snake_case)]
     fn unit__supersede_recency__older_mainstream_cannot_graduate_a_newer_fork() {
         let allows = EngineManager::supersede_recency_allows;
         // The a4cb4c6 false-supersede shape: fork pinned when the newest

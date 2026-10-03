@@ -263,6 +263,7 @@ pub fn quantized_safetensors_signal(name: &str, repo: &str, path: &str) -> bool 
 /// repo (`mlx-community/...`) or name/path token. Callers gate on the
 /// row being a directory (the safetensors class) exactly as they do
 /// for `safetensors` — a GGUF file from an mlx repo is a GGUF row.
+#[must_use]
 pub fn mlx_signal(name: &str, repo: &str, path: &str) -> bool {
     [name, repo, path].iter().any(|s| {
         s.to_ascii_lowercase()

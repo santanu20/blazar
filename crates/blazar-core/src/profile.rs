@@ -3191,44 +3191,7 @@ fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings:
     // a first-class flag: compose it into the user's model-args. An
     // explicit user entry for the same key wins — blazar never
     // overrides a named lever, it warns instead.
-    let merged_model_args = {
-        let user_args = cfg
-            .sdcpp_model_args
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        match (&cfg.sdcpp_qwen_prefix_cache_type, user_args) {
-            (Some(cache_type), Some(user)) => {
-                let cache_type = cache_type.trim();
-                if cache_type.is_empty() {
-                    Some(user.to_string())
-                } else if user.split(',').any(|kv| {
-                    kv.split('=').next().unwrap_or("").trim() == "qwen_image_2_1_prefix_cache_type"
-                }) {
-                    warnings.push(
-                        "sdcpp_qwen_prefix_cache_type ignored: \
-                         sdcpp_model_args already sets \
-                         qwen_image_2_1_prefix_cache_type"
-                            .into(),
-                    );
-                    Some(user.to_string())
-                } else {
-                    Some(format!(
-                        "{user},qwen_image_2_1_prefix_cache_type={cache_type}"
-                    ))
-                }
-            }
-            (Some(cache_type), None) => {
-                let cache_type = cache_type.trim();
-                if cache_type.is_empty() {
-                    None
-                } else {
-                    Some(format!("qwen_image_2_1_prefix_cache_type={cache_type}"))
-                }
-            }
-            (None, user) => user.map(str::to_string),
-        }
-    };
+    let merged_model_args = merged_sdcpp_model_args(cfg, warnings);
     for (key, flag, value) in [
         (
             "cache_option",
@@ -3267,6 +3230,48 @@ fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings:
             "--conditioning-cache-size",
             &[n.to_string()],
         );
+    }
+}
+
+/// Compose `sdcpp_qwen_prefix_cache_type` into the user's
+/// `sdcpp_model_args` string. An explicit user entry for the same key
+/// wins (warn, keep theirs); an empty configured value is transparent.
+fn merged_sdcpp_model_args(cfg: &Config, warnings: &mut Vec<String>) -> Option<String> {
+    let user_args = cfg
+        .sdcpp_model_args
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (&cfg.sdcpp_qwen_prefix_cache_type, user_args) {
+        (Some(cache_type), Some(user)) => {
+            let cache_type = cache_type.trim();
+            if cache_type.is_empty() {
+                Some(user.to_string())
+            } else if user.split(',').any(|kv| {
+                kv.split('=').next().unwrap_or("").trim() == "qwen_image_2_1_prefix_cache_type"
+            }) {
+                warnings.push(
+                    "sdcpp_qwen_prefix_cache_type ignored: \
+                     sdcpp_model_args already sets \
+                     qwen_image_2_1_prefix_cache_type"
+                        .into(),
+                );
+                Some(user.to_string())
+            } else {
+                Some(format!(
+                    "{user},qwen_image_2_1_prefix_cache_type={cache_type}"
+                ))
+            }
+        }
+        (Some(cache_type), None) => {
+            let cache_type = cache_type.trim();
+            if cache_type.is_empty() {
+                None
+            } else {
+                Some(format!("qwen_image_2_1_prefix_cache_type={cache_type}"))
+            }
+        }
+        (None, user) => user.map(str::to_string),
     }
 }
 
@@ -3657,9 +3662,748 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     };
 
     // --- ctx: overlay > config default, clamped to the training ceiling
-    // (max_position_embeddings). YaRN ctx_extend is a llama-server knob;
-    // sglang 0.5.19 has no equivalent flag, so an active extend gets a
-    // warning instead of a silently ignored number.
+    // (teaching for YaRN extend lives in the resolver).
+    let ctx = sglang_resolve_ctx(input, tuning, hf, &mut argv, &mut warnings);
+    // --- concurrency: slots resolve + deterministic serialization pin.
+    let slots = sglang_resolve_slots(input, &mut argv, &mut warnings);
+    // --- loras: PEFT adapters only; the gguf/.bin gate errors here.
+    push_sglang_loras(input, &mut argv, &mut warnings)?;
+    // --- speculative pair: EAGLE3 dirs; the GGUF-draft gate teaches here.
+    push_sglang_speculative(input, &mut argv, &mut warnings);
+    // --- llama-vocabulary knobs that do NOT translate: teach here.
+    push_sglang_vocab_teaching(input, &mut warnings);
+    // --- the fit ladder: tier selection + mem-fraction derive.
+    let (gpu_label, kv_est_bytes) =
+        sglang_run_fit_ladder(input, &tun, hf, ctx, slots, &mut argv, &mut warnings)?;
+
+    // HiCache viability gates refuse impossible host-RAM tiers.
+    push_sglang_hicache(input, &tun, &mut argv, &mut warnings)?;
+
+    push_sglang_portability_defaults(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_string_pins(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_scalar_pins(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_tokenizer_throughput(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_cache_policy(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_lifecycle_hygiene(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_scheduler_observability(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_graph_capture(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_parallel_sizes(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_lora_capacity(input, &tun, &mut argv, &mut warnings);
+
+    // extra_args: reserved/unknown flags are a compile-time error.
+    extend_sglang_extra_args(input, &mut argv)?;
+
+    Ok(Profile {
+        argv,
+        warnings,
+        ctx,
+        gpu: gpu_label,
+        kv_est_bytes,
+        ctx_autofit: None,
+    })
+}
+
+/// Explicit cuda-graph capture list + KV token cap; the prefill-backend
+/// pin exists because the 42-shape breakable prefill capture deadlocked
+/// at 0% on hybrid-GPU laptops (decode graphs stay on when disabled).
+fn push_sglang_graph_capture(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(list) = &tun.cuda_graph_bs {
+        let tokens: Vec<String> = list.iter().map(ToString::to_string).collect();
+        push_tuned_list(
+            argv,
+            input.supported_flags,
+            "sglang.cuda_graph_bs",
+            "--cuda-graph-bs",
+            &tokens,
+            warnings,
+        );
+    }
+    if let Some(backend) = &tun.cuda_graph_backend_prefill {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.cuda_graph_backend_prefill",
+            "--cuda-graph-backend-prefill",
+            backend,
+            warnings,
+        );
+    }
+    if let Some(v) = tun.max_total_tokens {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.max_total_tokens",
+            "--max-total-tokens",
+            &v.to_string(),
+            warnings,
+        );
+    }
+}
+
+/// tp/dp/pp/ep pins: only meaningful above 1; a >1 pin on a single-GPU
+/// machine is a spawn-time death (sglang shards across ranks), so warn
+/// at compile time with the census. Auto-TP emission mirrors the
+/// llamacpp auto tensor-split posture: last resort, manual pin wins.
+fn push_sglang_parallel_sizes(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let parallel_pins = [
+        ("tp_size", &tun.tp_size, "--tp-size"),
+        ("dp_size", &tun.dp_size, "--dp-size"),
+        ("pp_size", &tun.pp_size, "--pp-size"),
+        ("ep_size", &tun.ep_size, "--ep-size"),
+    ];
+    let multi_pin = parallel_pins
+        .iter()
+        .any(|(_, v, _)| v.is_some_and(|n| n > 1));
+    for (field, v, flag) in parallel_pins {
+        if let Some(n) = v {
+            if *n > 1 {
+                push_tuned(
+                    argv,
+                    input.supported_flags,
+                    &format!("sglang.{field}"),
+                    flag,
+                    &n.to_string(),
+                    warnings,
+                );
+            } else {
+                warnings.push(format!(
+                    "sglang.{field} = {n} is the upstream default; nothing emitted"
+                ));
+            }
+        }
+    }
+    if multi_pin && input.hardware.gpus.len() < 2 {
+        warnings.push(format!(
+            "sglang parallel sizes > 1 on a {} GPU machine — sglang shards the \
+             model across ranks and will fail or CPU-shard at spawn; this pin \
+             only makes sense multi-GPU",
+            input.hardware.gpus.len()
+        ));
+    }
+    if tun.tp_size.is_none_or(|n| n <= 1) {
+        if let Some(tp) = input.auto_tp_size.filter(|n| *n > 1) {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "auto_tp_size",
+                "--tp-size",
+                &tp.to_string(),
+                warnings,
+            );
+            warnings.push(format!(
+                "auto tensor-parallelism: weights+KV exceed the best single card but \
+                 fit {tp} discrete cards per-rank (manual parallel pins unset); ranks \
+                 bind over every visible GPU via NCCL — inter-card bandwidth is the \
+                 price of capacity. Pin models.<name>.sglang.tp_size to override"
+            ));
+        }
+    }
+}
+
+/// `LoRA` capacity knobs (the adapters themselves ride the loras lane).
+fn push_sglang_lora_capacity(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(v) = tun.max_lora_rank {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.max_lora_rank",
+            "--max-lora-rank",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = &tun.lora_backend {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.lora_backend",
+            "--lora-backend",
+            v,
+            warnings,
+        );
+    }
+}
+
+/// `extra_args` passthrough, strict: reserved flags (connection quintet +
+/// ladder outputs) are a hard error — a duplicate would silently shadow
+/// the supervisor-owned values (loopback bind, API key, VRAM budget).
+fn extend_sglang_extra_args(
+    input: &ProfileInput<'_>,
+    argv: &mut Vec<String>,
+) -> Result<(), String> {
+    if let Some(extra) = &input.overlay.extra_args {
+        for a in extra {
+            if a.starts_with("--") {
+                let name = a.split('=').next().unwrap_or(a);
+                if SGLANG_RESERVED_FLAGS.contains(&name) {
+                    return Err(format!(
+                        "extra_args {name} is reserved on sglang: the supervisor \
+                         owns the connection flags and the VRAM ladder owns {name}; \
+                         use the config knobs (ctx, slots, sglang.*) instead"
+                    ));
+                }
+                if !input.supported_flags.contains(name) {
+                    return Err(format!(
+                        "engine {} does not support {name}; try `blazar engine \
+                         install --kind sglang` for a newer sglang",
+                        input.engine_tag
+                    ));
+                }
+            }
+        }
+        argv.extend(extra.iter().cloned());
+    }
+    Ok(())
+}
+
+/// Tokenizer/detokenizer throughput knobs (flag-gated passthrough).
+fn push_sglang_tokenizer_throughput(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(v) = &tun.tokenizer_mode {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.tokenizer_mode",
+            "--tokenizer-mode",
+            v,
+            warnings,
+        );
+    }
+    if let Some(v) = &tun.tokenizer_backend {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.tokenizer_backend",
+            "--tokenizer-backend",
+            v,
+            warnings,
+        );
+    }
+    if let Some(v) = tun.tokenizer_worker_num {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.tokenizer_worker_num",
+            "--tokenizer-worker-num",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.detokenizer_worker_num {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.detokenizer_worker_num",
+            "--detokenizer-worker-num",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if tun.dynamic_batch_tokenizer == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.dynamic_batch_tokenizer",
+            "--enable-dynamic-batch-tokenizer",
+            "",
+            warnings,
+        );
+    }
+    if let Some(v) = tun.dynamic_batch_tokenizer_batch_size {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.dynamic_batch_tokenizer_batch_size",
+            "--dynamic-batch-tokenizer-batch-size",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.dynamic_batch_tokenizer_batch_timeout {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.dynamic_batch_tokenizer_batch_timeout",
+            "--dynamic-batch-tokenizer-batch-timeout",
+            &format!("{v}"),
+            warnings,
+        );
+    }
+}
+
+/// Structured-output + radix cache policy knobs.
+fn push_sglang_cache_policy(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(v) = &tun.grammar_backend {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.grammar_backend",
+            "--grammar-backend",
+            v,
+            warnings,
+        );
+    }
+    if let Some(v) = &tun.radix_eviction_policy {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.radix_eviction_policy",
+            "--radix-eviction-policy",
+            v,
+            warnings,
+        );
+    }
+    if tun.session_radix_cache == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.session_radix_cache",
+            "--enable-session-radix-cache",
+            "",
+            warnings,
+        );
+    }
+    if tun.mixed_chunk == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.mixed_chunk",
+            "--enable-mixed-chunk",
+            "",
+            warnings,
+        );
+    }
+}
+
+/// Idle/lifecycle hygiene knobs (sleep, memory saver, watchdog).
+fn push_sglang_lifecycle_hygiene(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if tun.sleep_on_idle == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.sleep_on_idle",
+            "--sleep-on-idle",
+            "",
+            warnings,
+        );
+    }
+    if tun.memory_saver == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.memory_saver",
+            "--enable-memory-saver",
+            "",
+            warnings,
+        );
+    }
+    if let Some(v) = tun.watchdog_timeout {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.watchdog_timeout",
+            "--watchdog-timeout",
+            &format!("{v}"),
+            warnings,
+        );
+    }
+}
+
+/// Scheduler/observability knobs; `cache_report` default-on powers the gateway warm/cold split.
+fn push_sglang_scheduler_observability(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    // Default-on: the report powers the gateway's warm/cold split and
+    // per-model cache-hit surfaces (`ps` HIT, /metrics); it is metrics
+    // reporting only, never a scheduling change. `cache_report = false`
+    // opts out. Engines without the flag degrade via push_tuned's
+    // supported-flags guard (warn + skip), same as any tuned knob.
+    if tun.cache_report != Some(false) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.cache_report",
+            "--enable-cache-report",
+            "",
+            warnings,
+        );
+    }
+    if let Some(v) = tun.batch_notify_size {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.batch_notify_size",
+            "--batch-notify-size",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.scheduler_recv_interval {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.scheduler_recv_interval",
+            "--scheduler-recv-interval",
+            &v.to_string(),
+            warnings,
+        );
+    }
+}
+
+/// `HiCache` (KV tiering to host RAM) — opt-in, with structural viability
+/// gates that convert sglang's guaranteed-boot-crash RAM math into a
+/// teaching refusal before any flag leaves the profile.
+fn push_sglang_hicache(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    if tun.is_embedding == Some(true) {
+        // Dedicated embedding posture: upstream runs the CausalLM as an
+        // embedder — decoder pooling, normalized vectors, `/v1/embeddings`
+        // served while generation is refused on this child (without the
+        // flag the mirror image holds: embeddings raise "Please add
+        // `--is-embedding`"). That exclusivity is why this knob belongs
+        // on an embedding-specific model entry, never the main chat lane.
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.is_embedding",
+            "--is-embedding",
+            "",
+            warnings,
+        );
+    }
+    if tun.hicache_enable == Some(true) {
+        // Structural viability BEFORE any flag leaves the profile:
+        // sglang 0.5.19 sizes its host tier against
+        // `MemAvailable - 10 GiB` (HICACHE_HOST_MEMORY_RESERVE_BYTES,
+        // srt/mem_cache/pool_host/base.py) and aborts boot mid-init when
+        // the tier does not fit — on a 16 GiB-RAM box (≈5.8 GiB available
+        // after torch+weights staging) that budget is NEGATIVE and every
+        // tier size fails (receipt: "Requesting 4.59 GB but only have
+        // -4.22 GB free", then kill_process_tree SIGKILL → opaque 502).
+        // Convert the guaranteed crash into a teaching refusal here; on
+        // RAM classes where the tier CAN fit, the flag passes through
+        // untouched.
+        let total_ram_mib = input.hardware.total_ram_mib;
+        let budget_mib = total_ram_mib
+            .saturating_sub(SGLANG_HICACHE_HOST_RESERVE_MIB + SGLANG_HOST_ENGINE_FOOTPRINT_MIB);
+        if let Some(size_gib) = tun.hicache_size {
+            #[allow(clippy::cast_precision_loss)]
+            let fits = (size_gib * 1024.0) <= budget_mib as f64;
+            if !fits {
+                return Err(format!(
+                    "sglang.hicache_size {size_gib} GiB cannot fit this host: sglang sizes \
+                 the hierarchical tier against MemAvailable minus a fixed \
+                 {} GiB reserve and the engine's own ~{} GiB host footprint, \
+                 leaving {budget_mib} MiB of headroom on this box's \
+                 {total_ram_mib} MiB RAM. Reduce the tier or disable \
+                 sglang.hicache_enable",
+                    SGLANG_HICACHE_HOST_RESERVE_MIB / 1024,
+                    SGLANG_HOST_ENGINE_FOOTPRINT_MIB / 1024,
+                ));
+            }
+        } else if budget_mib < 1024 {
+            return Err(format!(
+                "sglang.hicache_enable cannot work on this host: sglang sizes the \
+             hierarchical tier against MemAvailable minus a fixed {} GiB \
+             reserve plus the engine's own ~{} GiB host footprint, leaving \
+             only {budget_mib} MiB of headroom on this box's {total_ram_mib} \
+             MiB RAM — every tier size fails at boot (upstream aborts \
+             scheduler init). HiCache needs a RAM class with at least ~{} \
+             GiB of headroom; disable sglang.hicache_enable",
+                SGLANG_HICACHE_HOST_RESERVE_MIB / 1024,
+                SGLANG_HOST_ENGINE_FOOTPRINT_MIB / 1024,
+                (SGLANG_HICACHE_HOST_RESERVE_MIB + SGLANG_HOST_ENGINE_FOOTPRINT_MIB + 1024) / 1024,
+            ));
+        }
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.hicache_enable",
+            "--enable-hierarchical-cache",
+            "",
+            warnings,
+        );
+        if let Some(r) = tun.hicache_ratio {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "sglang.hicache_ratio",
+                "--hicache-ratio",
+                &format!("{r}"),
+                warnings,
+            );
+        }
+        if let Some(s) = tun.hicache_size {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "sglang.hicache_size",
+                "--hicache-size",
+                &format!("{s}"),
+                warnings,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Portability defaults: triton attention + pytorch sampling need no
+/// external toolchain, unlike flashinfer's nvcc-matched JIT kernels.
+fn push_sglang_portability_defaults(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    // Portability defaults: flashinfer (sglang's pick on CUDA) JIT-compiles
+    // kernels with the system nvcc and dies whenever it does not match the
+    // bundled CUDA wheels (e.g. nvcc 12.0 vs cu13 torch). Triton attention
+    // + pytorch sampling need no external toolchain, so they are the
+    // out-of-the-box lane; a tuning pin overrides either.
+    if tun.attention_backend.is_none() {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang defaults",
+            "--attention-backend",
+            "triton",
+            warnings,
+        );
+        // Static portability rationale, not a per-instance health fact:
+        // debug-level everywhere (visible when diagnosing with
+        // RUST_LOG=debug) — at info it fired three times before the
+        // `doctor` table during the config-parse compile pass, and per
+        // spawn in the journal, without anything to act on whenever the
+        // local toolchain cannot host flashinfer anyway.
+        tracing::debug!(
+            model = input.model_name,
+            "sglang: attention defaults to triton for portability (flashinfer JIT requires a \
+         matching nvcc; the sglang venv bundles one on the child PATH); override with \
+         models.<name>.sglang.attention_backend"
+        );
+    }
+    if tun.sampling_backend.is_none() {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang defaults",
+            "--sampling-backend",
+            "pytorch",
+            warnings,
+        );
+    }
+}
+
+/// String-valued tuning pins (flag-gated, warn-skip), including the
+/// reasoning-parser `auto` default that keeps the gateway's
+/// thinking/answer split honest on thinking templates.
+fn push_sglang_string_pins(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let mut tun_str = |flag: &str, v: &Option<String>, warnings: &mut Vec<String>| {
+        if let Some(v) = v {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "sglang tuning",
+                flag,
+                v,
+                warnings,
+            );
+        }
+    };
+    tun_str("--attention-backend", &tun.attention_backend, warnings);
+    tun_str("--tool-call-parser", &tun.tool_call_parser, warnings);
+    // Reasoning split defaults to `auto` (detect from the chat template),
+    // mirroring llama-server's own `--reasoning-format auto` default.
+    // Without it a thinking template streams literal `<think>` blocks
+    // inside `content` and the thinking/answer split the gateway promises
+    // never happens (live receipt 2026-09-30: qwen3-1.7b, think=true,
+    // reasoning rode inline). An explicit pin wins; engines without the
+    // flag are warned about only when the USER pinned a parser — the
+    // default itself stays silent on legacy surfaces.
+    let reasoning_parser = tun.reasoning_parser.clone().or_else(|| {
+        input
+            .supported_flags
+            .contains(&"--reasoning-parser".to_string())
+            .then(|| "auto".to_string())
+    });
+    tun_str("--reasoning-parser", &reasoning_parser, warnings);
+    tun_str("--tokenizer-path", &tun.tokenizer_path, warnings);
+    tun_str("--dtype", &tun.dtype, warnings);
+    tun_str("--quantization", &tun.quantization, warnings);
+    tun_str("--kv-cache-dtype", &tun.kv_cache_dtype, warnings);
+    tun_str("--schedule-policy", &tun.schedule_policy, warnings);
+}
+
+/// Numeric and boolean tuning singles (flag-gated, warn-skip).
+fn push_sglang_scalar_pins(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(v) = tun.page_size {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.page_size",
+            "--page-size",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.schedule_conservativeness {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.schedule_conservativeness",
+            "--schedule-conservativeness",
+            &format!("{v}"),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.chunked_prefill_size {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.chunked_prefill_size",
+            "--chunked-prefill-size",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.max_prefill_tokens {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.max_prefill_tokens",
+            "--max-prefill-tokens",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.stream_interval {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.stream_interval",
+            "--stream-interval",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.random_seed {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.random_seed",
+            "--random-seed",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.cuda_graph_max_bs {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.cuda_graph_max_bs",
+            "--cuda-graph-max-bs",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if tun.metrics == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.metrics",
+            "--enable-metrics",
+            "",
+            warnings,
+        );
+    }
+    if tun.skip_warmup == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.skip_warmup",
+            "--skip-server-warmup",
+            "",
+            warnings,
+        );
+    }
+    if tun.torch_compile == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.torch_compile",
+            "--enable-torch-compile",
+            "",
+            warnings,
+        );
+    }
+}
+
+/// Resolve the serving ctx: overlay > config default, clamped to the
+/// training ceiling (`max_position_embeddings`). `YaRN` `ctx_extend` is a
+/// llama-server knob; sglang 0.5.19 has no equivalent flag, so an
+/// active extend gets a warning instead of a silently ignored number.
+fn sglang_resolve_ctx(
+    input: &ProfileInput<'_>,
+    tuning: &TuningOverrides,
+    hf: &HfMeta,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> u32 {
     let requested = tuning
         .ctx
         .unwrap_or_else(|| input.overlay.ctx.unwrap_or(input.config.default_ctx));
@@ -3681,22 +4425,29 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
         ));
     }
     push_tuned(
-        &mut argv,
+        argv,
         input.supported_flags,
         "model ctx",
         "--context-length",
         &ctx.to_string(),
-        &mut warnings,
+        warnings,
     );
+    ctx
+}
 
-    // --- concurrency: slots -> --max-running-requests (sglang's batching
-    // parallelism; 0/None keeps upstream auto). Deterministic pin forces
-    // single-stream exactly like the mistralrs profile, and additionally
-    // engages sglang's native deterministic-inference flag when the
-    // installed engine advertises it (batch-invariant kernels on top of
-    // the serialization pin — additive, never a replacement: the slots=1
-    // pin is what actually guarantees token-for-token greedy
-    // reproducibility).
+/// Concurrency: slots -> --max-running-requests (sglang's batching
+/// parallelism; 0/None keeps upstream auto). Deterministic pin forces
+/// single-stream exactly like the mistralrs profile, and additionally
+/// engages sglang's native deterministic-inference flag when the
+/// installed engine advertises it (batch-invariant kernels on top of
+/// the serialization pin — additive, never a replacement: the slots=1
+/// pin is what actually guarantees token-for-token greedy
+/// reproducibility). Returns the resolved slots for the fit ladder.
+fn sglang_resolve_slots(
+    input: &ProfileInput<'_>,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> u32 {
     let mut slots = input.overlay.slots.unwrap_or(input.config.slots);
     if input
         .overlay
@@ -3713,85 +4464,100 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
         }
         slots = 1;
         push_tuned(
-            &mut argv,
+            argv,
             input.supported_flags,
             "deterministic",
             "--enable-deterministic-inference",
             "",
-            &mut warnings,
+            warnings,
         );
     }
     if slots != 0 {
         push_tuned(
-            &mut argv,
+            argv,
             input.supported_flags,
             "model slots",
             "--max-running-requests",
             &slots.to_string(),
-            &mut warnings,
+            warnings,
         );
     }
+    slots
+}
 
-    // --- loras: sglang serves PEFT/safetensors adapters via --enable-lora
-    // + --lora-paths name=path. llama.cpp-class .gguf/.bin adapters are a
-    // different format entirely — hard error with the lane teaching
-    // instead of a child crash mid-boot. The llama.cpp `scale` dial has no
-    // sglang equivalent (upstream applies the adapter at its trained
-    // strength): warn, never silently drop the pair.
-    if !input.loras.is_empty() {
-        let mut lora_tokens: Vec<String> = Vec::new();
-        let mut scale_warned = false;
-        for (path, scale) in input.loras {
-            let p = std::path::Path::new(path);
-            let is_llamacpp_adapter = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("gguf") || e.eq_ignore_ascii_case("bin"));
-            if is_llamacpp_adapter {
-                return Err(format!(
-                    "lora {path} is a .gguf/.bin adapter — the sglang engine loads \
-                     PEFT/safetensors adapters only (adapter_model.safetensors \
-                     dirs); run it on the llamacpp engine or pull a PEFT variant"
-                ));
-            }
-            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("adapter");
-            lora_tokens.push(format!("{name}={path}"));
-            if (*scale - 1.0).abs() > f64::EPSILON && !scale_warned {
-                warnings.push(
-                    "lora scale is llama.cpp vocabulary and is ignored on sglang — \
-                     adapters apply at their trained strength"
-                        .into(),
-                );
-                scale_warned = true;
-            }
+/// `LoRA` adapters: sglang serves PEFT/safetensors via --enable-lora +
+/// --lora-paths name=path. llama.cpp-class .gguf/.bin adapters are a
+/// different format entirely — hard error with the lane teaching
+/// instead of a child crash mid-boot. The llama.cpp `scale` dial has no
+/// sglang equivalent (upstream applies the adapter at its trained
+/// strength): warn, never silently drop the pair.
+fn push_sglang_loras(
+    input: &ProfileInput<'_>,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    if input.loras.is_empty() {
+        return Ok(());
+    }
+    let mut lora_tokens: Vec<String> = Vec::new();
+    let mut scale_warned = false;
+    for (path, scale) in input.loras {
+        let p = std::path::Path::new(path);
+        let is_llamacpp_adapter = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf") || e.eq_ignore_ascii_case("bin"));
+        if is_llamacpp_adapter {
+            return Err(format!(
+                "lora {path} is a .gguf/.bin adapter — the sglang engine loads \
+                 PEFT/safetensors adapters only (adapter_model.safetensors \
+                 dirs); run it on the llamacpp engine or pull a PEFT variant"
+            ));
         }
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "loras",
-            "--enable-lora",
-            "",
-            &mut warnings,
-        );
-        push_tuned_list(
-            &mut argv,
-            input.supported_flags,
-            "loras",
-            "--lora-paths",
-            &lora_tokens,
-            &mut warnings,
-        );
+        let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("adapter");
+        lora_tokens.push(format!("{name}={path}"));
+        if (*scale - 1.0).abs() > f64::EPSILON && !scale_warned {
+            warnings.push(
+                "lora scale is llama.cpp vocabulary and is ignored on sglang — \
+                 adapters apply at their trained strength"
+                    .into(),
+            );
+            scale_warned = true;
+        }
     }
+    push_tuned(
+        argv,
+        input.supported_flags,
+        "loras",
+        "--enable-lora",
+        "",
+        warnings,
+    );
+    push_tuned_list(
+        argv,
+        input.supported_flags,
+        "loras",
+        "--lora-paths",
+        &lora_tokens,
+        warnings,
+    );
+    Ok(())
+}
 
-    // --- speculative pair: sglang rows resolve `spec = "eagle3"`-class
-    // drafts as safetensors dirs; the manifest carries no spec_types for
-    // sglang (no --spec-type flag upstream), so the pair gates on flags.
-    // A GGUF file is never a valid EAGLE draft here: sglang's loader
-    // treats unknown-path drafts as HF repo ids and dies in
-    // download_weights_from_hf — the shared spec catalog pairs a text
-    // model with a small GGUF (fine for llama.cpp's EAGLE lane), so the
-    // format gate must live at the engine boundary (2026-09-30 receipt:
-    // qwen3-1.7b + pulled Qwen3-0.6B-f16.gguf -> EAGLE3 draft -> 502).
+/// Speculative pair: sglang rows resolve `spec = "eagle3"`-class drafts
+/// as safetensors dirs; the manifest carries no `spec_types` for sglang
+/// (no --spec-type flag upstream), so the pair gates on flags. A GGUF
+/// file is never a valid EAGLE draft here: sglang's loader treats
+/// unknown-path drafts as HF repo ids and dies in
+/// `download_weights_from_hf` — the shared spec catalog pairs a text
+/// model with a small GGUF (fine for llama.cpp's EAGLE lane), so the
+/// format gate must live at the engine boundary (2026-09-30 receipt:
+/// qwen3-1.7b + pulled Qwen3-0.6B-f16.gguf -> EAGLE3 draft -> 502).
+fn push_sglang_speculative(
+    input: &ProfileInput<'_>,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
     if let Some(draft) = input.draft_path {
         if draft
             .rsplit_once('.')
@@ -3818,10 +4584,12 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
             ));
         }
     }
+}
 
-    // --- llama-vocabulary knobs that do NOT translate: cache_type is
-    // q8_0/q4_0 grammar; sglang wants fp8_e5m2/fp8_e4m3/bf16 via
-    // sglang.kv_cache_dtype. Teach, never silently remap.
+/// llama-vocabulary knobs that do NOT translate: `cache_type` is
+/// `q8_0/q4_0` grammar; sglang wants `fp8_e5m2/fp8_e4m3/bf16` via
+/// `sglang.kv_cache_dtype`. Teach, never silently remap.
+fn push_sglang_vocab_teaching(input: &ProfileInput<'_>, warnings: &mut Vec<String>) {
     if input
         .overlay
         .cache_type
@@ -3835,7 +4603,21 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
                 .into(),
         );
     }
+}
 
+/// The fit ladder orchestrator: resolves the KV estimates, picks the
+/// serving tier (see `sglang_gpu_fit`), derives mem-fraction-static,
+/// and hands the CPU lane its `--device cpu` teaching. Returns the
+/// profile's gpu label and KV estimate.
+fn sglang_run_fit_ladder(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    hf: &HfMeta,
+    ctx: u32,
+    slots: u32,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(&'static str, Option<u64>), String> {
     // --- the fit ladder
     let kv_dtype_effective = tun
         .kv_cache_dtype
@@ -3846,89 +4628,20 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
         // — shared with the mistral.rs pa-fraction derive (one formula).
         hf_kv_bytes(&hf.kv, u64::from(ctx), elem)
     };
-
     let gpu_label: &'static str;
     let kv_est_bytes: Option<u64>;
     if input.hardware.has_gpu() {
-        // Tensor-parallel sharding: the manual `tp_size` pin wins over
-        // the supervisor's auto plan; > 1 divides weights AND KV across
-        // ranks, and the capacity anchor becomes the SMALLEST discrete
-        // card (the bottleneck rank), never the summed pool — planning
-        // 2x8 GiB as 16 GiB is how NCCL dies at spawn. Zero discrete
-        // cards under a shard pin falls back to single-rank math (the
-        // census warning below already flags the impossible pin).
-        let shard: u32 = tun
-            .tp_size
-            .filter(|n| *n > 1)
-            .or(input.auto_tp_size.filter(|n| *n > 1))
-            .unwrap_or(1);
-        let (vram, budget) = if shard > 1 {
-            let per_card: Vec<u64> = input
-                .hardware
-                .gpus
-                .iter()
-                .filter(|g| !g.is_integrated())
-                .map(|g| {
-                    if g.free_mib > 0 {
-                        Hardware::bytes(g.free_mib)
-                    } else {
-                        Hardware::bytes(g.total_mib)
-                    }
-                })
-                .collect();
-            let min_card = per_card.iter().copied().min().unwrap_or(0);
-            if min_card == 0 {
-                let summed = capacity_bytes(input.hardware);
-                (
-                    summed,
-                    summed
-                        .saturating_mul(SGLANG_VRAM_USABLE_PCT)
-                        .saturating_div(100)
-                        .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
-                )
-            } else {
-                (
-                    min_card,
-                    min_card
-                        .saturating_mul(SGLANG_VRAM_USABLE_PCT)
-                        .saturating_div(100)
-                        .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
-                )
-            }
-        } else {
-            let vram = capacity_bytes(input.hardware);
-            (vram, {
-                vram.saturating_mul(SGLANG_VRAM_USABLE_PCT)
-                    .saturating_div(100)
-                    .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES)
-            })
-        };
+        let (shard, vram, budget) = sglang_shard_budget(input, tun);
         let ceil_div = |n: u64, d: u32| n.saturating_add(u64::from(d) - 1) / u64::from(d);
-        let weights = ceil_div(input.model_bytes, shard);
         let kv16 = kv_bytes_at(2).map(|b| ceil_div(b, shard));
         let kv8 = kv_bytes_at(1).map(|b| ceil_div(b, shard));
-        // An explicit cpu_offload_gb pin is honored in EVERY tier (the
-        // user asked for offload; the ladder only derives it when
-        // unpinned) and feeds the mem-fraction below.
-        let mut offload_total_gb = 0.0f32;
-        if let Some(pin) = tun.cpu_offload_gb {
-            push_tuned(
-                &mut argv,
-                input.supported_flags,
-                "sglang.cpu_offload_gb",
-                "--cpu-offload-gb",
-                &format!("{pin}"),
-                &mut warnings,
-            );
-            offload_total_gb = pin;
-        }
         match kv16 {
             None => {
                 warnings.push(
                     "fit ladder skipped: config.json lacks KV geometry \
-                     (num_hidden_layers / num_key_value_heads / head_dim); \
-                     sglang defaults apply and may OOM on tight cards — a \
-                     rebuilt/complete checkpoint dir fixes this"
+                 (num_hidden_layers / num_key_value_heads / head_dim); \
+                 sglang defaults apply and may OOM on tight cards — a \
+                 rebuilt/complete checkpoint dir fixes this"
                         .into(),
                 );
                 gpu_label = "auto";
@@ -3936,798 +4649,360 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
             }
             Some(kv16_v) => {
                 let kv8_v = kv8.unwrap_or(kv16_v / 2);
-                if weights.saturating_add(kv16_v) <= budget {
-                    // Tier A: full GPU, f16 KV.
-                    gpu_label = "full";
-                    kv_est_bytes = Some(kv16_v);
-                    if tun.kv_cache_dtype.is_none() && input.overlay.cache_type.is_none() {
-                        // f16 KV is the default; nothing to emit.
-                    }
-                } else if weights.saturating_add(kv8_v) <= budget {
-                    // Tier B: fp8 KV fits.
-                    gpu_label = "full";
-                    kv_est_bytes = Some(kv8_v);
-                    if tun.kv_cache_dtype.is_none() {
-                        push_tuned(
-                            &mut argv,
-                            input.supported_flags,
-                            "fit ladder",
-                            "--kv-cache-dtype",
-                            "fp8_e5m2",
-                            &mut warnings,
-                        );
-                        warnings.push(
-                            "fit ladder Tier B: f16 KV would overflow the card — \
-                             KV cache pinned to fp8_e5m2 (halves KV VRAM; slight \
-                             precision cost on long-tail logits). Override with \
-                             models.<name>.sglang.kv_cache_dtype"
-                                .into(),
-                        );
-                    }
-                    let headroom = budget.saturating_sub(weights).saturating_sub(kv8_v);
-                    sglang_tight_fit_knobs(
-                        &mut argv,
-                        input.supported_flags,
-                        slots,
-                        headroom,
-                        weights,
-                        &tun,
-                        &mut warnings,
-                    );
-                } else {
-                    // Tier C: offload the weights overflow to host RAM.
-                    let overflow = weights.saturating_add(kv8_v).saturating_sub(budget);
-                    let offload_gb = ceil_gb(overflow);
-                    // Per-rank share of the host offload budget: every TP
-                    // rank offloads independently into the same host RAM.
-                    let host_budget = input
-                        .hardware
-                        .total_ram_mib
-                        .saturating_mul(4)
-                        .saturating_div(10)
-                        .saturating_div(u64::from(shard));
-                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                    let offload_bytes = (f64::from(offload_gb) * 1e9).round() as u64;
-                    if offload_gb > 0.0 && offload_bytes <= Hardware::bytes(host_budget) {
-                        gpu_label = "partial";
-                        kv_est_bytes = Some(kv8_v);
-                        let emitted = if let Some(pin) = tun.cpu_offload_gb {
-                            pin
-                        } else {
-                            warnings.push(format!(
-                                "fit ladder Tier C: weights {:.2} GiB + KV {:.2} GiB \
-                                 exceed the {:.2} GiB usable VRAM — offloading \
-                                 {offload_gb} GB of weights to host RAM (decode \
-                                 speed drops roughly with the offloaded share); \
-                                 override with models.<name>.sglang.cpu_offload_gb",
-                                bytes_gib(weights),
-                                bytes_gib(kv8_v),
-                                bytes_gib(budget),
-                            ));
-                            offload_gb
-                        };
-                        offload_total_gb = emitted;
-                        if tun.kv_cache_dtype.is_none() {
-                            push_tuned(
-                                &mut argv,
-                                input.supported_flags,
-                                "fit ladder",
-                                "--kv-cache-dtype",
-                                "fp8_e5m2",
-                                &mut warnings,
-                            );
-                        }
-                        push_tuned(
-                            &mut argv,
-                            input.supported_flags,
-                            "fit ladder",
-                            "--cpu-offload-gb",
-                            &format!("{emitted}"),
-                            &mut warnings,
-                        );
-                        // Graph slope follows the TOTAL model (activations
-                        // need capturing wherever the weights live); the
-                        // headroom only counts what stays on the GPU.
-                        let on_gpu_weights = weights.saturating_sub(offload_bytes);
-                        let headroom = budget.saturating_sub(on_gpu_weights).saturating_sub(kv8_v);
-                        sglang_tight_fit_knobs(
-                            &mut argv,
-                            input.supported_flags,
-                            slots,
-                            headroom,
-                            weights,
-                            &tun,
-                            &mut warnings,
-                        );
-                    } else {
-                        // Tier D: refusal — spawning would only OOM-loop.
-                        return Err(format!(
-                            "model {} does not fit this machine: weights {:.2} GiB + \
-                             fp8 KV {:.2} GiB vs {:.2} GiB usable VRAM (needs \
-                             {:.1} GB host offload, host RAM budget {:.2} GiB). \
-                             Use a smaller checkpoint, lower ctx ({ctx}), or \
-                             slots = 1",
-                            input.model_name,
-                            bytes_gib(weights),
-                            bytes_gib(kv8_v),
-                            bytes_gib(budget),
-                            offload_gb,
-                            bytes_gib(Hardware::bytes(host_budget)),
-                        ));
-                    }
-                }
-
-                // mem-fraction-static: the anti-OOM heart. Derived from
-                // what actually stays device-side (weights minus the
-                // EMITTED offload — pin or ladder-derived — plus KV).
-                // An explicit pin still passes governance: it may tighten
-                // or widen the derived fit, but never past the
-                // activation+graph reserve (SGLANG_ACTIVATION_RESERVE_MIB
-                // receipts) or the hard band — an over-budget pin is a
-                // mid-boot crash (capture assert → kill_process_tree →
-                // opaque 502), never a usable configuration.
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                let gpu_static =
-                    weights.saturating_sub((f64::from(offload_total_gb) * 1e9).round() as u64);
-                let static_demand = gpu_static.saturating_add(kv_est_bytes.unwrap_or(0));
-                let ceiling = if vram > 0 {
-                    let reserve_vram =
-                        vram.saturating_sub(Hardware::bytes(SGLANG_ACTIVATION_RESERVE_MIB));
-                    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-                    let frac = (reserve_vram as f64 / vram as f64) as f32;
-                    frac.clamp(SGLANG_MEM_FRACTION_MIN, SGLANG_MEM_FRACTION_MAX)
-                } else {
-                    SGLANG_MEM_FRACTION_MAX
+                let weights = ceil_div(input.model_bytes, shard);
+                let geom = SglangFitGeometry {
+                    shard,
+                    vram,
+                    budget,
+                    weights,
+                    kv16_v,
+                    kv8_v,
                 };
-                let frac = if let Some(pin) = tun.mem_fraction_static {
-                    let governed = pin.clamp(SGLANG_MEM_FRACTION_MIN, ceiling);
-                    if (governed - pin).abs() > f32::EPSILON {
-                        warnings.push(format!(
-                            "sglang.mem_fraction_static {pin:.3} clamped to \
-                             {governed:.3}: the pin must leave \
-                             {SGLANG_ACTIVATION_RESERVE_MIB} MiB of VRAM for \
-                             activations and CUDA-graph capture (receipt: \
-                             0.90 on an 8 GiB card crashed in graph capture; \
-                             sglang then SIGKILLs itself and the gateway \
-                             surfaces a 502)"
-                        ));
-                    }
-                    governed
-                } else {
-                    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-                    let raw = (static_demand as f64 / vram.max(1) as f64) as f32;
-                    raw.clamp(SGLANG_MEM_FRACTION_MIN, ceiling)
-                };
-                if vram > 0 {
-                    push_tuned(
-                        &mut argv,
-                        input.supported_flags,
-                        "fit ladder",
-                        "--mem-fraction-static",
-                        &format!("{frac:.3}"),
-                        &mut warnings,
-                    );
-                }
+                let fit = sglang_gpu_fit(input, tun, argv, warnings, slots, ctx, &geom)?;
+                gpu_label = fit.gpu_label;
+                kv_est_bytes = fit.kv_est_bytes;
+                sglang_push_mem_fraction(
+                    input,
+                    tun,
+                    argv,
+                    warnings,
+                    &geom,
+                    fit.kv_est_bytes,
+                    fit.offload_gb,
+                );
             }
         }
     } else {
         gpu_label = "cpu";
         kv_est_bytes = kv_bytes_at(HfMeta::kv_elem_bytes(&kv_dtype_effective));
         push_tuned(
-            &mut argv,
+            argv,
             input.supported_flags,
             "cpu lane",
             "--device",
             "cpu",
-            &mut warnings,
+            warnings,
         );
         warnings.push(
             "no GPU detected: sglang runs on --device cpu (torch-native attention); \
-             expect server-class decode speeds, not GPU throughput"
+         expect server-class decode speeds, not GPU throughput"
                 .into(),
         );
     }
+    Ok((gpu_label, kv_est_bytes))
+}
 
-    // --- HiCache (KV tiering to host RAM), opt-in.
-    if tun.is_embedding == Some(true) {
-        // Dedicated embedding posture: upstream runs the CausalLM as an
-        // embedder — decoder pooling, normalized vectors, `/v1/embeddings`
-        // served while generation is refused on this child (without the
-        // flag the mirror image holds: embeddings raise "Please add
-        // `--is-embedding`"). That exclusivity is why this knob belongs
-        // on an embedding-specific model entry, never the main chat lane.
+/// The fit ladder's derived geometry: the shard math outputs the tiers
+/// consume. One struct instead of six positional integers so the tier
+/// helpers and the mem-fraction derive read by name at call sites.
+struct SglangFitGeometry {
+    shard: u32,
+    vram: u64,
+    budget: u64,
+    weights: u64,
+    kv16_v: u64,
+    kv8_v: u64,
+}
+
+/// What the chosen fit tier decided: the serving-tier label, the KV
+/// bytes it budgeted, and the total host-offload it emitted (manual pin
+/// or ladder-derived) — the mem-fraction derive consumes all three.
+struct SglangFitOutcome {
+    gpu_label: &'static str,
+    kv_est_bytes: Option<u64>,
+    offload_gb: f32,
+}
+
+/// Fit-ladder capacity anchor: the TP shard size (the manual `tp_size`
+/// pin wins over the supervisor's auto plan) and the (vram, usable
+/// budget) pair the tiers must fit inside. Under a shard pin > 1 the
+/// anchor is the SMALLEST discrete card (the bottleneck rank), never
+/// the summed pool — planning 2x8 GiB as 16 GiB is how NCCL dies at
+/// spawn. Zero discrete cards under a shard pin falls back to
+/// single-rank math (the census warning already flags the impossible
+/// pin).
+fn sglang_shard_budget(input: &ProfileInput<'_>, tun: &SglangTuning) -> (u32, u64, u64) {
+    let shard: u32 = tun
+        .tp_size
+        .filter(|n| *n > 1)
+        .or(input.auto_tp_size.filter(|n| *n > 1))
+        .unwrap_or(1);
+    let (vram, budget) = if shard > 1 {
+        let per_card: Vec<u64> = input
+            .hardware
+            .gpus
+            .iter()
+            .filter(|g| !g.is_integrated())
+            .map(|g| {
+                if g.free_mib > 0 {
+                    Hardware::bytes(g.free_mib)
+                } else {
+                    Hardware::bytes(g.total_mib)
+                }
+            })
+            .collect();
+        let min_card = per_card.iter().copied().min().unwrap_or(0);
+        if min_card == 0 {
+            let summed = capacity_bytes(input.hardware);
+            (
+                summed,
+                summed
+                    .saturating_mul(SGLANG_VRAM_USABLE_PCT)
+                    .saturating_div(100)
+                    .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
+            )
+        } else {
+            (
+                min_card,
+                min_card
+                    .saturating_mul(SGLANG_VRAM_USABLE_PCT)
+                    .saturating_div(100)
+                    .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
+            )
+        }
+    } else {
+        let vram = capacity_bytes(input.hardware);
+        (
+            vram,
+            vram.saturating_mul(SGLANG_VRAM_USABLE_PCT)
+                .saturating_div(100)
+                .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
+        )
+    };
+    (shard, vram, budget)
+}
+
+/// The GPU fit tiers, tried cheapest-first: A full-GPU f16 KV, B fp8
+/// KV, C host-offload; D (inside the Tier C helper) refuses — spawning
+/// would only OOM-loop. The manual `cpu_offload_gb` pin is honored in
+/// EVERY tier (the user asked for offload; the ladder only derives it
+/// when unpinned) and rides into the outcome for the mem-fraction
+/// derive.
+fn sglang_gpu_fit(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    slots: u32,
+    ctx: u32,
+    geom: &SglangFitGeometry,
+) -> Result<SglangFitOutcome, String> {
+    let mut offload_total_gb = 0.0f32;
+    if let Some(pin) = tun.cpu_offload_gb {
         push_tuned(
-            &mut argv,
+            argv,
             input.supported_flags,
-            "sglang.is_embedding",
-            "--is-embedding",
-            "",
-            &mut warnings,
+            "sglang.cpu_offload_gb",
+            "--cpu-offload-gb",
+            &format!("{pin}"),
+            warnings,
         );
+        offload_total_gb = pin;
     }
-    if tun.hicache_enable == Some(true) {
-        // Structural viability BEFORE any flag leaves the profile:
-        // sglang 0.5.19 sizes its host tier against
-        // `MemAvailable - 10 GiB` (HICACHE_HOST_MEMORY_RESERVE_BYTES,
-        // srt/mem_cache/pool_host/base.py) and aborts boot mid-init when
-        // the tier does not fit — on a 16 GiB-RAM box (≈5.8 GiB available
-        // after torch+weights staging) that budget is NEGATIVE and every
-        // tier size fails (receipt: "Requesting 4.59 GB but only have
-        // -4.22 GB free", then kill_process_tree SIGKILL → opaque 502).
-        // Convert the guaranteed crash into a teaching refusal here; on
-        // RAM classes where the tier CAN fit, the flag passes through
-        // untouched.
-        let total_ram_mib = input.hardware.total_ram_mib;
-        let budget_mib = total_ram_mib
-            .saturating_sub(SGLANG_HICACHE_HOST_RESERVE_MIB + SGLANG_HOST_ENGINE_FOOTPRINT_MIB);
-        if let Some(size_gib) = tun.hicache_size {
-            #[allow(clippy::cast_precision_loss)]
-            let fits = (size_gib * 1024.0) <= budget_mib as f64;
-            if !fits {
-                return Err(format!(
-                    "sglang.hicache_size {size_gib} GiB cannot fit this host: sglang sizes \
-                     the hierarchical tier against MemAvailable minus a fixed \
-                     {} GiB reserve and the engine's own ~{} GiB host footprint, \
-                     leaving {budget_mib} MiB of headroom on this box's \
-                     {total_ram_mib} MiB RAM. Reduce the tier or disable \
-                     sglang.hicache_enable",
-                    SGLANG_HICACHE_HOST_RESERVE_MIB / 1024,
-                    SGLANG_HOST_ENGINE_FOOTPRINT_MIB / 1024,
-                ));
-            }
-        } else if budget_mib < 1024 {
-            return Err(format!(
-                "sglang.hicache_enable cannot work on this host: sglang sizes the \
-                 hierarchical tier against MemAvailable minus a fixed {} GiB \
-                 reserve plus the engine's own ~{} GiB host footprint, leaving \
-                 only {budget_mib} MiB of headroom on this box's {total_ram_mib} \
-                 MiB RAM — every tier size fails at boot (upstream aborts \
-                 scheduler init). HiCache needs a RAM class with at least ~{} \
-                 GiB of headroom; disable sglang.hicache_enable",
-                SGLANG_HICACHE_HOST_RESERVE_MIB / 1024,
-                SGLANG_HOST_ENGINE_FOOTPRINT_MIB / 1024,
-                (SGLANG_HICACHE_HOST_RESERVE_MIB + SGLANG_HOST_ENGINE_FOOTPRINT_MIB + 1024) / 1024,
+    let (weights, budget, kv16_v, kv8_v) = (geom.weights, geom.budget, geom.kv16_v, geom.kv8_v);
+    if weights.saturating_add(kv16_v) <= budget {
+        // Tier A: full GPU, f16 KV.
+        if tun.kv_cache_dtype.is_none() && input.overlay.cache_type.is_none() {
+            // f16 KV is the default; nothing to emit.
+        }
+        Ok(SglangFitOutcome {
+            gpu_label: "full",
+            kv_est_bytes: Some(kv16_v),
+            offload_gb: offload_total_gb,
+        })
+    } else if weights.saturating_add(kv8_v) <= budget {
+        // Tier B: fp8 KV fits.
+        if tun.kv_cache_dtype.is_none() {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "fit ladder",
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+                warnings,
+            );
+            warnings.push(
+                "fit ladder Tier B: f16 KV would overflow the card — \
+                 KV cache pinned to fp8_e5m2 (halves KV VRAM; slight \
+                 precision cost on long-tail logits). Override with \
+                 models.<name>.sglang.kv_cache_dtype"
+                    .into(),
+            );
+        }
+        let headroom = budget.saturating_sub(weights).saturating_sub(kv8_v);
+        sglang_tight_fit_knobs(
+            argv,
+            input.supported_flags,
+            slots,
+            headroom,
+            weights,
+            tun,
+            warnings,
+        );
+        Ok(SglangFitOutcome {
+            gpu_label: "full",
+            kv_est_bytes: Some(kv8_v),
+            offload_gb: offload_total_gb,
+        })
+    } else {
+        sglang_tier_c_host_offload(input, tun, argv, warnings, slots, ctx, geom)
+    }
+}
+
+/// Tier C: offload the weights overflow to host RAM (decode speed
+/// drops roughly with the offloaded share). The per-rank share of the
+/// host budget matters: every TP rank offloads independently into the
+/// same host RAM. Tier D refusal when even that budget cannot absorb
+/// it.
+fn sglang_tier_c_host_offload(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    slots: u32,
+    ctx: u32,
+    geom: &SglangFitGeometry,
+) -> Result<SglangFitOutcome, String> {
+    let (shard, budget, weights, kv8_v) = (geom.shard, geom.budget, geom.weights, geom.kv8_v);
+    let overflow = weights.saturating_add(kv8_v).saturating_sub(budget);
+    let offload_gb = ceil_gb(overflow);
+    let host_budget = input
+        .hardware
+        .total_ram_mib
+        .saturating_mul(4)
+        .saturating_div(10)
+        .saturating_div(u64::from(shard));
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let offload_bytes = (f64::from(offload_gb) * 1e9).round() as u64;
+    if offload_gb > 0.0 && offload_bytes <= Hardware::bytes(host_budget) {
+        let emitted = if let Some(pin) = tun.cpu_offload_gb {
+            pin
+        } else {
+            warnings.push(format!(
+                "fit ladder Tier C: weights {:.2} GiB + KV {:.2} GiB \
+                 exceed the {:.2} GiB usable VRAM — offloading \
+                 {offload_gb} GB of weights to host RAM (decode \
+                 speed drops roughly with the offloaded share); \
+                 override with models.<name>.sglang.cpu_offload_gb",
+                bytes_gib(weights),
+                bytes_gib(kv8_v),
+                bytes_gib(budget),
             ));
-        }
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.hicache_enable",
-            "--enable-hierarchical-cache",
-            "",
-            &mut warnings,
-        );
-        if let Some(r) = tun.hicache_ratio {
+            offload_gb
+        };
+        if tun.kv_cache_dtype.is_none() {
             push_tuned(
-                &mut argv,
+                argv,
                 input.supported_flags,
-                "sglang.hicache_ratio",
-                "--hicache-ratio",
-                &format!("{r}"),
-                &mut warnings,
-            );
-        }
-        if let Some(s) = tun.hicache_size {
-            push_tuned(
-                &mut argv,
-                input.supported_flags,
-                "sglang.hicache_size",
-                "--hicache-size",
-                &format!("{s}"),
-                &mut warnings,
-            );
-        }
-    }
-
-    // --- scalar tuning passthrough (flag-gated, warn-skip).
-    // Portability defaults: flashinfer (sglang's pick on CUDA) JIT-compiles
-    // kernels with the system nvcc and dies whenever it does not match the
-    // bundled CUDA wheels (e.g. nvcc 12.0 vs cu13 torch). Triton attention
-    // + pytorch sampling need no external toolchain, so they are the
-    // out-of-the-box lane; a tuning pin overrides either.
-    if tun.attention_backend.is_none() {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang defaults",
-            "--attention-backend",
-            "triton",
-            &mut warnings,
-        );
-        // Static portability rationale, not a per-instance health fact:
-        // debug-level everywhere (visible when diagnosing with
-        // RUST_LOG=debug) — at info it fired three times before the
-        // `doctor` table during the config-parse compile pass, and per
-        // spawn in the journal, without anything to act on whenever the
-        // local toolchain cannot host flashinfer anyway.
-        tracing::debug!(
-            model = input.model_name,
-            "sglang: attention defaults to triton for portability (flashinfer JIT requires a \
-             matching nvcc; the sglang venv bundles one on the child PATH); override with \
-             models.<name>.sglang.attention_backend"
-        );
-    }
-    if tun.sampling_backend.is_none() {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang defaults",
-            "--sampling-backend",
-            "pytorch",
-            &mut warnings,
-        );
-    }
-    let mut tun_str = |flag: &str, v: &Option<String>, warnings: &mut Vec<String>| {
-        if let Some(v) = v {
-            push_tuned(
-                &mut argv,
-                input.supported_flags,
-                "sglang tuning",
-                flag,
-                v,
+                "fit ladder",
+                "--kv-cache-dtype",
+                "fp8_e5m2",
                 warnings,
             );
         }
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "fit ladder",
+            "--cpu-offload-gb",
+            &format!("{emitted}"),
+            warnings,
+        );
+        // Graph slope follows the TOTAL model (activations need
+        // capturing wherever the weights live); the headroom only
+        // counts what stays on the GPU.
+        let on_gpu_weights = weights.saturating_sub(offload_bytes);
+        let headroom = budget.saturating_sub(on_gpu_weights).saturating_sub(kv8_v);
+        sglang_tight_fit_knobs(
+            argv,
+            input.supported_flags,
+            slots,
+            headroom,
+            weights,
+            tun,
+            warnings,
+        );
+        Ok(SglangFitOutcome {
+            gpu_label: "partial",
+            kv_est_bytes: Some(kv8_v),
+            offload_gb: emitted,
+        })
+    } else {
+        // Tier D: refusal — spawning would only OOM-loop.
+        Err(format!(
+            "model {} does not fit this machine: weights {:.2} GiB + \
+             fp8 KV {:.2} GiB vs {:.2} GiB usable VRAM (needs \
+             {:.1} GB host offload, host RAM budget {:.2} GiB). \
+             Use a smaller checkpoint, lower ctx ({ctx}), or \
+             slots = 1",
+            input.model_name,
+            bytes_gib(weights),
+            bytes_gib(kv8_v),
+            bytes_gib(budget),
+            offload_gb,
+            bytes_gib(Hardware::bytes(host_budget)),
+        ))
+    }
+}
+
+/// mem-fraction-static: the anti-OOM heart. Derived from what actually
+/// stays device-side (weights minus the EMITTED offload — pin or
+/// ladder-derived — plus KV). An explicit pin still passes governance:
+/// it may tighten or widen the derived fit, but never past the
+/// activation+graph reserve (`SGLANG_ACTIVATION_RESERVE_MIB` receipts)
+/// or the hard band — an over-budget pin is a mid-boot crash (capture
+/// assert → `kill_process_tree` → opaque 502), never a usable
+/// configuration.
+fn sglang_push_mem_fraction(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    geom: &SglangFitGeometry,
+    kv_est_bytes: Option<u64>,
+    offload_total_gb: f32,
+) {
+    let (vram, weights) = (geom.vram, geom.weights);
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let gpu_static = weights.saturating_sub((f64::from(offload_total_gb) * 1e9).round() as u64);
+    let static_demand = gpu_static.saturating_add(kv_est_bytes.unwrap_or(0));
+    let ceiling = if vram > 0 {
+        let reserve_vram = vram.saturating_sub(Hardware::bytes(SGLANG_ACTIVATION_RESERVE_MIB));
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let frac = (reserve_vram as f64 / vram as f64) as f32;
+        frac.clamp(SGLANG_MEM_FRACTION_MIN, SGLANG_MEM_FRACTION_MAX)
+    } else {
+        SGLANG_MEM_FRACTION_MAX
     };
-    tun_str("--attention-backend", &tun.attention_backend, &mut warnings);
-    tun_str("--tool-call-parser", &tun.tool_call_parser, &mut warnings);
-    // Reasoning split defaults to `auto` (detect from the chat template),
-    // mirroring llama-server's own `--reasoning-format auto` default.
-    // Without it a thinking template streams literal `<think>` blocks
-    // inside `content` and the thinking/answer split the gateway promises
-    // never happens (live receipt 2026-09-30: qwen3-1.7b, think=true,
-    // reasoning rode inline). An explicit pin wins; engines without the
-    // flag are warned about only when the USER pinned a parser — the
-    // default itself stays silent on legacy surfaces.
-    let reasoning_parser = tun.reasoning_parser.clone().or_else(|| {
-        input
-            .supported_flags
-            .contains(&"--reasoning-parser".to_string())
-            .then(|| "auto".to_string())
-    });
-    tun_str("--reasoning-parser", &reasoning_parser, &mut warnings);
-    tun_str("--tokenizer-path", &tun.tokenizer_path, &mut warnings);
-    tun_str("--dtype", &tun.dtype, &mut warnings);
-    tun_str("--quantization", &tun.quantization, &mut warnings);
-    tun_str("--kv-cache-dtype", &tun.kv_cache_dtype, &mut warnings);
-    tun_str("--schedule-policy", &tun.schedule_policy, &mut warnings);
-    if let Some(v) = tun.page_size {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.page_size",
-            "--page-size",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.schedule_conservativeness {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.schedule_conservativeness",
-            "--schedule-conservativeness",
-            &format!("{v}"),
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.chunked_prefill_size {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.chunked_prefill_size",
-            "--chunked-prefill-size",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.max_prefill_tokens {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.max_prefill_tokens",
-            "--max-prefill-tokens",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.stream_interval {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.stream_interval",
-            "--stream-interval",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.random_seed {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.random_seed",
-            "--random-seed",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.cuda_graph_max_bs {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.cuda_graph_max_bs",
-            "--cuda-graph-max-bs",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if tun.metrics == Some(true) {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.metrics",
-            "--enable-metrics",
-            "",
-            &mut warnings,
-        );
-    }
-    if tun.skip_warmup == Some(true) {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.skip_warmup",
-            "--skip-server-warmup",
-            "",
-            &mut warnings,
-        );
-    }
-    if tun.torch_compile == Some(true) {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.torch_compile",
-            "--enable-torch-compile",
-            "",
-            &mut warnings,
-        );
-    }
-
-    // --- tokenizer / detokenizer throughput family
-    if let Some(v) = &tun.tokenizer_mode {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.tokenizer_mode",
-            "--tokenizer-mode",
-            v,
-            &mut warnings,
-        );
-    }
-    if let Some(v) = &tun.tokenizer_backend {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.tokenizer_backend",
-            "--tokenizer-backend",
-            v,
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.tokenizer_worker_num {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.tokenizer_worker_num",
-            "--tokenizer-worker-num",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.detokenizer_worker_num {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.detokenizer_worker_num",
-            "--detokenizer-worker-num",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if tun.dynamic_batch_tokenizer == Some(true) {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.dynamic_batch_tokenizer",
-            "--enable-dynamic-batch-tokenizer",
-            "",
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.dynamic_batch_tokenizer_batch_size {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.dynamic_batch_tokenizer_batch_size",
-            "--dynamic-batch-tokenizer-batch-size",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.dynamic_batch_tokenizer_batch_timeout {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.dynamic_batch_tokenizer_batch_timeout",
-            "--dynamic-batch-tokenizer-batch-timeout",
-            &format!("{v}"),
-            &mut warnings,
-        );
-    }
-
-    // --- structured output + radix cache policy family
-    if let Some(v) = &tun.grammar_backend {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.grammar_backend",
-            "--grammar-backend",
-            v,
-            &mut warnings,
-        );
-    }
-    if let Some(v) = &tun.radix_eviction_policy {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.radix_eviction_policy",
-            "--radix-eviction-policy",
-            v,
-            &mut warnings,
-        );
-    }
-    if tun.session_radix_cache == Some(true) {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.session_radix_cache",
-            "--enable-session-radix-cache",
-            "",
-            &mut warnings,
-        );
-    }
-    if tun.mixed_chunk == Some(true) {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.mixed_chunk",
-            "--enable-mixed-chunk",
-            "",
-            &mut warnings,
-        );
-    }
-
-    // --- idle / lifecycle hygiene family
-    if tun.sleep_on_idle == Some(true) {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.sleep_on_idle",
-            "--sleep-on-idle",
-            "",
-            &mut warnings,
-        );
-    }
-    if tun.memory_saver == Some(true) {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.memory_saver",
-            "--enable-memory-saver",
-            "",
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.watchdog_timeout {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.watchdog_timeout",
-            "--watchdog-timeout",
-            &format!("{v}"),
-            &mut warnings,
-        );
-    }
-
-    // --- scheduler / observability family
-    // Default-on: the report powers the gateway's warm/cold split and
-    // per-model cache-hit surfaces (`ps` HIT, /metrics); it is metrics
-    // reporting only, never a scheduling change. `cache_report = false`
-    // opts out. Engines without the flag degrade via push_tuned's
-    // supported-flags guard (warn + skip), same as any tuned knob.
-    if tun.cache_report != Some(false) {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.cache_report",
-            "--enable-cache-report",
-            "",
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.batch_notify_size {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.batch_notify_size",
-            "--batch-notify-size",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.scheduler_recv_interval {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.scheduler_recv_interval",
-            "--scheduler-recv-interval",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-
-    // --- explicit cuda-graph capture list + KV token cap
-    if let Some(list) = &tun.cuda_graph_bs {
-        let tokens: Vec<String> = list.iter().map(ToString::to_string).collect();
-        push_tuned_list(
-            &mut argv,
-            input.supported_flags,
-            "sglang.cuda_graph_bs",
-            "--cuda-graph-bs",
-            &tokens,
-            &mut warnings,
-        );
-    }
-    // Prefill graph backend: the 42-shape breakable prefill capture has
-    // deadlocked at 0% on hybrid-GPU laptops (live-proven with an AWQ
-    // marlin model); `disabled` skips it while decode graphs stay on.
-    if let Some(backend) = &tun.cuda_graph_backend_prefill {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.cuda_graph_backend_prefill",
-            "--cuda-graph-backend-prefill",
-            backend,
-            &mut warnings,
-        );
-    }
-    if let Some(v) = tun.max_total_tokens {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.max_total_tokens",
-            "--max-total-tokens",
-            &v.to_string(),
-            &mut warnings,
-        );
-    }
-
-    // --- parallel sizes: only meaningful above 1; a >1 pin on a
-    // single-GPU machine is a spawn-time death (sglang shards across
-    // tp/dp/pp/ep ranks), so warn at compile time with the census.
-    let parallel_pins = [
-        ("tp_size", &tun.tp_size, "--tp-size"),
-        ("dp_size", &tun.dp_size, "--dp-size"),
-        ("pp_size", &tun.pp_size, "--pp-size"),
-        ("ep_size", &tun.ep_size, "--ep-size"),
-    ];
-    let multi_pin = parallel_pins
-        .iter()
-        .any(|(_, v, _)| v.is_some_and(|n| n > 1));
-    for (field, v, flag) in parallel_pins {
-        if let Some(n) = v {
-            if *n > 1 {
-                push_tuned(
-                    &mut argv,
-                    input.supported_flags,
-                    &format!("sglang.{field}"),
-                    flag,
-                    &n.to_string(),
-                    &mut warnings,
-                );
-            } else {
-                warnings.push(format!(
-                    "sglang.{field} = {n} is the upstream default; nothing emitted"
-                ));
-            }
-        }
-    }
-    if multi_pin && input.hardware.gpus.len() < 2 {
-        warnings.push(format!(
-            "sglang parallel sizes > 1 on a {} GPU machine — sglang shards the \
-             model across ranks and will fail or CPU-shard at spawn; this pin \
-             only makes sense multi-GPU",
-            input.hardware.gpus.len()
-        ));
-    }
-    // Auto tensor-parallelism: the supervisor planned TP ranks (weights+KV
-    // over the best single card, per-rank within the smallest). The manual
-    // `tp_size` pin always wins (user-orchestrated sharding); emission is
-    // last-resort, mirroring the llamacpp auto tensor-split posture.
-    if tun.tp_size.is_none_or(|n| n <= 1) {
-        if let Some(tp) = input.auto_tp_size.filter(|n| *n > 1) {
-            push_tuned(
-                &mut argv,
-                input.supported_flags,
-                "auto_tp_size",
-                "--tp-size",
-                &tp.to_string(),
-                &mut warnings,
-            );
+    let frac = if let Some(pin) = tun.mem_fraction_static {
+        let governed = pin.clamp(SGLANG_MEM_FRACTION_MIN, ceiling);
+        if (governed - pin).abs() > f32::EPSILON {
             warnings.push(format!(
-                "auto tensor-parallelism: weights+KV exceed the best single card but \
-                 fit {tp} discrete cards per-rank (manual parallel pins unset); ranks \
-                 bind over every visible GPU via NCCL — inter-card bandwidth is the \
-                 price of capacity. Pin models.<name>.sglang.tp_size to override"
+                "sglang.mem_fraction_static {pin:.3} clamped to \
+                 {governed:.3}: the pin must leave \
+                 {SGLANG_ACTIVATION_RESERVE_MIB} MiB of VRAM for \
+                 activations and CUDA-graph capture (receipt: \
+                 0.90 on an 8 GiB card crashed in graph capture; \
+                 sglang then SIGKILLs itself and the gateway \
+                 surfaces a 502)"
             ));
         }
-    }
-
-    // --- lora capacity knobs (adapters themselves ride the loras lane)
-    if let Some(v) = tun.max_lora_rank {
+        governed
+    } else {
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let raw = (static_demand as f64 / vram.max(1) as f64) as f32;
+        raw.clamp(SGLANG_MEM_FRACTION_MIN, ceiling)
+    };
+    if vram > 0 {
         push_tuned(
-            &mut argv,
+            argv,
             input.supported_flags,
-            "sglang.max_lora_rank",
-            "--max-lora-rank",
-            &v.to_string(),
-            &mut warnings,
+            "fit ladder",
+            "--mem-fraction-static",
+            &format!("{frac:.3}"),
+            warnings,
         );
     }
-    if let Some(v) = &tun.lora_backend {
-        push_tuned(
-            &mut argv,
-            input.supported_flags,
-            "sglang.lora_backend",
-            "--lora-backend",
-            v,
-            &mut warnings,
-        );
-    }
-
-    // --- extra_args: strict. Reserved flags (connection quintet + ladder
-    // outputs) are a hard error — a duplicate would silently shadow the
-    // supervisor-owned values (loopback bind, API key, VRAM budget).
-    if let Some(extra) = &input.overlay.extra_args {
-        for a in extra {
-            if a.starts_with("--") {
-                let name = a.split('=').next().unwrap_or(a);
-                if SGLANG_RESERVED_FLAGS.contains(&name) {
-                    return Err(format!(
-                        "extra_args {name} is reserved on sglang: the supervisor \
-                         owns the connection flags and the VRAM ladder owns {name}; \
-                         use the config knobs (ctx, slots, sglang.*) instead"
-                    ));
-                }
-                if !input.supported_flags.contains(name) {
-                    return Err(format!(
-                        "engine {} does not support {name}; try `blazar engine \
-                         install --kind sglang` for a newer sglang",
-                        input.engine_tag
-                    ));
-                }
-            }
-        }
-        argv.extend(extra.iter().cloned());
-    }
-
-    Ok(Profile {
-        argv,
-        warnings,
-        ctx,
-        gpu: gpu_label,
-        kv_est_bytes,
-        ctx_autofit: None,
-    })
 }
 
 /// Captured-graph memory slope: MiB of CUDA-graph pool per captured batch
