@@ -1163,7 +1163,8 @@ with tempfile.TemporaryDirectory() as td:
 # retired tables are gone but verdicts/receipts stay; slim chapters drop
 # the globally duplicated context sections; the policy line surfaces
 # coverage honesty for policy-skipped engine versions.
-_pub_recs = _charts_recs + [
+_pub_recs = [
+    *_charts_recs,
     {
         "key": "inventory",
         "provider": "inventory",
@@ -1272,7 +1273,8 @@ with tempfile.TemporaryDirectory() as td:
         quality_conc_rate=0.778,
         quality_conc_errors=0,
     )
-    _qpub_recs = _pub_recs + [
+    _qpub_recs = [
+        *_pub_recs,
         _qpub_cell("quality-direct", "direct", {"reason": 1}),
         _qblazar,
         _qpub_cell("quality-ollama", "ollama", {"reason": 3, "schema": 1})

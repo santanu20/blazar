@@ -310,7 +310,7 @@ def line_svg(
     xlo, xhi = lo(xs, log_x), hi(xs, log_x)
     ylo, yhi = lo(ys, log_y), hi(ys, log_y)
     direct = len(series) <= 4
-    top, bottom, left = 56, 40, 58
+    top, left = 56, 58
     right = (
         W - (_text_w(max((s[0] for s in series), key=len), TICK_PX) + 18)
         if direct
@@ -1120,7 +1120,7 @@ def render_campaign_charts(
         ("cold start to first token", cold_blazar, cold_ollama),
         ("idle wake to first token", idle_blazar, idle_ollama),
     ]
-    life_rows_spec = [(l, a, b) for l, a, b in life_rows_spec if a or b]
+    life_rows_spec = [(label, a, b) for label, a, b in life_rows_spec if a or b]
     if life_rows_spec:
         ca, cb = FAMILY_COLOR["blazar"], FAMILY_COLOR["ollama"]
         rows = [
@@ -1310,9 +1310,7 @@ def render_campaign_charts(
 
     # (f3) quality vs configuration knob: overall-rate delta per axis cell
     q_axes = [
-        r
-        for r in qcells
-        if r.get("provider") == "quality" and q_cfg(r) not in ("default",)
+        r for r in qcells if r.get("provider") == "quality" and q_cfg(r) != "default"
     ]
     cfg_rows: list[tuple[str, float]] = []
     for r in q_axes:

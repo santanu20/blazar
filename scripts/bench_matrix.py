@@ -66,6 +66,7 @@ import itertools
 import json
 import math
 import os
+import random
 import re
 import shutil
 import signal
@@ -81,7 +82,6 @@ import traceback
 import unicodedata
 import urllib.error
 import urllib.request
-import random
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,7 +94,9 @@ from typing import Any
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
-from bench_charts import render_campaign_charts
+from bench_charts import (  # noqa: E402 — requires the sys.path bootstrap above
+    render_campaign_charts,
+)
 
 # Optional quality-lane dependency: the image lane stamps perceptual
 # metrics (contrast / entropy / color diversity) when Pillow is importable
@@ -3952,7 +3954,7 @@ def niah_build_prompt(probe: dict, seed: int) -> str:
         parts.append(s)
         used += len(s) + 1
     hole = int(len(parts) * probe["depth"])
-    body = "\n".join(parts[:hole] + [needle] + parts[hole:])
+    body = "\n".join([*parts[:hole], needle, *parts[hole:]])
     return body + question
 
 
@@ -4180,6 +4182,7 @@ def check_code(resp: str, task: dict) -> bool:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -4210,9 +4213,8 @@ def check_schema(resp: str, schema: dict) -> bool:
         elif want == "float":
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 return False
-        elif want == "str":
-            if not isinstance(v, str):
-                return False
+        elif want == "str" and not isinstance(v, str):
+            return False
     return True
 
 
@@ -4247,7 +4249,7 @@ def check_embed_triple(vecs: dict[str, list[float]], triple: dict) -> bool:
     (zero vector) counts as fail."""
 
     def cos(x: list[float], y: list[float]) -> float:
-        dot = sum(p * q for p, q in zip(x, y))
+        dot = sum(p * q for p, q in zip(x, y, strict=False))
         nx = math.sqrt(sum(p * p for p in x))
         ny = math.sqrt(sum(q * q for q in y))
         return dot / (nx * ny) if nx > 0 and ny > 0 else float("nan")
