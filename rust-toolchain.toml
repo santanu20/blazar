@@ -5,3 +5,7 @@
 # floor for older toolchains is rust-version = "1.95" in Cargo.toml
 # (sysinfo 0.39 requirement).
 channel = "1.98.1"
+# Ride the pin: without these, a rustup-resolved pinned toolchain has no
+# rustfmt/clippy (the CI action installs components under `stable`), and
+# `cargo fmt`/`cargo clippy` fail with "not installed for the toolchain".
+components = ["rustfmt", "clippy"]
