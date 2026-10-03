@@ -6,6 +6,14 @@ order: 1
 
 <img src="assets/BLAZAR_Banner.webp" alt="Blazar banner" width="896" />
 
+## The control plane for local AI inference.
+
+Unified APIs. Intelligent routing. Resource-aware scheduling. Multi-engine serving.
+
+**OpenAI · Ollama · Anthropic**
+
+llama.cpp · mistral.rs · SGLang · MLX-LM · sd.cpp · whisper.cpp · piper
+
 Blazar is a local AI gateway and runtime orchestrator in one Rust binary. Applications talk to one endpoint; Blazar manages the model store, picks or pins the right inference engine, fits workloads to your hardware, and controls concurrency, lifecycle, and diagnostics.
 
 Bring your client. Bring your model. Blazar handles the serving stack.

@@ -393,7 +393,7 @@ crates/
 
 ## Documentation
 
-This README is the product entry point; depth lives in dedicated documents.
+This README is the product entry point; depth lives in dedicated documents. The full series is also hosted at [santanu20.github.io/blazar](https://santanu20.github.io/blazar/).
 
 | Document | Purpose |
 |---|---|
