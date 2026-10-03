@@ -204,7 +204,7 @@ The repository includes reproducible benchmark campaigns covering raw engine ove
 
 The latest committed flagship campaign was recorded on **September 29, 2026**. It used an NVIDIA RTX 4070 Laptop GPU (8 GiB), Intel Core i7-14650HX, 16 GiB RAM, and Linux Mint 22.3. The campaign receipt is published in [`BENCHMARK.md`](BENCHMARK.md) and [`bench-artifacts/`](bench-artifacts/).
 
-> **Important:** these are measured results from a specific model, engine build, hardware configuration, workload, and software version. They are evidence of observed behavior, not universal performance guarantees. This campaign ran against Blazar `0.13.0`; the current release is `0.18.0`.
+> **Important:** these are measured results from a specific model, engine build, hardware configuration, workload, and software version. They are evidence of observed behavior, not universal performance guarantees. This campaign ran against Blazar `0.13.0`; the current release is `0.19.0`.
 
 ### Headline evidence
 
@@ -333,14 +333,14 @@ fit → pull/import → serve → run → observe → tune
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/santanu20/blazar/v0.18.0/scripts/install.sh \
+  https://raw.githubusercontent.com/santanu20/blazar/v0.19.0/scripts/install.sh \
   | BLAZAR_REPO=santanu20/blazar sh
 ```
 
 #### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/santanu20/blazar/v0.18.0/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/santanu20/blazar/v0.19.0/scripts/install.ps1 | iex
 ```
 
 The Blazar binary and inference engines are separate artifacts. The installer can bootstrap the default engine; you can also manage the engine explicitly:

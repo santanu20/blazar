@@ -100,7 +100,10 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
         .await?;
         // The farm must exist before the row can ever serve: JIT kernel
         // compiles happen at generation time, so a missing farm is an
-        // instant broken lane, not a degraded one.
+        // instant broken lane, not a degraded one. The helper itself is
+        // Linux-only (CUDA farm), so the reference is gated to match —
+        // this branch is selected at runtime, not compile time.
+        #[cfg(target_os = "linux")]
         link_cuda_home(dir)?;
         Ok(venv)
     } else {
