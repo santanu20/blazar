@@ -57,6 +57,8 @@ Validation axes executed:
 | H-4 | Run #8: `_promote_fixture` sqlite3.Row iteration crash; `list` table-truncation blindness; `--tag` flag that does not exist | **FIXED (harness)** — `row.keys()` iteration; `list --json` JSONL parsing; positional TAG conflict probe (`engine update --all b000000` exercises the real rc1 teaching). |
 | H-5f | Auto-boot burned the full 15s systemd poll whenever a user unit exists but serves another port | **FIXED** — after a 5s grace, one `is-active` query decides: only an `activating` unit keeps the budget; everything else yields to the detached fallback (exit-watched retry converges if the unit binds late). Live-measured 20s → 8.2s on this box. |
 | H-5 | Run #9: `whisper.transcribe`/`run.miss-pulls` rc=1 — CLI auto-boot bind race during phase-daemon churn | **FIXED (harness + product)** — harness: `ensure_phase_daemon()` health-poll before auto-boot lanes. Product root cause (spawn-once, death-blind boot loop): `ensure_daemon` now keeps the child handle and retries a spawn ONLY after an observed child exit — bounded (3 attempts, 1s backoff, healthy-recheck between attempts), never stacking daemons. Unit-pinned policy + live-proven all three scenarios (free-port clean boot unchanged; port race recovers to rc=0 via retry; permanent holder fails fast in 14s with honest teaching vs 30s blind stall). |
+| BUG-12 | Wan video gate priced documented `width`/`height` numerics as the 512×512 default → over-reject of small renders | **FIXED** — `gate_size` reads the `size` "WxH" string dialect first, else the documented `width`+`height` pair. Pinned. Live: 320×320×8f async job accepted → completed in 47s → real EBML/WebM artifact. |
+| BUG-13 | Rerank surface dead: blazar never passed `--reranking` to any llama-server child | **FIXED** — profile arm: `pooling_type == 4 (RANK)` or arch `bert` (exact match; `modern-bert` excluded — upstream core-dump) spawns `--embeddings --reranking` with no `--pooling` (upstream precedence: `--pooling` neutralizes `--reranking`). 4 pins. Live: bge-reranker-v2-m3 E2E 4/4 — correct ranking through the gateway (idx0 8.19 / idx2 5.03). |
 
 Hidden breakage caught beyond the ledger: a deleted model blob with a live DB row
 (self-healed via `blazar pull`; surfaced the doctor-warn behavior above), and stale
@@ -91,6 +93,33 @@ zero spurious warnings (was 2+ per chat).
 ### 3.4 Doctor certificate rendering (BUG-10) — `crates/blazar-cli/src/main.rs`
 `epoch_to_utc` (Hinnant civil-from-days, no datetime dependency); TESTED row renders
 human-readable UTC. Pins: calendar boundaries + render. Live receipt: 2026-10-03 10:58:43 UTC.
+
+### 3.5 Rerank serving wiring (BUG-13) — `crates/blazar-core/src/profile.rs`
+Two detection signals, both live-proven against upstream b11370: `pooling_type = 4`
+(LLAMA_POOLING_TYPE_RANK, the bge-reranker KV dialect) and `arch == "bert"` (the
+KV-less gpustack bge GGUFs; embed-berts serve fine under `--reranking`, tested with
+bge-small-en). `modern-bert` is explicitly excluded — rank pooling against its
+classifier head core-dumps upstream (Laya, live-proven). The spawned argv never carries
+`--pooling` in this arm: upstream precedence makes `--pooling last` silently disable
+the rerank endpoint (501, live-proven) — which is also why a user-level
+`model_overrides extra_args` could not fix this. Legacy engines lacking the flag get a
+teaching warning instead.
+
+### 3.6 Video gate dialect (BUG-12) — `crates/blazar-gateway/src/images.rs`
+`gate_size` accepted only the `size` "WxH" string; the documented top-level
+`width`/`height` numerics fell to the 512×512 default, over-rejecting small video
+renders on 8 GiB cards. Now: `size` string outranks, else the numeric pair, else
+default. Pin: `unit__gate_size__reads_documented_width_height_dialect`.
+
+## 3a. P8 gap-closure lanes (second validation wave)
+
+| Gap | Lane result |
+|---|---|
+| umt5-xxl embeddings | **CLOSED** — `/v1/embeddings` 200 (4096-dim real vectors) + ollama-style `/api/embed` 200 + argv `--embeddings` |
+| Real rerank | **CLOSED** — gateway `/v1/rerank` + `/api/rerank` 200 with correct ranking on bge-reranker-v2-m3 Q8_0 (post BUG-13 fix) |
+| Wan 2.1 video | **CLOSED** — async job → completed 47s → EBML/WebM artifact (post BUG-12 fix); warm-child capabilities 200 |
+| TLS serving | **CLOSED** — self-signed daemon: handshake + `/healthz` + real chat over TLS, plaintext refused |
+| Laya (modern-bert) | **Upstream-blocked, boundary-classified** — all 4 pooling values live-tested against b11370: mean/last/cls → server healthy but embeddings 400 ("Pooling type 'none' is not OAI compatible", upstream forces none for modern-bert); rank → instant upstream core-dump. Blazar forwards the child teaching correctly; no product change warranted. |
 
 ## 4. Engine lane E2E results (P4)
 
@@ -141,17 +170,18 @@ floors exceed the 8 GiB card — correct classification, not a skip).
 
 | Suite | Result |
 |---|---|
-| cargo-nextest full workspace | **1767/1767 PASS** (baseline 1750 at session start + 17 new pins) |
+| cargo-nextest full workspace | **1785/1785 PASS** (baseline 1750 at session start + 35 new pins across all fix waves) |
 | cargo clippy --workspace --all-targets | clean (only pre-existing proc-macro-error2 future-incompat notice) |
 | cargo fmt --check | clean |
 | validate.py FAST (run #3, post-fix) | **221/221 PASS** (run #2 same tree pre-fix: 16 fails) |
-| validate.py FULL mode | see receipt run below — deep batteries: predictive_preload, engine update --all live walk, engine.build, whisper.pull+transcribe, tts pull+synthesize, quantize happy/refusal/imatrix, run.miss-pulls |
-| Engine lanes E2E | 7/7 PASS (llamacpp, sglang, mistralrs, sdcpp, whisper, piper, mlx) |
+| validate.py FULL mode | **226/226 PASS** (run #10) — deep batteries: predictive_preload boundary, engine update --all live walk, engine.build (source build b11375), whisper.pull+transcribe, tts pull+synthesize, quantize happy/refusal/imatrix, run.miss-pulls |
+| Engine lanes E2E (P4) | 7/7 PASS (llamacpp, sglang, mistralrs, sdcpp image, whisper, piper, mlx) |
+| Gap-closure lanes (P8) | 5/5 PASS (umt5 embeddings, bge rerank, wan video, TLS serving) + laya boundary-classified (upstream-blocked, documented) |
 
 ## 7. Reproduce
 
 ```bash
-cargo nextest run -E 'all()'          # 1767 tests
+cargo nextest run -E 'all()'          # 1785 tests
 python3 scripts/validate.py --smoke   # FAST subset
 python3 scripts/validate.py           # full suite (all deep batteries)
 GH_TOKEN=$(gh auth token) python3 scripts/validate.py   # with engine.build lane
