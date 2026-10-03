@@ -54,7 +54,10 @@ permalink: /
 <span class="p">$</span> blazar run qwen3-0.6b          <span class="c"># interactive REPL</span>
 <span class="o">blazar 0.19.0 — powered by upstream llama.cpp, mistral.rs and SGLang</span></pre>
   </div>
-  <p class="hero-meta" style="margin-top:14px">also available: <code>cargo install blazar</code></p>
+  <p class="hero-meta" style="margin-top:14px">
+    also available: <code>cargo install blazar</code> ·
+    client setup for OpenAI, Ollama and Anthropic dialects: <a href="{{ '/integrations.html' | relative_url }}">Integrations</a>
+  </p>
 </section>
 
 <section class="section" id="features">
@@ -110,6 +113,9 @@ permalink: /
     <div class="engine-pill"><b>whisper.cpp</b><span>speech to text</span></div>
     <div class="engine-pill"><b>piper</b><span>text to speech</span></div>
   </div>
+  <p class="hero-meta" style="margin-top:18px">
+    how models map to lanes: <a href="{{ '/engines.html' | relative_url }}">Engines &amp; Routing</a>
+  </p>
 </section>
 
 <section class="section" id="architecture">
@@ -117,40 +123,88 @@ permalink: /
     <h2>Architecture</h2>
     <p>Applications speak OpenAI-, Ollama- or Anthropic-shaped HTTP. Blazar translates, admits, routes, and supervises the engine processes.</p>
   </div>
-  <div class="term">
-    <div class="term-bar"><i></i><i></i><i></i><span class="term-title">request path</span></div>
-    <pre class="term-body">                           Applications
-      ┌───────────────────────┬────────────────────────┐
-      │                       │                        │
-  OpenAI SDK            Ollama clients         Anthropic SDK
-      │                       │                        │
-      └───────────────────────┴────────────────────────┘
-                              │
-                              ▼
-                    ┌───────────────────┐
-                    │      BLAZAR       │
-                    │───────────────────│
-                    │ API gateway       │
-                    │ Routing           │
-                    │ Admission/queue   │
-                    │ Model store       │
-                    │ VRAM/KV fit       │
-                    │ Sessions/cache    │
-                    │ Diagnostics       │
-                    │ Engine lifecycle  │
-                    └─────────┬─────────┘
-                              │
-      ┌───────────┬───────────┴───────────┬───────────┐
-      │           │           │           │           │
-        llama.cpp  mistral.rs    SGLang        MLX
-      │           │           │           │           │
-      └────────────── Text / Embeddings ──────────────┘
-                              │
-                 ┌────────────┼─────────────┐
-                 │            │             │
-              sd.cpp       whisper.cpp     piper
-               Images       Speech         TTS
-               Video        to text</pre>
+  <div class="arch-figure">
+    <svg viewBox="0 0 920 730" width="100%" height="auto" role="img" aria-label="Blazar architecture: applications talk to the Blazar control plane, which routes to four text engines and three media engines, with federation to remote peers" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0L10 5L0 10z" fill="#8b949e"/>
+        </marker>
+      </defs>
+      <text x="460" y="26" text-anchor="middle" font-size="12" letter-spacing="3" fill="#8b949e">APPLICATIONS</text>
+      <g>
+        <rect x="60" y="44" width="200" height="52" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="160" y="75" text-anchor="middle" font-size="14" fill="#e6edf3">OpenAI SDK</text>
+        <rect x="360" y="44" width="200" height="52" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="460" y="75" text-anchor="middle" font-size="14" fill="#e6edf3">Ollama clients</text>
+        <rect x="660" y="44" width="200" height="52" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="760" y="75" text-anchor="middle" font-size="14" fill="#e6edf3">Anthropic SDK</text>
+      </g>
+      <g stroke="#8b949e" stroke-width="1.5" fill="none">
+        <polyline points="160,96 160,126 460,126 460,156" marker-end="url(#arr)"/>
+        <polyline points="460,96 460,156" marker-end="url(#arr)"/>
+        <polyline points="760,96 760,126 460,126"/>
+      </g>
+      <rect x="230" y="160" width="460" height="286" rx="12" fill="#11161f" stroke="#7020f0" stroke-width="1.5"/>
+      <text x="460" y="192" text-anchor="middle" font-size="17" font-weight="bold" letter-spacing="6" fill="#e6edf3">BLAZAR</text>
+      <g font-size="13" fill="#c9d1d9">
+        <rect x="252" y="210" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="353" y="232" text-anchor="middle">API gateway</text>
+        <rect x="466" y="210" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="567" y="232" text-anchor="middle">Routing</text>
+        <rect x="252" y="252" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="353" y="274" text-anchor="middle">Admission / queue</text>
+        <rect x="466" y="252" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="567" y="274" text-anchor="middle">Model store</text>
+        <rect x="252" y="294" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="353" y="316" text-anchor="middle">VRAM / KV fit</text>
+        <rect x="466" y="294" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="567" y="316" text-anchor="middle">Sessions / cache</text>
+        <rect x="252" y="336" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="353" y="358" text-anchor="middle">Durable jobs</text>
+        <rect x="466" y="336" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="567" y="358" text-anchor="middle">Federation</text>
+        <rect x="252" y="378" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="353" y="400" text-anchor="middle">Diagnostics</text>
+        <rect x="466" y="378" width="202" height="34" rx="6" fill="#0a0e16" stroke="#30363d"/><text x="567" y="400" text-anchor="middle">Engine lifecycle</text>
+      </g>
+      <g stroke="#8b949e" stroke-width="1.5" fill="none">
+        <polyline points="690,353 839,353 839,166" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+      </g>
+      <rect x="764" y="110" width="150" height="52" rx="8" fill="#11161f" stroke="#30363d" stroke-dasharray="5 4"/>
+      <text x="839" y="133" text-anchor="middle" font-size="13" fill="#c9d1d9">Remote peers</text>
+      <text x="839" y="151" text-anchor="middle" font-size="10.5" fill="#8b949e">capacity / warm / route</text>
+      <g stroke="#8b949e" stroke-width="1.5" fill="none">
+        <polyline points="460,446 460,468 130,468 130,490" marker-end="url(#arr)"/>
+        <polyline points="460,446 460,468 350,468 350,490" marker-end="url(#arr)"/>
+        <polyline points="460,446 460,468 570,468 570,490" marker-end="url(#arr)"/>
+        <polyline points="460,446 460,468 790,468 790,490" marker-end="url(#arr)"/>
+      </g>
+      <g>
+        <rect x="40" y="494" width="180" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="130" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">llama.cpp</text>
+        <rect x="260" y="494" width="180" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="350" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">mistral.rs</text>
+        <rect x="480" y="494" width="180" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="570" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">SGLang</text>
+        <rect x="700" y="494" width="180" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="790" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">MLX</text>
+      </g>
+      <g stroke="#8b949e" stroke-width="1.5" fill="none">
+        <line x1="130" y1="550" x2="130" y2="570"/>
+        <line x1="350" y1="550" x2="350" y2="570"/>
+        <line x1="570" y1="550" x2="570" y2="570"/>
+        <line x1="790" y1="550" x2="790" y2="570"/>
+      </g>
+      <rect x="40" y="572" width="840" height="38" rx="8" fill="#11161f" stroke="#30363d"/>
+      <text x="460" y="597" text-anchor="middle" font-size="13" fill="#c9d1d9">Text / Embeddings</text>
+      <g stroke="#8b949e" stroke-width="1.5" fill="none">
+        <polyline points="460,610 460,626 210,626 210,640" marker-end="url(#arr)"/>
+        <polyline points="460,610 460,640" marker-end="url(#arr)"/>
+        <polyline points="460,610 460,626 710,626 710,640" marker-end="url(#arr)"/>
+      </g>
+      <g>
+        <rect x="110" y="644" width="200" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="210" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">sd.cpp</text>
+        <text x="210" y="688" text-anchor="middle" font-size="11" fill="#8b949e">Images / Video</text>
+        <rect x="360" y="644" width="200" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="460" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">whisper.cpp</text>
+        <text x="460" y="688" text-anchor="middle" font-size="11" fill="#8b949e">Speech to text</text>
+        <rect x="610" y="644" width="200" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="710" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">piper</text>
+        <text x="710" y="688" text-anchor="middle" font-size="11" fill="#8b949e">TTS</text>
+      </g>
+    </svg>
   </div>
 </section>
 
@@ -177,7 +231,8 @@ permalink: /
     </div>
   </div>
   <p class="hero-meta" style="margin-top:16px">
-    full methodology and raw numbers: <a href="https://github.com/santanu20/blazar/blob/main/BENCHMARK.md">BENCHMARK.md</a>
+    charts and methodology: <a href="{{ '/benchmarks.html' | relative_url }}">Benchmarks</a> ·
+    full report and raw numbers: <a href="https://github.com/santanu20/blazar/blob/main/BENCHMARK.md">BENCHMARK.md</a>
   </p>
 </section>
 
@@ -187,7 +242,7 @@ permalink: /
     <p>Ten deep dives — concepts to schema to every HTTP surface — plus the research notes that shaped the engine lanes.</p>
   </div>
   <div class="grid-cards">
-    {% for item in site.data.docs_nav[0].items limit: 9 %}
+    {% for item in site.data.docs_nav[1].items limit: 9 %}
     <a class="card" href="{{ item.path | relative_url }}" style="display:block;color:inherit">
       <h3 style="margin-top:0">{{ item.title }}</h3>
       <p>{{ item.note }}</p>
@@ -195,7 +250,7 @@ permalink: /
     {% endfor %}
   </div>
   <p class="hero-meta" style="margin-top:18px">
-    research notes: {% for item in site.data.docs_nav[1].items %}<a href="{{ item.path | relative_url }}">{{ item.title }}</a> · {% endfor %}
+    research notes: {% for item in site.data.docs_nav[2].items %}<a href="{{ item.path | relative_url }}">{{ item.title }}</a> · {% endfor %}
     <a href="https://github.com/santanu20/blazar/blob/main/CHANGELOG.md">changelog</a>
   </p>
 </section>

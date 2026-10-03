@@ -1,5 +1,16 @@
 # Ordered documentation navigation. `path` values are Jekyll page paths;
 # the doc layout links them with .html URLs.
+- section: Product
+  items:
+    - title: Benchmarks
+      path: /benchmarks.html
+      note: Measured gateway overhead, concurrency scaling, charts
+    - title: Engines & Routing
+      path: /engines.html
+      note: The seven serving lanes and how models map to them
+    - title: Integrations
+      path: /integrations.html
+      note: Client dialects, blazar connect, the Ollama drop-in path
 - section: Documentation
   items:
     - title: System Overview
