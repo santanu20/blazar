@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned to the known-good stable the edition-2024 migration was validated
+# on (suite 1786/1786). CI intentionally runs @stable as the forward-drift
+# canary; bump this pin deliberately when adopting a new stable. The hard
+# floor for older toolchains is rust-version = "1.95" in Cargo.toml
+# (sysinfo 0.39 requirement).
+channel = "1.98.1"
