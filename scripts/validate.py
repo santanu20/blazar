@@ -3510,8 +3510,9 @@ def _promote_fixture(ref: str) -> None:
     meta = cache / f"{repo.replace('/', '_')}__{quant}.json"
     # sqlite3.Row iteration yields VALUES, not keys — row[k] on a value
     # raises IndexError("No item with that key") (quantize-lane crash,
-    # 2026-10-03). .keys() is the column-name iterator.
-    meta.write_text(json.dumps({k: row[k] for k in row.keys()}))
+    # 2026-10-03). .keys() is the column-name iterator; the dict-membership
+    # advice below does not apply to sqlite3.Row.
+    meta.write_text(json.dumps({k: row[k] for k in row.keys()}))  # noqa: SIM118
 
 
 def cli(

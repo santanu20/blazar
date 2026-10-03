@@ -17642,10 +17642,10 @@ mod tests {
             vec!["sglang".to_string()]
         );
         // Free-form map sections must never match (they accept any key).
-        assert!(bare_leaf_sections("zzz_never_a_leaf", "").is_empty());
+        assert_eq!(bare_leaf_sections("zzz_never_a_leaf", ""), [] as [String; 0]);
         // Flat root knobs (`spec_draft_threads` and friends are ROOT
         // fields, not a [spec_draft] table) resolve to no section.
-        assert!(bare_leaf_sections("spec_draft_threads", "").is_empty());
+        assert_eq!(bare_leaf_sections("spec_draft_threads", ""), [] as [String; 0]);
     }
 
     #[test]
@@ -17713,7 +17713,7 @@ mod tests {
         let raw = "# lead comment\n[semantic_cache]\nenabled = true\n\n# inner\n[sglang]\n";
         let pins = table_pins(raw, "semantic_cache");
         assert_eq!(pins, vec!["enabled = true".to_string()]);
-        assert!(table_pins(raw, "sglang").is_empty());
+        assert_eq!(table_pins(raw, "sglang"), [] as [String; 0]);
     }
 
     #[test]

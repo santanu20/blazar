@@ -14,7 +14,7 @@ phases P0–P7, every defect found, root causes, fixes, pins, and receipts.
 | OS | Linux; prod daemon :11435 throughout |
 | Harness | `scripts/validate.py` (221-check FAST suite, sandboxed XDG, own port) + bespoke probes |
 | Engine lanes installed | llamacpp b11370-cuda, sglang 0.5.21, sdcpp master-929, whisper b5130, mistral.rs v0.9.4, piper 2023.11.14, mlx 0.32.0 |
-| Receipts | `/tmp/opencode/comval/{p0..p6,golds_*,validate_run3.log,FINDINGS.md}` |
+| Receipts | Session scratch ledger: per-phase subdirectories `p0`–`p6`, `golds_*.log`, `validate_run*.log`, `FINDINGS.md` |
 
 Validation axes executed:
 
@@ -157,5 +157,5 @@ python3 scripts/validate.py           # full suite (all deep batteries)
 GH_TOKEN=$(gh auth token) python3 scripts/validate.py   # with engine.build lane
 ```
 
-Receipts: `/tmp/opencode/comval/` (FINDINGS.md is the session ledger; per-phase
-subdirectories p0–p6, golds_*.log, validate_full_final*.log run series).
+Receipts: session scratch ledger (`FINDINGS.md` is the session ledger; per-phase
+subdirectories `p0`–`p6`, `golds_*.log`, `validate_full_final*.log` run series).
