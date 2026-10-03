@@ -21,8 +21,8 @@ jobs:
         include:
           # glibc 2.35 floor (ubuntu-22.04). Older glibc / Alpine -> musl assets.
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, smoke: true }
-          # Cross C deps (aws-lc-sys needs a target sysroot for their C
-          # sources): the cross images carry the full toolchain + libc
+          # Cross C deps (ring compiles C/asm sources and needs a target
+          # sysroot): the cross images carry the full toolchain + libc
           # headers, where hand-rolled apt cross-gcc leaves them missing
           # and a glibc-compiled object linked into a static musl binary
           # segfaults at startup.
@@ -102,8 +102,46 @@ jobs:
           path: blazar-*.*
           if-no-files-found: error
 
+  # Release gate: a tag must not ship binaries (or crates) unless the
+  # full suite is green at the tagged commit. ci.yml only fires on
+  # branch pushes and PRs — tags never reach it — so this job re-runs
+  # the same commands here. Ubuntu alone: the tagged commit always
+  # landed on main first, where the 3-OS matrix already covered the
+  # platform-specific paths.
+  checks:
+    name: fmt + clippy + tests (release gate)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log
+        shell: bash
+      - name: upload clippy log (always, for diagnosis)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-clippy
+          path: clippy.log
+          if-no-files-found: ignore
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace 2>&1 | tee test.log
+        shell: bash
+      - name: upload test log (always, for diagnosis)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-test
+          path: test.log
+          if-no-files-found: ignore
+
   release:
-    needs: build
+    needs: [build, checks]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -153,6 +191,59 @@ jobs:
               --notes-file notes.md \
               --generate-notes
           fi
+
+  # crates.io update rides the same chain: tag == workspace version,
+  # suite green (via release gate above), then publish in dependency
+  # order. Idempotent on re-runs — if the version is already on the
+  # registry (same philosophy as the clobber-upload release logic), the
+  # publish step skips instead of failing the re-run.
+  publish-crates:
+    name: publish crates.io
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches workspace version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="blazar") | .version')"
+          if [ "$tag" != "$version" ]; then
+            echo "tag v$tag does not match workspace version $version" >&2
+            echo "bump the workspace version before tagging" >&2
+            exit 1
+          fi
+          echo "releasing blazar $version to crates.io"
+      - name: Skip if this version is already published
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "CARGO_REGISTRY_TOKEN secret is not set — add it under" >&2
+            echo "Settings > Secrets and variables > Actions, then re-run." >&2
+            exit 1
+          fi
+          current="$(curl -sf -A "blazar-release" https://crates.io/api/v1/crates/blazar | jq -r '.crate.max_stable_version')" || current="none"
+          if [ "$current" = "$tag" ]; then
+            echo "blazar $tag is already the newest crate on crates.io — skipping publish"
+            echo "SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+          fi
+      - name: Publish (core -> runtime -> gateway -> blazar)
+        if: env.SKIP_PUBLISH != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -e
+          cargo publish -p blazar-core
+          # the registry index needs a moment before downstream crates resolve it
+          sleep 45
+          cargo publish -p blazar-runtime
+          sleep 45
+          cargo publish -p blazar-gateway
+          sleep 45
+          cargo publish -p blazar
 
   # Real-OS validation of the just-published installers: download via the
   # GitHub API, sha256-verify, extract, PATH, service lane. Engine
