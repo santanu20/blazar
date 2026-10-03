@@ -107,9 +107,10 @@ The Blazar binary and inference engines are separate artifacts. The installer ca
 ### 2. Pull a model
 
 ```sh
-blazar pull qwen3-0.6b                                # registry shortname
-blazar pull ggml-org/Qwen3-8B-GGUF:Q4_K_M            # Hugging Face GGUF
-blazar import /path/to/model.gguf --name mymodel      # existing local file
+blazar search qwen3 instruct                        # find models on Hugging Face
+blazar pull qwen3-0.6b                              # registry shortname
+blazar pull ggml-org/Qwen3-8B-GGUF:Q4_K_M           # Hugging Face GGUF
+blazar import /path/to/model.gguf --name mymodel    # existing local file
 ```
 
 ### 3. Serve and run
