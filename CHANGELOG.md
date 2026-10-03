@@ -4,10 +4,27 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
-## [Unreleased]
+## [0.20.0] - 2026-10-03
 
 ### Security
+
 - **Loopback gateway hardened against browser-borne attacks (DNS rebinding + cross-origin).** When bound to a loopback address the gateway now validates the `Host` header (localhost names, local/private/link-local IP literals, `*.localhost`/`*.local`/`*.internal`, machine hostname; anything else gets a 403, preflights and `/health` stay open) — the same defense ollama shipped for CVE-2024-28224 — and the CORS default flipped from deny-all to a local-origin allowlist: `localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0` on any port plus desktop-webview schemes (`app://`, `file://`, `tauri://`, `vscode-webview://`, `vscode-file://`) are always allowed, `cors_origins` entries are added on top, and `"*"` restores any-origin. Non-browser clients (SDKs, curl, AI CLIs) are untouched: they send no `Origin` and their `Host` is a local literal. Non-loopback binds keep their pre-guard semantics deliberately.
+
+### Added
+- **Reranker-class checkpoints are served, not just stored.** bge-reranker-style GGUFs (pooling_type = rank, or the bert architecture) now spawn their llama-server child with `--embeddings --reranking` — `POST /v1/rerank`, the `/v1/reranking` alias, and ollama-style `/api/rerank` return live relevance scores end-to-end. The detection follows upstream semantics exactly: rank-pooling KV or `arch = bert` (exact match — modern-bert is deliberately excluded: its classifier head core-dumps upstream under rank pooling, verified live), no `--pooling` flag is ever sent on this arm (an explicit pooling value neutralizes `--reranking` upstream — 501), and engines whose manifest lacks the flag get a teaching warning with the `blazar engine update` escape instead of a broken boot.
+- **Detached daemon auto-boot survives port races.** `ensure_daemon` now watches the spawned child process: a spawn that loses the bind race (another daemon mid-drain, a foreign listener) exits within milliseconds and is retried — bounded at 3 attempts with backoff and a healthy-recheck between attempts — instead of stalling the full 30s budget on a dead process. A respawn happens only after an observed exit, so two daemons can never stack; a live-but-slow child keeps the whole budget. Auto-boot also yields early (~5s instead of 15s) when a systemd unit is up but serving a different port.
+
+### Fixed
+- **Anthropic/OpenAI request fidelity through the gateway (single-parse pipeline).** Three body mutators (include_usage forcing, child-model rewrite, per-engine think management) each re-serialized from the original parsed body, silently dropping their predecessors' edits — every default-shaped mistral.rs chat 400'd with "model not found" and sglang/mlx/mistral.rs streams lost the usage flag. All mutations now apply to one parsed value with a single serialization, byte-identical passthrough when nothing changes; responses (buffered and SSE, frame-preserving) re-stamp the model name to the caller's exact spelling so child-internal ids never leak.
+- **`config get/set/unset` understand bare section keys.** Unpinned settable leaves answered "unknown config key" (get), `unset ttl_secs` claimed "not pinned" while the pin stayed (unset), and section parents (`config set sglang x`) died in a raw TOML parse error. All three arms now share one key classifier — root knob, section parent (teaching with the leaf list), single-section leaf, or ambiguity — so bare and dotted forms behave consistently, and a root-key write can no longer clobber a same-named pin inside `[engine_env]`.
+- **Video scratch gate prices the documented request dialect.** `width`/`height` numeric fields were invisible to the VRAM gate (only the `size` "WxH" string was read), so a 320x320 request was priced as the 512x512 default and over-rejected on 8 GiB cards the calibration says fit. Both dialects now feed the gate.
+- **mlx context metadata (ctx = 0) is treated as unknown, not a zero ceiling.** Requests through the mlx lane no longer emit spurious "hit the context ceiling (0)" / near-limit warnings; truncation and near-limit logic skip absent windows.
+- **Empty-string `mmproj_path` (legacy/hand-edited stores) reads as no projector.** A `""` dialect could classify a text model as multimodal, silently skipping cache_reuse and forcing projector-offload flags.
+- **`model-doctor` renders the TESTED timestamp.** The certificate table printed "TESTED unknown" for numeric epochs; it now renders `YYYY-MM-DD HH:MM:SS UTC` (dependency-free civil-calendar conversion).
+- **Diffusion child narrowing accepts store aliases.** `?model=` on the capabilities and job routes matched only the child's canonical registered name, so the alias a caller actually uses (e.g. `wan_2.1` vs `wan_2.1_comfyui_repackaged`) missed its own family with "no live diffusion child"; both spellings now resolve through the same model resolution the spawn path uses.
+
+### Changed
+- Engine update channels, validation harness, and goldens hardened during the comprehensive all-surface validation pass (226-check full-mode suite, 12 lanes end-to-end): the shipped `scripts/validate.py` runs every command leaf path and config knob flow with evidence, sandboxes fully rebase store paths so destructive probes can never touch real blobs, and the regenerated goldens reflect the current command/knob surface.
 
 ## [0.19.0] - 2026-10-03
 
