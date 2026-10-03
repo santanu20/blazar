@@ -3,4 +3,7 @@ description: >-
   Multi-engine local AI inference platform in Rust — one gateway for llama.cpp,
   mistral.rs, SGLang, MLX, whisper.cpp, Piper and stable-diffusion.cpp, with
   resource-aware scheduling, durable jobs and federation.
+url: "https://santanu20.github.io"
+baseurl: "/blazar"
+repository: "santanu20/blazar"
 theme: jekyll-theme-cayman
