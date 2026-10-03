@@ -37,14 +37,20 @@ jobs:
           name: clippy-${{ matrix.os }}
           path: clippy.log
           if-no-files-found: ignore
-      # Linux/macOS: parallel (the same suite runs parallel green under
-      # cargo-nextest locally, per-test process isolation). Windows keeps
-      # serial execution: parallel has never been exercised on windows
-      # runners and the pin predates the matrix (born in ci.yml's first
-      # commit, not a fix for an observed race). Lift after one green
-      # parallel windows run. Tee'd for the same reason as clippy above:
-      # a flaky cell leaves its exact panic behind in the artifact.
-      - run: cargo test --workspace ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }} 2>&1 | tee test.log
+      # Tests run via cargo-nextest: per-test process isolation is what the
+      # suite is written for. Several e2e tests shape their stub engine via
+      # STUB_* env vars (std::env::set_var) and spawn stub-llama-server
+      # children that inherit them; under plain `cargo test` all tests share
+      # one process, so a knob set by one test leaks into concurrently
+      # running byte-exact tests. nextest gives every test its own process,
+      # making the knobs deterministic — and matches how the suite is run
+      # locally. It also runs test binaries in parallel on every OS, so the
+      # old Windows serial pin is obsolete. No doc-tests exist in the
+      # workspace, so nextest covers the full cargo-test surface.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace 2>&1 | tee test.log
         shell: bash
       - name: upload test log (always, for diagnosis)
         if: always()
