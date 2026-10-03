@@ -495,11 +495,11 @@ build_from_checkout() {
     as_user sh -c 'command -v cargo >/dev/null 2>&1' || return 1
     CK=$(find_checkout) || return 1
     hdr "build"
-    status "building from source: cargo build --release -p blazar-cli (in ${CK})"
+    status "building from source: cargo build --release -p blazar (in ${CK})"
     # Always build in the invoking user's environment: a root-run build
     # leaves root-owned artifacts in the user's target/ and breaks every
     # later user build.
-    if ! as_user sh -c "cd '$CK' && cargo build --release -p blazar-cli"; then
+    if ! as_user sh -c "cd '$CK' && cargo build --release -p blazar"; then
         echo "ERROR: source build failed (cargo output above)" >&2
         return 1
     fi

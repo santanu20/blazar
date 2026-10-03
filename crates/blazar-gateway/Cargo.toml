@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Blazar gateway: OpenAI + ollama-compat APIs, metrics aggregation, priority queue, SSE"
+repository = "https://github.com/santanu20/blazar"
+homepage = "https://github.com/santanu20/blazar"
+readme = "README.md"
+keywords = ["openai", "ollama", "api", "sse", "llm"]
+categories = ["web-programming::http-server", "api-bindings"]
 
 [features]
 default = []

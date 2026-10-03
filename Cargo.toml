@@ -14,9 +14,11 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 libc = "0.2.189"
-blazar-core = { path = "crates/blazar-core" }
-blazar-runtime = { path = "crates/blazar-runtime" }
-blazar-gateway = { path = "crates/blazar-gateway" }
+# Path for local dev; the version is what crates.io resolves once published.
+# Bump these in lockstep with workspace.package.version on every release.
+blazar-core = { path = "crates/blazar-core", version = "0.19.0" }
+blazar-runtime = { path = "crates/blazar-runtime", version = "0.19.0" }
+blazar-gateway = { path = "crates/blazar-gateway", version = "0.19.0" }
 
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json"] }

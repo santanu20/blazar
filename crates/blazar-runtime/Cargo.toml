@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Blazar runtime: engine installer, HF client, process supervisor, event bus, bench runner"
+repository = "https://github.com/santanu20/blazar"
+homepage = "https://github.com/santanu20/blazar"
+readme = "README.md"
+keywords = ["llm", "inference", "llama-cpp", "sglang", "whisper"]
+categories = ["science"]
 
 [features]
 default = []

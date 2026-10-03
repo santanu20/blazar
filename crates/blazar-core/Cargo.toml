@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Blazar pure domain core: config, store, catalog, gguf, profile compiler"
+repository = "https://github.com/santanu20/blazar"
+homepage = "https://github.com/santanu20/blazar"
+readme = "README.md"
+keywords = ["llm", "gguf", "config", "catalog", "model"]
+categories = ["config", "science"]
 
 [features]
 test-util = []

@@ -1,9 +1,14 @@
 [package]
-name = "blazar-cli"
+name = "blazar"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "blazar binary: multi-engine local inference platform (llama.cpp, mistral.rs, SGLang) CLI and daemon"
+description = "Multi-engine local inference platform: one `blazar` binary serving llama.cpp, mistral.rs, SGLang, and MLX through OpenAI- and ollama-compatible APIs"
+repository = "https://github.com/santanu20/blazar"
+homepage = "https://github.com/santanu20/blazar"
+readme = "README.md"
+keywords = ["llm", "inference", "ollama", "openai", "local-ai"]
+categories = ["command-line-utilities", "science"]
 
 [[bin]]
 name = "blazar"
