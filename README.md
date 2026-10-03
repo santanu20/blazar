@@ -9,9 +9,16 @@
 Unified OpenAI · Ollama · Anthropic gateway &nbsp;·&nbsp; Multi-engine serving &nbsp;·&nbsp; Resource-aware orchestration &nbsp;·&nbsp; Multimodal
 
 [![CI](https://github.com/santanu20/blazar/actions/workflows/ci.yml/badge.svg)](https://github.com/santanu20/blazar/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/blazar.svg)](https://crates.io/crates/blazar)
 [![Release](https://img.shields.io/github/v/release/santanu20/blazar)](https://github.com/santanu20/blazar/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
+
+
+
+<div align="center">
+
+<img src="docs/assets/BLAZAR_Banner.webp" alt="Blazar — the control plane for local AI inference" width="896"/>
 
 </div>
 
@@ -999,6 +1006,12 @@ Current release targets include:
 - Windows: x64 and ARM64.
 
 Engine capability and accelerator support depend on the selected runtime and platform.
+
+### Install from crates.io
+
+```sh
+cargo install blazar
+```
 
 ### Build from source
 
