@@ -398,13 +398,11 @@ mod tests {
         std::fs::write(&old, vec![0u8; 4]).unwrap();
         let stale_time =
             std::time::SystemTime::now() - std::time::Duration::from_secs(PART_MIN_AGE_SECS + 60);
-        #[cfg(unix)]
-        {
-            let f = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
-            f.set_times(std::fs::FileTimes::new().set_modified(stale_time))
-                .unwrap();
-        }
-        #[cfg(unix)]
+        // FileTimes::set_modified and hard_link are cross-platform std APIs,
+        // so the stale-partial and twin scenarios stay under test everywhere.
+        let f = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(stale_time))
+            .unwrap();
         std::fs::hard_link(&owned_file, m.join("twin-copy.gguf")).unwrap();
 
         let r = orphan_scan(&m, &[row(owned_file.to_str().unwrap(), "big-model", 100)]);
