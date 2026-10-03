@@ -1895,7 +1895,7 @@ async fn adopt__piper_tree_moves_legacy_dir_and_row_created() {
         .engines_dir()
         .join("2023.11.14-2")
         .join("piper-linux-x64")
-        .join("piper");
+        .join(piper_bin_name());
     assert!(moved.is_file(), "tree lives in the engines lane now");
     let store = Store::open(&dirs).unwrap();
     let row = store
