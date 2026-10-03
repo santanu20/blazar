@@ -801,6 +801,31 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 input.engine_tag
             ));
         }
+    } else if gguf.pooling_type == Some(POOLING_TYPE_RANK) || gguf.architecture == "bert" {
+        // Reranker-class checkpoint: either an explicit rank pooling type
+        // (LLAMA_POOLING_TYPE_RANK, e.g. GGUFs carrying the KV) or a plain
+        // `bert` architecture — the bge-reranker GGUFs ship with NO
+        // pooling KV at all, and upstream serves them under the same
+        // shape, so arch is the only reliable signal for those. Plain
+        // embed-berts are unaffected: live-proven to keep serving
+        // /v1/embeddings (bge-small-en, 384-dim, HTTP 200) under these
+        // flags. `modern-bert` is excluded on purpose — upstream crashes
+        // a rank head against its classifier (GGML_ASSERT in
+        // build_pooling). Serving shape: `--embeddings --reranking` with
+        // NO `--pooling` (any explicit pooling would neutralize
+        // --reranking upstream). Takes precedence over the native and
+        // parity pooling arms below, which would mis-serve a rank model.
+        if input.supported_flags.contains("--embeddings")
+            && input.supported_flags.contains("--reranking")
+        {
+            argv.push("--embeddings".into());
+            argv.push("--reranking".into());
+        } else {
+            warnings.push(format!(
+                "reranker model detected (pooling_type = rank or bert arch) but engine {} lacks --embeddings/--reranking; run: blazar engine update",
+                input.engine_tag
+            ));
+        }
     } else if let Some(pooling) = gguf.pooling_type {
         if input.supported_flags.contains("--embeddings") {
             argv.push("--embeddings".into());
@@ -2238,6 +2263,13 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 /// (embeddinggemma sets `n_batch` = `n_ubatch` = 2048). One embedding doc
 /// must fit a single micro-batch; a full-ctx ubatch OOMs tight GPUs.
 pub const LATE_CHUNK_UBATCH_DEFAULT: u32 = 2048;
+
+/// `LLAMA_POOLING_TYPE_RANK` from upstream llama.h: a GGUF carrying this
+/// pooling type is a reranker-class checkpoint (bge-reranker family) whose
+/// classification head outputs relevance scores. `mean`/`cls`/`last`
+/// pooling would mis-serve it, so spawn-time detection must branch on it
+/// before the native-pooling arm.
+pub const POOLING_TYPE_RANK: u64 = 4;
 
 /// VRAM the unified KV cache still touches on TOP of its f16 pool when
 /// `--kv-unified` is on: the resident slice + paging working set
@@ -6364,6 +6396,7 @@ mod tests {
             "--no-warmup",
             "--samplers",
             "--embeddings",
+            "--reranking",
             "--pooling",
             // Modern-engine superset (b10896): the spec-draft placement
             // family, reasoning control, scheduling extras, and
@@ -6661,6 +6694,94 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--pooling" && w[1] == "mean"));
+    }
+
+    #[test]
+    fn unit__rerank_pooling__rank_checkpoint_serves_rerank_flags() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut g = meta();
+        // bge-reranker-class GGUF: {arch}.pooling_type = 4 (rank)
+        g.pooling_type = Some(POOLING_TYPE_RANK);
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        // upstream's documented reranker shape: --embeddings --reranking
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--embeddings" && w[1] == "--reranking"));
+        // no pooled mean/cls/last mode: that would mis-serve a rank model
+        assert!(!p.argv.contains(&"--pooling".to_string()));
+        assert!(!p
+            .warnings
+            .iter()
+            .any(|w| w.contains("lacks --embeddings/--reranking")));
+    }
+
+    #[test]
+    fn unit__rerank_pooling__engine_lacking_rerank_flag_warns_instead() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut g = meta();
+        g.pooling_type = Some(POOLING_TYPE_RANK);
+        // old engine whose --help never advertised --reranking
+        let legacy_flags: BTreeSet<String> = ALL_FLAGS
+            .iter()
+            .filter(|f| *f != "--reranking")
+            .cloned()
+            .collect();
+        let p = compile(
+            &input(&g, &hw, &cfg, &legacy_flags),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p.argv.contains(&"--reranking".to_string()));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.contains("lacks --embeddings/--reranking")));
+    }
+
+    #[test]
+    fn unit__rerank_pooling__bert_arch_without_pooling_kv_serves_rerank_flags() {
+        // bge-reranker GGUFs ship with NO pooling KV — arch is the only
+        // signal (live receipt: gpustack/bge-reranker-v2-m3 Q8_0, upstream
+        // /v1/rerank 200 with correct ranking under --embeddings --reranking).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut g = meta();
+        g.architecture = "bert".into();
+        g.pooling_type = None;
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--embeddings" && w[1] == "--reranking"));
+        assert!(!p.argv.contains(&"--pooling".to_string()));
+    }
+
+    #[test]
+    fn unit__rerank_pooling__modern_bert_arch_is_not_a_reranker() {
+        // live receipt: Laya-BF16 (arch modern-bert) core-dumps upstream
+        // when spawned with a rank head — exact-match `bert` keeps it out.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut g = meta();
+        g.architecture = "modern-bert".into();
+        g.pooling_type = None;
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p.argv.contains(&"--reranking".to_string()));
     }
 
     #[test]
