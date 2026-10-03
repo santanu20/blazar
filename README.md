@@ -422,7 +422,8 @@ This README is the product entry point; depth lives in dedicated documents.
 
 Blazar is an orchestration layer built on upstream open-source projects:
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) · [mistral.rs](https://github.com/EricLBuehler/mistral.rs) · [SGLang](https://github.com/sgl-project/sglang) · [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) · [whisper.cpp](https://github.com/ggml-org/whisper.cpp) · [piper](https://github.com/rhasspy/piper)
+- Inference runtimes: [llama.cpp](https://github.com/ggml-org/llama.cpp) · [mistral.rs](https://github.com/EricLBuehler/mistral.rs) · [SGLang](https://github.com/sgl-project/sglang) · [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) · [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) · [whisper.cpp](https://github.com/ggml-org/whisper.cpp) · [piper](https://github.com/rhasspy/piper)
+- Models and architectures: [Silero VAD](https://github.com/snakers4/silero-vad) (speech detection for streaming audio) · [ModernBERT](https://github.com/AnswerDotAI/modernbert) (the System One decision-model family rides ModernBERT-architecture GGUFs)
 
 Those projects provide the inference runtimes. Model weights remain subject to their publishers' licenses and distribution terms.
 
