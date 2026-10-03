@@ -1286,7 +1286,65 @@ fn systemd_start_attempts() -> Vec<Vec<&'static str>> {
 }
 
 /// Auto-start (plan G): 1s probe; on refusal, detached self-exec `serve`
-/// (own session, logs to run/daemon.log), then poll /healthz ≤30s.
+/// (own session, logs to run/daemon.log), then poll /healthz.
+///
+/// The detached spawn can lose a race for the port — typically another
+/// blazar daemon mid-drain, or a foreign server holding the listener —
+/// in which case the child exits within milliseconds of spawning. The
+/// boot loop watches the child process, so an exited spawn is retried
+/// (bounded) instead of burning the whole health budget on a dead
+/// process. A respawn happens ONLY after an observed exit: a child that
+/// is alive but not yet healthy keeps the full budget, so two daemons
+/// can never stack.
+const DETACHED_BOOT_ATTEMPTS: usize = 3;
+const DETACHED_BOOT_HEALTH_BUDGET: Duration = Duration::from_secs(30);
+const DETACHED_BOOT_POLL: Duration = Duration::from_millis(300);
+const DETACHED_BOOT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// How one detached-boot attempt ended.
+enum DetachedBootOutcome {
+    Healthy,
+    ChildExited(std::process::ExitStatus),
+    BudgetElapsed,
+}
+
+/// Policy after a failed attempt: respawn when the child was OBSERVED to
+/// exit (port race or boot crash — a fresh spawn may win the port) and
+/// attempts remain; stop otherwise. A live-but-unhealthy child never
+/// earns a respawn.
+fn next_boot_action(attempt: usize, outcome: &DetachedBootOutcome) -> bool {
+    match outcome {
+        // A live child — healthy (caller returned already), or alive but
+        // wedged — never earns a respawn: no stacking daemons.
+        DetachedBootOutcome::Healthy | DetachedBootOutcome::BudgetElapsed => false,
+        DetachedBootOutcome::ChildExited(_) => attempt < DETACHED_BOOT_ATTEMPTS,
+    }
+}
+
+/// Detached `serve` self-exec: own process session, logs to `log_file`.
+/// F132 (windows): `DETACHED_PROCESS` keeps the auto-started daemon off the
+/// CLI's console so Ctrl-C at the prompt cannot kill it.
+fn detached_serve_command(log_file: &std::fs::File) -> std::io::Result<std::process::Command> {
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file.try_clone()?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    Ok(cmd)
+}
+
 async fn ensure_daemon() -> Result<String> {
     let cfg = config()?;
     let base = daemon_base(&cfg);
@@ -1320,46 +1378,67 @@ async fn ensure_daemon() -> Result<String> {
         }
     }
     eprintln!("no healthy systemd unit — falling back to a detached daemon");
-    // Self-exec detached.
     let log = dirs().run_dir().join("daemon.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .with_context(|| format!("open {}", log.display()))?;
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("serve")
-        .stdin(std::process::Stdio::null())
-        .stdout(log_file.try_clone()?)
-        .stderr(log_file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        // F132: without DETACHED_PROCESS the auto-started daemon shares
-        // the CLI's console — Ctrl-C at the prompt kills it too.
-        use std::os::windows::process::CommandExt as _;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-    cmd.spawn().context("spawn detached blazar serve")?;
-    let deadline = tokio_deadline(Duration::from_secs(30));
-    while std::time::Instant::now() < deadline {
-        if let Ok(r) = http.get(format!("{base}/healthz")).send().await {
-            if r.status().is_success() {
-                return Ok(base);
+    let mut attempt = 0usize;
+    let mut child_exits = 0usize;
+    loop {
+        attempt += 1;
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .with_context(|| format!("open {}", log.display()))?;
+        let mut child = detached_serve_command(&log_file)
+            .and_then(|mut cmd| cmd.spawn())
+            .context("spawn detached blazar serve")?;
+        let deadline = tokio_deadline(DETACHED_BOOT_HEALTH_BUDGET);
+        let outcome = loop {
+            if daemon_healthy(&base, &http).await {
+                break DetachedBootOutcome::Healthy;
+            }
+            // The spawn losing the port race exits within milliseconds;
+            // watching the child turns that from a 30s stall into a retry.
+            if let Some(status) = child.try_wait().unwrap_or(None) {
+                break DetachedBootOutcome::ChildExited(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break DetachedBootOutcome::BudgetElapsed;
+            }
+            std::thread::sleep(DETACHED_BOOT_POLL);
+        };
+        match outcome {
+            DetachedBootOutcome::Healthy => return Ok(base),
+            DetachedBootOutcome::ChildExited(status) => {
+                child_exits += 1;
+                eprintln!("detached serve exited during boot ({status})");
+                if !next_boot_action(attempt, &DetachedBootOutcome::ChildExited(status)) {
+                    return Err(anyhow!(
+                        "detached daemon exited {child_exits}x during boot — see {} \
+                         (another process may be holding {base}, or serve itself \
+                         failed to start)",
+                        log.display()
+                    ));
+                }
+                std::thread::sleep(DETACHED_BOOT_RETRY_BACKOFF);
+                // A daemon that became healthy in the window (e.g. the one
+                // that was draining) wins over a respawn.
+                if daemon_healthy(&base, &http).await {
+                    return Ok(base);
+                }
+                eprintln!(
+                    "retrying detached boot (attempt {}/{DETACHED_BOOT_ATTEMPTS})",
+                    attempt + 1
+                );
+            }
+            DetachedBootOutcome::BudgetElapsed => {
+                return Err(anyhow!(
+                    "daemon did not become healthy within {}s; see {}",
+                    DETACHED_BOOT_HEALTH_BUDGET.as_secs(),
+                    log.display()
+                ));
             }
         }
-        std::thread::sleep(Duration::from_millis(300));
     }
-    Err(anyhow!(
-        "daemon did not become healthy within 30s; see {}",
-        log.display()
-    ))
 }
 
 fn tokio_deadline(d: Duration) -> std::time::Instant {
@@ -7426,8 +7505,37 @@ async fn model_doctor_cmd(model: &str, json: bool) -> Result<()> {
     }
 }
 
+/// Format a unix-seconds epoch as `YYYY-MM-DD HH:MM:SS UTC` for table
+/// rows (civil-calendar math, no datetime dependency; same algorithm
+/// and boundary pins as the gateway's RFC3339 helper).
+// Single-letter bindings (z, era, doe, yoe, doy, mp, d) follow Howard
+// Hinnant's published civil_from_days notation verbatim.
+#[allow(clippy::many_single_char_names)]
+fn epoch_to_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil_from_days: epoch day 0 -> 1970-01-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mth <= 2 {
+        yoe + era * 400 + 1
+    } else {
+        yoe + era * 400
+    };
+    format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
 /// Render the capability certificate as a table. Pure; unknown fields
-/// (e.g. engine unresolved on a cold run) print as `unknown`.
+/// (e.g. engine unresolved on a cold run) print as `unknown`. The
+/// `tested_at` epoch arrives as a NUMBER from the daemon — render it
+/// human-readable instead of the old `TESTED unknown`.
 fn render_doctor_cert(cert: &serde_json::Value) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -7435,7 +7543,11 @@ fn render_doctor_cert(cert: &serde_json::Value) -> String {
         |x: &serde_json::Value| x.as_str().map_or_else(|| "unknown".into(), str::to_string);
     let _ = writeln!(s, "MODEL     {}", or_unknown(&cert["model"]));
     let _ = writeln!(s, "ENGINE    {}", or_unknown(&cert["engine_tag"]));
-    let _ = writeln!(s, "TESTED    {}", or_unknown(&cert["tested_at"]));
+    let tested = match cert["tested_at"].as_i64() {
+        Some(secs) => epoch_to_utc(secs),
+        None => or_unknown(&cert["tested_at"]),
+    };
+    let _ = writeln!(s, "TESTED    {tested}");
     let mut rows: Vec<(String, String, String)> = cert["caps"]
         .as_object()
         .map(|caps| {
@@ -10846,6 +10958,156 @@ fn known_config_key(key: &str) -> bool {
         .any(|v| toml::from_str::<Config>(&format!("{key} = {v}\n")).is_ok())
 }
 
+/// Does the schema know this key as a ROOT knob? The routing oracle
+/// for bare keys: root knobs replace at the root scope only, section
+/// leaves route to their table. Unlike `known_config_key` (which also
+/// matches leaf names inside sections), the defaults scan here never
+/// crosses the first table header.
+fn top_level_key_known(key: &str) -> bool {
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return false; // TOML bare keys only; anything else is a typo
+    }
+    let defaults = Config::default()
+        .to_toml()
+        .expect("serializing the built-in default config cannot fail");
+    let mut in_root_scope = true;
+    for line in defaults.lines() {
+        if in_root_scope && line.starts_with('[') {
+            in_root_scope = false;
+        }
+        if in_root_scope && key_before_eq(line) == Some(key) {
+            return true;
+        }
+    }
+    // Option knobs serialize as absent while None, so they never appear
+    // in the default TOML — probe the schema at the root scope instead.
+    ["\"s\"", "0", "0.5", "true", "[]"]
+        .iter()
+        .any(|v| toml::from_str::<Config>(&format!("{key} = {v}\n")).is_ok())
+}
+
+/// Top-level section names the schema knows: every table header of the
+/// serialized default config, plus headers already present in the
+/// user's file (all-Option sections like `[spec_draft]` render only
+/// after a leaf is pinned). First segment only — nested headers
+/// (`[model_overrides."m".sglang]`) count as their root table.
+fn config_section_names(extra_raw: &str) -> Vec<String> {
+    let defaults = Config::default()
+        .to_toml()
+        .expect("serializing the built-in default config cannot fail");
+    let mut names: Vec<String> = Vec::new();
+    for line in defaults.lines().chain(extra_raw.lines()) {
+        if let Some(first) = header_segments(line).and_then(|segs| segs.first().cloned()) {
+            if !names.contains(&first) {
+                names.push(first);
+            }
+        }
+    }
+    names
+}
+
+/// Free-form map sections (`[engine_env]`: string -> string) accept ANY
+/// key, so a parse probe there proves nothing about leaf names. One
+/// probe with a deliberately impossible key tells them apart from
+/// struct sections, which deny unknown fields.
+fn is_free_form_map_section(section: &str) -> bool {
+    toml::from_str::<Config>(&format!("[{section}]\nzzz_probe_leaf = \"s\"\n")).is_ok()
+}
+
+/// Which struct sections carry this bare leaf name? A one-line parse
+/// probe per section: `[sglang]\n<key> = <scalar>` parses only when the
+/// schema really has that leaf (`sglang.grammar_backend`). Map sections
+/// are excluded up front — they accept any key and would always match.
+fn bare_leaf_sections(key: &str, raw_file: &str) -> Vec<String> {
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Vec::new();
+    }
+    config_section_names(raw_file)
+        .into_iter()
+        .filter(|s| !is_free_form_map_section(s))
+        .filter(|s| {
+            ["\"s\"", "0", "0.5", "true", "[]"]
+                .iter()
+                .any(|v| toml::from_str::<Config>(&format!("[{s}]\n{key} = {v}\n")).is_ok())
+        })
+        .collect()
+}
+
+/// Is this bare key the NAME of a table itself (`warm_peg`, `sglang`)?
+fn is_section_parent(key: &str, raw_file: &str) -> bool {
+    config_section_names(raw_file).iter().any(|s| s == key)
+}
+
+/// Leaf names a struct section accepts, parsed from the serde
+/// `deny_unknown_fields` teaching text ("unknown field … expected one
+/// of `a`, `b`"). Sections whose leaves never serialize ([sglang] is
+/// all-Option) still enumerate this way; map sections and unexpected
+/// error shapes fall back to the leaves the default TOML renders.
+fn section_leaf_names(section: &str) -> Vec<String> {
+    let probe = format!("[{section}]\nzzz_probe_leaf = 0\n");
+    if let Err(err) = toml::from_str::<Config>(&probe) {
+        let msg = err.to_string();
+        if let Some(idx) = msg.find("expected ") {
+            let rest = msg[idx + "expected ".len()..]
+                .trim_start_matches("one of ")
+                .split(" at line")
+                .next()
+                .unwrap_or("");
+            let leaves: Vec<String> = rest
+                .split([',', ' '])
+                .filter(|t| !t.is_empty() && *t != "or")
+                .map(|t| t.trim().trim_matches('`').trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if !leaves.is_empty() {
+                return leaves;
+            }
+        }
+    }
+    let defaults = Config::default()
+        .to_toml()
+        .expect("serializing the built-in default config cannot fail");
+    let mut in_section = false;
+    let mut leaves = Vec::new();
+    for line in defaults.lines() {
+        if line.starts_with('[') {
+            in_section =
+                header_segments(line).is_some_and(|segs| segs.len() == 1 && segs[0] == section);
+        } else if in_section {
+            if let Some(k) = key_before_eq(line) {
+                leaves.push(k.to_string());
+            }
+        }
+    }
+    leaves
+}
+
+/// Pinned `key = value` lines of a single-segment `[section]` block in
+/// the file (blank lines and comments skipped) — the parent-key view
+/// for `config get <table>`.
+fn table_pins(raw: &str, section: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut pins = Vec::new();
+    for line in raw.lines() {
+        if line.trim_start().starts_with('[') {
+            in_section =
+                header_segments(line).is_some_and(|segs| segs.len() == 1 && segs[0] == section);
+        } else if in_section {
+            let t = line.trim();
+            if !t.is_empty() && !t.starts_with('#') && key_before_eq(t).is_some() {
+                pins.push(t.to_string());
+            }
+        }
+    }
+    pins
+}
+
 /// Remove a top-level pin (`key = ...` before the first `[table]`
 /// header). Table-scoped keys are never touched — the same knob name
 /// inside `[model_overrides."<model>"]` is a different setting. Returns
@@ -11253,6 +11515,40 @@ fn set_table_key(raw: &str, path: &[&str], leaf: &str, stored: &str) -> String {
     let mut out = lines.clone();
     out.insert(insert_at, &header);
     out.insert(insert_at + 1, &newline);
+    out.join("\n") + "\n"
+}
+
+/// Set `key = stored` at the ROOT scope only: replace existing root
+/// pins in place, insert above the first table header when new. A root
+/// knob must never rewrite the same leaf name pinned inside a section
+/// (`port` vs an env var pinned as `[engine_env] port`) — that clobber
+/// was the old section-blind whole-file scan's failure mode.
+fn set_root_key(raw: &str, key: &str, stored: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    let mut in_root_scope = true;
+    for line in raw.lines() {
+        if in_root_scope && line.starts_with('[') {
+            in_root_scope = false;
+        }
+        // F128: tolerant key match (compact `key="v"`, indented).
+        if in_root_scope && key_before_eq(line).is_some_and(|k| k == key) {
+            out.push(format!("{key} = {stored}"));
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        // A NEW top-level key must go ABOVE the first table header
+        // (`[engine_env]`, `[model_overrides.x]`…); appending at the
+        // end would nest it inside that table.
+        let insert_at = out
+            .iter()
+            .position(|l| l.starts_with('['))
+            .unwrap_or(out.len());
+        out.insert(insert_at, format!("{key} = {stored}"));
+    }
     out.join("\n") + "\n"
 }
 
@@ -15085,13 +15381,64 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                     None => Err(anyhow!("unknown config key: {key}")),
                 }
             } else {
+                let file_raw = std::fs::read_to_string(dirs().config_file()).unwrap_or_default();
                 let raw = cfg.to_toml().map_err(|e| anyhow!("{e}"))?;
                 let lines: Vec<&str> = raw.lines().collect();
                 if let Some(line) = top_level_span(&lines, &key) {
                     println!("{line}");
                     Ok(())
+                } else if top_level_key_known(&key) {
+                    // Root knob that serializes as absent while unset
+                    // (Option fields) — known to the schema, not pinned.
+                    println!("{key} = <not set>");
+                    Ok(())
                 } else {
-                    Err(anyhow!("unknown config key: {key}"))
+                    // Root precedence first, then table names for their
+                    // own name (`sglang` the SECTION beats the unlucky
+                    // `warm_peg.sglang` leaf), then bare section leaves
+                    // (`ttl_secs` == `semantic_cache.ttl_secs`),
+                    // mirroring `set`/`unset` routing.
+                    if is_section_parent(&key, &file_raw) {
+                        let pins = table_pins(&file_raw, &key);
+                        if pins.is_empty() {
+                            let leaves = section_leaf_names(&key);
+                            if leaves.is_empty() {
+                                println!("{key} is a table — no pins");
+                            } else {
+                                println!(
+                                    "{key} is a table — no pins (defaults apply); leaves: {}",
+                                    leaves.join(", ")
+                                );
+                            }
+                        } else {
+                            for line in pins {
+                                println!("{line}");
+                            }
+                        }
+                        Ok(())
+                    } else {
+                        match bare_leaf_sections(&key, &file_raw).as_slice() {
+                            [only] => {
+                                if let Some(line) = get_table_key(&file_raw, &[only.as_str()], &key)
+                                {
+                                    println!("{line}");
+                                } else {
+                                    println!("{key} = <not set>");
+                                }
+                                Ok(())
+                            }
+                            sections if !sections.is_empty() => Err(anyhow!(
+                                "ambiguous key: {key} is a leaf of several sections ({}) — use the dotted form: {}",
+                                sections.join(", "),
+                                sections
+                                    .iter()
+                                    .map(|s| format!("{s}.{key}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )),
+                            _ => Err(anyhow!("unknown config key: {key}")),
+                        }
+                    }
                 }
             }
         }
@@ -15120,33 +15467,42 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             };
             // Dotted keys (`sglang.grammar_backend`,
             // `model_overrides.qwen.sglang.stream_interval`) target a table
-            // leaf and take the surgical insert path; bare keys keep the
-            // root-scope replace/insert flow.
+            // leaf and take the surgical insert path. Bare keys route by
+            // what they are: root knob -> root-scoped replace; known
+            // section leaf (`ttl_secs`) -> its table; section parent ->
+            // teaching; unknown -> root insert, where the schema reject
+            // below stays the oracle.
             let mut candidate = if let Some((tpath, leaf)) = split_table_path(&key) {
                 set_table_key(&raw, &tpath, leaf, &stored)
+            } else if top_level_key_known(&key) {
+                set_root_key(&raw, &key, &stored)
             } else {
-                let mut out: Vec<String> = Vec::new();
-                let mut replaced = false;
-                for line in raw.lines() {
-                    // F128: tolerant key match (compact `key="v"`, indented).
-                    if key_before_eq(line).is_some_and(|k| k == key) {
-                        out.push(format!("{key} = {stored}"));
-                        replaced = true;
+                let sections = bare_leaf_sections(&key, &raw);
+                if is_section_parent(&key, &raw) {
+                    let leaves = section_leaf_names(&key);
+                    let hint = if leaves.is_empty() {
+                        String::new()
                     } else {
-                        out.push(line.to_string());
+                        format!(" (leaves: {})", leaves.join(", "))
+                    };
+                    return Err(anyhow!(
+                        "{key} is a table, not a value — set individual leaves: {key}.<leaf> <value>{hint}"
+                    ));
+                }
+                match sections.as_slice() {
+                    [only] => set_table_key(&raw, &[only.as_str()], &key, &stored),
+                    many if !many.is_empty() => {
+                        return Err(anyhow!(
+                            "ambiguous key: {key} is a leaf of several sections ({}) — use the dotted form: {}",
+                            many.join(", "),
+                            many.iter()
+                                .map(|s| format!("{s}.{key}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
                     }
+                    _ => set_root_key(&raw, &key, &stored),
                 }
-                if !replaced {
-                    // A NEW top-level key must go ABOVE the first table header
-                    // (`[engine_env]`, `[model_overrides.x]`…); appending at the
-                    // end would nest it inside that table.
-                    let insert_at = out
-                        .iter()
-                        .position(|l| l.starts_with('['))
-                        .unwrap_or(out.len());
-                    out.insert(insert_at, format!("{key} = {stored}"));
-                }
-                out.join("\n") + "\n"
             };
             // A dotted MODEL NAME (`model_overrides.qwen3-1.7b.engine`)
             // makes the straight candidate nest one table too deep. Retry
@@ -15219,7 +15575,36 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                     )),
                 };
             }
-            let (candidate, removed) = remove_top_level_pin(&raw, &key);
+            let (mut candidate, mut removed) = remove_top_level_pin(&raw, &key);
+            if removed.is_none() {
+                // No root pin. A bare SECTION leaf (`ttl_secs`) used to
+                // fall through to "not pinned" while the file kept the
+                // value — resolve it against the sections first, with
+                // the same root/table-name/leaf routing as `set`.
+                if is_section_parent(&key, &raw) {
+                    return Err(anyhow!(
+                        "{key} is a table — unset individual leaves: {key}.<leaf>"
+                    ));
+                }
+                match bare_leaf_sections(&key, &raw).as_slice() {
+                    [only] => {
+                        let (cand, rem) = remove_table_key(&raw, &[only.as_str()], &key);
+                        candidate = cand;
+                        removed = rem;
+                    }
+                    many if !many.is_empty() => {
+                        return Err(anyhow!(
+                            "ambiguous key: {key} is a leaf of several sections ({}) — use the dotted form: {}",
+                            many.join(", "),
+                            many.iter()
+                                .map(|s| format!("{s}.{key}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             match removed {
                 Some(old) => {
                     // A candidate the schema rejects must never replace
@@ -15596,6 +15981,10 @@ mod tests {
         }));
         assert!(out.contains("MODEL     qwen3-1.7b"));
         assert!(out.contains("ENGINE    llamacpp-cuda"));
+        // Numeric epoch renders human-readable, not `TESTED unknown`.
+        assert!(out.contains("TESTED    "));
+        assert!(!out.contains("TESTED    unknown"));
+        assert!(out.contains("UTC"));
         assert!(out.contains("CAPABILITY"));
         assert!(out.contains("chat"));
         assert!(out.contains("PASS"));
@@ -15614,6 +16003,48 @@ mod tests {
         }));
         assert!(out.contains("unknown"));
         assert!(out.contains("(no capabilities recorded)"));
+    }
+
+    #[test]
+    fn unit__epoch_to_utc__calendar_boundaries() {
+        // Same boundaries as the gateway's RFC3339 pins.
+        assert_eq!(epoch_to_utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(epoch_to_utc(86_399), "1970-01-01 23:59:59 UTC");
+        assert_eq!(epoch_to_utc(86400), "1970-01-02 00:00:00 UTC");
+        assert_eq!(epoch_to_utc(1_700_000_000), "2023-11-14 22:13:20 UTC");
+    }
+
+    /// Real exit status for the boot-policy pins (`ExitStatus` has no
+    /// public cross-platform constructor).
+    fn quick_exit_status() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        let mut cmd = std::process::Command::new("sh");
+        #[cfg(unix)]
+        cmd.arg("-c").arg("exit 3");
+        #[cfg(windows)]
+        let mut cmd = std::process::Command::new("cmd");
+        #[cfg(windows)]
+        cmd.arg("/C").arg("exit 3");
+        cmd.status().expect("spawn probe child")
+    }
+
+    #[test]
+    fn unit__next_boot_action__respawn_only_after_observed_child_exit() {
+        // A live child — healthy, or alive but wedged — never earns a
+        // respawn: the boot loop must not stack daemons.
+        assert!(!next_boot_action(1, &DetachedBootOutcome::Healthy));
+        assert!(!next_boot_action(1, &DetachedBootOutcome::BudgetElapsed));
+        assert!(!next_boot_action(9, &DetachedBootOutcome::BudgetElapsed));
+    }
+
+    #[test]
+    fn unit__next_boot_action__observed_exit_retries_within_bounded_attempts() {
+        let exited = DetachedBootOutcome::ChildExited(quick_exit_status());
+        assert_eq!(DETACHED_BOOT_ATTEMPTS, 3);
+        assert!(next_boot_action(1, &exited));
+        assert!(next_boot_action(2, &exited));
+        assert!(!next_boot_action(3, &exited));
+        assert!(!next_boot_action(4, &exited));
     }
 
     #[test]
@@ -17070,6 +17501,106 @@ mod tests {
         // Commented-out lines are not pins (no '=' before the comment).
         let (out, _) = remove_top_level_pin("# cache_type = \"f16\"\n", "cache_type");
         assert!(out.contains("# cache_type"));
+    }
+
+    #[test]
+    fn unit__top_level_key_known__root_knobs_yes_section_leaves_no() {
+        // Root knobs (slots renders; child_auth is an Option knob the
+        // defaults never render but the schema accepts at root scope).
+        assert!(top_level_key_known("slots"));
+        assert!(top_level_key_known("child_auth"));
+        // Section leaves must NOT route as root keys.
+        assert!(!top_level_key_known("ttl_secs"));
+        assert!(!top_level_key_known("grammar_backend"));
+        // Typos and table names are not root knobs.
+        assert!(!top_level_key_known("zzz_never_a_knob"));
+        assert!(!top_level_key_known("warm_peg"));
+    }
+
+    #[test]
+    fn unit__bare_leaf_sections__resolves_struct_section_leaves() {
+        assert_eq!(
+            bare_leaf_sections("ttl_secs", ""),
+            vec!["semantic_cache".to_string()],
+            "ttl_secs belongs to exactly one section"
+        );
+        assert_eq!(
+            bare_leaf_sections("grammar_backend", ""),
+            vec!["sglang".to_string()]
+        );
+        // Free-form map sections must never match (they accept any key).
+        assert!(bare_leaf_sections("zzz_never_a_leaf", "").is_empty());
+        // Flat root knobs (`spec_draft_threads` and friends are ROOT
+        // fields, not a [spec_draft] table) resolve to no section.
+        assert!(bare_leaf_sections("spec_draft_threads", "").is_empty());
+    }
+
+    #[test]
+    fn unit__config_section_names__defaults_union_file_headers() {
+        let names = config_section_names("[stale_custom]\nx = 1\n");
+        assert!(names.contains(&"sglang".to_string()));
+        assert!(names.contains(&"semantic_cache".to_string()));
+        assert!(
+            names.contains(&"stale_custom".to_string()),
+            "file headers join the defaults set"
+        );
+        assert!(is_section_parent("warm_peg", ""));
+        assert!(!is_section_parent("ttl_secs", ""));
+    }
+
+    #[test]
+    fn unit__section_leaf_names__schema_enumerates_unrendered_sections() {
+        // [sglang] renders empty in defaults (all-Option) — the deny
+        // teaching text is the only enumerator.
+        let sglang = section_leaf_names("sglang");
+        assert!(sglang.contains(&"grammar_backend".to_string()));
+        // Rendered sections enumerate too.
+        let cache = section_leaf_names("semantic_cache");
+        assert!(cache.contains(&"ttl_secs".to_string()));
+        assert!(cache.contains(&"enabled".to_string()));
+    }
+
+    #[test]
+    fn unit__set_root_key__section_pin_with_same_leaf_name_survives() {
+        // Schema-valid clobber case: root `port` knob vs an env var
+        // literally named `port` pinned under [engine_env].
+        let raw = "host = \"127.0.0.1\"\n[engine_env]\nport = \"1\"\n";
+        let out = set_root_key(raw, "port", "9000");
+        assert!(
+            out.contains("[engine_env]\nport = \"1\""),
+            "section pin must survive a root-key set of the same name"
+        );
+        assert!(out.contains("port = 9000"));
+        // New root keys land above the first table header, not nested.
+        let fresh = set_root_key("[engine_env]\nA = \"b\"\n", "port", "9000");
+        assert!(fresh.starts_with("port = 9000\n"));
+    }
+
+    #[test]
+    fn unit__config_unset__bare_section_leaf_finds_the_real_pin() {
+        // BUG-2 pin: `config unset ttl_secs` used to report "not
+        // pinned" while the file kept the value — the root scan misses,
+        // the section-aware retry must find and remove it.
+        let raw = "[semantic_cache]\nthreshold = 0.4\nttl_secs = 2\n";
+        let (root_cand, root_removed) = remove_top_level_pin(raw, "ttl_secs");
+        assert!(root_removed.is_none(), "root scope never sees section pins");
+        assert_eq!(
+            bare_leaf_sections("ttl_secs", raw),
+            vec!["semantic_cache".to_string()]
+        );
+        let (cand, removed) = remove_table_key(&root_cand, &["semantic_cache"], "ttl_secs");
+        assert_eq!(removed.as_deref(), Some("ttl_secs = 2"));
+        assert!(!cand.contains("ttl_secs"));
+        assert!(cand.contains("threshold = 0.4"), "siblings survive");
+        Config::from_toml(&cand).expect("config stays valid after unset");
+    }
+
+    #[test]
+    fn unit__table_pins__parent_view_reads_file_pins_only() {
+        let raw = "# lead comment\n[semantic_cache]\nenabled = true\n\n# inner\n[sglang]\n";
+        let pins = table_pins(raw, "semantic_cache");
+        assert_eq!(pins, vec!["enabled = true".to_string()]);
+        assert!(table_pins(raw, "sglang").is_empty());
     }
 
     #[test]

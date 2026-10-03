@@ -1448,7 +1448,15 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
         path: r.get(3)?,
         bytes: r.get(4)?,
         sha256: r.get(5)?,
-        mmproj_path: r.get(6)?,
+        // NULL and '' both mean "no projector": hand-edited stores and
+        // older writers use the empty-string dialect, and treating
+        // Some("") as attached would misclassify the model as multimodal
+        // (cache_reuse skip, mmproj lazy/offload flags firing on text
+        // models). Same normalization the components field applies above.
+        mmproj_path: match r.get::<_, Option<String>>(6)? {
+            Some(p) if !p.is_empty() => Some(p),
+            _ => None,
+        },
         components,
         shards: r.get(8)?,
         arch: r.get(9)?,
@@ -1874,6 +1882,40 @@ mod tests {
         assert_eq!(s.resolve_model_name("qwen3.5:9b"), "qwen3.5-9b");
         // Miss on both forms returns the input verbatim (caller errors).
         assert_eq!(s.resolve_model_name("nope:9b"), "nope:9b");
+    }
+
+    #[test]
+    fn unit__model_from_row__empty_mmproj_dialect_reads_as_no_projector() {
+        let (_t, s) = tmp_store();
+        s.upsert_model(&base_model("text-only")).unwrap();
+        // Simulate the empty-string dialect (hand-edited store / older
+        // writer): both NULL and '' must read back as None so profile
+        // never classifies the model as multimodal.
+        s.conn()
+            .execute(
+                "UPDATE models SET mmproj_path = '' WHERE name = 'text-only'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.get_model("text-only").unwrap().unwrap().mmproj_path, None);
+        s.conn()
+            .execute(
+                "UPDATE models SET mmproj_path = NULL WHERE name = 'text-only'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.get_model("text-only").unwrap().unwrap().mmproj_path, None);
+        // A real projector path survives normalization.
+        s.conn()
+            .execute(
+                "UPDATE models SET mmproj_path = '/tmp/mmproj-X.gguf' WHERE name = 'text-only'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            s.get_model("text-only").unwrap().unwrap().mmproj_path,
+            Some("/tmp/mmproj-X.gguf".into())
+        );
     }
 
     fn base_model(name: &str) -> ModelRow {
