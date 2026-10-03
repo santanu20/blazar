@@ -277,6 +277,7 @@ Local-first: loopback by default, no cloud dependency.
 
 - Optional API keys with model, rate, token, and concurrency scopes (`blazar keys add/list/rotate`)
 - TLS from PEM pairs, explicit CORS policy
+- DNS-rebinding and cross-origin hardening on loopback binds: local browser origins work by default, everything else is refused (`cors_origins` adds origins explicitly, `"*"` opts out)
 - Audit logging, PII scrubbing, opt-in OTLP, explicit remote routing
 
 ---

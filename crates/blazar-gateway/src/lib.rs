@@ -11,6 +11,7 @@ pub mod cascade;
 pub mod explain;
 pub mod federation;
 pub mod histogram;
+pub mod host_guard;
 pub mod http_pool;
 pub mod images;
 pub mod jobs;
@@ -445,11 +446,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Hardening: 50 MiB request ceiling (audio uploads fit; nothing
         // legit is larger locally).
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
-        // CORS: opt-in per configured origins (empty = none, matching
-        // pre-CORS behavior exactly; ["*"] = any). Non-browser clients
-        // are unaffected either way. Sits OUTSIDE auth (F64): browser
-        // preflights carry no bearer and must get a CORS answer, not a
-        // bare 401.
+        // CORS: browser origins are gated to the local set by default
+        // (localhost/127.0.0.1/[::1]/0.0.0.0 on any port plus desktop
+        // webview schemes), so a page on some other site cannot read
+        // gateway responses. `cors_origins` ADDS explicit origins
+        // (additive, e.g. a hosted UI), and ["*"] restores any-origin.
+        // Headers stay `Any` on purpose: the origin gate already limits
+        // callers to the local user's own pages, and SDK header
+        // families (x-stainless-*) evolve independently of us.
+        // Sits OUTSIDE auth (F64): browser preflights carry no bearer
+        // and must get a CORS answer, not a bare 401.
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(cors_allow_origin(&state.config.cors_origins))
@@ -467,6 +473,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         // still access-logged and traced — brute-force probing no
         // longer flies blind.
         .layer(middleware::from_fn_with_state(state.clone(), auth))
+        // Host guard: DNS-rebinding defense (ollama CVE-2024-28224
+        // class). Armed only on loopback binds — a non-loopback bind
+        // is a deliberate LAN exposure decision. Preflights (OPTIONS)
+        // and health probes pass through so CORS and orchestrators
+        // keep working; anything else with a non-local Host is 403.
+        // Inside request_log so blocks are visible in the access log.
+        .layer(middleware::from_fn_with_state(
+            (host_guard::guard_scope(&state.config.host),),
+            host_guard::host_guard_mw,
+        ))
         // request_log: outermost — every request, including 401s and
         // preflights, gets a trace id and an access-log line.
         .layer(middleware::from_fn_with_state(state.clone(), request_log))
@@ -474,17 +490,26 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// Translate the config's origin list into tower-http's `AllowOrigin`.
-/// Empty list -> empty allow-list (no ACAO header is ever emitted —
-/// exactly the pre-CORS behavior).
+/// Default: the local browser set (localhost/127.0.0.1/IPv6 loopback/0.0.0.0 on
+/// any port + desktop webview schemes) — local UIs work with zero
+/// config, other sites get nothing. Configured entries are ADDITIVE on
+/// top of that set; the sole entry "*" restores any-origin.
 fn cors_allow_origin(origins: &[String]) -> tower_http::cors::AllowOrigin {
     if origins.iter().any(|o| o == "*") {
         tower_http::cors::AllowOrigin::any()
     } else {
-        tower_http::cors::AllowOrigin::list(
-            origins
-                .iter()
-                .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok()),
-        )
+        let explicit: Vec<String> = origins
+            .iter()
+            .map(|o| o.trim().to_ascii_lowercase())
+            .collect();
+        tower_http::cors::AllowOrigin::predicate(move |origin, _| {
+            let Ok(value) = origin.to_str() else {
+                return false;
+            };
+            let lowered = value.trim().to_ascii_lowercase();
+            explicit.iter().any(|e| e == &lowered)
+                || host_guard::is_default_browser_origin(&lowered)
+        })
     }
 }
 

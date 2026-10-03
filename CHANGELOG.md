@@ -4,6 +4,11 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Security
+- **Loopback gateway hardened against browser-borne attacks (DNS rebinding + cross-origin).** When bound to a loopback address the gateway now validates the `Host` header (localhost names, local/private/link-local IP literals, `*.localhost`/`*.local`/`*.internal`, machine hostname; anything else gets a 403, preflights and `/health` stay open) — the same defense ollama shipped for CVE-2024-28224 — and the CORS default flipped from deny-all to a local-origin allowlist: `localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0` on any port plus desktop-webview schemes (`app://`, `file://`, `tauri://`, `vscode-webview://`, `vscode-file://`) are always allowed, `cors_origins` entries are added on top, and `"*"` restores any-origin. Non-browser clients (SDKs, curl, AI CLIs) are untouched: they send no `Origin` and their `Host` is a local literal. Non-loopback binds keep their pre-guard semantics deliberately.
+
 ## [0.19.0] - 2026-10-03
 
 ### Added

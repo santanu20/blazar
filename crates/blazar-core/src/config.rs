@@ -647,9 +647,12 @@ pub struct Config {
     /// TLS: PEM private key path matching `tls_cert`.
     #[serde(default)]
     pub tls_key: String,
-    /// CORS: allowed origin list, e.g. a single `https://chat.example`
-    /// entry. Empty = no CORS headers (the previous behavior). The string
-    /// `*` = any origin. Never affects non-browser clients.
+    /// CORS: additional allowed origins, e.g. a single
+    /// `https://chat.example` entry. The local set (localhost /
+    /// 127.0.0.1 / the IPv6 loopback / 0.0.0.0 on any port, plus desktop webview
+    /// schemes) is ALWAYS allowed, so local UIs need zero config.
+    /// Entries here are additive on top of that set; the sole entry `*`
+    /// = any origin (full opt-out). Never affects non-browser clients.
     #[serde(default)]
     pub cors_origins: Vec<String>,
     /// OTLP trace export: collector base URL (e.g.
