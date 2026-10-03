@@ -1,0 +1,30 @@
+#!/bin/sh
+# Identity guard: GitHub's contributor graph attributes commits by the
+# email stamped on them. A session carrying GIT_AUTHOR_* /
+# GIT_COMMITTER_* env overrides (or a wrong user.email) commits as the
+# wrong account silently. This hook blocks the commit when the identity
+# git is about to stamp differs from this repository's configured one.
+#
+# Install once per clone:  git config core.hooksPath .githooks
+
+expected="$(git config user.email)"
+if [ -z "$expected" ]; then
+    echo "pre-commit: user.email is unset; refusing to commit blind." >&2
+    exit 1
+fi
+
+# git var resolves env overrides first, then config — the exact value
+# the commit would carry.
+a_email=$(git var GIT_AUTHOR_IDENT | sed -n 's/.*<\([^>]*\)>.*/\1/p')
+c_email=$(git var GIT_COMMITTER_IDENT | sed -n 's/.*<\([^>]*\)>.*/\1/p')
+
+if [ "$a_email" != "$expected" ] || [ "$c_email" != "$expected" ]; then
+    echo "pre-commit: commit identity does not match this repository." >&2
+    echo "  expected : $expected" >&2
+    echo "  author   : $a_email" >&2
+    echo "  committer: $c_email" >&2
+    echo "  fix: unset GIT_AUTHOR_EMAIL / GIT_COMMITTER_EMAIL (and the" >&2
+    echo "       *_NAME twins) in this shell, or set them to the repo" >&2
+    echo "       identity above, then retry the commit." >&2
+    exit 1
+fi
