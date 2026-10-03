@@ -162,19 +162,34 @@ fn estimate_video_scratch(
     }
 }
 
-/// Parse `size` (``WxH``) for the gate; absent or unparseable sizes take
-/// the child's 512x512 default — the conservative side of the estimate.
+/// Parse the frame geometry the gate prices. Two dialects name it:
+/// `size` (``WxH`` string, translated onto width/height for the child in
+/// `translate_to_native`) and the documented top-level `width`/`height`
+/// pair, which rides to the child verbatim — the gate must price BOTH,
+/// or a 320x320 request that fits gets billed the 512x512 default and
+/// over-rejected. Absent or unparseable geometry still takes the
+/// child's 512x512 default — the conservative side of the estimate.
 fn gate_size(v: &serde_json::Value) -> (u64, u64) {
-    v.get("size")
-        .and_then(|s| s.as_str())
-        .and_then(|s| s.split_once('x'))
-        .and_then(|(w, h)| {
+    if let Some((w, h)) = v.get("size").and_then(|s| s.as_str()).and_then(|s| {
+        s.split_once('x').and_then(|(w, h)| {
             let w = w.trim().parse::<u64>().ok()?;
             let h = h.trim().parse::<u64>().ok()?;
             Some((w, h))
         })
-        .filter(|(w, h)| *w > 0 && *h > 0)
-        .unwrap_or(VIDEO_DEFAULT_SIZE)
+    }) {
+        if w > 0 && h > 0 {
+            return (w, h);
+        }
+    }
+    if let (Some(w), Some(h)) = (
+        v.get("width").and_then(serde_json::Value::as_u64),
+        v.get("height").and_then(serde_json::Value::as_u64),
+    ) {
+        if w > 0 && h > 0 {
+            return (w, h);
+        }
+    }
+    VIDEO_DEFAULT_SIZE
 }
 
 /// Frame count the gate prices: the request's own `video_frames` when
@@ -1871,6 +1886,38 @@ mod tests {
         assert_eq!(gate_size(&serde_json::json!({})), (512, 512));
         assert_eq!(gate_size(&serde_json::json!({"size": "big"})), (512, 512));
         assert_eq!(gate_size(&serde_json::json!({"size": "0x0"})), (512, 512));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__gate_size__reads_documented_width_height_dialect() {
+        // The API documents top-level width/height and the child takes
+        // them verbatim; a 320x320 request must not be billed the 512x512
+        // default (over-reject of a render that fits).
+        assert_eq!(
+            gate_size(&serde_json::json!({"width": 320, "height": 320})),
+            (320, 320)
+        );
+        assert_eq!(
+            gate_size(&serde_json::json!({"width": 768, "height": 432})),
+            (768, 432)
+        );
+        // Zero/partial/malformed numeric dims are not a geometry — the
+        // conservative default still wins.
+        assert_eq!(
+            gate_size(&serde_json::json!({"width": 0, "height": 320})),
+            (512, 512)
+        );
+        assert_eq!(gate_size(&serde_json::json!({"width": 320})), (512, 512));
+        assert_eq!(
+            gate_size(&serde_json::json!({"width": "320", "height": "320"})),
+            (512, 512)
+        );
+        // The explicit size dialect outranks stray numeric fields.
+        assert_eq!(
+            gate_size(&serde_json::json!({"size": "320x320", "width": 1024, "height": 1024})),
+            (320, 320)
+        );
     }
 
     #[test]
