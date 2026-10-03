@@ -162,9 +162,9 @@ mod tests {
     #[tokio::test]
     async fn unit__acquire__paced_reads_sleep_the_deficit() {
         let t = Throttle::shared(1_000_000.0).expect("valid rate"); // 1 MB/s
-                                                                    // Three immediate 500 KiB reads against a 1 MiB burst: the first
-                                                                    // two drain the allowance, the third owes its full 500 KiB ->
-                                                                    // ~0.5 s (CI jitter margin in the assert).
+        // Three immediate 500 KiB reads against a 1 MiB burst: the first
+        // two drain the allowance, the third owes its full 500 KiB ->
+        // ~0.5 s (CI jitter margin in the assert).
         t.acquire(500_000).await;
         t.acquire(500_000).await;
         let t0 = std::time::Instant::now();

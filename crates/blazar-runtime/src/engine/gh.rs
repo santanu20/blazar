@@ -5,7 +5,7 @@
 //! `llama-{tag}-bin-{asset}.tar.gz|.zip` and expose `digest:
 //! sha256:...` — verified before extraction.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use blazar_core::config::UpdateChannel;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -209,13 +209,13 @@ impl GhClient {
                 let resp = match sent {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
-                        return Attempt::Retry(anyhow!("GitHub releases request failed: {e}"))
+                        return Attempt::Retry(anyhow!("GitHub releases request failed: {e}"));
                     }
                     Err(_) => {
                         return Attempt::Retry(anyhow!(
                             "GitHub releases request exceeded {}s",
                             net_probe::PROBE_ATTEMPT_CAP.as_secs()
-                        ))
+                        ));
                     }
                 };
                 match resp.status() {
@@ -280,13 +280,13 @@ impl GhClient {
                 let resp = match sent {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
-                        return Attempt::Retry(anyhow!("GitHub release request failed: {e}"))
+                        return Attempt::Retry(anyhow!("GitHub release request failed: {e}"));
                     }
                     Err(_) => {
                         return Attempt::Retry(anyhow!(
                             "GitHub release request exceeded {}s",
                             net_probe::PROBE_ATTEMPT_CAP.as_secs()
-                        ))
+                        ));
                     }
                 };
                 match resp.status() {
@@ -411,13 +411,15 @@ impl GhClient {
                 let resp = match sent {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
-                        return Attempt::Retry(anyhow!("GitHub release-by-tag request failed: {e}"))
+                        return Attempt::Retry(anyhow!(
+                            "GitHub release-by-tag request failed: {e}"
+                        ));
                     }
                     Err(_) => {
                         return Attempt::Retry(anyhow!(
                             "GitHub release-by-tag request exceeded {}s",
                             net_probe::PROBE_ATTEMPT_CAP.as_secs()
-                        ))
+                        ));
                     }
                 };
                 match resp.status() {
@@ -471,13 +473,13 @@ impl GhClient {
                 let resp = match sent {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
-                        return Attempt::Retry(anyhow!("GitHub commit-lookup request failed: {e}"))
+                        return Attempt::Retry(anyhow!("GitHub commit-lookup request failed: {e}"));
                     }
                     Err(_) => {
                         return Attempt::Retry(anyhow!(
                             "GitHub commit-lookup request exceeded {}s",
                             net_probe::PROBE_ATTEMPT_CAP.as_secs()
-                        ))
+                        ));
                     }
                 };
                 match resp.status() {
@@ -633,14 +635,14 @@ impl GhClient {
         // could install truncated (live case: 14 MiB of a 1+ GiB
         // mistral.rs tarball accepted, gzip EOF mid-extract). The
         // release-API size is authoritative; enforce it.
-        if let Some(size) = asset.size {
-            if bytes.len() as u64 != size {
-                return Err(anyhow!(
-                    "asset {} truncated: got {} bytes, release metadata says {size}",
-                    asset.name,
-                    bytes.len()
-                ));
-            }
+        if let Some(size) = asset.size
+            && bytes.len() as u64 != size
+        {
+            return Err(anyhow!(
+                "asset {} truncated: got {} bytes, release metadata says {size}",
+                asset.name,
+                bytes.len()
+            ));
         }
         if let Some(digest) = &asset.digest {
             let expected = digest
@@ -693,13 +695,11 @@ impl GhClient {
         if let Some(size) = asset
             .size
             .filter(|s| *s >= crate::hf_parallel::MIN_PARALLEL_BYTES)
-        {
-            if let Some(n) = self
+            && let Some(n) = self
                 .download_asset_file_parallel(asset, &url, dest, size, throttle.as_ref())
                 .await?
-            {
-                return Ok(n);
-            }
+        {
+            return Ok(n);
         }
         let mut req = self.http.get(url.clone());
         if url.host_str() == Some("api.github.com") {
@@ -1043,11 +1043,11 @@ pub fn resolve_asset(
                     let parts: Option<Vec<u32>> =
                         version.split('.').map(|p| p.parse().ok()).collect();
                     let Some(parts) = parts else { continue };
-                    if let (true, Some((dmin_maj, dmin_min))) = (capped, driver_cuda) {
-                        if parts > vec![dmin_maj, dmin_min] {
-                            skipped_over_cap += 1;
-                            continue;
-                        }
+                    if let (true, Some((dmin_maj, dmin_min))) = (capped, driver_cuda)
+                        && parts > vec![dmin_maj, dmin_min]
+                    {
+                        skipped_over_cap += 1;
+                        continue;
                     }
                     if best.as_ref().is_none_or(|(b, _)| parts > *b) {
                         best = Some((parts, version.to_string()));
@@ -1583,8 +1583,8 @@ pub fn newest_runnable_overlay<'a>(
 mod tests {
     use super::*;
     use crate::engine::manifest::Vendor;
-    use std::sync::{Arc, Mutex};
     use Candidate::{Cpu, Exact, Versioned};
+    use std::sync::{Arc, Mutex};
 
     fn rel(tag: &str, assets: &[&str]) -> GhRelease {
         GhRelease {
@@ -2442,8 +2442,10 @@ mod tests {
         // arm64 box gets the arm64 asset, never an x64 one.
         let p = resolve_cuda_asset(&r, (13, 5), Some(95), "arm64").unwrap();
         assert_eq!(p.name, "llama-b11011-bin-ubuntu-cuda-13.3-arm64.tar.gz");
-        assert!(resolve_cuda_asset(&r, (13, 5), Some(89), "x64")
-            .is_none_or(|p| !p.name.ends_with("arm64.tar.gz")));
+        assert!(
+            resolve_cuda_asset(&r, (13, 5), Some(89), "x64")
+                .is_none_or(|p| !p.name.ends_with("arm64.tar.gz"))
+        );
         // Driver too old for every toolkit: lane declines.
         assert!(resolve_cuda_asset(&r, (12, 4), Some(89), "x64").is_none());
     }
@@ -2496,19 +2498,19 @@ mod tests {
         // channel is upstream-direct, so unset/empty env disables the
         // overlay lanes rather than pointing them at a project repo.
         let saved = std::env::var(ENGINE_OVERLAY_REPO_ENV).ok();
-        std::env::remove_var(ENGINE_OVERLAY_REPO_ENV);
+        crate::test_env::remove_env(ENGINE_OVERLAY_REPO_ENV);
         assert_eq!(engine_overlay_repo(), None);
-        std::env::set_var(ENGINE_OVERLAY_REPO_ENV, "");
+        crate::test_env::set_env(ENGINE_OVERLAY_REPO_ENV, "");
         assert_eq!(
             engine_overlay_repo(),
             None,
             "empty env means no overlay lane"
         );
-        std::env::set_var(ENGINE_OVERLAY_REPO_ENV, "  acme/blazar  ");
+        crate::test_env::set_env(ENGINE_OVERLAY_REPO_ENV, "  acme/blazar  ");
         assert_eq!(engine_overlay_repo(), Some("acme/blazar".to_string()));
         match saved {
-            Some(v) => std::env::set_var(ENGINE_OVERLAY_REPO_ENV, v),
-            None => std::env::remove_var(ENGINE_OVERLAY_REPO_ENV),
+            Some(v) => crate::test_env::set_env(ENGINE_OVERLAY_REPO_ENV, v),
+            None => crate::test_env::remove_env(ENGINE_OVERLAY_REPO_ENV),
         }
     }
 
@@ -2718,74 +2720,76 @@ mod tests {
             for conn in listener.incoming() {
                 let Ok(mut sock) = conn else { break };
                 let logger = Arc::clone(&logger);
-                std::thread::spawn(move || loop {
-                    let mut buf = Vec::with_capacity(2048);
+                std::thread::spawn(move || {
                     loop {
-                        let mut byte = [0u8; 1024];
-                        let n = match sock.read(&mut byte) {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => n,
-                        };
-                        buf.extend_from_slice(&byte[..n]);
-                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
+                        let mut buf = Vec::with_capacity(2048);
+                        loop {
+                            let mut byte = [0u8; 1024];
+                            let n = match sock.read(&mut byte) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            buf.extend_from_slice(&byte[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
                         }
-                    }
-                    let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
-                    let range = head
-                        .lines()
-                        .find_map(|l| l.strip_prefix("range:"))
-                        .map(str::trim)
-                        .map(str::to_string);
-                    let resp = match range.as_deref() {
-                        Some(spec) => {
-                            let spec = spec
-                                .strip_prefix("bytes=")
-                                .expect("probe/chunks send byte ranges");
-                            let (a, b) = spec.split_once('-').expect("A-B form");
-                            let a: usize = a.parse().expect("range start");
-                            let b: usize = b.parse().expect("range end");
-                            logger
-                                .lock()
-                                .expect("log lock")
-                                .push(format!("bytes={spec}"));
-                            format!(
+                        let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                        let range = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("range:"))
+                            .map(str::trim)
+                            .map(str::to_string);
+                        let resp = match range.as_deref() {
+                            Some(spec) => {
+                                let spec = spec
+                                    .strip_prefix("bytes=")
+                                    .expect("probe/chunks send byte ranges");
+                                let (a, b) = spec.split_once('-').expect("A-B form");
+                                let a: usize = a.parse().expect("range start");
+                                let b: usize = b.parse().expect("range end");
+                                logger
+                                    .lock()
+                                    .expect("log lock")
+                                    .push(format!("bytes={spec}"));
+                                format!(
                                     "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\n\r\n",
                                     a,
                                     b,
                                     body.len(),
                                     b - a + 1
                                 )
+                            }
+                            None => {
+                                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                            }
+                        };
+                        if sock.write_all(resp.as_bytes()).is_err() {
+                            return;
                         }
-                        None => {
-                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                        let slice_start = range.as_deref().and_then(|r| {
+                            r.strip_prefix("bytes=")
+                                .and_then(|s| s.split_once('-'))
+                                .and_then(|(a, _)| a.parse::<usize>().ok())
+                        });
+                        let payload = match slice_start {
+                            Some(start) => {
+                                let end = start
+                                    + resp
+                                        .lines()
+                                        .find_map(|l| {
+                                            l.strip_prefix("Content-Length: ")
+                                                .map(str::trim)
+                                                .and_then(|v| v.parse::<usize>().ok())
+                                        })
+                                        .expect("length known");
+                                &body[start..end]
+                            }
+                            None => body,
+                        };
+                        if sock.write_all(payload).is_err() {
+                            return;
                         }
-                    };
-                    if sock.write_all(resp.as_bytes()).is_err() {
-                        return;
-                    }
-                    let slice_start = range.as_deref().and_then(|r| {
-                        r.strip_prefix("bytes=")
-                            .and_then(|s| s.split_once('-'))
-                            .and_then(|(a, _)| a.parse::<usize>().ok())
-                    });
-                    let payload = match slice_start {
-                        Some(start) => {
-                            let end = start
-                                + resp
-                                    .lines()
-                                    .find_map(|l| {
-                                        l.strip_prefix("Content-Length: ")
-                                            .map(str::trim)
-                                            .and_then(|v| v.parse::<usize>().ok())
-                                    })
-                                    .expect("length known");
-                            &body[start..end]
-                        }
-                        None => body,
-                    };
-                    if sock.write_all(payload).is_err() {
-                        return;
                     }
                 });
             }
@@ -2804,25 +2808,28 @@ mod tests {
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut sock) = conn else { break };
-                std::thread::spawn(move || loop {
-                    let mut buf = Vec::with_capacity(2048);
+                std::thread::spawn(move || {
                     loop {
-                        let mut byte = [0u8; 1024];
-                        let n = match sock.read(&mut byte) {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => n,
-                        };
-                        buf.extend_from_slice(&byte[..n]);
-                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
+                        let mut buf = Vec::with_capacity(2048);
+                        loop {
+                            let mut byte = [0u8; 1024];
+                            let n = match sock.read(&mut byte) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            buf.extend_from_slice(&byte[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
                         }
-                    }
-                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
-                    if sock.write_all(head.as_bytes()).is_err() {
-                        return;
-                    }
-                    if sock.write_all(body).is_err() {
-                        return;
+                        let head =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                        if sock.write_all(head.as_bytes()).is_err() {
+                            return;
+                        }
+                        if sock.write_all(body).is_err() {
+                            return;
+                        }
                     }
                 });
             }

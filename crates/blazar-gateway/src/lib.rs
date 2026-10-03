@@ -42,6 +42,7 @@ pub mod whisper;
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Extension, State};
 use axum::http::{Request, StatusCode};
@@ -49,7 +50,6 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::serve::ListenerExt;
-use axum::Router;
 
 use blazar_core::ApiKey;
 use state::AppState;
@@ -208,23 +208,23 @@ async fn request_log(
     // E4 audit line: identity + outcome, never content. try_send — a
     // saturated writer drops (and counts) rather than stalling the
     // response.
-    if let Some(tx) = &state.audit_tx {
-        if crate::audit::AUDITED_PATHS.contains(&path.as_str()) {
-            let line = crate::audit::AuditLine {
-                ts,
-                trace: trace.clone(),
-                key,
-                method: method.to_string(),
-                path: path.clone(),
-                model,
-                status,
-                ms,
-                priority: priority.clone(),
-                queue_depth: state.queue.depth(),
-            };
-            if tx.try_send(line).is_err() {
-                state.audit_dropped.fetch_add(1, Ordering::Relaxed);
-            }
+    if let Some(tx) = &state.audit_tx
+        && crate::audit::AUDITED_PATHS.contains(&path.as_str())
+    {
+        let line = crate::audit::AuditLine {
+            ts,
+            trace: trace.clone(),
+            key,
+            method: method.to_string(),
+            path: path.clone(),
+            model,
+            status,
+            ms,
+            priority: priority.clone(),
+            queue_depth: state.queue.depth(),
+        };
+        if tx.try_send(line).is_err() {
+            state.audit_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
     if state.otlp.enabled() {

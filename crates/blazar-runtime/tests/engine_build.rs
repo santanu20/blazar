@@ -9,17 +9,28 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use blazar_core::store::Store;
 use blazar_core::BlazarDirs;
+use blazar_core::store::Store;
+use blazar_runtime::EventBus;
 use blazar_runtime::engine::build::{
-    derive_fork_engine_tag, parse_fork_spec, validate_commit_sha, validate_repo_slug, BuildBackend,
-    BuildOpts, Toolchain,
+    BuildBackend, BuildOpts, Toolchain, derive_fork_engine_tag, parse_fork_spec,
+    validate_commit_sha, validate_repo_slug,
 };
 use blazar_runtime::engine::{EngineManager, LOCAL_TAG};
-use blazar_runtime::EventBus;
 
 fn stub_server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_stub-llama-server"))
+}
+
+// Edition 2024 makes env mutation unsafe (std demands no concurrent
+// reader/writer thread). These tests run one-per-process under nextest and
+// only the spawning test thread touches STUB_SERVER — the condition std
+// requires.
+fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+    #[expect(unsafe_code)]
+    unsafe {
+        std::env::set_var(key, value);
+    }
 }
 
 fn tmp_dirs() -> (tempfile::TempDir, BlazarDirs) {
@@ -109,7 +120,7 @@ async fn integration__build_cpu__installs_probes_activates() {
     let mut o = opts(BuildBackend::Cpu, "b4242");
     o.source_dir = Some(source_tree(tmp.path()));
     o.toolchain = Some(tc);
-    std::env::set_var("STUB_SERVER", stub_server_bin());
+    set_env("STUB_SERVER", stub_server_bin());
 
     let mut lines = Vec::new();
     let row = manager(&dirs)
@@ -187,7 +198,7 @@ async fn integration__build_cuda__host_compiler_rule_and_arch_args() {
     o.source_dir = Some(source_tree(tmp.path()));
     o.toolchain = Some(tc);
     o.arch = Some("89".into()); // cross-build: no nvidia-smi needed
-    std::env::set_var("STUB_SERVER", stub_server_bin());
+    set_env("STUB_SERVER", stub_server_bin());
 
     let mut lines = Vec::new();
     let row = manager(&dirs)
@@ -287,7 +298,7 @@ exit 0";
     let mut o = opts(BuildBackend::Cpu, "b4242");
     o.source_dir = Some(source_tree(tmp.path()));
     o.toolchain = Some(tc);
-    std::env::set_var("STUB_SERVER", stub_server_bin());
+    set_env("STUB_SERVER", stub_server_bin());
 
     let err = manager(&dirs)
         .build_and_install(&o, &mut |_| {})

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 use blazar_core::config::{RoutingMode, RoutingPolicy};
@@ -127,7 +127,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             return crate::error_response(
                 404,
                 "store unavailable — start the daemon with a writable data dir",
-            )
+            );
         }
     };
     let Some(Some(row)) = state.with_store(|s| s.get_model(&resolved).ok().flatten()) else {

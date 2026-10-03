@@ -1246,11 +1246,7 @@ pub enum MmprojPolicy {
 
 impl From<bool> for MmprojPolicy {
     fn from(b: bool) -> Self {
-        if b {
-            Self::Attach
-        } else {
-            Self::Skip
-        }
+        if b { Self::Attach } else { Self::Skip }
     }
 }
 
@@ -1431,47 +1427,47 @@ impl SglangTuning {
     /// Numeric envelopes for knobs the engine would only reject
     /// (or silently misbehave with) at spawn time.
     fn validate_scalar_ranges(&self, where_: &str) -> Result<(), CoreError> {
-        if let Some(frac) = self.mem_fraction_static {
-            if !(0.05..=0.95).contains(&frac) {
-                return Err(CoreError::Config(format!(
-                    "{where_}.mem_fraction_static must be 0.05..=0.95, got {frac}"
-                )));
-            }
+        if let Some(frac) = self.mem_fraction_static
+            && !(0.05..=0.95).contains(&frac)
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.mem_fraction_static must be 0.05..=0.95, got {frac}"
+            )));
         }
-        if let Some(gb) = self.cpu_offload_gb {
-            if gb < 0.0 {
-                return Err(CoreError::Config(format!(
-                    "{where_}.cpu_offload_gb must be >= 0, got {gb}"
-                )));
-            }
+        if let Some(gb) = self.cpu_offload_gb
+            && gb < 0.0
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.cpu_offload_gb must be >= 0, got {gb}"
+            )));
         }
-        if let Some(r) = self.hicache_ratio {
-            if r <= 0.0 {
-                return Err(CoreError::Config(format!(
-                    "{where_}.hicache_ratio must be > 0, got {r}"
-                )));
-            }
+        if let Some(r) = self.hicache_ratio
+            && r <= 0.0
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.hicache_ratio must be > 0, got {r}"
+            )));
         }
-        if let Some(t) = self.watchdog_timeout {
-            if t <= 0.0 {
-                return Err(CoreError::Config(format!(
-                    "{where_}.watchdog_timeout must be > 0, got {t}"
-                )));
-            }
+        if let Some(t) = self.watchdog_timeout
+            && t <= 0.0
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.watchdog_timeout must be > 0, got {t}"
+            )));
         }
-        if let Some(t) = self.dynamic_batch_tokenizer_batch_timeout {
-            if t <= 0.0 {
-                return Err(CoreError::Config(format!(
-                    "{where_}.dynamic_batch_tokenizer_batch_timeout must be > 0, got {t}"
-                )));
-            }
+        if let Some(t) = self.dynamic_batch_tokenizer_batch_timeout
+            && t <= 0.0
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.dynamic_batch_tokenizer_batch_timeout must be > 0, got {t}"
+            )));
         }
-        if let Some(t) = self.max_total_tokens {
-            if t == 0 {
-                return Err(CoreError::Config(format!(
-                    "{where_}.max_total_tokens must be >= 1, got 0"
-                )));
-            }
+        if let Some(t) = self.max_total_tokens
+            && t == 0
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.max_total_tokens must be >= 1, got 0"
+            )));
         }
         Ok(())
     }
@@ -1678,12 +1674,12 @@ impl MistralrsTuning {
         }
         // prefix_cache_n: 0 is a valid "disable" — only negative is
         // impossible in u64, so no floor check.
-        if let Some(s) = &self.mtp_draft_sampling {
-            if !["auto", "greedy", "probabilistic"].contains(&s.as_str()) {
-                return Err(CoreError::Config(format!(
-                    "{where_}.mtp_draft_sampling must be one of [\"auto\", \"greedy\", \"probabilistic\"], got {s:?}"
-                )));
-            }
+        if let Some(s) = &self.mtp_draft_sampling
+            && !["auto", "greedy", "probabilistic"].contains(&s.as_str())
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.mtp_draft_sampling must be one of [\"auto\", \"greedy\", \"probabilistic\"], got {s:?}"
+            )));
         }
         if let Some(layers) = &self.device_layers {
             let pair = |p: &str| -> bool {
@@ -1847,23 +1843,23 @@ impl SamplerDefaults {
             } else {
                 self.frequency_penalty
             };
-            if let Some(v) = v {
-                if !v.is_finite() {
-                    return Err(CoreError::Config(format!(
-                        "{ctx}.{field} must be finite, got {v}"
-                    )));
-                }
+            if let Some(v) = v
+                && !v.is_finite()
+            {
+                return Err(CoreError::Config(format!(
+                    "{ctx}.{field} must be finite, got {v}"
+                )));
             }
         }
         if let Some(v) = self.dry_multiplier {
             nonneg("dry_multiplier", v)?;
         }
-        if let Some(v) = self.dry_base {
-            if v.is_nan() || v <= 1.0 {
-                return Err(CoreError::Config(format!(
-                    "{ctx}.dry_base must be > 1.0, got {v}"
-                )));
-            }
+        if let Some(v) = self.dry_base
+            && (v.is_nan() || v <= 1.0)
+        {
+            return Err(CoreError::Config(format!(
+                "{ctx}.dry_base must be > 1.0, got {v}"
+            )));
         }
         if let Some(v) = self.dry_allowed_length {
             count("dry_allowed_length", v)?;
@@ -1877,12 +1873,12 @@ impl SamplerDefaults {
         if let Some(v) = self.xtc_threshold {
             nonneg("xtc_threshold", v)?;
         }
-        if let Some(v) = self.mirostat {
-            if !(0..=2).contains(&v) {
-                return Err(CoreError::Config(format!(
-                    "{ctx}.mirostat must be 0 (off), 1 or 2, got {v}"
-                )));
-            }
+        if let Some(v) = self.mirostat
+            && !(0..=2).contains(&v)
+        {
+            return Err(CoreError::Config(format!(
+                "{ctx}.mirostat must be 0 (off), 1 or 2, got {v}"
+            )));
         }
         Ok(())
     }
@@ -2819,10 +2815,10 @@ impl Config {
         {
             return list.as_slice();
         }
-        if !self.tensor_preset.is_empty() {
-            if let Some(entries) = tensor_preset_entries(&self.tensor_preset) {
-                return entries;
-            }
+        if !self.tensor_preset.is_empty()
+            && let Some(entries) = tensor_preset_entries(&self.tensor_preset)
+        {
+            return entries;
         }
         self.override_tensor.as_slice()
     }
@@ -2976,7 +2972,7 @@ impl Config {
             other => {
                 return Err(CoreError::Config(format!(
                     "child_transport must be \"tcp\" or \"unix\", got {other:?}"
-                )))
+                )));
             }
         }
         if !is_valid_spec_mode(&self.spec) {
@@ -3017,14 +3013,14 @@ impl Config {
                 ));
             }
         }
-        if let Some(json) = &self.mcp_servers_json {
-            if serde_json::from_str::<serde_json::Value>(json).is_err() {
-                return Err(CoreError::Config(
-                    "mcp_servers_json must be valid JSON (Cursor-compatible MCP \
+        if let Some(json) = &self.mcp_servers_json
+            && serde_json::from_str::<serde_json::Value>(json).is_err()
+        {
+            return Err(CoreError::Config(
+                "mcp_servers_json must be valid JSON (Cursor-compatible MCP \
                      server definitions), parse failed"
-                        .into(),
-                ));
-            }
+                    .into(),
+            ));
         }
         if self.mcp_servers_config.is_some() && self.mcp_servers_json.is_some() {
             return Err(CoreError::Config(
@@ -3050,7 +3046,7 @@ impl Config {
             other => {
                 return Err(CoreError::Config(format!(
                     "reasoning_format must be \"none\", \"deepseek\" or \"deepseek-legacy\", got {other:?}"
-                )))
+                )));
             }
         }
         match self.reasoning.as_str() {
@@ -3058,15 +3054,15 @@ impl Config {
             other => {
                 return Err(CoreError::Config(format!(
                     "reasoning must be \"on\", \"off\" or \"auto\", got {other:?}"
-                )))
-            }
-        }
-        if let Some(frac) = self.mistralrs_pa_memory_fraction {
-            if !(0.05..=0.95).contains(&frac) {
-                return Err(CoreError::Config(format!(
-                    "mistralrs_pa_memory_fraction must be 0.05..=0.95, got {frac}"
                 )));
             }
+        }
+        if let Some(frac) = self.mistralrs_pa_memory_fraction
+            && !(0.05..=0.95).contains(&frac)
+        {
+            return Err(CoreError::Config(format!(
+                "mistralrs_pa_memory_fraction must be 0.05..=0.95, got {frac}"
+            )));
         }
         self.sglang.validate("sglang")?;
         self.mistralrs.validate("mistralrs")?;
@@ -3079,19 +3075,19 @@ impl Config {
             }
         }
         // Child HTTP server behavior knobs.
-        if let Some(p) = self.sse_ping_interval {
-            if p < -1 {
-                return Err(CoreError::Config(format!(
-                    "sse_ping_interval must be >= -1 (-1 disables), got {p}"
-                )));
-            }
+        if let Some(p) = self.sse_ping_interval
+            && p < -1
+        {
+            return Err(CoreError::Config(format!(
+                "sse_ping_interval must be >= -1 (-1 disables), got {p}"
+            )));
         }
-        if let Some(t) = self.server_timeout_secs {
-            if t == 0 {
-                return Err(CoreError::Config(
-                    "server_timeout_secs must be >= 1, got 0".into(),
-                ));
-            }
+        if let Some(t) = self.server_timeout_secs
+            && t == 0
+        {
+            return Err(CoreError::Config(
+                "server_timeout_secs must be >= 1, got 0".into(),
+            ));
         }
         if let Some(kwargs) = &self.chat_template_kwargs {
             let trimmed = kwargs.trim();
@@ -3112,55 +3108,56 @@ impl Config {
         self.validate_new_knobs()?;
         self.validate_wire_knobs()?;
         for (name, o) in &self.model_overrides {
-            if let Some(spec) = &o.spec {
-                if !is_valid_spec_mode(spec) {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \"dflash\" or \"dspark\", got {spec:?}"
-                    )));
-                }
+            if let Some(spec) = &o.spec
+                && !is_valid_spec_mode(spec)
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \"dflash\" or \"dspark\", got {spec:?}"
+                )));
             }
-            if let Some(lm) = &o.lazy_mode {
-                if !matches!(lm.as_str(), "auto" | "on" | "off") {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.lazy_mode must be \"auto\", \"on\" or \"off\", got {lm:?}"
-                    )));
-                }
+            if let Some(lm) = &o.lazy_mode
+                && !matches!(lm.as_str(), "auto" | "on" | "off")
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.lazy_mode must be \"auto\", \"on\" or \"off\", got {lm:?}"
+                )));
             }
-            if let Some(ctx) = o.ctx {
-                if ctx == 0 {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.ctx must be > 0"
-                    )));
-                }
+            if let Some(ctx) = o.ctx
+                && ctx == 0
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.ctx must be > 0"
+                )));
             }
-            if let Some(ct) = &o.cache_type {
-                if !valid_cache_type(ct) {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.cache_type must be one of {} (or empty), got {ct:?}",
-                        CACHE_TYPES.join(", ")
-                    )));
-                }
+            if let Some(ct) = &o.cache_type
+                && !valid_cache_type(ct)
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.cache_type must be one of {} (or empty), got {ct:?}",
+                    CACHE_TYPES.join(", ")
+                )));
             }
-            if let Some(ce) = o.ctx_extend {
-                if ce != 0.0 && !(1.0 < ce && ce <= 32.0) {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.ctx_extend must be 0 (off) or within (1.0..=32.0], got {ce}"
-                    )));
-                }
+            if let Some(ce) = o.ctx_extend
+                && ce != 0.0
+                && !(1.0 < ce && ce <= 32.0)
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.ctx_extend must be 0 (off) or within (1.0..=32.0], got {ce}"
+                )));
             }
-            if let Some(n) = o.cpu_moe_n {
-                if n < 0 {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.cpu_moe_n must be >= 0, got {n}"
-                    )));
-                }
+            if let Some(n) = o.cpu_moe_n
+                && n < 0
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.cpu_moe_n must be >= 0, got {n}"
+                )));
             }
-            if let Some(n) = o.cpu_ffn_n {
-                if n < 0 {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.cpu_ffn_n must be >= 0, got {n}"
-                    )));
-                }
+            if let Some(n) = o.cpu_ffn_n
+                && n < 0
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.cpu_ffn_n must be >= 0, got {n}"
+                )));
             }
             if let Some(ots) = &o.override_tensor {
                 for ot in ots {
@@ -3176,12 +3173,12 @@ impl Config {
                     "model_overrides.{name}: set only one of chat_template or chat_template_file"
                 )));
             }
-            if let Some(f) = &o.chat_template_file {
-                if !std::path::Path::new(f).exists() {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.chat_template_file not found: {f:?}"
-                    )));
-                }
+            if let Some(f) = &o.chat_template_file
+                && !std::path::Path::new(f).exists()
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.chat_template_file not found: {f:?}"
+                )));
             }
             if let Some(sd) = &o.sampler_defaults {
                 sd.validate(&format!("model_overrides.{name}.sampler_defaults"))?;
@@ -3244,13 +3241,13 @@ impl Config {
             "cache-dit",
             "spectrum",
         ];
-        if let Some(mode) = self.sdcpp_cache_mode.as_deref() {
-            if !sdcpp_cache_modes.contains(&mode) {
-                return Err(CoreError::Config(format!(
-                    "sdcpp_cache_mode must be one of {} (or unset), got {mode:?}",
-                    sdcpp_cache_modes.join(" | ")
-                )));
-            }
+        if let Some(mode) = self.sdcpp_cache_mode.as_deref()
+            && !sdcpp_cache_modes.contains(&mode)
+        {
+            return Err(CoreError::Config(format!(
+                "sdcpp_cache_mode must be one of {} (or unset), got {mode:?}",
+                sdcpp_cache_modes.join(" | ")
+            )));
         }
         for endpoint in &self.sdcpp_rpc_servers {
             if endpoint.is_empty() || !endpoint.contains(':') {
@@ -3303,19 +3300,19 @@ impl Config {
                 )));
             }
         }
-        if let Some(tae) = self.sdcpp_tae.as_deref() {
-            if tae.trim().is_empty() {
-                return Err(CoreError::Config(
-                    "sdcpp_tae must be a Tiny AutoEncoder model path, got \"\"".into(),
-                ));
-            }
+        if let Some(tae) = self.sdcpp_tae.as_deref()
+            && tae.trim().is_empty()
+        {
+            return Err(CoreError::Config(
+                "sdcpp_tae must be a Tiny AutoEncoder model path, got \"\"".into(),
+            ));
         }
-        if let Some(n) = self.sdcpp_conditioning_cache_size {
-            if n > 1024 {
-                return Err(CoreError::Config(format!(
-                    "sdcpp_conditioning_cache_size must be 0 (disable) ..= 1024, got {n}"
-                )));
-            }
+        if let Some(n) = self.sdcpp_conditioning_cache_size
+            && n > 1024
+        {
+            return Err(CoreError::Config(format!(
+                "sdcpp_conditioning_cache_size must be 0 (disable) ..= 1024, got {n}"
+            )));
         }
         Ok(())
     }
@@ -3386,13 +3383,14 @@ impl Config {
                 ("cache_type_k", &o.cache_type_k),
                 ("cache_type_v", &o.cache_type_v),
             ] {
-                if let Some(t) = val {
-                    if !t.is_empty() && !valid_cache_type(t) {
-                        return Err(CoreError::Config(format!(
-                            "model_overrides.{name}.{key} must be one of {}, got {t:?}",
-                            CACHE_TYPES.join(", ")
-                        )));
-                    }
+                if let Some(t) = val
+                    && !t.is_empty()
+                    && !valid_cache_type(t)
+                {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.{key} must be one of {}, got {t:?}",
+                        CACHE_TYPES.join(", ")
+                    )));
                 }
             }
         }
@@ -3420,19 +3418,21 @@ impl Config {
             )));
         }
         for (name, o) in &self.model_overrides {
-            if let Some(r) = &o.prompt_recipe {
-                if r != "child" && r != "ollama_compat" {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.prompt_recipe must be \"child\" or \"ollama_compat\", got {r:?}"
-                    )));
-                }
+            if let Some(r) = &o.prompt_recipe
+                && r != "child"
+                && r != "ollama_compat"
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.prompt_recipe must be \"child\" or \"ollama_compat\", got {r:?}"
+                )));
             }
-            if let Some(d) = &o.decode_policy {
-                if d != "free" && d != "strict" {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.decode_policy must be \"free\" or \"strict\", got {d:?}"
-                    )));
-                }
+            if let Some(d) = &o.decode_policy
+                && d != "free"
+                && d != "strict"
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.decode_policy must be \"free\" or \"strict\", got {d:?}"
+                )));
             }
         }
         self.validate_cache_type_vocab()?;
@@ -3488,12 +3488,12 @@ impl Config {
             ("lookup_cache_static", &self.lookup_cache_static),
             ("lookup_cache_dynamic", &self.lookup_cache_dynamic),
         ] {
-            if let Some(p) = path {
-                if !std::path::Path::new(p).is_file() {
-                    return Err(CoreError::Config(format!(
-                        "{field} must point at an existing cache file, got {p:?}"
-                    )));
-                }
+            if let Some(p) = path
+                && !std::path::Path::new(p).is_file()
+            {
+                return Err(CoreError::Config(format!(
+                    "{field} must point at an existing cache file, got {p:?}"
+                )));
             }
         }
         if !self.spec_draft_cpu_range.is_empty() && !valid_cpu_range(&self.spec_draft_cpu_range) {
@@ -3512,26 +3512,26 @@ impl Config {
                 self.spec_draft_ngl
             )));
         }
-        if let Some(p) = self.spec_draft_p_min {
-            if !(0.0..=1.0).contains(&p) {
-                return Err(CoreError::Config(format!(
-                    "spec_draft_p_min must be within 0.0..=1.0, got {p}"
-                )));
-            }
+        if let Some(p) = self.spec_draft_p_min
+            && !(0.0..=1.0).contains(&p)
+        {
+            return Err(CoreError::Config(format!(
+                "spec_draft_p_min must be within 0.0..=1.0, got {p}"
+            )));
         }
-        if let Some(p) = self.spec_draft_p_split {
-            if !(0.0..=1.0).contains(&p) {
-                return Err(CoreError::Config(format!(
-                    "spec_draft_p_split must be within 0.0..=1.0, got {p}"
-                )));
-            }
+        if let Some(p) = self.spec_draft_p_split
+            && !(0.0..=1.0).contains(&p)
+        {
+            return Err(CoreError::Config(format!(
+                "spec_draft_p_split must be within 0.0..=1.0, got {p}"
+            )));
         }
-        if let Some(p) = self.spec_draft_poll {
-            if p > 100 {
-                return Err(CoreError::Config(format!(
-                    "spec_draft_poll must be 0..=100, got {p}"
-                )));
-            }
+        if let Some(p) = self.spec_draft_poll
+            && p > 100
+        {
+            return Err(CoreError::Config(format!(
+                "spec_draft_poll must be 0..=100, got {p}"
+            )));
         }
         if !(-1..=3).contains(&self.spec_draft_prio) {
             return Err(CoreError::Config(format!(
@@ -3736,12 +3736,12 @@ impl Config {
                     )));
                 }
             }
-            if let Some(d) = o.devices.as_ref() {
-                if d.iter().any(|x| x.trim().is_empty()) {
-                    return Err(CoreError::Config(format!(
-                        "model_overrides.{name}.devices entries must be non-empty device names"
-                    )));
-                }
+            if let Some(d) = o.devices.as_ref()
+                && d.iter().any(|x| x.trim().is_empty())
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.devices entries must be non-empty device names"
+                )));
             }
         }
         Ok(())
@@ -4399,12 +4399,14 @@ mod tests {
 
     #[test]
     fn unit__wire_validation__tensor_preset_vocabulary() {
-        assert!(Config {
-            tensor_preset: "everything-on-cpu".into(),
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
+        assert!(
+            Config {
+                tensor_preset: "everything-on-cpu".into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
         let cfg = Config {
             tensor_preset: "moe-cpu-offload".into(),
             ..Default::default()
@@ -5019,11 +5021,12 @@ default_ctx = 16384
             sdcpp_rpc_servers: vec!["no-port".to_string()],
             ..Config::default()
         };
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("sdcpp_rpc_servers"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sdcpp_rpc_servers")
+        );
         // New sd-server knob surface: bad shapes teach, good shapes pass.
         for (field, bad) in [
             ("sdcpp_cache_option", Some("threshold 0.25")),
@@ -5057,11 +5060,12 @@ default_ctx = 16384
             sdcpp_conditioning_cache_size: Some(2000),
             ..Config::default()
         };
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("sdcpp_conditioning_cache_size"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sdcpp_conditioning_cache_size")
+        );
         let cfg = Config {
             sdcpp_cache_option: Some("threshold=0.25,reset=0".to_string()),
             sdcpp_max_vram: Some("cuda0=8,cuda1=6".to_string()),
@@ -5079,11 +5083,12 @@ default_ctx = 16384
             sdcpp_rpc_servers: vec![String::new()],
             ..Config::default()
         };
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("sdcpp_rpc_servers"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sdcpp_rpc_servers")
+        );
         let cfg = Config {
             sdcpp_rpc_servers: vec!["10.0.0.2:50052".to_string()],
             ..Config::default()
@@ -5258,11 +5263,11 @@ default_ctx = 16384
             port: 1,
             ..Config::default()
         };
-        std::env::set_var("BLAZAR_PORT", "12345");
-        std::env::set_var("BLAZAR_DEFAULT_CTX", "4096");
+        set_env("BLAZAR_PORT", "12345");
+        set_env("BLAZAR_DEFAULT_CTX", "4096");
         let merged = cfg.with_env_overrides().unwrap();
-        std::env::remove_var("BLAZAR_PORT");
-        std::env::remove_var("BLAZAR_DEFAULT_CTX");
+        remove_env("BLAZAR_PORT");
+        remove_env("BLAZAR_DEFAULT_CTX");
         assert_eq!(merged.port, 12345);
         assert_eq!(merged.default_ctx, 4096);
     }
@@ -5270,9 +5275,9 @@ default_ctx = 16384
     #[test]
     fn unit__env_override__malformed_value__named_error() {
         let _g = env_lock();
-        std::env::set_var("BLAZAR_PORT", "not-a-port");
+        set_env("BLAZAR_PORT", "not-a-port");
         let err = Config::default().with_env_overrides().unwrap_err();
-        std::env::remove_var("BLAZAR_PORT");
+        remove_env("BLAZAR_PORT");
         let msg = err.to_string();
         assert!(
             msg.contains("BLAZAR_PORT") && msg.contains("not-a-port"),
@@ -5284,18 +5289,18 @@ default_ctx = 16384
     fn unit__download_speed_limit__env_override_and_validation() {
         // Scoped env mutation: serial test, restored unconditionally.
         let _g = env_lock();
-        std::env::set_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", "12.5");
+        set_env("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", "12.5");
         let merged = Config::default().with_env_overrides().unwrap();
-        std::env::remove_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB");
+        remove_env("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB");
         assert!((merged.download_speed_limit_mb - 12.5).abs() < f64::EPSILON);
         assert!(merged.validate().is_ok(), "12.5 MB/s is a legal cap");
 
-        std::env::set_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", "-3");
+        set_env("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB", "-3");
         let msg = Config::default()
             .with_env_overrides()
             .unwrap_err()
             .to_string();
-        std::env::remove_var("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB");
+        remove_env("BLAZAR_DOWNLOAD_SPEED_LIMIT_MB");
         assert!(
             msg.contains("download_speed_limit_mb") && msg.contains("unlimited"),
             "teaching error names the knob and the 0-means-unlimited escape: {msg}"
@@ -5423,9 +5428,9 @@ default_ctx = 16384
     #[test]
     fn unit__keys_env__name_key_pairs() {
         let _g = env_lock();
-        std::env::set_var("BLAZAR_KEYS", " alice:plm_a , bob:plm_b ,");
+        set_env("BLAZAR_KEYS", " alice:plm_a , bob:plm_b ,");
         let cfg = Config::default().with_env_overrides().unwrap();
-        std::env::remove_var("BLAZAR_KEYS");
+        remove_env("BLAZAR_KEYS");
         assert_eq!(cfg.keys.len(), 2);
         assert_eq!(cfg.keys[0].name, "alice");
         assert_eq!(cfg.keys[0].key, "plm_a");
@@ -5454,9 +5459,10 @@ key = "plm_admin"
         assert_eq!(ci.rpm, 12);
         assert_eq!(ci.tpm, 4000);
         assert_eq!(ci.daily_tokens, 1_000_000);
-        assert!(cfg
-            .key_for("plm_admin")
-            .is_some_and(|k| k.models.is_empty()));
+        assert!(
+            cfg.key_for("plm_admin")
+                .is_some_and(|k| k.models.is_empty())
+        );
     }
 
     #[test]
@@ -5506,11 +5512,12 @@ key = "plm_admin"
                 ..ApiKey::default()
             },
         ]);
-        assert!(c
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate name"));
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate name")
+        );
     }
 
     #[test]
@@ -5836,6 +5843,27 @@ key = "plm_admin"
         ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // Edition 2024 makes env mutation an unsafe operation: std requires
+    // that no other thread read or write the environment concurrently.
+    // Every caller of these helpers holds `env_lock()`, and the env-reading
+    // production code under test runs on the calling thread between lock
+    // acquire and release — the one safety condition std demands.
+    /// # Safety-free wrapper around `std::env::set_var` (see note above).
+    fn set_env(key: &str, value: &str) {
+        #[expect(unsafe_code)]
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    /// # Safety-free wrapper around `std::env::remove_var` (see note above).
+    fn remove_env(key: &str) {
+        #[expect(unsafe_code)]
+        unsafe {
+            std::env::remove_var(key);
+        }
     }
 }
 

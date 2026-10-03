@@ -22,10 +22,10 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use anyhow::anyhow;
 use anyhow::Result;
-use serde::de::DeserializeOwned;
+use anyhow::anyhow;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use sha2::Digest as _;
 use sha2::Sha256;
 
@@ -33,14 +33,14 @@ use blazar_core::gguf;
 use blazar_core::store::{ModelRow, Store};
 
 use crate::events::BlazarEvent;
-use crate::hf::est_params;
-use crate::hf::unique_dest;
 use crate::hf::FilePlan;
 use crate::hf::HfClient;
 use crate::hf::PullLock;
 use crate::hf::PullOutcome;
 use crate::hf::Puller;
-use crate::hf::{sweep_stale_part, Repull};
+use crate::hf::est_params;
+use crate::hf::unique_dest;
+use crate::hf::{Repull, sweep_stale_part};
 
 /// Base with a trailing slash so `Url::join("{repo}/manifests/{tag}")`
 /// appends segments instead of replacing the last path element.
@@ -78,10 +78,10 @@ pub fn parse_registry_target(input: &str) -> Result<RegistryTarget> {
         Some((b, d)) => (b, Some(d.to_string())),
         None => (input, None),
     };
-    if let Some(d) = &digest {
-        if !d.starts_with("sha256:") || d.len() != "sha256:".len() + 64 {
-            return Err(anyhow!("invalid digest pin {d:?} (want sha256:<64 hex>)"));
-        }
+    if let Some(d) = &digest
+        && (!d.starts_with("sha256:") || d.len() != "sha256:".len() + 64)
+    {
+        return Err(anyhow!("invalid digest pin {d:?} (want sha256:<64 hex>)"));
     }
 
     let (repo_part, tag) = match body.rsplit_once(':') {
@@ -491,28 +491,28 @@ impl Puller {
                 already_present: true,
             }));
         }
-        if let Repull::DeltaMmproj { expected } = decision {
-            if let Some(old) = existing {
-                let row = self
-                    .registry_delta_mmproj(
-                        client,
-                        name,
-                        target,
-                        old,
-                        plan,
-                        plan.projector.as_ref().filter(|_| expected),
-                    )
-                    .await?;
-                Store::open(&self.dirs)?.upsert_model(&row)?;
-                self.bus.publish(BlazarEvent::ModelPulled {
-                    name: name.to_string(),
-                    warning: None,
-                });
-                return Ok(Some(PullOutcome {
-                    row,
-                    already_present: false,
-                }));
-            }
+        if let Repull::DeltaMmproj { expected } = decision
+            && let Some(old) = existing
+        {
+            let row = self
+                .registry_delta_mmproj(
+                    client,
+                    name,
+                    target,
+                    old,
+                    plan,
+                    plan.projector.as_ref().filter(|_| expected),
+                )
+                .await?;
+            Store::open(&self.dirs)?.upsert_model(&row)?;
+            self.bus.publish(BlazarEvent::ModelPulled {
+                name: name.to_string(),
+                warning: None,
+            });
+            return Ok(Some(PullOutcome {
+                row,
+                already_present: false,
+            }));
         }
         if let Some(old) = existing {
             if old.repo != expected_repo {
@@ -592,10 +592,10 @@ impl Puller {
         } else if let Some(old_mm) = &old.mmproj_path {
             // Tag dropped the projector: forget it from the row and
             // remove the dead sidecar file.
-            if let Err(e) = std::fs::remove_file(old_mm) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(model = %name, "could not remove stale mmproj {old_mm}: {e}");
-                }
+            if let Err(e) = std::fs::remove_file(old_mm)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(model = %name, "could not remove stale mmproj {old_mm}: {e}");
             }
         }
         // Model plan values come from the fresh manifest; the intact blob
@@ -847,10 +847,11 @@ mod tests {
         assert_eq!(model.size, 522_640_096);
         assert!(model.digest.starts_with("sha256:7f4030"));
         // Captured qwen3:0.6b ships template/license/params only.
-        assert!(m
-            .layers
-            .iter()
-            .all(|l| l.media_type != OLLAMA_PROJECTOR_LAYER));
+        assert!(
+            m.layers
+                .iter()
+                .all(|l| l.media_type != OLLAMA_PROJECTOR_LAYER)
+        );
         assert_eq!(m.layers.len(), 4);
         assert_eq!(
             m.config.as_ref().map(|c| c.digest.as_str()),
@@ -982,7 +983,7 @@ mod tests {
         // 404 and fail the pull: the gate must resolve from metadata.
         let api = wiremock::MockServer::start().await;
         manifest_mock(&api).await;
-        std::env::set_var("BLAZAR_REGISTRY_BASE", format!("{}/v2/", api.uri()));
+        crate::test_env::set_env("BLAZAR_REGISTRY_BASE", format!("{}/v2/", api.uri()));
 
         // Seed an intact row exactly as a prior pull would have recorded
         // it (repo string, tag-pinned sha, canonical `{name}.gguf` leaf).
@@ -1023,7 +1024,7 @@ mod tests {
             force: false,
         };
         let outcome = puller.pull_ollama("qwen3:0.6b").await.unwrap();
-        std::env::remove_var("BLAZAR_REGISTRY_BASE");
+        crate::test_env::remove_env("BLAZAR_REGISTRY_BASE");
 
         assert!(outcome.already_present, "gate must short-circuit");
         assert_eq!(outcome.row.path, leaf.display().to_string());

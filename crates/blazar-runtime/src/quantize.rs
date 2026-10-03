@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use blazar_core::{BlazarDirs, Store};
 
 /// Locate an engine tool binary (`llama-quantize`, `llama-imatrix`,

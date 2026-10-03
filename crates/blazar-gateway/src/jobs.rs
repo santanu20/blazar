@@ -227,13 +227,12 @@ impl JobRuntime {
         );
         // Spillover lands in the dedicated column: `set_job_state` only
         // touches state/result/error.
-        if let Some(path) = artifact_path.as_deref() {
-            if let Some(err) = state
+        if let Some(path) = artifact_path.as_deref()
+            && let Some(err) = state
                 .with_store(|s| s.set_job_artifact(id, path).err())
                 .flatten()
-            {
-                tracing::warn!(target: "blazar::jobs", job = %id, %err, "artifact path recording failed");
-            }
+        {
+            tracing::warn!(target: "blazar::jobs", job = %id, %err, "artifact path recording failed");
         }
     }
 
@@ -275,10 +274,8 @@ impl JobRuntime {
     ) {
         let outcome = state.with_store(|s| {
             let flipped = s.set_job_state(id, to, result_json, error).unwrap_or(false);
-            if flipped {
-                if let Err(err) = s.append_job_event(id, event_kind, None) {
-                    tracing::warn!(target: "blazar::jobs", job = %id, %err, "job event append failed");
-                }
+            if flipped && let Err(err) = s.append_job_event(id, event_kind, None) {
+                tracing::warn!(target: "blazar::jobs", job = %id, %err, "job event append failed");
             }
             flipped
         });
@@ -509,7 +506,7 @@ pub async fn jobs_cancel(
             return crate::proxy::openai_error(
                 500,
                 &format!("job {job_id} has unknown kind {other:?} — ledger corruption?"),
-            )
+            );
         }
     }
     let closed = state

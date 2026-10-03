@@ -26,11 +26,11 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -175,10 +175,10 @@ fn store_sidecar(part: &Path, sidecar: &ProgressSidecar) -> io::Result<()> {
 
     std::fs::rename(&tmp, &path)?;
 
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -527,15 +527,15 @@ async fn finalize_parallel(part: &Path, dest: &Path, plan: &FilePlan) -> Result<
         Ok(hex::encode(hasher.finalize()))
     })
     .await??;
-    if let Some(expected) = &plan.sha256 {
-        if !got.eq_ignore_ascii_case(expected) {
-            let _ = std::fs::remove_file(part);
-            let _ = std::fs::remove_file(sidecar_path(part));
-            return Err(anyhow!(
-                "sha256 mismatch for {}: expected {expected}, got {got}; partial deleted",
-                plan.filename
-            ));
-        }
+    if let Some(expected) = &plan.sha256
+        && !got.eq_ignore_ascii_case(expected)
+    {
+        let _ = std::fs::remove_file(part);
+        let _ = std::fs::remove_file(sidecar_path(part));
+        return Err(anyhow!(
+            "sha256 mismatch for {}: expected {expected}, got {got}; partial deleted",
+            plan.filename
+        ));
     }
     tokio::fs::rename(part, dest)
         .await
@@ -607,8 +607,8 @@ fn resume_state(
         .collect();
     let completed: Vec<u64> = map
         .iter()
-        .filter(|(&idx, &bytes)| bytes >= chunk_len(cp, idx))
-        .map(|(&idx, _)| idx)
+        .filter(|&(idx, bytes)| *bytes >= chunk_len(cp, *idx))
+        .map(|(idx, _)| *idx)
         .collect();
     for idx in completed {
         map.remove(&idx);
@@ -941,11 +941,7 @@ mod tests {
                         Some("bytes=0-0") => {
                             if fail_probe
                                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                    if v > 0 {
-                                        Some(v - 1)
-                                    } else {
-                                        None
-                                    }
+                                    if v > 0 { Some(v - 1) } else { None }
                                 })
                                 .is_ok()
                             {

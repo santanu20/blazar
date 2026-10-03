@@ -18,8 +18,8 @@
 //!   admission collapses the fan-out to 1 with a response header
 //!   saying so.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::http::HeaderMap;
 use serde_json::Value;
@@ -58,17 +58,18 @@ pub fn resolve_best_of(
     let body_val = body_field
         .filter(|v| v.is_u64() || v.is_string())
         .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(parse_u64)));
-    if let Some(v) = body_field.filter(|v| !v.is_null()) {
-        if v.as_u64().is_none() && v.as_str().and_then(parse_u64).is_none() {
-            return Err(format!("best_of must be an integer in 2..={MAX_BEST_OF}"));
-        }
+    if let Some(v) = body_field.filter(|v| !v.is_null())
+        && v.as_u64().is_none()
+        && v.as_str().and_then(parse_u64).is_none()
+    {
+        return Err(format!("best_of must be an integer in 2..={MAX_BEST_OF}"));
     }
-    if let (Some(h), Some(b)) = (header_val, body_val) {
-        if h != b {
-            return Err(format!(
-                "{HEADER} header ({h}) and best_of body field ({b}) disagree — send one"
-            ));
-        }
+    if let (Some(h), Some(b)) = (header_val, body_val)
+        && h != b
+    {
+        return Err(format!(
+            "{HEADER} header ({h}) and best_of body field ({b}) disagree — send one"
+        ));
     }
     Ok(header_val
         .or(body_val)
@@ -324,10 +325,10 @@ pub(crate) async fn fan_out(
 /// Stamp the transparency header onto a client-facing response (the
 /// child-facing copy already rides inside the reconstructed winner).
 pub fn stamp(resp: &mut axum::response::Response, hdr: Option<&str>) {
-    if let Some(h) = hdr {
-        if let Ok(v) = axum::http::HeaderValue::from_str(h) {
-            resp.headers_mut().insert(HEADER, v);
-        }
+    if let Some(h) = hdr
+        && let Ok(v) = axum::http::HeaderValue::from_str(h)
+    {
+        resp.headers_mut().insert(HEADER, v);
     }
 }
 

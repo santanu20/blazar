@@ -7,11 +7,11 @@
 //! every state transition publishes an event.
 
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use tokio::sync::Notify;
 
@@ -876,27 +876,27 @@ fn spanning_env_from_census(
     // enumeration — the CUDA pair would silently pin nothing.
     if lane_allows_vk && argv_device_free {
         let vk_ids: Option<Vec<u32>> = census_names.iter().map(|nm| parse_vk_id(nm)).collect();
-        if let Some(ids) = vk_ids {
-            if ids.len() == n as usize {
-                if ids.iter().copied().eq(0..n) {
-                    // Identity: the unfiltered child sees exactly the
-                    // plan's cards — no env needed.
-                    tracing::info!(
-                        ranks = n,
-                        "spanning spawn: Vulkan census is the full plan (no pin needed)"
-                    );
-                    return Vec::new();
-                }
+        if let Some(ids) = vk_ids
+            && ids.len() == n as usize
+        {
+            if ids.iter().copied().eq(0..n) {
+                // Identity: the unfiltered child sees exactly the
+                // plan's cards — no env needed.
                 tracing::info!(
                     ranks = n,
-                    devices = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
-                    "spanning spawn pinned to Vulkan cards (census indices)"
+                    "spanning spawn: Vulkan census is the full plan (no pin needed)"
                 );
-                return vec![(
-                    "GGML_VK_VISIBLE_DEVICES".to_string(),
-                    ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
-                )];
+                return Vec::new();
             }
+            tracing::info!(
+                ranks = n,
+                devices = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+                "spanning spawn pinned to Vulkan cards (census indices)"
+            );
+            return vec![(
+                "GGML_VK_VISIBLE_DEVICES".to_string(),
+                ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+            )];
         }
     }
     spanning_env_from_probe(Some(n), probed_nvidia)
@@ -2294,17 +2294,17 @@ impl Supervisor {
         let result = self.ensure_key_opts(&key, captive).await;
         // Best-effort affinity record: pin this prefix to the replica
         // that served it, so the next turn hits its warm cache.
-        if let Some(pk) = prefix {
-            if result.is_ok() {
-                self.note_prefix_affinity(&pk, &key);
-                // F8: remember the sys class this replica has warm.
-                let mut ring = self.sys_rings.entry(key).or_default();
-                if ring.len() >= SYS_RING_CAP {
-                    ring.pop_front();
-                }
-                if !ring.contains(&pk.sys) {
-                    ring.push_back(pk.sys);
-                }
+        if let Some(pk) = prefix
+            && result.is_ok()
+        {
+            self.note_prefix_affinity(&pk, &key);
+            // F8: remember the sys class this replica has warm.
+            let mut ring = self.sys_rings.entry(key).or_default();
+            if ring.len() >= SYS_RING_CAP {
+                ring.pop_front();
+            }
+            if !ring.contains(&pk.sys) {
+                ring.push_back(pk.sys);
             }
         }
         // LC1 predictive pre-loading: record the A→B edge on every
@@ -2458,15 +2458,15 @@ impl Supervisor {
             return name.to_string();
         }
         // (a) Sticky prefix: same conversation → same warm cache.
-        if let Some(pk) = prefix {
-            if let Some(hit) = self.prefix_affinity.get(&pk.convo) {
-                let key = hit.value().clone();
-                drop(hit);
-                if let Some(inst) = self.instances.get(&key) {
-                    let state = *inst.state.read().expect("state lock");
-                    if matches!(state, InstanceState::Ready | InstanceState::Sleeping) {
-                        return key;
-                    }
+        if let Some(pk) = prefix
+            && let Some(hit) = self.prefix_affinity.get(&pk.convo)
+        {
+            let key = hit.value().clone();
+            drop(hit);
+            if let Some(inst) = self.instances.get(&key) {
+                let state = *inst.state.read().expect("state lock");
+                if matches!(state, InstanceState::Ready | InstanceState::Sleeping) {
+                    return key;
                 }
             }
         }
@@ -2493,15 +2493,14 @@ impl Supervisor {
             if best.as_ref().is_none_or(|b| load < b.1) {
                 best = Some((e.key().clone(), load));
             }
-            if let Some(pk) = prefix {
-                if self
+            if let Some(pk) = prefix
+                && self
                     .sys_rings
                     .get(e.key())
                     .is_some_and(|ring| ring.contains(&pk.sys))
-                    && scored.as_ref().is_none_or(|sc| load < sc.1)
-                {
-                    scored = Some((e.key().clone(), load));
-                }
+                && scored.as_ref().is_none_or(|sc| load < sc.1)
+            {
+                scored = Some((e.key().clone(), load));
             }
         }
         // (a2) Cache-aware coalesce: same system-prompt class, new
@@ -3248,37 +3247,37 @@ impl Supervisor {
         let mut warnings = Vec::new();
         let mut i = 0;
         while i < argv.len() {
-            if argv[i] == "--device" {
-                if let Some(name) = argv.get(i + 1) {
-                    if live.iter().any(|d| &d.name == name) {
+            if argv[i] == "--device"
+                && let Some(name) = argv.get(i + 1)
+            {
+                if live.iter().any(|d| &d.name == name) {
+                    out.push(argv[i].clone());
+                    out.push(name.clone());
+                } else {
+                    let mapped = frozen
+                        .iter()
+                        .find(|d| &d.name == name)
+                        .and_then(|old| live.iter().find(|l| same_device(old, l)));
+                    if let Some(l) = mapped {
                         out.push(argv[i].clone());
-                        out.push(name.clone());
-                    } else {
-                        let mapped = frozen
-                            .iter()
-                            .find(|d| &d.name == name)
-                            .and_then(|old| live.iter().find(|l| same_device(old, l)));
-                        if let Some(l) = mapped {
-                            out.push(argv[i].clone());
-                            out.push(l.name.clone());
-                            warnings.push(format!(
+                        out.push(l.name.clone());
+                        warnings.push(format!(
                             "device {name} re-enumerated as {} in the serving child context; using it",
                             l.name
                         ));
-                        } else {
-                            let sees = live
-                                .iter()
-                                .map(|d| d.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            warnings.push(format!(
+                    } else {
+                        let sees = live
+                            .iter()
+                            .map(|d| d.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        warnings.push(format!(
                             "device {name} not visible to the serving child (sees: {sees}); dropping --device, llama.cpp will auto-pick"
                         ));
-                        }
                     }
-                    i += 2;
-                    continue;
                 }
+                i += 2;
+                continue;
             }
             out.push(argv[i].clone());
             i += 1;
@@ -3553,7 +3552,7 @@ impl Supervisor {
                             "no lora {stem:?} attached to {name:?}: attach it with \
                              `blazar lora add {name} <adapter-file>` then request \
                              `{name}+{stem}` (attached rows: `blazar lora list`)"
-                        )))
+                        )));
                     }
                     many => {
                         let ids: Vec<i64> = many.iter().map(|l| l.id).collect();
@@ -3618,10 +3617,10 @@ impl Supervisor {
         // LC4: in-memory adaptive slots fill in ONLY where the user left
         // slots unset (manual overlay always wins; `tune --slots` writes
         // the overlay, which then shadows any adoption).
-        if overlay.slots.is_none() {
-            if let Some(adopted) = self.adopted_slots.get(name) {
-                overlay.slots = Some(*adopted);
-            }
+        if overlay.slots.is_none()
+            && let Some(adopted) = self.adopted_slots.get(name)
+        {
+            overlay.slots = Some(*adopted);
         }
         // Engine routing v1: per-model pin (overlay `engine`, tag or
         // kind) > auto-format route (mode = "auto") > the daemon's
@@ -3665,16 +3664,16 @@ impl Supervisor {
         // paradigm named. Only a FORK lane advertising the arch (when a
         // diffusion-capable one ships) bypasses the guard — mainstream
         // mined sets record loader support, which is the hazard itself.
-        if let blazar_core::hfmeta::ModelMeta::Gguf(g) = meta_box.borrow_meta() {
-            if let Some(teach) = Self::diffusion_paradigm_block(
+        if let blazar_core::hfmeta::ModelMeta::Gguf(g) = meta_box.borrow_meta()
+            && let Some(teach) = Self::diffusion_paradigm_block(
                 &g.architecture,
                 &Self::fork_advertising_lanes(&g.architecture, &store),
-            ) {
-                return Err(SupervisionError::UnsupportedModel(format!(
-                    "{}: {teach}",
-                    model.path
-                )));
-            }
+            )
+        {
+            return Err(SupervisionError::UnsupportedModel(format!(
+                "{}: {teach}",
+                model.path
+            )));
         }
         let loras = Self::resolve_lora_lane(
             &store
@@ -3942,20 +3941,21 @@ impl Supervisor {
         // alone exceed free VRAM — the child will either spill layers to
         // CPU (slow) or die mid-load. Teaching warn only: partial offload
         // is legitimate, probe failure is skipped, never blocks a spawn.
-        if let Some(f) = &fresh {
-            if self.config.spawn_mem_guard && self.hardware.has_gpu() {
-                let free_vram: u64 = f.gpus.iter().map(|g| g.free_mib).sum();
-                let weights_mib = model_bytes / (1024 * 1024);
-                if free_vram > 0 && weights_mib > free_vram * 95 / 100 {
-                    tracing::warn!(
-                        model = name,
-                        weights_mib,
-                        free_vram_mib = free_vram,
-                        "model weights exceed free VRAM at spawn time — the engine will spill \
+        if let Some(f) = &fresh
+            && self.config.spawn_mem_guard
+            && self.hardware.has_gpu()
+        {
+            let free_vram: u64 = f.gpus.iter().map(|g| g.free_mib).sum();
+            let weights_mib = model_bytes / (1024 * 1024);
+            if free_vram > 0 && weights_mib > free_vram * 95 / 100 {
+                tracing::warn!(
+                    model = name,
+                    weights_mib,
+                    free_vram_mib = free_vram,
+                    "model weights exceed free VRAM at spawn time — the engine will spill \
                          layers to CPU (slow) or fail mid-load; consider a smaller quant \
                          (blazar fit), freeing GPU memory (blazar ps), or kv quantization"
-                    );
-                }
+                );
             }
         }
         // Auto GPU bin-packing (LC2): with several cards and no manual
@@ -4158,16 +4158,15 @@ impl Supervisor {
             && sd_backend_token.is_none()
             && engine.kind() == blazar_core::engine_kind::EngineKind::SdCpp
             && self.config.effective_devices(name).is_empty()
+            && let Some((token, display)) = pick_sd_backend_device(&manifest.devices)
         {
-            if let Some((token, display)) = pick_sd_backend_device(&manifest.devices) {
-                tracing::info!(
-                    model = name,
-                    device = %token,
-                    "sdcpp backend token: engine census pick for the --backend module split"
-                );
-                sd_backend_token = Some(token);
-                picked_display = Some(display);
-            }
+            tracing::info!(
+                model = name,
+                device = %token,
+                "sdcpp backend token: engine census pick for the --backend module split"
+            );
+            sd_backend_token = Some(token);
+            picked_display = Some(display);
         }
         // Placement label for `ps` (`full@<card>`): auto-pick names its
         // card above; cover the other placements — manual `devices`
@@ -4345,7 +4344,10 @@ impl Supervisor {
                     model_bytes,
                     candidate_kv,
                 ) {
-                    tracing::warn!(model = name, "co-residency planner: KV downgraded to q8_0 to fit alongside resident models (weights+KV exceed VRAM)");
+                    tracing::warn!(
+                        model = name,
+                        "co-residency planner: KV downgraded to q8_0 to fit alongside resident models (weights+KV exceed VRAM)"
+                    );
                     tuning.kv_quant = Some(true);
                 }
             }
@@ -4662,21 +4664,22 @@ impl Supervisor {
         // pin is the user's explicit choice and stays untouched (H4).
         if let Some(arch) = Self::classify_unknown_arch(&last_load_tail) {
             let advertisers = Self::advertising_lanes(&arch, &store, routed_tag.as_deref());
-            if !forced_lane && overlay.engine.is_none() {
-                if let Some(tag) = advertisers.first() {
-                    tracing::warn!(
-                        model = name,
-                        architecture = %arch,
-                        engine = %tag,
-                        "mainstream lane rejected this architecture — re-routing to the \
-                         installed lane that advertises it (single attempt)"
-                    );
-                    self.capability_pins
-                        .lock()
-                        .expect("capability pins lock")
-                        .insert(name.to_string(), tag.clone());
-                    return Box::pin(self.spawn_instance_forced(key, true, false)).await;
-                }
+            if !forced_lane
+                && overlay.engine.is_none()
+                && let Some(tag) = advertisers.first()
+            {
+                tracing::warn!(
+                    model = name,
+                    architecture = %arch,
+                    engine = %tag,
+                    "mainstream lane rejected this architecture — re-routing to the \
+                     installed lane that advertises it (single attempt)"
+                );
+                self.capability_pins
+                    .lock()
+                    .expect("capability pins lock")
+                    .insert(name.to_string(), tag.clone());
+                return Box::pin(self.spawn_instance_forced(key, true, false)).await;
             }
             // No rescue available (no advertiser, already re-routed, or
             // the user pinned the failing lane): teach the escape hatch.
@@ -4710,14 +4713,15 @@ impl Supervisor {
         // build passes it and aborts the child at the first
         // handshake. Classified only when this spawn's argv actually
         // dialed RPC backends, so unrelated connect errors stay raw.
-        if child_died_during_load && argv_dialed_rpc {
-            if let Some(teach) = Self::classify_rpc_handshake_failure(&last_load_tail) {
-                return Err(SupervisionError::EngineCrashed(format!(
-                    "{key} [{}]: {} — {teach}",
-                    manifest.tag,
-                    Self::tail_excerpt(&last_load_tail)
-                )));
-            }
+        if child_died_during_load
+            && argv_dialed_rpc
+            && let Some(teach) = Self::classify_rpc_handshake_failure(&last_load_tail)
+        {
+            return Err(SupervisionError::EngineCrashed(format!(
+                "{key} [{}]: {} — {teach}",
+                manifest.tag,
+                Self::tail_excerpt(&last_load_tail)
+            )));
         }
         Err(if child_died_during_load {
             SupervisionError::EngineCrashed(format!(
@@ -5008,10 +5012,10 @@ drop them from rpc_servers in config.toml",
                 None
             }
         };
-        if let Some(reason) = trigger {
-            if let Err(e) = self.rollback_active_engine(&reason) {
-                tracing::warn!("engine rollback skipped: {e:#}");
-            }
+        if let Some(reason) = trigger
+            && let Err(e) = self.rollback_active_engine(&reason)
+        {
+            tracing::warn!("engine rollback skipped: {e:#}");
         }
     }
 
@@ -5292,15 +5296,15 @@ drop them from rpc_servers in config.toml",
         if file.exists() {
             restores.push((0, format!("_auto-{ctx}")));
         }
-        if let Some(dir) = file.parent() {
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                for entry in rd.flatten() {
-                    let name = entry.file_name();
-                    if let Some(id) = Self::bank_slot_of(&name, ctx) {
-                        if id != 0 {
-                            restores.push((id, name.to_string_lossy().into_owned()));
-                        }
-                    }
+        if let Some(dir) = file.parent()
+            && let Ok(rd) = std::fs::read_dir(dir)
+        {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                if let Some(id) = Self::bank_slot_of(&name, ctx)
+                    && id != 0
+                {
+                    restores.push((id, name.to_string_lossy().into_owned()));
                 }
             }
         }
@@ -5805,10 +5809,10 @@ drop them from rpc_servers in config.toml",
             return;
         }
         // Recent-failure backoff.
-        if let Some(t) = self.preload_failures.get(&next) {
-            if t.elapsed() < PRELOAD_BACKOFF {
-                return;
-            }
+        if let Some(t) = self.preload_failures.get(&next)
+            && t.elapsed() < PRELOAD_BACKOFF
+        {
+            return;
         }
         // Known model + capacity headroom.
         let Ok(store) = Store::open(&self.dirs) else {
@@ -6370,11 +6374,7 @@ drop them from rpc_servers in config.toml",
         argv_cap
             .or_else(|| {
                 let s = self.config.slots;
-                if s > 0 {
-                    Some(i64::from(s))
-                } else {
-                    None
-                }
+                if s > 0 { Some(i64::from(s)) } else { None }
             })
             .unwrap_or(4)
     }
@@ -6450,11 +6450,11 @@ drop them from rpc_servers in config.toml",
         // instance — on the instance counter (prenatal reads zero then;
         // fall through). Base-keyed, matching `begin_request`.
         let base = model_of_key(name).to_string();
-        if let Some(mut e) = self.prenatal_load.get_mut(&base) {
-            if *e > 0 {
-                *e -= 1;
-                return;
-            }
+        if let Some(mut e) = self.prenatal_load.get_mut(&base)
+            && *e > 0
+        {
+            *e -= 1;
+            return;
         }
         // Replica lanes: the guard may spell a base name while the load
         // landed on a `model#N` replica. Decrement a holder that still
@@ -6519,12 +6519,11 @@ drop them from rpc_servers in config.toml",
     /// (`end_request` falls through when the prenatal entry is empty).
     fn fold_prenatal_load(&self, key: &str) {
         let base = model_of_key(key);
-        if let Some((_, p)) = self.prenatal_load.remove(base) {
-            if p > 0 {
-                if let Some(i) = self.instances.get(key) {
-                    i.in_flight.fetch_add(p, Ordering::SeqCst);
-                }
-            }
+        if let Some((_, p)) = self.prenatal_load.remove(base)
+            && p > 0
+            && let Some(i) = self.instances.get(key)
+        {
+            i.in_flight.fetch_add(p, Ordering::SeqCst);
         }
     }
 
@@ -6714,11 +6713,11 @@ drop them from rpc_servers in config.toml",
         e.1 = Instant::now();
         // Bound the table: models come and go; 256 entries is far beyond
         // any live box's model count.
-        if heat.len() > 256 {
-            if let Some((coldest, _)) = heat.iter().min_by_key(|(_, v)| v.0) {
-                let coldest = coldest.clone();
-                heat.remove(&coldest);
-            }
+        if heat.len() > 256
+            && let Some((coldest, _)) = heat.iter().min_by_key(|(_, v)| v.0)
+        {
+            let coldest = coldest.clone();
+            heat.remove(&coldest);
         }
     }
 
@@ -7318,6 +7317,8 @@ mod routing_tests {
     /// warned fallback; gaining the file flag on an engine update flips
     /// the lane with no blazar-side change.
     #[allow(non_snake_case)]
+    // One cohesive lane scenario: argv fallback + three gate variants.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn unit__mint_child_auth__keyfile_lane_argv_fallback_and_gates() {
         use blazar_core::engine_kind::EngineKind as K;
@@ -7403,34 +7404,38 @@ mod routing_tests {
         );
 
         // No auth flag surface: warn-skip, child stays open.
-        assert!(auto
-            .mint_child_auth("m4", &tcp, &manifest(&[]), K::LlamaCpp)
-            .unwrap()
-            .is_none());
+        assert!(
+            auto.mint_child_auth("m4", &tcp, &manifest(&[]), K::LlamaCpp)
+                .unwrap()
+                .is_none()
+        );
 
         // Unix socket: filesystem permissions already gate it (auto-off).
         let uds = Endpoint::Unix {
             socket: "/unused/blazar.sock".into(),
         };
-        assert!(auto
-            .mint_child_auth("m5", &uds, &manifest(&["--api-key"]), K::LlamaCpp)
-            .unwrap()
-            .is_none());
+        assert!(
+            auto.mint_child_auth("m5", &uds, &manifest(&["--api-key"]), K::LlamaCpp)
+                .unwrap()
+                .is_none()
+        );
 
         // Explicit opt-out beats any manifest surface.
         let off = blazar_core::Config {
             child_auth: Some(false),
             ..Config::default()
         };
-        assert!(sup(off)
-            .mint_child_auth(
-                "m6",
-                &tcp,
-                &manifest(&["--api-key", "--api-key-file"]),
-                K::LlamaCpp
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            sup(off)
+                .mint_child_auth(
+                    "m6",
+                    &tcp,
+                    &manifest(&["--api-key", "--api-key-file"]),
+                    K::LlamaCpp
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
@@ -8891,12 +8896,12 @@ mod routing_tests {
         assert_eq!(model_of_key("m"), "m");
         assert_eq!(model_of_key("m#3"), "m");
         assert_eq!(model_of_key("m#3#4"), "m"); // first '#' wins
-                                                // @vision suffix (lazy projector respawn key) must never leak
-                                                // into model resolution — evict_model-style filters stay correct
+        // @vision suffix (lazy projector respawn key) must never leak
+        // into model resolution — evict_model-style filters stay correct
         assert_eq!(model_of_key("m@vision"), "m");
         assert_eq!(model_of_key("m#1@vision"), "m");
         assert_eq!(model_of_key("m@vision#1"), "m"); // '@' stripped first
-                                                     // +lora variant keys: stem stripped after '@' and '#N'
+        // +lora variant keys: stem stripped after '@' and '#N'
         assert_eq!(model_of_key("m+adapter"), "m");
         assert_eq!(model_of_key("m+adapter#2"), "m");
         assert_eq!(model_of_key("m#2+adapter"), "m"); // '#' first if adjacent
@@ -8913,8 +8918,8 @@ mod routing_tests {
         assert_eq!(lora_suffix_of_key("m#2"), None);
         assert_eq!(lora_suffix_of_key("m@vision"), None);
         assert_eq!(lora_suffix_of_key("m+"), None); // degenerate stays dense
-                                                    // Display keeps the variant marker so ps distinguishes children;
-                                                    // @vision/#N stay hidden.
+        // Display keeps the variant marker so ps distinguishes children;
+        // @vision/#N stay hidden.
         assert_eq!(display_name_of_key("m+foo"), "m+foo");
         assert_eq!(display_name_of_key("m+foo#2"), "m+foo");
         assert_eq!(display_name_of_key("m@vision"), "m");
@@ -9115,7 +9120,7 @@ mod routing_tests {
         assert_eq!(split_replica("m#0"), Some(("m", 0)));
         assert_eq!(split_replica("m#x"), None); // non-numeric suffix
         assert_eq!(split_replica("m#"), None); // empty suffix
-                                               // vision keys keep their replica index underneath the suffix
+        // vision keys keep their replica index underneath the suffix
         assert_eq!(split_replica("m#1@vision"), Some(("m", 1)));
         assert_eq!(split_replica("m@vision"), None); // no replica part
     }
@@ -9524,10 +9529,11 @@ mod routing_tests {
         // resolves to the global lane (serving_lane returns None when the
         // routed kind matches the global engine kind) — the pin is gone
         // and the resolver is back on its normal decision path.
-        assert!(sup
-            .resolve_routed_engine(&store, &overlay, &model)
-            .unwrap()
-            .is_none());
+        assert!(
+            sup.resolve_routed_engine(&store, &overlay, &model)
+                .unwrap()
+                .is_none()
+        );
         assert!(
             !sup.capability_pins.lock().unwrap().contains_key("m"),
             "superseded pin must be dropped"

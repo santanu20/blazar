@@ -70,7 +70,7 @@ pub async fn audio_speech(
                      piper speaks WAV (omit response_format) or \"pcm\" (raw streamed \
                      s16le); convert downstream if you need {other}"
                 ),
-            )
+            );
         }
     };
     let speed = match req.get("speed").and_then(Value::as_f64) {
@@ -81,13 +81,13 @@ pub async fn audio_speech(
 
     // Remote intent wins: `name:model` never goes local.
     if split_remote(voice, &state.config).is_some() {
-        if let Some(Extension(k)) = &key_ext {
-            if let Some(entry) = state.keys.entry(&k.name) {
-                if let Err(rej) = state.keys.check(&entry, voice) {
-                    return rej.to_response();
-                }
-                state.keys.charge_request(&k.name);
+        if let Some(Extension(k)) = &key_ext
+            && let Some(entry) = state.keys.entry(&k.name)
+        {
+            if let Err(rej) = state.keys.check(&entry, voice) {
+                return rej.to_response();
             }
+            state.keys.charge_request(&k.name);
         }
         return crate::remotes::forward_with_health(
             &state,

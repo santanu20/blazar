@@ -15,10 +15,10 @@ static CACHE: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
 /// Free VRAM (MiB, summed across NVIDIA cards) sampled no older than
 /// `ttl`. `None` when this box has no working `nvidia-smi`.
 pub fn free_vram_mib(ttl: Duration) -> Option<u64> {
-    if let Some((at, mib)) = *CACHE.lock().unwrap() {
-        if at.elapsed() <= ttl {
-            return Some(mib);
-        }
+    if let Some((at, mib)) = *CACHE.lock().unwrap()
+        && at.elapsed() <= ttl
+    {
+        return Some(mib);
     }
     let fresh = blazar_runtime::probe::nvidia_free_vram_mib()?;
     *CACHE.lock().unwrap() = Some((Instant::now(), fresh));

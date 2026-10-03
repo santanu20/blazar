@@ -29,7 +29,7 @@
 //!   parsed — never estimated.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,7 +39,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
-use futures::stream::{unfold, StreamExt};
+use futures::stream::{StreamExt, unfold};
 use tokio::sync::watch;
 
 use crate::keys::KeyCtx;

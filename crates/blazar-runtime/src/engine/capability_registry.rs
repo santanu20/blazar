@@ -112,13 +112,13 @@ pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<RegistryLa
 /// user-configurable input, so a hostile mirror must not be able to
 /// buffer unbounded memory behind the fetch timeout.
 async fn read_body_bounded(resp: &mut reqwest::Response, url: &str, cap: usize) -> Result<String> {
-    if let Some(len) = resp.content_length() {
-        if len > cap as u64 {
-            anyhow::bail!(
-                "capability registry {url} declares {len} bytes — over the {cap}-byte cap; \
+    if let Some(len) = resp.content_length()
+        && len > cap as u64
+    {
+        anyhow::bail!(
+            "capability registry {url} declares {len} bytes — over the {cap}-byte cap; \
                  point capability_registry_url at a sane mirror"
-            );
-        }
+        );
     }
     let mut body = Vec::with_capacity(4096);
     while let Some(chunk) = resp
@@ -337,12 +337,12 @@ mod tests {
         );
         assert_eq!(resolve_registry_url(Some("  ")), None);
         // Env fills in when config is absent.
-        std::env::set_var(REGISTRY_URL_ENV, "http://127.0.0.1:9/reg.json");
+        crate::test_env::set_env(REGISTRY_URL_ENV, "http://127.0.0.1:9/reg.json");
         assert_eq!(
             resolve_registry_url(None),
             Some("http://127.0.0.1:9/reg.json".to_string())
         );
-        std::env::remove_var(REGISTRY_URL_ENV);
+        crate::test_env::remove_env(REGISTRY_URL_ENV);
         assert_eq!(
             resolve_registry_url(None),
             Some(DEFAULT_REGISTRY_URL.to_string())

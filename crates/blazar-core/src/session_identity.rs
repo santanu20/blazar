@@ -63,11 +63,7 @@ pub fn build(dirs: &BlazarDirs, config: &Config, model: &str) -> Option<SessionI
         // old-vs-new direction without a schema change.
         cache_type: {
             let (k, v) = config.effective_cache_type_kv(model);
-            if k == v {
-                k
-            } else {
-                format!("{k}/{v}")
-            }
+            if k == v { k } else { format!("{k}/{v}") }
         },
         kv_unified: config.effective_kv_unified(model),
         // F121: record the overlay-effective slot count, not the raw
@@ -131,10 +127,10 @@ pub fn verify(saved: &SessionIdentity, current: &SessionIdentity) -> Vec<String>
             current.engine_sha.clone(),
         );
     }
-    if let (Some(s), Some(c)) = (&saved.model_sha, &current.model_sha) {
-        if s != c {
-            push("model_sha", s.clone(), c.clone());
-        }
+    if let (Some(s), Some(c)) = (&saved.model_sha, &current.model_sha)
+        && s != c
+    {
+        push("model_sha", s.clone(), c.clone());
     }
     if saved.ctx != current.ctx {
         push("ctx", saved.ctx.to_string(), current.ctx.to_string());
@@ -146,10 +142,10 @@ pub fn verify(saved: &SessionIdentity, current: &SessionIdentity) -> Vec<String>
             current.cache_type.clone(),
         );
     }
-    if let (Some(s), Some(c)) = (saved.kv_unified, current.kv_unified) {
-        if s != c {
-            push("kv_unified", s.to_string(), c.to_string());
-        }
+    if let (Some(s), Some(c)) = (saved.kv_unified, current.kv_unified)
+        && s != c
+    {
+        push("kv_unified", s.to_string(), c.to_string());
     }
     if saved.slots != current.slots {
         push("slots", saved.slots.to_string(), current.slots.to_string());
@@ -202,17 +198,21 @@ mod tests {
         );
         let mut t = ident();
         t.blazar_version = "0.5.0".into();
-        assert!(verify(&base, &t)
-            .iter()
-            .any(|d| d.contains("blazar_version")));
+        assert!(
+            verify(&base, &t)
+                .iter()
+                .any(|d| d.contains("blazar_version"))
+        );
         let mut t = ident();
         t.engine_sha = "zzz".into();
         assert!(verify(&base, &t).iter().any(|d| d.contains("engine_sha")));
         let mut t = ident();
         t.ctx = 16_384;
-        assert!(verify(&base, &t)
-            .iter()
-            .any(|d| d.contains("ctx: saved 8192")));
+        assert!(
+            verify(&base, &t)
+                .iter()
+                .any(|d| d.contains("ctx: saved 8192"))
+        );
         let mut t = ident();
         t.cache_type = "q4_0".into();
         assert!(verify(&base, &t).iter().any(|d| d.contains("cache_type")));
@@ -241,9 +241,11 @@ mod tests {
         current.model_sha = Some("same".into());
         assert_eq!(verify(&saved, &current).len(), 0);
         current.model_sha = Some("other".into());
-        assert!(verify(&saved, &current)
-            .iter()
-            .any(|d| d.contains("model_sha")));
+        assert!(
+            verify(&saved, &current)
+                .iter()
+                .any(|d| d.contains("model_sha"))
+        );
     }
 
     #[test]

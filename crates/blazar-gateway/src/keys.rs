@@ -182,26 +182,26 @@ impl KeysLimiter {
     pub fn loaded(store: Option<&Store>, entries: Vec<blazar_core::ApiKey>) -> Self {
         let today = utc_day(SystemTime::now());
         let mut pre: HashMap<String, KeyState> = HashMap::new();
-        if let Some(s) = store {
-            if let Ok(rows) = s.key_usage(&today) {
-                for KeyUsageRow {
+        if let Some(s) = store
+            && let Ok(rows) = s.key_usage(&today)
+        {
+            for KeyUsageRow {
+                name,
+                requests,
+                tokens,
+                ..
+            } in rows
+            {
+                pre.insert(
                     name,
-                    requests,
-                    tokens,
-                    ..
-                } in rows
-                {
-                    pre.insert(
-                        name,
-                        KeyState {
-                            day: today.clone(),
-                            requests: u64::try_from(requests).unwrap_or(0),
-                            tokens: u64::try_from(tokens).unwrap_or(0),
-                            dirty: false,
-                            ..KeyState::default()
-                        },
-                    );
-                }
+                    KeyState {
+                        day: today.clone(),
+                        requests: u64::try_from(requests).unwrap_or(0),
+                        tokens: u64::try_from(tokens).unwrap_or(0),
+                        dirty: false,
+                        ..KeyState::default()
+                    },
+                );
             }
         }
         Self {
@@ -722,10 +722,10 @@ pub fn charge_outgoing(
         limiter,
     )));
     let mapped = body.into_data_stream().map(move |r| {
-        if let Ok(bytes) = r.as_ref() {
-            if let Some(f) = finish.lock().expect("usage finisher").0.as_mut() {
-                f.push(bytes);
-            }
+        if let Ok(bytes) = r.as_ref()
+            && let Some(f) = finish.lock().expect("usage finisher").0.as_mut()
+        {
+            f.push(bytes);
         }
         r.map_err(|e| std::io::Error::other(e.to_string()))
     });
@@ -1017,8 +1017,9 @@ mod tests {
         let total = s.finish(&lim);
         assert_eq!(total, 10);
         let snap = lim.usage_snapshot();
-        assert!(snap
-            .iter()
-            .any(|(n, _, req, tok)| n == "ci" && *tok == 10 && *req == 0));
+        assert!(
+            snap.iter()
+                .any(|(n, _, req, tok)| n == "ci" && *tok == 10 && *req == 0)
+        );
     }
 }

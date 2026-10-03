@@ -4,7 +4,7 @@
 //! outbound traffic is user-initiated engine/model downloads. Powered by
 //! upstream llama.cpp, mistral.rs and `SGLang` — unmodified.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -14,15 +14,15 @@ use std::time::Duration;
 
 use blazar_core::engine_kind::EngineKind;
 use blazar_core::{BlazarDirs, Config, Store};
-use blazar_runtime::engine::build::{
-    detect_toolchain, nvidia_gpu_facts, parse_fork_spec, path_dirs, require_toolchain,
-    validate_commit_sha, validate_repo_slug, BuildBackend, BuildOpts, BuildSource, Toolchain,
-};
-use blazar_runtime::engine::gh::{btag_number, same_build, GhClient};
-use blazar_runtime::engine::{EngineManager, STALLED_INSTALL_GRACE};
-use blazar_runtime::engine_impl::Engine;
 use blazar_runtime::EventBus;
 use blazar_runtime::VerifyReport;
+use blazar_runtime::engine::build::{
+    BuildBackend, BuildOpts, BuildSource, Toolchain, detect_toolchain, nvidia_gpu_facts,
+    parse_fork_spec, path_dirs, require_toolchain, validate_commit_sha, validate_repo_slug,
+};
+use blazar_runtime::engine::gh::{GhClient, btag_number, same_build};
+use blazar_runtime::engine::{EngineManager, STALLED_INSTALL_GRACE};
+use blazar_runtime::engine_impl::Engine;
 use blazar_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
 
 #[derive(Parser)]
@@ -1126,56 +1126,55 @@ fn match_model_basename(input: &str, rows: &[blazar_core::store::ModelRow]) -> O
 /// last resort for API callers). Store hits never touch the network.
 async fn ensure_run_model(name: &str) -> Result<String> {
     let d = dirs();
-    if d.db_file().is_file() {
-        if let Ok(store) = Store::open(&d) {
-            let resolved = store.resolve_model_name(name);
-            if let Ok(Some(row)) = store.get_model(&resolved) {
-                offer_missing_engine(&d, &row).await;
-                return Ok(resolved);
-            }
-            // Miss with a file-shaped input: resolve by exact basename
-            // before anything network-shaped gets a chance (`run
-            // model-Q2_K.gguf` is never a repo ref worth pulling).
-            if let Ok(rows) = store.list_models() {
-                if let Some(local) = match_model_basename(&resolved, &rows) {
-                    if let Ok(Some(row)) = store.get_model(&local) {
-                        println!("{resolved} resolves to stored model {local}");
-                        offer_missing_engine(&d, &row).await;
-                        return Ok(local);
-                    }
-                }
-            }
-            // Miss: repo refs and catalog short names auto-pull
-            // (Ctrl-C keeps the partial; `blazar pull` resumes it).
-            if let Ok(t) = blazar_runtime::hf::parse_pull_target(&resolved) {
-                // Catalog short names differ from the row the pull
-                // normalizes to (`qwen2.5-0.5b` -> row
-                // `qwen2.5-0.5b-instruct`). Check the pull's canonical
-                // name FIRST: pulling over an existing row would
-                // replace + prune it (data hazard, not a fetch).
-                let local = blazar_runtime::hf::registry_name(&t.repo);
-                if let Ok(Some(row)) = store.get_model(&local) {
-                    offer_missing_engine(&d, &row).await;
-                    return Ok(local);
-                }
-                println!(
-                    "{resolved} not in the store — pulling {}:{} first \
-                     (Ctrl-C keeps the partial for resume)",
-                    t.repo, t.quant
-                );
-                let (row, already) = pull_model(&resolved, false).await?;
-                if already {
-                    println!("already present as {} — starting", row.name);
-                }
-                offer_missing_engine(&d, &row).await;
-                return Ok(row.name);
-            }
-            // Nothing matched and nothing parses: fail HERE, not at
-            // the daemon on the first REPL send. The daemon's
-            // not-found teaching stays reachable for callers that
-            // bypass the CLI (`curl /v1/...`).
-            return Err(no_such_model(&resolved));
+    if d.db_file().is_file()
+        && let Ok(store) = Store::open(&d)
+    {
+        let resolved = store.resolve_model_name(name);
+        if let Ok(Some(row)) = store.get_model(&resolved) {
+            offer_missing_engine(&d, &row).await;
+            return Ok(resolved);
         }
+        // Miss with a file-shaped input: resolve by exact basename
+        // before anything network-shaped gets a chance (`run
+        // model-Q2_K.gguf` is never a repo ref worth pulling).
+        if let Ok(rows) = store.list_models()
+            && let Some(local) = match_model_basename(&resolved, &rows)
+            && let Ok(Some(row)) = store.get_model(&local)
+        {
+            println!("{resolved} resolves to stored model {local}");
+            offer_missing_engine(&d, &row).await;
+            return Ok(local);
+        }
+        // Miss: repo refs and catalog short names auto-pull
+        // (Ctrl-C keeps the partial; `blazar pull` resumes it).
+        if let Ok(t) = blazar_runtime::hf::parse_pull_target(&resolved) {
+            // Catalog short names differ from the row the pull
+            // normalizes to (`qwen2.5-0.5b` -> row
+            // `qwen2.5-0.5b-instruct`). Check the pull's canonical
+            // name FIRST: pulling over an existing row would
+            // replace + prune it (data hazard, not a fetch).
+            let local = blazar_runtime::hf::registry_name(&t.repo);
+            if let Ok(Some(row)) = store.get_model(&local) {
+                offer_missing_engine(&d, &row).await;
+                return Ok(local);
+            }
+            println!(
+                "{resolved} not in the store — pulling {}:{} first \
+                     (Ctrl-C keeps the partial for resume)",
+                t.repo, t.quant
+            );
+            let (row, already) = pull_model(&resolved, false).await?;
+            if already {
+                println!("already present as {} — starting", row.name);
+            }
+            offer_missing_engine(&d, &row).await;
+            return Ok(row.name);
+        }
+        // Nothing matched and nothing parses: fail HERE, not at
+        // the daemon on the first REPL send. The daemon's
+        // not-found teaching stays reachable for callers that
+        // bypass the CLI (`curl /v1/...`).
+        return Err(no_such_model(&resolved));
     }
     Ok(name.to_string())
 }
@@ -2211,40 +2210,40 @@ fn routed_engine_lane(
     // mainstream manifests mine loader-level support (llada is in the
     // 150+ arch set of every overlay build), which is exactly the
     // hazard — loading is not serving.
-    if let Some(arch) = arch {
-        if blazar_core::DIFFUSION_PARADIGM_ARCHS.contains(&arch) {
-            // Decoded manifests must outlive the borrowed lane views.
-            let decoded: Vec<(usize, blazar_runtime::Manifest)> = engine_rows
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
-                .filter(|(_, r)| r.lane_class() == blazar_core::engine_kind::LaneClass::Fork)
-                .filter_map(|(i, r)| {
-                    serde_json::from_str::<blazar_runtime::Manifest>(&r.manifest)
-                        .ok()
-                        .map(|m| (i, m))
-                })
-                .collect();
-            let lanes: Vec<blazar_core::engine_kind::LaneArchView> = decoded
-                .iter()
-                .map(|(i, m)| {
-                    (
-                        engine_rows[*i].tag.as_str(),
-                        engine_rows[*i].lane_class(),
-                        m.advertised_archs(),
-                    )
-                })
-                .collect();
-            if blazar_core::engine_kind::advertising_lanes(arch, None, &lanes).is_empty() {
-                return Err(format!(
-                    "block-diffusion LLM (arch '{arch}') — no installed lane can serve it: \
+    if let Some(arch) = arch
+        && blazar_core::DIFFUSION_PARADIGM_ARCHS.contains(&arch)
+    {
+        // Decoded manifests must outlive the borrowed lane views.
+        let decoded: Vec<(usize, blazar_runtime::Manifest)> = engine_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+            .filter(|(_, r)| r.lane_class() == blazar_core::engine_kind::LaneClass::Fork)
+            .filter_map(|(i, r)| {
+                serde_json::from_str::<blazar_runtime::Manifest>(&r.manifest)
+                    .ok()
+                    .map(|m| (i, m))
+            })
+            .collect();
+        let lanes: Vec<blazar_core::engine_kind::LaneArchView> = decoded
+            .iter()
+            .map(|(i, m)| {
+                (
+                    engine_rows[*i].tag.as_str(),
+                    engine_rows[*i].lane_class(),
+                    m.advertised_archs(),
+                )
+            })
+            .collect();
+        if blazar_core::engine_kind::advertising_lanes(arch, None, &lanes).is_empty() {
+            return Err(format!(
+                "block-diffusion LLM (arch '{arch}') — no installed lane can serve it: \
                      llama-server would decode it autoregressively into garbage, and llama.cpp \
                      ships no HTTP diffusion server yet (upstream PR 24423 DiffusionGemma / \
                      PR 17454 LLADA 2.0 tracking). Serve a transformer GGUF, or build a \
                      capability lane once a diffusion-capable fork ships: \
                      blazar engine build --fork <owner>/llama.cpp@<commit-sha>"
-                ));
-            }
+            ));
         }
     }
     let overlay = cfg.overlay_for(name);
@@ -2589,11 +2588,7 @@ async fn offer_missing_engine(d: &BlazarDirs, row: &blazar_core::store::ModelRow
         eprint!("install it now? [y/N] ");
         let _ = std::io::stderr().flush();
         let yes = read_menu_line().is_some_and(|a| a.eq_ignore_ascii_case("y"));
-        if yes {
-            missing.clone()
-        } else {
-            Vec::new()
-        }
+        if yes { missing.clone() } else { Vec::new() }
     } else {
         eprintln!();
         eprintln!("this model's format has no serving engine installed:");
@@ -2822,10 +2817,10 @@ async fn doctor(flat: bool, json: bool) -> Result<()> {
 /// `console` (already compiled in via indicatif) reports the size on
 /// Windows too, without raw ioctl calls this crate forbids.
 fn terminal_width() -> usize {
-    if let Some((_rows, cols)) = console::Term::stdout().size_checked() {
-        if cols >= 40 {
-            return cols as usize;
-        }
+    if let Some((_rows, cols)) = console::Term::stdout().size_checked()
+        && cols >= 40
+    {
+        return cols as usize;
     }
     std::env::var("COLUMNS")
         .ok()
@@ -3093,12 +3088,18 @@ fn gpu_fit_check(d: &BlazarDirs, vram: u64) -> Option<Check> {
     Some(if fits {
         Check::ok(
             "gpu fit",
-            format!("largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) — KV cache has headroom", big.name),
+            format!(
+                "largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) — KV cache has headroom",
+                big.name
+            ),
         )
     } else {
         Check::warn(
             "gpu fit",
-            format!("largest model {} ({gib:.1} GiB) exceeds VRAM ({vram_gib:.1} GiB) — layers will offload to RAM", big.name),
+            format!(
+                "largest model {} ({gib:.1} GiB) exceeds VRAM ({vram_gib:.1} GiB) — layers will offload to RAM",
+                big.name
+            ),
         )
     })
 }
@@ -3288,7 +3289,9 @@ fn gpu_arch_match_check(d: &BlazarDirs, sm: Option<u32>) -> Option<Check> {
         ),
         (Some(a), Some(g)) => Check::warn(
             "gpu arch match",
-            format!("active asset targets sm{a} but GPU is sm{g} — `blazar engine update` should pick the right per-arch asset"),
+            format!(
+                "active asset targets sm{a} but GPU is sm{g} — `blazar engine update` should pick the right per-arch asset"
+            ),
         ),
         (None, Some(_)) => Check::ok(
             "gpu arch match",
@@ -4186,17 +4189,16 @@ fn doctor_exposure(d: &BlazarDirs) -> Vec<Check> {
     // child-auth lane at all. Blazar forces their bind to loopback and
     // the gateway stays the only authenticated surface — say so loudly
     // while one is active, so the security model is never silent.
-    if let Ok(store) = Store::open(d) {
-        if let Ok(Some(row)) = store.active_engine() {
-            if row.kind == EngineKind::MistralRs {
-                checks.push(Check::warn(
-                    "exposure",
-                    "mistral.rs engine active: the child has NO authentication and ignores \
+    if let Ok(store) = Store::open(d)
+        && let Ok(Some(row)) = store.active_engine()
+        && row.kind == EngineKind::MistralRs
+    {
+        checks.push(Check::warn(
+            "exposure",
+            "mistral.rs engine active: the child has NO authentication and ignores \
                      bearer keys; blazar binds it to 127.0.0.1 and the gateway remains the \
                      only authenticated surface",
-                ));
-            }
-        }
+        ));
     }
     checks
 }
@@ -4268,7 +4270,10 @@ fn doctor_store(d: &BlazarDirs) -> Vec<Check> {
             } else {
                 vec![Check::warn(
                     "store",
-                    format!("quick_check: {verdict} — back up, then delete {} to regenerate (usage history lost)", db.display()),
+                    format!(
+                        "quick_check: {verdict} — back up, then delete {} to regenerate (usage history lost)",
+                        db.display()
+                    ),
                 )]
             }
         }
@@ -4517,29 +4522,26 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     let cfg_channel = blazar_core::Config::load(d)
         .map(|c| c.update_channel)
         .unwrap_or_default();
-    if let Ok(raw) = std::fs::read_to_string(d.run_dir().join("engine-check.json")) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |n| n.as_secs());
-            let marker_usable = now.saturating_sub(v["checked_at"].as_u64().unwrap_or(0))
-                <= 2 * 86_400
-                && marker_channel_matches(&v, cfg_channel);
-            if marker_usable {
-                if let Some(live) = census_names(&v) {
-                    let drift = device_drift(&frozen_gpu_names, &live);
-                    if !drift.is_empty() {
-                        checks.push(Check::warn(
-                            "engine devices",
-                            format!(
-                                "enumeration drift: {} known to the install-time probe but \
+    if let Ok(raw) = std::fs::read_to_string(d.run_dir().join("engine-check.json"))
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |n| n.as_secs());
+        let marker_usable = now.saturating_sub(v["checked_at"].as_u64().unwrap_or(0)) <= 2 * 86_400
+            && marker_channel_matches(&v, cfg_channel);
+        if marker_usable && let Some(live) = census_names(&v) {
+            let drift = device_drift(&frozen_gpu_names, &live);
+            if !drift.is_empty() {
+                checks.push(Check::warn(
+                    "engine devices",
+                    format!(
+                        "enumeration drift: {} known to the install-time probe but \
                                  invisible to the serving child — spawns auto-remap, \
                                  `blazar engine update` refreshes the probe",
-                                drift.join(", ")
-                            ),
-                        ));
-                    }
-                }
+                        drift.join(", ")
+                    ),
+                ));
             }
         }
     }
@@ -5700,11 +5702,11 @@ fn orphan_scan(models: &[blazar_core::store::ModelRow], dir: &Path) -> OrphanRep
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            if let Ok(md) = std::fs::metadata(&canon) {
-                if referenced_inodes.contains(&(md.dev(), md.ino())) {
-                    out.twins += 1;
-                    continue;
-                }
+            if let Ok(md) = std::fs::metadata(&canon)
+                && referenced_inodes.contains(&(md.dev(), md.ino()))
+            {
+                out.twins += 1;
+                continue;
             }
         }
         // Windows: no std inode access — every unreferenced GGUF is
@@ -5723,17 +5725,14 @@ fn orphan_scan(models: &[blazar_core::store::ModelRow], dir: &Path) -> OrphanRep
         // (the size gate keeps hashing off the hot path; the hash gate
         // keeps same-size siblings from being libelled as duplicates).
         let mut twin_of = None;
-        if bytes > 0 {
-            if let Some(cands) = referenced_by_size.get(&bytes) {
-                if let Some(orphan_hash) = file_sha256(&path) {
-                    if let Some((_, model, leaf)) = cands
-                        .iter()
-                        .find(|(c, _, _)| file_sha256(c).as_deref() == Some(orphan_hash.as_str()))
-                    {
-                        twin_of = Some(format!("{leaf} — linked to {model}"));
-                    }
-                }
-            }
+        if bytes > 0
+            && let Some(cands) = referenced_by_size.get(&bytes)
+            && let Some(orphan_hash) = file_sha256(&path)
+            && let Some((_, model, leaf)) = cands
+                .iter()
+                .find(|(c, _, _)| file_sha256(c).as_deref() == Some(orphan_hash.as_str()))
+        {
+            twin_of = Some(format!("{leaf} — linked to {model}"));
         }
         out.orphans.push(OrphanFile {
             name: name(),
@@ -6209,11 +6208,11 @@ async fn serve() -> Result<()> {
     state.keys.flush(&d);
     // A hard bind conflict (ollama owns the port) must not feed the
     // systemd Restart=always loop: exit 3 + RestartPreventExitStatus.
-    if let Err(e) = &served {
-        if e.downcast_ref::<blazar_gateway::BindConflict>().is_some() {
-            eprintln!("blazar: {e} — fix config.toml `port` (or BLAZAR_PORT) and start again");
-            std::process::exit(blazar_gateway::EXIT_BIND_CONFLICT);
-        }
+    if let Err(e) = &served
+        && e.downcast_ref::<blazar_gateway::BindConflict>().is_some()
+    {
+        eprintln!("blazar: {e} — fix config.toml `port` (or BLAZAR_PORT) and start again");
+        std::process::exit(blazar_gateway::EXIT_BIND_CONFLICT);
     }
     served?;
     println!("{}", ok_line("blazar stopped cleanly"));
@@ -6423,7 +6422,12 @@ fn install_model_file(path: &std::path::Path, dest: &std::path::Path, copy: bool
         if std::fs::hard_link(path, dest).is_err() {
             std::os::unix::fs::symlink(path, dest)
                 .with_context(|| format!("symlink {}", dest.display()))?;
-            println!("{}", dim_line("note: used symlink (hardlink blocked); if the source store deletes the blob, re-import"));
+            println!(
+                "{}",
+                dim_line(
+                    "note: used symlink (hardlink blocked); if the source store deletes the blob, re-import"
+                )
+            );
         }
     }
     Ok(())
@@ -6935,7 +6939,9 @@ fn list(json: bool) -> Result<()> {
     println!(
         "{}",
         render_list_table(
-            ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE"],
+            [
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE"
+            ],
             &rows
         )
     );
@@ -7235,10 +7241,8 @@ async fn run_dispatch(
     // Profile decisions for THIS model (unified-KV ctx fit, slot auto,
     // offload rationale) stay off the chat stream — `blazar ps` and the
     // REPL /profile command own that surface.
-    if verbose {
-        if let Some(v) = &outcome.final_chunk {
-            println!("\n\n{}", chat_stats_line(v));
-        }
+    if verbose && let Some(v) = &outcome.final_chunk {
+        println!("\n\n{}", chat_stats_line(v));
     }
     Ok(())
 }
@@ -7360,10 +7364,14 @@ async fn warm_cmd(model: &str) -> Result<()> {
         v["lane"].as_str().unwrap_or("unknown"),
         v["engine"].as_str().unwrap_or("unknown"),
         r["state"].as_str().unwrap_or("unknown"),
-        r["ctx"].as_u64().map_or_else(|| "unknown".into(), |c| c.to_string()),
+        r["ctx"]
+            .as_u64()
+            .map_or_else(|| "unknown".into(), |c| c.to_string()),
         match r["slots"].as_u64() {
             Some(s) => s.to_string(),
-            None => r["slots_configured"].as_u64().map_or_else(|| "unknown".into(), |s| s.to_string()),
+            None => r["slots_configured"]
+                .as_u64()
+                .map_or_else(|| "unknown".into(), |s| s.to_string()),
         },
         v["load_ms"].as_u64().unwrap_or(0),
     );
@@ -7897,10 +7905,10 @@ async fn watch() -> Result<()> {
         while let Some(pos) = buf.find("\n\n") {
             let frame: String = buf.drain(..pos + 2).collect();
             for line in frame.lines() {
-                if let Some(payload) = line.strip_prefix("data: ") {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
-                        print_record(&v);
-                    }
+                if let Some(payload) = line.strip_prefix("data: ")
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
+                {
+                    print_record(&v);
                 }
             }
         }
@@ -8703,7 +8711,9 @@ fn coreside_cmd() -> Result<()> {
         });
     }
     let (resident, deferred) = blazar_core::coreside::plan(&fps, vram);
-    println!("VRAM {vram} MiB — co-residency plan (weights + KV @ ctx; KV is device-backed on both lanes, --kv-unified shares one buffer across sequences; 512 MiB headroom):");
+    println!(
+        "VRAM {vram} MiB — co-residency plan (weights + KV @ ctx; KV is device-backed on both lanes, --kv-unified shares one buffer across sequences; 512 MiB headroom):"
+    );
     println!(
         "{:<24} {:>8} {:>9} {:>7}",
         "MODEL", "WEIGHTS", "KV@CTX", "CTX"
@@ -8975,13 +8985,12 @@ async fn whisper_cmd(
                 // lane holds it: pinned==serving tag means the pin is
                 // live (installed_tag mirrors server_bin's resolution).
                 let pinned = blazar_runtime::whisper::pinned_tag(&d);
-                let pin = if pinned.is_some()
-                    && pinned == blazar_runtime::whisper::installed_tag(&d)
-                {
-                    " (pinned)"
-                } else {
-                    ""
-                };
+                let pin =
+                    if pinned.is_some() && pinned == blazar_runtime::whisper::installed_tag(&d) {
+                        " (pinned)"
+                    } else {
+                        ""
+                    };
                 println!("server: {tag}{pin} ({})", bin.display());
             }
             None => println!(
@@ -9478,7 +9487,9 @@ async fn ask_systemone(
             .unwrap_or("request failed");
         println!("  error ({status}): {msg}");
         if status.as_u16() == 501 {
-            println!("  this model is not a decision model — System One REPL is for laya/julia/lev/openjev/kev-class models");
+            println!(
+                "  this model is not a decision model — System One REPL is for laya/julia/lev/openjev/kev-class models"
+            );
             return Ok(true);
         }
         return Ok(false);
@@ -10376,14 +10387,12 @@ async fn repl_turn(
     if !outcome.text.is_empty() {
         history.push(serde_json::json!({"role": "assistant", "content": outcome.text}));
     }
-    if verbose {
-        if let Some(v) = &outcome.final_chunk {
-            use std::io::IsTerminal as _;
-            if std::io::stdout().is_terminal() {
-                println!("\x1b[2m{}\x1b[0m", chat_stats_line(v));
-            } else {
-                println!("{}", chat_stats_line(v));
-            }
+    if verbose && let Some(v) = &outcome.final_chunk {
+        use std::io::IsTerminal as _;
+        if std::io::stdout().is_terminal() {
+            println!("\x1b[2m{}\x1b[0m", chat_stats_line(v));
+        } else {
+            println!("{}", chat_stats_line(v));
         }
     }
     Ok(false)
@@ -10476,31 +10485,30 @@ async fn stream_chat(base: String, body: serde_json::Value) -> Result<StreamOutc
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if is_tty {
-                    if let Some(thinking) = v["message"]["thinking"].as_str() {
-                        if !thinking.is_empty() {
-                            // Dull font for the reasoning block: dim +
-                            // italic, distinct at a glance from the answer.
-                            write!(stdout.lock(), "\x1b[2;3m{thinking}\x1b[0m").ok();
-                            after_thinking = true;
-                            rendered_any = true;
-                        }
-                    }
+                if is_tty
+                    && let Some(thinking) = v["message"]["thinking"].as_str()
+                    && !thinking.is_empty()
+                {
+                    // Dull font for the reasoning block: dim +
+                    // italic, distinct at a glance from the answer.
+                    write!(stdout.lock(), "\x1b[2;3m{thinking}\x1b[0m").ok();
+                    after_thinking = true;
+                    rendered_any = true;
                 }
-                if let Some(content) = v["message"]["content"].as_str() {
-                    if !content.is_empty() {
-                        if after_thinking {
-                            // End the thinking block's line, then one blank
-                            // line so the answer starts crisp at full
-                            // brightness — the visual split IS the feature.
-                            writeln!(stdout.lock()).ok();
-                            writeln!(stdout.lock()).ok();
-                            after_thinking = false;
-                        }
-                        write!(stdout.lock(), "{content}").ok();
-                        text.push_str(content);
-                        rendered_any = true;
+                if let Some(content) = v["message"]["content"].as_str()
+                    && !content.is_empty()
+                {
+                    if after_thinking {
+                        // End the thinking block's line, then one blank
+                        // line so the answer starts crisp at full
+                        // brightness — the visual split IS the feature.
+                        writeln!(stdout.lock()).ok();
+                        writeln!(stdout.lock()).ok();
+                        after_thinking = false;
                     }
+                    write!(stdout.lock(), "{content}").ok();
+                    text.push_str(content);
+                    rendered_any = true;
                 }
                 if v["done"].as_bool().unwrap_or(false) {
                     final_chunk = Some(v);
@@ -11080,10 +11088,10 @@ fn config_section_names(extra_raw: &str) -> Vec<String> {
         .expect("serializing the built-in default config cannot fail");
     let mut names: Vec<String> = Vec::new();
     for line in defaults.lines().chain(extra_raw.lines()) {
-        if let Some(first) = header_segments(line).and_then(|segs| segs.first().cloned()) {
-            if !names.contains(&first) {
-                names.push(first);
-            }
+        if let Some(first) = header_segments(line).and_then(|segs| segs.first().cloned())
+            && !names.contains(&first)
+        {
+            names.push(first);
         }
     }
     names
@@ -11159,10 +11167,8 @@ fn section_leaf_names(section: &str) -> Vec<String> {
         if line.starts_with('[') {
             in_section =
                 header_segments(line).is_some_and(|segs| segs.len() == 1 && segs[0] == section);
-        } else if in_section {
-            if let Some(k) = key_before_eq(line) {
-                leaves.push(k.to_string());
-            }
+        } else if in_section && let Some(k) = key_before_eq(line) {
+            leaves.push(k.to_string());
         }
     }
     leaves
@@ -11917,10 +11923,10 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                         "sha256": e.sha256,
                         "source": prov.as_ref().map_or("unknown", |(_, s)| s.as_str()),
                     });
-                    if let Some((label, _)) = &prov {
-                        if !label.is_empty() {
-                            obj["provenance"] = serde_json::Value::String(label.clone());
-                        }
+                    if let Some((label, _)) = &prov
+                        && !label.is_empty()
+                    {
+                        obj["provenance"] = serde_json::Value::String(label.clone());
                     }
                     if let Some(by) = m.as_ref().and_then(|m| m.superseded_by.clone()) {
                         obj["superseded_by"] = serde_json::Value::String(by);
@@ -12726,10 +12732,8 @@ async fn engine_update_mlx(d: &BlazarDirs, version: Option<String>, check: bool)
     if version.is_some() && !check {
         return engine_install_mlx(d, version).await;
     }
-    if check {
-        if let Some(v) = &version {
-            println!("--check ignores the version pin (drop --check to install mlx-lm {v})");
-        }
+    if check && let Some(v) = &version {
+        println!("--check ignores the version pin (drop --check to install mlx-lm {v})");
     }
     let store = Store::open(d)?;
     let installed = store
@@ -12794,10 +12798,8 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
     if version.is_some() && !check {
         return engine_install_sglang(d, version).await;
     }
-    if check {
-        if let Some(v) = &version {
-            println!("--check ignores the version pin (drop --check to install sglang {v})");
-        }
+    if check && let Some(v) = &version {
+        println!("--check ignores the version pin (drop --check to install sglang {v})");
     }
     let store = Store::open(d)?;
     let installed = store
@@ -13193,7 +13195,9 @@ async fn engine_update(
         ),
         None => println!(
             "{}",
-            dim_line("installing upstream engine — runtime companion downloads show their own progress bar")
+            dim_line(
+                "installing upstream engine — runtime companion downloads show their own progress bar"
+            )
         ),
     }
     let row = match resolved {
@@ -13217,23 +13221,24 @@ async fn engine_update(
         // lane published = Update routes itself to the local build lane
         // (with the same F7 gate and restart hint as `engine build`)
         // instead of no-op'ing behind a dead-end hint.
-        if from_channel {
-            if let Some(active_row) = active.as_ref() {
-                if route_update_to_build(
-                    d,
-                    &active_row.asset,
-                    &active_row.tag,
-                    &target_tag,
-                    &cfg.engine_asset,
-                    no_gate,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-            }
+        if from_channel
+            && let Some(active_row) = active.as_ref()
+            && route_update_to_build(
+                d,
+                &active_row.asset,
+                &active_row.tag,
+                &target_tag,
+                &cfg.engine_asset,
+                no_gate,
+            )
+            .await?
+        {
+            return Ok(());
         }
-        println!("engine {} already active — nothing new installed (see the warning above for lane options)", row.tag);
+        println!(
+            "engine {} already active — nothing new installed (see the warning above for lane options)",
+            row.tag
+        );
     } else if gate_on {
         engine_regression_gate(&mgr, d, &row)?;
     } else if downgrade {
@@ -13772,11 +13777,11 @@ fn spawn_engine_check_task(
             if !llama_channel_hint_applies(&active.tag, active.kind) {
                 delay = full_delay;
                 continue; // the llamacpp channel survey is meaningless
-                          // against non-llamacpp lanes (it would nag
-                          // "update available: bNNNN" cross-kind);
-                          // each lane carries its own update path
-                          // (mistral.rs/sdcpp/whisper: `engine update
-                          // --kind`, sglang: pinned pip lane)
+                // against non-llamacpp lanes (it would nag
+                // "update available: bNNNN" cross-kind);
+                // each lane carries its own update path
+                // (mistral.rs/sdcpp/whisper: `engine update
+                // --kind`, sglang: pinned pip lane)
             }
             let Ok(cfg) = Config::load(&dirs) else {
                 delay = retry_delay;
@@ -13863,12 +13868,12 @@ fn write_engine_check_marker(dirs: &BlazarDirs, marker: &serde_json::Value) {
 fn rotate_daemon_log(d: &BlazarDirs) {
     const MAX: u64 = 10 * 1024 * 1024;
     let log = d.run_dir().join("daemon.log");
-    if let Ok(meta) = std::fs::metadata(&log) {
-        if meta.len() > MAX {
-            let old = d.run_dir().join("daemon.log.1");
-            let _ = std::fs::remove_file(&old);
-            let _ = std::fs::rename(&log, &old);
-        }
+    if let Ok(meta) = std::fs::metadata(&log)
+        && meta.len() > MAX
+    {
+        let old = d.run_dir().join("daemon.log.1");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&log, &old);
     }
 }
 
@@ -14888,7 +14893,9 @@ async fn prune_cmd(
         .unwrap_or_default();
     let (residents, daemon_up) = resident_models().await;
     if !daemon_up {
-        eprintln!("warning: daemon not reachable — resident models are not guarded; a model mid-serve could be deleted");
+        eprintln!(
+            "warning: daemon not reachable — resident models are not guarded; a model mid-serve could be deleted"
+        );
     }
     let scan = storage::orphan_scan(&d.models_dir(), &rows);
     let now = blazar_core::store::unix_now();
@@ -14912,7 +14919,9 @@ async fn prune_cmd(
             scan.orphan_files.len() + scan.stale_partials.len(),
             storage::unused_rows(&rows, since_days * 86_400, &residents, now).len()
         );
-        println!("pass --orphans and/or --unused (plus --yes to execute); hardlink twins are report-only");
+        println!(
+            "pass --orphans and/or --unused (plus --yes to execute); hardlink twins are report-only"
+        );
         return Ok(());
     }
     let hs = |b: u64| humansize(i64::try_from(b).unwrap_or(i64::MAX));
@@ -15099,8 +15108,12 @@ fn connect_plan(
             let cfg = read(&[".codex", "config.toml"]);
             let action = if cfg.is_none() {
                 ConnectAction::Create(codex_full_config(base, model))
-            } else if cfg.as_deref().is_some_and(|c| c.contains("model_providers.blazar"))
-                || cfg.as_deref().is_some_and(|c| c.contains("model_provider ="))
+            } else if cfg
+                .as_deref()
+                .is_some_and(|c| c.contains("model_providers.blazar"))
+                || cfg
+                    .as_deref()
+                    .is_some_and(|c| c.contains("model_provider ="))
             {
                 ConnectAction::Snippet
             } else {
@@ -15125,8 +15138,11 @@ fn connect_plan(
             let cfg = read(&[".claude", "settings.json"]);
             let action = if cfg.is_none() {
                 ConnectAction::Create(
-                    serde_json::to_string_pretty(&claude_settings_merge(&serde_json::json!({}), base))
-                        .expect("serializing a plain object cannot fail")
+                    serde_json::to_string_pretty(&claude_settings_merge(
+                        &serde_json::json!({}),
+                        base,
+                    ))
+                    .expect("serializing a plain object cannot fail")
                         + "\n",
                 )
             } else {
@@ -15140,8 +15156,11 @@ fn connect_plan(
                 action,
                 detail: format!(
                     "merge into ~/.claude/settings.json:\n{}",
-                    serde_json::to_string_pretty(&claude_settings_merge(&serde_json::json!({}), base))
-                        .expect("serializing a plain object cannot fail")
+                    serde_json::to_string_pretty(&claude_settings_merge(
+                        &serde_json::json!({}),
+                        base
+                    ))
+                    .expect("serializing a plain object cannot fail")
                 ),
             })
         }
@@ -15417,11 +15436,7 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
 }
 
 fn yes_no(b: bool) -> &'static str {
-    if b {
-        "yes"
-    } else {
-        "no"
-    }
+    if b { "yes" } else { "no" }
 }
 
 #[allow(clippy::too_many_lines)] // command dispatch: one arm per config subcommand
@@ -15589,15 +15604,15 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             // with merged model names — the schema is the oracle, the first
             // candidate it accepts wins, and the final validation below
             // still gates the winner before anything is persisted.
-            if Config::from_toml(&candidate).is_err() {
-                if let Some(candidates) = merged_override_splits(&key) {
-                    for (segs, leaf) in &candidates {
-                        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
-                        let alt = set_table_key(&raw, &segs, leaf, &stored);
-                        if Config::from_toml(&alt).is_ok() {
-                            candidate = alt;
-                            break;
-                        }
+            if Config::from_toml(&candidate).is_err()
+                && let Some(candidates) = merged_override_splits(&key)
+            {
+                for (segs, leaf) in &candidates {
+                    let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                    let alt = set_table_key(&raw, &segs, leaf, &stored);
+                    if Config::from_toml(&alt).is_ok() {
+                        candidate = alt;
+                        break;
                     }
                 }
             }
@@ -15624,15 +15639,15 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 // pin is actually found (see `config set`).
                 let merged = merged_override_splits(&key);
                 let mut removed_pair = remove_table_key(&raw, &tpath, leaf);
-                if removed_pair.1.is_none() {
-                    if let Some(candidates) = &merged {
-                        for (segs, leaf) in candidates {
-                            let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
-                            let pair = remove_table_key(&raw, &segs, leaf);
-                            if pair.1.is_some() {
-                                removed_pair = pair;
-                                break;
-                            }
+                if removed_pair.1.is_none()
+                    && let Some(candidates) = &merged
+                {
+                    for (segs, leaf) in candidates {
+                        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                        let pair = remove_table_key(&raw, &segs, leaf);
+                        if pair.1.is_some() {
+                            removed_pair = pair;
+                            break;
                         }
                     }
                 }
@@ -16241,9 +16256,10 @@ mod tests {
         // Unknown client teaches the list.
         let err = connect_plan("vscode", home.path(), base, "m1").expect_err("teaches");
         assert!(err.to_string().contains("unknown client 'vscode'"));
-        assert!(err
-            .to_string()
-            .contains("codex, claude, continue, cline, openwebui"));
+        assert!(
+            err.to_string()
+                .contains("codex, claude, continue, cline, openwebui")
+        );
     }
 
     /// Minimal model row for lora-attach admission tests: only `path`
@@ -18265,9 +18281,10 @@ mod tests {
             "FROM m\nPARAMETER temperature 0.7\nSYSTEM you are a pirate\nTEMPLATE {{x}}\n",
         )
         .unwrap();
-        assert!(spec
-            .unsupported
-            .contains(&"PARAMETER temperature".to_string()));
+        assert!(
+            spec.unsupported
+                .contains(&"PARAMETER temperature".to_string())
+        );
         assert!(spec.unsupported.iter().any(|u| u.starts_with("SYSTEM")));
         assert!(spec.unsupported.iter().any(|u| u.starts_with("TEMPLATE")));
     }
@@ -19479,14 +19496,16 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         // No NVIDIA driver: nothing at all.
-        assert!(cuda_opportunity_rows(
-            Some("b10809"),
-            Some(EngineKind::LlamaCpp),
-            None,
-            None,
-            &full
-        )
-        .is_empty());
+        assert!(
+            cuda_opportunity_rows(
+                Some("b10809"),
+                Some(EngineKind::LlamaCpp),
+                None,
+                None,
+                &full
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -19535,12 +19554,14 @@ mod tests {
         assert_eq!(gpu_driver_rows(&[], Vendor::Other, false).len(), 0);
         // Hybrid box (Intel iGPU + NVIDIA) with only the NVIDIA driver
         // present: no vulkan row for the iGPU when ICDs exist.
-        assert!(gpu_driver_rows(
-            &["10de".to_string(), "8086".to_string()],
-            Vendor::Nvidia,
-            true
-        )
-        .is_empty());
+        assert!(
+            gpu_driver_rows(
+                &["10de".to_string(), "8086".to_string()],
+                Vendor::Nvidia,
+                true
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -19850,7 +19871,9 @@ mod tests {
         );
         assert_eq!(
             render_list_table(
-                ["NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",],
+                [
+                    "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
+                ],
                 &rows,
             ),
             golden

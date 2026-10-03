@@ -9,22 +9,22 @@
 
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fmt::Write as _;
 use tokio_stream::StreamExt as TsExt;
 
+use crate::TraceId;
 use crate::proxy::{affinity_hash, child_auth, child_base, ensure_with_admission, resolve_model};
 use crate::queue::Priority;
 use crate::semcache;
 use crate::sentinel;
 use crate::state::AppState;
 use crate::translate as tr;
-use crate::TraceId;
 
 pub(crate) fn api_error(status: u16, message: &str) -> Response {
     (
@@ -1037,10 +1037,10 @@ pub async fn chat(
     // F27: validate num_ctx BEFORE the semantic cache — a hit must not
     // skip the validation a miss enforces (miss→400, hit→200 asymmetry).
     // The restart itself stays on the miss path (a hit needs no model).
-    if let Some(want) = num_ctx {
-        if want <= 0 {
-            return api_error(400, "options.num_ctx must be positive");
-        }
+    if let Some(want) = num_ctx
+        && want <= 0
+    {
+        return api_error(400, "options.num_ctx must be positive");
     }
     // R4 semantic cache (ollama lane, non-stream only). A hit skips model
     // admission entirely; embed failures bypass (never fail the request);
@@ -1597,66 +1597,65 @@ pub(crate) async fn apply_num_ctx(
         let row = state
             .with_store(|s| s.get_model(&model).ok().flatten())
             .flatten();
-        if let Some(row) = row {
-            if let Ok(meta) = blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
-                let total_vram = state.sup.hardware.total_vram_mib();
-                if total_vram > 0 {
-                    // KV must be judged at the quant the spawn will run.
-                    // An EXPLICIT config/overlay pair (per-phase k/v or
-                    // legacy symmetric) is sovereign (single shot,
-                    // mirroring the compiler's explicit-beats-ladder
-                    // doctrine); an unpinned one LADDERS
-                    // f16 -> q8_0 -> q8_0/q4_0 -> q4_0 like the spawn
-                    // compiler's kv_quant_ladder (which additionally
-                    // skips the mixed rung on CUDA+FA spawns — no
-                    // symmetric-pair flash-attention kernel in stock
-                    // builds; the mixed rung here stays feasibility-
-                    // equivalent: anything it fits, the smaller q4_0
-                    // rung fits too), so the preflight never refuses a
-                    // pin the spawn itself would host (split-brain
-                    // observed live: a 65536 vision pin refused at f16
-                    // math while the spawn laddered to q8_0 happily).
-                    let (eff_k, eff_v) = state.config.effective_cache_type_kv(&model);
-                    let pair_set = !eff_k.is_empty() || !eff_v.is_empty();
-                    let ladder: Vec<Option<(String, String)>> = if pair_set {
-                        vec![Some((eff_k, eff_v))]
-                    } else {
-                        vec![
-                            None,
-                            Some(("q8_0".to_string(), "q8_0".to_string())),
-                            Some(("q8_0".to_string(), "q4_0".to_string())),
-                            Some(("q4_0".to_string(), "q4_0".to_string())),
-                        ]
-                    };
-                    let kv_f16 = crate::preflight::kv_f16_mib(
-                        &meta,
-                        u64::try_from(want).unwrap_or(u64::MAX),
-                    ) * 1024
+        if let Some(row) = row
+            && let Ok(meta) = blazar_core::read_metadata_file(std::path::Path::new(&row.path))
+        {
+            let total_vram = state.sup.hardware.total_vram_mib();
+            if total_vram > 0 {
+                // KV must be judged at the quant the spawn will run.
+                // An EXPLICIT config/overlay pair (per-phase k/v or
+                // legacy symmetric) is sovereign (single shot,
+                // mirroring the compiler's explicit-beats-ladder
+                // doctrine); an unpinned one LADDERS
+                // f16 -> q8_0 -> q8_0/q4_0 -> q4_0 like the spawn
+                // compiler's kv_quant_ladder (which additionally
+                // skips the mixed rung on CUDA+FA spawns — no
+                // symmetric-pair flash-attention kernel in stock
+                // builds; the mixed rung here stays feasibility-
+                // equivalent: anything it fits, the smaller q4_0
+                // rung fits too), so the preflight never refuses a
+                // pin the spawn itself would host (split-brain
+                // observed live: a 65536 vision pin refused at f16
+                // math while the spawn laddered to q8_0 happily).
+                let (eff_k, eff_v) = state.config.effective_cache_type_kv(&model);
+                let pair_set = !eff_k.is_empty() || !eff_v.is_empty();
+                let ladder: Vec<Option<(String, String)>> = if pair_set {
+                    vec![Some((eff_k, eff_v))]
+                } else {
+                    vec![
+                        None,
+                        Some(("q8_0".to_string(), "q8_0".to_string())),
+                        Some(("q8_0".to_string(), "q4_0".to_string())),
+                        Some(("q4_0".to_string(), "q4_0".to_string())),
+                    ]
+                };
+                let kv_f16 =
+                    crate::preflight::kv_f16_mib(&meta, u64::try_from(want).unwrap_or(u64::MAX))
+                        * 1024
                         * 1024;
-                    let mut refuse: Option<String> = None;
-                    for pair in ladder {
-                        let kv_bytes = match &pair {
-                            Some((k, v)) => blazar_core::profile::scale_kv_pair(kv_f16, k, v),
-                            None => kv_f16,
-                        };
-                        match blazar_core::profile::unified_ctx_verdict(
-                            u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
-                            kv_bytes,
-                            total_vram * 1024 * 1024,
-                            u32::try_from(want).unwrap_or(u32::MAX),
-                        ) {
-                            blazar_core::profile::UnifiedCtxVerdict::Fit => {
-                                refuse = None;
-                                break;
-                            }
-                            blazar_core::profile::UnifiedCtxVerdict::Refuse(msg) => {
-                                refuse = Some(msg);
-                            }
+                let mut refuse: Option<String> = None;
+                for pair in ladder {
+                    let kv_bytes = match &pair {
+                        Some((k, v)) => blazar_core::profile::scale_kv_pair(kv_f16, k, v),
+                        None => kv_f16,
+                    };
+                    match blazar_core::profile::unified_ctx_verdict(
+                        u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
+                        kv_bytes,
+                        total_vram * 1024 * 1024,
+                        u32::try_from(want).unwrap_or(u32::MAX),
+                    ) {
+                        blazar_core::profile::UnifiedCtxVerdict::Fit => {
+                            refuse = None;
+                            break;
+                        }
+                        blazar_core::profile::UnifiedCtxVerdict::Refuse(msg) => {
+                            refuse = Some(msg);
                         }
                     }
-                    if let Some(msg) = refuse {
-                        return Err(Box::new(api_error(400, &msg)));
-                    }
+                }
+                if let Some(msg) = refuse {
+                    return Err(Box::new(api_error(400, &msg)));
                 }
             }
         }
@@ -1831,9 +1830,9 @@ async fn proxy_core_chat(
                     }
                     Err(e) => {
                         tracing::warn!(
-                    model,
-                    "nonstream upstream failed: {e} — respawning lane, retrying once in-band"
-                );
+                            model,
+                            "nonstream upstream failed: {e} — respawning lane, retrying once in-band"
+                        );
                         // Same crash-recovery contract as the proxy path:
                         // `child_send` already evicted a wedged child; the
                         // respawn reaps the dead ones. Exactly one in-band
@@ -1867,11 +1866,11 @@ async fn proxy_core_chat(
                                     }
                                     Err(e2) => {
                                         return api_error(
-                                        e2.status_u16(),
-                                        &format!(
-                                            "engine request failed: {e}; retry on respawned child: {e2}"
-                                        ),
-                                    );
+                                            e2.status_u16(),
+                                            &format!(
+                                                "engine request failed: {e}; retry on respawned child: {e2}"
+                                            ),
+                                        );
                                     }
                                 }
                             }
@@ -2431,13 +2430,13 @@ pub async fn embeddings(
     // Scope + request count (plain embeds carry no token usage, so budgets
     // apply on request counts; late-chunking embeds additionally charge
     // their exact token count below).
-    if let Some(Extension(k)) = &key_ext {
-        if let Some(entry) = state.keys.entry(&k.name) {
-            if let Err(rej) = state.keys.check(&entry, &row.name) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&k.name);
+    if let Some(Extension(k)) = &key_ext
+        && let Some(entry) = state.keys.entry(&k.name)
+    {
+        if let Err(rej) = state.keys.check(&entry, &row.name) {
+            return rej.to_response();
         }
+        state.keys.charge_request(&k.name);
     }
     // Request-level admission (chat parity): embeddings are cheap but
     // still occupy child slots — park at the ceiling instead of piling
@@ -2568,7 +2567,7 @@ pub async fn embed(
             return api_error(
                 400,
                 "\"input\" must be a string or a non-empty array of strings",
-            )
+            );
         }
     };
     // F14: resolve first, scope-check the RESOLVED name (chat parity).
@@ -2580,13 +2579,13 @@ pub async fn embed(
         Some(Err(e)) => return api_error(404, &e),
         None => return api_error(500, "store unavailable"),
     };
-    if let Some(Extension(k)) = &key_ext {
-        if let Some(entry) = state.keys.entry(&k.name) {
-            if let Err(rej) = state.keys.check(&entry, &row.name) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&k.name);
+    if let Some(Extension(k)) = &key_ext
+        && let Some(entry) = state.keys.entry(&k.name)
+    {
+        if let Err(rej) = state.keys.check(&entry, &row.name) {
+            return rej.to_response();
         }
+        state.keys.charge_request(&k.name);
     }
     // Request-level admission (chat parity): embeddings are cheap but
     // still occupy child slots — park at the ceiling instead of piling
@@ -2761,13 +2760,13 @@ pub async fn rerank(
         Some(Err(e)) => return api_error(404, &e),
         None => return api_error(500, "store unavailable"),
     };
-    if let Some(Extension(k)) = &key_ext {
-        if let Some(entry) = state.keys.entry(&k.name) {
-            if let Err(rej) = state.keys.check(&entry, &row.name) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&k.name);
+    if let Some(Extension(k)) = &key_ext
+        && let Some(entry) = state.keys.entry(&k.name)
+    {
+        if let Err(rej) = state.keys.check(&entry, &row.name) {
+            return rej.to_response();
         }
+        state.keys.charge_request(&k.name);
     }
     // Request-level admission (chat parity): embeddings are cheap but
     // still occupy child slots — park at the ceiling instead of piling
@@ -3165,17 +3164,18 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
                 .flatten()
                 .map(|e| e.kind)
         });
-    if let Some(kind) = engine_kind {
-        if action != "close" && kind != blazar_core::engine_kind::EngineKind::LlamaCpp {
-            return api_error(
-                400,
-                &format!(
-                    "slot KV checkpoints are llama-server-only; the {kind} lane that \
+    if let Some(kind) = engine_kind
+        && action != "close"
+        && kind != blazar_core::engine_kind::EngineKind::LlamaCpp
+    {
+        return api_error(
+            400,
+            &format!(
+                "slot KV checkpoints are llama-server-only; the {kind} lane that \
                      serves this request does not implement /slots — switch with \
                      `blazar engine use <tag>` or a model_overrides engine pin",
-                ),
-            );
-        }
+            ),
+        );
     }
     // Close releases a session PIN (R3) — no model, slot or checkpoint
     // involved; safe to run while children are asleep or absent.
@@ -3460,9 +3460,18 @@ fn cache_metrics(state: &AppState, merged: &mut String) {
     let _ = write!(
         merged,
         "# HELP blazar_prompt_cached_tokens_observed_total Prompt tokens reported REUSED by completed responses observed at the gateway (per-response usage sum, not the scrape)\n# TYPE blazar_prompt_cached_tokens_observed_total counter\nblazar_prompt_cached_tokens_observed_total {}\n# HELP blazar_prompt_tokens_observed_total Prompt tokens reported by completed responses observed at the gateway\n# TYPE blazar_prompt_tokens_observed_total counter\nblazar_prompt_tokens_observed_total {}\n# HELP blazar_ttft_unclassified_total Completed responses whose usage never surfaced (aborted before usage chunk or upstream omission) - excluded from the warm/cold split\n# TYPE blazar_ttft_unclassified_total counter\nblazar_ttft_unclassified_total {}\n",
-        state.obs.cached_tokens.load(std::sync::atomic::Ordering::Relaxed),
-        state.obs.prompt_tokens.load(std::sync::atomic::Ordering::Relaxed),
-        state.obs.unclassified.load(std::sync::atomic::Ordering::Relaxed),
+        state
+            .obs
+            .cached_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+        state
+            .obs
+            .prompt_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+        state
+            .obs
+            .unclassified
+            .load(std::sync::atomic::Ordering::Relaxed),
     );
     state.obs.ttft_warm.render(merged);
     state.obs.ttft_cold.render(merged);
@@ -3494,14 +3503,14 @@ fn cache_metrics(state: &AppState, merged: &mut String) {
 
 /// Active engine build gauge; absent when the store is not readable.
 fn engine_build_gauge(state: &AppState, out: &mut String) {
-    if let Some(Ok(Some(engine))) = state.with_store(blazar_core::Store::active_engine) {
-        if let Ok(m) = serde_json::from_str::<blazar_runtime::Manifest>(&engine.manifest) {
-            let _ = write!(
-                out,
-                "# HELP blazar_engine_build Active engine build number\n# TYPE blazar_engine_build gauge\nblazar_engine_build {}\n",
-                m.build_number
-            );
-        }
+    if let Some(Ok(Some(engine))) = state.with_store(blazar_core::Store::active_engine)
+        && let Ok(m) = serde_json::from_str::<blazar_runtime::Manifest>(&engine.manifest)
+    {
+        let _ = write!(
+            out,
+            "# HELP blazar_engine_build Active engine build number\n# TYPE blazar_engine_build gauge\nblazar_engine_build {}\n",
+            m.build_number
+        );
     }
 }
 
@@ -3519,13 +3528,11 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         )
         .send()
         .await
+            && resp.status().is_success()
+            && let Ok(text) = resp.text().await
         {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    merged.push_str(&text);
-                    merged.push('\n');
-                }
-            }
+            merged.push_str(&text);
+            merged.push('\n');
         }
     }
     // Prompt-cache economics (R6/R7-lite): authoritative child-side
@@ -3611,7 +3618,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let _ = write!(
         merged,
         "# HELP blazar_evictions_total Total instance evictions\n# TYPE blazar_evictions_total counter\nblazar_evictions_total {}\n",
-        state.sup.evictions.load(std::sync::atomic::Ordering::Relaxed)
+        state
+            .sup
+            .evictions
+            .load(std::sync::atomic::Ordering::Relaxed)
     );
     // E4: audit lines dropped (writer saturated / IO failure). Non-zero
     // while `audit_log = true` means the trail has gaps.
@@ -3945,36 +3955,43 @@ mod tests {
         // Thinking template + think:true -> pass.
         let thinker = tmp.path().join("thinker.gguf");
         write_gguf_with_template(&thinker, Some("{%- if enable_thinking -%}"));
-        assert!(refuse_unsupported_think(
-            &row_with_path(thinker.to_str().unwrap()),
-            &think_req(Some(true))
-        )
-        .is_none());
+        assert!(
+            refuse_unsupported_think(
+                &row_with_path(thinker.to_str().unwrap()),
+                &think_req(Some(true))
+            )
+            .is_none()
+        );
         // Template absent -> fail-open (legacy GGUFs).
         let bare = tmp.path().join("bare.gguf");
         write_gguf_with_template(&bare, None);
-        assert!(refuse_unsupported_think(
-            &row_with_path(bare.to_str().unwrap()),
-            &think_req(Some(true))
-        )
-        .is_none());
+        assert!(
+            refuse_unsupported_think(
+                &row_with_path(bare.to_str().unwrap()),
+                &think_req(Some(true))
+            )
+            .is_none()
+        );
         // Unreadable path -> fail-open (safetensors lanes).
-        assert!(refuse_unsupported_think(
-            &row_with_path("/nonexistent/m1.gguf"),
-            &think_req(Some(true))
-        )
-        .is_none());
+        assert!(
+            refuse_unsupported_think(
+                &row_with_path("/nonexistent/m1.gguf"),
+                &think_req(Some(true))
+            )
+            .is_none()
+        );
         // Gate dormant without an explicit think:true.
-        assert!(refuse_unsupported_think(
-            &row_with_path(plain.to_str().unwrap()),
-            &think_req(None)
-        )
-        .is_none());
-        assert!(refuse_unsupported_think(
-            &row_with_path(plain.to_str().unwrap()),
-            &think_req(Some(false))
-        )
-        .is_none());
+        assert!(
+            refuse_unsupported_think(&row_with_path(plain.to_str().unwrap()), &think_req(None))
+                .is_none()
+        );
+        assert!(
+            refuse_unsupported_think(
+                &row_with_path(plain.to_str().unwrap()),
+                &think_req(Some(false))
+            )
+            .is_none()
+        );
     }
 
     #[test]

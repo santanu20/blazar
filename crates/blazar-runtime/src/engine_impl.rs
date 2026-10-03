@@ -4,7 +4,7 @@
 //! adapters later implement the same trait — gateway, supervisor and
 //! lifecycle stay engine-agnostic.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
 use blazar_core::profile::{Endpoint, Profile};
@@ -584,10 +584,10 @@ fn split_shard_base(file_name: &str) -> String {
     if !is_digits(total) {
         return stem.to_string();
     }
-    if let Some(dash) = head.rfind('-') {
-        if is_digits(&head[dash + 1..]) {
-            return head[..dash].to_string();
-        }
+    if let Some(dash) = head.rfind('-')
+        && is_digits(&head[dash + 1..])
+    {
+        return head[..dash].to_string();
     }
     stem.to_string()
 }
@@ -683,11 +683,11 @@ pub fn mistralrs_argv(
         argv.push("--max-seqs".into());
         argv.push(n.to_string());
     }
-    if let Some(mm) = model.mmproj_path.as_deref() {
-        if flags.contains("--mmproj") {
-            argv.push("--mmproj".into());
-            argv.push(mm.to_string());
-        }
+    if let Some(mm) = model.mmproj_path.as_deref()
+        && flags.contains("--mmproj")
+    {
+        argv.push("--mmproj".into());
+        argv.push(mm.to_string());
     }
     // Repackaged multimodal GGUFs (lmstudio-community style) carry no
     // base-model identity mistral.rs can read: the child aborts with
@@ -697,13 +697,14 @@ pub fn mistralrs_argv(
     // v0.9.4 with Qwen3.5-9B-Q4_K_M: config refusal gone, server
     // healthy). Un-derivable files emit nothing and keep the engine's
     // teaching error.
-    if !is_hf_dir && model.mmproj_path.is_some() && flags.contains("--tok-model-id") {
-        if let Ok(meta) = blazar_core::gguf::read_metadata_file(std::path::Path::new(&model.path)) {
-            if let Some(id) = meta.hf_base_model_id() {
-                argv.push("--tok-model-id".into());
-                argv.push(id);
-            }
-        }
+    if !is_hf_dir
+        && model.mmproj_path.is_some()
+        && flags.contains("--tok-model-id")
+        && let Ok(meta) = blazar_core::gguf::read_metadata_file(std::path::Path::new(&model.path))
+        && let Some(id) = meta.hf_base_model_id()
+    {
+        argv.push("--tok-model-id".into());
+        argv.push(id);
     }
     // Engine-tuning passthrough: the mistral.rs profile dialect emits
     // tuning flags (pa-memory-fraction, paged-attn, scheduler/MTP/
@@ -751,10 +752,10 @@ pub fn mistralrs_argv(
         }
         if flags.contains(t) {
             argv.push(t.to_string());
-            if let Some(v) = profile.argv.get(i + 1) {
-                if !v.starts_with('-') {
-                    argv.push(v.clone());
-                }
+            if let Some(v) = profile.argv.get(i + 1)
+                && !v.starts_with('-')
+            {
+                argv.push(v.clone());
             }
         }
     }
@@ -846,21 +847,21 @@ impl Engine for MistralRsEngine {
         // probes, back off to 150ms steady state.
         let mut poll = std::time::Duration::from_millis(25);
         loop {
-            if let Ok(resp) = self.http.get(format!("{url}/v1/models")).send().await {
-                if resp.status().is_success() {
-                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                    // mistralrs reports per-model status; "loaded" is the
-                    // serving-ready state. Some builds omit the field —
-                    // treat a listed model as loaded then.
-                    let loaded = body["data"].as_array().is_some_and(|models| {
-                        models
-                            .iter()
-                            .any(|m| m["status"].as_str().unwrap_or("loaded") == "loaded")
-                    });
-                    if loaded {
-                        tracing::debug!("mistralrs healthy at {url} after {:?}", started.elapsed());
-                        return Ok(());
-                    }
+            if let Ok(resp) = self.http.get(format!("{url}/v1/models")).send().await
+                && resp.status().is_success()
+            {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                // mistralrs reports per-model status; "loaded" is the
+                // serving-ready state. Some builds omit the field —
+                // treat a listed model as loaded then.
+                let loaded = body["data"].as_array().is_some_and(|models| {
+                    models
+                        .iter()
+                        .any(|m| m["status"].as_str().unwrap_or("loaded") == "loaded")
+                });
+                if loaded {
+                    tracing::debug!("mistralrs healthy at {url} after {:?}", started.elapsed());
+                    return Ok(());
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1259,11 +1260,11 @@ impl Engine for SglangEngine {
         // not a contract (v0.5.19 http_server.py:662).
         let mut poll = std::time::Duration::from_millis(25);
         loop {
-            if let Ok(resp) = self.http.get(format!("{url}/health")).send().await {
-                if resp.status().is_success() {
-                    tracing::debug!("sglang healthy at {url} after {:?}", started.elapsed());
-                    return Ok(());
-                }
+            if let Ok(resp) = self.http.get(format!("{url}/health")).send().await
+                && resp.status().is_success()
+            {
+                tracing::debug!("sglang healthy at {url} after {:?}", started.elapsed());
+                return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(anyhow!(
@@ -1430,17 +1431,16 @@ impl Engine for MlxEngine {
             let have_user = env.iter().any(|(k, _)| k == CUDA_HOME || k == "CUDA_PATH")
                 || std::env::var(CUDA_HOME).is_ok()
                 || std::env::var("CUDA_PATH").is_ok();
-            if !have_user {
-                if let Some(engine_dir) = std::path::Path::new(&self.manifest.server_path).parent()
-                {
-                    let farm = engine_dir.join("cuda-home");
-                    if farm.is_dir() {
-                        let farm_str = farm.to_string_lossy().into_owned();
-                        env.retain(|(k, _)| k != CUDA_HOME && k != "CUDA_PATH");
-                        env.push((CUDA_HOME.to_string(), farm_str.clone()));
-                        env.push(("CUDA_PATH".to_string(), farm_str));
-                        tracing::debug!("mlx spawn: CUDA_HOME -> engine-local cuda-home");
-                    }
+            if !have_user
+                && let Some(engine_dir) = std::path::Path::new(&self.manifest.server_path).parent()
+            {
+                let farm = engine_dir.join("cuda-home");
+                if farm.is_dir() {
+                    let farm_str = farm.to_string_lossy().into_owned();
+                    env.retain(|(k, _)| k != CUDA_HOME && k != "CUDA_PATH");
+                    env.push((CUDA_HOME.to_string(), farm_str.clone()));
+                    env.push(("CUDA_PATH".to_string(), farm_str));
+                    tracing::debug!("mlx spawn: CUDA_HOME -> engine-local cuda-home");
                 }
             }
         }
@@ -1465,11 +1465,11 @@ impl Engine for MlxEngine {
         // boot window long and hammering serves nothing.
         let mut poll = std::time::Duration::from_millis(25);
         loop {
-            if let Ok(resp) = self.http.get(format!("{url}/v1/models")).send().await {
-                if resp.status().is_success() {
-                    tracing::debug!("mlx healthy at {url} after {:?}", started.elapsed());
-                    return Ok(());
-                }
+            if let Ok(resp) = self.http.get(format!("{url}/v1/models")).send().await
+                && resp.status().is_success()
+            {
+                tracing::debug!("mlx healthy at {url} after {:?}", started.elapsed());
+                return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(anyhow!(
@@ -1738,15 +1738,21 @@ mod tests {
         // loopback -> unreachable; the other two are malformed; the
         // empty entry is dropped.
         assert_eq!(reported.len(), 3, "{reported:?}");
-        assert!(reported
-            .iter()
-            .any(|r| r.contains("nohostport (malformed host:port)")));
-        assert!(reported
-            .iter()
-            .any(|r| r.contains("box1:notaport (malformed port)")));
-        assert!(reported
-            .iter()
-            .any(|r| r.contains("127.0.0.1:1 (unreachable)")));
+        assert!(
+            reported
+                .iter()
+                .any(|r| r.contains("nohostport (malformed host:port)"))
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|r| r.contains("box1:notaport (malformed port)"))
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|r| r.contains("127.0.0.1:1 (unreachable)"))
+        );
     }
 
     #[tokio::test]

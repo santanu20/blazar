@@ -15,13 +15,13 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use crate::TraceId;
 use crate::proxy::{
     admission_gate_slo, affinity_hash_bytes, ensure_with_admission, exclusive_intent_bytes,
     openai_error, path_and_query, proxy_request,
 };
 use crate::queue::Priority;
 use crate::state::AppState;
-use crate::TraceId;
 
 use axum::Extension;
 
@@ -142,13 +142,13 @@ pub async fn embeddings(
     }
     let model = requested.unwrap_or_default();
     // Per-key admission mirrors the proxy path (scope + rpm + count).
-    if let Some(Extension(k)) = &key_ext {
-        if let Some(entry) = state.keys.entry(&k.name) {
-            if let Err(rej) = state.keys.check(&entry, &model) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&k.name);
+    if let Some(Extension(k)) = &key_ext
+        && let Some(entry) = state.keys.entry(&k.name)
+    {
+        if let Err(rej) = state.keys.check(&entry, &model) {
+            return rej.to_response();
         }
+        state.keys.charge_request(&k.name);
     }
     let req: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -200,14 +200,16 @@ pub async fn embeddings(
                     .collect();
                 match all_int_arrays {
                     Some(chunk_ids) => {
-                        crate::latechunk::late_embed_pretokenized(&state, &engine, &model, &chunk_ids)
-                            .await
+                        crate::latechunk::late_embed_pretokenized(
+                            &state, &engine, &model, &chunk_ids,
+                        )
+                        .await
                     }
                     None => {
                         return openai_error(
                             400,
                             "late chunking: \"input\" must be a string, an array of strings, or an array of token-id arrays",
-                        )
+                        );
                     }
                 }
             }
@@ -378,10 +380,10 @@ pub async fn openai_proxy(
     }
     // F7: strict `n` validation at the plane edge — an invalid choice
     // count fails fast, BEFORE admission bills the request.
-    if let Some(body) = parsed_body.as_ref() {
-        if let Err(msg) = crate::proxy::requested_choices(uri.path(), body) {
-            return openai_error(400, &msg);
-        }
+    if let Some(body) = parsed_body.as_ref()
+        && let Err(msg) = crate::proxy::requested_choices(uri.path(), body)
+    {
+        return openai_error(400, &msg);
     }
     let Some(model) = model else {
         return openai_error(400, "missing `model` field in request body");
@@ -390,33 +392,31 @@ pub async fn openai_proxy(
     // serving engine may cap lower (llama-server: 2). Reject in our voice,
     // before admission bills a request the engine would refuse anyway.
     // Only runs when the caller actually asked for extra choices.
-    if let Some(body) = parsed_body.as_ref() {
-        if let Ok(Some(n)) = crate::proxy::requested_choices(uri.path(), body) {
-            if n > 1 {
-                if let Some(kind) = crate::proxy::routed_kind_for(&state, &model) {
-                    let cap = crate::proxy::lane_max_n(kind);
-                    if n > cap {
-                        return openai_error(
-                            400,
-                            &format!(
-                                "n = {n} exceeds this lane's ceiling: {kind} serves at most \
+    if let Some(body) = parsed_body.as_ref()
+        && let Ok(Some(n)) = crate::proxy::requested_choices(uri.path(), body)
+        && n > 1
+        && let Some(kind) = crate::proxy::routed_kind_for(&state, &model)
+    {
+        let cap = crate::proxy::lane_max_n(kind);
+        if n > cap {
+            return openai_error(
+                400,
+                &format!(
+                    "n = {n} exceeds this lane's ceiling: {kind} serves at most \
                                  {cap} choices per request (plane-wide limit is {})",
-                                crate::proxy::MAX_N_CHOICES
-                            ),
-                        );
-                    }
-                }
-            }
+                    crate::proxy::MAX_N_CHOICES
+                ),
+            );
         }
     }
     // Per-key admission: model scope + rate limits + request accounting.
-    if let Some(key) = key_ext.as_ref().map(|Extension(k)| k) {
-        if let Some(entry) = state.keys.entry(&key.name) {
-            if let Err(rej) = state.keys.check(&entry, &model) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&key.name);
+    if let Some(key) = key_ext.as_ref().map(|Extension(k)| k)
+        && let Some(entry) = state.keys.entry(&key.name)
+    {
+        if let Err(rej) = state.keys.check(&entry, &model) {
+            return rej.to_response();
         }
+        state.keys.charge_request(&key.name);
     }
     // Remote routing: `<remote-name>:<model>` never loads locally.
     if crate::remotes::split_remote(&model, &state.config).is_some() {
@@ -455,16 +455,16 @@ pub async fn openai_proxy(
     // the parsed body BEFORE every downstream consumer so lint, affinity
     // hashing, and the forwarded bytes all see the same final body.
     let mut body = body;
-    if uri.path().ends_with("/chat/completions") {
-        if let Some(v) = parsed_body.as_mut() {
-            let mut rewritten = inject_reasoning_effort_kwarg(v);
-            // Think-default-off parity (chat lane): a thinking-capable
-            // template with no caller toggle renders reasoning ON and
-            // eats the token budget before the answer.
-            rewritten |= inject_default_think_off(&state, v);
-            if rewritten {
-                body = Bytes::from(serde_json::to_vec(v).unwrap_or_default());
-            }
+    if uri.path().ends_with("/chat/completions")
+        && let Some(v) = parsed_body.as_mut()
+    {
+        let mut rewritten = inject_reasoning_effort_kwarg(v);
+        // Think-default-off parity (chat lane): a thinking-capable
+        // template with no caller toggle renders reasoning ON and
+        // eats the token budget before the answer.
+        rewritten |= inject_default_think_off(&state, v);
+        if rewritten {
+            body = Bytes::from(serde_json::to_vec(v).unwrap_or_default());
         }
     }
     // Best-of-N: this lane forwards byte-faithful (both stream and
@@ -482,7 +482,7 @@ pub async fn openai_proxy(
                     400,
                     "best_of is not available on /v1/chat/completions (byte-faithful \
                      passthrough lane) — use /v1/responses, /api/chat, or /v1/messages",
-                )
+                );
             }
             Ok(None) => {}
         }
@@ -494,16 +494,13 @@ pub async fn openai_proxy(
     let chat_family = uri.path().ends_with("/chat/completions")
         || uri.path().ends_with("/completions")
         || uri.path().ends_with("/responses");
-    if chat_family {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(err) = state.sentinel.strict_tool_def_error_cached(&v) {
-                return openai_error(400, &format!("invalid tools: {err}"));
-            }
-            let eff = crate::preflight::admission_ctx(&state, &model);
-            if let Err(resp) = crate::preflight::enforce_prompt_fits(&state, &model, &v, eff).await
-            {
-                return *resp;
-            }
+    if chat_family && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+        if let Some(err) = state.sentinel.strict_tool_def_error_cached(&v) {
+            return openai_error(400, &format!("invalid tools: {err}"));
+        }
+        let eff = crate::preflight::admission_ctx(&state, &model);
+        if let Err(resp) = crate::preflight::enforce_prompt_fits(&state, &model, &v, eff).await {
+            return *resp;
         }
     }
     let priority = Priority::from_header(
@@ -522,7 +519,7 @@ pub async fn openai_proxy(
         let want: i64 = match raw.parse() {
             Ok(w) => w,
             Err(_) => {
-                return openai_error(400, &format!("X-Blazar-Num-Ctx: not a number: {raw:?}"))
+                return openai_error(400, &format!("X-Blazar-Num-Ctx: not a number: {raw:?}"));
             }
         };
         if want <= 0 {
@@ -536,10 +533,10 @@ pub async fn openai_proxy(
     // X-Blazar-Spec: per-request spec mode on the OpenAI path —
     // protocol has no such field, the extension header fills the gap
     // (same semantics as options.spec on the ollama API).
-    if let Some(raw) = headers.get("x-blazar-spec").and_then(|v| v.to_str().ok()) {
-        if let Err(resp) = crate::ollama::apply_spec(&state, &model, raw).await {
-            return *resp;
-        }
+    if let Some(raw) = headers.get("x-blazar-spec").and_then(|v| v.to_str().ok())
+        && let Err(resp) = crate::ollama::apply_spec(&state, &model, raw).await
+    {
+        return *resp;
     }
 
     let prefix = if chat_family {
@@ -574,20 +571,20 @@ pub async fn openai_proxy(
     // Cache-bust telemetry (chat completions only: the messages+tools
     // shape the detector fingerprints). Strictly advisory — never
     // mutates parsed_body, never blocks the forward.
-    if uri.path().ends_with("/chat/completions") {
-        if let Some(req) = parsed_body.as_ref() {
-            crate::cache_bust::note_request(
-                &state.sentinel,
-                &state.cache_bust,
-                &model_name,
-                req,
-                "v1/chat/completions",
-                &trace_ext
-                    .as_ref()
-                    .map(|Extension(t)| t.0.clone())
-                    .unwrap_or_default(),
-            );
-        }
+    if uri.path().ends_with("/chat/completions")
+        && let Some(req) = parsed_body.as_ref()
+    {
+        crate::cache_bust::note_request(
+            &state.sentinel,
+            &state.cache_bust,
+            &model_name,
+            req,
+            "v1/chat/completions",
+            &trace_ext
+                .as_ref()
+                .map(|Extension(t)| t.0.clone())
+                .unwrap_or_default(),
+        );
     }
 
     // Single-flight BEFORE slot admission (chat lane): the bounded
@@ -762,54 +759,52 @@ pub async fn responses_get(
     let row = state
         .with_store(|s| s.get_response(&id).ok().flatten())
         .flatten();
-    if let Some(r) = &row {
-        if let Some(bj) = &r.body_json {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(bj) {
-                return (StatusCode::OK, axum::Json(v)).into_response();
-            }
-        }
+    if let Some(r) = &row
+        && let Some(bj) = &r.body_json
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(bj)
+    {
+        return (StatusCode::OK, axum::Json(v)).into_response();
     }
     // Background lifecycle: no stored body yet — the job row says where
     // the run is (same id namespace by construction).
-    if row.is_none() {
-        if let Some(job) = state
+    if row.is_none()
+        && let Some(job) = state
             .with_store(|s| s.get_job(&id).ok().flatten())
             .flatten()
-        {
-            return match job.state.as_str() {
-                "queued" | "running" => (
-                    StatusCode::OK,
-                    axum::Json(serde_json::json!({
-                        "id": id,
-                        "object": "response",
-                        "status": "in_progress",
-                        "background": true,
-                    })),
-                )
-                    .into_response(),
-                "failed" => (
-                    StatusCode::OK,
-                    axum::Json(serde_json::json!({
-                        "id": id,
-                        "object": "response",
-                        "status": "failed",
-                        "background": true,
-                        "error": job.error,
-                    })),
-                )
-                    .into_response(),
-                _ => (
-                    StatusCode::OK,
-                    axum::Json(serde_json::json!({
-                        "id": id,
-                        "object": "response",
-                        "status": job.state,
-                        "background": true,
-                    })),
-                )
-                    .into_response(),
-            };
-        }
+    {
+        return match job.state.as_str() {
+            "queued" | "running" => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "id": id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "background": true,
+                })),
+            )
+                .into_response(),
+            "failed" => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "id": id,
+                    "object": "response",
+                    "status": "failed",
+                    "background": true,
+                    "error": job.error,
+                })),
+            )
+                .into_response(),
+            _ => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "id": id,
+                    "object": "response",
+                    "status": job.state,
+                    "background": true,
+                })),
+            )
+                .into_response(),
+        };
     }
     let found = state.stored_response(&id).map(|s| {
         serde_json::json!({
@@ -953,13 +948,13 @@ pub async fn scoped_proxy(
         );
     };
     // Per-key admission (same contract as openai_proxy).
-    if let Some(key) = key_ext.as_ref().map(|Extension(k)| k) {
-        if let Some(entry) = state.keys.entry(&key.name) {
-            if let Err(rej) = state.keys.check(&entry, &model) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&key.name);
+    if let Some(key) = key_ext.as_ref().map(|Extension(k)| k)
+        && let Some(entry) = state.keys.entry(&key.name)
+    {
+        if let Err(rej) = state.keys.check(&entry, &model) {
+            return rej.to_response();
         }
+        state.keys.charge_request(&key.name);
     }
     if crate::remotes::split_remote(&model, &state.config).is_some() {
         return crate::remotes::forward_with_health(
@@ -1042,13 +1037,13 @@ pub async fn responses_api(
     let model = extract_model(&body)
         .or_else(|| extract_model_multipart(&body, "multipart/form-data"))
         .unwrap_or_default();
-    if let Some(key) = key_ext.as_ref().map(|Extension(k)| k) {
-        if let Some(entry) = state.keys.entry(&key.name) {
-            if let Err(rej) = state.keys.check(&entry, &model) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&key.name);
+    if let Some(key) = key_ext.as_ref().map(|Extension(k)| k)
+        && let Some(entry) = state.keys.entry(&key.name)
+    {
+        if let Err(rej) = state.keys.check(&entry, &model) {
+            return rej.to_response();
         }
+        state.keys.charge_request(&key.name);
     }
     // Remote routing first (registry chaining is local-only today).
     if crate::remotes::split_remote(&model, &state.config).is_some() {
@@ -1345,10 +1340,10 @@ pub async fn responses_api(
     if load_ms > 100 {
         builder = builder.header("x-blazar-status", "loading");
     }
-    if let Some(h) = &bestof_hdr {
-        if let Ok(v) = axum::http::HeaderValue::from_str(h) {
-            builder = builder.header(crate::bestof::HEADER, v);
-        }
+    if let Some(h) = &bestof_hdr
+        && let Ok(v) = axum::http::HeaderValue::from_str(h)
+    {
+        builder = builder.header(crate::bestof::HEADER, v);
     }
     builder
         .body(axum::body::Body::from(
@@ -1453,8 +1448,8 @@ async fn buffered_response_roundtrip(
                                 return fail(
                                     e2.status_u16(),
                                     &format!(
-                                "engine request failed: {e}; retry on respawned child: {e2}"
-                            ),
+                                        "engine request failed: {e}; retry on respawned child: {e2}"
+                                    ),
                                 );
                             }
                         }

@@ -68,7 +68,9 @@ pub fn resolve(name: &str) -> CoreResult<&'static CatalogEntry> {
                 .map(|e| e.short_name.as_str())
                 .collect();
             Err(CoreError::Catalog(if suggestions.is_empty() {
-                format!("no catalog model matching {name:?}; try `blazar search <query>` or pull an explicit owner/repo:quant")
+                format!(
+                    "no catalog model matching {name:?}; try `blazar search <query>` or pull an explicit owner/repo:quant"
+                )
             } else {
                 format!(
                     "no catalog model matching {name:?}; did you mean: {}?",

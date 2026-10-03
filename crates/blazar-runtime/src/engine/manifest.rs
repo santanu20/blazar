@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -417,12 +417,31 @@ impl Manifest {
 
 /// Probe a llama-server binary: version, devices, flags.
 pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
+    probe_with_env(server_path, tag, &[])
+}
+
+/// `probe` with extra environment applied to every probe child, exactly
+/// the way `engine_env` applies to a serving child (e.g. `GGML_BACKEND_PATH`
+/// so a CUDA build discovers its GPU during probing). The process
+/// environment itself is never mutated — edition 2024 makes that unsafe,
+/// and a set-around-call dance would also leak the probe env into any
+/// concurrently spawned child.
+pub fn probe_with_env(
+    server_path: &Path,
+    tag: &str,
+    extra_env: &[(String, String)],
+) -> Result<Manifest> {
     let server = server_path
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
 
-    let out = crate::probe::probe_output(Command::new(server).arg("--version"), 30)
-        .with_context(|| format!("run {server} --version (timed out or failed to spawn)"))?;
+    let out = crate::probe::probe_output(
+        Command::new(server)
+            .arg("--version")
+            .envs(extra_env.iter().map(|(k, v)| (k, v))),
+        30,
+    )
+    .with_context(|| format!("run {server} --version (timed out or failed to spawn)"))?;
     if !out.status.success() {
         return Err(anyhow!(
             "{server} --version exited {}: {}",
@@ -444,10 +463,15 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
     // true number; non-b tags ("local") keep the probed value.
     let build_number = super::gh::btag_number(tag).unwrap_or(parsed_build);
 
-    let devices = run_list_devices(server_path);
+    let devices = run_list_devices_with_env(server_path, extra_env);
 
-    let out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
-        .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
+    let out = crate::probe::probe_output(
+        Command::new(server)
+            .arg("--help")
+            .envs(extra_env.iter().map(|(k, v)| (k, v))),
+        30,
+    )
+    .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
     let help = String::from_utf8_lossy(&out.stdout).to_string();
     let (flags, spec_types) = parse_help(&help);
 
@@ -994,11 +1018,23 @@ fn parse_version(text: &str) -> Result<(u64, String)> {
 /// init), so callers throttle to spawn-time and ≥60s periodic.
 #[must_use]
 pub fn run_list_devices(server: &Path) -> Vec<DeviceDesc> {
+    run_list_devices_with_env(server, &[])
+}
+
+/// [`run_list_devices`] with extra environment for the census child (the
+/// serving child's `engine_env`, so the census sees what a real spawn
+/// would see). The process environment is never mutated.
+#[must_use]
+pub fn run_list_devices_with_env(server: &Path, extra_env: &[(String, String)]) -> Vec<DeviceDesc> {
     // F85: the doc's "a hung census returns an empty list" is now
     // literally true — a deadline-bounded probe replaces the blocking
     // `.output()` that would wedge forever.
-    let Some(out) = crate::probe::probe_output(Command::new(server).arg("--list-devices"), 30)
-    else {
+    let Some(out) = crate::probe::probe_output(
+        Command::new(server)
+            .arg("--list-devices")
+            .envs(extra_env.iter().map(|(k, v)| (k, v))),
+        30,
+    ) else {
         return Vec::new();
     };
     // Upstream exits 0 here even when listing; tolerate non-zero but parse stdout.

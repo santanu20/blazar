@@ -49,10 +49,10 @@ fn main() {
                 if let Some(v) = it.peek().and_then(|s| s.parse::<i64>().ok()) {
                     ctx = v;
                 }
-            } else if let Some(v) = a.strip_prefix("--ctx-size=") {
-                if let Ok(v) = v.parse::<i64>() {
-                    ctx = v;
-                }
+            } else if let Some(v) = a.strip_prefix("--ctx-size=")
+                && let Ok(v) = v.parse::<i64>()
+            {
+                ctx = v;
             }
         }
         ctx
@@ -105,7 +105,9 @@ fn main() {
         println!("  -cram, --cache-ram N  cache size in MiB");
         println!("  -mm, --mmproj FILE    multimodal projector");
         println!("  -fit, --fit [on|off]  adjust args to fit device memory");
-        println!("  --spec-type none,draft-simple,draft-eagle3,draft-mtp,ngram-simple types of speculative decoding");
+        println!(
+            "  --spec-type none,draft-simple,draft-eagle3,draft-mtp,ngram-simple types of speculative decoding"
+        );
         println!("  --spec-draft-model FNAME");
         println!("  --spec-draft-n-max N");
         println!("  --slots               slots endpoint");
@@ -190,12 +192,12 @@ fn main() {
                     names.push(name.clone());
                 }
                 section = Some(name);
-            } else if let Some((k, v)) = t.split_once('=') {
-                if k.trim() == "slot-save-path" && section.as_deref() != Some("*") {
-                    if let Some(s) = &section {
-                        slot_dirs.push((s.clone(), v.trim().to_string()));
-                    }
-                }
+            } else if let Some((k, v)) = t.split_once('=')
+                && k.trim() == "slot-save-path"
+                && section.as_deref() != Some("*")
+                && let Some(s) = &section
+            {
+                slot_dirs.push((s.clone(), v.trim().to_string()));
             }
         }
         ROUTER_MODELS.set(names).expect("router models once");
@@ -261,7 +263,8 @@ fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
     let alias_for_routes = alias.to_string();
     // Owned up front: the auth middleware must capture 'static data.
     let secret = api_key.map(str::to_string);
-    let app = axum::Router::new()
+
+    axum::Router::new()
         .route(
             "/health",
             get(|| async {
@@ -355,8 +358,7 @@ fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
                     next.run(req).await
                 }
             },
-        ));
-    app
+        ))
 }
 
 async fn serve(host: String, port: Option<u16>, alias: String, api_key: Option<String>) {
@@ -466,19 +468,18 @@ fn should_hang(text: &str) -> bool {
             .is_ok(),
         Err(_) => true,
     };
-    if let Ok(diag) = std::env::var("STUB_DIAG_FILE") {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Ok(diag) = std::env::var("STUB_DIAG_FILE")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&diag)
-        {
-            use std::io::Write;
-            let _ = writeln!(
-                f,
-                "[pid {}] should_hang marker_hit=true once_claimed={once}",
-                std::process::id()
-            );
-        }
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[pid {}] should_hang marker_hit=true once_claimed={once}",
+            std::process::id()
+        );
     }
     once
 }
@@ -1270,10 +1271,10 @@ async fn props(
         "model_alias": state,
         "default_props": {"temperature": 0.8, "top_k": 40},
     });
-    if method == axum::http::Method::POST {
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
-            props["user_props"] = parsed;
-        }
+    if method == axum::http::Method::POST
+        && let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body)
+    {
+        props["user_props"] = parsed;
     }
     axum::Json(props)
 }

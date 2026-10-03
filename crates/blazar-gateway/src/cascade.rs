@@ -6,17 +6,17 @@
 //! small-model call (AgentRouter-lineage behavior: most agentic steps
 //! route to the smaller model; only the failures pay the big one).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Extension, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use serde_json::Value;
 
-use crate::state::AppState;
 use crate::TraceId;
+use crate::state::AppState;
 
 pub const HEADER: &str = "x-blazar-cascade";
 
@@ -78,10 +78,11 @@ pub(crate) fn resolve_cascade(
             names.len()
         ));
     }
-    if let Some(arr) = req.get("cascade").and_then(|c| c.as_array()) {
-        if !header_pinned && arr.is_empty() {
-            return Err("cascade list is empty — name at least one model".into());
-        }
+    if let Some(arr) = req.get("cascade").and_then(|c| c.as_array())
+        && !header_pinned
+        && arr.is_empty()
+    {
+        return Err("cascade list is empty — name at least one model".into());
     }
     Ok(Some(names))
 }

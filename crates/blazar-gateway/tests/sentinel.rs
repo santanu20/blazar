@@ -466,9 +466,10 @@ async fn integration__why__flagged_filter_limit_and_code_reach() {
         .unwrap();
     let arr = flagged["records"].as_array().unwrap();
     assert_eq!(arr.len(), 2, "limit=2 must cap the result");
-    assert!(arr
-        .iter()
-        .all(|r| { r["detections"].as_array().is_some_and(|d| !d.is_empty()) }));
+    assert!(
+        arr.iter()
+            .all(|r| { r["detections"].as_array().is_some_and(|d| !d.is_empty()) })
+    );
 
     let by_code: serde_json::Value = c
         .get(format!("{}/api/why?code=empty_response&limit=256", ts.base))
@@ -686,10 +687,12 @@ async fn integration__sentinel__enforce_config_global_and_ollama_path() {
         .unwrap();
     assert_eq!(o.status(), 422);
     let obody: serde_json::Value = o.json().await.unwrap();
-    assert!(obody["error"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("sentinel enforce"));
+    assert!(
+        obody["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("sentinel enforce")
+    );
     // Enforce decisions land in the ring (answerable via why).
     let rec = await_record(&ts, "ollama-chat").await;
     assert!(
@@ -713,11 +716,13 @@ async fn integration__watch_sse_streams_live_detections() {
         .await
         .unwrap();
     assert_eq!(stream.status(), 200);
-    assert!(stream
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("text/event-stream")));
+    assert!(
+        stream
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("text/event-stream"))
+    );
     let reader = stream;
     let (tx_lines, rx_lines) = tokio::sync::oneshot::channel::<String>();
     let handle = tokio::spawn(async move {

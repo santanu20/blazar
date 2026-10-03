@@ -8,7 +8,7 @@
 //! `BLAZAR_VERSION` behave as in the installer, which is what the tests
 //! exercise against a fake release server.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use blazar_core::config::UpdateChannel;
 
 use crate::engine::gh::{GhAsset, GhClient};

@@ -20,16 +20,16 @@ pub mod tls;
 
 pub use catalog::{catalog, pair_for_spec_mode, resolve, spec_pair_for, spec_pair_for_typed};
 pub use config::{
-    is_valid_spec_mode, persist_config, ApiKey, Config, ModelOverride, Remote, SemanticCacheConfig,
+    ApiKey, Config, ModelOverride, Remote, SemanticCacheConfig, is_valid_spec_mode, persist_config,
 };
 pub use dirs::BlazarDirs;
 pub use error::{CoreError, CoreResult};
 pub use gguf::{
-    is_gguf_container, read_metadata_file, GgufMeta, GgufValue, DIFFUSION_PARADIGM_ARCHS,
+    DIFFUSION_PARADIGM_ARCHS, GgufMeta, GgufValue, is_gguf_container, read_metadata_file,
 };
 pub use hardware::{GpuInfo, Hardware};
 pub use hfmeta::{
-    read_hf_config, root_safetensors, root_safetensors_bytes, HfMeta, KvGeom, ModelMeta,
+    HfMeta, KvGeom, ModelMeta, read_hf_config, root_safetensors, root_safetensors_bytes,
 };
-pub use profile::{compile as compile_profile, Endpoint, Profile, ProfileInput, TuningOverrides};
+pub use profile::{Endpoint, Profile, ProfileInput, TuningOverrides, compile as compile_profile};
 pub use store::{EngineRow, KeyUsageRow, LoraRow, ModelRow, ProfileRow, Store};

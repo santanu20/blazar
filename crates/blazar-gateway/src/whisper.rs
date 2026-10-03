@@ -36,11 +36,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
 use blazar_runtime::whisper;
 use futures::StreamExt as _;
 
@@ -536,32 +536,32 @@ impl AudioJobs {
 
     fn mark_running(&self, id: &str) {
         let mut store = self.inner.lock().expect("audio jobs lock");
-        if let Some(entry) = store.jobs.get_mut(id) {
-            if matches!(entry.state, AudioJobState::Queued) {
-                entry.state = AudioJobState::Running;
-            }
+        if let Some(entry) = store.jobs.get_mut(id)
+            && matches!(entry.state, AudioJobState::Queued)
+        {
+            entry.state = AudioJobState::Running;
         }
     }
 
     fn finish(&self, id: &str, status: u16, content_type: &str, body: Vec<u8>) {
         let mut store = self.inner.lock().expect("audio jobs lock");
-        if let Some(entry) = store.jobs.get_mut(id) {
-            if matches!(entry.state, AudioJobState::Queued | AudioJobState::Running) {
-                entry.state = AudioJobState::Completed {
-                    status,
-                    content_type: content_type.to_string(),
-                    body: Arc::new(body),
-                };
-            }
+        if let Some(entry) = store.jobs.get_mut(id)
+            && matches!(entry.state, AudioJobState::Queued | AudioJobState::Running)
+        {
+            entry.state = AudioJobState::Completed {
+                status,
+                content_type: content_type.to_string(),
+                body: Arc::new(body),
+            };
         }
     }
 
     fn fail(&self, id: &str, message: String) {
         let mut store = self.inner.lock().expect("audio jobs lock");
-        if let Some(entry) = store.jobs.get_mut(id) {
-            if matches!(entry.state, AudioJobState::Queued | AudioJobState::Running) {
-                entry.state = AudioJobState::Failed(message);
-            }
+        if let Some(entry) = store.jobs.get_mut(id)
+            && matches!(entry.state, AudioJobState::Queued | AudioJobState::Running)
+        {
+            entry.state = AudioJobState::Failed(message);
         }
     }
 
@@ -628,12 +628,11 @@ fn evict_one(store: &mut AudioJobStore) {
         .iter()
         .min_by_key(|(_, e)| (u64::from(!e.state.terminal()), e.seq))
         .map(|(id, _)| id.clone());
-    if let Some(id) = victim {
-        if let Some(entry) = store.jobs.remove(&id) {
-            if let Some(handle) = entry.handle {
-                handle.abort();
-            }
-        }
+    if let Some(id) = victim
+        && let Some(entry) = store.jobs.remove(&id)
+        && let Some(handle) = entry.handle
+    {
+        handle.abort();
     }
 }
 
@@ -1111,29 +1110,29 @@ pub async fn audio_transcriptions(
     // request count) — every other remote lane has since the audit; the
     // token sniffer has nothing to read in whisper JSON (no usage
     // field), so request counts are the charge unit here.
-    if let Some(model) = model.as_deref() {
-        if split_remote(model, &state.config).is_some() {
-            if let Some(Extension(k)) = &key_ext {
-                if let Some(entry) = state.keys.entry(&k.name) {
-                    if let Err(rej) = state.keys.check(&entry, model) {
-                        return rej.to_response();
-                    }
-                    state.keys.charge_request(&k.name);
-                }
+    if let Some(model) = model.as_deref()
+        && split_remote(model, &state.config).is_some()
+    {
+        if let Some(Extension(k)) = &key_ext
+            && let Some(entry) = state.keys.entry(&k.name)
+        {
+            if let Err(rej) = state.keys.check(&entry, model) {
+                return rej.to_response();
             }
-            return crate::remotes::forward_with_health(
-                &state,
-                model,
-                &method,
-                uri.path_and_query().map_or(
-                    "/v1/audio/transcriptions",
-                    axum::http::uri::PathAndQuery::as_str,
-                ),
-                &headers,
-                body,
-            )
-            .await;
+            state.keys.charge_request(&k.name);
         }
+        return crate::remotes::forward_with_health(
+            &state,
+            model,
+            &method,
+            uri.path_and_query().map_or(
+                "/v1/audio/transcriptions",
+                axum::http::uri::PathAndQuery::as_str,
+            ),
+            &headers,
+            body,
+        )
+        .await;
     }
 
     // (2) Local lane: installed binary + pulled ggml model. Name the exact
@@ -1214,29 +1213,29 @@ pub async fn audio_translations(
 
     // (1) Explicit remote intent wins (F11 admission, same as
     // transcriptions — request counts are the charge unit here).
-    if let Some(model) = model.as_deref() {
-        if split_remote(model, &state.config).is_some() {
-            if let Some(Extension(k)) = &key_ext {
-                if let Some(entry) = state.keys.entry(&k.name) {
-                    if let Err(rej) = state.keys.check(&entry, model) {
-                        return rej.to_response();
-                    }
-                    state.keys.charge_request(&k.name);
-                }
+    if let Some(model) = model.as_deref()
+        && split_remote(model, &state.config).is_some()
+    {
+        if let Some(Extension(k)) = &key_ext
+            && let Some(entry) = state.keys.entry(&k.name)
+        {
+            if let Err(rej) = state.keys.check(&entry, model) {
+                return rej.to_response();
             }
-            return crate::remotes::forward_with_health(
-                &state,
-                model,
-                &method,
-                uri.path_and_query().map_or(
-                    "/v1/audio/translations",
-                    axum::http::uri::PathAndQuery::as_str,
-                ),
-                &headers,
-                body,
-            )
-            .await;
+            state.keys.charge_request(&k.name);
         }
+        return crate::remotes::forward_with_health(
+            &state,
+            model,
+            &method,
+            uri.path_and_query().map_or(
+                "/v1/audio/translations",
+                axum::http::uri::PathAndQuery::as_str,
+            ),
+            &headers,
+            body,
+        )
+        .await;
     }
 
     // (2) Local lane, forced translation. Same admission as the remote

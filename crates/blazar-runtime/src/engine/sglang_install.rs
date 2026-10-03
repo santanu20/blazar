@@ -19,7 +19,7 @@
 //! macOS are not supported upstream, so this lane refuses there with a
 //! teaching error instead of installing an engine that cannot spawn.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 use super::net_probe::Attempt;
@@ -378,13 +378,13 @@ fn ensure_dev_toolkit_layout(root: &Path) {
             return;
         }
         let lib64 = root.join("lib64");
-        if !lib64.exists() {
-            if let Err(e) = std::os::unix::fs::symlink("lib", &lib64) {
-                tracing::warn!(
-                    "cannot link {} -> lib in the bundled toolkit: {e}",
-                    lib64.display()
-                );
-            }
+        if !lib64.exists()
+            && let Err(e) = std::os::unix::fs::symlink("lib", &lib64)
+        {
+            tracing::warn!(
+                "cannot link {} -> lib in the bundled toolkit: {e}",
+                lib64.display()
+            );
         }
         // Highest versioned soname wins if a wheel ever ships several.
         let soname = std::fs::read_dir(&lib).ok().and_then(|entries| {
@@ -401,12 +401,10 @@ fn ensure_dev_toolkit_layout(root: &Path) {
         });
         if let Some(soname) = soname {
             let dev_link = lib.join("libcudart.so");
-            if !dev_link.exists() {
-                if let Err(e) = std::os::unix::fs::symlink(&soname, &dev_link) {
-                    tracing::warn!(
-                        "cannot link libcudart.so -> {soname} in the bundled toolkit: {e}"
-                    );
-                }
+            if !dev_link.exists()
+                && let Err(e) = std::os::unix::fs::symlink(&soname, &dev_link)
+            {
+                tracing::warn!("cannot link libcudart.so -> {soname} in the bundled toolkit: {e}");
             }
         }
     }
@@ -521,13 +519,13 @@ mod tests {
         // The wheel lands nvcc.exe on Windows, bare nvcc elsewhere — the
         // probe checks the platform-correct name.
         let nvcc = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
-        let site_packages = |venv: &tempfile::TempDir, gen: &str| {
+        let site_packages = |venv: &tempfile::TempDir, generation: &str| {
             venv.path()
                 .join("lib")
                 .join("python3.12")
                 .join("site-packages")
                 .join("nvidia")
-                .join(gen)
+                .join(generation)
         };
 
         let venv = tempfile::tempdir().unwrap();

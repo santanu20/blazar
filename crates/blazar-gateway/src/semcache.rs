@@ -8,8 +8,8 @@
 //! (`x-blazar-cache: off`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -291,7 +291,7 @@ pub fn directive(
             _ => {
                 return Err(format!(
                     "invalid {HDR_CACHE_TTL} value (expected 1..=86400 seconds)"
-                ))
+                ));
             }
         },
     };
@@ -302,7 +302,7 @@ pub fn directive(
             _ => {
                 return Err(format!(
                     "invalid {HDR_CACHE_THRESHOLD} value (expected 0.01..=1.0)"
-                ))
+                ));
             }
         },
     };
@@ -520,18 +520,21 @@ mod tests {
         assert!((hit.1 - 1.0).abs() < 1e-6);
         assert_eq!(hit.2, serde_json::json!({"a": 1}));
         // different model / key / lane -> miss
-        assert!(sc
-            .lookup(LANE_OLLAMA, "m2", Some("k1"), &emb, 0.5, FP)
-            .is_none());
-        assert!(sc
-            .lookup(LANE_OLLAMA, "m1", Some("k2"), &emb, 0.5, FP)
-            .is_none());
+        assert!(
+            sc.lookup(LANE_OLLAMA, "m2", Some("k1"), &emb, 0.5, FP)
+                .is_none()
+        );
+        assert!(
+            sc.lookup(LANE_OLLAMA, "m1", Some("k2"), &emb, 0.5, FP)
+                .is_none()
+        );
         assert!(sc.lookup(LANE_OLLAMA, "m1", None, &emb, 0.5, FP).is_none());
         // below threshold -> miss
         let orth = [0.0f32, 1.0];
-        assert!(sc
-            .lookup(LANE_OLLAMA, "m1", Some("k1"), &orth, 0.5, FP)
-            .is_none());
+        assert!(
+            sc.lookup(LANE_OLLAMA, "m1", Some("k1"), &orth, 0.5, FP)
+                .is_none()
+        );
     }
 
     #[test]
@@ -551,9 +554,10 @@ mod tests {
             16,
             FP,
         );
-        assert!(sc
-            .lookup(LANE_OLLAMA, "m1", None, &emb, 0.0, FP + 1)
-            .is_none());
+        assert!(
+            sc.lookup(LANE_OLLAMA, "m1", None, &emb, 0.0, FP + 1)
+                .is_none()
+        );
     }
 
     #[test]

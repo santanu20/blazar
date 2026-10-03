@@ -11,8 +11,8 @@
 
 use std::collections::VecDeque;
 
-use blazar_core::store::StoredResponseRow;
 use blazar_core::Store;
+use blazar_core::store::StoredResponseRow;
 use serde_json::Value;
 
 /// One stored response: enough to reconstruct the conversation prefix.

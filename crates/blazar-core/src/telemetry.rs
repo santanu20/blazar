@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::MakeWriter;
 
 /// Tracing sink that tees every event to stderr and, when armed, to a
 /// daemon-owned log file. File-side failures (rotated-away file, full
@@ -30,20 +30,20 @@ struct TeeWrite {
 impl std::io::Write for TeeWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let _ = std::io::stderr().write_all(buf);
-        if let Some(file) = &self.file {
-            if let Ok(mut guard) = file.lock() {
-                let _ = guard.write_all(buf);
-            }
+        if let Some(file) = &self.file
+            && let Ok(mut guard) = file.lock()
+        {
+            let _ = guard.write_all(buf);
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         let _ = std::io::stderr().flush();
-        if let Some(file) = &self.file {
-            if let Ok(mut guard) = file.lock() {
-                let _ = guard.flush();
-            }
+        if let Some(file) = &self.file
+            && let Ok(mut guard) = file.lock()
+        {
+            let _ = guard.flush();
         }
         Ok(())
     }

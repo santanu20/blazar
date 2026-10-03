@@ -9,8 +9,8 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use std::time::Duration;
@@ -88,16 +88,32 @@ impl Code {
     #[must_use]
     pub fn hint(self) -> &'static str {
         match self {
-            Self::CtxTruncated => "generation hit the context ceiling: raise default_ctx / [model_overrides].ctx, or pass options.num_ctx (ollama API)",
-            Self::CtxNearLimit => "prompt is near the serving context; the next requests will truncate",
-            Self::ToolArgsInvalidJson => "model emitted tool-call arguments that are not valid JSON",
-            Self::ToolNameUnknown => "model called a tool absent from the request's tools list (hallucinated tool)",
-            Self::SchemaViolation => "response violated the requested JSON schema / json_object format",
+            Self::CtxTruncated => {
+                "generation hit the context ceiling: raise default_ctx / [model_overrides].ctx, or pass options.num_ctx (ollama API)"
+            }
+            Self::CtxNearLimit => {
+                "prompt is near the serving context; the next requests will truncate"
+            }
+            Self::ToolArgsInvalidJson => {
+                "model emitted tool-call arguments that are not valid JSON"
+            }
+            Self::ToolNameUnknown => {
+                "model called a tool absent from the request's tools list (hallucinated tool)"
+            }
+            Self::SchemaViolation => {
+                "response violated the requested JSON schema / json_object format"
+            }
             Self::EmptyResponse => "200 with no content, no tool calls, no reasoning",
             Self::ReasoningNoAnswer => "model produced reasoning but never answered",
-            Self::StalledStream => "stream alive but no chunks for the stall threshold (swap thrash / CPU fallback?)",
-            Self::TemplateNoTools => "request carries tools but the model's chat template has no tool support — expect plain text instead of tool calls",
-            Self::CacheBustSystem => "system prompt or tools mutate between turns on a stable conversation — every turn re-prefills from scratch (KV cache busted). If unintended, keep the system prompt byte-stable (move counters/timestamps to the last user message)",
+            Self::StalledStream => {
+                "stream alive but no chunks for the stall threshold (swap thrash / CPU fallback?)"
+            }
+            Self::TemplateNoTools => {
+                "request carries tools but the model's chat template has no tool support — expect plain text instead of tool calls"
+            }
+            Self::CacheBustSystem => {
+                "system prompt or tools mutate between turns on a stable conversation — every turn re-prefills from scratch (KV cache busted). If unintended, keep the system prompt byte-stable (move counters/timestamps to the last user message)"
+            }
         }
     }
 
@@ -106,16 +122,36 @@ impl Code {
     #[must_use]
     pub fn retry_hint(self) -> &'static str {
         match self {
-            Self::CtxTruncated => "retry: raise ctx (X-Blazar-Num-Ctx / options.num_ctx / [model_overrides].ctx) and resend the same request",
-            Self::CtxNearLimit => "retry: trim history or raise ctx before sending the next request",
-            Self::ToolArgsInvalidJson => "retry: one repair round-trip — resend with the parse error quoted back to the model",
-            Self::ToolNameUnknown => "retry: one repair round-trip — name the valid tools in the repair prompt",
-            Self::SchemaViolation => "retry: one repair round-trip — include the schema error and the schema in the prompt",
-            Self::EmptyResponse => "retry: resend once; persistent empties point at ctx/template config — `blazar doctor`",
-            Self::ReasoningNoAnswer => "retry: resend (reasoning consumed the budget); persistent -> raise max tokens or switch reasoning_format",
-            Self::StalledStream => "retry after checking `blazar ps` (swap thrash / CPU fallback); the request may still complete late",
-            Self::TemplateNoTools => "no retry will help: pull a tool-capable model (template with tool markers) for tool work",
-            Self::CacheBustSystem => "no retry needed — advisory: stabilize the client system prompt to restore full prefix-cache reuse",
+            Self::CtxTruncated => {
+                "retry: raise ctx (X-Blazar-Num-Ctx / options.num_ctx / [model_overrides].ctx) and resend the same request"
+            }
+            Self::CtxNearLimit => {
+                "retry: trim history or raise ctx before sending the next request"
+            }
+            Self::ToolArgsInvalidJson => {
+                "retry: one repair round-trip — resend with the parse error quoted back to the model"
+            }
+            Self::ToolNameUnknown => {
+                "retry: one repair round-trip — name the valid tools in the repair prompt"
+            }
+            Self::SchemaViolation => {
+                "retry: one repair round-trip — include the schema error and the schema in the prompt"
+            }
+            Self::EmptyResponse => {
+                "retry: resend once; persistent empties point at ctx/template config — `blazar doctor`"
+            }
+            Self::ReasoningNoAnswer => {
+                "retry: resend (reasoning consumed the budget); persistent -> raise max tokens or switch reasoning_format"
+            }
+            Self::StalledStream => {
+                "retry after checking `blazar ps` (swap thrash / CPU fallback); the request may still complete late"
+            }
+            Self::TemplateNoTools => {
+                "no retry will help: pull a tool-capable model (template with tool markers) for tool work"
+            }
+            Self::CacheBustSystem => {
+                "no retry needed — advisory: stabilize the client system prompt to restore full prefix-cache reuse"
+            }
         }
     }
 }
@@ -390,10 +426,10 @@ pub fn structured_output_error(body: &Value) -> Option<String> {
             if !js.is_object() {
                 return Some("response_format.json_schema must be an object".into());
             }
-            if let Some(sch) = js.get("schema").filter(|v| !v.is_null()) {
-                if !sch.is_object() {
-                    return Some("response_format.json_schema.schema must be an object".into());
-                }
+            if let Some(sch) = js.get("schema").filter(|v| !v.is_null())
+                && !sch.is_object()
+            {
+                return Some("response_format.json_schema.schema must be an object".into());
             }
         }
     }
@@ -402,10 +438,10 @@ pub fn structured_output_error(body: &Value) -> Option<String> {
 
 /// Top-level shape sanity for a schema object carried in ollama `format`.
 fn schema_shape_error(schema: &Value) -> Option<String> {
-    if let Some(p) = schema.get("properties").filter(|v| !v.is_null()) {
-        if !p.is_object() {
-            return Some("format.properties must be an object".into());
-        }
+    if let Some(p) = schema.get("properties").filter(|v| !v.is_null())
+        && !p.is_object()
+    {
+        return Some("format.properties must be an object".into());
     }
     if let Some(r) = schema.get("required").filter(|v| !v.is_null()) {
         let all_strings = r.as_array().is_some_and(|a| a.iter().all(Value::is_string));
@@ -472,18 +508,18 @@ pub struct SentinelFeed {
 
 impl SentinelFeed {
     pub fn bytes(&self, b: axum::body::Bytes) {
-        if let Some(tx) = &self.tx {
-            if tx.try_send(FeedEvent::Bytes(b)).is_err() {
-                self.degraded.store(true, Ordering::Relaxed);
-            }
+        if let Some(tx) = &self.tx
+            && tx.try_send(FeedEvent::Bytes(b)).is_err()
+        {
+            self.degraded.store(true, Ordering::Relaxed);
         }
     }
 
     pub fn value(&self, v: Value) {
-        if let Some(tx) = &self.tx {
-            if tx.try_send(FeedEvent::Value(v)).is_err() {
-                self.degraded.store(true, Ordering::Relaxed);
-            }
+        if let Some(tx) = &self.tx
+            && tx.try_send(FeedEvent::Value(v)).is_err()
+        {
+            self.degraded.store(true, Ordering::Relaxed);
         }
     }
 
@@ -635,10 +671,11 @@ impl VerdictCache {
     }
 
     fn put(&mut self, k: u64, v: Option<String>) {
-        if self.map.len() >= VERDICT_CAP && !self.map.contains_key(&k) {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
-            }
+        if self.map.len() >= VERDICT_CAP
+            && !self.map.contains_key(&k)
+            && let Some(old) = self.order.pop_front()
+        {
+            self.map.remove(&old);
         }
         if !self.map.contains_key(&k) {
             self.order.push_back(k);
@@ -845,15 +882,15 @@ impl Sentinel {
             return;
         }
         *silent_windows += 1;
-        if *silent_windows == 2 {
-            if let Some(hook) = self.evict_hook.lock().clone() {
-                let _ = hook.0.send(ctx.model.clone());
-                tracing::info!(
-                    target: "blazar::sentinel",
-                    model = %ctx.model,
-                    "progress-less stalled child — eviction requested"
-                );
-            }
+        if *silent_windows == 2
+            && let Some(hook) = self.evict_hook.lock().clone()
+        {
+            let _ = hook.0.send(ctx.model.clone());
+            tracing::info!(
+                target: "blazar::sentinel",
+                model = %ctx.model,
+                "progress-less stalled child — eviction requested"
+            );
         }
     }
 
@@ -964,13 +1001,13 @@ impl Sentinel {
                 Some(FeedEvent::End) | None => break,
             }
         }
-        if !json_buf.is_empty() {
-            if let Ok(v) = serde_json::from_slice::<Value>(&json_buf) {
-                if responses {
-                    acc.apply_responses(&v);
-                } else {
-                    acc.apply(&v);
-                }
+        if !json_buf.is_empty()
+            && let Ok(v) = serde_json::from_slice::<Value>(&json_buf)
+        {
+            if responses {
+                acc.apply_responses(&v);
+            } else {
+                acc.apply(&v);
             }
         }
         let mut detections = self.finalize(&ctx, &acc, status);
@@ -1012,11 +1049,11 @@ impl Sentinel {
             // thrash / driver hang) — ask the supervisor to reap it so
             // the next request respawns clean instead of queueing
             // behind a zombie. Best-effort: the evict itself is async.
-            if d.code == Code::StalledStream {
-                if let Some(hook) = self.evict_hook.lock().clone() {
-                    let _ = hook.0.send(record.model.clone());
-                    tracing::info!(target: "blazar::sentinel", model = %record.model, "stalled child — eviction requested");
-                }
+            if d.code == Code::StalledStream
+                && let Some(hook) = self.evict_hook.lock().clone()
+            {
+                let _ = hook.0.send(record.model.clone());
+                tracing::info!(target: "blazar::sentinel", model = %record.model, "stalled child — eviction requested");
             }
         }
         {
@@ -1136,13 +1173,13 @@ impl Sentinel {
                 });
             }
         }
-        if let (Some(p), Some(c)) = (acc.usage_prompt, ctx.ctx.filter(|c| *c > 0)) {
-            if p * 10 > u64::from(c) * NEAR_LIMIT_TENTHS {
-                out.push(Detection {
-                    code: Code::CtxNearLimit,
-                    detail: format!("prompt {p} tokens vs ctx {c}"),
-                });
-            }
+        if let (Some(p), Some(c)) = (acc.usage_prompt, ctx.ctx.filter(|c| *c > 0))
+            && p * 10 > u64::from(c) * NEAR_LIMIT_TENTHS
+        {
+            out.push(Detection {
+                code: Code::CtxNearLimit,
+                detail: format!("prompt {p} tokens vs ctx {c}"),
+            });
         }
 
         self.tool_detections(ctx, acc, &mut out);
@@ -1221,13 +1258,13 @@ impl Sentinel {
                     ),
                 }),
                 Ok(v) => {
-                    if let Some(schema) = ctx.tool_schemas.get(&frag.name) {
-                        if let Some(e) = self.schema_violation(schema, &v) {
-                            out.push(Detection {
-                                code: Code::SchemaViolation,
-                                detail: format!("tool `{}` args: {e}", frag.name),
-                            });
-                        }
+                    if let Some(schema) = ctx.tool_schemas.get(&frag.name)
+                        && let Some(e) = self.schema_violation(schema, &v)
+                    {
+                        out.push(Detection {
+                            code: Code::SchemaViolation,
+                            detail: format!("tool `{}` args: {e}", frag.name),
+                        });
                     }
                 }
             }
@@ -1255,15 +1292,14 @@ impl Sentinel {
                 detail: format!("response is not valid JSON: {e}"),
             }),
             Ok(v) => {
-                if ty == "json_schema" {
-                    if let Some(schema) = rf.get("schema") {
-                        if let Some(e) = self.schema_violation(schema, &v) {
-                            out.push(Detection {
-                                code: Code::SchemaViolation,
-                                detail: format!("response: {e}"),
-                            });
-                        }
-                    }
+                if ty == "json_schema"
+                    && let Some(schema) = rf.get("schema")
+                    && let Some(e) = self.schema_violation(schema, &v)
+                {
+                    out.push(Detection {
+                        code: Code::SchemaViolation,
+                        detail: format!("response: {e}"),
+                    });
                 }
             }
         }
@@ -1576,15 +1612,15 @@ impl Accum {
                         // `done` carries the complete item: only take its
                         // arguments when the deltas never fed this frag
                         // (double-append would corrupt the JSON check).
-                        if ty.ends_with("done") {
-                            if let Some(a) = item.get("arguments").and_then(Value::as_str) {
-                                // F61: bound like every sibling accumulator
-                                if entry.args.is_empty()
-                                    && !a.is_empty()
-                                    && entry.args.len() + a.len() < MAX_ACCUM_BYTES
-                                {
-                                    entry.args.push_str(a);
-                                }
+                        if ty.ends_with("done")
+                            && let Some(a) = item.get("arguments").and_then(Value::as_str)
+                        {
+                            // F61: bound like every sibling accumulator
+                            if entry.args.is_empty()
+                                && !a.is_empty()
+                                && entry.args.len() + a.len() < MAX_ACCUM_BYTES
+                            {
+                                entry.args.push_str(a);
                             }
                         }
                         self.last_tool = Some(key);
@@ -1595,13 +1631,12 @@ impl Accum {
                 "response.function_call_arguments.delta" => {
                     if let (Some(key), Some(d)) =
                         (self.last_tool, ev.get("delta").and_then(Value::as_str))
+                        && let Some(entry) = self.tools.get_mut(&key)
                     {
-                        if let Some(entry) = self.tools.get_mut(&key) {
-                            if entry.args.len() + d.len() < MAX_ACCUM_BYTES {
-                                entry.args.push_str(d);
-                            } else {
-                                self.degraded = true;
-                            }
+                        if entry.args.len() + d.len() < MAX_ACCUM_BYTES {
+                            entry.args.push_str(d);
+                        } else {
+                            self.degraded = true;
                         }
                     }
                 }
@@ -1652,10 +1687,10 @@ impl Accum {
                         // F61: bound like every sibling accumulator — a
                         // body-limit-sized `arguments` string must not
                         // mirror into memory unbounded.
-                        if let Some(a) = item.get("arguments").and_then(Value::as_str) {
-                            if entry.args.len() + a.len() < MAX_ACCUM_BYTES {
-                                entry.args.push_str(a);
-                            }
+                        if let Some(a) = item.get("arguments").and_then(Value::as_str)
+                            && entry.args.len() + a.len() < MAX_ACCUM_BYTES
+                        {
+                            entry.args.push_str(a);
                         }
                     }
                     Some("message") => {
@@ -1799,9 +1834,11 @@ mod tests {
             logprob_tokens: None,
             ms: 1,
         };
-        assert!(rec.to_json()["detections"][0]["retry"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()));
+        assert!(
+            rec.to_json()["detections"][0]["retry"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
     }
 
     #[test]
@@ -1900,9 +1937,11 @@ mod tests {
             "tools": [{"function": {"name": "f", "strict": true,
                 "parameters": {"type": "object", "properties": {"x": {}}, "required": ["x"]}}}]
         });
-        assert!(strict_tool_def_error(&ap)
-            .unwrap()
-            .contains("additionalProperties"));
+        assert!(
+            strict_tool_def_error(&ap)
+                .unwrap()
+                .contains("additionalProperties")
+        );
         // Property not in required.
         let req_missing = serde_json::json!({
             "tools": [{"function": {"name": "f", "strict": true,
@@ -1915,9 +1954,11 @@ mod tests {
             "tools": [{"function": {"name": "f",
                 "parameters": {"type": "not-a-type"}}}]
         });
-        assert!(strict_tool_def_error(&bad_schema)
-            .unwrap()
-            .contains("JSON Schema"));
+        assert!(
+            strict_tool_def_error(&bad_schema)
+                .unwrap()
+                .contains("JSON Schema")
+        );
         // No tools / no strict = None.
         assert!(strict_tool_def_error(&serde_json::json!({"model": "m"})).is_none());
     }
@@ -1992,17 +2033,23 @@ mod tests {
     #[test]
     fn unit__structured_output__schema_top_level_shape() {
         let bad_props = serde_json::json!({"model": "m", "format": {"properties": 5}});
-        assert!(structured_output_error(&bad_props)
-            .unwrap()
-            .contains("properties"));
+        assert!(
+            structured_output_error(&bad_props)
+                .unwrap()
+                .contains("properties")
+        );
         let bad_required = serde_json::json!({"model": "m", "format": {"required": ["a", 5]}});
-        assert!(structured_output_error(&bad_required)
-            .unwrap()
-            .contains("required"));
+        assert!(
+            structured_output_error(&bad_required)
+                .unwrap()
+                .contains("required")
+        );
         let bad_required2 = serde_json::json!({"model": "m", "format": {"required": "a"}});
-        assert!(structured_output_error(&bad_required2)
-            .unwrap()
-            .contains("required"));
+        assert!(
+            structured_output_error(&bad_required2)
+                .unwrap()
+                .contains("required")
+        );
         let bad_type = serde_json::json!({"model": "m", "format": {"type": 7}});
         assert!(structured_output_error(&bad_type).unwrap().contains("type"));
         // String-array type is legal.
@@ -2033,25 +2080,33 @@ mod tests {
     fn unit__structured_output__response_format_mirrors_child_type_set() {
         // Unknown non-empty type → 400 (child: server-common.cpp:1180).
         let body = serde_json::json!({"model": "m", "response_format": {"type": "yaml"}});
-        assert!(structured_output_error(&body)
-            .unwrap()
-            .contains("response_format.type"));
+        assert!(
+            structured_output_error(&body)
+                .unwrap()
+                .contains("response_format.type")
+        );
         // Non-string type.
         let body = serde_json::json!({"model": "m", "response_format": {"type": 4}});
-        assert!(structured_output_error(&body)
-            .unwrap()
-            .contains("response_format.type"));
+        assert!(
+            structured_output_error(&body)
+                .unwrap()
+                .contains("response_format.type")
+        );
         // Non-object response_format.
         let body = serde_json::json!({"model": "m", "response_format": "json"});
-        assert!(structured_output_error(&body)
-            .unwrap()
-            .contains("response_format must be"));
+        assert!(
+            structured_output_error(&body)
+                .unwrap()
+                .contains("response_format must be")
+        );
         // json_schema.schema present-non-object.
         let body = serde_json::json!({"model": "m",
             "response_format": {"type": "json_schema", "json_schema": {"schema": "oops"}}});
-        assert!(structured_output_error(&body)
-            .unwrap()
-            .contains("schema must be an object"));
+        assert!(
+            structured_output_error(&body)
+                .unwrap()
+                .contains("schema must be an object")
+        );
         // Absent schema inside json_schema = pass (child defaults {}).
         let body = serde_json::json!({"model": "m",
             "response_format": {"type": "json_schema", "json_schema": {}}});

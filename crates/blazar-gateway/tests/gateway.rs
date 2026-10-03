@@ -36,6 +36,24 @@ fn stub_bin() -> PathBuf {
     panic!("stub-llama-server not found near {}", exe.display());
 }
 
+// Edition 2024 makes env mutation unsafe (std demands no concurrent
+// reader/writer thread). These tests run one-per-process under nextest and
+// only the spawning test thread and its stub children touch the STUB_*
+// knobs — the condition std requires.
+fn set_env(key: &str, value: &str) {
+    #[expect(unsafe_code)]
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+fn remove_env(key: &str) {
+    #[expect(unsafe_code)]
+    unsafe {
+        std::env::remove_var(key);
+    }
+}
+
 fn write_gguf(path: &std::path::Path) {
     let mut b: Vec<u8> = Vec::new();
     b.extend_from_slice(b"GGUF");
@@ -358,7 +376,7 @@ async fn e2e__n_choices_engine_ignoring_n_gets_a_teaching_502() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__n_choices_honored_passes_through_with_all_choices() {
-    std::env::set_var("STUB_CHOICE_COUNT", "2");
+    set_env("STUB_CHOICE_COUNT", "2");
     let ts = start(Config::default()).await;
     let c = client();
     let r: serde_json::Value = c
@@ -520,7 +538,7 @@ async fn e2e__n_choices_lane_ceiling_teaches_before_the_engine_can() {
 async fn e2e__openai_chat_nonstream_and_stream() {
     // Pin the local-lane framing contract: the gateway must forward an exact
     // Content-Length, never chunked (mlx_lm.server class children 411 on it).
-    std::env::set_var("STUB_REJECT_CHUNKED", "1");
+    set_env("STUB_REJECT_CHUNKED", "1");
     let ts = start(Config::default()).await;
     let c = client();
     let body = serde_json::json!({
@@ -985,9 +1003,10 @@ async fn e2e__keys_scoped_rate_and_accounting() {
         .unwrap();
     let keys = listed["keys"].as_array().cloned().unwrap_or_default();
     assert_eq!(keys.len(), 2);
-    assert!(keys
-        .iter()
-        .all(|k| !k["key"].as_str().unwrap_or("").contains("plm_admin")));
+    assert!(
+        keys.iter()
+            .all(|k| !k["key"].as_str().unwrap_or("").contains("plm_admin"))
+    );
     let refused = c
         .get(format!("{}/api/keys", ts.base))
         .bearer_auth("plm_scoped")
@@ -1176,9 +1195,10 @@ async fn e2e__models_capabilities_field_matches_mmproj() {
         );
     }
     // The harness rows have no mmproj attached.
-    assert!(data
-        .iter()
-        .all(|r| r["capabilities"].as_array().is_some_and(Vec::is_empty)));
+    assert!(
+        data.iter()
+            .all(|r| r["capabilities"].as_array().is_some_and(Vec::is_empty))
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -1190,7 +1210,7 @@ async fn e2e__keys_concurrency_cap() {
     // only when the body drains or the client disconnects). The stub delays
     // its SSE chunks via env, inherited by the spawned stub child; tests run
     // with --test-threads=1 in the gate, so the global env is safe here.
-    std::env::set_var("STUB_DELAY_CHUNK_MS", "400");
+    set_env("STUB_DELAY_CHUNK_MS", "400");
     let cfg = Config {
         keys: vec![ApiKey {
             name: "cap".into(),
@@ -1265,7 +1285,7 @@ async fn e2e__keys_concurrency_cap() {
         "lease must release after client disconnect"
     );
 
-    std::env::remove_var("STUB_DELAY_CHUNK_MS");
+    remove_env("STUB_DELAY_CHUNK_MS");
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -1340,10 +1360,12 @@ async fn e2e__tls_serves_https_and_cors_headers() {
         .send()
         .await
         .unwrap();
-    assert!(denied
-        .headers()
-        .get("access-control-allow-origin")
-        .is_none());
+    assert!(
+        denied
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
     let _ = tx.send(());
     ts.state.sup.shutdown_all().await.unwrap();
 }
@@ -1523,10 +1545,12 @@ async fn e2e__responses__background_conversations_and_cloud_tools() {
         .unwrap();
     assert_eq!(bad.status(), 400);
     let b: serde_json::Value = bad.json().await.unwrap();
-    assert!(b["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("background"));
+    assert!(
+        b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("background")
+    );
 
     // Cloud builtin tools teach, never silently pretend.
     let cloud = c
@@ -1770,11 +1794,12 @@ async fn e2e__generate_images_and_streaming_chat_bus() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert!(resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("ndjson")));
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("ndjson"))
+    );
     let body = resp.text().await.unwrap();
     let mut saw_delta = false;
     let mut final_line: Option<serde_json::Value> = None;
@@ -2356,9 +2381,11 @@ async fn e2e__explain__card_provenance_and_unknown_404() {
         v["cache"]["kv_k"].is_string(),
         "kv grade or auto ladder: {v}"
     );
-    assert!(v["residents"]
-        .as_array()
-        .is_some_and(std::vec::Vec::is_empty));
+    assert!(
+        v["residents"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty)
+    );
 
     // Tag-form alias (`name:quant`, the display shape /api/tags emits)
     // resolves through the canonical ladder — regression pin for the
@@ -2421,9 +2448,11 @@ async fn e2e__model_doctor__job_cert_and_stored_caps() {
     let started: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(started["object"], "blazar.doctor");
     let id = started["id"].as_str().expect("job id").to_string();
-    assert!(started["poll_url"]
-        .as_str()
-        .is_some_and(|u| u.contains(&id)));
+    assert!(
+        started["poll_url"]
+            .as_str()
+            .is_some_and(|u| u.contains(&id))
+    );
 
     let cert;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -2756,12 +2785,13 @@ async fn e2e__router_mode_sessions_route_by_model() {
         .await
         .unwrap();
     assert_eq!(save["status"], "ok", "{save}");
-    assert!(ts
-        .dirs
-        .sessions_dir()
-        .join(blazar_core::profile::path_safe("m1"))
-        .join("r1")
-        .exists());
+    assert!(
+        ts.dirs
+            .sessions_dir()
+            .join(blazar_core::profile::path_safe("m1"))
+            .join("r1")
+            .exists()
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

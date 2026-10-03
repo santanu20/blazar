@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Config, MmprojPolicy, ModelOverride, DEFAULT_CACHE_RAM_MB};
+use crate::config::{Config, DEFAULT_CACHE_RAM_MB, MmprojPolicy, ModelOverride};
 use crate::config::{MistralrsTuning, SglangTuning};
 use crate::gguf::GgufMeta;
 use crate::hardware::GpuInfo;
@@ -260,14 +260,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // a stale store row — file deleted or moved after the pull — fails
     // HERE with a re-pull instruction instead of five seconds into a
     // child boot with an opaque engine error.
-    if let Some(draft) = input.draft_path {
-        if !std::path::Path::new(draft).is_file() {
-            return Err(format!(
-                "draft model file for {} is missing at {draft} — the store row is \
+    if let Some(draft) = input.draft_path
+        && !std::path::Path::new(draft).is_file()
+    {
+        return Err(format!(
+            "draft model file for {} is missing at {draft} — the store row is \
                  stale; pull the draft model again to refresh it",
-                input.model_name
-            ));
-        }
+            input.model_name
+        ));
     }
 
     // --- 1. model + endpoint + alias
@@ -403,112 +403,111 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // below AUTOFIT_CTX_FLOOR) to fit; pinned ctx is never touched —
     // verdict/refuse instead. f16 bytes are an upper bound (quantized
     // KV only shrinks it) — conservative by design.
-    if kv_unified_emitted(input) {
-        if let Some(f16) = kv_f16_bytes(input, rs.total_ctx).filter(|kv| *kv > 0) {
-            // A PIN the f16 pool cannot host may still be hostable at
-            // the quant the spawn will actually run: an explicit
-            // cache_type override (per-phase pair or legacy), or the
-            // ladder demotion the same tight card triggers anyway. The
-            // refuse teaching names this exact lever — it must not be a
-            // dead end.
-            let mut scratch: Vec<String> = Vec::new();
-            let pinned_pair: Option<(String, String)> = if tuning.kv_quant == Some(true) {
-                Some(("q8_0".to_string(), "q8_0".to_string()))
+    if kv_unified_emitted(input)
+        && let Some(f16) = kv_f16_bytes(input, rs.total_ctx).filter(|kv| *kv > 0)
+    {
+        // A PIN the f16 pool cannot host may still be hostable at
+        // the quant the spawn will actually run: an explicit
+        // cache_type override (per-phase pair or legacy), or the
+        // ladder demotion the same tight card triggers anyway. The
+        // refuse teaching names this exact lever — it must not be a
+        // dead end.
+        let mut scratch: Vec<String> = Vec::new();
+        let pinned_pair: Option<(String, String)> = if tuning.kv_quant == Some(true) {
+            Some(("q8_0".to_string(), "q8_0".to_string()))
+        } else {
+            let (k, v) = config.effective_cache_type_kv(input.model_name);
+            if k.is_empty() && v.is_empty() {
+                kv_quant_ladder(
+                    input,
+                    vram_bytes,
+                    rs.total_ctx,
+                    tuning.fa == Some(false),
+                    &mut scratch,
+                )
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+            } else if k == v {
+                // Symmetric f16-class pin = force off (full-size math).
+                match k.as_str() {
+                    "f32" | "f16" | "bf16" => None,
+                    _ => Some((k, v)),
+                }
             } else {
-                let (k, v) = config.effective_cache_type_kv(input.model_name);
-                if k.is_empty() && v.is_empty() {
-                    kv_quant_ladder(
-                        input,
-                        vram_bytes,
-                        rs.total_ctx,
-                        tuning.fa == Some(false),
-                        &mut scratch,
-                    )
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                } else if k == v {
-                    // Symmetric f16-class pin = force off (full-size math).
-                    match k.as_str() {
-                        "f32" | "f16" | "bf16" => None,
-                        _ => Some((k, v)),
-                    }
-                } else {
-                    Some((k, v))
-                }
-            };
-            let kv = match pinned_pair {
-                Some((k, v)) => scale_kv_pair(f16, &k, &v),
-                None => f16,
-            };
-            let mib = |b: u64| b / (1024 * 1024);
-            let demand = input.model_bytes.saturating_add(kv);
-            let vram85 = vram_bytes / 100 * 85;
-            if ctx_pinned {
-                // Pinned ctx is sovereign — never shrunk. The SHARED
-                // verdict (same fn the gateway preflights with) refuses
-                // a pin the device cannot host; warn-yet-proceed here is
-                // how a doomed pin 502-looped through spawn retries
-                // while the child died at context creation every time.
-                if let UnifiedCtxVerdict::Refuse(msg) =
-                    unified_ctx_verdict(input.model_bytes, kv, vram_bytes, rs.total_ctx)
-                {
-                    return Err(msg);
-                }
-                if demand > vram85 {
-                    // Middle zone (85%..100%): physically hostable, so
-                    // serve it — but gpu-layers stays on the engine's
-                    // live fitter, which may CPU-split the last layers.
-                    // Honest degraded serve, not a refuse.
-                    warnings.push(format!(
-                        "pinned ctx {} fits the {} MiB VRAM only above the 85% share \
+                Some((k, v))
+            }
+        };
+        let kv = match pinned_pair {
+            Some((k, v)) => scale_kv_pair(f16, &k, &v),
+            None => f16,
+        };
+        let mib = |b: u64| b / (1024 * 1024);
+        let demand = input.model_bytes.saturating_add(kv);
+        let vram85 = vram_bytes / 100 * 85;
+        if ctx_pinned {
+            // Pinned ctx is sovereign — never shrunk. The SHARED
+            // verdict (same fn the gateway preflights with) refuses
+            // a pin the device cannot host; warn-yet-proceed here is
+            // how a doomed pin 502-looped through spawn retries
+            // while the child died at context creation every time.
+            if let UnifiedCtxVerdict::Refuse(msg) =
+                unified_ctx_verdict(input.model_bytes, kv, vram_bytes, rs.total_ctx)
+            {
+                return Err(msg);
+            }
+            if demand > vram85 {
+                // Middle zone (85%..100%): physically hostable, so
+                // serve it — but gpu-layers stays on the engine's
+                // live fitter, which may CPU-split the last layers.
+                // Honest degraded serve, not a refuse.
+                warnings.push(format!(
+                    "pinned ctx {} fits the {} MiB VRAM only above the 85% share \
                          (demand {} MiB) — gpu-layers left to the engine fitter; it may \
                          CPU-split layers for the last stretch",
-                        rs.total_ctx,
-                        mib(vram_bytes),
-                        mib(demand)
-                    ));
-                }
-            } else if demand > vram_bytes && !kv_pool_relocatable(input) {
-                let per_ctx = kv / u64::from(rs.total_ctx);
-                let fit =
-                    (vram_bytes / 100 * 85).saturating_sub(input.model_bytes) / per_ctx.max(1);
-                // 256-token multiple keeps upstream-friendly sizes.
-                let new_ctx = u32::try_from(fit).unwrap_or(u32::MAX) & !255;
-                if new_ctx >= AUTOFIT_CTX_FLOOR && new_ctx < rs.total_ctx {
-                    let per_slot = (new_ctx / rs.slots).max(1);
-                    warnings.push(format!(
-                        "unified KV pool fit: ctx {} -> {} (f16 KV {} MiB + weights {} MiB \
+                    rs.total_ctx,
+                    mib(vram_bytes),
+                    mib(demand)
+                ));
+            }
+        } else if demand > vram_bytes && !kv_pool_relocatable(input) {
+            let per_ctx = kv / u64::from(rs.total_ctx);
+            let fit = (vram_bytes / 100 * 85).saturating_sub(input.model_bytes) / per_ctx.max(1);
+            // 256-token multiple keeps upstream-friendly sizes.
+            let new_ctx = u32::try_from(fit).unwrap_or(u32::MAX) & !255;
+            if new_ctx >= AUTOFIT_CTX_FLOOR && new_ctx < rs.total_ctx {
+                let per_slot = (new_ctx / rs.slots).max(1);
+                warnings.push(format!(
+                    "unified KV pool fit: ctx {} -> {} (f16 KV {} MiB + weights {} MiB \
                              vs {} MiB VRAM)",
-                        rs.total_ctx,
-                        new_ctx,
-                        mib(kv),
-                        mib(input.model_bytes),
-                        mib(vram_bytes)
-                    ));
-                    // Same (per_slot, slots) pair resolve_slots uses, so
-                    // the SlotsCtxAutoFit event stays truthful.
-                    rs.autofit = Some((per_slot, rs.slots));
-                    rs.total_ctx = new_ctx;
-                    rs.per_slot_ctx = per_slot;
-                } else {
-                    warnings.push(format!(
-                        "unified KV pool cannot fit the {} MiB VRAM even at the ctx floor \
+                    rs.total_ctx,
+                    new_ctx,
+                    mib(kv),
+                    mib(input.model_bytes),
+                    mib(vram_bytes)
+                ));
+                // Same (per_slot, slots) pair resolve_slots uses, so
+                // the SlotsCtxAutoFit event stays truthful.
+                rs.autofit = Some((per_slot, rs.slots));
+                rs.total_ctx = new_ctx;
+                rs.per_slot_ctx = per_slot;
+            } else {
+                warnings.push(format!(
+                    "unified KV pool cannot fit the {} MiB VRAM even at the ctx floor \
                              {AUTOFIT_CTX_FLOOR}: spawn will likely fail — pull a smaller quant \
                              (blazar fit) or set cache_type = \"q8_0\"",
-                        mib(vram_bytes)
-                    ));
-                }
-            } else if demand > vram_bytes {
-                // Relocatable posture: the engine moves the over-subscribed
-                // pool slice to host instead of dying at context creation —
-                // keep the auto-fit ctx (host relocation, not an OOM bet).
-                tracing::info!(
-                    model = input.model_name,
-                    "profile: unified KV pool {} MiB exceeds the {} MiB VRAM — engine \
-                     relocates the overflow to host (--no-kv-offload available, not disabled)",
-                    mib(demand),
                     mib(vram_bytes)
-                );
+                ));
             }
+        } else if demand > vram_bytes {
+            // Relocatable posture: the engine moves the over-subscribed
+            // pool slice to host instead of dying at context creation —
+            // keep the auto-fit ctx (host relocation, not an OOM bet).
+            tracing::info!(
+                model = input.model_name,
+                "profile: unified KV pool {} MiB exceeds the {} MiB VRAM — engine \
+                     relocates the overflow to host (--no-kv-offload available, not disabled)",
+                mib(demand),
+                mib(vram_bytes)
+            );
         }
     }
     let slots = rs.slots;
@@ -691,10 +690,10 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         .devices
         .clone()
         .unwrap_or_else(|| config.effective_devices(input.model_name).to_vec());
-    if devices.is_empty() {
-        if let Some(hint) = input.device_hint {
-            devices.push(hint.to_string());
-        }
+    if devices.is_empty()
+        && let Some(hint) = input.device_hint
+    {
+        devices.push(hint.to_string());
     }
     if !devices.is_empty() {
         if !input.supported_flags.contains("--device") {
@@ -1806,17 +1805,17 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     if !config.mmproj_device.is_empty() {
         argv.push("--mmproj-device".into());
         argv.push(config.mmproj_device.clone());
-    } else if input.mmproj_path.is_some() {
-        if let Some(spare) = input.sibling_devices.first() {
-            // Vision prefill bursts steal compute cycles from the target
-            // card; an idle discrete sibling absorbs them for free. Opt-in
-            // (teaching warning) because projector placement is workload-
-            // dependent.
-            warnings.push(format!(
-                "mmproj shares the target's GPU; spare discrete card {spare} \
+    } else if input.mmproj_path.is_some()
+        && let Some(spare) = input.sibling_devices.first()
+    {
+        // Vision prefill bursts steal compute cycles from the target
+        // card; an idle discrete sibling absorbs them for free. Opt-in
+        // (teaching warning) because projector placement is workload-
+        // dependent.
+        warnings.push(format!(
+            "mmproj shares the target's GPU; spare discrete card {spare} \
                  is idle — try mmproj_device = \"{spare}\""
-            ));
-        }
+        ));
     }
     if config.embd_normalize > 0 {
         argv.push("--embd-normalize".into());
@@ -2322,12 +2321,11 @@ const UNIFIED_COMPUTE_PER_TOKEN_BYTES: u64 = 24 * 1024;
 /// (late-chunking correctness: one doc must fit one ubatch). No-op when
 /// the flag is absent or already large enough.
 fn floor_batch_flag(argv: &mut [String], flag: &str, floor: u32) {
-    if let Some(pos) = argv.iter().position(|a| a == flag) {
-        if let Some(v) = argv.get(pos + 1).and_then(|s| s.parse::<u32>().ok()) {
-            if v < floor {
-                argv[pos + 1] = floor.to_string();
-            }
-        }
+    if let Some(pos) = argv.iter().position(|a| a == flag)
+        && let Some(v) = argv.get(pos + 1).and_then(|s| s.parse::<u32>().ok())
+        && v < floor
+    {
+        argv[pos + 1] = floor.to_string();
     }
 }
 
@@ -2492,14 +2490,17 @@ fn derive_pa_fraction(
         // sized to ctx×geometry, the rest of the card stays free for
         // co-resident lanes.
         (Some(g), None) => {
-            emit(g, format!(
-                "pa-memory-fraction {g:.2} sized from model geometry (weights+projector \
+            emit(
+                g,
+                format!(
+                    "pa-memory-fraction {g:.2} sized from model geometry (weights+projector \
                  {resident_mib} MiB + f16 KV {} MiB at ctx {ctx} + floor {MISTRALRS_RUNTIME_FLOOR_MIB} MiB, \
                  of {total} MiB total) — upstream's 0.90-of-total default would grab the \
                  whole card and starve co-resident lanes; pin mistralrs_pa_memory_fraction \
                  to override",
-                geometry_mib.unwrap_or(0)
-            ));
+                    geometry_mib.unwrap_or(0)
+                ),
+            );
         }
         // Co-tenant guard only (no geometry): the historical behavior.
         (None, Some(b)) if b >= MIN_KV_MIB => {
@@ -3831,23 +3832,23 @@ fn push_sglang_parallel_sizes(
             input.hardware.gpus.len()
         ));
     }
-    if tun.tp_size.is_none_or(|n| n <= 1) {
-        if let Some(tp) = input.auto_tp_size.filter(|n| *n > 1) {
-            push_tuned(
-                argv,
-                input.supported_flags,
-                "auto_tp_size",
-                "--tp-size",
-                &tp.to_string(),
-                warnings,
-            );
-            warnings.push(format!(
-                "auto tensor-parallelism: weights+KV exceed the best single card but \
+    if tun.tp_size.is_none_or(|n| n <= 1)
+        && let Some(tp) = input.auto_tp_size.filter(|n| *n > 1)
+    {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "auto_tp_size",
+            "--tp-size",
+            &tp.to_string(),
+            warnings,
+        );
+        warnings.push(format!(
+            "auto tensor-parallelism: weights+KV exceed the best single card but \
                  fit {tp} discrete cards per-rank (manual parallel pins unset); ranks \
                  bind over every visible GPU via NCCL — inter-card bandwidth is the \
                  price of capacity. Pin models.<name>.sglang.tp_size to override"
-            ));
-        }
+        ));
     }
 }
 
@@ -5431,10 +5432,10 @@ pub fn cache_ram_from_extra_args(extra: &[String]) -> Option<u64> {
             if let Some(v) = it.peek().and_then(|s| s.parse::<u64>().ok()) {
                 return Some(v);
             }
-        } else if let Some(v) = a.strip_prefix("--cache-ram=") {
-            if let Ok(v) = v.parse::<u64>() {
-                return Some(v);
-            }
+        } else if let Some(v) = a.strip_prefix("--cache-ram=")
+            && let Ok(v) = v.parse::<u64>()
+        {
+            return Some(v);
         }
     }
     None
@@ -6671,10 +6672,11 @@ mod tests {
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         inp.overlay = &late;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(3)
-            .any(|w| w[0] == "--embeddings" && w[1] == "--pooling" && w[2] == "none"));
+        assert!(
+            p.argv
+                .windows(3)
+                .any(|w| w[0] == "--embeddings" && w[1] == "--pooling" && w[2] == "none")
+        );
         // no duplicate pooling flag from the GGUF branch
         assert_eq!(p.argv.iter().filter(|a| *a == "--pooling").count(), 1);
         // embedding docs must fit one ubatch: default floors at the
@@ -6690,10 +6692,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--pooling" && w[1] == "mean"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--pooling" && w[1] == "mean")
+        );
     }
 
     #[test]
@@ -6709,16 +6712,18 @@ mod tests {
         )
         .unwrap();
         // upstream's documented reranker shape: --embeddings --reranking
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--embeddings" && w[1] == "--reranking"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--embeddings" && w[1] == "--reranking")
+        );
         // no pooled mean/cls/last mode: that would mis-serve a rank model
         assert!(!p.argv.contains(&"--pooling".to_string()));
-        assert!(!p
-            .warnings
-            .iter()
-            .any(|w| w.contains("lacks --embeddings/--reranking")));
+        assert!(
+            !p.warnings
+                .iter()
+                .any(|w| w.contains("lacks --embeddings/--reranking"))
+        );
     }
 
     #[test]
@@ -6739,10 +6744,11 @@ mod tests {
         )
         .unwrap();
         assert!(!p.argv.contains(&"--reranking".to_string()));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("lacks --embeddings/--reranking")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("lacks --embeddings/--reranking"))
+        );
     }
 
     #[test]
@@ -6760,10 +6766,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--embeddings" && w[1] == "--reranking"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--embeddings" && w[1] == "--reranking")
+        );
         assert!(!p.argv.contains(&"--pooling".to_string()));
     }
 
@@ -6798,10 +6805,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(3)
-            .any(|w| w[0] == "--embeddings" && w[1] == "--pooling" && w[2] == "last"));
+        assert!(
+            p.argv
+                .windows(3)
+                .any(|w| w[0] == "--embeddings" && w[1] == "--pooling" && w[2] == "last")
+        );
         // legacy engine without the flag: arm stays off, no warning noise
         let legacy: BTreeSet<String> = ALL_FLAGS
             .iter()
@@ -6828,41 +6836,48 @@ mod tests {
         // Rule 1: model, endpoint, alias
         assert_eq!(p.argv[0], "-m");
         assert_eq!(p.argv[1], "/models/qwen3-8b.gguf");
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--host" && w[1] == "127.0.0.1"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--port" && w[1] == "12345"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--alias" && w[1] == "qwen3-8b"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--host" && w[1] == "127.0.0.1")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--port" && w[1] == "12345")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--alias" && w[1] == "qwen3-8b")
+        );
         // Rule 2: jinja + metrics + flash-attn auto + ctx — default slots=0
         // auto earns np=2 (train 40960 / base 16384), scaling the total.
         assert!(p.argv.contains(&"--jinja".to_string()));
         assert!(p.argv.contains(&"--metrics".to_string()));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--flash-attn" && w[1] == "auto"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "32768"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--flash-attn" && w[1] == "auto")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--ctx-size" && w[1] == "32768")
+        );
         // Rule 3: threads = physical cores
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--threads" && w[1] == "8"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--threads" && w[1] == "8")
+        );
         // Rule 4: comfortable full fit (5 GB + 469 MB KV <= 85% of 12 GB)
         // -> pinned 999, labeled "full" in ps
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--gpu-layers" && w[1] == "999"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "999")
+        );
         assert_eq!(p.gpu, "full");
         // Rule 5: cache-reuse defaults OFF (native slot cache covers
         // identical/extended prefixes; engine force-disables it at load
@@ -6873,19 +6888,21 @@ mod tests {
         // +5GB < 0.9*12GB -> NO kv quant
         assert!(!p.argv.contains(&"--cache-type-k".to_string()));
         // Rule 8: sleep (GPU present)
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--sleep-idle-seconds" && w[1] == "300"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--sleep-idle-seconds" && w[1] == "300")
+        );
         // Rule 9: default slots=0 = blazar auto -> np 2 on this fixture.
         assert!(p.argv.windows(2).any(|w| w[0] == "-np" && w[1] == "2"));
         // Auto-slot rationale is journal-only now.
         assert!(!p.warnings.iter().any(|w| w.contains("slots auto")));
         // Rule 12: cache-ram default 8192
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "8192"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-ram" && w[1] == "8192")
+        );
         // Rule 15: sessions dir default-on when the engine supports it
         assert!(p.argv.windows(2).any(|w| w[0] == "--slot-save-path"));
         assert_eq!(p.ctx, 16384, "Profile.ctx reports the per-slot ctx");
@@ -6915,10 +6932,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--samplers" && w[1] == "top_k;top_p;temperature"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--samplers" && w[1] == "top_k;top_p;temperature")
+        );
         assert!(
             !p.argv.iter().any(|a| a.contains(',')),
             "no comma form may reach the engine: {:?}",
@@ -7004,16 +7022,18 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--gpu-layers" && w[1] == "auto"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "auto")
+        );
         assert_eq!(p.gpu, "auto");
         assert!(p.argv.contains(&"--kv-unified".to_string()));
-        assert!(!p
-            .warnings
-            .iter()
-            .any(|w| w.contains("unified-KV accounting")));
+        assert!(
+            !p.warnings
+                .iter()
+                .any(|w| w.contains("unified-KV accounting"))
+        );
     }
 
     #[test]
@@ -7028,10 +7048,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--gpu-layers" && w[1] == "auto"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "auto")
+        );
         assert_eq!(p.gpu, "auto");
         assert!(!p.warnings.iter().any(|w| w.contains("unified-KV")));
     }
@@ -7050,10 +7071,11 @@ mod tests {
         )
         .unwrap();
         assert!(p.argv.contains(&"--no-kv-unified".to_string()));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--gpu-layers" && w[1] == "auto"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "auto")
+        );
         assert!(!p.warnings.iter().any(|w| w.contains("unified-KV")));
     }
 
@@ -7361,10 +7383,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "5957"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-ram" && w[1] == "5957")
+        );
         // Default budget meeting the adaptive cap is silent auto-tuning.
         assert!(p.warnings.iter().any(|w| w.contains("floored to 5957 MiB")));
         assert!(
@@ -7385,10 +7408,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p2
-            .warnings
-            .iter()
-            .any(|w| w.contains("cache_ram_mb 16384 clamped to 4007")));
+        assert!(
+            p2.warnings
+                .iter()
+                .any(|w| w.contains("cache_ram_mb 16384 clamped to 4007"))
+        );
     }
 
     #[test]
@@ -7431,15 +7455,17 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cpu-range" && w[1] == "0-15"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-range" && w[1] == "0-15")
+        );
         assert!(p.argv.windows(2).any(|w| w[0] == "--poll" && w[1] == "50"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--reasoning-format" && w[1] == "deepseek"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--reasoning-format" && w[1] == "deepseek")
+        );
     }
 
     #[test]
@@ -7456,10 +7482,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple")
+        );
         assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
         // Rule 14: persistent lookup cache rides along with ngram mode.
         // Expected path derives via path_safe (FNV-suffixed since the
@@ -7468,10 +7495,11 @@ mod tests {
             "/tmp/blazar-test-data/speccache/{}.lcache",
             path_safe("qwen3-8b")
         );
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--lookup-cache-dynamic" && w[1] == lcache));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--lookup-cache-dynamic" && w[1] == lcache)
+        );
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
@@ -7489,10 +7517,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp")
+        );
         // The MTP head ships inside the GGUF — no draft model to name.
         assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
         // n-gram-only lookup cache must not ride along (rule 14 gate).
@@ -7540,14 +7569,16 @@ mod tests {
         let draft = draft_file("eagle3");
         inp.draft_path = Some(&draft);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "draft-eagle3"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-draft-model" && w[1] == draft.as_str()));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "draft-eagle3")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-model" && w[1] == draft.as_str())
+        );
         // Spec pair: gpu-layers is deliberately NOT pinned so the engine
         // live fitter owns the split (draft weights+KV are unplanned).
         assert!(
@@ -7727,18 +7758,21 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp")
+        );
         // n-max capped by the trained head count.
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "1"));
-        assert!(p
-            .argv
-            .contains(&"--spec-draft-backend-sampling".to_string()));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "1")
+        );
+        assert!(
+            p.argv
+                .contains(&"--spec-draft-backend-sampling".to_string())
+        );
         // No external draft model — the head ships in the weights.
         assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
         assert!(
@@ -7762,10 +7796,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "2")
+        );
     }
 
     #[test]
@@ -7806,10 +7841,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(!p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"));
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp")
+        );
         // qwen3-8b has no catalog pair either: dense, no spec args at all.
         assert!(!p.argv.contains(&"--spec-type".to_string()));
     }
@@ -7866,10 +7902,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "2")
+        );
     }
 
     #[test]
@@ -7932,15 +7969,17 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--reasoning-budget" && w[1] == "4096"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--reasoning-budget" && w[1] == "4096")
+        );
         assert!(p2.argv.windows(2).any(|w| w[0] == "--prio" && w[1] == "2"));
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--threads-http" && w[1] == "4"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--threads-http" && w[1] == "4")
+        );
     }
 
     #[test]
@@ -7957,10 +7996,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(!p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"));
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp")
+        );
         // llama3.2-3b has no catalog pair either: dense, no spec args at all.
         assert!(!p.argv.contains(&"--spec-type".to_string()));
     }
@@ -7974,10 +8014,11 @@ mod tests {
             ..TuningOverrides::default()
         };
         let p = compile(&input(&g, &hw, &Config::default(), &ALL_FLAGS), &t).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ubatch-size" && w[1] == "2048"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--ubatch-size" && w[1] == "2048")
+        );
         let p2 = compile(
             &input(&g, &hw, &Config::default(), &ALL_FLAGS),
             &TuningOverrides::default(),
@@ -8001,18 +8042,21 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--batch-size" && w[1] == "4096"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ubatch-size" && w[1] == "1024"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--threads-batch" && w[1] == "4"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--batch-size" && w[1] == "4096")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--ubatch-size" && w[1] == "1024")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--threads-batch" && w[1] == "4")
+        );
         // Bench-adopted tuning wins over the config knob (short -b form).
         let t = TuningOverrides {
             batch: Some(2048),
@@ -8022,10 +8066,11 @@ mod tests {
         let p2 = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
         assert!(p2.argv.windows(2).any(|w| w[0] == "-b" && w[1] == "2048"));
         assert!(!p2.argv.contains(&"--batch-size".to_string()));
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ubatch-size" && w[1] == "512"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--ubatch-size" && w[1] == "512")
+        );
         // Defaults: nothing emitted.
         let p3 = compile(
             &input(&g, &hw, &Config::default(), &ALL_FLAGS),
@@ -8051,18 +8096,21 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--main-gpu" && w[1] == "1"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--split-mode" && w[1] == "row"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--tensor-split" && w[1] == "3,1"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--main-gpu" && w[1] == "1")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--split-mode" && w[1] == "row")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tensor-split" && w[1] == "3,1")
+        );
         // Old engine lacking the trio: warn-skip, never a hard failure.
         let sparse: BTreeSet<String> = ALL_FLAGS
             .iter()
@@ -8099,10 +8147,11 @@ mod tests {
         // truth) then re-spends it as 8 shallow slots (train_slots 1 at
         // the full clamp, so the re-spend branch wins; the auto ceiling
         // on this 8 GiB+ card is 8): 8x5120.
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "40960"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--ctx-size" && w[1] == "40960")
+        );
         assert!(p.argv.windows(2).any(|w| w == ["-np", "8"]));
         assert_eq!(p.ctx, 5_120);
         assert_eq!(p.ctx_autofit, Some((5_120, 8)));
@@ -8133,14 +8182,16 @@ mod tests {
         // no shrink needed.
         assert_eq!(p.ctx, 5_120);
         assert_eq!(p.ctx_autofit, Some((5_120, 8)));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("yarn-stretched window 81920")));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "40960"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("yarn-stretched window 81920"))
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--ctx-size" && w[1] == "40960")
+        );
     }
 
     #[test]
@@ -8343,14 +8394,14 @@ mod tests {
         assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
         assert_eq!(p.ctx_autofit, None);
         // …and the degraded serve is surfaced, not hidden.
-        assert!(p.warnings.iter().any(
-            |w| w.contains("fits the 5200 MiB VRAM only above the 85% share (demand 4492 MiB)")
-        ));
+        assert!(p.warnings.iter().any(|w| {
+            w.contains("fits the 5200 MiB VRAM only above the 85% share (demand 4492 MiB)")
+        }));
     }
 
     #[test]
     fn unit__unified_ctx_verdict__pure_helper_boundary() {
-        use super::{unified_ctx_verdict, UnifiedCtxVerdict};
+        use super::{UnifiedCtxVerdict, unified_ctx_verdict};
         let weights = 2_455 * MIB;
         let kv = 1_792 * MIB;
         // Weights + KV + spawn overhead fit the device as-is
@@ -8432,10 +8483,11 @@ mod tests {
         inp.model_bytes = 500 * MIB;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
-        assert!(!p
-            .warnings
-            .iter()
-            .any(|w| w.contains("unified KV pool") || w.contains("pinned ctx")));
+        assert!(
+            !p.warnings
+                .iter()
+                .any(|w| w.contains("unified KV pool") || w.contains("pinned ctx"))
+        );
     }
 
     #[test]
@@ -8457,10 +8509,11 @@ mod tests {
         // this 8 GiB+ card.
         assert_eq!(p.ctx, 7_680);
         assert_eq!(p.ctx_autofit, Some((7_680, 5)));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "38400"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--ctx-size" && w[1] == "38400")
+        );
     }
 
     #[test]
@@ -8474,14 +8527,16 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "16384"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("lacks context_length")));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--ctx-size" && w[1] == "16384")
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("lacks context_length"))
+        );
     }
 
     #[test]
@@ -8503,14 +8558,16 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-type-v" && w[1] == "q8_0"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-type-v" && w[1] == "q8_0")
+        );
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
@@ -8533,14 +8590,16 @@ mod tests {
             ..Default::default()
         };
         let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--flash-attn" && w[1] == "off"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--flash-attn" && w[1] == "off")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0")
+        );
         assert!(
             !p.argv.contains(&"--cache-type-v".to_string()),
             "{:?}",
@@ -8568,18 +8627,21 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-type-k" && w[1] == "q4_0"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-type-v" && w[1] == "q4_0"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("still exceed 90% VRAM")));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-type-k" && w[1] == "q4_0")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-type-v" && w[1] == "q4_0")
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("still exceed 90% VRAM"))
+        );
     }
 
     #[test]
@@ -8595,14 +8657,16 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-type-k" && w[1] == "q5_0"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-type-v" && w[1] == "q5_0"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-type-k" && w[1] == "q5_0")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-type-v" && w[1] == "q5_0")
+        );
     }
 
     #[test]
@@ -8772,14 +8836,16 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--rope-scaling" && w[1] == "yarn"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--rope-scale" && w[1] == "2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--rope-scaling" && w[1] == "yarn")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--rope-scale" && w[1] == "2")
+        );
         assert!(p.warnings.iter().any(|w| w.contains("YaRN")));
     }
 
@@ -8797,14 +8863,16 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--n-cpu-moe" && w[1] == "12"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--override-tensor" && w[1] == ".ffn_.*_exps.=CPU"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--n-cpu-moe" && w[1] == "12")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--override-tensor" && w[1] == ".ffn_.*_exps.=CPU")
+        );
     }
 
     #[test]
@@ -8820,10 +8888,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--n-cpu-ffn" && w[1] == "3"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--n-cpu-ffn" && w[1] == "3")
+        );
         // Default stays argv-silent.
         let p0 = compile(
             &input(&g, &hw, &Config::default(), &ALL_FLAGS),
@@ -8985,10 +9054,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--slot-prompt-similarity" && w[1] == "0.3"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--slot-prompt-similarity" && w[1] == "0.3")
+        );
     }
 
     #[test]
@@ -9008,10 +9078,11 @@ mod tests {
         assert!(!p.argv.contains(&"--slot-save-path".to_string()));
         assert!(!p.argv.contains(&"--lookup-cache-dynamic".to_string()));
         assert!(p.warnings.iter().any(|w| w.contains("--slot-save-path")));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("--lookup-cache-dynamic")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("--lookup-cache-dynamic"))
+        );
     }
 
     #[test]
@@ -9070,10 +9141,11 @@ mod tests {
         )
         .unwrap();
         assert!(!p.argv.contains(&"--sleep-idle-seconds".to_string()));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--gpu-layers" && w[1] == "0"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "0")
+        );
         assert_eq!(p.gpu, "cpu");
     }
 
@@ -9101,10 +9173,11 @@ mod tests {
             "contended free VRAM must defer to the engine auto band: {:?}",
             p.argv
         );
-        assert!(!p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--gpu-layers" && w[1] == "999"));
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "999")
+        );
 
         // Same box idle (free == total): the comfortable full fit keeps
         // the deterministic 999 pin (ps labeling + no estimator drift).
@@ -9114,10 +9187,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--gpu-layers" && w[1] == "999"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "999")
+        );
     }
 
     #[test]
@@ -9130,10 +9204,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--gpu-layers" && w[1] == "auto"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "auto")
+        );
         assert_eq!(p.gpu, "partial");
         assert!(p.warnings.iter().any(|w| w.contains("exceed VRAM")));
     }
@@ -9153,18 +9228,21 @@ mod tests {
         ];
         inp.loras = &loras;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--rpc" && w[1] == "box1:50052,box2:50052"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--lora" && w[1] == "/loras/a.bin"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--lora-scaled" && w[1] == "/loras/b.bin:0.5"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--rpc" && w[1] == "box1:50052,box2:50052")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--lora" && w[1] == "/loras/a.bin")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--lora-scaled" && w[1] == "/loras/b.bin:0.5")
+        );
     }
 
     #[test]
@@ -9186,14 +9264,16 @@ mod tests {
         let g = meta();
         let inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--rpc" && w[1] == "gpu3:50052"));
-        assert!(!p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--rpc" && w[1].contains("box1")));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--rpc" && w[1] == "gpu3:50052")
+        );
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--rpc" && w[1].contains("box1"))
+        );
 
         // Overlay present but empty -> global inherited.
         let cfg = Config {
@@ -9209,10 +9289,11 @@ mod tests {
         };
         let inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--rpc" && w[1] == "box1:50052"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--rpc" && w[1] == "box1:50052")
+        );
     }
 
     #[test]
@@ -9225,10 +9306,11 @@ mod tests {
             socket: "/run/blazar/m.sock".into(),
         };
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--host" && w[1] == "/run/blazar/m.sock"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--host" && w[1] == "/run/blazar/m.sock")
+        );
         assert!(!p.argv.contains(&"--port".to_string()));
     }
 
@@ -9254,18 +9336,21 @@ mod tests {
         let draft = draft_file("auto-pair");
         inp.draft_path = Some(&draft);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "draft-simple"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-draft-model" && w[1] == draft.as_str()));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "3"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "draft-simple")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-model" && w[1] == draft.as_str())
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-n-max" && w[1] == "3")
+        );
     }
 
     #[test]
@@ -9815,10 +9900,11 @@ mod tests {
         .unwrap();
         assert!(p.argv.windows(2).any(|w| w == ["-np", "1"]));
         assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "16384"]));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("deterministic = true: slots pinned")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("deterministic = true: slots pinned"))
+        );
 
         // Explicit slots > 1 loses to the pin, loudly.
         let cfg_pin = Config {
@@ -9832,10 +9918,11 @@ mod tests {
         )
         .unwrap();
         assert!(p2.argv.windows(2).any(|w| w == ["-np", "1"]));
-        assert!(p2
-            .warnings
-            .iter()
-            .any(|w| w.contains("explicit slots = 3 ignored")));
+        assert!(
+            p2.warnings
+                .iter()
+                .any(|w| w.contains("explicit slots = 3 ignored"))
+        );
 
         // Overlay false un-pins a global true.
         let ov_off = ModelOverride {
@@ -9880,10 +9967,11 @@ mod tests {
         inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(p.argv.windows(2).any(|w| w == ["-np", "1"]));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("deterministic = true")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("deterministic = true"))
+        );
     }
 
     /// Hardware with a co-tenant GPU: total 8 GiB, only `free` still
@@ -10020,10 +10108,11 @@ mod tests {
             "idle card must get geometry-sized 0.29, got {:?}",
             p.argv
         );
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("sized from model geometry")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("sized from model geometry"))
+        );
     }
 
     /// Geometry caps under a co-tenant too: free 6144 gives a budget
@@ -10089,10 +10178,11 @@ mod tests {
             p.argv
         );
         assert!(!p.argv.windows(2).any(|w| w[0] == "--pa-memory-fraction"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("classic ctx-sized KV")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("classic ctx-sized KV"))
+        );
     }
 
     /// An explicit `mistralrs_paged_attn = true` pin is respected even
@@ -10114,10 +10204,11 @@ mod tests {
         assert!(p.argv.windows(2).any(|w| w == ["--paged-attn", "on"]));
         assert!(!p.argv.windows(2).any(|w| w == ["--paged-attn", "off"]));
         assert!(!p.argv.windows(2).any(|w| w[0] == "--pa-memory-fraction"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("expect a loud load failure")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("expect a loud load failure"))
+        );
     }
 
     /// Single-tenant GPUs (free ≈ total) are exactly today's argv: the
@@ -10199,9 +10290,10 @@ mod tests {
         let a = &p.argv;
         assert!(a.windows(2).any(|w| w == ["--sse-ping-interval", "-1"]));
         assert!(a.windows(2).any(|w| w == ["--timeout", "600"]));
-        assert!(a
-            .windows(2)
-            .any(|w| w == ["--chat-template-kwargs", r#"{"enable_thinking": false}"#]));
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--chat-template-kwargs", r#"{"enable_thinking": false}"#])
+        );
         // Some(false) is the NEGATION spelling, never the positive flag.
         assert!(a.iter().any(|t| t == "--no-cont-batching"));
         assert!(!a.iter().any(|t| t == "--cont-batching"));
@@ -10367,15 +10459,17 @@ mod tests {
         let mtp_model = a.iter().position(|t| t == "--mtp-model").unwrap();
         assert!(mtp < mtp_model, "--mtp must lead its dependents");
         // Single-GPU box: device_layers still emits, with the teaching.
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("single GPU") && w.contains("device_layers")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("single GPU") && w.contains("device_layers"))
+        );
         // GGUF adapters are first-class on mistral.rs; scale warns.
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("ignored on the mistralrs engine")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("ignored on the mistralrs engine"))
+        );
     }
 
     /// `extra_args` on the mistralrs lane: manifest-gated strict
@@ -10998,10 +11092,11 @@ mod tests {
         let mut text = input(&g, &hw, &cfg, &flags);
         text.engine_kind = crate::engine_kind::EngineKind::MistralRs;
         let p2 = compile(&text, &TuningOverrides::default()).unwrap();
-        assert!(!p2
-            .warnings
-            .iter()
-            .any(|w| w.contains("device-map activation reservation")));
+        assert!(
+            !p2.warnings
+                .iter()
+                .any(|w| w.contains("device-map activation reservation"))
+        );
     }
 
     #[test]
@@ -11018,14 +11113,16 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w == ["--lookup-cache-static", "/tmp/lc-static.bin"]));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w == ["--lookup-cache-dynamic", "/tmp/lc-dynamic.bin"]));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--lookup-cache-static", "/tmp/lc-static.bin"])
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--lookup-cache-dynamic", "/tmp/lc-dynamic.bin"])
+        );
     }
 
     #[test]
@@ -11045,11 +11142,10 @@ mod tests {
         let mut inp = input(&g, &hw, &cfg, &flags);
         inp.model_name = "qwen3-8b"; // catalog pair, draft NOT pulled
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("not pulled")
-                && w.contains("blazar pull ggml-org/Qwen3-0.6B-GGUF:Q4_0")));
+        assert!(
+            p.warnings.iter().any(|w| w.contains("not pulled")
+                && w.contains("blazar pull ggml-org/Qwen3-0.6B-GGUF:Q4_0"))
+        );
         assert!(!p.argv.contains(&"--spec-type".to_string()));
     }
 
@@ -11096,10 +11192,11 @@ mod tests {
         };
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--tensor-split" && w[1] == "3,1"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tensor-split" && w[1] == "3,1")
+        );
 
         // Unknown extra flag -> error.
         let bad = ModelOverride {
@@ -11123,10 +11220,11 @@ mod tests {
         };
         inp.overlay = &o_tpl;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--chat-template" && w[1] == "{{ custom }}"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--chat-template" && w[1] == "{{ custom }}")
+        );
 
         // Engine without the flag: warn-skip, argv clean, compile still OK.
         let sparse: BTreeSet<String> = ALL_FLAGS
@@ -11248,10 +11346,11 @@ mod tests {
             ..Default::default()
         };
         let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--flash-attn" && w[1] == "off"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--flash-attn" && w[1] == "off")
+        );
         assert!(p.argv.windows(2).any(|w| w[0] == "-b" && w[1] == "1024"));
     }
 
@@ -11270,14 +11369,16 @@ mod tests {
             ..Default::default()
         };
         let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--ctx-size" && w[1] == "8192"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--threads" && w[1] == "6"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--ctx-size" && w[1] == "8192")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--threads" && w[1] == "6")
+        );
         assert!(p.argv.contains(&"--cache-type-k".to_string()));
         assert_eq!(p.ctx, 8192);
     }
@@ -11294,10 +11395,11 @@ mod tests {
         };
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "-mm" && w[1] == "/models/mmproj.gguf"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "-mm" && w[1] == "/models/mmproj.gguf")
+        );
         // The raw --mmproj passthrough also remains (harmless duplicate of
         // intent; llama-server takes the last one).
     }
@@ -11367,14 +11469,16 @@ mod tests {
         };
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "-mm" && w[1] == "/models/custom.gguf"));
-        assert!(!p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "-mm" && w[1] == "/models/pulled.gguf"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "-mm" && w[1] == "/models/custom.gguf")
+        );
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "-mm" && w[1] == "/models/pulled.gguf")
+        );
     }
 
     #[test]
@@ -11449,10 +11553,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--lazy-mode" && w[1] == "on"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--lazy-mode" && w[1] == "on")
+        );
         // Overlay wins over the global pin.
         let over = ModelOverride {
             lazy_mode: Some("off".into()),
@@ -11611,19 +11716,22 @@ mod tests {
         let g = meta();
         let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--reasoning-budget" && w[1] == "256"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--reasoning-effort" && w[1] == "low"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--reasoning-budget" && w[1] == "256")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--reasoning-effort" && w[1] == "low")
+        );
         assert!(p.argv.iter().any(|a| a == "--no-reasoning-preserve"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--reasoning" && w[1] == "on"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--reasoning" && w[1] == "on")
+        );
         // Default (empty) never emits the flag — child keeps its own
         // auto-detect default, argv byte-identical to pre-knob.
         let p_default = compile(
@@ -11671,14 +11779,16 @@ mod tests {
         // Full engine: typed flags emitted.
         let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-ngram-simple-size-m" && w[1] == "32"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-ngram-simple-min-hits" && w[1] == "2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-ngram-simple-size-m" && w[1] == "32")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-ngram-simple-min-hits" && w[1] == "2")
+        );
         // Old engine without the typed flags: warn-skip, spec still on.
         let mut old_flags = WIRE_FLAGS.clone();
         for f in [
@@ -11690,14 +11800,16 @@ mod tests {
         }
         let inp = input(&g, &hw, &cfg, &old_flags);
         let p2 = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple"));
-        assert!(p2
-            .warnings
-            .iter()
-            .any(|w| w.contains("--spec-ngram-simple-size-m")));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-simple")
+        );
+        assert!(
+            p2.warnings
+                .iter()
+                .any(|w| w.contains("--spec-ngram-simple-size-m"))
+        );
     }
 
     #[test]
@@ -11717,22 +11829,26 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "ngram-map-k"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-ngram-map-k-size-m" && w[1] == "64"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-ngram-map-k-size-n" && w[1] == "16"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-ngram-map-k-min-hits" && w[1] == "2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-map-k")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-ngram-map-k-size-m" && w[1] == "64")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-ngram-map-k-size-n" && w[1] == "16")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-ngram-map-k-min-hits" && w[1] == "2")
+        );
         assert!(!p.argv.iter().any(|a| a.starts_with("--spec-ngram-simple")));
         // mod: its own knob family, upstream defaults 24/64/48.
         let cfg = Config {
@@ -11747,22 +11863,26 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "ngram-mod"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-ngram-mod-n-match" && w[1] == "32"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-ngram-mod-n-max" && w[1] == "96"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-ngram-mod-n-min" && w[1] == "12"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-mod")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-ngram-mod-n-match" && w[1] == "32")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-ngram-mod-n-max" && w[1] == "96")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-ngram-mod-n-min" && w[1] == "12")
+        );
         // cache: parameterless — only --spec-type, but the rule-14 lookup
         // cache still rides when spec_cache is on.
         let cfg = Config {
@@ -11774,10 +11894,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "ngram-cache"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "ngram-cache")
+        );
         assert!(!p.argv.iter().any(|a| a.starts_with("--spec-ngram-")));
         assert!(p.argv.windows(2).any(|w| w[0] == "--lookup-cache-dynamic"));
     }
@@ -11839,24 +11960,28 @@ mod tests {
         let g = meta();
         let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cpu-strict" && w[1] == "1"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-strict" && w[1] == "1")
+        );
         assert!(p.argv.windows(2).any(|w| w[0] == "--prio" && w[1] == "2"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--poll-batch" && w[1] == "0"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--image-max-tokens" && w[1] == "1024"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--poll-batch" && w[1] == "0")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--image-max-tokens" && w[1] == "1024")
+        );
         assert!(p.argv.iter().any(|a| a == "--no-mmproj-offload"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--yarn-orig-ctx" && w[1] == "4096"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--yarn-orig-ctx" && w[1] == "4096")
+        );
         assert!(p.argv.iter().any(|a| a == "--no-warmup"));
         assert!(p.argv.windows(2).any(|w| w[0] == "--keep" && w[1] == "64"));
     }
@@ -11882,18 +12007,21 @@ mod tests {
             2,
             "both kv overrides emitted"
         );
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--control-vector" && w[1] == "/cv/steer.gguf"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--control-vector-scaled" && w[1] == "/cv/soft.gguf:0.5"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--control-vector-layer-range" && w[1] == "0-10"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--control-vector" && w[1] == "/cv/steer.gguf")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--control-vector-scaled" && w[1] == "/cv/soft.gguf:0.5")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--control-vector-layer-range" && w[1] == "0-10")
+        );
     }
 
     #[test]
@@ -11913,14 +12041,16 @@ mod tests {
         let mut inp = input(&g, &hw, &cfg, &flags);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--device" && w[1] == "CUDA0"));
-        assert!(!p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--device" && w[1] == "Vulkan1"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--device" && w[1] == "CUDA0")
+        );
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--device" && w[1] == "Vulkan1")
+        );
     }
 
     #[test]
@@ -11933,10 +12063,11 @@ mod tests {
         let g = meta();
         let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--override-tensor" && w[1] == "exps=CPU"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--override-tensor" && w[1] == "exps=CPU")
+        );
     }
 
     #[test]
@@ -11954,29 +12085,32 @@ mod tests {
         let mut inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         inp.cache_hit_rate = Some(0.8);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "6553"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-ram" && w[1] == "6553")
+        );
         // Cold: 20% cap = 3276, but the 2a-bis weights floor (5000 + 64
         // over 0.85 = 5957) lifts every below-floor cap to 5957 — a
         // sub-weights budget CPU-splits layers at the fitter.
         let mut inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         inp.cache_hit_rate = Some(0.01);
         let p2 = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "5957"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-ram" && w[1] == "5957")
+        );
         // The tier itself stays visible in the clamp warning.
         assert!(p2.warnings.iter().any(|w| w.contains("clamped to 3276")));
         // None: static 30% = 4915 — also below the floor.
         let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         let p3 = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p3
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cache-ram" && w[1] == "5957"));
+        assert!(
+            p3.argv
+                .windows(2)
+                .any(|w| w[0] == "--cache-ram" && w[1] == "5957")
+        );
     }
 
     #[test]
@@ -12937,10 +13071,11 @@ mod tests {
             "{:?}",
             p.warnings
         );
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w == ["--cache-mode", "easycache"]));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--cache-mode", "easycache"])
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -13029,10 +13164,11 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp-adaptive"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp-adaptive")
+        );
         assert!(
             p.argv
                 .windows(2)
@@ -13325,14 +13461,16 @@ mod tests {
             "{:?}",
             p2.argv
         );
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-draft-ngl" && w[1] == "all"));
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-draft-p-min" && w[1].starts_with("0.2")));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-ngl" && w[1] == "all")
+        );
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-p-min" && w[1].starts_with("0.2"))
+        );
     }
 
     /// `ALL_FLAGS` + the placement flags the sibling tests pin explicitly
@@ -13378,10 +13516,11 @@ mod tests {
         pinned.sibling_devices = vec!["GPU1".to_string()];
         let p2 = compile(&pinned, &TuningOverrides::default()).unwrap();
         assert!(!p2.warnings.iter().any(|w| w.contains("spec draft shares")));
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--spec-draft-device" && w[1] == "GPU1"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-device" && w[1] == "GPU1")
+        );
     }
 
     #[test]
@@ -13392,10 +13531,11 @@ mod tests {
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         inp.auto_tensor_split = Some("2,1".to_string());
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--tensor-split" && w[1] == "2,1"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tensor-split" && w[1] == "2,1")
+        );
         assert!(
             p.warnings
                 .iter()
@@ -13419,10 +13559,11 @@ mod tests {
                 .count(),
             1
         );
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--tensor-split" && w[1] == "3,1"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--tensor-split" && w[1] == "3,1")
+        );
     }
 
     #[test]
@@ -13436,11 +13577,12 @@ mod tests {
         inp.auto_tensor_split = Some("2,1".to_string());
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(!p.argv.iter().any(|a| a == "--tensor-split"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("auto tensor-split planned but engine")
-                && w.contains("lacks --tensor-split")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("auto tensor-split planned but engine")
+                    && w.contains("lacks --tensor-split"))
+        );
     }
 
     #[test]
@@ -13469,10 +13611,11 @@ mod tests {
         pinned.sibling_devices = vec!["GPU1".to_string()];
         let p2 = compile(&pinned, &TuningOverrides::default()).unwrap();
         assert!(!p2.warnings.iter().any(|w| w.contains("mmproj shares")));
-        assert!(p2
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--mmproj-device" && w[1] == "GPU1"));
+        assert!(
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--mmproj-device" && w[1] == "GPU1")
+        );
     }
 
     #[test]
@@ -13619,14 +13762,16 @@ mod tests {
         // f16 KV is upstream default: no dtype flag in Tier A
         assert!(!p.argv.iter().any(|a| a == "--kv-cache-dtype"));
         assert!(!p.argv.iter().any(|a| a == "--cpu-offload-gb"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--context-length" && w[1] == "32768"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.741"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--context-length" && w[1] == "32768")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.741")
+        );
     }
 
     #[test]
@@ -13640,33 +13785,38 @@ mod tests {
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.gpu, "full");
         assert_eq!(p.kv_est_bytes, Some(469_762_048));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--kv-cache-dtype" && w[1] == "fp8_e5m2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--kv-cache-dtype" && w[1] == "fp8_e5m2")
+        );
         assert!(p.warnings.iter().any(|w| w.contains("Tier B")));
         // tight-fit knobs engage. Graph ceiling from the bench-calibrated
         // slope: headroom = 10,502,537,216 - 9,856,614,400 - 469,762,048 =
         // 168 MiB; per-size = 9.1797 GiB * 0.335 = 3.0752 MiB; ceiling =
         // 84 / 3.0752 = 27 (auto slots take the ceiling, floor 4 no longer
         // applies at this headroom).
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "27"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "27")
+        );
         // the derivation warning the doctor check surfaces verbatim
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("cuda-graph capture list <= 27")));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--chunked-prefill-size" && w[1] == "2048"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.821"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("cuda-graph capture list <= 27"))
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--chunked-prefill-size" && w[1] == "2048")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.821")
+        );
     }
 
     /// Dual-discrete-card hardware (the 2x RTX 4070-class shape) for the
@@ -13710,20 +13860,23 @@ mod tests {
         // Tier A holds per-rank where the summed pool would have said D.
         assert_eq!(p.gpu, "full");
         assert_eq!(p.kv_est_bytes, Some(469_762_048));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--tp-size" && w[1] == "2"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("auto tensor-parallelism")));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tp-size" && w[1] == "2")
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("auto tensor-parallelism"))
+        );
         // Per-rank demand against the bottleneck card's RAW VRAM
         // (8,585,740,288 B), activation reserve clamps 0.7875 -> 0.756.
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.756"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.756")
+        );
         assert!(!p.argv.iter().any(|a| a == "--cpu-offload-gb"));
     }
 
@@ -13756,10 +13909,11 @@ mod tests {
         // The ladder sharded by the MANUAL rank count (2), not the stale
         // auto plan (3): per-rank KV is the /2 share.
         assert_eq!(p.kv_est_bytes, Some(469_762_048));
-        assert!(!p
-            .warnings
-            .iter()
-            .any(|w| w.contains("auto tensor-parallelism")));
+        assert!(
+            !p.warnings
+                .iter()
+                .any(|w| w.contains("auto tensor-parallelism"))
+        );
     }
 
     #[test]
@@ -13780,14 +13934,16 @@ mod tests {
         // never a blind NCCL death.
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.gpu, "partial");
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--tp-size" && w[1] == "2"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "3"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tp-size" && w[1] == "2")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "3")
+        );
         assert!(p.warnings.iter().any(|w| w.contains("Tier C")));
     }
 
@@ -13802,20 +13958,23 @@ mod tests {
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.gpu, "partial");
         assert_eq!(p.kv_est_bytes, Some(469_762_048));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "1"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--kv-cache-dtype" && w[1] == "fp8_e5m2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "1")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--kv-cache-dtype" && w[1] == "fp8_e5m2")
+        );
         assert!(p.warnings.iter().any(|w| w.contains("Tier C")));
         // mem-fraction must account for the emitted offload, not re-add it
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.833"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.833")
+        );
     }
 
     #[test]
@@ -13829,10 +13988,11 @@ mod tests {
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         // headroom = 68 MiB; per-size = 9.2773 * 0.335 = 3.1079;
         // ceiling = 34 / 3.1079 = 10
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "10"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "10")
+        );
     }
 
     #[test]
@@ -13846,10 +14006,11 @@ mod tests {
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         // weights + kv8 = 10,494,140,416 still fits Tier B, but headroom is
         // 8 MiB -> raw ceiling 1.28 clamps up to the floor of 4
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "4"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "4")
+        );
     }
 
     #[test]
@@ -13861,23 +14022,26 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 11_000 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
+        );
         // slope follows TOTAL weights (10.7422 GiB -> 3.5986 MiB/size) while
         // headroom counts only the on-GPU share (11,534,336,000 - 2e9
         // weights + kv8 -> 475 MiB): 237.5 / 3.5986 = 65. A naive
         // implementation that slopes the on-GPU share would print 75.
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "65"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "65")
+        );
         // the derivation warning the doctor check surfaces verbatim
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("cuda-graph capture list <= 65")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("cuda-graph capture list <= 65"))
+        );
     }
 
     #[test]
@@ -13894,14 +14058,16 @@ mod tests {
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         // explicit slots 16 < ceiling 65: batching and graph cover match
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--max-running-requests" && w[1] == "16"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "16"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--max-running-requests" && w[1] == "16")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "16")
+        );
 
         let det = ModelOverride {
             ctx: Some(32_768),
@@ -13911,10 +14077,11 @@ mod tests {
         inp.overlay = &det;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         // deterministic pins slots = 1; graphs follow at min(1, ceiling)
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "1"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "1")
+        );
     }
 
     #[test]
@@ -13945,10 +14112,11 @@ mod tests {
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.gpu, "cpu");
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--device" && w[1] == "cpu"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--device" && w[1] == "cpu")
+        );
         assert!(p.warnings.iter().any(|w| w.contains("no GPU detected")));
     }
 
@@ -14023,10 +14191,11 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--stream-interval" && w[1] == "2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--stream-interval" && w[1] == "2")
+        );
     }
 
     #[test]
@@ -14042,10 +14211,11 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("sglang.kv_cache_dtype")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("sglang.kv_cache_dtype"))
+        );
         assert!(!p.argv.iter().any(|a| a == "--cache-type"));
     }
 
@@ -14062,14 +14232,16 @@ mod tests {
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.ctx, 32_768);
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("clamped to model max_position_embeddings")));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--context-length" && w[1] == "32768"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("clamped to model max_position_embeddings"))
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--context-length" && w[1] == "32768")
+        );
     }
 
     #[test]
@@ -14086,14 +14258,16 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--max-running-requests" && w[1] == "1"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("pins max-running-requests = 1")));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--max-running-requests" && w[1] == "1")
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("pins max-running-requests = 1"))
+        );
     }
 
     #[test]
@@ -14110,14 +14284,16 @@ mod tests {
         inp.overlay = &overlay;
         inp.draft_path = Some(&draft);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--speculative-algorithm" && w[1] == "EAGLE3"));
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--speculative-draft-model-path" && w[1] == draft));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "EAGLE3")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-draft-model-path" && w[1] == draft)
+        );
     }
 
     #[test]
@@ -14138,10 +14314,11 @@ mod tests {
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(!p.argv.iter().any(|a| a == "--speculative-algorithm"));
         assert!(!p.argv.iter().any(|a| a == "--speculative-draft-model-path"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("GGUF file") && w.contains("safetensors dirs")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("GGUF file") && w.contains("safetensors dirs"))
+        );
     }
 
     #[test]
@@ -14160,15 +14337,17 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
+        );
         // mem-fraction nets out the pinned offload: (weights − 2GB + kv16)/vram
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.582"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.582")
+        );
     }
 
     #[test]
@@ -14250,13 +14429,15 @@ mod tests {
         inp.overlay = &overlay;
         inp.supported_flags = &flags;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--max-running-requests" && w[1] == "1"));
-        assert!(p
-            .argv
-            .contains(&"--enable-deterministic-inference".to_string()));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--max-running-requests" && w[1] == "1")
+        );
+        assert!(
+            p.argv
+                .contains(&"--enable-deterministic-inference".to_string())
+        );
     }
 
     #[test]
@@ -14282,14 +14463,16 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.750"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("clamped to") && w.contains("graph capture")));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.750")
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("clamped to") && w.contains("graph capture"))
+        );
 
         // 24 GiB card: ceiling 0.917 hits the band max first — a 0.90
         // pin is legitimate and must pass through untouched.
@@ -14297,14 +14480,18 @@ mod tests {
         let mut inp_big = sglang_input(&hf, &hw_big, &cfg, 3_300 * MIB);
         inp_big.overlay = &overlay;
         let p_big = compile(&inp_big, &TuningOverrides::default()).unwrap();
-        assert!(p_big
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.900"));
-        assert!(!p_big
-            .warnings
-            .iter()
-            .any(|w| w.contains("mem_fraction_static")));
+        assert!(
+            p_big
+                .argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.900")
+        );
+        assert!(
+            !p_big
+                .warnings
+                .iter()
+                .any(|w| w.contains("mem_fraction_static"))
+        );
 
         // Under-band pin clamps up with the same warning surface.
         let overlay_low = ModelOverride {
@@ -14318,10 +14505,12 @@ mod tests {
         let mut inp_low = sglang_input(&hf, &hw_big, &cfg, 3_300 * MIB);
         inp_low.overlay = &overlay_low;
         let p_low = compile(&inp_low, &TuningOverrides::default()).unwrap();
-        assert!(p_low
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.200"));
+        assert!(
+            p_low
+                .argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.200")
+        );
     }
 
     #[test]
@@ -14367,10 +14556,11 @@ mod tests {
         let mut inp_fit = sglang_input(&hf, &hw_big, &cfg, 3_300 * MIB);
         inp_fit.overlay = &overlay_fit;
         let p = compile(&inp_fit, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--hicache-size" && w[1] == "40"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--hicache-size" && w[1] == "40")
+        );
 
         let overlay_huge = ModelOverride {
             ctx: Some(32_768),
@@ -14506,17 +14696,20 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--max-running-requests" && w[1] == "1"));
-        assert!(!p
-            .argv
-            .contains(&"--enable-deterministic-inference".to_string()));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("--enable-deterministic-inference")));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--max-running-requests" && w[1] == "1")
+        );
+        assert!(
+            !p.argv
+                .contains(&"--enable-deterministic-inference".to_string())
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("--enable-deterministic-inference"))
+        );
     }
 
     #[test]
@@ -14609,10 +14802,11 @@ mod tests {
         pair("--detokenizer-worker-num", "2");
         bare("--enable-dynamic-batch-tokenizer");
         pair("--dynamic-batch-tokenizer-batch-size", "8");
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--dynamic-batch-tokenizer-batch-timeout" && w[1] == "0.01"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--dynamic-batch-tokenizer-batch-timeout" && w[1] == "0.01")
+        );
         pair("--grammar-backend", "xgrammar");
         pair("--radix-eviction-policy", "lfu");
         bare("--enable-session-radix-cache");
@@ -14724,10 +14918,11 @@ mod tests {
             "qwen-lora-r16=/models/adapters/qwen-lora-r16"
         );
         // llama.cpp scale has no upstream equivalent — teach, never drop
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("scale") && w.contains("ignored")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("scale") && w.contains("ignored"))
+        );
     }
 
     #[test]
@@ -14768,19 +14963,22 @@ mod tests {
         inp.overlay = &overlay;
         inp.supported_flags = &flags;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--tp-size" && w[1] == "2"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tp-size" && w[1] == "2")
+        );
         assert!(!p.argv.iter().any(|a| a == "--dp-size"));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("dp_size = 1 is the upstream default")));
-        assert!(p
-            .warnings
-            .iter()
-            .any(|w| w.contains("only makes sense multi-GPU")));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("dp_size = 1 is the upstream default"))
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("only makes sense multi-GPU"))
+        );
     }
 
     #[test]
@@ -14806,9 +15004,10 @@ mod tests {
         assert!(p.argv.iter().any(|a| a == "--cuda-graph-bs"));
         assert!(!p.argv.iter().any(|a| a == "--cuda-graph-max-bs"));
         // chunked-prefill tight-fit still applies (different knob)
-        assert!(p
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--chunked-prefill-size" && w[1] == "2048"));
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--chunked-prefill-size" && w[1] == "2048")
+        );
     }
 }

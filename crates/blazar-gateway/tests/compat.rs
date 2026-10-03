@@ -127,11 +127,12 @@ async fn client__continue_vscode__chat_stream_and_usage_chunk() {
         .send()
         .await
         .unwrap();
-    assert!(resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("text/event-stream")));
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("text/event-stream"))
+    );
     let body = resp.text().await.unwrap();
     assert!(body.contains("data:"), "SSE framing: {body}");
     ts.state.sup.shutdown_all().await.unwrap();
@@ -351,11 +352,11 @@ async fn client__audit_log__generation_lines_written() {
     let audit_path = ts.dirs.data_dir.join("log").join("audit.jsonl");
     let mut line = String::new();
     for _ in 0..40 {
-        if let Ok(raw) = std::fs::read_to_string(&audit_path) {
-            if let Some(l) = raw.lines().find(|l| l.contains(&trace)) {
-                line = l.to_string();
-                break;
-            }
+        if let Ok(raw) = std::fs::read_to_string(&audit_path)
+            && let Some(l) = raw.lines().find(|l| l.contains(&trace))
+        {
+            line = l.to_string();
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -411,11 +412,13 @@ async fn client__well_known__capability_discovery() {
     assert_eq!(v["name"], "blazar");
     assert_eq!(v["features"]["keys"], true);
     assert_eq!(v["features"]["singleflight"], true);
-    assert!(v["endpoints"]["openai"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|e| e == "/v1/chat/completions"));
+    assert!(
+        v["endpoints"]["openai"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e == "/v1/chat/completions")
+    );
     // Audit MM15: the census must advertise EVERY media generation
     // route (plus the engine-scoped surfaces) — a client discovering
     // capabilities needs them as much as the text lanes.
@@ -461,11 +464,13 @@ async fn client__well_known__capability_discovery() {
             .unwrap();
         assert_eq!(r.status(), 401, "{path} must be a mounted route");
     }
-    assert!(v["headers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|h| h == "x-blazar-num-ctx"));
+    assert!(
+        v["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h == "x-blazar-num-ctx")
+    );
     // Auth applies: anonymous discovery is refused when keys exist.
     blazar_core::tls::ensure_tls_provider();
     let anon = reqwest::Client::new()

@@ -7,13 +7,13 @@ use sha2::Digest as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use blazar_core::BlazarDirs;
 use blazar_core::config::UpdateChannel;
 use blazar_core::store::Store;
-use blazar_core::BlazarDirs;
+use blazar_runtime::EventBus;
 use blazar_runtime::engine::gh::GhClient;
 use blazar_runtime::engine::manifest::{EngineSource, LaneProvenance, Manifest, TrustTier};
 use blazar_runtime::engine::{EngineManager, KEEP_TAGS, LOCAL_TAG};
-use blazar_runtime::EventBus;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -26,11 +26,7 @@ fn stub_server_bin() -> PathBuf {
 /// literal "piper" copy dangles there and the pin silently loses to the
 /// engines row.
 fn piper_bin_name() -> &'static str {
-    if cfg!(windows) {
-        "piper.exe"
-    } else {
-        "piper"
-    }
+    if cfg!(windows) { "piper.exe" } else { "piper" }
 }
 
 /// Build a llama.cpp-style release tar.gz: root dir `llama-<tag>/` with
@@ -220,11 +216,7 @@ fn fixture_host_archive(tag: &str) -> Vec<u8> {
 }
 
 fn host_asset_ext() -> &'static str {
-    if cfg!(windows) {
-        "zip"
-    } else {
-        "tar.gz"
-    }
+    if cfg!(windows) { "zip" } else { "tar.gz" }
 }
 
 /// Release-`assets` JSON for every host-platform candidate, digest and

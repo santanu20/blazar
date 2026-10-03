@@ -179,7 +179,9 @@ pub fn ttft() -> Histogram {
     Histogram::new(
         "blazar_ttft_seconds",
         "Gateway time-to-first-token: request start to first body byte of a generation (vLLM-style evidence loop)",
-        &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+        &[
+            0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ],
     )
 }
 

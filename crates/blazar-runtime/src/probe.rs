@@ -375,8 +375,8 @@ pub fn hardware_with(gpus: Vec<GpuInfo>) -> Hardware {
     let mut sys = sysinfo::System::new();
     sys.refresh_cpu_usage();
     sys.refresh_memory();
-    let physical_cores = sys
-        .physical_core_count()
+    // Associated function since sysinfo 0.34 (no receiver needed).
+    let physical_cores = sysinfo::System::physical_core_count()
         .map_or(1, |c| u32::try_from(c).unwrap_or(1))
         .max(1);
     let total_ram_mib = sys.total_memory() / (1024 * 1024); // sysinfo returns bytes
@@ -446,13 +446,12 @@ pub fn pci_gpu_vendors() -> Vec<String> {
             .arg("-d")
             .arg("::0302"),
         10,
-    ) {
-        if out2.status.success() {
-            let text2 = String::from_utf8_lossy(&out2.stdout).into_owned();
-            for v in parse_pci_vendors(&text2) {
-                if !vendors.contains(&v) {
-                    vendors.push(v);
-                }
+    ) && out2.status.success()
+    {
+        let text2 = String::from_utf8_lossy(&out2.stdout).into_owned();
+        for v in parse_pci_vendors(&text2) {
+            if !vendors.contains(&v) {
+                vendors.push(v);
             }
         }
     }

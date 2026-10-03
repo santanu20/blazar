@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use blazar_core::dirs::BlazarDirs;
 use blazar_core::store::ModelRow;
 
@@ -185,13 +185,13 @@ pub fn orphan_scan(models_dir: &Path, rows: &[ModelRow]) -> OrphanReport {
             owned.insert(PathBuf::from(mm));
         }
         // Safetensors models own their whole directory.
-        if row_path.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(row_path) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_file() {
-                        owned.insert(p);
-                    }
+        if row_path.is_dir()
+            && let Ok(entries) = std::fs::read_dir(row_path)
+        {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    owned.insert(p);
                 }
             }
         }
@@ -200,14 +200,14 @@ pub fn orphan_scan(models_dir: &Path, rows: &[ModelRow]) -> OrphanReport {
         // prefix needs it re-added — the convention is
         // `stem-0000N-of-0000M.gguf`, and a missing dash would orphan
         // every shard past the first (prune bait).
-        if let Some(name) = row_path.file_name().and_then(|n| n.to_str()) {
-            if let Some(set_len) = shard_set_len(name) {
-                let stem = name.trim_end_matches(".gguf");
-                let prefix = stem.strip_suffix(shard_first_suffix(stem)).unwrap_or(stem);
-                for idx in 1..=set_len {
-                    let sibling = format!("{prefix}-{idx:05}-of-{set_len:05}.gguf");
-                    owned.insert(row_path.with_file_name(sibling));
-                }
+        if let Some(name) = row_path.file_name().and_then(|n| n.to_str())
+            && let Some(set_len) = shard_set_len(name)
+        {
+            let stem = name.trim_end_matches(".gguf");
+            let prefix = stem.strip_suffix(shard_first_suffix(stem)).unwrap_or(stem);
+            for idx in 1..=set_len {
+                let sibling = format!("{prefix}-{idx:05}-of-{set_len:05}.gguf");
+                owned.insert(row_path.with_file_name(sibling));
             }
         }
     }
@@ -407,21 +407,24 @@ mod tests {
 
         let r = orphan_scan(&m, &[row(owned_file.to_str().unwrap(), "big-model", 100)]);
 
-        assert!(r
-            .orphan_files
-            .iter()
-            .any(|(p, _)| p.ends_with("stray-q4.gguf")));
-        assert!(!r
-            .orphan_files
-            .iter()
-            .any(|(p, _)| p.to_string_lossy().contains("big-0000")));
+        assert!(
+            r.orphan_files
+                .iter()
+                .any(|(p, _)| p.ends_with("stray-q4.gguf"))
+        );
+        assert!(
+            !r.orphan_files
+                .iter()
+                .any(|(p, _)| p.to_string_lossy().contains("big-0000"))
+        );
         #[cfg(unix)]
         assert!(r.twins.iter().any(|(p, _)| p.ends_with("twin-copy.gguf")));
         assert!(r.stale_partials.iter().any(|(p, _)| p == &old));
-        assert!(!r
-            .stale_partials
-            .iter()
-            .any(|(p, _)| p.ends_with("00002.gguf.part")));
+        assert!(
+            !r.stale_partials
+                .iter()
+                .any(|(p, _)| p.ends_with("00002.gguf.part"))
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@
 //! conventions; it is deliberately NOT a byte-copy of any other
 //! server's prompt.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Recipe name selecting gateway-side pre-rendering (see
 /// `Config::prompt_recipe`). Anything else means the child renders.
@@ -320,10 +320,8 @@ pub fn to_completion_request(
     // <tool_call> envelopes with a whitelisted name — decoder-level
     // grammar, not a prompt instruction. Only ever attached alongside
     // tools; prose-only requests stay free.
-    if strict_tools {
-        if let Some(names) = extract_tool_names(body) {
-            req["grammar"] = json!(build_tool_grammar(&names));
-        }
+    if strict_tools && let Some(names) = extract_tool_names(body) {
+        req["grammar"] = json!(build_tool_grammar(&names));
     }
     for key in [
         "max_tokens",
@@ -337,10 +335,10 @@ pub fn to_completion_request(
         "frequency_penalty",
         "n",
     ] {
-        if let Some(v) = body.get(key) {
-            if !v.is_null() {
-                req[key] = v.clone();
-            }
+        if let Some(v) = body.get(key)
+            && !v.is_null()
+        {
+            req[key] = v.clone();
         }
     }
     // Server-side ceiling: the raw lane bounds generations the caller
@@ -987,9 +985,10 @@ mod tests {
                                       "function": {"name": "compute_geochem",
                                                    "parameters": {"type": "object"}}}]});
         let req = to_completion_request(&tools, false, 0, true);
-        assert!(req
-            .get("grammar")
-            .is_some_and(|g| g.as_str().unwrap().contains("compute_geochem")));
+        assert!(
+            req.get("grammar")
+                .is_some_and(|g| g.as_str().unwrap().contains("compute_geochem"))
+        );
         // free policy: no grammar even with tools.
         let req = to_completion_request(&tools, false, 0, false);
         assert!(req.get("grammar").is_none());

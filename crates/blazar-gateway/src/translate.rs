@@ -1,7 +1,7 @@
 //! Pure ollama <-> `OpenAI` translation functions. No I/O — every function
 //! is table-testable, including stream-chunk splitting across boundaries.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// llama-server's default sampler chain (verified live via /props on
 /// b10896). Used when `adaptive_p` is enabled without an explicit
@@ -217,10 +217,10 @@ fn translate_message_images(messages: &Value) -> Result<Value, String> {
             continue;
         };
         let mut parts = Vec::new();
-        if let Some(text) = msg.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                parts.push(json!({"type": "text", "text": text}));
-            }
+        if let Some(text) = msg.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            parts.push(json!({"type": "text", "text": text}));
         }
         if let Some(arr) = images.as_array() {
             for img in arr {
@@ -291,10 +291,9 @@ fn normalize_tool_call_types(messages: &Value) -> Value {
             if let Some(args) = call
                 .get_mut("function")
                 .and_then(|f| f.get_mut("arguments"))
+                && args.is_object()
             {
-                if args.is_object() {
-                    *args = Value::String(args.to_string());
-                }
+                *args = Value::String(args.to_string());
             }
         }
         m["tool_calls"] = Value::Array(fixed);
@@ -335,10 +334,10 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     }
     // Raw GBNF passthrough (R9): an explicit grammar is forwarded 1:1 —
     // the child skips schema conversion entirely for it.
-    if let Some(g) = req.get("grammar").and_then(Value::as_str) {
-        if !g.is_empty() {
-            out["grammar"] = json!(g);
-        }
+    if let Some(g) = req.get("grammar").and_then(Value::as_str)
+        && !g.is_empty()
+    {
+        out["grammar"] = json!(g);
     }
     // Confidence scoring (R2): ollama clients asking for logprobs get
     // them passed through 1:1 — the sentinel turns them into response
@@ -632,10 +631,11 @@ pub fn openai_chunk_to_ollama(accum: &mut ToolCallAccum, model: &str, chunk: &Va
                 .filter(|a| !a.is_empty());
             // A non-tool delta after fragments means the call is complete —
             // flush the merged calls as their own line first.
-            if fragments.is_none() && !accum.is_empty() {
-                if let Some(merged) = accum.flush() {
-                    out.push(tool_calls_line(model, &merged));
-                }
+            if fragments.is_none()
+                && !accum.is_empty()
+                && let Some(merged) = accum.flush()
+            {
+                out.push(tool_calls_line(model, &merged));
             }
             if let Some(frags) = fragments {
                 accum.absorb(frags);
@@ -643,10 +643,10 @@ pub fn openai_chunk_to_ollama(accum: &mut ToolCallAccum, model: &str, chunk: &Va
             }
             if has_content || has_thinking {
                 let mut msg = json!({"role": "assistant"});
-                if let Some(c) = delta.get("content") {
-                    if c.as_str().is_some_and(|s| !s.is_empty()) {
-                        msg["content"] = c.clone();
-                    }
+                if let Some(c) = delta.get("content")
+                    && c.as_str().is_some_and(|s| !s.is_empty())
+                {
+                    msg["content"] = c.clone();
                 }
                 if let Some(rc) = delta.get("reasoning_content") {
                     msg["thinking"] = rc.clone();
@@ -808,10 +808,10 @@ pub fn generate_to_openai(req: &Value) -> Result<Option<Value>, String> {
     let model = req["model"].as_str().ok_or("missing field: model")?;
     let prompt = req["prompt"].as_str().ok_or("missing field: prompt")?;
     let mut messages = Vec::new();
-    if let Some(system) = req.get("system").and_then(Value::as_str) {
-        if !system.is_empty() {
-            messages.push(json!({"role": "system", "content": system}));
-        }
+    if let Some(system) = req.get("system").and_then(Value::as_str)
+        && !system.is_empty()
+    {
+        messages.push(json!({"role": "system", "content": system}));
     }
     let mut user = json!({"role": "user", "content": prompt});
     if let Some(images) = req
@@ -1003,11 +1003,7 @@ impl ThinkSplitter {
     /// literal text and ships as content.
     pub fn finish(&mut self) -> String {
         let held = std::mem::take(&mut self.held);
-        if self.in_think {
-            String::new()
-        } else {
-            held
-        }
+        if self.in_think { String::new() } else { held }
     }
 }
 
@@ -1287,15 +1283,16 @@ impl SseRestamper {
         let Ok(mut v) = serde_json::from_str::<Value>(payload) else {
             return line.as_bytes().to_vec();
         };
-        if let Some(m) = v.get_mut("model") {
-            if m.is_string() && m.as_str() != Some(self.target.as_str()) {
-                *m = Value::String(self.target.clone());
-                // Line-for-line replacement: the original data line ends
-                // with \n (or \r\n) and the frame's blank-line separator
-                // follows as its own (unmodified) line.
-                let line_end = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
-                return format!("data: {v}{line_end}").into_bytes();
-            }
+        if let Some(m) = v.get_mut("model")
+            && m.is_string()
+            && m.as_str() != Some(self.target.as_str())
+        {
+            *m = Value::String(self.target.clone());
+            // Line-for-line replacement: the original data line ends
+            // with \n (or \r\n) and the frame's blank-line separator
+            // follows as its own (unmodified) line.
+            let line_end = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+            return format!("data: {v}{line_end}").into_bytes();
         }
         line.as_bytes().to_vec()
     }
@@ -2081,9 +2078,11 @@ mod tests {
             "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 40, "completion_tokens": 4},
         });
-        assert!(openai_chat_to_ollama("m", &cold)
-            .get("prompt_eval_cached_count")
-            .is_none());
+        assert!(
+            openai_chat_to_ollama("m", &cold)
+                .get("prompt_eval_cached_count")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2239,9 +2238,9 @@ mod tests {
         suppress_raw_think_response(&mut chat);
         assert_eq!(chat["choices"][0]["message"]["content"], json!("answer"));
 
-        let mut gen = json!({"response": "<think>plan</think>result"});
-        suppress_raw_think_response(&mut gen);
-        assert_eq!(gen["response"], json!("result"));
+        let mut generated = json!({"response": "<think>plan</think>result"});
+        suppress_raw_think_response(&mut generated);
+        assert_eq!(generated["response"], json!("result"));
 
         // Ollama chat non-stream shape: top-level message.content.
         let mut ollama_chat =

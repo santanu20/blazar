@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tokio::io::AsyncWriteExt as _;
 
 use blazar_core::BlazarDirs;
@@ -229,13 +229,12 @@ fn prune(dirs: &BlazarDirs) -> Result<()> {
 #[must_use]
 pub fn server_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
     if let Some(tag) = pinned_tag(dirs) {
-        if let Some(row) = engines_lane_row(dirs) {
-            if row.tag == tag {
-                if let Some(bin) = engines_lane_server_bin(dirs, &row) {
-                    let lib = bin.parent()?.to_path_buf();
-                    return Some((bin, lib));
-                }
-            }
+        if let Some(row) = engines_lane_row(dirs)
+            && row.tag == tag
+            && let Some(bin) = engines_lane_server_bin(dirs, &row)
+        {
+            let lib = bin.parent()?.to_path_buf();
+            return Some((bin, lib));
         }
         let dir = bin_root(dirs).join(&tag);
         if let Some((bin, lib)) = bin_and_lib_in(&dir) {
@@ -284,13 +283,12 @@ fn engines_lane_row(dirs: &BlazarDirs) -> Option<blazar_core::store::EngineRow> 
             return None;
         }
     };
-    if let Some(tag) = pinned_tag(dirs) {
-        if let Some(row) = rows
+    if let Some(tag) = pinned_tag(dirs)
+        && let Some(row) = rows
             .iter()
             .find(|r| r.kind == blazar_core::engine_kind::EngineKind::Piper && r.tag == tag)
-        {
-            return Some(row.clone());
-        }
+    {
+        return Some(row.clone());
     }
     // `list_engines` orders newest-installed first; the active row (if
     // any) still wins so a flagged lane is honored. `installed_at`
@@ -345,10 +343,10 @@ pub fn installed_tag(dirs: &BlazarDirs) -> Option<String> {
         }
         // Dangling pin (no row with a binary, no dir): fall through.
     }
-    if let Some(row) = engines_lane_row(dirs) {
-        if engines_lane_server_bin(dirs, &row).is_some() {
-            return Some(row.tag);
-        }
+    if let Some(row) = engines_lane_row(dirs)
+        && engines_lane_server_bin(dirs, &row).is_some()
+    {
+        return Some(row.tag);
     }
     sorted_tag_dirs(dirs)
         .into_iter()
@@ -453,11 +451,7 @@ fn voice_lang_scope(root: &[crate::hf::HfTreeEntry], query: &str) -> Vec<String>
         .filter(|l| l.starts_with(query))
         .cloned()
         .collect();
-    if scoped.is_empty() {
-        langs
-    } else {
-        scoped
-    }
+    if scoped.is_empty() { langs } else { scoped }
 }
 
 /// Search `rhasspy/piper-voices` for voices whose id contains `query`
@@ -480,14 +474,14 @@ pub async fn search_voices(hf: &crate::hf::HfClient, query: &str) -> Result<Vec<
     let mut out: Vec<RemoteVoice> = Vec::new();
     for page in walks {
         for entry in page?.into_iter().filter(crate::hf::HfTreeEntry::is_file) {
-            if let Some((id, quality)) = voice_from_tree_path(&entry.path) {
-                if id.to_lowercase().contains(&needle) {
-                    out.push(RemoteVoice {
-                        id,
-                        quality,
-                        bytes: entry.size.unwrap_or(0),
-                    });
-                }
+            if let Some((id, quality)) = voice_from_tree_path(&entry.path)
+                && id.to_lowercase().contains(&needle)
+            {
+                out.push(RemoteVoice {
+                    id,
+                    quality,
+                    bytes: entry.size.unwrap_or(0),
+                });
             }
         }
     }

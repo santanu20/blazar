@@ -9,7 +9,9 @@ members = [
 
 [workspace.package]
 version = "0.20.0"
-edition = "2021"
+edition = "2024"
+# Floor is sysinfo 0.39 (MSRV 1.95); edition 2024 itself needs >=1.85.
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -53,7 +55,7 @@ toml = "1"
 thiserror = "2"
 anyhow = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
-sysinfo = "0.33"
+sysinfo = "0.39"
 dirs = "7"
 rustyline = "18"
 indicatif = "0.18"

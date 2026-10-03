@@ -35,23 +35,26 @@ pub mod upgrade;
 pub mod verify;
 pub mod whisper;
 
-pub use bench::{parse_bench_json, BenchRow, Tuner};
+#[cfg(test)]
+mod test_env;
+
+pub use bench::{BenchRow, Tuner, parse_bench_json};
 pub use daemon::{
-    process_alive_by_pid, validate_parent_death_guard, wait_for_shutdown_signal, DaemonLock,
-    LockHeld,
+    DaemonLock, LockHeld, process_alive_by_pid, validate_parent_death_guard,
+    wait_for_shutdown_signal,
 };
 pub use engine::gh::GhClient;
-pub use engine::manifest::{predicted_rescue_lane, probe as probe_manifest, Manifest, Vendor};
-pub use engine::{system_vendor_hint, EngineManager, LOCAL_TAG};
+pub use engine::manifest::{Manifest, Vendor, predicted_rescue_lane, probe as probe_manifest};
+pub use engine::{EngineManager, LOCAL_TAG, system_vendor_hint};
 pub use engine_impl::{
     ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, MlxEngine, SdCppEngine, SglangEngine,
 };
 pub use events::{BlazarEvent, EventBus, InstanceState};
-pub use hf::{parse_pull_target, registry_name, PullOutcome, PullTarget, Puller};
+pub use hf::{PullOutcome, PullTarget, Puller, parse_pull_target, registry_name};
 pub use models::{instance_running, remove_model};
 pub use probe::probe_hardware;
 pub use supervisor::{
-    resolve_draft_path, resolve_spec_mode, EngineRef, PrefixKey, PsRow, SupervisionError,
-    Supervisor, ROUTER_KEY,
+    EngineRef, PrefixKey, PsRow, ROUTER_KEY, SupervisionError, Supervisor, resolve_draft_path,
+    resolve_spec_mode,
 };
-pub use verify::{verify_model, VerifyReport};
+pub use verify::{VerifyReport, verify_model};

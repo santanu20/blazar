@@ -192,10 +192,12 @@ mod tests {
         let v = json!({"model": "m", "detail": "mail me x@y.io", "nested": {"ip": "192.168.1.10"}});
         let out = scrub_value(&v);
         assert!(out["detail"].as_str().unwrap().contains("[email redacted]"));
-        assert!(out["nested"]["ip"]
-            .as_str()
-            .unwrap()
-            .contains("[ip redacted]"));
+        assert!(
+            out["nested"]["ip"]
+                .as_str()
+                .unwrap()
+                .contains("[ip redacted]")
+        );
         assert_eq!(out["model"], "m");
     }
 

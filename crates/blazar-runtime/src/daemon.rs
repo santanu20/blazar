@@ -3,7 +3,7 @@
 //! Refusals carry the [`LockHeld`] marker so the CLI can map them to the
 //! singleton-conflict exit code the systemd unit refuses to restart on.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use blazar_core::BlazarDirs;
 

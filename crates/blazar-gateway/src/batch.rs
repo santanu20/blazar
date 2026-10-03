@@ -17,7 +17,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use blazar_core::BlazarDirs;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -124,10 +124,10 @@ pub async fn upload_file(
         .iter()
         .find(|p| p.name == "purpose")
         .map(|p| String::from_utf8_lossy(&p.data).trim().to_string());
-    if let Some(p) = &purpose {
-        if p != "batch" {
-            return err(StatusCode::BAD_REQUEST, "only purpose=batch is supported");
-        }
+    if let Some(p) = &purpose
+        && p != "batch"
+    {
+        return err(StatusCode::BAD_REQUEST, "only purpose=batch is supported");
     }
     let id = short_id("file");
     let dir = files_dir(&state.dirs);
@@ -380,17 +380,17 @@ async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
 
     for line in input.lines().filter(|l| !l.trim().is_empty()) {
         // Cancel is signalled through the meta file; check between items.
-        if let Some(m) = read_json(&batch_meta(&dirs, &id)) {
-            if m["status"] == "cancelling" {
-                finish_batch(
-                    &dirs,
-                    &job_ref,
-                    "cancelled",
-                    (completed, failed),
-                    &mut writer,
-                );
-                return;
-            }
+        if let Some(m) = read_json(&batch_meta(&dirs, &id))
+            && m["status"] == "cancelling"
+        {
+            finish_batch(
+                &dirs,
+                &job_ref,
+                "cancelled",
+                (completed, failed),
+                &mut writer,
+            );
+            return;
         }
         let (custom_id, body) = match serde_json::from_str::<Value>(line) {
             Ok(v) => (
@@ -610,15 +610,13 @@ pub async fn list_batches(State(state): State<std::sync::Arc<AppState>>) -> Resp
     if let Ok(entries) = std::fs::read_dir(batches_dir(&state.dirs)) {
         for e in entries.flatten() {
             let name = e.file_name();
-            if let Some(name) = name.to_str() {
-                if std::path::Path::new(name)
+            if let Some(name) = name.to_str()
+                && std::path::Path::new(name)
                     .extension()
                     .is_some_and(|e| e == "json")
-                {
-                    if let Some(v) = read_json(&e.path()) {
-                        rows.push(v);
-                    }
-                }
+                && let Some(v) = read_json(&e.path())
+            {
+                rows.push(v);
             }
         }
     }

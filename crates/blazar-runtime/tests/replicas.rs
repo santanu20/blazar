@@ -9,7 +9,7 @@ use std::time::Duration;
 use blazar_core::hardware::{GpuInfo, Hardware};
 use blazar_core::store::Store;
 use blazar_core::{BlazarDirs, Config, ModelOverride};
-use blazar_runtime::engine::manifest::{probe as probe_manifest, Manifest};
+use blazar_runtime::engine::manifest::{Manifest, probe as probe_manifest};
 use blazar_runtime::supervisor::PrefixKey;
 use blazar_runtime::{EventBus, LlamaCppEngine, Supervisor};
 

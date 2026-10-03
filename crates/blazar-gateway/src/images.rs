@@ -24,7 +24,7 @@
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap};
+use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -176,18 +176,18 @@ fn gate_size(v: &serde_json::Value) -> (u64, u64) {
             let h = h.trim().parse::<u64>().ok()?;
             Some((w, h))
         })
-    }) {
-        if w > 0 && h > 0 {
-            return (w, h);
-        }
+    }) && w > 0
+        && h > 0
+    {
+        return (w, h);
     }
     if let (Some(w), Some(h)) = (
         v.get("width").and_then(serde_json::Value::as_u64),
         v.get("height").and_then(serde_json::Value::as_u64),
-    ) {
-        if w > 0 && h > 0 {
-            return (w, h);
-        }
+    ) && w > 0
+        && h > 0
+    {
+        return (w, h);
     }
     VIDEO_DEFAULT_SIZE
 }
@@ -1454,23 +1454,23 @@ pub async fn jobs_cancel(
     .json(&serde_json::json!({}))
     .send()
     .await;
-    if let Ok(resp) = sent {
-        if resp.status().as_u16() == 409 {
-            let upstream_msg = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
-                .unwrap_or_else(|| "cancel refused".to_string());
-            return openai_error(
-                409,
-                &format!(
-                    "engine refused the cancel: {upstream_msg} — this build only cancels \
+    if let Ok(resp) = sent
+        && resp.status().as_u16() == 409
+    {
+        let upstream_msg = resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_else(|| "cancel refused".to_string());
+        return openai_error(
+            409,
+            &format!(
+                "engine refused the cancel: {upstream_msg} — this build only cancels \
                      queued jobs; generating ones run to completion"
-                ),
-            )
-            .into_response();
-        }
+            ),
+        )
+        .into_response();
     }
     match poll_child_job(&state, &engine, &job_id).await {
         Ok(Some(verdict)) => {
@@ -1644,7 +1644,7 @@ mod tests {
             child
         ));
         assert!(!child_matches_model("wan_2.1", None, child)); // unresolved alias
-                                                               // Store resolution landing elsewhere must not widen the match.
+        // Store resolution landing elsewhere must not widen the match.
         assert!(!child_matches_model("wan_2.1", Some("other_family"), child));
     }
 
@@ -1816,14 +1816,18 @@ mod tests {
         );
 
         let mut v = serde_json::json!({"frames": "33"});
-        assert!(canonicalize_video_frames(&mut v)
-            .unwrap_err()
-            .contains("positive integer"));
+        assert!(
+            canonicalize_video_frames(&mut v)
+                .unwrap_err()
+                .contains("positive integer")
+        );
 
         let mut v = serde_json::json!({"frames": 0});
-        assert!(canonicalize_video_frames(&mut v)
-            .unwrap_err()
-            .contains("positive integer"));
+        assert!(
+            canonicalize_video_frames(&mut v)
+                .unwrap_err()
+                .contains("positive integer")
+        );
 
         // duration joins the conflict vocabulary; fps itself stays.
         let mut v = serde_json::json!({"frames": 33, "duration": 1});
@@ -1834,9 +1838,11 @@ mod tests {
         );
 
         let mut v = serde_json::json!({"duration": -1});
-        assert!(canonicalize_video_frames(&mut v)
-            .unwrap_err()
-            .contains("positive number of seconds"));
+        assert!(
+            canonicalize_video_frames(&mut v)
+                .unwrap_err()
+                .contains("positive number of seconds")
+        );
     }
 
     #[test]
@@ -2235,8 +2241,10 @@ mod tests {
         assert_eq!(out["data"][0]["b64_json"], serde_json::json!("AAA"));
         // Missing result → empty data array, never a null.
         let failed = serde_json::json!({"status": "failed"});
-        assert!(native_job_to_openai(&failed)["data"]
-            .as_array()
-            .is_some_and(std::vec::Vec::is_empty));
+        assert!(
+            native_job_to_openai(&failed)["data"]
+                .as_array()
+                .is_some_and(std::vec::Vec::is_empty)
+        );
     }
 }

@@ -2,9 +2,9 @@
 //! vulkan census + real mmproj and print slots + warnings.
 //! Run: `cargo run --example slots_probe -p blazar-core -- <model.gguf> <mmproj.gguf>`
 use blazar_core::{
-    gguf::read_metadata_file,
-    profile::{compile, ProfileInput, TuningOverrides},
     Config, Endpoint, GpuInfo, Hardware, ModelMeta, ModelOverride,
+    gguf::read_metadata_file,
+    profile::{ProfileInput, TuningOverrides, compile},
 };
 use std::collections::BTreeSet;
 

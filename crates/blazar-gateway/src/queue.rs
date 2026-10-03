@@ -354,15 +354,15 @@ impl PriorityQueue {
                     continue; // timed out while queued
                 }
                 // Charge the WFQ bucket of the admitted waiter.
-                if let Some(m) = admitted {
-                    if m.tier_secs.is_some() {
-                        let bucket = m.wfq_name.unwrap_or_default();
-                        let w = f64::from(m.weight.max(1));
-                        let credit = q.credits.entry(bucket).or_insert(0.0);
-                        *credit += 1.0 / w;
-                        if q.credits.len() > WFQ_CREDIT_BUCKETS_MAX {
-                            q.credits.clear();
-                        }
+                if let Some(m) = admitted
+                    && m.tier_secs.is_some()
+                {
+                    let bucket = m.wfq_name.unwrap_or_default();
+                    let w = f64::from(m.weight.max(1));
+                    let credit = q.credits.entry(bucket).or_insert(0.0);
+                    *credit += 1.0 / w;
+                    if q.credits.len() > WFQ_CREDIT_BUCKETS_MAX {
+                        q.credits.clear();
                     }
                 }
                 break Some((pick, tx));

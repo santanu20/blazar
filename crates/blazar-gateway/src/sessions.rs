@@ -155,7 +155,7 @@ mod tests {
     #[allow(non_snake_case)]
     #[allow(clippy::duration_suboptimal_units)]
     mod pin_target {
-        use super::super::{pin_target, MAX_SESSION_NAME};
+        use super::super::{MAX_SESSION_NAME, pin_target};
         use blazar_core::{BlazarDirs, ModelRow, Store};
 
         fn fixture_store() -> (tempfile::TempDir, Store) {

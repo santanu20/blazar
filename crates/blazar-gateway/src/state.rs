@@ -1,7 +1,7 @@
 //! Shared gateway state.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use blazar_core::{BlazarDirs, Config};
 use blazar_runtime::{EventBus, Supervisor};

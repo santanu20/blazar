@@ -164,7 +164,7 @@ impl EventBus {
 pub async fn interrupted() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
         let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");

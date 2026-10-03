@@ -225,14 +225,22 @@ impl fmt::Display for LaneError {
                 f,
                 "model engine pin \"{pin}\" matches no installed tag or kind — installed: {roster}"
             ),
-            Self::FormatUnserved { shape, roster } if shape.shards == ShardFormat::QuantizedSafetensors => write!(
-                f,
-                "no installed engine serves quantized safetensors (AWQ/GPTQ/FP8) — sglang is the lane for those; blazar engine install --kind sglang (installed: {roster})"
-            ),
+            Self::FormatUnserved { shape, roster }
+                if shape.shards == ShardFormat::QuantizedSafetensors =>
+            {
+                write!(
+                    f,
+                    "no installed engine serves quantized safetensors (AWQ/GPTQ/FP8) — sglang is the lane for those; blazar engine install --kind sglang (installed: {roster})"
+                )
+            }
             Self::FormatUnserved { shape, roster } => write!(
                 f,
                 "no installed engine serves the {} format — install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: {roster}",
-                if shape.shards.is_dir() { "safetensors" } else { "GGUF" }
+                if shape.shards.is_dir() {
+                    "safetensors"
+                } else {
+                    "GGUF"
+                }
             ),
             Self::DiffusionUnserved { roster } => write!(
                 f,

@@ -13,14 +13,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use blazar_core::BlazarDirs;
 use blazar_core::gguf;
 use blazar_core::store::{ModelRow, Store};
-use blazar_core::BlazarDirs;
 
 use crate::events::BlazarEvent;
 
@@ -1500,11 +1500,11 @@ pub fn fit_rows(siblings: &[HfSibling], vram_bytes: u64, default_ctx: u32) -> Ve
             if !s.rfilename.to_lowercase().ends_with(".safetensors") {
                 continue;
             }
-            if let Some(bytes) = s.lfs.as_ref().and_then(|l| l.size).or(s.size) {
-                if bytes > 0 {
-                    total = total.saturating_add(bytes);
-                    shards += 1;
-                }
+            if let Some(bytes) = s.lfs.as_ref().and_then(|l| l.size).or(s.size)
+                && bytes > 0
+            {
+                total = total.saturating_add(bytes);
+                shards += 1;
             }
         }
         if total > 0 {
@@ -1763,10 +1763,10 @@ pub(crate) fn mmproj_matches(row: &ModelRow, expects_mmproj: bool) -> bool {
 pub(crate) fn sweep_stale_part(final_path: &str) {
     for suffix in [".part", ".part.progress"] {
         let stale = format!("{final_path}{suffix}");
-        if let Err(e) = std::fs::remove_file(&stale) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("could not remove stale partial {stale}: {e}");
-            }
+        if let Err(e) = std::fs::remove_file(&stale)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("could not remove stale partial {stale}: {e}");
         }
     }
 }
@@ -2170,16 +2170,15 @@ impl Puller {
         // row under the same name goes through the shared pruner.
         let old_path = Path::new(&row.path);
         if old_path.is_dir() {
-            if old_path != dir {
-                if let Err(e) = std::fs::remove_dir_all(old_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(
-                            model = %name,
-                            "could not remove replaced dir {}: {e}",
-                            old_path.display()
-                        );
-                    }
-                }
+            if old_path != dir
+                && let Err(e) = std::fs::remove_dir_all(old_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    model = %name,
+                    "could not remove replaced dir {}: {e}",
+                    old_path.display()
+                );
             }
         } else {
             prune_replaced(name, row, &[], "replaced by a safetensors pull");
@@ -2782,10 +2781,10 @@ impl Puller {
         } else if let Some(old_mm) = &old.mmproj_path {
             // Repo dropped the projector: forget it from the row and
             // remove the dead sidecar file.
-            if let Err(e) = std::fs::remove_file(old_mm) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(model = %name, "could not remove stale mmproj {old_mm}: {e}");
-                }
+            if let Err(e) = std::fs::remove_file(old_mm)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(model = %name, "could not remove stale mmproj {old_mm}: {e}");
             }
         }
         build_model_row(
@@ -2928,11 +2927,11 @@ pub(crate) fn unique_dest(dir: &Path, filename: &str, repo: &str) -> PathBuf {
     // first (matches the repo's internal layout), then the repo slug for
     // flat filenames (e.g. two Qwen3.5-9B-Q4_K_M.gguf from different
     // repos — verified live: unsloth base vs unsloth MTP collide).
-    if let Some(parent) = flat.parent() {
-        if !parent.as_os_str().is_empty() {
-            let slug: String = parent.to_string_lossy().replace(['/', '\\'], "--");
-            return dir.join(format!("{slug}--{}", leaf.to_string_lossy()));
-        }
+    if let Some(parent) = flat.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let slug: String = parent.to_string_lossy().replace(['/', '\\'], "--");
+        return dir.join(format!("{slug}--{}", leaf.to_string_lossy()));
     }
     let repo_slug = repo.replace(['/', '\\'], "--");
     dir.join(format!("{repo_slug}--{}", leaf.to_string_lossy()))
@@ -2986,15 +2985,15 @@ fn reuse_byte_exact(candidate: &Path, plan: &FilePlan) -> Option<PathBuf> {
 /// as `huggingface_hub` itself: `HF_HUB_CACHE`, then `HF_HOME/hub`, then the
 /// per-user default `~/.cache/huggingface/hub`.
 fn hf_hub_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("HF_HUB_CACHE") {
-        if !root.is_empty() {
-            return Some(PathBuf::from(root));
-        }
+    if let Some(root) = std::env::var_os("HF_HUB_CACHE")
+        && !root.is_empty()
+    {
+        return Some(PathBuf::from(root));
     }
-    if let Some(home) = std::env::var_os("HF_HOME") {
-        if !home.is_empty() {
-            return Some(Path::new(&home).join("hub"));
-        }
+    if let Some(home) = std::env::var_os("HF_HOME")
+        && !home.is_empty()
+    {
+        return Some(Path::new(&home).join("hub"));
     }
     let home = dirs::home_dir()?;
     Some(home.join(".cache").join("huggingface").join("hub"))
@@ -3101,7 +3100,9 @@ mod tests {
         let link = r#"<https://huggingface.co/api/models/rhasspy/piper-voices/tree/main/en?limit=1000&cursor=abc>; rel="next", <https://huggingface.co/first>; rel="first""#;
         assert_eq!(
             next_link(link),
-            Some("https://huggingface.co/api/models/rhasspy/piper-voices/tree/main/en?limit=1000&cursor=abc")
+            Some(
+                "https://huggingface.co/api/models/rhasspy/piper-voices/tree/main/en?limit=1000&cursor=abc"
+            )
         );
         // Last page: other rels but no next.
         assert_eq!(next_link(r#"<https://huggingface.co/x>; rel="prev""#), None);
@@ -3198,7 +3199,7 @@ mod tests {
         let p = plan(body.len() as u64, Some(&sha));
 
         // Miss: nothing on disk, no hub cache.
-        std::env::set_var("HF_HUB_CACHE", tmp.path().join("absent-hub"));
+        crate::test_env::set_env("HF_HUB_CACHE", tmp.path().join("absent-hub"));
         let dest = models.join("m-q4_k_m.gguf");
         assert_eq!(reuse_on_disk("m", "o/r", &p, &dest, None), None);
 
@@ -3228,7 +3229,7 @@ mod tests {
         let snap = hub.join("models--o--r").join("snapshots").join("rev1");
         std::fs::create_dir_all(&snap).unwrap();
         std::fs::write(snap.join("m-q4_k_m.gguf"), &body).unwrap();
-        std::env::set_var("HF_HUB_CACHE", &hub);
+        crate::test_env::set_env("HF_HUB_CACHE", &hub);
         assert_eq!(
             reuse_on_disk("m", "o/r", &p, &dest, Some(&bare)),
             Some(dest.clone())
@@ -4292,10 +4293,12 @@ mod tests {
             "fast path must not fetch a single download byte"
         );
         assert!(!dirs.models_dir().join("r-q4_k_m.gguf.part").exists());
-        assert!(!dirs
-            .models_dir()
-            .join("r-q4_k_m.gguf.part.progress")
-            .exists());
+        assert!(
+            !dirs
+                .models_dir()
+                .join("r-q4_k_m.gguf.part.progress")
+                .exists()
+        );
         // Store row NOT clobbered by a re-derived slug twin.
         assert_eq!(
             Store::open(&dirs)

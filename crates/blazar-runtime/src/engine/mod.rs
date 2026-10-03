@@ -14,16 +14,16 @@ pub mod sglang_install;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
+use blazar_core::BlazarDirs;
 use blazar_core::config::UpdateChannel;
 use blazar_core::engine_kind::EngineKind;
-use blazar_core::fs_safety::{path_is_within, remove_dir_within, GuardedRemoval};
+use blazar_core::fs_safety::{GuardedRemoval, path_is_within, remove_dir_within};
 use blazar_core::store::{EngineRow, Store};
-use blazar_core::BlazarDirs;
 
 use crate::events::{BlazarEvent, EventBus};
-use gh::{same_build, GhClient, GhRelease};
+use gh::{GhClient, GhRelease, same_build};
 use manifest::Manifest;
 
 /// Retention for engine dirs: the newest 2 survive auto-prune — the
@@ -332,11 +332,11 @@ pub fn remove_engine_row_and_tree(
         crate::whisper::pin_path_in(data_dir),
         crate::piper::pin_path_in(data_dir),
     ] {
-        if let Ok(raw) = std::fs::read_to_string(&pin_file) {
-            if raw.trim() == tag {
-                let _ = std::fs::remove_file(&pin_file);
-                tracing::info!("lazy-lane pin cleared (pinned tag {tag} was removed)");
-            }
+        if let Ok(raw) = std::fs::read_to_string(&pin_file)
+            && raw.trim() == tag
+        {
+            let _ = std::fs::remove_file(&pin_file);
+            tracing::info!("lazy-lane pin cleared (pinned tag {tag} was removed)");
         }
     }
     Ok(bytes)
@@ -497,10 +497,10 @@ impl EngineManager {
         // Explicit `-cuda` pins address the overlay repo directly (our
         // CI publishes `bNNNN-cuda` releases there); every other tag
         // resolves upstream first and probes the overlay afterwards.
-        if let Some(t) = tag {
-            if t.ends_with("-cuda") {
-                return self.install_cuda_overlay_tag(t).await;
-            }
+        if let Some(t) = tag
+            && t.ends_with("-cuda")
+        {
+            return self.install_cuda_overlay_tag(t).await;
         }
         let release = match tag {
             Some(t) => self.gh.resolve_tag(t).await?,
@@ -509,14 +509,14 @@ impl EngineManager {
         // Channel updates are idempotent: a channel target that is
         // already the active engine has nothing to fetch or retire.
         // Explicit tag pins keep their install semantics (repair lane).
-        if tag.is_none() {
-            if let Some(row) = self.active_row_if_tag(&release.tag_name)? {
-                tracing::info!(
-                    "channel target {} is already the active engine — skipping the download",
-                    release.tag_name
-                );
-                return Ok(row);
-            }
+        if tag.is_none()
+            && let Some(row) = self.active_row_if_tag(&release.tag_name)?
+        {
+            tracing::info!(
+                "channel target {} is already the active engine — skipping the download",
+                release.tag_name
+            );
+            return Ok(row);
         }
         if let Some(row) = self.maybe_cuda_overlay(&release, tag.is_some()).await? {
             return Ok(row);
@@ -524,10 +524,10 @@ impl EngineManager {
         // Channel automation never benefits from the standard (Vulkan)
         // lane while the keep-CUDA guard holds — explicit tag pins
         // still download so `blazar engine use <tag>` can reach them.
-        if tag.is_none() {
-            if let Some(row) = self.try_keep_cuda_skip(&release.tag_name, system_vendor_hint())? {
-                return Ok(row);
-            }
+        if tag.is_none()
+            && let Some(row) = self.try_keep_cuda_skip(&release.tag_name, system_vendor_hint())?
+        {
+            return Ok(row);
         }
         self.install_with_retries(release, retry_delay).await
     }
@@ -626,14 +626,12 @@ impl EngineManager {
         // Same-tag idempotency: an update that resolved to the
         // already-active engine must not retire + re-download it. Exact
         // pins stay on the install path — re-install is the point.
-        if !exact_pin {
-            if let Some(row) = self.active_row_if_tag(&release.tag_name)? {
-                tracing::info!(
-                    "target {} is already the active engine — skipping the download",
-                    release.tag_name
-                );
-                return Ok(row);
-            }
+        if !exact_pin && let Some(row) = self.active_row_if_tag(&release.tag_name)? {
+            tracing::info!(
+                "target {} is already the active engine — skipping the download",
+                release.tag_name
+            );
+            return Ok(row);
         }
         if let Some(row) = self.maybe_cuda_overlay(&release, exact_pin).await? {
             return Ok(row);
@@ -1127,14 +1125,14 @@ impl EngineManager {
         ) else {
             return Ok(LagOutcome::NothingRunnable);
         };
-        if let Some(row) = Store::open(&self.dirs)?.active_engine()? {
-            if row.tag == pick_rel.tag_name {
-                tracing::info!(
-                    "newest runnable overlay build {} is already active",
-                    pick_rel.tag_name
-                );
-                return Ok(LagOutcome::AlreadyActive(row));
-            }
+        if let Some(row) = Store::open(&self.dirs)?.active_engine()?
+            && row.tag == pick_rel.tag_name
+        {
+            tracing::info!(
+                "newest runnable overlay build {} is already active",
+                pick_rel.tag_name
+            );
+            return Ok(LagOutcome::AlreadyActive(row));
         }
         let Some(pick) = gh::resolve_cuda_asset(pick_rel, lane.driver_cuda, lane.sm, lane.arch)
         else {
@@ -2270,10 +2268,10 @@ impl EngineManager {
             // Registration-time retention only touches the lane that just
             // changed; rows of other lanes are skipped before slot
             // counting so an away-lane active flag cannot strand them.
-            if let Some(kind) = changed_kind {
-                if e.kind.as_str() != kind {
-                    continue;
-                }
+            if let Some(kind) = changed_kind
+                && e.kind.as_str() != kind
+            {
+                continue;
             }
             // A user-installed fork lane never consumes a mainstream
             // retention slot: skipping BEFORE the count keeps KEEP_TAGS
@@ -2865,22 +2863,16 @@ impl EngineManager {
             ));
         }
         // Probe under the configured engine env (e.g. GGML_BACKEND_PATH so
-        // a CUDA build actually discovers its GPU).
-        let mut m = {
-            let prev: Vec<(String, String)> = extra_env
-                .iter()
-                .filter(|(k, _)| std::env::var_os(k).is_none())
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            for (k, v) in &prev {
-                std::env::set_var(k, v);
-            }
-            let r = manifest::probe(server, LOCAL_TAG);
-            for (k, _) in &prev {
-                std::env::remove_var(k);
-            }
-            r?
-        };
+        // a CUDA build actually discovers its GPU) — applied to the probe
+        // children directly, never to this process's environment. Keys
+        // already present in the parent env keep the parent's value,
+        // matching what a serving child would inherit.
+        let probe_env: Vec<(String, String)> = extra_env
+            .iter()
+            .filter(|(k, _)| std::env::var_os(k).is_none())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut m = manifest::probe_with_env(server, LOCAL_TAG, &probe_env)?;
         // Local lane: BLAZAR_ENGINE_PATH is user-owned and usually
         // out-of-tree — relativize is a no-op there by design.
         m.relativize_server_path(&self.dirs.data_dir);
@@ -3042,10 +3034,10 @@ impl EngineManager {
                 // failed attempt left behind (upsert is transactional,
                 // but never bet data placement on that), rescue the
                 // tree back to the legacy lane, then put the aside back.
-                if let Ok(store) = Store::open(&self.dirs) {
-                    if let Err(del) = store.delete_engine(tag) {
-                        tracing::warn!("cannot drop failed adoption row for {tag}: {del}");
-                    }
+                if let Ok(store) = Store::open(&self.dirs)
+                    && let Err(del) = store.delete_engine(tag)
+                {
+                    tracing::warn!("cannot drop failed adoption row for {tag}: {del}");
                 }
                 if let Err(back) = std::fs::rename(&target, legacy_dir) {
                     // The tree cannot go home: it already sits at the
@@ -3172,10 +3164,10 @@ impl EngineManager {
                 // Registration failed after the move: drop any row the
                 // failed attempt left behind, rescue the tree back to
                 // the legacy lane, then put the aside back.
-                if let Ok(store) = Store::open(&self.dirs) {
-                    if let Err(del) = store.delete_engine(tag) {
-                        tracing::warn!("cannot drop failed adoption row for {tag}: {del}");
-                    }
+                if let Ok(store) = Store::open(&self.dirs)
+                    && let Err(del) = store.delete_engine(tag)
+                {
+                    tracing::warn!("cannot drop failed adoption row for {tag}: {del}");
                 }
                 if let Err(back) = std::fs::rename(&target, legacy_dir) {
                     // The tree cannot go home: it already sits at the

@@ -15,7 +15,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use sha2::{Digest, Sha256};
 
 use blazar_core::{BlazarDirs, ModelRow, Store};

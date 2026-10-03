@@ -14,18 +14,18 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
+use blazar_core::BlazarDirs;
 use blazar_core::engine_kind::EngineKind;
 use blazar_core::store::EngineRow;
-use blazar_core::BlazarDirs;
 
 use super::gh;
 use super::gh::LLAMA_CPP_REPO;
 use super::manifest::{EngineSource, LaneProvenance};
 use super::{
-    discard_retired_engine, restore_retired_engine, retire_engine_dir, CancelledInstallGuard,
-    EngineManager,
+    CancelledInstallGuard, EngineManager, discard_retired_engine, restore_retired_engine,
+    retire_engine_dir,
 };
 
 /// Where `engine build` compiles from. Upstream = a `bNNNN` tag of
@@ -565,7 +565,7 @@ async fn run_step(
     });
 
     let waited = tokio::time::timeout(timeout, async {
-        let status = loop {
+        loop {
             tokio::select! {
                 line = rx.recv() => {
                     if let Some(l) = line {
@@ -574,8 +574,7 @@ async fn run_step(
                 }
                 st = child.wait() => break st,
             }
-        };
-        status
+        }
     })
     .await;
 
@@ -696,21 +695,21 @@ impl EngineManager {
         if let (Some(dir), BuildSource::Upstream) = (&resolved.source_dir, &resolved.source) {
             let origin = git_remote_slug(tc, dir).await;
             let head = git_rev_parse(tc, dir).await.ok();
-            if let (Some(slug), Some(sha)) = (origin, head) {
-                if slug != *LLAMA_CPP_REPO {
-                    (on_line)(&format!(
-                        "source tree origin is {slug} (not upstream llama.cpp) — \
+            if let (Some(slug), Some(sha)) = (origin, head)
+                && slug != *LLAMA_CPP_REPO
+            {
+                (on_line)(&format!(
+                    "source tree origin is {slug} (not upstream llama.cpp) — \
                          stamping this build as a fork lane"
-                    ));
-                    return Ok(BuildOpts {
-                        source: BuildSource::Fork {
-                            repo: slug,
-                            ref_sha: sha,
-                            base_ref: None,
-                        },
-                        ..resolved
-                    });
-                }
+                ));
+                return Ok(BuildOpts {
+                    source: BuildSource::Fork {
+                        repo: slug,
+                        ref_sha: sha,
+                        base_ref: None,
+                    },
+                    ..resolved
+                });
             }
         }
         Ok(resolved)

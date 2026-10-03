@@ -229,11 +229,7 @@ impl GgufMeta {
                     0
                 } else {
                     let window = windows.map_or(0, |w| w[i]);
-                    if window == 0 {
-                        ctx
-                    } else {
-                        window.min(ctx)
-                    }
+                    if window == 0 { ctx } else { window.min(ctx) }
                 }
             })
             .sum()
@@ -254,11 +250,7 @@ impl GgufMeta {
     pub fn swa_token_sum(&self, ctx: u64) -> Option<u64> {
         let blocks = self.block_count?;
         let layer_tokens = |window: u64| {
-            if window == 0 {
-                ctx
-            } else {
-                window.min(ctx)
-            }
+            if window == 0 { ctx } else { window.min(ctx) }
         };
         if let Some(per_layer) = &self.sliding_window_per_layer {
             if per_layer.len() as u64 == blocks {
@@ -356,10 +348,10 @@ impl GgufMeta {
                 "attention geometry incomplete — KV/VRAM estimates are disabled (fit, cache-ram, coresidency run blind)",
             );
         }
-        if let (Some(blocks), Some(windows)) = (self.block_count, &self.sliding_window_per_layer) {
-            if windows.len() != usize::try_from(blocks).unwrap_or(usize::MAX) {
-                out.push("sliding_window array length != block_count — SWA KV savings ignored");
-            }
+        if let (Some(blocks), Some(windows)) = (self.block_count, &self.sliding_window_per_layer)
+            && windows.len() != usize::try_from(blocks).unwrap_or(usize::MAX)
+        {
+            out.push("sliding_window array length != block_count — SWA KV savings ignored");
         }
         if self.attention_class() == AttentionClass::HybridLinear
             && !self.recurrent_split_provable()
@@ -391,11 +383,12 @@ impl GgufMeta {
             return None;
         }
         let mut id = format!("{org}/{repo}");
-        if let Some(size) = self.size_label.as_deref().map(str::trim) {
-            if !size.is_empty() && !id.ends_with(size) {
-                id.push('-');
-                id.push_str(size);
-            }
+        if let Some(size) = self.size_label.as_deref().map(str::trim)
+            && !size.is_empty()
+            && !id.ends_with(size)
+        {
+            id.push('-');
+            id.push_str(size);
         }
         Some(id)
     }
@@ -1494,10 +1487,11 @@ mod tests {
         let m = hybrid_kv_meta("kimi-k3", 69);
         assert!(!m.recurrent_split_provable());
         assert_eq!(m.kv_f16_bytes(1024), Some(2048 * 69 * 1024));
-        assert!(m
-            .lint()
-            .iter()
-            .any(|w| w.contains("hybrid-linear architecture")));
+        assert!(
+            m.lint()
+                .iter()
+                .any(|w| w.contains("hybrid-linear architecture"))
+        );
         // Provable split (qwen35 interval): no lint noise.
         let (q, _) = parse_metadata(&build_gguf(&qwen35_mla())).unwrap();
         assert!(!q.lint().iter().any(|w| w.contains("hybrid-linear")));
@@ -1519,7 +1513,7 @@ mod depth_tests {
         b.extend_from_slice(&3u32.to_le_bytes());
         b.extend_from_slice(&0u64.to_le_bytes()); // tensors
         b.extend_from_slice(&1u64.to_le_bytes()); // one KV pair
-                                                  // key "deep"
+        // key "deep"
         b.extend_from_slice(&4u64.to_le_bytes());
         b.extend_from_slice(b"deep");
         // Value: type 9 (array) ONCE — nested levels are just

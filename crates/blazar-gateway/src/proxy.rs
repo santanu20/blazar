@@ -14,9 +14,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 
+use blazar_core::ModelRow;
 use blazar_core::engine_kind::EngineKind;
 use blazar_core::store::Store;
-use blazar_core::ModelRow;
 
 use crate::queue::Priority;
 use crate::sentinel;
@@ -1145,20 +1145,20 @@ pub async fn proxy_request(
                     feed.bytes(buf.clone());
                 }
                 drop(sf); // F31: Drop removes the singleflight entry
-                          // Same contract as the ollama lanes: when the caller did not
-                          // ask for thinking, strip raw <think> blocks before the body
-                          // reaches the client. Parse failure fails open (original body).
+                // Same contract as the ollama lanes: when the caller did not
+                // ask for thinking, strip raw <think> blocks before the body
+                // reaches the client. Parse failure fails open (original body).
                 let buf = if suppress_think || restamp {
                     match serde_json::from_slice::<serde_json::Value>(&buf) {
                         Ok(mut v) => {
                             let mut touched = false;
-                            if restamp {
-                                if let Some(m) = v.get_mut("model") {
-                                    if m.is_string() && m.as_str() != Some(caller_model.as_str()) {
-                                        *m = serde_json::Value::String(caller_model.clone());
-                                        touched = true;
-                                    }
-                                }
+                            if restamp
+                                && let Some(m) = v.get_mut("model")
+                                && m.is_string()
+                                && m.as_str() != Some(caller_model.as_str())
+                            {
+                                *m = serde_json::Value::String(caller_model.clone());
+                                touched = true;
                             }
                             if suppress_think {
                                 crate::translate::suppress_raw_think_response(&mut v);

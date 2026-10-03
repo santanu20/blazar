@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use blazar_core::store::Store;
 use blazar_core::{BlazarDirs, ModelRow};
@@ -717,10 +717,10 @@ fn gguf_derivations(first_leaf: &str, meta: &blazar_core::GgufMeta) -> (String, 
         .next()
         .unwrap_or_default()
         .to_string();
-    if is_quant_token(&tail) {
-        if let Some(base) = quant_source.strip_suffix(&format!("-{tail}")) {
-            candidates.push(base.to_string());
-        }
+    if is_quant_token(&tail)
+        && let Some(base) = quant_source.strip_suffix(&format!("-{tail}"))
+    {
+        candidates.push(base.to_string());
     }
     candidates.push(quant_source.clone());
     (quant, candidates)

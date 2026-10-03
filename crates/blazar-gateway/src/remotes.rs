@@ -70,10 +70,11 @@ fn bind_remote(
     hkey: &str,
 ) {
     let mut m = map.lock().expect("remote_affinity lock poisoned");
-    if m.len() >= REMOTE_AFFINITY_CAP && !m.contains_key(&key) {
-        if let Some(evict) = m.keys().next().copied() {
-            m.remove(&evict);
-        }
+    if m.len() >= REMOTE_AFFINITY_CAP
+        && !m.contains_key(&key)
+        && let Some(evict) = m.keys().next().copied()
+    {
+        m.remove(&evict);
     }
     m.insert(key, hkey.to_string());
 }
@@ -101,10 +102,10 @@ pub struct RemoteLease {
 
 impl Drop for RemoteLease {
     fn drop(&mut self) {
-        if let Ok(mut m) = self.map.lock() {
-            if let Some(h) = m.get_mut(&self.key) {
-                h.in_flight = h.in_flight.saturating_sub(1);
-            }
+        if let Ok(mut m) = self.map.lock()
+            && let Some(h) = m.get_mut(&self.key)
+        {
+            h.in_flight = h.in_flight.saturating_sub(1);
         }
     }
 }
@@ -569,10 +570,11 @@ fn insert_capacity(
     cap: PeerCapacity,
 ) {
     let mut m = map.lock().expect("remote_capacity lock poisoned");
-    if m.len() >= REMOTE_CAPACITY_CAP && !m.contains_key(hkey) {
-        if let Some(evict) = m.keys().next().cloned() {
-            m.remove(&evict);
-        }
+    if m.len() >= REMOTE_CAPACITY_CAP
+        && !m.contains_key(hkey)
+        && let Some(evict) = m.keys().next().cloned()
+    {
+        m.remove(&evict);
     }
     m.insert(hkey.to_string(), cap);
 }
@@ -724,10 +726,10 @@ async fn fetch_presence(state: &AppState, remote: &Remote) -> Option<Vec<String>
 /// refreshes preserve the forced-probe throttle state.
 async fn refresh_presence(state: &AppState, remote: &Remote) -> Option<Vec<String>> {
     let hkey = health_key(remote);
-    if let Some(p) = state.remote_presence.lock().ok()?.get(&hkey) {
-        if p.fresh() {
-            return Some(p.entries.clone());
-        }
+    if let Some(p) = state.remote_presence.lock().ok()?.get(&hkey)
+        && p.fresh()
+    {
+        return Some(p.entries.clone());
     }
     // Presence + capacity ride together: a slow-but-alive peer pays
     // max(3s, 3s) wall, never the sum (F15). Capacity failure alone
@@ -812,16 +814,16 @@ pub async fn peers_serving<'a>(state: &'a AppState, model: &str) -> Vec<&'a Remo
         if !live {
             continue;
         }
-        if let Some(entries) = refresh_presence(state, remote).await {
-            if entries.iter().any(|id| peer_id_matches(id, model)) {
-                let in_flight = state
-                    .remote_health
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(&health_key(remote)).map(|h| h.in_flight))
-                    .unwrap_or(0);
-                candidates.push((remote, in_flight));
-            }
+        if let Some(entries) = refresh_presence(state, remote).await
+            && entries.iter().any(|id| peer_id_matches(id, model))
+        {
+            let in_flight = state
+                .remote_health
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&health_key(remote)).map(|h| h.in_flight))
+                .unwrap_or(0);
+            candidates.push((remote, in_flight));
         }
     }
     candidates.sort_by_key(|(_, f)| *f);
@@ -852,16 +854,16 @@ pub async fn peers_serving_with_refresh<'a>(state: &'a AppState, model: &str) ->
         if !live {
             continue;
         }
-        if let Some(entries) = force_refresh_presence(state, remote).await {
-            if entries.iter().any(|id| peer_id_matches(id, model)) {
-                let in_flight = state
-                    .remote_health
-                    .lock()
-                    .ok()
-                    .and_then(|m| m.get(&health_key(remote)).map(|h| h.in_flight))
-                    .unwrap_or(0);
-                candidates.push((remote, in_flight));
-            }
+        if let Some(entries) = force_refresh_presence(state, remote).await
+            && entries.iter().any(|id| peer_id_matches(id, model))
+        {
+            let in_flight = state
+                .remote_health
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&health_key(remote)).map(|h| h.in_flight))
+                .unwrap_or(0);
+            candidates.push((remote, in_flight));
         }
     }
     candidates.sort_by_key(|(_, f)| *f);
@@ -986,13 +988,11 @@ pub async fn ollama_chat_remote(
         .get("stream")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
-    if stream {
-        if let Some(obj) = openai_req.as_object_mut() {
-            obj.insert(
-                "stream_options".into(),
-                serde_json::json!({"include_usage": true}),
-            );
-        }
+    if stream && let Some(obj) = openai_req.as_object_mut() {
+        obj.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": true}),
+        );
     }
     let url = format!("{}/v1/chat/completions", remote.url.trim_end_matches('/'));
     let mut http = state.http.post(&url).json(&openai_req);

@@ -30,10 +30,10 @@ use blazar_core::config::Remote;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::AppState;
 use crate::ollama::api_error;
 use crate::proxy::{ensure_with_admission, resolve_model};
 use crate::queue::{Priority, WorkClass};
-use crate::AppState;
 
 /// Default per-peer bound for a replicate warm call. Generous on
 /// purpose: a peer loading a multi-GiB model from cold disk legally

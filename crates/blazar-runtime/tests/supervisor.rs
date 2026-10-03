@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use blazar_core::hardware::{GpuInfo, Hardware};
 use blazar_core::store::Store;
 use blazar_core::{BlazarDirs, Config};
-use blazar_runtime::engine::manifest::{probe as probe_manifest, Manifest};
 use blazar_runtime::EventBus;
+use blazar_runtime::engine::manifest::{Manifest, probe as probe_manifest};
 use blazar_runtime::{LlamaCppEngine, SupervisionError, Supervisor};
 
 fn stub_bin() -> PathBuf {
@@ -201,9 +201,10 @@ async fn integration__ensure_ready__health_and_argv_flags() {
     assert!(argv.windows(2).any(|w| w[0] == "--alias" && w[1] == "m1"));
     // Default slots=0 auto: train ctx 40960 / base 16384 -> np 2 with the
     // total ctx scaled; ps still reports the per-slot ctx below.
-    assert!(argv
-        .windows(2)
-        .any(|w| w[0] == "--ctx-size" && w[1] == "32768"));
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--ctx-size" && w[1] == "32768")
+    );
     assert!(argv.windows(2).any(|w| w[0] == "-np" && w[1] == "2"));
 
     // ps shows ready with ctx.

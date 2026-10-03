@@ -51,11 +51,7 @@ impl HfMeta {
     /// (fp8 = 1, everything 16-bit = 2).
     #[must_use]
     pub fn kv_elem_bytes(cache_dtype: &str) -> u64 {
-        if cache_dtype.starts_with("fp8") {
-            1
-        } else {
-            2
-        }
+        if cache_dtype.starts_with("fp8") { 1 } else { 2 }
     }
 }
 

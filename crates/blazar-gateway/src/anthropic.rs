@@ -14,7 +14,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::proxy::{admission_gate_slo, child_base, ensure_with_admission};
@@ -32,7 +32,7 @@ pub async fn messages(
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return anthropic_error(400, "invalid_request_error", &format!("invalid JSON: {e}"))
+            return anthropic_error(400, "invalid_request_error", &format!("invalid JSON: {e}"));
         }
     };
     let model = parsed
@@ -65,15 +65,14 @@ pub async fn messages(
             "max_tokens is required and must be a non-negative integer",
         );
     }
-    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k) {
-        if let Some(entry) = state.keys.entry(&key.name) {
-            if let Err(rej) = state.keys.check(&entry, &model) {
-                return rej.to_response();
-            }
-            // F53: charge AFTER translate_request validation — 400s must
-            // not consume a request from the key's budget.
-        }
+    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
+        && let Some(entry) = state.keys.entry(&key.name)
+        && let Err(rej) = state.keys.check(&entry, &model)
+    {
+        return rej.to_response();
     }
+    // F53: charge AFTER translate_request validation — 400s must
+    // not consume a request from the key's budget.
     let stream = parsed
         .get("stream")
         .and_then(Value::as_bool)
@@ -255,7 +254,7 @@ pub async fn messages(
                 status.as_u16(),
                 "api_error",
                 &String::from_utf8_lossy(&bytes[..bytes.len().min(400)]),
-            )
+            );
         }
     };
     if !status.is_success() {
@@ -295,7 +294,7 @@ pub async fn count_tokens(
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            return anthropic_error(400, "invalid_request_error", &format!("invalid JSON: {e}"))
+            return anthropic_error(400, "invalid_request_error", &format!("invalid JSON: {e}"));
         }
     };
     let model = parsed
@@ -308,20 +307,20 @@ pub async fn count_tokens(
     }
     // F48: tokenizing a model SP loads it — scoped keys must not spawn
     // outside their scope through this lane.
-    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k) {
-        if let Some(entry) = state.keys.entry(&key.name) {
-            if let Err(rej) = state.keys.check(&entry, &model) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&key.name);
+    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
+        && let Some(entry) = state.keys.entry(&key.name)
+    {
+        if let Err(rej) = state.keys.check(&entry, &model) {
+            return rej.to_response();
         }
+        state.keys.charge_request(&key.name);
     }
     let mut text = String::new();
-    if let Some(sys) = parsed.get("system") {
-        if let Some(s) = system_to_text(sys) {
-            text.push_str(&s);
-            text.push_str("\n\n");
-        }
+    if let Some(sys) = parsed.get("system")
+        && let Some(s) = system_to_text(sys)
+    {
+        text.push_str(&s);
+        text.push_str("\n\n");
     }
     if let Some(msgs) = parsed.get("messages").and_then(Value::as_array) {
         for m in msgs {
@@ -380,10 +379,10 @@ pub fn translate_request(v: &Value, stream: bool) -> Result<Value, String> {
         .as_object()
         .ok_or_else(|| "request body must be a JSON object".to_string())?;
     let mut messages: Vec<Value> = Vec::new();
-    if let Some(sys) = obj.get("system") {
-        if let Some(text) = system_to_text(sys) {
-            messages.push(json!({"role": "system", "content": text}));
-        }
+    if let Some(sys) = obj.get("system")
+        && let Some(text) = system_to_text(sys)
+    {
+        messages.push(json!({"role": "system", "content": text}));
     }
     let msgs = obj
         .get("messages")
@@ -399,10 +398,10 @@ pub fn translate_request(v: &Value, stream: bool) -> Result<Value, String> {
         out["max_tokens"] = json!(mt);
     }
     for key in ["temperature", "top_p"] {
-        if let Some(x) = obj.get(key) {
-            if !x.is_null() {
-                out[key] = x.clone();
-            }
+        if let Some(x) = obj.get(key)
+            && !x.is_null()
+        {
+            out[key] = x.clone();
         }
     }
     if let Some(stops) = obj.get("stop_sequences").and_then(Value::as_array) {
@@ -442,12 +441,12 @@ pub fn translate_request(v: &Value, stream: bool) -> Result<Value, String> {
         let mut kwargs = json!({"thinking": enabled, "enable_thinking": enabled});
         if enabled && budget.is_some_and(|b| b > 0) {
             let b = budget.unwrap_or_default();
-            if let Some(mt) = out.get("max_tokens").and_then(Value::as_u64) {
-                if b >= mt {
-                    return Err(format!(
-                        "max_tokens must be greater than thinking.budget_tokens (got max_tokens {mt}, budget_tokens {b})"
-                    ));
-                }
+            if let Some(mt) = out.get("max_tokens").and_then(Value::as_u64)
+                && b >= mt
+            {
+                return Err(format!(
+                    "max_tokens must be greater than thinking.budget_tokens (got max_tokens {mt}, budget_tokens {b})"
+                ));
             }
             kwargs["thinking_budget"] = json!(b);
         }
@@ -730,15 +729,15 @@ pub fn translate_response(openai: &Value, model: &str) -> Value {
     let mut content: Vec<Value> = Vec::new();
     // F47: engines exposing reasoning (DeepSeek-style `reasoning_content`)
     // surface it as a leading Anthropic `thinking` block, ahead of text.
-    if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
-        if !rc.is_empty() {
-            content.push(json!({"type": "thinking", "thinking": rc}));
-        }
+    if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str)
+        && !rc.is_empty()
+    {
+        content.push(json!({"type": "thinking", "thinking": rc}));
     }
-    if let Some(text) = msg.get("content").and_then(Value::as_str) {
-        if !text.is_empty() {
-            content.push(json!({"type": "text", "text": text}));
-        }
+    if let Some(text) = msg.get("content").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        content.push(json!({"type": "text", "text": text}));
     }
     if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
         for c in calls {
@@ -813,51 +812,50 @@ pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Valu
     if let Some(rc) = choice
         .pointer("/delta/reasoning_content")
         .and_then(Value::as_str)
+        && !rc.is_empty()
     {
-        if !rc.is_empty() {
-            match state.thinking_idx {
-                None => {
-                    let i = state.output_blocks;
-                    state.output_blocks += 1;
-                    state.thinking_idx = Some(i);
-                    events.push((
-                        "content_block_start".into(),
-                        json!({"type": "content_block_start", "index": i,
+        match state.thinking_idx {
+            None => {
+                let i = state.output_blocks;
+                state.output_blocks += 1;
+                state.thinking_idx = Some(i);
+                events.push((
+                    "content_block_start".into(),
+                    json!({"type": "content_block_start", "index": i,
                                "content_block": {"type": "thinking", "thinking": ""}}),
-                    ));
-                    events.push((
-                        "content_block_delta".into(),
-                        json!({"type": "content_block_delta", "index": i,
-                               "delta": {"type": "thinking_delta", "thinking": rc}}),
-                    ));
-                }
-                Some(i) => events.push((
+                ));
+                events.push((
                     "content_block_delta".into(),
                     json!({"type": "content_block_delta", "index": i,
-                           "delta": {"type": "thinking_delta", "thinking": rc}}),
-                )),
+                               "delta": {"type": "thinking_delta", "thinking": rc}}),
+                ));
             }
+            Some(i) => events.push((
+                "content_block_delta".into(),
+                json!({"type": "content_block_delta", "index": i,
+                           "delta": {"type": "thinking_delta", "thinking": rc}}),
+            )),
         }
     }
-    if let Some(text) = choice.pointer("/delta/content").and_then(Value::as_str) {
-        if !text.is_empty() {
-            // F50: track the ACTUAL text block index — with tool-first
-            // streams the text slot is not 0 and hardcoding it corrupted
-            // the Anthropic indices.
-            match state.text_idx {
-                None => {
-                    let i = state.output_blocks;
-                    state.output_blocks += 1;
-                    state.text_idx = Some(i);
-                    events.push((
-                        "content_block_start".into(),
-                        json!({"type": "content_block_start", "index": i,
+    if let Some(text) = choice.pointer("/delta/content").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        // F50: track the ACTUAL text block index — with tool-first
+        // streams the text slot is not 0 and hardcoding it corrupted
+        // the Anthropic indices.
+        match state.text_idx {
+            None => {
+                let i = state.output_blocks;
+                state.output_blocks += 1;
+                state.text_idx = Some(i);
+                events.push((
+                    "content_block_start".into(),
+                    json!({"type": "content_block_start", "index": i,
                                "content_block": {"type": "text", "text": ""}}),
-                    ));
-                    events.push(text_delta(i, text));
-                }
-                Some(i) => events.push(text_delta(i, text)),
+                ));
+                events.push(text_delta(i, text));
             }
+            Some(i) => events.push(text_delta(i, text)),
         }
     }
     if let Some(calls) = choice
@@ -867,14 +865,14 @@ pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Valu
         for c in calls {
             let oai_idx = c.get("index").and_then(Value::as_u64).unwrap_or(0);
             let slot = state.tool_slot(oai_idx, c, &mut events);
-            if let Some(frag) = c.pointer("/function/arguments").and_then(Value::as_str) {
-                if !frag.is_empty() {
-                    events.push((
-                        "content_block_delta".into(),
-                        json!({"type": "content_block_delta", "index": slot,
+            if let Some(frag) = c.pointer("/function/arguments").and_then(Value::as_str)
+                && !frag.is_empty()
+            {
+                events.push((
+                    "content_block_delta".into(),
+                    json!({"type": "content_block_delta", "index": slot,
                                "delta": {"type": "input_json_delta", "partial_json": frag}}),
-                    ));
-                }
+                ));
             }
         }
     }
@@ -1190,10 +1188,12 @@ mod tests {
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "frame captured");
         assert_eq!(parts[1]["type"], "image_url");
-        assert!(parts[1]["image_url"]["url"]
-            .as_str()
-            .unwrap()
-            .starts_with("data:image/png;base64,"));
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
     }
 
     fn anthropic_req() -> Value {
@@ -1347,9 +1347,11 @@ mod tests {
         let out2 = translate_request(&budgetless, false).expect("ok");
         assert_eq!(out2["chat_template_kwargs"]["thinking"], true);
         assert_eq!(out2["chat_template_kwargs"]["enable_thinking"], true);
-        assert!(out2["chat_template_kwargs"]
-            .get("thinking_budget")
-            .is_none());
+        assert!(
+            out2["chat_template_kwargs"]
+                .get("thinking_budget")
+                .is_none()
+        );
     }
 
     #[test]
