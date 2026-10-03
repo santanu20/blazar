@@ -1,7 +1,3 @@
-<div align="center">
-
-<img src="docs/assets/BLAZAR_Banner.webp" alt="Blazar — the control plane for local AI inference" width="896"/>
-
 # Blazar
 
 **The control plane for local AI inference.**
