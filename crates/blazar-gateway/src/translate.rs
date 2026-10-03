@@ -1233,6 +1233,74 @@ impl SseThinkFilter {
     }
 }
 
+/// Streaming `text/event-stream` filter that rewrites the top-level
+/// `model` field of `data:` frames to the caller-facing name. Stamped
+/// lanes (mistral.rs, sglang, mlx) answer under their own child-side
+/// ids — `default`, sanitized registration names, or full model paths —
+/// so this restores the model-name round trip the `OpenAI` wire contract
+/// implies: the client asked for `X`, every frame says `X` back.
+/// Frame-preserving: frames already carrying the target (or carrying no
+/// `model` field at all) re-emit byte-identical; only rewritten frames
+/// re-serialize. Fail-open: non-`data:` lines, the `[DONE]` sentinel,
+/// and unparseable payloads pass through verbatim.
+pub struct SseRestamper {
+    buf: String,
+    target: String,
+}
+
+impl SseRestamper {
+    #[must_use]
+    pub fn new(target: String) -> Self {
+        Self {
+            buf: String::new(),
+            target,
+        }
+    }
+
+    /// Feed one raw byte chunk from the child; returns the bytes to
+    /// forward. Incomplete trailing lines stay buffered until the next
+    /// chunk (frames may split anywhere, including mid-`model` value).
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.buf.push_str(&String::from_utf8_lossy(chunk));
+        let mut out = Vec::new();
+        while let Some(nl) = self.buf.find('\n') {
+            let line: String = self.buf.drain(..=nl).collect();
+            out.extend_from_slice(&self.filter_line(&line));
+        }
+        out
+    }
+
+    /// Stream ended: any incomplete trailing line ships verbatim — a
+    /// truncated frame is the child's story, not ours to rewrite.
+    pub fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf).into_bytes()
+    }
+
+    fn filter_line(&mut self, line: &str) -> Vec<u8> {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let Some(payload) = trimmed.strip_prefix("data: ") else {
+            return line.as_bytes().to_vec();
+        };
+        if payload == "[DONE]" {
+            return line.as_bytes().to_vec();
+        }
+        let Ok(mut v) = serde_json::from_str::<Value>(payload) else {
+            return line.as_bytes().to_vec();
+        };
+        if let Some(m) = v.get_mut("model") {
+            if m.is_string() && m.as_str() != Some(self.target.as_str()) {
+                *m = Value::String(self.target.clone());
+                // Line-for-line replacement: the original data line ends
+                // with \n (or \r\n) and the frame's blank-line separator
+                // follows as its own (unmodified) line.
+                let line_end = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+                return format!("data: {v}{line_end}").into_bytes();
+            }
+        }
+        line.as_bytes().to_vec()
+    }
+}
+
 /// Final ollama generate line from usage/finish (stream path — gateway-
 /// measured durations, same contract as `ollama_final_chunk`).
 #[must_use]
@@ -2210,7 +2278,7 @@ mod tests {
                 .as_bytes()
         ));
         assert!(!request_asks_thinking(br"{}"));
-        // mistral.rs top-level dialect (set by normalize_think_for_engine).
+        // mistral.rs top-level dialect (set by the think bridge).
         assert!(request_asks_thinking(br#"{"enable_thinking": true}"#));
         assert!(!request_asks_thinking(br#"{"enable_thinking": false}"#));
         // A non-empty reasoning_effort asks for thinking; explicit
@@ -2231,6 +2299,57 @@ mod tests {
         let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
         assert_eq!(f.feed(raw.as_bytes()), raw.as_bytes());
         assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_restamper__rewrites_model_split_across_chunks() {
+        let mut f = SseRestamper::new("store-name".to_string());
+        // Frame straddles two chunks — the rewrite must survive the split.
+        let out = f.feed(b"data: {\"model\": \"/engines/m");
+        assert!(out.is_empty(), "incomplete line held: {out:?}");
+        let out = String::from_utf8(f.feed(b"odel.gguf\", \"choices\": []}\n\n")).unwrap();
+        assert!(
+            out.contains("\"model\":\"store-name\""),
+            "child id rewritten to caller spelling: {out}"
+        );
+        assert!(!out.contains("/engines/m"), "child path never ships: {out}");
+        assert!(out.ends_with("\n\n"), "frame framing preserved: {out:?}");
+    }
+
+    #[test]
+    fn unit__sse_restamper__already_target_and_fieldless_verbatim() {
+        let mut f = SseRestamper::new("store-name".to_string());
+        let hit = "data: {\"model\":\"store-name\",\"choices\": []}\n\n";
+        assert_eq!(f.feed(hit.as_bytes()), hit.as_bytes());
+        // No model field (gateway-synthetic frames): nothing to rewrite.
+        let bare = "data: {\"choices\": []}\n\n";
+        assert_eq!(f.feed(bare.as_bytes()), bare.as_bytes());
+        // [DONE], comments, and junk data lines stay verbatim.
+        let tail = ": comment\ndata: [DONE]\ndata: {{{\n";
+        assert_eq!(f.feed(tail.as_bytes()), tail.as_bytes());
+        assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_restamper__finish_ships_partial_line_verbatim() {
+        let mut f = SseRestamper::new("store-name".to_string());
+        f.feed(b"data: {\"model\": \"trunc");
+        // Truncated frame = the child's story; ships untouched.
+        assert_eq!(f.finish(), b"data: {\"model\": \"trunc");
+        // finish() is a drain — a second call returns empty.
+        assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_restamper__crlf_line_endings_preserved() {
+        let mut f = SseRestamper::new("store-name".to_string());
+        let out =
+            String::from_utf8(f.feed(b"data: {\"model\": \"default\", \"choices\": []}\r\n\r\n"))
+                .unwrap();
+        assert!(
+            out.contains("\"model\":\"store-name\"") && out.ends_with("\r\n\r\n"),
+            "CRLF framing preserved: {out:?}"
+        );
     }
 
     #[test]

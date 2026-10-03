@@ -743,14 +743,14 @@ pub async fn proxy_request(
     let url = format!("{base}{path_query}");
     let began = std::time::Instant::now();
 
-    // R6: force the final usage chunk on /v1 chat streams so warm/cold
-    // classification has data — most clients never opt in. Additive and
-    // spec-compliant (usage-only extra chunk; ollama lane already does
-    // the same). Legacy /completions and non-chat routes pass through.
-    // Both consumers reuse the hot lane's single parse.
-    let body = inject_include_usage(path_query, body, parsed.as_ref());
-    let body = rewrite_child_model(engine, body, parsed.as_ref());
-    let body = normalize_think_for_engine(engine.kind, path_query, body, parsed.as_ref());
+    // Child-boundary body mutations, composed on the hot lane's single
+    // parse: R6 include_usage forcing (stream warm/cold classification
+    // data; ollama lane does the same in its translator), the per-engine
+    // model stamp, and the mistral.rs think bridge. One parse, one
+    // serialization — a chain of per-mutator re-serializations would
+    // silently drop whichever mutations ran first (each rebuilt the body
+    // from the ORIGINAL parse, not its predecessor's output).
+    let body = apply_child_request_mutations(engine, path_query, body, parsed.as_ref());
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
     // coalesce AT THE CHILD-CALL BOUNDARY. Two acquisition phases:
@@ -852,10 +852,12 @@ pub async fn proxy_request(
                         "proxy {path_query}: child died mid-request; retrying once on respawned lane {}",
                         fresh.key
                     );
-                    let retry_body =
-                        rewrite_child_model(&fresh, body_snapshot.clone(), parsed.as_ref());
-                    let retry_body =
-                        normalize_think_for_engine(fresh.kind, path_query, retry_body, None);
+                    let retry_body = apply_child_request_mutations(
+                        &fresh,
+                        path_query,
+                        body_snapshot.clone(),
+                        parsed.as_ref(),
+                    );
                     body_snapshot = retry_body.clone();
                     match forward_once(state, &fresh, method, &fresh_url, headers, retry_body).await
                     {
@@ -989,7 +991,20 @@ pub async fn proxy_request(
         && is_chat_path(path_query)
         && !enforce_oversized
         && !crate::translate::request_asks_thinking(&body_snapshot);
-    if sentinel_active || want_choice_verify || (suppress_think && !sse) {
+    // Model round-trip (stamped lanes): the request carried the child's
+    // stamp (`default`, sanitized sglang name, full mlx path); the
+    // response must carry the CALLER's spelling back. The hot lane's
+    // parse holds that spelling exactly; the resolved `model` is the
+    // fallback for parse-less lanes. Cap-busting bodies skip the
+    // buffering branch (same contract as enforce) and stream un-restamped.
+    let caller_model = parsed
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(model)
+        .to_string();
+    let restamp = !enforce_oversized && status.is_success() && child_model_stamp(engine).is_some();
+    if sentinel_active || want_choice_verify || (suppress_think && !sse) || (restamp && !sse) {
         let ctx = if sentinel_active {
             let (ctx, warnings) = sentinel::request_ctx(
                 state,
@@ -1133,11 +1148,27 @@ pub async fn proxy_request(
                           // Same contract as the ollama lanes: when the caller did not
                           // ask for thinking, strip raw <think> blocks before the body
                           // reaches the client. Parse failure fails open (original body).
-                let buf = if suppress_think {
+                let buf = if suppress_think || restamp {
                     match serde_json::from_slice::<serde_json::Value>(&buf) {
                         Ok(mut v) => {
-                            crate::translate::suppress_raw_think_response(&mut v);
-                            serde_json::to_vec(&v).unwrap_or_else(|_| buf.to_vec())
+                            let mut touched = false;
+                            if restamp {
+                                if let Some(m) = v.get_mut("model") {
+                                    if m.is_string() && m.as_str() != Some(caller_model.as_str()) {
+                                        *m = serde_json::Value::String(caller_model.clone());
+                                        touched = true;
+                                    }
+                                }
+                            }
+                            if suppress_think {
+                                crate::translate::suppress_raw_think_response(&mut v);
+                                touched = true; // legacy think path always re-serializes
+                            }
+                            if touched {
+                                serde_json::to_vec(&v).unwrap_or_else(|_| buf.to_vec())
+                            } else {
+                                buf.to_vec()
+                            }
                         }
                         Err(_) => buf.to_vec(),
                     }
@@ -1206,6 +1237,16 @@ pub async fn proxy_request(
         None
     }));
     let think_filter_stream = std::sync::Arc::clone(&think_filter_cell);
+    // SSE counterpart of the buffered model re-stamp above: per-frame
+    // rewrite of the child's echoed id back to the caller's spelling.
+    // Held separately from the think filter — each fires on its own
+    // lanes (thinking-asked streams still restamp).
+    let restamp_cell = std::sync::Arc::new(std::sync::Mutex::new(if restamp && sse {
+        Some(crate::translate::SseRestamper::new(caller_model))
+    } else {
+        None
+    }));
+    let restamp_stream = std::sync::Arc::clone(&restamp_cell);
     let stream = resp.bytes_stream().flat_map(move |r| {
         match r {
             Ok(bytes) => {
@@ -1229,6 +1270,10 @@ pub async fn proxy_request(
                     s.push(bytes.as_ref());
                 }
                 let bytes = match think_filter_stream.lock().expect("think filter").as_mut() {
+                    Some(f) => axum::body::Bytes::from(f.feed(&bytes)),
+                    None => bytes,
+                };
+                let bytes = match restamp_stream.lock().expect("model restamper").as_mut() {
                     Some(f) => axum::body::Bytes::from(f.feed(&bytes)),
                     None => bytes,
                 };
@@ -1278,6 +1323,19 @@ pub async fn proxy_request(
             }
         },
     ));
+    // Flush any incomplete line the model restamper still holds (child
+    // ended the body mid-frame): ships verbatim.
+    let stream = stream.chain(futures::stream::unfold(restamp_cell, |cell| async move {
+        let tail = match cell.lock().expect("model restamper").as_mut() {
+            Some(f) => f.finish(),
+            None => Vec::new(),
+        };
+        if tail.is_empty() {
+            None
+        } else {
+            Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(tail)), cell))
+        }
+    }));
     // Hold in-flight accounting for the body's lifetime: the guard drops
     // when the client drains (or aborts) the stream.
     let stream = stream.chain(futures::stream::unfold(
@@ -1332,7 +1390,7 @@ pub enum SfGate {
 /// `proxy_request`'s internal block exactly — same route check, size
 /// cap, stream bit, and key material — so the two phases always agree
 /// on ownership. The key folds the pre-mutation body here (the handler
-/// runs before `inject_include_usage`/`rewrite_child_model`); the
+/// runs before `apply_child_request_mutations`); the
 /// legacy block folds the post-mutation body. Twins hashing identically
 /// within their own phase is what matters — the two key spaces never
 /// mix for one request because `Held`/`TimedOut` bypass the internal
@@ -1623,9 +1681,18 @@ pub(crate) fn child_model_stamp_predicted(
     }
 }
 
-pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) {
-    if v.get("model").and_then(serde_json::Value::as_str).is_some() {
-        v["model"] = serde_json::Value::String(stamp.to_string());
+/// Stamp the child-facing model id into a request body. Never invents a
+/// `model` field (absent stays absent — children judge bodies without
+/// one). Returns whether the field actually changed, so composition
+/// callers can keep byte-identical passthrough for untouched bodies.
+pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) -> bool {
+    match v.get("model").and_then(serde_json::Value::as_str) {
+        Some(current) if current == stamp => false,
+        Some(_) => {
+            v["model"] = serde_json::Value::String(stamp.to_string());
+            true
+        }
+        None => false,
     }
 }
 
@@ -1641,36 +1708,8 @@ pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) {
 /// request with NO think controls gets the ollama-parity default-off
 /// (`enable_thinking: false`) — the same teaching stance the other lanes
 /// take against the reasoning-eats-the-budget spiral. Add-only: kwargs
-/// and user fields are never removed. Untouched bodies (non-mistral.rs
-/// kinds, other paths, unparseable) return byte-identical.
-pub(crate) fn normalize_think_for_engine(
-    kind: EngineKind,
-    path_query: &str,
-    body: axum::body::Bytes,
-    parsed: Option<&serde_json::Value>,
-) -> axum::body::Bytes {
-    if kind != EngineKind::MistralRs || !is_chat_path(path_query) {
-        return body;
-    }
-    let mut v = match parsed.cloned() {
-        Some(v) => v,
-        None => match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(v) => v,
-            Err(_) => return body, // fail-open: the child reports its own error
-        },
-    };
-    if !normalize_think_in_value(kind, &mut v) {
-        return body;
-    }
-    match serde_json::to_vec(&v) {
-        Ok(bytes) => axum::body::Bytes::from(bytes),
-        Err(_) => body,
-    }
-}
-
-/// Value-level core of the think-dialect bridge (see
-/// `normalize_think_for_engine`); lanes that already hold the parsed
-/// child body call this directly. Returns whether `v` changed.
+/// and user fields are never removed. Returns whether `v` changed;
+/// callers keep the body byte-identical when it does not.
 pub(crate) fn normalize_think_in_value(kind: EngineKind, v: &mut serde_json::Value) -> bool {
     if kind != EngineKind::MistralRs || !v.is_object() {
         return false;
@@ -1759,69 +1798,74 @@ pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<String> {
     }
 }
 
-/// `parsed` = the request body pre-parsed by the hot lane (one parse,
-/// many consumers); `None` = caller had no parse (cold lanes fall back
-/// to parsing here, exactly the old behavior).
-fn rewrite_child_model(
+/// One parse, one `Value`, one serialization for ALL child-boundary body
+/// mutations, in order: `R6` `include_usage` forcing (chat streams), the
+/// per-engine model stamp (`child_model_stamp`), and the mistral.rs
+/// think bridge. `parsed` = the request body pre-parsed by the hot lane;
+/// `None` = caller had no parse (fallback lanes parse here). Bodies that
+/// need no change — or cannot be parsed — return byte-identical
+/// (fail-open: the child reports its own error). This composition
+/// replaced a chain of per-mutator wrappers that each re-serialized from
+/// the ORIGINAL parse, silently dropping every earlier mutation
+/// (mistral.rs chats lost their `default` model stamp whenever the think
+/// bridge fired, and stamped lanes lost `include_usage`).
+pub(crate) fn apply_child_request_mutations(
     engine: &EngineRef,
-    body: axum::body::Bytes,
-    parsed: Option<&serde_json::Value>,
-) -> axum::body::Bytes {
-    if body.is_empty() {
-        return body;
-    }
-    let Some(stamp) = child_model_stamp(engine) else {
-        return body;
-    };
-    let maybe_owned = parsed.cloned().map_or_else(
-        || serde_json::from_slice::<serde_json::Value>(&body).ok(),
-        Some,
-    );
-    let Some(v) = maybe_owned else {
-        return body;
-    };
-    let mut v = v.clone();
-    set_child_model(&mut v, &stamp);
-    match serde_json::to_vec(&v) {
-        Ok(bytes) => bytes.into(),
-        Err(_) => body,
-    }
-}
-
-fn inject_include_usage(
     path_query: &str,
     body: axum::body::Bytes,
     parsed: Option<&serde_json::Value>,
 ) -> axum::body::Bytes {
-    let p = path_query.split('?').next().unwrap_or(path_query);
-    if !p.ends_with("/chat/completions") {
+    let path = path_query.split('?').next().unwrap_or(path_query);
+    let usage_lane = path.ends_with("/chat/completions");
+    let think_lane = engine.kind == EngineKind::MistralRs && is_chat_path(path_query);
+    let stamp = child_model_stamp(engine);
+    if body.is_empty() || !(usage_lane || think_lane || stamp.is_some()) {
         return body;
     }
-    let maybe_owned = parsed.cloned().map_or_else(
-        || serde_json::from_slice::<serde_json::Value>(&body).ok(),
-        Some,
-    );
-    let Some(v) = maybe_owned else {
-        return body;
+    let mut v = match parsed.cloned() {
+        Some(v) => v,
+        None => match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(v) => v,
+            Err(_) => return body, // fail-open: the child reports its own error
+        },
     };
-    if v.get("stream").and_then(serde_json::Value::as_bool) != Some(true) {
+    let mut changed = false;
+    if usage_lane {
+        changed |= include_usage_in_value(&mut v);
+    }
+    if let Some(stamp) = stamp.as_deref() {
+        changed |= set_child_model(&mut v, stamp);
+    }
+    if think_lane {
+        changed |= normalize_think_in_value(engine.kind, &mut v);
+    }
+    if !changed {
         return body;
+    }
+    match serde_json::to_vec(&v) {
+        Ok(bytes) => axum::body::Bytes::from(bytes),
+        Err(_) => body,
+    }
+}
+
+/// Value-level core of R6: force the final usage chunk on chat streams
+/// so warm/cold classification has data — most clients never opt in.
+/// Additive and spec-compliant (usage-only extra chunk; ollama lane
+/// does the same in its translator). Legacy `/completions` and non-chat
+/// routes never reach this core (path-gated by the caller). Returns
+/// whether `v` changed.
+fn include_usage_in_value(v: &mut serde_json::Value) -> bool {
+    if v.get("stream").and_then(serde_json::Value::as_bool) != Some(true) {
+        return false;
     }
     if v.pointer("/stream_options/include_usage")
         .and_then(serde_json::Value::as_bool)
         == Some(true)
     {
-        return body;
+        return false;
     }
-    let mut v = v; // owned already — F32: the clone re-copied the body
     v["stream_options"]["include_usage"] = serde_json::Value::Bool(true);
-    match serde_json::to_vec(&v) {
-        Ok(bytes) => axum::body::Bytes::from(bytes),
-        // serializing a parsed Value cannot fail; keep the original on
-        // any error anyway (additive contract: never reject what the
-        // child might accept)
-        Err(_) => body,
-    }
+    true
 }
 
 /// Classify a fully-buffered non-stream chat body (enforce path) from
@@ -2541,6 +2585,23 @@ mod affinity_tests {
 }
 
 #[cfg(test)]
+#[cfg(test)]
+fn eng(kind: EngineKind) -> blazar_runtime::EngineRef {
+    use blazar_core::profile::Endpoint;
+    blazar_runtime::EngineRef {
+        name: "qwen2.5-0.5b-instruct-awq".to_string(),
+        key: "qwen2.5-0.5b-instruct-awq".to_string(),
+        kind,
+        endpoint: Endpoint::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+        },
+        auth: None,
+        model_path: "/models/qwen2.5-0.5b-instruct-4bit.d".to_string(),
+    }
+}
+
+#[cfg(test)]
 mod cache_obs_tests {
     #![allow(non_snake_case)]
     use super::*;
@@ -2555,11 +2616,12 @@ mod cache_obs_tests {
         serde_json::from_slice(b).unwrap()
     }
 
-    // --- inject_include_usage -------------------------------------------
+    // --- apply_child_request_mutations: include_usage lane ---------------
 
     #[test]
-    fn unit__inject_include_usage__stream_true_adds_flag() {
-        let out = inject_include_usage(
+    fn unit__mutations__stream_true_adds_usage_flag() {
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::LlamaCpp),
             "/v1/chat/completions",
             json_body(&json!({"model": "m", "messages": [], "stream": true})),
             None,
@@ -2573,55 +2635,187 @@ mod cache_obs_tests {
     }
 
     #[test]
-    fn unit__inject_include_usage__pre_parsed_matches_fallback_exactly() {
+    fn unit__mutations__pre_parsed_matches_fallback_exactly() {
         // The hot lane hands the pre-parsed body in; the byte-identical
         // contract must hold against the None fallback (parse-here)
-        // path for EVERY branch: mutate, already-set, non-stream.
-        let cases = [
+        // path for EVERY branch: mutate, already-set, non-stream — and
+        // across engines (stamp + think lanes included).
+        use blazar_core::engine_kind::EngineKind as K;
+        let bodies = [
             json!({"model": "m", "messages": [], "stream": true}),
             json!({"stream": true, "stream_options": {"include_usage": true}}),
             json!({"model": "m", "messages": []}),
+            json!({"model": "store-name", "messages": [], "stream": true}),
         ];
-        for body in &cases {
-            let bytes = json_body(body);
-            let pre = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
-            let a = inject_include_usage("/v1/chat/completions", bytes.clone(), pre.as_ref());
-            let b = inject_include_usage("/v1/chat/completions", bytes.clone(), None);
-            assert_eq!(a, b, "pre-parsed lane must equal fallback lane: {body}");
+        let engines = [K::LlamaCpp, K::MistralRs, K::Sglang, K::Mlx];
+        for body in &bodies {
+            for kind in engines {
+                let bytes = json_body(body);
+                let pre = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+                let a = apply_child_request_mutations(
+                    &eng(kind),
+                    "/v1/chat/completions",
+                    bytes.clone(),
+                    pre.as_ref(),
+                );
+                let b =
+                    apply_child_request_mutations(&eng(kind), "/v1/chat/completions", bytes, None);
+                assert_eq!(
+                    a, b,
+                    "pre-parsed lane must equal fallback lane: {body} / {kind:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn unit__inject_include_usage__already_set_passthrough() {
+    fn unit__mutations__usage_already_set_passthrough() {
         let orig = json_body(&json!({"stream": true, "stream_options": {"include_usage": true}}));
-        let out = inject_include_usage("/v1/chat/completions", orig.clone(), None);
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::LlamaCpp),
+            "/v1/chat/completions",
+            orig.clone(),
+            None,
+        );
         assert_eq!(out, orig, "byte-identical: nothing to add");
     }
 
     #[test]
-    fn unit__inject_include_usage__non_stream_passthrough() {
+    fn unit__mutations__non_stream_passthrough() {
         let orig = json_body(&json!({"model": "m", "messages": []}));
-        let out = inject_include_usage("/v1/chat/completions", orig.clone(), None);
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::LlamaCpp),
+            "/v1/chat/completions",
+            orig.clone(),
+            None,
+        );
         assert_eq!(out, orig, "non-stream requests untouched");
     }
 
     #[test]
-    fn unit__inject_include_usage__non_chat_route_passthrough() {
+    fn unit__mutations__non_chat_route_passthrough() {
         let orig = json_body(&json!({"stream": true}));
-        let out = inject_include_usage("/v1/completions", orig.clone(), None);
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::LlamaCpp),
+            "/v1/completions",
+            orig.clone(),
+            None,
+        );
         assert_eq!(
             out, orig,
             "completions lane untouched (usage shape differs)"
         );
-        let out2 = inject_include_usage("/v1/embeddings", orig.clone(), None);
+        let out2 = apply_child_request_mutations(
+            &eng(EngineKind::LlamaCpp),
+            "/v1/embeddings",
+            orig.clone(),
+            None,
+        );
         assert_eq!(out2, orig);
     }
 
     #[test]
-    fn unit__inject_include_usage__invalid_json_passthrough() {
+    fn unit__mutations__invalid_json_passthrough() {
         let orig = axum::body::Bytes::from_static(b"{not json stream:true");
-        let out = inject_include_usage("/v1/chat/completions", orig.clone(), None);
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
+            "/v1/chat/completions",
+            orig.clone(),
+            None,
+        );
         assert_eq!(out, orig, "child remains the judge of odd bodies");
+    }
+
+    // --- apply_child_request_mutations: composition pins ------------------
+    // Regression pins for the clobber chain this pipeline replaced:
+    // per-mutator wrappers each re-serialized from the ORIGINAL parse,
+    // so the model stamp was dropped whenever the think bridge fired,
+    // and include_usage was dropped on every stamped lane.
+
+    #[test]
+    fn unit__mutations__mistralrs_default_chat_keeps_model_stamp_and_pins_think() {
+        // The exact BUG-6 repro shape: a default chat (no think controls,
+        // no stream) from a caller using the store name. The child must
+        // see `default` AND `enable_thinking: false` together.
+        let body = json!({"model": "store-name", "messages": [{"role": "user", "content": "hi"}]});
+        let pre = body.clone();
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
+            "/v1/chat/completions",
+            json_body(&body),
+            Some(&pre),
+        );
+        let v = parse(&out);
+        assert_eq!(
+            v["model"],
+            json!("default"),
+            "stamp must survive the think bridge"
+        );
+        assert_eq!(v["enable_thinking"], json!(false), "default-off think pin");
+    }
+
+    #[test]
+    fn unit__mutations__mistralrs_stream_chat_keeps_usage_and_model_stamp() {
+        // All three mutations visible in ONE body — impossible under
+        // the old chain (last mutator always won).
+        let body = json!({
+            "model": "store-name",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let pre = body.clone();
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
+            "/v1/chat/completions",
+            json_body(&body),
+            Some(&pre),
+        );
+        let v = parse(&out);
+        assert_eq!(v["model"], json!("default"));
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&json!(true))
+        );
+        assert_eq!(v["enable_thinking"], json!(false));
+    }
+
+    #[test]
+    fn unit__mutations__sglang_stream_chat_keeps_usage_and_model_stamp() {
+        // sglang stamp is the sanitized registration name; R6 usage data
+        // must survive the stamp (warm/cold classification depends on it).
+        let body = json!({
+            "model": "qwen3.5-9b-eoq-v3:safetensors",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let pre = body.clone();
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::Sglang),
+            "/v1/chat/completions",
+            json_body(&body),
+            Some(&pre),
+        );
+        let v = parse(&out);
+        assert_eq!(v["model"], json!("qwen2.5-0.5b-instruct-awq"));
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn unit__mutations__mlx_stamp_applies_across_routes() {
+        // The stamp is path-independent (mlx serves the full path id);
+        // embeddings-shaped bodies keep their model field re-stamped.
+        let body = json!({"model": "store-name", "input": "x"});
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::Mlx),
+            "/v1/embeddings",
+            json_body(&body),
+            None,
+        );
+        let v = parse(&out);
+        assert_eq!(v["model"], json!("/models/qwen2.5-0.5b-instruct-4bit.d"));
     }
 
     // --- record_buffered_chat -------------------------------------------
@@ -3070,26 +3264,29 @@ mod resolve_model_tests {
         // the caller's spelling survives for response-echo fidelity.
         assert_eq!(child_model_stamp(&ref_for(EngineKind::LlamaCpp)), None);
 
-        // The setter never invents a model field (absent stays absent).
+        // The setter never invents a model field (absent stays absent)
+        // and reports whether it actually changed the body.
         let mut v = serde_json::json!({"input": "x"});
-        set_child_model(&mut v, "default");
+        assert!(!set_child_model(&mut v, "default"));
         assert!(v.get("model").is_none());
         let mut v = serde_json::json!({"model": "caller-spelling"});
-        set_child_model(&mut v, "default");
+        assert!(set_child_model(&mut v, "default"));
         assert_eq!(v["model"], "default");
+        // Re-stamping the same value is a no-op (byte-identical bodies).
+        assert!(!set_child_model(&mut v, "default"));
     }
 
     // --- Think-dialect bridge (mistral.rs children) ----------------------
 
     #[test]
-    fn unit__normalize_think_for_engine__mistralrs_matrix() {
+    fn unit__mutations__mistralrs_think_matrix() {
         use serde_json::json;
         let chat = "/v1/chat/completions";
         let bytes = |v: &serde_json::Value| axum::body::Bytes::from(v.to_string());
 
         // No think controls: mistral.rs defaults thinking ON — pin OFF.
-        let out = normalize_think_for_engine(
-            EngineKind::MistralRs,
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
             chat,
             bytes(&json!({"model": "default"})),
             None,
@@ -3100,8 +3297,8 @@ mod resolve_model_tests {
         );
 
         // Kwargs on → mirrored top-level (kwargs preserved, add-only).
-        let out = normalize_think_for_engine(
-            EngineKind::MistralRs,
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
             chat,
             bytes(&json!({
                 "model": "default",
@@ -3114,19 +3311,20 @@ mod resolve_model_tests {
         assert_eq!(v["chat_template_kwargs"]["thinking"], json!(true));
 
         // Kwargs off: already-off top-level stays untouched (no change →
-        // byte-identical body).
+        // byte-identical body; the model stamp is a no-op on "default").
         let src = json!({
             "model": "default",
             "enable_thinking": false,
             "chat_template_kwargs": {"thinking": false}
         });
-        let out = normalize_think_for_engine(EngineKind::MistralRs, chat, bytes(&src), None);
+        let out =
+            apply_child_request_mutations(&eng(EngineKind::MistralRs), chat, bytes(&src), None);
         assert_eq!(&out[..], src.to_string().as_bytes());
 
         // Effort vocabulary bridge: minimal → off, max → xhigh; an
         // effort request implies thinking on unless explicitly off.
-        let out = normalize_think_for_engine(
-            EngineKind::MistralRs,
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
             chat,
             bytes(&json!({"model": "default", "reasoning_effort": "minimal"})),
             None,
@@ -3135,8 +3333,8 @@ mod resolve_model_tests {
         assert_eq!(v["reasoning_effort"], json!("off"));
         assert_eq!(v["enable_thinking"], json!(true));
 
-        let out = normalize_think_for_engine(
-            EngineKind::MistralRs,
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
             chat,
             bytes(&json!({"model": "default", "reasoning_effort": "max"})),
             None,
@@ -3145,8 +3343,8 @@ mod resolve_model_tests {
         assert_eq!(v["reasoning_effort"], json!("xhigh"));
 
         // Explicit top-level true survives (kwargs absent → none added).
-        let out = normalize_think_for_engine(
-            EngineKind::MistralRs,
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
             chat,
             bytes(&json!({"model": "default", "enable_thinking": true})),
             None,
@@ -3156,8 +3354,8 @@ mod resolve_model_tests {
         assert!(v.get("chat_template_kwargs").is_none());
 
         // Explicit top-level false survives too.
-        let out = normalize_think_for_engine(
-            EngineKind::MistralRs,
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
             chat,
             bytes(&json!({"model": "default", "enable_thinking": false})),
             None,
@@ -3167,7 +3365,7 @@ mod resolve_model_tests {
     }
 
     #[test]
-    fn unit__normalize_think_for_engine__scope_guards() {
+    fn unit__mutations__think_scope_guards() {
         use serde_json::json;
         let chat = "/v1/chat/completions";
         let bytes = |v: &serde_json::Value| axum::body::Bytes::from(v.to_string());
@@ -3175,14 +3373,32 @@ mod resolve_model_tests {
 
         // Non-mistral.rs kinds: byte-identical (llamacpp defaults are the
         // template-sniffing lane's job, not this bridge's).
-        let out = normalize_think_for_engine(EngineKind::LlamaCpp, chat, bytes(&no_controls), None);
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::LlamaCpp),
+            chat,
+            bytes(&no_controls),
+            None,
+        );
         assert_eq!(&out[..], no_controls.to_string().as_bytes());
-        let out = normalize_think_for_engine(EngineKind::Sglang, chat, bytes(&no_controls), None);
-        assert_eq!(&out[..], no_controls.to_string().as_bytes());
+        // sglang always re-stamps (its registration name derives from
+        // the engine row, never the caller's spelling).
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::Sglang),
+            chat,
+            bytes(&no_controls),
+            None,
+        );
+        assert_eq!(
+            &out[..],
+            json!({"model": "qwen2.5-0.5b-instruct-awq"})
+                .to_string()
+                .as_bytes()
+        );
 
-        // Non-chat paths (embeddings, tokenize) untouched.
-        let out = normalize_think_for_engine(
-            EngineKind::MistralRs,
+        // Non-chat paths (embeddings, tokenize) never gain think pins
+        // (the model stamp still applies — path-independent contract).
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
             "/v1/embeddings",
             bytes(&no_controls),
             None,
@@ -3190,8 +3406,8 @@ mod resolve_model_tests {
         assert_eq!(&out[..], no_controls.to_string().as_bytes());
 
         // Query-string suffix still counts as the chat path.
-        let out = normalize_think_for_engine(
-            EngineKind::MistralRs,
+        let out = apply_child_request_mutations(
+            &eng(EngineKind::MistralRs),
             "/v1/chat/completions?api-key=x",
             bytes(&no_controls),
             None,
@@ -3200,7 +3416,8 @@ mod resolve_model_tests {
 
         // Unparseable body passes through for the child to reject.
         let junk = axum::body::Bytes::from_static(b"not json");
-        let out = normalize_think_for_engine(EngineKind::MistralRs, chat, junk.clone(), None);
+        let out =
+            apply_child_request_mutations(&eng(EngineKind::MistralRs), chat, junk.clone(), None);
         assert_eq!(out, junk);
 
         // Value-level core is the same contract for lane-held bodies.

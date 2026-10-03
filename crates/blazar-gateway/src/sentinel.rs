@@ -561,7 +561,10 @@ pub fn request_ctx(
             .ps()
             .into_iter()
             .find(|p| p.name == model)
-            .map(|p| p.ctx),
+            // ctx == 0 marks lanes that manage their own window (mlx:
+            // compile_mlx reports 0 by design) — that is "unknown",
+            // never a zero-token ceiling.
+            .and_then(|p| (p.ctx > 0).then_some(p.ctx)),
         template,
     };
     (ctx, warnings)
@@ -1104,12 +1107,22 @@ impl Sentinel {
             // token counts prove the ceiling was approached; a small budget
             // capping generation is the client's own request, not a fault
             // (ReasoningNoAnswer still catches the pathological pairing).
-            // Unverifiable (usage or ctx unknown) keeps the legacy flag.
-            let ctx_exhausted = match (acc.usage_prompt, acc.usage_completion, ctx.ctx) {
+            // A 0 window is never real (mlx-style lanes report 0 for
+            // "managed inside the engine") — normalize it away, and with
+            // no window at all there is nothing blazar can raise, so the
+            // flag stays silent instead of guessing.
+            let window = ctx.ctx.filter(|c| *c > 0);
+            let ctx_exhausted = match (acc.usage_prompt, acc.usage_completion, window) {
                 (Some(p), Some(c), Some(window)) => {
                     (p + c) * 10 >= u64::from(window) * NEAR_LIMIT_TENTHS
                 }
-                _ => true,
+                // usage unknown keeps the legacy flag (a real ceiling hit
+                // with broken usage reporting must not go silent)…
+                (None, _, _) | (_, None, _) => true,
+                // …but an absent window never flags: mlx-style lanes
+                // manage context inside the engine, so "raise default_ctx"
+                // is not a remediation blazar can offer.
+                (_, _, None) => false,
             };
             if ctx_exhausted {
                 out.push(Detection {
@@ -1118,12 +1131,12 @@ impl Sentinel {
                         "prompt {:?} + completion {:?} tokens hit the ctx ceiling{}",
                         acc.usage_prompt,
                         acc.usage_completion,
-                        ctx.ctx.map(|c| format!(" ({c})")).unwrap_or_default()
+                        window.map(|c| format!(" ({c})")).unwrap_or_default()
                     ),
                 });
             }
         }
-        if let (Some(p), Some(c)) = (acc.usage_prompt, ctx.ctx) {
+        if let (Some(p), Some(c)) = (acc.usage_prompt, ctx.ctx.filter(|c| *c > 0)) {
             if p * 10 > u64::from(c) * NEAR_LIMIT_TENTHS {
                 out.push(Detection {
                     code: Code::CtxNearLimit,
@@ -2104,6 +2117,51 @@ mod tests {
         let d = s.finalize(&ctx, &acc, 200);
         assert!(d.iter().any(|x| x.code == Code::CtxTruncated), "{d:?}");
         assert!(d.iter().any(|x| x.code == Code::CtxNearLimit), "{d:?}");
+    }
+
+    #[test]
+    fn unit__finalize__zero_ctx_window_is_unknown_not_a_ceiling() {
+        // BUG-9 pin (mlx lane): compile_mlx reports ctx 0 for "the
+        // engine manages its own window" — a zero/absent window must
+        // never fire near-limit or truncation detections.
+        let s = Sentinel::new(true, 0, None);
+        let acc = Accum {
+            finish: Some("length".into()),
+            usage_prompt: Some(31),
+            usage_completion: Some(8),
+            saw_any_choice: true,
+            content: "answer".into(),
+            ..Accum::default()
+        };
+        let d = s.finalize(
+            &RequestCtx {
+                ctx: Some(0),
+                ..RequestCtx::default()
+            },
+            &acc,
+            200,
+        );
+        assert!(
+            !d.iter().any(|x| x.code == Code::CtxNearLimit),
+            "0 window is unknown: {d:?}"
+        );
+        assert!(
+            !d.iter().any(|x| x.code == Code::CtxTruncated),
+            "no window -> nothing to raise -> no flag: {d:?}"
+        );
+        // Same shape with NO window at all behaves identically.
+        let d = s.finalize(
+            &RequestCtx {
+                ctx: None,
+                ..RequestCtx::default()
+            },
+            &acc,
+            200,
+        );
+        assert!(
+            !d.iter().any(|x| x.code == Code::CtxTruncated),
+            "absent window -> no flag: {d:?}"
+        );
     }
 
     #[test]
