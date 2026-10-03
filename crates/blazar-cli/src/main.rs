@@ -17642,10 +17642,16 @@ mod tests {
             vec!["sglang".to_string()]
         );
         // Free-form map sections must never match (they accept any key).
-        assert_eq!(bare_leaf_sections("zzz_never_a_leaf", ""), [] as [String; 0]);
+        assert_eq!(
+            bare_leaf_sections("zzz_never_a_leaf", ""),
+            [] as [String; 0]
+        );
         // Flat root knobs (`spec_draft_threads` and friends are ROOT
         // fields, not a [spec_draft] table) resolve to no section.
-        assert_eq!(bare_leaf_sections("spec_draft_threads", ""), [] as [String; 0]);
+        assert_eq!(
+            bare_leaf_sections("spec_draft_threads", ""),
+            [] as [String; 0]
+        );
     }
 
     #[test]
