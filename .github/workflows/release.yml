@@ -221,9 +221,12 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME#v}"
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "CARGO_REGISTRY_TOKEN secret is not set — add it under" >&2
-            echo "Settings > Secrets and variables > Actions, then re-run." >&2
-            exit 1
+            # Absent credential is an operator choice, not a release
+            # failure: skip loudly (warning annotation + env marker so
+            # the publish step no-ops) instead of failing the run.
+            echo "::warning::CARGO_REGISTRY_TOKEN secret is not set — skipping crates.io publish. Add it under Settings > Secrets and variables > Actions and re-run this job to publish blazar $tag."
+            echo "SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+            exit 0
           fi
           current="$(curl -sf -A "blazar-release" https://crates.io/api/v1/crates/blazar | jq -r '.crate.max_stable_version')" || current="none"
           if [ "$current" = "$tag" ]; then
@@ -267,6 +270,9 @@ jobs:
         env:
           BLAZAR_REPO: ${{ github.repository }}
           BLAZAR_INSTALL_ENGINE: '0'
+          # Authenticated API: shared runner IPs burn the anonymous
+          # 60/hr GitHub quota and the release lookup 403s.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           for i in 1 2 3 4; do
             if sh scripts/install.sh; then break; fi
@@ -284,6 +290,8 @@ jobs:
         shell: pwsh
         env:
           BLAZAR_INSTALL_ENGINE: '0'
+          # Same anonymous-quota protection as the sh smoke above.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           for ($i = 1; $i -le 4; $i++) {
             # Child pwsh: the installer's Fail() exits its session, a
