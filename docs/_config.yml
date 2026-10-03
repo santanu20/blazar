@@ -1,0 +1,6 @@
+title: Blazar
+description: >-
+  Multi-engine local AI inference platform in Rust — one gateway for llama.cpp,
+  mistral.rs, SGLang, MLX, whisper.cpp, Piper and stable-diffusion.cpp, with
+  resource-aware scheduling, durable jobs and federation.
+theme: jekyll-theme-cayman
