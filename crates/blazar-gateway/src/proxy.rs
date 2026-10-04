@@ -313,6 +313,15 @@ pub async fn ensure_with_admission(
             &crate::images::diffusion_text_refusal(&row.name),
         )));
     }
+    // Same teaching contract one hop earlier: a vision request against
+    // a model with no projector sidecar would reach the lane and die
+    // inside the engine with a buried 500 hint. The row already knows.
+    if needs_vision && row.mmproj_path.is_none() {
+        return Err(Box::new(openai_error(
+            StatusCode::BAD_REQUEST.as_u16(),
+            &crate::preflight::vision_missing_refusal(&row.name),
+        )));
+    }
     // On-demand LoRA variant (`model+adapter`): re-attach the stem to
     // the CANONICAL base row so the supervisor spawns/looks up the
     // variant lane (`base+adapter`) regardless of how the caller spelled

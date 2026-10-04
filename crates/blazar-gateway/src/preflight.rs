@@ -227,6 +227,19 @@ pub fn capability_needs(parsed: &serde_json::Value, ollama_shape: bool) -> Capab
     }
 }
 
+/// Teaching refusal for vision requests against a model with no
+/// projector sidecar. Without this the request reaches the lane and
+/// dies inside the engine with a buried 500 hint; the store row
+/// already knows the truth, so admission teaches instead.
+#[must_use]
+pub fn vision_missing_refusal(name: &str) -> String {
+    format!(
+        "\"{name}\" has no projector sidecar attached — vision requests cannot be served. \
+         Attach one while the model is stopped: `blazar mmproj {name} <mmproj.gguf path>` \
+         (the next spawn picks it up). Plain text chat works unchanged."
+    )
+}
+
 /// Certificate gate (pure): `Some(teaching message)` when a needed
 /// capability is VERIFIED-FAILED. Absent probes, `N/A` verdicts, and
 /// unknown-or-mismatched engine kinds all pass — a stale or partial
@@ -380,6 +393,18 @@ mod tests {
         let oplain =
             serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
         assert_eq!(capability_needs(&oplain, true), CapabilityNeeds::default());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__vision_missing_refusal__teaches_the_fix_command() {
+        let msg = vision_missing_refusal("qwen:8b");
+        assert!(msg.contains("\"qwen:8b\""), "{msg}");
+        assert!(msg.contains("no projector sidecar attached"), "{msg}");
+        // The exact attach command, including the stop-first contract.
+        assert!(msg.contains("blazar mmproj qwen:8b"), "{msg}");
+        assert!(msg.contains("while the model is stopped"), "{msg}");
+        assert!(msg.contains("Plain text chat works unchanged"), "{msg}");
     }
 
     #[test]
