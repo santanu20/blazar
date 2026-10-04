@@ -1832,6 +1832,7 @@ pub(crate) fn apply_child_request_mutations(
     let mut changed = false;
     if usage_lane {
         changed |= include_usage_in_value(&mut v);
+        changed |= normalize_system_first_in_value(&mut v);
     }
     if let Some(stamp) = stamp.as_deref() {
         changed |= set_child_model(&mut v, stamp);
@@ -1866,6 +1867,55 @@ fn include_usage_in_value(v: &mut serde_json::Value) -> bool {
     }
     v["stream_options"]["include_usage"] = serde_json::Value::Bool(true);
     true
+}
+
+/// Hoist `system` messages to the head of the chat list and merge them
+/// into ONE leading system message (blocks joined by a blank line).
+/// The OpenAI-compatible dialect permits system messages anywhere in
+/// the list, but
+/// many model chat templates (Qwen3-class) raise a Jinja exception for
+/// a system message after the first position — agent harnesses
+/// (opencode & friends) legitimately send mid-list system blocks, so
+/// the gateway adapts the order at the engine boundary instead of
+/// leaking the template error as a 500. Only plain-string contents
+/// merge; any structured (multi-part) system content leaves the list
+/// untouched (fail-open: the child reports its own error). Returns
+/// whether `v` changed.
+fn normalize_system_first_in_value(v: &mut serde_json::Value) -> bool {
+    let Some(messages) = v
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let system_texts: Vec<String> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .map(|m| m.get("content").and_then(serde_json::Value::as_str))
+        .collect::<Option<Vec<_>>>()
+        .map(|texts| {
+            texts
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    match system_texts.len() {
+        0 => return false,
+        1 if messages.first().is_some_and(is_system_message) => return false,
+        _ => {}
+    }
+    messages.retain(|m| !is_system_message(m));
+    messages.insert(
+        0,
+        serde_json::json!({"role": "system", "content": system_texts.join("\n\n")}),
+    );
+    true
+}
+
+fn is_system_message(m: &serde_json::Value) -> bool {
+    m.get("role").and_then(serde_json::Value::as_str) == Some("system")
 }
 
 /// Classify a fully-buffered non-stream chat body (enforce path) from
@@ -3430,5 +3480,66 @@ mod resolve_model_tests {
         let mut other = json!({"model": "default"});
         assert!(!normalize_think_in_value(EngineKind::LlamaCpp, &mut other));
         assert!(other.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn unit__normalize_system_first__mid_list_blocks_hoist_and_merge() {
+        use serde_json::json;
+        // The opencode repro shape: a system block after user turns —
+        // Qwen3-class templates raise on it verbatim.
+        let mut v = json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "be brief"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "system", "content": "stay terse"},
+            {"role": "user", "content": "bye"},
+        ]});
+        assert!(normalize_system_first_in_value(&mut v));
+        let msgs = v["messages"].as_array().expect("still an array");
+        assert_eq!(msgs.len(), 4, "two systems collapse into one: {msgs:?}");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "be brief\n\nstay terse");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["content"], "hello");
+        assert_eq!(msgs[3]["content"], "bye");
+        // Idempotent: a second pass is a no-op.
+        assert!(!normalize_system_first_in_value(&mut v));
+    }
+
+    #[test]
+    fn unit__normalize_system_first__leading_single_system_untouched() {
+        use serde_json::json;
+        let mut v = json!({"messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+        ]});
+        assert!(!normalize_system_first_in_value(&mut v));
+        // Two leading system blocks DO merge: the second sits at a
+        // non-first template position even though it precedes every turn.
+        let mut v = json!({"messages": [
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": "b"},
+            {"role": "user", "content": "u"},
+        ]});
+        assert!(normalize_system_first_in_value(&mut v));
+        assert_eq!(v["messages"][0]["content"], "a\n\nb");
+        assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unit__normalize_system_first__structured_content_fail_open() {
+        use serde_json::json;
+        // Multi-part system content (vision blocks) is left alone: the
+        // child reports its own error rather than losing parts.
+        let mut v = json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "be brief"},
+            ]},
+        ]});
+        assert!(!normalize_system_first_in_value(&mut v));
+        // No messages array at all (completions lane): untouched.
+        let mut v = json!({"prompt": "hi"});
+        assert!(!normalize_system_first_in_value(&mut v));
     }
 }
