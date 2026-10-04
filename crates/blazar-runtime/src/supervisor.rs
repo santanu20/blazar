@@ -548,6 +548,13 @@ pub enum SupervisionError {
     /// parking the request behind the bounded `all_slots_busy` queue.
     #[error("{0}")]
     ModelTooLarge(String),
+    /// Spawn-time memory floor (J3): the box cannot host this load
+    /// without thrashing swap. Distinct from `ModelTooLarge` (a floor no
+    /// card could ever meet) — here freeing co-resident engines WOULD
+    /// change the verdict, so the message names those levers. Maps to
+    /// HTTP 507: the resource is exhausted, not "busy".
+    #[error("{0}")]
+    InsufficientMemory(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -3930,7 +3937,7 @@ impl Supervisor {
             let model_mib = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX) / (1024 * 1024);
             let need = (model_mib / 2) + 512;
             if avail < need {
-                return Err(SupervisionError::Internal(anyhow!(
+                return Err(SupervisionError::InsufficientMemory(format!(
                     "insufficient memory to load {:?}: MemAvailable {avail} MiB < floor {need} MiB \
                      (model {} MiB). Stop co-resident engines (blazar ps / ollama stop) or free RAM; \
                      disable this guard with spawn_mem_guard = false",

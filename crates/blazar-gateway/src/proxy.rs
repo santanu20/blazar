@@ -483,6 +483,9 @@ pub fn supervision_error(e: &SupervisionError) -> Response {
         // served immediately — queueing this could only burn the caller's
         // two-minute admission budget for a verdict known at entry.
         SupervisionError::ModelTooLarge(m) => openai_error(503, m),
+        // J3 memory floor: the box is exhausted, not broken — 507 until
+        // co-resident engines free their memory (the message names them).
+        SupervisionError::InsufficientMemory(m) => openai_error(507, m),
         SupervisionError::EngineCrashed(m) => openai_error(502, &format!("engine crashed: {m}")),
         SupervisionError::Internal(e) => openai_error(500, &format!("{e:#}")),
     }

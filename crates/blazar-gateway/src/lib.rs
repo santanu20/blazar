@@ -1394,6 +1394,32 @@ mod tests {
             "physical-refusal teaching must survive the mapping: {msg}"
         );
     }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__supervision_error__insufficient_memory_maps_to_507_teaching() {
+        use crate::proxy::supervision_error;
+        use blazar_runtime::SupervisionError;
+        // Live shape of the 18 GiB bf16 refusal (MemAvailable < spawn
+        // floor): honest and teaching, but it surfaced as a bare 500 —
+        // 507 says "resource exhausted", the levers stay in the body.
+        let resp = supervision_error(&SupervisionError::InsufficientMemory(
+            "insufficient memory to load \"qwen3.5-9b-bf16\": MemAvailable 1612 MiB < \
+             floor 9437 MiB (model 18432 MiB). Stop co-resident engines (blazar ps / \
+             ollama stop) or free RAM; disable this guard with spawn_mem_guard = false"
+                .to_string(),
+        ));
+        assert_eq!(resp.status(), 507);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let msg = v["error"]["message"].as_str().expect("message");
+        assert!(
+            msg.contains("MemAvailable") && msg.contains("spawn_mem_guard"),
+            "memory-floor teaching must survive the mapping: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
