@@ -8814,14 +8814,19 @@ mod routing_tests {
     }
 
     fn dummy_process() -> tokio::process::Child {
+        // kill_on_drop: the fabricated pid outlives the helper, but the
+        // real process must not — an orphaned child parks tokio's
+        // orphan-reaper thread and nextest flags the test as LEAK.
         #[cfg(not(windows))]
         return tokio::process::Command::new("sleep")
             .arg("30")
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn sleep");
         #[cfg(windows)]
         return tokio::process::Command::new("cmd")
             .args(["/C", "pause"])
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn cmd");
     }
