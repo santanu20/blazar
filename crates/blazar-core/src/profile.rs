@@ -825,18 +825,22 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 input.engine_tag
             ));
         }
-    } else if gguf.architecture == "modern-bert" {
-        // modern-bert checkpoint with no pooling KV (Laya-2 GGUFs ship
-        // none). Classifier-tagged (classification/routing/scoring), NOT
-        // a generative model. Upstream reality (live-verified): the
-        // reranker arm crashes a rank head against the modern-bert
-        // classifier (GGML_ASSERT in build_pooling), and even an
-        // explicit `--pooling cls` serves LLAMA_POOLING_TYPE_NONE —
-        // llama.cpp's modern-bert has no pooling support, so
-        // /v1/embeddings 400s ("Pooling type 'none' is not OAI
-        // compatible") and generation 500s ("context does not support
-        // logits computation"). The flags ride along for the day
-        // upstream grows pooling; the warning tells the truth today.
+    } else if gguf.architecture == "modern-bert" && gguf.pooling_type.is_none() {
+        // modern-bert checkpoint with NO pooling KV (pre-b11273
+        // conversions, e.g. the Laya-2 GGUF on disk). Classifier-tagged
+        // (classification/routing/scoring), NOT generative. Upstream
+        // reality (live-verified): the reranker arm crashes a rank head
+        // against the modern-bert classifier (GGML_ASSERT in
+        // build_pooling), and even an explicit `--pooling cls` serves
+        // LLAMA_POOLING_TYPE_NONE — llama.cpp's modern-bert has no
+        // pooling support, so /v1/embeddings 400s ("Pooling type
+        // 'none' is not OAI compatible") and generation 500s ("context
+        // does not support logits computation"). A re-converted GGUF
+        // (b11273+ writes the pooling KV) must NOT land here — the
+        // `pooling_type.is_none()` guard sends it down the normal
+        // pooling arm below, so the upstream fix is honored the day a
+        // new artifact arrives, no blazar change needed. Flags ride
+        // along here for the same reason; the warning tells the truth.
         if input.supported_flags.contains("--embeddings")
             && input.supported_flags.contains("--pooling")
         {
@@ -845,9 +849,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             argv.push("cls".into());
         }
         warnings.push(
-            "modern-bert classifier checkpoint: llama.cpp serves it without pooling and \
-             without a language head — chat and embeddings are unavailable upstream; \
-             sequence-classification endpoints are this class's surface"
+            "modern-bert classifier checkpoint (no pooling metadata — pre-b11273 \
+             conversion): llama.cpp serves it without pooling and without a language \
+             head — chat and embeddings are unavailable upstream; re-convert the GGUF \
+             with a current llama.cpp to gain the pooling arm, sequence-classification \
+             endpoints are this class's other surface"
                 .to_string(),
         );
     } else if let Some(pooling) = gguf.pooling_type {
