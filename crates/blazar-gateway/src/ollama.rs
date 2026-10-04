@@ -3102,8 +3102,21 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
     let Some(model) = v["model"].as_str() else {
         return api_error(400, "missing 'model'");
     };
+    // Resolve through the shared ladder (exact → colon-swap → bare stem
+    // → unique prefix → suggestion) so a client can evict by the very
+    // `name:quant` string GET /api/tags renders — instance keys hold
+    // bare store names, and a raw passthrough here no-op'd 200 on the
+    // tags form while the model kept serving (live-repro'd against
+    // bge-reranker-v2-m3:q8_0). Same rule /api/delete applies.
+    let key = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
+        Some(Ok(row)) => row.name,
+        Some(Err(msg)) => return api_error(404, &msg),
+        None => return api_error(500, "store unavailable"),
+    };
     // Router mode: the engine owns per-model lifecycle — forward the
     // unload to the router child (models stay preset-listed, just unloaded).
+    // The child's preset list is built from store rows, so the resolved
+    // bare name is what it keys on too.
     if state.config.router {
         let engine = match crate::proxy::ensure_router_detached(&state.sup).await {
             Ok(e) => e,
@@ -3114,7 +3127,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             crate::state::child_client(&state, &engine.endpoint).post(&url),
             &engine,
         )
-        .json(&json!({"model": model}))
+        .json(&json!({"model": key}))
         .send()
         .await
         {
@@ -3127,7 +3140,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
             Err(e) => api_error(502, &format!("router unload: {e}")),
         };
     }
-    match state.sup.evict_model(model).await {
+    match state.sup.evict_model(&key).await {
         Ok(()) => axum::Json(json!({"status": "ok"})).into_response(),
         Err(e) => api_error(404, &e.to_string()),
     }
