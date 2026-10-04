@@ -31,7 +31,10 @@ use crate::state::AppState;
 /// Bounded external-process run: kill past the deadline, drain both pipes
 /// through threads (mirrors the runtime probe helper's fork-pressure
 /// discipline — a wedged probe must never wedge the endpoint).
-fn bounded_output(cmd: &mut std::process::Command, secs: u64) -> Option<std::process::Output> {
+pub(crate) fn bounded_output(
+    cmd: &mut std::process::Command,
+    secs: u64,
+) -> Option<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
     cmd.stdin(Stdio::null())
@@ -76,18 +79,19 @@ fn bounded_output(cmd: &mut std::process::Command, secs: u64) -> Option<std::pro
     })
 }
 
-struct DeviceRow {
-    index: u32,
-    name: String,
-    total_mib: u64,
-    free_mib: u64,
-    util_pct: u64,
+#[derive(Clone)]
+pub(crate) struct DeviceRow {
+    pub(crate) index: u32,
+    pub(crate) name: String,
+    pub(crate) total_mib: u64,
+    pub(crate) free_mib: u64,
+    pub(crate) util_pct: u64,
 }
 
 /// `index, name, total MiB, free MiB, util %` per line
 /// (`--format=csv,noheader,nounits`). Rows with unparseable fields drop
 /// silently-unknown rather than half-guessed.
-fn parse_devices(text: &str) -> Vec<DeviceRow> {
+pub(crate) fn parse_devices(text: &str) -> Vec<DeviceRow> {
     text.lines()
         .filter_map(|ln| {
             let mut parts = ln.split(',').map(str::trim);
@@ -109,7 +113,7 @@ fn parse_devices(text: &str) -> Vec<DeviceRow> {
 
 /// `pid, used MiB` per line. Drivers without the number print `[N/A]` —
 /// those rows report the pid with an unknown footprint (0), never a guess.
-fn parse_compute_apps(text: &str) -> Vec<(u32, u64)> {
+pub(crate) fn parse_compute_apps(text: &str) -> Vec<(u32, u64)> {
     text.lines()
         .filter_map(|ln| {
             let mut parts = ln.split(',').map(str::trim);

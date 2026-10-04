@@ -4,11 +4,14 @@
 pub mod anthropic;
 pub mod audit;
 pub mod batch;
+pub mod benchmarks;
 pub mod bestof;
 pub mod cache_bust;
 pub mod capacity;
 pub mod cascade;
+pub mod console;
 pub mod explain;
+pub mod fabric;
 pub mod federation;
 pub mod histogram;
 pub mod host_guard;
@@ -16,6 +19,7 @@ pub mod http_pool;
 pub mod images;
 pub mod jobs;
 pub mod model_doctor;
+pub mod quantiles;
 pub mod requests;
 
 pub mod keys;
@@ -379,6 +383,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Per-GPU capacity: device census + per-resident VRAM
         // attribution joined from the supervisor's live rows.
         .route("/api/capacity", get(capacity::capacity))
+        .route("/api/fabric", get(fabric::fabric))
+        .route("/api/quantiles", get(quantiles::quantiles))
+        .route("/api/benchmarks", get(benchmarks::benchmarks))
+        .route("/ui", get(console::ui))
         .route("/api/replicate", post(federation::replicate))
         .route("/api/route/{model}", get(federation::route))
         .route("/api/explain/{model}", get(explain::explain))
