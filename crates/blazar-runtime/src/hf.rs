@@ -1267,23 +1267,69 @@ impl HfClient {
             .api_base
             .join(&search_path(query, format, fetch))
             .map_err(|e| anyhow!("bad search URL: {e}"))?;
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .context("HF search request")?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("HF search returned {}", resp.status()));
+        // Bounded retry on transient failures: the Hub search API throws
+        // short 5xx blips (and connection resets) far more often than it
+        // runs cold-down, and every caller is a one-shot CLI invocation
+        // (`blazar search`, `blazar drafts` with 4 queries) that would
+        // otherwise die on the first blip. Fixed steps, no jitter — a
+        // single client retrying itself is not a herd, and deterministic
+        // steps keep the hard-failure path quick.
+        let attempts = 3usize;
+        let backoff = [Duration::from_secs(1), Duration::from_secs(3)];
+        let mut last_failure = String::new();
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(backoff[attempt - 1]).await;
+            }
+            let resp = match self.http.get(url.clone()).send().await {
+                Ok(r) => r,
+                // Transport errors (DNS, TLS, reset) sit in the same
+                // transient class as a 5xx for a one-shot CLI call.
+                Err(e) => {
+                    last_failure = format!("transport error: {e}");
+                    continue;
+                }
+            };
+            let status = resp.status();
+            if status.is_success() {
+                let entries: Vec<SearchEntry> =
+                    resp.json().await.context("decode search results")?;
+                return Ok(if rerank {
+                    let mut ranked = relevance_rank(&entries, query);
+                    ranked.truncate(limit as usize);
+                    ranked
+                } else {
+                    entries
+                });
+            }
+            if status.as_u16() == 429 {
+                // The Hub's anonymous window is 5 minutes wide — sleeping
+                // it out inside a CLI call is wrong. Teach and abort.
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("the announced window")
+                    .to_string();
+                return Err(anyhow!(
+                    "HF search rate limited — set HF_TOKEN for the higher quota, retry after {retry_after}"
+                ));
+            }
+            if status.is_server_error() {
+                last_failure = format!("HTTP {status}");
+                continue;
+            }
+            // 4xx: this request is wrong; retrying an identical request
+            // cannot fix it.
+            return Err(anyhow!(
+                "HF search rejected the request with {status} — check the query text, --format tag, or token"
+            ));
         }
-        let entries: Vec<SearchEntry> = resp.json().await.context("decode search results")?;
-        Ok(if rerank {
-            let mut ranked = relevance_rank(&entries, query);
-            ranked.truncate(limit as usize);
-            ranked
-        } else {
-            entries
-        })
+        Err(anyhow!(
+            "HF search API is failing upstream ({last_failure} on all {attempts} attempts) — the Hub itself is in \
+             trouble, not this query; retry in a few minutes or check status.huggingface.co (browse mode \
+             `blazar search ''` rides a separate, usually healthy path)"
+        ))
     }
 }
 
@@ -3386,6 +3432,66 @@ mod tests {
         let p = search_path("mini cpm+", "a&b=c", 5);
         assert!(p.contains("search=mini%20cpm%2B"), "{p}");
         assert!(p.contains("filter=a%26b%3Dc"), "{p}");
+    }
+
+    #[tokio::test]
+    async fn integration__search__transient_5xx_recovers_within_bounded_retries() {
+        // Pinned 2026-10-04: a live Hub search outage served 500 on every
+        // query for minutes; short blips of the same shape were already
+        // killing one-shot CLI calls. The contract: two 500s then a 200
+        // must surface the results, having made exactly 3 requests.
+        let api = MockServer::start().await;
+        // First-mounted mock has precedence while its budget lasts.
+        Mock::given(method("GET"))
+            .and(path("/api/models"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(serde_json::json!({"error": "Internal Error"})),
+            )
+            .up_to_n_times(2)
+            .mount(&api)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "o/r", "downloads": 10, "likes": 2}
+            ])))
+            .mount(&api)
+            .await;
+        let client =
+            HfClient::with_bases(&api.uri(), &api.uri(), None, vec![host_of(&api.uri())]).unwrap();
+        let results = client.search("r", "gguf", 5).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "o/r");
+        assert_eq!(
+            api.received_requests().await.unwrap().len(),
+            3,
+            "two failures then success = exactly three requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__search__persistent_5xx_teaches_upstream_after_bound() {
+        // Cold-down shape of the same outage: every attempt 500s. The
+        // contract: stop at the bound (3 requests) and name the Hub as
+        // the failing side so a user cannot mistake it for their query.
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&api)
+            .await;
+        let client =
+            HfClient::with_bases(&api.uri(), &api.uri(), None, vec![host_of(&api.uri())]).unwrap();
+        let err = client
+            .search("wan", "gguf", 5)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(api.received_requests().await.unwrap().len(), 3);
+        for needle in ["upstream", "3 attempts", "status.huggingface.co"] {
+            assert!(err.contains(needle), "error must teach {needle:?}: {err}");
+        }
     }
 
     #[test]
