@@ -149,9 +149,11 @@ Blazar runs alongside an existing Ollama install, and can later serve on `11434`
 blazar launch <command>     # prepare env vars, then exec the command
 blazar connect              # print the client-integration plan
 blazar connect --write      # apply with backup; rolls back if the test request fails
+blazar connect opencode --write --all-models   # agent-harness menu in one write
+blazar connect pi --write                     # pi / oh-my-pi, same treatment
 ```
 
-`connect` configures Codex, Claude Code, Continue, Cline, and Open WebUI to talk to Blazar.
+`connect` configures Codex, Claude Code, Continue, Cline, Open WebUI, opencode, and pi (oh my pi) to talk to Blazar — capability-driven model menus included (`--all-models` lists every certified chat model; the default pick follows the chat+tools > chat > uncertified ladder). Harnesses without a `connect` lane still work: point any OpenAI-compatible client at `http://127.0.0.1:11435/v1`, any Ollama client at the gateway root, or any Anthropic SDK client at `http://127.0.0.1:11435`.
 
 ---
 
@@ -343,6 +345,9 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | Observe → recommend per model | `blazar autopilot`, `blazar autopilot --apply` |
 | Pull / import models | `blazar pull <target>`, `blazar import <file> --name <name>` |
 | Inspect models | `blazar list`, `blazar show <model>`, `blazar ps` |
+| Stop / remove | `blazar stop` (daemon), `blazar rm <model>` |
+| Quantize / attach projector | `blazar quantize <model> <out-quant>`, `blazar mmproj <model> <mmproj.gguf path>` |
+| Tune generation speed | `blazar tune <model>`, `blazar bench <model>` (results stored) |
 | Launch an AI CLI | `blazar launch <command>` |
 | Connect AI clients | `blazar connect --write` (Claude Code, Codex, Continue, Cline, Open WebUI, opencode, pi) |
 | Explain serving config | `blazar explain <model>` |
