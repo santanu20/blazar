@@ -13410,6 +13410,8 @@ mod tests {
             ctx_train: Some(32_768),
             dtype: Some("bfloat16".into()),
             quant_bits: None,
+            quant_method: None,
+            vision_tower: false,
             kv: crate::hfmeta::KvGeom {
                 layers: Some(28),
                 kv_heads: Some(2),
@@ -13686,6 +13688,8 @@ mod tests {
             ctx_train: Some(32_768),
             dtype: Some("bfloat16".into()),
             quant_bits: None,
+            quant_method: None,
+            vision_tower: false,
             kv: crate::hfmeta::KvGeom {
                 layers: Some(28),
                 kv_heads: Some(2),

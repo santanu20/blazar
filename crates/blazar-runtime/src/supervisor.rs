@@ -3675,6 +3675,24 @@ impl Supervisor {
                 model.path
             )));
         }
+        // SGLang lane admission (config facts that predict engine death —
+        // same teach-at-the-door pattern as the diffusion guard above): a
+        // quant_method this build cannot load crashes the server during
+        // weight load, and a vision-tower config without
+        // preprocessor_config.json dies in processor init. Both would
+        // otherwise surface as an opaque 502 ~30s later; the gate names
+        // the offending value instead. Dense text models and complete
+        // multimodal dirs pass untouched (verified against the live lane).
+        if engine.kind() == blazar_core::engine_kind::EngineKind::Sglang
+            && let blazar_core::hfmeta::ModelMeta::Hf(h) = meta_box.borrow_meta()
+            && let Some(teach) =
+                blazar_core::hfmeta::sglang_lane_teach(h, std::path::Path::new(&model.path))
+        {
+            return Err(SupervisionError::UnsupportedModel(format!(
+                "{}: {teach}",
+                model.path
+            )));
+        }
         let loras = Self::resolve_lora_lane(
             &store
                 .list_loras(Some(name))
