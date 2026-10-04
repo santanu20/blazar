@@ -198,6 +198,21 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
     }
 }
 
+/// m1's vision-capable sibling: same row plus a projector sidecar. The
+/// admission gate 400s image requests against a sidecar-less model, so
+/// vision-pipeline e2e tests ride this row (the stub child never reads
+/// the sidecar path).
+fn upsert_vision_sibling(ts: &TestServer) {
+    ts.state
+        .with_store(|s| {
+            let mut row = s.get_model("m1").unwrap().expect("m1 fixture row");
+            row.name = "m1v".into();
+            row.mmproj_path = Some("mmproj.gguf".into());
+            s.upsert_model(&row).unwrap();
+        })
+        .unwrap();
+}
+
 fn client() -> reqwest::Client {
     blazar_core::tls::ensure_tls_provider();
     reqwest::Client::builder()
@@ -295,6 +310,56 @@ async fn e2e__ollama_delete_accepts_the_tags_rendered_name() {
             .status();
         assert_eq!(status, 404, "probe {probe:?}");
     }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__ollama_evict_accepts_the_tags_rendered_name() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // GET /api/tags renders `name:quant`; a client evicting by that exact
+    // string must reach the supervisor. The raw passthrough this replaces
+    // no-op'd 200 on the tags form — instance keys hold bare store names,
+    // so `model_of_key(k) == model` never matched and the child kept
+    // serving (live-repro'd: bge-reranker-v2-m3:q8_0 evicted, still ready).
+    let status = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": "m1:q4_k_m"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200, "tags form resolves and unloads");
+    // Unloading a not-loaded model stays a 200 no-op (ollama keep_alive:0
+    // semantics) — but only for names that RESOLVE. Garbage teaches 404
+    // through the resolver instead of silently ok-ing.
+    let status = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": "m1"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200, "bare form resolves too");
+    for probe in ["no-such-model", "zz:q4_k_m"] {
+        let status = c
+            .post(format!("{}/api/evict", ts.base))
+            .json(&serde_json::json!({"model": probe}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 404, "unresolvable {probe:?} teaches 404");
+    }
+    let status = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": 42}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 400, "non-string model is a 400");
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -1739,11 +1804,12 @@ async fn e2e__generate_raw_ok_templated_400_and_embeddings() {
 async fn e2e__generate_images_and_streaming_chat_bus() {
     let ts = start(Config::default()).await;
     let c = client();
+    upsert_vision_sibling(&ts);
     // pdf_ocr-shaped payload: images[] (b64 of PNG magic + padding) +
     // system + options.
     let png_b64 = "iVBORw0KGgoAAAA";
     let vision = serde_json::json!({
-        "model": "m1",
+        "model": "m1v",
         "prompt": "describe",
         "system": "be terse",
         "images": [png_b64],
@@ -1761,6 +1827,26 @@ async fn e2e__generate_images_and_streaming_chat_bus() {
         .unwrap();
     assert!(r["done"] == true, "vision generate works: {r}");
     assert!(r["response"].as_str().unwrap().contains("describe"));
+
+    // No-projector contract (e2e): m1 has no sidecar, so the same
+    // payload teaches instead of reaching a child that would 500.
+    let refused = c
+        .post(format!("{}/api/generate", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "prompt": "describe", "images": [png_b64], "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let rb: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        rb["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no projector sidecar"),
+        "teaching refusal: {rb}"
+    );
 
     // Bad image magic: fail fast 400 (never a silent text-only answer).
     let bad = serde_json::json!({
@@ -1829,10 +1915,11 @@ async fn e2e__generate_images_and_streaming_chat_bus() {
 async fn e2e__chat_message_images_translate_to_parts() {
     let ts = start(Config::default()).await;
     let c = client();
+    upsert_vision_sibling(&ts);
     // b64 of PNG magic + 4 zero bytes (decodes cleanly at 12 bytes).
     let png_b64 = "iVBORw0KGgoAAAA";
     let body = serde_json::json!({
-        "model": "m1",
+        "model": "m1v",
         "stream": false,
         "messages": [
             {"role": "user", "content": "what is this?", "images": [png_b64]}
