@@ -1011,6 +1011,16 @@ pub async fn chat(
     if let Some(err) = state.sentinel.structured_output_error_cached(&req) {
         return api_error(400, &format!("invalid structured output: {err}"));
     }
+    // Capability-certificate gate: refuse what the model's own VERIFIED
+    // probe says it cannot do — a fresh matching FAIL only; absent or
+    // stale certificates fail open (the sentinel still watches every
+    // response live).
+    let cap_needs = crate::preflight::capability_needs(&req, true);
+    if cap_needs.any()
+        && let Some(msg) = crate::preflight::capability_cert_refusal(&state, &row.name, cap_needs)
+    {
+        return api_error(400, &msg);
+    }
     // Prompt-fit preflight (num_ctx request override counts).
     {
         let eff = match req

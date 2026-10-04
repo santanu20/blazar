@@ -498,6 +498,16 @@ pub async fn openai_proxy(
         if let Some(err) = state.sentinel.strict_tool_def_error_cached(&v) {
             return openai_error(400, &format!("invalid tools: {err}"));
         }
+        // Capability-certificate gate: refuse what the model's own
+        // VERIFIED probe says it cannot do — a fresh matching FAIL only;
+        // absent or stale certificates fail open (the sentinel still
+        // watches every response live).
+        let cap_needs = crate::preflight::capability_needs(&v, false);
+        if cap_needs.any()
+            && let Some(msg) = crate::preflight::capability_cert_refusal(&state, &model, cap_needs)
+        {
+            return openai_error(400, &msg);
+        }
         let eff = crate::preflight::admission_ctx(&state, &model);
         if let Err(resp) = crate::preflight::enforce_prompt_fits(&state, &model, &v, eff).await {
             return *resp;
