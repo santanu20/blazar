@@ -1773,7 +1773,22 @@ async fn proxy_core_chat(
     // child's native multimodal template lane.
     let ollama_compat = {
         let parsed: Option<serde_json::Value> = serde_json::from_slice(&openai_body).ok();
-        state.config.effective_prompt_recipe(model) == crate::prompt_recipe::OLLAMA_COMPAT
+        let recipe_pinned =
+            state.config.effective_prompt_recipe(model) == crate::prompt_recipe::OLLAMA_COMPAT;
+        // mlx-lm 0.32.0 reports `finish_reason: "tool_calls"` but drops
+        // `message.tool_calls` at serialization (live receipt: 23
+        // completion tokens, finish tool_calls, message absent + content
+        // null) — native tool calls die inside the child. The
+        // gateway-rendered tool grammar on the raw completion lane never
+        // enters that code path, so tool requests on the mlx lane route
+        // here even under the default `child` recipe.
+        let mlx_tools = engine.kind == blazar_core::engine_kind::EngineKind::Mlx
+            && parsed
+                .as_ref()
+                .and_then(|v| v.get("tools"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|a| !a.is_empty());
+        (recipe_pinned || mlx_tools)
             && parsed
                 .as_ref()
                 .is_some_and(|v| !crate::prompt_recipe::has_images(v))
