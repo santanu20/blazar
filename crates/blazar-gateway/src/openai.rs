@@ -504,6 +504,7 @@ pub async fn openai_proxy(
         // watches every response live).
         let cap_needs = crate::preflight::capability_needs(&v, false);
         if cap_needs.any()
+            && !crate::preflight::is_capability_probe(&headers)
             && let Some(msg) = crate::preflight::capability_cert_refusal(&state, &model, cap_needs)
         {
             return openai_error(400, &msg);

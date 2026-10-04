@@ -271,6 +271,19 @@ or re-verify after an engine change: `blazar model-doctor {model}`",
     None
 }
 
+/// The prober is the one actor the certificate gate must never block:
+/// a model whose stored verdict is FAIL would otherwise 400 the very
+/// probe sent to re-measure it — a self-heal deadlock (the probe
+/// receipt would record the gate's refusal, not the model's behavior).
+/// `model_doctor` tags its in-process probe calls with this header; both
+/// gate call sites stand down for it.
+pub const PROBE_HEADER: &str = "x-blazar-model-doctor";
+
+#[must_use]
+pub fn is_capability_probe(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(PROBE_HEADER)
+}
+
 /// Capability-certificate admission: read the stored model-doctor
 /// certificate once, then gate the request's strict needs against it.
 /// `None` = proceed (no certificate, no matching need, or fail-open
@@ -306,6 +319,16 @@ pub fn capability_cert_refusal(
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__is_capability_probe__header_marks_the_prober() {
+        // The self-heal loop depends on this: a stored FAIL verdict must
+        // never block the probe that re-measures it.
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(!is_capability_probe(&headers));
+        headers.insert(PROBE_HEADER, axum::http::HeaderValue::from_static("1"));
+        assert!(is_capability_probe(&headers));
+    }
 
     fn cert(tools: &str, vision: &str, json: &str) -> serde_json::Value {
         serde_json::json!({

@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
@@ -230,6 +229,12 @@ fn judge_embed(code: u16, body: &[u8]) -> Verdict {
     if code == 400 && text.to_lowercase().contains("embed") {
         return na(format!("lane refuses embeddings for this model: {text}"));
     }
+    // 404 = the lane never routed the endpoint — the model was never
+    // measured, so the honest verdict is "not applicable here", not a
+    // failure the scorecard would attribute to the model.
+    if code == 404 {
+        return na(format!("lane exposes no embeddings endpoint: {text}"));
+    }
     fail(format!("HTTP {code}: {text}"))
 }
 
@@ -238,11 +243,20 @@ fn judge_embed(code: u16, body: &[u8]) -> Verdict {
 // ---------------------------------------------------------------------------
 
 async fn call_chat(state: &Arc<AppState>, body: Value) -> (u16, Option<String>, Bytes) {
+    // Tag every probe with the model-doctor header: the certificate
+    // gate stands down for the prober (is_capability_probe), otherwise
+    // a stored FAIL verdict would 400 the very probe sent to re-measure
+    // it and the certificate could never change.
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        crate::preflight::PROBE_HEADER,
+        axum::http::HeaderValue::from_static("1"),
+    );
     let resp = crate::ollama::chat(
         State(Arc::clone(state)),
         None,
         None,
-        HeaderMap::new(),
+        headers,
         Bytes::from(body.to_string()),
     )
     .await;
@@ -693,6 +707,8 @@ mod tests {
         assert_eq!(judge_embed(400, refuse).status, "N/A");
         // a 400 that never mentions embeddings is a real failure
         assert_eq!(judge_embed(400, b"bad input").status, "FAIL");
+        // 404 = lane exposes no embeddings endpoint: not measured, not failed
+        assert_eq!(judge_embed(404, br#"{"error":"Not Found"}"#).status, "N/A");
         assert_eq!(judge_embed(200, br#"{"embeddings":[]}"#).status, "FAIL");
     }
 

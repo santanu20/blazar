@@ -1017,6 +1017,7 @@ pub async fn chat(
     // response live).
     let cap_needs = crate::preflight::capability_needs(&req, true);
     if cap_needs.any()
+        && !crate::preflight::is_capability_probe(&headers)
         && let Some(msg) = crate::preflight::capability_cert_refusal(&state, &row.name, cap_needs)
     {
         return api_error(400, &msg);
