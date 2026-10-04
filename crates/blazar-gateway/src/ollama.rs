@@ -3110,7 +3110,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
     // bge-reranker-v2-m3:q8_0). Same rule /api/delete applies.
     let key = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
         Some(Ok(row)) => row.name,
-        Some(Err(msg)) => return api_error(404, &msg),
+        Some(Err(msg)) => return evict_unresolved(&state, model, &msg).await,
         None => return api_error(500, "store unavailable"),
     };
     // Router mode: the engine owns per-model lifecycle — forward the
@@ -3144,6 +3144,69 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
         Ok(()) => axum::Json(json!({"status": "ok"})).into_response(),
         Err(e) => api_error(404, &e.to_string()),
     }
+}
+
+/// Store-miss resolution for /api/evict: two name spaces the store
+/// ladder cannot see — the lazy whisper lane (its child keys by the
+/// whisper size name, e.g. "base", never a store row) and supervised
+/// instances outliving their store row. A lane hit tears that lane
+/// down; otherwise the 404 teaches with BOTH the store suggestion and
+/// the live candidates. (Live-repro'd before this ladder: evicting
+/// "base" while the whisper child was loaded returned a store-shaped
+/// 404 suggesting "laya" — a levenshtein artifact — and the audio
+/// child stayed resident.)
+async fn evict_unresolved(state: &Arc<AppState>, model: &str, store_msg: &str) -> Response {
+    // Whisper lane first: its names never exist in the store, so this
+    // is their ONLY resolution path. Case-insensitive — the size name
+    // is a CLI convention, not a store key.
+    if let Some((_, loaded)) = state.whisper.status().await
+        && loaded.eq_ignore_ascii_case(model)
+    {
+        state.whisper.shutdown().await;
+        tracing::info!(model = %loaded, "whisper lane evicted by size name");
+        return axum::Json(json!({
+            "status": "ok",
+            "lane": "whisper",
+            "model": loaded,
+        }))
+        .into_response();
+    }
+    // Live supervised instances whose store row is gone (or whose name
+    // the store ladder could not expand): match by the instance's own
+    // base-name grammar, evict every key grammar of that model.
+    let live_base = state.sup.ps().into_iter().find_map(|row| {
+        let base = blazar_runtime::supervisor::model_of_key(&row.name);
+        (base.eq_ignore_ascii_case(model) || row.name.eq_ignore_ascii_case(model))
+            .then(|| base.to_string())
+    });
+    if let Some(base) = live_base {
+        return match state.sup.evict_model(&base).await {
+            Ok(()) => axum::Json(json!({
+                "status": "ok",
+                "lane": "supervised",
+                "model": base,
+            }))
+            .into_response(),
+            Err(e) => api_error(500, &format!("evict {base}: {e}")),
+        };
+    }
+    // Nothing matched anywhere: enrich the store's 404 with whatever
+    // IS live so the suggestion cannot point past a loaded lane again.
+    let mut live_names: Vec<String> = state
+        .sup
+        .ps()
+        .into_iter()
+        .map(|row| blazar_runtime::supervisor::model_of_key(&row.name).to_string())
+        .collect();
+    if let Some((_, loaded)) = state.whisper.status().await {
+        live_names.push(format!("whisper:{loaded}"));
+    }
+    let msg = if live_names.is_empty() {
+        store_msg.to_string()
+    } else {
+        format!("{store_msg} — live now: {}", live_names.join(", "))
+    };
+    api_error(404, &msg)
 }
 
 /// A session checkpoint filename: alphanumerics, dot, underscore, dash.

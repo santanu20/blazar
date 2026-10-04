@@ -772,16 +772,21 @@ pub async fn pull(
 /// bind + OS-assigned ephemeral port, pinned by unit test below.
 /// Revisit if upstream grows an auth option.
 pub struct WhisperRuntime {
-    child: tokio::sync::Mutex<Option<WhisperChild>>,
+    /// The single lane slot. Public so integration tests can plant a
+    /// fabricated child (the evict-by-size-name e2e pin); production
+    /// code drives the lane through ensure/status/shutdown only.
+    pub child: tokio::sync::Mutex<Option<WhisperChild>>,
 }
 
-struct WhisperChild {
-    child: tokio::process::Child,
-    port: u16,
-    loaded: String,
+/// One lazily-spawned whisper-server child. Fields public for the same
+/// test-planting reason as the slot above; teardown is `shutdown()`.
+pub struct WhisperChild {
+    pub child: tokio::process::Child,
+    pub port: u16,
+    pub loaded: String,
     /// Last instant the lane served (or swapped) a request — the idle
     /// reaper's clock. Refreshed on every `ensure` hit, never elsewhere.
-    last_used: tokio::time::Instant,
+    pub last_used: tokio::time::Instant,
 }
 
 impl WhisperRuntime {

@@ -365,6 +365,59 @@ async fn e2e__ollama_evict_accepts_the_tags_rendered_name() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__ollama_evict_unresolvable_name_finds_the_whisper_lane() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // The whisper child keys by its size name ("base"), which is never
+    // a store row: before the lane fallback, evicting "base" 404'd with
+    // a levenshtein guess ("laya") while the audio child stayed loaded.
+    // Plant a live sleeper as the lane child, then evict by size name.
+    let child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id().expect("pid");
+    *ts.state.whisper.child.lock().await = Some(blazar_runtime::whisper::WhisperChild {
+        child,
+        port: 1,
+        loaded: "base".into(),
+        last_used: tokio::time::Instant::now(),
+    });
+    // While the lane is live but the name does NOT match: the 404 must
+    // teach with the live lanes listed, not a bare store suggestion.
+    let resp = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": "no-such-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let msg = v["error"].as_str().expect("message");
+    assert!(msg.contains("whisper:base"), "404 names live lanes: {msg}");
+    // The size name resolves to the lane and tears it down for real.
+    let resp = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": "base"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "whisper size name resolves to the lane");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["lane"], "whisper");
+    assert_eq!(v["model"], "base");
+    assert!(ts.state.whisper.status().await.is_none(), "slot drained");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "whisper child {pid} leaked past evict"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__num_ctx_header_resolves_the_tags_rendered_name() {
     let ts = start(Config::default()).await;
     let c = client();

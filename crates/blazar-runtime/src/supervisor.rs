@@ -222,8 +222,10 @@ const UBATCH_GOV_TIERS: [u32; 2] = [1024, 2048];
 /// A trailing `@vision` marker (projector-carrying respawn of a
 /// text-only instance, see `ensure_vision`) and an on-demand `+lora`
 /// variant marker (see `spawn_instance`) are stripped too, so every
-/// consumer sees the plain model name.
-fn model_of_key(key: &str) -> &str {
+/// consumer sees the plain model name. Public: the gateway's evict
+/// fallback compares live instance names by this same grammar.
+#[must_use]
+pub fn model_of_key(key: &str) -> &str {
     let key = key.split('@').next().unwrap_or(key);
     let key = match key.split_once('#') {
         Some((model, _)) => model,
