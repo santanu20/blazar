@@ -213,6 +213,10 @@ Routing follows model format and engine capability. The default preserves single
 
 ## Features
 
+### One-word UX on top of the control plane
+
+Beginners get verbs, not knobs. `blazar plan <model>` previews what `run` would decide — identity, the live routing card, measured speed, verified capability, next actions — read-only, never pulling. `blazar run` prints a one-line ready-card of the daemon's real decision (engine, context, KV, speculation, warm state) before the first token, and `--intent agent|batch|coding|reasoning|vision` maps a workload class to queue priority, reasoning defaults, and a multimodal preflight (explicit flags still win). `blazar config preset balanced|fast|quality|agent|max-throughput` moves a handful of root knobs in one validated, printed, reversible step. `blazar scorecard <model>` assembles the stored benchmark and the capability certificate into one dated card — it never re-runs anything. `blazar autopilot` reads every model's stored records and recommends only real work (missing bench, bench newer than the tuned profile, missing or stale certificate — each rec cites its datum); `--apply` runs the list sequentially. The capability certificate also gates admission: a request whose strict needs (tools, images, JSON mode) hit a verified FAIL on the same engine kind is refused with the probe, date, and refresh command before it burns a turn — absent or stale certificates always pass.
+
 ### Resource-aware scheduling
 
 Memory, concurrency, and residency are scheduling problems, not side effects. `blazar fit <target>` previews fit, context limits, and quantization before a download. The planner accounts for weights, context, KV-cache posture, slots, host-memory spill, co-residency, and multi-GPU placement. Saturated models get bounded admission instead of uncontrolled concurrency; supported lanes reshape slot capacity from live telemetry.
@@ -224,7 +228,7 @@ Jobs, request cards, and response chains live in a SQLite ledger that survives r
 - **Durable jobs** — `/v1/jobs` plane with events, cancel, and artifact endpoints. A gateway crash mid-job marks the row `abandoned` with a teaching error; terminal jobs prune after 7 days.
 - **Request cards** — `GET /v1/requests` lists live generations; cancel or interrupt them from another connection, keeping partial output where asked.
 - **Durable response chains** — `previous_response_id` chains promote from the ledger across restarts, never served stale.
-- **Disk intelligence** — `blazar fit` checks required-vs-available disk before download; `blazar storage` reports where bytes went; `blazar prune --orphans/--unused` reclaims (dry-run by default).
+- **Disk intelligence** — `blazar fit` checks required-vs-available disk before download; `blazar storage` reports where bytes went (per-model VRAM/disk tiers included); `blazar prune --orphans/--unused` reclaims (dry-run by default).
 
 ### Federation
 
@@ -270,6 +274,10 @@ SHA-256 verification, capability probing, side-by-side installs, explicit activa
 ### Diagnostics and observability
 
 `blazar doctor` checks system, GPU, engines, models, and channels with corrective hints. `blazar why` explains request behavior from trace data. `blazar explain <model>` prints the effective-config card where every value names its source. `blazar model-doctor <model>` runs real probes (chat, streaming, strict JSON schema, tool-call elicitation, embeddings) and stores a capability certificate. `/api/capacity` gives a live per-GPU census; `/metrics` and OTLP export cover telemetry; audit JSONL and PII scrubbing are built in.
+
+### Web console and the ComputeFabric read-model
+
+`http://127.0.0.1:11435/ui` is a zero-dependency, offline console served by the daemon itself — dashboard (TTFT/TPOT quantiles, cache hit rates, live engines), models, engine inventory, compute (GPU census with per-device tenants and remote peers), stored benchmarks, jobs, and sessions. It only composes existing read-only endpoints, so the page can never mutate state. `/api/fabric` exposes the same ComputeFabric inventory as JSON — CPU, GPUs (live `nvidia-smi` census with manifest fallback), residents joined to their device, external GPU processes, installed engines, and federated peers — a read model by design: it answers "what is there and what is it doing", it never moves work. `/api/quantiles` gives p50/p95/p99 latency blocks (warm/cold split) and cache counters; `/api/benchmarks` lists every stored benchmark and tuning record without re-running anything.
 
 ### Security and network behavior
 
@@ -328,13 +336,18 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 |---|---|
 | Start gateway | `blazar serve` |
 | Run a model | `blazar run <model>` |
+| Run with a workload posture | `blazar run <model> --intent agent` |
+| Preview a model before running | `blazar plan <model>` |
+| One-page perf + quality card | `blazar scorecard <model>` |
+| One-word config posture | `blazar config preset balanced` |
+| Observe → recommend per model | `blazar autopilot`, `blazar autopilot --apply` |
 | Pull / import models | `blazar pull <target>`, `blazar import <file> --name <name>` |
 | Inspect models | `blazar list`, `blazar show <model>`, `blazar ps` |
 | Launch an AI CLI | `blazar launch <command>` |
-| Connect AI clients | `blazar connect --write` |
+| Connect AI clients | `blazar connect --write` (Claude Code, Codex, Continue, Cline, Open WebUI, opencode, pi) |
 | Explain serving config | `blazar explain <model>` |
 | Certify capabilities | `blazar model-doctor <model>` |
-| Check health | `blazar doctor`, `blazar why`, `blazar watch` |
+| Check health / heal | `blazar doctor`, `blazar doctor --fix`, `blazar why`, `blazar watch` |
 | Preview fit / co-residency | `blazar fit <target>`, `blazar coreside` |
 | Manage engines | `blazar engine update / list / use / rollback / install / build / prune` |
 | Federate | `blazar warm`, `blazar replicate`, `blazar route` |
