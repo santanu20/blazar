@@ -122,7 +122,14 @@ pub fn translate_format(format: &Value) -> Option<Value> {
     match format {
         Value::String(s) if s == "json" => Some(json!({"type": "json_object"})),
         // Structured schema: ollama accepts a raw JSON schema in format.
-        Value::Object(_) => Some(json!({"type": "json_schema", "json_schema": {"schema": format}})),
+        // `name` is synthesized: the OpenAI shape requires it and
+        // sglang's pydantic union hard-rejects its absence (6
+        // validation errors, live-receipted) while llama.cpp ignores
+        // it — one synthesized name keeps every child happy.
+        Value::Object(_) => Some(json!({
+            "type": "json_schema",
+            "json_schema": {"name": "blazar_format", "schema": format}
+        })),
         _ => None,
     }
 }
