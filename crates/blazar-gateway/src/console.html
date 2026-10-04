@@ -278,7 +278,7 @@ function renderBenchmarks(d) {
 
 function renderJobs(d) {
   if (d.jobsErr) { $("jobs-body").innerHTML = errorRow(d.jobsErr.message); return; }
-  const list = Array.isArray(d.jobs) ? d.jobs : (d.jobs && d.jobs.jobs) || [];
+    const list = Array.isArray(d.jobs) ? d.jobs : (d.jobs && d.jobs.data) || (d.jobs && d.jobs.jobs) || [];
   const rows = list.map((j) => [
     `<b>${esc(j.id)}</b>`, val(j.kind), val(j.state, (s) =>
       `<span class="${s === "done" ? "ok" : s === "failed" ? "err" : "warn"}">${esc(s)}</span>`),
