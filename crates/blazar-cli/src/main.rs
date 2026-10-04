@@ -7755,6 +7755,28 @@ struct AutopilotRec {
 /// (diffusion/video lanes have no chat pp/tg to measure); output is
 /// ordered onboarding work. A model with every record fresh gets an
 /// EMPTY list, never a busywork rec.
+/// Encoder-only architecture classes in Blazar's own normalized arch
+/// vocabulary (GGUF metadata). llama-bench measures generative decode
+/// (pp/tg); these families generate nothing to measure and llama-bench
+/// on them aborts after a long CUDA init (observed live: hours-class
+/// hangs on embedders/rerankers). Generative families that merely LOOK
+/// related (`Qwen3_5ForConditionalGeneration`) stay benchable.
+#[must_use]
+fn bench_arch_refusal(arch: Option<&str>) -> Option<&'static str> {
+    const ENCODER_CLASSES: &[&str] = &[
+        "bert",
+        "modern-bert",
+        "nomic-bert",
+        "t5encoder",
+        "xlm-roberta",
+    ];
+    let arch = arch?;
+    ENCODER_CLASSES
+        .iter()
+        .copied()
+        .find(|c| arch.starts_with(c))
+}
+
 fn autopilot_recs(
     name: &str,
     benchable: bool,
@@ -7828,7 +7850,7 @@ async fn autopilot(apply: bool) -> Result<()> {
         .unwrap_or_default()
         .as_secs()
         .cast_signed();
-    let mut plan: Vec<(String, Vec<AutopilotRec>)> = Vec::new();
+    let mut plan: Vec<(String, Vec<AutopilotRec>, Option<String>)> = Vec::new();
     for row in &models {
         let bench_at = store
             .latest_bench_result(&row.name, None)
@@ -7848,16 +7870,29 @@ async fn autopilot(apply: bool) -> Result<()> {
             .map(|(_, tested, _)| tested);
         // Bench drives llama-bench, which reads GGUF files only —
         // recommending it for a safetensors/mlx model is busywork the
-        // bench itself must refuse; gate on format too.
+        // bench itself must refuse; gate on format too. Encoder-only
+        // arches (embedders, rerankers, MT) get an explicit
+        // not-applicable note instead of a rec they can never satisfy.
+        let arch_class = bench_arch_refusal(row.arch.as_deref());
         let benchable = matches!(run_lane(row), RunLane::Text)
+            && arch_class.is_none()
             && std::path::Path::new(&row.path)
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+        let bench_note = arch_class.map(|class| {
+            format!(
+                "bench: not applicable — encoder-only class '{class}'; \
+llama-bench measures generative decode; embedding speed is per-request in /metrics"
+            )
+        });
         let recs = autopilot_recs(&row.name, benchable, bench_at, tuned_at, cert_at, now);
-        plan.push((row.name.clone(), recs));
+        plan.push((row.name.clone(), recs, bench_note));
     }
-    for (name, recs) in &plan {
+    for (name, recs, bench_note) in &plan {
         println!("{name}");
+        if let Some(note) = bench_note {
+            println!("  {note}");
+        }
         if recs.is_empty() {
             println!("  up to date — measured, tuned, certified");
         }
@@ -7867,7 +7902,7 @@ async fn autopilot(apply: bool) -> Result<()> {
         println!();
     }
     if !apply {
-        let n: usize = plan.iter().map(|(_, r)| r.len()).sum();
+        let n: usize = plan.iter().map(|(_, r, _)| r.len()).sum();
         if n == 0 {
             println!("autopilot: nothing to do — every model is measured, tuned, and certified");
         } else {
@@ -7877,7 +7912,7 @@ async fn autopilot(apply: bool) -> Result<()> {
     }
     // Sequential on purpose: bench feeds tune, and one model's failure
     // must not starve the rest.
-    for (name, recs) in &plan {
+    for (name, recs, _) in &plan {
         for r in recs {
             println!("running: {}", r.cmd);
             let outcome: Result<()> = if r.cmd.starts_with("blazar bench ") {
@@ -11667,6 +11702,16 @@ fn bench(model: &str) -> Result<()> {
     if std::path::Path::new(&row.path).is_dir() {
         anyhow::bail!(dir_bench_refusal(&row.name, row.is_mlx()));
     }
+    if let Some(class) = bench_arch_refusal(row.arch.as_deref()) {
+        anyhow::bail!(
+            "blazar bench {0}: refused — arch '{1}' is encoder-only (class '{class}'); \
+llama-bench measures generative decode (pp/tg) and aborts on this family after \
+a long CUDA init. Embedding/rerank speed is measured live per request (/metrics, \
+`blazar scorecard {0}`); capabilities: `blazar model-doctor {0}`",
+            row.name,
+            row.arch.as_deref().unwrap_or("?")
+        );
+    }
     let bench_bin = blazar_runtime::bench::find_bench_bin(&d)?;
     let tuner = blazar_runtime::Tuner {
         dirs: &d,
@@ -11722,6 +11767,17 @@ async fn tune_full(
     let row = store
         .get_model(model)?
         .ok_or_else(|| no_such_model(model))?;
+    // Same encoder-class refusal as `bench`: the tuner drives llama-bench
+    // under the hood, so the hours-class abort applies identically.
+    if let Some(class) = bench_arch_refusal(row.arch.as_deref()) {
+        anyhow::bail!(
+            "blazar tune {}: refused — arch '{}' is encoder-only (class '{class}'); \
+the tuner drives llama-bench, which measures generative decode (pp/tg) and \
+aborts on this family. Profile pins for it would measure nothing",
+            row.name,
+            row.arch.as_deref().unwrap_or("?")
+        );
+    }
     // The bench lane drives llama-bench, so the engine row must be a
     // llamacpp lane — the ACTIVE row may be any kind (a store flipped
     // by an sglang session would otherwise compile llamacpp argv
@@ -19290,6 +19346,40 @@ mod tests {
         assert_eq!(connect_default_tier(false, Some(true), true), 0);
         assert_eq!(connect_default_tier(true, Some(false), true), 0);
         assert_eq!(connect_default_tier(true, None, false), 1);
+    }
+
+    #[test]
+    fn unit__bench_arch_refusal__encoder_classes_only() {
+        // Encoder-only families in Blazar's normalized arch vocabulary
+        // can never produce pp/tg numbers — llama-bench aborts on them
+        // after a long CUDA init (observed live, hours-class).
+        for arch in [
+            "bert",
+            "bert-large",
+            "modern-bert",
+            "nomic-bert",
+            "t5encoder",
+            "xlm-roberta",
+        ] {
+            assert!(
+                bench_arch_refusal(Some(arch)).is_some(),
+                "{arch} must be refused"
+            );
+        }
+        // Generative look-alikes and unknown/absent arches stay benchable:
+        // the gate must never block a family it cannot identify.
+        for arch in [
+            Some("qwen2"),
+            Some("qwen3"),
+            Some("Qwen3_5ForConditionalGeneration"),
+            Some("gpt-oss"),
+            None,
+        ] {
+            assert!(
+                bench_arch_refusal(arch).is_none(),
+                "{arch:?} must stay benchable"
+            );
+        }
     }
 
     #[test]
