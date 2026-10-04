@@ -1,16 +1,16 @@
 {
  "object": "blazar.toolcall-eval",
- "timestamp": "2026-10-04T17:48:27+00:00",
+ "timestamp": "2026-10-04T18:27:05+00:00",
  "base": "http://127.0.0.1:11435",
  "version": {
   "name": "blazar",
   "version": "0.20.0"
  },
- "commit": "e5a53d5",
- "engine_first_model": null,
+ "commit": "0f72c21",
+ "engine_first_model": "sglang-0.5.21",
  "models": {
-  "qwen3.5-9b": {
-   "passed": 9,
+  "qwen3-1.7b": {
+   "passed": 8,
    "total": 9,
    "results": [
     {
@@ -46,25 +46,25 @@
     },
     {
      "test": "T7 strict json_schema output",
-     "ok": true,
-     "evidence": "status=200 content='{\\n  \"city\": \"Oslo\",\\n  \"temp_c\": 8\\n}'"
+     "ok": false,
+     "evidence": "status=400 content='None'"
     },
     {
      "test": "T8 streaming tool deltas",
      "ok": true,
-     "evidence": "streams=[['{\"city\":\"Berlin\"}']]"
+     "evidence": "streams=[['{\"city\": \"Berlin\"}']]"
     },
     {
      "test": "L1 tools-vs-no-tools latency (p50 of 3)",
      "ok": true,
-     "evidence": "with=223ms without=100ms delta=+123ms (prompt-token cost of carrying 3 tool schemas; gateway transport is the same path)",
+     "evidence": "with=147ms without=146ms delta=+1ms (prompt-token cost of carrying 3 tool schemas; gateway transport is the same path)",
      "measured": {
-      "with_tools_ms": 223,
-      "no_tools_ms": 100
+      "with_tools_ms": 147,
+      "no_tools_ms": 146
      }
     }
    ]
   }
  },
- "reproduce": "python3 scripts/toolcall_eval.py qwen3.5-9b"
+ "reproduce": "python3 scripts/toolcall_eval.py qwen3-1.7b"
 }
