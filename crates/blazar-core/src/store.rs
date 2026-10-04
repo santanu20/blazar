@@ -25,7 +25,11 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 10;
+// v11 adds `bench_results` (plain-bench payloads persisted by
+// `blazar bench`; scorecards fall back to it when no tuned profile
+// carries benchmark_json). Purely additive — CREATE TABLE IF NOT
+// EXISTS inside the migration batch covers both fresh and old stores.
+const SCHEMA_VERSION: i32 = 11;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -130,6 +134,13 @@ CREATE TABLE IF NOT EXISTS model_caps (
     caps_json  TEXT NOT NULL,
     PRIMARY KEY (model, engine_tag)
 );
+CREATE TABLE IF NOT EXISTS bench_results (
+    model        TEXT NOT NULL,
+    engine_tag   TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (model, engine_tag)
+);
 ";
 
 /// Row shapes shared across crates.
@@ -182,6 +193,28 @@ impl EngineRow {
             crate::engine_kind::LaneClass::Mainstream
         }
     }
+}
+
+/// UTC calendar date (`YYYY-MM-DD`) for an epoch-seconds stamp.
+/// Scorecards and capability certificates cite verification dates;
+/// sharing one implementation keeps the CLI and gateway citing the
+/// same calendar without a date dependency. Civil-calendar inverse of
+/// the epoch day count (Hinnant's `civil_from_days`); pinned against
+/// known dates including a leap day and a non-leap century year.
+#[must_use]
+pub fn epoch_to_utc_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -326,6 +359,16 @@ fn default_shards() -> i64 {
     1
 }
 
+#[derive(Debug, Clone)]
+/// One row of the `bench_results` table — the durable plain-bench
+/// history `blazar bench` upserts (model + lane keyed).
+pub struct BenchResultRow {
+    pub model: String,
+    pub engine_tag: String,
+    pub payload_json: String,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProfileRow {
     pub model_name: String,
@@ -440,6 +483,10 @@ impl Store {
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < SCHEMA_VERSION {
             self.conn.execute_batch(SCHEMA_SQL)?;
+            // v10→v11: `bench_results` (plain-bench persistence) is
+            // CREATE-TABLE-IF-NOT-EXISTS in SCHEMA_SQL — nothing more
+            // to do here; the version bump replays the batch on
+            // existing stores.
             // v4 added engines.kind. CREATE TABLE IF NOT EXISTS covers
             // fresh databases; existing ones need the explicit ALTER.
             if !self.table_columns("engines")?.contains(&"kind".to_string()) {
@@ -923,6 +970,119 @@ impl Store {
             })
     }
 
+    /// Same record as [`get_model_caps`] with its `tested_at` epoch stamp —
+    /// scorecards cite the verification date, so it travels with the caps.
+    pub fn get_model_caps_dated(&self, model: &str) -> CoreResult<Option<(String, i64, String)>> {
+        self.conn
+            .query_row(
+                "SELECT engine_tag, tested_at, caps_json FROM model_caps WHERE model = ?1",
+                params![model],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    // ---- bench result records -----------------------------------------
+    // `blazar bench` upserts its measured rows here (tune-owned launch
+    // profiles keep their richer payload in `profiles.benchmark_json`;
+    // this table is the plain-bench history scorecards fall back to).
+
+    pub fn put_bench_result(
+        &self,
+        model: &str,
+        engine_tag: &str,
+        payload_json: &str,
+    ) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO bench_results (model, engine_tag, payload_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(model, engine_tag) DO UPDATE SET
+               payload_json = excluded.payload_json, updated_at = excluded.updated_at",
+            params![model, engine_tag, payload_json, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    /// Latest plain-bench payload for a model — `engine_tag = Some`
+    /// pins the lane, `None` takes the most recent across lanes.
+    pub fn latest_bench_result(
+        &self,
+        model: &str,
+        engine_tag: Option<&str>,
+    ) -> CoreResult<Option<(String, String, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT engine_tag, payload_json, updated_at FROM bench_results
+                 WHERE model = ?1 AND (?2 IS NULL OR engine_tag = ?2)
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![model, engine_tag],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// Every plain-bench payload on record — one query for the console's
+    /// Benchmarks view instead of a per-model lookup per row.
+    pub fn list_bench_results(&self) -> CoreResult<Vec<BenchResultRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, engine_tag, payload_json, updated_at FROM bench_results
+             ORDER BY model, engine_tag",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(BenchResultRow {
+                    model: r.get(0)?,
+                    engine_tag: r.get(1)?,
+                    payload_json: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every tuned launch profile on record — pairs with
+    /// `list_bench_results` to show measured vs tuned per model + lane.
+    pub fn list_profiles(&self) -> CoreResult<Vec<ProfileRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model_name, engine_tag, args_hash, args_json, benchmark_json, updated_at
+             FROM profiles ORDER BY model_name, engine_tag",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ProfileRow {
+                    model_name: r.get(0)?,
+                    engine_tag: r.get(1)?,
+                    args_hash: r.get(2)?,
+                    args_json: r.get(3)?,
+                    benchmark_json: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -1035,6 +1195,24 @@ impl Store {
             return Err(CoreError::Store(rusqlite::Error::QueryReturnedNoRows));
         }
         Ok(())
+    }
+
+    /// Kind of a specific engine tag, retired or active — capability
+    /// certificates store only the tag, and tags are arbitrary build
+    /// strings (`b11370-cuda`, `mlx-0.32.0`); the kind comparison the
+    /// certificate gate needs lives here. `None` when the row is gone
+    /// or its kind no longer parses (callers fail open).
+    pub fn engine_kind_of_tag(&self, tag: &str) -> CoreResult<Option<EngineKind>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind FROM engines WHERE tag = ?")?;
+        let mut rows = stmt.query([tag])?;
+        if let Some(r) = rows.next()? {
+            let raw: String = r.get(0)?;
+            Ok(EngineKind::from_str(&raw).ok())
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn active_engine(&self) -> CoreResult<Option<EngineRow>> {
@@ -1774,6 +1952,112 @@ mod tests {
         s.insert_job(&job_row("upgrade_probe", "audio", "queued", 1000))
             .unwrap();
         assert!(s.get_job("upgrade_probe").unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__model_caps_dated__round_trips_with_stamp() {
+        let (_tmp, s) = tmp_store();
+        assert!(s.get_model_caps_dated("m1").unwrap().is_none());
+        s.put_model_caps("m1", "llamacpp-b1", "{\"caps\":{}}")
+            .unwrap();
+        let (tag, tested_at, caps_json) = s
+            .get_model_caps_dated("m1")
+            .unwrap()
+            .expect("row exists after put");
+        assert_eq!(tag, "llamacpp-b1");
+        assert!(
+            tested_at > 1_700_000_000,
+            "stamp is a real epoch: {tested_at}"
+        );
+        assert_eq!(caps_json, "{\"caps\":{}}");
+        // Undated view stays consistent with the dated one.
+        assert_eq!(s.get_model_caps("m1").unwrap().unwrap().0, tag);
+    }
+
+    #[test]
+    fn unit__bench_results__round_trip_pinned_then_latest_any() {
+        let (_tmp, s) = tmp_store();
+        assert!(s.latest_bench_result("m1", None).unwrap().is_none());
+        s.put_bench_result("m1", "lane-a", "[]").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        s.put_bench_result("m1", "lane-b", "[]").unwrap();
+        // Pinned lookup is exact; unpinned takes the most recent.
+        let (tag, payload, _) = s
+            .latest_bench_result("m1", Some("lane-a"))
+            .unwrap()
+            .expect("pinned row exists");
+        assert_eq!((tag.as_str(), payload.as_str()), ("lane-a", "[]"));
+        let (tag, _, _) = s
+            .latest_bench_result("m1", None)
+            .unwrap()
+            .expect("any row exists");
+        assert_eq!(tag, "lane-b", "latest across lanes wins: {tag}");
+        // Upsert, not append: re-benching the same (model, lane) replaces.
+        s.put_bench_result("m1", "lane-a", "[{\"ts\":1}]").unwrap();
+        let (tag, payload, _) = s
+            .latest_bench_result("m1", Some("lane-a"))
+            .unwrap()
+            .expect("row exists after upsert");
+        assert_eq!((tag.as_str(), payload.as_str()), ("lane-a", "[{\"ts\":1}]"));
+    }
+
+    #[test]
+    fn unit__list_bench_results_and_profiles__single_query_inventories() {
+        let (_tmp, s) = tmp_store();
+        s.put_bench_result("m2", "lane-b", "[]").unwrap();
+        s.put_bench_result("m1", "lane-a", "[]").unwrap();
+        let listed = s.list_bench_results().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| (r.model.as_str(), r.engine_tag.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("m1", "lane-a"), ("m2", "lane-b")],
+            "sorted by model then lane"
+        );
+        assert!(s.list_profiles().unwrap().is_empty());
+        s.upsert_profile(&ProfileRow {
+            model_name: "m1".into(),
+            engine_tag: "lane-a".into(),
+            args_hash: "h".into(),
+            args_json: "{}".into(),
+            benchmark_json: None,
+            updated_at: 7,
+        })
+        .unwrap();
+        let profiles = s.list_profiles().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            (profiles[0].model_name.as_str(), profiles[0].updated_at),
+            ("m1", 7)
+        );
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v10_to_v11() {
+        // Simulate a v10 database: no bench_results table, user_version 10.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE bench_results; PRAGMA user_version = 10;")
+                .unwrap();
+        }
+        // Reopen: migrate() recreates the table, stamps v11, and the
+        // accessors work on the upgraded store (the exact gap the live
+        // bench hit: version-gated schema replay).
+        let s = Store::open(&dirs).unwrap();
+        let v: i32 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        s.put_bench_result("m1", "lane-a", "[]").unwrap();
+        assert!(s.latest_bench_result("m1", None).unwrap().is_some());
     }
 
     #[test]
