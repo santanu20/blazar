@@ -312,7 +312,7 @@ pub async fn run(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     };
 
     // Static caps never spawn a child: vision is a pulled-mmproj fact,
-    // thinking is a chat-template fact.
+    // thinking is a chat-template fact, classify is an arch fact.
     let vision = if row.mmproj_path.is_some() {
         Verdict {
             status: "PASS",
@@ -320,6 +320,16 @@ pub async fn run(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         }
     } else {
         na("no mmproj pulled — vision requests would be text-only".to_string())
+    };
+    // Decision-class checkpoint: the /v1/classify lane is its surface.
+    // Probed live below for modern-bert rows; everything else is an
+    // honest N/A (a generative model is not a classifier).
+    let classify_static = if row.arch.as_deref() == Some("modern-bert") {
+        None // probe live
+    } else {
+        Some(na(
+            "not a decision-class model (arch != modern-bert)".to_string()
+        ))
     };
     let think = if crate::ollama::template_supports_thinking_cached(&row) {
         Verdict {
@@ -344,6 +354,7 @@ pub async fn run(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         model.clone(),
         vision,
         think,
+        classify_static,
     ));
 
     axum::Json(json!({
@@ -396,6 +407,7 @@ async fn run_probes(
     model: String,
     vision: Verdict,
     think: Verdict,
+    classify: Option<Verdict>,
 ) {
     state.jobs.record_running(&state, &id);
     let started = Instant::now();
@@ -570,6 +582,63 @@ async fn run_probes(
         json!({"status": v_tools.status, "receipt": v_tools.receipt}),
     );
     caps.insert("tools".into(), verdict_json(&v_tools));
+
+    // classify — the decision-model lane (modern-bert arch only; static
+    // N/A above for everything else). Rides the in-process handler so
+    // the probe crosses the exact public contract, spawn included.
+    let v_classify = match classify {
+        Some(v) => v,
+        None => {
+            if row_cancelled(&state) {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                fail("overall time budget exhausted".to_string())
+            } else {
+                let body = json!({
+                    "model": model,
+                    "input": "The assistant answered a factual question directly.",
+                    "labels": ["appropriate", "evasive"],
+                });
+                let bytes = axum::body::Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+                match tokio::time::timeout(
+                    PROBE_TIMEOUT.min(remaining),
+                    crate::classify::classify(
+                        axum::extract::State(std::sync::Arc::clone(&state)),
+                        bytes,
+                    ),
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let rb = resp.into_body();
+                        let raw = axum::body::to_bytes(rb, 1024 * 1024)
+                            .await
+                            .unwrap_or_default();
+                        let parsed: Option<serde_json::Value> = serde_json::from_slice(&raw).ok();
+                        let top = parsed
+                            .as_ref()
+                            .and_then(|v| v.get("top")?.as_str())
+                            .map(str::to_string);
+                        match (status.is_success(), top) {
+                            (true, Some(top)) => pass(format!("200, top label: {top}")),
+                            _ => fail(format!("HTTP {status}: {}", excerpt(&raw, 160))),
+                        }
+                    }
+                    Err(_) => fail(format!("no completion within {}s", PROBE_TIMEOUT.as_secs())),
+                }
+            }
+        }
+    };
+    state.jobs.record_event(
+        &state,
+        &id,
+        "probe:classify",
+        json!({"status": v_classify.status, "receipt": v_classify.receipt}),
+    );
+    caps.insert("classify".into(), verdict_json(&v_classify));
 
     // embeddings — separate handler, honest N/A on lane refusal.
     let v_embed = {

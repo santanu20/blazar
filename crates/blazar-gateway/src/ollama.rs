@@ -1781,7 +1781,10 @@ async fn proxy_core_chat(
         // null) — native tool calls die inside the child. The
         // gateway-rendered tool grammar on the raw completion lane never
         // enters that code path, so tool requests on the mlx lane route
-        // here even under the default `child` recipe.
+        // here even under the default `child` recipe. (sglang's
+        // equivalent marker-as-prose bug is fixed at the spawn instead —
+        // `--tool-call-parser auto` — because the recipe's GBNF grammar
+        // is llama.cpp-only and native parsing is the stronger lane.)
         let mlx_tools = engine.kind == blazar_core::engine_kind::EngineKind::Mlx
             && parsed
                 .as_ref()

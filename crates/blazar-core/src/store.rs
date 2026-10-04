@@ -957,9 +957,14 @@ impl Store {
     }
 
     pub fn get_model_caps(&self, model: &str) -> CoreResult<Option<(String, String)>> {
+        // Latest verification wins: certs are keyed (model, engine_tag),
+        // so a model served by two lanes carries two rows — admission
+        // and scorecards must read the most recent measurement, not
+        // whichever row SQLite happens to return first.
         self.conn
             .query_row(
-                "SELECT engine_tag, caps_json FROM model_caps WHERE model = ?1",
+                "SELECT engine_tag, caps_json FROM model_caps WHERE model = ?1 \
+                 ORDER BY tested_at DESC LIMIT 1",
                 params![model],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
@@ -975,7 +980,8 @@ impl Store {
     pub fn get_model_caps_dated(&self, model: &str) -> CoreResult<Option<(String, i64, String)>> {
         self.conn
             .query_row(
-                "SELECT engine_tag, tested_at, caps_json FROM model_caps WHERE model = ?1",
+                "SELECT engine_tag, tested_at, caps_json FROM model_caps WHERE model = ?1 \
+                 ORDER BY tested_at DESC LIMIT 1",
                 params![model],
                 |r| {
                     Ok((

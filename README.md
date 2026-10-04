@@ -339,6 +339,7 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | Start gateway | `blazar serve` |
 | Run a model | `blazar run <model>` |
 | Run with a workload posture | `blazar run <model> --intent agent` |
+| One-shot decision scoring | `blazar classify <model> "text" --labels safe,unsafe` |
 | Preview a model before running | `blazar plan <model>` |
 | One-page perf + quality card | `blazar scorecard <model>` |
 | One-word config posture | `blazar config preset balanced` |

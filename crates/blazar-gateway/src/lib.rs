@@ -9,6 +9,7 @@ pub mod bestof;
 pub mod cache_bust;
 pub mod capacity;
 pub mod cascade;
+pub mod classify;
 pub mod console;
 pub mod explain;
 pub mod fabric;
@@ -352,6 +353,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/responses/input_tokens", post(openai::openai_proxy))
         .route("/v1/systemone", post(openai::openai_proxy))
+        .route("/v1/classify", post(classify::classify))
         .route("/responses/input_tokens", post(openai::openai_proxy))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         .route("/tokenize", post(openai::openai_proxy))

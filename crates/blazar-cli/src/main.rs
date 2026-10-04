@@ -176,6 +176,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// One-shot classification through a decision model (Laya-class
+    /// system-one classifiers): the input plus candidate labels in, a
+    /// calibrated label distribution out — no prose generation
+    Classify {
+        /// Decision model to consult (e.g. laya)
+        model: String,
+        /// The text to classify (state for the decision model)
+        text: Vec<String>,
+        /// 2..=16 candidate labels, comma-separated
+        #[arg(long, value_delimiter = ',')]
+        labels: Vec<String>,
+        /// Emit the normalized JSON card instead of the table
+        #[arg(long)]
+        json: bool,
+    },
     /// Interactive loop against a model, by kind: text chats (streams;
     /// /exit /clear /model /sysinfo /profile), diffusion sets generate
     /// images or video, pulled piper voices write WAV clips; with an
@@ -916,7 +931,9 @@ An unknown key or bad value is rejected with the file unchanged.";
 const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Serve & Chat",
-        &["serve", "run", "ps", "stop", "launch", "session"],
+        &[
+            "serve", "run", "ps", "classify", "stop", "launch", "session",
+        ],
     ),
     (
         "Model Management",
@@ -1841,6 +1858,12 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::List { json } => list(json),
         Cmd::Show { model, json } => show(&resolve_model_cli(&model), json),
         Cmd::Ps { reset, json } => ps(reset, json).await,
+        Cmd::Classify {
+            model,
+            text,
+            labels,
+            json,
+        } => classify_cmd(&model, &text, &labels, json).await,
         Cmd::Run {
             model,
             prompt,
@@ -7447,6 +7470,7 @@ fn scorecard_caps_rows(caps_raw: &str) -> Option<Vec<(String, String)>> {
             "embeddings",
             "vision",
             "think",
+            "classify",
         ]
         .iter()
         .map(|k| {
@@ -8080,6 +8104,56 @@ fn ps_row_cells(m: &serde_json::Value) -> (String, String, String) {
         None => "-".to_string(),
     };
     (gpu, spec, hit)
+}
+
+/// `blazar classify` — one-shot decision-model consultation: the
+/// normalized /v1/classify lane over the child's systemone surface.
+async fn classify_cmd(model: &str, text: &[String], labels: &[String], json: bool) -> Result<()> {
+    if text.is_empty() {
+        bail!(
+            "classify needs the text to classify — blazar classify <model> \"the text\" --labels a,b"
+        );
+    }
+    if labels.len() < 2 {
+        bail!("classify needs 2..=16 labels — --labels safe,unsafe,unclear");
+    }
+    let base = ensure_daemon().await?;
+    let body = serde_json::json!({
+        "model": resolve_model_cli(model),
+        "input": text.join(" "),
+        "labels": labels,
+    });
+    let resp = cli_http()
+        .post(format!("{base}/v1/classify"))
+        .json(&body)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        let msg = v["error"]["message"]
+            .as_str()
+            .or_else(|| v["error"].as_str())
+            .unwrap_or("no detail");
+        bail!("classify failed ({status}): {msg}");
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!("model       {}", v["model"].as_str().unwrap_or(model));
+    println!();
+    for l in v["labels"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let pct = l["probability"].as_f64().unwrap_or(0.0) * 100.0;
+        println!("{:<24} {:>5.1}%", l["label"].as_str().unwrap_or("-"), pct);
+    }
+    println!();
+    println!("top         {}", v["top"].as_str().unwrap_or("-"));
+    if let Some(c) = v["confidence"].as_f64() {
+        println!("confidence  {c:.3}");
+    }
+    Ok(())
 }
 
 async fn ps(reset: bool, json: bool) -> Result<()> {
@@ -19192,7 +19266,8 @@ mod tests {
                 "tools",
                 "embeddings",
                 "vision",
-                "think"
+                "think",
+                "classify"
             ],
             "certificate probe order is fixed"
         );
