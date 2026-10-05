@@ -355,6 +355,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     let cache = json!({
         "kv_k": kv_key_label,
         "kv_v": kv_value_label,
+        "kv_advisory": kv_advisory(shape, kv_k.as_str(), requested, resident_ctx),
         "semantic_cache": {
             "enabled": state.config.semantic_cache.enabled,
             "model": state.config.semantic_cache.model,
@@ -397,6 +398,69 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         "residents": residents,
     });
     (StatusCode::OK, axum::Json(card)).into_response()
+}
+
+/// C3 per-phase KV-quant advisory for the explain card. llama.cpp
+/// documents the ladder as f16 (lossless, largest KV footprint) >
+/// `q8_0` (near-lossless, roughly half the footprint) > `q4_0`
+/// (measurable quality impact, quarter footprint). The advisory says
+/// which tier the config sits at and when one step down pays; it never
+/// invents byte counts (per-token KV size depends on the model's
+/// layer/head geometry, which this card does not read).
+fn kv_advisory(
+    shape: blazar_core::engine_kind::FormatShape,
+    kv_k: &str,
+    requested_ctx: u32,
+    resident_ctx: Option<u32>,
+) -> Value {
+    if shape.shards == blazar_core::engine_kind::ShardFormat::MlxLayout {
+        return json!({
+            "applies": false,
+            "reason": "mlx runtime owns KV quantization (kv-bits / kv-group-size via argv)",
+        });
+    }
+    let ctx_in_play = resident_ctx.unwrap_or(requested_ctx);
+    let long_ctx = ctx_in_play >= 32_768;
+    let (grade, next_step, why) = if kv_k.is_empty() {
+        (
+            "f16 (engine auto ladder)",
+            Some("cache_type_k = \"q8_0\" + cache_type_v = \"q8_0\""),
+            if long_ctx {
+                "effective ctx >= 32k: q8_0 KV roughly halves the KV footprint with \
+                 near-lossless quality — the standard first step when ctx or VRAM is tight"
+            } else {
+                "KV stays f16 unless ctx or VRAM pressure appears (q8_0 is the first \
+                 step when it does)"
+            },
+        )
+    } else if kv_k.eq_ignore_ascii_case("q8_0") {
+        (
+            "q8_0",
+            Some("cache_type_* = \"q4_0\" (only when VRAM-bound and quality-tolerant)"),
+            "already at the near-lossless tier; q4_0 trades measurable quality for a \
+             quarter of the f16 footprint",
+        )
+    } else if kv_k.eq_ignore_ascii_case("q4_0") {
+        (
+            "q4_0",
+            None,
+            "most aggressive KV tier; stepping back up to q8_0 restores quality if \
+             generations degrade",
+        )
+    } else {
+        (
+            kv_k,
+            None,
+            "custom cache_type_k grade; ladder advice does not apply",
+        )
+    };
+    json!({
+        "applies": true,
+        "current": grade,
+        "effective_ctx": ctx_in_play,
+        "next_step": next_step,
+        "why": why,
+    })
 }
 
 #[cfg(test)]

@@ -33,6 +33,7 @@ pub(crate) const STRIP_REQUEST: &[&str] = &[
     "x-blazar-priority",
     "x-blazar-num-ctx",
     "x-blazar-enforce",
+    "x-blazar-failover-attempt",
     "accept-encoding",
 ];
 pub(crate) const STRIP_RESPONSE: &[&str] = &[
@@ -912,6 +913,16 @@ pub async fn proxy_request(
     if load_ms > 100 {
         builder = builder.header("x-blazar-status", "loading");
     }
+    // Structured-output receipt (E2-δ): successful responses that rode
+    // a constraint say WHICH one — clients auditing schema conformance
+    // get a machine-readable guarantee marker instead of inferring
+    // from the body shape. Error responses carry no receipt (the
+    // constraint was not served).
+    if status.is_success()
+        && let Some(kind) = structured_output_kind(parsed.as_ref())
+    {
+        builder = builder.header("x-blazar-structured-output", kind);
+    }
     // Sentinel (semantic reliability layer): warn-only observation of
     // response semantics. Bytes are cloned onto a bounded side-channel;
     // parsing and detection run off the hot path, and an overloaded or
@@ -1150,6 +1161,18 @@ pub async fn proxy_request(
                 // R6: buffered non-stream chat — classify from the exact
                 // JSON (no substring heuristics on this path).
                 record_buffered_chat(&state.obs, model, &buf, began.elapsed().as_secs_f64());
+                // Metadata cards: the one buffered site where the full
+                // completion body and the original request parse are in
+                // hand — persist the id→metadata card when the caller
+                // tagged the create.
+                if path_query.starts_with("/v1/chat/completions") {
+                    crate::metadata_card::persist_from_response(
+                        state,
+                        model,
+                        parsed.as_ref(),
+                        &buf,
+                    );
+                }
                 if let Some(feed) = suppress_feed.take() {
                     // RAW engine bytes (pre-suppression): sentinel
                     // detections judge what the engine actually returned.
@@ -1928,6 +1951,33 @@ fn normalize_system_first_in_value(v: &mut serde_json::Value) -> bool {
 
 fn is_system_message(m: &serde_json::Value) -> bool {
     m.get("role").and_then(serde_json::Value::as_str) == Some("system")
+}
+
+/// Which output constraint a request body carries, as the receipt
+/// value for `x-blazar-structured-output`. `json_schema` and
+/// `json_object` come from the `OpenAI` `response_format` field; `gbnf`
+/// from a raw grammar (llama.cpp lane passthrough). `None` = the
+/// request asked for no constraint (plain text is not a receipt).
+#[must_use]
+pub fn structured_output_kind(v: Option<&serde_json::Value>) -> Option<&'static str> {
+    let v = v?;
+    if let Some(t) = v
+        .pointer("/response_format/type")
+        .and_then(serde_json::Value::as_str)
+    {
+        match t {
+            "json_schema" => return Some("json_schema"),
+            "json_object" => return Some("json_object"),
+            _ => {}
+        }
+    }
+    if v.get("grammar")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|g| !g.is_empty())
+    {
+        return Some("gbnf");
+    }
+    None
 }
 
 /// Classify a fully-buffered non-stream chat body (enforce path) from
@@ -2881,6 +2931,45 @@ mod cache_obs_tests {
     }
 
     // --- record_buffered_chat -------------------------------------------
+
+    #[test]
+    fn unit__structured_output_kind__dialect_vocabulary() {
+        use serde_json::json;
+        // json_schema via response_format.type
+        assert_eq!(
+            structured_output_kind(Some(&json!({
+                "response_format": {"type": "json_schema", "json_schema": {"name": "x"}}
+            }))),
+            Some("json_schema")
+        );
+        // json_object
+        assert_eq!(
+            structured_output_kind(Some(&json!({"response_format": {"type": "json_object"}}))),
+            Some("json_object")
+        );
+        // raw grammar passthrough (R9)
+        assert_eq!(
+            structured_output_kind(Some(&json!({"grammar": "root ::= [0-9]+"}))),
+            Some("gbnf")
+        );
+        // response_format wins over an (unusual) co-present grammar
+        assert_eq!(
+            structured_output_kind(Some(&json!({
+                "response_format": {"type": "json_object"},
+                "grammar": "root ::= \"a\""
+            }))),
+            Some("json_object")
+        );
+        // plain text is NOT a constraint — no receipt
+        assert_eq!(
+            structured_output_kind(Some(&json!({"response_format": {"type": "text"}}))),
+            None
+        );
+        assert_eq!(structured_output_kind(Some(&json!({"messages": []}))), None);
+        assert_eq!(structured_output_kind(None), None);
+        // empty grammar = absent
+        assert_eq!(structured_output_kind(Some(&json!({"grammar": ""}))), None);
+    }
 
     #[test]
     fn unit__record_buffered_chat__usage_records_warm() {

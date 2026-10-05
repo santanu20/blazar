@@ -1962,6 +1962,18 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
     }
 
+    // --- 15b. props endpoint: llama-server gates POST /props behind a
+    // spawn flag (model/template capability discovery for clients).
+    // Default-on read-only surface — warn-skip on engines without it.
+    if input.supported_flags.contains("--props") {
+        argv.push("--props".into());
+    } else {
+        warnings.push(
+            "props endpoint skipped: engine lacks --props (POST /props unavailable; engine update recommended)"
+                .into(),
+        );
+    }
+
     // --- 16. YaRN context extension (explicitly configured; emit-then-gate
     // so an ancient engine names the missing flag instead of silently
     // running at base ctx).
@@ -6348,6 +6360,7 @@ mod tests {
             "--port",
             "--alias",
             "--jinja",
+            "--props",
             "--device",
             "--lookup-cache-static",
             "--lookup-cache-dynamic",

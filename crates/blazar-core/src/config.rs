@@ -668,6 +668,14 @@ pub struct Config {
     /// `<remote>:<model>` route there instead of loading locally.
     #[serde(default)]
     pub remotes: Vec<Remote>,
+    /// Ordered failover chains (`[[failover]]`): a virtual `alias`
+    /// served by the first healthy target, escalating on failure with
+    /// anti-flap benching. See `FailoverChain`.
+    #[serde(default)]
+    pub failover: Vec<FailoverChain>,
+    /// Registered MCP stdio servers (gateway-side tool catalog).
+    #[serde(default)]
+    pub mcp: Vec<McpServer>,
     /// Federation fallback: when a requested model is absent from the
     /// local store but a `[[remotes]]` peer lists it (`/v1/models`
     /// presence), the request routes there instead of 404ing. Kill
@@ -1898,6 +1906,68 @@ pub struct Remote {
     pub key: String,
 }
 
+/// One hop of a failover chain: either a locally served model or a
+/// `[[remotes]]` entry (which itself carries the URL/key). Chains are
+/// tried in order; a failed hop is benched for the chain's
+/// `min_residence_secs` before it is eligible again (anti-flap).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverTarget {
+    /// Name of a `[[remotes]]` entry; absent = local model.
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// Model the hop serves (local model name, or the remote's model).
+    pub model: String,
+}
+
+/// An ordered failover chain exposed under a virtual model `alias`:
+/// requests for the alias land on the first healthy target and escalate
+/// on failure (unknown model, load/spawn errors, 5xx). Availability
+/// first, flap safety via benching.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverChain {
+    /// Unique chain name (surfaced in `/api/failover` + event stream).
+    pub name: String,
+    /// Virtual model name requests use to enter the chain.
+    pub alias: String,
+    /// Ordered targets; index 0 is the primary.
+    pub targets: Vec<FailoverTarget>,
+    /// How long a failed target stays benched before re-entering
+    /// rotation (anti-flap). Default 30s.
+    #[serde(default = "default_failover_min_residence_secs")]
+    pub min_residence_secs: u64,
+}
+
+fn default_failover_min_residence_secs() -> u64 {
+    30
+}
+
+/// A local MCP (Model Context Protocol) server the gateway can pull
+/// tools from. Tools are injected into chat requests that opt in via
+/// the `mcp` body field or `x-blazar-mcp` header; the gateway executes
+/// the calls the model makes and feeds results back — every engine
+/// lane gets tool use, no child-side MCP support required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServer {
+    /// Unique server name; tools are namespaced `mcp__<name>__<tool>`.
+    pub name: String,
+    /// Command line that starts the stdio MCP server, e.g.
+    /// `["uvx", "mcp-server-fetch"]`.
+    pub command: Vec<String>,
+    /// Extra environment variables for the child process.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Per `tools/call` timeout in seconds (1..=600). Default 30.
+    #[serde(default = "default_mcp_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_mcp_timeout_secs() -> u64 {
+    30
+}
+
 /// Federation fallback defaults ON: with remotes configured, a bare
 /// model name absent locally but present on a peer routes there.
 fn default_remote_fallback() -> bool {
@@ -2197,6 +2267,8 @@ impl Default for Config {
             mcp_servers_json: None,
             cache_reuse: 0,
             keys: Vec::new(),
+            failover: Vec::new(),
+            mcp: Vec::new(),
             rpc_servers: String::new(),
             cache_ram_mb: DEFAULT_CACHE_RAM_MB,
             slots: default_slots(),
@@ -2876,6 +2948,32 @@ impl Config {
     /// fail fast rather than run with contradictory knobs.
     #[allow(clippy::too_many_lines)] // flat one-check-per-knob by design
     pub fn validate(&self) -> CoreResult<()> {
+        let mut names = std::collections::HashSet::new();
+        for srv in &self.mcp {
+            if srv.name.is_empty() {
+                return Err(CoreError::Config(
+                    "mcp server name must be non-empty".into(),
+                ));
+            }
+            if !names.insert(srv.name.clone()) {
+                return Err(CoreError::Config(format!(
+                    "duplicate mcp server name '{}'",
+                    srv.name
+                )));
+            }
+            if srv.command.is_empty() || srv.command.iter().any(String::is_empty) {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' command must be a non-empty argv list",
+                    srv.name
+                )));
+            }
+            if !(1..=600).contains(&srv.timeout_secs) {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' timeout_secs must be in 1..=600",
+                    srv.name
+                )));
+            }
+        }
         if self.default_ctx == 0 {
             return Err(CoreError::Config("default_ctx must be > 0".into()));
         }

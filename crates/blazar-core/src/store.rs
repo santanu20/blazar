@@ -29,7 +29,11 @@ pub struct Store {
 // `blazar bench`; scorecards fall back to it when no tuned profile
 // carries benchmark_json). Purely additive — CREATE TABLE IF NOT
 // EXISTS inside the migration batch covers both fresh and old stores.
-const SCHEMA_VERSION: i32 = 11;
+// v12 adds `completion_cards` (slim OpenAI chat-completion metadata
+// cards — the id→metadata mapping behind POST /v1/chat/completions/{id}).
+// Cards exist ONLY for completions created with a `metadata` field;
+// the cap prunes oldest-first so the table stays bounded.
+const SCHEMA_VERSION: i32 = 12;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -140,6 +144,13 @@ CREATE TABLE IF NOT EXISTS bench_results (
     payload_json TEXT NOT NULL,
     updated_at   INTEGER NOT NULL,
     PRIMARY KEY (model, engine_tag)
+);
+CREATE TABLE IF NOT EXISTS completion_cards (
+    id        TEXT PRIMARY KEY,
+    model     TEXT NOT NULL,
+    created   INTEGER NOT NULL,
+    metadata  TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 ";
 
@@ -412,6 +423,20 @@ pub struct JobEventRow {
     pub ts: i64,
     pub kind: String,
     pub data_json: Option<String>,
+}
+
+/// Slim chat-completion card: the id→metadata mapping that lets
+/// `POST /v1/chat/completions/{id}` update metadata after the fact.
+/// Stored only for completions whose create request carried
+/// `metadata` (non-stream; streams cannot be persisted after the
+/// fact — bytes are already on the wire).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CompletionCardRow {
+    pub id: String,
+    pub model: String,
+    pub created: i64,
+    pub metadata_json: String,
+    pub updated_at: i64,
 }
 
 /// Persisted Responses-API entry: enough to reconstruct a
@@ -916,6 +941,84 @@ impl Store {
             params![conversation],
         )?;
         Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    // ---- completion metadata cards (v12) ------------------------------
+
+    /// Upper bound on persisted cards. Completions vastly outnumber
+    /// stored responses (every metadata-tagged chat passes here), so the
+    /// cap prunes oldest-updated-first instead of growing forever.
+    const COMPLETION_CARD_CAP: i64 = 4096;
+
+    /// Persist (or overwrite) the slim card for a completion created
+    /// with `metadata`. Prunes beyond the cap in the same transaction
+    /// window — a card that ages out simply stops being updatable, which
+    /// the update endpoint teaches.
+    pub fn put_completion_card(&self, card: &CompletionCardRow) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO completion_cards (id, model, created, metadata, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               model = excluded.model, created = excluded.created,
+               metadata = excluded.metadata, updated_at = excluded.updated_at",
+            params![
+                card.id,
+                card.model,
+                card.created,
+                card.metadata_json,
+                card.updated_at
+            ],
+        )?;
+        self.conn.execute(
+            "DELETE FROM completion_cards WHERE id IN (
+                SELECT id FROM completion_cards
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT -1 OFFSET ?1
+            )",
+            params![Self::COMPLETION_CARD_CAP],
+        )?;
+        Ok(())
+    }
+
+    /// Update only the metadata of an existing card. `Ok(None)` = no
+    /// card under this id (never created with metadata, streamed,
+    /// expired, or pruned) — the caller turns that into the teaching 404.
+    pub fn update_completion_card(
+        &self,
+        id: &str,
+        metadata_json: &str,
+        updated_at: i64,
+    ) -> CoreResult<Option<CompletionCardRow>> {
+        let n = self.conn.execute(
+            "UPDATE completion_cards SET metadata = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, metadata_json, updated_at],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.get_completion_card(id)
+    }
+
+    pub fn get_completion_card(&self, id: &str) -> CoreResult<Option<CompletionCardRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, model, created, metadata, updated_at FROM completion_cards WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(CompletionCardRow {
+                        id: r.get(0)?,
+                        model: r.get(1)?,
+                        created: r.get(2)?,
+                        metadata_json: r.get(3)?,
+                        updated_at: r.get(4)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
     }
 
     /// Mirror of the in-memory registry contract: entries older than
@@ -1665,6 +1768,74 @@ mod tests {
         };
         let store = Store::open(&dirs).unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn unit__completion_card__put_update_get_roundtrip() {
+        let (_t, s) = tmp_store();
+        let card = CompletionCardRow {
+            id: "chatcmpl-abc".into(),
+            model: "qwen3:14b".into(),
+            created: 1_760_000_000,
+            metadata_json: r#"{"tag":"eval-42"}"#.into(),
+            updated_at: 1_760_000_000,
+        };
+        s.put_completion_card(&card).unwrap();
+        let got = s.get_completion_card("chatcmpl-abc").unwrap().unwrap();
+        assert_eq!(got.metadata_json, r#"{"tag":"eval-42"}"#);
+        assert_eq!(got.model, "qwen3:14b");
+
+        let upd = s
+            .update_completion_card("chatcmpl-abc", r#"{"tag":"eval-43"}"#, 1_760_000_900)
+            .unwrap()
+            .unwrap();
+        assert_eq!(upd.metadata_json, r#"{"tag":"eval-43"}"#);
+        assert_eq!(upd.updated_at, 1_760_000_900);
+
+        // Unknown id: Ok(None) — the API layer turns this into the
+        // teaching 404, not a store error.
+        assert!(
+            s.update_completion_card("chatcmpl-nope", "{}", 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(s.get_completion_card("chatcmpl-nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn integration__completion_card__v11_store_migrates_to_v12() {
+        // Simulate a v11 database: completion_cards absent, user_version 11.
+        // (Open a real store first, then drop only the new table — a
+        // hand-rolled minimal schema would fool the older-step column
+        // backfills the migration also replays.)
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE completion_cards; PRAGMA user_version = 11;")
+                .unwrap();
+        }
+        // Reopen: migrate() recreates the table, stamps v12, and the
+        // card accessors work on the upgraded store.
+        let s = Store::open(&dirs).unwrap();
+        let v: i32 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        s.put_completion_card(&CompletionCardRow {
+            id: "x".into(),
+            model: "m".into(),
+            created: 1,
+            metadata_json: "{}".into(),
+            updated_at: 1,
+        })
+        .unwrap();
+        assert!(s.get_completion_card("x").unwrap().is_some());
     }
 
     #[test]

@@ -23,7 +23,7 @@ blazar-runtime = { path = "crates/blazar-runtime", version = "0.20.0" }
 blazar-gateway = { path = "crates/blazar-gateway", version = "0.20.0" }
 
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "ws"] }
 # Provider-less TLS: the workspace pins ONE rustls crypto provider (ring,
 # via the rustls entry below). axum-server's tls-rustls feature would force
 # rustls/aws-lc-rs into the graph (ambiguous dual providers at runtime, plus

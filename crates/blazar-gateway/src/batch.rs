@@ -31,7 +31,7 @@ const MAX_UPLOAD_BYTES: usize = 48 * 1024 * 1024;
 const SUPPORTED_ENDPOINT: &str = "/v1/chat/completions";
 /// Ids are short random hex so they sort/echo like upstream (`file-…`,
 /// `batch-…`).
-fn short_id(prefix: &str) -> String {
+pub(crate) fn short_id(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = u64::try_from(
         SystemTime::now()
@@ -662,6 +662,577 @@ pub async fn cancel_batch(
     }
 }
 
+// ---------- Anthropic Message Batches ----------
+//
+// Anthropic's batch dialect embeds the requests inline (`requests:
+// [{custom_id, params}]`) instead of referencing an uploaded file, reports
+// five-way request counts, stamps RFC3339 times, and streams results as a
+// `.jsonl` of `{custom_id, result}` rows. Same execution model as the
+// OpenAI lane: a worker replays each request through the gateway's own
+// loopback `/v1/messages` listener so auth/quotas/sentinel all apply.
+
+/// Anthropic caps a batch at 100k requests (their documented maxItems).
+const ANTHROPIC_MAX_REQUESTS: usize = 100_000;
+/// Results are retained server-side for 24h upstream; the same retention
+/// window is advertised here.
+const ANTHROPIC_RETENTION_SECS: u64 = 24 * 60 * 60;
+
+/// `custom_id` charset per upstream: 1..=64 chars of `[A-Za-z0-9_-]`.
+fn valid_anthropic_custom_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Internal meta → the public `MessageBatch` object. Internal fields carry
+/// `_secs` unix ints; the wire shape is ISO-3339 strings.
+fn anthropic_public_shape(m: &Value) -> Value {
+    let created = m["created_at_secs"].as_u64().unwrap_or(0);
+    let ended = m["ended_at_secs"].as_u64();
+    let cancel_requested = m["cancel_requested"].as_bool().unwrap_or(false);
+    let processing_status = if m["internal_status"] == "ended" {
+        "ended"
+    } else if cancel_requested {
+        "canceling"
+    } else {
+        "in_progress"
+    };
+    json!({
+        "id": m["id"],
+        "type": "message_batch",
+        "archived_at": m["archived_at_secs"].as_u64().map_or(Value::Null, |s| Value::String(crate::ollama::iso(i64::try_from(s).unwrap_or(0)))),
+        "cancel_initiated_at": m["cancel_initiated_at_secs"].as_u64().map_or(Value::Null, |s| Value::String(crate::ollama::iso(i64::try_from(s).unwrap_or(0)))),
+        "created_at": Value::String(crate::ollama::iso(i64::try_from(created).unwrap_or(0))),
+        "ended_at": ended.map_or(Value::Null, |s| Value::String(crate::ollama::iso(i64::try_from(s).unwrap_or(0)))),
+        "expires_at": Value::String(crate::ollama::iso(i64::try_from(created + ANTHROPIC_RETENTION_SECS).unwrap_or(0))),
+        "processing_status": processing_status,
+        "request_counts": m["request_counts"],
+        "results_url": format!("/v1/messages/batches/{}/results", m["id"].as_str().unwrap_or_default()),
+    })
+}
+
+/// One output row: a successful request carries the translated
+/// `OpenAI`-shape message body of the `/v1/messages` response.
+fn anthropic_row_success(custom_id: &str, message: &Value) -> String {
+    serde_json::to_string(&json!({
+        "custom_id": custom_id,
+        "result": {"type": "message", "message": message},
+    }))
+    .unwrap_or_default()
+}
+
+/// One output row: a failed request carries the lane's error shape.
+fn anthropic_row_errored(custom_id: &str, error_type: &str, message: &str) -> String {
+    serde_json::to_string(&json!({
+        "custom_id": custom_id,
+        "result": {"type": "errored", "error": {"type": error_type, "message": message}},
+    }))
+    .unwrap_or_default()
+}
+
+/// One output row: cancellation reached this request before it ran.
+fn anthropic_row_canceled(custom_id: &str) -> String {
+    serde_json::to_string(&json!({
+        "custom_id": custom_id,
+        "result": {"type": "canceled"},
+    }))
+    .unwrap_or_default()
+}
+
+/// POST one `params` body through the gateway's own `/v1/messages`.
+async fn anthropic_replay_line(
+    client: &reqwest::Client,
+    base: &str,
+    auth_headers: &[(String, String)],
+    body: &Value,
+) -> Result<(u16, String), reqwest::Error> {
+    let mut rb = client.post(format!("{base}/v1/messages")).json(body);
+    for (name, value) in auth_headers {
+        rb = rb.header(name, value);
+    }
+    let r = rb.send().await?;
+    let code = r.status().as_u16();
+    let text = r.text().await?;
+    Ok((code, text))
+}
+
+/// Shared worker state for the anthropic lane (mirrors `BatchJob`).
+struct AnthropicBatchJob {
+    id: String,
+    output_id: String,
+    host: String,
+    port: u16,
+    auth_headers: Vec<(String, String)>,
+}
+
+/// Progress update: mutates only the counts so a concurrent cancel flag
+/// survives (same `F75` discipline as the `OpenAI` lane).
+fn update_anthropic_progress(dirs: &BlazarDirs, id: &str, counts: &Value) {
+    let path = batch_meta(dirs, id);
+    if let Some(mut m) = read_json(&path) {
+        m["request_counts"] = counts.clone();
+        if let Err(e) = write_json(&path, &m) {
+            tracing::warn!(target: "blazar::batch", batch = %id, error = %e, "anthropic progress meta write failed");
+        }
+    }
+}
+
+/// Terminal write: flush output, record the output-file meta, and stamp
+/// `ended` (with `cancel_initiated_at` when the run was cancelled).
+fn finish_anthropic_batch(
+    dirs: &BlazarDirs,
+    job: &AnthropicBatchJob,
+    counts: &Value,
+    writer: &mut std::io::BufWriter<std::fs::File>,
+    was_cancelled: bool,
+) {
+    let out_path = files_dir(dirs).join(format!("{}.jsonl", job.output_id));
+    // F76 discipline: a failed flush must not masquerade as success.
+    let flush = writer.flush();
+    let bytes = std::fs::metadata(&out_path).map_or(0, |md| md.len());
+    if let Err(e) = &flush {
+        tracing::error!(target: "blazar::batch", batch = %job.id, error = %e, "anthropic batch output flush failed");
+    }
+    let out_meta = json!({
+        "id": job.output_id,
+        "object": "file",
+        "bytes": bytes,
+        "created_at": now_secs(),
+        "filename": format!("{}-results.jsonl", job.id),
+        "purpose": "batch_output",
+    });
+    if let Err(e) = write_json(
+        &files_dir(dirs).join(format!("{}.meta.json", job.output_id)),
+        &out_meta,
+    ) {
+        tracing::warn!(target: "blazar::batch", batch = %job.id, error = %e, "anthropic output file meta write failed");
+    }
+    let path = batch_meta(dirs, &job.id);
+    if let Some(mut m) = read_json(&path) {
+        m["internal_status"] = json!("ended");
+        m["ended_at_secs"] = json!(now_secs());
+        m["output_file_id"] = json!(job.output_id);
+        m["request_counts"] = counts.clone();
+        if was_cancelled && m["cancel_initiated_at_secs"].is_null() {
+            m["cancel_initiated_at_secs"] = json!(now_secs());
+        }
+        if let Err(e) = write_json(&path, &m) {
+            tracing::error!(target: "blazar::batch", batch = %job.id, error = %e, "anthropic final meta write failed");
+        }
+    }
+    tracing::info!(target: "blazar::batch", batch = %job.id, cancelled = was_cancelled, "anthropic batch finished");
+}
+
+#[allow(clippy::too_many_lines)] // one cohesive replay loop
+async fn run_anthropic_batch(dirs: BlazarDirs, job: AnthropicBatchJob, input: String) {
+    let out_path = files_dir(&dirs).join(format!("{}.jsonl", job.output_id));
+    if let Some(d) = out_path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let client = crate::http_pool::tuned(reqwest::Client::builder())
+        .timeout(std::time::Duration::from_mins(10))
+        .build()
+        .unwrap_or_default();
+    let mut writer = match std::fs::File::create(&out_path) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            tracing::error!(target: "blazar::batch", batch = %job.id, error = %e, "anthropic output file create failed");
+            return;
+        }
+    };
+    let base = format!("http://{}:{}", job.host, job.port);
+    let mut succeeded = 0u64;
+    let mut errored = 0u64;
+    let mut canceled = 0u64;
+    let mut remaining: u64 = input
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+        .try_into()
+        .unwrap_or(0);
+
+    let finalize = |succeeded: u64,
+                    errored: u64,
+                    canceled: u64,
+                    was_cancelled: bool,
+                    writer: &mut std::io::BufWriter<std::fs::File>| {
+        let counts = json!({
+            "processing": 0, "succeeded": succeeded, "errored": errored,
+            "canceled": canceled, "expired": 0,
+        });
+        finish_anthropic_batch(&dirs, &job, &counts, writer, was_cancelled);
+    };
+
+    for line in input.lines().filter(|l| !l.trim().is_empty()) {
+        remaining = remaining.saturating_sub(1);
+        // Cancel is signalled through the meta file; check between items.
+        if let Some(m) = read_json(&batch_meta(&dirs, &job.id))
+            && m["cancel_requested"].as_bool().unwrap_or(false)
+        {
+            let row = anthropic_row_canceled(&serde_json::from_str::<Value>(line).map_or_else(
+                |_| "request".into(),
+                |v| v["custom_id"].as_str().unwrap_or("request").to_string(),
+            ));
+            canceled += 1;
+            if writeln!(writer, "{row}").is_err() {
+                break;
+            }
+            continue;
+        }
+        let (custom_id, params) = match serde_json::from_str::<Value>(line) {
+            Ok(v) => (
+                v["custom_id"].as_str().unwrap_or("request").to_string(),
+                v["params"].clone(),
+            ),
+            Err(_) => ("request".to_string(), Value::Null),
+        };
+        let row = match anthropic_replay_line(&client, &base, &job.auth_headers, &params).await {
+            Ok((200, body)) => {
+                succeeded += 1;
+                let msg = serde_json::from_str(&body).unwrap_or(json!({"raw": body}));
+                anthropic_row_success(&custom_id, &msg)
+            }
+            Ok((_, body)) => {
+                errored += 1;
+                let (etype, emsg) = serde_json::from_str::<Value>(&body).map_or_else(
+                    |_| ("api_error".into(), body.trim().to_string()),
+                    |v| {
+                        (
+                            v.pointer("/error/type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("api_error")
+                                .to_string(),
+                            v.pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .unwrap_or(body.trim())
+                                .to_string(),
+                        )
+                    },
+                );
+                anthropic_row_errored(&custom_id, &etype, &emsg)
+            }
+            Err(e) => {
+                errored += 1;
+                anthropic_row_errored(&custom_id, "api_error", &format!("loopback call: {e}"))
+            }
+        };
+        if writeln!(writer, "{row}").is_err() {
+            tracing::error!(target: "blazar::batch", batch = %job.id, "anthropic output write failed");
+            break;
+        }
+        update_anthropic_progress(
+            &dirs,
+            &job.id,
+            &json!({
+                "processing": remaining, "succeeded": succeeded,
+                "errored": errored, "canceled": canceled, "expired": 0,
+            }),
+        );
+    }
+    let was_cancelled = read_json(&batch_meta(&dirs, &job.id))
+        .is_some_and(|m| m["cancel_requested"].as_bool().unwrap_or(false));
+    finalize(succeeded, errored, canceled, was_cancelled, &mut writer);
+}
+
+/// `POST /v1/messages/batches` — validate inline requests, persist them
+/// as an internal JSONL, spawn the worker.
+#[allow(clippy::too_many_lines)] // one cohesive validation + spawn path
+pub async fn anthropic_batches_create(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+        return err(StatusCode::BAD_REQUEST, "body must be JSON");
+    };
+    let Some(requests) = req["requests"].as_array() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "requests must be an array of {custom_id, params} objects",
+        );
+    };
+    if requests.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "requests must not be empty");
+    }
+    if requests.len() > ANTHROPIC_MAX_REQUESTS {
+        return err(
+            StatusCode::BAD_REQUEST,
+            &format!("requests exceed the {ANTHROPIC_MAX_REQUESTS}-item batch cap"),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    for r in requests {
+        let Some(custom_id) = r["custom_id"].as_str() else {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "every request needs a custom_id string",
+            );
+        };
+        if !valid_anthropic_custom_id(custom_id) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "custom_id must be 1..=64 chars of [a-zA-Z0-9_-]",
+            );
+        }
+        if !seen.insert(custom_id.to_string()) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("custom_id '{custom_id}' appears more than once (must be unique)"),
+            );
+        }
+        let params = &r["params"];
+        if !params.is_object() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "every request needs a params object",
+            );
+        }
+        if params["model"].as_str().is_none() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("params for '{custom_id}' is missing model"),
+            );
+        }
+        if !params["messages"].is_array() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("params for '{custom_id}' is missing messages"),
+            );
+        }
+    }
+
+    // Internal JSONL: one {custom_id, params} line per request, stored in
+    // the same files/ pool the OpenAI lane uses.
+    let input_id = short_id("file");
+    let input_path = files_dir(&state.dirs).join(format!("{input_id}.jsonl"));
+    if let Err(e) = std::fs::create_dir_all(files_dir(&state.dirs)) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("create batch dir: {e}"),
+        );
+    }
+    let lines: Vec<String> = requests
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap_or_default())
+        .collect();
+    if let Err(e) = std::fs::write(&input_path, lines.join("\n") + "\n") {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("write requests file: {e}"),
+        );
+    }
+
+    let id = short_id("msgbatch");
+    let output_id = short_id("file");
+    let total = requests.len();
+    let meta = json!({
+        "dialect": "anthropic",
+        "id": id,
+        "internal_status": "in_progress",
+        "cancel_requested": false,
+        "created_at_secs": now_secs(),
+        "ended_at_secs": Value::Null,
+        "cancel_initiated_at_secs": Value::Null,
+        "archived_at_secs": Value::Null,
+        "input_file_id": input_id,
+        "output_file_id": Value::Null,
+        "request_counts": {
+            "processing": total, "succeeded": 0, "errored": 0,
+            "canceled": 0, "expired": 0,
+        },
+    });
+    if let Err(e) = write_json(&batch_meta(&state.dirs, &id), &meta) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("persist batch: {e}"),
+        );
+    }
+
+    let (host, port) = state.http_addr.get().cloned().unwrap_or_else(|| {
+        let h = if state.config.host == "0.0.0.0" || state.config.host == "::" {
+            "127.0.0.1".to_string()
+        } else {
+            state.config.host.clone()
+        };
+        (h, state.config.port)
+    });
+    let auth_headers: Vec<(String, String)> = ["authorization", "x-api-key"]
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| ((*name).to_string(), v.to_string()))
+        })
+        .collect();
+    let dirs = state.dirs.clone();
+    let job = AnthropicBatchJob {
+        id: id.clone(),
+        output_id,
+        host,
+        port,
+        auth_headers,
+    };
+    tokio::spawn(async move { run_anthropic_batch(dirs, job, lines.join("\n")).await });
+
+    (
+        StatusCode::OK,
+        axum::Json(anthropic_public_shape(
+            &read_json(&batch_meta(&state.dirs, &id)).unwrap_or(meta),
+        )),
+    )
+        .into_response()
+}
+
+/// Load an anthropic-dialect batch meta or produce the error response.
+#[allow(clippy::result_large_err)] // Response is the handlers' currency here
+fn anthropic_meta(state: &std::sync::Arc<AppState>, id: &str) -> Result<Value, Response> {
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid message batch id"));
+    }
+    match read_json(&batch_meta(&state.dirs, id)) {
+        Some(m) if m["dialect"] == "anthropic" => Ok(m),
+        // An OpenAI-dialect batch under the same routes is indistinguishable
+        // from an unknown id — same 404.
+        _ => Err(err(
+            StatusCode::NOT_FOUND,
+            "unknown message batch id (message batches use the /v1/messages/batches routes)",
+        )),
+    }
+}
+
+/// `GET /v1/messages/batches/{id}` — idempotent poll target.
+pub async fn anthropic_batches_get(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match anthropic_meta(&state, &id) {
+        Ok(m) => (StatusCode::OK, axum::Json(anthropic_public_shape(&m))).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /v1/messages/batches` — newest first.
+pub async fn anthropic_batches_list(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    let mut rows: Vec<Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(batches_dir(&state.dirs)) {
+        for e in entries.flatten() {
+            if let Some(name) = e.file_name().to_str()
+                && std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|x| x == "json")
+                && let Some(v) = read_json(&e.path())
+                && v["dialect"] == "anthropic"
+            {
+                rows.push(anthropic_public_shape(&v));
+            }
+        }
+    }
+    // UTC ISO-8601 stamps sort correctly as plain strings — newest first.
+    rows.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
+    let first_id = rows
+        .first()
+        .and_then(|v| v["id"].as_str())
+        .map(String::from);
+    let last_id = rows.last().and_then(|v| v["id"].as_str()).map(String::from);
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "data": rows,
+            "has_more": false,
+            "first_id": first_id,
+            "last_id": last_id,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /v1/messages/batches/{id}/cancel` — flags the worker; final state
+/// lands asynchronously (`ended` once the in-flight request finishes).
+pub async fn anthropic_batches_cancel(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let mut m = match anthropic_meta(&state, &id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if m["internal_status"] == "ended" {
+        return err(StatusCode::BAD_REQUEST, "batch already ended");
+    }
+    if m["cancel_requested"].as_bool().unwrap_or(false) {
+        return err(StatusCode::BAD_REQUEST, "batch cancel already in progress");
+    }
+    m["cancel_requested"] = json!(true);
+    m["cancel_initiated_at_secs"] = json!(now_secs());
+    let path = batch_meta(&state.dirs, &id);
+    if let Err(e) = write_json(&path, &m) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("persist cancel: {e}"),
+        );
+    }
+    (StatusCode::OK, axum::Json(anthropic_public_shape(&m))).into_response()
+}
+
+/// `DELETE /v1/messages/batches/{id}` — archives the batch (results stay
+/// readable through `expires_at`; upstream semantics, documented honestly).
+pub async fn anthropic_batches_delete(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let mut m = match anthropic_meta(&state, &id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    m["archived_at_secs"] = json!(now_secs());
+    if let Err(e) = write_json(&batch_meta(&state.dirs, &id), &m) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("persist archive: {e}"),
+        );
+    }
+    (StatusCode::OK, axum::Json(anthropic_public_shape(&m))).into_response()
+}
+
+/// `GET /v1/messages/batches/{id}/results` — streams the `.jsonl` result
+/// file once the batch has ended.
+pub async fn anthropic_batches_results(
+    State(state): State<std::sync::Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let m = match anthropic_meta(&state, &id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if m["internal_status"] != "ended" {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "results are streamed only after the batch ends — poll \
+             GET /v1/messages/batches/{id} until processing_status is \"ended\"",
+        );
+    }
+    let Some(output_id) = m["output_file_id"].as_str() else {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ended batch has no output file (ledger corruption?)",
+        );
+    };
+    match std::fs::read(files_dir(&state.dirs).join(format!("{output_id}.jsonl"))) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [("content-type", "application/jsonl")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => err(StatusCode::NOT_FOUND, "results file missing"),
+    }
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -687,5 +1258,157 @@ mod tests {
             batch_meta(&dirs, "batch-1"),
             PathBuf::from("/tmp/d/batch/batches/batch-1.json")
         );
+    }
+
+    #[test]
+    fn unit__anthropic_custom_id__charset_pattern() {
+        assert!(valid_anthropic_custom_id("a"));
+        assert!(valid_anthropic_custom_id("task-1"));
+        assert!(valid_anthropic_custom_id("Job_42"));
+        assert!(valid_anthropic_custom_id(&"x".repeat(64)));
+        assert!(!valid_anthropic_custom_id(""), "empty");
+        assert!(!valid_anthropic_custom_id(&"x".repeat(65)), "65 chars");
+        assert!(!valid_anthropic_custom_id("no spaces"), "space");
+        assert!(!valid_anthropic_custom_id("dot.id"), "dot");
+        assert!(!valid_anthropic_custom_id("id:1"), "colon");
+    }
+
+    #[test]
+    fn unit__anthropic_public_shape__statuses_and_counts_keys() {
+        let base = json!({
+            "dialect": "anthropic",
+            "id": "msgbatch_t",
+            "internal_status": "in_progress",
+            "cancel_requested": false,
+            "created_at_secs": 1_729_032_000_u64,
+            "ended_at_secs": Value::Null,
+            "cancel_initiated_at_secs": Value::Null,
+            "archived_at_secs": Value::Null,
+            "request_counts": {
+                "processing": 2, "succeeded": 0, "errored": 0,
+                "canceled": 0, "expired": 0,
+            },
+        });
+        let v = anthropic_public_shape(&base);
+        assert_eq!(v["type"], "message_batch");
+        assert_eq!(v["processing_status"], "in_progress");
+        assert_eq!(v["created_at"], "2024-10-15T22:40:00Z");
+        assert_eq!(v["expires_at"], "2024-10-16T22:40:00Z", "24h retention");
+        assert_eq!(v["results_url"], "/v1/messages/batches/msgbatch_t/results");
+        assert!(v["ended_at"].is_null());
+        assert!(v["archived_at"].is_null());
+        let mut keys: Vec<&str> = v["request_counts"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["canceled", "errored", "expired", "processing", "succeeded"]
+        );
+
+        let mut canceling = base.clone();
+        canceling["cancel_requested"] = json!(true);
+        assert_eq!(
+            anthropic_public_shape(&canceling)["processing_status"],
+            "canceling"
+        );
+
+        let mut ended = base.clone();
+        ended["internal_status"] = json!("ended");
+        ended["ended_at_secs"] = json!(1_729_032_100_u64);
+        assert_eq!(anthropic_public_shape(&ended)["processing_status"], "ended");
+        assert_eq!(
+            anthropic_public_shape(&ended)["ended_at"],
+            "2024-10-15T22:41:40Z"
+        );
+    }
+
+    #[test]
+    fn unit__anthropic_rows__success_errored_canceled() {
+        let ok = anthropic_row_success("a-1", &json!({"id": "msg_1", "role": "assistant"}));
+        let v: Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(v["custom_id"], "a-1");
+        assert_eq!(v["result"]["type"], "message");
+        assert_eq!(v["result"]["message"]["role"], "assistant");
+
+        let bad = anthropic_row_errored("a-2", "invalid_request_error", "max_tokens is required");
+        let v: Value = serde_json::from_str(&bad).unwrap();
+        assert_eq!(v["result"]["type"], "errored");
+        assert_eq!(v["result"]["error"]["type"], "invalid_request_error");
+        assert_eq!(v["result"]["error"]["message"], "max_tokens is required");
+
+        let cxl = anthropic_row_canceled("a-3");
+        let v: Value = serde_json::from_str(&cxl).unwrap();
+        assert_eq!(v["result"]["type"], "canceled");
+    }
+
+    /// Worker-level cancel pin: a cancel flag in the meta file turns every
+    /// remaining request into a `canceled` row — deterministic, zero network
+    /// (the worker checks the flag BEFORE its first replay).
+    #[tokio::test]
+    async fn unit__anthropic_worker__cancel_flag_cancels_remaining_rows() {
+        let tmp = std::env::temp_dir().join(format!("blazar-abatch-{}", std::process::id()));
+        let dirs = BlazarDirs {
+            config_dir: tmp.clone(),
+            data_dir: tmp.clone(),
+        };
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(files_dir(&dirs)).unwrap();
+        std::fs::create_dir_all(batches_dir(&dirs)).unwrap();
+
+        let input = "{\"custom_id\":\"r-1\",\"params\":{\"model\":\"m\"}}\n\
+                     {\"custom_id\":\"r-2\",\"params\":{\"model\":\"m\"}}\n\
+                     {\"custom_id\":\"r-3\",\"params\":{\"model\":\"m\"}}\n";
+        let meta = json!({
+            "dialect": "anthropic",
+            "id": "msgbatch_c",
+            "internal_status": "in_progress",
+            "cancel_requested": true,
+            "created_at_secs": 1_u64,
+            "ended_at_secs": Value::Null,
+            "cancel_initiated_at_secs": 1_u64,
+            "archived_at_secs": Value::Null,
+            "input_file_id": "f",
+            "output_file_id": Value::Null,
+            "request_counts": {
+                "processing": 3, "succeeded": 0, "errored": 0,
+                "canceled": 0, "expired": 0,
+            },
+        });
+        let meta_path = batch_meta(&dirs, "msgbatch_c");
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+        let job = AnthropicBatchJob {
+            id: "msgbatch_c".into(),
+            output_id: "out".into(),
+            host: "127.0.0.1".into(),
+            // Never contacted: the cancel flag precedes the first replay.
+            port: 1,
+            auth_headers: Vec::new(),
+        };
+        run_anthropic_batch(dirs.clone(), job, input.to_string()).await;
+
+        let m: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        assert_eq!(m["internal_status"], "ended");
+        assert_eq!(m["request_counts"]["canceled"], 3, "meta: {m:?}");
+        assert_eq!(m["request_counts"]["processing"], 0);
+        assert!(m["ended_at_secs"].as_u64().is_some());
+        assert!(m["cancel_initiated_at_secs"].as_u64().is_some());
+        assert_eq!(m["output_file_id"], "out");
+        let out = std::fs::read_to_string(files_dir(&dirs).join("out.jsonl")).unwrap();
+        let rows: Vec<Value> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3, "all rows written: {out}");
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(r["custom_id"], format!("r-{}", i + 1), "row: {r:?}");
+            assert_eq!(r["result"]["type"], "canceled", "row: {r:?}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

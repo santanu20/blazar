@@ -225,7 +225,7 @@ pub async fn tags(State(state): State<Arc<AppState>>) -> Response {
 /// Civil date from days-since-epoch (Howard Hinnant's `civil_from_days`,
 /// proleptic Gregorian; same integer math as `keys::utc_day`). Feeds
 /// [`iso`].
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -241,7 +241,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 /// RFC3339 UTC stamp from epoch seconds (ollama emits full date-time
 /// strings, not bare epoch ints — F16).
-fn iso(secs: i64) -> String {
+pub(crate) fn iso(secs: i64) -> String {
     let secs = secs.max(0);
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
@@ -395,13 +395,55 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
 /// GET /api/ps — live slots: name, state, ctx, idle countdown, endpoint.
 /// Router mode: translate the child's GET /models (per-model load state
 /// from the engine's own supervisor) instead of blazar instance rows.
+#[allow(clippy::too_many_lines)] // row assembly + sleep probes + remote capacity fold
 pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
     if state.config.router {
         return ps_router(&state).await;
     }
-    let rows: Vec<Value> = state
-        .sup
-        .ps()
+    let entries = state.sup.ps();
+    // Sleep surfacing (llama.cpp children): `/props` carries `is_sleeping`
+    // once the child enters its `--sleep-idle-seconds` rest — VRAM
+    // released, next request pays the wake. Probes ride the engine-level
+    // fetch list (`live_http_endpoints`, the same seam the metrics
+    // merger uses) with the per-child auth stamped, concurrently under a
+    // tight cap so `ps` stays fast. The field is ABSENT when the child
+    // does not report sleeping state (non-llama engine, probe failure) —
+    // absence means unknown, never guessed.
+    let engines = state.sup.live_http_endpoints();
+    let probe_futs: Vec<_> = engines
+        .iter()
+        .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+        .map(|e| {
+            let state = &state;
+            async move {
+                let base = crate::proxy::child_base(&e.endpoint);
+                let url = format!("{base}/props");
+                let req = crate::proxy::child_auth(
+                    crate::state::child_client(state, &e.endpoint).get(&url),
+                    e,
+                );
+                match tokio::time::timeout(std::time::Duration::from_millis(1200), req.send()).await
+                {
+                    Ok(Ok(resp)) if resp.status().is_success() => {
+                        let body = resp.json::<serde_json::Value>().await.ok();
+                        let ep_key = match &e.endpoint {
+                            blazar_core::Endpoint::Tcp { host, port } => format!("{host}:{port}"),
+                            blazar_core::Endpoint::Unix { socket } => socket.clone(),
+                        };
+                        body.and_then(|v| v["is_sleeping"].as_bool())
+                            .map(|flag| (ep_key, flag))
+                    }
+                    _ => None,
+                }
+            }
+        })
+        .collect();
+    let sleeping: std::collections::HashMap<String, bool> = futures::future::join_all(probe_futs)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    let rows: Vec<Value> = entries
         .iter()
         .map(|p| {
             let idle_remaining = state
@@ -418,7 +460,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                     .as_secs(),
             )
             .unwrap_or(i64::MAX);
-            json!({
+            let mut row = json!({
                 "name": p.name,
                 "model": p.name,
                 "size": p.bytes,
@@ -439,7 +481,11 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "blazar_endpoint": p.endpoint,
                 "blazar_heat": p.heat,
                 "expires_at": iso(now_secs.saturating_add(i64::try_from(remaining).unwrap_or(i64::MAX))),
-            })
+            });
+            if let Some(flag) = sleeping.get(&p.endpoint) {
+                row["blazar_sleeping"] = json!(flag);
+            }
+            row
         })
         .collect();
     // Remotes: probed concurrently (3s cap each) so `ps` stays fast
@@ -764,9 +810,10 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
 
 fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
-        BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated, InstanceStateChanged,
-        ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress, QueueDepth,
-        SlotsAutoAdopted, SlotsCtxAutoFit, SlotsReshaped, SpecGovernorOff, SpecGovernorRecovered,
+        BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated, FailoverSwitched,
+        InstanceStateChanged, ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress,
+        QueueDepth, SlotsAutoAdopted, SlotsCtxAutoFit, SlotsReshaped, SpecGovernorOff,
+        SpecGovernorRecovered,
     };
     match e {
         EngineUpdated { .. } => "engine_updated",
@@ -785,6 +832,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
         InstanceStateChanged { .. } => "instance_state_changed",
         BenchmarkDone { .. } => "benchmark_done",
         QueueDepth { .. } => "queue_depth",
+        FailoverSwitched { .. } => "failover_switched",
     }
 }
 
@@ -862,6 +910,63 @@ pub async fn chat(
     .await
     {
         return resp;
+    }
+    // Failover chains (ollama dialect): a virtual alias resolves to a
+    // concrete target — local model or `remote:<name>:<model>` (the
+    // pool-aware remote branch above serves the latter). A failing
+    // target is benched (anti-flap) and the request escalates.
+    if !state.failover.is_empty()
+        && !headers.contains_key(crate::failover::ATTEMPT_HEADER)
+        && let Some(mut attempt) = state.failover.plan(&model_field)
+    {
+        loop {
+            let mut chain_headers = headers.clone();
+            if let Ok(v) =
+                axum::http::HeaderValue::from_str(&format!("{}:{}", attempt.chain, attempt.index))
+            {
+                chain_headers.insert(crate::failover::ATTEMPT_HEADER, v);
+            }
+            let chain_body = crate::remotes::rewrite_model(body.clone(), &attempt.serve_model);
+            let mut resp = Box::pin(chat(
+                State(state.clone()),
+                trace_ext.clone(),
+                key_ext.clone(),
+                chain_headers,
+                chain_body,
+            ))
+            .await;
+            if crate::failover::escalate_response(&mut resp).await {
+                if let Some(sw) = state.failover.record_failure(&model_field, attempt.index) {
+                    state
+                        .bus
+                        .publish(blazar_runtime::BlazarEvent::FailoverSwitched {
+                            chain: sw.attempt.chain.clone(),
+                            from: sw.benched_index,
+                            to: sw.attempt.index,
+                            reason: format!(
+                                "target {} failed with HTTP {} — benched, escalating",
+                                attempt.label,
+                                resp.status().as_u16()
+                            ),
+                        });
+                    attempt = sw.attempt;
+                    continue;
+                }
+            } else if let Some((from, to)) =
+                state.failover.record_success(&model_field, attempt.index)
+            {
+                state
+                    .bus
+                    .publish(blazar_runtime::BlazarEvent::FailoverSwitched {
+                        chain: attempt.chain.clone(),
+                        from,
+                        to,
+                        reason: format!("served by target {} ({})", attempt.index, attempt.label),
+                    });
+            }
+            crate::failover::stamp(&mut resp, &attempt);
+            return resp;
+        }
     }
     // Key admission resolved ONCE, before any lane decision (F11): the
     // remote branch below needs it too — previously `remote:<model>`
@@ -1261,6 +1366,18 @@ pub async fn chat(
     state.sup.note_prefix_hit(&engine.name);
 
     let stream = req["stream"].as_bool().unwrap_or(true);
+    // MCP tool catalog (opt-in): resolve the selector while the ollama
+    // body is still in hand — the core chat path takes it from here.
+    let mcp_sel = match crate::mcp::selector_read(&headers, &req) {
+        Ok(sel) => sel,
+        Err(msg) => return api_error(400, &msg),
+    };
+    if stream && mcp_sel.is_some() {
+        return api_error(
+            400,
+            "mcp tool loop requires stream:false in this release — the gateway mediates buffered tool rounds",
+        );
+    }
     let model_name = row.name.clone();
     let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();
     let state2 = state.clone();
@@ -1288,6 +1405,7 @@ pub async fn chat(
                 sem_ctx,
                 OutputShape::Chat,
                 best_of,
+                mcp_sel,
             )
             .await;
             // keep_alive=0: evict right after this response (complaint #12),
@@ -1764,6 +1882,7 @@ async fn proxy_core_chat(
     sem: Option<semcache::SemCtx>,
     shape: OutputShape,
     best_of: Option<u64>,
+    mcp_sel: Option<String>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     // Pre-render recipe lane: the gateway owns the prompt (chatml wrap
@@ -1825,6 +1944,28 @@ async fn proxy_core_chat(
         // We translate the non-stream response into ollama shape.
         let t0 = std::time::Instant::now();
         let ttft_secs;
+        // Gateway-mediated MCP tools: the loop owns every child round,
+        // so it takes precedence over the best-of fan on requests that
+        // opt in. The recipe-rendered completion lane speaks a
+        // different wire shape — teach instead of guessing.
+        let mcp_child = if let Some(sel) = &mcp_sel {
+            if ollama_compat {
+                return api_error(
+                    400,
+                    "mcp is not available on the recipe-rendered completion lane \
+                     (pinned recipe or mlx tool grammar) — clear the pin or use the chat lane",
+                );
+            }
+            let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&openai_body) else {
+                return api_error(400, "mcp loop could not parse the translated body");
+            };
+            match crate::mcp::chat_via_mcp(state, engine, &mut v, sel).await {
+                Ok(child) => Some(child),
+                Err(resp) => return resp,
+            }
+        } else {
+            None
+        };
         // Best-of-N: judge N candidates, return the winner as a normal
         // child response (usage summed across candidates). Degrades to
         // the single-send path below on saturation, oversize bodies, or
@@ -1839,80 +1980,95 @@ async fn proxy_core_chat(
         if let crate::bestof::FanOut::Degraded(h) = &fan {
             bestof_hdr = Some(h.clone());
         }
-        let resp = match fan {
-            crate::bestof::FanOut::Ran(outcome) => {
-                let s = outcome.elapsed.as_secs_f64();
+        let resp = match mcp_child {
+            Some(child) => {
+                let s = t0.elapsed().as_secs_f64();
                 state.ttft.observe_secs(s);
                 ttft_secs = Some(s);
-                bestof_hdr = Some(outcome.hdr);
-                outcome.resp
+                child
             }
-            _ => {
-                match crate::proxy::child_send(state, engine, req.body(openai_body.clone()).send())
+            None => match fan {
+                crate::bestof::FanOut::Ran(outcome) => {
+                    let s = outcome.elapsed.as_secs_f64();
+                    state.ttft.observe_secs(s);
+                    ttft_secs = Some(s);
+                    bestof_hdr = Some(outcome.hdr);
+                    outcome.resp
+                }
+                _ => {
+                    match crate::proxy::child_send(
+                        state,
+                        engine,
+                        req.body(openai_body.clone()).send(),
+                    )
                     .await
-                {
-                    Ok(r) => {
-                        let s = t0.elapsed().as_secs_f64();
-                        state.ttft.observe_secs(s);
-                        ttft_secs = Some(s);
-                        r
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            model,
-                            "nonstream upstream failed: {e} — respawning lane, retrying once in-band"
-                        );
-                        // Same crash-recovery contract as the proxy path:
-                        // `child_send` already evicted a wedged child; the
-                        // respawn reaps the dead ones. Exactly one in-band
-                        // retry so single-shot clients don't eat the 502/504
-                        // for a child they never got to talk to.
-                        match crate::proxy::respawn_lane(state, &engine.key).await {
-                            Ok(fresh) => {
-                                let fresh_url = if ollama_compat {
-                                    format!("{}/v1/completions", child_base(&fresh.endpoint))
-                                } else {
-                                    format!("{}/v1/chat/completions", child_base(&fresh.endpoint))
-                                };
-                                let fresh_req = child_auth(
-                                    crate::state::child_client(state, &fresh.endpoint)
-                                        .post(&fresh_url)
-                                        .header("content-type", "application/json"),
-                                    &fresh,
-                                );
-                                match crate::proxy::child_send(
-                                    state,
-                                    &fresh,
-                                    fresh_req.body(openai_body.clone()).send(),
-                                )
-                                .await
-                                {
-                                    Ok(r) => {
-                                        let s = t0.elapsed().as_secs_f64();
-                                        state.ttft.observe_secs(s);
-                                        ttft_secs = Some(s);
-                                        r
-                                    }
-                                    Err(e2) => {
-                                        return api_error(
-                                            e2.status_u16(),
-                                            &format!(
-                                                "engine request failed: {e}; retry on respawned child: {e2}"
-                                            ),
-                                        );
+                    {
+                        Ok(r) => {
+                            let s = t0.elapsed().as_secs_f64();
+                            state.ttft.observe_secs(s);
+                            ttft_secs = Some(s);
+                            r
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                model,
+                                "nonstream upstream failed: {e} — respawning lane, retrying once in-band"
+                            );
+                            // Same crash-recovery contract as the proxy path:
+                            // `child_send` already evicted a wedged child; the
+                            // respawn reaps the dead ones. Exactly one in-band
+                            // retry so single-shot clients don't eat the 502/504
+                            // for a child they never got to talk to.
+                            match crate::proxy::respawn_lane(state, &engine.key).await {
+                                Ok(fresh) => {
+                                    let fresh_url = if ollama_compat {
+                                        format!("{}/v1/completions", child_base(&fresh.endpoint))
+                                    } else {
+                                        format!(
+                                            "{}/v1/chat/completions",
+                                            child_base(&fresh.endpoint)
+                                        )
+                                    };
+                                    let fresh_req = child_auth(
+                                        crate::state::child_client(state, &fresh.endpoint)
+                                            .post(&fresh_url)
+                                            .header("content-type", "application/json"),
+                                        &fresh,
+                                    );
+                                    match crate::proxy::child_send(
+                                        state,
+                                        &fresh,
+                                        fresh_req.body(openai_body.clone()).send(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(r) => {
+                                            let s = t0.elapsed().as_secs_f64();
+                                            state.ttft.observe_secs(s);
+                                            ttft_secs = Some(s);
+                                            r
+                                        }
+                                        Err(e2) => {
+                                            return api_error(
+                                                e2.status_u16(),
+                                                &format!(
+                                                    "engine request failed: {e}; retry on respawned child: {e2}"
+                                                ),
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            Err(re) => {
-                                return api_error(
-                                    e.status_u16(),
-                                    &format!("engine request failed: {e}; respawn: {re:#}"),
-                                );
+                                Err(re) => {
+                                    return api_error(
+                                        e.status_u16(),
+                                        &format!("engine request failed: {e}; respawn: {re:#}"),
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            }
+            },
         };
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -2029,10 +2185,12 @@ async fn proxy_core_chat(
             resp.headers_mut()
                 .insert(semcache::HDR_CACHE, HeaderValue::from_static("miss"));
             crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
+            stamp_so_receipt(&mut resp, &openai_body);
             return resp;
         }
         let mut resp = axum::Json(ollama).into_response();
         crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
+        stamp_so_receipt(&mut resp, &openai_body);
         return resp;
     }
     // Stream: child SSE -> ollama NDJSON with final counts. Force the
@@ -2425,9 +2583,24 @@ async fn proxy_core_chat(
     if load_hdr {
         builder = builder.header("x-blazar-status", "loading");
     }
-    builder
+    let mut resp = builder
         .body(Body::from_stream(ndjson))
-        .unwrap_or_else(|e| api_error(500, &e.to_string()))
+        .unwrap_or_else(|e| api_error(500, &e.to_string()));
+    stamp_so_receipt(&mut resp, &openai_body);
+    resp
+}
+
+/// Structured-output receipt (E2-δ), ollama lane: the translated
+/// request's constraint stamped on completed responses (success paths
+/// only — this helper runs at response assembly, after the child
+/// answered). Same header/kind vocabulary as the `OpenAI` lane.
+fn stamp_so_receipt(resp: &mut Response, openai_body: &[u8]) {
+    let parsed = serde_json::from_slice::<Value>(openai_body).ok();
+    if let Some(kind) = crate::proxy::structured_output_kind(parsed.as_ref())
+        && let Ok(v) = kind.parse()
+    {
+        resp.headers_mut().insert("x-blazar-structured-output", v);
+    }
 }
 
 /// POST /api/embeddings (legacy ollama shape).
@@ -3065,6 +3238,17 @@ pub async fn generate(
     let openai_bytes = serde_json::to_vec(&openai_req).unwrap_or_default();
     // ollama defaults stream=true on generate; the chat bus mirrors it.
     let stream = req["stream"].as_bool().unwrap_or(true);
+    // MCP tool catalog (opt-in), generate-lane parity with /api/chat.
+    let mcp_sel = match crate::mcp::selector_read(&headers, &req) {
+        Ok(sel) => sel,
+        Err(msg) => return api_error(400, &msg),
+    };
+    if stream && mcp_sel.is_some() {
+        return api_error(
+            400,
+            "mcp tool loop requires stream:false in this release — the gateway mediates buffered tool rounds",
+        );
+    }
     let state_ej = state.clone();
     let mut out = crate::proxy::hold_body(
         guard,
@@ -3083,6 +3267,7 @@ pub async fn generate(
                 None, // semantic cache is chat-lane only (response-shape keyed)
                 OutputShape::Generate,
                 best_of,
+                mcp_sel,
             )
             .await;
             // keep_alive=0: evict right after this response (complaint

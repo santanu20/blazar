@@ -99,6 +99,16 @@ pub enum BlazarEvent {
     QueueDepth {
         n: usize,
     },
+    /// A failover chain moved to a different target: the previous hop
+    /// failed (unknown model, load/spawn error, 5xx) and the chain
+    /// benched it for `min_residence_secs`. Visible in `/api/events`
+    /// and the chain's history via `/api/failover/<name>`.
+    FailoverSwitched {
+        chain: String,
+        from: usize,
+        to: usize,
+        reason: String,
+    },
 }
 
 /// Lifecycle state of a model instance.

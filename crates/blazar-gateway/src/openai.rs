@@ -385,9 +385,76 @@ pub async fn openai_proxy(
     {
         return openai_error(400, &msg);
     }
+    // Metadata cards (chat lane): validate at create so a bad shape
+    // fails BEFORE tokens are spent — the update endpoint and the card
+    // writer both enforce the same OpenAI limits.
+    if uri.path().ends_with("/chat/completions")
+        && let Some(meta) = parsed_body.as_ref().and_then(|v| v.get("metadata"))
+        && let Err(e) = crate::metadata_card::validate_metadata(meta)
+    {
+        return openai_error(400, &e);
+    }
     let Some(model) = model else {
         return openai_error(400, "missing `model` field in request body");
     };
+    // Failover chains: a virtual alias resolves to a concrete target
+    // (local model or `remote:<name>:<model>`); a failing target is
+    // benched (anti-flap) and the request escalates — bounded by the
+    // target count. The recursion marker prevents re-entering chain
+    // resolution for the rewritten model string.
+    if !state.failover.is_empty()
+        && !headers.contains_key(crate::failover::ATTEMPT_HEADER)
+        && let Some(mut attempt) = state.failover.plan(&model)
+    {
+        loop {
+            let mut chain_headers = headers.clone();
+            if let Ok(v) =
+                axum::http::HeaderValue::from_str(&format!("{}:{}", attempt.chain, attempt.index))
+            {
+                chain_headers.insert(crate::failover::ATTEMPT_HEADER, v);
+            }
+            let chain_body = crate::remotes::rewrite_model(body.clone(), &attempt.serve_model);
+            let mut resp = Box::pin(openai_proxy(
+                State(state.clone()),
+                trace_ext.clone(),
+                key_ext.clone(),
+                uri.clone(),
+                method.clone(),
+                chain_headers,
+                chain_body,
+            ))
+            .await;
+            if crate::failover::escalate_response(&mut resp).await {
+                if let Some(sw) = state.failover.record_failure(&model, attempt.index) {
+                    state
+                        .bus
+                        .publish(blazar_runtime::BlazarEvent::FailoverSwitched {
+                            chain: sw.attempt.chain.clone(),
+                            from: sw.benched_index,
+                            to: sw.attempt.index,
+                            reason: format!(
+                                "target {} failed with HTTP {} — benched, escalating",
+                                attempt.label,
+                                resp.status().as_u16()
+                            ),
+                        });
+                    attempt = sw.attempt;
+                    continue;
+                }
+            } else if let Some((from, to)) = state.failover.record_success(&model, attempt.index) {
+                state
+                    .bus
+                    .publish(blazar_runtime::BlazarEvent::FailoverSwitched {
+                        chain: attempt.chain.clone(),
+                        from,
+                        to,
+                        reason: format!("served by target {} ({})", attempt.index, attempt.label),
+                    });
+            }
+            crate::failover::stamp(&mut resp, &attempt);
+            return resp;
+        }
+    }
     // Lane-aware `n` ceiling: the plane-wide bound is the promise, but the
     // serving engine may cap lower (llama-server: 2). Reject in our voice,
     // before admission bills a request the engine would refuse anyway.
@@ -598,6 +665,46 @@ pub async fn openai_proxy(
         );
     }
 
+    // MCP tool catalog (opt-in, chat lane): the selector rides the `mcp`
+    // body field or `x-blazar-mcp` header. Resolved BEFORE single-flight
+    // registers a leader — the mediated tool loop must not leave followers
+    // waiting on an entry that never resolves through proxy_request.
+    if chat_family && let Some(v) = parsed_body.as_mut() {
+        let sel = match crate::mcp::selector_from(&headers, Some(v)) {
+            Ok(sel) => sel,
+            Err(msg) => return openai_error(400, &msg),
+        };
+        if let Some(sel) = sel {
+            if v["stream"].as_bool().unwrap_or(false) {
+                return openai_error(
+                    400,
+                    "mcp tool loop requires stream:false in this release — the gateway mediates buffered tool rounds",
+                );
+            }
+            v["stream"] = serde_json::Value::Bool(false);
+            return match crate::mcp::chat_via_mcp(&state, &engine, v, &sel).await {
+                Ok(child) => {
+                    let status = axum::http::StatusCode::from_u16(child.status().as_u16())
+                        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                    let headers = child.headers().clone();
+                    let bytes = child.bytes().await.unwrap_or_default();
+                    let mut builder = axum::response::Response::builder().status(status);
+                    for (name, value) in headers.iter() {
+                        if name != axum::http::header::CONTENT_LENGTH {
+                            builder = builder.header(name, value);
+                        }
+                    }
+                    builder
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap_or_else(|e| {
+                            openai_error(502, &format!("mcp response rebuild failed: {e}"))
+                        })
+                }
+                Err(resp) => resp,
+            };
+        }
+    }
+
     // Single-flight BEFORE slot admission (chat lane): the bounded
     // coalescing wait runs with NO InFlightGuard held, so identical
     // duplicates don't occupy in_flight capacity while merely waiting
@@ -751,6 +858,49 @@ pub async fn conversations_delete(
         None => openai_error(
             503,
             "store unavailable — the conversation list lives in the ledger; retry shortly",
+        ),
+    }
+}
+
+/// `POST /v1/chat/completions/{id}` — update a completion's `metadata`
+/// after the fact (`OpenAI` spec v2.3.0 parity). Only completions created
+/// WITH a `metadata` field (non-stream) hold a card; everything else
+/// 404s with teaching instead of pretending the id never existed.
+pub async fn chat_completion_update(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return openai_error(400, &format!("invalid JSON body: {e}")),
+    };
+    let Some(meta) = v.get("metadata") else {
+        return openai_error(400, "body must carry a `metadata` object to update");
+    };
+    if let Err(e) = crate::metadata_card::validate_metadata(meta) {
+        return openai_error(400, &e);
+    }
+    let metadata_json = meta.to_string();
+    let updated_at = crate::responses::unix_now().cast_signed();
+    match state.with_store(|s| s.update_completion_card(&id, &metadata_json, updated_at)) {
+        Some(Ok(Some(card))) => (
+            StatusCode::OK,
+            axum::Json(crate::metadata_card::card_to_json(&card)),
+        )
+            .into_response(),
+        Some(Ok(None)) => openai_error(
+            404,
+            &format!(
+                "completion {id:?} has no metadata card — it was created without a `metadata` \
+                 field, streamed (bytes were already on the wire when the id appeared), or its \
+                 card aged out of the bounded ledger"
+            ),
+        ),
+        Some(Err(e)) => openai_error(500, &format!("metadata update failed: {e}")),
+        None => openai_error(
+            503,
+            "store unavailable — metadata cards live in the ledger; retry shortly",
         ),
     }
 }

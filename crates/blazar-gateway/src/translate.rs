@@ -248,6 +248,38 @@ fn translate_message_images(messages: &Value) -> Result<Value, String> {
     Ok(Value::Array(out))
 }
 
+/// ollama's `tool_name` (api.md: "add the name of the tool that was
+/// executed to inform the model of the result") rides tool-result
+/// messages; the OpenAI dialect spells the same slot `name`. Map it on
+/// the way in so templates that render the tool's name (llama-server
+/// tool-call rendering) see it; children without `name` support ignore
+/// the field. Everything else passes through untouched.
+fn normalize_tool_result_names(messages: &Value) -> Value {
+    let Some(list) = messages.as_array() else {
+        return messages.clone();
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for msg in list {
+        let is_tool = msg.get("role").and_then(Value::as_str) == Some("tool");
+        let tool_name = msg
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty());
+        if is_tool && let Some(name) = tool_name {
+            let mut m = msg.clone();
+            if let Some(obj) = m.as_object_mut() {
+                obj.remove("tool_name");
+                obj.entry("name".to_string())
+                    .or_insert_with(|| Value::String(name.to_string()));
+            }
+            out.push(m);
+        } else {
+            out.push(msg.clone());
+        }
+    }
+    Value::Array(out)
+}
+
 /// ollama assistant `tool_calls` entries may omit the `type` field
 /// (ollama's own wire shape); llama-server rejects them with
 /// "Missing tool call type". Fill `type: "function"` where absent so
@@ -323,7 +355,9 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
         // ollama-style message images[] become multimodal content parts
         // (children ignore the raw field — this was silent vision loss),
         // and ollama tool_calls entries gain the `type` the child demands.
-        "messages": normalize_tool_call_types(&translate_message_images(&req["messages"])?),
+        "messages": normalize_tool_result_names(&normalize_tool_call_types(
+            &translate_message_images(&req["messages"])?,
+        )),
     });
     // ollama defaults stream=true; OpenAI defaults false — mirror the
     // caller's explicit choice only.
@@ -1539,6 +1573,44 @@ mod tests {
     #[test]
     fn unit__chat_to_openai__missing_model__error() {
         assert!(chat_to_openai(&json!({"messages": []})).is_err());
+    }
+
+    #[test]
+    fn unit__chat_to_openai__tool_name_maps_to_openai_name_slot() {
+        // ollama api.md: tool-result messages may carry `tool_name`;
+        // the OpenAI dialect spells the slot `name`.
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "tool_calls": [
+                    {"function": {"name": "get_weather", "arguments": {"city": "Tokyo"}}}
+                ]},
+                {"role": "tool", "content": "22C", "tool_name": "get_weather"}
+            ]
+        });
+        let (out, _) = chat_to_openai(&req).unwrap();
+        let tool_msg = &out["messages"][2];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["name"], "get_weather");
+        assert!(tool_msg.get("tool_name").is_none());
+        // An explicit `name` wins; `tool_name` never overwrites it.
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "tool", "content": "x", "name": "explicit", "tool_name": "ignored"}
+            ]
+        });
+        let (out, _) = chat_to_openai(&req).unwrap();
+        assert_eq!(out["messages"][0]["name"], "explicit");
+        // Non-tool roles pass through verbatim (unknown-field fidelity).
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi", "tool_name": "weird"}]
+        });
+        let (out, _) = chat_to_openai(&req).unwrap();
+        assert_eq!(out["messages"][0]["tool_name"], "weird");
+        assert!(out["messages"][0].get("name").is_none());
     }
 
     #[test]

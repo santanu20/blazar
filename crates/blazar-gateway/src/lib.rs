@@ -23,8 +23,11 @@ pub mod model_doctor;
 pub mod quantiles;
 pub mod requests;
 
+pub mod failover;
 pub mod keys;
 pub mod latechunk;
+pub mod mcp;
+pub mod metadata_card;
 pub mod ollama;
 pub mod openai;
 pub mod otlp;
@@ -32,6 +35,7 @@ pub mod preflight;
 pub mod prompt_recipe;
 pub mod proxy;
 pub mod queue;
+pub mod realtime;
 pub mod remotes;
 pub mod responses;
 pub mod scrub;
@@ -272,6 +276,10 @@ async fn request_log(
 pub fn router(state: Arc<AppState>) -> Router {
     let openai_any = Router::new()
         .route("/v1/chat/completions", post(openai::openai_proxy))
+        .route(
+            "/v1/chat/completions/{id}",
+            post(openai::chat_completion_update),
+        )
         .route("/v1/completions", post(openai::openai_proxy))
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/rerank", post(openai::openai_proxy))
@@ -355,7 +363,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/systemone", post(openai::openai_proxy))
         .route("/v1/classify", post(classify::classify))
         .route("/responses/input_tokens", post(openai::openai_proxy))
+        // Realtime voice lane: WS upgrade, one utterance pipeline per
+        // commit (STT → chat → TTS through the gateway's own lanes).
+        .route("/v1/realtime", get(realtime::realtime_session))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
+        // Anthropic Message Batches: inline-request batch dialect. The
+        // worker replays each params body through our own /v1/messages.
+        .route(
+            "/v1/messages/batches",
+            post(batch::anthropic_batches_create).get(batch::anthropic_batches_list),
+        )
+        .route(
+            "/v1/messages/batches/{id}",
+            get(batch::anthropic_batches_get).delete(batch::anthropic_batches_delete),
+        )
+        .route(
+            "/v1/messages/batches/{id}/cancel",
+            post(batch::anthropic_batches_cancel),
+        )
+        .route(
+            "/v1/messages/batches/{id}/results",
+            get(batch::anthropic_batches_results),
+        )
         .route("/tokenize", post(openai::openai_proxy))
         .route("/detokenize", post(openai::openai_proxy))
         .route("/apply-template", post(openai::openai_proxy))
@@ -385,6 +414,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Per-GPU capacity: device census + per-resident VRAM
         // attribution joined from the supervisor's live rows.
         .route("/api/capacity", get(capacity::capacity))
+        .route("/api/failover", get(failover::list))
+        .route("/api/failover/{chain}", get(failover::detail))
+        .route("/api/failover/{chain}/pin", post(failover::pin))
+        .route("/api/failover/{chain}/unpin", post(failover::unpin))
+        .route("/api/mcp", get(mcp::mcp_status))
         .route("/api/fabric", get(fabric::fabric))
         .route("/api/quantiles", get(quantiles::quantiles))
         .route("/api/benchmarks", get(benchmarks::benchmarks))
@@ -1302,6 +1336,8 @@ pub async fn serve(
     reshape_wake_task.abort();
     // H8: the lazy whisper-server child (if any request spawned one).
     state.whisper.shutdown().await;
+    // MCP stdio children die before the engines (fast, independent).
+    state.mcp.shutdown_all().await;
     state.sup.shutdown_all().await?;
     Ok(())
 }

@@ -55,6 +55,72 @@ pub async fn messages(
              remote-prefixed models are not translated (their dialect is the remote's own)",
         );
     }
+    // Failover chains (Anthropic dialect): the translate lane serves
+    // LOCAL targets only — a remote hop would need dialect re-translation
+    // both ways, which this lane refuses by design (see above). Mixed
+    // chains stay fully usable on the OpenAI and ollama lanes.
+    if !state.failover.is_empty()
+        && !headers.contains_key(crate::failover::ATTEMPT_HEADER)
+        && let Some(mut attempt) = state.failover.plan(&model)
+    {
+        loop {
+            if attempt.label.starts_with("remote:") {
+                return anthropic_error(
+                    400,
+                    "invalid_request_error",
+                    &format!(
+                        "failover chain {:?} includes remote targets; the /v1/messages \
+                         translate lane serves local targets only — use the chain on the \
+                         OpenAI or ollama lane, or keep its targets local",
+                        attempt.chain
+                    ),
+                );
+            }
+            let mut chain_headers = headers.clone();
+            if let Ok(v) =
+                axum::http::HeaderValue::from_str(&format!("{}:{}", attempt.chain, attempt.index))
+            {
+                chain_headers.insert(crate::failover::ATTEMPT_HEADER, v);
+            }
+            let chain_body = crate::remotes::rewrite_model(body.clone(), &attempt.serve_model);
+            let mut resp = Box::pin(messages(
+                axum::extract::State(state.clone()),
+                key_ext.clone(),
+                chain_headers,
+                chain_body,
+            ))
+            .await;
+            if crate::failover::escalate_response(&mut resp).await {
+                if let Some(sw) = state.failover.record_failure(&model, attempt.index) {
+                    state
+                        .bus
+                        .publish(blazar_runtime::BlazarEvent::FailoverSwitched {
+                            chain: sw.attempt.chain.clone(),
+                            from: sw.benched_index,
+                            to: sw.attempt.index,
+                            reason: format!(
+                                "target {} failed with HTTP {} — benched, escalating",
+                                attempt.label,
+                                resp.status().as_u16()
+                            ),
+                        });
+                    attempt = sw.attempt;
+                    continue;
+                }
+            } else if let Some((from, to)) = state.failover.record_success(&model, attempt.index) {
+                state
+                    .bus
+                    .publish(blazar_runtime::BlazarEvent::FailoverSwitched {
+                        chain: attempt.chain.clone(),
+                        from,
+                        to,
+                        reason: format!("served by target {} ({})", attempt.index, attempt.label),
+                    });
+            }
+            crate::failover::stamp(&mut resp, &attempt);
+            return resp;
+        }
+    }
     // F46: the Anthropic schema makes `max_tokens` REQUIRED — accepting
     // requests without an output cap lets a reasoning model burn the
     // whole context before the client learns anything.
@@ -170,6 +236,22 @@ pub async fn messages(
         Err(resp) => return *resp,
     };
     let url = format!("{}/v1/chat/completions", child_base(&engine.endpoint));
+    // Gateway-mediated MCP tools (opt-in via `mcp` body field or
+    // `x-blazar-mcp` header). The loop is buffered this release, so a
+    // streaming request that opts in is taught the constraint instead
+    // of silently degrading.
+    let mcp_sel = match crate::mcp::selector_read(&headers, &parsed) {
+        Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
+        Ok(sel) => sel,
+    };
+    if stream && mcp_sel.is_some() {
+        return anthropic_error(
+            400,
+            "invalid_request_error",
+            "mcp tool loop requires stream:false in this release — the gateway mediates \
+             buffered tool rounds",
+        );
+    }
     // F44: pooled client (10-min total timeout) instead of a per-request
     // build — same transport every other child lane uses (socket-pinned
     // for unix children).
@@ -232,14 +314,28 @@ pub async fn messages(
     if let crate::bestof::FanOut::Degraded(h) = &fan {
         bestof_hdr = Some(h.clone());
     }
-    let resp = match fan {
-        crate::bestof::FanOut::Ran(outcome) => {
-            bestof_hdr = Some(outcome.hdr);
-            outcome.resp
+    // MCP mediation takes precedence over the fan on the requests that
+    // opt in (the loop owns every child round; judging candidates on
+    // top would double-call the engine).
+    let mcp_child = if let Some(sel) = &mcp_sel {
+        match crate::mcp::chat_via_mcp(&state, &engine, &mut openai_body, sel).await {
+            Ok(child) => Some(child),
+            Err(resp) => return resp,
         }
-        _ => match send.send().await {
-            Ok(r) => r,
-            Err(e) => return anthropic_error(502, "api_error", &format!("engine: {e}")),
+    } else {
+        None
+    };
+    let resp = match mcp_child {
+        Some(child) => child,
+        None => match fan {
+            crate::bestof::FanOut::Ran(outcome) => {
+                bestof_hdr = Some(outcome.hdr);
+                outcome.resp
+            }
+            _ => match send.send().await {
+                Ok(r) => r,
+                Err(e) => return anthropic_error(502, "api_error", &format!("engine: {e}")),
+            },
         },
     };
     let status = resp.status();
@@ -775,10 +871,25 @@ pub fn translate_response(openai: &Value, model: &str) -> Value {
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": Value::Null,
-        "usage": {
-            "input_tokens": openai.pointer("/usage/prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-            "output_tokens": openai.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0),
-        }
+        "usage": anthropic_usage(openai.pointer("/usage"))
+    })
+}
+
+/// `OpenAI` usage object → Anthropic usage shape. Anthropic clients
+/// expect the prompt-caching accounting fields to be present (0 when
+/// nothing was cached); `cache_read_input_tokens` maps 1:1 from the
+/// child's `prompt_tokens_details.cached_tokens`. llama-server reports
+/// reads only (it never bills a cache-write tier separately), so
+/// creation is honestly 0.
+#[must_use]
+pub fn anthropic_usage(openai_usage: Option<&Value>) -> Value {
+    let u = openai_usage.unwrap_or(&Value::Null);
+    let read = crate::translate::cached_prompt_tokens(Some(u));
+    json!({
+        "input_tokens": u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+        "output_tokens": u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+        "cache_read_input_tokens": read,
+        "cache_creation_input_tokens": 0,
     })
 }
 
@@ -802,7 +913,9 @@ pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Valu
                 "id": state.id, "type": "message", "role": "assistant",
                 "model": state.model, "content": [],
                 "stop_reason": Value::Null, "stop_sequence": Value::Null,
-                "usage": {"input_tokens": input, "output_tokens": 1}
+                "usage": {"input_tokens": input, "output_tokens": 1,
+                          "cache_read_input_tokens": 0,
+                          "cache_creation_input_tokens": 0}
             }}),
         ));
     }
@@ -913,6 +1026,16 @@ pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Valu
         let mut usage = json!({"output_tokens": output});
         if input > 0 {
             usage["input_tokens"] = json!(input);
+        }
+        // Prompt-caching accounting (same semantics as the non-stream
+        // direction): reads from the child's cached_tokens detail; the
+        // child reports no separate write tier.
+        let cached = chunk
+            .pointer("/usage")
+            .map_or(0, |u| crate::translate::cached_prompt_tokens(Some(u)));
+        if cached > 0 {
+            usage["cache_read_input_tokens"] = json!(cached);
+            usage["cache_creation_input_tokens"] = json!(0);
         }
         events.push((
             "message_delta".into(),
@@ -1390,6 +1513,41 @@ mod tests {
     }
 
     #[test]
+    fn unit__anthropic_usage__cache_fields_from_cached_tokens() {
+        let openai = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 80}
+        });
+        let u = anthropic_usage(Some(&openai));
+        assert_eq!(u["input_tokens"], 100);
+        assert_eq!(u["output_tokens"], 5);
+        assert_eq!(u["cache_read_input_tokens"], 80);
+        assert_eq!(u["cache_creation_input_tokens"], 0);
+        // Absent usage: zeroed, fields still present.
+        let u = anthropic_usage(None);
+        assert_eq!(u["input_tokens"], 0);
+        assert_eq!(u["cache_read_input_tokens"], 0);
+    }
+
+    #[test]
+    fn unit__translate_response__counts_and_cache_accounting() {
+        let openai = json!({
+            "id": "chatcmpl-42",
+            "choices": [{"message": {"role": "assistant", "content": "hi"},
+                          "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2,
+                      "prompt_tokens_details": {"cached_tokens": 6}},
+        });
+        let v = translate_response(&openai, "m1");
+        assert_eq!(v["id"], "msg_42");
+        assert_eq!(v["usage"]["input_tokens"], 10);
+        assert_eq!(v["usage"]["output_tokens"], 2);
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 6);
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
+    }
+
+    #[test]
     fn unit__chunk_events__full_sse_sequence() {
         let mut st = StreamState::new("msg_t", "m1");
         let c1: Value = serde_json::from_str(
@@ -1458,6 +1616,32 @@ mod tests {
             .unwrap();
         assert_eq!(delta["usage"]["input_tokens"], 77, "{delta}");
         assert_eq!(delta["usage"]["output_tokens"], 3, "{delta}");
+    }
+
+    #[test]
+    fn unit__chunk_events__final_delta_carries_cache_read() {
+        // Stream direction of the cache accounting: the final chunk's
+        // cached_tokens detail becomes cache_read_input_tokens.
+        let mut st = StreamState::new("msg_t", "m1");
+        let c1: Value = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": null}]}"#,
+        )
+        .unwrap();
+        let _ = chunk_events(&c1, &mut st);
+        let c2: Value = serde_json::from_str(
+            r#"{"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+               "usage": {"prompt_tokens": 50, "completion_tokens": 3,
+                         "prompt_tokens_details": {"cached_tokens": 40}}}"#,
+        )
+        .unwrap();
+        let ev = chunk_events(&c2, &mut st);
+        let delta = ev
+            .iter()
+            .find(|(k, _)| k == "message_delta")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 40, "{delta}");
+        assert_eq!(delta["usage"]["cache_creation_input_tokens"], 0);
     }
 
     #[test]

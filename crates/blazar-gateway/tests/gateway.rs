@@ -3754,6 +3754,208 @@ async fn e2e__batch_jsonl_end_to_end() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// Anthropic Message Batches end-to-end: inline requests, replay through
+/// the gateway's own /v1/messages, five-way counts, jsonl results, cancel
+/// and validation teaching errors.
+#[tokio::test]
+#[allow(non_snake_case)]
+#[allow(clippy::too_many_lines)] // one linear scenario, assertions inline
+async fn e2e__anthropic_batch__create_replay_and_results() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // Validation teaching errors: empty, bad custom_id, duplicate, and
+    // missing model.
+    let bad = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let bad = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": [
+            {"custom_id": "no spaces!", "params": {"model": "m1", "messages": []}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let bad = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": [
+            {"custom_id": "a", "params": {"model": "m1", "messages": []}},
+            {"custom_id": "a", "params": {"model": "m1", "messages": []}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let bad = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": [
+            {"custom_id": "a", "params": {"messages": []}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    // Create: two good requests + one that the lane refuses at replay
+    // (max_tokens missing -> /v1/messages 400 -> errored row, not a dead
+    // batch — the documented per-request error contract).
+    let batch: serde_json::Value = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": [
+            {"custom_id": "a-1", "params": {
+                "model": "m1", "max_tokens": 5,
+                "messages": [{"role": "user", "content": "hello"}]}},
+            {"custom_id": "a-2", "params": {
+                "model": "m1", "max_tokens": 5,
+                "messages": [{"role": "user", "content": "second"}]}},
+            {"custom_id": "bad-1", "params": {
+                "model": "m1",
+                "messages": [{"role": "user", "content": "no max tokens"}]}}
+        ]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = batch["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("msgbatch-"), "batch id: {batch:?}");
+    assert_eq!(batch["type"], "message_batch");
+    assert_eq!(batch["processing_status"], "in_progress");
+    assert_eq!(batch["request_counts"]["processing"], 3);
+    assert_eq!(
+        batch["results_url"],
+        format!("/v1/messages/batches/{id}/results")
+    );
+    for key in ["created_at", "expires_at"] {
+        let s = batch[key].as_str().unwrap();
+        assert!(
+            s.len() == 20 && s.ends_with('Z') && s.contains('T'),
+            "{key} must be ISO-8601 UTC: {s}"
+        );
+    }
+
+    // Poll to ended.
+    let mut done = None;
+    for _ in 0..100 {
+        let v: serde_json::Value = c
+            .get(format!("{}/v1/messages/batches/{id}", ts.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if v["processing_status"] == "ended" {
+            done = Some(v);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let done = done.expect("anthropic batch reaches ended");
+    assert_eq!(done["request_counts"]["succeeded"], 2, "batch: {done:?}");
+    assert_eq!(done["request_counts"]["errored"], 1);
+    assert_eq!(done["request_counts"]["processing"], 0);
+    assert!(done["ended_at"].is_string(), "ended_at stamped: {done:?}");
+
+    // Results jsonl: match rows by custom_id (order not guaranteed).
+    let results = c
+        .get(format!("{}/v1/messages/batches/{id}/results", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(results.status(), 200);
+    let body = results.text().await.unwrap();
+    let rows: std::collections::HashMap<String, serde_json::Value> = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            (v["custom_id"].as_str().unwrap().to_string(), v)
+        })
+        .collect();
+    assert_eq!(rows.len(), 3, "three result rows: {body}");
+    for cid in ["a-1", "a-2"] {
+        let r = &rows[cid];
+        assert_eq!(r["result"]["type"], "message", "row {cid}: {r:?}");
+        assert_eq!(r["result"]["message"]["role"], "assistant", "row {cid}");
+        assert!(
+            r["result"]["message"]["content"].is_array(),
+            "anthropic content blocks: {r:?}"
+        );
+    }
+    let bad_row = &rows["bad-1"];
+    assert_eq!(bad_row["result"]["type"], "errored", "row: {bad_row:?}");
+    assert!(
+        bad_row["result"]["error"]["message"].is_string(),
+        "teaching error carried: {bad_row:?}"
+    );
+
+    // List contains the batch with first/last ids.
+    let list: serde_json::Value = c
+        .get(format!("{}/v1/messages/batches", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"].as_str() == Some(id.as_str())),
+        "list contains the batch: {list:?}"
+    );
+    assert!(list["first_id"].is_string() || list["data"].as_array().unwrap().is_empty());
+
+    // Cancel after ended and unknown id both teach, not crash.
+    let r = c
+        .post(format!("{}/v1/messages/batches/{id}/cancel", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = c
+        .get(format!(
+            "{}/v1/messages/batches/msgbatch-none/results",
+            ts.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // Archive marks archived_at and keeps the object readable.
+    let archived: serde_json::Value = c
+        .delete(format!("{}/v1/messages/batches/{id}", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        archived["archived_at"].is_string(),
+        "archived: {archived:?}"
+    );
+    let r = c
+        .get(format!("{}/v1/messages/batches/{id}", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__llamacpp_only_gate__non_llamacpp_kinds_get_teaching_400() {
@@ -4153,6 +4355,284 @@ async fn e2e__unknown_route__404_json_envelope_with_teaching_pointer() {
     assert!(
         msg.contains("/.well-known/blazar"),
         "message teaches the census: {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Failover chains (Wave B): a virtual alias escalates from a failing
+/// primary to the healthy secondary on the same request, stamps
+/// provenance headers, records the switch in the registry, and the
+/// admin plane (list/detail/pin/unpin) controls resolution.
+#[allow(non_snake_case)]
+#[allow(clippy::too_many_lines)] // one end-to-end receipt per concern
+#[tokio::test]
+async fn e2e__failover_chain__escalates_stamps_and_admin_plane() {
+    use blazar_core::config::{FailoverChain, FailoverTarget};
+    let cfg = Config {
+        failover: vec![FailoverChain {
+            name: "receipt".into(),
+            alias: "assistant".into(),
+            min_residence_secs: 30,
+            targets: vec![
+                FailoverTarget {
+                    remote: None,
+                    model: "missing-model".into(),
+                },
+                FailoverTarget {
+                    remote: None,
+                    model: "m1".into(),
+                },
+            ],
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+
+    // OpenAI lane: alias enters the chain, primary 404s, secondary serves.
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({"model": "assistant", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "escalated to the healthy target");
+    assert_eq!(
+        resp.headers()
+            .get("x-blazar-failover")
+            .and_then(|v| v.to_str().ok()),
+        Some("receipt")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-blazar-served-model")
+            .and_then(|v| v.to_str().ok()),
+        Some("local:m1")
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("stub:m1:"),
+        "answered by the stub child: {v:?}"
+    );
+
+    // Anti-flap: the failed primary is benched, the ollama lane resolves
+    // straight to the secondary.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({"model": "assistant", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "ollama lane rides the benched chain");
+    assert_eq!(
+        resp.headers()
+            .get("x-blazar-served-model")
+            .and_then(|v| v.to_str().ok()),
+        Some("local:m1"),
+        "benched primary skipped without a second failure"
+    );
+
+    // Admin plane: status shows the sticky switch; detail accepts name
+    // AND alias; pin forces; unpin releases.
+    let st: serde_json::Value = c
+        .get(format!("{}/api/failover", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let chain = &st["chains"][0];
+    assert_eq!(chain["name"], "receipt");
+    assert_eq!(
+        chain["sticky"], 1,
+        "sticky moved to the serving target: {chain}"
+    );
+    assert!(chain["switches"].as_u64().unwrap() >= 1);
+    // 30s bench minus the seconds elapsed since the failure landed.
+    let bench = chain["targets"][0]["benched_for_secs"].as_u64().unwrap();
+    assert!(
+        (25..=30).contains(&bench),
+        "primary benched for ~30s (anti-flap): {bench}"
+    );
+
+    let det: serde_json::Value = c
+        .get(format!("{}/api/failover/assistant", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(det["alias"], "assistant", "detail by alias");
+    let det2: serde_json::Value = c
+        .get(format!("{}/api/failover/receipt", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(det2["name"], "receipt", "detail by name");
+
+    let pin: serde_json::Value = c
+        .post(format!("{}/api/failover/receipt/pin", ts.base))
+        .json(&serde_json::json!({"target": 1}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pin["pinned"], 1);
+    let bad = c
+        .post(format!("{}/api/failover/receipt/pin", ts.base))
+        .json(&serde_json::json!({"target": 9}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400, "out-of-range pin teaches");
+    let unpin: serde_json::Value = c
+        .post(format!("{}/api/failover/receipt/unpin", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(unpin["pinned"].is_null());
+    let unknown = c
+        .get(format!("{}/api/failover/nope", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// MCP tool catalog: the status plane lists configured servers
+/// report-only (never spawning one), and the buffered-tool-round guard
+/// teaches instead of guessing when a client asks for streaming.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__mcp__status_plane_and_stream_guard() {
+    use blazar_core::config::McpServer;
+    let cfg = Config {
+        mcp: vec![McpServer {
+            name: "demo".into(),
+            command: vec!["sleep".into(), "600".into()],
+            env: std::collections::HashMap::new(),
+            timeout_secs: 30,
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+
+    // Status plane: report-only — `sleep` is not an MCP server and must
+    // never have been spawned to answer this.
+    let st: serde_json::Value = c
+        .get(format!("{}/api/mcp", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["servers"][0]["name"], "demo");
+    assert_eq!(
+        st["servers"][0]["timeout_secs"], 30,
+        "config carried through: {st}"
+    );
+    assert!(
+        st["servers"][0]["alive"].is_boolean(),
+        "alive reports without probing (report-only plane): {st}"
+    );
+
+    // Stream guard on the ollama lane: teaching 400 before any child or
+    // MCP process is touched.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(
+            &serde_json::json!({"model": "m1", "stream": true, "mcp": "demo",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "streaming + mcp teaches");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    // ollama dialect carries the message as a bare error string.
+    let msg = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+        .unwrap_or_default();
+    assert!(msg.contains("stream:false"), "message names the fix: {msg}");
+
+    // Selector validation: an unconfigured server name teaches with the
+    // configured list, not a bare 500.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "nope",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "unknown server teaches");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let msg = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("demo"),
+        "teaching lists the configured servers: {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// The Anthropic translate lane teaches (never guesses) when a chain
+/// carries remote targets: local-only chains serve, remote ones 400.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__failover_chain__anthropic_lane_local_targets_only() {
+    use blazar_core::config::{FailoverChain, FailoverTarget};
+    let cfg = Config {
+        failover: vec![FailoverChain {
+            name: "mixed".into(),
+            alias: "mixed-assistant".into(),
+            min_residence_secs: 30,
+            targets: vec![FailoverTarget {
+                remote: Some("elsewhere".into()),
+                model: "m1".into(),
+            }],
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let resp = client()
+        .post(format!("{}/v1/messages", ts.base))
+        .json(
+            &serde_json::json!({"model": "mixed-assistant", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "remote target on the translate lane");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("local targets only") && msg.contains("mixed"),
+        "teaching names the chain and the lane constraint: {msg}"
     );
     ts.state.sup.shutdown_all().await.unwrap();
 }
