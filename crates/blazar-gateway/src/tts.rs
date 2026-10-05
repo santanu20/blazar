@@ -87,6 +87,37 @@ fn parse_speech_format(raw: Option<&str>) -> Result<SpeechFormat, String> {
     }
 }
 
+/// Egress lane combining `response_format` with the optional `stream`
+/// flag. PCM always streams — it is the raw streaming format, byte-stable
+/// with the pre-flag contract — so the flag only upgrades the lossy
+/// family from a buffered transcode to a streaming one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamLane {
+    /// Whole-body synthesis then one reply (today's default lanes).
+    Buffered,
+    /// Raw s16le streamed per sentence (the historical PCM lane).
+    PcmStream,
+    /// One persistent ffmpeg fed raw PCM per sentence, container bytes
+    /// streamed as they are muxed.
+    LossyStream(LossyFormat),
+}
+
+/// Decide the egress lane. `stream: true` + `wav` teaches: a RIFF header
+/// needs total lengths up front, so a wav cannot stream mid-audio.
+fn stream_lane(format: SpeechFormat, stream: bool) -> Result<StreamLane, String> {
+    match (format, stream) {
+        (SpeechFormat::Pcm, _) => Ok(StreamLane::PcmStream),
+        (_, false) => Ok(StreamLane::Buffered),
+        (SpeechFormat::Wav, true) => Err(
+            "streaming wav is not supported — a WAV header needs total lengths up front; \
+             use \"pcm\" (raw s16le) or a lossy format (\"mp3\", \"opus\", \"aac\", \
+             \"flac\"), or drop \"stream\" for the buffered wav"
+                .to_string(),
+        ),
+        (SpeechFormat::Lossy(f), true) => Ok(StreamLane::LossyStream(f)),
+    }
+}
+
 /// Parse the tuning knobs off the speech body: `OpenAI` `speed` plus the
 /// native piper extensions (`speaker`, `noise_scale`, `noise_w`,
 /// `sentence_silence`). Ranges mirror the runtime's checks so bad values
@@ -165,6 +196,60 @@ fn ffmpeg_argv(format: LossyFormat) -> Vec<String> {
     argv
 }
 
+/// ffmpeg argv for the STREAMING transcode lane: raw s16le mono PCM on
+/// stdin → the requested container on stdout. `-ar`/`-ac` pin the input
+/// shape to the voice's own sample rate so piper's raw bytes need no WAV
+/// header. Enum-derived only — no client string reaches the process.
+#[must_use]
+fn ffmpeg_stream_argv(format: LossyFormat, sample_rate: u32) -> Vec<String> {
+    let (muxer, codec, extra, _) = format.parts();
+    let mut argv: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "s16le",
+        "-ar",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    argv.push(sample_rate.to_string());
+    argv.extend(["-ac", "1", "-i", "pipe:0"].iter().map(|s| (*s).to_string()));
+    argv.extend(extra.iter().map(|s| (*s).to_string()));
+    argv.extend(["-c:a", codec, "-f", muxer, "pipe:1"].iter().map(|s| (*s).to_string()));
+    argv
+}
+
+/// Raw-PCM twin of the WAV peak limiter: scales an s16le sample slice's
+/// peak down to [`PEAK_CEILING`] when (and only when) it exceeds it.
+/// Quiet audio stays byte-identical; an odd trailing byte (not a whole
+/// sample) is left in place untouched.
+fn limit_pcm16_peak(pcm: &mut [u8]) {
+    let scale = {
+        let mut peak: f32 = 0.0;
+        for pair in pcm.chunks_exact(2) {
+            let s = i16::from_le_bytes([pair[0], pair[1]]) as f32;
+            peak = peak.max(s.abs());
+        }
+        if peak <= PEAK_CEILING * 32_768.0 {
+            return; // within the ceiling (or silence): byte-identical
+        }
+        PEAK_CEILING * 32_768.0 / peak
+    };
+    for pair in pcm.chunks_exact_mut(2) {
+        let s = i16::from_le_bytes([pair[0], pair[1]]) as f32 * scale;
+        let s = s.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        pair.copy_from_slice(&s.to_le_bytes());
+    }
+}
+
+/// Teaching for a missing ffmpeg, shared by the buffered and streaming
+/// transcode lanes so the story stays identical.
+const FFMPEG_ABSENT_TEACH: &str = "ffmpeg is not on PATH — mp3/opus/aac/flac transcode \
+     through the system ffmpeg; \"wav\" (default) and \"pcm\" need none. Install \
+     ffmpeg or switch response_format";
+
 /// Hard ceiling for one transcode. Synthesis itself is already bounded
 /// by the piper timeout; this only guards a wedged ffmpeg.
 const FFMPEG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -186,12 +271,7 @@ async fn transcode(wav: Vec<u8>, format: LossyFormat) -> Result<Vec<u8>, Respons
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(openai_error(
-                400,
-                "ffmpeg is not on PATH — mp3/opus/aac/flac transcode through the system \
-                 ffmpeg; \"wav\" (default) and \"pcm\" need none. Install ffmpeg or switch \
-                 response_format",
-            ));
+            return Err(openai_error(400, FFMPEG_ABSENT_TEACH));
         }
         Err(e) => return Err(openai_error(502, &format!("ffmpeg spawn failed: {e}"))),
     };
@@ -273,6 +353,17 @@ pub async fn audio_speech(
         Ok(o) => o,
         Err(msg) => return openai_error(400, &msg),
     };
+    let stream = match req.get("stream") {
+        None | Some(Value::Null) => false,
+        Some(v) => match v.as_bool() {
+            Some(b) => b,
+            None => return openai_error(400, "stream must be a boolean (true | false)"),
+        },
+    };
+    let lane = match stream_lane(format, stream) {
+        Ok(l) => l,
+        Err(msg) => return openai_error(400, &msg),
+    };
 
     // Remote intent wins: `name:model` never goes local.
     if split_remote(voice, &state.config).is_some() {
@@ -308,7 +399,7 @@ pub async fn audio_speech(
     // still maps to its teaching status before any bytes flow — then
     // stream the rest so time-to-first-audio tracks the first sentence,
     // not the whole document.
-    if matches!(format, SpeechFormat::Pcm) {
+    if matches!(lane, StreamLane::PcmStream) {
         let chunks = split_streaming_chunks(text);
         let first = blazar_runtime::piper::synthesize(
             &state.dirs,
@@ -388,6 +479,165 @@ pub async fn audio_speech(
             .status(StatusCode::OK)
             .header(axum::http::header::CONTENT_TYPE, "audio/pcm")
             .header("x-blazar-pcm-format", header_val)
+            .body(axum::body::Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response());
+    }
+
+    // Streaming lossy ("stream": true + mp3/opus/aac/flac): one persistent
+    // ffmpeg fed raw s16le per sentence, so time-to-first-audio tracks the
+    // first sentence for the lossy family too — the posture the PCM lane
+    // has always had. The voice's own sample rate pins ffmpeg's input
+    // shape; unreadable voice config teaches instead of guessing.
+    if let StreamLane::LossyStream(lossy) = lane {
+        let Some(sample_rate) = blazar_runtime::piper::voice_sample_rate(&state.dirs, voice)
+        else {
+            return openai_error(
+                400,
+                "voice config is unreadable (missing or malformed .onnx.json) — the \
+                 streaming transcode needs the voice's sample_rate; retry without \
+                 \"stream\": true (the buffered lane reads it from the WAV header)",
+            );
+        };
+        let chunks = split_streaming_chunks(text);
+        // Eager first chunk: admission, install and pull teachings all map
+        // to their honest status BEFORE any bytes flow.
+        let mut first_pcm = match blazar_runtime::piper::synthesize_raw(
+            &state.dirs,
+            voice,
+            &chunks[0],
+            opts,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => return tts_error(&e),
+        };
+        limit_pcm16_peak(&mut first_pcm);
+
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.args(ffmpeg_stream_argv(lossy, sample_rate))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return openai_error(400, FFMPEG_ABSENT_TEACH);
+            }
+            Err(e) => return openai_error(502, &format!("ffmpeg spawn failed: {e}")),
+        };
+        // Stdio::piped() guarantees both handles exist at spawn.
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+        // Drain flag: the reader sets it when the client goes away (send
+        // fails) or ffmpeg's output closes, so the feeder never blocks
+        // forever writing a pipe nobody reads (§9 release path).
+        let (drained_tx, mut drained_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut stdout = stdout;
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = drained_tx.send(true);
+                        return;
+                    }
+                    Ok(n) => {
+                        if tx
+                            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                            .await
+                            .is_err()
+                        {
+                            let _ = drained_tx.send(true);
+                            return; // client went away
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        let _ = drained_tx.send(true);
+                        return;
+                    }
+                }
+            }
+        });
+        let dirs = state.dirs.clone();
+        let voice_owned = voice.to_string();
+        let rest = chunks[1..].to_vec();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // Synthesize the remaining sentences while the first bytes are
+            // already flowing; peak limiting is per chunk, same as the PCM
+            // stream lane (streaming cannot look ahead).
+            let mut pieces: Vec<Vec<u8>> = Vec::with_capacity(rest.len() + 1);
+            pieces.push(first_pcm);
+            for chunk in &rest {
+                match blazar_runtime::piper::synthesize_raw(
+                    &dirs,
+                    &voice_owned,
+                    chunk,
+                    opts,
+                    std::time::Duration::from_secs(120),
+                )
+                .await
+                {
+                    Ok(mut pcm) => {
+                        limit_pcm16_peak(&mut pcm);
+                        pieces.push(pcm);
+                    }
+                    Err(e) => {
+                        // Headers are committed to 200: the honest failure
+                        // is a truncated stream plus a server-side log.
+                        tracing::warn!("speech lossy stream ended early: {e:#}");
+                        break;
+                    }
+                }
+            }
+            let mut aborted = false;
+            for pcm in pieces {
+                tokio::select! {
+                    _ = drained_rx.changed() => {
+                        aborted = true;
+                        break;
+                    }
+                    r = stdin.write_all(&pcm) => {
+                        if r.is_err() {
+                            aborted = true; // ffmpeg went away (EPIPE)
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = stdin.shutdown().await;
+            drop(stdin);
+            if aborted {
+                // Nobody consumes ffmpeg's output anymore: kill rather
+                // than wait on a pipe that will never drain.
+                let _ = child.kill().await;
+                return;
+            }
+            match child.wait().await {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    tracing::warn!(
+                        "speech lossy stream: ffmpeg exited {status} — stream truncated"
+                    );
+                }
+                Err(e) => tracing::warn!("speech lossy stream: ffmpeg wait failed: {e}"),
+            }
+        });
+
+        let (_, _, _, content_type) = lossy.parts();
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, content_type)
             .body(axum::body::Body::from_stream(
                 tokio_stream::wrappers::ReceiverStream::new(rx),
             ))
@@ -1010,6 +1260,94 @@ mod tests {
         );
         assert_eq!(chunks.concat(), blob, "hard split must be lossless");
         assert!(chunks.iter().all(|c| !c.is_empty()));
+    }
+
+    #[test]
+    fn unit__stream_lane__matrix_and_wav_teaching() {
+        // No flag: every format stays on the buffered lanes (BP0).
+        assert_eq!(stream_lane(SpeechFormat::Wav, false), Ok(StreamLane::Buffered));
+        assert_eq!(
+            stream_lane(SpeechFormat::Lossy(LossyFormat::Mp3), false),
+            Ok(StreamLane::Buffered)
+        );
+        // PCM always streams — flag or not (the pre-flag contract).
+        assert_eq!(stream_lane(SpeechFormat::Pcm, false), Ok(StreamLane::PcmStream));
+        assert_eq!(stream_lane(SpeechFormat::Pcm, true), Ok(StreamLane::PcmStream));
+        // The flag upgrades the lossy family to a streaming transcode.
+        assert_eq!(
+            stream_lane(SpeechFormat::Lossy(LossyFormat::Opus), true),
+            Ok(StreamLane::LossyStream(LossyFormat::Opus))
+        );
+        // wav + stream teaches (RIFF header needs lengths up front).
+        let err = stream_lane(SpeechFormat::Wav, true).expect_err("teaches");
+        assert!(err.contains("streaming wav is not supported"));
+        assert!(err.contains("\"pcm\""));
+    }
+
+    #[test]
+    fn unit__ffmpeg_stream_argv__s16le_pipe_and_codec_flags() {
+        let mp3 = ffmpeg_stream_argv(LossyFormat::Mp3, 22_050);
+        assert_eq!(
+            mp3,
+            vec![
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "s16le",
+                "-ar",
+                "22050",
+                "-ac",
+                "1",
+                "-i",
+                "pipe:0",
+                "-b:a",
+                "128k",
+                "-c:a",
+                "libmp3lame",
+                "-f",
+                "mp3",
+                "pipe:1",
+            ]
+        );
+        // FLAC: lossless, no bitrate flag, muxer tail intact.
+        let flac = ffmpeg_stream_argv(LossyFormat::Flac, 16_000);
+        assert!(!flac.contains(&"-b:a".to_string()));
+        assert_eq!(&flac[flac.len() - 3..], &["-f", "flac", "pipe:1"]);
+        assert!(flac.contains(&"16000".to_string()));
+    }
+
+    #[test]
+    fn unit__limit_pcm16_peak__ceiling_only_when_exceeded() {
+        // Quiet audio: byte-identical passthrough.
+        let quiet: Vec<u8> = [1000i16, -1000, 5]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let mut pcm = quiet.clone();
+        limit_pcm16_peak(&mut pcm);
+        assert_eq!(pcm, quiet, "quiet PCM must stay byte-identical");
+
+        // Full-scale audio: scaled under the -1 dBFS ceiling, and an odd
+        // trailing byte (not a whole sample) is preserved untouched.
+        let mut loud: Vec<u8> = [i16::MAX, i16::MIN, 16_000]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        loud.push(0xAB);
+        let mut pcm = loud.clone();
+        limit_pcm16_peak(&mut pcm);
+        let scaled: Vec<i16> = pcm[..pcm.len() - 1]
+            .chunks_exact(2)
+            .map(|p| i16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        let peak = scaled.iter().map(|s| s.abs()).max().unwrap();
+        assert!(
+            peak <= 29_206,
+            "peak {peak} must sit at/below the ceiling"
+        );
+        assert!(peak > 29_000, "loud audio scales TO the ceiling, not below");
+        assert_eq!(pcm[pcm.len() - 1], 0xAB, "odd tail byte kept");
     }
 
     #[test]

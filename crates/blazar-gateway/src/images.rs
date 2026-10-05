@@ -2002,13 +2002,9 @@ pub async fn jobs_get(
         return openai_error(400, "invalid job id");
     }
     let children_empty = live_sdcpp_children(&state, params.model.as_deref()).is_empty();
-    if children_empty {
-        return openai_error(
-            404,
-            "no live diffusion child serves jobs — POST /v1/images/generations boots one",
-        );
-    }
-    if let Some(job) = poll_live_child(&state, params.model.as_deref(), &job_id).await {
+    if !children_empty
+        && let Some(job) = poll_live_child(&state, params.model.as_deref(), &job_id).await
+    {
         crate::jobs::mirror_child_terminal(&state, &job_id, &job);
         return Response::builder()
             .status(200)
@@ -2018,7 +2014,8 @@ pub async fn jobs_get(
                 openai_error(500, &format!("response build: {e}")).into_response()
             });
     }
-    // No live child owns the job: the ledger is the afterlife. A
+    // No live child owns the job — none is booted at all, or eviction /
+    // crash took the owner: the ledger is the afterlife either way. A
     // non-terminal row means the child died mid-render — close it
     // honestly instead of leaving a forever-running zombie row.
     let row = state
@@ -2039,6 +2036,12 @@ pub async fn jobs_get(
         if let Some(fresh) = fresh {
             return axum::Json(crate::jobs::row_payload(&fresh)).into_response();
         }
+    }
+    if children_empty {
+        return openai_error(
+            404,
+            "no live diffusion child serves jobs — POST /v1/images/generations boots one",
+        );
     }
     openai_error(
         404,
@@ -2064,12 +2067,6 @@ pub async fn jobs_cancel(
         return openai_error(400, "invalid job id");
     }
     let children = live_sdcpp_children(&state, params.model.as_deref());
-    if children.is_empty() {
-        return openai_error(
-            404,
-            "no live diffusion child serves jobs — POST /v1/images/generations boots one",
-        );
-    }
     let mut last_known: Option<(serde_json::Value, blazar_runtime::EngineRef)> = None;
     for engine in &children {
         // Locate the owning child first — cancel on a non-owner would
@@ -2096,6 +2093,12 @@ pub async fn jobs_cancel(
             if let Some(fresh) = fresh {
                 return axum::Json(crate::jobs::row_payload(&fresh)).into_response();
             }
+        }
+        if children.is_empty() {
+            return openai_error(
+                404,
+                "no live diffusion child serves jobs — POST /v1/images/generations boots one",
+            );
         }
         return openai_error(
             404,
@@ -2385,7 +2388,10 @@ fn completed_video_bytes(
 
 /// Poll the live child for an in-flight row and mirror any terminal
 /// verdict into the ledger. Returns the fresh child snapshot (progress
-/// carrier) or `None` when the row is terminal or its child is gone.
+/// carrier) or `None` when the row is terminal. A non-terminal row no
+/// live child owns is a mid-render death (eviction, crash, restart) —
+/// it closes failed right here so the Sora views never serve a
+/// forever-in_progress zombie.
 async fn freshen_video_row(
     state: &AppState,
     row: &blazar_core::store::JobRow,
@@ -2393,7 +2399,14 @@ async fn freshen_video_row(
     if !matches!(row.state.as_str(), "queued" | "running") {
         return None;
     }
-    let fresh = poll_live_child(state, None, &row.id).await?;
+    let Some(fresh) = poll_live_child(state, None, &row.id).await else {
+        state.jobs.record_failed(
+            state,
+            &row.id,
+            "job's engine child is gone (eviction, crash or restart) — resubmit the generation",
+        );
+        return None;
+    };
     crate::jobs::mirror_child_terminal(state, &row.id, &fresh);
     Some(fresh)
 }

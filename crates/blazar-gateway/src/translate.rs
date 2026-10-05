@@ -250,7 +250,7 @@ fn translate_message_images(messages: &Value) -> Result<Value, String> {
 
 /// ollama's `tool_name` (api.md: "add the name of the tool that was
 /// executed to inform the model of the result") rides tool-result
-/// messages; the OpenAI dialect spells the same slot `name`. Map it on
+/// messages; the `OpenAI` dialect spells the same slot `name`. Map it on
 /// the way in so templates that render the tool's name (llama-server
 /// tool-call rendering) see it; children without `name` support ignore
 /// the field. Everything else passes through untouched.

@@ -617,33 +617,22 @@ fn option_argv(opts: &SpeakOptions) -> Vec<String> {
     argv
 }
 
-/// Synthesize `text` to a full `WAV` file (`RIFF` bytes) with the installed
-/// binary and voice. [`SpeakOptions`] carries the `OpenAI` `speed` plus
-/// the native piper knobs; every value is range-checked here so callers
-/// get one authoritative error site. Spawn-per-call: piper is a one-shot
-/// binary (no server, nothing to pool), cold start ~1 s.
-pub async fn synthesize(
-    dirs: &BlazarDirs,
-    voice: &str,
-    text: &str,
-    opts: SpeakOptions,
-    timeout: std::time::Duration,
-) -> Result<Vec<u8>> {
+/// Range-check the synthesis input and knobs so both the WAV and raw
+/// lanes share one authoritative validation site.
+fn validate_speech_input(text: &str, opts: &SpeakOptions) -> Result<(), anyhow::Error> {
     if text.trim().is_empty() {
         return Err(anyhow!("input text is empty"));
     }
     if text.chars().count() > MAX_INPUT_CHARS {
         return Err(anyhow!(
-            "input text is {} chars (max {MAX_INPUT_CHARS}) — split long documents",
+            "input is {} chars (max {MAX_INPUT_CHARS}) — split long documents",
             text.chars().count()
         ));
     }
     if let Some(speed) = opts.speed
         && !(0.25..=4.0).contains(&speed)
     {
-        return Err(anyhow!(
-            "speed {speed} out of range (0.25..=4.0, OpenAI contract)"
-        ));
+        return Err(anyhow!("speed {speed} out of range (0.25..=4.0, OpenAI contract)"));
     }
     if let Some(v) = opts.noise_scale
         && !NOISE_RANGE.contains(&v)
@@ -662,7 +651,77 @@ pub async fn synthesize(
             "sentence_silence {v} out of range (0.0..=10.0 seconds)"
         ));
     }
-    synthesize_inner(dirs, voice, text, &opts, timeout).await
+    Ok(())
+}
+
+/// Synthesize `text` to a full `WAV` file (`RIFF` bytes) with the installed
+/// binary and voice. [`SpeakOptions`] carries the `OpenAI` `speed` plus
+/// the native piper knobs; every value is range-checked here so callers
+/// get one authoritative error site. Spawn-per-call: piper is a one-shot
+/// binary (no server, nothing to pool), cold start ~1 s.
+pub async fn synthesize(
+    dirs: &BlazarDirs,
+    voice: &str,
+    text: &str,
+    opts: SpeakOptions,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    validate_speech_input(text, &opts)?;
+    synthesize_inner(dirs, voice, text, &opts, timeout, false).await
+}
+
+/// Streaming twin of [`synthesize`]: the same validation and engine knobs
+/// but `--output_raw`, so stdout carries bare PCM samples (s16le, mono,
+/// voice sample rate) with no WAV container. The gateway's streaming
+/// transcode lane feeds these bytes straight into ffmpeg's s16le input.
+pub async fn synthesize_raw(
+    dirs: &BlazarDirs,
+    voice: &str,
+    text: &str,
+    opts: SpeakOptions,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    validate_speech_input(text, &opts)?;
+    synthesize_inner(dirs, voice, text, &opts, timeout, true).await
+}
+
+/// `sample_rate` from a voice's `.onnx.json` (`audio.sample_rate`), the
+/// one field the streaming transcode lane needs from the voice config.
+/// `None` on any missing/unreadable/malformed piece — the caller teaches
+/// rather than guessing a rate.
+#[must_use]
+pub fn voice_sample_rate(dirs: &BlazarDirs, voice: &str) -> Option<u32> {
+    let (_, json) = voice_file(dirs, voice)?;
+    let raw = std::fs::read_to_string(json).ok()?;
+    let cfg: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let rate = cfg.pointer("/audio/sample_rate")?.as_u64()?;
+    u32::try_from(rate).ok()
+}
+
+/// Full piper argv (minus the binary) for either output form: `wav`
+/// writes a RIFF container via `--output_file -`, `raw` writes bare
+/// s16le samples via `--output_raw`. Pure so the exact bytes are
+/// pinnable by unit test.
+#[must_use]
+fn synthesis_argv(
+    onnx: &std::path::Path,
+    espeak_data: &std::path::Path,
+    opts: &SpeakOptions,
+    raw: bool,
+) -> Vec<String> {
+    let mut argv = vec!["-q".to_string()];
+    if raw {
+        argv.push("--output_raw".to_string());
+    } else {
+        argv.push("--output_file".to_string());
+        argv.push("-".to_string());
+    }
+    argv.push("--model".to_string());
+    argv.push(onnx.display().to_string());
+    argv.push("--espeak_data".to_string());
+    argv.push(espeak_data.display().to_string());
+    argv.extend(option_argv(opts));
+    argv
 }
 
 async fn synthesize_inner(
@@ -671,6 +730,7 @@ async fn synthesize_inner(
     text: &str,
     opts: &SpeakOptions,
     timeout: std::time::Duration,
+    raw: bool,
 ) -> Result<Vec<u8>> {
     let Some((bin, lib_dir)) = server_bin(dirs) else {
         return Err(anyhow!(
@@ -690,19 +750,10 @@ async fn synthesize_inner(
     };
     let espeak_data = lib_dir.join("espeak-ng-data");
     let mut cmd = tokio::process::Command::new(&bin);
-    cmd.arg("-q")
-        .arg("--model")
-        .arg(&onnx)
-        .arg("--output_file")
-        .arg("-")
-        .arg("--espeak_data")
-        .arg(&espeak_data)
+    cmd.args(synthesis_argv(&onnx, &espeak_data, opts, raw))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    for arg in option_argv(opts) {
-        cmd.arg(arg);
-    }
     if cfg!(unix) {
         // The tarball binary links sibling .so files in place.
         cmd.env("LD_LIBRARY_PATH", &lib_dir);
@@ -720,7 +771,22 @@ async fn synthesize_inner(
     let out = tokio::time::timeout(timeout, child.wait_with_output()).await;
     match out {
         Ok(Ok(output)) if output.status.success() => {
-            if !output.stdout.starts_with(b"RIFF") {
+            if raw {
+                // Bare PCM has no magic bytes; emptiness is the only
+                // structural signal that nothing was synthesized.
+                if output.stdout.is_empty() {
+                    let tail = String::from_utf8_lossy(&output.stderr);
+                    let tail = tail.lines().last().unwrap_or("").trim();
+                    return Err(anyhow!(
+                        "piper produced no raw audio (0 bytes stdout{})",
+                        if tail.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; stderr: {tail}")
+                        }
+                    ));
+                }
+            } else if !output.stdout.starts_with(b"RIFF") {
                 let tail = String::from_utf8_lossy(&output.stderr);
                 let tail = tail.lines().last().unwrap_or("").trim();
                 return Err(anyhow!(
@@ -809,6 +875,71 @@ mod tests {
             }),
             vec!["--speaker", "1"]
         );
+    }
+
+    #[test]
+    fn unit__synthesis_argv__wav_container_and_raw_forms() {
+        let opts = SpeakOptions {
+            speed: Some(2.0),
+            ..Default::default()
+        };
+        let wav = synthesis_argv(
+            std::path::Path::new("/v/a.onnx"),
+            std::path::Path::new("/e/espeak-ng-data"),
+            &opts,
+            false,
+        );
+        assert_eq!(
+            wav,
+            vec![
+                "-q",
+                "--output_file",
+                "-",
+                "--model",
+                "/v/a.onnx",
+                "--espeak_data",
+                "/e/espeak-ng-data",
+                "--length_scale",
+                "0.5000",
+            ]
+        );
+        let raw = synthesis_argv(
+            std::path::Path::new("/v/a.onnx"),
+            std::path::Path::new("/e/espeak-ng-data"),
+            &SpeakOptions::default(),
+            true,
+        );
+        assert_eq!(raw.first().map(String::as_str), Some("-q"));
+        assert!(raw.contains(&"--output_raw".to_string()));
+        assert!(!raw.contains(&"--output_file".to_string()));
+        // Raw keeps the same model/espeak pinning as the WAV form.
+        assert!(raw.contains(&"/v/a.onnx".to_string()));
+        assert!(raw.contains(&"/e/espeak-ng-data".to_string()));
+    }
+
+    #[test]
+    fn unit__voice_sample_rate__reads_voice_json_or_none() {
+        let tmp = std::env::temp_dir().join(format!("piper-sr-{}", std::process::id()));
+        let voice = "en_US-amy-medium";
+        let voice_dir = tmp.join("voices").join(voice);
+        std::fs::create_dir_all(&voice_dir).unwrap();
+        std::fs::write(voice_dir.join(format!("{voice}.onnx")), b"x").unwrap();
+        std::fs::write(
+            voice_dir.join(format!("{voice}.onnx.json")),
+            br#"{"audio":{"sample_rate":22050}}"#,
+        )
+        .unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.join("cfg"),
+            data_dir: tmp.clone(),
+        };
+        assert_eq!(voice_sample_rate(&dirs, voice), Some(22_050));
+        // Junk config → None: the caller teaches instead of guessing a rate.
+        std::fs::write(voice_dir.join(format!("{voice}.onnx.json")), b"not json").unwrap();
+        assert_eq!(voice_sample_rate(&dirs, voice), None);
+        // Missing voice → None.
+        assert_eq!(voice_sample_rate(&dirs, "en_US-nobody-x"), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -378,6 +378,14 @@ pub async fn openai_proxy(
     if let Some(resp) = llamacpp_only_gate(&state, &uri, model.as_deref()) {
         return resp;
     }
+    // Forced tool_choice on the mlx lane: mlx-lm has no tool_choice
+    // handling at all — a forced call would stream back HTTP 200 prose
+    // with the constraint silently dropped.
+    if let Some(resp) =
+        mlx_forced_tool_choice_gate(&state, &uri, model.as_deref(), parsed_body.as_ref())
+    {
+        return resp;
+    }
     // F7: strict `n` validation at the plane edge — an invalid choice
     // count fails fast, BEFORE admission bills the request.
     if let Some(body) = parsed_body.as_ref()
@@ -692,7 +700,7 @@ pub async fn openai_proxy(
                     let headers = child.headers().clone();
                     let bytes = child.bytes().await.unwrap_or_default();
                     let mut builder = axum::response::Response::builder().status(status);
-                    for (name, value) in headers.iter() {
+                    for (name, value) in &headers {
                         if name != axum::http::header::CONTENT_LENGTH {
                             builder = builder.header(name, value);
                         }
@@ -1027,6 +1035,55 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
 /// covers sub-paths (`/slots/{id}`). `model: None` (no resolvable
 /// target) falls back to the global active kind, matching the
 /// pre-routing estimate.
+/// mlx-lm (0.32) parses `tools` and emits voluntary tool_calls but has no
+/// `tool_choice` handling anywhere in the package (verified against the
+/// installed venv source) — a forced choice (`"required"` or a named
+/// function) is silently dropped and the model answers prose: HTTP 200,
+/// zero tool_calls, the client never learns the constraint was ignored.
+/// Refuse loudly at the plane edge instead, before tokens are spent
+/// (live receipt: forced-choice battery T2/T3/T4 on the mlx lane —
+/// 200 + zero calls while voluntary calling passes).
+fn mlx_forced_tool_choice_gate(
+    state: &Arc<AppState>,
+    uri: &Uri,
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Option<Response> {
+    if !uri.path().ends_with("/chat/completions") {
+        return None;
+    }
+    let tc = body?.get("tool_choice")?;
+    let forced_shape = match tc {
+        serde_json::Value::String(s) => s == "required",
+        serde_json::Value::Object(o) => o
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t == "function"),
+        _ => false,
+    };
+    if !forced_shape {
+        return None;
+    }
+    let kind = model
+        .and_then(|m| crate::proxy::routed_kind_for(state, m))
+        .or_else(|| {
+            state
+                .with_store(|s| s.active_engine().ok().flatten())
+                .flatten()
+                .map(|r| r.kind)
+        })?;
+    if kind != blazar_core::engine_kind::EngineKind::Mlx {
+        return None;
+    }
+    Some(openai_error(
+        400,
+        "tool_choice is forced but the mlx lane's upstream (mlx-lm) ignores tool_choice \
+         entirely — the request would return HTTP 200 with zero tool_calls. Drop \
+         tool_choice (voluntary tool calling works on this lane) or serve the model \
+         on a lane that enforces forcing via model_overrides (see `blazar engine list`)",
+    ))
+}
+
 fn llamacpp_only_gate(state: &Arc<AppState>, uri: &Uri, model: Option<&str>) -> Option<Response> {
     let path = uri.path();
     if !LLAMACPP_ONLY_PATHS
