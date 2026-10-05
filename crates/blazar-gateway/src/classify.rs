@@ -159,6 +159,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__classify_request_to_systemone__maps_labels_to_criteria() {
         let body = json!({
             "model": "laya",
@@ -210,6 +211,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__systemone_to_classify__normalizes_sorted_probabilities() {
         let live = json!({
             "model": "laya",

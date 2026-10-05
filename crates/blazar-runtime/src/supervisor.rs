@@ -8230,8 +8230,11 @@ mod routing_tests {
             4,
         )
         .await;
+        // Wall-clock bound, generous on purpose: this only proves no
+        // HTTP machinery spins up (a real dial far exceeds it). Tight
+        // bounds flake under a saturated parallel test run.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(100),
+            started.elapsed() < std::time::Duration::from_secs(2),
             "unix guard returns without HTTP"
         );
     }

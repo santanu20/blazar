@@ -5241,9 +5241,9 @@ ENG_TOOL_CALC = {
 
 # Embedder/reranker families never serve chat; "rerank" models are not
 # embedders either — both stay out of the chat-lane and embedding picks.
-ENG_EMBEDDER_RE = re.compile(r"bge|embed|minilm|e5", re.I)
-ENG_NON_CHAT_RE = re.compile(r"bge|embed|minilm|e5|rerank", re.I)
-ENG_QUANTIZED_ST_RE = re.compile(r"\b(?:awq|gptq|fp8)\b", re.I)
+ENG_EMBEDDER_RE = re.compile(r"bge|embed|minilm|e5", re.IGNORECASE)
+ENG_NON_CHAT_RE = re.compile(r"bge|embed|minilm|e5|rerank", re.IGNORECASE)
+ENG_QUANTIZED_ST_RE = re.compile(r"\b(?:awq|gptq|fp8)\b", re.IGNORECASE)
 
 
 def _eng_store() -> tuple[list[dict], dict]:
@@ -5251,12 +5251,12 @@ def _eng_store() -> tuple[list[dict], dict]:
     install state, which every lane pick resolves against."""
     db = sqlite3.connect(os.path.join(SANDBOX.data_dir, "blazar.db"))
     models = [
-        dict(zip(("name", "repo", "quant", "path", "bytes", "components", "arch"), r))
+        dict(zip(("name", "repo", "quant", "path", "bytes", "components", "arch"), r, strict=True))
         for r in db.execute(
             "SELECT name, repo, quant, path, bytes, components, arch FROM models"
         )
     ]
-    kinds = {tag: kind for tag, kind in db.execute("SELECT tag, kind FROM engines")}
+    kinds = dict(db.execute("SELECT tag, kind FROM engines"))
     db.close()
     return models, kinds
 
@@ -5396,7 +5396,7 @@ def _eng_probe(probe, attempts: int = 2):
         tries = i + 1
         try:
             ok, evidence = probe()
-        except Exception as exc:  # noqa: BLE001 - evidence, not a crash
+        except Exception as exc:
             ok, evidence = False, f"{type(exc).__name__}: {exc}"
         if ok:
             break
@@ -5427,7 +5427,7 @@ def _eng_cert_gate_check(lane: str, model: str, weather_tool: dict) -> None:
             None,
             240,
         )
-    except Exception as exc:  # noqa: BLE001 - evidence, not a crash
+    except Exception as exc:
         check(ph, "cert-gate policy observation", False, f"{type(exc).__name__}: {exc}")
         return
     if st == 200:
@@ -5626,7 +5626,7 @@ def _eng_tool_battery(lane: str, model: str) -> None:
             and any(n == "get_weather" for n in names.values())
             and parsed_ok
         )
-        n_frames = sum(1 for l in collected.splitlines() if l.startswith("data: "))
+        n_frames = sum(1 for ln in collected.splitlines() if ln.startswith("data: "))
         return (
             ok,
             f"done={done} frames={n_frames} names={list(names.values())} "
@@ -5835,7 +5835,7 @@ def _eng_classify(lane: str, model: str) -> None:
                 "classify returns the normalized card",
                 ok,
                 f"model={m} status={status} top={card.get('top')!r} "
-                f"rows={list(zip(names, probs))} "
+                f"rows={list(zip(names, probs, strict=True))} "
                 f"sum={sum(probs):.3f} confidence={card.get('confidence')!r}",
             )
             return
@@ -6043,7 +6043,7 @@ def _eng_embeddings(lane: str, embed_row: dict | None) -> None:
             f"status={st1}/{st2} vectors={'ok' if a else 'missing'}/{'ok' if b else 'missing'} model={name}",
         )
         return
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     na = sum(x * x for x in a) ** 0.5
     nb = sum(x * x for x in b) ** 0.5
     # An exactly-zero norm means the engine returned an all-zero vector
@@ -6069,7 +6069,7 @@ def _eng_embeddings(lane: str, embed_row: dict | None) -> None:
     c = vec(v3)
     if st3 == 200 and c is not None and not zero:
         nc = sum(x * x for x in c) ** 0.5
-        cos_diff = sum(x * y for x, y in zip(a, c)) / (na * nc) if na and nc else 0.0
+        cos_diff = sum(x * y for x, y in zip(a, c, strict=True)) / (na * nc) if na and nc else 0.0
         check(
             ph,
             "embeddings distinct-input separability",
@@ -6585,7 +6585,7 @@ def phase_engines() -> None:
                 reg(
                     f"engines.{kind}.cli", ok, "ps row + engine list on the lane daemon"
                 )
-            except Exception as exc:  # noqa: BLE001 - fail the lane, keep the phase
+            except Exception as exc:
                 if isinstance(exc, RuntimeError) and "MemAvailable" in str(exc):
                     # Environmental mem gate (co-resident daemon), not an
                     # engine verdict — the lane re-runs when the box frees.
@@ -12627,7 +12627,7 @@ def phase_wave13() -> None:
     )
     if full and ":" in full:
         st, _, v = http_json("POST", "/api/evict", body={"model": full})
-        st2, _, ps = http_json("GET", "/api/ps")
+        _, _, ps = http_json("GET", "/api/ps")
         gone = isinstance(ps, dict) and not [
             r for r in ps.get("models", []) if r.get("name") == MODEL
         ]

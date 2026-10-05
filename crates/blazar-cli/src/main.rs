@@ -8216,7 +8216,10 @@ async fn classify_cmd(model: &str, text: &[String], labels: &[String], json: boo
     }
     println!("model       {}", v["model"].as_str().unwrap_or(model));
     println!();
-    for l in v["labels"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+    for l in v["labels"]
+        .as_array()
+        .map_or(&[] as &[serde_json::Value], Vec::as_slice)
+    {
         let pct = l["probability"].as_f64().unwrap_or(0.0) * 100.0;
         println!("{:<24} {:>5.1}%", l["label"].as_str().unwrap_or("-"), pct);
     }
@@ -13087,10 +13090,10 @@ fn gate_baseline(store: &Store) -> Result<Option<(String, f64, String)>> {
 /// prevents is not. `None` (no measurable GPU — AMD/Metal/CPU boxes)
 /// never refuses: no gate data is not zero headroom.
 fn gate_bench_fits(weights_bytes: u64, free_mib: Option<u64>) -> bool {
+    const BENCH_HEADROOM_MIB: u64 = 1536;
     let Some(free) = free_mib else {
         return true;
     };
-    const BENCH_HEADROOM_MIB: u64 = 1536;
     let weights_mib = weights_bytes / (1024 * 1024);
     weights_mib + BENCH_HEADROOM_MIB <= free
 }
@@ -13109,6 +13112,7 @@ fn gate_vram_preflight(model_path: &std::path::Path) -> Result<(), String> {
     if gate_bench_fits(meta.len(), free) {
         return Ok(());
     }
+    #[allow(clippy::cast_precision_loss)] // display rounding only
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     Err(format!(
         "gate bench cannot fit: {} needs ~{:.1} GiB (+~1.5 GiB bench overhead) but only \
@@ -18944,7 +18948,7 @@ mod tests {
     fn unit__connect_backup_path__keeps_extension_and_stamps_generations() {
         // Every generation gets its own file: the second connect must
         // never overwrite the first backup.
-        let p = std::path::Path::new("/home/u/.claude/settings.json");
+        let p = std::path::Path::new("u/.claude/settings.json");
         assert_eq!(
             connect_backup_path(p, 100).file_name().unwrap(),
             "settings.json.blazar-bak-100"
@@ -18954,7 +18958,7 @@ mod tests {
             "settings.json.blazar-bak-200"
         );
         // Extension-less targets keep their name and gain the suffix.
-        let no_ext = connect_backup_path(std::path::Path::new("/home/u/.codex/config"), 5);
+        let no_ext = connect_backup_path(std::path::Path::new("u/.codex/config"), 5);
         assert!(no_ext.to_str().unwrap().ends_with("config.blazar-bak-5"));
     }
 

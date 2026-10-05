@@ -181,7 +181,7 @@ class Battery:
         # sample prose on the first draw even under the constraint —
         # transport enforcement is what this pins, not draw luck.
         t3_calls, t3_st, attempt = 0, 0, -1
-        for attempt in range(2):
+        for _attempt in range(2):
             st, v, _ = self.chat(
                 [WEATHER],
                 [
@@ -220,7 +220,7 @@ class Battery:
             else []
         )
         names = [t["function"]["name"] for t in tcs]
-        ok = st == 200 and names and all(n == "get_weather" for n in names)
+        ok = st == 200 and bool(names) and all(n == "get_weather" for n in names)
         self.record(
             "T4 tool_choice dict-form pin",
             ok,
@@ -371,11 +371,10 @@ class Battery:
                         assembled[idx] = assembled.get(idx, "") + (
                             tc.get("function", {}).get("arguments") or ""
                         )
-        except Exception as e:  # noqa: BLE001 - record transport failure
+        except Exception as e:
             self.record("T8 streaming tool deltas", False, f"transport: {e}")
             assembled = {}
         if assembled or sse_ok:
-            names_ok = True
             args_ok = any("city" in (a or "") for a in assembled.values())
             # name fragments arrive as deltas too; accept if any args JSON parses
             try:
@@ -479,10 +478,10 @@ def main() -> int:
         )
         for m, rows in all_rows.items():
             f.write(f"## {m} — {rows['passed']}/{rows['total']} passed\n\n")
-            for r in rows["results"]:
-                f.write(
-                    f"- {'PASS' if r['ok'] else 'FAIL'} · {r['test']} — {r['evidence']}\n"
-                )
+            f.writelines(
+                f"- {'PASS' if r['ok'] else 'FAIL'} · {r['test']} — {r['evidence']}\n"
+                for r in rows["results"]
+            )
             f.write("\n")
     total_ok = sum(r["passed"] for r in all_rows.values())
     total_n = sum(r["total"] for r in all_rows.values())

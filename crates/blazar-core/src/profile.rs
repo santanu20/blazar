@@ -804,7 +804,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         || (gguf.architecture == "bert"
             && !matches!(
                 gguf.pooling_type,
-                Some(POOLING_TYPE_MEAN) | Some(POOLING_TYPE_CLS) | Some(POOLING_TYPE_LAST)
+                Some(POOLING_TYPE_MEAN | POOLING_TYPE_CLS | POOLING_TYPE_LAST)
             ))
     {
         // Reranker-class checkpoint: either an explicit rank pooling type
