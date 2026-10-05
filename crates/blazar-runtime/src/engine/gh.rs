@@ -199,7 +199,9 @@ impl GhClient {
         let url = self
             .base
             .join(&format!("repos/{repo}/releases?per_page=30"))
-            .unwrap();
+            .context(
+                "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+            )?;
         let http = self.http.clone();
         let token = self.token.clone();
         net_probe::retry_probe(move || {
@@ -269,7 +271,9 @@ impl GhClient {
     }
 
     async fn release_by_path(&self, path: &str) -> Result<GhRelease> {
-        let url = self.base.join(path).unwrap();
+        let url = self.base.join(path).context(
+            "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+        )?;
         let http = self.http.clone();
         let token = self.token.clone();
         net_probe::retry_probe(move || {
@@ -365,7 +369,9 @@ impl GhClient {
             let url = self
                 .base
                 .join(&format!("repos/{LLAMA_CPP_REPO}/releases/tags/{tag}"))
-                .unwrap();
+                .context(
+                    "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+                )?;
             let resp = self
                 .auth(self.http.get(url.clone()))
                 .send()
@@ -398,7 +404,9 @@ impl GhClient {
         let url = self
             .base
             .join(&format!("repos/{repo}/releases/tags/{tag}"))
-            .unwrap();
+            .context(
+                "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+            )?;
         let http = self.http.clone();
         let token = self.token.clone();
         let repo = repo.to_string();
@@ -460,7 +468,9 @@ impl GhClient {
         let url = self
             .base
             .join(&format!("repos/{repo}/commits/{git_ref}"))
-            .unwrap();
+            .context(
+                "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+            )?;
         let http = self.http.clone();
         let token = self.token.clone();
         let repo = repo.to_string();
