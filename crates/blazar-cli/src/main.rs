@@ -13007,6 +13007,49 @@ fn gate_baseline(store: &Store) -> Result<Option<(String, f64, String)>> {
     Ok(store.latest_bench_by_time()?)
 }
 
+/// Guard math for the gate probe: does a llama-bench load of `weights`
+/// bytes fit `free_mib` of measured VRAM? Beyond the weights, llama-bench
+/// allocates CUDA context + compute buffers + a small KV for its rows —
+/// 1.5 GiB covers that overhead for the model classes this gate benches
+/// (0.5B-70B Q4-Q8); refusing slightly early is safe, the OOM dump it
+/// prevents is not. `None` (no measurable GPU — AMD/Metal/CPU boxes)
+/// never refuses: no gate data is not zero headroom.
+fn gate_bench_fits(weights_bytes: u64, free_mib: Option<u64>) -> bool {
+    let Some(free) = free_mib else {
+        return true;
+    };
+    const BENCH_HEADROOM_MIB: u64 = 1536;
+    let weights_mib = weights_bytes / (1024 * 1024);
+    weights_mib + BENCH_HEADROOM_MIB <= free
+}
+
+/// Free-VRAM pre-flight for the gate probe. The bench loads the FULL
+/// baseline model; when a daemon (ours or a foreign tenant) already
+/// holds the card, that load OOMs deep inside llama-bench and surfaces
+/// as a raw stderr dump. Fail fast with a teaching error instead.
+fn gate_vram_preflight(model_path: &std::path::Path) -> Result<(), String> {
+    // Unreadable/missing file: skip the guard — the bench itself owns
+    // that error with its own message.
+    let Ok(meta) = std::fs::metadata(model_path) else {
+        return Ok(());
+    };
+    let free = blazar_runtime::probe::nvidia_free_vram_mib();
+    if gate_bench_fits(meta.len(), free) {
+        return Ok(());
+    }
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    Err(format!(
+        "gate bench cannot fit: {} needs ~{:.1} GiB (+~1.5 GiB bench overhead) but only \
+         {} MiB VRAM is free — a resident model holds the card. Free it first \
+         (`blazar ps` to see holders, `blazar stop` or evict), re-run when idle, or \
+         skip the comparison with `engine update --no-gate` (the gate row stays \
+         recorded; nothing else changes).",
+        model_path.display(),
+        gib(meta.len()),
+        free.unwrap_or_default(),
+    ))
+}
+
 /// Single-shot tg128 on a specific engine's llama-bench.
 fn quick_tg(
     d: &BlazarDirs,
@@ -13028,6 +13071,8 @@ fn quick_tg(
             "probing decode on {which} (tg128; loads the model first, ~30-60s)..."
         ))
     );
+    gate_vram_preflight(std::path::Path::new(model_path))
+        .map_err(|e| anyhow!("gate pre-flight: {e}"))?;
     let rows = tuner.bench_default(std::path::Path::new(model_path))?;
     let tg = rows
         .iter()
@@ -18098,6 +18143,23 @@ mod tests {
         assert_eq!(parse_systemd_state("failed"), SystemdUnitState::Failed);
         assert_eq!(parse_systemd_state("inactive"), SystemdUnitState::Inactive);
         assert_eq!(parse_systemd_state("reloading"), SystemdUnitState::Unknown);
+    }
+
+    #[test]
+    fn unit__gate_bench_fits__refuses_only_when_measured_and_tight() {
+        let gib9_q4: u64 = 5_782_568_000; // the 9B Q4_K_M that OOMed live
+        // Measured card with a resident tenant: refuse before llama-bench.
+        assert!(!gate_bench_fits(gib9_q4, Some(2_300)));
+        // Idle card: the same model fits.
+        assert!(gate_bench_fits(gib9_q4, Some(7_800)));
+        // Exactly weights + headroom is the boundary (1536 MiB overhead).
+        let free_boundary = gib9_q4 / (1024 * 1024) + 1536;
+        assert!(gate_bench_fits(gib9_q4, Some(free_boundary)));
+        assert!(!gate_bench_fits(gib9_q4, Some(free_boundary - 1)));
+        // No measurable GPU (AMD/Metal/CPU boxes): never refuse.
+        assert!(gate_bench_fits(gib9_q4, None));
+        // Tiny model with a nearly-full card still refuses honestly.
+        assert!(!gate_bench_fits(400 * 1024 * 1024, Some(1_500)));
     }
 
     #[test]
