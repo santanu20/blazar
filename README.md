@@ -69,16 +69,18 @@ The engines still perform inference. **Blazar is the control plane around them**
 
 ### At a glance
 
-| Capability | Blazar provides |
+| If you need | Blazar provides |
 |---|---|
-| **One gateway** | OpenAI-, Ollama-, and Anthropic-compatible APIs |
-| **Multiple runtimes** | llama.cpp, mistral.rs, SGLang, MLX, stable-diffusion.cpp, whisper.cpp, piper |
-| **Resource control** | VRAM/KV fit, slots, admission, co-residency, lifecycle |
-| **Reliability** | Durable jobs, request cancel/interrupt, restart-safe response chains |
-| **Model operations** | Pull, import, inspect, pin, tune, snapshot, restore |
-| **Production controls** | API keys, TLS, CORS, audit logging, metrics, traces |
-| **Federation** | Capacity-aware peers with warm, replicate, and route verbs |
-| **Multimodal** | Text, embeddings, image, video, speech-to-text, TTS |
+| Apps speaking OpenAI, Ollama, **and** Anthropic | All three dialects natively, one gateway |
+| Different models on different runtimes | Capability-aware lanes across llama.cpp, mistral.rs, SGLang, MLX, sd.cpp, whisper.cpp, piper |
+| GPU memory and context under control | VRAM/KV fit planning, slots, admission, co-residency, lifecycle |
+| Long work that survives restarts | Durable jobs, request cancel/interrupt, restart-safe response chains (SQLite) |
+| Engines that update without breaking | Side-by-side versioned installs, regression gates, rollback |
+| Failures you can diagnose | `doctor`, `why`, `watch`, metrics, trace IDs, teaching errors |
+| Models managed like software | Pull, import, inspect, pin, tune, snapshot, restore |
+| Several machines as one pool | Capacity-aware federation: warm, replicate, route |
+| Multimodal in one place | Text, embeddings, image, video, speech-to-text, TTS |
+| Production controls, locally | API keys, TLS, CORS, audit logging, PII scrubbing, OTLP |
 
 ---
 
@@ -138,7 +140,7 @@ No application rewrite needed — point clients at Blazar's compatible surfaces.
 | Client | Base URL | Surfaces |
 |---|---|---|
 | **OpenAI SDK** | `http://127.0.0.1:11435/v1` | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/v1/batches`, `/v1/files`, `/v1/audio/*`, `/v1/images/*`, `/v1/videos/*` |
-| **Ollama clients** | `OLLAMA_HOST=http://127.0.0.1:11435` | `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/embeddings`, `/api/embed`, `/api/rerank`, model verbs `/api/create|copy|delete|push` |
+| **Ollama clients** | `OLLAMA_HOST=http://127.0.0.1:11435` | `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/embeddings`, `/api/embed`, `/api/rerank`, model verbs `/api/create`, `/api/copy`, `/api/delete`, `/api/push` |
 | **Anthropic SDK** | `http://127.0.0.1:11435` | `/v1/messages`, `/v1/messages/batches` |
 | **Blazar Python SDK** | `BLAZAR_URL=http://127.0.0.1:11434` | chat + streaming + `best_of`/`mcp` tools, `ps`, `explain`, `failover` — zero dependencies (`sdk/python`) |
 
@@ -158,22 +160,38 @@ blazar connect pi --write                     # pi / oh-my-pi, same treatment
 
 `connect` configures Codex, Claude Code, Continue, Cline, Open WebUI, opencode, and pi (oh my pi) to talk to Blazar — capability-driven model menus included (`--all-models` lists every certified chat model; the default pick follows the chat+tools > chat > uncertified ladder). Harnesses without a `connect` lane still work: point any OpenAI-compatible client at `http://127.0.0.1:11435/v1`, any Ollama client at the gateway root, or any Anthropic SDK client at `http://127.0.0.1:11435`.
 
+### MCP tool calling for any client
+
+Any app that speaks OpenAI, Anthropic, or Ollama gets MCP tools through Blazar — the client needs zero MCP knowledge. You register [MCP](https://modelcontextprotocol.io) servers once — local stdio commands or remote Streamable HTTP endpoints — and Blazar injects their tools as `mcp__<server>__<tool>` and runs the whole call loop (tool dispatch, argument passing, result replay) on the server side.
+
+```toml
+# config.toml — register servers once (stdio command OR http url)
+[[mcp]]
+name = "fetch"
+command = ["uvx", "mcp-server-fetch"]
+
+[[mcp]]
+name = "remote"
+url = "http://mcp.internal:8808/mcp"
+
+mcp_default = "all"   # optional: every request gets the catalog with no opt-in
+```
+
+```sh
+# per-request opt-in (or set mcp_default above and skip the field entirely)
+curl http://127.0.0.1:11435/v1/chat/completions -d '{
+  "model": "qwen3:8b", "mcp": "fetch", "stream": false,
+  "messages": [{"role": "user", "content": "fetch example.com and summarize"}]
+}'
+```
+
+The same `"mcp"` field (or `x-blazar-mcp` header) works on `/api/chat` and `/v1/messages`; the response carries `x-blazar-mcp: rounds=N` proving real tool executions. `stream: false` is required on mediated calls, `"none"` opts a request out when a default is set, and `GET /api/mcp` lists servers without spawning them. The Python SDK takes `Client(...).chat(model, messages, mcp="all")`. Config owners declare servers; keyed clients can only select among them — never add their own. → [`7.SETUP.md`](docs/7.SETUP.md)
+
 ---
 
 ## Why use Blazar?
 
-When local inference has outgrown "run one server for one model", Blazar is the next step.
-
-| Need | Blazar's approach |
-|---|---|
-| Apps speak different APIs | One gateway with **OpenAI + Ollama + Anthropic** surfaces |
-| Different models need different runtimes | Capability-aware lanes across 7 engines |
-| GPU memory and context are hard to manage | Fit planning, KV-aware sizing, slots, admission, co-residency |
-| Engines update and break things | Verified side-by-side installs, regression gates, rollback |
-| Failures are hard to diagnose | `doctor`, `why`, `watch`, metrics, trace IDs, actionable errors |
-| Long generations die with the process | Durable jobs and restart-safe response chains in SQLite |
-| Several machines should act as one pool | Capacity-aware federation with warm, replicate, route |
-| Local deployments need controls | API keys, TLS, CORS, audit logging, PII scrubbing, OTLP |
+When local inference has outgrown "run one server for one model", Blazar is the next step — the table above is the short version, [Features](#features) is the long one.
 
 ### Blazar vs. common approaches
 
@@ -202,17 +220,7 @@ If you only need one model, one runtime, and one process, a direct engine server
 | **whisper.cpp** | Speech recognition | Transcription and translation |
 | **piper** | Offline speech synthesis | Local TTS voices |
 
-```text
-GGUF                      → llama.cpp / mistral.rs
-Quantized safetensors     → SGLang
-Plain safetensors         → SGLang / mistral.rs
-MLX quant directories     → MLX
-Diffusion component sets  → stable-diffusion.cpp
-Audio transcription       → whisper.cpp
-Offline TTS               → piper
-```
-
-Full lane inventory and channel policy: [`docs/engines.md`](docs/engines.md). Routing follows model format and engine capability. The default preserves single-active-engine behavior; per-model engine pins give deterministic placement. Curated capability lanes cover GGUF architectures the mainstream llama.cpp lane does not yet support.
+Full lane inventory and channel policy: [`docs/engines.md`](docs/engines.md). Routing follows model format and engine capability (the table's Workloads column is the format map). The default preserves single-active-engine behavior; per-model engine pins give deterministic placement. Curated capability lanes cover GGUF architectures the mainstream llama.cpp lane does not yet support.
 
 ---
 
@@ -224,7 +232,7 @@ Three native dialects with per-engine **thinking management** (effort mapping, `
 
 ### Voice, tools, resilience add-ons
 
-`/v1/realtime` WebSocket voice (whisper STT → chat → piper TTS); `[[mcp]]` stdio tool catalog — the gateway runs the tool loop for engines with no MCP support of their own, per-request opt-in (`/api/mcp` status); `[[failover]]` alias chains over ordered local/remote targets (anti-flap benching, pin/unpin at `/api/failover`); idle-sleep visibility (`blazar_sleeping` in `/api/ps`). → [`7.SETUP.md`](docs/7.SETUP.md)
+`/v1/realtime` WebSocket voice (whisper STT → chat → piper TTS); `[[mcp]]` tool catalog over stdio or Streamable HTTP — the gateway runs the tool loop for engines with no MCP support of their own, per-request opt-in or config-wide `mcp_default` (`/api/mcp` status); `[[failover]]` alias chains over ordered local/remote targets (anti-flap benching, pin/unpin at `/api/failover`); idle-sleep visibility (`blazar_sleeping` in `/api/ps`). → [`7.SETUP.md`](docs/7.SETUP.md)
 
 ### One-word UX
 
