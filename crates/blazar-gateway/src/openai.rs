@@ -1588,6 +1588,17 @@ async fn buffered_response_roundtrip(
                 r
             }
             Err(e) => {
+                // Busy-child header timeout: the child is healthy and still
+                // generating (buffered responses emit headers only at
+                // completion). Retrying on a respawned lane re-runs the same
+                // oversized generation into the same ceiling — surface the
+                // teaching 504 for the caller instead.
+                if matches!(
+                    &e,
+                    crate::proxy::ChildSendError::HeaderTimeout { evicted: false, .. }
+                ) {
+                    return fail(e.status_u16(), &e.to_string());
+                }
                 tracing::warn!(
                     model = %model_name,
                     "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"

@@ -2018,6 +2018,18 @@ async fn proxy_core_chat(
                             r
                         }
                         Err(e) => {
+                            // Busy-child header timeout: the child is healthy
+                            // and still generating (buffered responses emit
+                            // headers only at completion). Retrying on a
+                            // respawned lane re-runs the same oversized
+                            // generation into the same ceiling — surface the
+                            // teaching 504 for the caller instead.
+                            if matches!(
+                                &e,
+                                crate::proxy::ChildSendError::HeaderTimeout { evicted: false, .. }
+                            ) {
+                                return api_error(e.status_u16(), &e.to_string());
+                            }
                             tracing::warn!(
                                 model,
                                 "nonstream upstream failed: {e} — respawning lane, retrying once in-band"
@@ -2230,6 +2242,15 @@ async fn proxy_core_chat(
             // Same crash-recovery contract as the OpenAI proxy path; the
             // in-band retry is safe here because no client bytes have
             // been sent yet (headers are built only after this match).
+            // Busy-child header timeout (a giant prefill still computing):
+            // the child is healthy, a respawn+retry would re-run the same
+            // prefill into the same ceiling — teaching error wins.
+            if matches!(
+                &e,
+                crate::proxy::ChildSendError::HeaderTimeout { evicted: false, .. }
+            ) {
+                return api_error(e.status_u16(), &e.to_string());
+            }
             tracing::warn!(
                 model,
                 "stream upstream failed: {e} — respawning lane, retrying once in-band"

@@ -3030,7 +3030,11 @@ async fn e2e__child_header_timeout_busy_child_kept_teaching_504() {
         child_header_timeout_secs: 1,
         ..Config::default()
     };
-    let ts = start_with(cfg, vec![("STUB_HANG_BUSY_ON".into(), "busy-token-7".into())]).await;
+    let ts = start_with(
+        cfg,
+        vec![("STUB_HANG_BUSY_ON".into(), "busy-token-7".into())],
+    )
+    .await;
     let c = client();
     let resp = c
         .post(format!("{}/api/chat", ts.base))
@@ -3062,6 +3066,16 @@ async fn e2e__child_header_timeout_busy_child_kept_teaching_504() {
     assert!(
         !msg.contains("wedged child evicted"),
         "busy-child 504 must NOT claim an eviction, got: {msg}"
+    );
+    assert!(
+        !msg.contains("retry on respawned child"),
+        "busy-child 504 must NOT retry onto a respawned lane (the retry would \
+         re-run the same oversized generation into the same ceiling), got: {msg}"
+    );
+    assert_eq!(
+        msg.matches("still generating").count(),
+        1,
+        "teaching message must appear exactly once (no duplicated retry text), got: {msg}"
     );
     // The child was NOT evicted: ps still shows m1 resident and ready
     // (nothing respawns it without traffic), and a follow-up request
