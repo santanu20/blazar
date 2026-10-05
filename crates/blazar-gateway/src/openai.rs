@@ -373,6 +373,11 @@ pub async fn openai_proxy(
                 None
             }
         });
+    // Native llama-server surfaces whose upstream bodies carry no
+    // `model` field (a router-mode-only field there — direct clients
+    // post them bare): resolve the target with the `scoped_proxy` chain
+    // instead of falling through to the OpenAI-dialect hard 400.
+    let model = model.or_else(|| native_modelless_target(&state, &uri, &headers));
     // Routed-lane surface gate: needs the model to know which engine
     // will serve it (GGUF routes llamacpp regardless of the active row).
     if let Some(resp) = llamacpp_only_gate(&state, &uri, model.as_deref()) {
@@ -1014,6 +1019,8 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
     "/detokenize",
     "/apply-template",
     "/infill",
+    "/completion",
+    "/embeddings",
     "/v1/chat/completions/control",
     "/v1/chat/completions/input_tokens",
     "/v1/systemone",
@@ -1035,11 +1042,11 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
 /// covers sub-paths (`/slots/{id}`). `model: None` (no resolvable
 /// target) falls back to the global active kind, matching the
 /// pre-routing estimate.
-/// mlx-lm (0.32) parses `tools` and emits voluntary tool_calls but has no
+/// mlx-lm (0.32) parses `tools` and emits voluntary `tool_calls` but has no
 /// `tool_choice` handling anywhere in the package (verified against the
 /// installed venv source) — a forced choice (`"required"` or a named
 /// function) is silently dropped and the model answers prose: HTTP 200,
-/// zero tool_calls, the client never learns the constraint was ignored.
+/// zero `tool_calls`, the client never learns the constraint was ignored.
 /// Refuse loudly at the plane edge instead, before tokens are spent
 /// (live receipt: forced-choice battery T2/T3/T4 on the mlx lane —
 /// 200 + zero calls while voluntary calling passes).
@@ -1113,6 +1120,60 @@ fn llamacpp_only_gate(state: &Arc<AppState>, uri: &Uri, model: Option<&str>) -> 
     ))
 }
 
+/// `X-Blazar-Model` header hint (engine-scoped surface targeting).
+fn header_model(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-blazar-model")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// `?model=` query hint — first matching pair wins.
+fn query_model(uri: &Uri) -> Option<String> {
+    uri.query().and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == "model").then(|| v.to_string())
+        })
+    })
+}
+
+/// The single hot child, when exactly one model is loaded — the only
+/// unambiguous model-less default. Zero or many loaded: None (the
+/// caller turns that into a teaching 400, never a silent guess).
+fn single_hot_child(state: &Arc<AppState>) -> Option<String> {
+    let hot = state.sup.ps();
+    if hot.len() == 1 {
+        hot.first().map(|p| p.name.clone())
+    } else {
+        None
+    }
+}
+
+/// Native llama-server request surfaces whose upstream bodies carry no
+/// `model` field — it is a router-mode-only field upstream, so direct
+/// llama-server clients post them bare. Blazar still needs a target to
+/// route, admission-check, and forward, so mirror the `scoped_proxy`
+/// resolution order: `X-Blazar-Model` header > `?model=` query > the
+/// single hot child. Exact-path match only; OpenAI-dialect paths keep
+/// the hard 400 — their clients always name the model, and silence
+/// there would route a typo to the wrong lane.
+const NATIVE_MODELLESS_PATHS: [&str; 4] =
+    ["/infill", "/v1/systemone", "/completion", "/embeddings"];
+
+fn native_modelless_target(
+    state: &Arc<AppState>,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if !NATIVE_MODELLESS_PATHS.contains(&uri.path()) {
+        return None;
+    }
+    header_model(headers)
+        .or_else(|| query_model(uri))
+        .or_else(|| single_hot_child(state))
+}
+
 /// Engine-scoped upstream surfaces whose body carries no `model` field:
 /// `/props`, `/slots`, `/slots/{id}`, `/v1/stream`, `/v1/streams/lookup`.
 /// Model resolution order: `X-Blazar-Model` header > `?model=` query >
@@ -1145,23 +1206,10 @@ pub async fn scoped_proxy(
     if let Some(resp) = llamacpp_only_gate(&state, &uri, body_model.as_deref()) {
         return resp;
     }
-    let header_model = headers
-        .get("x-blazar-model")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let query_model = uri.query().and_then(|q| {
-        q.split('&').find_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            (k == "model").then(|| v.to_string())
-        })
-    });
-    let hot = state.sup.ps();
-    let single = if hot.len() == 1 {
-        hot.first().map(|p| p.name.clone())
-    } else {
-        None
-    };
-    let model = body_model.or(header_model).or(query_model).or(single);
+    let model = body_model
+        .or_else(|| header_model(&headers))
+        .or_else(|| query_model(&uri))
+        .or_else(|| single_hot_child(&state));
     let Some(model) = model else {
         return openai_error(
             400,

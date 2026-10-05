@@ -305,9 +305,11 @@ fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/completions", post(completions))
+        .route("/completion", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/embeddings", post(embeddings))
         .route("/lora-adapters", get(lora_adapters))
+        .route("/v1/systemone", post(systemone))
         .route("/metrics", get(metrics))
         .route("/slots", get(slots))
         // New-wave surfaces: Responses API, audio transcriptions, FIM
@@ -919,6 +921,18 @@ async fn embeddings(
 
 async fn lora_adapters() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({"adapters": []}))
+}
+
+/// /v1/systemone (`TypeSafe System One` dialect): mirrors the live child
+/// response shape the gateway's `systemone_to_classify` normalizer
+/// consumes (choice answer + probabilities + confidence + usage).
+async fn systemone() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "answers": {"q1": {"type": "choice", "choice": "no",
+                            "probabilities": {"yes": 0.123, "no": 0.877},
+                            "confidence": 0.75}},
+        "usage": {"input_tokens": 38, "output_tokens": 0}
+    }))
 }
 
 async fn metrics() -> axum::response::Response {

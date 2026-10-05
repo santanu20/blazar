@@ -3629,6 +3629,63 @@ def _option_flags(help_stdout: str) -> list[str]:
 # ----------------------------------------------------------------- phases
 
 
+def phase_inventory() -> None:
+    """Upstream llama-server API parity guard (audit 2026-10-05).
+
+    docs/upstream-api-inventory.json pins the endpoint set documented in
+    the upstream server README. Every entry must either map to a route
+    actually mounted in crates/blazar-gateway/src/lib.rs or carry a
+    non-empty exemption reason. This is the drift alarm the audit found
+    missing: routes were added piecemeal (client demand) with nothing
+    diffing Blazar's surface against the upstream inventory.
+    """
+    print("\n== phase 0b: upstream llama-server API inventory parity ==")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    inv_path = os.path.join(repo, "docs", "upstream-api-inventory.json")
+    try:
+        with open(inv_path, encoding="utf-8") as f:
+            inv = json.load(f)
+    except FileNotFoundError:
+        check("inventory", "inventory file present", False, inv_path)
+        return
+    src = inv.get("source", {})
+    check(
+        "inventory",
+        "inventory pinned with source + date",
+        bool(src.get("url")) and bool(src.get("pinned_at")),
+        f"{src.get('url')} @ {src.get('pinned_at')}",
+    )
+    router_path = os.path.join(repo, "crates", "blazar-gateway", "src", "lib.rs")
+    with open(router_path, encoding="utf-8") as f:
+        mounted = set(re.findall(r'\.route\(\s*"([^"]+)"', f.read()))
+    endpoints = inv.get("endpoints", [])
+    check(
+        "inventory",
+        "inventory non-empty",
+        bool(endpoints),
+        f"{len(endpoints)} upstream endpoints pinned",
+    )
+    for ep in endpoints:
+        label = f"{ep.get('method', '?')} {ep.get('upstream_path', '?')}"
+        route = ep.get("blazar_route")
+        if route is None:
+            reason = ep.get("exemption", "")
+            check(
+                "inventory",
+                f"{label}: exempted with reason",
+                bool(reason.strip()),
+                reason or "EMPTY exemption",
+            )
+            continue
+        check(
+            "inventory",
+            f"{label}: route mounted",
+            route in mounted,
+            f"-> {route}"
+            + (f" (+aliases {', '.join(ep['aliases'])})" if ep.get("aliases") else ""),
+        )
+
+
 def phase_manifests() -> None:
     print("\n== phase 0: manifest registry sanity (merged validate_manifests) ==")
     check(
@@ -13068,6 +13125,7 @@ def main() -> int:
 
     phases = [
         ("manifests", phase_manifests),
+        ("inventory", phase_inventory),
         ("baseline", phase_baseline),
         ("config", phase_config),
         ("api", phase_api),

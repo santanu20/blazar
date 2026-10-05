@@ -368,6 +368,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         // same alias symmetry as transcriptions).
         .route("/audio/translations", post(whisper::audio_translations))
         .route("/infill", post(openai::openai_proxy))
+        // Native llama-server dialect (no /v1 prefix, no `model` field
+        // in the body upstream): /completion is the raw prompt surface,
+        // /embeddings the token-level batch one (pooling=none). Same
+        // handler — model resolution mirrors scoped_proxy for them.
+        .route("/completion", post(openai::openai_proxy))
+        .route("/embeddings", post(openai::openai_proxy))
         .route("/v1/chat/completions/control", post(openai::openai_proxy))
         .route(
             "/v1/chat/completions/input_tokens",
@@ -946,8 +952,9 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/v1/adapters", "/v1/batches", "/v1/batches/{id}",
                        "/v1/batches/{id}/cancel", "/v1/files", "/v1/files/{id}",
                        "/v1/files/{id}/content", "/v1/streams/lookup", "/v1/stream",
-                       "/props", "/infill", "/tokenize", "/detokenize",
-                       "/apply-template", "/slots", "/slots/{id}", "/responses",
+                        "/props", "/infill", "/completion", "/embeddings",
+                        "/tokenize", "/detokenize",
+                        "/apply-template", "/slots", "/slots/{id}", "/responses",
                        "/responses/input_tokens",
                         "/v1/images/generations", "/v1/images/edits",
                         "/v1/images/variations", "/v1/images/upscale",
