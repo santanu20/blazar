@@ -546,6 +546,13 @@ pub(crate) async fn send_with_child_retry(
         Ok(r) => return Ok(r),
         Err(e) => e,
     };
+    // Busy-child header timeout is TERMINAL: the child is healthy and
+    // still generating — evicting/respawning would kill sibling streams,
+    // and a retry would park for another full ceiling on the same busy
+    // child. The teaching error reaches the caller unchanged.
+    if matches!(&first, ChildSendError::HeaderTimeout { evicted: false, .. }) {
+        return Err(first.to_string());
+    }
     tracing::warn!(
         model = %engine.key,
         "child send failure ({first}); reaping and retrying once on a respawned lane"
@@ -609,10 +616,24 @@ pub(crate) async fn ensure_key_detached(
 /// Child-bound send failure classes: transport errors mean the child is
 /// gone (crash-window semantics, 502); a header-phase stall means the
 /// child is ALIVE but wedged (504) — [`child_send`] has already evicted
-/// it synchronously by the time this reaches a caller.
+/// it synchronously by the time this reaches a caller — UNLESS the
+/// post-timeout slot probe found the child mid-generation
+/// (`evicted: false`): then the child is healthy, kept serving, and the
+/// error body teaches the two real remedies instead.
 pub(crate) enum ChildSendError {
     Transport(reqwest::Error),
-    HeaderTimeout { secs: u64 },
+    HeaderTimeout {
+        secs: u64,
+        /// Whether the wedged-child guard destroyed the child. `false`
+        /// = slot probe saw active generation: a buffered long request
+        /// outran the ceiling; evicting would also kill every sibling
+        /// in-flight stream, so the child stays and the request fails
+        /// alone with a teaching body.
+        evicted: bool,
+        /// Config knob governing the ceiling, named in the error body
+        /// so the remedy is actionable without doc lookup.
+        knob: &'static str,
+    },
 }
 
 impl ChildSendError {
@@ -629,11 +650,67 @@ impl std::fmt::Display for ChildSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(e) => write!(f, "{e:#}"),
-            Self::HeaderTimeout { secs } => {
-                write!(f, "no response headers from child within {secs}s")
-            }
+            Self::HeaderTimeout {
+                secs,
+                evicted: true,
+                knob,
+            } => write!(
+                f,
+                "no response headers from child within {secs}s — wedged child evicted ({knob})"
+            ),
+            Self::HeaderTimeout {
+                secs,
+                evicted: false,
+                knob,
+            } => write!(
+                f,
+                "no response headers from child within {secs}s but the child is healthy — \
+                 its slots are still generating, and a buffered (non-stream) response \
+                 emits headers only at completion. Send \"stream\": true for long \
+                 generations, or raise {knob} (0 disables the bound). The child was \
+                 kept alive and keeps serving other requests"
+            ),
         }
     }
+}
+
+/// `GET /slots` body → is any slot mid-generation? `None` when the shape
+/// is not a bare array of slot objects (unknown is not guessed as idle).
+fn slots_any_processing(body: &serde_json::Value) -> Option<bool> {
+    body.as_array().map(|slots| {
+        slots.iter().any(|slot| {
+            slot.get("is_processing")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Probe the child's own slot activity — the discriminator between a
+/// WEDGED child (parked, slots idle: evict) and a HEALTHY one
+/// mid-generation on a buffered request (slots busy: teach and keep).
+/// LlamaCpp-only (`/slots` is a llama-server surface); any probe
+/// failure returns `None` and the caller falls back to the legacy
+/// wedged-child semantics — the probe must never make the decision
+/// LESS safe. Bounded at 2s: this runs on an already-degraded path.
+async fn child_slots_generating(state: &AppState, engine: &EngineRef) -> Option<bool> {
+    if engine.kind != EngineKind::LlamaCpp {
+        return None;
+    }
+    let url = format!("{}/slots", child_base(&engine.endpoint));
+    let probe = child_auth(
+        crate::state::child_client(state, &engine.endpoint).get(&url),
+        engine,
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(2), probe.send())
+        .await
+        .ok()?
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    slots_any_processing(&body)
 }
 
 /// Bounded child-bound send — the transport choke point for EVERY
@@ -675,13 +752,44 @@ pub(crate) async fn child_send(
         secs => match tokio::time::timeout(std::time::Duration::from_secs(secs), send).await {
             Ok(result) => result.map_err(ChildSendError::Transport),
             Err(_elapsed) => {
-                tracing::warn!(
-                    target: "blazar::proxy",
-                    model = %engine.key,
-                    "child produced no response headers in {secs}s — evicting synchronously ({knob})"
-                );
-                let _ = state.sup.evict(&engine.key).await;
-                Err(ChildSendError::HeaderTimeout { secs })
+                // Wedged or busy? A buffered (non-stream) long generation
+                // emits headers only at completion — byte-identical to a
+                // wedged child from this bound's point of view. Ask the
+                // child itself: slots mid-generation means healthy (keep
+                // it — eviction would also kill every sibling in-flight
+                // stream; vLLM and ollama cap no generation either);
+                // probe unknown or slots idle means the original
+                // wedged-child case, and the synchronous eviction stands.
+                match child_slots_generating(state, engine).await {
+                    Some(true) => {
+                        tracing::warn!(
+                            target: "blazar::proxy",
+                            model = %engine.key,
+                            "child silent for {secs}s but its slots are generating — \
+                             buffered long generation; child kept ({knob})"
+                        );
+                        Err(ChildSendError::HeaderTimeout {
+                            secs,
+                            evicted: false,
+                            knob,
+                        })
+                    }
+                    slots => {
+                        tracing::warn!(
+                            target: "blazar::proxy",
+                            model = %engine.key,
+                            "child produced no response headers in {secs}s — evicting \
+                             synchronously ({knob}; slot probe: {:?})",
+                            slots.map_or("unavailable".to_string(), |b| b.to_string())
+                        );
+                        let _ = state.sup.evict(&engine.key).await;
+                        Err(ChildSendError::HeaderTimeout {
+                            secs,
+                            evicted: true,
+                            knob,
+                        })
+                    }
+                }
             }
         },
     }
@@ -834,7 +942,17 @@ pub async fn proxy_request(
             // LIVE child is a gateway timeout (504); a dead child that
             // could not be revived is a bad gateway (502).
             let terminal = match &e {
-                ChildSendError::HeaderTimeout { secs } => {
+                ChildSendError::HeaderTimeout { evicted: false, .. } => {
+                    // Healthy child mid-generation (slot probe said so in
+                    // `child_send`): terminal teaching error — a respawn
+                    // would kill the very child that is still serving,
+                    // and the retry would ride the same busy lane for
+                    // another full ceiling. Drop the singleflight entry
+                    // and hand the caller the remedy.
+                    drop(sf); // F31: Drop removes the singleflight entry
+                    return openai_error(StatusCode::GATEWAY_TIMEOUT.as_u16(), &e.to_string());
+                }
+                ChildSendError::HeaderTimeout { secs, .. } => {
                     tracing::warn!(
                         target: "blazar::proxy",
                         model,
@@ -3642,5 +3760,42 @@ mod resolve_model_tests {
         // No messages array at all (completions lane): untouched.
         let mut v = json!({"prompt": "hi"});
         assert!(!normalize_system_first_in_value(&mut v));
+    }
+}
+
+#[cfg(test)]
+mod header_probe_tests {
+    #![allow(non_snake_case)]
+    use super::slots_any_processing;
+
+    #[test]
+    fn unit__slots_any_processing__busy_idle_and_unknown_shapes() {
+        let busy = serde_json::json!([
+            {"id": 0, "is_processing": true, "prompt": "", "n_ctx": 4096},
+        ]);
+        assert_eq!(slots_any_processing(&busy), Some(true));
+
+        // Multiple slots: any one generating counts (the probe asks "is
+        // the child alive mid-work", not "is every slot busy").
+        let mixed = serde_json::json!([
+            {"id": 0, "is_processing": false, "prompt": "", "n_ctx": 4096},
+            {"id": 1, "is_processing": true, "prompt": "", "n_ctx": 4096},
+        ]);
+        assert_eq!(slots_any_processing(&mixed), Some(true));
+
+        let idle = serde_json::json!([
+            {"id": 0, "is_processing": false, "prompt": "", "n_ctx": 4096},
+        ]);
+        assert_eq!(slots_any_processing(&idle), Some(false));
+
+        // Unknown shapes are None, never guessed as idle: an engine that
+        // wraps or renames the slot array must fall back to the legacy
+        // wedged-child semantics rather than a false "healthy" verdict.
+        assert_eq!(slots_any_processing(&serde_json::json!({})), None);
+        assert_eq!(slots_any_processing(&serde_json::json!("ok")), None);
+        assert_eq!(
+            slots_any_processing(&serde_json::json!([{"id": 0}])),
+            Some(false) // slot object without is_processing reads as not busy
+        );
     }
 }
