@@ -1,0 +1,1 @@
+{"id": "reason-0", "prompt": "Cleo starts with 25 pens, buys 29 more, then gives away 1. If Cleo ends up with this many pens 5 times over, how many pens does that make in total? Answer with just the final number.", "expected": 265, "checker": "numeric"}

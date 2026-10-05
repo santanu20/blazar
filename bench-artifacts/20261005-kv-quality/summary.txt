@@ -1,0 +1,13 @@
+engine | kind | provider | params | ttft_ms_p50 | ttft_ms_p99 | itl_p50_ms | itl_p99_ms | decode_tps | prefill_tps_cold | prefill_tps_cached | load_s | gpu_peak_mib | gpu_power_peak_w | gpu_power_avg_w | gpu_power_idle_w | cpu_power_avg_w | cpu_power_idle_w | decode_tps_per_w_net | rss_peak_mib | tokens_source
+--------------------------------------------------------------------------------------------------------------------------------------------
+inventory | inventory | inventory | {} | - | - | - | - | - | - | - | - | 0 | - | - | - | - | - | - | 0 | -
+b11393-cuda | llamacpp | ppl | {'ppl': 2048} | - | - | - | - | - | - | - | - | 0 | - | - | - | - | - | - | 0 | -
+b11393-cuda | llamacpp | ppl | {'ppl': 2048, 'ppl_kv': 'q8_0/q8_0'} | - | - | - | - | - | - | - | - | 0 | - | - | - | - | - | - | 0 | -
+b11393-cuda | llamacpp | ppl | {'ppl': 2048, 'ppl_kv': 'q4_0/q4_0'} | - | - | - | - | - | - | - | - | 0 | - | - | - | - | - | - | 0 | -
+b11393-cuda | llamacpp | blazar | {'config': 'default'} | 180 | 180 | 24.56 | 26.26 | 40.58 | 1309.9 | 1309.9 | - | 6332 | 55.1 | 31.4 | 8.9 | - | - | 1.806 | 1724 | chunks
+b11393-cuda | llamacpp | blazar | {'config': 'single-stream'} | 127 | 127 | 24.18 | 25.53 | 41.26 | 1328.2 | 1328.2 | - | 6070 | 55.1 | 33.1 | 8.7 | - | - | 1.69 | 1683 | chunks
+ollama-host | ollama | ollama | {'reference': True} | 123 | 123 | 24.93 | 74.92 | 40.51 | 1409.5 | 1409.5 | - | 6566 | 55.2 | 24.7 | 19.3 | - | - | 7.487 | 0 | engine_counters
+ollama-host | ollama | cold-ollama | {'cold': True} | - | - | - | - | - | - | - | - | 6826 | 21.5 | 14.2 | 18.3 | - | - | - | 0 | -
+b11393-cuda | llamacpp | quality | {'config': 'default'} | - | - | - | - | - | - | - | - | 6344 | 58.1 | 49.0 | 10.5 | - | - | - | 0 | -
+
+quality lane: ran — 1 scored row(s); suites: code, instruct, multilingual, niah, reason, safety, schema
