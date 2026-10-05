@@ -142,7 +142,7 @@ No application rewrite needed — point clients at Blazar's compatible surfaces.
 | **OpenAI SDK** | `http://127.0.0.1:11435/v1` | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/v1/batches`, `/v1/files`, `/v1/audio/*`, `/v1/images/*`, `/v1/videos/*` |
 | **Ollama clients** | `OLLAMA_HOST=http://127.0.0.1:11435` | `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/embeddings`, `/api/embed`, `/api/rerank`, model verbs `/api/create`, `/api/copy`, `/api/delete`, `/api/push` |
 | **Anthropic SDK** | `http://127.0.0.1:11435` | `/v1/messages`, `/v1/messages/batches` |
-| **Blazar Python SDK** | `BLAZAR_URL=http://127.0.0.1:11434` | chat + streaming + `best_of`/`mcp` tools, `ps`, `explain`, `failover` — zero dependencies (`sdk/python`) |
+| **Blazar Python SDK** | `BLAZAR_URL=http://127.0.0.1:11434` | chat + streaming + `best_of`/`mcp` tools, `ps`, `explain`, `failover`, realtime voice, Anthropic batches, metadata cards — zero dependencies (`sdk/python`) |
 
 Beyond dialect compatibility: `/v1/realtime` voice, `[[failover]]` chains, the `[[mcp]]` tool catalog, completion metadata cards, and idle-sleep visibility — one line each in [Features](#features).
 

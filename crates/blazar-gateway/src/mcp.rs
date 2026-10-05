@@ -867,6 +867,8 @@ pub(crate) async fn chat_via_mcp(
         crate::proxy::child_base(&engine.endpoint)
     );
     let client = crate::state::child_client(state, &engine.endpoint);
+    // Computed once: the constraint receipt the proxy lane would stamp.
+    let so_kind = crate::proxy::structured_output_kind(Some(openai_body));
     let mut rounds = 0usize;
     loop {
         let bytes = serde_json::to_vec(openai_body).unwrap_or_default();
@@ -893,7 +895,16 @@ pub(crate) async fn chat_via_mcp(
             .await
             .map_err(|e| teaching_error(StatusCode::BAD_GATEWAY, &format!("engine body: {e}")))?;
         if !status.is_success() {
-            return Ok(rebuild(status, &headers, body_bytes, rounds));
+            crate::metadata_card::persist_from_response(
+                state,
+                openai_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                Some(openai_body),
+                &body_bytes,
+            );
+            return Ok(rebuild(status, &headers, body_bytes, rounds, so_kind));
         }
         let parsed: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
         let calls = parsed
@@ -913,7 +924,16 @@ pub(crate) async fn chat_via_mcp(
         if mcp_calls.is_empty() {
             // No gateway tool requested: this is the final answer (or a
             // caller-tool call the client executes as usual).
-            return Ok(rebuild(status, &headers, body_bytes, rounds));
+            crate::metadata_card::persist_from_response(
+                state,
+                openai_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                Some(openai_body),
+                &body_bytes,
+            );
+            return Ok(rebuild(status, &headers, body_bytes, rounds, so_kind));
         }
         rounds += 1;
         if rounds > MCP_MAX_ROUNDS {
@@ -981,6 +1001,7 @@ fn rebuild(
     headers: &reqwest::header::HeaderMap,
     body: axum::body::Bytes,
     rounds: usize,
+    so_kind: Option<&'static str>,
 ) -> reqwest::Response {
     let mut builder = axum::http::Response::builder().status(
         axum::http::StatusCode::from_u16(status.as_u16())
@@ -993,6 +1014,11 @@ fn rebuild(
         builder = builder.header(k, v);
     }
     builder = builder.header("x-blazar-mcp", format!("rounds={rounds}"));
+    // The mediated path never passes through the proxy response builder,
+    // so the structured-output receipt rides here instead.
+    if let Some(kind) = so_kind {
+        builder = builder.header("x-blazar-structured-output", kind);
+    }
     let http_resp = builder
         .body(body)
         .unwrap_or_else(|_| axum::http::Response::new(axum::body::Bytes::new()));
@@ -1137,6 +1163,40 @@ mod tests {
         let mut bare = axum::response::Response::new(axum::body::Body::empty());
         stamp(&mut bare, None);
         assert!(bare.headers().get("x-blazar-mcp").is_none());
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__rebuild__stamps_structured_output_receipt() {
+        // The mediated lane must carry the same constraint receipt the
+        // proxy lane stamps, so constrained requests stay provable.
+        let resp = rebuild(
+            reqwest::StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+            axum::body::Bytes::new(),
+            1,
+            Some("json_schema"),
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-blazar-structured-output")
+                .and_then(|v| v.to_str().ok()),
+            Some("json_schema")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-blazar-mcp")
+                .and_then(|v| v.to_str().ok()),
+            Some("rounds=1")
+        );
+        let bare = rebuild(
+            reqwest::StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+            axum::body::Bytes::new(),
+            0,
+            None,
+        );
+        assert!(bare.headers().get("x-blazar-structured-output").is_none());
     }
 
     #[allow(non_snake_case)]
