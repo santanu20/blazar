@@ -800,16 +800,27 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 input.engine_tag
             ));
         }
-    } else if gguf.pooling_type == Some(POOLING_TYPE_RANK) || gguf.architecture == "bert" {
+    } else if gguf.pooling_type == Some(POOLING_TYPE_RANK)
+        || (gguf.architecture == "bert"
+            && !matches!(
+                gguf.pooling_type,
+                Some(POOLING_TYPE_MEAN) | Some(POOLING_TYPE_CLS) | Some(POOLING_TYPE_LAST)
+            ))
+    {
         // Reranker-class checkpoint: either an explicit rank pooling type
-        // (LLAMA_POOLING_TYPE_RANK, e.g. GGUFs carrying the KV) or a plain
-        // `bert` architecture — the bge-reranker GGUFs ship with NO
-        // pooling KV at all, and upstream serves them under the same
-        // shape, so arch is the only reliable signal for those. Plain
-        // embed-berts are unaffected: live-proven to keep serving
-        // /v1/embeddings (bge-small-en, 384-dim, HTTP 200) under these
-        // flags. `modern-bert` is excluded on purpose — upstream crashes
-        // a rank head against its classifier (GGML_ASSERT in
+        // (LLAMA_POOLING_TYPE_RANK, e.g. GGUFs carrying the KV) or a
+        // `bert` architecture with NO pooling KV — the bge-reranker GGUFs
+        // ship without the KV and upstream serves them under the same
+        // shape, so arch is the only reliable signal for those. A bert
+        // WITH an embed pooling KV (MEAN/CLS/LAST, e.g. bge-small-en
+        // CLS) is an embedder, not a reranker: forcing the rerank arm on
+        // it makes upstream select RANK pooling against a checkpoint
+        // with no rank head and /v1/embeddings silently returns
+        // all-zero vectors (live-proven: norm 0.000000 under
+        // `--embeddings --reranking`, norm 1.000000 under plain
+        // `--embeddings`), so those fall through to the native pooling
+        // arm below. `modern-bert` is excluded on purpose — upstream
+        // crashes a rank head against its classifier (GGML_ASSERT in
         // build_pooling). Serving shape: `--embeddings --reranking` with
         // NO `--pooling` (any explicit pooling would neutralize
         // --reranking upstream). Takes precedence over the native and
@@ -2313,6 +2324,17 @@ pub const LATE_CHUNK_UBATCH_DEFAULT: u32 = 2048;
 /// before the native-pooling arm.
 pub const POOLING_TYPE_RANK: u64 = 4;
 
+/// `LLAMA_POOLING_TYPE_MEAN` / `_CLS` / `_LAST` from upstream llama.h,
+/// as carried in the GGUF `{arch}.pooling_type` KV (value space confirmed
+/// against upstream's `llama_pooling_type` enum — NONE=0, MEAN=1, CLS=2,
+/// LAST=3, RANK=4 — and a raw KV parse of bge-small-en: 2 = cls). A
+/// bert-class GGUF carrying any of these is
+/// an EMBEDDER: the reranker arm must not claim it (see the spawn-time
+/// branch above for the zero-vector receipt).
+pub const POOLING_TYPE_MEAN: u64 = 1;
+pub const POOLING_TYPE_CLS: u64 = 2;
+pub const POOLING_TYPE_LAST: u64 = 3;
+
 /// VRAM the unified KV cache still touches on TOP of its f16 pool when
 /// `--kv-unified` is on: the resident slice + paging working set
 /// (device-backed pool — see `estimate_kv_vram_charge`). Measured as
@@ -3165,8 +3187,9 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
 
     // extra_args: strict manifest-gated passthrough, same contract as the
     // other dialects — blazar-owned launch pins refuse rather than
-    // double-set the component/listen pair.
-    argv.extend(sdcpp_extra_args(input)?);
+    // double-set the component/listen pair. Config tier first, model
+    // overlay after (engine last-wins).
+    argv.extend(sdcpp_extra_args(input, &mut warnings)?);
     Ok(Profile {
         argv,
         warnings,
@@ -3428,8 +3451,9 @@ fn sdcpp_offload_decision(vram_bytes: u64, resident: u64) -> SdOffload {
 /// blanket on an 8 GiB card). Fences: only the `--llm` family (other
 /// families' module names are unverified), only when the GPU pair fits
 /// 75% of VRAM (the same ladder the blanket arm trips on), never when
-/// `extra_args` already owns `--backend` (last-wins would silently
-/// clobber the user's posture), and the flag itself rides the manifest
+/// `extra_args` (either tier — config or model overlay) already owns
+/// `--backend` (last-wins would silently clobber the user's posture), and
+/// the flag itself rides the manifest
 /// gate — an engine without `--backend` degrades to the blanket posture
 /// instead of dying on an unknown flag.
 fn apply_sdcpp_offload(
@@ -3454,10 +3478,20 @@ fn apply_sdcpp_offload(
             .map(|c| std::fs::metadata(c.path).map_or(0, |m| m.len()))
             .sum::<u64>()
     };
-    let user_owns_backend = input.overlay.extra_args.as_ref().is_some_and(|args| {
+    let tier_owns_backend = |args: &[String]| {
         args.iter()
             .any(|t| t == "--backend" || t.starts_with("--backend="))
-    });
+    };
+    let user_owns_backend = input
+        .overlay
+        .extra_args
+        .as_deref()
+        .is_some_and(tier_owns_backend)
+        || input
+            .config
+            .sdcpp_extra_args
+            .as_deref()
+            .is_some_and(tier_owns_backend);
     // A user-set --backend owns the posture outright — neither the split
     // nor the blanket flag stacks underneath it (last-wins confusion).
     if user_owns_backend {
@@ -3503,10 +3537,18 @@ fn apply_sdcpp_offload(
     }
 }
 
-/// Strict manifest-gated `extra_args` passthrough for the sdcpp dialect:
-/// reserved launch pins refuse rather than double-set the component/listen
-/// pair; anything else must appear in the engine's probed flags.
-fn sdcpp_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
+/// Strict manifest-gated `extra_args` passthrough for the sdcpp dialect,
+/// two tiers deep: the config-level `sdcpp_extra_args` fleet lever and the
+/// per-model `model_overrides.<m>.extra_args` overlay. Reserved launch
+/// pins refuse rather than double-set the component/listen pair; anything
+/// else must appear in the engine's probed flags. The config tier rides
+/// first, the overlay after — the engine parses last-wins, so a flag set
+/// in both resolves to the overlay's posture and a warning names the
+/// shadowing.
+fn sdcpp_extra_args(
+    input: &ProfileInput<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
     const RESERVED: &[&str] = &[
         "--listen-ip",
         "--listen-port",
@@ -3523,28 +3565,46 @@ fn sdcpp_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
         "-t",
         "--threads",
     ];
-    let Some(extra) = &input.overlay.extra_args else {
+    let config_tier = input.config.sdcpp_extra_args.as_deref().unwrap_or(&[]);
+    let overlay_tier = input.overlay.extra_args.as_deref().unwrap_or(&[]);
+    if config_tier.is_empty() && overlay_tier.is_empty() {
         return Ok(Vec::new());
-    };
-    for tok in extra {
-        if !tok.starts_with('-') {
-            continue; // value token riding its preceding flag
-        }
-        if RESERVED.contains(&tok.as_str()) {
-            return Err(format!(
-                "extra_args {tok} is reserved — blazar owns it on the sdcpp \
-                 engine (component set + listen pins); remove it from the override"
-            ));
-        }
-        if !input.supported_flags.contains(tok.as_str()) {
-            return Err(format!(
-                "extra_args {tok} is not in this sdcpp engine's probed manifest \
-                 (blazar engine list) — drop it, or blazar engine update refreshes \
-                 the probe"
-            ));
+    }
+    for (tier, tokens) in [
+        ("sdcpp_extra_args (config)", config_tier),
+        ("extra_args (model override)", overlay_tier),
+    ] {
+        for tok in tokens {
+            if !tok.starts_with('-') {
+                continue; // value token riding its preceding flag
+            }
+            if RESERVED.contains(&tok.as_str()) {
+                return Err(format!(
+                    "{tok} in {tier} is reserved — blazar owns it on the sdcpp \
+                     engine (component set + listen pins); remove the entry"
+                ));
+            }
+            if !input.supported_flags.contains(tok.as_str()) {
+                return Err(format!(
+                    "{tok} in {tier} is not in this sdcpp engine's probed \
+                     manifest (blazar engine list) — drop it, or blazar engine \
+                     update refreshes the probe"
+                ));
+            }
         }
     }
-    Ok(extra.clone())
+    let mut merged = Vec::with_capacity(config_tier.len() + overlay_tier.len());
+    merged.extend(config_tier.iter().cloned());
+    for tok in overlay_tier {
+        if tok.starts_with('-') && config_tier.contains(tok) {
+            warnings.push(format!(
+                "sdcpp_extra_args {tok} is also set by the model override's \
+                 extra_args — the model override wins (engine last-wins)"
+            ));
+        }
+        merged.push(tok.clone());
+    }
+    Ok(merged)
 }
 
 /// Share of measured free VRAM the ladder is allowed to promise to
@@ -6768,6 +6828,53 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("lacks --embeddings/--reranking"))
         );
+    }
+
+    #[test]
+    fn unit__rerank_pooling__bert_with_cls_pooling_is_an_embedder_not_a_reranker() {
+        // bge-small-en shape (live-parsed GGUF KV: arch bert, pooling 2 =
+        // cls): forcing the rerank arm made upstream select RANK pooling
+        // against a checkpoint with no rank head — /v1/embeddings answered
+        // HTTP 200 with all-zero vectors. It must ride the native pooling
+        // arm instead.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut g = meta();
+        g.architecture = "bert".into();
+        g.pooling_type = Some(POOLING_TYPE_CLS);
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p.argv.contains(&"--reranking".to_string()));
+        assert!(
+            p.argv
+                .windows(3)
+                .any(|w| w[0] == "--embeddings" && w[1] == "--pooling" && w[2] == "cls")
+        );
+    }
+
+    #[test]
+    fn unit__rerank_pooling__bert_without_pooling_kv_stays_reranker() {
+        // bge-reranker-class GGUF: bert arch carrying NO pooling KV — the
+        // arch signal alone must keep serving the rerank shape.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut g = meta();
+        g.architecture = "bert".into();
+        g.pooling_type = None;
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--embeddings" && w[1] == "--reranking")
+        );
+        assert!(!p.argv.contains(&"--pooling".to_string()));
     }
 
     #[test]
@@ -13189,6 +13296,159 @@ mod tests {
                 .any(|w| w.contains("sdcpp_qwen_prefix_cache_type ignored")),
             "{:?}",
             clash.warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__config_extra_args_rides_under_overlay() {
+        // Two tiers: the config-level sdcpp_extra_args fleet lever rides
+        // first, the per-model overlay after — engine last-wins resolves a
+        // flag set in both to the overlay, with a warning naming the
+        // shadowing. Gate contract (reserved pins + probed manifest) fires
+        // on BOTH tiers with the tier named in the error.
+        let (dir, vae, llm) = sdcpp_tuning_fixture("cfg-extra");
+        let g = meta();
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let set = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+        ];
+        let mut flags = sd_tuning_flags();
+        for f in ["--control-net", "--photo-maker", "--backend"] {
+            flags.insert(f.to_string());
+        }
+        let run = |cfg: &Config, overlay: &ModelOverride| {
+            let mut inp = input(&g, &hw, cfg, &flags);
+            inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+            inp.components = &set;
+            inp.overlay = overlay;
+            compile(&inp, &TuningOverrides::default())
+        };
+        let cfg_tier = Config {
+            sdcpp_extra_args: Some(vec![
+                "--control-net".to_string(),
+                "cn-a.onnx".to_string(),
+            ]),
+            ..Config::default()
+        };
+        // Config tier alone rides.
+        let solo = run(&cfg_tier, &ModelOverride::default()).unwrap();
+        assert!(
+            solo.argv
+                .windows(2)
+                .any(|w| w == ["--control-net", "cn-a.onnx"]),
+            "{:?}",
+            solo.argv
+        );
+        // Overlay wins the duplicate flag (rides after, last-wins) and a
+        // warning names the shadowing.
+        let overlay = ModelOverride {
+            extra_args: Some(vec![
+                "--control-net".to_string(),
+                "cn-b.onnx".to_string(),
+                "--photo-maker".to_string(),
+                "pm.bin".to_string(),
+            ]),
+            ..ModelOverride::default()
+        };
+        let stacked = run(&cfg_tier, &overlay).unwrap();
+        let a = stacked
+            .argv
+            .windows(2)
+            .position(|w| w == ["--control-net", "cn-a.onnx"])
+            .expect("config entry rides");
+        let b = stacked
+            .argv
+            .windows(2)
+            .position(|w| w == ["--control-net", "cn-b.onnx"])
+            .expect("overlay entry rides after");
+        assert!(a < b, "config tier must precede the overlay: {:?}", stacked.argv);
+        assert!(
+            stacked
+                .warnings
+                .iter()
+                .any(|w| w.contains("model override wins")),
+            "{:?}",
+            stacked.warnings
+        );
+        // Reserved pin on the config tier refuses with the tier named.
+        let reserved = Config {
+            sdcpp_extra_args: Some(vec!["--vae".to_string(), "x".to_string()]),
+            ..Config::default()
+        };
+        let err = run(&reserved, &ModelOverride::default()).unwrap_err();
+        assert!(err.contains("reserved") && err.contains("(config)"), "{err}");
+        // Unknown flag on the config tier refuses against the manifest.
+        let unknown = Config {
+            sdcpp_extra_args: Some(vec!["--nope".to_string()]),
+            ..Config::default()
+        };
+        let err = run(&unknown, &ModelOverride::default()).unwrap_err();
+        assert!(err.contains("probed manifest"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unit__compile_sdcpp__config_backend_owns_posture_over_auto_split() {
+        // A --backend in EITHER extra-args tier suppresses the automatic
+        // DiT+VAE/te=cpu split — last-wins must not silently clobber the
+        // user's posture. Fixture trips the split without user flags
+        // (small DiT+VAE fits 75%, a 3 GiB TE does not) and asserts it
+        // disappears under the config-tier lever.
+        let (dir, vae, llm) = sdcpp_tuning_fixture("cfg-backend");
+        // Sparse-expand the TE fixture: metadata reports 3 GiB without
+        // touching disk.
+        std::fs::File::create(&llm)
+            .unwrap()
+            .set_len(3_000 * 1024 * 1024)
+            .unwrap();
+        let g = meta();
+        let hw = gpu_hw(4_000, 32_000, 8);
+        let set = [
+            ComponentArg::new("--vae", vae.to_str().unwrap()),
+            ComponentArg::new("--llm", llm.to_str().unwrap()),
+        ];
+        let mut flags = sd_tuning_flags();
+        flags.insert("--backend".to_string());
+        let default_cfg = Config::default();
+        let mut inp = input(&g, &hw, &default_cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+        inp.components = &set;
+        inp.model_bytes = 1_000 * MIB;
+        inp.device_hint = Some("cuda0");
+        let split = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            split.argv.iter().any(|a| a.starts_with("diffusion=")),
+            "fixture must trip the auto split: {:?}",
+            split.argv
+        );
+        // Config-tier --backend now owns the posture.
+        let cfg = Config {
+            sdcpp_extra_args: Some(vec!["--backend".to_string(), "vae=cpu".to_string()]),
+            ..Config::default()
+        };
+        inp.config = &cfg;
+        let owned = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !owned.argv.iter().any(|a| a.starts_with("diffusion=")),
+            "auto split must yield to the config-tier backend: {:?}",
+            owned.argv
+        );
+        assert_eq!(
+            owned
+                .argv
+                .iter()
+                .filter(|a| **a == "--backend")
+                .count(),
+            1,
+            "{:?}",
+            owned.argv
+        );
+        assert!(
+            owned.argv.windows(2).any(|w| w == ["--backend", "vae=cpu"]),
+            "{:?}",
+            owned.argv
         );
         std::fs::remove_dir_all(&dir).ok();
     }

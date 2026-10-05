@@ -430,6 +430,15 @@ pub struct Config {
     /// no VAD (upstream default; behavior unchanged).
     #[serde(default)]
     pub whisper_vad_model: Option<String>,
+    /// Engine-boot flag passthrough for the whisper-server child
+    /// (e.g. `["--suppress-nst", "--detect-language"]`). Blazar pins
+    /// `--host/--port/--model/--vad/--vad-model` and refuses them here;
+    /// every other flag must be a flag of the installed whisper build
+    /// (validated at child compile against the engine manifest, so an
+    /// unknown flag fails with a teaching error instead of dying at
+    /// boot). Unset = today's argv, unchanged.
+    #[serde(default)]
+    pub whisper_extra_args: Option<Vec<String>>,
     /// Capability-lane registry URL (curated fork lanes for GGUF
     /// architectures mainline llama.cpp can't load yet). `None` = the
     /// default registry; `Some("")` disables registry lookups entirely
@@ -622,6 +631,17 @@ pub struct Config {
     /// engine defaults.
     #[serde(default)]
     pub sdcpp_model_args: Option<String>,
+    /// Engine-boot flag passthrough for sd-server children — the
+    /// addon-model levers with no first-class knob (`--control-net`,
+    /// `--ip-adapter`, `--photo-maker`, `--motion-module`,
+    /// `--upscale-model`, `--lora-model-dir`, `--backend`, ...).
+    /// Blazar's launch pins are refused here; flags are validated
+    /// against the installed sdcpp engine's probed manifest at child
+    /// compile. Merges UNDER per-model `model_overrides.<m>.extra_args`
+    /// (an overlay flag wins over the config-level flag, with a
+    /// warning). Unset = engine defaults.
+    #[serde(default)]
+    pub sdcpp_extra_args: Option<Vec<String>>,
     /// Per-tensor quantization overrides for sd-server children
     /// (`--tensor-type-rules`, regex=type list, e.g.
     /// `model.=q6_k,vae.=f16`): quantizes matching weight groups
@@ -2273,6 +2293,7 @@ impl Default for Config {
             whisper_idle_secs: default_whisper_idle_secs(),
             whisper_stream_chunk_ms: default_whisper_stream_chunk_ms(),
             whisper_vad_model: None,
+            whisper_extra_args: None,
             sdcpp_qwen_prefix_cache_type: None,
             capability_registry_url: None,
             fork_retire_days: default_fork_retire_days(),
@@ -2322,6 +2343,7 @@ impl Default for Config {
             sdcpp_tae: None,
             sdcpp_conditioning_cache_size: None,
             sdcpp_model_args: None,
+            sdcpp_extra_args: None,
             sdcpp_tensor_type_rules: None,
             media_job_wait_secs: 900,
             sentinel_enforce: false,
@@ -3418,6 +3440,7 @@ impl Config {
             }
         }
         self.validate_sdcpp_kv_tokens()?;
+        self.validate_boot_extra_args()?;
         if let Some(vram) = self.sdcpp_max_vram.as_deref() {
             let bad = vram.split(',').find(|t| {
                 let t = t.trim();
@@ -3507,6 +3530,34 @@ impl Config {
             if let Some(t) = bad {
                 return Err(CoreError::Config(format!(
                     "{key} must be comma-separated key=value tokens (e.g. \"{example}\"), got {t:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Structural validation for the engine-boot flag passthrough lists
+    /// (`sdcpp_extra_args`, `whisper_extra_args`): trimmed tokens must be
+    /// non-empty and the first token must be a flag (a bare leading value
+    /// has no flag to ride). Engine-pin refusal and per-build manifest
+    /// gating live at child compile (profile dialects) — one authority
+    /// per concern, no duplicated reserved lists.
+    fn validate_boot_extra_args(&self) -> CoreResult<()> {
+        for (key, list) in [
+            ("sdcpp_extra_args", self.sdcpp_extra_args.as_deref()),
+            ("whisper_extra_args", self.whisper_extra_args.as_deref()),
+        ] {
+            let Some(list) = list else { continue };
+            if let Some(t) = list.iter().find(|t| t.trim().is_empty()) {
+                return Err(CoreError::Config(format!(
+                    "{key} tokens must be non-empty after trimming, got {t:?}"
+                )));
+            }
+            if let Some(first) = list.first()
+                && !first.starts_with('-')
+            {
+                return Err(CoreError::Config(format!(
+                    "{key} must start with a flag token, got {first:?} — values ride their preceding flag"
                 )));
             }
         }
@@ -3967,6 +4018,14 @@ impl Config {
         if let Some(v) = env("BLAZAR_WHISPER_STREAM_CHUNK_MS") {
             cfg.whisper_stream_chunk_ms = parse_u64("BLAZAR_WHISPER_STREAM_CHUNK_MS", &v)?;
         }
+        if let Some(v) = env("BLAZAR_WHISPER_EXTRA_ARGS") {
+            // Comma-split like BLAZAR_PRELOAD; flag values that themselves
+            // contain commas belong in the TOML list key.
+            cfg.whisper_extra_args = Some(split_extra_args_env("BLAZAR_WHISPER_EXTRA_ARGS", &v)?);
+        }
+        if let Some(v) = env("BLAZAR_SDCPP_EXTRA_ARGS") {
+            cfg.sdcpp_extra_args = Some(split_extra_args_env("BLAZAR_SDCPP_EXTRA_ARGS", &v)?);
+        }
         if let Some(v) = env("BLAZAR_SPEC") {
             cfg.spec = v;
         }
@@ -4132,6 +4191,27 @@ fn parse_bool(key: &str, raw: &str) -> CoreResult<bool> {
     raw.parse::<bool>()
         .map_err(|_| CoreError::Config(format!("invalid {key} {raw:?}: expected true or false")))
 }
+/// Split a comma-separated extra-args env var into flag tokens. Empty
+/// segments are dropped; an all-empty value or a non-flag first token is
+/// a config error (same rule the TOML list validation enforces).
+fn split_extra_args_env(key: &str, raw: &str) -> CoreResult<Vec<String>> {
+    let tokens: Vec<String> = raw
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return Err(CoreError::Config(format!(
+            "invalid {key} {raw:?}: expected comma-separated engine flags"
+        )));
+    }
+    if !tokens[0].starts_with('-') {
+        return Err(CoreError::Config(format!(
+            "invalid {key} {raw:?}: must start with a flag token — values ride their preceding flag"
+        )));
+    }
+    Ok(tokens)
+}
 fn parse_i32(key: &str, raw: &str) -> CoreResult<i32> {
     raw.parse::<i32>()
         .map_err(|e| CoreError::Config(format!("invalid {key} {raw:?}: {e}")))
@@ -4210,6 +4290,53 @@ fn valid_override_tensor(s: &str) -> bool {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__boot_extra_args__structure_validated_and_reserved_deferred_to_compile() {
+        // Config layer enforces shape only (non-empty trimmed tokens,
+        // flag-first); engine pins + manifest gating are the profile
+        // dialect's authority, so a reserved flag like --port passes
+        // here and dies at child compile with the teaching error.
+        let good = Config {
+            sdcpp_extra_args: Some(vec!["--control-net".into(), "/models/cnet.safetensors".into()]),
+            whisper_extra_args: Some(vec!["--suppress-nst".into()]),
+            ..Config::default()
+        };
+        good.validate().expect("well-formed lists validate");
+
+        let empty_tok = Config {
+            sdcpp_extra_args: Some(vec!["--taesd".into(), "  ".into()]),
+            ..Config::default()
+        };
+        let err = empty_tok.validate().unwrap_err().to_string();
+        assert!(err.contains("non-empty after trimming"), "got: {err}");
+
+        let bare_first = Config {
+            whisper_extra_args: Some(vec!["4".into(), "--threads".into()]),
+            ..Config::default()
+        };
+        let err = bare_first.validate().unwrap_err().to_string();
+        assert!(err.contains("must start with a flag token"), "got: {err}");
+    }
+
+    #[test]
+    fn unit__split_extra_args_env__trims_drops_empties_and_refuses_bare_leads() {
+        let split =
+            split_extra_args_env("K", " --taesd , , /models/tae.safetensors ,, --threads, 4 ")
+                .expect("comma list splits");
+        assert_eq!(
+            split,
+            vec![
+                "--taesd".to_string(),
+                "/models/tae.safetensors".to_string(),
+                "--threads".to_string(),
+                "4".to_string(),
+            ]
+        );
+        assert!(split_extra_args_env("K", " , , ").is_err());
+        let err = split_extra_args_env("K", "cnet.safetensors").unwrap_err().to_string();
+        assert!(err.contains("must start with a flag token"), "got: {err}");
+    }
 
     /// Live receipt 2026-09-29: a minimal config.toml (the validate
     /// sandbox writes exactly `port = N` + a model override) ran the
