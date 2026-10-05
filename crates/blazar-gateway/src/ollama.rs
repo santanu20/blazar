@@ -1368,7 +1368,7 @@ pub async fn chat(
     let stream = req["stream"].as_bool().unwrap_or(true);
     // MCP tool catalog (opt-in): resolve the selector while the ollama
     // body is still in hand — the core chat path takes it from here.
-    let mcp_sel = match crate::mcp::selector_read(&headers, &req) {
+    let mcp_sel = match state.mcp.resolve(crate::mcp::selector_read(&headers, &req)) {
         Ok(sel) => sel,
         Err(msg) => return api_error(400, &msg),
     };
@@ -1973,6 +1973,9 @@ async fn proxy_core_chat(
         // then owns crash recovery); a guard degrade still stamps the
         // reason header so the client sees the ask was heard.
         let mut bestof_hdr: Option<String> = None;
+        // MCP receipt survives the dialect rebuild via this capture (see
+        // `mcp::stamp`).
+        let mut mcp_hdr: Option<String> = None;
         let fan = match best_of.filter(|n| *n >= 2) {
             Some(want) => crate::bestof::fan_out(state, engine, &url, &openai_body, want).await,
             None => crate::bestof::FanOut::Skip,
@@ -1985,6 +1988,11 @@ async fn proxy_core_chat(
                 let s = t0.elapsed().as_secs_f64();
                 state.ttft.observe_secs(s);
                 ttft_secs = Some(s);
+                mcp_hdr = child
+                    .headers()
+                    .get("x-blazar-mcp")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 child
             }
             None => match fan {
@@ -2075,6 +2083,7 @@ async fn proxy_core_chat(
             let text = resp.text().await.unwrap_or_default();
             let mut r = api_error(status, &format!("engine error: {text}"));
             crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+            crate::mcp::stamp(&mut r, mcp_hdr.as_deref());
             return r;
         }
         let openai: Value = match resp.json().await {
@@ -2145,6 +2154,7 @@ async fn proxy_core_chat(
         if let Some(msg) = child_error_body(&openai) {
             let mut r = api_error(502, &format!("engine error: {msg}"));
             crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+            crate::mcp::stamp(&mut r, mcp_hdr.as_deref());
             return r;
         }
         let mut ollama = match shape {
@@ -2185,11 +2195,13 @@ async fn proxy_core_chat(
             resp.headers_mut()
                 .insert(semcache::HDR_CACHE, HeaderValue::from_static("miss"));
             crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
+            crate::mcp::stamp(&mut resp, mcp_hdr.as_deref());
             stamp_so_receipt(&mut resp, &openai_body);
             return resp;
         }
         let mut resp = axum::Json(ollama).into_response();
         crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
+        crate::mcp::stamp(&mut resp, mcp_hdr.as_deref());
         stamp_so_receipt(&mut resp, &openai_body);
         return resp;
     }
@@ -3239,7 +3251,7 @@ pub async fn generate(
     // ollama defaults stream=true on generate; the chat bus mirrors it.
     let stream = req["stream"].as_bool().unwrap_or(true);
     // MCP tool catalog (opt-in), generate-lane parity with /api/chat.
-    let mcp_sel = match crate::mcp::selector_read(&headers, &req) {
+    let mcp_sel = match state.mcp.resolve(crate::mcp::selector_read(&headers, &req)) {
         Ok(sel) => sel,
         Err(msg) => return api_error(400, &msg),
     };

@@ -1,8 +1,8 @@
 //! Gateway-side MCP (Model Context Protocol) tool catalog: registered
-//! stdio servers contribute tools that any dialect lane can inject on
-//! request; the gateway executes the tool calls the model makes and
-//! feeds results back — every engine gets tool use with zero
-//! child-side MCP support.
+//! stdio or streamable-HTTP servers contribute tools that any dialect
+//! lane can inject on request; the gateway executes the tool calls the
+//! model makes and feeds results back — every engine gets tool use with
+//! zero child-side MCP support.
 //!
 //! Opt-in per request: body field `"mcp": "all" | "<server>"` or header
 //! `x-blazar-mcp` (header wins). The field is stripped before the body
@@ -10,10 +10,11 @@
 //! can never collide with caller-provided tools; only calls carrying
 //! that prefix are gateway-executed.
 //!
-//! Protocol: JSON-RPC 2.0 over stdio (initialize → initialized →
-//! tools/list with cursor pagination → tools/call), per the MCP
-//! 2025-06-18 specification. Shutdown follows the spec order: close
-//! stdin, wait, `SIGTERM`, `SIGKILL`.
+//! Protocol: JSON-RPC 2.0 per the MCP 2025-06-18 specification, over
+//! stdio (newline-delimited; shutdown: close stdin, wait, `SIGTERM`,
+//! `SIGKILL`) or Streamable HTTP (POST with `Accept:
+//! application/json, text/event-stream`; JSON or SSE-framed responses;
+//! `Mcp-Session-Id` carried on every request after initialize).
 //!
 //! Bounds: `MCP_MAX_ROUNDS` tool rounds per request, per-server
 //! `timeout_secs` on every call, streaming requests are refused with a
@@ -59,33 +60,69 @@ pub struct McpTool {
     pub input_schema: Value,
 }
 
+/// Streamable-HTTP session state (MCP 2025-06-18): the server-assigned
+/// session id and negotiated protocol version ride every request after
+/// initialize; the tool list is fetched once per session.
+struct HttpState {
+    session_id: Option<String>,
+    protocol_version: Option<String>,
+    next_id: u64,
+    tools: Vec<McpTool>,
+    inited: bool,
+}
+
+struct HttpSession {
+    endpoint: String,
+    client: reqwest::Client,
+    state: tokio::sync::Mutex<HttpState>,
+}
+
+enum Transport {
+    Stdio(tokio::sync::Mutex<Option<Session>>),
+    Http(HttpSession),
+}
+
 struct Entry {
     cfg: McpServer,
-    session: tokio::sync::Mutex<Option<Session>>,
+    transport: Transport,
 }
 
 /// Process registry for the configured `[[mcp]]` servers.
 pub struct Registry {
     entries: HashMap<String, Arc<Entry>>,
+    /// Config-level default (`mcp_default`) applied when a request carries
+    /// no selector of its own. `"none"`/absent keeps requests MCP-free.
+    default_sel: Option<String>,
 }
 
 impl Registry {
     #[must_use]
-    pub fn from_config(servers: &[McpServer]) -> Self {
+    pub fn from_config(servers: &[McpServer], default_sel: Option<String>) -> Self {
         let entries = servers
             .iter()
             .cloned()
             .map(|cfg| {
-                (
-                    cfg.name.clone(),
-                    Arc::new(Entry {
-                        cfg,
-                        session: tokio::sync::Mutex::new(None),
+                let transport = match cfg.url.clone() {
+                    Some(endpoint) => Transport::Http(HttpSession {
+                        endpoint,
+                        client: reqwest::Client::new(),
+                        state: tokio::sync::Mutex::new(HttpState {
+                            session_id: None,
+                            protocol_version: None,
+                            next_id: 1,
+                            tools: Vec::new(),
+                            inited: false,
+                        }),
                     }),
-                )
+                    None => Transport::Stdio(tokio::sync::Mutex::new(None)),
+                };
+                (cfg.name.clone(), Arc::new(Entry { cfg, transport }))
             })
             .collect();
-        Self { entries }
+        Self {
+            entries,
+            default_sel,
+        }
     }
 
     #[must_use]
@@ -93,21 +130,52 @@ impl Registry {
         self.entries.keys().cloned().collect()
     }
 
-    /// Spec-ordered teardown for every live session: close stdin,
-    /// wait, SIGTERM, SIGKILL. Idempotent.
+    /// Layer the config default under a request-level selector result:
+    /// header/body win (with `"none"` as the explicit opt-out), then the
+    /// config default, then no MCP. Errors from the request selector
+    /// pass straight through — invalid input must teach, not fall back.
+    pub(crate) fn resolve(
+        &self,
+        request: Result<Option<String>, String>,
+    ) -> Result<Option<String>, String> {
+        match request? {
+            Some(sel) if sel == "none" => Ok(None),
+            Some(sel) => Ok(Some(sel)),
+            None => Ok(self.default_sel.clone().filter(|d| d != "none")),
+        }
+    }
+
+    /// Spec-ordered teardown for every live session: stdio closes
+    /// stdin, waits, `SIGTERM`, `SIGKILL`; HTTP sends a best-effort
+    /// session `DELETE`. Idempotent.
     pub async fn shutdown_all(&self) {
         for entry in self.entries.values() {
-            let mut guard = entry.session.lock().await;
-            if let Some(Session {
-                mut child, stdin, ..
-            }) = guard.take()
-            {
-                drop(stdin); // close stdin first, per the spec shutdown order
-                if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
-                    .await
-                    .is_err()
-                {
-                    let _ = child.start_kill();
+            match &entry.transport {
+                Transport::Stdio(m) => {
+                    let mut guard = m.lock().await;
+                    if let Some(Session {
+                        mut child, stdin, ..
+                    }) = guard.take()
+                    {
+                        drop(stdin); // close stdin first, per the spec shutdown order
+                        if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+                            .await
+                            .is_err()
+                        {
+                            let _ = child.start_kill();
+                        }
+                    }
+                }
+                Transport::Http(h) => {
+                    let sid = h.state.lock().await.session_id.clone();
+                    if let Some(sid) = sid {
+                        let _ = h
+                            .client
+                            .delete(&h.endpoint)
+                            .header("Mcp-Session-Id", sid)
+                            .send()
+                            .await;
+                    }
                 }
             }
         }
@@ -129,14 +197,27 @@ impl Registry {
                 .entries
                 .get(&name)
                 .ok_or_else(|| unknown_server(&name, &self.configured_names()))?;
-            let mut guard = entry.session.lock().await;
-            if guard.is_none() {
-                *guard = Some(spawn_session(&entry.cfg).await.map_err(|e| {
-                    format!("mcp server '{}' failed to start: {e}", entry.cfg.name)
-                })?);
+            match &entry.transport {
+                Transport::Stdio(m) => {
+                    let mut guard = m.lock().await;
+                    if guard.is_none() {
+                        *guard = Some(spawn_session(&entry.cfg).await.map_err(|e| {
+                            format!("mcp server '{}' failed to start: {e}", entry.cfg.name)
+                        })?);
+                    }
+                    let session = guard.as_ref().expect("just spawned");
+                    tools.extend(session.tools.iter().cloned());
+                }
+                Transport::Http(h) => {
+                    let mut st = h.state.lock().await;
+                    if !st.inited {
+                        *st = http_init(&entry.cfg, h).await.map_err(|e| {
+                            format!("mcp server '{}' failed to initialize: {e}", entry.cfg.name)
+                        })?;
+                    }
+                    tools.extend(st.tools.iter().cloned());
+                }
             }
-            let session = guard.as_ref().expect("just spawned");
-            tools.extend(session.tools.iter().cloned());
         }
         Ok(tools)
     }
@@ -148,39 +229,84 @@ impl Registry {
             .entries
             .get(server)
             .ok_or_else(|| format!("mcp server '{server}' is no longer configured"))?;
-        let mut guard = entry.session.lock().await;
-        // Dead session (server exited mid-flight): respawn once.
-        if guard.is_none() {
-            *guard = Some(
-                spawn_session(&entry.cfg)
+        match &entry.transport {
+            Transport::Stdio(m) => {
+                let mut guard = m.lock().await;
+                // Dead session (server exited mid-flight): respawn once.
+                if guard.is_none() {
+                    *guard =
+                        Some(spawn_session(&entry.cfg).await.map_err(|e| {
+                            format!("mcp server '{server}' failed to restart: {e}")
+                        })?);
+                }
+                let timeout = std::time::Duration::from_secs(entry.cfg.timeout_secs);
+                let call = async {
+                    let session = guard.as_mut().expect("just spawned");
+                    let id = session.next_id;
+                    session.next_id += 1;
+                    rpc_call(
+                        session,
+                        id,
+                        "tools/call",
+                        &json!({"name": tool, "arguments": args}),
+                    )
                     .await
-                    .map_err(|e| format!("mcp server '{server}' failed to restart: {e}"))?,
-            );
-        }
-        let timeout = std::time::Duration::from_secs(entry.cfg.timeout_secs);
-        let call = async {
-            let session = guard.as_mut().expect("just spawned");
-            let id = session.next_id;
-            session.next_id += 1;
-            rpc_call(
-                session,
-                id,
-                "tools/call",
-                &json!({"name": tool, "arguments": args}),
-            )
-            .await
-        };
-        match tokio::time::timeout(timeout, call).await {
-            Ok(Ok(result)) => Ok(render_content(&result)),
-            Ok(Err(e)) => {
-                // Transport broke: mark dead so the next call respawns.
-                *guard = None;
-                Err(format!("mcp server '{server}' call failed: {e}"))
+                };
+                match tokio::time::timeout(timeout, call).await {
+                    Ok(Ok(result)) => Ok(render_content(&result)),
+                    Ok(Err(e)) => {
+                        // Transport broke: mark dead so the next call respawns.
+                        *guard = None;
+                        Err(format!("mcp server '{server}' call failed: {e}"))
+                    }
+                    Err(_) => Err(format!(
+                        "mcp server '{server}' tool '{tool}' timed out after {}s",
+                        entry.cfg.timeout_secs
+                    )),
+                }
             }
-            Err(_) => Err(format!(
-                "mcp server '{server}' tool '{tool}' timed out after {}s",
-                entry.cfg.timeout_secs
-            )),
+            Transport::Http(h) => {
+                let timeout = std::time::Duration::from_secs(entry.cfg.timeout_secs);
+                let call = async {
+                    // Session marked dead (404/transport error): re-init once.
+                    let mut st = h.state.lock().await;
+                    if !st.inited {
+                        *st = http_init(&entry.cfg, h).await.map_err(|e| {
+                            format!("mcp server '{server}' failed to initialize: {e}")
+                        })?;
+                    }
+                    let id = st.next_id;
+                    st.next_id += 1;
+                    http_rpc(
+                        h,
+                        Some(id),
+                        "tools/call",
+                        &json!({"name": tool, "arguments": args}),
+                        st.session_id.as_deref(),
+                        st.protocol_version.as_deref(),
+                        timeout,
+                    )
+                    .await
+                    .map(|(result, sid)| {
+                        if let Some(s) = sid {
+                            st.session_id = Some(s);
+                        }
+                        result
+                    })
+                };
+                match tokio::time::timeout(timeout, call).await {
+                    Ok(Ok(result)) => Ok(render_content(&result)),
+                    Ok(Err(e)) => {
+                        // Session presumed stale or expired: re-init next call.
+                        h.state.lock().await.inited = false;
+                        Err(format!("mcp server '{server}' call failed: {e}"))
+                    }
+                    Err(_) => Err(format!(
+                        "mcp server '{server}' tool '{tool}' timed out after {}s",
+                        entry.cfg.timeout_secs
+                    )),
+                }
+            }
         }
     }
 
@@ -189,13 +315,23 @@ impl Registry {
     pub async fn status_json(&self) -> Value {
         let mut servers = Vec::new();
         for (name, entry) in &self.entries {
-            let alive = entry.session.lock().await.is_some();
-            servers.push(json!({
-                "name": name,
-                "command": entry.cfg.command,
-                "alive": alive,
-                "timeout_secs": entry.cfg.timeout_secs,
-            }));
+            let row = match &entry.transport {
+                Transport::Stdio(m) => json!({
+                    "name": name,
+                    "transport": "stdio",
+                    "command": entry.cfg.command,
+                    "alive": m.lock().await.is_some(),
+                    "timeout_secs": entry.cfg.timeout_secs,
+                }),
+                Transport::Http(h) => json!({
+                    "name": name,
+                    "transport": "http",
+                    "url": entry.cfg.url,
+                    "alive": h.state.lock().await.inited,
+                    "timeout_secs": entry.cfg.timeout_secs,
+                }),
+            };
+            servers.push(row);
         }
         servers.sort_by_key(|s| s["name"].as_str().unwrap_or_default().to_string());
         json!({ "servers": servers })
@@ -334,6 +470,186 @@ async fn rpc_call(
     }
 }
 
+// ---------------------------------------------------------------------------
+// streamable-HTTP transport
+// ---------------------------------------------------------------------------
+
+/// POST one JSON-RPC message to the endpoint per the Streamable HTTP
+/// transport: `Accept: application/json, text/event-stream`, response
+/// either a single JSON object or SSE `data:` frames (first frame
+/// carrying the matching id wins; interleaved notifications are
+/// skipped). Returns `(result, Mcp-Session-Id)` — the session id only
+/// appears on the initialize response.
+async fn http_rpc(
+    hs: &HttpSession,
+    id: Option<u64>,
+    method: &str,
+    params: &Value,
+    session_hdr: Option<&str>,
+    protocol_hdr: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<(Value, Option<String>), String> {
+    let mut msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
+    if let Some(id) = id {
+        msg["id"] = json!(id);
+    }
+    let body = serde_json::to_vec(&msg).map_err(|e| format!("encode {method}: {e}"))?;
+    let mut req = hs
+        .client
+        .post(&hs.endpoint)
+        .timeout(timeout)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(body);
+    if let Some(s) = session_hdr {
+        req = req.header("Mcp-Session-Id", s);
+    }
+    if let Some(p) = protocol_hdr {
+        req = req.header("MCP-Protocol-Version", p);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("http {method}: {e}"))?;
+    let sid = resp
+        .headers()
+        .get("Mcp-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let excerpt: String = body.chars().take(200).collect();
+        return Err(format!("http {method}: status {status}: {excerpt}"));
+    }
+    let Some(id) = id else {
+        return Ok((Value::Null, sid)); // notification: 202, no body
+    };
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("http {method} body: {e}"))?;
+    let v = if ctype.contains("text/event-stream") {
+        sse_response(&body, id).ok_or_else(|| {
+            format!("http {method}: sse stream closed without a matching response")
+        })?
+    } else {
+        serde_json::from_str(&body).map_err(|e| format!("http {method} json body: {e}"))?
+    };
+    if let Some(err) = v.get("error") {
+        return Err(format!(
+            "{}: {}",
+            err["code"].as_i64().unwrap_or_default(),
+            err["message"].as_str().unwrap_or("unknown error")
+        ));
+    }
+    Ok((v.get("result").cloned().unwrap_or(Value::Null), sid))
+}
+
+/// Scan SSE frames for the JSON-RPC response carrying `id`, skipping
+/// interleaved notifications and server-initiated requests.
+fn sse_response(body: &str, id: u64) -> Option<Value> {
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        if v.get("id").is_some() && v["id"].as_u64() == Some(id) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Fresh HTTP initialize: negotiate protocol version, capture the
+/// server-assigned session id, announce `notifications/initialized`,
+/// then page through `tools/list` (cycle-guarded, mirroring stdio).
+async fn http_init(cfg: &McpServer, hs: &HttpSession) -> Result<HttpState, String> {
+    let timeout = std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
+    let (result, sid) = http_rpc(
+        hs,
+        Some(1),
+        "initialize",
+        &json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "blazar", "version": env!("CARGO_PKG_VERSION")},
+        }),
+        None, // fresh session — never a stale header
+        None,
+        timeout,
+    )
+    .await?;
+    let protocol_version = result["protocolVersion"]
+        .as_str()
+        .unwrap_or("2025-06-18")
+        .to_string();
+    // Initialized notification: 202 Accepted, no body to read.
+    let _ = http_rpc(
+        hs,
+        None,
+        "notifications/initialized",
+        &json!({}),
+        sid.as_deref(),
+        Some(&protocol_version),
+        timeout,
+    )
+    .await;
+    let mut state = HttpState {
+        session_id: sid,
+        protocol_version: Some(protocol_version),
+        next_id: 2,
+        tools: Vec::new(),
+        inited: true,
+    };
+    let mut cursor: Option<String> = None;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let id = state.next_id;
+        state.next_id += 1;
+        let mut params = json!({});
+        if let Some(c) = &cursor {
+            params["cursor"] = json!(c);
+        }
+        let (page, _) = http_rpc(
+            hs,
+            Some(id),
+            "tools/list",
+            &params,
+            state.session_id.as_deref(),
+            state.protocol_version.as_deref(),
+            timeout,
+        )
+        .await?;
+        for t in page["tools"].as_array().cloned().unwrap_or_default() {
+            let name = t["name"].as_str().unwrap_or_default().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            state.tools.push(McpTool {
+                server: cfg.name.clone(),
+                name,
+                description: t["description"].as_str().unwrap_or_default().to_string(),
+                input_schema: t["inputSchema"].clone(),
+            });
+        }
+        cursor = page["nextCursor"].as_str().map(str::to_string);
+        match cursor {
+            Some(ref c) if !c.is_empty() && seen.insert(c.clone()) => {}
+            _ => break,
+        }
+    }
+    Ok(state)
+}
+
 fn render_content(result: &Value) -> String {
     let mut text = String::new();
     for part in result["content"].as_array().cloned().unwrap_or_default() {
@@ -388,13 +704,24 @@ pub(crate) fn selector_from(
     }
     let Some(sel) = raw.as_str() else {
         return Err(format!(
-            "body field 'mcp' must be a string (\"all\" or a server name), got {raw}"
+            "body field 'mcp' must be a string (\"all\", a server name, or \"none\"), got {raw}"
         ));
     };
     if sel.is_empty() {
         return Err("body field 'mcp' must not be empty".into());
     }
     Ok(Some(sel.to_string()))
+}
+
+/// Re-stamp the mediation receipt on a lane-rebuilt response: the child
+/// carries `x-blazar-mcp`, but the ollama/anthropic lanes rebuild the
+/// dialect response around it and would drop the header otherwise.
+pub(crate) fn stamp(resp: &mut axum::response::Response, hdr: Option<&str>) {
+    if let Some(h) = hdr
+        && let Ok(v) = axum::http::HeaderValue::from_str(h)
+    {
+        resp.headers_mut().insert("x-blazar-mcp", v);
+    }
 }
 
 /// Read-only variant for lanes whose translated body already dropped
@@ -410,7 +737,7 @@ pub(crate) fn selector_read(headers: &HeaderMap, body: &Value) -> Result<Option<
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(sel)) if !sel.is_empty() => Ok(Some(sel.clone())),
         Some(other) => Err(format!(
-            "body field 'mcp' must be a string (\"all\" or a server name), got {other}"
+            "body field 'mcp' must be a string (\"all\", a server name, or \"none\"), got {other}"
         )),
     }
 }
@@ -464,6 +791,32 @@ pub(crate) fn tool_result_messages(
                 "role": "tool",
                 "tool_call_id": call["id"].clone(),
                 "content": content,
+            })
+        })
+        .collect()
+}
+
+/// Tool results for caller-owned tool calls that landed in a mixed
+/// turn (caller tools alongside gateway tools): the gateway cannot
+/// execute them — the client owns them — so they get an honest
+/// placeholder result instead of being silently dropped, which would
+/// leave a dangling `tool_call` and violate the chat protocol on the
+/// next turn.
+pub(crate) fn caller_tool_results(all_calls: &[Value], mcp_calls: &[Value]) -> Vec<Value> {
+    all_calls
+        .iter()
+        .filter(|c| !mcp_calls.contains(*c))
+        .map(|call| {
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            json!({
+                "role": "tool",
+                "tool_call_id": call["id"].clone(),
+                "content": format!(
+                    "(gateway mcp note: caller tool '{name}' runs on the client, not in this mediated turn — answer from the mcp results, or re-issue it on a follow-up request)"
+                ),
             })
         })
         .collect()
@@ -608,6 +961,10 @@ pub(crate) async fn chat_via_mcp(
                 msgs.push(entry);
             }
             msgs.extend(tool_result_messages(&mcp_calls, &results));
+            // Mixed turns: backfill results for caller-owned calls so
+            // every tool_call in the appended assistant turn is
+            // answered (protocol-complete round 2).
+            msgs.extend(caller_tool_results(&calls, &mcp_calls));
         } else {
             return Err(teaching_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -756,5 +1113,162 @@ mod tests {
         assert_eq!(render_content(&err), "tool error: boom");
         let none = json!({"content": []});
         assert_eq!(render_content(&none), "(tool returned no text content)");
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__stamp__receipt_survives_lane_rebuild() {
+        let mut resp = axum::response::Response::new(axum::body::Body::empty());
+        stamp(&mut resp, Some("rounds=2"));
+        assert_eq!(
+            resp.headers()
+                .get("x-blazar-mcp")
+                .and_then(|v| v.to_str().ok()),
+            Some("rounds=2")
+        );
+        stamp(&mut resp, None);
+        assert_eq!(
+            resp.headers()
+                .get("x-blazar-mcp")
+                .and_then(|v| v.to_str().ok()),
+            // Some overwrites a prior None-stamp path; None never clears.
+            Some("rounds=2")
+        );
+        let mut bare = axum::response::Response::new(axum::body::Body::empty());
+        stamp(&mut bare, None);
+        assert!(bare.headers().get("x-blazar-mcp").is_none());
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__resolve__request_wins_default_layers_none_opts_out() {
+        let with_default = Registry::from_config(&[], Some("all".into()));
+        // No request selector -> config default applies.
+        assert_eq!(with_default.resolve(Ok(None)), Ok(Some("all".into())));
+        // Request selector overrides the default.
+        assert_eq!(
+            with_default.resolve(Ok(Some("fetch".into()))),
+            Ok(Some("fetch".into()))
+        );
+        // "none" is the explicit opt-out even with a default configured.
+        assert_eq!(with_default.resolve(Ok(Some("none".into()))), Ok(None));
+        // Request errors teach, never fall back to the default.
+        assert!(with_default.resolve(Err("bad selector".into())).is_err());
+
+        let off = Registry::from_config(&[], Some("none".into()));
+        assert_eq!(off.resolve(Ok(None)), Ok(None));
+        let bare = Registry::from_config(&[], None);
+        assert_eq!(bare.resolve(Ok(None)), Ok(None));
+        assert_eq!(
+            bare.resolve(Ok(Some("fetch".into()))),
+            Ok(Some("fetch".into()))
+        );
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__sse_response__finds_matching_id_among_frames() {
+        let body = concat!(
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tools\":[]}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{}}\n\n",
+        );
+        let hit = sse_response(body, 7).expect("frame for id 7 present");
+        assert!(hit.pointer("/result/tools").is_some());
+        assert!(sse_response(body, 9).is_none(), "no frame for id 9");
+        assert!(sse_response("", 7).is_none(), "empty stream");
+    }
+
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn unit__http_rpc__attaches_jsonrpc_body_and_reads_json_reply() {
+        // One-shot TCP server: pins the wire contract — the POST must
+        // carry the JSON-RPC envelope as its body (a regression once
+        // sent headers only, which lenient servers masked as 202s).
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let clen = req
+                .split("content-length:")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|v| v.parse::<usize>().ok())
+                .expect("content-length header present");
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or_default();
+            assert!(clen > 0, "request must carry a body");
+            let parsed: Value = serde_json::from_str(body).expect("body is the JSON-RPC envelope");
+            assert_eq!(parsed["jsonrpc"], "2.0");
+            assert_eq!(parsed["method"], "tools/list");
+            assert_eq!(parsed["id"], 5);
+            let reply = json!({"jsonrpc": "2.0", "id": 5, "result": {"tools": []}});
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.to_string().len(),
+                reply
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+        let hs = HttpSession {
+            endpoint: format!("http://127.0.0.1:{port}/mcp"),
+            client: {
+                blazar_core::tls::ensure_tls_provider();
+                reqwest::Client::new()
+            },
+            state: tokio::sync::Mutex::new(HttpState {
+                session_id: None,
+                protocol_version: None,
+                next_id: 1,
+                tools: Vec::new(),
+                inited: false,
+            }),
+        };
+        let (result, sid) = http_rpc(
+            &hs,
+            Some(5),
+            "tools/list",
+            &json!({}),
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("rpc over the one-shot server");
+        assert!(result["tools"].is_array());
+        assert!(sid.is_none(), "no session id on a plain reply");
+        srv.join().unwrap();
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__caller_tool_results__mixed_turn_backfills_non_mcp_calls() {
+        let caller = |id: &str, name: &str| {
+            json!({
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"},
+            })
+        };
+        let all = vec![
+            caller("call_1", "get_weather"),
+            caller("call_2", "mcp__demo__add"),
+            caller("call_3", "search_docs"),
+        ];
+        let mcp = vec![all[1].clone()];
+        let out = caller_tool_results(&all, &mcp);
+        assert_eq!(out.len(), 2, "only the two caller tools get results");
+        assert_eq!(out[0]["tool_call_id"], json!("call_1"));
+        assert_eq!(out[1]["tool_call_id"], json!("call_3"));
+        let note = out[0]["content"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("get_weather") && note.contains("client"),
+            "placeholder names the tool and who runs it: {note}"
+        );
+        assert!(caller_tool_results(&all, &all).is_empty(), "no mixed calls");
     }
 }

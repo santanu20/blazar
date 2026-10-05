@@ -3002,6 +3002,96 @@ async fn e2e__child_header_stall_bounded_evicted_and_504() {
         status, 504,
         "terminal header-stall status, got {status} in {elapsed:?}"
     );
+    // Wedge branch (slot probe said idle): the body must say the child
+    // was evicted — the discriminator against the busy-child branch.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("wedged child evicted"),
+        "wedge 504 must name the eviction, got: {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__child_header_timeout_busy_child_kept_teaching_504() {
+    // Pin (live evidence, 2026-10-05): a buffered (non-stream) think-mode
+    // generation ran past child_header_timeout_secs and drew a 504 while
+    // the child was healthy mid-generation — the synchronous eviction
+    // then killed the child (and would kill sibling streams on a
+    // multi-slot instance). vLLM and ollama cap no generation. The guard
+    // now probes /slots on expiry: slots busy → child KEPT, request
+    // fails alone with a teaching body naming the two remedies.
+    let cfg = Config {
+        child_header_timeout_secs: 1,
+        ..Config::default()
+    };
+    let ts = start_with(cfg, vec![("STUB_HANG_BUSY_ON".into(), "busy-token-7".into())]).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "busy-token-7"}],
+        }))
+        .send()
+        .await
+        .expect("bounded: the request must return, never park to the blanket ceiling");
+    assert_eq!(resp.status().as_u16(), 504);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("still generating"),
+        "busy-child 504 must say the child is healthy, got: {msg}"
+    );
+    assert!(
+        msg.contains("\"stream\": true"),
+        "busy-child 504 must teach the streaming remedy, got: {msg}"
+    );
+    assert!(
+        msg.contains("child_header_timeout_secs"),
+        "busy-child 504 must name the knob, got: {msg}"
+    );
+    assert!(
+        !msg.contains("wedged child evicted"),
+        "busy-child 504 must NOT claim an eviction, got: {msg}"
+    );
+    // The child was NOT evicted: ps still shows m1 resident and ready
+    // (nothing respawns it without traffic), and a follow-up request
+    // serves from the same live child.
+    let ps: serde_json::Value = c
+        .get(format!("{}/api/ps", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        ps["models"][0]["name"], "m1",
+        "child must stay resident after the busy-child teaching 504"
+    );
+    assert_eq!(
+        ps["models"][0]["blazar_state"], "ready",
+        "child must stay ready after the busy-child teaching 504"
+    );
+    let follow_up = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "are you alive"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(follow_up.status(), 200, "same child keeps serving");
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -4527,6 +4617,7 @@ async fn e2e__mcp__status_plane_and_stream_guard() {
         mcp: vec![McpServer {
             name: "demo".into(),
             command: vec!["sleep".into(), "600".into()],
+            url: None,
             env: std::collections::HashMap::new(),
             timeout_secs: 30,
         }],

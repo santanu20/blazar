@@ -330,7 +330,7 @@ impl AppState {
     #[allow(clippy::too_many_lines)] // constructor: field-by-field wiring, splitting would not reduce it
     pub fn new(dirs: BlazarDirs, config: Config, sup: Arc<Supervisor>, bus: EventBus) -> Self {
         let failover = crate::failover::Registry::from_config(&config.failover);
-        let mcp = crate::mcp::Registry::from_config(&config.mcp);
+        let mcp = crate::mcp::Registry::from_config(&config.mcp, config.mcp_default.clone());
         let http = crate::http_pool::tuned(reqwest::Client::builder())
             .timeout(std::time::Duration::from_secs(10 * 60))
             .build()

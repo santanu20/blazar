@@ -240,7 +240,10 @@ pub async fn messages(
     // `x-blazar-mcp` header). The loop is buffered this release, so a
     // streaming request that opts in is taught the constraint instead
     // of silently degrading.
-    let mcp_sel = match crate::mcp::selector_read(&headers, &parsed) {
+    let mcp_sel = match state
+        .mcp
+        .resolve(crate::mcp::selector_read(&headers, &parsed))
+    {
         Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
         Ok(sel) => sel,
     };
@@ -296,6 +299,9 @@ pub async fn messages(
     // transport failure) falls through to the single-send path below; a
     // guard degrade still stamps the reason header.
     let mut bestof_hdr: Option<String> = None;
+    // MCP receipt survives the dialect rebuild via this capture (see
+    // `mcp::stamp`).
+    let mut mcp_hdr: Option<String> = None;
     // A2: wall anchor for the decode-throughput observation below —
     // predates both the fan and the single send.
     let t0 = std::time::Instant::now();
@@ -326,7 +332,14 @@ pub async fn messages(
         None
     };
     let resp = match mcp_child {
-        Some(child) => child,
+        Some(child) => {
+            mcp_hdr = child
+                .headers()
+                .get("x-blazar-mcp")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            child
+        }
         None => match fan {
             crate::bestof::FanOut::Ran(outcome) => {
                 bestof_hdr = Some(outcome.hdr);
@@ -360,6 +373,7 @@ pub async fn messages(
             .unwrap_or("engine error");
         let mut r = anthropic_error(status.as_u16(), "api_error", msg);
         crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
+        crate::mcp::stamp(&mut r, mcp_hdr.as_deref());
         return r;
     }
     let translated = translate_response(&openai, &model);
@@ -374,6 +388,7 @@ pub async fn messages(
     }
     let mut resp = (StatusCode::OK, axum::Json(translated)).into_response();
     crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
+    crate::mcp::stamp(&mut resp, mcp_hdr.as_deref());
     resp
 }
 

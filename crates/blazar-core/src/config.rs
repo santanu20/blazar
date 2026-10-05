@@ -676,6 +676,13 @@ pub struct Config {
     /// Registered MCP stdio servers (gateway-side tool catalog).
     #[serde(default)]
     pub mcp: Vec<McpServer>,
+    /// Default MCP selector applied when a request carries no `mcp` field
+    /// and no `x-blazar-mcp` header: `"all"`, a server name, or `"none"`.
+    /// Lets stock OpenAI/Anthropic/Ollama clients use the catalog with
+    /// zero MCP knowledge. Absent keeps requests MCP-free unless they
+    /// opt in per request.
+    #[serde(default)]
+    pub mcp_default: Option<String>,
     /// Federation fallback: when a requested model is absent from the
     /// local store but a `[[remotes]]` peer lists it (`/v1/models`
     /// presence), the request routes there instead of 404ing. Kill
@@ -1954,9 +1961,14 @@ pub struct McpServer {
     /// Unique server name; tools are namespaced `mcp__<name>__<tool>`.
     pub name: String,
     /// Command line that starts the stdio MCP server, e.g.
-    /// `["uvx", "mcp-server-fetch"]`.
+    /// `["uvx", "mcp-server-fetch"]`. Exactly one of `command` / `url`.
+    #[serde(default)]
     pub command: Vec<String>,
-    /// Extra environment variables for the child process.
+    /// Streamable-HTTP MCP endpoint, e.g. `http://127.0.0.1:8808/mcp`.
+    /// Exactly one of `command` / `url`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Extra environment variables for the child process (stdio only).
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
     /// Per `tools/call` timeout in seconds (1..=600). Default 30.
@@ -2269,6 +2281,7 @@ impl Default for Config {
             keys: Vec::new(),
             failover: Vec::new(),
             mcp: Vec::new(),
+            mcp_default: None,
             rpc_servers: String::new(),
             cache_ram_mb: DEFAULT_CACHE_RAM_MB,
             slots: default_slots(),
@@ -2961,11 +2974,31 @@ impl Config {
                     srv.name
                 )));
             }
-            if srv.command.is_empty() || srv.command.iter().any(String::is_empty) {
+            let has_command = !srv.command.is_empty();
+            let has_url = srv.url.is_some();
+            if has_command == has_url {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' must set exactly one of command (stdio) or url (streamable HTTP)",
+                    srv.name
+                )));
+            }
+            if has_command && srv.command.iter().any(String::is_empty) {
                 return Err(CoreError::Config(format!(
                     "mcp server '{}' command must be a non-empty argv list",
                     srv.name
                 )));
+            }
+            if let Some(url) = &srv.url {
+                let rest = url
+                    .strip_prefix("http://")
+                    .or_else(|| url.strip_prefix("https://"))
+                    .filter(|r| !r.is_empty() && !r.starts_with('/'));
+                if rest.is_none() {
+                    return Err(CoreError::Config(format!(
+                        "mcp server '{}' url must be an absolute http(s) endpoint, e.g. http://127.0.0.1:8808/mcp",
+                        srv.name
+                    )));
+                }
             }
             if !(1..=600).contains(&srv.timeout_secs) {
                 return Err(CoreError::Config(format!(
@@ -2973,6 +3006,18 @@ impl Config {
                     srv.name
                 )));
             }
+        }
+        if let Some(d) = &self.mcp_default
+            && d != "all"
+            && d != "none"
+            && !self.mcp.iter().any(|srv| &srv.name == d)
+        {
+            let known: Vec<&str> = self.mcp.iter().map(|srv| srv.name.as_str()).collect();
+            return Err(CoreError::Config(format!(
+                "mcp_default '{}' matches no configured mcp server (known: [{}] — or use \"all\"/\"none\")",
+                d,
+                known.join(", ")
+            )));
         }
         if self.default_ctx == 0 {
             return Err(CoreError::Config("default_ctx must be > 0".into()));
@@ -5335,6 +5380,74 @@ default_ctx = 16384
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn unit__validation__mcp_server_command_xor_url() {
+        let mut cfg = Config::default();
+        let stdio = McpServer {
+            name: "s".into(),
+            command: vec!["sleep".into(), "600".into()],
+            url: None,
+            env: std::collections::HashMap::new(),
+            timeout_secs: default_mcp_timeout_secs(),
+        };
+        cfg.mcp.push(stdio.clone());
+        cfg.validate().expect("stdio-only server is valid");
+
+        // Neither transport.
+        let mut neither = stdio.clone();
+        neither.command.clear();
+        neither.url = None;
+        cfg.mcp[0] = neither;
+        assert!(cfg.validate().is_err(), "no transport must be rejected");
+
+        // Both transports.
+        let mut both = stdio;
+        both.url = Some("http://127.0.0.1:8808/mcp".into());
+        cfg.mcp[0] = both;
+        assert!(cfg.validate().is_err(), "both transports must be rejected");
+
+        // Malformed url.
+        let mut bad = McpServer {
+            name: "s".into(),
+            command: Vec::new(),
+            url: Some("not-a-url".into()),
+            env: std::collections::HashMap::new(),
+            timeout_secs: default_mcp_timeout_secs(),
+        };
+        cfg.mcp[0] = bad.clone();
+        assert!(cfg.validate().is_err(), "relative url must be rejected");
+        bad.url = Some("https://mcp.example.com/mcp".into());
+        cfg.mcp[0] = bad;
+        cfg.validate()
+            .expect("http(s) url with host is valid, command empty");
+    }
+
+    #[test]
+    fn unit__validation__mcp_default_must_name_known_selector() {
+        let mut cfg = Config::default();
+        cfg.mcp.push(McpServer {
+            name: "fetch".into(),
+            command: vec!["uvx".into(), "mcp-server-fetch".into()],
+            url: None,
+            env: std::collections::HashMap::new(),
+            timeout_secs: default_mcp_timeout_secs(),
+        });
+        for good in ["all", "none", "fetch"] {
+            cfg.mcp_default = Some(good.into());
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{good} must validate: {e}"));
+        }
+        cfg.mcp_default = Some("ghost".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("mcp_default 'ghost' matches no configured mcp server"),
+            "{err}"
+        );
+        assert!(err.contains("fetch"), "teaching lists known names: {err}");
+        cfg.mcp_default = None;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

@@ -670,7 +670,10 @@ pub async fn openai_proxy(
     // registers a leader — the mediated tool loop must not leave followers
     // waiting on an entry that never resolves through proxy_request.
     if chat_family && let Some(v) = parsed_body.as_mut() {
-        let sel = match crate::mcp::selector_from(&headers, Some(v)) {
+        let sel = match state
+            .mcp
+            .resolve(crate::mcp::selector_from(&headers, Some(v)))
+        {
             Ok(sel) => sel,
             Err(msg) => return openai_error(400, &msg),
         };
