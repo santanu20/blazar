@@ -312,6 +312,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/audio/translations", post(whisper::audio_translations))
         .route("/v1/audio/speech", post(tts::audio_speech))
+        .route("/v1/audio/voices", get(tts::voices))
         .route("/v1/audio/jobs/{id}", get(whisper::audio_jobs_get))
         .route(
             "/v1/audio/jobs/{id}/cancel",
@@ -339,11 +340,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/audio/capabilities", get(whisper::audio_capabilities))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
+        .route("/v1/images/variations", post(images::variations))
         .route("/v1/images/upscale", post(images::upscale))
         .route("/v1/images/jobs/{id}", get(images::jobs_get))
         .route("/v1/images/jobs/{id}/cancel", post(images::jobs_cancel))
         .route("/v1/images/capabilities", get(images::capabilities))
         .route("/v1/videos/generations", post(images::video_generations))
+        // Sora verbs: POST /v1/videos is the Sora-native create (same
+        // handler), GET lists the durable video rows, {id}/content
+        // serves bytes once completed, DELETE cancels.
+        .route(
+            "/v1/videos",
+            get(images::videos_list).post(images::video_generations),
+        )
+        .route(
+            "/v1/videos/{id}",
+            get(images::video_get).delete(images::video_delete),
+        )
+        .route("/v1/videos/{id}/content", get(images::video_content))
         // Jobs and capabilities are surface-agnostic upstream (one
         // queue, `kind` distinguishes) — same handlers on both mounts.
         .route("/v1/videos/jobs/{id}", get(images::jobs_get))
@@ -935,14 +949,18 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/props", "/infill", "/tokenize", "/detokenize",
                        "/apply-template", "/slots", "/slots/{id}", "/responses",
                        "/responses/input_tokens",
-                       "/v1/images/generations", "/v1/images/edits",
-                       "/v1/images/jobs/{id}", "/v1/images/jobs/{id}/cancel",
-                       "/v1/images/capabilities",
-                       "/v1/videos/generations", "/v1/videos/jobs/{id}",
-                       "/v1/videos/jobs/{id}/cancel", "/v1/videos/capabilities",
-                        "/v1/audio/transcriptions", "/v1/audio/translations",
-                        "/v1/audio/speech", "/v1/audio/jobs/{id}",
-                        "/v1/audio/jobs/{id}/cancel", "/v1/audio/capabilities",
+                        "/v1/images/generations", "/v1/images/edits",
+                        "/v1/images/variations", "/v1/images/upscale",
+                        "/v1/images/jobs/{id}", "/v1/images/jobs/{id}/cancel",
+                        "/v1/images/capabilities",
+                        "/v1/videos/generations", "/v1/videos",
+                        "/v1/videos/{id}", "/v1/videos/{id}/content",
+                        "/v1/videos/jobs/{id}",
+                        "/v1/videos/jobs/{id}/cancel", "/v1/videos/capabilities",
+                         "/v1/audio/transcriptions", "/v1/audio/translations",
+                         "/v1/audio/speech", "/v1/audio/voices",
+                         "/v1/audio/jobs/{id}",
+                         "/v1/audio/jobs/{id}/cancel", "/v1/audio/capabilities",
                         "/v1/jobs", "/v1/jobs/{id}", "/v1/jobs/{id}/cancel",
                         "/v1/jobs/{id}/events", "/v1/jobs/{id}/artifact",
                         "/v1/requests", "/v1/requests/{id}",

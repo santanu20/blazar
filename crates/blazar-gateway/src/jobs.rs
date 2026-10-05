@@ -84,10 +84,10 @@ impl JobRuntime {
             .with_store(|s| {
                 let cutoff = blazar_core::store::unix_now() - BOOT_GRACE_SECS;
                 let abandoned = s.sweep_jobs_updated_before(cutoff).unwrap_or_default();
-                let pruned = s.prune_jobs(TERMINAL_PRUNE_SECS).unwrap_or(0);
+                let pruned = s.prune_jobs(TERMINAL_PRUNE_SECS).unwrap_or((0, Vec::new()));
                 (abandoned, pruned)
             })
-            .unwrap_or((Vec::new(), 0));
+            .unwrap_or((Vec::new(), (0, Vec::new())));
         if !swept.0.is_empty() {
             tracing::info!(
                 target: "blazar::jobs",
@@ -95,13 +95,18 @@ impl JobRuntime {
                 "boot sweep: in-flight jobs from a previous gateway marked abandoned (resubmit to rerun)"
             );
         }
-        if swept.1 > 0 {
+        let (pruned_rows, artifact_paths) = &swept.1;
+        if *pruned_rows > 0 {
             tracing::info!(
                 target: "blazar::jobs",
-                pruned = swept.1,
+                pruned = pruned_rows,
+                artifacts = artifact_paths.len(),
                 "boot sweep: pruned terminal job rows older than 7 days"
             );
         }
+        // Spilled files die with their rows — the ledger reference is
+        // gone, so the bytes are unreachable orphans otherwise.
+        remove_pruned_artifact_files(artifact_paths);
         let st = Arc::clone(state);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(
@@ -244,6 +249,38 @@ impl JobRuntime {
         self.transition(state, id, "cancelled", None, None, "cancelled");
     }
 
+    /// Delete a terminal job's render (Sora `DELETE /v1/videos/{id}`):
+    /// state flips to `cancelled` and the stored result is dropped, so
+    /// `/content` stops serving the bytes. Open rows are NOT touched —
+    /// cancel those via [`JobRuntime::record_cancelled`] instead. A
+    /// spilled artifact file is removed best-effort (its ledger reference
+    /// is already gone). Idempotent: returns silently on an
+    /// already-deleted row.
+    pub fn record_deleted(&self, state: &AppState, id: &str, artifact_path: Option<&str>) {
+        let flipped = state.with_store(|s| s.delete_job_result(id));
+        let purged = matches!(flipped, Some(Ok(true)));
+        match flipped {
+            Some(Ok(true)) => {
+                self.record_event(
+                    state,
+                    id,
+                    "deleted",
+                    serde_json::json!({"artifact": artifact_path.is_some()}),
+                );
+            }
+            Some(Ok(false)) => {} // open, already-deleted or missing — caller owns those arms
+            Some(Err(err)) => {
+                tracing::warn!(target: "blazar::jobs", job = %id, %err, "job delete failed");
+            }
+            None => {
+                tracing::warn!(target: "blazar::jobs", job = %id, "job ledger unavailable; delete not recorded");
+            }
+        }
+        if purged && let Some(path) = artifact_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// Append a progress event without a state transition — doctor probe
     /// verdicts today, lane milestones later. The row must already exist;
     /// a missing row is a debug-level note (the lane stays authoritative).
@@ -343,6 +380,25 @@ fn not_found(id: &str) -> Response {
              and completed records live 7 days; submit a new request"
         ),
     )
+}
+
+/// Remove the spilled artifact files of pruned rows (best-effort, logged).
+/// Paths come from the store's own prune result — never from a request —
+/// so a missing file is simply already-gone, and a failure to unlink is a
+/// disk concern worth a warning, never a boot abort.
+fn remove_pruned_artifact_files(paths: &[String]) {
+    for path in paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                target: "blazar::jobs",
+                path = %path,
+                error = %e,
+                "prune: spilled artifact file removal failed (disk concern, not a ledger one)"
+            ),
+        }
+    }
 }
 
 /// GET /v1/jobs?state=&kind=&limit= — the durable ledger, newest first.
@@ -648,6 +704,30 @@ mod tests {
         assert!(p.get("result").is_none());
         assert!(p.get("error").is_none());
         assert!(p.get("artifact").is_none());
+    }
+
+    #[test]
+    fn unit__remove_pruned_artifact_files__removes_spared_missing_quiet() {
+        let dir = std::env::temp_dir().join(format!(
+            "blazar-prune-artifacts-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spilled = dir.join("result");
+        std::fs::write(&spilled, b"bytes").unwrap();
+
+        let paths = vec![
+            spilled.to_string_lossy().into_owned(),
+            format!("{}/already-gone", dir.to_string_lossy()),
+        ];
+        remove_pruned_artifact_files(&paths);
+
+        assert!(!spilled.exists(), "spilled file removed with its row");
+        // Missing paths are quiet, not panics.
+        remove_pruned_artifact_files(&paths);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

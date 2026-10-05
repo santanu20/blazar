@@ -609,10 +609,12 @@ async fn client__ollama_options_spec__off_shapes_the_spawn_and_ps_reports_it() {
 }
 
 #[tokio::test]
-async fn client__audio_speech__teaches_install_and_format_lanes() {
+async fn client__audio_speech__teaches_install_and_unknown_formats() {
     // Hermetic harness dir carries no piper install: the route must
-    // name the exact remedy, and the WAV-only contract must teach the
-    // alternative instead of silently transcoding.
+    // name the exact remedy. Lossy formats are first-class (ffmpeg
+    // lane), so an accepted format rides through to the same install
+    // teaching, while a genuinely unknown format must teach the full
+    // vocabulary instead of silently falling back to WAV.
     let ts = start(support::config_with_keys()).await;
     let c = client();
     let resp = c
@@ -640,11 +642,27 @@ async fn client__audio_speech__teaches_install_and_format_lanes() {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("blazar tts --install"),
+        "accepted lossy format reaches the install teaching, not a format rejection: {body}"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/speech", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "en_US-amy-medium", "input": "hi",
+            "response_format": "wma"
+        }))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("WAV") && body.contains("mp3"),
-        "format teaching: {body}"
+        body.contains("wav") && body.contains("mp3") && body.contains("pcm16"),
+        "unknown-format teaching lists the full vocabulary: {body}"
     );
     let resp = c
         .post(format!("{}/v1/audio/speech", ts.base))

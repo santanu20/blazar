@@ -679,6 +679,23 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// User-initiated delete of a terminal job's payload (the Sora-plane
+    /// `DELETE /v1/videos/{id}`): flips `completed`/`failed` rows to
+    /// `cancelled` and drops the stored result/error so the render is no
+    /// longer servable. Deliberately narrower than `set_job_state`'s
+    /// one-way close — that invariant still holds (open rows can only be
+    /// closed once); this only narrows from an already-terminal state,
+    /// which nothing else may do. Returns `false` when the row is open,
+    /// already cancelled, or missing.
+    pub fn delete_job_result(&self, id: &str) -> CoreResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE jobs SET state = 'cancelled', result_json = NULL, error = NULL, updated_at = ?2 \
+             WHERE id = ?1 AND state IN ('completed','failed')",
+            params![id, unix_now()],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Attach a spilled-result artifact path to a job row (results too
     /// large for the inline column). Separate from `set_job_state` so a
     /// transition never needs to know about disk spillover.
@@ -835,11 +852,23 @@ impl Store {
     }
 
     /// Bounded retention: terminal jobs older than `older_than_secs`
-    /// (and their events) are deleted. Called at boot — the table must
-    /// not grow forever.
-    pub fn prune_jobs(&self, older_than_secs: i64) -> CoreResult<u64> {
+    /// (and their events) are deleted, and the artifact paths of the
+    /// deleted rows are returned so the caller can remove the spilled
+    /// files — the store owns the rows, not the disk. Called at boot —
+    /// the table must not grow forever (and neither may the spill dir).
+    pub fn prune_jobs(&self, older_than_secs: i64) -> CoreResult<(u64, Vec<String>)> {
         let cutoff = unix_now() - older_than_secs.max(0);
         let tx = self.conn.unchecked_transaction()?;
+        // Collected before the delete in the same transaction: after it,
+        // the paths would be unrecoverable (and unlinkable).
+        let artifacts = {
+            let mut stmt = tx.prepare(
+                "SELECT artifact_path FROM jobs WHERE state IN ('completed','failed','cancelled','abandoned') \
+                 AND updated_at < ?1 AND artifact_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
         tx.execute(
             "DELETE FROM job_events WHERE job_id IN (
                 SELECT id FROM jobs WHERE state IN ('completed','failed','cancelled','abandoned') AND updated_at < ?1
@@ -851,7 +880,7 @@ impl Store {
             params![cutoff],
         )?;
         tx.commit()?;
-        Ok(u64::try_from(n).unwrap_or(0))
+        Ok((u64::try_from(n).unwrap_or(0), artifacts))
     }
 
     // ---- durable responses (v8) --------------------------------------
@@ -1958,6 +1987,39 @@ mod tests {
     }
 
     #[test]
+    fn unit__jobs__delete_result_purges_terminal_only() {
+        let (_t, s) = tmp_store();
+        let now = unix_now();
+        // A completed row carrying a render...
+        s.insert_job(&job_row("render", "video", "running", now))
+            .unwrap();
+        s.set_job_state("render", "completed", Some("{\"result\":{}}"), None)
+            .unwrap();
+        // ...an open row...
+        s.insert_job(&job_row("wip", "video", "running", now))
+            .unwrap();
+        // ...and an already-cancelled one.
+        s.insert_job(&job_row("gone", "video", "running", now))
+            .unwrap();
+        s.set_job_state("gone", "cancelled", None, None).unwrap();
+
+        // Delete only narrows from completed/failed.
+        assert!(s.delete_job_result("render").unwrap());
+        assert!(!s.delete_job_result("wip").unwrap());
+        assert!(!s.delete_job_result("gone").unwrap());
+
+        let purged = s.get_job("render").unwrap().unwrap();
+        assert_eq!(purged.state, "cancelled");
+        assert!(purged.result_json.is_none());
+        assert!(purged.error.is_none());
+        // Open + already-cancelled rows are untouched.
+        assert_eq!(s.get_job("wip").unwrap().unwrap().state, "running");
+        assert_eq!(s.get_job("gone").unwrap().unwrap().state, "cancelled");
+        // Idempotent second delete.
+        assert!(!s.delete_job_result("render").unwrap());
+    }
+
+    #[test]
     fn unit__jobs__prune_removes_terminal_and_events() {
         let (_t, s) = tmp_store();
         let now = unix_now();
@@ -1973,14 +2035,36 @@ mod tests {
         ))
         .unwrap();
 
-        let n = s.prune_jobs(7 * 86400).unwrap();
+        let (n, artifacts) = s.prune_jobs(7 * 86400).unwrap();
         assert_eq!(n, 1);
+        assert!(artifacts.is_empty(), "no artifact on this row");
         assert!(s.get_job("ancient").unwrap().is_none());
         // Events die with their job — no orphans.
         assert_eq!(s.job_events("ancient", 10).unwrap(), Vec::new());
         // Recent terminal and old-but-in-flight both survive (the sweep owns in-flight).
         assert!(s.get_job("recent").unwrap().is_some());
         assert!(s.get_job("old_inflight").unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__jobs__prune_returns_artifact_paths_of_deleted_rows_only() {
+        let (_t, s) = tmp_store();
+        let now = unix_now();
+        let mut spilled = job_row("spilled", "video", "completed", now - 30 * 86400);
+        spilled.artifact_path = Some("/tmp/jobs/spilled/result".into());
+        s.insert_job(&spilled).unwrap();
+        let mut kept = job_row("kept", "video", "completed", now);
+        kept.artifact_path = Some("/tmp/jobs/kept/result".into());
+        s.insert_job(&kept).unwrap();
+        let mut inflight = job_row("inflight", "video", "running", now - 30 * 86400);
+        inflight.artifact_path = Some("/tmp/jobs/inflight/result".into());
+        s.insert_job(&inflight).unwrap();
+
+        let (n, artifacts) = s.prune_jobs(7 * 86400).unwrap();
+        assert_eq!(n, 1);
+        // Only the pruned row's path comes back — the caller deletes
+        // exactly those files and nothing else.
+        assert_eq!(artifacts, vec!["/tmp/jobs/spilled/result".to_string()]);
     }
 
     #[test]

@@ -79,7 +79,7 @@ The engines still perform inference. **Blazar is the control plane around them**
 | Failures you can diagnose | `doctor`, `why`, `watch`, metrics, trace IDs, teaching errors |
 | Models managed like software | Pull, import, inspect, pin, tune, snapshot, restore |
 | Several machines as one pool | Capacity-aware federation: warm, replicate, route |
-| Multimodal in one place | Text, embeddings, image, video, speech-to-text, TTS |
+| Multimodal in one place | Text, embeddings, image (variations, upscale), video (Sora verbs), speech-to-text (word timestamps), TTS (wav/pcm + ffmpeg lossy), realtime voice |
 | Production controls, locally | API keys, TLS, CORS, audit logging, PII scrubbing, OTLP |
 
 ---

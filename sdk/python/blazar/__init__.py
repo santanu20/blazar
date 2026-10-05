@@ -17,7 +17,7 @@ Streaming iterates server-sent events as they land:
         delta = chunk["choices"][0]["delta"].get("content", "")
         print(delta, end="", flush=True)
 
-Batch (Anthropic dialect), completion metadata, and realtime voice:
+    Batch (Anthropic dialect), completion metadata, realtime voice, and TTS:
 
     batch = blazar.anthropic_batch_create([
         {"custom_id": "req-1",
@@ -32,6 +32,10 @@ Batch (Anthropic dialect), completion metadata, and realtime voice:
 
     with blazar.realtime(model) as rt:
         out = rt.voice_turn(pcm_bytes)   # STT -> chat -> TTS, one call
+
+    ctype, audio = blazar.speech("en_US-amy-medium", "hello there",
+                                 response_format="mp3")
+    voices = blazar.voices(search="en_US")   # installed + HF results
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ import urllib.error
 import urllib.request
 
 __all__ = ["BlazarError", "Client", "RealtimeSession"]
-__version__ = "0.2.0"
+__version__ = "0.3.1"
 
 
 class BlazarError(RuntimeError):
@@ -204,6 +208,115 @@ class Client:
         """
         return RealtimeSession(self, model, voice, stt_model)
 
+    # -- media: voices + speech ----------------------------------------------
+
+    def voices(self, search: t.Optional[str] = None) -> t.Dict[str, t.Any]:
+        """GET /v1/audio/voices — the piper voice menu.
+
+        Installed voices always come back under ``data``; ``search`` also
+        queries HuggingFace for remote voice packs (``search.results`` rows
+        carry an ``installed`` flag). A failed search still returns the
+        installed list with a ``search.search_error`` note.
+        """
+        from urllib.parse import quote
+
+        path = "/v1/audio/voices"
+        if search:
+            path += "?search=" + quote(search, safe="")
+        return self._request(path, None)
+
+    def speech(
+        self,
+        voice: str,
+        input: str,
+        *,
+        response_format: str = "wav",
+        **kwargs: t.Any,
+    ) -> t.Tuple[str, bytes]:
+        """POST /v1/audio/speech — offline TTS.
+
+        Returns ``(content_type, audio_bytes)``. ``response_format`` is one
+        of ``wav`` (default), ``pcm``/``pcm16``, or ``mp3``/``opus``/
+        ``aac``/``flac`` (the lossy family needs system ffmpeg on the
+        gateway host). Native piper knobs pass through as keywords:
+        ``speed``, ``speaker``, ``noise_scale``, ``noise_w``,
+        ``sentence_silence``.
+        """
+        body: t.Dict[str, t.Any] = {
+            "model": voice,
+            "input": input,
+            "response_format": response_format,
+            **kwargs,
+        }
+        return self._request_bytes("/v1/audio/speech", body)
+
+    def transcribe(
+        self,
+        path: str,
+        *,
+        model: t.Optional[str] = None,
+        response_format: t.Optional[str] = None,
+        **kwargs: t.Any,
+    ) -> t.Any:
+        """POST /v1/audio/transcriptions — speech-to-text.
+
+        ``path`` is a local audio file (wav/flac/mp3/webm/...). Returns a
+        dict for the JSON family (``json`` default, ``verbose_json``,
+        ``diarized_json``) or the raw string for ``text``/``srt``/``vtt``.
+        Everything else passes through as form fields: ``language``,
+        ``prompt``, ``beam_size``, the VAD knobs, ``diarize``,
+        ``no_language_probabilities``, and ``timestamp_granularities``
+        (list — sent per-value, forces ``verbose_json`` server-side).
+        """
+        import mimetypes
+        import os
+        import uuid
+
+        with open(path, "rb") as fh:
+            audio = fh.read()
+        fields: list[tuple[str, str]] = [("model", model or "whisper-1")]
+        if response_format is not None:
+            fields.append(("response_format", response_format))
+        for key, value in kwargs.items():
+            if isinstance(value, (list, tuple)):
+                fields.extend((f"{key}[]", str(item)) for item in value)
+            else:
+                fields.append((key, str(value)))
+
+        boundary = "blazar-" + uuid.uuid4().hex
+        parts: list[bytes] = []
+        for name, value in fields:
+            parts.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+                f"\r\n\r\n{value}\r\n".encode()
+            )
+        filename = os.path.basename(path)
+        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+            f'filename="{filename}"\r\nContent-Type: {ctype}\r\n\r\n'.encode()
+            + audio
+            + b"\r\n"
+        )
+        parts.append(f"--{boundary}--\r\n".encode())
+
+        req = urllib.request.Request(
+            self.base_url + "/v1/audio/transcriptions",
+            data=b"".join(parts),
+            method="POST",
+        )
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        if self.api_key:
+            req.add_header("Authorization", f"Bearer {self.api_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                payload = resp.read()
+        except urllib.error.HTTPError as e:
+            raise self._blazar_error(e) from None
+        if response_format in ("text", "srt", "vtt"):
+            return payload.decode("utf-8", "replace")
+        return json.loads(payload)
+
     # -- operations ----------------------------------------------------------
 
     def ps(self) -> t.Dict[str, t.Any]:
@@ -248,6 +361,22 @@ class Client:
         except urllib.error.HTTPError as e:
             raise self._blazar_error(e) from None
         return json.loads(payload)
+
+    def _request_bytes(
+        self, path: str, body: t.Dict[str, t.Any]
+    ) -> t.Tuple[str, bytes]:
+        """POST and return (content_type, raw body) for binary responses."""
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(self.base_url + path, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if self.api_key:
+            req.add_header("Authorization", f"Bearer {self.api_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                ctype = resp.headers.get("Content-Type", "application/octet-stream")
+                return ctype, resp.read()
+        except urllib.error.HTTPError as e:
+            raise self._blazar_error(e) from None
 
     def _request_text(self, path: str) -> str:
         req = urllib.request.Request(self.base_url + path, method="GET")

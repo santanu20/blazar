@@ -424,14 +424,13 @@ fn whisper_engine_tags(dirs: &BlazarDirs) -> Result<Vec<String>> {
     Ok(tags)
 }
 
-/// Keep the newest `KEEP_TAGS` server dirs; the pinned dir (if any) is
-/// never pruned — mirrors the llama engine lane's retention policy.
+/// Keep the newest `keep_tags` server dirs (config knob, default
+/// `KEEP_TAGS`); the pinned dir (if any) is never pruned — mirrors the
+/// llama engine lane's retention policy.
 fn prune(dirs: &BlazarDirs) -> Result<()> {
     let pin = pinned_tag(dirs);
-    for dir in sorted_tag_dirs(dirs)
-        .into_iter()
-        .skip(crate::engine::KEEP_TAGS)
-    {
+    let keep = crate::engine::effective_keep_tags(dirs)?;
+    for dir in sorted_tag_dirs(dirs).into_iter().skip(keep) {
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1757,6 +1756,39 @@ mod tests {
             .map(String::from)
             .collect();
         assert_eq!(installed_tags(&dirs), expected);
+    }
+
+    #[test]
+    fn unit__prune__config_keep_tags_one_keeps_single_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        for t in ["v1.1.0", "v1.2.0", "v1.3.0"] {
+            stage_server(&dirs, t);
+        }
+        std::fs::create_dir_all(&dirs.config_dir).expect("cfg");
+        std::fs::write(dirs.config_file(), "keep_tags = 1\n").expect("knob");
+        prune(&dirs).expect("prune");
+        // One slot: newest only, no rollback anchor.
+        assert_eq!(installed_tags(&dirs), vec!["v1.3.0".to_string()]);
+    }
+
+    #[test]
+    fn unit__prune__broken_config_fails_loudly() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        for t in ["v1.1.0", "v1.2.0", "v1.3.0"] {
+            stage_server(&dirs, t);
+        }
+        std::fs::create_dir_all(&dirs.config_dir).expect("cfg");
+        std::fs::write(dirs.config_file(), "keep_tags = \"one\"\n").expect("bad cfg");
+        let err = prune(&dirs).expect_err("must refuse to prune on broken config");
+        assert!(err.to_string().contains("keep_tags"));
     }
 
     #[test]

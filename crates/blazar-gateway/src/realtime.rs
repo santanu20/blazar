@@ -1,17 +1,27 @@
 //! Realtime voice lane: one WebSocket per session, one utterance pipeline
-//! per commit — STT (whisper lane) → chat (`OpenAI` lane) → TTS (piper
-//! lane). Every stage calls the gateway's own handlers, so admission,
+//! per committed buffer — STT (whisper lane) → chat (`OpenAI` lane) → TTS
+//! (piper lane). Every stage calls the gateway's own handlers, so admission,
 //! queueing, and telemetry apply exactly as on the HTTP lanes.
 //!
-//! MVP protocol (documented in `docs/4.API_SPEC.md`):
+//! Event surface (documented in `docs/4.API_SPEC.md`):
 //!
 //! ```text
 //! client → server : {"type":"input_audio_buffer.append","audio":"<b64>"}
 //! client → server : {"type":"input_audio_buffer.commit"}
+//! client → server : {"type":"input_audio_buffer.clear"}
+//! client → server : {"type":"session.update","session":{voice?,stt_model?,instructions?}}
+//! client → server : {"type":"response.create"}
+//! client → server : {"type":"response.cancel"}
+//! client → server : {"type":"conversation.item.create","item":{...}}
 //! server → client : {"type":"session.created","session":{...}}
+//! server → client : {"type":"session.updated","session":{...}}
 //! server → client : {"type":"input_audio_transcription.completed",...}
+//! server → client : {"type":"input_audio_transcription.failed","error":{...}}
 //! server → client : {"type":"response.audio_transcript.delta"/".done",...}
 //! server → client : {"type":"response.audio.delta"/".done",...}
+//! server → client : {"type":"response.cancelled",...}
+//! server → client : {"type":"input_audio_buffer.cleared",...}
+//! server → client : {"type":"conversation.item.created","item":{...}}
 //! server → client : {"type":"error","error":{"type","message"}}
 //! ```
 //!
@@ -20,15 +30,33 @@
 //! Model selection rides `?model=`; the piper voice rides `?voice=`
 //! (default `en_US-amy-medium`); the whisper size rides `?stt_model=`
 //! (default `whisper-1`, resolved by the whisper lane's own ladder).
+//!
+//! Semantics worth knowing:
+//! - `session.update` mutates voice / `stt_model` / instructions and they
+//!   apply from the NEXT turn on (a running turn snapshots the config).
+//! - `response.cancel` sets a flag checked BETWEEN pipeline stages, so a
+//!   cancel lands after the current stage finishes (chat streams are not
+//!   cut mid-flight — each stage call is atomic here). A cancel that
+//!   arrives too late (turn already finished) simply has no effect.
+//! - `conversation.item.create` accepts text messages only (the local
+//!   chat lane consumes text context); context is capped at 16 items /
+//!   8 192 chars, oldest evicted first. Items created mid-turn apply to
+//!   the next turn.
+//! - While a turn runs, only `response.cancel`, `input_audio_buffer.append`,
+//!   and `conversation.item.create` are accepted; anything else gets an
+//!   error event.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use futures::SinkExt;
+use futures::StreamExt;
+use futures::stream::SplitSink;
 use serde_json::{Value, json};
 
 use crate::state::AppState;
@@ -44,8 +72,101 @@ const AUDIO_BUFFER_CAP_BYTES: usize = 20 * 1024 * 1024;
 const TTS_CHUNK_BYTES: usize = 4 * 1024;
 /// Utterance budget for the reply text.
 const CHAT_MAX_TOKENS: u64 = 512;
+/// Conversation-context ceiling: at most this many remembered items ...
+const CHAT_CTX_MAX_ITEMS: usize = 16;
+/// ... and this many characters of item text (oldest evicted first).
+const CHAT_CTX_MAX_CHARS: usize = 8_192;
 const PCM_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_VOICE: &str = "en_US-amy-medium";
+
+/// Mutable per-session configuration (voice, stt size, system prompt).
+/// Snapshot-cloned at each turn start so `session.update` mid-turn can
+/// only affect the next turn.
+#[derive(Debug, Clone)]
+struct SessionCfg {
+    voice: String,
+    stt_model: String,
+    instructions: String,
+}
+
+/// Apply a `session.update` payload to the config; returns the session
+/// object to echo back in `session.updated`. Unknown session keys are
+/// tolerated and ignored (`OpenAI` clients send many we do not consume);
+/// known keys are validated.
+fn apply_session_update(cfg: &mut SessionCfg, ev: &Value) -> Result<Value, String> {
+    let Some(session) = ev.get("session") else {
+        return Err("session.update needs a `session` object".into());
+    };
+    if let Some(v) = session.get("voice") {
+        match v.as_str() {
+            Some(s) if !s.trim().is_empty() => cfg.voice = s.trim().to_string(),
+            _ => return Err("`voice` must be a non-empty string".into()),
+        }
+    }
+    if let Some(m) = session.get("stt_model") {
+        match m.as_str() {
+            Some(s) if !s.trim().is_empty() => cfg.stt_model = s.trim().to_string(),
+            _ => return Err("`stt_model` must be a non-empty string".into()),
+        }
+    }
+    if let Some(i) = session.get("instructions") {
+        match i.as_str() {
+            Some(s) => cfg.instructions = s.to_string(),
+            None => return Err("`instructions` must be a string".into()),
+        }
+    }
+    Ok(json!({
+        "voice": cfg.voice,
+        "stt_model": cfg.stt_model,
+        "instructions": cfg.instructions,
+    }))
+}
+
+/// Extract `(role, text)` from a `conversation.item.create` item. Only
+/// text messages are consumable by the local chat lane; everything else
+/// gets a teaching error instead of a silent drop.
+fn item_text(item: &Value) -> Result<(String, String), String> {
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    let content = item.pointer("/content/0").ok_or(
+        "item needs content[0] with type \"text\" (the local chat lane consumes text context only)",
+    )?;
+    if content.get("type").and_then(Value::as_str) != Some("text") {
+        return Err(format!(
+            "item content type '{}' is not supported — this lane consumes text context only",
+            content.get("type").and_then(Value::as_str).unwrap_or("?")
+        ));
+    }
+    let text = content
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or("text content needs a `text` field")?;
+    Ok((role.to_string(), text.to_string()))
+}
+
+/// Push one item into the conversation context, enforcing both caps by
+/// evicting oldest-first.
+fn ctx_push(ctx: &mut Vec<(String, String)>, role: &str, text: &str) {
+    ctx.push((role.to_string(), text.to_string()));
+    let mut chars: usize = ctx.iter().map(|(_, t)| t.len()).sum();
+    while (ctx.len() > CHAT_CTX_MAX_ITEMS || chars > CHAT_CTX_MAX_CHARS) && !ctx.is_empty() {
+        chars = chars.saturating_sub(ctx[0].1.len());
+        ctx.remove(0);
+    }
+}
+
+/// Build the chat-completion `messages` array: optional system
+/// instructions, remembered context items, then the live transcript.
+fn ctx_messages(cfg: &SessionCfg, ctx: &[(String, String)], transcript: &str) -> Value {
+    let mut messages = Vec::with_capacity(ctx.len() + 2);
+    if !cfg.instructions.trim().is_empty() {
+        messages.push(json!({"role": "system", "content": cfg.instructions}));
+    }
+    for (role, text) in ctx {
+        messages.push(json!({"role": role, "content": text}));
+    }
+    messages.push(json!({"role": "user", "content": transcript}));
+    Value::Array(messages)
+}
 
 /// `GET /v1/realtime?model=...` — upgrade, then run the session loop.
 #[allow(clippy::too_many_lines, clippy::implicit_hasher)] // one cohesive upgrade path; bind_remote precedent
@@ -74,13 +195,23 @@ pub async fn realtime_session(
     ws.on_upgrade(move |socket| run_session(socket, state, model, voice, stt_model, key))
 }
 /// Emit one JSON text frame; failures (client gone) are quietly the end
-/// of the session — the read loop notices the closed socket next.
-async fn send_json(socket: &mut WebSocket, v: &Value) {
-    let _ = socket
+/// of the session — the read loop notices the closed socket next. The
+/// sink is shared between the turn future and the event loop, so it
+/// rides an async mutex (short sends; held only per frame).
+type WsSink = Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>;
+
+async fn send_json(sink: &WsSink, v: &Value) {
+    let mut guard = sink.lock().await;
+    let _ = guard
         .send(Message::Text(
             serde_json::to_string(v).unwrap_or_default().into(),
         ))
         .await;
+}
+
+/// Close the shared sink (session teardown paths).
+async fn sink_close(sink: &WsSink) {
+    let _ = sink.lock().await.close().await;
 }
 
 fn error_event(etype: &str, message: &str) -> Value {
@@ -143,15 +274,19 @@ fn reply_text(chat: &Value) -> String {
 
 /// One committed utterance: STT → chat → TTS, each event streamed as it
 /// lands. A stage failure emits an error event and returns — the socket
-/// stays usable for the next utterance.
+/// stays usable for the next utterance. `cancel` is checked between
+/// stages (chat streams are not cut mid-flight); observing it emits
+/// `response.cancelled` and stops the pipeline.
 #[allow(clippy::too_many_lines)] // one cohesive staged pipeline
+#[allow(clippy::too_many_arguments)] // staged pipeline: socket, state, key, model, cfg, ctx, cancel, buffer
 async fn run_turn(
-    socket: &mut WebSocket,
+    socket: &WsSink,
     state: &Arc<AppState>,
     key: Option<&crate::keys::KeyCtx>,
     model: &str,
-    voice: &str,
-    stt_model: &str,
+    cfg: &SessionCfg,
+    ctx: &[(String, String)],
+    cancel: &AtomicBool,
     buffer: &[u8],
 ) {
     if buffer.is_empty() {
@@ -165,7 +300,7 @@ async fn run_turn(
     let key_ext = key.cloned().map(axum::Extension);
 
     // 1. STT through the gateway's own whisper lane.
-    let (ct, body) = transcription_multipart(&wav_wrap(buffer), stt_model);
+    let (ct, body) = transcription_multipart(&wav_wrap(buffer), &cfg.stt_model);
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::CONTENT_TYPE,
@@ -190,19 +325,25 @@ async fn run_turn(
         None
     };
     let Some(transcript) = transcript.filter(|t| !t.trim().is_empty()) else {
+        let message = format!(
+            "whisper lane returned {} — is a whisper model pulled and the engine installed?",
+            stt_status.as_u16()
+        );
         send_json(
             socket,
-            &error_event(
-                "transcription_failed",
-                &format!(
-                    "whisper lane returned {} — is a whisper model pulled and the engine installed?",
-                    stt_status.as_u16()
-                ),
-            ),
+            &json!({
+                "type": "input_audio_transcription.failed",
+                "error": {"code": "transcription_failed", "message": message},
+            }),
         )
         .await;
+        send_json(socket, &error_event("transcription_failed", &message)).await;
         return;
     };
+    if cancel.load(Ordering::Relaxed) {
+        send_json(socket, &json!({"type": "response.cancelled"})).await;
+        return;
+    }
     send_json(
         socket,
         &json!({"type": "input_audio_transcription.completed", "transcript": transcript}),
@@ -212,7 +353,7 @@ async fn run_turn(
     // 2. Chat through the full OpenAI lane (admission, queue, sentinel).
     let chat_body = serde_json::to_vec(&json!({
         "model": model,
-        "messages": [{"role": "user", "content": transcript}],
+        "messages": ctx_messages(cfg, ctx, &transcript),
         "max_tokens": CHAT_MAX_TOKENS,
         "stream": false,
     }))
@@ -251,6 +392,16 @@ async fn run_turn(
         .await;
         return;
     }
+    if cancel.load(Ordering::Relaxed) {
+        // Text exists but audio synthesis is the expensive stage — a
+        // cancel here keeps the transcript delivered and skips voice.
+        send_json(
+            socket,
+            &json!({"type": "response.cancelled", "transcript_delivered": true}),
+        )
+        .await;
+        return;
+    }
     send_json(
         socket,
         &json!({"type": "response.audio_transcript.delta", "delta": text}),
@@ -265,7 +416,7 @@ async fn run_turn(
     // 3. TTS through the piper lane; failure degrades to text-only with
     // an explicit error event (the transcript was already delivered).
     let tts_body = serde_json::to_vec(&json!({
-        "model": voice,
+        "model": cfg.voice,
         "input": text,
         "response_format": "wav",
     }))
@@ -286,8 +437,9 @@ async fn run_turn(
             &error_event(
                 "tts_failed",
                 &format!(
-                    "piper lane returned {} (voice '{voice}') — transcript delivered above, audio skipped",
-                    tts_status.as_u16()
+                    "piper lane returned {} (voice '{}') — transcript delivered above, audio skipped",
+                    tts_status.as_u16(),
+                    cfg.voice
                 ),
             ),
         )
@@ -314,19 +466,121 @@ async fn response_parts(resp: Response) -> (StatusCode, axum::body::Bytes) {
     (status, body)
 }
 
-/// Session loop: bounded idle, hard TTL, bounded buffer.
+/// Decode one append payload into the session buffer; `Err` is a fatal
+/// misbehavior (bad base64 or over-capacity) and the message says which.
+fn append_audio(buffer: &mut Vec<u8>, b64: &str) -> Result<(), String> {
+    let decoded = base64_decode(b64).map_err(|e| format!("audio is not base64: {e}"))?;
+    if buffer.len() + decoded.len() > AUDIO_BUFFER_CAP_BYTES {
+        return Err("audio buffer exceeded 20 MiB — this lane is for utterances, not files".into());
+    }
+    buffer.extend_from_slice(&decoded);
+    Ok(())
+}
+
+/// Echo a created conversation item back with a server-assigned id.
+async fn item_created(socket: &WsSink, item: &Value, seq: u64) {
+    let mut echoed = item.clone();
+    if echoed.get("id").and_then(Value::as_str).is_none() {
+        echoed["id"] = json!(format!("item_{seq}"));
+    }
+    if echoed.get("object").is_none() {
+        echoed["object"] = json!("realtime.item");
+    }
+    send_json(
+        socket,
+        &json!({"type": "conversation.item.created", "item": echoed}),
+    )
+    .await;
+}
+
+/// Mid-turn event routing: only cancel / append / item-create are live
+/// while a turn runs; everything else is taught, nothing is dropped
+/// silently. Returns `true` when the session must close.
+async fn dispatch_mid_turn(
+    raw: &str,
+    socket: &WsSink,
+    buffer: &mut Vec<u8>,
+    ctx: &mut Vec<(String, String)>,
+    item_seq: &mut u64,
+    cancel: &AtomicBool,
+) -> bool {
+    let ev: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            send_json(
+                socket,
+                &error_event("invalid_request", &format!("event is not JSON: {e}")),
+            )
+            .await;
+            return false;
+        }
+    };
+    match ev["type"].as_str().unwrap_or_default() {
+        "response.cancel" => {
+            // Silent by design: the running turn emits
+            // `response.cancelled` at its next between-stage checkpoint.
+            cancel.store(true, Ordering::Relaxed);
+        }
+        "input_audio_buffer.append" => match ev["audio"].as_str() {
+            Some(b64) => {
+                if let Err(msg) = append_audio(buffer, b64) {
+                    send_json(socket, &error_event("buffer_overflow", &msg)).await;
+                    return true;
+                }
+            }
+            None => {
+                send_json(
+                    socket,
+                    &error_event("invalid_request", "append needs a base64 `audio` field"),
+                )
+                .await;
+            }
+        },
+        "conversation.item.create" => match item_text(&ev["item"]) {
+            Ok((role, text)) => {
+                *item_seq += 1;
+                ctx_push(ctx, &role, &text);
+                item_created(socket, &ev["item"], *item_seq).await;
+            }
+            Err(msg) => {
+                send_json(socket, &error_event("invalid_request", &msg)).await;
+            }
+        },
+        other => {
+            send_json(
+                socket,
+                &error_event(
+                    "invalid_request",
+                    &format!(
+                        "event '{other}' is not accepted while a response is running — \
+                         mid-turn this lane accepts response.cancel, \
+                         input_audio_buffer.append, and conversation.item.create"
+                    ),
+                ),
+            )
+            .await;
+        }
+    }
+    false
+}
+
+/// Session loop: bounded idle, hard TTL, bounded buffer, concurrent-turn
+/// cancel. The turn future is pinned and polled alongside the read half
+/// so a `response.cancel` frame can land while stages are still running.
 #[allow(clippy::too_many_lines)] // one cohesive event loop
 async fn run_session(
-    mut socket: WebSocket,
+    socket: WebSocket,
     state: Arc<AppState>,
     model: String,
     voice: String,
     stt_model: String,
     key: Option<crate::keys::KeyCtx>,
 ) {
+    let (sink, mut stream) = socket.split();
+    let sink: WsSink = Arc::new(tokio::sync::Mutex::new(sink));
     let session_id = crate::batch::short_id("rt");
     send_json(
-        &mut socket,
+        &sink,
         &json!({
             "type": "session.created",
             "session": {"id": session_id, "model": model, "voice": voice, "stt_model": stt_model},
@@ -334,28 +588,36 @@ async fn run_session(
     )
     .await;
     let started = std::time::Instant::now();
+    let mut cfg = SessionCfg {
+        voice,
+        stt_model,
+        instructions: String::new(),
+    };
+    let mut ctx: Vec<(String, String)> = Vec::new();
+    let mut item_seq: u64 = 0;
+    let cancel = AtomicBool::new(false);
     let mut buffer: Vec<u8> = Vec::new();
     loop {
         if started.elapsed().as_secs() >= SESSION_MAX_SECS {
             send_json(
-                &mut socket,
+                &sink,
                 &error_event(
                     "session_expired",
                     "session hit its 10-minute ceiling — reconnect",
                 ),
             )
             .await;
-            let _ = socket.close().await;
+            sink_close(&sink).await;
             return;
         }
         let frame = tokio::time::timeout(
             std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
-            socket.recv(),
+            stream.next(),
         )
         .await;
         let Ok(Some(Ok(msg))) = frame else {
             // Idle timeout or client-gone: both end the session quietly.
-            let _ = socket.close().await;
+            sink_close(&sink).await;
             return;
         };
         match msg {
@@ -364,7 +626,7 @@ async fn run_session(
                     Ok(v) => v,
                     Err(e) => {
                         send_json(
-                            &mut socket,
+                            &sink,
                             &error_event("invalid_request", &format!("event is not JSON: {e}")),
                         )
                         .await;
@@ -375,7 +637,7 @@ async fn run_session(
                     "input_audio_buffer.append" => {
                         let Some(b64) = ev["audio"].as_str() else {
                             send_json(
-                                &mut socket,
+                                &sink,
                                 &error_event(
                                     "invalid_request",
                                     "append needs a base64 `audio` field",
@@ -384,55 +646,122 @@ async fn run_session(
                             .await;
                             continue;
                         };
-                        let decoded = match base64_decode(b64) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                send_json(
-                                    &mut socket,
-                                    &error_event(
-                                        "invalid_request",
-                                        &format!("audio is not base64: {e}"),
-                                    ),
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-                        if buffer.len() + decoded.len() > AUDIO_BUFFER_CAP_BYTES {
+                        if let Err(msg) = append_audio(&mut buffer, b64) {
+                            send_json(&sink, &error_event("buffer_overflow", &msg)).await;
+                            sink_close(&sink).await;
+                            return;
+                        }
+                    }
+                    "input_audio_buffer.clear" => {
+                        buffer.clear();
+                        send_json(&sink, &json!({"type": "input_audio_buffer.cleared"})).await;
+                    }
+                    "input_audio_buffer.commit" | "response.create" => {
+                        if buffer.is_empty() {
                             send_json(
-                                &mut socket,
+                                &sink,
                                 &error_event(
-                                    "buffer_overflow",
-                                    "audio buffer exceeded 20 MiB — this lane is for utterances, not files",
+                                    "invalid_request",
+                                    "cannot start a response from an empty audio buffer — \
+                                     append audio first",
                                 ),
                             )
                             .await;
-                            let _ = socket.close().await;
-                            return;
+                            continue;
                         }
-                        buffer.extend_from_slice(&decoded);
-                    }
-                    "input_audio_buffer.commit" => {
-                        run_turn(
-                            &mut socket,
+                        cancel.store(false, Ordering::Relaxed);
+                        let turn_buf = std::mem::take(&mut buffer);
+                        let turn_cfg = cfg.clone();
+                        let turn_ctx = ctx.clone();
+                        let turn = run_turn(
+                            &sink,
                             &state,
                             key.as_ref(),
                             &model,
-                            &voice,
-                            &stt_model,
-                            &buffer,
+                            &turn_cfg,
+                            &turn_ctx,
+                            &cancel,
+                            &turn_buf,
+                        );
+                        tokio::pin!(turn);
+                        loop {
+                            tokio::select! {
+                                () = &mut turn => break,
+                                maybe = stream.next() => {
+                                    let Some(Ok(next)) = maybe else {
+                                        sink_close(&sink).await;
+                                        return;
+                                    };
+                                    match next {
+                                        Message::Text(raw) => {
+                                            if dispatch_mid_turn(
+                                                &raw,
+                                                &sink,
+                                                &mut buffer,
+                                                &mut ctx,
+                                                &mut item_seq,
+                                                &cancel,
+                                            )
+                                            .await
+                                            {
+                                                sink_close(&sink).await;
+                                                return;
+                                            }
+                                        }
+                                        Message::Close(_) => {
+                                            sink_close(&sink).await;
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "session.update" => match apply_session_update(&mut cfg, &ev) {
+                        Ok(session) => {
+                            send_json(
+                                &sink,
+                                &json!({"type": "session.updated", "session": session}),
+                            )
+                            .await;
+                        }
+                        Err(msg) => {
+                            send_json(&sink, &error_event("invalid_request", &msg)).await;
+                        }
+                    },
+                    "response.cancel" => {
+                        send_json(
+                            &sink,
+                            &error_event(
+                                "invalid_request",
+                                "no response in flight — cancel is honored while a \
+                                 turn is running (sent mid-turn) and lands at the next \
+                                 stage checkpoint",
+                            ),
                         )
                         .await;
-                        buffer.clear();
                     }
+                    "conversation.item.create" => match item_text(&ev["item"]) {
+                        Ok((role, text)) => {
+                            item_seq += 1;
+                            ctx_push(&mut ctx, &role, &text);
+                            item_created(&sink, &ev["item"], item_seq).await;
+                        }
+                        Err(msg) => {
+                            send_json(&sink, &error_event("invalid_request", &msg)).await;
+                        }
+                    },
                     other => {
                         send_json(
-                            &mut socket,
+                            &sink,
                             &error_event(
                                 "unknown_event",
                                 &format!(
                                     "unsupported event '{other}' — this lane speaks \
-                                     input_audio_buffer.append/commit (see docs/4.API_SPEC.md)"
+                                     input_audio_buffer.append/commit/clear, session.update, \
+                                     response.create/cancel, and conversation.item.create \
+                                     (see docs/4.API_SPEC.md)"
                                 ),
                             ),
                         )
@@ -445,16 +774,19 @@ async fn run_session(
                 // non-browser clients (same buffer, same cap).
                 if buffer.len() + b.len() > AUDIO_BUFFER_CAP_BYTES {
                     send_json(
-                        &mut socket,
+                        &sink,
                         &error_event("buffer_overflow", "audio buffer exceeded 20 MiB"),
                     )
                     .await;
-                    let _ = socket.close().await;
+                    sink_close(&sink).await;
                     return;
                 }
                 buffer.extend_from_slice(&b);
             }
-            Message::Close(_) => return,
+            Message::Close(_) => {
+                sink_close(&sink).await;
+                return;
+            }
             Message::Ping(_) | Message::Pong(_) => {}
         }
     }
@@ -589,5 +921,126 @@ mod tests {
         let v = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}]});
         assert_eq!(reply_text(&v), "hi");
         assert_eq!(reply_text(&json!({})), "");
+    }
+
+    #[test]
+    fn unit__apply_session_update__mutates_known_keys_and_tolerates_unknown() {
+        let mut cfg = SessionCfg {
+            voice: "en_US-amy-medium".into(),
+            stt_model: "whisper-1".into(),
+            instructions: String::new(),
+        };
+        let ev = json!({
+            "type": "session.update",
+            "session": {
+                "voice": "en_US-lessac-medium",
+                "stt_model": "whisper-large-v3",
+                "instructions": "Answer in one word.",
+                "modalities": ["text", "audio"],   // OpenAI key we ignore
+                "turn_detection": null,             // ... on purpose
+            }
+        });
+        let echo = apply_session_update(&mut cfg, &ev).unwrap();
+        assert_eq!(cfg.voice, "en_US-lessac-medium");
+        assert_eq!(cfg.stt_model, "whisper-large-v3");
+        assert_eq!(cfg.instructions, "Answer in one word.");
+        assert_eq!(echo["voice"], "en_US-lessac-medium");
+        assert_eq!(echo["stt_model"], "whisper-large-v3");
+        assert_eq!(echo["instructions"], "Answer in one word.");
+
+        assert!(apply_session_update(&mut cfg, &json!({"type": "session.update"})).is_err());
+        assert!(
+            apply_session_update(&mut cfg, &json!({"session": {"voice": 7}})).is_err(),
+            "non-string voice is rejected"
+        );
+        assert!(
+            apply_session_update(&mut cfg, &json!({"session": {"voice": "  "}})).is_err(),
+            "blank voice is rejected"
+        );
+    }
+
+    #[test]
+    fn unit__item_text__accepts_text_messages_teaches_everything_else() {
+        let ok = json!({
+            "type": "message",
+            "role": "system",
+            "content": [{"type": "text", "text": "prefer short answers"}],
+        });
+        assert_eq!(
+            item_text(&ok).unwrap(),
+            ("system".to_string(), "prefer short answers".to_string())
+        );
+        let default_role = json!({"content": [{"type": "text", "text": "hi"}]});
+        assert_eq!(
+            item_text(&default_role).unwrap(),
+            ("user".to_string(), "hi".to_string())
+        );
+
+        let function = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+        });
+        let err = item_text(&function).unwrap_err();
+        assert!(err.contains("text context"), "{err}");
+
+        let no_text = json!({"content": [{"type": "input_audio", "audio": "AA=="}]});
+        assert!(item_text(&no_text).unwrap_err().contains("not supported"));
+
+        let empty = json!({});
+        assert!(item_text(&empty).unwrap_err().contains("content[0]"));
+    }
+
+    #[test]
+    fn unit__ctx_push__caps_evict_oldest_first() {
+        let mut ctx = Vec::new();
+        for i in 0..CHAT_CTX_MAX_ITEMS {
+            ctx_push(&mut ctx, "user", &format!("item-{i:02}"));
+        }
+        assert_eq!(ctx.len(), CHAT_CTX_MAX_ITEMS);
+        assert_eq!(ctx[0].1, "item-00");
+        ctx_push(&mut ctx, "user", "one-more");
+        assert_eq!(ctx.len(), CHAT_CTX_MAX_ITEMS, "item cap holds");
+        assert_eq!(ctx[0].1, "item-01", "oldest evicted");
+        assert_eq!(ctx.last().unwrap().1, "one-more");
+
+        // Character cap: one big item larger than the whole budget keeps
+        // only its tail once smaller items age out (never silent growth).
+        let mut wide = Vec::new();
+        let big = "x".repeat(CHAT_CTX_MAX_CHARS + 100);
+        ctx_push(&mut wide, "user", &big);
+        ctx_push(&mut wide, "user", "small");
+        let chars: usize = wide.iter().map(|(_, t)| t.len()).sum();
+        assert!(chars <= CHAT_CTX_MAX_CHARS + "small".len());
+        assert_eq!(wide.last().unwrap().1, "small", "newest always kept");
+    }
+
+    #[test]
+    fn unit__ctx_messages__instructions_head_context_middle_transcript_last() {
+        let cfg = SessionCfg {
+            voice: "v".into(),
+            stt_model: "whisper-1".into(),
+            instructions: "be terse".into(),
+        };
+        let ctx = vec![
+            ("system".to_string(), "ctx-a".to_string()),
+            ("user".to_string(), "ctx-b".to_string()),
+        ];
+        let msgs = ctx_messages(&cfg, &ctx, "live question");
+        let arr = msgs.as_array().unwrap();
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[0]["content"], "be terse");
+        assert_eq!(arr[1]["content"], "ctx-a");
+        assert_eq!(arr[2]["content"], "ctx-b");
+        assert_eq!(arr[3]["role"], "user");
+        assert_eq!(arr[3]["content"], "live question");
+
+        let no_instructions = SessionCfg {
+            voice: "v".into(),
+            stt_model: "whisper-1".into(),
+            instructions: "   ".into(),
+        };
+        let bare = ctx_messages(&no_instructions, &[], "solo");
+        assert_eq!(bare.as_array().unwrap().len(), 1, "no empty system slot");
     }
 }

@@ -16,6 +16,10 @@
 //! is the whole surface), so transcription/translation ride the same
 //! lazy child. `/v1/audio/translations` forces `translate=true` on the
 //! rebuilt request; upstream reports `"task": "translate"` back.
+//! `timestamp_granularities` is consumed gateway-side: it forces the
+//! `verbose_json` shape, turns on the engine's token timing, and the
+//! gateway folds token timings into `segments[].words` (engine-derived
+//! only — never interpolated).
 //!
 //! Async: upstream `/inference` is sync-only (no job surface to relay,
 //! unlike the sd-server image lane), so `"async": "true"` as a form
@@ -172,8 +176,11 @@ fn field(parts: &[Part], key: &str) -> Option<String> {
 
 /// whisper-server `/inference` fields we forward, live-verified on
 /// master b5130 (probe + binary strings). Everything else a client
-/// sends (OpenAI-only concepts like `timestamp_granularities` included)
-/// is dropped rather than relayed into an upstream 400.
+/// sends is dropped rather than relayed into an upstream 400 — except
+/// `timestamp_granularities`, which is CONSUMED gateway-side (see
+/// `granularity_plan`): it forces the `verbose_json` shape and turns on
+/// token-level timing, whose output the gateway folds into
+/// `segments[].words`.
 const FORWARDED_FIELDS: &[&str] = &[
     "response_format",
     "language",
@@ -196,6 +203,26 @@ const FORWARDED_FIELDS: &[&str] = &[
     "carry_initial_prompt",
     "detect_language",
     "audio_ctx",
+    // Token-level timing and non-speech suppression — form-field names
+    // verified in the b5130 binary strings.
+    "token_timestamps",
+    "suppress_non_speech",
+    "suppress_nst",
+    // Energy-VAD tuning (Silero; the child boots the VAD model when the
+    // gateway is configured with one).
+    "vad_simple",
+    "vad_threshold",
+    "vad_min_speech_duration_ms",
+    "vad_min_silence_duration_ms",
+    "vad_max_speech_duration_s",
+    "vad_speech_pad_ms",
+    "vad_samples_overlap",
+    // Diarization and verbose-json shaping — live-probed on the b5130
+    // child: `diarize=true` labels each segment with its channel's
+    // speaker index, `no_language_probabilities=true` drops the
+    // language_probabilities/detected_language keys from verbose_json.
+    "diarize",
+    "no_language_probabilities",
     // `translate` is handled by the caller: the transcriptions route
     // relays it as sent; the translations route owns it (always true).
 ];
@@ -237,6 +264,279 @@ fn forwarded_fields_stream(parts: &[Part], force_translate: bool) -> Vec<(String
         .filter(|(k, _)| !WINDOW_SHAPING.contains(&k.as_str()))
         .chain([("response_format".to_string(), "verbose_json".to_string())])
         .collect()
+}
+
+/// What the client asked of `timestamp_granularities`. `OpenAI`'s contract
+/// only defines `word` and `segment`, and both only ride on
+/// `verbose_json` — the gateway enforces exactly that (and derives the
+/// `words` arrays itself; see `enrich_verbose_json_with_words`).
+#[derive(Debug, Clone, Copy, Default)]
+struct Granularity {
+    word: bool,
+    segment: bool,
+}
+
+/// Field names a multipart client may carry the granularities in:
+/// `OpenAI` SDKs repeat `timestamp_granularities[]` per value; curl users
+/// send one `timestamp_granularities` part with comma-separated values.
+/// Both parse; values may not mix casings of unknown words.
+fn granularity_plan(parts: &[Part]) -> Result<Option<Granularity>, String> {
+    let mut raw: Vec<String> = Vec::new();
+    for name in ["timestamp_granularities[]", "timestamp_granularities"] {
+        for p in parts
+            .iter()
+            .filter(|p| p.name == name && p.filename.is_none())
+        {
+            raw.extend(
+                String::from_utf8_lossy(&p.data)
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToOwned::to_owned),
+            );
+        }
+    }
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut gran = Granularity::default();
+    for value in &raw {
+        match value.to_ascii_lowercase().as_str() {
+            "word" => gran.word = true,
+            "segment" => gran.segment = true,
+            other => {
+                return Err(format!(
+                    "timestamp_granularities accepts 'word' or 'segment' — got {other:?}. \
+                     Word timings come back as segments[].words on verbose_json (derived \
+                     from the engine's token timestamps, never interpolated); segment \
+                     timings are always present on verbose_json"
+                ));
+            }
+        }
+    }
+    // OpenAI's contract: granularities only exist on verbose_json. A
+    // client naming another format says two contradictory things —
+    // teach instead of silently picking one.
+    if let Some(fmt) = field(parts, "response_format")
+        && fmt.trim() != "verbose_json"
+    {
+        return Err(format!(
+            "timestamp_granularities requires response_format=verbose_json — request \
+             also named {fmt:?}: drop the explicit format (verbose_json is forced) or \
+             set it to verbose_json"
+        ));
+    }
+    Ok(Some(gran))
+}
+
+/// Apply a granularity plan to the rebuilt field set: `verbose_json`
+/// forced (segment/word payloads live on that shape) and word requests
+/// turn on the engine's token-level timing.
+fn apply_granularity(fields: &mut Vec<(String, String)>, gran: Granularity) {
+    set_field(fields, "response_format", "verbose_json");
+    if gran.word {
+        set_field(fields, "token_timestamps", "true");
+    }
+}
+
+/// Replace an existing field's value or append it — the rebuilt form
+/// must never carry duplicates (upstream reads the first occurrence).
+fn set_field(fields: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some(slot) = fields.iter_mut().find(|(n, _)| n == key) {
+        slot.1 = value.to_string();
+    } else {
+        fields.push((key.to_string(), value.to_string()));
+    }
+}
+
+/// `response_format=diarized_json` — a gateway-built format, not an
+/// engine one: the child gets `verbose_json` + `diarize=true` and the
+/// reply is mapped to the documented diarized shape. Stereo input is
+/// what makes the labels meaningful (channel 0 = speaker 0, channel 1 =
+/// speaker 1); mono collapses to a single speaker.
+fn diarize_requested(parts: &[Part]) -> bool {
+    field(parts, "response_format").is_some_and(|f| f.trim() == "diarized_json")
+}
+
+/// Engine diarization prefixes segment text with "(speaker N)" — the
+/// mapped format carries the label as a field, so the prefix goes.
+fn strip_speaker_prefix(text: &str) -> &str {
+    let t = text.trim_start();
+    let Some(rest) = t.strip_prefix("(speaker ") else {
+        return t;
+    };
+    let Some((_, tail)) = rest.split_once(')') else {
+        return t;
+    };
+    let body = tail.strip_prefix(' ').unwrap_or(tail);
+    if body.is_empty() {
+        // A bare "(speaker N)" prefix leaves nothing behind.
+        return "";
+    }
+    body
+}
+
+/// Map the engine's diarized `verbose_json` to the `diarized_json` reply:
+/// `{duration, text, segments[{id, start, end, text, speaker}]}`. The
+/// speaker value rides verbatim (the engine's channel index); a segment
+/// the engine left unlabeled omits the field instead of guessing.
+/// `None` when the body carries no segments array — the caller fails
+/// loud rather than relaying a wrong shape under a `diarized_json` name.
+fn to_diarized_json(body: &serde_json::Value) -> Option<serde_json::Value> {
+    let segments = body.get("segments")?.as_array()?;
+    let mut mapped = Vec::with_capacity(segments.len());
+    let mut texts: Vec<String> = Vec::with_capacity(segments.len());
+    for (idx, seg) in segments.iter().enumerate() {
+        let raw = seg
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let clean = strip_speaker_prefix(raw);
+        texts.push(clean.to_string());
+        let mut out = serde_json::json!({
+            "id": seg.get("id").cloned().unwrap_or(serde_json::json!(idx)),
+            "start": seg.get("start").cloned().unwrap_or(serde_json::json!(0.0)),
+            "end": seg.get("end").cloned().unwrap_or(serde_json::json!(0.0)),
+            "text": clean,
+        });
+        if let Some(speaker) = seg.get("speaker") {
+            out["speaker"] = speaker.clone();
+        }
+        mapped.push(out);
+    }
+    Some(serde_json::json!({
+        "duration": body.get("duration").cloned().unwrap_or(serde_json::json!(0)),
+        "text": texts.join(" ").trim().to_string(),
+        "segments": mapped,
+    }))
+}
+
+/// `OpenAI` audio params the local whisper lane cannot honor — each gets
+/// a teaching 400 that names the nearest supported thing, never a
+/// silent drop.
+fn unsupported_field_error(parts: &[Part]) -> Option<String> {
+    if let Some(v) = field(parts, "include") {
+        return Some(format!(
+            "include={v:?} is an OpenAI cloud extra (logprobs) the local whisper lane \
+             cannot produce — drop it"
+        ));
+    }
+    if let Some(v) = field(parts, "keywords") {
+        return Some(format!(
+            "keywords={v:?} biases gpt-transcribe on OpenAI's cloud; the local lane \
+             takes `prompt` for vocabulary steering instead"
+        ));
+    }
+    None
+}
+
+/// `(start, end)` timing off one `verbose_json` token entry. whisper.cpp
+/// serves token timing as a `timestamps` pair; upstream units are
+/// milliseconds while segment `start`/`end` are seconds (an upstream
+/// quirk the caller normalizes against the segment bound).
+fn token_times(token: &serde_json::Value) -> Option<(f64, f64)> {
+    let ts = token.get("timestamps")?.as_array()?;
+    if ts.len() < 2 {
+        return None;
+    }
+    let (s, e) = (ts[0].as_f64()?, ts[1].as_f64()?);
+    (e > s).then_some((s, e))
+}
+
+/// Group one segment's timed tokens into `OpenAI` `words` entries, using
+/// the engine's own word-boundary convention (a token whose text begins
+/// with a space or `▁` starts the next word — the `SentencePiece` marker).
+/// Times come only from engine tokens: a word missing any token timing
+/// is omitted rather than interpolated. Returns the words (empty when
+/// nothing derivable).
+fn words_from_tokens(tokens: &[serde_json::Value], seg_end: Option<f64>) -> Vec<serde_json::Value> {
+    let mut words: Vec<serde_json::Value> = Vec::new();
+    let mut current: Option<(String, f64, f64)> = None;
+    let flush = |current: &mut Option<(String, f64, f64)>, words: &mut Vec<serde_json::Value>| {
+        if let Some((text, start, end)) = current.take()
+            && !text.is_empty()
+        {
+            words.push(serde_json::json!({"word": text, "start": start, "end": end}));
+        }
+    };
+    for token in tokens {
+        let Some(text) = token.get("text").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let starts_word = text.starts_with(' ') || text.starts_with('▁');
+        let piece = text.trim_start_matches([' ', '▁']);
+        if starts_word {
+            flush(&mut current, &mut words);
+        }
+        if piece.is_empty() {
+            continue; // a bare separator: word already flushed
+        }
+        match token_times(token) {
+            Some((start, end)) => match &mut current {
+                Some((word, s, e)) if !starts_word => {
+                    word.push_str(piece);
+                    *e = end; // word extends through its last timed token
+                }
+                _ => current = Some((piece.to_string(), start, end)),
+            },
+            None => {
+                if !starts_word && let Some((word, _, _)) = &mut current {
+                    word.push_str(piece); // text rides along, timing stays absent
+                } else {
+                    flush(&mut current, &mut words); // untimed word start: cannot time it honestly
+                }
+            }
+        }
+    }
+    flush(&mut current, &mut words);
+    // Upstream quirk: token `timestamps` are milliseconds while segment
+    // bounds are seconds. A word end beyond the segment's own end (plus
+    // slack) but sane once divided by 1000 was milliseconds. Segments
+    // past ~9 minutes are ambiguous under this rule — verified against
+    // the running child in live validation.
+    if let Some(seg_end) = seg_end {
+        for w in &mut words {
+            let end = w["end"].as_f64().unwrap_or(f64::INFINITY);
+            let start = w["start"].as_f64().unwrap_or(f64::INFINITY);
+            if end > seg_end + 1.5 && start * 0.001 <= seg_end + 1.5 && end * 0.001 <= seg_end + 1.5
+            {
+                w["start"] = serde_json::json!(start * 0.001);
+                w["end"] = serde_json::json!(end * 0.001);
+            }
+        }
+    }
+    words
+}
+
+/// Fold token-level timing into `segments[].words` on a `verbose_json`
+/// body (in place, only what the engine actually timed — never
+/// interpolated). Engine-served `words` arrays pass through untouched.
+/// Returns whether any words surfaced.
+fn enrich_verbose_json_with_words(body: &mut serde_json::Value) -> bool {
+    let Some(segments) = body.get_mut("segments").and_then(|s| s.as_array_mut()) else {
+        return false;
+    };
+    let mut any = false;
+    for seg in segments.iter_mut() {
+        if seg
+            .get("words")
+            .and_then(|w| w.as_array())
+            .is_some_and(|a| !a.is_empty())
+        {
+            any = true; // the engine already served word timings
+            continue;
+        }
+        let Some(tokens) = seg.get("tokens").and_then(|t| t.as_array().cloned()) else {
+            continue;
+        };
+        let seg_end = seg.get("end").and_then(serde_json::Value::as_f64);
+        let words = words_from_tokens(&tokens, seg_end);
+        if !words.is_empty() {
+            seg["words"] = serde_json::json!(words);
+            any = true;
+        }
+    }
+    any
 }
 
 /// One wire-encoded SSE frame. `serde_json`'s Display is single-line
@@ -342,6 +642,7 @@ fn resolve_vad_model(
 /// and return the raw upstream triple. Shared by the sync path and the
 /// async job task — the Err codes/messages are the sync route's exact
 /// error surface, so both lanes fail identically.
+#[allow(clippy::too_many_arguments)] // natural lane surface: state, parts, file, model, translate, stream, gran
 async fn forward_local_raw(
     state: &Arc<AppState>,
     parts: &[Part],
@@ -350,7 +651,9 @@ async fn forward_local_raw(
     bin: &std::path::Path,
     lib_dir: &std::path::Path,
     force_translate: bool,
-) -> Result<(StatusCode, String, Bytes), (u16, String)> {
+    gran: Option<Granularity>,
+    diarize: bool,
+) -> Result<((StatusCode, String, Bytes), bool), (u16, String)> {
     let Some(model_path) = whisper::model_file(&state.dirs, size) else {
         return Err((500, format!("whisper model ggml-{size}.bin vanished")));
     };
@@ -377,8 +680,17 @@ async fn forward_local_raw(
         .content_type
         .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    let fields = forwarded_fields(parts, force_translate);
-    inference_post(
+    let mut fields = forwarded_fields(parts, force_translate);
+    if let Some(gran) = gran {
+        apply_granularity(&mut fields, gran);
+    }
+    if diarize {
+        // diarized_json is gateway-built: the child decodes verbose_json
+        // with diarization on, the reply is mapped on the way out.
+        set_field(&mut fields, "response_format", "verbose_json");
+        set_field(&mut fields, "diarize", "true");
+    }
+    let triple = inference_post(
         state,
         port,
         &file.data,
@@ -386,12 +698,68 @@ async fn forward_local_raw(
         &mime,
         &fields,
     )
-    .await
+    .await?;
+    let ((status, ct, bytes), words_derived) = match triple {
+        (status, _ct, bytes) if diarize && status.is_success() => {
+            // diarized_json: map the engine's diarized verbose_json to
+            // the documented shape. A success body without a segments
+            // array is not mappable — fail loud, never hand back
+            // verbose_json under a diarized_json name.
+            let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err((
+                        502,
+                        "whisper-server returned a non-JSON body with diarization on — \
+                         cannot build diarized_json"
+                            .to_string(),
+                    ));
+                }
+            };
+            match to_diarized_json(&parsed) {
+                Some(mapped) => match serde_json::to_vec(&mapped) {
+                    Ok(out) => (
+                        (status, "application/json".to_string(), Bytes::from(out)),
+                        false,
+                    ),
+                    Err(_) => {
+                        return Err((502, "diarized_json serialization failed".to_string()));
+                    }
+                },
+                None => {
+                    return Err((
+                        502,
+                        "whisper-server returned no segments with diarization on — cannot \
+                         build diarized_json"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        (status, ct, bytes) if gran.is_some_and(|g| g.word) && status.is_success() => {
+            // Word granularity: fold the engine's token timings into
+            // segments[].words before the body leaves the gateway. Parse
+            // failures leave the body verbatim — the client still gets
+            // the engine's own verbose_json.
+            let mut v: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => return Ok(((status, ct, bytes), false)),
+            };
+            let derived = enrich_verbose_json_with_words(&mut v);
+            match serde_json::to_vec(&v) {
+                Ok(enriched) => ((status, ct, Bytes::from(enriched)), derived),
+                Err(_) => ((status, ct, bytes), false),
+            }
+        }
+        other => (other, false),
+    };
+    Ok(((status, ct, bytes), words_derived))
 }
 
 /// Sync local lane: same contract as before the async split — the raw
 /// triple rendered as a verbatim passthrough, errors as `openai_error`
 /// with the historical codes and messages.
+#[allow(clippy::too_many_arguments)] // same surface as forward_local_raw
 async fn forward_local(
     state: &Arc<AppState>,
     parts: &[Part],
@@ -400,13 +768,42 @@ async fn forward_local(
     bin: &std::path::Path,
     lib_dir: &std::path::Path,
     force_translate: bool,
+    gran: Option<Granularity>,
+    diarize: bool,
 ) -> Response {
-    match forward_local_raw(state, parts, file, size, bin, lib_dir, force_translate).await {
-        Ok((status, ct, bytes)) => Response::builder()
-            .status(status)
-            .header(axum::http::header::CONTENT_TYPE, ct)
-            .body(axum::body::Body::from(bytes))
-            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+    match forward_local_raw(
+        state,
+        parts,
+        file,
+        size,
+        bin,
+        lib_dir,
+        force_translate,
+        gran,
+        diarize,
+    )
+    .await
+    {
+        Ok(((status, ct, bytes), words_derived)) => {
+            let mut builder = Response::builder()
+                .status(status)
+                .header(axum::http::header::CONTENT_TYPE, ct);
+            // Word granularity reports its own outcome — an unavailable
+            // verdict is a capability statement, not a failure.
+            if gran.is_some_and(|g| g.word) {
+                builder = builder.header(
+                    "x-blazar-word-timestamps",
+                    if words_derived {
+                        "derived"
+                    } else {
+                        "unavailable"
+                    },
+                );
+            }
+            builder
+                .body(axum::body::Body::from(bytes))
+                .unwrap_or_else(|_| openai_error(500, "response build").into_response())
+        }
         Err((code, msg)) => openai_error(code, &msg),
     }
 }
@@ -860,6 +1257,7 @@ async fn forward_local_stream(
 /// answer with the gateway-owned job envelope (same shape vocabulary as
 /// the images lane's `async` handles). No awaits — the spawned task owns
 /// all the waiting.
+#[allow(clippy::too_many_arguments)] // mirrors forward_local_raw plus owned parts
 fn submit_async(
     state: &Arc<AppState>,
     parts: Vec<Part>,
@@ -868,22 +1266,34 @@ fn submit_async(
     bin: &std::path::Path,
     lib_dir: &std::path::Path,
     force_translate: bool,
+    gran: Option<Granularity>,
+    diarize: bool,
 ) -> Response {
     let id = state.audio_jobs.reserve();
     // Durable ledger write-through: the row outlives the gateway, the
     // input artifact makes a resubmit after an abandon possible without
     // re-uploading (bounded — oversized uploads skip the copy, the row
     // still lands).
+    let mut request = serde_json::json!({
+        "size": size,
+        "filename": file.filename,
+        "translate": force_translate,
+    });
+    if let Some(gran) = gran {
+        request["timestamp_granularities"] = serde_json::json!({
+            "word": gran.word,
+            "segment": gran.segment,
+        });
+    }
+    if diarize {
+        request["response_format"] = serde_json::json!("diarized_json");
+    }
     state.jobs.record_created(
         state,
         &id,
         "audio",
         field(&parts, "model").as_deref(),
-        serde_json::json!({
-            "size": size,
-            "filename": file.filename,
-            "translate": force_translate,
-        }),
+        request,
     );
     state
         .jobs
@@ -903,10 +1313,15 @@ fn submit_async(
             &bin,
             &lib_dir,
             force_translate,
+            gran,
+            diarize,
         )
         .await
         {
-            Ok((status, ct, bytes)) => {
+            Ok(((status, ct, bytes), _words_derived)) => {
+                // Word-derived bodies are already enriched inside
+                // forward_local_raw — pollers see the same words the
+                // sync lane returns.
                 task_state
                     .audio_jobs
                     .finish(&task_id, status.as_u16(), &ct, bytes.to_vec());
@@ -1071,6 +1486,45 @@ pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response 
              final event",
             "content_type": "text/event-stream",
         },
+        "response_formats": [
+            "json",
+            "text",
+            "srt",
+            "verbose_json",
+            "vtt",
+            "diarized_json",
+        ],
+        "diarized_json": {
+            "input": "stereo (channel 0 = speaker 0, channel 1 = speaker 1); mono collapses \
+                      to a single speaker",
+            "shape": "{duration, text, segments[{id, start, end, text, speaker}]} — speaker \
+                      is the engine's channel index, segments the engine left unlabeled \
+                      omit the field",
+        },
+        "timestamp_granularities": {
+            "values": ["word", "segment"],
+            "requires": "response_format=verbose_json — forced automatically when absent, \
+                         400 when the request names another format",
+            "words": "segments[].words derived from the engine's token timestamps, never \
+                      interpolated — the sync lane reports derived|unavailable via the \
+                      x-blazar-word-timestamps header",
+        },
+        "engine_fields": {
+            "note": "whisper.cpp /inference knobs relayed verbatim from the request",
+            "timing": ["token_timestamps", "split_on_word", "word_thold", "no_timestamps"],
+            "vad": [
+                "vad_simple", "vad_threshold", "vad_min_speech_duration_ms",
+                "vad_min_silence_duration_ms", "vad_max_speech_duration_s",
+                "vad_speech_pad_ms", "vad_samples_overlap",
+            ],
+            "decode": [
+                "language", "temperature", "temperature_inc", "prompt", "beam_size", "best_of",
+                "entropy_thold", "logprob_thold", "no_fallback", "carry_initial_prompt",
+                "detect_language", "audio_ctx", "max_context", "max_len", "offset_t",
+                "offset_n", "duration", "suppress_non_speech", "suppress_nst",
+                "no_language_probabilities",
+            ],
+        },
         "idle_timeout_secs": state.config.whisper_idle_secs,
     });
     Response::builder()
@@ -1082,6 +1536,7 @@ pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response 
         .unwrap_or_else(|_| openai_error(500, "response build").into_response())
 }
 
+#[allow(clippy::too_many_lines)] // handler: parse, teach, gate, three delivery lanes
 pub async fn audio_transcriptions(
     State(state): State<Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -1162,6 +1617,30 @@ pub async fn audio_transcriptions(
              events, async returns a pollable job handle — pick one",
         );
     }
+    if let Some(msg) = unsupported_field_error(&parts) {
+        return openai_error(400, &msg);
+    }
+    let gran = match granularity_plan(&parts) {
+        Ok(g) => g,
+        Err(msg) => return openai_error(400, &msg),
+    };
+    if gran.is_some() && wants_stream(&parts) {
+        return openai_error(
+            400,
+            "timestamp_granularities applies to the buffered lanes — the SSE stream emits \
+             its own segment events and has no words surface: drop stream or the \
+             granularities field",
+        );
+    }
+    let diarize = diarize_requested(&parts);
+    if diarize && wants_stream(&parts) {
+        return openai_error(
+            400,
+            "response_format=diarized_json applies to the buffered lanes — the SSE stream \
+             emits its own segment events and carries no speaker labels: drop stream or \
+             pick verbose_json",
+        );
+    }
     if let (Some((bin, lib_dir)), Some(size)) = (&server, size) {
         let stream = wants_stream(&parts);
         if stream {
@@ -1169,9 +1648,22 @@ pub async fn audio_transcriptions(
         }
         if wants_async(&parts) {
             let file_part = file.clone();
-            return submit_async(&state, parts, file_part, size.clone(), bin, lib_dir, false);
+            return submit_async(
+                &state,
+                parts,
+                file_part,
+                size.clone(),
+                bin,
+                lib_dir,
+                false,
+                gran,
+                diarize,
+            );
         }
-        return forward_local(&state, &parts, file, &size, bin, lib_dir, false).await;
+        return forward_local(
+            &state, &parts, file, &size, bin, lib_dir, false, gran, diarize,
+        )
+        .await;
     }
 
     // (3) Teaching error: no local lane and no remote intent.
@@ -1188,6 +1680,7 @@ pub async fn audio_transcriptions(
 /// `/v1/audio/translations`: same decision order as transcriptions,
 /// same lazy child — the only difference is `translate=true` forced on
 /// the rebuilt `/inference` request (upstream has no separate route).
+#[allow(clippy::too_many_lines)] // mirrors audio_transcriptions plus the translate flag
 pub async fn audio_translations(
     State(state): State<Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -1260,6 +1753,30 @@ pub async fn audio_translations(
              events, async returns a pollable job handle — pick one",
         );
     }
+    if let Some(msg) = unsupported_field_error(&parts) {
+        return openai_error(400, &msg);
+    }
+    let gran = match granularity_plan(&parts) {
+        Ok(g) => g,
+        Err(msg) => return openai_error(400, &msg),
+    };
+    if gran.is_some() && wants_stream(&parts) {
+        return openai_error(
+            400,
+            "timestamp_granularities applies to the buffered lanes — the SSE stream emits \
+             its own segment events and has no words surface: drop stream or the \
+             granularities field",
+        );
+    }
+    let diarize = diarize_requested(&parts);
+    if diarize && wants_stream(&parts) {
+        return openai_error(
+            400,
+            "response_format=diarized_json applies to the buffered lanes — the SSE stream \
+             emits its own segment events and carries no speaker labels: drop stream or \
+             pick verbose_json",
+        );
+    }
     if let (Some((bin, lib_dir)), Some(size)) = (&server, size) {
         let stream = wants_stream(&parts);
         if stream {
@@ -1267,9 +1784,22 @@ pub async fn audio_translations(
         }
         if wants_async(&parts) {
             let file_part = file.clone();
-            return submit_async(&state, parts, file_part, size.clone(), bin, lib_dir, true);
+            return submit_async(
+                &state,
+                parts,
+                file_part,
+                size.clone(),
+                bin,
+                lib_dir,
+                true,
+                gran,
+                diarize,
+            );
         }
-        return forward_local(&state, &parts, file, &size, bin, lib_dir, true).await;
+        return forward_local(
+            &state, &parts, file, &size, bin, lib_dir, true, gran, diarize,
+        )
+        .await;
     }
 
     // (3) Teaching error: no local lane and no remote intent.
@@ -1728,5 +2258,329 @@ mod tests {
         // Non-numeric times pass through untouched rather than panicking.
         assert_eq!(segs[2]["start"].as_str(), Some("not-a-number"));
         assert!(segs[2]["end"].is_null());
+    }
+
+    #[test]
+    fn unit__forwarded_fields__vad_and_token_fields_ride() {
+        // The b5130-verified engine knobs must reach the rebuilt form
+        // verbatim — VAD tuning and token timing are request-side
+        // whisper.cpp fields, not gateway concepts.
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[
+                ("token_timestamps", b"true"),
+                ("vad_threshold", b"0.4"),
+                ("vad_min_silence_duration_ms", b"200"),
+                ("suppress_non_speech", b"true"),
+            ],
+            ("a.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let fields = forwarded_fields(&parts, false);
+        let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("token_timestamps"), Some("true"));
+        assert_eq!(get("vad_threshold"), Some("0.4"));
+        assert_eq!(get("vad_min_silence_duration_ms"), Some("200"));
+        assert_eq!(get("suppress_non_speech"), Some("true"));
+    }
+
+    #[test]
+    fn unit__granularity_plan__array_parts_commas_and_case() {
+        // OpenAI SDK style (repeated [] parts), curl style (one
+        // comma-separated part), and case-insensitive values all parse
+        // to the same plan; absent field is None.
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[
+                ("timestamp_granularities[]", b"word"),
+                ("timestamp_granularities[]", b"SEGMENT"),
+            ],
+            ("a.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let gran = granularity_plan(&parts).expect("ok").expect("some");
+        assert!(gran.word && gran.segment);
+
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[("timestamp_granularities", b"word, segment")],
+            ("a.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let gran = granularity_plan(&parts).expect("ok").expect("some");
+        assert!(gran.word && gran.segment);
+
+        let (b, ct) = mixed_body("XbOuNdArY", &[], ("a.wav", b"RIFF"));
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        assert!(granularity_plan(&parts).expect("ok").is_none());
+    }
+
+    #[test]
+    fn unit__granularity_plan__unknown_value_and_format_conflict() {
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[("timestamp_granularities[]", b"syllable")],
+            ("a.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let err = granularity_plan(&parts).expect_err("unknown value rejected");
+        assert!(err.contains("'word' or 'segment'"), "got: {err}");
+        assert!(err.contains("syllable"), "got: {err}");
+
+        // Granularities only exist on verbose_json — an explicit other
+        // format is a contradiction, taught, not silently resolved.
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[
+                ("timestamp_granularities[]", b"word"),
+                ("response_format", b"srt"),
+            ],
+            ("a.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let err = granularity_plan(&parts).expect_err("conflict rejected");
+        assert!(err.contains("verbose_json"), "got: {err}");
+
+        // Explicit verbose_json + word: fine.
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[
+                ("timestamp_granularities[]", b"word"),
+                ("response_format", b"verbose_json"),
+            ],
+            ("a.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let gran = granularity_plan(&parts).expect("ok").expect("some");
+        assert!(gran.word && !gran.segment);
+    }
+
+    #[test]
+    fn unit__apply_granularity__forces_verbose_json_and_token_timing() {
+        fn get<'a>(k: &'a str, fields: &'a [(String, String)]) -> Option<&'a str> {
+            fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+        }
+        // From the forwarded_fields defaults (json injected): word
+        // granularity flips the format to verbose_json and turns on
+        // token timing; segment-only leaves token_timestamps alone; a
+        // client token_timestamps value is overridden (word timing is
+        // the point of the request).
+        let (b, ct) = mixed_body("XbOuNdArY", &[], ("a.wav", b"RIFF"));
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let mut fields = forwarded_fields(&parts, false);
+        apply_granularity(
+            &mut fields,
+            Granularity {
+                word: true,
+                segment: false,
+            },
+        );
+        assert_eq!(get("response_format", &fields), Some("verbose_json"));
+        assert_eq!(get("token_timestamps", &fields), Some("true"));
+        // Exactly one of each key — duplicates would shift meaning
+        // upstream (first occurrence wins).
+        for key in ["response_format", "token_timestamps"] {
+            let n = fields.iter().filter(|(n, _)| n == key).count();
+            assert_eq!(n, 1, "{key} duplicated: {fields:?}");
+        }
+
+        let mut fields = forwarded_fields(&parts, false);
+        apply_granularity(
+            &mut fields,
+            Granularity {
+                word: false,
+                segment: true,
+            },
+        );
+        assert_eq!(get("response_format", &fields), Some("verbose_json"));
+        assert_eq!(get("token_timestamps", &fields), None);
+    }
+
+    #[test]
+    fn unit__unsupported_field_error__include_keywords_only() {
+        let mk = |name: &str, value: &[u8]| {
+            let (b, ct) = mixed_body("XbOuNdArY", &[(name, value)], ("a.wav", b"RIFF"));
+            parse_multipart(&b, &ct).expect("parses")
+        };
+        let err = unsupported_field_error(&mk("include", b"logprobs")).expect("teaches");
+        assert!(
+            err.contains("include") && err.contains("logprobs"),
+            "got: {err}"
+        );
+
+        let err = unsupported_field_error(&mk("keywords", b"whisper")).expect("teaches");
+        assert!(
+            err.contains("keywords") && err.contains("`prompt`"),
+            "got: {err}"
+        );
+
+        // The supported vocabulary stays silent — diarized_json included
+        // since W9 (gateway-built on the engine's live-probed diarize
+        // field; mono input collapses to one speaker).
+        for fmt in [
+            "json",
+            "text",
+            "srt",
+            "verbose_json",
+            "vtt",
+            "diarized_json",
+        ] {
+            let parts = mk("response_format", fmt.as_bytes());
+            assert!(unsupported_field_error(&parts).is_none(), "{fmt} must pass");
+        }
+        let (b, ct) = mixed_body("XbOuNdArY", &[], ("a.wav", b"RIFF"));
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        assert!(unsupported_field_error(&parts).is_none());
+    }
+
+    #[test]
+    fn unit__to_diarized_json__strips_prefixes_labels_and_joins_text() {
+        // Live-probed engine shape (b5130, stereo fixture): diarize
+        // labels each segment with the channel's speaker index and
+        // prefixes its text with "(speaker N)".
+        let body = serde_json::json!({
+            "task": "transcribe",
+            "language": "en",
+            "duration": 7.9,
+            "text": "(speaker 0) Hello there. (speaker 1) Hi back.",
+            "segments": [
+                {"id": 0, "start": 0.0, "end": 3.4, "text": " (speaker 0) Hello there.",
+                 "speaker": 0, "no_speech_prob": 0.1},
+                {"id": 1, "start": 5.0, "end": 7.9, "text": "(speaker 1) Hi back.",
+                 "speaker": 1, "no_speech_prob": 0.2},
+            ],
+        });
+        let mapped = to_diarized_json(&body).expect("maps");
+        assert_eq!(mapped["duration"], 7.9);
+        assert_eq!(mapped["text"], "Hello there. Hi back.");
+        let segs = mapped["segments"].as_array().expect("segments");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0]["text"], "Hello there.");
+        assert_eq!(segs[0]["speaker"], 0);
+        assert_eq!(segs[1]["text"], "Hi back.");
+        assert_eq!(segs[1]["speaker"], 1);
+        assert!(
+            segs[0].get("no_speech_prob").is_none(),
+            "engine-only keys are dropped from the mapped shape"
+        );
+
+        // Unlabeled segment (mono or engine fallback): the field is
+        // omitted, never guessed.
+        let mono = serde_json::json!({
+            "duration": 1.0,
+            "segments": [{"id": 0, "start": 0.0, "end": 1.0, "text": "just words"}],
+        });
+        let mapped = to_diarized_json(&mono).expect("maps");
+        assert!(mapped["segments"][0].get("speaker").is_none());
+        assert_eq!(mapped["text"], "just words");
+
+        // Bare "(speaker 0)" prefix with no text after it.
+        assert_eq!(strip_speaker_prefix("(speaker 0)"), "");
+        // No prefix at all.
+        assert_eq!(strip_speaker_prefix("  plain"), "plain");
+
+        // No segments array → None (caller fails loud, 502).
+        assert!(to_diarized_json(&serde_json::json!({"text": "x"})).is_none());
+    }
+
+    #[test]
+    fn unit__forwarded_fields__diarize_and_no_language_probabilities_ride() {
+        let (b, ct) = mixed_body(
+            "XbOuNdArY",
+            &[
+                ("diarize", b"true"),
+                ("no_language_probabilities", b"true"),
+                ("tinydiarize", b"true"), // unprobed on the child: stays out
+                ("dtw", b"tiny"),         // no observable effect: stays out
+            ],
+            ("a.wav", b"RIFF"),
+        );
+        let parts = parse_multipart(&b, &ct).expect("parses");
+        let fields = forwarded_fields(&parts, false);
+        let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("diarize"), Some("true"));
+        assert_eq!(get("no_language_probabilities"), Some("true"));
+        assert!(fields.iter().all(|(n, _)| n != "tinydiarize" && n != "dtw"));
+    }
+
+    #[test]
+    fn unit__enrich_verbose_json_with_words__groups_tokens_by_leading_marker() {
+        // whisper.cpp token timings arrive in MILLISECONDS while segment
+        // bounds are seconds — the normalization against the segment
+        // end converts (0,320)/(320,640) into 0.0/0.32/0.64. The
+        // SentencePiece marker (▁) starts a new word; unmarked tokens
+        // append to the current word ("▁cat" + "s" → "cats").
+        let mut body = serde_json::json!({
+            "text": "The cats",
+            "segments": [{
+                "id": 0, "start": 0.0, "end": 0.64, "text": " The cats",
+                "tokens": [
+                    {"text": "The", "timestamps": [0, 320]},
+                    {"text": "▁cat", "timestamps": [320, 560]},
+                    {"text": "s", "timestamps": [560, 640]}
+                ]
+            }]
+        });
+        assert!(enrich_verbose_json_with_words(&mut body));
+        let words = body["segments"][0]["words"].as_array().expect("words");
+        assert_eq!(words.len(), 2, "got: {words:?}");
+        assert_eq!(words[0]["word"], "The");
+        assert_eq!(words[0]["start"].as_f64(), Some(0.0));
+        assert_eq!(words[0]["end"].as_f64(), Some(0.32));
+        assert_eq!(words[1]["word"], "cats");
+        assert_eq!(words[1]["start"].as_f64(), Some(0.32));
+        assert_eq!(words[1]["end"].as_f64(), Some(0.64));
+    }
+
+    #[test]
+    fn unit__enrich_verbose_json_with_words__seconds_units_and_missing_cases() {
+        // Token timings already in seconds pass through untouched (no
+        // spurious /1000): end 1.1 is within the segment bound.
+        let mut body = serde_json::json!({
+            "segments": [{
+                "id": 0, "start": 0.0, "end": 1.2,
+                "tokens": [
+                    {"text": "▁hello", "timestamps": [0.0, 0.5]},
+                    {"text": "▁world", "timestamps": [0.5, 1.1]}
+                ]
+            }]
+        });
+        assert!(enrich_verbose_json_with_words(&mut body));
+        let words = body["segments"][0]["words"].as_array().expect("words");
+        assert_eq!(words[0]["word"], "hello");
+        assert_eq!(words[0]["end"].as_f64(), Some(0.5));
+        assert_eq!(words[1]["word"], "world");
+        assert_eq!(words[1]["start"].as_f64(), Some(0.5));
+
+        // Engine-served words pass through untouched.
+        let mut body = serde_json::json!({
+            "segments": [{
+                "id": 0, "start": 0.0, "end": 1.0,
+                "words": [{"word": "kept", "start": 0.0, "end": 1.0}],
+                "tokens": [{"text": "▁other", "timestamps": [0, 1000]}]
+            }]
+        });
+        assert!(enrich_verbose_json_with_words(&mut body));
+        let words = body["segments"][0]["words"].as_array().expect("words");
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0]["word"], "kept");
+
+        // No timing anywhere: nothing derived (false), body unchanged —
+        // never interpolated.
+        let mut body = serde_json::json!({
+            "segments": [{
+                "id": 0, "start": 0.0, "end": 1.0,
+                "tokens": [{"text": "▁untimed"}]
+            }]
+        });
+        assert!(!enrich_verbose_json_with_words(&mut body));
+        assert!(
+            body["segments"][0].get("words").is_none(),
+            "no fabricated words"
+        );
+
+        // No segments array at all: false, no panic.
+        let mut body = serde_json::json!({"text": "bare"});
+        assert!(!enrich_verbose_json_with_words(&mut body));
     }
 }

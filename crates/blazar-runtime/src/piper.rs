@@ -189,10 +189,8 @@ fn piper_engine_tags(dirs: &BlazarDirs) -> Result<Vec<String>> {
 
 fn prune(dirs: &BlazarDirs) -> Result<()> {
     let pin = pinned_tag(dirs);
-    for dir in sorted_tag_dirs(dirs)
-        .into_iter()
-        .skip(crate::engine::KEEP_TAGS)
-    {
+    let keep = crate::engine::effective_keep_tags(dirs)?;
+    for dir in sorted_tag_dirs(dirs).into_iter().skip(keep) {
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -366,8 +364,10 @@ pub fn voice_repo_path(voice: &str) -> Option<String> {
 
 /// Voice id → (locale, name, quality). Piper names use `_`, never `-`
 /// (en_GB-northern_english_male-medium), so an rsplitn(3, '-') is
-/// unambiguous.
-fn parse_voice_id(voice: &str) -> Option<(String, String, String)> {
+/// unambiguous. Public so the gateway voices listing can split the same
+/// way the runtime does.
+#[must_use]
+pub fn parse_voice_id(voice: &str) -> Option<(String, String, String)> {
     let mut parts = voice.rsplitn(3, '-');
     let quality = parts.next()?.to_string();
     let name = parts.next()?.to_string();
@@ -560,16 +560,73 @@ pub async fn pull_voice(
 /// hold the request for minutes and balloon the WAV into RAM.
 pub const MAX_INPUT_CHARS: usize = 10_000;
 
-/// Synthesize `text` to a full WAV file (RIFF bytes) with the installed
-/// binary and voice. `speed` follows the `OpenAI` contract (1.0 = native,
-/// 2.0 = twice as fast) and maps to piper's inverse `--length_scale`.
-/// Spawn-per-call: piper is a one-shot binary (no server, nothing to
-/// pool), cold start ~1 s.
+/// Native piper synthesis knobs beyond the `OpenAI` contract. Every field
+/// is optional; absent fields ride the engine's own defaults
+/// (`speaker` 0, `noise_scale` 0.667, `noise_w` 0.8, `sentence_silence` 0.2 s).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpeakOptions {
+    /// `OpenAI` speed contract (1.0 = native, 2.0 = twice as fast),
+    /// mapped to piper's inverse `--length_scale`.
+    pub speed: Option<f64>,
+    /// Multi-speaker voice index (`--speaker`); engine teaches via exit
+    /// code when the index exceeds the voice's speaker count.
+    pub speaker: Option<u64>,
+    /// Phoneme-duration jitter (`--noise_scale`).
+    pub noise_scale: Option<f64>,
+    /// Generator noise, adds prosody variety (`--noise_w`).
+    pub noise_w: Option<f64>,
+    /// Seconds of silence inserted between sentences
+    /// (`--sentence_silence`).
+    pub sentence_silence: Option<f64>,
+}
+
+/// Range envelopes around piper's defaults (`noise_scale` 0.667,
+/// `noise_w` 0.8): wide enough for expressive tuning, narrow enough that
+/// a hostile value cannot degrade into pure noise.
+const NOISE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+/// Inter-sentence silence cap: 10 s per sentence boundary is already
+/// pathological pacing; anything beyond is a client bug.
+const SILENCE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=10.0;
+
+/// Argv for the optional synthesis flags, in a fixed order (length
+/// scale, `speaker`, `noise_scale`, `noise_w`, `sentence_silence`). Pure so the
+/// exact bytes piper receives are pinnable by unit test.
+#[must_use]
+fn option_argv(opts: &SpeakOptions) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Some(speed) = opts.speed {
+        argv.push("--length_scale".to_string());
+        argv.push(format!("{:.4}", 1.0 / speed));
+    }
+    if let Some(speaker) = opts.speaker {
+        argv.push("--speaker".to_string());
+        argv.push(speaker.to_string());
+    }
+    if let Some(v) = opts.noise_scale {
+        argv.push("--noise_scale".to_string());
+        argv.push(format!("{v:.4}"));
+    }
+    if let Some(v) = opts.noise_w {
+        argv.push("--noise_w".to_string());
+        argv.push(format!("{v:.4}"));
+    }
+    if let Some(v) = opts.sentence_silence {
+        argv.push("--sentence_silence".to_string());
+        argv.push(format!("{v:.4}"));
+    }
+    argv
+}
+
+/// Synthesize `text` to a full `WAV` file (`RIFF` bytes) with the installed
+/// binary and voice. [`SpeakOptions`] carries the `OpenAI` `speed` plus
+/// the native piper knobs; every value is range-checked here so callers
+/// get one authoritative error site. Spawn-per-call: piper is a one-shot
+/// binary (no server, nothing to pool), cold start ~1 s.
 pub async fn synthesize(
     dirs: &BlazarDirs,
     voice: &str,
     text: &str,
-    speed: Option<f64>,
+    opts: SpeakOptions,
     timeout: std::time::Duration,
 ) -> Result<Vec<u8>> {
     if text.trim().is_empty() {
@@ -581,22 +638,38 @@ pub async fn synthesize(
             text.chars().count()
         ));
     }
-    let Some(speed) = speed else {
-        return synthesize_inner(dirs, voice, text, None, timeout).await;
-    };
-    if !(0.25..=4.0).contains(&speed) {
+    if let Some(speed) = opts.speed
+        && !(0.25..=4.0).contains(&speed)
+    {
         return Err(anyhow!(
             "speed {speed} out of range (0.25..=4.0, OpenAI contract)"
         ));
     }
-    synthesize_inner(dirs, voice, text, Some(1.0 / speed), timeout).await
+    if let Some(v) = opts.noise_scale
+        && !NOISE_RANGE.contains(&v)
+    {
+        return Err(anyhow!("noise_scale {v} out of range (0.0..=2.0)"));
+    }
+    if let Some(v) = opts.noise_w
+        && !NOISE_RANGE.contains(&v)
+    {
+        return Err(anyhow!("noise_w {v} out of range (0.0..=2.0)"));
+    }
+    if let Some(v) = opts.sentence_silence
+        && !SILENCE_RANGE.contains(&v)
+    {
+        return Err(anyhow!(
+            "sentence_silence {v} out of range (0.0..=10.0 seconds)"
+        ));
+    }
+    synthesize_inner(dirs, voice, text, &opts, timeout).await
 }
 
 async fn synthesize_inner(
     dirs: &BlazarDirs,
     voice: &str,
     text: &str,
-    length_scale: Option<f64>,
+    opts: &SpeakOptions,
     timeout: std::time::Duration,
 ) -> Result<Vec<u8>> {
     let Some((bin, lib_dir)) = server_bin(dirs) else {
@@ -627,8 +700,8 @@ async fn synthesize_inner(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if let Some(scale) = length_scale {
-        cmd.arg("--length_scale").arg(format!("{scale:.4}"));
+    for arg in option_argv(opts) {
+        cmd.arg(arg);
     }
     if cfg!(unix) {
         // The tarball binary links sibling .so files in place.
@@ -700,6 +773,42 @@ mod tests {
             kind: kind.to_string(),
             size: None,
         }
+    }
+
+    #[test]
+    fn unit__option_argv__fixed_order_and_engine_formatting() {
+        let opts = SpeakOptions {
+            speed: Some(2.0),
+            speaker: Some(3),
+            noise_scale: Some(0.5),
+            noise_w: Some(0.75),
+            sentence_silence: Some(0.4),
+        };
+        assert_eq!(
+            option_argv(&opts),
+            vec![
+                "--length_scale",
+                "0.5000", // speed 2.0 → inverse length scale
+                "--speaker",
+                "3",
+                "--noise_scale",
+                "0.5000",
+                "--noise_w",
+                "0.7500",
+                "--sentence_silence",
+                "0.4000",
+            ]
+        );
+        // Absent fields ride engine defaults: no argv at all.
+        assert!(option_argv(&SpeakOptions::default()).is_empty());
+        // Every knob alone keeps its fixed slot.
+        assert_eq!(
+            option_argv(&SpeakOptions {
+                speaker: Some(1),
+                ..Default::default()
+            }),
+            vec!["--speaker", "1"]
+        );
     }
 
     #[test]
@@ -805,7 +914,7 @@ mod tests {
                 &dirs,
                 "en_US-amy-medium",
                 "  ",
-                None,
+                SpeakOptions::default(),
                 std::time::Duration::from_secs(5),
             ))
             .unwrap_err();
@@ -815,7 +924,10 @@ mod tests {
                 &dirs,
                 "en_US-amy-medium",
                 "hi",
-                Some(9.0),
+                SpeakOptions {
+                    speed: Some(9.0),
+                    ..SpeakOptions::default()
+                },
                 std::time::Duration::from_secs(5),
             ))
             .unwrap_err();
@@ -826,7 +938,7 @@ mod tests {
                 &dirs,
                 "en_US-amy-medium",
                 &long,
-                None,
+                SpeakOptions::default(),
                 std::time::Duration::from_secs(5),
             ))
             .unwrap_err();
@@ -838,7 +950,7 @@ mod tests {
                 &dirs,
                 "en_US-amy-medium",
                 "hi",
-                None,
+                SpeakOptions::default(),
                 std::time::Duration::from_secs(5),
             ))
             .unwrap_err();

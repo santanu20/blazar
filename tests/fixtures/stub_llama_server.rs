@@ -502,7 +502,7 @@ fn should_hang(text: &str) -> bool {
 }
 
 /// `STUB_HANG_BUSY_ON`: same park, but the child is healthy — the slot is
-/// mid-generation (SLOT_BUSY → `/slots` shows `is_processing: true`) and the
+/// mid-generation (`SLOT_BUSY` → `/slots` shows `is_processing: true`) and the
 /// buffered response simply has not completed yet. The header-timeout guard
 /// must distinguish this from [`should_hang`]'s wedged child (parked, slot
 /// idle) and refuse to evict.
