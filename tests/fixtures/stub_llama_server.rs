@@ -15,6 +15,13 @@
 //!   `STUB_BUILD`       build number for --version (default 9999)
 //!   `STUB_DELAY_MS`    extra latency before answering each request (default 0)
 //!   `STUB_HANG_ON`     park chat/completions whose text contains this marker (header-stall pin)
+//!   `STUB_HANG_BUSY_ON` like `STUB_HANG_ON`, but the parked request models a
+//!                       buffered long generation: the slot reports
+//!                       `is_processing: true` on `/slots` while no response
+//!                       byte is emitted (headers arrive only at completion).
+//!                       The header-timeout guard must probe, see a busy
+//!                       child, and keep it alive — unlike `STUB_HANG_ON`,
+//!                       which models a wedged child (parked, slot idle).
 //!   `STUB_HANG_ONCE_FILE` when set, only the FIRST child to claim this path hangs;
 //!                       respawned children serve the retry (evict-and-retry pins)
 
@@ -298,9 +305,11 @@ fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/completions", post(completions))
+        .route("/completion", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/embeddings", post(embeddings))
         .route("/lora-adapters", get(lora_adapters))
+        .route("/v1/systemone", post(systemone))
         .route("/metrics", get(metrics))
         .route("/slots", get(slots))
         // New-wave surfaces: Responses API, audio transcriptions, FIM
@@ -442,20 +451,10 @@ fn count_tokens(s: &str) -> i64 {
     }
 }
 
-/// Park forever when `STUB_HANG_ON` matches the request text: the
-/// header-stall pin wedges exactly the marked request mid-traffic while
-/// the supervisor's warm-peg probes (fixed tiny prompts) pass through.
-///
-/// `STUB_HANG_ONCE_FILE` narrows the hang to the FIRST child process
-/// that claims the marker (atomic `O_EXCL` create): respawned children
-/// see the claim and serve the request. This is what lets the
-/// evict-and-retry pins discriminate — a 200 proves the retry landed on
-/// a fresh child, a 504 proves it hit the same wedged endpoint.
-fn should_hang(text: &str) -> bool {
-    let Ok(marker) = std::env::var("STUB_HANG_ON") else {
-        return false;
-    };
-    if !text.contains(&marker) {
+/// Marker matched and one-shot claimed (if configured)? Shared by both hang
+/// markers so the busy and wedged shapes claim identically.
+fn marker_claimed(marker: &str, text: &str) -> bool {
+    if !text.contains(marker) {
         return false;
     }
     // Claim only when the marker actually hits: an unconditional claim
@@ -477,11 +476,48 @@ fn should_hang(text: &str) -> bool {
         use std::io::Write;
         let _ = writeln!(
             f,
-            "[pid {}] should_hang marker_hit=true once_claimed={once}",
+            "[pid {}] marker_hit=true marker={marker:?} once_claimed={once}",
             std::process::id()
         );
     }
     once
+}
+
+/// Slot activity as `/slots` reports it: false unless a busy-marker request
+/// has parked mid-generation (the buffered long-generation shape).
+static SLOT_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Park forever when `STUB_HANG_ON` matches the request text: the
+/// header-stall pin wedges exactly the marked request mid-traffic while
+/// the supervisor's warm-peg probes (fixed tiny prompts) pass through.
+///
+/// `STUB_HANG_ONCE_FILE` narrows the hang to the FIRST child process
+/// that claims the marker (atomic `O_EXCL` create): respawned children
+/// see the claim and serve the request. This is what lets the
+/// evict-and-retry pins discriminate — a 200 proves the retry landed on
+/// a fresh child, a 504 proves it hit the same wedged endpoint.
+fn should_hang(text: &str) -> bool {
+    let Ok(marker) = std::env::var("STUB_HANG_ON") else {
+        return false;
+    };
+    marker_claimed(&marker, text)
+}
+
+/// `STUB_HANG_BUSY_ON`: same park, but the child is healthy — the slot is
+/// mid-generation (`SLOT_BUSY` → `/slots` shows `is_processing: true`) and the
+/// buffered response simply has not completed yet. The header-timeout guard
+/// must distinguish this from [`should_hang`]'s wedged child (parked, slot
+/// idle) and refuse to evict.
+fn should_hang_busy(text: &str) -> bool {
+    let Ok(marker) = std::env::var("STUB_HANG_BUSY_ON") else {
+        return false;
+    };
+    if marker_claimed(&marker, text) {
+        SLOT_BUSY.store(true, std::sync::atomic::Ordering::Release);
+        true
+    } else {
+        false
+    }
 }
 
 /// Marker-relevant request text (messages joined).
@@ -695,6 +731,12 @@ async fn chat_completions(
     // 600 s zero-chunk hangs, no tokens, no usage, no detection). The
     // sentinel stall detector must catch it, evict, and close the
     // client stream cleanly.
+    // Busy-marker check first: a buffered long generation parks the same
+    // way but flips the slot busy, and must NOT be preceded by any other
+    // marker handling.
+    if should_hang_busy(&req_text) {
+        std::future::pending::<()>().await;
+    }
     match marker_mode(&req_text) {
         Some(MarkerMode::HeaderStall) => std::future::pending::<()>().await,
         Some(MarkerMode::BodyStall) => return stall_body_response(),
@@ -826,6 +868,9 @@ async fn completions(
         .prompt
         .as_str()
         .map_or_else(|| req.prompt.to_string(), str::to_string);
+    if should_hang_busy(&req_text) {
+        std::future::pending::<()>().await;
+    }
     if should_hang(&req_text) {
         std::future::pending::<()>().await;
     }
@@ -876,6 +921,18 @@ async fn embeddings(
 
 async fn lora_adapters() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({"adapters": []}))
+}
+
+/// /v1/systemone (`TypeSafe System One` dialect): mirrors the live child
+/// response shape the gateway's `systemone_to_classify` normalizer
+/// consumes (choice answer + probabilities + confidence + usage).
+async fn systemone() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "answers": {"q1": {"type": "choice", "choice": "no",
+                            "probabilities": {"yes": 0.123, "no": 0.877},
+                            "confidence": 0.75}},
+        "usage": {"input_tokens": 38, "output_tokens": 0}
+    }))
 }
 
 async fn metrics() -> axum::response::Response {
@@ -1255,8 +1312,12 @@ async fn models_unload(body: axum::body::Bytes) -> axum::response::Response {
 
 async fn slots() -> axum::Json<serde_json::Value> {
     // Upstream GET /slots answers a bare array (not wrapped in an object).
+    // `is_processing` reflects the busy-marker shape: a parked buffered
+    // generation reports its slot busy (healthy child), while the wedged
+    // shape (`STUB_HANG_ON`) parks with the slot idle.
+    let processing = SLOT_BUSY.load(std::sync::atomic::Ordering::Acquire);
     axum::Json(serde_json::json!([
-        {"id": 0, "is_processing": false, "prompt": "", "n_ctx": 4096},
+        {"id": 0, "is_processing": processing, "prompt": "", "n_ctx": 4096},
     ]))
 }
 

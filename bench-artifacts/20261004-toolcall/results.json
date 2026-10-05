@@ -1,0 +1,70 @@
+{
+ "object": "blazar.toolcall-eval",
+ "timestamp": "2026-10-04T18:27:05+00:00",
+ "base": "http://127.0.0.1:11435",
+ "version": {
+  "name": "blazar",
+  "version": "0.20.0"
+ },
+ "commit": "0f72c21",
+ "engine_first_model": "sglang-0.5.21",
+ "models": {
+  "qwen3-1.7b": {
+   "passed": 8,
+   "total": 9,
+   "results": [
+    {
+     "test": "T1 single-call name+args",
+     "ok": true,
+     "evidence": "status=200 calls=['get_weather'] args=[{'city': 'Tokyo'}]"
+    },
+    {
+     "test": "T2 pick correct tool of three",
+     "ok": true,
+     "evidence": "status=200 picked=['calculator'] args=[{'expression': '47 * 93'}]"
+    },
+    {
+     "test": "T3 tool_choice=required",
+     "ok": true,
+     "evidence": "status=200 calls=1 attempts=1"
+    },
+    {
+     "test": "T4 tool_choice dict-form pin",
+     "ok": true,
+     "evidence": "status=200 picked=['get_weather']"
+    },
+    {
+     "test": "T5 parallel-call emission (measured)",
+     "ok": true,
+     "evidence": "calls_in_one_turn=2",
+     "measured": 2
+    },
+    {
+     "test": "T6 tool result -> grounded answer",
+     "ok": true,
+     "evidence": "status=200 answer='The current weather in Tokyo is 21\u00b0C with light rain.[]'"
+    },
+    {
+     "test": "T7 strict json_schema output",
+     "ok": false,
+     "evidence": "status=400 content='None'"
+    },
+    {
+     "test": "T8 streaming tool deltas",
+     "ok": true,
+     "evidence": "streams=[['{\"city\": \"Berlin\"}']]"
+    },
+    {
+     "test": "L1 tools-vs-no-tools latency (p50 of 3)",
+     "ok": true,
+     "evidence": "with=147ms without=146ms delta=+1ms (prompt-token cost of carrying 3 tool schemas; gateway transport is the same path)",
+     "measured": {
+      "with_tools_ms": 147,
+      "no_tools_ms": 146
+     }
+    }
+   ]
+  }
+ },
+ "reproduce": "python3 scripts/toolcall_eval.py qwen3-1.7b"
+}

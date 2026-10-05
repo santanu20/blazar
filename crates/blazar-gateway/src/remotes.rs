@@ -384,7 +384,10 @@ pub async fn forward_openai(
 /// Best-effort model rewrite on a JSON body; non-JSON (multipart)
 /// passes through untouched (remote gets the prefixed name — its owner
 /// can name the model that way if they want).
-fn rewrite_model(body: axum::body::Bytes, remote_model: &str) -> axum::body::Bytes {
+/// Rewrite the `model` field of a JSON request body (used by the
+/// remotes lane and failover chains). Non-JSON bodies pass through
+/// unchanged (multipart lanes never carry a model rewrite).
+pub(crate) fn rewrite_model(body: axum::body::Bytes, remote_model: &str) -> axum::body::Bytes {
     match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(mut v) => {
             if let Some(obj) = v.as_object_mut() {

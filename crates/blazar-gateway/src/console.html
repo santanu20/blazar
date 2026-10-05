@@ -1,0 +1,320 @@
+<!doctype html>
+<!-- blazar web console — embedded at build time (include_str), served at
+     /ui. Read-only: every number comes from an existing JSON endpoint
+     (/api/version, /api/tags, /api/ps, /api/fabric, /api/quantiles,
+     /api/benchmarks, /v1/jobs, /api/sessions). No external assets, no
+     CDN, fully offline. Field drift renders as "—", never as garbage. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blazar console</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --mono: 13px/1.5 ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: var(--mono); padding: 20px; }
+  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; letter-spacing: .5px; }
+  header h1 b { color: var(--accent); }
+  header .meta { color: var(--dim); }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; }
+  nav button {
+    background: var(--panel); color: var(--dim); border: 1px solid var(--border);
+    border-radius: 6px 6px 0 0; padding: 6px 14px; font: inherit; cursor: pointer;
+  }
+  nav button.on { color: var(--text); border-bottom: 2px solid var(--accent); background: #1c2431; }
+  section { display: none; }
+  section.on { display: block; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+  .card .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  .card .value { font-size: 20px; margin-top: 2px; }
+  .card .sub { color: var(--dim); font-size: 11px; margin-top: 2px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  th { text-align: left; color: var(--dim); font-weight: normal; font-size: 11px; text-transform: uppercase; padding: 7px 10px; border-bottom: 1px solid var(--border); background: #1c2431; }
+  td { padding: 6px 10px; border-bottom: 1px solid #21262d; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .gap { color: var(--dim); font-style: italic; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+  .muted { color: var(--dim); }
+  h2 { font-size: 13px; color: var(--dim); text-transform: uppercase; margin: 18px 0 8px; letter-spacing: .5px; }
+  h2:first-child { margin-top: 0; }
+  .note { color: var(--dim); margin-top: 8px; }
+  .bar { background: #21262d; border-radius: 3px; height: 8px; width: 90px; display: inline-block; vertical-align: middle; }
+  .bar i { display: block; height: 100%; border-radius: 3px; background: var(--accent); }
+  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1><b>blazar</b> console</h1>
+  <span class="meta" id="hdr-version">version —</span>
+  <span class="meta" id="hdr-updated">—</span>
+</header>
+<nav id="tabs">
+  <button data-tab="dashboard" class="on">Dashboard</button>
+  <button data-tab="models">Models</button>
+  <button data-tab="engines">Engines</button>
+  <button data-tab="compute">Compute</button>
+  <button data-tab="benchmarks">Benchmarks</button>
+  <button data-tab="jobs">Jobs</button>
+  <button data-tab="sessions">Sessions</button>
+</nav>
+
+<section id="dashboard" class="on">
+  <div class="cards" id="dash-cards"></div>
+  <h2>live models</h2>
+  <div id="dash-models"></div>
+</section>
+
+<section id="models"><div id="models-body"></div></section>
+<section id="engines"><div id="engines-body"></div></section>
+<section id="compute"><div id="compute-body"></div></section>
+<section id="benchmarks"><div id="benchmarks-body"></div></section>
+<section id="jobs"><div id="jobs-body"></div></section>
+<section id="sessions"><div id="sessions-body"></div></section>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// Absent fields render as a dim dash — never "undefined".
+const val = (x, f) => (x === null || x === undefined) ? '<span class="gap">—</span>' : (f ? f(x) : esc(x));
+const pct = (x) => val(x, (v) => v.toFixed ? v.toFixed(0) + "%" : esc(v));
+const ms = (x) => val(x, (v) => (v.toFixed ? v.toFixed(0) + " ms" : esc(v)));
+const bytes = (x) => val(x, (v) => {
+  if (typeof v !== "number") return esc(v);
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0; while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + u[i];
+});
+const when = (x) => val(x, (v) => {
+  if (typeof v !== "number") return esc(v);
+  const d = new Date(v > 1e12 ? v : v * 1000);
+  return isNaN(d) ? esc(v) : d.toLocaleString();
+});
+const ago = (secs) => val(secs, (v) => (typeof v === "number" ? v.toFixed(0) + "s" : esc(v)));
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+function errorRow(msg) {
+  return `<p class="note err">unavailable — ${esc(msg)} <span class="muted">(${esc(location.host)})</span></p>`;
+}
+
+function table(headers, rows) {
+  if (!rows.length) return '<p class="gap">nothing on record</p>';
+  const head = "<tr>" + headers.map((h) => "<th>" + esc(h) + "</th>").join("") + "</tr>";
+  const body = rows.map((r) => "<tr>" + r.map((c) => "<td>" + c + "</td>").join("") + "</tr>").join("");
+  return "<table>" + head + body + "</table>";
+}
+
+function utilBar(p) {
+  const v = (typeof p === "number" && p >= 0 && p <= 100) ? p : null;
+  return val(v, (x) => `<span class="bar"><i style="width:${x.toFixed(0)}%"></i></span> ${x.toFixed(0)}%`);
+}
+
+// ---- endpoint pulls ----------------------------------------------------
+async function pull() {
+  const out = {};
+  const jobs = [
+    fetchJSON("/api/version").then((v) => out.version = v).catch((e) => out.versionErr = e),
+    fetchJSON("/api/tags").then((v) => out.tags = v).catch((e) => out.tagsErr = e),
+    fetchJSON("/api/ps").then((v) => out.ps = v).catch((e) => out.psErr = e),
+    fetchJSON("/api/fabric").then((v) => out.fabric = v).catch((e) => out.fabricErr = e),
+    fetchJSON("/api/quantiles").then((v) => out.quant = v).catch((e) => out.quantErr = e),
+    fetchJSON("/api/benchmarks").then((v) => out.bench = v).catch((e) => out.benchErr = e),
+    fetchJSON("/v1/jobs").then((v) => out.jobs = v).catch((e) => out.jobsErr = e),
+    fetchJSON("/api/sessions").then((v) => out.sessions = v).catch((e) => out.sessionsErr = e),
+  ];
+  await Promise.all(jobs);
+  return out;
+}
+
+// ---- renderers ---------------------------------------------------------
+function render(d) {
+  $("hdr-version").textContent = d.version
+    ? `v${d.version.version || "?"} · ${location.host}`
+    : "daemon —";
+  $("hdr-updated").textContent = "updated " + new Date().toLocaleTimeString();
+  renderDashboard(d);
+  renderModels(d);
+  renderEngines(d);
+  renderCompute(d);
+  renderBenchmarks(d);
+  renderJobs(d);
+  renderSessions(d);
+}
+
+function renderDashboard(d) {
+  const q = d.quant || {};
+  const cards = [];
+  const card = (label, value, sub) =>
+    cards.push(`<div class="card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub || ""}</div></div>`);
+  if (d.quantErr) card("latency", '<span class="gap">—</span>', esc(d.quantErr.message));
+  else {
+    const t = q.ttft_ms || {}, tp = q.tpot_ms || {};
+    card("ttft p50", ms(t.p50_ms), `p95 ${t.p95_ms ?? "—"} · p99 ${t.p99_ms ?? "—"} · n=${t.count ?? 0}`);
+    card("tpot p50", ms(tp.p50_ms), `p95 ${tp.p95_ms ?? "—"} · n=${tp.count ?? 0}`);
+    const pc = q.prompt_cache || {};
+    card("prompt cache", val(pc.hit_rate, (v) => (v * 100).toFixed(1) + "%"),
+      `${(pc.cached_tokens ?? 0).toLocaleString()} / ${(pc.prompt_tokens ?? 0).toLocaleString()} tokens`);
+    const sc = q.semantic_cache || {};
+    card("semantic cache", (sc.hits ?? 0) + " hits", `${sc.misses ?? 0} misses · ${sc.stores ?? 0} stores`);
+  }
+  $("dash-cards").innerHTML = cards.join("");
+  if (d.psErr) { $("dash-models").innerHTML = errorRow(d.psErr.message); return; }
+  // /api/ps is the ollama-compat surface: rich fields ride `blazar_*` keys.
+  const rows = ((d.ps && d.ps.models) || []).map((m) => [
+    `<b>${esc(m.name)}</b>`,
+    val(m.blazar_engine), val(m.blazar_state, (s) => `<span class="${s === "ready" || s === "loaded" ? "ok" : "muted"}">${esc(s)}</span>`),
+    val(m.blazar_ctx), val(m.blazar_slots), val(m.blazar_in_flight), ago(m.blazar_idle_secs),
+    val(m.blazar_device), val(m.blazar_gpu, (g) => esc(g)),
+  ]);
+  $("dash-models").innerHTML =
+    table(["model", "engine", "state", "ctx", "slots", "in-flight", "idle", "device", "gpu"], rows);
+}
+
+function renderModels(d) {
+  if (d.tagsErr) { $("models-body").innerHTML = errorRow(d.tagsErr.message); return; }
+  const resident = new Map(((d.ps && d.ps.models) || []).map((m) => [m.name, m]));
+  const models = (d.tags && d.tags.models) || [];
+  const rows = models.map((m) => {
+    const live = resident.get(m.name);
+    return [
+      `<b>${esc(m.name)}</b>`,
+      bytes(m.size),
+      when(m.expires_at),
+      live ? `<span class="ok">${esc(live.blazar_state || live.state)}</span>` : '<span class="muted">cold</span>',
+      live ? val(live.blazar_ctx ?? live.ctx) : '<span class="gap">—</span>',
+    ];
+  });
+  $("models-body").innerHTML = table(["model", "size", "expires", "state", "ctx"], rows);
+}
+
+function renderEngines(d) {
+  if (d.fabricErr) { $("engines-body").innerHTML = errorRow(d.fabricErr.message); return; }
+  const engines = (d.fabric && d.fabric.engines) || [];
+  const rows = engines.map((e) => [
+    `<b>${esc(e.tag)}</b>`,
+    val(e.kind),
+    e.active ? '<span class="ok">active</span>' : '<span class="muted">installed</span>',
+    when(e.installed_at),
+  ]);
+  $("engines-body").innerHTML =
+    table(["tag", "kind", "status", "installed"], rows) +
+    `<p class="note">one active engine per daemon — kind switches restart the daemon</p>`;
+}
+
+function renderCompute(d) {
+  if (d.fabricErr) { $("compute-body").innerHTML = errorRow(d.fabricErr.message); return; }
+  const f = d.fabric || {};
+  const cpu = f.cpu || {};
+  let html = `<div class="cards">
+    <div class="card"><div class="label">cpu</div><div class="value">${val(cpu.physical_cores)}</div><div class="sub">cores</div></div>
+    <div class="card"><div class="label">ram</div><div class="value">${bytes(cpu.total_ram_bytes)}</div><div class="sub">total</div></div>
+  </div>`;
+  const devices = f.devices || [];
+  const devRows = devices.map((dev) => [
+    `<b>${esc(dev.id)}</b>`, val(dev.name), bytes(dev.total_vram_bytes),
+    bytes(dev.free_vram_bytes), utilBar(dev.utilization_percent),
+    (dev.residents || []).length + (dev.external || []).length,
+  ]);
+  html += `<h2>devices</h2>` +
+    table(["device", "name", "vram", "free", "utilization", "tenants"], devRows);
+  for (const dev of devices) {
+    const res = (dev.residents || []).map((r) => [
+      `<b>${esc(r.model)}</b>`, val(r.engine), val(r.pid), val(r.state),
+      val(r.slots), val(r.in_flight), bytes(r.vram_bytes),
+    ]);
+    const ext = (dev.external || []).map((a) => [val(a.pid), bytes(a.vram_bytes), val(a.note)]);
+    if (res.length || ext.length) {
+      html += `<h2>${esc(dev.id)} tenants</h2>`;
+      if (res.length) html += table(["model", "engine", "pid", "state", "slots", "in-flight", "vram"], res);
+      if (ext.length) html += table(["external pid", "vram", "note"], ext);
+    }
+  }
+  const peers = f.peers || [];
+  html += `<h2>remote compute</h2>`;
+  if (!peers.length) html += `<p class="gap">no remotes configured — see \`blazar remote\` and \`blazar route\`</p>`;
+  for (const p of peers) {
+    const devs = (p.devices || []).map((x) => [
+      `<b>${esc(x.name)}</b>`, bytes(x.total_vram_bytes), bytes(x.free_vram_bytes),
+    ]);
+    const res = (p.residents || []).map((r) => [
+      `<b>${esc(r.model)}</b>`, val(r.engine), val(r.state), val(r.slots), val(r.in_flight),
+    ]);
+    html += `<h2>${esc(p.name)} <span class="muted">${esc(p.url || "")}</span></h2>`;
+    if (devs.length) html += table(["device", "vram", "free"], devs);
+    if (res.length) html += table(["model", "engine", "state", "slots", "in-flight"], res);
+    if (!devs.length && !res.length) html += `<p class="gap">no capacity probed yet</p>`;
+  }
+  const notes = f.notes || [];
+  if (notes.length) html += `<p class="note">${notes.map(esc).join(" · ")}</p>`;
+  $("compute-body").innerHTML = html;
+}
+
+function renderBenchmarks(d) {
+  if (d.benchErr) { $("benchmarks-body").innerHTML = errorRow(d.benchErr.message); return; }
+  const rows = ((d.bench && d.bench.rows) || []).map((r) => [
+    `<b>${esc(r.model)}</b>`, val(r.engine_tag),
+    when(r.measured_at),
+    val(r.score, (v) => v.toFixed(1)),
+    val(r.tests, (t) => t.map(esc).join(", ")),
+    when(r.tuned_at),
+  ]);
+  $("benchmarks-body").innerHTML =
+    table(["model", "lane", "measured", "score", "tests", "tuned"], rows) +
+    `<p class="note">stored records only — nothing re-runs here. Fill gaps with \`blazar bench\` / \`blazar tune\` / \`blazar autopilot --apply\`.</p>`;
+}
+
+function renderJobs(d) {
+  if (d.jobsErr) { $("jobs-body").innerHTML = errorRow(d.jobsErr.message); return; }
+    const list = Array.isArray(d.jobs) ? d.jobs : (d.jobs && d.jobs.data) || (d.jobs && d.jobs.jobs) || [];
+  const rows = list.map((j) => [
+    `<b>${esc(j.id)}</b>`, val(j.kind), val(j.state, (s) =>
+      `<span class="${s === "done" ? "ok" : s === "failed" ? "err" : "warn"}">${esc(s)}</span>`),
+    val(j.model), when(j.created_at), when(j.updated_at),
+  ]);
+  $("jobs-body").innerHTML = table(["id", "kind", "state", "model", "created", "updated"], rows);
+}
+
+function renderSessions(d) {
+  if (d.sessionsErr) { $("sessions-body").innerHTML = errorRow(d.sessionsErr.message); return; }
+  const list = Array.isArray(d.sessions) ? d.sessions : (d.sessions && d.sessions.sessions) || [];
+  if (!list.length) {
+    $("sessions-body").innerHTML = `<p class="gap">no sessions on record</p>`;
+    return;
+  }
+  // Shape-tolerant: render whichever of the common keys exist.
+  const keys = Object.keys(list[0] || {});
+  const headers = keys.slice(0, 6);
+  const rows = list.map((s) => headers.map((k) =>
+    typeof s[k] === "number" ? when(s[k]) : val(s[k])));
+  $("sessions-body").innerHTML = table(headers, rows);
+}
+
+// ---- tabs + refresh ----------------------------------------------------
+const tabs = document.querySelectorAll("#tabs button");
+tabs.forEach((b) => b.addEventListener("click", () => {
+  tabs.forEach((x) => x.classList.toggle("on", x === b));
+  document.querySelectorAll("section").forEach((s) =>
+    s.classList.toggle("on", s.id === b.dataset.tab));
+}));
+
+async function tick() {
+  try { render(await pull()); } catch (e) { $("hdr-updated").textContent = "refresh failed — " + esc(e.message); }
+}
+tick();
+setInterval(tick, 5000); // dashboard cadence; every tab re-renders from the same pull
+</script>
+</body>
+</html>

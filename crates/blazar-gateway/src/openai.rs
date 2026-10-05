@@ -373,9 +373,22 @@ pub async fn openai_proxy(
                 None
             }
         });
+    // Native llama-server surfaces whose upstream bodies carry no
+    // `model` field (a router-mode-only field there — direct clients
+    // post them bare): resolve the target with the `scoped_proxy` chain
+    // instead of falling through to the OpenAI-dialect hard 400.
+    let model = model.or_else(|| native_modelless_target(&state, &uri, &headers));
     // Routed-lane surface gate: needs the model to know which engine
     // will serve it (GGUF routes llamacpp regardless of the active row).
     if let Some(resp) = llamacpp_only_gate(&state, &uri, model.as_deref()) {
+        return resp;
+    }
+    // Forced tool_choice on the mlx lane: mlx-lm has no tool_choice
+    // handling at all — a forced call would stream back HTTP 200 prose
+    // with the constraint silently dropped.
+    if let Some(resp) =
+        mlx_forced_tool_choice_gate(&state, &uri, model.as_deref(), parsed_body.as_ref())
+    {
         return resp;
     }
     // F7: strict `n` validation at the plane edge — an invalid choice
@@ -385,9 +398,76 @@ pub async fn openai_proxy(
     {
         return openai_error(400, &msg);
     }
+    // Metadata cards (chat lane): validate at create so a bad shape
+    // fails BEFORE tokens are spent — the update endpoint and the card
+    // writer both enforce the same OpenAI limits.
+    if uri.path().ends_with("/chat/completions")
+        && let Some(meta) = parsed_body.as_ref().and_then(|v| v.get("metadata"))
+        && let Err(e) = crate::metadata_card::validate_metadata(meta)
+    {
+        return openai_error(400, &e);
+    }
     let Some(model) = model else {
         return openai_error(400, "missing `model` field in request body");
     };
+    // Failover chains: a virtual alias resolves to a concrete target
+    // (local model or `remote:<name>:<model>`); a failing target is
+    // benched (anti-flap) and the request escalates — bounded by the
+    // target count. The recursion marker prevents re-entering chain
+    // resolution for the rewritten model string.
+    if !state.failover.is_empty()
+        && !headers.contains_key(crate::failover::ATTEMPT_HEADER)
+        && let Some(mut attempt) = state.failover.plan(&model)
+    {
+        loop {
+            let mut chain_headers = headers.clone();
+            if let Ok(v) =
+                axum::http::HeaderValue::from_str(&format!("{}:{}", attempt.chain, attempt.index))
+            {
+                chain_headers.insert(crate::failover::ATTEMPT_HEADER, v);
+            }
+            let chain_body = crate::remotes::rewrite_model(body.clone(), &attempt.serve_model);
+            let mut resp = Box::pin(openai_proxy(
+                State(state.clone()),
+                trace_ext.clone(),
+                key_ext.clone(),
+                uri.clone(),
+                method.clone(),
+                chain_headers,
+                chain_body,
+            ))
+            .await;
+            if crate::failover::escalate_response(&mut resp).await {
+                if let Some(sw) = state.failover.record_failure(&model, attempt.index) {
+                    state
+                        .bus
+                        .publish(blazar_runtime::BlazarEvent::FailoverSwitched {
+                            chain: sw.attempt.chain.clone(),
+                            from: sw.benched_index,
+                            to: sw.attempt.index,
+                            reason: format!(
+                                "target {} failed with HTTP {} — benched, escalating",
+                                attempt.label,
+                                resp.status().as_u16()
+                            ),
+                        });
+                    attempt = sw.attempt;
+                    continue;
+                }
+            } else if let Some((from, to)) = state.failover.record_success(&model, attempt.index) {
+                state
+                    .bus
+                    .publish(blazar_runtime::BlazarEvent::FailoverSwitched {
+                        chain: attempt.chain.clone(),
+                        from,
+                        to,
+                        reason: format!("served by target {} ({})", attempt.index, attempt.label),
+                    });
+            }
+            crate::failover::stamp(&mut resp, &attempt);
+            return resp;
+        }
+    }
     // Lane-aware `n` ceiling: the plane-wide bound is the promise, but the
     // serving engine may cap lower (llama-server: 2). Reject in our voice,
     // before admission bills a request the engine would refuse anyway.
@@ -498,6 +578,17 @@ pub async fn openai_proxy(
         if let Some(err) = state.sentinel.strict_tool_def_error_cached(&v) {
             return openai_error(400, &format!("invalid tools: {err}"));
         }
+        // Capability-certificate gate: refuse what the model's own
+        // VERIFIED probe says it cannot do — a fresh matching FAIL only;
+        // absent or stale certificates fail open (the sentinel still
+        // watches every response live).
+        let cap_needs = crate::preflight::capability_needs(&v, false);
+        if cap_needs.any()
+            && !crate::preflight::is_capability_probe(&headers)
+            && let Some(msg) = crate::preflight::capability_cert_refusal(&state, &model, cap_needs)
+        {
+            return openai_error(400, &msg);
+        }
         let eff = crate::preflight::admission_ctx(&state, &model);
         if let Err(resp) = crate::preflight::enforce_prompt_fits(&state, &model, &v, eff).await {
             return *resp;
@@ -585,6 +676,49 @@ pub async fn openai_proxy(
                 .map(|Extension(t)| t.0.clone())
                 .unwrap_or_default(),
         );
+    }
+
+    // MCP tool catalog (opt-in, chat lane): the selector rides the `mcp`
+    // body field or `x-blazar-mcp` header. Resolved BEFORE single-flight
+    // registers a leader — the mediated tool loop must not leave followers
+    // waiting on an entry that never resolves through proxy_request.
+    if chat_family && let Some(v) = parsed_body.as_mut() {
+        let sel = match state
+            .mcp
+            .resolve(crate::mcp::selector_from(&headers, Some(v)))
+        {
+            Ok(sel) => sel,
+            Err(msg) => return openai_error(400, &msg),
+        };
+        if let Some(sel) = sel {
+            if v["stream"].as_bool().unwrap_or(false) {
+                return openai_error(
+                    400,
+                    "mcp tool loop requires stream:false in this release — the gateway mediates buffered tool rounds",
+                );
+            }
+            v["stream"] = serde_json::Value::Bool(false);
+            return match crate::mcp::chat_via_mcp(&state, &engine, v, &sel).await {
+                Ok(child) => {
+                    let status = axum::http::StatusCode::from_u16(child.status().as_u16())
+                        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                    let headers = child.headers().clone();
+                    let bytes = child.bytes().await.unwrap_or_default();
+                    let mut builder = axum::response::Response::builder().status(status);
+                    for (name, value) in &headers {
+                        if name != axum::http::header::CONTENT_LENGTH {
+                            builder = builder.header(name, value);
+                        }
+                    }
+                    builder
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap_or_else(|e| {
+                            openai_error(502, &format!("mcp response rebuild failed: {e}"))
+                        })
+                }
+                Err(resp) => resp,
+            };
+        }
     }
 
     // Single-flight BEFORE slot admission (chat lane): the bounded
@@ -744,6 +878,49 @@ pub async fn conversations_delete(
     }
 }
 
+/// `POST /v1/chat/completions/{id}` — update a completion's `metadata`
+/// after the fact (`OpenAI` spec v2.3.0 parity). Only completions created
+/// WITH a `metadata` field (non-stream) hold a card; everything else
+/// 404s with teaching instead of pretending the id never existed.
+pub async fn chat_completion_update(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return openai_error(400, &format!("invalid JSON body: {e}")),
+    };
+    let Some(meta) = v.get("metadata") else {
+        return openai_error(400, "body must carry a `metadata` object to update");
+    };
+    if let Err(e) = crate::metadata_card::validate_metadata(meta) {
+        return openai_error(400, &e);
+    }
+    let metadata_json = meta.to_string();
+    let updated_at = crate::responses::unix_now().cast_signed();
+    match state.with_store(|s| s.update_completion_card(&id, &metadata_json, updated_at)) {
+        Some(Ok(Some(card))) => (
+            StatusCode::OK,
+            axum::Json(crate::metadata_card::card_to_json(&card)),
+        )
+            .into_response(),
+        Some(Ok(None)) => openai_error(
+            404,
+            &format!(
+                "completion {id:?} has no metadata card — it was created without a `metadata` \
+                 field, streamed (bytes were already on the wire when the id appeared), or its \
+                 card aged out of the bounded ledger"
+            ),
+        ),
+        Some(Err(e)) => openai_error(500, &format!("metadata update failed: {e}")),
+        None => openai_error(
+            503,
+            "store unavailable — metadata cards live in the ledger; retry shortly",
+        ),
+    }
+}
+
 /// `GET /v1/responses/{id}` — retrieve a stored (chained) response:
 /// `OpenAI` retrieval surface over the gateway registry (memory-first,
 /// SQLite ledger fallback — stored responses survive restarts). Expired
@@ -842,6 +1019,8 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
     "/detokenize",
     "/apply-template",
     "/infill",
+    "/completion",
+    "/embeddings",
     "/v1/chat/completions/control",
     "/v1/chat/completions/input_tokens",
     "/v1/systemone",
@@ -863,6 +1042,55 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
 /// covers sub-paths (`/slots/{id}`). `model: None` (no resolvable
 /// target) falls back to the global active kind, matching the
 /// pre-routing estimate.
+/// mlx-lm (0.32) parses `tools` and emits voluntary `tool_calls` but has no
+/// `tool_choice` handling anywhere in the package (verified against the
+/// installed venv source) — a forced choice (`"required"` or a named
+/// function) is silently dropped and the model answers prose: HTTP 200,
+/// zero `tool_calls`, the client never learns the constraint was ignored.
+/// Refuse loudly at the plane edge instead, before tokens are spent
+/// (live receipt: forced-choice battery T2/T3/T4 on the mlx lane —
+/// 200 + zero calls while voluntary calling passes).
+fn mlx_forced_tool_choice_gate(
+    state: &Arc<AppState>,
+    uri: &Uri,
+    model: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Option<Response> {
+    if !uri.path().ends_with("/chat/completions") {
+        return None;
+    }
+    let tc = body?.get("tool_choice")?;
+    let forced_shape = match tc {
+        serde_json::Value::String(s) => s == "required",
+        serde_json::Value::Object(o) => o
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t == "function"),
+        _ => false,
+    };
+    if !forced_shape {
+        return None;
+    }
+    let kind = model
+        .and_then(|m| crate::proxy::routed_kind_for(state, m))
+        .or_else(|| {
+            state
+                .with_store(|s| s.active_engine().ok().flatten())
+                .flatten()
+                .map(|r| r.kind)
+        })?;
+    if kind != blazar_core::engine_kind::EngineKind::Mlx {
+        return None;
+    }
+    Some(openai_error(
+        400,
+        "tool_choice is forced but the mlx lane's upstream (mlx-lm) ignores tool_choice \
+         entirely — the request would return HTTP 200 with zero tool_calls. Drop \
+         tool_choice (voluntary tool calling works on this lane) or serve the model \
+         on a lane that enforces forcing via model_overrides (see `blazar engine list`)",
+    ))
+}
+
 fn llamacpp_only_gate(state: &Arc<AppState>, uri: &Uri, model: Option<&str>) -> Option<Response> {
     let path = uri.path();
     if !LLAMACPP_ONLY_PATHS
@@ -890,6 +1118,60 @@ fn llamacpp_only_gate(state: &Arc<AppState>, uri: &Uri, model: Option<&str>) -> 
              or a model_overrides engine pin (see `blazar engine list`)",
         ),
     ))
+}
+
+/// `X-Blazar-Model` header hint (engine-scoped surface targeting).
+fn header_model(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-blazar-model")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// `?model=` query hint — first matching pair wins.
+fn query_model(uri: &Uri) -> Option<String> {
+    uri.query().and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == "model").then(|| v.to_string())
+        })
+    })
+}
+
+/// The single hot child, when exactly one model is loaded — the only
+/// unambiguous model-less default. Zero or many loaded: None (the
+/// caller turns that into a teaching 400, never a silent guess).
+fn single_hot_child(state: &Arc<AppState>) -> Option<String> {
+    let hot = state.sup.ps();
+    if hot.len() == 1 {
+        hot.first().map(|p| p.name.clone())
+    } else {
+        None
+    }
+}
+
+/// Native llama-server request surfaces whose upstream bodies carry no
+/// `model` field — it is a router-mode-only field upstream, so direct
+/// llama-server clients post them bare. Blazar still needs a target to
+/// route, admission-check, and forward, so mirror the `scoped_proxy`
+/// resolution order: `X-Blazar-Model` header > `?model=` query > the
+/// single hot child. Exact-path match only; OpenAI-dialect paths keep
+/// the hard 400 — their clients always name the model, and silence
+/// there would route a typo to the wrong lane.
+const NATIVE_MODELLESS_PATHS: [&str; 4] =
+    ["/infill", "/v1/systemone", "/completion", "/embeddings"];
+
+fn native_modelless_target(
+    state: &Arc<AppState>,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if !NATIVE_MODELLESS_PATHS.contains(&uri.path()) {
+        return None;
+    }
+    header_model(headers)
+        .or_else(|| query_model(uri))
+        .or_else(|| single_hot_child(state))
 }
 
 /// Engine-scoped upstream surfaces whose body carries no `model` field:
@@ -924,23 +1206,10 @@ pub async fn scoped_proxy(
     if let Some(resp) = llamacpp_only_gate(&state, &uri, body_model.as_deref()) {
         return resp;
     }
-    let header_model = headers
-        .get("x-blazar-model")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let query_model = uri.query().and_then(|q| {
-        q.split('&').find_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            (k == "model").then(|| v.to_string())
-        })
-    });
-    let hot = state.sup.ps();
-    let single = if hot.len() == 1 {
-        hot.first().map(|p| p.name.clone())
-    } else {
-        None
-    };
-    let model = body_model.or(header_model).or(query_model).or(single);
+    let model = body_model
+        .or_else(|| header_model(&headers))
+        .or_else(|| query_model(&uri))
+        .or_else(|| single_hot_child(&state));
     let Some(model) = model else {
         return openai_error(
             400,
@@ -1424,6 +1693,17 @@ async fn buffered_response_roundtrip(
                 r
             }
             Err(e) => {
+                // Busy-child header timeout: the child is healthy and still
+                // generating (buffered responses emit headers only at
+                // completion). Retrying on a respawned lane re-runs the same
+                // oversized generation into the same ceiling — surface the
+                // teaching 504 for the caller instead.
+                if matches!(
+                    &e,
+                    crate::proxy::ChildSendError::HeaderTimeout { evicted: false, .. }
+                ) {
+                    return fail(e.status_u16(), &e.to_string());
+                }
                 tracing::warn!(
                     model = %model_name,
                     "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"

@@ -20,7 +20,7 @@ use blazar_runtime::engine::build::{
     BuildBackend, BuildOpts, BuildSource, Toolchain, detect_toolchain, nvidia_gpu_facts,
     parse_fork_spec, path_dirs, require_toolchain, validate_commit_sha, validate_repo_slug,
 };
-use blazar_runtime::engine::gh::{GhClient, btag_number, same_build};
+use blazar_runtime::engine::gh::{GhClient, StableMarker, btag_number, same_build};
 use blazar_runtime::engine::{EngineManager, STALLED_INSTALL_GRACE};
 use blazar_runtime::engine_impl::Engine;
 use blazar_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
@@ -176,6 +176,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// One-shot classification through a decision model (Laya-class
+    /// system-one classifiers): the input plus candidate labels in, a
+    /// calibrated label distribution out — no prose generation
+    Classify {
+        /// Decision model to consult (e.g. laya)
+        model: String,
+        /// The text to classify (state for the decision model)
+        text: Vec<String>,
+        /// 2..=16 candidate labels, comma-separated
+        #[arg(long, value_delimiter = ',')]
+        labels: Vec<String>,
+        /// Emit the normalized JSON card instead of the table
+        #[arg(long)]
+        json: bool,
+    },
     /// Interactive loop against a model, by kind: text chats (streams;
     /// /exit /clear /model /sysinfo /profile), diffusion sets generate
     /// images or video, pulled piper voices write WAV clips; with an
@@ -200,6 +215,11 @@ enum Cmd {
         /// speculative vs dense throughput side by side.
         #[arg(long)]
         no_draft: bool,
+        /// Shape the session for a workload class (queue priority,
+        /// reasoning defaults, multimodal preflight). The mapping is
+        /// thin and printed; explicit flags still win.
+        #[arg(long, value_enum)]
+        intent: Option<Intent>,
     },
     /// Benchmark a model (pp/tg table; history kept for tune gates)
     Bench { model: String },
@@ -240,6 +260,32 @@ enum Cmd {
         /// beats the current default (256) by >5%
         #[arg(long)]
         cache_reuse: bool,
+    },
+    /// One-page scorecard for a model: measured performance (last bench),
+    /// verified capability verdicts (model-doctor certificate), identity —
+    /// all read from the store, nothing is re-run
+    Scorecard {
+        model: String,
+        /// NDJSON-shaped single JSON object instead of the aligned card
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pre-run plan for a model: live routing decision (daemon card),
+    /// measured profile, capability certificate, and next actions —
+    /// read-only; an unpulled target shows the upstream fit preview
+    Plan {
+        model: String,
+        /// Machine-readable object (unpulled targets emit fit rows)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Observe every local model and recommend the work that fills a
+    /// real gap (missing/stale bench, tune, capability certificate) —
+    /// each rec cites its stored datum; `--apply` runs them sequentially
+    Autopilot {
+        /// Run the recommended commands (default: report only)
+        #[arg(long)]
+        apply: bool,
     },
     /// Persist config migrations (legacy `api_keys` -> [[keys]]), with a
     /// timestamped backup; idempotent
@@ -409,13 +455,20 @@ enum Cmd {
     /// exact config change, optionally write it (backup + rollback), then
     /// fire a test request. Bare `blazar connect` lists every known client
     Connect {
-        /// Client id: codex, claude, continue, cline, openwebui (bare
-        /// `blazar connect` lists every known client)
+        /// Client id: codex, claude, continue, cline, openwebui,
+        /// opencode, pi (bare `blazar connect` lists every known
+        /// client)
         #[arg(default_value_t = String::new())]
         client: String,
-        /// Model the test request should use (default: first local model)
+        /// Model the test request should use (default: the most
+        /// capable certified chat model)
         #[arg(long)]
         model: Option<String>,
+        /// Advertise EVERY certified chat model in the client's menu
+        /// (multi-model clients only: opencode, pi); the top pick still
+        /// rides the test request
+        #[arg(long, conflicts_with = "model")]
+        all_models: bool,
         /// Write the config change (default: print only); backs up first,
         /// rolls back if the test request fails
         #[arg(long)]
@@ -482,6 +535,13 @@ enum Cmd {
         flat: bool,
         #[arg(long)]
         json: bool,
+        /// Apply the safe fix set (adopt legacy engine/model trees,
+        /// sweep stalled install debris, reconcile store rows against
+        /// disk) before the report. Disk-touching fixes only run while
+        /// the daemon is down; anything destructive stays advisory in
+        /// the report.
+        #[arg(long)]
+        fix: bool,
     },
     /// Run per-model capability probes (chat/stream/JSON/tools/embeds)
     /// through the real gateway path and store a certificate; the cert
@@ -825,6 +885,16 @@ enum ConfigCmd {
         /// editor hints
         model: Option<String>,
     },
+    /// Apply a one-word posture over the tuning knobs a beginner should
+    /// never have to learn (`balanced`, `fast`, `quality`, `agent`,
+    /// `max-throughput`). Every knob the posture touches is printed
+    /// with its old and new value and the whole bundle is validated
+    /// before the file is written; omit NAME to list the postures.
+    /// Fine-tune afterwards with `config set`/`config unset` as usual.
+    Preset {
+        /// One of: balanced, fast, quality, agent, max-throughput
+        name: Option<String>,
+    },
 }
 
 /// `blazar config --help` footer: the set → get → unset → defaults
@@ -861,7 +931,9 @@ An unknown key or bad value is rejected with the file unchanged.";
 const HELP_GROUPS: &[(&str, &[&str])] = &[
     (
         "Serve & Chat",
-        &["serve", "run", "ps", "stop", "launch", "session"],
+        &[
+            "serve", "run", "ps", "classify", "stop", "launch", "session",
+        ],
     ),
     (
         "Model Management",
@@ -877,6 +949,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "mmproj",
             "search",
             "fit",
+            "plan",
             "storage",
             "prune",
             "lora",
@@ -886,7 +959,14 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Tuning & Benchmarks",
-        &["bench", "tune", "drafts", "coreside"],
+        &[
+            "autopilot",
+            "bench",
+            "tune",
+            "scorecard",
+            "drafts",
+            "coreside",
+        ],
     ),
     (
         "Engine & Config",
@@ -1778,17 +1858,25 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::List { json } => list(json),
         Cmd::Show { model, json } => show(&resolve_model_cli(&model), json),
         Cmd::Ps { reset, json } => ps(reset, json).await,
+        Cmd::Classify {
+            model,
+            text,
+            labels,
+            json,
+        } => classify_cmd(&model, &text, &labels, json).await,
         Cmd::Run {
             model,
             prompt,
             verbose,
             max_tokens,
             no_draft,
+            intent,
         } => {
             let inline: Option<String> = {
                 let joined = prompt.join(" ");
                 (!joined.is_empty()).then_some(joined)
             };
+            let plan = intent.map(intent_plan);
             // Lane routing: diffusion rows and piper voices never reach
             // the chat REPL — each drives its own generation loop (an
             // inline prompt runs a single shot, no loop). Resolution
@@ -1804,23 +1892,36 @@ async fn run(cmd: Cmd) -> Result<()> {
                 let model = model_ref.to_string();
                 match run_lane(&row) {
                     RunLane::Image => {
+                        intent_lane_note(intent, "image");
                         let base = ensure_daemon().await?;
                         return image_repl(&base, &model, inline.as_deref()).await;
                     }
                     RunLane::Video => {
+                        intent_lane_note(intent, "video");
                         let base = ensure_daemon().await?;
                         return video_repl(&base, &model, inline.as_deref()).await;
                     }
                     RunLane::Text => {}
                 }
+                // Vision refuses before the first request fires: a chat
+                // model without its projector sidecar would 500 mid-turn,
+                // which teaches nothing. Point at the command that fixes it.
+                if plan.is_some_and(|p| p.needs_vision) && row.mmproj_path.is_none() {
+                    return Err(anyhow!(
+                        "blazar run {model}: --intent vision refused — no projector sidecar \
+attached (the chat model cannot see images without one). Attach one: \
+blazar mmproj <model> <mmproj.gguf path>"
+                    ));
+                }
             } else if let Some(voice) =
                 tts_voice_target(model_ref, &blazar_runtime::piper::list_voices(&dirs()))
             {
+                intent_lane_note(intent, "voice");
                 let base = ensure_daemon().await?;
                 return tts_repl(&base, voice, inline.as_deref()).await;
             }
             let model = ensured?;
-            run_dispatch(&model, &prompt, verbose, max_tokens, no_draft).await
+            run_dispatch(&model, &prompt, verbose, max_tokens, no_draft, intent).await
         }
         Cmd::Bench { model } => bench(&resolve_model_cli(&model)),
         Cmd::Tune {
@@ -1847,6 +1948,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             )
             .await
         }
+        Cmd::Scorecard { model, json } => scorecard(&resolve_model_cli(&model), json),
+        Cmd::Plan { model, json } => plan_cmd(&model, json).await,
+        Cmd::Autopilot { apply } => autopilot(apply).await,
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
         Cmd::Lora { cmd } => lora_cmd(cmd),
         Cmd::Search {
@@ -1860,9 +1964,10 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Connect {
             client,
             model,
+            all_models,
             write,
             json,
-        } => connect_cmd(&client, model, write, json).await,
+        } => connect_cmd(&client, model, all_models, write, json).await,
         Cmd::Prune {
             orphans,
             unused,
@@ -1951,7 +2056,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Signout => cloud_refusal("signout", ""),
         Cmd::Logout => cloud_refusal("logout", ""),
         Cmd::Session { cmd } => session_cmd(cmd).await,
-        Cmd::Doctor { flat, json } => doctor(flat, json).await,
+        Cmd::Doctor { flat, json, fix } => doctor(flat, json, fix).await,
         Cmd::ModelDoctor { model, json } => model_doctor_cmd(&model, json).await,
         Cmd::Warm { model } => warm_cmd(&model).await,
         Cmd::Replicate {
@@ -2665,9 +2770,101 @@ async fn install_offer_kinds(
     }
 }
 
+/// The `doctor --fix` safe set. Every entry is idempotent, reversible,
+/// and already proven as the `serve()` boot preflight — `--fix` just
+/// runs them on demand. Disk-moving work is skipped while the daemon
+/// holds the trees (adoption mid-serve is unsafe); those fixes re-run
+/// automatically at the next `blazar serve` boot.
+#[allow(clippy::too_many_lines)] // one fix entry per subsystem, cohesive
+async fn doctor_fix(d: &BlazarDirs) -> Vec<(String, String)> {
+    if daemon_base_if_up().await.is_some() {
+        return vec![(
+            "disk fixes".to_string(),
+            "skipped — daemon is running (stop it with `blazar stop` first); these run automatically at `blazar serve` boot".to_string(),
+        )];
+    }
+    let mut out = Vec::new();
+    let mgr = match local_engine_manager(d) {
+        Ok(mgr) => mgr,
+        Err(e) => {
+            out.push(("engine manager".to_string(), format!("unavailable: {e}")));
+            return out;
+        }
+    };
+    let adopted_whisper = mgr.adopt_whisper_legacy_trees();
+    out.push((
+        "legacy whisper trees".to_string(),
+        if adopted_whisper.is_empty() {
+            "nothing to adopt".to_string()
+        } else {
+            format!(
+                "adopted {} ({})",
+                adopted_whisper.len(),
+                adopted_whisper.join(", ")
+            )
+        },
+    ));
+    let adopted_piper = mgr.adopt_piper_legacy_trees();
+    out.push((
+        "legacy piper trees".to_string(),
+        if adopted_piper.is_empty() {
+            "nothing to adopt".to_string()
+        } else {
+            format!(
+                "adopted {} ({})",
+                adopted_piper.len(),
+                adopted_piper.join(", ")
+            )
+        },
+    ));
+    let debris = mgr.sweep_install_debris(STALLED_INSTALL_GRACE);
+    out.push((
+        "install debris".to_string(),
+        if debris.is_empty() {
+            "no stalled installs".to_string()
+        } else {
+            let bytes: u64 = debris.iter().map(|(_, b)| b).sum();
+            format!(
+                "swept {} item(s), {}",
+                debris.len(),
+                humansize(bytes.cast_signed())
+            )
+        },
+    ));
+    if let Ok(store) = blazar_core::Store::open(d) {
+        let report = blazar_runtime::models::reconcile_models(d, &store);
+        out.push(
+            match (report.adopted.is_empty(), report.relinked.is_empty()) {
+                (true, true) => ("model rows".to_string(), "already in sync".to_string()),
+                (false, _) => (
+                    "model rows".to_string(),
+                    format!("adopted {} model(s) from disk", report.adopted.len()),
+                ),
+                (true, false) => (
+                    "model rows".to_string(),
+                    format!("re-linked {} projector sidecar(s)", report.relinked.len()),
+                ),
+            },
+        );
+    }
+    out
+}
+
 #[allow(clippy::too_many_lines)] // report builder: one row per subsystem, cohesive
-async fn doctor(flat: bool, json: bool) -> Result<()> {
+async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     let d = dirs();
+    if fix {
+        for (name, outcome) in doctor_fix(&d).await {
+            if json {
+                println!("{}", serde_json::json!({"fix": name, "detail": outcome}));
+            } else {
+                println!("fix: {name} — {outcome}");
+            }
+        }
+        if !json {
+            println!();
+        }
+    }
     let mut checks: Vec<Check> = Vec::new();
 
     // 1. config parses + validates
@@ -3363,6 +3560,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
             ));
             continue;
         }
+        let mut any_missing = false;
         let entries: Vec<String> = rows
             .iter()
             .map(|e| {
@@ -3376,6 +3574,23 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
                     "overlay prebuilt"
                 };
                 let active_mark = if e.active { " [active]" } else { "" };
+                // Rows can outlive their files (tree deleted under the
+                // store) — flag them here too; `engine list` shows the
+                // same state in its STATE column.
+                let files = d
+                    .engines_dir()
+                    .join(&e.tag)
+                    .read_dir()
+                    .is_ok_and(|mut rd| rd.next().is_some());
+                if !files {
+                    any_missing = true;
+                    return format!(
+                        "{tag} ({asset}, {provenance}) FILES MISSING — blazar engine install --kind {kind}{active_mark}",
+                        tag = e.tag,
+                        asset = e.asset,
+                        kind = e.kind
+                    );
+                }
                 format!(
                     "{} ({asset}, {provenance}, {gib:.1} GiB){active_mark}",
                     e.tag,
@@ -3383,7 +3598,17 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
                 )
             })
             .collect();
-        out.push(Check::ok(label, entries.join(" | ")));
+        if any_missing {
+            out.push(Check::warn(
+                label,
+                format!(
+                    "{} — row(s) whose engine dir is absent from disk; spawn would fail",
+                    entries.join(" | ")
+                ),
+            ));
+        } else {
+            out.push(Check::ok(label, entries.join(" | ")));
+        }
     }
     out.extend(doctor_engine_retention(d, &engines));
     out
@@ -3398,7 +3623,11 @@ fn doctor_engine_retention(
     engines: &[blazar_core::store::EngineRow],
 ) -> Vec<Check> {
     let mut out = Vec::new();
-    let keep = blazar_runtime::engine::KEEP_TAGS;
+    // Advisory display: a config load failure falls back to the default
+    // here — doctor's config section is the right place to surface that
+    // error, not the retention tail.
+    let keep =
+        blazar_runtime::engine::effective_keep_tags(d).unwrap_or(blazar_runtime::engine::KEEP_TAGS);
     let mut over: Vec<String> = Vec::new();
     for kind in ["llamacpp", "mistralrs", "sglang", "sdcpp", "whisper"] {
         let n = engines.iter().filter(|e| e.kind.as_str() == kind).count();
@@ -4648,6 +4877,41 @@ fn channel_word(active: &str, target: &str) -> &'static str {
     }
 }
 
+/// Stable-name relation of `tag` to upstream's current stable marker
+/// (see `GhClient::stable_marker`): "stable v0.6.0" when the tag IS the
+/// marked build (build numbers equal, lane suffixes like `-cuda`
+/// match), "newer than stable v0.6.0" for later b-builds, "" when no
+/// marker, the tag predates it, or it is not a b-build. Engine tags
+/// stay b-dialect; this is what makes them read as release names.
+fn stable_alias(marker: Option<&StableMarker>, tag: &str) -> String {
+    let Some(m) = marker else {
+        return String::new();
+    };
+    match (btag_number(tag), btag_number(&m.btag)) {
+        (Some(t), Some(s)) if t == s => format!("stable {}", m.vtag),
+        (Some(t), Some(s)) if t > s => format!("newer than stable {}", m.vtag),
+        _ => String::new(),
+    }
+}
+
+/// `stable_alias` wrapped for append-to-line contexts: "" or
+/// " (stable v0.6.0)".
+fn stable_alias_paren(marker: Option<&StableMarker>, tag: &str) -> String {
+    match stable_alias(marker, tag).as_str() {
+        "" => String::new(),
+        alias => format!(" ({alias})"),
+    }
+}
+
+/// `stable_alias` folded for prefix position inside a parenthesized
+/// detail: "" or "stable v0.6.0, ".
+fn stable_prefix(marker: Option<&StableMarker>, tag: &str) -> String {
+    match stable_alias(marker, tag).as_str() {
+        "" => String::new(),
+        alias => format!("{alias}, "),
+    }
+}
+
 /// The command that updates the ACTIVE engine's lane: source-built
 /// engines (`asset` = `built-*`) refresh by rebuilding the source lane —
 /// `engine update` would install the Vulkan prebuilt instead. Overlay
@@ -4701,18 +4965,23 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
             // b-tags compare by build number: lane suffixes (-cuda/-cpu)
             // are the SAME build — string equality would nag a current
             // source-built engine forever.
+            let stable = gh.stable_marker().await.ok().flatten();
             if same_build(active, &rel.tag_name) {
                 Check::ok(
                     "engine currency",
-                    format!("up to date ({active}, channel: {channel})"),
+                    format!(
+                        "up to date ({active}, {}channel: {channel})",
+                        stable_prefix(stable.as_ref(), active)
+                    ),
                 )
             } else {
                 Check::warn(
                     "engine currency",
                     format!(
-                        "{} available: {} (active: {}, channel: {}) — run: {}{}",
+                        "{} available: {}{} (active: {}, channel: {}) — run: {}{}",
                         channel_word(active, &rel.tag_name),
                         rel.tag_name,
+                        stable_alias_paren(stable.as_ref(), &rel.tag_name),
                         active,
                         channel,
                         engine_update_command(active, asset),
@@ -7064,6 +7333,822 @@ fn embedded_json(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or(serde_json::Value::String(raw.to_string()))
 }
 
+/// UTC calendar date (`YYYY-MM-DD`) for an epoch-seconds stamp —
+/// scorecard/plan citations print verification dates, and the CLI crate
+/// carries no date dependency. Shared implementation lives in
+/// `blazar_core::store::epoch_to_utc_date` (the gateway's capability
+/// certificates cite the same dates); pinned there against known dates
+/// including a leap day and a non-leap century year.
+fn epoch_to_utc_date(secs: i64) -> String {
+    blazar_core::store::epoch_to_utc_date(secs)
+}
+
+/// `(score, per-test rows)` from a stored `benchmark_json` payload:
+/// rows grouped by test name (sorted), mean t/s across repeats, and the
+/// first context size seen for the group. `None` when the column is
+/// absent or does not parse — the scorecard then prints its honest
+/// "no benchmark on record" row instead of a zero.
+fn scorecard_bench_summary(payload_raw: &str) -> Option<(f64, Vec<BenchTestRow>)> {
+    let payload: blazar_runtime::bench::BenchmarkPayload =
+        serde_json::from_str(payload_raw).ok()?;
+    Some((payload.score, group_bench_rows(&payload.rows)))
+}
+
+/// Group raw bench rows by derived test name into mean-per-test display
+/// rows (repeats of one test collapse to their mean; first ctx wins).
+fn group_bench_rows(rows: &[blazar_runtime::bench::BenchRow]) -> Vec<BenchTestRow> {
+    let mut groups: std::collections::BTreeMap<String, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    let mut ctxs: std::collections::BTreeMap<String, Option<u64>> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        let name = r.test_name();
+        if name.is_empty() {
+            continue;
+        }
+        groups.entry(name.clone()).or_default().push(r.ts);
+        let entry = ctxs.entry(name).or_insert(r.n_ctx);
+        if entry.is_none() {
+            *entry = r.n_ctx;
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(name, ts)| {
+            #[allow(clippy::cast_precision_loss)] // bench repeat counts are tiny
+            let mean = ts.iter().sum::<f64>() / ts.len() as f64;
+            let ctx = ctxs.get(&name).copied().flatten();
+            (name, mean, ctx)
+        })
+        .collect()
+}
+
+/// Where a model's measured performance comes from, newest wins:
+/// a tuned launch profile (richer: score + rows, written by `tune`)
+/// or the plain-bench record (rows only, written by `bench`).
+enum Measured {
+    Tuned {
+        tag: String,
+        updated_at: i64,
+        score: f64,
+        tests: Vec<BenchTestRow>,
+    },
+    Benched {
+        tag: String,
+        updated_at: i64,
+        tests: Vec<BenchTestRow>,
+    },
+    Absent,
+}
+
+fn resolve_measured(store: &Store, model: &str) -> Result<Measured> {
+    let tuned = store.active_engine()?.and_then(|e| {
+        store
+            .get_profile(model, &e.tag)
+            .ok()
+            .flatten()
+            .and_then(|p| {
+                p.benchmark_json
+                    .as_deref()
+                    .and_then(scorecard_bench_summary)
+                    .map(|(score, tests)| (e.tag, p.updated_at, score, tests))
+            })
+    });
+    if let Some((tag, updated_at, score, tests)) = tuned {
+        return Ok(Measured::Tuned {
+            tag,
+            updated_at,
+            score,
+            tests,
+        });
+    }
+    let benched =
+        store
+            .latest_bench_result(model, None)?
+            .and_then(|(tag, payload_json, updated_at)| {
+                let rows: Vec<blazar_runtime::bench::BenchRow> =
+                    serde_json::from_str(&payload_json).ok()?;
+                let tests = group_bench_rows(&rows);
+                (!tests.is_empty()).then_some((tag, updated_at, tests))
+            });
+    match benched {
+        Some((tag, updated_at, tests)) => Ok(Measured::Benched {
+            tag,
+            updated_at,
+            tests,
+        }),
+        None => Ok(Measured::Absent),
+    }
+}
+
+/// The JSON shape plan/scorecard both emit for MEASURED/performance:
+/// `null` when nothing is on record, `score` only for tuned profiles.
+fn measured_json_value(measured: &Measured) -> Option<serde_json::Value> {
+    match measured {
+        Measured::Absent => None,
+        Measured::Tuned {
+            tag,
+            updated_at,
+            tests,
+            ..
+        }
+        | Measured::Benched {
+            tag,
+            updated_at,
+            tests,
+        } => {
+            let tests_json = tests
+                .iter()
+                .map(|(n, ts, ctx)| serde_json::json!({"test": n, "t_per_s": ts, "ctx": ctx}))
+                .collect::<Vec<_>>();
+            let mut obj = serde_json::Map::new();
+            obj.insert("engine".into(), serde_json::json!(tag));
+            obj.insert(
+                "measured_at".into(),
+                serde_json::json!(epoch_to_utc_date(*updated_at)),
+            );
+            if let Measured::Tuned { score, .. } = measured {
+                obj.insert("score".into(), serde_json::json!(score));
+            }
+            obj.insert("tests".into(), serde_json::Value::Array(tests_json));
+            Some(serde_json::Value::Object(obj))
+        }
+    }
+}
+
+/// Bench row reduced for display: `(test name, mean t/s, first ctx)`.
+type BenchTestRow = (String, f64, Option<u64>);
+
+/// Identity rows shared by `plan` MODEL and `scorecard` (`show()`
+/// layout): repo/quant/size always; `params`/`arch`/`ctx_train` only
+/// when known. `with_name` prefixes the model row — scorecard headers
+/// carry it, plan already names the model in its title line.
+fn model_identity_rows(
+    row: &blazar_core::store::ModelRow,
+    with_name: bool,
+) -> Vec<(&'static str, String)> {
+    let mut identity = Vec::new();
+    if with_name {
+        identity.push(("model", row.name.clone()));
+    }
+    identity.push(("repo", row.repo.clone()));
+    identity.push(("quant", row.quant.clone()));
+    identity.push(("size", humansize(row.bytes)));
+    if let Some(p) = row.params.filter(|p| *p > 0.0) {
+        identity.push(("params", format!("{p:.1}B")));
+    }
+    if let Some(a) = &row.arch {
+        identity.push(("arch", a.clone()));
+    }
+    if let Some(c) = row.ctx_train {
+        identity.push(("ctx_train", format_k(c)));
+    }
+    identity
+}
+
+/// Score + per-test mean rows shared by `plan` MEASURED and `scorecard`
+/// performance blocks; callers print them with their own indent. The
+/// score line only exists for tuned profiles — plain bench has rows.
+fn bench_rows_lines(bench_score: Option<f64>, tests: &[BenchTestRow]) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(s) = bench_score {
+        out.push(format!("score      {s}"));
+    }
+    for (name, ts, ctx) in tests {
+        let ctx_s = ctx.map_or_else(
+            || "-".to_string(),
+            |c| format_k(i64::try_from(c).unwrap_or_default()),
+        );
+        out.push(format!("{name:<10}  {ts:>8.1} tok/s   ctx {ctx_s}"));
+    }
+    out
+}
+
+/// Capability-certificate display rows in the certificate's own probe
+/// order: `(probe, status)`. The stored `caps_json` is the full
+/// `blazar.model-doctor` certificate object with probes nested under
+/// `.caps` (verified against live certificates); absent probes on an
+/// older certificate render as `-` — a real gap, never a guessed
+/// verdict.
+fn scorecard_caps_rows(caps_raw: &str) -> Option<Vec<(String, String)>> {
+    let v: serde_json::Value = serde_json::from_str(caps_raw).ok()?;
+    let caps = &v["caps"];
+    Some(
+        [
+            "chat",
+            "stream",
+            "json",
+            "tools",
+            "embeddings",
+            "vision",
+            "think",
+            "classify",
+        ]
+        .iter()
+        .map(|k| {
+            (
+                (*k).to_string(),
+                caps[*k]["status"].as_str().unwrap_or("-").to_string(),
+            )
+        })
+        .collect(),
+    )
+}
+
+/// Base URL (`http://host:port`) when the daemon answers `/api/version`,
+/// else `None` — read-only preview surfaces (`plan`) probe for a live
+/// daemon instead of booting one via `ensure_daemon`.
+async fn daemon_base_if_up() -> Option<String> {
+    let cfg = config().ok()?;
+    let base = format!("http://{}:{}", cfg.host, cfg.port);
+    cli_http()
+        .get(format!("{base}/api/version"))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok()
+        .then_some(base)
+}
+
+/// The `blazar plan` DECISION block, rendered from the daemon's live
+/// `/api/explain` card — the same card `run` will act on, never a
+/// client-side re-derivation. Pure over the card value; missing fields
+/// render as `unknown`.
+fn plan_decision_lines(v: &serde_json::Value) -> Vec<String> {
+    let or_unknown =
+        |x: &serde_json::Value| x.as_str().map_or_else(|| "unknown".into(), str::to_string);
+    let e = &v["engine"];
+    let c = &v["context"];
+    let sp = &v["speculation"];
+    let ca = &v["cache"];
+    let warm = v["slots"]["live"]
+        .as_u64()
+        .map_or_else(|| "cold".to_string(), |n| format!("resident ({n} slot(s))"));
+    vec![
+        format!(
+            "engine      {} ({}) — {}",
+            or_unknown(&e["tag"]),
+            or_unknown(&e["kind"]),
+            or_unknown(&e["reason"])
+        ),
+        format!(
+            "context     {} ({})",
+            c["effective"]
+                .as_u64()
+                .map_or_else(|| "unknown".into(), |n| n.to_string()),
+            or_unknown(&c["effective_source"])
+        ),
+        format!(
+            "kv          {}/{}",
+            or_unknown(&ca["kv_k"]),
+            or_unknown(&ca["kv_v"])
+        ),
+        format!(
+            "spec        {} ({})",
+            or_unknown(&sp["mode"]),
+            or_unknown(&sp["source"])
+        ),
+        format!("warm        {warm}"),
+    ]
+}
+
+/// The `blazar plan` NEXT block: only the actions that fill a real gap.
+fn plan_next_hints(name: &str, has_bench: bool, has_cert: bool, daemon_up: bool) -> Vec<String> {
+    let mut hints = vec![format!("blazar run {name}           serve + chat now")];
+    if !daemon_up {
+        hints.push(
+            "blazar serve               start the daemon (decision preview needs it)".to_string(),
+        );
+    }
+    if !has_bench {
+        hints.push(format!("blazar bench {name}      fill MEASURED"));
+    }
+    if !has_cert {
+        hints.push(format!("blazar model-doctor {name}  fill CERTIFICATE"));
+    }
+    hints
+}
+
+/// Fetch the daemon's live decision card for a model; `None` on any
+/// transport or parse failure (callers own the "why" message).
+async fn fetch_explain_card(base: &str, model: &str) -> Option<serde_json::Value> {
+    let url = format!("{base}/api/explain/{}", encode_path_segment(model));
+    match cli_http()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp.json::<serde_json::Value>().await.ok(),
+        _ => None,
+    }
+}
+
+/// The run ready-card: ONE line of the daemon's real decision (same
+/// `/api/explain` card `plan` shows in full) so the first token already
+/// knows what engine/ctx/kv/spec is serving it. `None` when the card is
+/// too empty to be worth a line.
+fn ready_card_line(v: &serde_json::Value) -> Option<String> {
+    let or_unknown = |x: &serde_json::Value| {
+        x.as_str()
+            .map_or_else(|| "unknown".to_string(), str::to_string)
+    };
+    let tag = v["engine"]["tag"].as_str()?;
+    let engine = match v["engine"]["kind"].as_str() {
+        Some(kind) => format!("{tag} ({kind})"),
+        None => tag.to_string(),
+    };
+    let ctx = v["context"]["effective"]
+        .as_i64()
+        .map_or_else(|| "unknown".into(), format_k);
+    let warm = v["slots"]["live"]
+        .as_u64()
+        .map_or_else(|| "cold".to_string(), |n| format!("resident, {n} slot(s)"));
+    Some(format!(
+        "profile: engine {engine} · ctx {ctx} ({}) · kv {}/{} · spec {} · {warm}",
+        or_unknown(&v["context"]["effective_source"]),
+        or_unknown(&v["cache"]["kv_k"]),
+        or_unknown(&v["cache"]["kv_v"]),
+        or_unknown(&v["speculation"]["mode"]),
+    ))
+}
+
+/// `blazar plan <model>` — read-only pre-run assembly: identity, the
+/// daemon's live decision card (when up), the measured profile, the
+/// capability certificate, and next actions. Never pulls, never probes,
+/// never boots a daemon. A target that is not local but parses as a
+/// pull target falls through to the upstream fit preview (network) plus
+/// a pull hint.
+#[allow(clippy::too_many_lines)] // card assembly: one block per section
+async fn plan_cmd(model: &str, json: bool) -> Result<()> {
+    let d = dirs();
+    let store = Store::open(&d)?;
+    let name = resolve_model_cli(model);
+    let Some(row) = store.get_model(&name)? else {
+        if blazar_runtime::parse_pull_target(model).is_ok() {
+            if !json {
+                println!("{model} is not pulled — upstream fit preview:");
+                println!();
+            }
+            fit(model, json).await?;
+            if !json {
+                println!();
+                println!("NEXT");
+                println!("  blazar pull {model}   fetch a variant, then re-run plan");
+            }
+            return Ok(());
+        }
+        return Err(no_such_model(model));
+    };
+
+    let base = daemon_base_if_up().await;
+    let decision = if let Some(base) = &base {
+        fetch_explain_card(base, &name).await
+    } else {
+        None
+    };
+
+    let measured = resolve_measured(&store, &row.name)?;
+    let cert = store.get_model_caps_dated(&row.name)?;
+
+    if json {
+        let measured_json = measured_json_value(&measured);
+        let cert_json = cert.as_ref().map(|(tag, tested_at, caps_json)| {
+            serde_json::json!({
+                "engine": tag,
+                "verified_at": epoch_to_utc_date(*tested_at),
+                "probes": scorecard_caps_rows(caps_json),
+            })
+        });
+        println!(
+            "{}",
+            serde_json::json!({
+                "object": "blazar.plan",
+                "local": true,
+                "model": {
+                    "name": row.name, "repo": row.repo, "quant": row.quant,
+                    "size_bytes": row.bytes, "params_b": row.params,
+                    "arch": row.arch, "ctx_train": row.ctx_train,
+                    "mmproj": row.mmproj_path,
+                },
+                "decision": decision,
+                "measured": measured_json,
+                "certificate": cert_json,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("PLAN — {} (local)", row.name);
+    println!();
+    println!("MODEL");
+    let identity = model_identity_rows(&row, false);
+    let w = identity.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in &identity {
+        println!("  {k:<w$}  {v}");
+    }
+
+    println!();
+    println!("DECISION");
+    match (&decision, &base) {
+        (Some(card), _) => {
+            for line in plan_decision_lines(card) {
+                println!("  {line}");
+            }
+        }
+        (None, Some(_)) => {
+            println!("  unavailable — daemon answered but the explain card fetch failed");
+        }
+        (None, None) => println!(
+            "  daemon not running — start it with `blazar serve` to see the live routing card"
+        ),
+    }
+
+    println!();
+    println!("MEASURED");
+    match &measured {
+        Measured::Tuned {
+            tag,
+            updated_at,
+            score,
+            tests,
+        } => {
+            println!(
+                "  engine {tag}, measured {} (tuned profile, blazar tune)",
+                epoch_to_utc_date(*updated_at)
+            );
+            for line in bench_rows_lines(Some(*score), tests) {
+                println!("  {line}");
+            }
+        }
+        Measured::Benched {
+            tag,
+            updated_at,
+            tests,
+        } => {
+            println!(
+                "  engine {tag}, measured {} (blazar bench)",
+                epoch_to_utc_date(*updated_at)
+            );
+            for line in bench_rows_lines(None, tests) {
+                println!("  {line}");
+            }
+        }
+        Measured::Absent => {
+            println!("  no benchmark on record — run: blazar bench {}", row.name);
+        }
+    }
+
+    println!();
+    println!("CERTIFICATE");
+    match &cert {
+        Some((tag, tested_at, caps_json)) => {
+            println!("  engine {tag}, verified {}", epoch_to_utc_date(*tested_at));
+            let probes = scorecard_caps_rows(caps_json).unwrap_or_default();
+            let line = probes
+                .iter()
+                .map(|(k, s)| format!("{k} {s}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  {line}");
+        }
+        None => println!(
+            "  no certificate on record — run: blazar model-doctor {}",
+            row.name
+        ),
+    }
+
+    println!();
+    println!("NEXT");
+    for hint in plan_next_hints(
+        &row.name,
+        !matches!(measured, Measured::Absent),
+        cert.is_some(),
+        base.is_some(),
+    ) {
+        println!("  {hint}");
+    }
+    Ok(())
+}
+
+/// A certificate older than this stops vouching for the model and the
+/// autopilot asks for a refresh (engine builds move under it).
+const AUTOPILOT_CERT_STALE_SECS: i64 = 30 * 86_400;
+
+/// One autopilot recommendation: the command to run, the one-line why,
+/// and the stored datum that justifies it — nothing recommends without
+/// evidence.
+#[derive(Debug)]
+struct AutopilotRec {
+    cmd: String,
+    why: &'static str,
+    datum: String,
+}
+
+/// Pure gap analysis for one local model — the autopilot's whole brain.
+/// Inputs are stored facts (bench stamp, tuned-profile stamp, certificate
+/// stamp vs now) plus whether the model's lane is benchable at all
+/// (diffusion/video lanes have no chat pp/tg to measure); output is
+/// ordered onboarding work. A model with every record fresh gets an
+/// EMPTY list, never a busywork rec.
+/// Encoder-only architecture classes in Blazar's own normalized arch
+/// vocabulary (GGUF metadata). llama-bench measures generative decode
+/// (pp/tg); these families generate nothing to measure and llama-bench
+/// on them aborts after a long CUDA init (observed live: hours-class
+/// hangs on embedders/rerankers). Generative families that merely LOOK
+/// related (`Qwen3_5ForConditionalGeneration`) stay benchable.
+#[must_use]
+fn bench_arch_refusal(arch: Option<&str>) -> Option<&'static str> {
+    const ENCODER_CLASSES: &[&str] = &[
+        "bert",
+        "modern-bert",
+        "nomic-bert",
+        "t5encoder",
+        "xlm-roberta",
+    ];
+    let arch = arch?;
+    ENCODER_CLASSES
+        .iter()
+        .copied()
+        .find(|c| arch.starts_with(c))
+}
+
+fn autopilot_recs(
+    name: &str,
+    benchable: bool,
+    bench_at: Option<i64>,
+    tuned_at: Option<i64>,
+    cert_at: Option<i64>,
+    now: i64,
+) -> Vec<AutopilotRec> {
+    let mut recs = Vec::new();
+    let bench_at = bench_at.filter(|t| *t > 0);
+    let tuned_at = tuned_at.filter(|t| *t > 0);
+    let cert_at = cert_at.filter(|t| *t > 0);
+    if benchable && bench_at.is_none() {
+        recs.push(AutopilotRec {
+            cmd: format!("blazar bench {name}"),
+            why: "no measured speed on record",
+            datum: "bench_results: no row".to_string(),
+        });
+    }
+    if let (Some(bench), Some(tuned)) = (bench_at, tuned_at)
+        && bench > tuned
+    {
+        recs.push(AutopilotRec {
+            cmd: format!("blazar tune {name}"),
+            why: "bench is newer than the adopted profile — the pins predate the measurement",
+            datum: format!(
+                "bench {} > tuned {}",
+                epoch_to_utc_date(bench),
+                epoch_to_utc_date(tuned)
+            ),
+        });
+    }
+    match cert_at {
+        None => recs.push(AutopilotRec {
+            cmd: format!("blazar model-doctor {name}"),
+            why: "no capability certificate on record — the admission gate has nothing to vouch with",
+            datum: "model_caps: no row".to_string(),
+        }),
+        Some(tested) => {
+            let age_days = (now - tested) / 86_400;
+            if now - tested > AUTOPILOT_CERT_STALE_SECS {
+                recs.push(AutopilotRec {
+                    cmd: format!("blazar model-doctor {name}"),
+                    why: "certificate is stale — engine builds moved under it",
+                    datum: format!(
+                        "verified {}, {age_days}d ago",
+                        epoch_to_utc_date(tested)
+                    ),
+                });
+            }
+        }
+    }
+    recs
+}
+
+/// `blazar autopilot` — observe → recommend (→ act with `--apply`).
+/// Read-only by construction: the analysis reads stored records and
+/// prints work; only `--apply` runs the recommended commands, and each
+/// one is the same command the user could type. Nothing mutates daemon
+/// state behind the user's back.
+async fn autopilot(apply: bool) -> Result<()> {
+    let d = dirs();
+    let store = Store::open(&d)?;
+    let models = store.list_models()?;
+    if models.is_empty() {
+        println!("no local models — pull one first: blazar pull <owner/repo:QUANT>");
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .cast_signed();
+    let mut plan: Vec<(String, Vec<AutopilotRec>, Option<String>)> = Vec::new();
+    for row in &models {
+        let bench_at = store
+            .latest_bench_result(&row.name, None)
+            .ok()
+            .flatten()
+            .map(|(_, _, at)| at);
+        let tuned_at = store
+            .active_engine()
+            .ok()
+            .flatten()
+            .and_then(|e| store.get_profile(&row.name, &e.tag).ok().flatten())
+            .map(|p| p.updated_at);
+        let cert_at = store
+            .get_model_caps_dated(&row.name)
+            .ok()
+            .flatten()
+            .map(|(_, tested, _)| tested);
+        // Bench drives llama-bench, which reads GGUF files only —
+        // recommending it for a safetensors/mlx model is busywork the
+        // bench itself must refuse; gate on format too. Encoder-only
+        // arches (embedders, rerankers, MT) get an explicit
+        // not-applicable note instead of a rec they can never satisfy.
+        let arch_class = bench_arch_refusal(row.arch.as_deref());
+        let benchable = matches!(run_lane(row), RunLane::Text)
+            && arch_class.is_none()
+            && std::path::Path::new(&row.path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+        let bench_note = arch_class.map(|class| {
+            format!(
+                "bench: not applicable — encoder-only class '{class}'; \
+llama-bench measures generative decode; embedding speed is per-request in /metrics"
+            )
+        });
+        let recs = autopilot_recs(&row.name, benchable, bench_at, tuned_at, cert_at, now);
+        plan.push((row.name.clone(), recs, bench_note));
+    }
+    for (name, recs, bench_note) in &plan {
+        println!("{name}");
+        if let Some(note) = bench_note {
+            println!("  {note}");
+        }
+        if recs.is_empty() {
+            println!("  up to date — measured, tuned, certified");
+        }
+        for r in recs {
+            println!("  → {} — {} ({})", r.cmd, r.why, r.datum);
+        }
+        println!();
+    }
+    if !apply {
+        let n: usize = plan.iter().map(|(_, r, _)| r.len()).sum();
+        if n == 0 {
+            println!("autopilot: nothing to do — every model is measured, tuned, and certified");
+        } else {
+            println!("autopilot: {n} recommendation(s) — apply with: blazar autopilot --apply");
+        }
+        return Ok(());
+    }
+    // Sequential on purpose: bench feeds tune, and one model's failure
+    // must not starve the rest.
+    for (name, recs, _) in &plan {
+        for r in recs {
+            println!("running: {}", r.cmd);
+            let outcome: Result<()> = if r.cmd.starts_with("blazar bench ") {
+                bench(name)
+            } else if r.cmd.starts_with("blazar tune ") {
+                tune_full(name, false, None, None, None, false, false, false, false).await
+            } else {
+                model_doctor_cmd(name, false).await
+            };
+            match outcome {
+                Ok(()) => println!("  done"),
+                Err(e) => println!("  failed: {e:#} — continuing with the remaining work"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `blazar scorecard <model>`: one-page card assembled purely from stored
+/// records — identity (store row), measured performance (the active
+/// engine's last bench payload), verified capabilities (the model-doctor
+/// certificate with its test date). Read-only: no probes, no benches, no
+/// spawns. Missing records print honest gap rows with the command that
+/// fills them.
+fn scorecard(model: &str, json: bool) -> Result<()> {
+    let d = dirs();
+    let store = Store::open(&d)?;
+    let row = store
+        .get_model(model)?
+        .ok_or_else(|| no_such_model(model))?;
+    let measured = resolve_measured(&store, &row.name)?;
+    let caps = store.get_model_caps_dated(&row.name).ok().flatten();
+
+    if json {
+        let identity = serde_json::json!({
+            "name": row.name,
+            "repo": row.repo,
+            "quant": row.quant,
+            "size_bytes": row.bytes,
+            "params_b": row.params,
+            "arch": row.arch,
+            "ctx_train": row.ctx_train,
+            "mmproj": row.mmproj_path,
+        });
+        let performance = measured_json_value(&measured);
+        let quality = caps.map(|(tag, tested_at, caps_json)| {
+            serde_json::json!({
+                "engine": tag,
+                "verified_at": epoch_to_utc_date(tested_at),
+                "probes": scorecard_caps_rows(&caps_json),
+            })
+        });
+        println!(
+            "{}",
+            serde_json::json!({
+                "object": "blazar.scorecard",
+                "identity": identity,
+                "performance": performance,
+                "quality": quality,
+            })
+        );
+        return Ok(());
+    }
+
+    // Human card: aligned key/value blocks per section (show() layout).
+    let mut identity = model_identity_rows(&row, true);
+    if let Some(m) = &row.mmproj_path {
+        identity.push(("mmproj", m.clone()));
+    }
+    let w = identity.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in &identity {
+        println!("{k:<w$}  {v}");
+    }
+
+    println!();
+    match &measured {
+        Measured::Tuned {
+            tag,
+            updated_at,
+            score,
+            tests,
+        } => {
+            println!(
+                "performance (engine {tag}, measured {} via blazar tune)",
+                epoch_to_utc_date(*updated_at)
+            );
+            for line in bench_rows_lines(Some(*score), tests) {
+                println!("  {line}");
+            }
+        }
+        Measured::Benched {
+            tag,
+            updated_at,
+            tests,
+        } => {
+            println!(
+                "performance (engine {tag}, measured {} via blazar bench)",
+                epoch_to_utc_date(*updated_at)
+            );
+            for line in bench_rows_lines(None, tests) {
+                println!("  {line}");
+            }
+        }
+        Measured::Absent => println!(
+            "performance  no benchmark on record — run: blazar bench {}",
+            row.name
+        ),
+    }
+
+    println!();
+    match &caps {
+        Some((tag, tested_at, caps_json)) => {
+            println!(
+                "quality (engine {tag}, verified {} via blazar model-doctor)",
+                epoch_to_utc_date(*tested_at)
+            );
+            for (probe, status) in scorecard_caps_rows(caps_json).unwrap_or_default() {
+                println!("  {probe:<12}  {status}");
+            }
+        }
+        None => println!(
+            "quality      no certificate on record — run: blazar model-doctor {}",
+            row.name
+        ),
+    }
+    Ok(())
+}
+
+/// Thousands-suffixed context/token counts (`8K`, `32K`) — keeps the card
+/// columns narrow; raw values live in `--json`.
+fn format_k(n: i64) -> String {
+    if n >= 1_048_576 && n % 1_048_576 == 0 {
+        format!("{}M", n / 1_048_576)
+    } else if n > 0 && n % 1024 == 0 {
+        format!("{}K", n / 1024)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Per-row table cells for `blazar ps`: GPU label (offload + card),
 /// SPEC label (mode + draft file), and the lifetime cache-hit ratio
 /// (`-` until the gateway has classified a completed response for the
@@ -7091,6 +8176,59 @@ fn ps_row_cells(m: &serde_json::Value) -> (String, String, String) {
         None => "-".to_string(),
     };
     (gpu, spec, hit)
+}
+
+/// `blazar classify` — one-shot decision-model consultation: the
+/// normalized /v1/classify lane over the child's systemone surface.
+async fn classify_cmd(model: &str, text: &[String], labels: &[String], json: bool) -> Result<()> {
+    if text.is_empty() {
+        bail!(
+            "classify needs the text to classify — blazar classify <model> \"the text\" --labels a,b"
+        );
+    }
+    if labels.len() < 2 {
+        bail!("classify needs 2..=16 labels — --labels safe,unsafe,unclear");
+    }
+    let base = ensure_daemon().await?;
+    let body = serde_json::json!({
+        "model": resolve_model_cli(model),
+        "input": text.join(" "),
+        "labels": labels,
+    });
+    let resp = cli_http()
+        .post(format!("{base}/v1/classify"))
+        .json(&body)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        let msg = v["error"]["message"]
+            .as_str()
+            .or_else(|| v["error"].as_str())
+            .unwrap_or("no detail");
+        bail!("classify failed ({status}): {msg}");
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!("model       {}", v["model"].as_str().unwrap_or(model));
+    println!();
+    for l in v["labels"]
+        .as_array()
+        .map_or(&[] as &[serde_json::Value], Vec::as_slice)
+    {
+        let pct = l["probability"].as_f64().unwrap_or(0.0) * 100.0;
+        println!("{:<24} {:>5.1}%", l["label"].as_str().unwrap_or("-"), pct);
+    }
+    println!();
+    println!("top         {}", v["top"].as_str().unwrap_or("-"));
+    if let Some(c) = v["confidence"].as_f64() {
+        println!("confidence  {c:.3}");
+    }
+    Ok(())
 }
 
 async fn ps(reset: bool, json: bool) -> Result<()> {
@@ -7202,18 +8340,105 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
 }
 
 /// `blazar run` dispatch: inline prompt = single-shot, none = REPL.
+/// Workload postures for `run --intent`: one word instead of a dozen
+/// knobs. The mapping stays thin — queue priority, reasoning default,
+/// multimodal preflight — and is printed so nothing applies silently.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+enum Intent {
+    Interactive,
+    Agent,
+    Batch,
+    Coding,
+    Reasoning,
+    Vision,
+}
+
+/// What one intent actually changes. `priority` rides the gateway's
+/// `x-blazar-priority` header on every request of the session.
+struct IntentPlan {
+    priority: Option<&'static str>,
+    force_think: bool,
+    needs_vision: bool,
+    note: &'static str,
+}
+
+fn intent_plan(intent: Intent) -> IntentPlan {
+    match intent {
+        Intent::Interactive => IntentPlan {
+            priority: None,
+            force_think: false,
+            needs_vision: false,
+            note: "interactive — default posture, no overrides",
+        },
+        Intent::Agent | Intent::Coding => IntentPlan {
+            priority: Some("high"),
+            force_think: false,
+            needs_vision: false,
+            note: "high queue priority — tool and coding turns jump the batch lane",
+        },
+        Intent::Batch => IntentPlan {
+            priority: Some("low"),
+            force_think: false,
+            needs_vision: false,
+            note: "low queue priority — batch turns yield to interactive traffic",
+        },
+        Intent::Reasoning => IntentPlan {
+            priority: None,
+            force_think: true,
+            needs_vision: false,
+            note: "reasoning requested — think=true rides every turn",
+        },
+        Intent::Vision => IntentPlan {
+            priority: None,
+            force_think: false,
+            needs_vision: true,
+            note: "multimodal preflight — projector sidecar verified before the first turn",
+        },
+    }
+}
+
+/// Intent never bends a media lane: say so instead of ignoring the flag.
+fn intent_lane_note(intent: Option<Intent>, lane: &str) {
+    if intent.is_some() {
+        println!("note: --intent shapes chat sessions; this model routes to the {lane} lane");
+    }
+}
+
 async fn run_dispatch(
     model: &str,
     prompt: &[String],
     verbose: bool,
     max_tokens: Option<u64>,
     no_draft: bool,
+    intent: Option<Intent>,
 ) -> Result<()> {
+    let plan = intent.map(intent_plan);
+    if let Some(p) = &plan {
+        println!("intent: {}", p.note);
+    }
     if prompt.is_empty() {
-        return run_repl(model, no_draft).await;
+        return run_repl(model, no_draft, plan.as_ref().and_then(|p| p.priority)).await;
     }
     let base = ensure_daemon().await?;
     let text = prompt.join(" ");
+    // Ready-card (interactive single-shot only): the daemon's real
+    // decision for THIS model, one line, before the first token. Piped
+    // output stays byte-identical for scripts and receipts.
+    {
+        use std::io::IsTerminal as _;
+        if std::io::stdout().is_terminal() {
+            match fetch_explain_card(&base, model).await {
+                Some(card) => {
+                    if let Some(line) = ready_card_line(&card) {
+                        println!("\x1b[2m{line}\x1b[0m");
+                    }
+                }
+                None => println!(
+                    "\x1b[2mprofile: unavailable (daemon did not answer the explain card)\x1b[0m"
+                ),
+            }
+        }
+    }
     let mut body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": text}],
@@ -7233,7 +8458,17 @@ async fn run_dispatch(
     if !options.is_empty() {
         body["options"] = serde_json::Value::Object(options);
     }
-    let outcome = stream_chat(base.clone(), body.clone()).await?;
+    // The REPL defaults think=true; a one-shot does not — reasoning
+    // intent closes that gap for single prompts.
+    if plan.as_ref().is_some_and(|p| p.force_think) {
+        body["think"] = serde_json::json!(true);
+    }
+    let outcome = stream_chat_opts(
+        base.clone(),
+        body.clone(),
+        plan.as_ref().and_then(|p| p.priority),
+    )
+    .await?;
     if outcome.interrupted {
         println!("\n^C interrupted");
         std::process::exit(130);
@@ -9522,7 +10757,7 @@ async fn ask_systemone(
     Ok(false)
 }
 
-async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
+async fn run_repl(model: &str, no_draft: bool, priority: Option<&str>) -> Result<()> {
     let base = ensure_daemon().await?;
     if repl_is_decision_model(model)? {
         return run_repl_systemone(&base, model).await;
@@ -9544,6 +10779,19 @@ async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
         "blazar REPL — {model} {} — /help for commands",
         repl_lane_suffix(&model)?
     );
+    if let Some(p) = priority {
+        println!("queue priority: {p} (session-wide, via --intent)");
+    }
+    // Ready-card: the daemon's real decision for this session's model,
+    // straight from the same card `plan` shows in full.
+    match fetch_explain_card(&base, &model).await {
+        Some(card) => {
+            if let Some(line) = ready_card_line(&card) {
+                println!("{line}");
+            }
+        }
+        None => println!("profile: unavailable (daemon did not answer the explain card)"),
+    }
     loop {
         let line = match repl_read_turn(&mut rl) {
             ReplRead::Exit => break,
@@ -9590,6 +10838,7 @@ async fn run_repl(model: &str, no_draft: bool) -> Result<()> {
             verbose,
             &mut thinks,
             no_draft,
+            priority,
         )
         .await?;
     }
@@ -9637,6 +10886,7 @@ fn repl_read_turn(rl: &mut rustyline::DefaultEditor) -> ReplRead {
 /// retry: the first turn per model asks for thinking; if the daemon's
 /// teaching 400 says the model has no thinking mode, remember that and
 /// re-send once without the knob. The notice keeps the fallback loud.
+#[allow(clippy::too_many_arguments)] // REPL turn plumbing: one param per concern
 async fn repl_send_turn(
     base: &str,
     model: &str,
@@ -9645,12 +10895,20 @@ async fn repl_send_turn(
     verbose: bool,
     thinks: &mut bool,
     no_draft: bool,
+    priority: Option<&str>,
 ) -> Result<()> {
-    if let Err(e) = repl_turn(base, model, history, system_msg, verbose, *thinks, no_draft).await {
+    if let Err(e) = repl_turn(
+        base, model, history, system_msg, verbose, *thinks, no_draft, priority,
+    )
+    .await
+    {
         if *thinks && is_unsupported_think_error(&e.to_string()) {
             *thinks = false;
             println!("(this model has no thinking mode — answers only)");
-            repl_turn(base, model, history, system_msg, verbose, *thinks, no_draft).await?;
+            repl_turn(
+                base, model, history, system_msg, verbose, *thinks, no_draft, priority,
+            )
+            .await?;
         } else {
             return Err(e);
         }
@@ -10345,6 +11603,7 @@ fn is_unsupported_think_error(msg: &str) -> bool {
 /// tokio's `ctrl_c` listener can stay unresolved for the whole stream under
 /// chunk-flood load (live-proven on this runtime), so the REPL must not
 /// depend on the async signal scheduler for this.
+#[allow(clippy::too_many_arguments)] // REPL turn plumbing: one param per concern
 async fn repl_turn(
     base: &str,
     model: &str,
@@ -10353,6 +11612,7 @@ async fn repl_turn(
     verbose: bool,
     thinks: bool,
     no_draft: bool,
+    priority: Option<&str>,
 ) -> Result<bool> {
     let mut messages = Vec::with_capacity(history.len() + 1);
     if let Some(sys) = system_msg {
@@ -10379,7 +11639,7 @@ async fn repl_turn(
         // to the configured spec mode.
         body["options"] = serde_json::json!({ "spec": "off" });
     }
-    let outcome = stream_chat(base.to_string(), body).await?;
+    let outcome = stream_chat_opts(base.to_string(), body, priority).await?;
     if outcome.interrupted {
         println!("\n^C interrupted");
         return Ok(true);
@@ -10436,19 +11696,26 @@ fn chat_stats_line(v: &serde_json::Value) -> String {
     format!("total duration: answer {ec} tokens at {rate:.1} t/s; prompt {pc} tokens")
 }
 
-/// Stream an /api/chat NDJSON response to stdout, accumulating the
-/// assistant text alongside the final (usage-carrying) chunk.
+/// `stream_chat` with an optional `x-blazar-priority` value ("high" /
+/// "low") riding every request — the session-wide lane `run --intent`
+/// sets. `None` is byte-identical to the historic request shape.
 #[allow(clippy::duration_suboptimal_units)] // 10-minute generation ceiling
-async fn stream_chat(base: String, body: serde_json::Value) -> Result<StreamOutcome> {
+async fn stream_chat_opts(
+    base: String,
+    body: serde_json::Value,
+    priority: Option<&str>,
+) -> Result<StreamOutcome> {
     use std::io::IsTerminal as _;
     // Streaming lane: no total-request ceiling; the 600s per-request
     // timeout below is the bound (F126 exemption).
-    let resp = reqwest::Client::new()
+    let mut req = reqwest::Client::new()
         .post(format!("{base}/api/chat"))
         .json(&body)
-        .timeout(std::time::Duration::from_secs(600))
-        .send()
-        .await?;
+        .timeout(std::time::Duration::from_secs(600));
+    if let Some(p) = priority {
+        req = req.header("x-blazar-priority", p);
+    }
+    let resp = req.send().await?;
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
         return Err(anyhow!("daemon: {text}"));
@@ -10557,6 +11824,24 @@ the running server."
     )
 }
 
+/// The llama-bench lane for measurement persistence: the ACTIVE engine
+/// when it is llamacpp, else the first installed llamacpp lane (same
+/// rule `tune` uses to pick its benching engine).
+fn bench_lane_engine(store: &Store) -> Option<blazar_core::store::EngineRow> {
+    store
+        .active_engine()
+        .ok()
+        .flatten()
+        .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+        .or_else(|| {
+            store
+                .list_engines()
+                .ok()?
+                .into_iter()
+                .find(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+        })
+}
+
 fn bench(model: &str) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
@@ -10565,6 +11850,16 @@ fn bench(model: &str) -> Result<()> {
         .ok_or_else(|| no_such_model(model))?;
     if std::path::Path::new(&row.path).is_dir() {
         anyhow::bail!(dir_bench_refusal(&row.name, row.is_mlx()));
+    }
+    if let Some(class) = bench_arch_refusal(row.arch.as_deref()) {
+        anyhow::bail!(
+            "blazar bench {0}: refused — arch '{1}' is encoder-only (class '{class}'); \
+llama-bench measures generative decode (pp/tg) and aborts on this family after \
+a long CUDA init. Embedding/rerank speed is measured live per request (/metrics, \
+`blazar scorecard {0}`); capabilities: `blazar model-doctor {0}`",
+            row.name,
+            row.arch.as_deref().unwrap_or("?")
+        );
     }
     let bench_bin = blazar_runtime::bench::find_bench_bin(&d)?;
     let tuner = blazar_runtime::Tuner {
@@ -10576,7 +11871,7 @@ fn bench(model: &str) -> Result<()> {
         "{:<10} {:>8} {:>8} {:>6} {:<6} {:<6}",
         "TEST", "T/S", "CTX", "THREADS", "CTK", "CTV"
     );
-    for r in rows {
+    for r in &rows {
         println!(
             "{:<10} {:>8.2} {:>8} {:>6} {:<6} {:<6}",
             r.test_name(),
@@ -10586,6 +11881,16 @@ fn bench(model: &str) -> Result<()> {
             r.type_k.as_deref().unwrap_or("-"),
             r.type_v.as_deref().unwrap_or("-"),
         );
+    }
+    // Persist for scorecards and `plan` MEASURED — durable per
+    // (model, lane): re-benching the same pair is unnecessary.
+    match bench_lane_engine(&store) {
+        Some(engine) => {
+            let payload =
+                serde_json::to_string(&rows).map_err(|e| anyhow!("serializing bench rows: {e}"))?;
+            store.put_bench_result(&row.name, &engine.tag, &payload)?;
+        }
+        None => println!("note: no llamacpp engine row on record — result not persisted"),
     }
     Ok(())
 }
@@ -10611,6 +11916,17 @@ async fn tune_full(
     let row = store
         .get_model(model)?
         .ok_or_else(|| no_such_model(model))?;
+    // Same encoder-class refusal as `bench`: the tuner drives llama-bench
+    // under the hood, so the hours-class abort applies identically.
+    if let Some(class) = bench_arch_refusal(row.arch.as_deref()) {
+        anyhow::bail!(
+            "blazar tune {}: refused — arch '{}' is encoder-only (class '{class}'); \
+the tuner drives llama-bench, which measures generative decode (pp/tg) and \
+aborts on this family. Profile pins for it would measure nothing",
+            row.name,
+            row.arch.as_deref().unwrap_or("?")
+        );
+    }
     // The bench lane drives llama-bench, so the engine row must be a
     // llamacpp lane — the ACTIVE row may be any kind (a store flipped
     // by an sglang session would otherwise compile llamacpp argv
@@ -11766,6 +13082,50 @@ fn gate_baseline(store: &Store) -> Result<Option<(String, f64, String)>> {
     Ok(store.latest_bench_by_time()?)
 }
 
+/// Guard math for the gate probe: does a llama-bench load of `weights`
+/// bytes fit `free_mib` of measured VRAM? Beyond the weights, llama-bench
+/// allocates CUDA context + compute buffers + a small KV for its rows —
+/// 1.5 GiB covers that overhead for the model classes this gate benches
+/// (0.5B-70B Q4-Q8); refusing slightly early is safe, the OOM dump it
+/// prevents is not. `None` (no measurable GPU — AMD/Metal/CPU boxes)
+/// never refuses: no gate data is not zero headroom.
+fn gate_bench_fits(weights_bytes: u64, free_mib: Option<u64>) -> bool {
+    const BENCH_HEADROOM_MIB: u64 = 1536;
+    let Some(free) = free_mib else {
+        return true;
+    };
+    let weights_mib = weights_bytes / (1024 * 1024);
+    weights_mib + BENCH_HEADROOM_MIB <= free
+}
+
+/// Free-VRAM pre-flight for the gate probe. The bench loads the FULL
+/// baseline model; when a daemon (ours or a foreign tenant) already
+/// holds the card, that load OOMs deep inside llama-bench and surfaces
+/// as a raw stderr dump. Fail fast with a teaching error instead.
+fn gate_vram_preflight(model_path: &std::path::Path) -> Result<(), String> {
+    // Unreadable/missing file: skip the guard — the bench itself owns
+    // that error with its own message.
+    let Ok(meta) = std::fs::metadata(model_path) else {
+        return Ok(());
+    };
+    let free = blazar_runtime::probe::nvidia_free_vram_mib();
+    if gate_bench_fits(meta.len(), free) {
+        return Ok(());
+    }
+    #[allow(clippy::cast_precision_loss)] // display rounding only
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    Err(format!(
+        "gate bench cannot fit: {} needs ~{:.1} GiB (+~1.5 GiB bench overhead) but only \
+         {} MiB VRAM is free — a resident model holds the card. Free it first \
+         (`blazar ps` to see holders, `blazar stop` or evict), re-run when idle, or \
+         skip the comparison with `engine update --no-gate` (the gate row stays \
+         recorded; nothing else changes).",
+        model_path.display(),
+        gib(meta.len()),
+        free.unwrap_or_default(),
+    ))
+}
+
 /// Single-shot tg128 on a specific engine's llama-bench.
 fn quick_tg(
     d: &BlazarDirs,
@@ -11787,6 +13147,8 @@ fn quick_tg(
             "probing decode on {which} (tg128; loads the model first, ~30-60s)..."
         ))
     );
+    gate_vram_preflight(std::path::Path::new(model_path))
+        .map_err(|e| anyhow!("gate pre-flight: {e}"))?;
     let rows = tuner.bench_default(std::path::Path::new(model_path))?;
     let tg = rows
         .iter()
@@ -11801,9 +13163,12 @@ fn quick_tg(
 }
 
 /// F7 regression gate: DEFAULT-config tg128 on the freshly installed
-/// engine vs the recorded baseline engine. Skips silently when no tune
-/// baseline exists (nothing to compare). On a >10% decode drop it rolls
-/// the previous engine back to active and errors.
+/// engine vs the recorded baseline engine. Skips when no tune baseline
+/// exists OR its references went stale (baseline model un-pulled /
+/// baseline engine pruned by retention — nothing to gate against, the
+/// same skip-no-baseline contract as having no record at all). On a
+/// decode drop over 10% it rolls the previous engine back to active
+/// and errors.
 fn engine_regression_gate(
     mgr: &EngineManager,
     d: &BlazarDirs,
@@ -11811,14 +13176,30 @@ fn engine_regression_gate(
 ) -> Result<()> {
     let store = Store::open(d)?;
     if let Some((prev_tag, _recorded_tg, model)) = gate_baseline(&store)? {
-        let mrow = store
-            .get_model(&model)?
-            .ok_or_else(|| anyhow!("gate baseline model {model:?} no longer pulled"))?;
-        let prev_row = store
+        let Some(mrow) = store.get_model(&model)? else {
+            println!(
+                "{}",
+                dim_line(&format!(
+                    "gate: baseline model {model:?} no longer pulled — skipping the comparison \
+                     (nothing to gate against)"
+                ))
+            );
+            return Ok(());
+        };
+        let Some(prev_row) = store
             .list_engines()?
             .into_iter()
             .find(|e| e.tag == prev_tag)
-            .ok_or_else(|| anyhow!("gate: baseline engine {prev_tag} pruned"))?;
+        else {
+            println!(
+                "{}",
+                dim_line(&format!(
+                    "gate: baseline engine {prev_tag} pruned — skipping the comparison \
+                     (nothing to gate against)"
+                ))
+            );
+            return Ok(());
+        };
         let prev_tg = quick_tg(d, &prev_row, &mrow.path, "current engine")?;
         let new_tg = quick_tg(d, row, &mrow.path, &format!("candidate {}", row.tag))?;
         println!(
@@ -11910,6 +13291,15 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 let prov = m
                     .as_ref()
                     .map(|m| (m.provenance_label(), m.source.as_str().to_string()));
+                // Registry rows can outlive their files (a tree deleted
+                // out from under the store) — the row renders healthy
+                // until the first spawn 500s mid-request. Surface the
+                // disk state at listing time: dir present AND non-empty.
+                let files_present = d
+                    .engines_dir()
+                    .join(&e.tag)
+                    .read_dir()
+                    .is_ok_and(|mut rd| rd.next().is_some());
                 if json {
                     // Full sha256 (the table truncates to 12 chars) —
                     // scripts verifying assets want the whole digest.
@@ -11922,6 +13312,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                         "active": e.active,
                         "sha256": e.sha256,
                         "source": prov.as_ref().map_or("unknown", |(_, s)| s.as_str()),
+                        "disk": if files_present { "present" } else { "missing" },
                     });
                     if let Some((label, _)) = &prov
                         && !label.is_empty()
@@ -11943,17 +13334,32 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     Some(by) => format!("superseded by {by}"),
                     None => String::new(),
                 };
+                // Missing files outrank the active mark in STATE (the
+                // row is unusable either way); the NOTES cell carries
+                // the reinstall teaching.
+                let notes = if files_present {
+                    superseded
+                } else {
+                    let teach = format!("FILES MISSING — blazar engine install --kind {}", e.kind);
+                    if superseded.is_empty() {
+                        teach
+                    } else {
+                        format!("{superseded}; {teach}")
+                    }
+                };
                 table.push(vec![
                     e.tag.clone(),
                     e.kind.as_str().to_string(),
                     asset,
-                    if e.active {
+                    if !files_present {
+                        "missing".to_string()
+                    } else if e.active {
                         "active".to_string()
                     } else {
                         "-".to_string()
                     },
                     e.sha256.chars().take(12).collect::<String>(),
-                    superseded,
+                    notes,
                 ]);
             }
             if json {
@@ -13114,6 +14520,17 @@ async fn engine_update(
         bus: EventBus::default(),
         asset_override: cfg.engine_asset.clone(),
     };
+    // Stable-name context for every report below: upstream's newest
+    // non-prerelease vX.Y.Z marker names the b-build it stamps, so
+    // "b11429" can read as "stable v0.6.0". Advisory only — a failed
+    // marker fetch (offline, rate limited) never blocks the update.
+    let stable = match mgr.gh.stable_marker().await {
+        Ok(m) => m,
+        Err(e) => {
+            println!("{}", dim_line(&format!("stable marker unavailable: {e:#}")));
+            None
+        }
+    };
     if check {
         // Dry-run: report the channel target and the prebuilt-asset story
         // for THIS box, then leave — nothing downloaded or written.
@@ -13130,16 +14547,25 @@ async fn engine_update(
             // Lane-suffixed active tags (b11339-cuda) are the same
             // build as the channel target (b11339) — raw string
             // equality would report an update forever on CUDA boxes.
-            Some(a) if same_build(a, &target_tag) => println!("up to date: {a} active"),
+            Some(a) if same_build(a, &target_tag) => {
+                println!(
+                    "up to date: {a} active{}",
+                    stable_alias_paren(stable.as_ref(), a)
+                );
+            }
             Some(a) => println!(
-                "update available: {a} -> {target_tag}{}",
+                "update available: {a} -> {target_tag}{}{}",
+                stable_alias_paren(stable.as_ref(), &target_tag),
                 if downgrade {
                     " (channel downgrade — channels are pins, not floors)"
                 } else {
                     ""
                 }
             ),
-            None => println!("no active engine — target {target_tag}"),
+            None => println!(
+                "no active engine — target {target_tag}{}",
+                stable_alias_paren(stable.as_ref(), &target_tag)
+            ),
         }
         if let (Some((maj, min)), Some(pick)) = (&lane.driver_cuda, &lane.upstream_cuda) {
             println!(
@@ -13189,8 +14615,9 @@ async fn engine_update(
         Some(rel) => println!(
             "{}",
             dim_line(&format!(
-                "installing upstream engine {} — runtime companion downloads show their own progress bar",
-                rel.tag_name
+                "installing upstream engine {}{} — runtime companion downloads show their own progress bar",
+                rel.tag_name,
+                stable_alias_paren(stable.as_ref(), &rel.tag_name)
             ))
         ),
         None => println!(
@@ -13236,8 +14663,9 @@ async fn engine_update(
             return Ok(());
         }
         println!(
-            "engine {} already active — nothing new installed (see the warning above for lane options)",
-            row.tag
+            "engine {}{} already active — nothing new installed (see the warning above for lane options)",
+            row.tag,
+            stable_alias_paren(stable.as_ref(), &row.tag)
         );
     } else if gate_on {
         engine_regression_gate(&mgr, d, &row)?;
@@ -13276,11 +14704,12 @@ async fn engine_update(
     }
     if row.active {
         println!(
-            "engine {} active (build {}, {} devices, {} flags)",
+            "engine {} active (build {}, {} devices, {} flags){}",
             row.tag,
             m.build_number,
             m.devices.len(),
-            m.flags.len()
+            m.flags.len(),
+            stable_alias_paren(stable.as_ref(), &row.tag)
         );
     } else {
         // keep-cuda guard fired: an installed CUDA engine stays active.
@@ -13724,16 +15153,22 @@ async fn upstream_update_hint(dirs: &BlazarDirs) {
     let Ok(gh) = GhClient::new(token) else { return };
     let latest = gh.channel_b_release(cfg.update_channel).await;
     if let Ok(rel) = latest {
+        // Advisory stable-name context; marker failure degrades to the
+        // plain channel wording.
+        let stable = gh.stable_marker().await.ok().flatten();
         if same_build(&active.tag, &rel.tag_name) {
             println!(
-                "engine up to date: {} (channel: {})",
-                active.tag, cfg.update_channel
+                "engine up to date: {} ({}channel: {})",
+                active.tag,
+                stable_prefix(stable.as_ref(), &active.tag),
+                cfg.update_channel
             );
         } else {
             println!(
-                "{} available: {} (active: {}, channel: {}) — run: {}",
+                "{} available: {}{} (active: {}, channel: {}) — run: {}",
                 channel_word(&active.tag, &rel.tag_name),
                 rel.tag_name,
+                stable_alias_paren(stable.as_ref(), &rel.tag_name),
                 active.tag,
                 cfg.update_channel,
                 engine_update_command(&active.tag, &active.asset)
@@ -14726,6 +16161,20 @@ async fn resident_models() -> (Vec<String>, bool) {
 // One report walked top-to-bottom (stores -> disk -> reclaim -> external);
 // splitting it hides the report order it exists to show.
 #[allow(clippy::too_many_lines)]
+/// One per-model tier line: where the model currently lives in the
+/// storage hierarchy. VRAM comes from the daemon's resident list (only
+/// meaningful while it is up), disk from the store row; remote presence
+/// is peer-probe territory and stays a pointer to `blazar route`.
+fn storage_tier_row(name: &str, vram_resident: bool, disk_bytes: i64) -> String {
+    let vram = if vram_resident {
+        "VRAM resident"
+    } else {
+        "cold"
+    };
+    format!("{name:<28} {vram:<14} disk {}", humansize(disk_bytes))
+}
+
+#[allow(clippy::too_many_lines)] // report builder: one section per surface
 async fn storage_cmd(json: bool) -> Result<()> {
     use blazar_runtime::storage;
 
@@ -14754,6 +16203,17 @@ async fn storage_cmd(json: bool) -> Result<()> {
         .map(|r| u64::try_from(r.bytes).unwrap_or(0))
         .sum();
     let hs = |b: u64| humansize(i64::try_from(b).unwrap_or(i64::MAX));
+    let tier_models: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "name": r.name,
+                "vram_resident": residents.contains(&r.name),
+                "disk_bytes": r.bytes,
+            })
+        })
+        .collect();
+    let remotes = config().map_or(0, |c| c.remotes.len());
     if json {
         let v = serde_json::json!({
             "object": "blazar.storage",
@@ -14783,6 +16243,10 @@ async fn storage_cmd(json: bool) -> Result<()> {
                     .collect::<Vec<_>>(),
             },
             "daemon_up": daemon_up,
+            "tiers": {
+                "models": tier_models,
+                "remote_peers": remotes,
+            },
         });
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -14811,6 +16275,28 @@ async fn storage_cmd(json: bool) -> Result<()> {
     match (free, total) {
         (Some(f), Some(t)) => println!("  available:   {} of {}", hs(f), hs(t)),
         _ => println!("  available:   unknown ({})", d.models_dir().display()),
+    }
+    // Storage hierarchy per model: what is hot (VRAM) vs what is only
+    // on disk, and the remote tier as a pointer — a peer's model list
+    // is live-probe territory (`blazar route`), not a stored fact.
+    if !rows.is_empty() {
+        println!("\nMODEL TIERS");
+        for r in &rows {
+            println!(
+                "  {}",
+                storage_tier_row(&r.name, residents.contains(&r.name), r.bytes)
+            );
+        }
+        if remotes > 0 {
+            println!(
+                "  remote: {remotes} peer(s) configured — `blazar route <model>` checks who lists it"
+            );
+        } else {
+            println!("  remote: no peers configured");
+        }
+        if !daemon_up {
+            println!("  note: daemon down — VRAM tiers reflect the last resident list");
+        }
     }
     println!("\nRECLAIM CANDIDATES");
     println!(
@@ -15010,7 +16496,15 @@ async fn prune_cmd(
 // Open WebUI are configured through their own UI/env, so they get printed
 // instructions instead of a written file.
 
-const CONNECT_CLIENTS: &[&str] = &["codex", "claude", "continue", "cline", "openwebui"];
+const CONNECT_CLIENTS: &[&str] = &[
+    "codex",
+    "claude",
+    "continue",
+    "cline",
+    "openwebui",
+    "opencode",
+    "pi",
+];
 
 /// What `connect` will do for one client.
 #[derive(Debug, Clone, PartialEq)]
@@ -15074,13 +16568,183 @@ fn continue_model_block(base: &str, model: &str) -> String {
     )
 }
 
+/// What the agent-harness configs need to know about the connect model:
+/// identity plus the VERIFIED capability flags (from the model-doctor
+/// certificate when present) and the training context. Defaults are
+/// conservative so an uncertified model still connects — flags off,
+/// context unknown.
+struct ConnectModelMeta {
+    id: String,
+    context: Option<i64>,
+    tools: bool,
+    reasoning: bool,
+    vision: bool,
+}
+
+fn connect_model_meta(model: &str) -> ConnectModelMeta {
+    let (context, tools, reasoning, vision) = Store::open(&dirs())
+        .ok()
+        .and_then(|s| {
+            let row = s.get_model(model).ok().flatten()?;
+            let caps = s
+                .get_model_caps_dated(model)
+                .ok()
+                .flatten()
+                .and_then(|(_, _, caps_json)| scorecard_caps_rows(&caps_json));
+            let status = |probe: &str| {
+                caps.as_ref()
+                    .and_then(|rows| {
+                        rows.iter()
+                            .find(|(p, _)| p == probe)
+                            .map(|(_, s)| s == "PASS")
+                    })
+                    .unwrap_or(false)
+            };
+            Some((
+                row.ctx_train,
+                status("tools"),
+                status("think"),
+                status("vision"),
+            ))
+        })
+        .unwrap_or((None, false, false, false));
+    ConnectModelMeta {
+        id: model.to_string(),
+        context,
+        tools,
+        reasoning,
+        vision,
+    }
+}
+
+/// opencode provider block (schema verified against the published
+/// config schema at <https://opencode.ai/config.json>): an
+/// OpenAI-compatible provider the agent loads via
+/// @ai-sdk/openai-compatible. Model flags come from the capability
+/// certificate; the context limit is the model's train context.
+/// Idempotent: re-running overwrites only provider.blazar.
+fn opencode_provider_merge(
+    existing: &serde_json::Value,
+    base: &str,
+    m: &ConnectModelMeta,
+) -> serde_json::Value {
+    let mut v = existing.clone();
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    let obj = v.as_object_mut().expect("just made an object");
+    let provider = obj
+        .entry("provider".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(p) = provider.as_object_mut() {
+        let mut model = serde_json::Map::new();
+        model.insert("name".into(), serde_json::json!(m.id));
+        if let Some(ctx) = m.context {
+            // output rides the same ceiling: the engine caps generation
+            // at the context, not a separate invented limit.
+            model.insert(
+                "limit".into(),
+                serde_json::json!({"context": ctx, "output": ctx}),
+            );
+        }
+        model.insert("tool_call".into(), serde_json::json!(m.tools));
+        model.insert("reasoning".into(), serde_json::json!(m.reasoning));
+        model.insert("attachment".into(), serde_json::json!(m.vision));
+        // ACCUMULATE: preserve models already advertised under
+        // provider.blazar so repeated connects (and --all-models) widen
+        // the menu instead of shrinking it back to one entry.
+        let mut blazar = p
+            .get("blazar")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(b) = blazar.as_object_mut() {
+            let models = b
+                .entry("models".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(mm) = models.as_object_mut() {
+                mm.insert(m.id.clone(), serde_json::Value::Object(model));
+            }
+            b.insert("name".into(), serde_json::json!("Blazar (local)"));
+            b.insert("npm".into(), serde_json::json!("@ai-sdk/openai-compatible"));
+            b.insert(
+                "options".into(),
+                serde_json::json!({
+                    "baseURL": format!("{base}/v1"),
+                    // Some provider clients refuse to boot without a
+                    // token present; Blazar ignores it when keys are off.
+                    "apiKey": "blazar-local",
+                }),
+            );
+        }
+        p.insert("blazar".into(), blazar);
+    }
+    v
+}
+
+/// pi (and oh-my-pi — same agent directory) models.json block (shape
+/// verified against pi-mono's official docs): an OpenAI-completions
+/// endpoint entry with the model list. Idempotent: providers.blazar is
+/// replaced wholesale, other providers untouched.
+fn pi_providers_merge(
+    existing: &serde_json::Value,
+    base: &str,
+    m: &ConnectModelMeta,
+) -> serde_json::Value {
+    let mut v = existing.clone();
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    let obj = v.as_object_mut().expect("just made an object");
+    let providers = obj
+        .entry("providers".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(p) = providers.as_object_mut() {
+        let mut model = serde_json::Map::new();
+        model.insert("id".into(), serde_json::json!(m.id));
+        model.insert("name".into(), serde_json::json!(m.id));
+        if m.reasoning {
+            model.insert("reasoning".into(), serde_json::json!(true));
+        }
+        if m.vision {
+            model.insert("input".into(), serde_json::json!(["text", "image"]));
+        }
+        // ACCUMULATE: keep models already listed under providers.blazar
+        // (repeated connects and --all-models widen the array; other
+        // providers untouched).
+        let mut blazar = p
+            .get("blazar")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(b) = blazar.as_object_mut() {
+            let models = b
+                .entry("models".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(arr) = models.as_array_mut() {
+                arr.retain(|existing| {
+                    existing.get("id").and_then(|i| i.as_str()) != Some(m.id.as_str())
+                });
+                arr.push(serde_json::Value::Object(model));
+            }
+            b.insert("baseUrl".into(), serde_json::json!(format!("{base}/v1")));
+            b.insert("api".into(), serde_json::json!("openai-completions"));
+            // Dummy key: pi refuses credentials-less providers; the
+            // value supports $ENV interpolation if real keys are ever
+            // configured on the gateway.
+            b.insert("apiKey".into(), serde_json::json!("blazar-local"));
+        }
+        p.insert("blazar".into(), blazar);
+    }
+    v
+}
+
 #[allow(clippy::too_many_lines)]
 fn connect_plan(
     client: &str,
     home: &std::path::Path,
     base: &str,
-    model: &str,
+    m: &ConnectModelMeta,
 ) -> Result<ConnectPlan> {
+    let model = m.id.as_str();
     let read = |rel: &[&str]| {
         let mut p = home.to_path_buf();
         for part in rel {
@@ -15186,6 +16850,87 @@ fn connect_plan(
                 ),
             })
         }
+        "opencode" => {
+            // opencode reads XDG_CONFIG_HOME (absolute) like every
+            // XDG-respecting tool; ~/.config is the fallback.
+            let cfg_root = std::env::var_os("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| home.join(".config"));
+            let config_path = cfg_root.join("opencode").join("opencode.json");
+            let cfg = std::fs::read_to_string(&config_path).ok();
+            let action = match cfg.as_deref() {
+                None => ConnectAction::Create(
+                    serde_json::to_string_pretty(&opencode_provider_merge(
+                        &serde_json::json!({}),
+                        base,
+                        m,
+                    ))
+                    .expect("serializing a plain object cannot fail")
+                        + "\n",
+                ),
+                // JSONC comments (or any non-strict JSON) cannot be
+                // mechanically merged without destroying them.
+                Some(c) if serde_json::from_str::<serde_json::Value>(c).is_err() => {
+                    ConnectAction::Snippet
+                }
+                Some(_) => ConnectAction::Merge,
+            };
+            Ok(ConnectPlan {
+                client: "opencode",
+                display: "opencode",
+                installed: cfg_root.join("opencode").exists(),
+                config_path,
+                action,
+                detail: format!(
+                    "provider.blazar block for opencode.json (model shows as blazar/{} — pick it in /models; restart opencode after writing):\n{}",
+                    m.id,
+                    serde_json::to_string_pretty(&opencode_provider_merge(
+                        &serde_json::json!({}),
+                        base,
+                        m
+                    ))
+                    .expect("serializing a plain object cannot fail")
+                ),
+            })
+        }
+        "pi" => {
+            // pi (and its oh-my-pi distribution) keeps compatible
+            // endpoints in <agent-dir>/models.json.
+            let config_path = home.join(".pi").join("agent").join("models.json");
+            let cfg = std::fs::read_to_string(&config_path).ok();
+            let action = match cfg.as_deref() {
+                None => ConnectAction::Create(
+                    serde_json::to_string_pretty(&pi_providers_merge(
+                        &serde_json::json!({}),
+                        base,
+                        m,
+                    ))
+                    .expect("serializing a plain object cannot fail")
+                        + "\n",
+                ),
+                Some(c) if serde_json::from_str::<serde_json::Value>(c).is_err() => {
+                    ConnectAction::Snippet
+                }
+                Some(_) => ConnectAction::Merge,
+            };
+            Ok(ConnectPlan {
+                client: "pi",
+                display: "pi / oh-my-pi",
+                installed: home.join(".pi").exists(),
+                config_path,
+                action,
+                detail: format!(
+                    "providers.blazar block for ~/.pi/agent/models.json (select the model with pi's /model):\n{}",
+                    serde_json::to_string_pretty(&pi_providers_merge(
+                        &serde_json::json!({}),
+                        base,
+                        m
+                    ))
+                    .expect("serializing a plain object cannot fail")
+                ),
+            })
+        }
         "cline" => Ok(ConnectPlan {
             client: "cline",
             display: "Cline (VS Code)",
@@ -15235,7 +16980,7 @@ async fn connect_test_request(client: &str, base: &str, model: &str) -> Result<b
             format!("{base}/v1/messages"),
             serde_json::json!({"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]}),
         ),
-        "cline" | "continue" => (
+        "cline" | "continue" | "opencode" | "pi" => (
             format!("{base}/v1/chat/completions"),
             serde_json::json!({"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with the single word: ok"}]}),
         ),
@@ -15254,38 +16999,119 @@ async fn connect_test_request(client: &str, base: &str, model: &str) -> Result<b
     Ok(matches!(resp, Ok(r) if r.status().is_success()))
 }
 
-async fn default_test_model(explicit: Option<String>) -> Result<String> {
+/// Default-model tier for harness connects. Capability-driven — the
+/// certificates exist for exactly this decision — and the store (not
+/// the daemon's tag list) is the source, so the default also works
+/// daemon-down. `chat_pass` is three-state: `None` = no certificate
+/// (an uncertified text model is still a plausible default), `Some(false)`
+/// = CERTIFIED non-chat (rerankers, embedders — never suggested).
+///
+///   tier 3: certificate says chat PASS AND tools PASS — a coding
+///           harness lives on tool calls
+///   tier 2: certificate says chat PASS
+///   tier 1: text-lane model, no certificate yet
+///   tier 0: never suggested (certified chat FAIL, media lanes)
+fn connect_default_tier(text_lane: bool, chat_pass: Option<bool>, tools_pass: bool) -> u8 {
+    match (text_lane, chat_pass, tools_pass) {
+        (true, Some(true), true) => 3,
+        (true, Some(true), false) => 2,
+        (true, None, _) => 1,
+        (_, _, _) => 0,
+    }
+}
+
+/// Pick the model a harness should be connected to by default: highest
+/// capability tier, then most recently used, then the larger model (a
+/// harness is the demanding workload). `None` when nothing is
+/// chat-shaped at all.
+fn pick_connect_default(
+    cands: &[(String, u8, i64, f64)], // (name, tier, last_used_at, params)
+) -> Option<String> {
+    cands
+        .iter()
+        .filter(|(_, tier, _, _)| *tier > 0)
+        .max_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then(a.2.cmp(&b.2))
+                .then(a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
+        })
+        .map(|(name, _, _, _)| name.clone())
+}
+
+/// Every local model that is a sane harness-connect candidate, best
+/// first: `(name, tier, last_used_at, params)` sorted by the capability
+/// ladder. Rerankers, embedders, and media lanes (tier 0) never appear.
+fn connect_candidates(store: &Store) -> Result<Vec<(String, u8, i64, f64)>> {
+    let mut cands: Vec<(String, u8, i64, f64)> = Vec::new();
+    for row in store.list_models()? {
+        // One certificate read answers both probe questions.
+        let statuses = store
+            .get_model_caps_dated(&row.name)
+            .ok()
+            .flatten()
+            .and_then(|(_, _, caps_json)| scorecard_caps_rows(&caps_json))
+            .map(|rows| {
+                let status = |probe: &str| {
+                    rows.iter()
+                        .find(|(p, _)| p == probe)
+                        .is_some_and(|(_, s)| s == "PASS")
+                };
+                (status("chat"), status("tools"))
+            });
+        // No certificate → three-state None (uncertified, plausible);
+        // certified FAIL must NOT masquerade as uncertified.
+        let (chat_pass, tools_pass) = match statuses {
+            Some((c, t)) => (Some(c), t),
+            None => (None, false),
+        };
+        let tier = connect_default_tier(
+            matches!(run_lane(&row), RunLane::Text),
+            chat_pass,
+            tools_pass,
+        );
+        cands.push((row.name, tier, row.last_used_at, row.params.unwrap_or(0.0)));
+    }
+    cands.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(b.2.cmp(&a.2))
+            .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    Ok(cands)
+}
+
+fn default_test_model(explicit: Option<String>) -> Result<String> {
     if let Some(m) = explicit {
         return Ok(m);
     }
-    let cfg = config()?;
-    let base = daemon_base(&cfg);
-    let tags = match crate::cli_http()
-        .get(format!("{base}/api/tags"))
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
-        _ => None,
-    };
-    let name = tags
-        .as_ref()
-        .and_then(|v| v["models"].as_array())
-        .and_then(|a| a.first())
-        .and_then(|m| {
-            m["model"]
-                .as_str()
-                .or_else(|| m["name"].as_str())
-                .map(str::to_string)
-        });
-    name.ok_or_else(|| {
-        anyhow!("no local model to test with — pass --model, or `blazar pull` one first")
+    let store = Store::open(&dirs())?;
+    pick_connect_default(&connect_candidates(&store)?).ok_or_else(|| {
+        anyhow!("no chat-shaped local model to connect — pass --model, or `blazar pull` one first")
     })
 }
 
+/// Timestamped sibling backup name for a client config about to be
+/// rewritten. Unix-seconds stamp (the config migrate/snapshot
+/// precedent) keeps every generation instead of one rolling copy that
+/// the next connect would overwrite.
+fn connect_backup_path(path: &std::path::Path, ts: u64) -> std::path::PathBuf {
+    // Append to the full file name (not with_extension) so
+    // extension-less targets and multi-dot names stay intact.
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(format!(".blazar-bak-{ts}"));
+    path.with_file_name(name)
+}
+
 #[allow(clippy::too_many_lines)]
-async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: bool) -> Result<()> {
+async fn connect_cmd(
+    client: &str,
+    model: Option<String>,
+    all_models: bool,
+    write: bool,
+    json: bool,
+) -> Result<()> {
     if client.is_empty() {
         let rows: Vec<Vec<String>> = CONNECT_CLIENTS
             .iter()
@@ -15298,6 +17124,8 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
                         "continue" => "~/.continue/config.yaml",
                         "cline" => "VS Code UI",
                         "openwebui" => "env at startup",
+                        "opencode" => "~/.config/opencode/opencode.json",
+                        "pi" => "~/.pi/agent/models.json",
                         _ => "?",
                     }
                     .to_string(),
@@ -15314,8 +17142,32 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
         .ok_or_else(|| anyhow!("cannot resolve the user home directory"))?;
     let cfg = config()?;
     let base = daemon_base(&cfg);
-    let model = default_test_model(model).await?;
-    let plan = connect_plan(client, &home, &base, &model)?;
+    let model = default_test_model(model)?;
+    let meta = connect_model_meta(&model);
+    // `--all-models`: every certified chat model joins the menu for the
+    // multi-model clients. The headline model still leads (plan, test
+    // request, snippet) — the extras only widen the menu.
+    let extra_metas: Vec<ConnectModelMeta> = if all_models {
+        match client {
+            "opencode" | "pi" => {
+                let store = Store::open(&dirs())?;
+                connect_candidates(&store)?
+                    .into_iter()
+                    .filter(|(name, tier, _, _)| *tier > 0 && name != &model)
+                    .map(|(name, _, _, _)| connect_model_meta(&name))
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    if all_models && extra_metas.is_empty() && client != "opencode" && client != "pi" {
+        println!(
+            "note: --all-models widens menus on opencode and pi; {client} keeps the single-model entry"
+        );
+    }
+    let plan = connect_plan(client, &home, &base, &meta)?;
 
     let action_label = match &plan.action {
         ConnectAction::Create(_) => "create",
@@ -15327,11 +17179,40 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
     let mut backup: Option<std::path::PathBuf> = None;
 
     if write {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         match &plan.action {
             ConnectAction::Create(content) => {
                 if let Some(parent) = plan.config_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
+                // An existing-but-unreadable target would otherwise be
+                // clobbered silently; a byte copy backs it up first.
+                if plan.config_path.exists() {
+                    let bak = connect_backup_path(&plan.config_path, ts);
+                    std::fs::copy(&plan.config_path, &bak)?;
+                    backup = Some(bak);
+                }
+                // Multi-model fold: the created block gains one entry
+                // per extra candidate before the single write.
+                let content = if extra_metas.is_empty() {
+                    content.clone()
+                } else {
+                    let mut v: serde_json::Value = serde_json::from_str(content).map_err(|e| {
+                        anyhow!("created block did not parse for --all-models: {e}")
+                    })?;
+                    for extra in &extra_metas {
+                        v = match plan.client {
+                            "opencode" => opencode_provider_merge(&v, &base, extra),
+                            "pi" => pi_providers_merge(&v, &base, extra),
+                            other => return Err(anyhow!("--all-models unsupported for {other}")),
+                        };
+                    }
+                    serde_json::to_string_pretty(&v)
+                        .map_err(|e| anyhow!("serializing the multi-model block failed: {e}"))?
+                };
                 std::fs::write(&plan.config_path, content)?;
                 wrote_path = Some(plan.config_path.clone());
             }
@@ -15340,10 +17221,29 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
                     std::fs::read_to_string(&plan.config_path).unwrap_or_else(|_| "{}".to_string());
                 let parsed: serde_json::Value =
                     serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
-                let bak = plan.config_path.with_extension("json.blazar-bak");
-                std::fs::write(&bak, &existing)?;
+                let bak = connect_backup_path(&plan.config_path, ts);
+                // Copy, not write-of-read: the original bytes survive
+                // even when the file is not valid UTF-8.
+                std::fs::copy(&plan.config_path, &bak)?;
                 backup = Some(bak);
-                let merged = claude_settings_merge(&parsed, &base);
+                let merged = match plan.client {
+                    "claude" => claude_settings_merge(&parsed, &base),
+                    "opencode" => {
+                        let mut v = opencode_provider_merge(&parsed, &base, &meta);
+                        for extra in &extra_metas {
+                            v = opencode_provider_merge(&v, &base, extra);
+                        }
+                        v
+                    }
+                    "pi" => {
+                        let mut v = pi_providers_merge(&parsed, &base, &meta);
+                        for extra in &extra_metas {
+                            v = pi_providers_merge(&v, &base, extra);
+                        }
+                        v
+                    }
+                    other => return Err(anyhow!("merge not implemented for client {other}")),
+                };
                 std::fs::write(
                     &plan.config_path,
                     serde_json::to_string_pretty(&merged)
@@ -15395,7 +17295,9 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
             "installed": plan.installed,
             "config_path": plan.config_path,
             "action": action_label,
+            "models_listed": extra_metas.len() + 1,
             "wrote": wrote_path.is_some(),
+            "backup": backup,
             "rolled_back": rolled_back,
             "test": if daemon_up { serde_json::json!({"ok": test_ok, "model": model}) } else { serde_json::json!({"ok": false, "skipped": true}) },
             "detail": plan.detail,
@@ -15408,6 +17310,12 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
     println!("installed:   {}", yes_no(plan.installed));
     println!("config:      {}", plan.config_path.display());
     println!("action:      {action_label}");
+    if !extra_metas.is_empty() {
+        println!(
+            "models:     {} will be listed (top: {model})",
+            extra_metas.len() + 1
+        );
+    }
     if write && wrote_path.is_some() {
         if rolled_back {
             println!(
@@ -15421,6 +17329,14 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
         }
     } else if !write {
         println!("dry run — pass --write to apply");
+    }
+    if let Some(bak) = &backup {
+        println!("backup:     {}", bak.display());
+        println!(
+            "restore:    cp '{}' '{}'",
+            bak.display(),
+            plan.config_path.display()
+        );
     }
     if matches!(
         plan.action,
@@ -15437,6 +17353,178 @@ async fn connect_cmd(client: &str, model: Option<String>, write: bool, json: boo
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
+}
+
+/// One posture knob: `Set` pins a root knob to a stored-form TOML
+/// scalar, `Unset` returns it to the built-in default. Root knobs only
+/// by construction — table-scoped pins (`model_overrides.*`, scoped
+/// keys) are power-user territory and presets never touch them.
+enum PresetOp {
+    Set(&'static str, &'static str),
+    Unset(&'static str),
+}
+
+/// A one-word tuning posture: the name the user types, the promise it
+/// makes, and the knob bundle that realizes it.
+struct Preset {
+    name: &'static str,
+    tagline: &'static str,
+    ops: &'static [PresetOp],
+}
+
+const PRESETS: [Preset; 5] = [
+    Preset {
+        name: "balanced",
+        tagline: "governors on, every knob back to measured defaults",
+        ops: &[
+            PresetOp::Set("ubatch_auto", "true"),
+            PresetOp::Set("spec_auto_manage", "true"),
+            PresetOp::Unset("spec"),
+            PresetOp::Unset("slots"),
+            PresetOp::Unset("cache_type"),
+            PresetOp::Unset("cache_type_k"),
+            PresetOp::Unset("cache_type_v"),
+            PresetOp::Unset("prompt_recipe"),
+            PresetOp::Unset("deterministic"),
+        ],
+    },
+    Preset {
+        name: "fast",
+        tagline: "one dedicated slot — lowest latency for a single chat",
+        ops: &[
+            PresetOp::Set("slots", "1"),
+            PresetOp::Unset("ubatch_auto"),
+            PresetOp::Unset("spec_auto_manage"),
+            PresetOp::Unset("spec"),
+            PresetOp::Unset("cache_type"),
+            PresetOp::Unset("cache_type_k"),
+            PresetOp::Unset("cache_type_v"),
+            PresetOp::Unset("prompt_recipe"),
+            PresetOp::Unset("deterministic"),
+        ],
+    },
+    Preset {
+        name: "quality",
+        tagline: "no lossy shortcuts: spec off, f16 KV cache, deterministic",
+        ops: &[
+            PresetOp::Set("spec", "\"off\""),
+            PresetOp::Set("deterministic", "true"),
+            PresetOp::Set("cache_type", "\"f16\""),
+            PresetOp::Unset("slots"),
+            PresetOp::Unset("cache_type_k"),
+            PresetOp::Unset("cache_type_v"),
+            PresetOp::Unset("ubatch_auto"),
+            PresetOp::Unset("spec_auto_manage"),
+            PresetOp::Unset("prompt_recipe"),
+        ],
+    },
+    Preset {
+        name: "agent",
+        tagline: "tool-call lane + adaptive prefill for agentic clients",
+        ops: &[
+            PresetOp::Set("prompt_recipe", "\"ollama_compat\""),
+            PresetOp::Set("ubatch_auto", "true"),
+            PresetOp::Set("spec_auto_manage", "true"),
+            PresetOp::Unset("spec"),
+            PresetOp::Unset("slots"),
+            PresetOp::Unset("cache_type"),
+            PresetOp::Unset("cache_type_k"),
+            PresetOp::Unset("cache_type_v"),
+            PresetOp::Unset("deterministic"),
+        ],
+    },
+    Preset {
+        name: "max-throughput",
+        tagline: "adaptive batching, speculation off — no draft overhead under saturation",
+        ops: &[
+            PresetOp::Set("spec", "\"off\""),
+            PresetOp::Set("ubatch_auto", "true"),
+            PresetOp::Unset("slots"),
+            PresetOp::Unset("cache_type"),
+            PresetOp::Unset("cache_type_k"),
+            PresetOp::Unset("cache_type_v"),
+            PresetOp::Unset("spec_auto_manage"),
+            PresetOp::Unset("prompt_recipe"),
+            PresetOp::Unset("deterministic"),
+        ],
+    },
+];
+
+fn preset_find(name: &str) -> Option<&'static Preset> {
+    PRESETS.iter().find(|p| p.name == name)
+}
+
+fn preset_names() -> String {
+    PRESETS
+        .iter()
+        .map(|p| p.name)
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+fn preset_list_text() -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("postures: {}\n\n", preset_names());
+    for p in &PRESETS {
+        writeln!(out, "{:<15} {}", p.name, p.tagline).expect("String writes cannot fail");
+    }
+    out.push_str("\napply with: blazar config preset <name>");
+    out
+}
+
+/// The pin line a knob carries in the built-in default config, e.g.
+/// `spec = "auto"`; `None` when the knob serializes as absent while
+/// unset (Option fields).
+fn default_pin_line(key: &str) -> Option<String> {
+    let raw = Config::default().to_toml().ok()?;
+    let lines: Vec<&str> = raw.lines().collect();
+    top_level_span(&lines, key)
+}
+
+#[derive(Debug)]
+struct PresetOpOutcome {
+    line: String,
+    changed: bool,
+}
+
+/// Fold a posture's knob bundle over the raw config, validating after
+/// every op so a rejected posture can never write a partial file: the
+/// caller only persists the final candidate once every op validated.
+fn apply_preset_ops(raw: &str, preset: &Preset) -> Result<(String, Vec<PresetOpOutcome>)> {
+    let mut current = raw.to_string();
+    let mut outcomes = Vec::new();
+    for op in preset.ops {
+        let (candidate, line) = match op {
+            PresetOp::Set(key, stored) => {
+                let candidate = set_root_key(&current, key, stored);
+                let line = format!("{key} = {stored}");
+                (candidate, line)
+            }
+            PresetOp::Unset(key) => {
+                let (candidate, removed) = remove_top_level_pin(&current, key);
+                let line = match removed {
+                    Some(old) => match default_pin_line(key) {
+                        Some(default_line) => {
+                            format!("{key} unset (was: {old}) — now: {default_line}")
+                        }
+                        None => format!("{key} unset (was: {old}) — not set by default"),
+                    },
+                    None => format!("{key} not pinned — already at the built-in default"),
+                };
+                (candidate, line)
+            }
+        };
+        Config::from_toml(&candidate).map_err(|e| {
+            anyhow!(
+                "preset {} rejected at knob `{line}`: {e} — file unchanged",
+                preset.name
+            )
+        })?;
+        let changed = candidate != current;
+        current = candidate;
+        outcomes.push(PresetOpOutcome { line, changed });
+    }
+    Ok((current, outcomes))
 }
 
 #[allow(clippy::too_many_lines)] // command dispatch: one arm per config subcommand
@@ -15813,6 +17901,37 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             println!("{} ok", path.display());
             Ok(())
         }
+        ConfigCmd::Preset { name } => {
+            let d = dirs();
+            d.ensure().ok();
+            let path = d.config_file();
+            if !path.exists() {
+                Config::load(&d)?;
+            }
+            let Some(name) = name else {
+                println!("{}", preset_list_text());
+                return Ok(());
+            };
+            let preset = preset_find(&name).ok_or_else(|| {
+                anyhow!("unknown posture: {name} — available: {}", preset_names())
+            })?;
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+            let (candidate, outcomes) = apply_preset_ops(&raw, preset)?;
+            blazar_core::persist_config(&path, &candidate)
+                .map_err(|e| anyhow!("write {}: {e}", path.display()))?;
+            for outcome in &outcomes {
+                println!("{}", outcome.line);
+            }
+            let changed = outcomes.iter().filter(|o| o.changed).count();
+            let kept = outcomes.len() - changed;
+            println!(
+                "preset {name} applied ({changed} knob{s} moved, {kept} already in place) — \
+                 restart the daemon (blazar stop && blazar serve) to serve it",
+                s = if changed == 1 { "" } else { "s" }
+            );
+            Ok(())
+        }
     }
 }
 
@@ -16176,6 +18295,23 @@ mod tests {
     }
 
     #[test]
+    fn unit__gate_bench_fits__refuses_only_when_measured_and_tight() {
+        let gib9_q4: u64 = 5_782_568_000; // the 9B Q4_K_M that OOMed live
+        // Measured card with a resident tenant: refuse before llama-bench.
+        assert!(!gate_bench_fits(gib9_q4, Some(2_300)));
+        // Idle card: the same model fits.
+        assert!(gate_bench_fits(gib9_q4, Some(7_800)));
+        // Exactly weights + headroom is the boundary (1536 MiB overhead).
+        let free_boundary = gib9_q4 / (1024 * 1024) + 1536;
+        assert!(gate_bench_fits(gib9_q4, Some(free_boundary)));
+        assert!(!gate_bench_fits(gib9_q4, Some(free_boundary - 1)));
+        // No measurable GPU (AMD/Metal/CPU boxes): never refuse.
+        assert!(gate_bench_fits(gib9_q4, None));
+        // Tiny model with a nearly-full card still refuses honestly.
+        assert!(!gate_bench_fits(400 * 1024 * 1024, Some(1_500)));
+    }
+
+    #[test]
     fn unit__connect_builders__codex_and_continue_shapes() {
         let toml = codex_provider_block("http://localhost:11435");
         assert!(toml.contains("[model_providers.blazar]"));
@@ -16215,12 +18351,23 @@ mod tests {
         assert_eq!(fresh["env"]["ANTHROPIC_BASE_URL"], "http://x");
     }
 
+    fn test_model_meta(id: &str) -> ConnectModelMeta {
+        ConnectModelMeta {
+            id: id.to_string(),
+            context: Some(32_768),
+            tools: true,
+            reasoning: true,
+            vision: false,
+        }
+    }
+
     #[test]
     fn unit__connect_plan__actions_and_unknown_client() {
         let home = tempfile::tempdir().expect("tempdir");
         let base = "http://localhost:11435";
+        let m1 = test_model_meta("m1");
         // codex: absent config → Create with the full TOML.
-        let plan = connect_plan("codex", home.path(), base, "m1").expect("plan");
+        let plan = connect_plan("codex", home.path(), base, &m1).expect("plan");
         assert_eq!(plan.client, "codex");
         assert!(!plan.installed);
         assert!(matches!(plan.action, ConnectAction::Create(_)));
@@ -16231,7 +18378,7 @@ mod tests {
             "model_provider = \"openai\"\n",
         )
         .expect("write");
-        let plan = connect_plan("codex", home.path(), base, "m1").expect("plan");
+        let plan = connect_plan("codex", home.path(), base, &m1).expect("plan");
         assert!(plan.installed);
         assert_eq!(plan.action, ConnectAction::Snippet);
         // claude: existing settings.json → Merge; detail stays a JSON snippet.
@@ -16241,24 +18388,84 @@ mod tests {
             "{\"model\": \"sonnet\"}\n",
         )
         .expect("write");
-        let plan = connect_plan("claude", home.path(), base, "m1").expect("plan");
+        let plan = connect_plan("claude", home.path(), base, &m1).expect("plan");
         assert_eq!(plan.action, ConnectAction::Merge);
         // continue: hand-tuned YAML → Snippet, never a blind merge.
         std::fs::create_dir_all(home.path().join(".continue")).expect("mkdir");
         std::fs::write(home.path().join(".continue/config.yaml"), "name: mine\n").expect("write");
-        let plan = connect_plan("continue", home.path(), base, "m1").expect("plan");
+        let plan = connect_plan("continue", home.path(), base, &m1).expect("plan");
         assert_eq!(plan.action, ConnectAction::Snippet);
         // cline/openwebui are instructions-only.
-        let plan = connect_plan("cline", home.path(), base, "m1").expect("plan");
+        let plan = connect_plan("cline", home.path(), base, &m1).expect("plan");
         assert_eq!(plan.action, ConnectAction::Instructions);
-        let plan = connect_plan("openwebui", home.path(), base, "m1").expect("plan");
+        let plan = connect_plan("openwebui", home.path(), base, &m1).expect("plan");
         assert_eq!(plan.action, ConnectAction::Instructions);
         // Unknown client teaches the list.
-        let err = connect_plan("vscode", home.path(), base, "m1").expect_err("teaches");
+        let err = connect_plan("vscode", home.path(), base, &m1).expect_err("teaches");
         assert!(err.to_string().contains("unknown client 'vscode'"));
         assert!(
             err.to_string()
                 .contains("codex, claude, continue, cline, openwebui")
+        );
+    }
+
+    #[test]
+    fn unit__opencode_provider_merge__block_shape_and_idempotence() {
+        let base = "http://127.0.0.1:11435";
+        let m = test_model_meta("qwen3:8b");
+        let existing =
+            serde_json::json!({"$schema": "https://opencode.ai/config.json", "theme": "dark"});
+        let merged = opencode_provider_merge(&existing, base, &m);
+        // User keys survive untouched.
+        assert_eq!(merged["theme"], "dark");
+        let prov = &merged["provider"]["blazar"];
+        assert_eq!(prov["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(prov["options"]["baseURL"], format!("{base}/v1"));
+        let model = &prov["models"]["qwen3:8b"];
+        assert_eq!(model["limit"]["context"], 32_768);
+        assert_eq!(model["tool_call"], true);
+        assert_eq!(model["reasoning"], true);
+        assert_eq!(model["attachment"], false);
+        // Idempotent: a second merge over the result is byte-stable.
+        let again = opencode_provider_merge(&merged, base, &m);
+        assert_eq!(merged.to_string(), again.to_string());
+    }
+
+    #[test]
+    fn unit__pi_providers_merge__block_shape_and_flag_gating() {
+        let base = "http://127.0.0.1:11435";
+        let m = test_model_meta("qwen3:8b");
+        let merged = pi_providers_merge(&serde_json::json!({}), base, &m);
+        let prov = &merged["providers"]["blazar"];
+        assert_eq!(prov["baseUrl"], format!("{base}/v1"));
+        assert_eq!(prov["api"], "openai-completions");
+        assert_eq!(prov["apiKey"], "blazar-local");
+        assert_eq!(prov["models"][0]["id"], "qwen3:8b");
+        assert_eq!(prov["models"][0]["reasoning"], true);
+        assert!(
+            prov["models"][0].get("input").is_none(),
+            "no vision meta means no input array"
+        );
+        // Other providers survive; vision adds the input modalities.
+        let existing = serde_json::json!({"providers": {"openai": {"apiKey": "sk"}}});
+        let vision = ConnectModelMeta {
+            id: "vl".into(),
+            context: None,
+            tools: false,
+            reasoning: false,
+            vision: true,
+        };
+        let merged = pi_providers_merge(&existing, base, &vision);
+        assert_eq!(merged["providers"]["openai"]["apiKey"], "sk");
+        assert_eq!(
+            merged["providers"]["blazar"]["models"][0]["input"],
+            serde_json::json!(["text", "image"])
+        );
+        assert!(
+            merged["providers"]["blazar"]["models"][0]
+                .get("reasoning")
+                .is_none(),
+            "no reasoning meta means the flag is omitted, not false"
         );
     }
 
@@ -16637,6 +18844,124 @@ mod tests {
         assert!(Cli::try_parse_from(["blazar", "run", "m1", "--", "-flaggy"]).is_ok());
     }
 
+    #[test]
+    fn unit__doctor_fix_flag__parses_and_defaults_off() {
+        // Plain `blazar doctor` must stay flag-for-flag identical to
+        // before: fix defaults off so the report path is untouched.
+        match Cli::try_parse_from(["blazar", "doctor"]).unwrap().cmd {
+            Cmd::Doctor { fix, flat, json } => {
+                assert!(!fix, "fix must default off");
+                assert!(!flat && !json);
+            }
+            _ => panic!("expected Doctor"),
+        }
+        match Cli::try_parse_from(["blazar", "doctor", "--fix", "--flat"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Doctor { fix, flat, .. } => {
+                assert!(fix);
+                assert!(flat);
+            }
+            _ => panic!("expected Doctor"),
+        }
+    }
+
+    #[test]
+    fn unit__intent_plan__maps_all_six_postures() {
+        // Agent + coding share the high lane; batch yields; reasoning
+        // forces think; vision demands the projector preflight; the
+        // interactive posture is the explicit spelling of "default".
+        let agent = intent_plan(Intent::Agent);
+        assert_eq!(agent.priority, Some("high"));
+        assert!(!agent.force_think && !agent.needs_vision);
+        assert_eq!(intent_plan(Intent::Coding).priority, Some("high"));
+        assert_eq!(intent_plan(Intent::Batch).priority, Some("low"));
+        assert!(intent_plan(Intent::Reasoning).force_think);
+        assert!(intent_plan(Intent::Vision).needs_vision);
+        let interactive = intent_plan(Intent::Interactive);
+        assert_eq!(interactive.priority, None);
+        assert!(!interactive.force_think && !interactive.needs_vision);
+    }
+
+    #[test]
+    fn unit__run_intent_flag__parses_and_defaults_none() {
+        // Bare `blazar run m` must stay flag-for-flag identical to
+        // before the intent knob existed.
+        match Cli::try_parse_from(["blazar", "run", "m"]).unwrap().cmd {
+            Cmd::Run { intent, .. } => assert!(intent.is_none()),
+            _ => panic!("expected Run"),
+        }
+        match Cli::try_parse_from(["blazar", "run", "m", "--intent", "agent"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Run { intent, .. } => assert_eq!(intent, Some(Intent::Agent)),
+            _ => panic!("expected Run"),
+        }
+        assert!(
+            Cli::try_parse_from(["blazar", "run", "m", "--intent", "turbo"]).is_err(),
+            "unknown intent must be a clap error listing the six values"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__stream_chat_opts__priority_header_rides_request() {
+        // Wire-level pin: the session priority reaches the gateway as
+        // the documented x-blazar-priority header, and the None path
+        // sends the historic header-less shape.
+        async fn serve_once(listener: &tokio::net::TcpListener, want_header: bool) {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let has = head
+                .to_ascii_lowercase()
+                .contains("x-blazar-priority: high");
+            assert_eq!(has, want_header, "request headers: {head}");
+            let resp = concat!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n",
+                "content-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        }
+        blazar_core::tls::ensure_tls_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::json!({"model": "m", "messages": [], "stream": true});
+        let base = format!("http://{addr}");
+        let server = async {
+            serve_once(&listener, true).await;
+            serve_once(&listener, false).await;
+        };
+        let client = async {
+            stream_chat_opts(base.clone(), body.clone(), Some("high"))
+                .await
+                .unwrap();
+            stream_chat_opts(base, body, None).await.unwrap();
+        };
+        let ((), ()) = tokio::join!(server, client);
+    }
+
+    #[test]
+    fn unit__connect_backup_path__keeps_extension_and_stamps_generations() {
+        // Every generation gets its own file: the second connect must
+        // never overwrite the first backup.
+        let p = std::path::Path::new("u/.claude/settings.json");
+        assert_eq!(
+            connect_backup_path(p, 100).file_name().unwrap(),
+            "settings.json.blazar-bak-100"
+        );
+        assert_eq!(
+            connect_backup_path(p, 200).file_name().unwrap(),
+            "settings.json.blazar-bak-200"
+        );
+        // Extension-less targets keep their name and gain the suffix.
+        let no_ext = connect_backup_path(std::path::Path::new("u/.codex/config"), 5);
+        assert!(no_ext.to_str().unwrap().ends_with("config.blazar-bak-5"));
+    }
+
     fn row(name: &str, path: &str) -> blazar_core::store::ModelRow {
         blazar_core::store::ModelRow {
             name: name.to_string(),
@@ -16654,6 +18979,92 @@ mod tests {
             pulled_at: 0,
             last_used_at: 0,
         }
+    }
+
+    #[test]
+    fn unit__stable_alias__marks_marked_build_newer_and_ignores_rest() {
+        let marker = StableMarker {
+            vtag: "v0.6.0".to_string(),
+            btag: "b11429".to_string(),
+        };
+        // Lane suffixes are the same build — the alias must survive them.
+        assert_eq!(stable_alias(Some(&marker), "b11429-cuda"), "stable v0.6.0");
+        assert_eq!(
+            stable_alias(Some(&marker), "b11440"),
+            "newer than stable v0.6.0"
+        );
+        // Older builds and non-b tags carry no stable relation.
+        assert_eq!(stable_alias(Some(&marker), "b11393"), "");
+        assert_eq!(stable_alias(Some(&marker), "v0.6.0"), "");
+        // No marker (offline / b-tag latest) degrades to silence.
+        assert_eq!(stable_alias(None, "b11429-cuda"), "");
+        assert_eq!(
+            stable_alias_paren(Some(&marker), "b11429-cuda"),
+            " (stable v0.6.0)"
+        );
+        assert_eq!(stable_alias_paren(None, "b11429-cuda"), "");
+        assert_eq!(
+            stable_prefix(Some(&marker), "b11429-cuda"),
+            "stable v0.6.0, "
+        );
+    }
+
+    #[test]
+    fn unit__engine_regression_gate__pruned_baseline_engine_skips_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row("m", "/tmp/m.gguf")).unwrap();
+            store
+                .upsert_engine(&gap_engine_row("b2-cuda", EngineKind::LlamaCpp, &[]))
+                .unwrap();
+            // Baseline recorded against b1-cuda, which retention has
+            // since pruned — the gate has nothing to compare against.
+            store.record_bench("b1-cuda", "m", 40.0, 0.0, 0).unwrap();
+        }
+        let mgr = EngineManager {
+            dirs: d.clone(),
+            gh: GhClient::new(None).unwrap(),
+            bus: EventBus::default(),
+            asset_override: String::new(),
+        };
+        let candidate = gap_engine_row("b2-cuda", EngineKind::LlamaCpp, &[]);
+        // Old behavior: hard Err ("baseline engine pruned") turned a
+        // successful install into a reported failure. Skip is Ok.
+        engine_regression_gate(&mgr, &d, &candidate).unwrap();
+    }
+
+    #[test]
+    fn unit__engine_regression_gate__unpulled_baseline_model_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            // The baseline ENGINE survives; its bench MODEL is gone.
+            store
+                .upsert_engine(&gap_engine_row("b1-cuda", EngineKind::LlamaCpp, &[]))
+                .unwrap();
+            store
+                .record_bench("b1-cuda", "ghost", 40.0, 0.0, 0)
+                .unwrap();
+        }
+        let mgr = EngineManager {
+            dirs: d.clone(),
+            gh: GhClient::new(None).unwrap(),
+            bus: EventBus::default(),
+            asset_override: String::new(),
+        };
+        let candidate = gap_engine_row("b2-cuda", EngineKind::LlamaCpp, &[]);
+        engine_regression_gate(&mgr, &d, &candidate).unwrap();
     }
 
     #[test]
@@ -17092,6 +19503,362 @@ mod tests {
         );
         // Corrupted row: raw string survives instead of crashing listings.
         assert_eq!(embedded_json("[oops"), serde_json::json!("[oops"));
+    }
+
+    #[test]
+    fn unit__epoch_to_utc_date__os_verified_anchors() {
+        // Expected values cross-checked against GNU date -u -d @N.
+        assert_eq!(epoch_to_utc_date(0), "1970-01-01");
+        assert_eq!(epoch_to_utc_date(86_400), "1970-01-02");
+        assert_eq!(epoch_to_utc_date(951_782_400), "2000-02-29");
+        assert_eq!(epoch_to_utc_date(951_868_800), "2000-03-01");
+        assert_eq!(epoch_to_utc_date(1_790_985_600), "2026-10-03");
+        assert_eq!(epoch_to_utc_date(1_791_072_000), "2026-10-04");
+    }
+
+    #[test]
+    fn unit__scorecard_bench_summary__groups_repeats_into_sorted_means() {
+        let payload = r#"{"score":12.5,"rows":[
+            {"t/s":100.0,"test":"pp512","n_ctx":8192},
+            {"t/s":200.0,"test":"pp512","n_ctx":8192},
+            {"t/s":40.0,"test":"tg128","n_ctx":8192},
+            {"t/s":7.0,"n_prompt":512,"n_gen":32,"n_ctx":4096},
+            {"t/s":9.0}
+        ]}"#;
+        let (score, rows) = scorecard_bench_summary(payload).expect("payload parses");
+        assert!((score - 12.5).abs() < 1e-9, "score round-trips: {score}");
+        assert_eq!(rows.len(), 3, "three named tests: {rows:?}");
+        assert_eq!(rows[0].0, "pp512");
+        assert!(
+            (rows[0].1 - 150.0).abs() < 1e-9,
+            "mean over repeats: {rows:?}"
+        );
+        assert_eq!(rows[0].2, Some(8192));
+        assert_eq!(rows[1].0, "pp512 @ tg");
+        assert!((rows[1].1 - 7.0).abs() < 1e-9, "derived name row: {rows:?}");
+        assert_eq!(rows[2].0, "tg128");
+        assert!((rows[2].1 - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unit__scorecard_bench_summary__absent_or_garbage_is_none() {
+        assert_eq!(scorecard_bench_summary(""), None);
+        assert_eq!(scorecard_bench_summary("{not json"), None);
+    }
+
+    #[test]
+    fn unit__scorecard_caps_rows__fixed_order_and_honest_gaps() {
+        // Live certificate shape: probes nest under .caps of the full
+        // model-doctor object (verified against a real stored row).
+        let caps = r#"{"object":"blazar.model-doctor","tested_at":1790882273,
+                      "caps":{"chat":{"status":"PASS","receipt":"ok"},
+                              "tools":{"status":"FAIL","receipt":"bad args"}}}"#;
+        let rows = scorecard_caps_rows(caps).expect("caps parse");
+        assert_eq!(
+            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            [
+                "chat",
+                "stream",
+                "json",
+                "tools",
+                "embeddings",
+                "vision",
+                "think",
+                "classify"
+            ],
+            "certificate probe order is fixed"
+        );
+        assert_eq!(rows[0].1, "PASS");
+        assert_eq!(
+            rows[1].1, "-",
+            "absent probe renders as a gap, never a guess"
+        );
+        assert_eq!(rows[3].1, "FAIL");
+    }
+
+    #[test]
+    fn unit__format_k__suffixes_only_clean_multiples() {
+        assert_eq!(format_k(8192), "8K");
+        assert_eq!(format_k(32_768), "32K");
+        assert_eq!(format_k(2_097_152), "2M");
+        assert_eq!(format_k(1000), "1000");
+        assert_eq!(format_k(0), "0");
+    }
+
+    #[test]
+    fn unit__plan_decision_lines__mirrors_explain_card_fields() {
+        let card = serde_json::json!({
+            "engine": {"tag": "b11370-cuda", "kind": "llamacpp", "reason": "active lane"},
+            "context": {"effective": 32768, "effective_source": "config default_ctx"},
+            "cache": {"kv_k": "q8_0", "kv_v": "q8_0"},
+            "speculation": {"mode": "auto", "source": "config"},
+            "slots": {"live": 2},
+        });
+        let lines = plan_decision_lines(&card);
+        assert_eq!(lines.len(), 5, "one line per decision axis: {lines:?}");
+        assert!(
+            lines[0].contains("b11370-cuda (llamacpp) — active lane"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("32768 (config default_ctx)"), "{lines:?}");
+        assert!(lines[2].contains("q8_0/q8_0"), "{lines:?}");
+        assert!(lines[3].contains("auto (config)"), "{lines:?}");
+        assert!(lines[4].contains("resident (2 slot(s))"), "{lines:?}");
+    }
+
+    #[test]
+    fn unit__plan_decision_lines__missing_fields_render_unknown_not_garbage() {
+        let lines = plan_decision_lines(&serde_json::json!({}));
+        assert!(lines[0].contains("unknown"), "{lines:?}");
+        assert!(lines[1].contains("unknown"), "{lines:?}");
+        assert!(
+            lines[4].contains("cold"),
+            "no live slots means cold: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn unit__plan_next_hints__only_fill_real_gaps() {
+        let all_gaps = plan_next_hints("m1", false, false, false);
+        assert_eq!(
+            all_gaps.len(),
+            4,
+            "run + serve + bench + model-doctor: {all_gaps:?}"
+        );
+        assert!(all_gaps.iter().any(|h| h.contains("blazar serve")));
+        assert!(all_gaps.iter().any(|h| h.contains("blazar bench m1")));
+        assert!(
+            all_gaps
+                .iter()
+                .any(|h| h.contains("blazar model-doctor m1"))
+        );
+
+        let no_gaps = plan_next_hints("m1", true, true, true);
+        assert_eq!(no_gaps.len(), 1, "only the run hint remains: {no_gaps:?}");
+        assert!(no_gaps[0].starts_with("blazar run m1"));
+    }
+
+    #[test]
+    fn unit__storage_tier_row__hierarchy_state_per_model() {
+        let hot = storage_tier_row("qwen2.5-0.5b-instruct", true, 469_000_000);
+        assert!(hot.contains("VRAM resident"), "{hot}");
+        assert!(hot.contains("disk "), "{hot}");
+        let cold = storage_tier_row("m:8b", false, 4_926_874_676);
+        assert!(cold.contains("cold"), "{cold}");
+        assert!(
+            cold.trim_start_matches("m:8b").contains("4.6 GiB") || cold.contains("GiB"),
+            "disk bytes render human-sized: {cold}"
+        );
+    }
+
+    #[test]
+    fn unit__connect_all_models_fold__one_entry_per_candidate() {
+        // --all-models folds one menu entry per certified chat model
+        // into the SAME provider block; the headline keeps its flags.
+        let base = "http://127.0.0.1:11435";
+        let headline = ConnectModelMeta {
+            id: "top:8b".into(),
+            context: Some(32_768),
+            tools: true,
+            reasoning: false,
+            vision: true,
+        };
+        let extra = ConnectModelMeta {
+            id: "small:0.5b".into(),
+            context: Some(8_192),
+            tools: true,
+            reasoning: false,
+            vision: false,
+        };
+        let mut block = opencode_provider_merge(&serde_json::json!({}), base, &headline);
+        block = opencode_provider_merge(&block, base, &extra);
+        let models = block
+            .pointer("/provider/blazar/models")
+            .and_then(|m| m.as_object())
+            .expect("models map");
+        assert_eq!(models.len(), 2, "{block}");
+        assert!(models.contains_key("top:8b") && models.contains_key("small:0.5b"));
+        assert_eq!(models["top:8b"]["tool_call"], serde_json::json!(true));
+        assert_eq!(models["small:0.5b"]["attachment"], serde_json::json!(false));
+
+        let mut pi = pi_providers_merge(&serde_json::json!({}), base, &headline);
+        pi = pi_providers_merge(&pi, base, &extra);
+        let pi_models = pi["providers"]["blazar"]["models"]
+            .as_array()
+            .expect("pi models array");
+        assert_eq!(pi_models.len(), 2);
+    }
+
+    #[test]
+    fn unit__pick_connect_default__capability_tier_beats_list_order() {
+        // The incident this pins: the old default took the FIRST entry
+        // of the daemon's tag list and connected a harness to a
+        // reranker. Tier, not list order, decides.
+        let cands = vec![
+            ("bge-reranker-v2-m3".into(), 0, 5, 0.6), // reranker: never
+            ("qwen2.5-0.5b-instruct".into(), 2, 90, 0.5), // chat PASS, tools unproven
+            ("qwen3.5-9b".into(), 3, 10, 9.0),        // chat + tools PASS
+            ("older-chat".into(), 2, 5, 8.0),
+        ];
+        let got = pick_connect_default(&cands).expect("a chat default exists");
+        assert_eq!(got, "qwen3.5-9b", "tools-capable tier wins over recency");
+
+        // Same tier → most recently used wins.
+        let cands = vec![("a".into(), 2, 5, 9.0), ("b".into(), 2, 50, 1.0)];
+        assert_eq!(pick_connect_default(&cands).as_deref(), Some("b"));
+
+        // Recency tie → larger params wins.
+        let cands = vec![("small".into(), 1, 7, 0.5), ("big".into(), 1, 7, 9.0)];
+        assert_eq!(pick_connect_default(&cands).as_deref(), Some("big"));
+
+        // Nothing chat-shaped → None, the caller teaches instead.
+        assert!(pick_connect_default(&[("x".into(), 0, 1, 1.0)]).is_none());
+        // Three-state ladder: uncertified text lane is plausible (1);
+        // CERTIFIED chat FAIL is excluded (0) even with tools claims.
+        assert_eq!(connect_default_tier(false, Some(true), true), 0);
+        assert_eq!(connect_default_tier(true, Some(false), true), 0);
+        assert_eq!(connect_default_tier(true, None, false), 1);
+    }
+
+    #[test]
+    fn unit__bench_arch_refusal__encoder_classes_only() {
+        // Encoder-only families in Blazar's normalized arch vocabulary
+        // can never produce pp/tg numbers — llama-bench aborts on them
+        // after a long CUDA init (observed live, hours-class).
+        for arch in [
+            "bert",
+            "bert-large",
+            "modern-bert",
+            "nomic-bert",
+            "t5encoder",
+            "xlm-roberta",
+        ] {
+            assert!(
+                bench_arch_refusal(Some(arch)).is_some(),
+                "{arch} must be refused"
+            );
+        }
+        // Generative look-alikes and unknown/absent arches stay benchable:
+        // the gate must never block a family it cannot identify.
+        for arch in [
+            Some("qwen2"),
+            Some("qwen3"),
+            Some("Qwen3_5ForConditionalGeneration"),
+            Some("gpt-oss"),
+            None,
+        ] {
+            assert!(
+                bench_arch_refusal(arch).is_none(),
+                "{arch:?} must stay benchable"
+            );
+        }
+    }
+
+    #[test]
+    fn unit__autopilot_recs__only_real_gaps_get_work() {
+        // Fresh everything → empty: a healthy model is never given
+        // busywork.
+        let now = 1_791_072_000;
+        assert!(
+            autopilot_recs(
+                "m",
+                true,
+                Some(now - 3600),
+                Some(now - 1800),
+                Some(now - 3600),
+                now
+            )
+            .is_empty(),
+            "measured + tuned-current + certified-fresh must produce no recs"
+        );
+
+        // Onboarding order: bench first, then the certificate.
+        let recs = autopilot_recs("m", true, None, None, None, now);
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert!(recs[0].cmd.starts_with("blazar bench m"), "{recs:?}");
+        assert_eq!(recs[0].datum, "bench_results: no row");
+        assert!(recs[1].cmd.starts_with("blazar model-doctor m"), "{recs:?}");
+        assert_eq!(recs[1].datum, "model_caps: no row");
+
+        // Bench newer than the adopted profile → tune rec citing both
+        // stamps.
+        let recs = autopilot_recs("m", true, Some(now - 100), Some(now - 500), Some(now), now);
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert!(recs[0].cmd.starts_with("blazar tune m"), "{recs:?}");
+        assert!(recs[0].datum.contains("bench "), "{recs:?}");
+
+        // Certificate staleness boundary: 29d fresh, 31d stale.
+        let fresh = autopilot_recs(
+            "m",
+            true,
+            Some(now),
+            Some(now),
+            Some(now - 29 * 86_400),
+            now,
+        );
+        assert!(fresh.is_empty(), "{fresh:?}");
+        let stale = autopilot_recs(
+            "m",
+            true,
+            Some(now),
+            Some(now),
+            Some(now - 31 * 86_400),
+            now,
+        );
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert!(
+            stale[0].cmd.starts_with("blazar model-doctor m"),
+            "{stale:?}"
+        );
+        assert!(stale[0].datum.contains("31d ago"), "{stale:?}");
+
+        // A diffusion/video lane has no chat pp/tg to bench — it gets
+        // certificate work only, never bench busywork. (The same holds
+        // for a safetensors/mlx chat model: bench drives llama-bench,
+        // which reads GGUF only — the format gate lives at the caller.)
+        let media = autopilot_recs("img", false, None, None, None, now);
+        assert_eq!(media.len(), 1, "{media:?}");
+        assert!(
+            media[0].cmd.starts_with("blazar model-doctor img"),
+            "{media:?}"
+        );
+    }
+
+    #[test]
+    fn unit__ready_card_line__one_dense_line_of_the_real_decision() {
+        let card = serde_json::json!({
+            "engine": {"tag": "b11370-cuda", "kind": null},
+            "context": {"effective": 16384, "effective_source": "config estimate"},
+            "cache": {"kv_k": "auto ladder", "kv_v": "auto ladder"},
+            "speculation": {"mode": "auto"},
+            "slots": {"live": null}
+        });
+        let line = ready_card_line(&card).expect("tagged card renders");
+        assert!(line.contains("engine b11370-cuda ·"), "{line}");
+        assert!(
+            !line.contains("b11370-cuda ("),
+            "null kind must not print a paren after the tag: {line}"
+        );
+        assert!(line.contains("ctx 16K (config estimate)"), "{line}");
+        assert!(line.contains("kv auto ladder/auto ladder"), "{line}");
+        assert!(line.contains("spec auto"), "{line}");
+        assert!(line.ends_with("cold"), "{line}");
+
+        let resident = serde_json::json!({
+            "engine": {"tag": "t", "kind": "llamacpp"},
+            "context": {"effective": 8192, "effective_source": "spawn planner"},
+            "cache": {"kv_k": "q8_0", "kv_v": "q8_0"},
+            "speculation": {"mode": "off"},
+            "slots": {"live": 2}
+        });
+        let line = ready_card_line(&resident).expect("resident card renders");
+        assert!(line.contains("engine t (llamacpp)"), "{line}");
+        assert!(line.contains("resident, 2 slot(s)"), "{line}");
+
+        assert!(
+            ready_card_line(&serde_json::json!({})).is_none(),
+            "a card with no engine tag is not worth a line"
+        );
     }
 
     #[test]
@@ -17728,6 +20495,113 @@ mod tests {
         assert!(!cand.contains("ttl_secs"));
         assert!(cand.contains("threshold = 0.4"), "siblings survive");
         Config::from_toml(&cand).expect("config stays valid after unset");
+    }
+
+    #[test]
+    fn unit__preset_ops__every_knob_is_a_known_root_key() {
+        // Postures are root-knob-only by construction: a section-scoped
+        // key here would silently no-op in apply_preset_ops.
+        for preset in &PRESETS {
+            for op in preset.ops {
+                let key = match op {
+                    PresetOp::Set(k, _) | PresetOp::Unset(k) => *k,
+                };
+                assert!(
+                    top_level_key_known(key),
+                    "{}/{} must be a known root knob",
+                    preset.name,
+                    key
+                );
+                if let PresetOp::Set(k, stored) = op {
+                    let scalar_ok =
+                        toml::from_str::<toml::Table>(&format!("v = {stored}\n")).is_ok();
+                    assert!(scalar_ok, "{k} value {stored} must be a TOML scalar");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unit__apply_preset_ops__posture_pins_validate_and_reset() {
+        // Stale pins from other postures + an unrelated section: the
+        // posture must land its own pins, clear the others, and leave
+        // foreign sections untouched.
+        let raw = "spec = \"ngram\"\nslots = 4\ncache_type = \"q4_0\"\n\
+                   prompt_recipe = \"child\"\ndeterministic = true\n\n[engine_env]\nA = \"b\"\n";
+        let (agent_raw, outcomes) =
+            apply_preset_ops(raw, preset_find("agent").expect("agent posture"))
+                .expect("agent applies");
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| o.line.contains("prompt_recipe = \"ollama_compat\""))
+        );
+        assert!(agent_raw.contains("ubatch_auto = true"));
+        assert!(agent_raw.contains("spec_auto_manage = true"));
+        assert!(!agent_raw.contains("spec = "));
+        assert!(!agent_raw.contains("slots = 4"));
+        assert!(!agent_raw.contains("cache_type = "));
+        assert!(!agent_raw.contains("deterministic = true"));
+        assert!(
+            agent_raw.contains("[engine_env]\nA = \"b\""),
+            "foreign sections survive a posture"
+        );
+        Config::from_toml(&agent_raw).expect("candidate stays schema-valid");
+        // Stale pins produce old→new lines; never-pinned knobs stay
+        // honest "not pinned" no-ops instead of claiming credit.
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| o.changed && o.line.starts_with("spec unset") && o.line.contains("was:")),
+            "stale spec pin must report old→new"
+        );
+        let k = outcomes
+            .iter()
+            .find(|o| o.line.starts_with("cache_type_k"))
+            .expect("k line present");
+        assert!(!k.changed, "never-pinned knob must not claim a change");
+        // Idempotent: same posture twice changes nothing.
+        let (again, outcomes2) =
+            apply_preset_ops(&agent_raw, preset_find("agent").unwrap()).expect("second apply");
+        assert!(
+            outcomes2.iter().all(|o| !o.changed),
+            "second apply is a no-op"
+        );
+        assert_eq!(again, agent_raw);
+        // Reset posture clears the agent pins again.
+        let (balanced, outcomes3) =
+            apply_preset_ops(&agent_raw, preset_find("balanced").unwrap()).expect("balanced");
+        assert!(
+            outcomes3
+                .iter()
+                .any(|o| o.line.starts_with("prompt_recipe unset"))
+        );
+        assert!(!balanced.contains("ollama_compat"));
+        assert!(balanced.contains("ubatch_auto = true"));
+    }
+
+    #[test]
+    fn unit__apply_preset_ops__broken_file_rejected_unchanged() {
+        // A file the schema rejects must abort the whole posture before
+        // any write, naming the knob that tripped.
+        let raw = "port = \"not-a-port\"\n";
+        let err = apply_preset_ops(raw, preset_find("balanced").unwrap())
+            .expect_err("invalid file must reject");
+        assert!(err.to_string().contains("rejected"), "error teaches: {err}");
+    }
+
+    #[test]
+    fn unit__preset_list__names_all_five_postures() {
+        let text = preset_list_text();
+        for name in ["balanced", "fast", "quality", "agent", "max-throughput"] {
+            assert!(text.contains(name), "list must name {name}");
+            assert!(preset_find(name).is_some(), "{name} must resolve");
+        }
+        assert!(text.contains("apply with: blazar config preset"));
+        assert!(
+            preset_find("turbo").is_none(),
+            "unknown posture must not resolve"
+        );
     }
 
     #[test]

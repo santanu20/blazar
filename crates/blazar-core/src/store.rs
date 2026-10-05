@@ -25,7 +25,15 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 10;
+// v11 adds `bench_results` (plain-bench payloads persisted by
+// `blazar bench`; scorecards fall back to it when no tuned profile
+// carries benchmark_json). Purely additive — CREATE TABLE IF NOT
+// EXISTS inside the migration batch covers both fresh and old stores.
+// v12 adds `completion_cards` (slim OpenAI chat-completion metadata
+// cards — the id→metadata mapping behind POST /v1/chat/completions/{id}).
+// Cards exist ONLY for completions created with a `metadata` field;
+// the cap prunes oldest-first so the table stays bounded.
+const SCHEMA_VERSION: i32 = 12;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -130,6 +138,20 @@ CREATE TABLE IF NOT EXISTS model_caps (
     caps_json  TEXT NOT NULL,
     PRIMARY KEY (model, engine_tag)
 );
+CREATE TABLE IF NOT EXISTS bench_results (
+    model        TEXT NOT NULL,
+    engine_tag   TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (model, engine_tag)
+);
+CREATE TABLE IF NOT EXISTS completion_cards (
+    id        TEXT PRIMARY KEY,
+    model     TEXT NOT NULL,
+    created   INTEGER NOT NULL,
+    metadata  TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 ";
 
 /// Row shapes shared across crates.
@@ -182,6 +204,28 @@ impl EngineRow {
             crate::engine_kind::LaneClass::Mainstream
         }
     }
+}
+
+/// UTC calendar date (`YYYY-MM-DD`) for an epoch-seconds stamp.
+/// Scorecards and capability certificates cite verification dates;
+/// sharing one implementation keeps the CLI and gateway citing the
+/// same calendar without a date dependency. Civil-calendar inverse of
+/// the epoch day count (Hinnant's `civil_from_days`); pinned against
+/// known dates including a leap day and a non-leap century year.
+#[must_use]
+pub fn epoch_to_utc_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -326,6 +370,16 @@ fn default_shards() -> i64 {
     1
 }
 
+#[derive(Debug, Clone)]
+/// One row of the `bench_results` table — the durable plain-bench
+/// history `blazar bench` upserts (model + lane keyed).
+pub struct BenchResultRow {
+    pub model: String,
+    pub engine_tag: String,
+    pub payload_json: String,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProfileRow {
     pub model_name: String,
@@ -369,6 +423,20 @@ pub struct JobEventRow {
     pub ts: i64,
     pub kind: String,
     pub data_json: Option<String>,
+}
+
+/// Slim chat-completion card: the id→metadata mapping that lets
+/// `POST /v1/chat/completions/{id}` update metadata after the fact.
+/// Stored only for completions whose create request carried
+/// `metadata` (non-stream; streams cannot be persisted after the
+/// fact — bytes are already on the wire).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CompletionCardRow {
+    pub id: String,
+    pub model: String,
+    pub created: i64,
+    pub metadata_json: String,
+    pub updated_at: i64,
 }
 
 /// Persisted Responses-API entry: enough to reconstruct a
@@ -440,6 +508,10 @@ impl Store {
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < SCHEMA_VERSION {
             self.conn.execute_batch(SCHEMA_SQL)?;
+            // v10→v11: `bench_results` (plain-bench persistence) is
+            // CREATE-TABLE-IF-NOT-EXISTS in SCHEMA_SQL — nothing more
+            // to do here; the version bump replays the batch on
+            // existing stores.
             // v4 added engines.kind. CREATE TABLE IF NOT EXISTS covers
             // fresh databases; existing ones need the explicit ALTER.
             if !self.table_columns("engines")?.contains(&"kind".to_string()) {
@@ -607,6 +679,23 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// User-initiated delete of a terminal job's payload (the Sora-plane
+    /// `DELETE /v1/videos/{id}`): flips `completed`/`failed` rows to
+    /// `cancelled` and drops the stored result/error so the render is no
+    /// longer servable. Deliberately narrower than `set_job_state`'s
+    /// one-way close — that invariant still holds (open rows can only be
+    /// closed once); this only narrows from an already-terminal state,
+    /// which nothing else may do. Returns `false` when the row is open,
+    /// already cancelled, or missing.
+    pub fn delete_job_result(&self, id: &str) -> CoreResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE jobs SET state = 'cancelled', result_json = NULL, error = NULL, updated_at = ?2 \
+             WHERE id = ?1 AND state IN ('completed','failed')",
+            params![id, unix_now()],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Attach a spilled-result artifact path to a job row (results too
     /// large for the inline column). Separate from `set_job_state` so a
     /// transition never needs to know about disk spillover.
@@ -763,11 +852,23 @@ impl Store {
     }
 
     /// Bounded retention: terminal jobs older than `older_than_secs`
-    /// (and their events) are deleted. Called at boot — the table must
-    /// not grow forever.
-    pub fn prune_jobs(&self, older_than_secs: i64) -> CoreResult<u64> {
+    /// (and their events) are deleted, and the artifact paths of the
+    /// deleted rows are returned so the caller can remove the spilled
+    /// files — the store owns the rows, not the disk. Called at boot —
+    /// the table must not grow forever (and neither may the spill dir).
+    pub fn prune_jobs(&self, older_than_secs: i64) -> CoreResult<(u64, Vec<String>)> {
         let cutoff = unix_now() - older_than_secs.max(0);
         let tx = self.conn.unchecked_transaction()?;
+        // Collected before the delete in the same transaction: after it,
+        // the paths would be unrecoverable (and unlinkable).
+        let artifacts = {
+            let mut stmt = tx.prepare(
+                "SELECT artifact_path FROM jobs WHERE state IN ('completed','failed','cancelled','abandoned') \
+                 AND updated_at < ?1 AND artifact_path IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
         tx.execute(
             "DELETE FROM job_events WHERE job_id IN (
                 SELECT id FROM jobs WHERE state IN ('completed','failed','cancelled','abandoned') AND updated_at < ?1
@@ -779,7 +880,7 @@ impl Store {
             params![cutoff],
         )?;
         tx.commit()?;
-        Ok(u64::try_from(n).unwrap_or(0))
+        Ok((u64::try_from(n).unwrap_or(0), artifacts))
     }
 
     // ---- durable responses (v8) --------------------------------------
@@ -871,6 +972,84 @@ impl Store {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
+    // ---- completion metadata cards (v12) ------------------------------
+
+    /// Upper bound on persisted cards. Completions vastly outnumber
+    /// stored responses (every metadata-tagged chat passes here), so the
+    /// cap prunes oldest-updated-first instead of growing forever.
+    const COMPLETION_CARD_CAP: i64 = 4096;
+
+    /// Persist (or overwrite) the slim card for a completion created
+    /// with `metadata`. Prunes beyond the cap in the same transaction
+    /// window — a card that ages out simply stops being updatable, which
+    /// the update endpoint teaches.
+    pub fn put_completion_card(&self, card: &CompletionCardRow) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO completion_cards (id, model, created, metadata, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               model = excluded.model, created = excluded.created,
+               metadata = excluded.metadata, updated_at = excluded.updated_at",
+            params![
+                card.id,
+                card.model,
+                card.created,
+                card.metadata_json,
+                card.updated_at
+            ],
+        )?;
+        self.conn.execute(
+            "DELETE FROM completion_cards WHERE id IN (
+                SELECT id FROM completion_cards
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT -1 OFFSET ?1
+            )",
+            params![Self::COMPLETION_CARD_CAP],
+        )?;
+        Ok(())
+    }
+
+    /// Update only the metadata of an existing card. `Ok(None)` = no
+    /// card under this id (never created with metadata, streamed,
+    /// expired, or pruned) — the caller turns that into the teaching 404.
+    pub fn update_completion_card(
+        &self,
+        id: &str,
+        metadata_json: &str,
+        updated_at: i64,
+    ) -> CoreResult<Option<CompletionCardRow>> {
+        let n = self.conn.execute(
+            "UPDATE completion_cards SET metadata = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, metadata_json, updated_at],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.get_completion_card(id)
+    }
+
+    pub fn get_completion_card(&self, id: &str) -> CoreResult<Option<CompletionCardRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, model, created, metadata, updated_at FROM completion_cards WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(CompletionCardRow {
+                        id: r.get(0)?,
+                        model: r.get(1)?,
+                        created: r.get(2)?,
+                        metadata_json: r.get(3)?,
+                        updated_at: r.get(4)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
     /// Mirror of the in-memory registry contract: entries older than
     /// `ttl_secs` die; past `cap` rows the oldest die. Keeps SQLite the
     /// same shape the RAM registry always had.
@@ -910,9 +1089,14 @@ impl Store {
     }
 
     pub fn get_model_caps(&self, model: &str) -> CoreResult<Option<(String, String)>> {
+        // Latest verification wins: certs are keyed (model, engine_tag),
+        // so a model served by two lanes carries two rows — admission
+        // and scorecards must read the most recent measurement, not
+        // whichever row SQLite happens to return first.
         self.conn
             .query_row(
-                "SELECT engine_tag, caps_json FROM model_caps WHERE model = ?1",
+                "SELECT engine_tag, caps_json FROM model_caps WHERE model = ?1 \
+                 ORDER BY tested_at DESC LIMIT 1",
                 params![model],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
@@ -921,6 +1105,120 @@ impl Store {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other.into()),
             })
+    }
+
+    /// Same record as [`get_model_caps`] with its `tested_at` epoch stamp —
+    /// scorecards cite the verification date, so it travels with the caps.
+    pub fn get_model_caps_dated(&self, model: &str) -> CoreResult<Option<(String, i64, String)>> {
+        self.conn
+            .query_row(
+                "SELECT engine_tag, tested_at, caps_json FROM model_caps WHERE model = ?1 \
+                 ORDER BY tested_at DESC LIMIT 1",
+                params![model],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    // ---- bench result records -----------------------------------------
+    // `blazar bench` upserts its measured rows here (tune-owned launch
+    // profiles keep their richer payload in `profiles.benchmark_json`;
+    // this table is the plain-bench history scorecards fall back to).
+
+    pub fn put_bench_result(
+        &self,
+        model: &str,
+        engine_tag: &str,
+        payload_json: &str,
+    ) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO bench_results (model, engine_tag, payload_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(model, engine_tag) DO UPDATE SET
+               payload_json = excluded.payload_json, updated_at = excluded.updated_at",
+            params![model, engine_tag, payload_json, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    /// Latest plain-bench payload for a model — `engine_tag = Some`
+    /// pins the lane, `None` takes the most recent across lanes.
+    pub fn latest_bench_result(
+        &self,
+        model: &str,
+        engine_tag: Option<&str>,
+    ) -> CoreResult<Option<(String, String, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT engine_tag, payload_json, updated_at FROM bench_results
+                 WHERE model = ?1 AND (?2 IS NULL OR engine_tag = ?2)
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![model, engine_tag],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
+    /// Every plain-bench payload on record — one query for the console's
+    /// Benchmarks view instead of a per-model lookup per row.
+    pub fn list_bench_results(&self) -> CoreResult<Vec<BenchResultRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, engine_tag, payload_json, updated_at FROM bench_results
+             ORDER BY model, engine_tag",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(BenchResultRow {
+                    model: r.get(0)?,
+                    engine_tag: r.get(1)?,
+                    payload_json: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every tuned launch profile on record — pairs with
+    /// `list_bench_results` to show measured vs tuned per model + lane.
+    pub fn list_profiles(&self) -> CoreResult<Vec<ProfileRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model_name, engine_tag, args_hash, args_json, benchmark_json, updated_at
+             FROM profiles ORDER BY model_name, engine_tag",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ProfileRow {
+                    model_name: r.get(0)?,
+                    engine_tag: r.get(1)?,
+                    args_hash: r.get(2)?,
+                    args_json: r.get(3)?,
+                    benchmark_json: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn conn(&self) -> &Connection {
@@ -1035,6 +1333,24 @@ impl Store {
             return Err(CoreError::Store(rusqlite::Error::QueryReturnedNoRows));
         }
         Ok(())
+    }
+
+    /// Kind of a specific engine tag, retired or active — capability
+    /// certificates store only the tag, and tags are arbitrary build
+    /// strings (`b11370-cuda`, `mlx-0.32.0`); the kind comparison the
+    /// certificate gate needs lives here. `None` when the row is gone
+    /// or its kind no longer parses (callers fail open).
+    pub fn engine_kind_of_tag(&self, tag: &str) -> CoreResult<Option<EngineKind>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind FROM engines WHERE tag = ?")?;
+        let mut rows = stmt.query([tag])?;
+        if let Some(r) = rows.next()? {
+            let raw: String = r.get(0)?;
+            Ok(EngineKind::from_str(&raw).ok())
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn active_engine(&self) -> CoreResult<Option<EngineRow>> {
@@ -1484,6 +1800,74 @@ mod tests {
     }
 
     #[test]
+    fn unit__completion_card__put_update_get_roundtrip() {
+        let (_t, s) = tmp_store();
+        let card = CompletionCardRow {
+            id: "chatcmpl-abc".into(),
+            model: "qwen3:14b".into(),
+            created: 1_760_000_000,
+            metadata_json: r#"{"tag":"eval-42"}"#.into(),
+            updated_at: 1_760_000_000,
+        };
+        s.put_completion_card(&card).unwrap();
+        let got = s.get_completion_card("chatcmpl-abc").unwrap().unwrap();
+        assert_eq!(got.metadata_json, r#"{"tag":"eval-42"}"#);
+        assert_eq!(got.model, "qwen3:14b");
+
+        let upd = s
+            .update_completion_card("chatcmpl-abc", r#"{"tag":"eval-43"}"#, 1_760_000_900)
+            .unwrap()
+            .unwrap();
+        assert_eq!(upd.metadata_json, r#"{"tag":"eval-43"}"#);
+        assert_eq!(upd.updated_at, 1_760_000_900);
+
+        // Unknown id: Ok(None) — the API layer turns this into the
+        // teaching 404, not a store error.
+        assert!(
+            s.update_completion_card("chatcmpl-nope", "{}", 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(s.get_completion_card("chatcmpl-nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn integration__completion_card__v11_store_migrates_to_v12() {
+        // Simulate a v11 database: completion_cards absent, user_version 11.
+        // (Open a real store first, then drop only the new table — a
+        // hand-rolled minimal schema would fool the older-step column
+        // backfills the migration also replays.)
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE completion_cards; PRAGMA user_version = 11;")
+                .unwrap();
+        }
+        // Reopen: migrate() recreates the table, stamps v12, and the
+        // card accessors work on the upgraded store.
+        let s = Store::open(&dirs).unwrap();
+        let v: i32 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        s.put_completion_card(&CompletionCardRow {
+            id: "x".into(),
+            model: "m".into(),
+            created: 1,
+            metadata_json: "{}".into(),
+            updated_at: 1,
+        })
+        .unwrap();
+        assert!(s.get_completion_card("x").unwrap().is_some());
+    }
+
+    #[test]
     fn unit__store_schema_created__tables_exist() {
         let (_t, s) = tmp_store();
         let n: i64 = s
@@ -1603,6 +1987,39 @@ mod tests {
     }
 
     #[test]
+    fn unit__jobs__delete_result_purges_terminal_only() {
+        let (_t, s) = tmp_store();
+        let now = unix_now();
+        // A completed row carrying a render...
+        s.insert_job(&job_row("render", "video", "running", now))
+            .unwrap();
+        s.set_job_state("render", "completed", Some("{\"result\":{}}"), None)
+            .unwrap();
+        // ...an open row...
+        s.insert_job(&job_row("wip", "video", "running", now))
+            .unwrap();
+        // ...and an already-cancelled one.
+        s.insert_job(&job_row("gone", "video", "running", now))
+            .unwrap();
+        s.set_job_state("gone", "cancelled", None, None).unwrap();
+
+        // Delete only narrows from completed/failed.
+        assert!(s.delete_job_result("render").unwrap());
+        assert!(!s.delete_job_result("wip").unwrap());
+        assert!(!s.delete_job_result("gone").unwrap());
+
+        let purged = s.get_job("render").unwrap().unwrap();
+        assert_eq!(purged.state, "cancelled");
+        assert!(purged.result_json.is_none());
+        assert!(purged.error.is_none());
+        // Open + already-cancelled rows are untouched.
+        assert_eq!(s.get_job("wip").unwrap().unwrap().state, "running");
+        assert_eq!(s.get_job("gone").unwrap().unwrap().state, "cancelled");
+        // Idempotent second delete.
+        assert!(!s.delete_job_result("render").unwrap());
+    }
+
+    #[test]
     fn unit__jobs__prune_removes_terminal_and_events() {
         let (_t, s) = tmp_store();
         let now = unix_now();
@@ -1618,14 +2035,36 @@ mod tests {
         ))
         .unwrap();
 
-        let n = s.prune_jobs(7 * 86400).unwrap();
+        let (n, artifacts) = s.prune_jobs(7 * 86400).unwrap();
         assert_eq!(n, 1);
+        assert!(artifacts.is_empty(), "no artifact on this row");
         assert!(s.get_job("ancient").unwrap().is_none());
         // Events die with their job — no orphans.
         assert_eq!(s.job_events("ancient", 10).unwrap(), Vec::new());
         // Recent terminal and old-but-in-flight both survive (the sweep owns in-flight).
         assert!(s.get_job("recent").unwrap().is_some());
         assert!(s.get_job("old_inflight").unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__jobs__prune_returns_artifact_paths_of_deleted_rows_only() {
+        let (_t, s) = tmp_store();
+        let now = unix_now();
+        let mut spilled = job_row("spilled", "video", "completed", now - 30 * 86400);
+        spilled.artifact_path = Some("/tmp/jobs/spilled/result".into());
+        s.insert_job(&spilled).unwrap();
+        let mut kept = job_row("kept", "video", "completed", now);
+        kept.artifact_path = Some("/tmp/jobs/kept/result".into());
+        s.insert_job(&kept).unwrap();
+        let mut inflight = job_row("inflight", "video", "running", now - 30 * 86400);
+        inflight.artifact_path = Some("/tmp/jobs/inflight/result".into());
+        s.insert_job(&inflight).unwrap();
+
+        let (n, artifacts) = s.prune_jobs(7 * 86400).unwrap();
+        assert_eq!(n, 1);
+        // Only the pruned row's path comes back — the caller deletes
+        // exactly those files and nothing else.
+        assert_eq!(artifacts, vec!["/tmp/jobs/spilled/result".to_string()]);
     }
 
     #[test]
@@ -1774,6 +2213,112 @@ mod tests {
         s.insert_job(&job_row("upgrade_probe", "audio", "queued", 1000))
             .unwrap();
         assert!(s.get_job("upgrade_probe").unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__model_caps_dated__round_trips_with_stamp() {
+        let (_tmp, s) = tmp_store();
+        assert!(s.get_model_caps_dated("m1").unwrap().is_none());
+        s.put_model_caps("m1", "llamacpp-b1", "{\"caps\":{}}")
+            .unwrap();
+        let (tag, tested_at, caps_json) = s
+            .get_model_caps_dated("m1")
+            .unwrap()
+            .expect("row exists after put");
+        assert_eq!(tag, "llamacpp-b1");
+        assert!(
+            tested_at > 1_700_000_000,
+            "stamp is a real epoch: {tested_at}"
+        );
+        assert_eq!(caps_json, "{\"caps\":{}}");
+        // Undated view stays consistent with the dated one.
+        assert_eq!(s.get_model_caps("m1").unwrap().unwrap().0, tag);
+    }
+
+    #[test]
+    fn unit__bench_results__round_trip_pinned_then_latest_any() {
+        let (_tmp, s) = tmp_store();
+        assert!(s.latest_bench_result("m1", None).unwrap().is_none());
+        s.put_bench_result("m1", "lane-a", "[]").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        s.put_bench_result("m1", "lane-b", "[]").unwrap();
+        // Pinned lookup is exact; unpinned takes the most recent.
+        let (tag, payload, _) = s
+            .latest_bench_result("m1", Some("lane-a"))
+            .unwrap()
+            .expect("pinned row exists");
+        assert_eq!((tag.as_str(), payload.as_str()), ("lane-a", "[]"));
+        let (tag, _, _) = s
+            .latest_bench_result("m1", None)
+            .unwrap()
+            .expect("any row exists");
+        assert_eq!(tag, "lane-b", "latest across lanes wins: {tag}");
+        // Upsert, not append: re-benching the same (model, lane) replaces.
+        s.put_bench_result("m1", "lane-a", "[{\"ts\":1}]").unwrap();
+        let (tag, payload, _) = s
+            .latest_bench_result("m1", Some("lane-a"))
+            .unwrap()
+            .expect("row exists after upsert");
+        assert_eq!((tag.as_str(), payload.as_str()), ("lane-a", "[{\"ts\":1}]"));
+    }
+
+    #[test]
+    fn unit__list_bench_results_and_profiles__single_query_inventories() {
+        let (_tmp, s) = tmp_store();
+        s.put_bench_result("m2", "lane-b", "[]").unwrap();
+        s.put_bench_result("m1", "lane-a", "[]").unwrap();
+        let listed = s.list_bench_results().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| (r.model.as_str(), r.engine_tag.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("m1", "lane-a"), ("m2", "lane-b")],
+            "sorted by model then lane"
+        );
+        assert!(s.list_profiles().unwrap().is_empty());
+        s.upsert_profile(&ProfileRow {
+            model_name: "m1".into(),
+            engine_tag: "lane-a".into(),
+            args_hash: "h".into(),
+            args_json: "{}".into(),
+            benchmark_json: None,
+            updated_at: 7,
+        })
+        .unwrap();
+        let profiles = s.list_profiles().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            (profiles[0].model_name.as_str(), profiles[0].updated_at),
+            ("m1", 7)
+        );
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v10_to_v11() {
+        // Simulate a v10 database: no bench_results table, user_version 10.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE bench_results; PRAGMA user_version = 10;")
+                .unwrap();
+        }
+        // Reopen: migrate() recreates the table, stamps v11, and the
+        // accessors work on the upgraded store (the exact gap the live
+        // bench hit: version-gated schema replay).
+        let s = Store::open(&dirs).unwrap();
+        let v: i32 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        s.put_bench_result("m1", "lane-a", "[]").unwrap();
+        assert!(s.latest_bench_result("m1", None).unwrap().is_some());
     }
 
     #[test]

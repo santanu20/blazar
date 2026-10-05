@@ -28,8 +28,23 @@ use manifest::Manifest;
 
 /// Retention for engine dirs: the newest 2 survive auto-prune — the
 /// fresh build plus one rollback anchor (~215 MiB each). `local` and the
-/// active tag are always kept on top of this.
-pub const KEEP_TAGS: usize = 2;
+/// active tag are always kept on top of this. The `keep_tags` config knob
+/// overrides this default per box (1 = no rollback anchor).
+pub use blazar_core::config::DEFAULT_KEEP_TAGS as KEEP_TAGS;
+
+/// Retention in force on this box: the `keep_tags` config knob when a
+/// config file exists (validated parse — a broken config fails the prune
+/// loudly instead of silently keeping stale builds), the built-in default
+/// otherwise. Read at prune time, not install time, so a knob edit
+/// applies to the very next install/prune with no daemon restart.
+pub fn effective_keep_tags(dirs: &BlazarDirs) -> Result<usize> {
+    let path = dirs.config_file();
+    if !path.exists() {
+        return Ok(KEEP_TAGS);
+    }
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    Ok(blazar_core::Config::from_toml(&raw)?.keep_tags)
+}
 
 /// How long an engine dir must stay quiet before the automatic debris
 /// sweep may reclaim it. Installs write continuously (each download
@@ -2236,7 +2251,8 @@ impl EngineManager {
         self.use_tag(&target)
     }
 
-    /// Keep the newest `KEEP_TAGS` engines; `local` and the active tag are
+    /// Keep the newest `keep_tags` engines (config knob, default
+    /// `KEEP_TAGS`); `local` and the active tag are
     /// never pruned. Fork capability lanes are exempt entirely — see
     /// [`is_fork_lane`]. Returns the freed (tag, bytes) pairs for the
     /// summary, mirroring [`Self::prune_siblings`].
@@ -2255,6 +2271,7 @@ impl EngineManager {
     pub fn prune(&self, store: &Store, changed_kind: Option<&str>) -> Result<Vec<(String, u64)>> {
         let engines = store.list_engines()?; // newest first
         let active = engines.iter().find(|e| e.active).map(|e| e.tag.clone());
+        let keep = effective_keep_tags(&self.dirs)?;
         // Retention is scoped per engine KIND: a mistral.rs build is never
         // a rollback anchor for an active llama.cpp engine (and vice
         // versa), so each lane keeps its own newest KEEP_TAGS. Kind-blind
@@ -2281,7 +2298,7 @@ impl EngineManager {
             }
             let seen = kept_per_kind.entry(e.kind.as_str()).or_insert(0);
             *seen += 1;
-            if *seen <= KEEP_TAGS || e.tag == LOCAL_TAG || Some(&e.tag) == active.as_ref() {
+            if *seen <= keep || e.tag == LOCAL_TAG || Some(&e.tag) == active.as_ref() {
                 continue;
             }
             let dir = self.dirs.engines_dir().join(&e.tag);

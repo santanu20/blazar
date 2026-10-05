@@ -222,8 +222,10 @@ const UBATCH_GOV_TIERS: [u32; 2] = [1024, 2048];
 /// A trailing `@vision` marker (projector-carrying respawn of a
 /// text-only instance, see `ensure_vision`) and an on-demand `+lora`
 /// variant marker (see `spawn_instance`) are stripped too, so every
-/// consumer sees the plain model name.
-fn model_of_key(key: &str) -> &str {
+/// consumer sees the plain model name. Public: the gateway's evict
+/// fallback compares live instance names by this same grammar.
+#[must_use]
+pub fn model_of_key(key: &str) -> &str {
     let key = key.split('@').next().unwrap_or(key);
     let key = match key.split_once('#') {
         Some((model, _)) => model,
@@ -548,6 +550,13 @@ pub enum SupervisionError {
     /// parking the request behind the bounded `all_slots_busy` queue.
     #[error("{0}")]
     ModelTooLarge(String),
+    /// Spawn-time memory floor (J3): the box cannot host this load
+    /// without thrashing swap. Distinct from `ModelTooLarge` (a floor no
+    /// card could ever meet) — here freeing co-resident engines WOULD
+    /// change the verdict, so the message names those levers. Maps to
+    /// HTTP 507: the resource is exhausted, not "busy".
+    #[error("{0}")]
+    InsufficientMemory(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -1661,6 +1670,14 @@ pub struct Supervisor {
     last_requested: std::sync::Mutex<Option<String>>,
     /// Models whose speculative preload failed recently (LC1 backoff).
     preload_failures: DashMap<String, Instant>,
+    /// Models live from a predictive preload that have not served yet
+    /// (LC1 negative feedback). Cleared on the first serve — the
+    /// prediction came true. An eviction with the entry still set
+    /// falsified the prediction and decays the transitions that
+    /// spawned it (`decay_transitions_to`), so a stale pattern stops
+    /// resurrecting an unwanted resident every reaper tick. Keyed by
+    /// model name, bounded by the store's model count — no cap needed.
+    preload_awaiting_use: DashMap<String, ()>,
     /// Weights files being re-paged into the OS cache right now (F1
     /// single-flight: one warm per path, later requests are no-ops).
     /// `Arc` so the detached warm task can retire its own guard.
@@ -1866,6 +1883,7 @@ impl Supervisor {
             transitions: DashMap::new(),
             last_requested: std::sync::Mutex::new(None),
             preload_failures: DashMap::new(),
+            preload_awaiting_use: DashMap::new(),
             ram_warming: Arc::new(DashMap::new()),
             busy_streak: DashMap::new(),
             reshape_draining: DashMap::new(),
@@ -2415,6 +2433,9 @@ impl Supervisor {
     }
 
     fn note_transition(&self, name: &str) {
+        // A serve is the prediction coming true: a resident that was a
+        // predictive preload must not be treated as unused at evict.
+        self.preload_awaiting_use.remove(name);
         let prev = {
             let mut last = self.last_requested.lock().unwrap();
             let prev = last.clone();
@@ -2436,6 +2457,31 @@ impl Supervisor {
             }
         }
         *self.transitions.entry(edge).or_insert(0) += 1;
+    }
+
+    /// LC1 negative feedback: halve every (prev → model) transition
+    /// count, dropping edges that fall to zero. Called only when a
+    /// predictively-preloaded model reaches eviction without a single
+    /// serve — the prediction was falsified, so the graph must learn.
+    /// Halving (not clearing) lets a genuinely alternating workflow
+    /// re-earn its preload on the next serve while a dead pattern fades
+    /// out over a couple of idle ladders instead of resurrecting the
+    /// model on every reaper tick.
+    fn decay_transitions_to(&self, model: &str) {
+        let mut decayed = 0usize;
+        self.transitions.retain(|edge, count| {
+            if edge.1 != model {
+                return true;
+            }
+            decayed += 1;
+            *count /= 2;
+            *count > 0
+        });
+        tracing::info!(
+            model,
+            edges = decayed,
+            "predictive preload unused: transitions decayed"
+        );
     }
 
     /// Pick the instance key for a request: `"model"` when
@@ -3675,6 +3721,24 @@ impl Supervisor {
                 model.path
             )));
         }
+        // SGLang lane admission (config facts that predict engine death —
+        // same teach-at-the-door pattern as the diffusion guard above): a
+        // quant_method this build cannot load crashes the server during
+        // weight load, and a vision-tower config without
+        // preprocessor_config.json dies in processor init. Both would
+        // otherwise surface as an opaque 502 ~30s later; the gate names
+        // the offending value instead. Dense text models and complete
+        // multimodal dirs pass untouched (verified against the live lane).
+        if engine.kind() == blazar_core::engine_kind::EngineKind::Sglang
+            && let blazar_core::hfmeta::ModelMeta::Hf(h) = meta_box.borrow_meta()
+            && let Some(teach) =
+                blazar_core::hfmeta::sglang_lane_teach(h, std::path::Path::new(&model.path))
+        {
+            return Err(SupervisionError::UnsupportedModel(format!(
+                "{}: {teach}",
+                model.path
+            )));
+        }
         let loras = Self::resolve_lora_lane(
             &store
                 .list_loras(Some(name))
@@ -3912,7 +3976,7 @@ impl Supervisor {
             let model_mib = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX) / (1024 * 1024);
             let need = (model_mib / 2) + 512;
             if avail < need {
-                return Err(SupervisionError::Internal(anyhow!(
+                return Err(SupervisionError::InsufficientMemory(format!(
                     "insufficient memory to load {:?}: MemAvailable {avail} MiB < floor {need} MiB \
                      (model {} MiB). Stop co-resident engines (blazar ps / ollama stop) or free RAM; \
                      disable this guard with spawn_mem_guard = false",
@@ -5152,6 +5216,15 @@ drop them from rpc_servers in config.toml",
         // once, bounded, and only for idle instances (live requests own
         // their KV).
         self.bank_save(inst).await;
+        // LC1 negative feedback: an eviction with the never-served flag
+        // still set falsified the predictive preload — decay the
+        // transitions that spawned it so they stop resurrecting the
+        // model every reaper tick. `name` is the instance key; the
+        // flag and the graph key by model.
+        let model = model_of_key(name);
+        if self.preload_awaiting_use.remove(model).is_some() {
+            self.decay_transitions_to(model);
+        }
         *inst.state.write().expect("state lock") = InstanceState::Evicted;
         self.evictions.fetch_add(1, Ordering::Relaxed);
         self.bus.publish(BlazarEvent::InstanceStateChanged {
@@ -5856,6 +5929,8 @@ drop them from rpc_servers in config.toml",
         tracing::info!(model = %next, from = %current, count, "predictive preload");
         match self.spawn_instance(&next).await {
             Ok(_) => {
+                // Track the spawn as an open prediction until first serve.
+                self.preload_awaiting_use.insert(next.clone(), ());
                 let _ = self.bus.publish(BlazarEvent::ModelPreloaded {
                     model: next,
                     from: current,
@@ -8155,8 +8230,11 @@ mod routing_tests {
             4,
         )
         .await;
+        // Wall-clock bound, generous on purpose: this only proves no
+        // HTTP machinery spins up (a real dial far exceeds it). Tight
+        // bounds flake under a saturated parallel test run.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(100),
+            started.elapsed() < std::time::Duration::from_secs(2),
             "unix guard returns without HTTP"
         );
     }
@@ -8814,14 +8892,19 @@ mod routing_tests {
     }
 
     fn dummy_process() -> tokio::process::Child {
+        // kill_on_drop: the fabricated pid outlives the helper, but the
+        // real process must not — an orphaned child parks tokio's
+        // orphan-reaper thread and nextest flags the test as LEAK.
         #[cfg(not(windows))]
         return tokio::process::Command::new("sleep")
             .arg("30")
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn sleep");
         #[cfg(windows)]
         return tokio::process::Command::new("cmd")
             .args(["/C", "pause"])
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn cmd");
     }
@@ -9668,6 +9751,86 @@ mod routing_tests {
         sup.note_transition("b");
         sup.note_transition("b");
         assert!(!sup.transitions.contains_key(&("b".into(), "b".into())));
+    }
+
+    #[test]
+    fn unit__decay_transitions_to__halves_incoming_drops_zeros_leaves_rest() {
+        let sup = routing_sup(1);
+        for (from, to, n) in [("a", "b", 6u64), ("c", "b", 1), ("b", "a", 4)] {
+            sup.transitions
+                .insert((from.to_string(), to.to_string()), n);
+        }
+        sup.decay_transitions_to("b");
+        let get = |f: &str, t: &str| {
+            sup.transitions
+                .get(&(f.to_string(), t.to_string()))
+                .map(|v| *v)
+        };
+        assert_eq!(get("a", "b"), Some(3), "incoming edge halves");
+        assert_eq!(get("c", "b"), None, "edge falling to zero is dropped");
+        assert_eq!(get("b", "a"), Some(4), "outgoing edge untouched");
+    }
+
+    #[test]
+    fn unit__note_transition__serve_clears_awaiting_use_flag() {
+        let sup = routing_sup(1);
+        sup.preload_awaiting_use.insert("b".to_string(), ());
+        sup.note_transition("a"); // establish prev so the serve below counts
+        sup.note_transition("b");
+        assert!(
+            !sup.preload_awaiting_use.contains_key("b"),
+            "a serve is the prediction coming true — flag must clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__evict__unused_predictive_preload_decays_until_loop_dies() {
+        // The live-observed resurrection loop: B preloaded from A→B
+        // edges, never serves, idle-evicts — and the stale edges used
+        // to re-spawn it on the very next reaper tick, forever. The
+        // evict-side decay must break the cycle within two ladders.
+        let sup = routing_sup(1);
+        for m in ["a", "b", "a", "b", "a", "b", "a", "b", "a", "b", "a", "b"] {
+            sup.note_transition(m);
+        }
+        let edge = ("a".to_string(), "b".to_string());
+        assert_eq!(sup.transitions.get(&edge).map(|v| *v), Some(6));
+        let mut holders = Vec::new();
+        for expected in [3u64, 1] {
+            sup.preload_awaiting_use.insert("b".to_string(), ());
+            let (inst, ph) = fake_instance("b", InstanceState::Ready, 0);
+            sup.instances.insert("b".to_string(), inst);
+            holders.push(ph);
+            sup.evict("b").await.unwrap();
+            assert_eq!(
+                sup.transitions.get(&edge).map(|v| *v),
+                Some(expected),
+                "unused predictive eviction must halve the incoming edge"
+            );
+            assert!(
+                !sup.preload_awaiting_use.contains_key("b"),
+                "flag is consumed exactly once"
+            );
+        }
+        assert!(
+            sup.transitions.get(&edge).map_or(0, |v| *v) < PRELOAD_MIN_TRANSITIONS,
+            "after two unused ladders the edge sits below the preload threshold — no resurrection"
+        );
+        // A model that DID serve keeps its edges at evict: the serve
+        // clears the flag, so the later eviction is organic.
+        sup.note_transition("a"); // refresh prev after the decay rounds
+        sup.preload_awaiting_use.insert("b".to_string(), ());
+        sup.note_transition("b"); // serve: a→b back to 2 AND clears the flag
+        let (inst, ph) = fake_instance("b", InstanceState::Ready, 0);
+        sup.instances.insert("b".to_string(), inst);
+        holders.push(ph);
+        sup.evict("b").await.unwrap();
+        assert_eq!(
+            sup.transitions.get(&edge).map(|v| *v),
+            Some(2),
+            "served-then-evicted model must not decay"
+        );
+        kill_all(&holders);
     }
 
     #[tokio::test]

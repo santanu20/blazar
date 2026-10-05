@@ -1,4 +1,6 @@
+autopilot
 bench
+classify
 completions
 config
 connect
@@ -21,6 +23,7 @@ lora
 migrate
 mmproj
 model-doctor
+plan
 prune
 ps
 pull
@@ -30,6 +33,7 @@ replicate
 rm
 route
 run
+scorecard
 search
 serve
 session

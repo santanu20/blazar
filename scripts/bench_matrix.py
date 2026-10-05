@@ -4260,7 +4260,13 @@ def check_embed_triple(vecs: dict[str, list[float]], triple: dict) -> bool:
 
 
 def chat_greedy(
-    port: int, model: str, user: str, max_tokens: int, system: str | None = None
+    port: int,
+    model: str,
+    user: str,
+    max_tokens: int,
+    system: str | None = None,
+    think: bool = False,
+    timeout: float = 300.0,
 ) -> tuple[str, float]:
     """Non-streaming greedy chat completion; HTTPError retries with a
     minimal body (same strictness ladder as greedy_completions).
@@ -4268,7 +4274,9 @@ def chat_greedy(
     enable_thinking=false pins hybrid reasoning models (Qwen3 family) to
     direct answers, so quality lanes measure task ability, not how much
     of the token budget <think> consumed. llama-server honors the kwarg;
-    servers that ignore unknown fields are unaffected."""
+    servers that ignore unknown fields are unaffected. think=True (the
+    reason suite: multi-step arithmetic a no-think 9B floors at 0/12 on)
+    flips the pin and the CALLER must supply a think-sized budget."""
     messages = [{"role": "system", "content": system}] if system else []
     messages.append({"role": "user", "content": user})
     body = {
@@ -4277,31 +4285,38 @@ def chat_greedy(
         "max_tokens": max_tokens,
         "stream": False,
         "temperature": 0,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": think},
     }
     t0 = time.perf_counter()
     try:
         j = http_json(
-            f"http://127.0.0.1:{port}/v1/chat/completions", body, timeout=300.0
+            f"http://127.0.0.1:{port}/v1/chat/completions", body, timeout=timeout
         )
     except urllib.error.HTTPError:
         body.pop("stream", None)
         j = http_json(
-            f"http://127.0.0.1:{port}/v1/chat/completions", body, timeout=300.0
+            f"http://127.0.0.1:{port}/v1/chat/completions", body, timeout=timeout
         )
     text = ((j.get("choices") or [{}])[0].get("message") or {}).get("content", "")
     return text or "", (time.perf_counter() - t0) * 1000.0
 
 
 def ollama_chat_greedy(
-    port: int, model: str, user: str, max_tokens: int, system: str | None = None
+    port: int,
+    model: str,
+    user: str,
+    max_tokens: int,
+    system: str | None = None,
+    think: bool = False,
+    timeout: float = 300.0,
 ) -> tuple[str, float]:
     """Native /api/chat greedy probe for the ollama reference lane.
 
     The OpenAI-compat endpoint ignores every thinking knob on current
     ollama builds (verified live: chat_template_kwargs and think=false
     both leave reasoning on); the native endpoint honors think=false.
-    Same (content, latency_ms) contract as chat_greedy."""
+    think=True serves the reason suite (see chat_greedy). Same
+    (content, latency_ms) contract as chat_greedy."""
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -4310,11 +4325,11 @@ def ollama_chat_greedy(
         "model": model,
         "messages": messages,
         "stream": False,
-        "think": False,
+        "think": think,
         "options": {"temperature": 0, "num_predict": max_tokens},
     }
     t0 = time.perf_counter()
-    j = http_json(f"http://127.0.0.1:{port}/api/chat", body, timeout=300.0)
+    j = http_json(f"http://127.0.0.1:{port}/api/chat", body, timeout=timeout)
     text = (j.get("message") or {}).get("content", "")
     return text or "", (time.perf_counter() - t0) * 1000.0
 
@@ -4413,14 +4428,38 @@ def run_quality_suites(
         for task in tasks_by_suite[suite]:
             if task["checker"] == "embed":
                 continue  # handled as its own suite below
+            think = False
+            task_timeout = 300.0
             if task["checker"] == "niah":
                 prompt = niah_build_prompt(task, seed)
                 max_tokens = 48
+            elif task["checker"] == "numeric":
+                # multi-step arithmetic needs the reasoning mode hybrid
+                # models are built around: measured 2026-10-05, a no-think
+                # 9B floors this suite at 0/12 while think=true passes
+                # the same seeds — the suite must measure computation
+                # ability, not the no-think mode. 8192 separates the
+                # measured populations cleanly: convergers land <=1.5k
+                # eval tokens, ruminators never converge at any budget
+                # (both measured live, 2026-10-05) — a smaller cap would
+                # score slow thinkers with the loopers.
+                prompt = task["prompt"]
+                max_tokens = 8192
+                think = True
+                task_timeout = 600.0
             else:
                 prompt = task["prompt"]
                 max_tokens = 400 if task["checker"] == "code" else 200
+                task_timeout = 300.0
             try:
-                resp, lat_ms = chat(port, model_body, prompt, max_tokens)
+                resp, lat_ms = chat(
+                    port,
+                    model_body,
+                    prompt,
+                    max_tokens,
+                    think=think,
+                    timeout=task_timeout,
+                )
             except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
                 if first_transport is None:
                     first_transport = f"{suite}/{task['id']}: {exc}"[:160]
@@ -4494,8 +4533,21 @@ def quality_conc_probe(
 
     def worker(task: dict) -> None:
         nonlocal errors
+        # reason tasks keep their think+budget treatment under load —
+        # running them no-think here would compare apples to the serial
+        # lane's oranges (the conc delta must be batching, not mode);
+        # budget mirrors run_quality_suites so the delta stays pure
+        think = task["checker"] == "numeric"
+        budget = 8192 if think else 200
         try:
-            resp, _ = chat(port, model_body, task["prompt"], 200)
+            resp, _ = chat(
+                port,
+                model_body,
+                task["prompt"],
+                budget,
+                think=think,
+                timeout=600.0 if think else 300.0,
+            )
             results[task["id"]] = score_quality_task(task, resp, {})
         except (urllib.error.URLError, OSError, json.JSONDecodeError):
             errors += 1
@@ -4548,7 +4600,20 @@ def run_quality_blazar_cell(
         try:
             daemon.start(
                 cfg=with_engine_pin(
-                    {"port": V.PORT, **(blazar_cfg or {})}, model_name, eng
+                    {
+                        "port": V.PORT,
+                        # non-streaming think-mode generations emit
+                        # headers only when the whole body is computed —
+                        # the 120s default ceiling would evict a healthy
+                        # mid-computation child (measured live: 8k-token
+                        # reasoning runs 504 at the default). 600 is the
+                        # text-lane config maximum; sandbox-only knob.
+                        # An explicit blazar_cfg axis still overrides.
+                        "child_header_timeout_secs": 600,
+                        **(blazar_cfg or {}),
+                    },
+                    model_name,
+                    eng,
                 ),
                 floor_model=model_name,
             )
@@ -5471,7 +5536,13 @@ def build_local_corpus(
 
 
 def run_perplexity(
-    eng: Engine, model: Path, corpus: Path, cfg: dict, tool: Path | None = None
+    eng: Engine,
+    model: Path,
+    corpus: Path,
+    cfg: dict,
+    tool: Path | None = None,
+    cache_k: str = "",
+    cache_v: str = "",
 ) -> dict:
     # `tool` borrows another engine's llama-perplexity (mistral.rs/sglang
     # engine dirs ship none): ppl measures the checkpoint, not the
@@ -5500,6 +5571,12 @@ def run_perplexity(
         "--chunks",
         "4",
     ]
+    # KV-quant rung for the ladder quality receipts: same corpus/ctx/
+    # chunks/ngl, only the cache types move — the ppl delta vs the f16
+    # row IS the measured quality cost of that rung. The f16 rung passes
+    # no flags (engine default), identical to the historical single cell.
+    if cache_k and cache_v:
+        argv += ["--cache-type-k", cache_k, "--cache-type-v", cache_v]
     t0 = time.time()
     p = subprocess.run(
         argv,
@@ -6064,6 +6141,7 @@ def write_markdown_report(
     argv_summary: str,
     ref_tag: str | None,
     blazar_version: str = "unknown",
+    quality_status: dict | None = None,
 ) -> None:
     """Human-first markdown report: environment, speed, resources,
     concurrency, quality, features, failures."""
@@ -6082,6 +6160,8 @@ def write_markdown_report(
     md.append("- **engines**: " + ", ".join(all_tags))
     md.append(f"- **harness**: bench_matrix v{HARNESS_VERSION} — `{argv_summary}`")
     md.append(f"- **blazar**: `{blazar_version}` (sandbox daemon binary)")
+    qstat = quality_status or quality_lane_status(records)
+    md.append(f"- **quality lane**: {qstat['status']} — {qstat['detail']}")
     # provenance disclosure: resumed campaigns mix rows measured by
     # different binaries — enumerate the stamps actually in the records
     blazar_owned = [
@@ -6468,6 +6548,15 @@ def main() -> int:
         "--soak", type=float, default=0.0, help="blazar soak seconds (0=off)"
     )
     ap.add_argument("--skip-ppl", action="store_true")
+    ap.add_argument(
+        "--ppl-kv-rungs",
+        default="f16",
+        help="KV-quant rungs for the ppl lane, comma-separated: 'f16' "
+        "(no cache flags, engine default — the historical single cell) "
+        "and/or 'k/v' grades like 'q8_0/q8_0,q4_0/q4_0'. One cell per "
+        "rung, identical corpus/ctx/chunks/ngl — the ppl delta across "
+        "rungs is the measured quality cost of the KV ladder.",
+    )
     ap.add_argument("--skip-greedy", action="store_true")
     ap.add_argument(
         "--skip-tools",
@@ -7657,64 +7746,87 @@ def main() -> int:
         ppl_owner = next(
             (e for e in engine_inventory if e.perplexity is not None), None
         )
+        # KV-quant rungs: "f16" keeps the historical params/key exactly
+        # (resume-compatible with every prior campaign cell); each quant
+        # rung gets its own params.ppl_kv so cells.jsonl dedups per rung.
+        ppl_rungs = [r.strip() for r in args.ppl_kv_rungs.split(",") if r.strip()]
+        bad_rungs = [
+            r
+            for r in ppl_rungs
+            if r != "f16" and (len(r.split("/")) != 2 or not all(r.split("/")))
+        ]
+        if bad_rungs:
+            log(
+                f"--ppl-kv-rungs entries must be 'f16' or 'k/v' grades: "
+                f"{bad_rungs} — aborting (exit 2)"
+            )
+            sys.exit(2)
         for eng in text_engines:
-            params = {"ppl": PPL_CTX}
-            key = cell_key(eng.tag, "ppl", params, model.name)
-            if key in done:
-                continue
-            log(f"[perplexity {eng.tag}]")
-            if eng.perplexity is None and ppl_owner is None:
-                emit(
-                    eng.tag,
-                    eng.kind,
-                    "ppl",
-                    params,
-                    key,
-                    {"error": "no llama-perplexity binary on this box"},
-                )
-                continue
-            # llama-perplexity loads GGUF files only — an HF safetensors
-            # campaign model is a format boundary for the tool (it exits
-            # 'failed to load model' on the directory). Honest note row,
-            # no error: the cell is structurally unmeasurable, not failed.
-            if model.is_dir():
-                emit(
-                    eng.tag,
-                    eng.kind,
-                    "ppl",
-                    params,
-                    key,
-                    {
-                        "note": (
-                            "skipped: llama-perplexity loads GGUF files only; "
-                            f"{model.name} is an HF safetensors directory - "
-                            "model-format boundary, not an engine failure"
-                        )
-                    },
-                )
-                continue
-            assert corpus is not None  # corpus_needed fetched or aborted above
-            if not mem_guard(2048.0, f"pre-ppl {eng.tag}"):
-                emit(
-                    eng.tag,
-                    eng.kind,
-                    "ppl",
-                    params,
-                    key,
-                    {"error": "GPU memory floor exceeded before cell"},
-                )
-                continue
-            try:
-                rec = run_perplexity(
-                    eng,
-                    model,
-                    corpus,
-                    cfg,
-                    tool=None if eng.perplexity is not None else ppl_owner.perplexity,
-                )
-            except Exception as exc:
-                rec = {"error": f"ppl cell crashed: {exc}"}
-            emit(eng.tag, eng.kind, "ppl", params, key, rec)
+            for rung in ppl_rungs:
+                cache_k = cache_v = ""
+                if rung != "f16":
+                    cache_k, _, cache_v = rung.partition("/")
+                params = {"ppl": PPL_CTX} | ({} if rung == "f16" else {"ppl_kv": rung})
+                key = cell_key(eng.tag, "ppl", params, model.name)
+                if key in done:
+                    continue
+                log(f"[perplexity {eng.tag} kv={rung}]")
+                if eng.perplexity is None and ppl_owner is None:
+                    emit(
+                        eng.tag,
+                        eng.kind,
+                        "ppl",
+                        params,
+                        key,
+                        {"error": "no llama-perplexity binary on this box"},
+                    )
+                    continue
+                # llama-perplexity loads GGUF files only — an HF safetensors
+                # campaign model is a format boundary for the tool (it exits
+                # 'failed to load model' on the directory). Honest note row,
+                # no error: the cell is structurally unmeasurable, not failed.
+                if model.is_dir():
+                    emit(
+                        eng.tag,
+                        eng.kind,
+                        "ppl",
+                        params,
+                        key,
+                        {
+                            "note": (
+                                "skipped: llama-perplexity loads GGUF files only; "
+                                f"{model.name} is an HF safetensors directory - "
+                                "model-format boundary, not an engine failure"
+                            )
+                        },
+                    )
+                    continue
+                assert corpus is not None  # corpus_needed fetched or aborted above
+                if not mem_guard(2048.0, f"pre-ppl {eng.tag}"):
+                    emit(
+                        eng.tag,
+                        eng.kind,
+                        "ppl",
+                        params,
+                        key,
+                        {"error": "GPU memory floor exceeded before cell"},
+                    )
+                    continue
+                try:
+                    rec = run_perplexity(
+                        eng,
+                        model,
+                        corpus,
+                        cfg,
+                        tool=None
+                        if eng.perplexity is not None
+                        else ppl_owner.perplexity,
+                        cache_k=cache_k,
+                        cache_v=cache_v,
+                    )
+                except Exception as exc:
+                    rec = {"error": f"ppl cell crashed: {exc}"}
+                emit(eng.tag, eng.kind, "ppl", params, key, rec)
 
     # ---- quality: tool-call selection + schema (single-turn, temp 0)
     # ---- no-lag reshape lane: sustained C=8 proves graceful-drain adoption
@@ -8131,6 +8243,13 @@ def main() -> int:
     # persist the real campaign invocation so later --render-only passes
     # can stamp it into the publication report's Reproduce section
     (art / "campaign_cmd.txt").write_text(argv_summary + "\n")
+    # quality-lane receipt: stamp the run/skip/error status beside the
+    # invocation so a speed-only campaign is machine-readably honest
+    qstat = quality_lane_status(all_records, args.skip_quality)
+    (art / "quality-status.json").write_text(
+        json.dumps({"status": qstat["status"], "detail": qstat["detail"]}, indent=2)
+        + "\n"
+    )
     write_markdown_report(
         md_path,
         all_records,
@@ -8140,12 +8259,17 @@ def main() -> int:
         argv_summary,
         ref_tag,
         blazar_version,
+        quality_status=qstat,
     )
     log(f"report  -> {md_path}")
     if args.md:
-        write_publication_report(all_records, art, Path(args.md), argv_summary)
+        write_publication_report(
+            all_records, art, Path(args.md), argv_summary, quality_status=qstat
+        )
         log(f"report -> {args.md}")
     write_speed_table(all_records, art / "summary.txt")
+    with (art / "summary.txt").open("a", encoding="utf-8") as fh:
+        fh.write(f"\nquality lane: {qstat['status']} — {qstat['detail']}\n")
     log(f"summary -> {art / 'summary.txt'}")
     log(f"cells   -> {cells_path} ({len(records)} new, {len(all_records)} total)")
     offenders = qc_drift_gate(all_records)
@@ -8442,12 +8566,15 @@ def ppl_table(recs: list[dict]) -> str:
             provenance = f"borrowed ({tool.split(':', 1)[1]})"
         else:
             provenance = "unstamped (pre-stamping campaign)"
-        rows.append((engine_label(r["tag"]), cell, provenance))
+        rung = str(r.get("params", {}).get("ppl_kv", "f16"))
+        rows.append((engine_label(r["tag"]), rung, cell, provenance))
     if not rows:
         return "_Not measured._"
-    head = "| Engine | perplexity (ctx 2048, offline ASCII corpus) | ppl tool |"
-    sep = "|---|---:|---|"
-    body = [f"| {n} | {c} | {p} |" for n, c, p in rows]
+    head = (
+        "| Engine | KV rung | perplexity (ctx 2048, offline ASCII corpus) | ppl tool |"
+    )
+    sep = "|---|---|---:|---|"
+    body = [f"| {n} | {g} | {c} | {p} |" for n, g, c, p in rows]
     return "\n".join([head, sep, *body])
 
 
@@ -9046,6 +9173,49 @@ def conc_axes_table(recs: list[dict]) -> str:
 # flash-attention off swaps the attention kernel (different floating-point
 # reduction order) — in both the drift IS the knob, not a bug.
 KNOWN_DRIFT: set[str] = {"cache_q8", "fa_off"}
+
+
+def quality_lane_status(recs: list[dict], skip_flag: bool = False) -> dict:
+    """Standing-lane receipt: did the checker-verified quality suites
+    actually run? Speed numbers without quality receipts are exactly how
+    a degraded config ships as a win, so the status is stamped on every
+    artifact surface (report header, publication quality section,
+    quality-status.json, summary.txt) — a skipped or failed lane must
+    never read as a passing one."""
+    fams = ("quality", "quality-direct", "quality-ollama")
+    rows = [r for r in recs if r.get("provider") in fams]
+    scored = [
+        r
+        for r in rows
+        if "error" not in r
+        and any(r.get(f"quality_{s}_total") for s in QUALITY_TABLE_SUITES)
+    ]
+    if skip_flag:
+        return {
+            "status": "skipped",
+            "detail": "--skip-quality: no checker-verified receipts back "
+            "any speed number in this campaign",
+        }
+    if rows and not scored:
+        errs = [str(r.get("error", "?"))[:120] for r in rows if "error" in r]
+        return {
+            "status": "error",
+            "detail": "quality lane ran but produced no scored rows"
+            + (f": {'; '.join(errs[:2])}" if errs else ""),
+        }
+    if not rows:
+        return {
+            "status": "not-measured",
+            "detail": "no quality rows in this campaign (lane not reached "
+            "for the selected providers/engines)",
+        }
+    suites = sorted(
+        {s for r in scored for s in QUALITY_TABLE_SUITES if r.get(f"quality_{s}_total")}
+    )
+    return {
+        "status": "ran",
+        "detail": f"{len(scored)} scored row(s); suites: {', '.join(suites) or '-'}",
+    }
 
 
 def quality_table(recs: list[dict]) -> str:
@@ -10580,6 +10750,7 @@ def write_publication_report(
     out_path: Path,
     argv_summary: str | None = None,
     slim: bool = False,
+    quality_status: dict | None = None,
 ) -> None:
     """Publication-format report.
 
@@ -10793,6 +10964,9 @@ def write_publication_report(
     )
     L.append("")
     L.append("### Quality suites (checker-verified, seeded, greedy)")
+    L.append("")
+    qstat = quality_status or quality_lane_status(recs)
+    L.append(f"- _quality lane: **{qstat['status']}** — {qstat['detail']}_")
     L.append("")
     L += details(
         "Receipt table - quality suites",

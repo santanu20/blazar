@@ -10,13 +10,20 @@
 //! covers long generations.
 //!
 //! Two dialects, one route. Plain `OpenAI` requests (the verified
-//! `{model, prompt, size, steps, n}` set) forward byte-identical to
-//! the child's compat route. Anything richer — cache modes, `LoRA`
-//! weights, sampling subtrees, guidance — rides the child's native
-//! async job dialect (`/sdcpp/v1/img_gen` + `/sdcpp/v1/jobs/{id}`)
-//! through a shallow translator, because the compat route accepts
-//! unknown fields without honoring them (probe 2026-09-22: `steps`
-//! changes timing, `negative_prompt` does not surface). `"async":
+//! `{model, prompt, size, steps, n, output_format, output_compression}`
+//! set) forward byte-identical to the child's compat route. Anything
+//! richer — cache modes, `LoRA` weights, sampling subtrees, guidance —
+//! rides the child's native async job dialect (`/sdcpp/v1/img_gen` +
+//! `/sdcpp/v1/jobs/{id}`) through a shallow translator, because the
+//! compat route accepts unknown fields without honoring them (probe
+//! 2026-09-22: `steps` changes timing, `negative_prompt` does not
+//! surface). `OpenAI`'s `quality` and `style` knobs are consumed here,
+//! resolved against the child's per-model `capabilities` defaults so a
+//! tier is a budget RELATIVE to the loaded model, never an absolute
+//! step count. Engine-unsupported `OpenAI` fields (`response_format:
+//! "url"`, `moderation`, `partial_images`, `background`,
+//! `input_fidelity`) answer teaching 400s instead of being swallowed.
+//! `"async":
 //! true` returns the job handle immediately; `"stream": true` relays
 //! progress as `SSE`; both set → stream wins. Job poll/cancel routes
 //! resolve the LIVE child only — a job dies with its child, and these
@@ -27,6 +34,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::proxy::{child_auth, child_base, ensure_with_admission, openai_error, resolve_model};
@@ -48,11 +56,21 @@ enum DeliveryMode {
     StreamNative,
 }
 
-/// Keys the compat route is verified to honor. Everything else in a
+/// Keys the compat route is verified to honor (api.md: prompt, n,
+/// size, `output_format`, `output_compression`). Everything else in a
 /// request means the native dialect, where the field is documented —
 /// and actually applied — rather than silently swallowed.
-const PLAIN_GENERATION_KEYS: [&str; 8] = [
-    "model", "prompt", "size", "steps", "n", "user", "async", "stream",
+const PLAIN_GENERATION_KEYS: [&str; 10] = [
+    "model",
+    "prompt",
+    "size",
+    "steps",
+    "n",
+    "user",
+    "async",
+    "stream",
+    "output_format",
+    "output_compression",
 ];
 
 /// One `SSE` poll per second. A single failed poll is a transport
@@ -105,6 +123,33 @@ const VIDEO_VRAM_HEADROOM_FRACTION: f64 = 0.95;
 /// Default frame geometry when the request names none — the child's own
 /// 512x512 default, which is also the conservative estimate.
 const VIDEO_DEFAULT_SIZE: (u64, u64) = (512, 512);
+
+/// Refusal when a request pulls the overcommit lever while the operator
+/// has centrally disabled it. Names the env var so the operator reading
+/// a client's error can find their own switch.
+const VRAM_OVERCOMMIT_DISABLED_TEACH: &str = "operator disabled the per-request VRAM overcommit \
+     lever (BLAZAR_VRAM_OVERCOMMIT=0) — remaining levers: fewer frames (video_frames/duration), \
+     smaller size, or freeing GPU memory held by other processes";
+
+/// Operator kill-switch for the per-request VRAM overcommit lever. The
+/// lever stays enabled by default (the scratch refusal teaches it);
+/// `BLAZAR_VRAM_OVERCOMMIT=0` makes the gateway reject requests that use
+/// it, so safety posture can be enforced centrally instead of per client.
+static VRAM_OVERCOMMIT_ALLOWED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    vram_overcommit_enabled(std::env::var("BLAZAR_VRAM_OVERCOMMIT").ok().as_deref())
+});
+
+/// Pure env-value parse so the policy is unit-testable without touching
+/// the process environment. Anything but an explicit off-value leaves
+/// the lever on — an unset or garbage value must not silently flip
+/// safety posture.
+fn vram_overcommit_enabled(raw: Option<&str>) -> bool {
+    let off = ["0", "false", "off", "no"];
+    !matches!(
+        raw,
+        Some(v) if off.contains(&v.trim().to_ascii_lowercase().as_str())
+    )
+}
 
 /// Wan's temporal grid: the engine aligns DOWN to 4k+1 frames (1, 5,
 /// 9, 13, ...) before generating — verified live: a `video_frames:4`
@@ -228,7 +273,12 @@ fn video_scratch_gate(
     {
         // Operator's explicit call: attempt it anyway; the child's own
         // failure (or success) answers. No silent path — the audit log
-        // carries the request that used the lever.
+        // carries the request that used the lever. A centrally disabled
+        // lever (BLAZAR_VRAM_OVERCOMMIT=0) turns the same request away
+        // instead of honoring it.
+        if !*VRAM_OVERCOMMIT_ALLOWED {
+            return Err(VRAM_OVERCOMMIT_DISABLED_TEACH.to_string());
+        }
         return Ok(());
     }
     let Some(free) = crate::vram::free_vram_mib(std::time::Duration::from_secs(5)) else {
@@ -245,12 +295,18 @@ fn video_scratch_gate(
         } else {
             String::new()
         };
+        // The overcommit lever is only taught when it can actually be
+        // pulled — pointing a client at a disabled switch would be a lie.
+        let overcommit_hint = if *VRAM_OVERCOMMIT_ALLOWED {
+            ", or \\\"vram_overcommit\\\": true to force the attempt"
+        } else {
+            " (the vram_overcommit lever is operator-disabled)"
+        };
         return Err(format!(
             "video request would exceed free VRAM: scratch ≈ {} MiB ({} aligned frames at \
              {w}x{h}{spawn_note}, safety ×{VIDEO_SCRATCH_SAFETY}) vs {budget} MiB free of \
              {free} (95% headroom rule). Levers: fewer frames (video_frames/duration), \
-             smaller size, free GPU memory held by other processes, or \
-             \"vram_overcommit\": true to force the attempt",
+             smaller size, free GPU memory held by other processes{overcommit_hint}",
             est.estimate_mib, est.aligned_frames,
         ));
     }
@@ -315,6 +371,31 @@ fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
         specs.push(("duration", dur_frames));
     }
 
+    // `seconds` (the Sora dialect): the same dial as `duration`, except
+    // the Sora SDK ships it as a STRING ("4" | "8" | "12") — number or
+    // clean numeric string both parse; anything else answers by name.
+    // Agreeing duration+seconds collapse; disagreeing ones hit the
+    // conflict check below like any other duplicate spelling.
+    if let Some(val) = obj.get("seconds").cloned() {
+        let fps = obj
+            .get("fps")
+            .and_then(|f| f.as_u64().filter(|f| *f >= 1))
+            .unwrap_or(DEFAULT_FPS);
+        let seconds_value = val
+            .as_f64()
+            .or_else(|| val.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .ok_or_else(|| {
+                format!(
+                    "seconds must be a positive number of seconds, number or numeric \
+                     string (got {val})"
+                )
+            })?;
+        obj.remove("seconds");
+        let secs_frames = ((seconds_value * fps as f64).round() as u64).max(1);
+        specs.push(("seconds", secs_frames));
+    }
+
     if specs.is_empty() {
         return Ok(());
     }
@@ -337,6 +418,305 @@ fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+// ---- OpenAI surface knobs: quality / style / response_format -------
+//
+// OpenAI's generation-quality vocabulary is RELATIVE ("high" spends
+// more compute than "low"). The engine's step budget is per-model, so
+// a tier resolves against the child's own `capabilities` defaults —
+// the multiplier is the curated fact, the base never is.
+
+/// Output containers the child validates per mode (api.md
+/// `output_formats_by_mode`). Gateway-side first so a typo answers a
+/// teaching instead of a child 400 that names neither the set nor lane.
+const OUTPUT_FORMATS_IMG: [&str; 3] = ["png", "jpeg", "webp"];
+const OUTPUT_FORMATS_VID: [&str; 3] = ["webm", "webp", "avi"];
+
+/// Families with a curated `style` preset. `txt_cfg` shifts are only
+/// honest where the family's guidance behavior is known; elsewhere the
+/// request teaches to set `sample_params.guidance.txt_cfg` directly.
+const STYLE_FAMILY_TOKENS: [&str; 1] = ["qwen-image"];
+
+/// Step-budget multipliers for `quality`. `Ok(None)` = engine default
+/// (`OpenAI`'s `auto`, or the knob absent). `standard`/`hd` are the
+/// dall-e-2 spellings of medium/high.
+fn quality_step_multiplier(quality: &str) -> Result<Option<f64>, String> {
+    let mult = match quality {
+        "auto" => return Ok(None),
+        "low" | "standard" => 0.5,
+        "medium" => 0.75,
+        "high" | "hd" => 1.0,
+        "xhigh" => 1.25,
+        "max" => 1.5,
+        other => {
+            return Err(format!(
+                "unknown quality \"{other}\" — supported: auto, low, medium, high, \
+                 xhigh, max (dall-e-2 synonyms: standard, hd)"
+            ));
+        }
+    };
+    Ok(Some(mult))
+}
+
+/// `txt_cfg` preset for `style`, relative to the model default so the
+/// family's own guidance scale stays the anchor.
+fn style_preset(style: &str) -> Option<f64> {
+    match style {
+        "vivid" => Some(1.25),
+        "natural" => Some(0.75),
+        _ => None,
+    }
+}
+
+/// Teaching gate for `OpenAI` fields this gateway does not serve.
+/// Returns the first teaching message, `None` when the surface is
+/// clean. `repo: None` (unknown model) counts as an uncurated family:
+/// `style` cannot be verified against a family it does not know.
+fn openai_surface_teaching(
+    v: &serde_json::Value,
+    video: bool,
+    repo: Option<&str>,
+) -> Option<String> {
+    let get = |k: &str| v.get(k).filter(|val| !val.is_null());
+    if get("response_format").and_then(serde_json::Value::as_str) == Some("url") {
+        return Some(
+            "response_format \"url\" is not served — blazar returns base64 directly \
+             (data[].b64_json); omit response_format or send \"b64_json\""
+                .into(),
+        );
+    }
+    if let Some(val) = get("moderation") {
+        return Some(format!(
+            "moderation ({val}) is a hosted-OpenAI filter — local generation has no \
+             moderation service to configure; drop the field"
+        ));
+    }
+    if let Some(val) = get("partial_images") {
+        return Some(format!(
+            "partial_images ({val}) is not implemented — \"stream\": true relays job \
+             progress as SSE events instead"
+        ));
+    }
+    if let Some(val) = get("background") {
+        return Some(format!(
+            "background \"{val}\" is not served — local diffusion has no \
+             alpha-controlled generation; PNG alpha only rides init/edit images"
+        ));
+    }
+    if let Some(val) = get("input_fidelity") {
+        return Some(format!(
+            "input_fidelity ({val}) is not served — edits approximate fidelity through \
+             the native \"strength\" knob (0..1 denoise)"
+        ));
+    }
+    if let Some(style) = get("style").and_then(serde_json::Value::as_str) {
+        if style_preset(style).is_none() {
+            return Some(format!(
+                "unknown style \"{style}\" — supported: vivid, natural"
+            ));
+        }
+        let curated = repo.is_some_and(|r| {
+            let lower = r.to_lowercase();
+            STYLE_FAMILY_TOKENS.iter().any(|t| lower.contains(t))
+        });
+        if !curated {
+            return Some(format!(
+                "style presets are curated per family — this model{} has none; set \
+                 sample_params.guidance.txt_cfg directly (vivid ≈ higher, natural ≈ lower)",
+                repo.map_or_else(String::new, |r| format!(" ({r})"))
+            ));
+        }
+    }
+    if let Some(quality) = get("quality").and_then(serde_json::Value::as_str)
+        && let Err(msg) = quality_step_multiplier(quality)
+    {
+        return Some(msg);
+    }
+    if let Some(fmt) = get("output_format").and_then(serde_json::Value::as_str) {
+        let set: &[&str] = if video {
+            &OUTPUT_FORMATS_VID
+        } else {
+            &OUTPUT_FORMATS_IMG
+        };
+        if !set.contains(&fmt) {
+            return Some(format!(
+                "output_format \"{fmt}\" is not one of {} on the {} lane",
+                set.join("|"),
+                if video { "video" } else { "image" }
+            ));
+        }
+    }
+    None
+}
+
+/// Per-model defaults from the child's capabilities, memoized per
+/// engine for [`CHILD_DEFAULTS_TTL`]. One model rides one child, so the
+/// key is the engine name; the TTL covers a re-pull swapping quants
+/// under the same name. A failed fetch is NOT cached — the next request
+/// retries.
+const CHILD_DEFAULTS_TTL: Duration = Duration::from_secs(600);
+type ChildDefaultsMap = std::collections::HashMap<String, (Instant, Arc<serde_json::Value>)>;
+static CHILD_DEFAULTS: std::sync::LazyLock<tokio::sync::RwLock<ChildDefaultsMap>> =
+    std::sync::LazyLock::new(|| tokio::sync::RwLock::new(ChildDefaultsMap::new()));
+
+async fn child_mode_defaults(
+    state: &AppState,
+    engine: &blazar_runtime::EngineRef,
+    mode: &str,
+) -> Result<Arc<serde_json::Value>, String> {
+    if let Some(hit) = CHILD_DEFAULTS
+        .read()
+        .await
+        .get(&engine.name)
+        .filter(|(at, _)| at.elapsed() < CHILD_DEFAULTS_TTL)
+    {
+        return Ok(Arc::clone(&hit.1));
+    }
+    let resp = crate::proxy::send_with_child_retry(state, engine, |eng| {
+        let mut rb = crate::state::media_child_client(state, &eng.endpoint).get(format!(
+            "{}/sdcpp/v1/capabilities",
+            child_base(&eng.endpoint)
+        ));
+        rb = child_auth(rb, eng);
+        rb
+    })
+    .await
+    .map_err(|msg| format!("engine capabilities unavailable: {msg}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("engine capabilities answered {status}: {text}"));
+    }
+    let caps: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("engine capabilities body unreadable: {e}"))?;
+    let defaults = caps
+        .pointer(&format!("/defaults_by_mode/{mode}"))
+        .cloned()
+        .ok_or_else(|| format!("engine capabilities lack defaults_by_mode.{mode}"))?;
+    let wrapped = Arc::new(defaults);
+    CHILD_DEFAULTS
+        .write()
+        .await
+        .insert(engine.name.clone(), (Instant::now(), Arc::clone(&wrapped)));
+    Ok(wrapped)
+}
+
+/// Resolve the gateway-consumed `OpenAI` knobs (`quality`, `style`)
+/// against the child's own defaults, rewriting `parsed` into plain
+/// native vocabulary before translation. Explicit `steps` or
+/// `sample_params.sample_steps` always wins over a quality tier.
+// Casting policy: step/cfg math runs in f64 (multipliers are fractional)
+// and lands back on u64 knobs the child validates — the trio below is
+// deliberate, mirroring `canonicalize_video_frames`.
+#[allow(
+    clippy::result_large_err,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+async fn apply_generation_semantics(
+    state: &AppState,
+    engine: &blazar_runtime::EngineRef,
+    parsed: &mut serde_json::Value,
+    video: bool,
+) -> Result<(), Response> {
+    let mode = if video { "vid_gen" } else { "img_gen" };
+    let wants_quality = parsed.get("quality").is_some();
+    let wants_style = parsed.get("style").is_some();
+    if !wants_quality && !wants_style {
+        return Ok(());
+    }
+    let has_explicit_steps = parsed.get("steps").is_some()
+        || parsed
+            .pointer("/sample_params/sample_steps")
+            .is_some_and(|s| !s.is_null());
+    // A fetch is only owed when a knob actually resolves to a value:
+    // quality=auto needs no defaults, style always does.
+    let needs_defaults = wants_style
+        || parsed
+            .get("quality")
+            .and_then(serde_json::Value::as_str)
+            .map(quality_step_multiplier)
+            .is_some_and(|m| matches!(m, Ok(Some(_))));
+    let defaults = if needs_defaults {
+        Some(
+            child_mode_defaults(state, engine, mode)
+                .await
+                .map_err(|msg| openai_error(502, &msg))?,
+        )
+    } else {
+        None
+    };
+    if wants_quality {
+        let quality = parsed
+            .get("quality")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        // Auto (and a null) means engine default: nothing to resolve.
+        if let Ok(Some(mult)) = quality_step_multiplier(quality) {
+            if has_explicit_steps {
+                return Err(openai_error(
+                    400,
+                    "\"steps\" and \"quality\" are two dials for the same budget — send one",
+                ));
+            }
+            let base = defaults
+                .as_deref()
+                .and_then(|d| d.pointer("/sample_params/sample_steps"))
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| openai_error(502,
+                    "engine capabilities carry no sample_steps default — set \"steps\" explicitly",
+                ))?;
+            let steps = ((base as f64) * mult).round().max(1.0) as u64;
+            if let Some(obj) = parsed.as_object_mut() {
+                obj.remove("quality");
+                obj.insert("steps".into(), serde_json::json!(steps));
+            }
+        } else if let Some(obj) = parsed.as_object_mut() {
+            obj.remove("quality");
+        }
+    }
+    if wants_style {
+        let style = parsed
+            .get("style")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if let Some(preset) = style_preset(style) {
+            let base = defaults
+                .as_deref()
+                .and_then(|d| d.pointer("/sample_params/guidance/txt_cfg"))
+                .and_then(serde_json::Value::as_f64);
+            let target = base.map(|b| (b * preset).max(1.0)).ok_or_else(|| {
+                openai_error(
+                    502,
+                    "engine capabilities carry no txt_cfg default — set \
+                     sample_params.guidance.txt_cfg explicitly",
+                )
+            })?;
+            // Same merge path as "steps": plant the subtrees when absent
+            // so the translator's verbatim arm carries the preset down.
+            if let Some(sp) = parsed
+                .as_object_mut()
+                .map(|o| o.entry("sample_params".to_string()))
+                .map(|e| e.or_insert_with(|| serde_json::Value::Object(serde_json::Map::new())))
+                .and_then(|v| v.as_object_mut())
+            {
+                let guidance = sp
+                    .entry("guidance".to_string())
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                if let Some(g) = guidance.as_object_mut() {
+                    g.insert("txt_cfg".into(), serde_json::json!(target));
+                }
+            }
+        }
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.remove("style");
+        }
+    }
+    Ok(())
+}
+
 /// `n`→`batch_count`, `size "WxH"`→`width`/`height`, `steps`→
 /// `sample_params.sample_steps` (merged into an existing subtree);
 /// control keys drop; every other key — including whole subtrees like
@@ -349,7 +729,13 @@ fn translate_to_native(v: &serde_json::Value, video: bool) -> serde_json::Value 
     };
     for (k, val) in obj {
         match k.as_str() {
-            "model" | "user" | "async" | "stream" => {}
+            // Consumed gateway-side (see `apply_generation_semantics`
+            // and the surface teachings); dropped defensively so a
+            // stale copy never rides to the child as junk. `seconds`
+            // is the Sora ghost-echo the video route plants for the
+            // ledger — never a child field.
+            "model" | "user" | "async" | "stream" | "quality" | "style" | "response_format"
+            | "seconds" => {}
             // `img_gen` batches through `batch_count`; the `vid_gen`
             // shape has no such field, so the key rides untouched.
             "n" if !video => {
@@ -566,7 +952,7 @@ pub async fn generations(
     if let Err(resp) = state.admit_or_respond(key_ext.as_ref(), &model) {
         return *resp;
     }
-    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+    let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return openai_error(400, &format!("invalid JSON: {e}")),
     };
@@ -609,6 +995,11 @@ pub async fn generations(
         ImagesGate::Serve => {}
         ImagesGate::Reject(msg) => return openai_error(400, &msg),
     }
+    if let Some(msg) =
+        openai_surface_teaching(&parsed, false, row.as_ref().map(|r| r.repo.as_str()))
+    {
+        return openai_error(400, &msg);
+    }
     let (engine, load_ms) = match ensure_with_admission(
         &state,
         &model,
@@ -624,6 +1015,9 @@ pub async fn generations(
         Ok(ok) => ok,
         Err(resp) => return *resp,
     };
+    if let Err(resp) = apply_generation_semantics(&state, &engine, &mut parsed, false).await {
+        return resp;
+    }
     match delivery_mode(&parsed) {
         DeliveryMode::SyncPlain => {
             // Verified dialect: byte-identical compat forward.
@@ -650,6 +1044,22 @@ pub async fn generations(
             .await
         }
     }
+}
+
+/// Ledger echo of the client-facing request shape (`prompt`, `size`,
+/// seconds, frame budget). The Sora video plane reads it back from the
+/// durable row; the child never sees any of it.
+fn request_echo(v: &serde_json::Value) -> serde_json::Value {
+    let mut echo = serde_json::Map::new();
+    if let Some(p) = v.get("prompt").and_then(serde_json::Value::as_str) {
+        echo.insert("prompt".into(), serde_json::json!(p));
+    }
+    for key in ["size", "n", "fps", "video_frames", "seconds"] {
+        if let Some(val) = v.get(key).filter(|x| !x.is_null()) {
+            echo.insert(key.into(), val.clone());
+        }
+    }
+    serde_json::Value::Object(echo)
 }
 
 /// Native-dialect delivery shared by the three non-plain modes:
@@ -691,6 +1101,7 @@ async fn deliver_native(
             "engine": engine.name,
             "native_path": native_path,
             "load_ms": load_ms,
+            "request": request_echo(parsed),
         }),
     );
     state.jobs.record_running(&state, job_id);
@@ -734,6 +1145,47 @@ async fn deliver_native(
     }
 }
 
+/// Video timing pass, after semantics: dynamic-fps correction plus the
+/// ghost-seconds echo for the Sora plane's ledger `request` block. The
+/// canonicalizer converted `seconds` with an assumed 16 fps; the loaded
+/// model's own capabilities default says otherwise — recompute the frame
+/// count and pin fps explicitly so the rendered duration matches the
+/// seconds asked. Unreachable capabilities keep the 16-fps conversion
+/// (today's behavior) — the request proceeds either way. The ghost
+/// `seconds` is gateway vocabulary: the translator drops it, it never
+/// rides to the child.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+async fn apply_video_timing(
+    state: &AppState,
+    engine: &blazar_runtime::EngineRef,
+    parsed: &mut serde_json::Value,
+    seconds_based: Option<f64>,
+    had_explicit_fps: bool,
+) {
+    if let (Some(secs), false) = (seconds_based, had_explicit_fps)
+        && let Ok(defaults) = child_mode_defaults(state, engine, "vid_gen").await
+        && let Some(fps) = defaults
+            .pointer("/fps")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|f| *f >= 1.0)
+        && (fps as u64) != 16
+        && let Some(obj) = parsed.as_object_mut()
+    {
+        let frames = ((secs * fps).round() as u64).max(1);
+        obj.insert("video_frames".into(), serde_json::json!(frames));
+        obj.insert("fps".into(), serde_json::json!(fps as u64));
+    }
+    if let Some(secs) = seconds_based
+        && let Some(obj) = parsed.as_object_mut()
+    {
+        obj.insert("seconds".into(), serde_json::json!(secs));
+    }
+}
+
 /// POST /v1/videos/generations — text-to-video on a video family
 /// (Wan). Same contract as image generations with two differences:
 /// the gate demands a curated video family, and there is no compat
@@ -761,6 +1213,30 @@ pub async fn video_generations(
     {
         return openai_error(400, "\"prompt\" must be a non-empty string");
     }
+    if parsed.get("remixed_from_video_id").is_some() {
+        return openai_error(
+            400,
+            "video remix (remixed_from_video_id) has no local engine primitive — sdcpp \
+             vid_gen is text-to-video (plus first/last-frame init images on some families); \
+             compose a continuation manually: an image edit, then a new video",
+        );
+    }
+    // Capture the seconds dial BEFORE canonicalization consumes it: the
+    // pure converter must assume the 16 fps default, but the honest
+    // frame count derives from the model's own default — corrected once
+    // the engine is known (below).
+    let seconds_based = parsed
+        .get("seconds")
+        .or_else(|| parsed.get("duration"))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                .filter(|s| s.is_finite() && *s > 0.0)
+        });
+    let had_explicit_fps = parsed
+        .get("fps")
+        .and_then(serde_json::Value::as_u64)
+        .is_some();
     if let Err(msg) = canonicalize_video_frames(&mut parsed) {
         return openai_error(400, &msg);
     }
@@ -774,6 +1250,10 @@ pub async fn video_generations(
     match images_gate(row.as_ref(), Surface::VidGen) {
         ImagesGate::Serve => {}
         ImagesGate::Reject(msg) => return openai_error(400, &msg),
+    }
+    if let Some(msg) = openai_surface_teaching(&parsed, true, row.as_ref().map(|r| r.repo.as_str()))
+    {
+        return openai_error(400, &msg);
     }
     if let Err(msg) = video_scratch_gate(&parsed, &model, &state) {
         return openai_error(400, &msg);
@@ -797,6 +1277,17 @@ pub async fn video_generations(
         Ok(ok) => ok,
         Err(resp) => return *resp,
     };
+    if let Err(resp) = apply_generation_semantics(&state, &engine, &mut parsed, true).await {
+        return resp;
+    }
+    apply_video_timing(
+        &state,
+        &engine,
+        &mut parsed,
+        seconds_based,
+        had_explicit_fps,
+    )
+    .await;
     let mode = match delivery_mode(&parsed) {
         // No compat route exists for video — plain requests also ride
         // the native dialect and come back mapped OpenAI-style.
@@ -867,6 +1358,191 @@ pub async fn edits(
         "/v1/images/edits",
         content_type.as_deref(),
         &body,
+        load_ms,
+    )
+    .await
+}
+
+/// Standard-alphabet base64 (RFC 4648, padded). The workspace ships no
+/// base64 crate — every other lane hands the child raw bytes or
+/// pre-encoded payloads — so the media lane owns this tiny codec for the
+/// spots where the gateway itself must transcode (variations upload
+/// encode here; video content decode in the Sora verbs).
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(B64_ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(B64_ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Scalar form fields that keep JSON number/bool types on the ride to
+/// the child; everything else stays a string (a prompt of "2024" must
+/// not silently become the number 2024).
+const VARIATIONS_INT_FIELDS: [&str; 3] = ["n", "output_compression", "clip_skip"];
+const VARIATIONS_SEED_FIELDS: [&str; 1] = ["seed"];
+const VARIATIONS_FLOAT_FIELDS: [&str; 3] = ["strength", "control_strength", "ip_adapter_strength"];
+const VARIATIONS_BOOL_FIELDS: [&str; 2] = ["async", "stream"];
+
+/// Assemble the native variations payload from parsed multipart parts.
+/// The uploaded image becomes `init_image` (base64 img2img); `OpenAI`'s
+/// contract sends no prompt, so a neutral empty one rides by default and
+/// the seed is random (-1) unless the client sets it.
+fn variations_payload(parts: &[crate::whisper::Part]) -> Result<serde_json::Value, String> {
+    let mut obj = serde_json::Map::new();
+    let mut image: Option<&crate::whisper::Part> = None;
+    for part in parts {
+        if part.name == "image" {
+            if image.is_some() {
+                return Err("multiple \"image\" parts — send exactly one image".into());
+            }
+            image = Some(part);
+        } else if part.filename.is_some() {
+            return Err(format!(
+                "unexpected file part \"{}\" — variations takes one \"image\" file; \
+                 mask/instruction editing is /v1/images/edits",
+                part.name
+            ));
+        } else if part.name == "model" || part.name == "user" {
+            // model is consumed by admission; user never rides (same
+            // strip the JSON generations lane performs).
+        } else {
+            let text = String::from_utf8_lossy(&part.data).trim().to_string();
+            let value = if VARIATIONS_SEED_FIELDS.contains(&part.name.as_str()) {
+                match text.parse::<i64>() {
+                    Ok(n) => serde_json::Value::from(n),
+                    Err(_) => return Err("seed must be an integer".into()),
+                }
+            } else if VARIATIONS_INT_FIELDS.contains(&part.name.as_str()) {
+                match text.parse::<u64>() {
+                    Ok(n) => serde_json::Value::from(n),
+                    Err(_) => {
+                        return Err(format!("\"{}\" must be a non-negative integer", part.name));
+                    }
+                }
+            } else if VARIATIONS_FLOAT_FIELDS.contains(&part.name.as_str()) {
+                match text.parse::<f64>() {
+                    Ok(f) => serde_json::Value::from(f),
+                    Err(_) => return Err(format!("\"{}\" must be a number", part.name)),
+                }
+            } else if VARIATIONS_BOOL_FIELDS.contains(&part.name.as_str()) {
+                match text.to_ascii_lowercase().as_str() {
+                    "true" => serde_json::Value::Bool(true),
+                    "false" => serde_json::Value::Bool(false),
+                    _ => return Err(format!("\"{}\" must be true or false", part.name)),
+                }
+            } else {
+                serde_json::Value::from(text)
+            };
+            obj.insert(part.name.clone(), value);
+        }
+    }
+    let image = image.ok_or("an \"image\" file part is required (png/jpeg/webp bytes)")?;
+    obj.insert(
+        "init_image".into(),
+        serde_json::Value::from(b64_encode(&image.data)),
+    );
+    obj.entry("prompt")
+        .or_insert_with(|| serde_json::Value::from(""));
+    obj.entry("seed")
+        .or_insert_with(|| serde_json::Value::from(-1_i64));
+    Ok(serde_json::Value::Object(obj))
+}
+
+/// POST /v1/images/variations — the `OpenAI` variation verb, served
+/// natively: the uploaded image rides as `init_image` (img2img with a
+/// neutral empty prompt — the `OpenAI` contract sends none), random seed
+/// unless set. Answers in the same `{created, data[].b64_json}` shape
+/// generations uses; the native dialect (strength, `negative_prompt`,
+/// `sample_params`, ...) rides as documented extensions, and the
+/// async/stream job modes are the same lanes generations offers.
+pub async fn variations(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let Some(model) = content_type
+        .as_deref()
+        .and_then(|ct| crate::openai::extract_model_multipart(&body, ct))
+    else {
+        return openai_error(
+            400,
+            "\"model\" form field is required (diffusion model name)",
+        );
+    };
+    if let Err(resp) = state.admit_or_respond(key_ext.as_ref(), &model) {
+        return *resp;
+    }
+    let Some(parts) = content_type
+        .as_deref()
+        .and_then(|ct| crate::whisper::parse_multipart(&body, ct))
+    else {
+        return openai_error(400, "multipart/form-data body with a boundary is required");
+    };
+    let mut payload = match variations_payload(&parts) {
+        Ok(v) => v,
+        Err(msg) => return openai_error(400, &msg),
+    };
+    let row = state
+        .with_store(|s| resolve_model(s, &model).ok())
+        .flatten();
+    match images_gate(row.as_ref(), Surface::ImgGen) {
+        ImagesGate::Serve => {}
+        ImagesGate::Reject(msg) => return openai_error(400, &msg),
+    }
+    if let Some(msg) =
+        openai_surface_teaching(&payload, false, row.as_ref().map(|r| r.repo.as_str()))
+    {
+        return openai_error(400, &msg);
+    }
+    let (engine, load_ms) = match ensure_with_admission(
+        &state,
+        &model,
+        Priority::Normal,
+        WorkClass::Interactive,
+        None,
+        false, // img2img needs no vision-encoder sidecar (that is edits cargo)
+        true,  // images lane: component sets are its cargo
+        false,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = apply_generation_semantics(&state, &engine, &mut payload, false).await {
+        return resp;
+    }
+    // `init_image` keeps this off the plain compat lane by construction —
+    // every variation is a native submit with an OpenAI-shaped answer.
+    deliver_native(
+        state,
+        engine,
+        &payload,
+        delivery_mode(&payload),
+        "/sdcpp/v1/img_gen",
+        false,
         load_ms,
     )
     .await
@@ -1326,13 +2002,9 @@ pub async fn jobs_get(
         return openai_error(400, "invalid job id");
     }
     let children_empty = live_sdcpp_children(&state, params.model.as_deref()).is_empty();
-    if children_empty {
-        return openai_error(
-            404,
-            "no live diffusion child serves jobs — POST /v1/images/generations boots one",
-        );
-    }
-    if let Some(job) = poll_live_child(&state, params.model.as_deref(), &job_id).await {
+    if !children_empty
+        && let Some(job) = poll_live_child(&state, params.model.as_deref(), &job_id).await
+    {
         crate::jobs::mirror_child_terminal(&state, &job_id, &job);
         return Response::builder()
             .status(200)
@@ -1342,7 +2014,8 @@ pub async fn jobs_get(
                 openai_error(500, &format!("response build: {e}")).into_response()
             });
     }
-    // No live child owns the job: the ledger is the afterlife. A
+    // No live child owns the job — none is booted at all, or eviction /
+    // crash took the owner: the ledger is the afterlife either way. A
     // non-terminal row means the child died mid-render — close it
     // honestly instead of leaving a forever-running zombie row.
     let row = state
@@ -1363,6 +2036,12 @@ pub async fn jobs_get(
         if let Some(fresh) = fresh {
             return axum::Json(crate::jobs::row_payload(&fresh)).into_response();
         }
+    }
+    if children_empty {
+        return openai_error(
+            404,
+            "no live diffusion child serves jobs — POST /v1/images/generations boots one",
+        );
     }
     openai_error(
         404,
@@ -1388,12 +2067,6 @@ pub async fn jobs_cancel(
         return openai_error(400, "invalid job id");
     }
     let children = live_sdcpp_children(&state, params.model.as_deref());
-    if children.is_empty() {
-        return openai_error(
-            404,
-            "no live diffusion child serves jobs — POST /v1/images/generations boots one",
-        );
-    }
     let mut last_known: Option<(serde_json::Value, blazar_runtime::EngineRef)> = None;
     for engine in &children {
         // Locate the owning child first — cancel on a non-owner would
@@ -1420,6 +2093,12 @@ pub async fn jobs_cancel(
             if let Some(fresh) = fresh {
                 return axum::Json(crate::jobs::row_payload(&fresh)).into_response();
             }
+        }
+        if children.is_empty() {
+            return openai_error(
+                404,
+                "no live diffusion child serves jobs — POST /v1/images/generations boots one",
+            );
         }
         return openai_error(
             404,
@@ -1490,10 +2169,412 @@ pub async fn jobs_cancel(
     }
 }
 
-/// GET /v1/images/capabilities?model=NAME — the live child's sampler/
-/// cache/LoRA menu. Read-only: boots nothing; no live child teaches
-/// instead. `?model=` narrows to that family's child — on a multi-family
-/// box the first live child is otherwise an arbitrary pick (audit MM3).
+// ---- Sora video plane: /v1/videos -----------------------------------
+//
+// The Sora dialect reads the SAME durable job ledger the video lane
+// writes (`kind: "video"` rows) — no parallel job subsystem. The
+// differences are shape only: `object: "video"`, `in_progress`
+// status, a `seconds` echo, content delivery as raw bytes
+// (`GET /{id}/content`) and DELETE-as-cancel. `cancelled` stays a
+// blazar-superset status (Sora's enum has no cancelled) — an honest
+// superset beats a lying `failed`.
+
+/// Strict RFC 4648 decoder — the inverse of [`b64_encode`], fed by the
+/// child's own padded standard-base64 output. Table-built once; any
+/// non-alphabet byte, misplaced `=` or ragged length is an error by
+/// name rather than a silent partial decode.
+// Table indices are 0..=63 by construction (alphabet length), so the
+// narrowing casts below are total, not lossy.
+#[allow(clippy::cast_possible_truncation)]
+static B64_DECODE_TABLE: std::sync::LazyLock<[u8; 256]> = std::sync::LazyLock::new(|| {
+    let mut table = [255u8; 256];
+    for (i, &c) in B64_ALPHABET.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    table
+});
+
+// Shifts below stay inside u32 then narrow to u8 — values are ≤ 0xFF by
+// construction (three payload bytes per quad).
+#[allow(clippy::cast_possible_truncation)]
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return Err(format!(
+            "base64 length {} is not a multiple of 4",
+            bytes.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (i, chunk) in bytes.chunks(4).enumerate() {
+        let mut vals = [0u32; 4];
+        let mut pad = 0usize;
+        for (j, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                // '=' only closes the tail: positions 2/3, never data
+                // after a pad.
+                if j < 2 || (j == 2 && chunk[3] != b'=') || pad > 0 && j == 3 && pad == 2 {
+                    return Err(format!("misplaced '=' at byte {}", i * 4 + j));
+                }
+                pad += 1;
+                continue;
+            }
+            if pad > 0 {
+                return Err(format!("data after '=' at byte {}", i * 4 + j));
+            }
+            let v = B64_DECODE_TABLE[b as usize];
+            if v == 255 {
+                return Err(format!(
+                    "invalid base64 byte {:?} at {}",
+                    b as char,
+                    i * 4 + j
+                ));
+            }
+            vals[j] = u32::from(v);
+        }
+        let n = (vals[0] << 18) | (vals[1] << 12) | (vals[2] << 6) | vals[3];
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(serde::Deserialize)]
+pub struct VideoListQuery {
+    pub limit: Option<u64>,
+}
+
+/// Map a ledger row (plus optional live child snapshot for fresh
+/// progress) to the Sora video object. `seconds` prefers the completed
+/// result's `frame_count`/`fps` — the engine normalizes the frame
+/// count (4n+1), so the render's own numbers are the truth over the
+/// request echo.
+// Progress arrives as an f64 fraction from the child; the OpenAI shape
+// wants an integer percentage — truncation toward 0 is the safe side.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn sora_video_object(
+    row: &blazar_core::store::JobRow,
+    fresh: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let status = match row.state.as_str() {
+        "queued" => "queued",
+        "running" => "in_progress",
+        "completed" => "completed",
+        "failed" => "failed",
+        other => other, // "cancelled" — documented superset
+    };
+    let mut obj = serde_json::json!({
+        "id": row.id,
+        "object": "video",
+        "status": status,
+        "created_at": row.created_at,
+    });
+    if let Some(progress) = fresh
+        .and_then(|j| j.get("progress"))
+        .and_then(serde_json::Value::as_f64)
+        .map(|p| p.clamp(0.0, 100.0) as u64)
+    {
+        obj["progress"] = serde_json::json!(progress);
+    } else if row.state == "queued" {
+        obj["progress"] = serde_json::json!(0);
+    } else if row.state == "completed" {
+        obj["progress"] = serde_json::json!(100);
+    }
+    let request = row
+        .request_json
+        .parse::<serde_json::Value>()
+        .ok()
+        .and_then(|r| r.get("request").cloned());
+    let echo = |key: &str| request.as_ref().and_then(|r| r.get(key));
+    if let Some(p) = echo("prompt") {
+        obj["prompt"] = p.clone();
+    }
+    if let Some(s) = echo("size") {
+        obj["size"] = s.clone();
+    }
+    if row.state == "completed" {
+        obj["completed_at"] = serde_json::json!(row.updated_at);
+        let result = row
+            .result_json
+            .as_deref()
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok());
+        let frames = result
+            .as_ref()
+            .and_then(|r| r.pointer("/result/frame_count"))
+            .and_then(serde_json::Value::as_f64);
+        let fps = result
+            .as_ref()
+            .and_then(|r| r.pointer("/result/fps"))
+            .and_then(serde_json::Value::as_f64);
+        if let (Some(frames), Some(fps)) = (frames, fps)
+            && fps > 0.0
+        {
+            obj["seconds"] = serde_json::json!((frames / fps * 1000.0).round() / 1000.0);
+        } else if let Some(secs) = echo("seconds").and_then(serde_json::Value::as_f64) {
+            obj["seconds"] = serde_json::json!(secs);
+        }
+    } else if let Some(secs) = echo("seconds").and_then(serde_json::Value::as_f64) {
+        obj["seconds"] = serde_json::json!(secs);
+    }
+    if let Some(err) = &row.error {
+        obj["error"] = serde_json::json!(err);
+    }
+    obj
+}
+
+/// Why `/content` cannot serve a completed row's bytes.
+#[derive(Debug)]
+enum VideoContentError {
+    NotCompleted,
+    Gone,
+    Unreadable(String),
+}
+
+/// Decode a completed video row into raw bytes + the child-reported
+/// media type. Inline results decode straight from `result_json`;
+/// artifact-spilled ones re-read the spilled file (it holds the same
+/// child job JSON); a dropped artifact answers `Gone`.
+fn completed_video_bytes(
+    row: &blazar_core::store::JobRow,
+) -> Result<(Vec<u8>, String), VideoContentError> {
+    if row.state != "completed" {
+        return Err(VideoContentError::NotCompleted);
+    }
+    let inline = row
+        .result_json
+        .as_deref()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok());
+    let job = match inline {
+        Some(v) if v.get("artifact") == Some(&serde_json::json!("dropped")) => {
+            return Err(VideoContentError::Gone);
+        }
+        Some(v) if v.get("artifact") == Some(&serde_json::json!(true)) => {
+            let Some(path) = row.artifact_path.as_deref() else {
+                return Err(VideoContentError::Gone);
+            };
+            let spilled = std::fs::read(path)
+                .map_err(|e| VideoContentError::Unreadable(format!("artifact read {path}: {e}")))?;
+            serde_json::from_slice::<serde_json::Value>(&spilled)
+                .map_err(|e| VideoContentError::Unreadable(format!("artifact JSON {path}: {e}")))?
+        }
+        Some(v) => v,
+        None => {
+            return Err(VideoContentError::Unreadable(
+                "completed row carries no parseable result".into(),
+            ));
+        }
+    };
+    let Some(b64) = job
+        .pointer("/result/b64_json")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Err(VideoContentError::Unreadable(
+            "engine result carries no b64_json".into(),
+        ));
+    };
+    let bytes = b64_decode(b64).map_err(VideoContentError::Unreadable)?;
+    let mime = job
+        .pointer("/result/mime_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    Ok((bytes, mime))
+}
+
+/// Poll the live child for an in-flight row and mirror any terminal
+/// verdict into the ledger. Returns the fresh child snapshot (progress
+/// carrier) or `None` when the row is terminal. A non-terminal row no
+/// live child owns is a mid-render death (eviction, crash, restart) —
+/// it closes failed right here so the Sora views never serve a
+/// forever-in_progress zombie.
+async fn freshen_video_row(
+    state: &AppState,
+    row: &blazar_core::store::JobRow,
+) -> Option<serde_json::Value> {
+    if !matches!(row.state.as_str(), "queued" | "running") {
+        return None;
+    }
+    let Some(fresh) = poll_live_child(state, None, &row.id).await else {
+        state.jobs.record_failed(
+            state,
+            &row.id,
+            "job's engine child is gone (eviction, crash or restart) — resubmit the generation",
+        );
+        return None;
+    };
+    crate::jobs::mirror_child_terminal(state, &row.id, &fresh);
+    Some(fresh)
+}
+
+fn video_row(state: &AppState, id: &str) -> Option<blazar_core::store::JobRow> {
+    state
+        .with_store(|s| s.get_job(id).ok().flatten())
+        .flatten()
+        .filter(|row| row.kind == "video")
+}
+
+/// GET /v1/videos — Sora's list verb over the durable video rows,
+/// newest first (Sora default limit 10, max 100).
+pub async fn videos_list(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<VideoListQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(10).clamp(1, 100);
+    let rows = state
+        .with_store(|s| {
+            s.list_jobs(None, Some("video"), limit + 1)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let has_more = rows.len() as u64 > limit;
+    let mut data: Vec<serde_json::Value> = Vec::new();
+    for row in rows.iter().take(limit as usize) {
+        let fresh = freshen_video_row(&state, row).await;
+        let refetched = state
+            .with_store(|s| s.get_job(&row.id).ok().flatten())
+            .unwrap_or_default();
+        let current = refetched.as_ref().unwrap_or(row);
+        data.push(sora_video_object(current, fresh.as_ref()));
+    }
+    let mut list = serde_json::json!({
+        "object": "list",
+        "data": data,
+        "has_more": has_more,
+    });
+    if let Some(first) = list
+        .pointer("/data/0/id")
+        .and_then(serde_json::Value::as_str)
+    {
+        list["first_id"] = serde_json::json!(first);
+    }
+    if let Some(idx) = data.len().checked_sub(1)
+        && let Some(last) = data[idx].get("id").and_then(serde_json::Value::as_str)
+    {
+        list["last_id"] = serde_json::json!(last);
+    }
+    axum::Json(list).into_response()
+}
+
+/// GET /v1/videos/{id} — the Sora video object, live-polled while
+/// in flight.
+pub async fn video_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return openai_error(400, "invalid video id");
+    }
+    let Some(row) = video_row(&state, &id) else {
+        return openai_error(404, &format!("video {id} not found"));
+    };
+    let fresh = freshen_video_row(&state, &row).await;
+    let refetched = state
+        .with_store(|s| s.get_job(&id).ok().flatten())
+        .unwrap_or_default();
+    let current = refetched.as_ref().unwrap_or(&row);
+    axum::Json(sora_video_object(current, fresh.as_ref())).into_response()
+}
+
+/// GET /v1/videos/{id}/content — the rendered bytes. Sora semantics:
+/// 404 until the render is completed, then the container the engine
+/// produced (webm today; webp/avi when asked via `output_format`).
+pub async fn video_content(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return openai_error(400, "invalid video id");
+    }
+    let Some(row) = video_row(&state, &id) else {
+        return openai_error(404, &format!("video {id} not found"));
+    };
+    match completed_video_bytes(&row) {
+        Ok((bytes, mime)) => Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, mime)
+            .body(Body::from(bytes))
+            .unwrap_or_else(|e| openai_error(500, &format!("content build: {e}")).into_response()),
+        Err(VideoContentError::NotCompleted) => {
+            if row.state == "cancelled" {
+                openai_error(
+                    404,
+                    &format!(
+                        "video {id} was cancelled or deleted — its bytes are gone; \
+                         submit a new generation"
+                    ),
+                )
+            } else {
+                openai_error(
+                    404,
+                    &format!(
+                        "video {id} is not completed yet — poll GET /v1/videos/{id} until \
+                         status is \"completed\""
+                    ),
+                )
+            }
+        }
+        Err(VideoContentError::Gone) => openai_error(
+            410,
+            &format!(
+                "video {id}'s rendered bytes outgrew the inline ledger, spilled to disk \
+                 and the spill was lost — regenerate"
+            ),
+        ),
+        Err(VideoContentError::Unreadable(msg)) => openai_error(500, &msg),
+    }
+}
+
+/// DELETE /v1/videos/{id} — Sora's deprecated cancel verb. Open rows
+/// (queued/running) get a best-effort child cancel (this engine build
+/// only interrupts queued jobs) and close `cancelled`. Terminal rows
+/// (completed/failed) have their render deleted — the stored result is
+/// purged so `/content` 404s afterward, matching the `video.deleted`
+/// claim instead of leaving a zombie download behind. Idempotent on
+/// every state.
+pub async fn video_delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return openai_error(400, "invalid video id");
+    }
+    let Some(row) = video_row(&state, &id) else {
+        return openai_error(404, &format!("video {id} not found"));
+    };
+    match row.state.as_str() {
+        "queued" | "running" => {
+            let engine = row
+                .request_json
+                .parse::<serde_json::Value>()
+                .ok()
+                .and_then(|r| {
+                    r.get("engine")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            cancel_child_best_effort(&state, engine.as_deref(), &id).await;
+            state.jobs.record_cancelled(&state, &id);
+        }
+        "completed" | "failed" => {
+            state
+                .jobs
+                .record_deleted(&state, &id, row.artifact_path.as_deref());
+        }
+        _ => {} // already cancelled/deleted — idempotent
+    }
+    axum::Json(serde_json::json!({
+        "id": id,
+        "object": "video.deleted",
+        "deleted": true,
+    }))
+    .into_response()
+}
+
 /// POST /v1/images/upscale — standalone ESRGAN upscale over HTTP
 /// (upstream PR2026, sd-server master-929+). Sync, no diffusion model
 /// load, no job machinery: upscaler weights come from the engine's
@@ -1585,6 +2666,10 @@ pub async fn upscale(
     .await
 }
 
+/// GET /v1/images/capabilities?model=NAME — the live child's sampler/
+/// cache/LoRA menu. Read-only: boots nothing; no live child teaches
+/// instead. `?model=` narrows to that family's child — on a multi-family
+/// box the first live child is otherwise an arbitrary pick (audit MM3).
 pub async fn capabilities(
     State(state): State<Arc<AppState>>,
     Query(params): Query<JobQuery>,
@@ -2139,11 +3224,225 @@ mod tests {
     }
 
     #[test]
+    fn unit__vram_overcommit_enabled__off_values_only_disable() {
+        // Unset (default), enabled spellings and garbage leave the lever on.
+        for raw in [
+            None,
+            Some("1"),
+            Some("true"),
+            Some("on"),
+            Some("yes"),
+            Some("junk"),
+        ] {
+            assert!(vram_overcommit_enabled(raw), "enabled for {raw:?}");
+        }
+        // Explicit off-spellings (case/whitespace tolerant) disable it.
+        for raw in ["0", "false", "OFF", " no "] {
+            assert!(!vram_overcommit_enabled(Some(raw)), "disabled for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn unit__vram_overcommit_disabled_teach__names_the_switch() {
+        // The refusal must tell the operator where their own switch is.
+        assert!(VRAM_OVERCOMMIT_DISABLED_TEACH.contains("BLAZAR_VRAM_OVERCOMMIT=0"));
+    }
+
+    #[test]
+    fn unit__quality_step_multiplier__tiers_synonyms_auto_and_teaching() {
+        assert_eq!(quality_step_multiplier("low"), Ok(Some(0.5)));
+        assert_eq!(quality_step_multiplier("standard"), Ok(Some(0.5)));
+        assert_eq!(quality_step_multiplier("medium"), Ok(Some(0.75)));
+        assert_eq!(quality_step_multiplier("high"), Ok(Some(1.0)));
+        assert_eq!(quality_step_multiplier("hd"), Ok(Some(1.0)));
+        assert_eq!(quality_step_multiplier("xhigh"), Ok(Some(1.25)));
+        assert_eq!(quality_step_multiplier("max"), Ok(Some(1.5)));
+        // Auto hands the budget back to the engine default.
+        assert_eq!(quality_step_multiplier("auto"), Ok(None));
+        let err = quality_step_multiplier("ultra").unwrap_err();
+        assert!(err.contains("unknown quality \"ultra\""), "{err}");
+        assert!(err.contains("xhigh, max"), "{err}");
+    }
+
+    #[test]
+    fn unit__style_preset__vivid_natural_only() {
+        assert_eq!(style_preset("vivid"), Some(1.25));
+        assert_eq!(style_preset("natural"), Some(0.75));
+        assert_eq!(style_preset("cinematic"), None);
+    }
+
+    #[test]
+    fn unit__openai_surface_teaching__covers_every_unserved_knob() {
+        let clean = serde_json::json!({"model": "m", "prompt": "p"});
+        assert!(openai_surface_teaching(&clean, false, None).is_none());
+
+        let url = serde_json::json!({"model": "m", "response_format": "url"});
+        let msg = openai_surface_teaching(&url, false, None).unwrap();
+        assert!(msg.contains("b64_json"), "{msg}");
+
+        // b64_json is the served shape — no teaching.
+        let b64 = serde_json::json!({"model": "m", "response_format": "b64_json"});
+        assert!(openai_surface_teaching(&b64, false, None).is_none());
+
+        for key in [
+            "moderation",
+            "partial_images",
+            "background",
+            "input_fidelity",
+        ] {
+            let req = serde_json::json!({"model": "m", key: "high"});
+            let msg = openai_surface_teaching(&req, false, None)
+                .unwrap_or_else(|| panic!("{key} must teach"));
+            assert!(msg.contains(key), "{key}: {msg}");
+        }
+
+        // Style: curated family passes, everything else teaches.
+        let styled = serde_json::json!({"model": "m", "style": "vivid"});
+        assert!(
+            openai_surface_teaching(&styled, false, Some("city96/Qwen-Image-2.1-GGUF")).is_none()
+        );
+        let flux = openai_surface_teaching(&styled, false, Some("city96/FLUX.1-dev-gguf")).unwrap();
+        assert!(flux.contains("curated per family"), "{flux}");
+        let unknown = openai_surface_teaching(&styled, false, None).unwrap();
+        assert!(unknown.contains("txt_cfg"), "{unknown}");
+        let bad = serde_json::json!({"model": "m", "style": "noir"});
+        assert!(openai_surface_teaching(&bad, false, Some("city96/Qwen-Image-2.1-GGUF")).is_some());
+
+        // Quality vocabulary teaches on the unknown value.
+        let q = serde_json::json!({"model": "m", "quality": "ultra"});
+        assert!(openai_surface_teaching(&q, false, None).is_some());
+        assert!(
+            openai_surface_teaching(
+                &serde_json::json!({"model": "m", "quality": "max"}),
+                false,
+                None
+            )
+            .is_none()
+        );
+
+        // output_format is mode-scoped: webm teaches on the image lane,
+        // jpeg teaches on the video lane, native values pass.
+        let img = serde_json::json!({"model": "m", "output_format": "webm"});
+        assert!(openai_surface_teaching(&img, false, None).is_some());
+        let vid = serde_json::json!({"model": "m", "output_format": "jpeg"});
+        assert!(openai_surface_teaching(&vid, true, None).is_some());
+        assert!(
+            openai_surface_teaching(
+                &serde_json::json!({"model": "m", "output_format": "avi"}),
+                true,
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn unit__translate_to_native__consumed_openai_knobs_never_ride() {
+        let req = serde_json::json!({
+            "model": "m", "prompt": "p",
+            "quality": "high", "style": "vivid", "response_format": "b64_json",
+            "output_format": "webp"
+        });
+        let native = translate_to_native(&req, false);
+        for gone in ["quality", "style", "response_format"] {
+            assert!(native.get(gone).is_none(), "{gone} rode: {native}");
+        }
+        // The child-honored output field still rides.
+        assert_eq!(native["output_format"], serde_json::json!("webp"));
+    }
+
+    #[test]
     fn unit__translate_to_native__unparseable_size_passes_through() {
         let req = serde_json::json!({ "model": "m", "prompt": "p", "size": "big" });
         let native = translate_to_native(&req, false);
         assert_eq!(native["size"], serde_json::json!("big"));
         assert!(native.get("width").is_none());
+    }
+
+    fn multipart_part(name: &str, filename: Option<&str>, data: &[u8]) -> crate::whisper::Part {
+        crate::whisper::Part {
+            name: name.to_string(),
+            filename: filename.map(str::to_string),
+            content_type: None,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn unit__b64_encode__rfc4648_vectors() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(b64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
+        // The pair the vid_gen fixture already pins repo-wide.
+        assert_eq!(b64_encode(b"GkX"), "R2tY");
+    }
+
+    #[test]
+    fn unit__variations_payload__init_image_neutral_prompt_random_seed() {
+        let parts = [
+            multipart_part("model", None, b"flux-dev"),
+            multipart_part("image", Some("cat.png"), b"GkX"),
+            multipart_part("n", None, b"2"),
+            multipart_part("size", None, b"512x512"),
+            multipart_part("prompt", None, b""),
+            multipart_part("user", None, b"tenant-7"),
+        ];
+        let v = variations_payload(&parts).expect("assembles");
+        assert_eq!(v["init_image"], "R2tY");
+        assert_eq!(v["prompt"], "");
+        assert_eq!(v["seed"], -1);
+        assert_eq!(v["n"], 2);
+        assert_eq!(v["size"], "512x512");
+        assert!(v.get("model").is_none(), "model never rides");
+        assert!(v.get("user").is_none(), "user never rides");
+    }
+
+    #[test]
+    fn unit__variations_payload__typed_fields_and_digit_prompts_survive() {
+        let parts = [
+            multipart_part("image", Some("i.png"), b"x"),
+            multipart_part("prompt", None, b"2024 a cat"),
+            multipart_part("seed", None, b"42"),
+            multipart_part("strength", None, b"0.5"),
+            multipart_part("async", None, b"true"),
+        ];
+        let v = variations_payload(&parts).expect("assembles");
+        assert_eq!(
+            v["prompt"], "2024 a cat",
+            "digit-only prefixes stay strings"
+        );
+        assert_eq!(v["seed"], 42);
+        assert_eq!(v["strength"], 0.5);
+        assert_eq!(v["async"], true);
+    }
+
+    #[test]
+    fn unit__variations_payload__missing_duplicate_and_stray_files_teach() {
+        let err =
+            variations_payload(&[multipart_part("model", None, b"m")]).expect_err("image required");
+        assert!(err.contains("image"), "{err}");
+        let two = [
+            multipart_part("image", Some("a.png"), b"a"),
+            multipart_part("image", Some("b.png"), b"b"),
+        ];
+        let err = variations_payload(&two).expect_err("one image only");
+        assert!(err.contains("exactly one"), "{err}");
+        let stray = [
+            multipart_part("image", Some("a.png"), b"a"),
+            multipart_part("mask", Some("m.png"), b"m"),
+        ];
+        let err = variations_payload(&stray).expect_err("mask is edits cargo");
+        assert!(err.contains("unexpected file part"), "{err}");
+        let bad_seed = [
+            multipart_part("image", Some("a.png"), b"a"),
+            multipart_part("seed", None, b"soon"),
+        ];
+        let err = variations_payload(&bad_seed).expect_err("seed must be an integer");
+        assert!(err.contains("seed"), "{err}");
     }
 
     #[test]
@@ -2246,5 +3545,223 @@ mod tests {
                 .as_array()
                 .is_some_and(std::vec::Vec::is_empty)
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__b64_decode__rfc4648_vectors_and_rejections() {
+        // RFC 4648 test vectors.
+        assert_eq!(b64_decode("").unwrap(), b"");
+        assert_eq!(b64_decode("Zg==").unwrap(), b"f");
+        assert_eq!(b64_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(b64_decode("Zm9v").unwrap(), b"foo");
+        assert_eq!(b64_decode("Zm9vYg==").unwrap(), b"foob");
+        assert_eq!(b64_decode("Zm9vYmE=").unwrap(), b"fooba");
+        assert_eq!(b64_decode("Zm9vYmFy").unwrap(), b"foobar");
+        // Roundtrip against the encoder over binary with all byte values.
+        let data: Vec<u8> = (0..=u8::MAX).collect();
+        let encoded = b64_encode(&data);
+        assert_eq!(b64_decode(&encoded).unwrap(), data);
+        // Rejections: ragged length, bad alphabet, misplaced padding.
+        assert!(b64_decode("Zm9").is_err());
+        assert!(b64_decode("Zm9*").is_err());
+        assert!(b64_decode("Z=9v").is_err());
+        assert!(b64_decode("Zm9v=Y==").is_err());
+        assert!(b64_decode("A===").is_err());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__canonicalize_video_frames__seconds_synonym_string_or_number() {
+        // Sora ships seconds as a STRING ("4"|"8"|"12"); both dialects
+        // convert with the assumed 16 fps default.
+        let mut v = serde_json::json!({"seconds": "8"});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(128));
+        assert!(v.get("seconds").is_none());
+
+        let mut v = serde_json::json!({"seconds": 4});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(64));
+
+        // Client fps participates: 2s x 12fps = 24 frames.
+        let mut v = serde_json::json!({"seconds": "2", "fps": 12});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(24));
+
+        // duration + seconds are the same dial: agreeing values collapse.
+        let mut v = serde_json::json!({"duration": 2, "seconds": "2"});
+        canonicalize_video_frames(&mut v).unwrap();
+        assert_eq!(v["video_frames"], serde_json::json!(32));
+
+        // Disagreeing values name both spellings in the conflict.
+        let mut v = serde_json::json!({"seconds": "4", "frames": 33});
+        let err = canonicalize_video_frames(&mut v).unwrap_err();
+        assert!(
+            err.contains("seconds=64") && err.contains("frames=33"),
+            "{err}"
+        );
+
+        // Junk answers by name.
+        let mut v = serde_json::json!({"seconds": "four"});
+        assert!(
+            canonicalize_video_frames(&mut v)
+                .unwrap_err()
+                .contains("seconds must be a positive")
+        );
+        let mut v = serde_json::json!({"seconds": 0});
+        assert!(canonicalize_video_frames(&mut v).is_err());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__request_echo__collects_client_facing_fields() {
+        let v = serde_json::json!({
+            "model": "wan", "prompt": "a cat", "size": "832x480",
+            "seconds": 8.0, "video_frames": 129, "fps": 16, "n": 1,
+            "negative_prompt": "blurry", "sample_params": {"sample_steps": 20}
+        });
+        let echo = request_echo(&v);
+        assert_eq!(echo["prompt"], serde_json::json!("a cat"));
+        assert_eq!(echo["size"], serde_json::json!("832x480"));
+        assert_eq!(echo["seconds"], serde_json::json!(8.0));
+        assert_eq!(echo["video_frames"], serde_json::json!(129));
+        assert_eq!(echo["fps"], serde_json::json!(16));
+        assert_eq!(echo["n"], serde_json::json!(1));
+        assert!(echo.get("negative_prompt").is_none());
+        assert!(echo.get("sample_params").is_none());
+        assert!(echo.get("model").is_none());
+    }
+
+    fn video_row_fixture(
+        state: &str,
+        request_json: &str,
+        result_json: Option<&str>,
+    ) -> blazar_core::store::JobRow {
+        blazar_core::store::JobRow {
+            id: "job_video1".into(),
+            kind: "video".into(),
+            model: Some("wan".into()),
+            state: state.into(),
+            request_json: request_json.into(),
+            result_json: result_json.map(str::to_string),
+            error: None,
+            artifact_path: None,
+            created_at: 1000,
+            updated_at: 1005,
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__sora_video_object__statuses_progress_and_seconds_echo() {
+        let request = r#"{"engine":"sdcpp","request":{"prompt":"a cat","size":"832x480","seconds":8.0,"fps":16,"video_frames":129}}"#;
+        // Queued: status maps, progress 0, request echo surfaces.
+        let row = video_row_fixture("queued", request, None);
+        let obj = sora_video_object(&row, None);
+        assert_eq!(obj["object"], serde_json::json!("video"));
+        assert_eq!(obj["status"], serde_json::json!("queued"));
+        assert_eq!(obj["progress"], serde_json::json!(0));
+        assert_eq!(obj["prompt"], serde_json::json!("a cat"));
+        assert_eq!(obj["size"], serde_json::json!("832x480"));
+        assert_eq!(obj["seconds"], serde_json::json!(8.0));
+        assert!(obj.get("completed_at").is_none());
+
+        // Running + fresh child progress: the live number wins over any
+        // state-derived guess.
+        let row = video_row_fixture("running", request, None);
+        let fresh = serde_json::json!({"status": "generating", "progress": 42});
+        let obj = sora_video_object(&row, Some(&fresh));
+        assert_eq!(obj["status"], serde_json::json!("in_progress"));
+        assert_eq!(obj["progress"], serde_json::json!(42));
+
+        // Completed inline: seconds from the render's own frame_count/
+        // fps (the engine normalized 129 = 4n+1), progress 100,
+        // completed_at stamped.
+        let result = r#"{"status":"completed","result":{"b64_json":"Zm9vYmFy","mime_type":"video/webm","fps":24.0,"frame_count":129}}"#;
+        let row = video_row_fixture("completed", request, Some(result));
+        let obj = sora_video_object(&row, None);
+        assert_eq!(obj["status"], serde_json::json!("completed"));
+        assert_eq!(obj["progress"], serde_json::json!(100));
+        assert_eq!(obj["completed_at"], serde_json::json!(1005));
+        assert_eq!(obj["seconds"], serde_json::json!(5.375));
+
+        // Result without frame truth falls back to the request echo.
+        let thin = r#"{"status":"completed","result":{"b64_json":"Zm9vYmFy"}}"#;
+        let row = video_row_fixture("completed", request, Some(thin));
+        assert_eq!(
+            sora_video_object(&row, None)["seconds"],
+            serde_json::json!(8.0)
+        );
+
+        // Cancelled stays an honest superset status.
+        let row = video_row_fixture("cancelled", request, None);
+        assert_eq!(
+            sora_video_object(&row, None)["status"],
+            serde_json::json!("cancelled")
+        );
+
+        // Failed carries the ledger error.
+        let row = blazar_core::store::JobRow {
+            state: "failed".into(),
+            error: Some("engine exploded".into()),
+            ..video_row_fixture("failed", request, None)
+        };
+        assert_eq!(
+            sora_video_object(&row, None)["error"],
+            serde_json::json!("engine exploded")
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__completed_video_bytes__inline_artifact_and_gates() {
+        // In-flight rows never serve content (Sora's 404-until-done).
+        let request = r#"{"engine":"sdcpp","request":{"seconds":8.0}}"#;
+        let row = video_row_fixture("running", request, None);
+        assert!(matches!(
+            completed_video_bytes(&row),
+            Err(VideoContentError::NotCompleted)
+        ));
+
+        // Inline completed result decodes to bytes + child mime type.
+        let result =
+            r#"{"status":"completed","result":{"b64_json":"Zm9vYmFy","mime_type":"video/webm"}}"#;
+        let row = video_row_fixture("completed", request, Some(result));
+        let (bytes, mime) = completed_video_bytes(&row).unwrap();
+        assert_eq!(bytes, b"foobar");
+        assert_eq!(mime, "video/webm");
+
+        // Artifact-spilled: the spill file holds the same child job JSON.
+        let dir = std::env::temp_dir().join(format!(
+            "blazar-video-artifact-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("result");
+        std::fs::write(&path, result.as_bytes()).unwrap();
+        let row = blazar_core::store::JobRow {
+            result_json: Some(r#"{"artifact":true,"bytes":9001}"#.into()),
+            artifact_path: Some(path.to_string_lossy().into_owned()),
+            ..video_row_fixture("completed", request, None)
+        };
+        let (bytes, mime) = completed_video_bytes(&row).unwrap();
+        assert_eq!(
+            (bytes.as_slice(), mime.as_str()),
+            (b"foobar".as_slice(), "video/webm")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Dropped spill answers Gone.
+        let row = blazar_core::store::JobRow {
+            result_json: Some(r#"{"artifact":"dropped","bytes":9001}"#.into()),
+            ..video_row_fixture("completed", request, None)
+        };
+        assert!(matches!(
+            completed_video_bytes(&row),
+            Err(VideoContentError::Gone)
+        ));
     }
 }

@@ -486,6 +486,52 @@ async fn integration__prune_keeps_newest_keep_tags_and_local() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__prune_config_keep_tags_one_drops_rollback_anchor() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let mgr = manager(&dirs, &api.uri());
+    let store = Store::open(&dirs).unwrap();
+
+    // Typical update trail: b1 (superseded), b2 (previous rollback
+    // anchor), b3 (fresh install, now active).
+    for (i, tag) in ["b1", "b2", "b3"].iter().enumerate() {
+        let dir = dirs.engines_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), tag).unwrap();
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: tag.to_string(),
+                asset: "x".into(),
+                sha256: "x".into(),
+                installed_at: 1000 + i64::try_from(i).unwrap_or(0),
+                active: false,
+                manifest: "{}".into(),
+                kind: blazar_core::engine_kind::EngineKind::default(),
+            })
+            .unwrap();
+    }
+    store.set_active_engine("b3").unwrap();
+
+    // keep_tags = 1: the knob applies at prune time with no restart.
+    std::fs::create_dir_all(&dirs.config_dir).unwrap();
+    std::fs::write(dirs.config_file(), "keep_tags = 1\n").unwrap();
+
+    mgr.prune(&store, None).unwrap();
+    let remaining: Vec<String> = store
+        .list_engines()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.tag)
+        .collect();
+    // One slot + active protection collapse onto the same tag: only the
+    // fresh build survives, the rollback anchor is gone.
+    assert_eq!(remaining, vec!["b3".to_string()]);
+    assert!(!dirs.engines_dir().join("b1").exists());
+    assert!(!dirs.engines_dir().join("b2").exists());
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__prune_reports_freed_tag_bytes() {
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;

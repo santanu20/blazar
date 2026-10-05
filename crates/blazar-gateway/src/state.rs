@@ -265,6 +265,13 @@ pub struct AppState {
     /// CONNECTION, not data: WAL + per-call queries keep CLI-side
     /// writes immediately visible cross-process.
     pub store: std::sync::Mutex<Option<blazar_core::Store>>,
+    /// Ordered failover chains (`[[failover]]`): alias resolution,
+    /// anti-flap benching, pin/unpin, bounded switch history. Empty
+    /// registry = zero request-path cost (one map miss on the alias).
+    pub failover: crate::failover::Registry,
+    /// MCP stdio server registry: lazily spawned sessions behind the
+    /// `mcp` request opt-in. Empty config = zero request-path cost.
+    pub mcp: crate::mcp::Registry,
 }
 
 /// Client for dialing ONE child endpoint: the shared TCP pool, or the
@@ -322,6 +329,8 @@ impl AppState {
     #[allow(clippy::duration_suboptimal_units)] // 10-minute ceiling mirrors long generations
     #[allow(clippy::too_many_lines)] // constructor: field-by-field wiring, splitting would not reduce it
     pub fn new(dirs: BlazarDirs, config: Config, sup: Arc<Supervisor>, bus: EventBus) -> Self {
+        let failover = crate::failover::Registry::from_config(&config.failover);
+        let mcp = crate::mcp::Registry::from_config(&config.mcp, config.mcp_default.clone());
         let http = crate::http_pool::tuned(reqwest::Client::builder())
             .timeout(std::time::Duration::from_secs(10 * 60))
             .build()
@@ -443,6 +452,8 @@ impl AppState {
             audit_tx,
             audit_dropped,
             store: std::sync::Mutex::new(store),
+            failover,
+            mcp,
             singleflight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),

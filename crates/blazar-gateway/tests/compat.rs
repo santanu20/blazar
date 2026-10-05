@@ -450,6 +450,8 @@ async fn client__well_known__capability_discovery() {
         "/v1/stream",
         "/v1/chat/completions/input_tokens",
         "/v1/systemone",
+        "/completion",
+        "/embeddings",
     ] {
         assert!(openai_eps.contains(&path), "census missing {path}");
     }
@@ -609,10 +611,12 @@ async fn client__ollama_options_spec__off_shapes_the_spawn_and_ps_reports_it() {
 }
 
 #[tokio::test]
-async fn client__audio_speech__teaches_install_and_format_lanes() {
+async fn client__audio_speech__teaches_install_and_unknown_formats() {
     // Hermetic harness dir carries no piper install: the route must
-    // name the exact remedy, and the WAV-only contract must teach the
-    // alternative instead of silently transcoding.
+    // name the exact remedy. Lossy formats are first-class (ffmpeg
+    // lane), so an accepted format rides through to the same install
+    // teaching, while a genuinely unknown format must teach the full
+    // vocabulary instead of silently falling back to WAV.
     let ts = start(support::config_with_keys()).await;
     let c = client();
     let resp = c
@@ -640,11 +644,27 @@ async fn client__audio_speech__teaches_install_and_format_lanes() {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("blazar tts --install"),
+        "accepted lossy format reaches the install teaching, not a format rejection: {body}"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/speech", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "en_US-amy-medium", "input": "hi",
+            "response_format": "wma"
+        }))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("WAV") && body.contains("mp3"),
-        "format teaching: {body}"
+        body.contains("wav") && body.contains("mp3") && body.contains("pcm16"),
+        "unknown-format teaching lists the full vocabulary: {body}"
     );
     let resp = c
         .post(format!("{}/v1/audio/speech", ts.base))
@@ -658,4 +678,85 @@ async fn client__audio_speech__teaches_install_and_format_lanes() {
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
     assert!(body.contains("0.25..=4.0"), "speed range teaching: {body}");
+}
+
+/// Native llama-server surface parity (upstream audit 2026-10-05):
+/// /infill, /v1/systemone, /completion, and /embeddings bodies carry no
+/// `model` field upstream — direct-server clients post them bare.
+/// Blazar must resolve a target (X-Blazar-Model > ?model= > single hot
+/// child) and forward, not answer the OpenAI-dialect hard 400.
+#[tokio::test]
+async fn client__native_modelless_surfaces__header_target_forwards() {
+    let stub = support::spawn_remote_stub().await;
+    let cfg = support::config_with_keys();
+    let cfg = support::with_remote(cfg, "far", &stub.base);
+    let ts = start(cfg).await;
+    let c = client();
+    for path in ["/infill", "/v1/systemone", "/completion", "/embeddings"] {
+        let r = c
+            .post(format!("{}{path}", ts.base))
+            .bearer_auth("plm_admin")
+            .header("x-blazar-model", "far:m1")
+            .json(&serde_json::json!({"input_prefix": "fn main() {"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            200,
+            "{path}: model-less native body must forward via X-Blazar-Model"
+        );
+    }
+    ts.state.sup.shutdown_all().await.unwrap();
+    stub.shutdown().await;
+}
+
+/// Same native surfaces, `?model=` query resolution — the second rung
+/// of the `scoped_proxy` chain.
+#[tokio::test]
+async fn client__native_modelless_surfaces__query_target_forwards() {
+    let stub = support::spawn_remote_stub().await;
+    let cfg = support::config_with_keys();
+    let cfg = support::with_remote(cfg, "far", &stub.base);
+    let ts = start(cfg).await;
+    let c = client();
+    let r = c
+        .post(format!("{}/completion?model=far:m1", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({"prompt": "the quick brown"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "?model= must resolve the native /completion target"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+    stub.shutdown().await;
+}
+
+/// Pin the OTHER side of the audit fix: OpenAI-dialect paths have no
+/// fallback — their clients always name the model, and a silent
+/// fallback would route a typo to the wrong lane.
+#[tokio::test]
+async fn client__openai_dialect__missing_model_still_400() {
+    let ts = start(support::config_with_keys()).await;
+    let c = client();
+    for path in ["/v1/chat/completions", "/v1/completions"] {
+        let r = c
+            .post(format!("{}{path}", ts.base))
+            .bearer_auth("plm_admin")
+            .json(&serde_json::json!({"prompt": "hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{path}: missing model stays a hard 400");
+        let body = r.text().await.unwrap();
+        assert!(
+            body.contains("missing `model` field"),
+            "{path}: teaching text preserved: {body}"
+        );
+    }
+    ts.state.sup.shutdown_all().await.unwrap();
 }

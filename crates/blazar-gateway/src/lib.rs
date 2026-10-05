@@ -4,11 +4,15 @@
 pub mod anthropic;
 pub mod audit;
 pub mod batch;
+pub mod benchmarks;
 pub mod bestof;
 pub mod cache_bust;
 pub mod capacity;
 pub mod cascade;
+pub mod classify;
+pub mod console;
 pub mod explain;
+pub mod fabric;
 pub mod federation;
 pub mod histogram;
 pub mod host_guard;
@@ -16,10 +20,14 @@ pub mod http_pool;
 pub mod images;
 pub mod jobs;
 pub mod model_doctor;
+pub mod quantiles;
 pub mod requests;
 
+pub mod failover;
 pub mod keys;
 pub mod latechunk;
+pub mod mcp;
+pub mod metadata_card;
 pub mod ollama;
 pub mod openai;
 pub mod otlp;
@@ -27,6 +35,7 @@ pub mod preflight;
 pub mod prompt_recipe;
 pub mod proxy;
 pub mod queue;
+pub mod realtime;
 pub mod remotes;
 pub mod responses;
 pub mod scrub;
@@ -267,6 +276,10 @@ async fn request_log(
 pub fn router(state: Arc<AppState>) -> Router {
     let openai_any = Router::new()
         .route("/v1/chat/completions", post(openai::openai_proxy))
+        .route(
+            "/v1/chat/completions/{id}",
+            post(openai::chat_completion_update),
+        )
         .route("/v1/completions", post(openai::openai_proxy))
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/rerank", post(openai::openai_proxy))
@@ -299,6 +312,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/audio/translations", post(whisper::audio_translations))
         .route("/v1/audio/speech", post(tts::audio_speech))
+        .route("/v1/audio/voices", get(tts::voices))
         .route("/v1/audio/jobs/{id}", get(whisper::audio_jobs_get))
         .route(
             "/v1/audio/jobs/{id}/cancel",
@@ -326,11 +340,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/audio/capabilities", get(whisper::audio_capabilities))
         .route("/v1/images/generations", post(images::generations))
         .route("/v1/images/edits", post(images::edits))
+        .route("/v1/images/variations", post(images::variations))
         .route("/v1/images/upscale", post(images::upscale))
         .route("/v1/images/jobs/{id}", get(images::jobs_get))
         .route("/v1/images/jobs/{id}/cancel", post(images::jobs_cancel))
         .route("/v1/images/capabilities", get(images::capabilities))
         .route("/v1/videos/generations", post(images::video_generations))
+        // Sora verbs: POST /v1/videos is the Sora-native create (same
+        // handler), GET lists the durable video rows, {id}/content
+        // serves bytes once completed, DELETE cancels.
+        .route(
+            "/v1/videos",
+            get(images::videos_list).post(images::video_generations),
+        )
+        .route(
+            "/v1/videos/{id}",
+            get(images::video_get).delete(images::video_delete),
+        )
+        .route("/v1/videos/{id}/content", get(images::video_content))
         // Jobs and capabilities are surface-agnostic upstream (one
         // queue, `kind` distinguishes) — same handlers on both mounts.
         .route("/v1/videos/jobs/{id}", get(images::jobs_get))
@@ -341,6 +368,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         // same alias symmetry as transcriptions).
         .route("/audio/translations", post(whisper::audio_translations))
         .route("/infill", post(openai::openai_proxy))
+        // Native llama-server dialect (no /v1 prefix, no `model` field
+        // in the body upstream): /completion is the raw prompt surface,
+        // /embeddings the token-level batch one (pooling=none). Same
+        // handler — model resolution mirrors scoped_proxy for them.
+        .route("/completion", post(openai::openai_proxy))
+        .route("/embeddings", post(openai::openai_proxy))
         .route("/v1/chat/completions/control", post(openai::openai_proxy))
         .route(
             "/v1/chat/completions/input_tokens",
@@ -348,8 +381,30 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/responses/input_tokens", post(openai::openai_proxy))
         .route("/v1/systemone", post(openai::openai_proxy))
+        .route("/v1/classify", post(classify::classify))
         .route("/responses/input_tokens", post(openai::openai_proxy))
+        // Realtime voice lane: WS upgrade, one utterance pipeline per
+        // commit (STT → chat → TTS through the gateway's own lanes).
+        .route("/v1/realtime", get(realtime::realtime_session))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
+        // Anthropic Message Batches: inline-request batch dialect. The
+        // worker replays each params body through our own /v1/messages.
+        .route(
+            "/v1/messages/batches",
+            post(batch::anthropic_batches_create).get(batch::anthropic_batches_list),
+        )
+        .route(
+            "/v1/messages/batches/{id}",
+            get(batch::anthropic_batches_get).delete(batch::anthropic_batches_delete),
+        )
+        .route(
+            "/v1/messages/batches/{id}/cancel",
+            post(batch::anthropic_batches_cancel),
+        )
+        .route(
+            "/v1/messages/batches/{id}/results",
+            get(batch::anthropic_batches_results),
+        )
         .route("/tokenize", post(openai::openai_proxy))
         .route("/detokenize", post(openai::openai_proxy))
         .route("/apply-template", post(openai::openai_proxy))
@@ -379,6 +434,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Per-GPU capacity: device census + per-resident VRAM
         // attribution joined from the supervisor's live rows.
         .route("/api/capacity", get(capacity::capacity))
+        .route("/api/failover", get(failover::list))
+        .route("/api/failover/{chain}", get(failover::detail))
+        .route("/api/failover/{chain}/pin", post(failover::pin))
+        .route("/api/failover/{chain}/unpin", post(failover::unpin))
+        .route("/api/mcp", get(mcp::mcp_status))
+        .route("/api/fabric", get(fabric::fabric))
+        .route("/api/quantiles", get(quantiles::quantiles))
+        .route("/api/benchmarks", get(benchmarks::benchmarks))
+        .route("/ui", get(console::ui))
         .route("/api/replicate", post(federation::replicate))
         .route("/api/route/{model}", get(federation::route))
         .route("/api/explain/{model}", get(explain::explain))
@@ -888,17 +952,22 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/v1/adapters", "/v1/batches", "/v1/batches/{id}",
                        "/v1/batches/{id}/cancel", "/v1/files", "/v1/files/{id}",
                        "/v1/files/{id}/content", "/v1/streams/lookup", "/v1/stream",
-                       "/props", "/infill", "/tokenize", "/detokenize",
-                       "/apply-template", "/slots", "/slots/{id}", "/responses",
+                        "/props", "/infill", "/completion", "/embeddings",
+                        "/tokenize", "/detokenize",
+                        "/apply-template", "/slots", "/slots/{id}", "/responses",
                        "/responses/input_tokens",
-                       "/v1/images/generations", "/v1/images/edits",
-                       "/v1/images/jobs/{id}", "/v1/images/jobs/{id}/cancel",
-                       "/v1/images/capabilities",
-                       "/v1/videos/generations", "/v1/videos/jobs/{id}",
-                       "/v1/videos/jobs/{id}/cancel", "/v1/videos/capabilities",
-                        "/v1/audio/transcriptions", "/v1/audio/translations",
-                        "/v1/audio/speech", "/v1/audio/jobs/{id}",
-                        "/v1/audio/jobs/{id}/cancel", "/v1/audio/capabilities",
+                        "/v1/images/generations", "/v1/images/edits",
+                        "/v1/images/variations", "/v1/images/upscale",
+                        "/v1/images/jobs/{id}", "/v1/images/jobs/{id}/cancel",
+                        "/v1/images/capabilities",
+                        "/v1/videos/generations", "/v1/videos",
+                        "/v1/videos/{id}", "/v1/videos/{id}/content",
+                        "/v1/videos/jobs/{id}",
+                        "/v1/videos/jobs/{id}/cancel", "/v1/videos/capabilities",
+                         "/v1/audio/transcriptions", "/v1/audio/translations",
+                         "/v1/audio/speech", "/v1/audio/voices",
+                         "/v1/audio/jobs/{id}",
+                         "/v1/audio/jobs/{id}/cancel", "/v1/audio/capabilities",
                         "/v1/jobs", "/v1/jobs/{id}", "/v1/jobs/{id}/cancel",
                         "/v1/jobs/{id}/events", "/v1/jobs/{id}/artifact",
                         "/v1/requests", "/v1/requests/{id}",
@@ -1292,6 +1361,8 @@ pub async fn serve(
     reshape_wake_task.abort();
     // H8: the lazy whisper-server child (if any request spawned one).
     state.whisper.shutdown().await;
+    // MCP stdio children die before the engines (fast, independent).
+    state.mcp.shutdown_all().await;
     state.sup.shutdown_all().await?;
     Ok(())
 }
@@ -1384,6 +1455,32 @@ mod tests {
         assert!(
             msg.contains("can never change this") && msg.contains("blazar fit"),
             "physical-refusal teaching must survive the mapping: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__supervision_error__insufficient_memory_maps_to_507_teaching() {
+        use crate::proxy::supervision_error;
+        use blazar_runtime::SupervisionError;
+        // Live shape of the 18 GiB bf16 refusal (MemAvailable < spawn
+        // floor): honest and teaching, but it surfaced as a bare 500 —
+        // 507 says "resource exhausted", the levers stay in the body.
+        let resp = supervision_error(&SupervisionError::InsufficientMemory(
+            "insufficient memory to load \"qwen3.5-9b-bf16\": MemAvailable 1612 MiB < \
+             floor 9437 MiB (model 18432 MiB). Stop co-resident engines (blazar ps / \
+             ollama stop) or free RAM; disable this guard with spawn_mem_guard = false"
+                .to_string(),
+        ));
+        assert_eq!(resp.status(), 507);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let msg = v["error"]["message"].as_str().expect("message");
+        assert!(
+            msg.contains("MemAvailable") && msg.contains("spawn_mem_guard"),
+            "memory-floor teaching must survive the mapping: {msg}"
         );
     }
 }

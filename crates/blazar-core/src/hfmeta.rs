@@ -43,6 +43,16 @@ pub struct HfMeta {
     /// Effective weight bits when a `quantization_config` is present
     /// (`bits`, bnb `load_in_4bit`/`load_in_8bit`, fp8 → 8).
     pub quant_bits: Option<u8>,
+    /// Raw `quantization_config.quant_method` (e.g. `awq`, `torchao`) —
+    /// the lane-admission signal. `quant_bits` says how wide the weights
+    /// are, not which loader must read them; a lane without the quantizer
+    /// dies at weight load.
+    pub quant_method: Option<String>,
+    /// Config declares a vision/image tower (top-level `vision_config` or
+    /// `image_config` object — the multimodal-wrapper class). Tower models
+    /// need their processor artifact (`preprocessor_config.json`) at engine
+    /// load time; `text_config` alone is NOT a tower declaration.
+    pub vision_tower: bool,
     pub kv: KvGeom,
 }
 
@@ -169,12 +179,89 @@ pub fn read_hf_config(dir: &Path) -> CoreResult<HfMeta> {
         ctx_train: u64_of_text_config(&v, "max_position_embeddings"),
         dtype: str_of_text_config(&v, "torch_dtype").or_else(|| str_of_text_config(&v, "dtype")),
         quant_bits: v.get("quantization_config").and_then(quant_bits_of),
+        quant_method: v
+            .get("quantization_config")
+            .and_then(|q| q.get("quant_method"))
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned),
+        vision_tower: ["vision_config", "image_config"]
+            .iter()
+            .any(|k| v.get(*k).is_some_and(Value::is_object)),
         kv: KvGeom {
             layers: kv_layers,
             kv_heads,
             head_dim,
         },
     })
+}
+
+/// `quantization_config.quant_method` values the installed sglang lane
+/// (0.5.21) can load, captured verbatim from the engine's loader error
+/// (live-repro'd: `torchao` weights die at weight load with an opaque
+/// 502 ~30s later). Re-verify against the engine's own rejection list
+/// on lane upgrade (`blazar engine use <newer-tag>`).
+pub const SGLANG_SUPPORTED_QUANT_METHODS: &[&str] = &[
+    "fp8",
+    "mxfp8",
+    "blockwise_int8",
+    "modelopt",
+    "modelopt_fp8",
+    "modelopt_fp4",
+    "nvfp4_online",
+    "modelopt_mixed",
+    "w8a8_int8",
+    "w8a8_fp8",
+    "awq",
+    "awq_marlin",
+    "bitsandbytes",
+    "gguf",
+    "gptq_marlin",
+    "moe_wna16",
+    "compressed-tensors",
+    "w4afp8",
+    "petit_nvfp4",
+    "quark",
+    "quark_mxfp4",
+    "auto-round",
+    "auto-round-int8",
+    "modelslim",
+    "quark_int4fp8_moe",
+    "humming",
+    "mxfp_w4a8",
+    "mxfp4",
+];
+
+/// SGLang-lane admission teaching: refuse models whose `config.json`
+/// facts predict engine death, naming the offending value and the levers.
+/// `None` = the lane has no objection. Two gates (both live-validated
+/// failure shapes): (1) a `quant_method` this sglang build cannot load,
+/// (2) a vision-tower config whose model dir lacks
+/// `preprocessor_config.json` — processor init dies at spawn. The working
+/// tower model on this box ships the artifact, so complete multimodal
+/// dirs and dense text models pass untouched.
+#[must_use]
+pub fn sglang_lane_teach(meta: &HfMeta, dir: &Path) -> Option<String> {
+    if let Some(method) = meta.quant_method.as_deref().filter(|m| !m.is_empty())
+        && !SGLANG_SUPPORTED_QUANT_METHODS.contains(&method)
+    {
+        return Some(format!(
+            "quant_method '{method}' is not loadable by this sglang lane (0.5.21; \
+             supported: {}). Serve it on a lane that reads the format \
+             (blazar engine use <tag>), or re-quantize (`blazar fit`)",
+            SGLANG_SUPPORTED_QUANT_METHODS.join(", ")
+        ));
+    }
+    if meta.vision_tower && !dir.join("preprocessor_config.json").is_file() {
+        return Some(format!(
+            "multimodal config (vision tower declared) but {} lacks \
+             preprocessor_config.json — the engine's processor init dies at spawn. \
+             Re-pull the complete repo (blazar pull <model>), or serve on a lane \
+             that tolerates the missing artifact",
+            dir.display()
+        ));
+    }
+    None
 }
 
 /// Root-level `.safetensors` weights of an HF model dir — the pull
@@ -423,5 +510,87 @@ mod tests {
         };
         assert_eq!(ModelMeta::Hf(&h).context_length(), Some(4096));
         assert_eq!(ModelMeta::Hf(&h).architecture(), "llama");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__hf_config_quant_method_and_vision_tower__parsed() {
+        // Live shape of the broken awq artifact: torchao method, no tower.
+        let dir = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["Qwen3ForCausalLM"],
+                "quantization_config": {"quant_method": "torchao"},
+                "vision_config": {"depth": 27}}"#,
+        )]);
+        let m = read_hf_config(dir.path()).unwrap();
+        assert_eq!(m.quant_method.as_deref(), Some("torchao"));
+        assert!(m.vision_tower);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__hf_config_text_config_alone__is_not_a_tower() {
+        // Dense flat config: no method, no tower.
+        let dir = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["Qwen3ForCausalLM"], "num_hidden_layers": 16}"#,
+        )]);
+        let m = read_hf_config(dir.path()).unwrap();
+        assert_eq!(m.quant_method, None);
+        assert!(!m.vision_tower);
+        // Nested text geometry alone must NOT read as a tower: text-only
+        // wrapper configs exist, and gate B would false-refuse them.
+        let dir = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["Qwen3_5ForConditionalGeneration"],
+                "text_config": {"num_hidden_layers": 16}}"#,
+        )]);
+        let m = read_hf_config(dir.path()).unwrap();
+        assert!(!m.vision_tower, "text_config alone is not a tower");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_lane_teach__unsupported_quant_method_refuses() {
+        let dir = write_dir(&[]);
+        let m = HfMeta {
+            quant_method: Some("torchao".into()),
+            ..Default::default()
+        };
+        let teach = sglang_lane_teach(&m, dir.path()).expect("unsupported method refuses");
+        assert!(teach.contains("'torchao'"), "{teach}");
+        assert!(teach.contains("awq"), "supported list shown: {teach}");
+        assert!(teach.contains("blazar engine use"), "{teach}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_lane_teach__supported_quant_and_dense_pass() {
+        let dir = write_dir(&[]);
+        let awq = HfMeta {
+            quant_method: Some("awq".into()),
+            ..Default::default()
+        };
+        assert_eq!(sglang_lane_teach(&awq, dir.path()), None);
+        // No method string at all: the engine decides, the gate stays out.
+        assert_eq!(sglang_lane_teach(&HfMeta::default(), dir.path()), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_lane_teach__vision_tower_without_processor_refuses() {
+        let tower = HfMeta {
+            vision_tower: true,
+            ..Default::default()
+        };
+        // Live shape of the broken eoq artifact: tower declared, no
+        // processor file in the dir.
+        let bare = write_dir(&[]);
+        let teach = sglang_lane_teach(&tower, bare.path()).expect("tower without processor");
+        assert!(teach.contains("preprocessor_config.json"), "{teach}");
+        assert!(teach.contains("blazar pull"), "{teach}");
+        // Live shape of the WORKING bf16 control: tower + artifact = pass.
+        let full = write_dir(&[("preprocessor_config.json", "{}")]);
+        assert_eq!(sglang_lane_teach(&tower, full.path()), None);
     }
 }

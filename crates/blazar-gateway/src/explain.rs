@@ -355,6 +355,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     let cache = json!({
         "kv_k": kv_key_label,
         "kv_v": kv_value_label,
+        "kv_advisory": kv_advisory(shape, kv_k.as_str(), requested, resident_ctx, &resolved),
         "semantic_cache": {
             "enabled": state.config.semantic_cache.enabled,
             "model": state.config.semantic_cache.model,
@@ -399,6 +400,118 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     (StatusCode::OK, axum::Json(card)).into_response()
 }
 
+/// C3 per-phase KV-quant advisory for the explain card. llama.cpp
+/// documents the ladder as f16 (lossless, largest KV footprint) >
+/// `q8_0` (near-lossless, roughly half the footprint) > `q4_0`
+/// (measurable quality impact, quarter footprint). The advisory says
+/// which tier the config sits at and when one step down pays; it never
+/// invents byte counts (per-token KV size depends on the model's
+/// layer/head geometry, which this card does not read).
+fn kv_advisory(
+    shape: blazar_core::engine_kind::FormatShape,
+    kv_k: &str,
+    requested_ctx: u32,
+    resident_ctx: Option<u32>,
+    model: &str,
+) -> Value {
+    if shape.shards == blazar_core::engine_kind::ShardFormat::MlxLayout {
+        return json!({
+            "applies": false,
+            "reason": "mlx runtime owns KV quantization (kv-bits / kv-group-size via argv)",
+        });
+    }
+    let ctx_in_play = resident_ctx.unwrap_or(requested_ctx);
+    let long_ctx = ctx_in_play >= 32_768;
+    let (grade, next_step, why) = if kv_k.is_empty() {
+        (
+            "f16 (engine auto ladder)",
+            Some("cache_type_k = \"q8_0\" + cache_type_v = \"q8_0\""),
+            if long_ctx {
+                "effective ctx >= 32k: q8_0 KV roughly halves the KV footprint with \
+                 near-lossless quality — the standard first step when ctx or VRAM is tight"
+            } else {
+                "KV stays f16 unless ctx or VRAM pressure appears (q8_0 is the first \
+                 step when it does)"
+            },
+        )
+    } else if kv_k.eq_ignore_ascii_case("q8_0") {
+        (
+            "q8_0",
+            Some("cache_type_* = \"q4_0\" (only when VRAM-bound and quality-tolerant)"),
+            "already at the near-lossless tier; q4_0 trades measurable quality for a \
+             quarter of the f16 footprint",
+        )
+    } else if kv_k.eq_ignore_ascii_case("q4_0") {
+        (
+            "q4_0",
+            None,
+            "most aggressive KV tier; stepping back up to q8_0 restores quality if \
+             generations degrade",
+        )
+    } else {
+        (
+            kv_k,
+            None,
+            "custom cache_type_k grade; ladder advice does not apply",
+        )
+    };
+    json!({
+        "applies": true,
+        "current": grade,
+        "effective_ctx": ctx_in_play,
+        "next_step": next_step,
+        "why": why,
+        "measured": kv_quality_measured(model),
+    })
+}
+
+/// Measured KV-quant quality receipts, compiled in from
+/// `registry/kv-quant-quality.json` (populated by the ppl A/B campaign:
+/// llama-perplexity on a fixed corpus, identical ctx, only the cache
+/// types varied). The ladder ordering above is documented llama.cpp
+/// behavior; these receipts are the measured proof for the exact
+/// checkpoints that were benched, with conditions stamped in the
+/// artifact the `source` field names. Unknown model = honest null — a
+/// number borrowed from a different checkpoint would be fabrication.
+const KV_QUALITY_RECEIPTS: &str = include_str!("../../../registry/kv-quant-quality.json");
+
+fn kv_quality_receipts() -> &'static Value {
+    static PARSED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    PARSED.get_or_init(|| serde_json::from_str(KV_QUALITY_RECEIPTS).unwrap_or(Value::Null))
+}
+
+/// Case-insensitive match on the basename without extension, so store
+/// rows ("Qwen3.5-9B-Q4_K_M.gguf") and request-level names
+/// ("qwen3.5-9b-q4_k_m") hit the same receipt.
+fn kv_model_key(model: &str) -> String {
+    let base = model.rsplit(['/', '\\']).next().unwrap_or(model);
+    base.trim_end_matches(".gguf").to_ascii_lowercase()
+}
+
+/// Pure matcher so tests can pin the lookup without touching the
+/// compiled-in registry. Returns every receipt for the model — one per
+/// measured context window — as a JSON array, or `Value::Null` when the
+/// model has never been measured. Multiple windows (e.g. ctx 2048 and
+/// 32768) are distinct receipts, not competing numbers.
+fn kv_quality_measured_from(registry: &Value, model: &str) -> Value {
+    let Some(receipts) = registry["receipts"].as_array() else {
+        return Value::Null;
+    };
+    let key = kv_model_key(model);
+    let matched: Vec<&Value> = receipts
+        .iter()
+        .filter(|r| r["model"].as_str().is_some_and(|m| kv_model_key(m) == key))
+        .collect();
+    match matched.len() {
+        0 => Value::Null,
+        _ => Value::Array(matched.into_iter().cloned().collect()),
+    }
+}
+
+fn kv_quality_measured(model: &str) -> Value {
+    kv_quality_measured_from(kv_quality_receipts(), model)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(non_snake_case)]
@@ -410,6 +523,103 @@ mod tests {
     /// first, shard shape second.
     fn fs(diffusion: bool, shards: ShardFormat) -> blazar_core::engine_kind::FormatShape {
         blazar_core::engine_kind::FormatShape { diffusion, shards }
+    }
+
+    #[test]
+    fn unit__kv_quality_measured__normalized_match_null_and_multi_window() {
+        let reg: Value = serde_json::json!({
+            "receipts": [
+                {
+                    "model": "Qwen3.5-9B.gguf",
+                    "ctx": 2048,
+                    "rungs": [
+                        {"kv": "f16", "ppl": 12.0},
+                        {"kv": "q8_0/q8_0", "ppl": 12.1},
+                        {"kv": "q4_0/q4_0", "ppl": 13.4}
+                    ],
+                    "source": "bench-artifacts/x/"
+                },
+                {
+                    "model": "qwen3.5-9b",
+                    "ctx": 32768,
+                    "rungs": [
+                        {"kv": "q8_0/q8_0", "ppl": 8.2},
+                        {"kv": "q4_0/q4_0", "ppl": 8.3}
+                    ],
+                    "source": "bench-artifacts/y/"
+                }
+            ]
+        });
+        // file-style and bare store-style keys normalize to the SAME key
+        // and hit the SAME receipts (both ctx windows)
+        let hits = kv_quality_measured_from(&reg, "qwen3.5-9b");
+        assert!(hits.is_array());
+        assert_eq!(hits.as_array().map(Vec::len), Some(2));
+        assert_eq!(hits[0]["ctx"], 2048);
+        assert_eq!(hits[0]["rungs"].as_array().map(Vec::len), Some(3));
+        assert_eq!(hits[1]["ctx"], 32768);
+        assert_eq!(hits[1]["rungs"].as_array().map(Vec::len), Some(2));
+        // unknown model, missing receipts array, null registry: honest null
+        assert!(kv_quality_measured_from(&reg, "other-model").is_null());
+        assert!(kv_quality_measured_from(&serde_json::json!({}), "x").is_null());
+        assert!(kv_quality_measured_from(&Value::Null, "x").is_null());
+    }
+
+    #[test]
+    fn unit__kv_quality_receipts__compiled_registry_parses_with_provenance() {
+        let reg = kv_quality_receipts();
+        assert!(reg.is_object(), "registry/kv-quant-quality.json must parse");
+        let receipts = reg["receipts"].as_array().expect("receipts array");
+        // every row fully stamped - no naked numbers without provenance
+        for r in receipts {
+            assert!(r["model"].is_string());
+            assert!(
+                r["rungs"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty() && a.iter().all(|g| g["ppl"].is_number()))
+            );
+            assert!(r["source"].is_string());
+        }
+    }
+
+    #[test]
+    fn unit__kv_advisory__grades_context_and_measured_shape() {
+        let adv = kv_advisory(
+            fs(false, ShardFormat::GgufFile),
+            "",
+            4096,
+            None,
+            "any-model",
+        );
+        assert_eq!(adv["applies"], true);
+        assert_eq!(adv["current"], "f16 (engine auto ladder)");
+        assert!(adv["measured"].is_null() || adv["measured"][0]["rungs"].is_array());
+        let adv = kv_advisory(
+            fs(false, ShardFormat::GgufFile),
+            "q8_0",
+            65536,
+            None,
+            "any-model",
+        );
+        assert_eq!(adv["current"], "q8_0");
+        assert_eq!(adv["effective_ctx"], 65536);
+        // resident ctx wins over requested when reporting the tier decision
+        let adv = kv_advisory(
+            fs(false, ShardFormat::GgufFile),
+            "",
+            65536,
+            Some(8192),
+            "any-model",
+        );
+        assert_eq!(adv["effective_ctx"], 8192);
+        let adv = kv_advisory(
+            fs(false, ShardFormat::MlxLayout),
+            "q8_0",
+            4096,
+            None,
+            "any-model",
+        );
+        assert_eq!(adv["applies"], false);
     }
 
     #[test]

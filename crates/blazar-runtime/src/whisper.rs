@@ -424,14 +424,13 @@ fn whisper_engine_tags(dirs: &BlazarDirs) -> Result<Vec<String>> {
     Ok(tags)
 }
 
-/// Keep the newest `KEEP_TAGS` server dirs; the pinned dir (if any) is
-/// never pruned — mirrors the llama engine lane's retention policy.
+/// Keep the newest `keep_tags` server dirs (config knob, default
+/// `KEEP_TAGS`); the pinned dir (if any) is never pruned — mirrors the
+/// llama engine lane's retention policy.
 fn prune(dirs: &BlazarDirs) -> Result<()> {
     let pin = pinned_tag(dirs);
-    for dir in sorted_tag_dirs(dirs)
-        .into_iter()
-        .skip(crate::engine::KEEP_TAGS)
-    {
+    let keep = crate::engine::effective_keep_tags(dirs)?;
+    for dir in sorted_tag_dirs(dirs).into_iter().skip(keep) {
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -772,16 +771,21 @@ pub async fn pull(
 /// bind + OS-assigned ephemeral port, pinned by unit test below.
 /// Revisit if upstream grows an auth option.
 pub struct WhisperRuntime {
-    child: tokio::sync::Mutex<Option<WhisperChild>>,
+    /// The single lane slot. Public so integration tests can plant a
+    /// fabricated child (the evict-by-size-name e2e pin); production
+    /// code drives the lane through ensure/status/shutdown only.
+    pub child: tokio::sync::Mutex<Option<WhisperChild>>,
 }
 
-struct WhisperChild {
-    child: tokio::process::Child,
-    port: u16,
-    loaded: String,
+/// One lazily-spawned whisper-server child. Fields public for the same
+/// test-planting reason as the slot above; teardown is `shutdown()`.
+pub struct WhisperChild {
+    pub child: tokio::process::Child,
+    pub port: u16,
+    pub loaded: String,
     /// Last instant the lane served (or swapped) a request — the idle
     /// reaper's clock. Refreshed on every `ensure` hit, never elsewhere.
-    last_used: tokio::time::Instant,
+    pub last_used: tokio::time::Instant,
 }
 
 impl WhisperRuntime {
@@ -794,7 +798,13 @@ impl WhisperRuntime {
 
     /// Port of a live server loaded with `size`; spawns on first use and
     /// hot-swaps models via POST /load (no restart) when the request
-    /// names a different pulled size.
+    /// names a different pulled size. `extra` (config
+    /// `whisper_extra_args`) rides the spawn argv after the gateway pins
+    /// — unknown flags are gated against this binary's own `--help`
+    /// surface so a typo teaches instead of crashing the boot.
+    // Spawning needs the full child context (paths, timeouts, VAD, extra
+    // flags) — nothing here is bundleable without hiding a boot decision.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn ensure(
         &self,
         size: &str,
@@ -803,6 +813,7 @@ impl WhisperRuntime {
         lib_dir: &Path,
         ready_timeout: std::time::Duration,
         vad_model: Option<&Path>,
+        extra: &[String],
     ) -> Result<u16> {
         let mut slot = self.child.lock().await;
         if let Some(live) = slot.as_mut() {
@@ -844,10 +855,33 @@ impl WhisperRuntime {
             // Dead child: reap before respawning.
             let _ = slot.take();
         }
+        // Config extra args: unknown flags are checked against this
+        // binary's own --help surface (fail-open when the surface cannot
+        // be captured) — the engine exits at boot on a bad flag, which
+        // would surface as an opaque health timeout instead of a teaching.
+        if !extra.is_empty()
+            && let Some(surface) = help_flag_surface(bin).await
+        {
+            for tok in extra {
+                if !tok.starts_with('-') {
+                    continue; // value token riding its preceding flag
+                }
+                let flag = tok.split('=').next().unwrap_or(tok);
+                if !surface.contains(flag) {
+                    return Err(anyhow!(
+                        "whisper_extra_args flag '{flag}' is not in this whisper-server's \
+                         --help surface — the engine would refuse to boot; fix the spelling \
+                         or unset the knob"
+                    ));
+                }
+            }
+        }
         let port = ephemeral_port()?;
+        let argv = server_args(port, model_path, vad_model, extra)
+            .map_err(|e| anyhow!("whisper_extra_args: {e}"))?;
         let mut std_cmd = std::process::Command::new(bin);
         std_cmd
-            .args(server_args(port, model_path, vad_model))
+            .args(argv)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(unix)]
@@ -965,11 +999,23 @@ fn ephemeral_port() -> Result<u16> {
     Ok(l.local_addr().context("local addr")?.port())
 }
 
+/// Flags the gateway itself pins on every spawn — a config `whisper_extra_args`
+/// entry fighting them would break the lane contract (loopback isolation,
+/// port bookkeeping, model loading, VAD), so they are refused, not overridden.
+const RESERVED_WHISPER_FLAGS: [&str; 5] = ["--host", "--port", "--model", "--vad", "--vad-model"];
+
 /// Child argv: loopback bind is a security invariant (upstream has no
 /// auth flag — see `WhisperRuntime` doc); pinned by unit test. VAD
 /// (PR4083 era) is argv-level: `--vad --vad-model <ggml>` skips
 /// silence/noise segments before decode. None = upstream default.
-fn server_args(port: u16, model_path: &Path, vad_model: Option<&Path>) -> Vec<String> {
+/// `extra` (config `whisper_extra_args`) rides after the VAD block;
+/// value tokens (no leading `-`) ride with their preceding flag.
+fn server_args(
+    port: u16,
+    model_path: &Path,
+    vad_model: Option<&Path>,
+    extra: &[String],
+) -> Result<Vec<String>, String> {
     let model_arg = argv_model_path(model_path);
     let mut args = vec![
         "--host".to_string(),
@@ -984,7 +1030,93 @@ fn server_args(port: u16, model_path: &Path, vad_model: Option<&Path>) -> Vec<St
         args.push("--vad-model".into());
         args.push(vad.display().to_string());
     }
-    args
+    for tok in extra {
+        if tok.starts_with('-') {
+            let flag = tok.split('=').next().unwrap_or(tok);
+            if RESERVED_WHISPER_FLAGS.contains(&flag) {
+                return Err(format!(
+                    "'{flag}' is reserved — the gateway owns the loopback bind, port, model \
+                     and VAD argv; remove it from whisper_extra_args"
+                ));
+            }
+        }
+        args.push(tok.clone());
+    }
+    Ok(args)
+}
+
+/// Extract the long-flag surface from a `--help` dump. Tokens are shaped
+/// `--flag` / `--flag-name` and must be word-delimited on both sides — a
+/// `--` inside prose or a value (`path--to--x`, bare `--`) is not a flag.
+/// Hand-rolled scanner: one fixed shape, no regex dependency.
+fn parse_help_flags(text: &str) -> std::collections::BTreeSet<String> {
+    let bytes = text.as_bytes();
+    let mut out = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            let prev_delimited =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let start = i + 2;
+            let mut j = start;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+            {
+                // An inner `--` starts a new token, never part of this flag.
+                if bytes[j] == b'-' && j + 1 < bytes.len() && bytes[j + 1] == b'-' {
+                    break;
+                }
+                j += 1;
+            }
+            let at_boundary =
+                j >= bytes.len() || !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_');
+            if prev_delimited && j > start && at_boundary {
+                let flag = &text[start..j];
+                if !flag.ends_with('-') {
+                    out.insert(format!("--{flag}"));
+                }
+            }
+            i = j.max(i + 2);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The live binary's own flag surface, parsed from `--help` (stdout and
+/// stderr — builds differ on where usage goes). Used to teach, not crash,
+/// on a `whisper_extra_args` flag this build does not know: the engine
+/// would exit at boot with a confusing argv error. Fail-open by design —
+/// a binary whose help cannot be captured (timeout, thin output, exotic
+/// build) skips this gate; structure and reserved-pin validation still
+/// apply, and a genuinely wrong flag then surfaces as the child-exit
+/// teaching from `ensure`.
+async fn help_flag_surface(bin: &Path) -> Option<std::collections::BTreeSet<String>> {
+    const HELP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const MIN_HELP_FLAGS: usize = 10;
+    let out = tokio::time::timeout(
+        HELP_TIMEOUT,
+        tokio::process::Command::new(bin)
+            .arg("--help")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut surface = parse_help_flags(&String::from_utf8_lossy(&out.stdout));
+    surface.extend(parse_help_flags(&String::from_utf8_lossy(&out.stderr)));
+    if surface.len() < MIN_HELP_FLAGS {
+        tracing::warn!(
+            bin = %bin.display(),
+            flags = surface.len(),
+            "whisper-server --help surface too thin to gate whisper_extra_args; skipping the unknown-flag check"
+        );
+        return None;
+    }
+    Some(surface)
 }
 
 #[cfg(test)]
@@ -1065,7 +1197,13 @@ mod tests {
 
     #[test]
     fn unit__server_args__loopback_bind_is_pinned() {
-        let args = server_args(49199, Path::new("/data/whisper/models/ggml-base.bin"), None);
+        let args = server_args(
+            49199,
+            Path::new("/data/whisper/models/ggml-base.bin"),
+            None,
+            &[],
+        )
+        .expect("no extra args always builds");
         assert_eq!(
             args,
             vec![
@@ -1086,13 +1224,94 @@ mod tests {
             49199,
             Path::new("/data/whisper/models/ggml-base.bin"),
             Some(Path::new("/engines/b5130/silero-vad-v5.ggml")),
-        );
+            &[],
+        )
+        .expect("no extra args always builds");
         let tail: Vec<&str> = args[6..].iter().map(String::as_str).collect();
         assert_eq!(
             tail,
             vec!["--vad", "--vad-model", "/engines/b5130/silero-vad-v5.ggml"],
             "VAD rides argv as --vad --vad-model after the base args; absent model = no VAD flags"
         );
+    }
+
+    #[test]
+    fn unit__server_args__extra_rides_after_vad_and_pins_refused() {
+        let extra = vec![
+            "--diarize".to_string(),
+            "--beam-size".to_string(),
+            "5".to_string(),
+        ];
+        let args = server_args(
+            49199,
+            Path::new("/data/whisper/models/ggml-base.bin"),
+            Some(Path::new("/engines/b5130/silero-vad-v5.ggml")),
+            &extra,
+        )
+        .expect("non-pin extra rides");
+        assert!(
+            args.ends_with(&extra[..]),
+            "extra args ride the argv tail in order: {args:?}"
+        );
+        // Value tokens (no leading '-') pass through untouched.
+        let lone_value = server_args(
+            49199,
+            Path::new("/m/ggml-base.bin"),
+            None,
+            &["4".to_string()],
+        )
+        .expect("value token rides");
+        assert_eq!(lone_value.last().map(String::as_str), Some("4"));
+        // Every gateway pin is refused — in both `--flag` and `--flag=v` form.
+        for pin in [
+            "--port",
+            "--host",
+            "--model=/x.ggml",
+            "--vad",
+            "--vad-model",
+        ] {
+            let err = server_args(
+                49199,
+                Path::new("/m/ggml-base.bin"),
+                None,
+                &[pin.to_string()],
+            )
+            .expect_err("pins must be refused, not overridden");
+            assert!(err.contains("reserved"), "pin {pin}: {err}");
+        }
+    }
+
+    #[test]
+    fn unit__parse_help_flags__extracts_long_flags_and_ignores_prose() {
+        let help = "usage: whisper-server [options]\n\noptions:\n  -h, --help      show help\n  \
+                    --host HOST     bind address (default 127.0.0.1)\n  --port N\n  \
+                    --beam-size N   beam size\n  --dtw MODEL     token timestamps\n  \
+                    --vad-model FNAME\n  --no-fallback\n  --suppress-nst\n  --translate\n  \
+                    --split-on-word\nvalues like path--to--x and a bare -- are not flags";
+        let flags = parse_help_flags(help);
+        for expect in [
+            "--help",
+            "--host",
+            "--port",
+            "--beam-size",
+            "--dtw",
+            "--vad-model",
+            "--no-fallback",
+            "--suppress-nst",
+            "--translate",
+            "--split-on-word",
+        ] {
+            assert!(flags.contains(expect), "missing {expect} in {flags:?}");
+        }
+        assert!(
+            !flags.contains("--to"),
+            "a -- inside a word is prose, not a flag: {flags:?}"
+        );
+        assert!(!flags.contains("--"), "bare -- is not a flag");
+        // End-of-text without a trailing newline is still a boundary.
+        assert_eq!(parse_help_flags("--help"), ["--help".to_string()].into());
+        assert!(parse_help_flags("").is_empty());
+        assert!(parse_help_flags("no flags here").is_empty());
     }
 
     /// Canonical 44-byte PCM WAV: mono, `byte_rate` bytes per second,
@@ -1752,6 +1971,39 @@ mod tests {
             .map(String::from)
             .collect();
         assert_eq!(installed_tags(&dirs), expected);
+    }
+
+    #[test]
+    fn unit__prune__config_keep_tags_one_keeps_single_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        for t in ["v1.1.0", "v1.2.0", "v1.3.0"] {
+            stage_server(&dirs, t);
+        }
+        std::fs::create_dir_all(&dirs.config_dir).expect("cfg");
+        std::fs::write(dirs.config_file(), "keep_tags = 1\n").expect("knob");
+        prune(&dirs).expect("prune");
+        // One slot: newest only, no rollback anchor.
+        assert_eq!(installed_tags(&dirs), vec!["v1.3.0".to_string()]);
+    }
+
+    #[test]
+    fn unit__prune__broken_config_fails_loudly() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        for t in ["v1.1.0", "v1.2.0", "v1.3.0"] {
+            stage_server(&dirs, t);
+        }
+        std::fs::create_dir_all(&dirs.config_dir).expect("cfg");
+        std::fs::write(dirs.config_file(), "keep_tags = \"one\"\n").expect("bad cfg");
+        let err = prune(&dirs).expect_err("must refuse to prune on broken config");
+        assert!(err.to_string().contains("keep_tags"));
     }
 
     #[test]

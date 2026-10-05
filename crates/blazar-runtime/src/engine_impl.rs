@@ -1113,6 +1113,16 @@ fn sglang_argv(
         "127.0.0.1".to_string(),
         "--port".to_string(),
         port.to_string(),
+        // Native tool-call parsing: sglang ships with
+        // tool_call_parser = None (verified against the installed
+        // 0.5.21 ServerArgs default), which serves a tool-calling
+        // model's `<tool_call>` markers as plain prose — the request
+        // succeeds, the structured tool_calls never appear. `auto`
+        // picks the detector from the model's own chat template
+        // (qwen → Qwen25Detector etc.), so no arch mapping is needed
+        // here and unknown families keep upstream behavior.
+        "--tool-call-parser".to_string(),
+        "auto".to_string(),
         "--served-model-name".to_string(),
         // sglang asserts on ':' (its LoRA model:adapter syntax) before
         // the model loads; the gateway's request-body stamp derives

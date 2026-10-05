@@ -1,17 +1,22 @@
-//! POST `/v1/audio/speech` — `OpenAI` TTS shape on the local piper lane.
+//! POST `/v1/audio/speech` + GET `/v1/audio/voices` — `OpenAI` TTS
+//! shape on the local piper lane.
 //!
 //! `model` IS the piper voice id (honest mapping: `en_US-amy-medium`),
-//! `response_format` speaks WAV (buffered, the default) or `pcm` (raw
-//! s16le PCM streamed sentence-by-sentence so time-to-first-audio scales
-//! with the first sentence instead of the whole document), `speed` maps
-//! to `piper`'s inverse length scale. Remote intent (`name:model`)
-//! forwards like every other lane.
+//! `response_format` speaks WAV (buffered, the default — a documented
+//! deviation: `OpenAI` defaults to mp3), `pcm`/`pcm16` (raw s16le PCM
+//! streamed sentence-by-sentence so time-to-first-audio scales with the
+//! first sentence instead of the whole document), and the lossy family
+//! mp3/opus/aac/flac (WAV transcoded through the system ffmpeg).
+//! `speed` maps to piper's inverse length scale; `speaker`, `noise_scale`,
+//! `noise_w`, `sentence_silence` ride as documented native extensions.
+//! Remote intent (`name:model`) forwards like every other lane.
 
 use axum::body::Bytes;
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::proxy::openai_error;
@@ -21,6 +26,291 @@ use crate::state::AppState;
 /// Bound mirrors the runtime cap; the route validates first so clients
 /// get a 400 before any spawn.
 const MAX_INPUT_CHARS: usize = 10_000;
+
+/// Lossy egress containers, transcoded from piper's WAV through the
+/// system ffmpeg. Muxer, codec, bitrate flags, and content type are
+/// gateway-fixed per format: the client picks a container by name, never
+/// raw ffmpeg argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LossyFormat {
+    Mp3,
+    Opus,
+    Aac,
+    Flac,
+}
+
+impl LossyFormat {
+    /// (ffmpeg muxer, codec, extra output flags, HTTP content type).
+    /// Bitrates sit at transparent-for-speech points for piper's
+    /// 22.05 kHz mono; flac is lossless so it takes no rate flags.
+    #[must_use]
+    fn parts(
+        self,
+    ) -> (
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+        &'static str,
+    ) {
+        match self {
+            Self::Mp3 => ("mp3", "libmp3lame", &["-b:a", "128k"], "audio/mpeg"),
+            Self::Opus => ("ogg", "libopus", &["-b:a", "64k"], "audio/ogg"),
+            Self::Aac => ("adts", "aac", &["-b:a", "128k"], "audio/aac"),
+            Self::Flac => ("flac", "flac", &[], "audio/flac"),
+        }
+    }
+}
+
+/// Egress container for one speech request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpeechFormat {
+    Wav,
+    Pcm,
+    Lossy(LossyFormat),
+}
+
+/// Parse `response_format` per the `OpenAI` TTS surface plus the pcm16
+/// alias. Errors carry the full supported list so a wrong pick teaches.
+fn parse_speech_format(raw: Option<&str>) -> Result<SpeechFormat, String> {
+    match raw {
+        None | Some("wav") => Ok(SpeechFormat::Wav),
+        Some("pcm" | "pcm16") => Ok(SpeechFormat::Pcm),
+        Some("mp3") => Ok(SpeechFormat::Lossy(LossyFormat::Mp3)),
+        Some("opus") => Ok(SpeechFormat::Lossy(LossyFormat::Opus)),
+        Some("aac") => Ok(SpeechFormat::Lossy(LossyFormat::Aac)),
+        Some("flac") => Ok(SpeechFormat::Lossy(LossyFormat::Flac)),
+        Some(other) => Err(format!(
+            "response_format {other:?} is not supported on the local lane — supported: \
+             \"wav\" (default), \"pcm\"/\"pcm16\" (raw streamed s16le), and \"mp3\", \
+             \"opus\", \"aac\", \"flac\" (transcoded via the system ffmpeg)"
+        )),
+    }
+}
+
+/// Egress lane combining `response_format` with the optional `stream`
+/// flag. PCM always streams — it is the raw streaming format, byte-stable
+/// with the pre-flag contract — so the flag only upgrades the lossy
+/// family from a buffered transcode to a streaming one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamLane {
+    /// Whole-body synthesis then one reply (today's default lanes).
+    Buffered,
+    /// Raw s16le streamed per sentence (the historical PCM lane).
+    PcmStream,
+    /// One persistent ffmpeg fed raw PCM per sentence, container bytes
+    /// streamed as they are muxed.
+    LossyStream(LossyFormat),
+}
+
+/// Decide the egress lane. `stream: true` + `wav` teaches: a RIFF header
+/// needs total lengths up front, so a wav cannot stream mid-audio.
+fn stream_lane(format: SpeechFormat, stream: bool) -> Result<StreamLane, String> {
+    match (format, stream) {
+        (SpeechFormat::Pcm, _) => Ok(StreamLane::PcmStream),
+        (_, false) => Ok(StreamLane::Buffered),
+        (SpeechFormat::Wav, true) => Err(
+            "streaming wav is not supported — a WAV header needs total lengths up front; \
+             use \"pcm\" (raw s16le) or a lossy format (\"mp3\", \"opus\", \"aac\", \
+             \"flac\"), or drop \"stream\" for the buffered wav"
+                .to_string(),
+        ),
+        (SpeechFormat::Lossy(f), true) => Ok(StreamLane::LossyStream(f)),
+    }
+}
+
+/// Parse the tuning knobs off the speech body: `OpenAI` `speed` plus the
+/// native piper extensions (`speaker`, `noise_scale`, `noise_w`,
+/// `sentence_silence`). Ranges mirror the runtime's checks so bad values
+/// die as a 400 before any spawn; `instructions` teaches because piper
+/// voices are fixed personalities, not steerable ones.
+fn parse_native_options(req: &Value) -> Result<blazar_runtime::piper::SpeakOptions, String> {
+    let mut opts = blazar_runtime::piper::SpeakOptions::default();
+    if let Some(raw) = req.get("instructions")
+        && !raw.is_null()
+    {
+        return Err(
+            "instructions is not supported — piper voices are fixed personalities with no \
+             style steering; pick a different voice (model) instead"
+                .to_string(),
+        );
+    }
+    match req.get("speed").and_then(Value::as_f64) {
+        None => {}
+        Some(s) if (0.25..=4.0).contains(&s) => opts.speed = Some(s),
+        Some(s) => return Err(format!("speed {s} out of range (0.25..=4.0)")),
+    }
+    if let Some(raw) = req.get("speaker")
+        && !raw.is_null()
+    {
+        match raw.as_u64() {
+            Some(s) => opts.speaker = Some(s),
+            None => return Err("speaker must be a non-negative integer".to_string()),
+        }
+    }
+    for (field, slot) in [
+        ("noise_scale", &mut opts.noise_scale),
+        ("noise_w", &mut opts.noise_w),
+    ] {
+        match req.get(field).and_then(Value::as_f64) {
+            None => {}
+            Some(v) if (0.0..=2.0).contains(&v) => *slot = Some(v),
+            Some(v) => return Err(format!("{field} {v} out of range (0.0..=2.0)")),
+        }
+    }
+    match req.get("sentence_silence").and_then(Value::as_f64) {
+        None => {}
+        Some(v) if (0.0..=10.0).contains(&v) => opts.sentence_silence = Some(v),
+        Some(v) => {
+            return Err(format!(
+                "sentence_silence {v} out of range (0.0..=10.0 seconds)"
+            ));
+        }
+    }
+    Ok(opts)
+}
+
+/// ffmpeg argv after the program name: WAV on stdin → the requested
+/// container on stdout. Enum-derived only — no client string reaches
+/// the process.
+#[must_use]
+fn ffmpeg_argv(format: LossyFormat) -> Vec<String> {
+    let (muxer, codec, extra, _) = format.parts();
+    let mut argv: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "wav",
+        "-i",
+        "pipe:0",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    argv.extend(extra.iter().map(|s| (*s).to_string()));
+    argv.extend(
+        ["-c:a", codec, "-f", muxer, "pipe:1"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+    argv
+}
+
+/// ffmpeg argv for the STREAMING transcode lane: raw s16le mono PCM on
+/// stdin → the requested container on stdout. `-ar`/`-ac` pin the input
+/// shape to the voice's own sample rate so piper's raw bytes need no WAV
+/// header. Enum-derived only — no client string reaches the process.
+#[must_use]
+fn ffmpeg_stream_argv(format: LossyFormat, sample_rate: u32) -> Vec<String> {
+    let (muxer, codec, extra, _) = format.parts();
+    let mut argv: Vec<String> = ["-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    argv.push(sample_rate.to_string());
+    argv.extend(
+        ["-ac", "1", "-i", "pipe:0"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+    argv.extend(extra.iter().map(|s| (*s).to_string()));
+    argv.extend(
+        ["-c:a", codec, "-f", muxer, "pipe:1"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+    argv
+}
+
+/// Raw-PCM twin of the WAV peak limiter: scales an s16le sample slice's
+/// peak down to [`PEAK_CEILING`] when (and only when) it exceeds it.
+/// Quiet audio stays byte-identical; an odd trailing byte (not a whole
+/// sample) is left in place untouched.
+fn limit_pcm16_peak(pcm: &mut [u8]) {
+    let scale = {
+        let mut peak: f32 = 0.0;
+        for pair in pcm.as_chunks::<2>().0 {
+            let s = f32::from(i16::from_le_bytes(*pair));
+            peak = peak.max(s.abs());
+        }
+        if peak <= PEAK_CEILING * 32_768.0 {
+            return; // within the ceiling (or silence): byte-identical
+        }
+        PEAK_CEILING * 32_768.0 / peak
+    };
+    for pair in pcm.as_chunks_mut::<2>().0 {
+        // scaled output never leaves i16 range: ceiling < 1.0 and round+clamp
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let s = (f32::from(i16::from_le_bytes(*pair)) * scale)
+            .round()
+            .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+        pair.copy_from_slice(&s.to_le_bytes());
+    }
+}
+
+/// Teaching for a missing ffmpeg, shared by the buffered and streaming
+/// transcode lanes so the story stays identical.
+const FFMPEG_ABSENT_TEACH: &str = "ffmpeg is not on PATH — mp3/opus/aac/flac transcode \
+     through the system ffmpeg; \"wav\" (default) and \"pcm\" need none. Install \
+     ffmpeg or switch response_format";
+
+/// Hard ceiling for one transcode. Synthesis itself is already bounded
+/// by the piper timeout; this only guards a wedged ffmpeg.
+const FFMPEG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Transcode WAV bytes to a lossy container through the system ffmpeg.
+/// A missing binary maps to the teaching 400 (deliberately NOT cached:
+/// installing ffmpeg later just works on the next request), a non-zero
+/// exit is 502 with the stderr tail, a hang is 504 with the child
+/// killed by `kill_on_drop` under the timeout.
+#[allow(clippy::result_large_err)] // axum Response is the lane's error currency
+async fn transcode(wav: Vec<u8>, format: LossyFormat) -> Result<Vec<u8>, Response> {
+    use tokio::io::AsyncWriteExt;
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args(ffmpeg_argv(format))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(openai_error(400, FFMPEG_ABSENT_TEACH));
+        }
+        Err(e) => return Err(openai_error(502, &format!("ffmpeg spawn failed: {e}"))),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&wav).await;
+        let _ = stdin.shutdown().await;
+    }
+    match tokio::time::timeout(FFMPEG_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(out)) if out.status.success() => Ok(out.stdout),
+        Ok(Ok(out)) => {
+            let tail = String::from_utf8_lossy(&out.stderr);
+            let tail = tail.lines().last().unwrap_or("").trim();
+            Err(openai_error(
+                502,
+                &format!(
+                    "ffmpeg exited {}{}",
+                    out.status,
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {tail}")
+                    }
+                ),
+            ))
+        }
+        Ok(Err(e)) => Err(openai_error(502, &format!("ffmpeg wait failed: {e}"))),
+        Err(_) => Err(openai_error(
+            504,
+            &format!(
+                "ffmpeg transcode timed out after {} s",
+                FFMPEG_TIMEOUT.as_secs()
+            ),
+        )),
+    }
+}
 
 // One handler owns the buffered-WAV vs streamed-PCM split end to end;
 // extracting sub-fns would separate the format decision from the
@@ -59,24 +349,24 @@ pub async fn audio_speech(
             ),
         );
     }
-    let wants_pcm = match req.get("response_format").and_then(Value::as_str) {
-        None | Some("wav") => false,
-        Some("pcm") => true,
-        Some(other) => {
-            return openai_error(
-                400,
-                &format!(
-                    "response_format {other:?} is not supported on the local lane — \
-                     piper speaks WAV (omit response_format) or \"pcm\" (raw streamed \
-                     s16le); convert downstream if you need {other}"
-                ),
-            );
-        }
+    let format = match parse_speech_format(req.get("response_format").and_then(Value::as_str)) {
+        Ok(f) => f,
+        Err(msg) => return openai_error(400, &msg),
     };
-    let speed = match req.get("speed").and_then(Value::as_f64) {
-        None => None,
-        Some(s) if (0.25..=4.0).contains(&s) => Some(s),
-        Some(s) => return openai_error(400, &format!("speed {s} out of range (0.25..=4.0)")),
+    let opts = match parse_native_options(&req) {
+        Ok(o) => o,
+        Err(msg) => return openai_error(400, &msg),
+    };
+    let stream = match req.get("stream") {
+        None | Some(Value::Null) => false,
+        Some(v) => match v.as_bool() {
+            Some(b) => b,
+            None => return openai_error(400, "stream must be a boolean (true | false)"),
+        },
+    };
+    let lane = match stream_lane(format, stream) {
+        Ok(l) => l,
+        Err(msg) => return openai_error(400, &msg),
     };
 
     // Remote intent wins: `name:model` never goes local.
@@ -113,13 +403,13 @@ pub async fn audio_speech(
     // still maps to its teaching status before any bytes flow — then
     // stream the rest so time-to-first-audio tracks the first sentence,
     // not the whole document.
-    if wants_pcm {
+    if matches!(lane, StreamLane::PcmStream) {
         let chunks = split_streaming_chunks(text);
         let first = blazar_runtime::piper::synthesize(
             &state.dirs,
             voice,
             &chunks[0],
-            speed,
+            opts,
             std::time::Duration::from_secs(120),
         )
         .await;
@@ -148,7 +438,7 @@ pub async fn audio_speech(
                     &dirs,
                     &voice,
                     chunk,
-                    speed,
+                    opts,
                     std::time::Duration::from_secs(120),
                 )
                 .await
@@ -199,27 +489,300 @@ pub async fn audio_speech(
             .unwrap_or_else(|_| openai_error(500, "response build").into_response());
     }
 
+    // Streaming lossy ("stream": true + mp3/opus/aac/flac): one persistent
+    // ffmpeg fed raw s16le per sentence, so time-to-first-audio tracks the
+    // first sentence for the lossy family too — the posture the PCM lane
+    // has always had. The voice's own sample rate pins ffmpeg's input
+    // shape; unreadable voice config teaches instead of guessing.
+    if let StreamLane::LossyStream(lossy) = lane {
+        let Some(sample_rate) = blazar_runtime::piper::voice_sample_rate(&state.dirs, voice) else {
+            return openai_error(
+                400,
+                "voice config is unreadable (missing or malformed .onnx.json) — the \
+                 streaming transcode needs the voice's sample_rate; retry without \
+                 \"stream\": true (the buffered lane reads it from the WAV header)",
+            );
+        };
+        let chunks = split_streaming_chunks(text);
+        // Eager first chunk: admission, install and pull teachings all map
+        // to their honest status BEFORE any bytes flow.
+        let mut first_pcm = match blazar_runtime::piper::synthesize_raw(
+            &state.dirs,
+            voice,
+            &chunks[0],
+            opts,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => return tts_error(&e),
+        };
+        limit_pcm16_peak(&mut first_pcm);
+
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.args(ffmpeg_stream_argv(lossy, sample_rate))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return openai_error(400, FFMPEG_ABSENT_TEACH);
+            }
+            Err(e) => return openai_error(502, &format!("ffmpeg spawn failed: {e}")),
+        };
+        // Stdio::piped() guarantees both handles exist at spawn.
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+        // Drain flag: the reader sets it when the client goes away (send
+        // fails) or ffmpeg's output closes, so the feeder never blocks
+        // forever writing a pipe nobody reads (§9 release path).
+        let (drained_tx, mut drained_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut stdout = stdout;
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = drained_tx.send(true);
+                        return;
+                    }
+                    Ok(n) => {
+                        if tx
+                            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                            .await
+                            .is_err()
+                        {
+                            let _ = drained_tx.send(true);
+                            return; // client went away
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        let _ = drained_tx.send(true);
+                        return;
+                    }
+                }
+            }
+        });
+        let dirs = state.dirs.clone();
+        let voice_owned = voice.to_string();
+        let rest = chunks[1..].to_vec();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // Synthesize the remaining sentences while the first bytes are
+            // already flowing; peak limiting is per chunk, same as the PCM
+            // stream lane (streaming cannot look ahead).
+            let mut pieces: Vec<Vec<u8>> = Vec::with_capacity(rest.len() + 1);
+            pieces.push(first_pcm);
+            for chunk in &rest {
+                match blazar_runtime::piper::synthesize_raw(
+                    &dirs,
+                    &voice_owned,
+                    chunk,
+                    opts,
+                    std::time::Duration::from_secs(120),
+                )
+                .await
+                {
+                    Ok(mut pcm) => {
+                        limit_pcm16_peak(&mut pcm);
+                        pieces.push(pcm);
+                    }
+                    Err(e) => {
+                        // Headers are committed to 200: the honest failure
+                        // is a truncated stream plus a server-side log.
+                        tracing::warn!("speech lossy stream ended early: {e:#}");
+                        break;
+                    }
+                }
+            }
+            let mut aborted = false;
+            for pcm in pieces {
+                tokio::select! {
+                    _ = drained_rx.changed() => {
+                        aborted = true;
+                        break;
+                    }
+                    r = stdin.write_all(&pcm) => {
+                        if r.is_err() {
+                            aborted = true; // ffmpeg went away (EPIPE)
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = stdin.shutdown().await;
+            drop(stdin);
+            if aborted {
+                // Nobody consumes ffmpeg's output anymore: kill rather
+                // than wait on a pipe that will never drain.
+                let _ = child.kill().await;
+                return;
+            }
+            match child.wait().await {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    tracing::warn!(
+                        "speech lossy stream: ffmpeg exited {status} — stream truncated"
+                    );
+                }
+                Err(e) => tracing::warn!("speech lossy stream: ffmpeg wait failed: {e}"),
+            }
+        });
+
+        let (_, _, _, content_type) = lossy.parts();
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, content_type)
+            .body(axum::body::Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response());
+    }
+
     // Local lane: the runtime error carries the exact teaching (install
     // vs pull vs voice list) — pass it through with the right status.
-    match blazar_runtime::piper::synthesize(
+    let wav = match blazar_runtime::piper::synthesize(
         &state.dirs,
         voice,
         text,
-        speed,
+        opts,
         std::time::Duration::from_secs(120),
     )
     .await
     {
-        Ok(wav) => {
-            let wav = limit_wav_peak(wav);
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(axum::http::header::CONTENT_TYPE, "audio/wav")
-                .body(axum::body::Body::from(wav))
-                .unwrap_or_else(|_| openai_error(500, "response build").into_response())
+        Ok(w) => limit_wav_peak(w),
+        Err(e) => return tts_error(&e),
+    };
+    match format {
+        SpeechFormat::Wav | SpeechFormat::Pcm => Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+            .body(axum::body::Body::from(wav))
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+        // Lossy containers are inherently buffered: transcode the whole
+        // WAV once, then serve bytes. PCM remains the streaming format.
+        SpeechFormat::Lossy(lossy) => {
+            let (_, _, _, content_type) = lossy.parts();
+            match transcode(wav, lossy).await {
+                Ok(bytes) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, content_type)
+                    .body(axum::body::Body::from(bytes))
+                    .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+                Err(resp) => resp,
+            }
         }
-        Err(e) => tts_error(&e),
     }
+}
+
+/// One voice row in the voices listing: piper ids
+/// (`<locale>-<name>-<quality>`) split into their parts for client-side
+/// filtering and display; unparsable ids still list with null parts.
+fn voice_row(id: &str, installed: bool, bytes: Option<u64>) -> Value {
+    let parts = blazar_runtime::piper::parse_voice_id(id);
+    let (language, name, quality) = match parts {
+        Some((l, n, q)) => (Value::from(l), Value::from(n), Value::from(q)),
+        None => (Value::Null, Value::Null, Value::Null),
+    };
+    let mut row = serde_json::json!({
+        "object": "voice",
+        "id": id,
+        "language": language,
+        "name": name,
+        "quality": quality,
+        "installed": installed,
+    });
+    if let Some(b) = bytes {
+        row["bytes"] = Value::from(b);
+    }
+    row
+}
+
+/// Remote catalog rows kept per search response — enough to choose a
+/// voice without dumping the whole multi-thousand-voice tree.
+const VOICES_SEARCH_CAP: usize = 50;
+/// Remote search query cap; the catalog match is a plain substring, so
+/// long queries are pure payload.
+const VOICES_QUERY_MAX_CHARS: usize = 100;
+/// Wall clock for one catalog walk (paginated tree API over every
+/// language directory).
+const VOICES_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// GET `/v1/audio/voices` — installed piper voices, plus an optional
+/// `?search=` probe of the upstream `rhasspy/piper-voices` catalog
+/// (results capped, marked with installed state). Boots nothing. A
+/// failed search keeps the installed list and surfaces the error as
+/// `search_error` instead of failing the endpoint.
+#[allow(clippy::implicit_hasher)] // axum Query extractor fixes the map type
+pub async fn voices(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let installed = blazar_runtime::piper::list_voices(&state.dirs);
+    let mut body = serde_json::json!({
+        "object": "list",
+        "data": installed
+            .iter()
+            .map(|id| voice_row(id, true, None))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(query) = params
+        .get("search")
+        .map(|s| s.trim())
+        .filter(|q| !q.is_empty())
+    {
+        if query.chars().count() > VOICES_QUERY_MAX_CHARS {
+            return openai_error(
+                400,
+                &format!("search query is capped at {VOICES_QUERY_MAX_CHARS} characters"),
+            );
+        }
+        let search = async {
+            let hf = blazar_runtime::hf::HfClient::new(std::env::var("HF_TOKEN").ok())?;
+            blazar_runtime::piper::search_voices(&hf, query).await
+        };
+        match tokio::time::timeout(VOICES_SEARCH_TIMEOUT, search).await {
+            Ok(Ok(remote)) => {
+                let count = remote.len();
+                let rows: Vec<Value> = remote
+                    .into_iter()
+                    .take(VOICES_SEARCH_CAP)
+                    .map(|v| {
+                        let installed_here = installed.contains(&v.id);
+                        voice_row(&v.id, installed_here, Some(v.bytes))
+                    })
+                    .collect();
+                body["search"] = serde_json::json!({
+                    "query": query,
+                    "count": count,
+                    "truncated": count > rows.len(),
+                    "results": rows,
+                });
+            }
+            Ok(Err(e)) => {
+                body["search_error"] = Value::String(format!("{e:#}"));
+            }
+            Err(_) => {
+                body["search_error"] = Value::String(format!(
+                    "voice search timed out after {} s",
+                    VOICES_SEARCH_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// Map a piper synthesis error to its teaching response (404 for a
@@ -493,6 +1056,117 @@ mod tests {
     }
 
     #[test]
+    fn unit__parse_speech_format__openai_surface_pcm16_alias_and_teaching() {
+        assert_eq!(parse_speech_format(None), Ok(SpeechFormat::Wav));
+        assert_eq!(parse_speech_format(Some("wav")), Ok(SpeechFormat::Wav));
+        // OpenAI's pcm16 names the same raw s16le lane as pcm.
+        assert_eq!(parse_speech_format(Some("pcm")), Ok(SpeechFormat::Pcm));
+        assert_eq!(parse_speech_format(Some("pcm16")), Ok(SpeechFormat::Pcm));
+        assert_eq!(
+            parse_speech_format(Some("mp3")),
+            Ok(SpeechFormat::Lossy(LossyFormat::Mp3))
+        );
+        assert_eq!(
+            parse_speech_format(Some("flac")),
+            Ok(SpeechFormat::Lossy(LossyFormat::Flac))
+        );
+        // Wrong picks teach the whole supported surface.
+        let err = parse_speech_format(Some("wma")).unwrap_err();
+        assert!(err.contains("wav"), "teaching lists wav: {err}");
+        assert!(err.contains("pcm16"), "teaching lists the alias: {err}");
+        assert!(
+            err.contains("flac"),
+            "teaching lists the lossy family: {err}"
+        );
+    }
+
+    #[test]
+    fn unit__ffmpeg_argv__gateway_fixed_enum_only() {
+        // mp3: bitrate flag then codec/muxer, mp3 container on stdout.
+        assert_eq!(
+            ffmpeg_argv(LossyFormat::Mp3),
+            vec![
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "wav",
+                "-i",
+                "pipe:0",
+                "-b:a",
+                "128k",
+                "-c:a",
+                "libmp3lame",
+                "-f",
+                "mp3",
+                "pipe:1",
+            ]
+        );
+        // flac is lossless: no rate flags at all.
+        let flac = ffmpeg_argv(LossyFormat::Flac);
+        assert!(!flac.contains(&"-b:a".to_string()));
+        assert_eq!(flac[flac.len() - 3..], vec!["-f", "flac", "pipe:1"]);
+    }
+
+    #[test]
+    fn unit__parse_native_options__ranges_and_teachings() {
+        let base = serde_json::json!({
+            "model": "en_US-amy-medium",
+            "input": "hi",
+        });
+        let opts = parse_native_options(&base).expect("plain body parses");
+        assert_eq!(opts, blazar_runtime::piper::SpeakOptions::default());
+
+        let full = serde_json::json!({
+            "speed": 2.0, "speaker": 2, "noise_scale": 0.7,
+            "noise_w": 0.9, "sentence_silence": 0.5,
+        });
+        let opts = parse_native_options(&full).expect("full native body parses");
+        assert_eq!(opts.speaker, Some(2));
+        assert_eq!(opts.sentence_silence, Some(0.5));
+
+        // OpenAI's instructions field teaches honestly: piper voices are
+        // fixed, style is not steerable.
+        let err =
+            parse_native_options(&serde_json::json!({"instructions": "whisper"})).unwrap_err();
+        assert!(err.contains("piper"), "teaching names the engine: {err}");
+
+        assert!(
+            parse_native_options(&serde_json::json!({"speaker": 1.5})).is_err(),
+            "fractional speaker indices reject"
+        );
+        assert!(
+            parse_native_options(&serde_json::json!({"noise_scale": 3.0})).is_err(),
+            "noise_scale above the envelope rejects"
+        );
+        assert!(
+            parse_native_options(&serde_json::json!({"sentence_silence": 30.0})).is_err(),
+            "pathological sentence_silence rejects"
+        );
+        assert!(
+            parse_native_options(&serde_json::json!({"speed": 5.0})).is_err(),
+            "speed keeps the OpenAI range"
+        );
+    }
+
+    #[test]
+    fn unit__voice_row__splits_locale_name_quality_and_survives_odd_ids() {
+        let row = voice_row("en_US-amy-medium", true, None);
+        assert_eq!(row["id"], "en_US-amy-medium");
+        assert_eq!(row["language"], "en_US");
+        assert_eq!(row["name"], "amy");
+        assert_eq!(row["quality"], "medium");
+        assert_eq!(row["installed"], true);
+        // Catalog rows carry their download size.
+        let remote = voice_row("de_DE-karlsson-low", false, Some(22_000_000));
+        assert_eq!(remote["bytes"], 22_000_000);
+        // An unparsable id still lists (null parts), never drops.
+        let odd = voice_row("custom", true, None);
+        assert_eq!(odd["id"], "custom");
+        assert_eq!(odd["language"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn unit__limit_wav_peak__full_scale_wav_scaled_to_minus_1dbfs_rms_proportional() {
         // Half the samples ride the rail: piper's normalize-to-peak shape.
         let samples: Vec<i16> = (0..2000)
@@ -588,6 +1262,102 @@ mod tests {
         );
         assert_eq!(chunks.concat(), blob, "hard split must be lossless");
         assert!(chunks.iter().all(|c| !c.is_empty()));
+    }
+
+    #[test]
+    fn unit__stream_lane__matrix_and_wav_teaching() {
+        // No flag: every format stays on the buffered lanes (BP0).
+        assert_eq!(
+            stream_lane(SpeechFormat::Wav, false),
+            Ok(StreamLane::Buffered)
+        );
+        assert_eq!(
+            stream_lane(SpeechFormat::Lossy(LossyFormat::Mp3), false),
+            Ok(StreamLane::Buffered)
+        );
+        // PCM always streams — flag or not (the pre-flag contract).
+        assert_eq!(
+            stream_lane(SpeechFormat::Pcm, false),
+            Ok(StreamLane::PcmStream)
+        );
+        assert_eq!(
+            stream_lane(SpeechFormat::Pcm, true),
+            Ok(StreamLane::PcmStream)
+        );
+        // The flag upgrades the lossy family to a streaming transcode.
+        assert_eq!(
+            stream_lane(SpeechFormat::Lossy(LossyFormat::Opus), true),
+            Ok(StreamLane::LossyStream(LossyFormat::Opus))
+        );
+        // wav + stream teaches (RIFF header needs lengths up front).
+        let err = stream_lane(SpeechFormat::Wav, true).expect_err("teaches");
+        assert!(err.contains("streaming wav is not supported"));
+        assert!(err.contains("\"pcm\""));
+    }
+
+    #[test]
+    fn unit__ffmpeg_stream_argv__s16le_pipe_and_codec_flags() {
+        let mp3 = ffmpeg_stream_argv(LossyFormat::Mp3, 22_050);
+        assert_eq!(
+            mp3,
+            vec![
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "s16le",
+                "-ar",
+                "22050",
+                "-ac",
+                "1",
+                "-i",
+                "pipe:0",
+                "-b:a",
+                "128k",
+                "-c:a",
+                "libmp3lame",
+                "-f",
+                "mp3",
+                "pipe:1",
+            ]
+        );
+        // FLAC: lossless, no bitrate flag, muxer tail intact.
+        let flac = ffmpeg_stream_argv(LossyFormat::Flac, 16_000);
+        assert!(!flac.contains(&"-b:a".to_string()));
+        assert_eq!(&flac[flac.len() - 3..], &["-f", "flac", "pipe:1"]);
+        assert!(flac.contains(&"16000".to_string()));
+    }
+
+    #[test]
+    fn unit__limit_pcm16_peak__ceiling_only_when_exceeded() {
+        // Quiet audio: byte-identical passthrough.
+        let quiet: Vec<u8> = [1000i16, -1000, 5]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let mut pcm = quiet.clone();
+        limit_pcm16_peak(&mut pcm);
+        assert_eq!(pcm, quiet, "quiet PCM must stay byte-identical");
+
+        // Full-scale audio: scaled under the -1 dBFS ceiling, and an odd
+        // trailing byte (not a whole sample) is preserved untouched.
+        let mut loud: Vec<u8> = [i16::MAX, i16::MIN, 16_000]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        loud.push(0xAB);
+        let mut pcm = loud.clone();
+        limit_pcm16_peak(&mut pcm);
+        let scaled: Vec<i16> = pcm[..pcm.len() - 1]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| i16::from_le_bytes(*p))
+            .collect();
+        let peak = scaled.iter().map(|s| s.abs()).max().unwrap();
+        assert!(peak <= 29_206, "peak {peak} must sit at/below the ceiling");
+        assert!(peak > 29_000, "loud audio scales TO the ceiling, not below");
+        assert_eq!(pcm[pcm.len() - 1], 0xAB, "odd tail byte kept");
     }
 
     #[test]

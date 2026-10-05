@@ -184,10 +184,353 @@ pub fn kv_f16_mib(meta: &GgufMeta, ctx: u64) -> u64 {
     blazar_core::coreside::kv_f16_mib(meta, ctx)
 }
 
+/// What a request strictly asks of the model, extracted from its body —
+/// the only features the capability certificate can vouch for. Strict
+/// shapes only: a false positive would refuse legitimate plain chat,
+/// while a false negative merely fails open (the sentinel still watches
+/// the response live).
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct CapabilityNeeds {
+    pub tools: bool,
+    pub vision: bool,
+    pub json_mode: bool,
+}
+
+impl CapabilityNeeds {
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.tools || self.vision || self.json_mode
+    }
+}
+
+/// Extract [`CapabilityNeeds`] from a parsed chat body. `ollama_shape`
+/// selects the ollama dialect (`images` arrays, `format` field) over
+/// the `OpenAI` dialect (content blocks, `response_format`).
+#[must_use]
+pub fn capability_needs(parsed: &serde_json::Value, ollama_shape: bool) -> CapabilityNeeds {
+    let non_empty_arr =
+        |v: Option<&serde_json::Value>| v.and_then(|t| t.as_array()).is_some_and(|a| !a.is_empty());
+    let tools = non_empty_arr(parsed.get("tools")) || non_empty_arr(parsed.get("functions"));
+    let vision = crate::proxy::body_needs_vision(parsed, ollama_shape);
+    let json_mode = if ollama_shape {
+        parsed.get("format").is_some_and(|f| !f.is_null())
+    } else {
+        parsed
+            .pointer("/response_format/type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "json_object" || t == "json_schema")
+    };
+    CapabilityNeeds {
+        tools,
+        vision,
+        json_mode,
+    }
+}
+
+/// Teaching refusal for vision requests against a model with no
+/// projector sidecar. Without this the request reaches the lane and
+/// dies inside the engine with a buried 500 hint; the store row
+/// already knows the truth, so admission teaches instead.
+#[must_use]
+pub fn vision_missing_refusal(name: &str) -> String {
+    format!(
+        "\"{name}\" has no projector sidecar attached — vision requests cannot be served. \
+         Attach one while the model is stopped: `blazar mmproj {name} <mmproj.gguf path>` \
+         (the next spawn picks it up). Plain text chat works unchanged."
+    )
+}
+
+/// Certificate gate (pure): `Some(teaching message)` when a needed
+/// capability is VERIFIED-FAILED. Absent probes, `N/A` verdicts, and
+/// unknown-or-mismatched engine kinds all pass — a stale or partial
+/// certificate must never refuse traffic, only a fresh matching FAIL
+/// on the SAME engine kind does (a build bump within the kind keeps
+/// the verdict; `blazar model-doctor` refresh advice covers drift).
+#[must_use]
+pub fn capability_refusal(
+    model: &str,
+    cert_engine_tag: &str,
+    cert_kind: Option<&str>,
+    serving_kind: Option<&str>,
+    tested_at: i64,
+    caps: &serde_json::Value,
+    needs: CapabilityNeeds,
+) -> Option<String> {
+    match (cert_kind, serving_kind) {
+        (Some(ck), Some(sk)) if ck == sk => {}
+        _ => return None,
+    }
+    let status = |probe: &str| {
+        caps.pointer(&format!("/caps/{probe}/status"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+    };
+    let verified = blazar_core::store::epoch_to_utc_date(tested_at);
+    for (needed, probe, what) in [
+        (needs.tools, "tools", "tool calling"),
+        (needs.vision, "vision", "image input"),
+        (needs.json_mode, "json", "structured JSON output"),
+    ] {
+        if needed && status(probe).as_deref() == Some("FAIL") {
+            return Some(format!(
+                "model {model:?} failed its verified {what} probe (certificate \
+{verified}, engine {cert_engine_tag}) — the request would burn a turn on \
+garbage output. Plain chat still works; for {what} pick a sibling whose \
+certificate shows {probe} = PASS (`blazar scorecard {model}` lists them), \
+or re-verify after an engine change: `blazar model-doctor {model}`",
+            ));
+        }
+    }
+    None
+}
+
+/// The prober is the one actor the certificate gate must never block:
+/// a model whose stored verdict is FAIL would otherwise 400 the very
+/// probe sent to re-measure it — a self-heal deadlock (the probe
+/// receipt would record the gate's refusal, not the model's behavior).
+/// `model_doctor` tags its in-process probe calls with this header; both
+/// gate call sites stand down for it.
+pub const PROBE_HEADER: &str = "x-blazar-model-doctor";
+
+#[must_use]
+pub fn is_capability_probe(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(PROBE_HEADER)
+}
+
+/// Capability-certificate admission: read the stored model-doctor
+/// certificate once, then gate the request's strict needs against it.
+/// `None` = proceed (no certificate, no matching need, or fail-open
+/// staleness); `Some(msg)` = teaching refusal the lane wraps in its own
+/// error shape.
+pub fn capability_cert_refusal(
+    state: &std::sync::Arc<crate::state::AppState>,
+    model: &str,
+    needs: CapabilityNeeds,
+) -> Option<String> {
+    if !needs.any() {
+        return None;
+    }
+    let cert = state.with_store(|s| s.get_model_caps_dated(model).ok().flatten())??;
+    let caps: serde_json::Value = serde_json::from_str(&cert.2).ok()?;
+    // Two SEPARATE store borrows: routed_kind_for takes the store mutex
+    // itself, so nesting it inside a with_store closure would deadlock
+    // the (non-reentrant) mutex and freeze every store-reading request.
+    let cert_kind = state.with_store(|s| s.engine_kind_of_tag(&cert.0).ok().flatten())?;
+    let serving_kind = crate::proxy::routed_kind_for(state, model);
+    capability_refusal(
+        model,
+        &cert.0,
+        cert_kind.as_ref().map(|k| k.as_str()),
+        serving_kind.as_ref().map(|k| k.as_str()),
+        cert.1,
+        &caps,
+        needs,
+    )
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__is_capability_probe__header_marks_the_prober() {
+        // The self-heal loop depends on this: a stored FAIL verdict must
+        // never block the probe that re-measures it.
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(!is_capability_probe(&headers));
+        headers.insert(PROBE_HEADER, axum::http::HeaderValue::from_static("1"));
+        assert!(is_capability_probe(&headers));
+    }
+
+    fn cert(tools: &str, vision: &str, json: &str) -> serde_json::Value {
+        serde_json::json!({
+            "object": "blazar.model-doctor",
+            "engine_tag": "llamacpp-b6019",
+            "tested_at": 1_790_985_600_i64,
+            "caps": {
+                "tools": {"status": tools},
+                "vision": {"status": vision},
+                "json": {"status": json},
+            }
+        })
+    }
+
+    #[test]
+    fn unit__capability_needs__strict_shapes_only() {
+        // OpenAI dialect: non-empty tools, legacy functions, image
+        // content blocks, JSON response_format.
+        let oa = serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}
+            ]}],
+            "response_format": {"type": "json_schema"}
+        });
+        let n = capability_needs(&oa, false);
+        assert!(n.tools && n.vision && n.json_mode && n.any());
+
+        // Strictness: EMPTY tools array and plain-text-only bodies ask
+        // for nothing — a false positive here would refuse legit chat.
+        let plain = serde_json::json!({
+            "tools": [],
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {"type": "text"}
+        });
+        assert_eq!(capability_needs(&plain, false), CapabilityNeeds::default());
+
+        // Ollama dialect: `images` + `format`, not content blocks.
+        let om = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi", "images": ["base64"]}],
+            "format": "json",
+            "tools": [{"name": "f"}]
+        });
+        let n = capability_needs(&om, true);
+        assert!(n.tools && n.vision && n.json_mode);
+        // Ollama plain chat with an images-free body asks nothing.
+        let oplain =
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(capability_needs(&oplain, true), CapabilityNeeds::default());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__vision_missing_refusal__teaches_the_fix_command() {
+        let msg = vision_missing_refusal("qwen:8b");
+        assert!(msg.contains("\"qwen:8b\""), "{msg}");
+        assert!(msg.contains("no projector sidecar attached"), "{msg}");
+        // The exact attach command, including the stop-first contract.
+        assert!(msg.contains("blazar mmproj qwen:8b"), "{msg}");
+        assert!(msg.contains("while the model is stopped"), "{msg}");
+        assert!(msg.contains("Plain text chat works unchanged"), "{msg}");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one assert block per refusal rule
+    fn unit__capability_refusal__fresh_matching_fail_only() {
+        let needs = CapabilityNeeds {
+            tools: true,
+            ..CapabilityNeeds::default()
+        };
+        // FAIL probe + matching need → teaching refusal naming the
+        // probe, the verification date, and the refresh command.
+        let msg = capability_refusal(
+            "m:8b",
+            "b11370-cuda",
+            Some("llamacpp"),
+            Some("llamacpp"),
+            1_790_985_600,
+            &cert("FAIL", "N/A", "PASS"),
+            needs,
+        )
+        .expect("verified FAIL must refuse");
+        assert!(msg.contains("\"m:8b\""), "{msg}");
+        assert!(msg.contains("tool calling"), "{msg}");
+        assert!(msg.contains("2026-10-03"), "{msg}");
+        assert!(msg.contains("blazar model-doctor m:8b"), "{msg}");
+
+        // N/A and absent probes never refuse (a gap is not a verdict).
+        assert!(
+            capability_refusal(
+                "m",
+                "b11370-cuda",
+                Some("llamacpp"),
+                Some("llamacpp"),
+                0,
+                &cert("N/A", "-", "PASS"),
+                needs,
+            )
+            .is_none()
+        );
+        assert!(
+            capability_refusal(
+                "m",
+                "b11370-cuda",
+                Some("llamacpp"),
+                Some("llamacpp"),
+                0,
+                &serde_json::json!({"caps": {}}),
+                needs,
+            )
+            .is_none()
+        );
+
+        // FAIL on an UNneeded probe stays silent.
+        let vision_needs = CapabilityNeeds {
+            vision: true,
+            ..CapabilityNeeds::default()
+        };
+        assert!(
+            capability_refusal(
+                "m",
+                "b11370-cuda",
+                Some("llamacpp"),
+                Some("llamacpp"),
+                0,
+                &cert("FAIL", "PASS", "PASS"),
+                vision_needs,
+            )
+            .is_none()
+        );
+
+        // Kind mismatch (lane switched since certification) fails open.
+        assert!(
+            capability_refusal(
+                "m",
+                "b11370-cuda",
+                Some("llamacpp"),
+                Some("mistralrs"),
+                0,
+                &cert("FAIL", "FAIL", "FAIL"),
+                CapabilityNeeds {
+                    tools: true,
+                    vision: true,
+                    json_mode: true
+                },
+            )
+            .is_none()
+        );
+
+        // Retired certificate engine (kind unresolvable) fails open —
+        // the engines row is gone, so the verdict cannot be matched to
+        // a serving lane.
+        assert!(
+            capability_refusal(
+                "m",
+                "deleted-build",
+                None,
+                Some("llamacpp"),
+                0,
+                &cert("FAIL", "FAIL", "FAIL"),
+                CapabilityNeeds {
+                    tools: true,
+                    vision: true,
+                    json_mode: true
+                },
+            )
+            .is_none()
+        );
+
+        // json_mode gates on the json probe.
+        let json_needs = CapabilityNeeds {
+            json_mode: true,
+            ..CapabilityNeeds::default()
+        };
+        assert!(
+            capability_refusal(
+                "m",
+                "b11370-cuda",
+                Some("llamacpp"),
+                Some("llamacpp"),
+                0,
+                &cert("PASS", "PASS", "FAIL"),
+                json_needs,
+            )
+            .is_some()
+        );
+    }
 
     fn meta(layers: u64, heads: u64, kv: u64, emb: u64) -> GgufMeta {
         GgufMeta {

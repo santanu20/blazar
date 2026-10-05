@@ -32,4 +32,7 @@ pub use hfmeta::{
     HfMeta, KvGeom, ModelMeta, read_hf_config, root_safetensors, root_safetensors_bytes,
 };
 pub use profile::{Endpoint, Profile, ProfileInput, TuningOverrides, compile as compile_profile};
-pub use store::{EngineRow, KeyUsageRow, LoraRow, ModelRow, ProfileRow, Store};
+pub use store::{
+    BenchResultRow, CompletionCardRow, EngineRow, JobEventRow, JobRow, KeyUsageRow, LoraRow,
+    ModelRow, ProfileRow, Store, StoredResponseRow,
+};

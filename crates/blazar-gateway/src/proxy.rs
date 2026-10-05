@@ -33,6 +33,7 @@ pub(crate) const STRIP_REQUEST: &[&str] = &[
     "x-blazar-priority",
     "x-blazar-num-ctx",
     "x-blazar-enforce",
+    "x-blazar-failover-attempt",
     "accept-encoding",
 ];
 pub(crate) const STRIP_RESPONSE: &[&str] = &[
@@ -313,6 +314,15 @@ pub async fn ensure_with_admission(
             &crate::images::diffusion_text_refusal(&row.name),
         )));
     }
+    // Same teaching contract one hop earlier: a vision request against
+    // a model with no projector sidecar would reach the lane and die
+    // inside the engine with a buried 500 hint. The row already knows.
+    if needs_vision && row.mmproj_path.is_none() {
+        return Err(Box::new(openai_error(
+            StatusCode::BAD_REQUEST.as_u16(),
+            &crate::preflight::vision_missing_refusal(&row.name),
+        )));
+    }
     // On-demand LoRA variant (`model+adapter`): re-attach the stem to
     // the CANONICAL base row so the supervisor spawns/looks up the
     // variant lane (`base+adapter`) regardless of how the caller spelled
@@ -474,6 +484,9 @@ pub fn supervision_error(e: &SupervisionError) -> Response {
         // served immediately — queueing this could only burn the caller's
         // two-minute admission budget for a verdict known at entry.
         SupervisionError::ModelTooLarge(m) => openai_error(503, m),
+        // J3 memory floor: the box is exhausted, not broken — 507 until
+        // co-resident engines free their memory (the message names them).
+        SupervisionError::InsufficientMemory(m) => openai_error(507, m),
         SupervisionError::EngineCrashed(m) => openai_error(502, &format!("engine crashed: {m}")),
         SupervisionError::Internal(e) => openai_error(500, &format!("{e:#}")),
     }
@@ -533,6 +546,13 @@ pub(crate) async fn send_with_child_retry(
         Ok(r) => return Ok(r),
         Err(e) => e,
     };
+    // Busy-child header timeout is TERMINAL: the child is healthy and
+    // still generating — evicting/respawning would kill sibling streams,
+    // and a retry would park for another full ceiling on the same busy
+    // child. The teaching error reaches the caller unchanged.
+    if matches!(&first, ChildSendError::HeaderTimeout { evicted: false, .. }) {
+        return Err(first.to_string());
+    }
     tracing::warn!(
         model = %engine.key,
         "child send failure ({first}); reaping and retrying once on a respawned lane"
@@ -596,10 +616,24 @@ pub(crate) async fn ensure_key_detached(
 /// Child-bound send failure classes: transport errors mean the child is
 /// gone (crash-window semantics, 502); a header-phase stall means the
 /// child is ALIVE but wedged (504) — [`child_send`] has already evicted
-/// it synchronously by the time this reaches a caller.
+/// it synchronously by the time this reaches a caller — UNLESS the
+/// post-timeout slot probe found the child mid-generation
+/// (`evicted: false`): then the child is healthy, kept serving, and the
+/// error body teaches the two real remedies instead.
 pub(crate) enum ChildSendError {
     Transport(reqwest::Error),
-    HeaderTimeout { secs: u64 },
+    HeaderTimeout {
+        secs: u64,
+        /// Whether the wedged-child guard destroyed the child. `false`
+        /// = slot probe saw active generation: a buffered long request
+        /// outran the ceiling; evicting would also kill every sibling
+        /// in-flight stream, so the child stays and the request fails
+        /// alone with a teaching body.
+        evicted: bool,
+        /// Config knob governing the ceiling, named in the error body
+        /// so the remedy is actionable without doc lookup.
+        knob: &'static str,
+    },
 }
 
 impl ChildSendError {
@@ -616,11 +650,67 @@ impl std::fmt::Display for ChildSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(e) => write!(f, "{e:#}"),
-            Self::HeaderTimeout { secs } => {
-                write!(f, "no response headers from child within {secs}s")
-            }
+            Self::HeaderTimeout {
+                secs,
+                evicted: true,
+                knob,
+            } => write!(
+                f,
+                "no response headers from child within {secs}s — wedged child evicted ({knob})"
+            ),
+            Self::HeaderTimeout {
+                secs,
+                evicted: false,
+                knob,
+            } => write!(
+                f,
+                "no response headers from child within {secs}s but the child is healthy — \
+                 its slots are still generating, and a buffered (non-stream) response \
+                 emits headers only at completion. Send \"stream\": true for long \
+                 generations, or raise {knob} (0 disables the bound). The child was \
+                 kept alive and keeps serving other requests"
+            ),
         }
     }
+}
+
+/// `GET /slots` body → is any slot mid-generation? `None` when the shape
+/// is not a bare array of slot objects (unknown is not guessed as idle).
+fn slots_any_processing(body: &serde_json::Value) -> Option<bool> {
+    body.as_array().map(|slots| {
+        slots.iter().any(|slot| {
+            slot.get("is_processing")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Probe the child's own slot activity — the discriminator between a
+/// WEDGED child (parked, slots idle: evict) and a HEALTHY one
+/// mid-generation on a buffered request (slots busy: teach and keep).
+/// LlamaCpp-only (`/slots` is a llama-server surface); any probe
+/// failure returns `None` and the caller falls back to the legacy
+/// wedged-child semantics — the probe must never make the decision
+/// LESS safe. Bounded at 2s: this runs on an already-degraded path.
+async fn child_slots_generating(state: &AppState, engine: &EngineRef) -> Option<bool> {
+    if engine.kind != EngineKind::LlamaCpp {
+        return None;
+    }
+    let url = format!("{}/slots", child_base(&engine.endpoint));
+    let probe = child_auth(
+        crate::state::child_client(state, &engine.endpoint).get(&url),
+        engine,
+    );
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(2), probe.send())
+        .await
+        .ok()?
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    slots_any_processing(&body)
 }
 
 /// Bounded child-bound send — the transport choke point for EVERY
@@ -662,13 +752,44 @@ pub(crate) async fn child_send(
         secs => match tokio::time::timeout(std::time::Duration::from_secs(secs), send).await {
             Ok(result) => result.map_err(ChildSendError::Transport),
             Err(_elapsed) => {
-                tracing::warn!(
-                    target: "blazar::proxy",
-                    model = %engine.key,
-                    "child produced no response headers in {secs}s — evicting synchronously ({knob})"
-                );
-                let _ = state.sup.evict(&engine.key).await;
-                Err(ChildSendError::HeaderTimeout { secs })
+                // Wedged or busy? A buffered (non-stream) long generation
+                // emits headers only at completion — byte-identical to a
+                // wedged child from this bound's point of view. Ask the
+                // child itself: slots mid-generation means healthy (keep
+                // it — eviction would also kill every sibling in-flight
+                // stream; vLLM and ollama cap no generation either);
+                // probe unknown or slots idle means the original
+                // wedged-child case, and the synchronous eviction stands.
+                match child_slots_generating(state, engine).await {
+                    Some(true) => {
+                        tracing::warn!(
+                            target: "blazar::proxy",
+                            model = %engine.key,
+                            "child silent for {secs}s but its slots are generating — \
+                             buffered long generation; child kept ({knob})"
+                        );
+                        Err(ChildSendError::HeaderTimeout {
+                            secs,
+                            evicted: false,
+                            knob,
+                        })
+                    }
+                    slots => {
+                        tracing::warn!(
+                            target: "blazar::proxy",
+                            model = %engine.key,
+                            "child produced no response headers in {secs}s — evicting \
+                             synchronously ({knob}; slot probe: {:?})",
+                            slots.map_or("unavailable".to_string(), |b| b.to_string())
+                        );
+                        let _ = state.sup.evict(&engine.key).await;
+                        Err(ChildSendError::HeaderTimeout {
+                            secs,
+                            evicted: true,
+                            knob,
+                        })
+                    }
+                }
             }
         },
     }
@@ -821,7 +942,17 @@ pub async fn proxy_request(
             // LIVE child is a gateway timeout (504); a dead child that
             // could not be revived is a bad gateway (502).
             let terminal = match &e {
-                ChildSendError::HeaderTimeout { secs } => {
+                ChildSendError::HeaderTimeout { evicted: false, .. } => {
+                    // Healthy child mid-generation (slot probe said so in
+                    // `child_send`): terminal teaching error — a respawn
+                    // would kill the very child that is still serving,
+                    // and the retry would ride the same busy lane for
+                    // another full ceiling. Drop the singleflight entry
+                    // and hand the caller the remedy.
+                    drop(sf); // F31: Drop removes the singleflight entry
+                    return openai_error(StatusCode::GATEWAY_TIMEOUT.as_u16(), &e.to_string());
+                }
+                ChildSendError::HeaderTimeout { secs, .. } => {
                     tracing::warn!(
                         target: "blazar::proxy",
                         model,
@@ -899,6 +1030,16 @@ pub async fn proxy_request(
     // cold load say so.
     if load_ms > 100 {
         builder = builder.header("x-blazar-status", "loading");
+    }
+    // Structured-output receipt (E2-δ): successful responses that rode
+    // a constraint say WHICH one — clients auditing schema conformance
+    // get a machine-readable guarantee marker instead of inferring
+    // from the body shape. Error responses carry no receipt (the
+    // constraint was not served).
+    if status.is_success()
+        && let Some(kind) = structured_output_kind(parsed.as_ref())
+    {
+        builder = builder.header("x-blazar-structured-output", kind);
     }
     // Sentinel (semantic reliability layer): warn-only observation of
     // response semantics. Bytes are cloned onto a bounded side-channel;
@@ -1138,6 +1279,18 @@ pub async fn proxy_request(
                 // R6: buffered non-stream chat — classify from the exact
                 // JSON (no substring heuristics on this path).
                 record_buffered_chat(&state.obs, model, &buf, began.elapsed().as_secs_f64());
+                // Metadata cards: the one buffered site where the full
+                // completion body and the original request parse are in
+                // hand — persist the id→metadata card when the caller
+                // tagged the create.
+                if path_query.starts_with("/v1/chat/completions") {
+                    crate::metadata_card::persist_from_response(
+                        state,
+                        model,
+                        parsed.as_ref(),
+                        &buf,
+                    );
+                }
                 if let Some(feed) = suppress_feed.take() {
                     // RAW engine bytes (pre-suppression): sentinel
                     // detections judge what the engine actually returned.
@@ -1832,6 +1985,7 @@ pub(crate) fn apply_child_request_mutations(
     let mut changed = false;
     if usage_lane {
         changed |= include_usage_in_value(&mut v);
+        changed |= normalize_system_first_in_value(&mut v);
     }
     if let Some(stamp) = stamp.as_deref() {
         changed |= set_child_model(&mut v, stamp);
@@ -1866,6 +2020,82 @@ fn include_usage_in_value(v: &mut serde_json::Value) -> bool {
     }
     v["stream_options"]["include_usage"] = serde_json::Value::Bool(true);
     true
+}
+
+/// Hoist `system` messages to the head of the chat list and merge them
+/// into ONE leading system message (blocks joined by a blank line).
+/// The OpenAI-compatible dialect permits system messages anywhere in
+/// the list, but
+/// many model chat templates (Qwen3-class) raise a Jinja exception for
+/// a system message after the first position — agent harnesses
+/// (opencode & friends) legitimately send mid-list system blocks, so
+/// the gateway adapts the order at the engine boundary instead of
+/// leaking the template error as a 500. Only plain-string contents
+/// merge; any structured (multi-part) system content leaves the list
+/// untouched (fail-open: the child reports its own error). Returns
+/// whether `v` changed.
+fn normalize_system_first_in_value(v: &mut serde_json::Value) -> bool {
+    let Some(messages) = v
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let system_texts: Vec<String> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .map(|m| m.get("content").and_then(serde_json::Value::as_str))
+        .collect::<Option<Vec<_>>>()
+        .map(|texts| {
+            texts
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    match system_texts.len() {
+        0 => return false,
+        1 if messages.first().is_some_and(is_system_message) => return false,
+        _ => {}
+    }
+    messages.retain(|m| !is_system_message(m));
+    messages.insert(
+        0,
+        serde_json::json!({"role": "system", "content": system_texts.join("\n\n")}),
+    );
+    true
+}
+
+fn is_system_message(m: &serde_json::Value) -> bool {
+    m.get("role").and_then(serde_json::Value::as_str) == Some("system")
+}
+
+/// Which output constraint a request body carries, as the receipt
+/// value for `x-blazar-structured-output`. `json_schema` and
+/// `json_object` come from the `OpenAI` `response_format` field; `gbnf`
+/// from a raw grammar (llama.cpp lane passthrough). `None` = the
+/// request asked for no constraint (plain text is not a receipt).
+#[must_use]
+pub fn structured_output_kind(v: Option<&serde_json::Value>) -> Option<&'static str> {
+    let v = v?;
+    if let Some(t) = v
+        .pointer("/response_format/type")
+        .and_then(serde_json::Value::as_str)
+    {
+        match t {
+            "json_schema" => return Some("json_schema"),
+            "json_object" => return Some("json_object"),
+            _ => {}
+        }
+    }
+    if v.get("grammar")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|g| !g.is_empty())
+    {
+        return Some("gbnf");
+    }
+    None
 }
 
 /// Classify a fully-buffered non-stream chat body (enforce path) from
@@ -2821,6 +3051,45 @@ mod cache_obs_tests {
     // --- record_buffered_chat -------------------------------------------
 
     #[test]
+    fn unit__structured_output_kind__dialect_vocabulary() {
+        use serde_json::json;
+        // json_schema via response_format.type
+        assert_eq!(
+            structured_output_kind(Some(&json!({
+                "response_format": {"type": "json_schema", "json_schema": {"name": "x"}}
+            }))),
+            Some("json_schema")
+        );
+        // json_object
+        assert_eq!(
+            structured_output_kind(Some(&json!({"response_format": {"type": "json_object"}}))),
+            Some("json_object")
+        );
+        // raw grammar passthrough (R9)
+        assert_eq!(
+            structured_output_kind(Some(&json!({"grammar": "root ::= [0-9]+"}))),
+            Some("gbnf")
+        );
+        // response_format wins over an (unusual) co-present grammar
+        assert_eq!(
+            structured_output_kind(Some(&json!({
+                "response_format": {"type": "json_object"},
+                "grammar": "root ::= \"a\""
+            }))),
+            Some("json_object")
+        );
+        // plain text is NOT a constraint — no receipt
+        assert_eq!(
+            structured_output_kind(Some(&json!({"response_format": {"type": "text"}}))),
+            None
+        );
+        assert_eq!(structured_output_kind(Some(&json!({"messages": []}))), None);
+        assert_eq!(structured_output_kind(None), None);
+        // empty grammar = absent
+        assert_eq!(structured_output_kind(Some(&json!({"grammar": ""}))), None);
+    }
+
+    #[test]
     fn unit__record_buffered_chat__usage_records_warm() {
         let obs = std::sync::Arc::new(crate::state::CacheObs::new());
         let body = json!({"choices": [], "usage": {
@@ -3430,5 +3699,103 @@ mod resolve_model_tests {
         let mut other = json!({"model": "default"});
         assert!(!normalize_think_in_value(EngineKind::LlamaCpp, &mut other));
         assert!(other.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn unit__normalize_system_first__mid_list_blocks_hoist_and_merge() {
+        use serde_json::json;
+        // The opencode repro shape: a system block after user turns —
+        // Qwen3-class templates raise on it verbatim.
+        let mut v = json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "be brief"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "system", "content": "stay terse"},
+            {"role": "user", "content": "bye"},
+        ]});
+        assert!(normalize_system_first_in_value(&mut v));
+        let msgs = v["messages"].as_array().expect("still an array");
+        assert_eq!(msgs.len(), 4, "two systems collapse into one: {msgs:?}");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "be brief\n\nstay terse");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["content"], "hello");
+        assert_eq!(msgs[3]["content"], "bye");
+        // Idempotent: a second pass is a no-op.
+        assert!(!normalize_system_first_in_value(&mut v));
+    }
+
+    #[test]
+    fn unit__normalize_system_first__leading_single_system_untouched() {
+        use serde_json::json;
+        let mut v = json!({"messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+        ]});
+        assert!(!normalize_system_first_in_value(&mut v));
+        // Two leading system blocks DO merge: the second sits at a
+        // non-first template position even though it precedes every turn.
+        let mut v = json!({"messages": [
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": "b"},
+            {"role": "user", "content": "u"},
+        ]});
+        assert!(normalize_system_first_in_value(&mut v));
+        assert_eq!(v["messages"][0]["content"], "a\n\nb");
+        assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unit__normalize_system_first__structured_content_fail_open() {
+        use serde_json::json;
+        // Multi-part system content (vision blocks) is left alone: the
+        // child reports its own error rather than losing parts.
+        let mut v = json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "be brief"},
+            ]},
+        ]});
+        assert!(!normalize_system_first_in_value(&mut v));
+        // No messages array at all (completions lane): untouched.
+        let mut v = json!({"prompt": "hi"});
+        assert!(!normalize_system_first_in_value(&mut v));
+    }
+}
+
+#[cfg(test)]
+mod header_probe_tests {
+    #![allow(non_snake_case)]
+    use super::slots_any_processing;
+
+    #[test]
+    fn unit__slots_any_processing__busy_idle_and_unknown_shapes() {
+        let busy = serde_json::json!([
+            {"id": 0, "is_processing": true, "prompt": "", "n_ctx": 4096},
+        ]);
+        assert_eq!(slots_any_processing(&busy), Some(true));
+
+        // Multiple slots: any one generating counts (the probe asks "is
+        // the child alive mid-work", not "is every slot busy").
+        let mixed = serde_json::json!([
+            {"id": 0, "is_processing": false, "prompt": "", "n_ctx": 4096},
+            {"id": 1, "is_processing": true, "prompt": "", "n_ctx": 4096},
+        ]);
+        assert_eq!(slots_any_processing(&mixed), Some(true));
+
+        let idle = serde_json::json!([
+            {"id": 0, "is_processing": false, "prompt": "", "n_ctx": 4096},
+        ]);
+        assert_eq!(slots_any_processing(&idle), Some(false));
+
+        // Unknown shapes are None, never guessed as idle: an engine that
+        // wraps or renames the slot array must fall back to the legacy
+        // wedged-child semantics rather than a false "healthy" verdict.
+        assert_eq!(slots_any_processing(&serde_json::json!({})), None);
+        assert_eq!(slots_any_processing(&serde_json::json!("ok")), None);
+        assert_eq!(
+            slots_any_processing(&serde_json::json!([{"id": 0}])),
+            Some(false) // slot object without is_processing reads as not busy
+        );
     }
 }

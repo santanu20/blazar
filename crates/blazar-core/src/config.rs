@@ -430,6 +430,15 @@ pub struct Config {
     /// no VAD (upstream default; behavior unchanged).
     #[serde(default)]
     pub whisper_vad_model: Option<String>,
+    /// Engine-boot flag passthrough for the whisper-server child
+    /// (e.g. `["--suppress-nst", "--detect-language"]`). Blazar pins
+    /// `--host/--port/--model/--vad/--vad-model` and refuses them here;
+    /// every other flag must be a flag of the installed whisper build
+    /// (validated at child compile against the engine manifest, so an
+    /// unknown flag fails with a teaching error instead of dying at
+    /// boot). Unset = today's argv, unchanged.
+    #[serde(default)]
+    pub whisper_extra_args: Option<Vec<String>>,
     /// Capability-lane registry URL (curated fork lanes for GGUF
     /// architectures mainline llama.cpp can't load yet). `None` = the
     /// default registry; `Some("")` disables registry lookups entirely
@@ -445,6 +454,14 @@ pub struct Config {
     /// NEVER auto-deleted regardless of this setting.
     #[serde(default = "default_fork_retire_days")]
     pub fork_retire_days: u64,
+    /// Engine builds retained per kind after an install: the newest N
+    /// survive auto-prune, with `local` and the active tag protected on
+    /// top. 2 (default) = fresh build plus one rollback anchor;
+    /// 1 = an update deletes the previous build (no rollback target for
+    /// `blazar engine rollback`). Also governs the whisper/piper
+    /// voice-dir retention, which mirrors the engine-lane policy.
+    #[serde(default = "default_keep_tags")]
+    pub keep_tags: usize,
     /// R4: opt-in semantic cache for non-stream chat responses.
     /// Disabled by default — semantic similarity can serve a near-miss
     /// where an exact match was required; correctness-sensitive lanes
@@ -614,6 +631,17 @@ pub struct Config {
     /// engine defaults.
     #[serde(default)]
     pub sdcpp_model_args: Option<String>,
+    /// Engine-boot flag passthrough for sd-server children — the
+    /// addon-model levers with no first-class knob (`--control-net`,
+    /// `--ip-adapter`, `--photo-maker`, `--motion-module`,
+    /// `--upscale-model`, `--lora-model-dir`, `--backend`, ...).
+    /// Blazar's launch pins are refused here; flags are validated
+    /// against the installed sdcpp engine's probed manifest at child
+    /// compile. Merges UNDER per-model `model_overrides.<m>.extra_args`
+    /// (an overlay flag wins over the config-level flag, with a
+    /// warning). Unset = engine defaults.
+    #[serde(default)]
+    pub sdcpp_extra_args: Option<Vec<String>>,
     /// Per-tensor quantization overrides for sd-server children
     /// (`--tensor-type-rules`, regex=type list, e.g.
     /// `model.=q6_k,vae.=f16`): quantizes matching weight groups
@@ -668,6 +696,21 @@ pub struct Config {
     /// `<remote>:<model>` route there instead of loading locally.
     #[serde(default)]
     pub remotes: Vec<Remote>,
+    /// Ordered failover chains (`[[failover]]`): a virtual `alias`
+    /// served by the first healthy target, escalating on failure with
+    /// anti-flap benching. See `FailoverChain`.
+    #[serde(default)]
+    pub failover: Vec<FailoverChain>,
+    /// Registered MCP stdio servers (gateway-side tool catalog).
+    #[serde(default)]
+    pub mcp: Vec<McpServer>,
+    /// Default MCP selector applied when a request carries no `mcp` field
+    /// and no `x-blazar-mcp` header: `"all"`, a server name, or `"none"`.
+    /// Lets stock OpenAI/Anthropic/Ollama clients use the catalog with
+    /// zero MCP knowledge. Absent keeps requests MCP-free unless they
+    /// opt in per request.
+    #[serde(default)]
+    pub mcp_default: Option<String>,
     /// Federation fallback: when a requested model is absent from the
     /// local store but a `[[remotes]]` peer lists it (`/v1/models`
     /// presence), the request routes there instead of 404ing. Kill
@@ -1898,6 +1941,73 @@ pub struct Remote {
     pub key: String,
 }
 
+/// One hop of a failover chain: either a locally served model or a
+/// `[[remotes]]` entry (which itself carries the URL/key). Chains are
+/// tried in order; a failed hop is benched for the chain's
+/// `min_residence_secs` before it is eligible again (anti-flap).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverTarget {
+    /// Name of a `[[remotes]]` entry; absent = local model.
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// Model the hop serves (local model name, or the remote's model).
+    pub model: String,
+}
+
+/// An ordered failover chain exposed under a virtual model `alias`:
+/// requests for the alias land on the first healthy target and escalate
+/// on failure (unknown model, load/spawn errors, 5xx). Availability
+/// first, flap safety via benching.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverChain {
+    /// Unique chain name (surfaced in `/api/failover` + event stream).
+    pub name: String,
+    /// Virtual model name requests use to enter the chain.
+    pub alias: String,
+    /// Ordered targets; index 0 is the primary.
+    pub targets: Vec<FailoverTarget>,
+    /// How long a failed target stays benched before re-entering
+    /// rotation (anti-flap). Default 30s.
+    #[serde(default = "default_failover_min_residence_secs")]
+    pub min_residence_secs: u64,
+}
+
+fn default_failover_min_residence_secs() -> u64 {
+    30
+}
+
+/// A local MCP (Model Context Protocol) server the gateway can pull
+/// tools from. Tools are injected into chat requests that opt in via
+/// the `mcp` body field or `x-blazar-mcp` header; the gateway executes
+/// the calls the model makes and feeds results back — every engine
+/// lane gets tool use, no child-side MCP support required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServer {
+    /// Unique server name; tools are namespaced `mcp__<name>__<tool>`.
+    pub name: String,
+    /// Command line that starts the stdio MCP server, e.g.
+    /// `["uvx", "mcp-server-fetch"]`. Exactly one of `command` / `url`.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Streamable-HTTP MCP endpoint, e.g. `http://127.0.0.1:8808/mcp`.
+    /// Exactly one of `command` / `url`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Extra environment variables for the child process (stdio only).
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Per `tools/call` timeout in seconds (1..=600). Default 30.
+    #[serde(default = "default_mcp_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_mcp_timeout_secs() -> u64 {
+    30
+}
+
 /// Federation fallback defaults ON: with remotes configured, a bare
 /// model name absent locally but present on a peer routes there.
 fn default_remote_fallback() -> bool {
@@ -1970,6 +2080,15 @@ fn default_whisper_stream_chunk_ms() -> u64 {
 
 fn default_fork_retire_days() -> u64 {
     7
+}
+
+/// Built-in engine retention (per kind) when the config knob is absent.
+/// blazar-runtime re-exports this as `engine::KEEP_TAGS` — one source of
+/// truth for the default across both crates.
+pub const DEFAULT_KEEP_TAGS: usize = 2;
+
+fn default_keep_tags() -> usize {
+    DEFAULT_KEEP_TAGS
 }
 
 fn default_semantic_ttl_secs() -> u64 {
@@ -2174,9 +2293,11 @@ impl Default for Config {
             whisper_idle_secs: default_whisper_idle_secs(),
             whisper_stream_chunk_ms: default_whisper_stream_chunk_ms(),
             whisper_vad_model: None,
+            whisper_extra_args: None,
             sdcpp_qwen_prefix_cache_type: None,
             capability_registry_url: None,
             fork_retire_days: default_fork_retire_days(),
+            keep_tags: default_keep_tags(),
             semantic_cache: SemanticCacheConfig::default(),
             remote_fallback: default_remote_fallback(),
             devices: Vec::new(),
@@ -2197,6 +2318,9 @@ impl Default for Config {
             mcp_servers_json: None,
             cache_reuse: 0,
             keys: Vec::new(),
+            failover: Vec::new(),
+            mcp: Vec::new(),
+            mcp_default: None,
             rpc_servers: String::new(),
             cache_ram_mb: DEFAULT_CACHE_RAM_MB,
             slots: default_slots(),
@@ -2219,6 +2343,7 @@ impl Default for Config {
             sdcpp_tae: None,
             sdcpp_conditioning_cache_size: None,
             sdcpp_model_args: None,
+            sdcpp_extra_args: None,
             sdcpp_tensor_type_rules: None,
             media_job_wait_secs: 900,
             sentinel_enforce: false,
@@ -2876,6 +3001,64 @@ impl Config {
     /// fail fast rather than run with contradictory knobs.
     #[allow(clippy::too_many_lines)] // flat one-check-per-knob by design
     pub fn validate(&self) -> CoreResult<()> {
+        let mut names = std::collections::HashSet::new();
+        for srv in &self.mcp {
+            if srv.name.is_empty() {
+                return Err(CoreError::Config(
+                    "mcp server name must be non-empty".into(),
+                ));
+            }
+            if !names.insert(srv.name.clone()) {
+                return Err(CoreError::Config(format!(
+                    "duplicate mcp server name '{}'",
+                    srv.name
+                )));
+            }
+            let has_command = !srv.command.is_empty();
+            let has_url = srv.url.is_some();
+            if has_command == has_url {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' must set exactly one of command (stdio) or url (streamable HTTP)",
+                    srv.name
+                )));
+            }
+            if has_command && srv.command.iter().any(String::is_empty) {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' command must be a non-empty argv list",
+                    srv.name
+                )));
+            }
+            if let Some(url) = &srv.url {
+                let rest = url
+                    .strip_prefix("http://")
+                    .or_else(|| url.strip_prefix("https://"))
+                    .filter(|r| !r.is_empty() && !r.starts_with('/'));
+                if rest.is_none() {
+                    return Err(CoreError::Config(format!(
+                        "mcp server '{}' url must be an absolute http(s) endpoint, e.g. http://127.0.0.1:8808/mcp",
+                        srv.name
+                    )));
+                }
+            }
+            if !(1..=600).contains(&srv.timeout_secs) {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' timeout_secs must be in 1..=600",
+                    srv.name
+                )));
+            }
+        }
+        if let Some(d) = &self.mcp_default
+            && d != "all"
+            && d != "none"
+            && !self.mcp.iter().any(|srv| &srv.name == d)
+        {
+            let known: Vec<&str> = self.mcp.iter().map(|srv| srv.name.as_str()).collect();
+            return Err(CoreError::Config(format!(
+                "mcp_default '{}' matches no configured mcp server (known: [{}] — or use \"all\"/\"none\")",
+                d,
+                known.join(", ")
+            )));
+        }
         if self.default_ctx == 0 {
             return Err(CoreError::Config("default_ctx must be > 0".into()));
         }
@@ -3257,6 +3440,7 @@ impl Config {
             }
         }
         self.validate_sdcpp_kv_tokens()?;
+        self.validate_boot_extra_args()?;
         if let Some(vram) = self.sdcpp_max_vram.as_deref() {
             let bad = vram.split(',').find(|t| {
                 let t = t.trim();
@@ -3352,6 +3536,34 @@ impl Config {
         Ok(())
     }
 
+    /// Structural validation for the engine-boot flag passthrough lists
+    /// (`sdcpp_extra_args`, `whisper_extra_args`): trimmed tokens must be
+    /// non-empty and the first token must be a flag (a bare leading value
+    /// has no flag to ride). Engine-pin refusal and per-build manifest
+    /// gating live at child compile (profile dialects) — one authority
+    /// per concern, no duplicated reserved lists.
+    fn validate_boot_extra_args(&self) -> CoreResult<()> {
+        for (key, list) in [
+            ("sdcpp_extra_args", self.sdcpp_extra_args.as_deref()),
+            ("whisper_extra_args", self.whisper_extra_args.as_deref()),
+        ] {
+            let Some(list) = list else { continue };
+            if let Some(t) = list.iter().find(|t| t.trim().is_empty()) {
+                return Err(CoreError::Config(format!(
+                    "{key} tokens must be non-empty after trimming, got {t:?}"
+                )));
+            }
+            if let Some(first) = list.first()
+                && !first.starts_with('-')
+            {
+                return Err(CoreError::Config(format!(
+                    "{key} must start with a flag token, got {first:?} — values ride their preceding flag"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Validation for the capacity/steering knobs added in the
     /// beat-ollama wave: `cache_type` vocabulary, `ctx_extend` range,
     /// expert counts, override-tensor shapes. Kept separate from `validate`
@@ -3399,6 +3611,14 @@ impl Config {
 
     fn validate_new_knobs(&self) -> CoreResult<()> {
         self.validate_time_bounds()?;
+        // 0 would starve the active lane's rollback target while the
+        // active tag itself stays protected — a confusing no-win setting.
+        if self.keep_tags == 0 {
+            return Err(CoreError::Config(
+                "keep_tags must be >= 1 (1 = no rollback anchor, 2 = fresh build + one anchor), got 0"
+                    .to_string(),
+            ));
+        }
         if self.raw_lane_max_tokens != 0 && !(256..=100_000).contains(&self.raw_lane_max_tokens) {
             return Err(CoreError::Config(format!(
                 "raw_lane_max_tokens must be 0 (off) or 256..=100000, got {}",
@@ -3798,6 +4018,14 @@ impl Config {
         if let Some(v) = env("BLAZAR_WHISPER_STREAM_CHUNK_MS") {
             cfg.whisper_stream_chunk_ms = parse_u64("BLAZAR_WHISPER_STREAM_CHUNK_MS", &v)?;
         }
+        if let Some(v) = env("BLAZAR_WHISPER_EXTRA_ARGS") {
+            // Comma-split like BLAZAR_PRELOAD; flag values that themselves
+            // contain commas belong in the TOML list key.
+            cfg.whisper_extra_args = Some(split_extra_args_env("BLAZAR_WHISPER_EXTRA_ARGS", &v)?);
+        }
+        if let Some(v) = env("BLAZAR_SDCPP_EXTRA_ARGS") {
+            cfg.sdcpp_extra_args = Some(split_extra_args_env("BLAZAR_SDCPP_EXTRA_ARGS", &v)?);
+        }
         if let Some(v) = env("BLAZAR_SPEC") {
             cfg.spec = v;
         }
@@ -3963,6 +4191,27 @@ fn parse_bool(key: &str, raw: &str) -> CoreResult<bool> {
     raw.parse::<bool>()
         .map_err(|_| CoreError::Config(format!("invalid {key} {raw:?}: expected true or false")))
 }
+/// Split a comma-separated extra-args env var into flag tokens. Empty
+/// segments are dropped; an all-empty value or a non-flag first token is
+/// a config error (same rule the TOML list validation enforces).
+fn split_extra_args_env(key: &str, raw: &str) -> CoreResult<Vec<String>> {
+    let tokens: Vec<String> = raw
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return Err(CoreError::Config(format!(
+            "invalid {key} {raw:?}: expected comma-separated engine flags"
+        )));
+    }
+    if !tokens[0].starts_with('-') {
+        return Err(CoreError::Config(format!(
+            "invalid {key} {raw:?}: must start with a flag token — values ride their preceding flag"
+        )));
+    }
+    Ok(tokens)
+}
 fn parse_i32(key: &str, raw: &str) -> CoreResult<i32> {
     raw.parse::<i32>()
         .map_err(|e| CoreError::Config(format!("invalid {key} {raw:?}: {e}")))
@@ -4041,6 +4290,58 @@ fn valid_override_tensor(s: &str) -> bool {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__boot_extra_args__structure_validated_and_reserved_deferred_to_compile() {
+        // Config layer enforces shape only (non-empty trimmed tokens,
+        // flag-first); engine pins + manifest gating are the profile
+        // dialect's authority, so a reserved flag like --port passes
+        // here and dies at child compile with the teaching error.
+        let good = Config {
+            sdcpp_extra_args: Some(vec![
+                "--control-net".into(),
+                "/models/cnet.safetensors".into(),
+            ]),
+            whisper_extra_args: Some(vec!["--suppress-nst".into()]),
+            ..Config::default()
+        };
+        good.validate().expect("well-formed lists validate");
+
+        let empty_tok = Config {
+            sdcpp_extra_args: Some(vec!["--taesd".into(), "  ".into()]),
+            ..Config::default()
+        };
+        let err = empty_tok.validate().unwrap_err().to_string();
+        assert!(err.contains("non-empty after trimming"), "got: {err}");
+
+        let bare_first = Config {
+            whisper_extra_args: Some(vec!["4".into(), "--threads".into()]),
+            ..Config::default()
+        };
+        let err = bare_first.validate().unwrap_err().to_string();
+        assert!(err.contains("must start with a flag token"), "got: {err}");
+    }
+
+    #[test]
+    fn unit__split_extra_args_env__trims_drops_empties_and_refuses_bare_leads() {
+        let split =
+            split_extra_args_env("K", " --taesd , , /models/tae.safetensors ,, --threads, 4 ")
+                .expect("comma list splits");
+        assert_eq!(
+            split,
+            vec![
+                "--taesd".to_string(),
+                "/models/tae.safetensors".to_string(),
+                "--threads".to_string(),
+                "4".to_string(),
+            ]
+        );
+        assert!(split_extra_args_env("K", " , , ").is_err());
+        let err = split_extra_args_env("K", "cnet.safetensors")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must start with a flag token"), "got: {err}");
+    }
 
     /// Live receipt 2026-09-29: a minimal config.toml (the validate
     /// sandbox writes exactly `port = N` + a model override) ran the
@@ -4618,6 +4919,7 @@ seed = 42
         // code reading and only caught by diffing the live `config defaults` dump.
         assert!(raw.contains("adaptive_slots = true"));
         assert!(raw.contains("engine_check_secs = 86400"));
+        assert!(raw.contains("keep_tags = 2"));
     }
 
     #[test]
@@ -4659,6 +4961,15 @@ default_ctx = 16384
             Config::from_toml("spec = \"ngram-simple\"\n").is_err(),
             "raw spec types are not config values"
         );
+
+        // Retention knob: absent -> default, 1 allowed, 0 rejected (it
+        // would starve the active lane's rollback target for nothing).
+        assert_eq!(
+            Config::from_toml("port = 11434\n").unwrap().keep_tags,
+            DEFAULT_KEEP_TAGS
+        );
+        assert_eq!(Config::from_toml("keep_tags = 1\n").unwrap().keep_tags, 1);
+        assert!(Config::from_toml("keep_tags = 0\n").is_err());
     }
 
     #[test]
@@ -5237,6 +5548,74 @@ default_ctx = 16384
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn unit__validation__mcp_server_command_xor_url() {
+        let mut cfg = Config::default();
+        let stdio = McpServer {
+            name: "s".into(),
+            command: vec!["sleep".into(), "600".into()],
+            url: None,
+            env: std::collections::HashMap::new(),
+            timeout_secs: default_mcp_timeout_secs(),
+        };
+        cfg.mcp.push(stdio.clone());
+        cfg.validate().expect("stdio-only server is valid");
+
+        // Neither transport.
+        let mut neither = stdio.clone();
+        neither.command.clear();
+        neither.url = None;
+        cfg.mcp[0] = neither;
+        assert!(cfg.validate().is_err(), "no transport must be rejected");
+
+        // Both transports.
+        let mut both = stdio;
+        both.url = Some("http://127.0.0.1:8808/mcp".into());
+        cfg.mcp[0] = both;
+        assert!(cfg.validate().is_err(), "both transports must be rejected");
+
+        // Malformed url.
+        let mut bad = McpServer {
+            name: "s".into(),
+            command: Vec::new(),
+            url: Some("not-a-url".into()),
+            env: std::collections::HashMap::new(),
+            timeout_secs: default_mcp_timeout_secs(),
+        };
+        cfg.mcp[0] = bad.clone();
+        assert!(cfg.validate().is_err(), "relative url must be rejected");
+        bad.url = Some("https://mcp.example.com/mcp".into());
+        cfg.mcp[0] = bad;
+        cfg.validate()
+            .expect("http(s) url with host is valid, command empty");
+    }
+
+    #[test]
+    fn unit__validation__mcp_default_must_name_known_selector() {
+        let mut cfg = Config::default();
+        cfg.mcp.push(McpServer {
+            name: "fetch".into(),
+            command: vec!["uvx".into(), "mcp-server-fetch".into()],
+            url: None,
+            env: std::collections::HashMap::new(),
+            timeout_secs: default_mcp_timeout_secs(),
+        });
+        for good in ["all", "none", "fetch"] {
+            cfg.mcp_default = Some(good.into());
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{good} must validate: {e}"));
+        }
+        cfg.mcp_default = Some("ghost".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("mcp_default 'ghost' matches no configured mcp server"),
+            "{err}"
+        );
+        assert!(err.contains("fetch"), "teaching lists known names: {err}");
+        cfg.mcp_default = None;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

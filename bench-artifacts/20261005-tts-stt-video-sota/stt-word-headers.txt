@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+content-type: application/json
+x-blazar-word-timestamps: derived
+vary: origin
+access-control-expose-headers: x-blazar-trace-id
+x-blazar-trace-id: plm-1a10d271e69-8
+content-length: 1304
+date: Mon, 05 Oct 2026 17:40:31 GMT
+

@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "note": "Measured KV-quant quality receipts (llama-perplexity A/B: fixed corpus, identical ctx/chunks/ngl, only cache types varied). `model` is the store name - the same string /api/explain/{model} resolves through the canonical ladder - so lookups match exactly; `file` records the measured GGUF for provenance. Populated by the kv-quality campaign; models without a row here have no measured receipt - the /api/explain kv_advisory reports measured: null for them rather than borrowing numbers. ppl at ctx 2048 does not cover long-context retrieval effects - see each receipt's note.",
+  "receipts": [
+    {
+      "model": "qwen3.5-9b",
+      "file": "Qwen3.5-9B-Q4_K_M.gguf",
+      "engine_tag": "b11393-cuda",
+      "ppl_tool": "own llama-perplexity",
+      "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+      "ctx": 2048,
+      "chunks": 4,
+      "ngl": 99,
+      "rungs": [
+        { "kv": "f16", "ppl": 5.3738, "ppl_err": 0.22409 },
+        { "kv": "q8_0/q8_0", "ppl": 5.3615, "ppl_err": 0.22315 },
+        { "kv": "q4_0/q4_0", "ppl": 5.3711, "ppl_err": 0.22331 }
+      ],
+      "source": "bench-artifacts/20261005-kv-quality/",
+      "note": "q8_0 and q4_0 KV deltas vs f16 are within the +/-0.22 error bars at ctx 2048 (ppl-equivalent at this ctx); long-context retrieval degradation is not covered by this receipt"
+    },
+    {
+      "model": "qwen3.5-9b",
+      "file": "Qwen3.5-9B-Q4_K_M.gguf",
+      "engine_tag": "b11417-cuda",
+      "ppl_tool": "own llama-perplexity",
+      "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+      "ctx": 32768,
+      "chunks": 4,
+      "ngl": 99,
+      "rungs": [
+        { "kv": "q8_0/q8_0", "ppl": 3.5472, "ppl_err": 0.03735 },
+        { "kv": "q4_0/q4_0", "ppl": 3.5302, "ppl_err": 0.03684 }
+      ],
+      "source": "bench-artifacts/20261005-kv-quality-32k/",
+      "note": "long-ctx receipt: q8_0-vs-q4_0 delta at ctx 32768 is 0.017, inside the +/-0.037 error bars - q4_0 KV is quality-free at 32k on this corpus. f16 was not run: it does not fit this 8GiB card at 32k. Cross-ctx ppl values are NOT comparable (different window scale); the comparable quantities are the within-ctx deltas"
+    }
+  ]
+}

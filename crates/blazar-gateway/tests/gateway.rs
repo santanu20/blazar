@@ -198,6 +198,21 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
     }
 }
 
+/// m1's vision-capable sibling: same row plus a projector sidecar. The
+/// admission gate 400s image requests against a sidecar-less model, so
+/// vision-pipeline e2e tests ride this row (the stub child never reads
+/// the sidecar path).
+fn upsert_vision_sibling(ts: &TestServer) {
+    ts.state
+        .with_store(|s| {
+            let mut row = s.get_model("m1").unwrap().expect("m1 fixture row");
+            row.name = "m1v".into();
+            row.mmproj_path = Some("mmproj.gguf".into());
+            s.upsert_model(&row).unwrap();
+        })
+        .unwrap();
+}
+
 fn client() -> reqwest::Client {
     blazar_core::tls::ensure_tls_provider();
     reqwest::Client::builder()
@@ -295,6 +310,109 @@ async fn e2e__ollama_delete_accepts_the_tags_rendered_name() {
             .status();
         assert_eq!(status, 404, "probe {probe:?}");
     }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__ollama_evict_accepts_the_tags_rendered_name() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // GET /api/tags renders `name:quant`; a client evicting by that exact
+    // string must reach the supervisor. The raw passthrough this replaces
+    // no-op'd 200 on the tags form — instance keys hold bare store names,
+    // so `model_of_key(k) == model` never matched and the child kept
+    // serving (live-repro'd: bge-reranker-v2-m3:q8_0 evicted, still ready).
+    let status = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": "m1:q4_k_m"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200, "tags form resolves and unloads");
+    // Unloading a not-loaded model stays a 200 no-op (ollama keep_alive:0
+    // semantics) — but only for names that RESOLVE. Garbage teaches 404
+    // through the resolver instead of silently ok-ing.
+    let status = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": "m1"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200, "bare form resolves too");
+    for probe in ["no-such-model", "zz:q4_k_m"] {
+        let status = c
+            .post(format!("{}/api/evict", ts.base))
+            .json(&serde_json::json!({"model": probe}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 404, "unresolvable {probe:?} teaches 404");
+    }
+    let status = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": 42}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 400, "non-string model is a 400");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__ollama_evict_unresolvable_name_finds_the_whisper_lane() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // The whisper child keys by its size name ("base"), which is never
+    // a store row: before the lane fallback, evicting "base" 404'd with
+    // a levenshtein guess ("laya") while the audio child stayed loaded.
+    // Plant a live sleeper as the lane child, then evict by size name.
+    let child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id().expect("pid");
+    *ts.state.whisper.child.lock().await = Some(blazar_runtime::whisper::WhisperChild {
+        child,
+        port: 1,
+        loaded: "base".into(),
+        last_used: tokio::time::Instant::now(),
+    });
+    // While the lane is live but the name does NOT match: the 404 must
+    // teach with the live lanes listed, not a bare store suggestion.
+    let resp = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": "no-such-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let msg = v["error"].as_str().expect("message");
+    assert!(msg.contains("whisper:base"), "404 names live lanes: {msg}");
+    // The size name resolves to the lane and tears it down for real.
+    let resp = c
+        .post(format!("{}/api/evict", ts.base))
+        .json(&serde_json::json!({"model": "base"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "whisper size name resolves to the lane");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["lane"], "whisper");
+    assert_eq!(v["model"], "base");
+    assert!(ts.state.whisper.status().await.is_none(), "slot drained");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "whisper child {pid} leaked past evict"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -1739,11 +1857,12 @@ async fn e2e__generate_raw_ok_templated_400_and_embeddings() {
 async fn e2e__generate_images_and_streaming_chat_bus() {
     let ts = start(Config::default()).await;
     let c = client();
+    upsert_vision_sibling(&ts);
     // pdf_ocr-shaped payload: images[] (b64 of PNG magic + padding) +
     // system + options.
     let png_b64 = "iVBORw0KGgoAAAA";
     let vision = serde_json::json!({
-        "model": "m1",
+        "model": "m1v",
         "prompt": "describe",
         "system": "be terse",
         "images": [png_b64],
@@ -1761,6 +1880,26 @@ async fn e2e__generate_images_and_streaming_chat_bus() {
         .unwrap();
     assert!(r["done"] == true, "vision generate works: {r}");
     assert!(r["response"].as_str().unwrap().contains("describe"));
+
+    // No-projector contract (e2e): m1 has no sidecar, so the same
+    // payload teaches instead of reaching a child that would 500.
+    let refused = c
+        .post(format!("{}/api/generate", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1", "prompt": "describe", "images": [png_b64], "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let rb: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        rb["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no projector sidecar"),
+        "teaching refusal: {rb}"
+    );
 
     // Bad image magic: fail fast 400 (never a silent text-only answer).
     let bad = serde_json::json!({
@@ -1829,10 +1968,11 @@ async fn e2e__generate_images_and_streaming_chat_bus() {
 async fn e2e__chat_message_images_translate_to_parts() {
     let ts = start(Config::default()).await;
     let c = client();
+    upsert_vision_sibling(&ts);
     // b64 of PNG magic + 4 zero bytes (decodes cleanly at 12 bytes).
     let png_b64 = "iVBORw0KGgoAAAA";
     let body = serde_json::json!({
-        "model": "m1",
+        "model": "m1v",
         "stream": false,
         "messages": [
             {"role": "user", "content": "what is this?", "images": [png_b64]}
@@ -2862,6 +3002,110 @@ async fn e2e__child_header_stall_bounded_evicted_and_504() {
         status, 504,
         "terminal header-stall status, got {status} in {elapsed:?}"
     );
+    // Wedge branch (slot probe said idle): the body must say the child
+    // was evicted — the discriminator against the busy-child branch.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("wedged child evicted"),
+        "wedge 504 must name the eviction, got: {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__child_header_timeout_busy_child_kept_teaching_504() {
+    // Pin (live evidence, 2026-10-05): a buffered (non-stream) think-mode
+    // generation ran past child_header_timeout_secs and drew a 504 while
+    // the child was healthy mid-generation — the synchronous eviction
+    // then killed the child (and would kill sibling streams on a
+    // multi-slot instance). vLLM and ollama cap no generation. The guard
+    // now probes /slots on expiry: slots busy → child KEPT, request
+    // fails alone with a teaching body naming the two remedies.
+    let cfg = Config {
+        child_header_timeout_secs: 1,
+        ..Config::default()
+    };
+    let ts = start_with(
+        cfg,
+        vec![("STUB_HANG_BUSY_ON".into(), "busy-token-7".into())],
+    )
+    .await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "busy-token-7"}],
+        }))
+        .send()
+        .await
+        .expect("bounded: the request must return, never park to the blanket ceiling");
+    assert_eq!(resp.status().as_u16(), 504);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("still generating"),
+        "busy-child 504 must say the child is healthy, got: {msg}"
+    );
+    assert!(
+        msg.contains("\"stream\": true"),
+        "busy-child 504 must teach the streaming remedy, got: {msg}"
+    );
+    assert!(
+        msg.contains("child_header_timeout_secs"),
+        "busy-child 504 must name the knob, got: {msg}"
+    );
+    assert!(
+        !msg.contains("wedged child evicted"),
+        "busy-child 504 must NOT claim an eviction, got: {msg}"
+    );
+    assert!(
+        !msg.contains("retry on respawned child"),
+        "busy-child 504 must NOT retry onto a respawned lane (the retry would \
+         re-run the same oversized generation into the same ceiling), got: {msg}"
+    );
+    assert_eq!(
+        msg.matches("still generating").count(),
+        1,
+        "teaching message must appear exactly once (no duplicated retry text), got: {msg}"
+    );
+    // The child was NOT evicted: ps still shows m1 resident and ready
+    // (nothing respawns it without traffic), and a follow-up request
+    // serves from the same live child.
+    let ps: serde_json::Value = c
+        .get(format!("{}/api/ps", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        ps["models"][0]["name"], "m1",
+        "child must stay resident after the busy-child teaching 504"
+    );
+    assert_eq!(
+        ps["models"][0]["blazar_state"], "ready",
+        "child must stay ready after the busy-child teaching 504"
+    );
+    let follow_up = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "are you alive"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(follow_up.status(), 200, "same child keeps serving");
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -3614,6 +3858,208 @@ async fn e2e__batch_jsonl_end_to_end() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// Anthropic Message Batches end-to-end: inline requests, replay through
+/// the gateway's own /v1/messages, five-way counts, jsonl results, cancel
+/// and validation teaching errors.
+#[tokio::test]
+#[allow(non_snake_case)]
+#[allow(clippy::too_many_lines)] // one linear scenario, assertions inline
+async fn e2e__anthropic_batch__create_replay_and_results() {
+    let ts = start(Config::default()).await;
+    let c = client();
+
+    // Validation teaching errors: empty, bad custom_id, duplicate, and
+    // missing model.
+    let bad = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let bad = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": [
+            {"custom_id": "no spaces!", "params": {"model": "m1", "messages": []}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let bad = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": [
+            {"custom_id": "a", "params": {"model": "m1", "messages": []}},
+            {"custom_id": "a", "params": {"model": "m1", "messages": []}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let bad = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": [
+            {"custom_id": "a", "params": {"messages": []}}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    // Create: two good requests + one that the lane refuses at replay
+    // (max_tokens missing -> /v1/messages 400 -> errored row, not a dead
+    // batch — the documented per-request error contract).
+    let batch: serde_json::Value = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .json(&serde_json::json!({"requests": [
+            {"custom_id": "a-1", "params": {
+                "model": "m1", "max_tokens": 5,
+                "messages": [{"role": "user", "content": "hello"}]}},
+            {"custom_id": "a-2", "params": {
+                "model": "m1", "max_tokens": 5,
+                "messages": [{"role": "user", "content": "second"}]}},
+            {"custom_id": "bad-1", "params": {
+                "model": "m1",
+                "messages": [{"role": "user", "content": "no max tokens"}]}}
+        ]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = batch["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("msgbatch-"), "batch id: {batch:?}");
+    assert_eq!(batch["type"], "message_batch");
+    assert_eq!(batch["processing_status"], "in_progress");
+    assert_eq!(batch["request_counts"]["processing"], 3);
+    assert_eq!(
+        batch["results_url"],
+        format!("/v1/messages/batches/{id}/results")
+    );
+    for key in ["created_at", "expires_at"] {
+        let s = batch[key].as_str().unwrap();
+        assert!(
+            s.len() == 20 && s.ends_with('Z') && s.contains('T'),
+            "{key} must be ISO-8601 UTC: {s}"
+        );
+    }
+
+    // Poll to ended.
+    let mut done = None;
+    for _ in 0..100 {
+        let v: serde_json::Value = c
+            .get(format!("{}/v1/messages/batches/{id}", ts.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if v["processing_status"] == "ended" {
+            done = Some(v);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let done = done.expect("anthropic batch reaches ended");
+    assert_eq!(done["request_counts"]["succeeded"], 2, "batch: {done:?}");
+    assert_eq!(done["request_counts"]["errored"], 1);
+    assert_eq!(done["request_counts"]["processing"], 0);
+    assert!(done["ended_at"].is_string(), "ended_at stamped: {done:?}");
+
+    // Results jsonl: match rows by custom_id (order not guaranteed).
+    let results = c
+        .get(format!("{}/v1/messages/batches/{id}/results", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(results.status(), 200);
+    let body = results.text().await.unwrap();
+    let rows: std::collections::HashMap<String, serde_json::Value> = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            (v["custom_id"].as_str().unwrap().to_string(), v)
+        })
+        .collect();
+    assert_eq!(rows.len(), 3, "three result rows: {body}");
+    for cid in ["a-1", "a-2"] {
+        let r = &rows[cid];
+        assert_eq!(r["result"]["type"], "message", "row {cid}: {r:?}");
+        assert_eq!(r["result"]["message"]["role"], "assistant", "row {cid}");
+        assert!(
+            r["result"]["message"]["content"].is_array(),
+            "anthropic content blocks: {r:?}"
+        );
+    }
+    let bad_row = &rows["bad-1"];
+    assert_eq!(bad_row["result"]["type"], "errored", "row: {bad_row:?}");
+    assert!(
+        bad_row["result"]["error"]["message"].is_string(),
+        "teaching error carried: {bad_row:?}"
+    );
+
+    // List contains the batch with first/last ids.
+    let list: serde_json::Value = c
+        .get(format!("{}/v1/messages/batches", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"].as_str() == Some(id.as_str())),
+        "list contains the batch: {list:?}"
+    );
+    assert!(list["first_id"].is_string() || list["data"].as_array().unwrap().is_empty());
+
+    // Cancel after ended and unknown id both teach, not crash.
+    let r = c
+        .post(format!("{}/v1/messages/batches/{id}/cancel", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = c
+        .get(format!(
+            "{}/v1/messages/batches/msgbatch-none/results",
+            ts.base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    // Archive marks archived_at and keeps the object readable.
+    let archived: serde_json::Value = c
+        .delete(format!("{}/v1/messages/batches/{id}", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        archived["archived_at"].is_string(),
+        "archived: {archived:?}"
+    );
+    let r = c
+        .get(format!("{}/v1/messages/batches/{id}", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__llamacpp_only_gate__non_llamacpp_kinds_get_teaching_400() {
@@ -4013,6 +4459,285 @@ async fn e2e__unknown_route__404_json_envelope_with_teaching_pointer() {
     assert!(
         msg.contains("/.well-known/blazar"),
         "message teaches the census: {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Failover chains (Wave B): a virtual alias escalates from a failing
+/// primary to the healthy secondary on the same request, stamps
+/// provenance headers, records the switch in the registry, and the
+/// admin plane (list/detail/pin/unpin) controls resolution.
+#[allow(non_snake_case)]
+#[allow(clippy::too_many_lines)] // one end-to-end receipt per concern
+#[tokio::test]
+async fn e2e__failover_chain__escalates_stamps_and_admin_plane() {
+    use blazar_core::config::{FailoverChain, FailoverTarget};
+    let cfg = Config {
+        failover: vec![FailoverChain {
+            name: "receipt".into(),
+            alias: "assistant".into(),
+            min_residence_secs: 30,
+            targets: vec![
+                FailoverTarget {
+                    remote: None,
+                    model: "missing-model".into(),
+                },
+                FailoverTarget {
+                    remote: None,
+                    model: "m1".into(),
+                },
+            ],
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+
+    // OpenAI lane: alias enters the chain, primary 404s, secondary serves.
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({"model": "assistant", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "escalated to the healthy target");
+    assert_eq!(
+        resp.headers()
+            .get("x-blazar-failover")
+            .and_then(|v| v.to_str().ok()),
+        Some("receipt")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-blazar-served-model")
+            .and_then(|v| v.to_str().ok()),
+        Some("local:m1")
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("stub:m1:"),
+        "answered by the stub child: {v:?}"
+    );
+
+    // Anti-flap: the failed primary is benched, the ollama lane resolves
+    // straight to the secondary.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(&serde_json::json!({"model": "assistant", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "ollama lane rides the benched chain");
+    assert_eq!(
+        resp.headers()
+            .get("x-blazar-served-model")
+            .and_then(|v| v.to_str().ok()),
+        Some("local:m1"),
+        "benched primary skipped without a second failure"
+    );
+
+    // Admin plane: status shows the sticky switch; detail accepts name
+    // AND alias; pin forces; unpin releases.
+    let st: serde_json::Value = c
+        .get(format!("{}/api/failover", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let chain = &st["chains"][0];
+    assert_eq!(chain["name"], "receipt");
+    assert_eq!(
+        chain["sticky"], 1,
+        "sticky moved to the serving target: {chain}"
+    );
+    assert!(chain["switches"].as_u64().unwrap() >= 1);
+    // 30s bench minus the seconds elapsed since the failure landed.
+    let bench = chain["targets"][0]["benched_for_secs"].as_u64().unwrap();
+    assert!(
+        (25..=30).contains(&bench),
+        "primary benched for ~30s (anti-flap): {bench}"
+    );
+
+    let det: serde_json::Value = c
+        .get(format!("{}/api/failover/assistant", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(det["alias"], "assistant", "detail by alias");
+    let det2: serde_json::Value = c
+        .get(format!("{}/api/failover/receipt", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(det2["name"], "receipt", "detail by name");
+
+    let pin: serde_json::Value = c
+        .post(format!("{}/api/failover/receipt/pin", ts.base))
+        .json(&serde_json::json!({"target": 1}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pin["pinned"], 1);
+    let bad = c
+        .post(format!("{}/api/failover/receipt/pin", ts.base))
+        .json(&serde_json::json!({"target": 9}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400, "out-of-range pin teaches");
+    let unpin: serde_json::Value = c
+        .post(format!("{}/api/failover/receipt/unpin", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(unpin["pinned"].is_null());
+    let unknown = c
+        .get(format!("{}/api/failover/nope", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// MCP tool catalog: the status plane lists configured servers
+/// report-only (never spawning one), and the buffered-tool-round guard
+/// teaches instead of guessing when a client asks for streaming.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__mcp__status_plane_and_stream_guard() {
+    use blazar_core::config::McpServer;
+    let cfg = Config {
+        mcp: vec![McpServer {
+            name: "demo".into(),
+            command: vec!["sleep".into(), "600".into()],
+            url: None,
+            env: std::collections::HashMap::new(),
+            timeout_secs: 30,
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+
+    // Status plane: report-only — `sleep` is not an MCP server and must
+    // never have been spawned to answer this.
+    let st: serde_json::Value = c
+        .get(format!("{}/api/mcp", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["servers"][0]["name"], "demo");
+    assert_eq!(
+        st["servers"][0]["timeout_secs"], 30,
+        "config carried through: {st}"
+    );
+    assert!(
+        st["servers"][0]["alive"].is_boolean(),
+        "alive reports without probing (report-only plane): {st}"
+    );
+
+    // Stream guard on the ollama lane: teaching 400 before any child or
+    // MCP process is touched.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(
+            &serde_json::json!({"model": "m1", "stream": true, "mcp": "demo",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "streaming + mcp teaches");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    // ollama dialect carries the message as a bare error string.
+    let msg = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+        .unwrap_or_default();
+    assert!(msg.contains("stream:false"), "message names the fix: {msg}");
+
+    // Selector validation: an unconfigured server name teaches with the
+    // configured list, not a bare 500.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "nope",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "unknown server teaches");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let msg = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("demo"),
+        "teaching lists the configured servers: {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// The Anthropic translate lane teaches (never guesses) when a chain
+/// carries remote targets: local-only chains serve, remote ones 400.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__failover_chain__anthropic_lane_local_targets_only() {
+    use blazar_core::config::{FailoverChain, FailoverTarget};
+    let cfg = Config {
+        failover: vec![FailoverChain {
+            name: "mixed".into(),
+            alias: "mixed-assistant".into(),
+            min_residence_secs: 30,
+            targets: vec![FailoverTarget {
+                remote: Some("elsewhere".into()),
+                model: "m1".into(),
+            }],
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let resp = client()
+        .post(format!("{}/v1/messages", ts.base))
+        .json(
+            &serde_json::json!({"model": "mixed-assistant", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "remote target on the translate lane");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("local targets only") && msg.contains("mixed"),
+        "teaching names the chain and the lane constraint: {msg}"
     );
     ts.state.sup.shutdown_all().await.unwrap();
 }
