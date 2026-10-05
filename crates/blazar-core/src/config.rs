@@ -445,6 +445,14 @@ pub struct Config {
     /// NEVER auto-deleted regardless of this setting.
     #[serde(default = "default_fork_retire_days")]
     pub fork_retire_days: u64,
+    /// Engine builds retained per kind after an install: the newest N
+    /// survive auto-prune, with `local` and the active tag protected on
+    /// top. 2 (default) = fresh build plus one rollback anchor;
+    /// 1 = an update deletes the previous build (no rollback target for
+    /// `blazar engine rollback`). Also governs the whisper/piper
+    /// voice-dir retention, which mirrors the engine-lane policy.
+    #[serde(default = "default_keep_tags")]
+    pub keep_tags: usize,
     /// R4: opt-in semantic cache for non-stream chat responses.
     /// Disabled by default — semantic similarity can serve a near-miss
     /// where an exact match was required; correctness-sensitive lanes
@@ -2054,6 +2062,15 @@ fn default_fork_retire_days() -> u64 {
     7
 }
 
+/// Built-in engine retention (per kind) when the config knob is absent.
+/// blazar-runtime re-exports this as `engine::KEEP_TAGS` — one source of
+/// truth for the default across both crates.
+pub const DEFAULT_KEEP_TAGS: usize = 2;
+
+fn default_keep_tags() -> usize {
+    DEFAULT_KEEP_TAGS
+}
+
 fn default_semantic_ttl_secs() -> u64 {
     600
 }
@@ -2259,6 +2276,7 @@ impl Default for Config {
             sdcpp_qwen_prefix_cache_type: None,
             capability_registry_url: None,
             fork_retire_days: default_fork_retire_days(),
+            keep_tags: default_keep_tags(),
             semantic_cache: SemanticCacheConfig::default(),
             remote_fallback: default_remote_fallback(),
             devices: Vec::new(),
@@ -3542,6 +3560,14 @@ impl Config {
 
     fn validate_new_knobs(&self) -> CoreResult<()> {
         self.validate_time_bounds()?;
+        // 0 would starve the active lane's rollback target while the
+        // active tag itself stays protected — a confusing no-win setting.
+        if self.keep_tags == 0 {
+            return Err(CoreError::Config(
+                "keep_tags must be >= 1 (1 = no rollback anchor, 2 = fresh build + one anchor), got 0"
+                    .to_string(),
+            ));
+        }
         if self.raw_lane_max_tokens != 0 && !(256..=100_000).contains(&self.raw_lane_max_tokens) {
             return Err(CoreError::Config(format!(
                 "raw_lane_max_tokens must be 0 (off) or 256..=100000, got {}",
@@ -4761,6 +4787,7 @@ seed = 42
         // code reading and only caught by diffing the live `config defaults` dump.
         assert!(raw.contains("adaptive_slots = true"));
         assert!(raw.contains("engine_check_secs = 86400"));
+        assert!(raw.contains("keep_tags = 2"));
     }
 
     #[test]
@@ -4802,6 +4829,15 @@ default_ctx = 16384
             Config::from_toml("spec = \"ngram-simple\"\n").is_err(),
             "raw spec types are not config values"
         );
+
+        // Retention knob: absent -> default, 1 allowed, 0 rejected (it
+        // would starve the active lane's rollback target for nothing).
+        assert_eq!(
+            Config::from_toml("port = 11434\n").unwrap().keep_tags,
+            DEFAULT_KEEP_TAGS
+        );
+        assert_eq!(Config::from_toml("keep_tags = 1\n").unwrap().keep_tags, 1);
+        assert!(Config::from_toml("keep_tags = 0\n").is_err());
     }
 
     #[test]

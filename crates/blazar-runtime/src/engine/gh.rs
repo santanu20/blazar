@@ -107,6 +107,20 @@ pub fn same_build(a: &str, b: &str) -> bool {
     }
 }
 
+/// Upstream's stable marker for the llama.cpp lane: the newest
+/// non-prerelease is published as a `vX.Y.Z` tag whose only asset,
+/// `nightly-tag.txt`, names the concrete b-build it stamps. Engines
+/// install under the b-tag; the v-tag is the stable name users compare
+/// against ("v0.6.0"), so currency surfaces carry this pair to bridge
+/// the two dialects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StableMarker {
+    /// The stable release tag, e.g. "v0.6.0".
+    pub vtag: String,
+    /// The b-build the marker stamps, e.g. "b11429".
+    pub btag: String,
+}
+
 /// Raw llama-arch.cpp URL for an upstream tag. Pure so tests can pin
 /// the mapping (engine tag -> source location) without network.
 #[must_use]
@@ -346,6 +360,41 @@ impl GhClient {
                 }
             }
         }
+    }
+
+    /// Read upstream's current stable marker for the llama.cpp lane:
+    /// the `vX.Y.Z` release GitHub's `/releases/latest` points at,
+    /// dereferenced through its `nightly-tag.txt` asset to the concrete
+    /// b-build it stamps. Returns `None` when the latest non-prerelease
+    /// is itself a b-tag (no stable marker published yet). Advisory by
+    /// design — callers annotate, they never gate on this.
+    pub async fn stable_marker(&self) -> Result<Option<StableMarker>> {
+        let latest = self.release_by(LLAMA_CPP_REPO, None).await?;
+        if !latest.tag_name.starts_with('v') {
+            return Ok(None);
+        }
+        let asset = latest
+            .assets
+            .iter()
+            .find(|a| a.name == "nightly-tag.txt")
+            .ok_or_else(|| {
+                anyhow!(
+                    "stable release {} has no nightly-tag.txt asset",
+                    latest.tag_name
+                )
+            })?;
+        let bytes = self.download_asset_bytes(asset).await?;
+        let btag = String::from_utf8_lossy(&bytes).trim().to_string();
+        if btag.is_empty() {
+            anyhow::bail!(
+                "stable release {} has an empty nightly-tag.txt",
+                latest.tag_name
+            );
+        }
+        Ok(Some(StableMarker {
+            vtag: latest.tag_name,
+            btag,
+        }))
     }
 
     /// Resolve the target release of an arbitrary repo (whisper.cpp,
@@ -1723,6 +1772,61 @@ mod tests {
         );
         // Re-issuing past a 403 is what the rate limit asks us not to do.
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn integration__stable_marker__latest_v_release_derefs_to_b() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let marker_url = format!("{}/stable/nightly-tag.txt", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/repos/ggml-org/llama.cpp/releases/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tag_name": "v0.6.0",
+                "assets": [{
+                    "name": "nightly-tag.txt",
+                    "browser_download_url": marker_url,
+                    "digest": null,
+                    "size": null
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/stable/nightly-tag.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("b11429\n"))
+            .mount(&server)
+            .await;
+        let gh = GhClient::with_base(&server.uri(), None).unwrap();
+        let marker = gh
+            .stable_marker()
+            .await
+            .unwrap()
+            .expect("v-release yields a marker");
+        assert_eq!(
+            marker,
+            StableMarker {
+                vtag: "v0.6.0".to_string(),
+                btag: "b11429".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__stable_marker__non_v_latest_is_none() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/ggml-org/llama.cpp/releases/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tag_name": "b11429"
+            })))
+            .mount(&server)
+            .await;
+        let gh = GhClient::with_base(&server.uri(), None).unwrap();
+        assert!(gh.stable_marker().await.unwrap().is_none());
     }
 
     #[test]

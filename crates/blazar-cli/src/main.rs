@@ -20,7 +20,7 @@ use blazar_runtime::engine::build::{
     BuildBackend, BuildOpts, BuildSource, Toolchain, detect_toolchain, nvidia_gpu_facts,
     parse_fork_spec, path_dirs, require_toolchain, validate_commit_sha, validate_repo_slug,
 };
-use blazar_runtime::engine::gh::{GhClient, btag_number, same_build};
+use blazar_runtime::engine::gh::{GhClient, StableMarker, btag_number, same_build};
 use blazar_runtime::engine::{EngineManager, STALLED_INSTALL_GRACE};
 use blazar_runtime::engine_impl::Engine;
 use blazar_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
@@ -3560,6 +3560,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
             ));
             continue;
         }
+        let mut any_missing = false;
         let entries: Vec<String> = rows
             .iter()
             .map(|e| {
@@ -3573,6 +3574,23 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
                     "overlay prebuilt"
                 };
                 let active_mark = if e.active { " [active]" } else { "" };
+                // Rows can outlive their files (tree deleted under the
+                // store) — flag them here too; `engine list` shows the
+                // same state in its STATE column.
+                let files = d
+                    .engines_dir()
+                    .join(&e.tag)
+                    .read_dir()
+                    .is_ok_and(|mut rd| rd.next().is_some());
+                if !files {
+                    any_missing = true;
+                    return format!(
+                        "{tag} ({asset}, {provenance}) FILES MISSING — blazar engine install --kind {kind}{active_mark}",
+                        tag = e.tag,
+                        asset = e.asset,
+                        kind = e.kind
+                    );
+                }
                 format!(
                     "{} ({asset}, {provenance}, {gib:.1} GiB){active_mark}",
                     e.tag,
@@ -3580,7 +3598,17 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
                 )
             })
             .collect();
-        out.push(Check::ok(label, entries.join(" | ")));
+        if any_missing {
+            out.push(Check::warn(
+                label,
+                format!(
+                    "{} — row(s) whose engine dir is absent from disk; spawn would fail",
+                    entries.join(" | ")
+                ),
+            ));
+        } else {
+            out.push(Check::ok(label, entries.join(" | ")));
+        }
     }
     out.extend(doctor_engine_retention(d, &engines));
     out
@@ -3595,7 +3623,11 @@ fn doctor_engine_retention(
     engines: &[blazar_core::store::EngineRow],
 ) -> Vec<Check> {
     let mut out = Vec::new();
-    let keep = blazar_runtime::engine::KEEP_TAGS;
+    // Advisory display: a config load failure falls back to the default
+    // here — doctor's config section is the right place to surface that
+    // error, not the retention tail.
+    let keep =
+        blazar_runtime::engine::effective_keep_tags(d).unwrap_or(blazar_runtime::engine::KEEP_TAGS);
     let mut over: Vec<String> = Vec::new();
     for kind in ["llamacpp", "mistralrs", "sglang", "sdcpp", "whisper"] {
         let n = engines.iter().filter(|e| e.kind.as_str() == kind).count();
@@ -4845,6 +4877,41 @@ fn channel_word(active: &str, target: &str) -> &'static str {
     }
 }
 
+/// Stable-name relation of `tag` to upstream's current stable marker
+/// (see `GhClient::stable_marker`): "stable v0.6.0" when the tag IS the
+/// marked build (build numbers equal, lane suffixes like `-cuda`
+/// match), "newer than stable v0.6.0" for later b-builds, "" when no
+/// marker, the tag predates it, or it is not a b-build. Engine tags
+/// stay b-dialect; this is what makes them read as release names.
+fn stable_alias(marker: Option<&StableMarker>, tag: &str) -> String {
+    let Some(m) = marker else {
+        return String::new();
+    };
+    match (btag_number(tag), btag_number(&m.btag)) {
+        (Some(t), Some(s)) if t == s => format!("stable {}", m.vtag),
+        (Some(t), Some(s)) if t > s => format!("newer than stable {}", m.vtag),
+        _ => String::new(),
+    }
+}
+
+/// `stable_alias` wrapped for append-to-line contexts: "" or
+/// " (stable v0.6.0)".
+fn stable_alias_paren(marker: Option<&StableMarker>, tag: &str) -> String {
+    match stable_alias(marker, tag).as_str() {
+        "" => String::new(),
+        alias => format!(" ({alias})"),
+    }
+}
+
+/// `stable_alias` folded for prefix position inside a parenthesized
+/// detail: "" or "stable v0.6.0, ".
+fn stable_prefix(marker: Option<&StableMarker>, tag: &str) -> String {
+    match stable_alias(marker, tag).as_str() {
+        "" => String::new(),
+        alias => format!("{alias}, "),
+    }
+}
+
 /// The command that updates the ACTIVE engine's lane: source-built
 /// engines (`asset` = `built-*`) refresh by rebuilding the source lane —
 /// `engine update` would install the Vulkan prebuilt instead. Overlay
@@ -4898,18 +4965,23 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
             // b-tags compare by build number: lane suffixes (-cuda/-cpu)
             // are the SAME build — string equality would nag a current
             // source-built engine forever.
+            let stable = gh.stable_marker().await.ok().flatten();
             if same_build(active, &rel.tag_name) {
                 Check::ok(
                     "engine currency",
-                    format!("up to date ({active}, channel: {channel})"),
+                    format!(
+                        "up to date ({active}, {}channel: {channel})",
+                        stable_prefix(stable.as_ref(), active)
+                    ),
                 )
             } else {
                 Check::warn(
                     "engine currency",
                     format!(
-                        "{} available: {} (active: {}, channel: {}) — run: {}{}",
+                        "{} available: {}{} (active: {}, channel: {}) — run: {}{}",
                         channel_word(active, &rel.tag_name),
                         rel.tag_name,
+                        stable_alias_paren(stable.as_ref(), &rel.tag_name),
                         active,
                         channel,
                         engine_update_command(active, asset),
@@ -13087,9 +13159,12 @@ fn quick_tg(
 }
 
 /// F7 regression gate: DEFAULT-config tg128 on the freshly installed
-/// engine vs the recorded baseline engine. Skips silently when no tune
-/// baseline exists (nothing to compare). On a >10% decode drop it rolls
-/// the previous engine back to active and errors.
+/// engine vs the recorded baseline engine. Skips when no tune baseline
+/// exists OR its references went stale (baseline model un-pulled /
+/// baseline engine pruned by retention — nothing to gate against, the
+/// same skip-no-baseline contract as having no record at all). On a
+/// decode drop over 10% it rolls the previous engine back to active
+/// and errors.
 fn engine_regression_gate(
     mgr: &EngineManager,
     d: &BlazarDirs,
@@ -13097,14 +13172,30 @@ fn engine_regression_gate(
 ) -> Result<()> {
     let store = Store::open(d)?;
     if let Some((prev_tag, _recorded_tg, model)) = gate_baseline(&store)? {
-        let mrow = store
-            .get_model(&model)?
-            .ok_or_else(|| anyhow!("gate baseline model {model:?} no longer pulled"))?;
-        let prev_row = store
+        let Some(mrow) = store.get_model(&model)? else {
+            println!(
+                "{}",
+                dim_line(&format!(
+                    "gate: baseline model {model:?} no longer pulled — skipping the comparison \
+                     (nothing to gate against)"
+                ))
+            );
+            return Ok(());
+        };
+        let Some(prev_row) = store
             .list_engines()?
             .into_iter()
             .find(|e| e.tag == prev_tag)
-            .ok_or_else(|| anyhow!("gate: baseline engine {prev_tag} pruned"))?;
+        else {
+            println!(
+                "{}",
+                dim_line(&format!(
+                    "gate: baseline engine {prev_tag} pruned — skipping the comparison \
+                     (nothing to gate against)"
+                ))
+            );
+            return Ok(());
+        };
         let prev_tg = quick_tg(d, &prev_row, &mrow.path, "current engine")?;
         let new_tg = quick_tg(d, row, &mrow.path, &format!("candidate {}", row.tag))?;
         println!(
@@ -13196,6 +13287,15 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 let prov = m
                     .as_ref()
                     .map(|m| (m.provenance_label(), m.source.as_str().to_string()));
+                // Registry rows can outlive their files (a tree deleted
+                // out from under the store) — the row renders healthy
+                // until the first spawn 500s mid-request. Surface the
+                // disk state at listing time: dir present AND non-empty.
+                let files_present = d
+                    .engines_dir()
+                    .join(&e.tag)
+                    .read_dir()
+                    .is_ok_and(|mut rd| rd.next().is_some());
                 if json {
                     // Full sha256 (the table truncates to 12 chars) —
                     // scripts verifying assets want the whole digest.
@@ -13208,6 +13308,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                         "active": e.active,
                         "sha256": e.sha256,
                         "source": prov.as_ref().map_or("unknown", |(_, s)| s.as_str()),
+                        "disk": if files_present { "present" } else { "missing" },
                     });
                     if let Some((label, _)) = &prov
                         && !label.is_empty()
@@ -13229,17 +13330,32 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     Some(by) => format!("superseded by {by}"),
                     None => String::new(),
                 };
+                // Missing files outrank the active mark in STATE (the
+                // row is unusable either way); the NOTES cell carries
+                // the reinstall teaching.
+                let notes = if files_present {
+                    superseded
+                } else {
+                    let teach = format!("FILES MISSING — blazar engine install --kind {}", e.kind);
+                    if superseded.is_empty() {
+                        teach
+                    } else {
+                        format!("{superseded}; {teach}")
+                    }
+                };
                 table.push(vec![
                     e.tag.clone(),
                     e.kind.as_str().to_string(),
                     asset,
-                    if e.active {
+                    if !files_present {
+                        "missing".to_string()
+                    } else if e.active {
                         "active".to_string()
                     } else {
                         "-".to_string()
                     },
                     e.sha256.chars().take(12).collect::<String>(),
-                    superseded,
+                    notes,
                 ]);
             }
             if json {
@@ -14400,6 +14516,17 @@ async fn engine_update(
         bus: EventBus::default(),
         asset_override: cfg.engine_asset.clone(),
     };
+    // Stable-name context for every report below: upstream's newest
+    // non-prerelease vX.Y.Z marker names the b-build it stamps, so
+    // "b11429" can read as "stable v0.6.0". Advisory only — a failed
+    // marker fetch (offline, rate limited) never blocks the update.
+    let stable = match mgr.gh.stable_marker().await {
+        Ok(m) => m,
+        Err(e) => {
+            println!("{}", dim_line(&format!("stable marker unavailable: {e:#}")));
+            None
+        }
+    };
     if check {
         // Dry-run: report the channel target and the prebuilt-asset story
         // for THIS box, then leave — nothing downloaded or written.
@@ -14416,16 +14543,25 @@ async fn engine_update(
             // Lane-suffixed active tags (b11339-cuda) are the same
             // build as the channel target (b11339) — raw string
             // equality would report an update forever on CUDA boxes.
-            Some(a) if same_build(a, &target_tag) => println!("up to date: {a} active"),
+            Some(a) if same_build(a, &target_tag) => {
+                println!(
+                    "up to date: {a} active{}",
+                    stable_alias_paren(stable.as_ref(), a)
+                );
+            }
             Some(a) => println!(
-                "update available: {a} -> {target_tag}{}",
+                "update available: {a} -> {target_tag}{}{}",
+                stable_alias_paren(stable.as_ref(), &target_tag),
                 if downgrade {
                     " (channel downgrade — channels are pins, not floors)"
                 } else {
                     ""
                 }
             ),
-            None => println!("no active engine — target {target_tag}"),
+            None => println!(
+                "no active engine — target {target_tag}{}",
+                stable_alias_paren(stable.as_ref(), &target_tag)
+            ),
         }
         if let (Some((maj, min)), Some(pick)) = (&lane.driver_cuda, &lane.upstream_cuda) {
             println!(
@@ -14475,8 +14611,9 @@ async fn engine_update(
         Some(rel) => println!(
             "{}",
             dim_line(&format!(
-                "installing upstream engine {} — runtime companion downloads show their own progress bar",
-                rel.tag_name
+                "installing upstream engine {}{} — runtime companion downloads show their own progress bar",
+                rel.tag_name,
+                stable_alias_paren(stable.as_ref(), &rel.tag_name)
             ))
         ),
         None => println!(
@@ -14522,8 +14659,9 @@ async fn engine_update(
             return Ok(());
         }
         println!(
-            "engine {} already active — nothing new installed (see the warning above for lane options)",
-            row.tag
+            "engine {}{} already active — nothing new installed (see the warning above for lane options)",
+            row.tag,
+            stable_alias_paren(stable.as_ref(), &row.tag)
         );
     } else if gate_on {
         engine_regression_gate(&mgr, d, &row)?;
@@ -14562,11 +14700,12 @@ async fn engine_update(
     }
     if row.active {
         println!(
-            "engine {} active (build {}, {} devices, {} flags)",
+            "engine {} active (build {}, {} devices, {} flags){}",
             row.tag,
             m.build_number,
             m.devices.len(),
-            m.flags.len()
+            m.flags.len(),
+            stable_alias_paren(stable.as_ref(), &row.tag)
         );
     } else {
         // keep-cuda guard fired: an installed CUDA engine stays active.
@@ -15010,16 +15149,22 @@ async fn upstream_update_hint(dirs: &BlazarDirs) {
     let Ok(gh) = GhClient::new(token) else { return };
     let latest = gh.channel_b_release(cfg.update_channel).await;
     if let Ok(rel) = latest {
+        // Advisory stable-name context; marker failure degrades to the
+        // plain channel wording.
+        let stable = gh.stable_marker().await.ok().flatten();
         if same_build(&active.tag, &rel.tag_name) {
             println!(
-                "engine up to date: {} (channel: {})",
-                active.tag, cfg.update_channel
+                "engine up to date: {} ({}channel: {})",
+                active.tag,
+                stable_prefix(stable.as_ref(), &active.tag),
+                cfg.update_channel
             );
         } else {
             println!(
-                "{} available: {} (active: {}, channel: {}) — run: {}",
+                "{} available: {}{} (active: {}, channel: {}) — run: {}",
                 channel_word(&active.tag, &rel.tag_name),
                 rel.tag_name,
+                stable_alias_paren(stable.as_ref(), &rel.tag_name),
                 active.tag,
                 cfg.update_channel,
                 engine_update_command(&active.tag, &active.asset)
@@ -18830,6 +18975,92 @@ mod tests {
             pulled_at: 0,
             last_used_at: 0,
         }
+    }
+
+    #[test]
+    fn unit__stable_alias__marks_marked_build_newer_and_ignores_rest() {
+        let marker = StableMarker {
+            vtag: "v0.6.0".to_string(),
+            btag: "b11429".to_string(),
+        };
+        // Lane suffixes are the same build — the alias must survive them.
+        assert_eq!(stable_alias(Some(&marker), "b11429-cuda"), "stable v0.6.0");
+        assert_eq!(
+            stable_alias(Some(&marker), "b11440"),
+            "newer than stable v0.6.0"
+        );
+        // Older builds and non-b tags carry no stable relation.
+        assert_eq!(stable_alias(Some(&marker), "b11393"), "");
+        assert_eq!(stable_alias(Some(&marker), "v0.6.0"), "");
+        // No marker (offline / b-tag latest) degrades to silence.
+        assert_eq!(stable_alias(None, "b11429-cuda"), "");
+        assert_eq!(
+            stable_alias_paren(Some(&marker), "b11429-cuda"),
+            " (stable v0.6.0)"
+        );
+        assert_eq!(stable_alias_paren(None, "b11429-cuda"), "");
+        assert_eq!(
+            stable_prefix(Some(&marker), "b11429-cuda"),
+            "stable v0.6.0, "
+        );
+    }
+
+    #[test]
+    fn unit__engine_regression_gate__pruned_baseline_engine_skips_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store.upsert_model(&row("m", "/tmp/m.gguf")).unwrap();
+            store
+                .upsert_engine(&gap_engine_row("b2-cuda", EngineKind::LlamaCpp, &[]))
+                .unwrap();
+            // Baseline recorded against b1-cuda, which retention has
+            // since pruned — the gate has nothing to compare against.
+            store.record_bench("b1-cuda", "m", 40.0, 0.0, 0).unwrap();
+        }
+        let mgr = EngineManager {
+            dirs: d.clone(),
+            gh: GhClient::new(None).unwrap(),
+            bus: EventBus::default(),
+            asset_override: String::new(),
+        };
+        let candidate = gap_engine_row("b2-cuda", EngineKind::LlamaCpp, &[]);
+        // Old behavior: hard Err ("baseline engine pruned") turned a
+        // successful install into a reported failure. Skip is Ok.
+        engine_regression_gate(&mgr, &d, &candidate).unwrap();
+    }
+
+    #[test]
+    fn unit__engine_regression_gate__unpulled_baseline_model_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            // The baseline ENGINE survives; its bench MODEL is gone.
+            store
+                .upsert_engine(&gap_engine_row("b1-cuda", EngineKind::LlamaCpp, &[]))
+                .unwrap();
+            store
+                .record_bench("b1-cuda", "ghost", 40.0, 0.0, 0)
+                .unwrap();
+        }
+        let mgr = EngineManager {
+            dirs: d.clone(),
+            gh: GhClient::new(None).unwrap(),
+            bus: EventBus::default(),
+            asset_override: String::new(),
+        };
+        let candidate = gap_engine_row("b2-cuda", EngineKind::LlamaCpp, &[]);
+        engine_regression_gate(&mgr, &d, &candidate).unwrap();
     }
 
     #[test]
