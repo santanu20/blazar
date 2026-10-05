@@ -632,7 +632,9 @@ fn validate_speech_input(text: &str, opts: &SpeakOptions) -> Result<(), anyhow::
     if let Some(speed) = opts.speed
         && !(0.25..=4.0).contains(&speed)
     {
-        return Err(anyhow!("speed {speed} out of range (0.25..=4.0, OpenAI contract)"));
+        return Err(anyhow!(
+            "speed {speed} out of range (0.25..=4.0, OpenAI contract)"
+        ));
     }
     if let Some(v) = opts.noise_scale
         && !NOISE_RANGE.contains(&v)

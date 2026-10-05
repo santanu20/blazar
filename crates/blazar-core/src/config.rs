@@ -4298,7 +4298,10 @@ mod tests {
         // dialect's authority, so a reserved flag like --port passes
         // here and dies at child compile with the teaching error.
         let good = Config {
-            sdcpp_extra_args: Some(vec!["--control-net".into(), "/models/cnet.safetensors".into()]),
+            sdcpp_extra_args: Some(vec![
+                "--control-net".into(),
+                "/models/cnet.safetensors".into(),
+            ]),
             whisper_extra_args: Some(vec!["--suppress-nst".into()]),
             ..Config::default()
         };
@@ -4334,7 +4337,9 @@ mod tests {
             ]
         );
         assert!(split_extra_args_env("K", " , , ").is_err());
-        let err = split_extra_args_env("K", "cnet.safetensors").unwrap_err().to_string();
+        let err = split_extra_args_env("K", "cnet.safetensors")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("must start with a flag token"), "got: {err}");
     }
 

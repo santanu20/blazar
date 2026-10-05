@@ -13326,10 +13326,7 @@ mod tests {
             compile(&inp, &TuningOverrides::default())
         };
         let cfg_tier = Config {
-            sdcpp_extra_args: Some(vec![
-                "--control-net".to_string(),
-                "cn-a.onnx".to_string(),
-            ]),
+            sdcpp_extra_args: Some(vec!["--control-net".to_string(), "cn-a.onnx".to_string()]),
             ..Config::default()
         };
         // Config tier alone rides.
@@ -13363,7 +13360,11 @@ mod tests {
             .windows(2)
             .position(|w| w == ["--control-net", "cn-b.onnx"])
             .expect("overlay entry rides after");
-        assert!(a < b, "config tier must precede the overlay: {:?}", stacked.argv);
+        assert!(
+            a < b,
+            "config tier must precede the overlay: {:?}",
+            stacked.argv
+        );
         assert!(
             stacked
                 .warnings
@@ -13378,7 +13379,10 @@ mod tests {
             ..Config::default()
         };
         let err = run(&reserved, &ModelOverride::default()).unwrap_err();
-        assert!(err.contains("reserved") && err.contains("(config)"), "{err}");
+        assert!(
+            err.contains("reserved") && err.contains("(config)"),
+            "{err}"
+        );
         // Unknown flag on the config tier refuses against the manifest.
         let unknown = Config {
             sdcpp_extra_args: Some(vec!["--nope".to_string()]),
@@ -13436,11 +13440,7 @@ mod tests {
             owned.argv
         );
         assert_eq!(
-            owned
-                .argv
-                .iter()
-                .filter(|a| **a == "--backend")
-                .count(),
+            owned.argv.iter().filter(|a| **a == "--backend").count(),
             1,
             "{:?}",
             owned.argv

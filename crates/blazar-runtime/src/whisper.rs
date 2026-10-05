@@ -802,6 +802,9 @@ impl WhisperRuntime {
     /// `whisper_extra_args`) rides the spawn argv after the gateway pins
     /// — unknown flags are gated against this binary's own `--help`
     /// surface so a typo teaches instead of crashing the boot.
+    // Spawning needs the full child context (paths, timeouts, VAD, extra
+    // flags) — nothing here is bundleable without hiding a boot decision.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn ensure(
         &self,
         size: &str,
@@ -856,20 +859,20 @@ impl WhisperRuntime {
         // binary's own --help surface (fail-open when the surface cannot
         // be captured) — the engine exits at boot on a bad flag, which
         // would surface as an opaque health timeout instead of a teaching.
-        if !extra.is_empty() {
-            if let Some(surface) = help_flag_surface(bin).await {
-                for tok in extra {
-                    if !tok.starts_with('-') {
-                        continue; // value token riding its preceding flag
-                    }
-                    let flag = tok.split('=').next().unwrap_or(tok);
-                    if !surface.contains(flag) {
-                        return Err(anyhow!(
-                            "whisper_extra_args flag '{flag}' is not in this whisper-server's \
-                             --help surface — the engine would refuse to boot; fix the spelling \
-                             or unset the knob"
-                        ));
-                    }
+        if !extra.is_empty()
+            && let Some(surface) = help_flag_surface(bin).await
+        {
+            for tok in extra {
+                if !tok.starts_with('-') {
+                    continue; // value token riding its preceding flag
+                }
+                let flag = tok.split('=').next().unwrap_or(tok);
+                if !surface.contains(flag) {
+                    return Err(anyhow!(
+                        "whisper_extra_args flag '{flag}' is not in this whisper-server's \
+                         --help surface — the engine would refuse to boot; fix the spelling \
+                         or unset the knob"
+                    ));
                 }
             }
         }
@@ -1194,8 +1197,13 @@ mod tests {
 
     #[test]
     fn unit__server_args__loopback_bind_is_pinned() {
-        let args = server_args(49199, Path::new("/data/whisper/models/ggml-base.bin"), None, &[])
-            .expect("no extra args always builds");
+        let args = server_args(
+            49199,
+            Path::new("/data/whisper/models/ggml-base.bin"),
+            None,
+            &[],
+        )
+        .expect("no extra args always builds");
         assert_eq!(
             args,
             vec![
@@ -1255,7 +1263,13 @@ mod tests {
         .expect("value token rides");
         assert_eq!(lone_value.last().map(String::as_str), Some("4"));
         // Every gateway pin is refused — in both `--flag` and `--flag=v` form.
-        for pin in ["--port", "--host", "--model=/x.ggml", "--vad", "--vad-model"] {
+        for pin in [
+            "--port",
+            "--host",
+            "--model=/x.ggml",
+            "--vad",
+            "--vad-model",
+        ] {
             let err = server_args(
                 49199,
                 Path::new("/m/ggml-base.bin"),

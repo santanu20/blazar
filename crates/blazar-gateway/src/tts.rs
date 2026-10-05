@@ -203,21 +203,22 @@ fn ffmpeg_argv(format: LossyFormat) -> Vec<String> {
 #[must_use]
 fn ffmpeg_stream_argv(format: LossyFormat, sample_rate: u32) -> Vec<String> {
     let (muxer, codec, extra, _) = format.parts();
-    let mut argv: Vec<String> = [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "s16le",
-        "-ar",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect();
+    let mut argv: Vec<String> = ["-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     argv.push(sample_rate.to_string());
-    argv.extend(["-ac", "1", "-i", "pipe:0"].iter().map(|s| (*s).to_string()));
+    argv.extend(
+        ["-ac", "1", "-i", "pipe:0"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
     argv.extend(extra.iter().map(|s| (*s).to_string()));
-    argv.extend(["-c:a", codec, "-f", muxer, "pipe:1"].iter().map(|s| (*s).to_string()));
+    argv.extend(
+        ["-c:a", codec, "-f", muxer, "pipe:1"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
     argv
 }
 
@@ -228,8 +229,8 @@ fn ffmpeg_stream_argv(format: LossyFormat, sample_rate: u32) -> Vec<String> {
 fn limit_pcm16_peak(pcm: &mut [u8]) {
     let scale = {
         let mut peak: f32 = 0.0;
-        for pair in pcm.chunks_exact(2) {
-            let s = i16::from_le_bytes([pair[0], pair[1]]) as f32;
+        for pair in pcm.as_chunks::<2>().0 {
+            let s = f32::from(i16::from_le_bytes(*pair));
             peak = peak.max(s.abs());
         }
         if peak <= PEAK_CEILING * 32_768.0 {
@@ -237,9 +238,12 @@ fn limit_pcm16_peak(pcm: &mut [u8]) {
         }
         PEAK_CEILING * 32_768.0 / peak
     };
-    for pair in pcm.chunks_exact_mut(2) {
-        let s = i16::from_le_bytes([pair[0], pair[1]]) as f32 * scale;
-        let s = s.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    for pair in pcm.as_chunks_mut::<2>().0 {
+        // scaled output never leaves i16 range: ceiling < 1.0 and round+clamp
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let s = (f32::from(i16::from_le_bytes(*pair)) * scale)
+            .round()
+            .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
         pair.copy_from_slice(&s.to_le_bytes());
     }
 }
@@ -491,8 +495,7 @@ pub async fn audio_speech(
     // has always had. The voice's own sample rate pins ffmpeg's input
     // shape; unreadable voice config teaches instead of guessing.
     if let StreamLane::LossyStream(lossy) = lane {
-        let Some(sample_rate) = blazar_runtime::piper::voice_sample_rate(&state.dirs, voice)
-        else {
+        let Some(sample_rate) = blazar_runtime::piper::voice_sample_rate(&state.dirs, voice) else {
             return openai_error(
                 400,
                 "voice config is unreadable (missing or malformed .onnx.json) — the \
@@ -534,8 +537,7 @@ pub async fn audio_speech(
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
 
-        let (tx, rx) =
-            tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
         // Drain flag: the reader sets it when the client goes away (send
         // fails) or ffmpeg's output closes, so the feeder never blocks
         // forever writing a pipe nobody reads (§9 release path).
@@ -1265,14 +1267,23 @@ mod tests {
     #[test]
     fn unit__stream_lane__matrix_and_wav_teaching() {
         // No flag: every format stays on the buffered lanes (BP0).
-        assert_eq!(stream_lane(SpeechFormat::Wav, false), Ok(StreamLane::Buffered));
+        assert_eq!(
+            stream_lane(SpeechFormat::Wav, false),
+            Ok(StreamLane::Buffered)
+        );
         assert_eq!(
             stream_lane(SpeechFormat::Lossy(LossyFormat::Mp3), false),
             Ok(StreamLane::Buffered)
         );
         // PCM always streams — flag or not (the pre-flag contract).
-        assert_eq!(stream_lane(SpeechFormat::Pcm, false), Ok(StreamLane::PcmStream));
-        assert_eq!(stream_lane(SpeechFormat::Pcm, true), Ok(StreamLane::PcmStream));
+        assert_eq!(
+            stream_lane(SpeechFormat::Pcm, false),
+            Ok(StreamLane::PcmStream)
+        );
+        assert_eq!(
+            stream_lane(SpeechFormat::Pcm, true),
+            Ok(StreamLane::PcmStream)
+        );
         // The flag upgrades the lossy family to a streaming transcode.
         assert_eq!(
             stream_lane(SpeechFormat::Lossy(LossyFormat::Opus), true),
@@ -1338,14 +1349,13 @@ mod tests {
         let mut pcm = loud.clone();
         limit_pcm16_peak(&mut pcm);
         let scaled: Vec<i16> = pcm[..pcm.len() - 1]
-            .chunks_exact(2)
-            .map(|p| i16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| i16::from_le_bytes(*p))
             .collect();
         let peak = scaled.iter().map(|s| s.abs()).max().unwrap();
-        assert!(
-            peak <= 29_206,
-            "peak {peak} must sit at/below the ceiling"
-        );
+        assert!(peak <= 29_206, "peak {peak} must sit at/below the ceiling");
         assert!(peak > 29_000, "loud audio scales TO the ceiling, not below");
         assert_eq!(pcm[pcm.len() - 1], 0xAB, "odd tail byte kept");
     }

@@ -18,4 +18,4 @@
 | 20260929-f1f2f3-livecheck | 20260929 | blazar,cold,conc,ollama,reshape | 19 | 0.13.0 |
 | 20260929-flagship-gguf | 20260929 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,greedy_ollama,idle,media,ollama,ppl,reshape,tools | 101 | 0.13.0 |
 | 20260929-sglang-safetensors | 20260929 | blazar,cold,conc,ctxcurve,features,greedy_ollama,idle,media,ollama,ppl,reshape,tools | 48 | 0.13.0 |
-| 20261005-tts-stt-video-sota | 20261005 | tts,stt,images,variations,video,realtime,diarized,sdk | 23 | 0.20.0 |
+| 20261005-tts-stt-video-sota | 20261005 | tts,stt,images,variations,video,realtime,diarized,sdk,bootflags,streaming | 28 | 0.20.0 |
