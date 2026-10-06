@@ -41,6 +41,7 @@ Streaming iterates server-sent events as they land:
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import socket
@@ -77,8 +78,8 @@ class Client:
 
     def __init__(
         self,
-        base_url: t.Optional[str] = None,
-        api_key: t.Optional[str] = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
         timeout: float = 300.0,
     ) -> None:
         import os
@@ -94,12 +95,12 @@ class Client:
     def chat(
         self,
         model: str,
-        messages: t.List[t.Dict[str, t.Any]],
+        messages: list[dict[str, t.Any]],
         *,
         stream: bool = False,
-        tools: t.Optional[t.List[t.Dict[str, t.Any]]] = None,
-        best_of: t.Optional[int] = None,
-        mcp: t.Optional[str] = None,
+        tools: list[dict[str, t.Any]] | None = None,
+        best_of: int | None = None,
+        mcp: str | None = None,
         **kwargs: t.Any,
     ) -> t.Any:
         """POST /v1/chat/completions.
@@ -109,7 +110,7 @@ class Client:
         or a server name); the gateway mediates the tool loop — it
         requires ``stream=False``.
         """
-        body: t.Dict[str, t.Any] = {"model": model, "messages": messages, **kwargs}
+        body: dict[str, t.Any] = {"model": model, "messages": messages, **kwargs}
         if stream:
             body["stream"] = True
         if tools is not None:
@@ -125,21 +126,21 @@ class Client:
     def ollama_chat(
         self,
         model: str,
-        messages: t.List[t.Dict[str, t.Any]],
+        messages: list[dict[str, t.Any]],
         **kwargs: t.Any,
-    ) -> t.Dict[str, t.Any]:
+    ) -> dict[str, t.Any]:
         """POST /api/chat — the ollama dialect, for migrant scripts."""
         return self._request(
             "/api/chat", {"model": model, "messages": messages, **kwargs}
         )
 
-    def models(self) -> t.List[t.Dict[str, t.Any]]:
+    def models(self) -> list[dict[str, t.Any]]:
         """GET /v1/models."""
         return self._request("/v1/models", None)["data"]
 
     def metadata_update(
-        self, completion_id: str, metadata: t.Dict[str, str]
-    ) -> t.Dict[str, t.Any]:
+        self, completion_id: str, metadata: dict[str, str]
+    ) -> dict[str, t.Any]:
         """POST /v1/chat/completions/{id} — edit a completion's metadata.
 
         Works on completions created non-streaming with a ``metadata``
@@ -154,17 +155,17 @@ class Client:
 
     # -- anthropic batches ---------------------------------------------------
 
-    def anthropic_batches(self) -> t.List[t.Dict[str, t.Any]]:
+    def anthropic_batches(self) -> list[dict[str, t.Any]]:
         """GET /v1/messages/batches — most recent first."""
         return self._request("/v1/messages/batches", None)["data"]
 
-    def anthropic_batch(self, batch_id: str) -> t.Dict[str, t.Any]:
+    def anthropic_batch(self, batch_id: str) -> dict[str, t.Any]:
         """GET /v1/messages/batches/{id} — status and request counts."""
         return self._request(f"/v1/messages/batches/{batch_id}", None)
 
     def anthropic_batch_create(
-        self, requests: t.List[t.Dict[str, t.Any]]
-    ) -> t.Dict[str, t.Any]:
+        self, requests: list[dict[str, t.Any]]
+    ) -> dict[str, t.Any]:
         """POST /v1/messages/batches — queue an Anthropic-dialect batch.
 
         Each item is ``{"custom_id": ..., "params": {/v1/messages body}}``.
@@ -173,17 +174,17 @@ class Client:
         """
         return self._request("/v1/messages/batches", {"requests": requests})
 
-    def anthropic_batch_cancel(self, batch_id: str) -> t.Dict[str, t.Any]:
+    def anthropic_batch_cancel(self, batch_id: str) -> dict[str, t.Any]:
         """POST /v1/messages/batches/{id}/cancel."""
         return self._request(
             f"/v1/messages/batches/{batch_id}/cancel", {}, method="POST"
         )
 
-    def anthropic_batch_delete(self, batch_id: str) -> t.Dict[str, t.Any]:
+    def anthropic_batch_delete(self, batch_id: str) -> dict[str, t.Any]:
         """DELETE /v1/messages/batches/{id} — archive; stays readable."""
         return self._request(f"/v1/messages/batches/{batch_id}", None, method="DELETE")
 
-    def anthropic_batch_results(self, batch_id: str) -> t.List[t.Dict[str, t.Any]]:
+    def anthropic_batch_results(self, batch_id: str) -> list[dict[str, t.Any]]:
         """GET /v1/messages/batches/{id}/results — JSONL rows as dicts.
 
         Only after the batch ``ended``; otherwise the gateway 400s with a
@@ -198,9 +199,9 @@ class Client:
         self,
         model: str,
         *,
-        voice: t.Optional[str] = None,
-        stt_model: t.Optional[str] = None,
-    ) -> "RealtimeSession":
+        voice: str | None = None,
+        stt_model: str | None = None,
+    ) -> RealtimeSession:
         """Open a /v1/realtime voice session (STT -> chat -> TTS).
 
         Returns a connected ``RealtimeSession`` — use it as a context
@@ -210,7 +211,7 @@ class Client:
 
     # -- media: voices + speech ----------------------------------------------
 
-    def voices(self, search: t.Optional[str] = None) -> t.Dict[str, t.Any]:
+    def voices(self, search: str | None = None) -> dict[str, t.Any]:
         """GET /v1/audio/voices — the piper voice menu.
 
         Installed voices always come back under ``data``; ``search`` also
@@ -232,7 +233,7 @@ class Client:
         *,
         response_format: str = "wav",
         **kwargs: t.Any,
-    ) -> t.Tuple[str, bytes]:
+    ) -> tuple[str, bytes]:
         """POST /v1/audio/speech — offline TTS.
 
         Returns ``(content_type, audio_bytes)``. ``response_format`` is one
@@ -242,7 +243,7 @@ class Client:
         ``speed``, ``speaker``, ``noise_scale``, ``noise_w``,
         ``sentence_silence``.
         """
-        body: t.Dict[str, t.Any] = {
+        body: dict[str, t.Any] = {
             "model": voice,
             "input": input,
             "response_format": response_format,
@@ -254,8 +255,8 @@ class Client:
         self,
         path: str,
         *,
-        model: t.Optional[str] = None,
-        response_format: t.Optional[str] = None,
+        model: str | None = None,
+        response_format: str | None = None,
         **kwargs: t.Any,
     ) -> t.Any:
         """POST /v1/audio/transcriptions — speech-to-text.
@@ -319,17 +320,17 @@ class Client:
 
     # -- operations ----------------------------------------------------------
 
-    def ps(self) -> t.Dict[str, t.Any]:
+    def ps(self) -> dict[str, t.Any]:
         """GET /api/ps — residents, engine posture, sleep state, remotes."""
         return self._request("/api/ps", None)
 
-    def explain(self, model: str) -> t.Dict[str, t.Any]:
+    def explain(self, model: str) -> dict[str, t.Any]:
         """GET /api/explain/{model} — the routing decision card."""
         from urllib.parse import quote
 
         return self._request(f"/api/explain/{quote(model, safe='')}", None)
 
-    def failover(self) -> t.Dict[str, t.Any]:
+    def failover(self) -> dict[str, t.Any]:
         """GET /api/failover — chain registry state (sticky, benched)."""
         return self._request("/api/failover", None)
 
@@ -342,9 +343,9 @@ class Client:
     def _request(
         self,
         path: str,
-        body: t.Optional[t.Dict[str, t.Any]],
+        body: dict[str, t.Any] | None,
         *,
-        method: t.Optional[str] = None,
+        method: str | None = None,
     ) -> t.Any:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(
@@ -362,9 +363,7 @@ class Client:
             raise self._blazar_error(e) from None
         return json.loads(payload)
 
-    def _request_bytes(
-        self, path: str, body: t.Dict[str, t.Any]
-    ) -> t.Tuple[str, bytes]:
+    def _request_bytes(self, path: str, body: dict[str, t.Any]) -> tuple[str, bytes]:
         """POST and return (content_type, raw body) for binary responses."""
         data = json.dumps(body).encode()
         req = urllib.request.Request(self.base_url + path, data=data, method="POST")
@@ -389,8 +388,8 @@ class Client:
             raise self._blazar_error(e) from None
 
     def _stream(
-        self, path: str, body: t.Dict[str, t.Any]
-    ) -> t.Iterator[t.Dict[str, t.Any]]:
+        self, path: str, body: dict[str, t.Any]
+    ) -> t.Iterator[dict[str, t.Any]]:
         data = json.dumps(body).encode()
         req = urllib.request.Request(self.base_url + path, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
@@ -442,8 +441,8 @@ class RealtimeSession:
         self,
         client: Client,
         model: str,
-        voice: t.Optional[str] = None,
-        stt_model: t.Optional[str] = None,
+        voice: str | None = None,
+        stt_model: str | None = None,
     ) -> None:
         from urllib.parse import urlencode, urlparse
 
@@ -549,7 +548,7 @@ class RealtimeSession:
         out, self._recv_buf = self._recv_buf[:count], self._recv_buf[count:]
         return out
 
-    def _recv_frame(self) -> t.Tuple[int, bytes]:
+    def _recv_frame(self) -> tuple[int, bytes]:
         first, second = self._recv_exact(2)
         opcode = first & 0x0F
         length = second & 0x7F
@@ -568,11 +567,11 @@ class RealtimeSession:
 
     # -- protocol ------------------------------------------------------------
 
-    def send(self, event: t.Dict[str, t.Any]) -> None:
+    def send(self, event: dict[str, t.Any]) -> None:
         """Send one realtime event (e.g. input_audio_buffer.append)."""
         self._send_frame(json.dumps(event).encode())
 
-    def events(self) -> t.Iterator[t.Dict[str, t.Any]]:
+    def events(self) -> t.Iterator[dict[str, t.Any]]:
         """Yield server events until the socket closes or errors."""
         while True:
             opcode, data = self._recv_frame()
@@ -581,9 +580,8 @@ class RealtimeSession:
             if opcode == 0x9:  # ping -> pong
                 self._send_frame(data, opcode=0xA)
                 continue
-            if opcode in (0x1, 0x2, 0x0):  # text / binary / continuation
-                if data:
-                    yield json.loads(data.decode("utf-8", "replace"))
+            if opcode in (0x1, 0x2, 0x0) and data:  # text / binary / continuation
+                yield json.loads(data.decode("utf-8", "replace"))
 
     def append_audio(self, pcm: bytes) -> None:
         """Queue PCM16 mono 24 kHz audio for the next utterance."""
@@ -598,7 +596,7 @@ class RealtimeSession:
         """End the utterance: STT -> chat -> TTS runs server-side."""
         self.send({"type": "input_audio_buffer.commit"})
 
-    def voice_turn(self, pcm: bytes) -> t.Dict[str, t.Any]:
+    def voice_turn(self, pcm: bytes) -> dict[str, t.Any]:
         """One utterance, start to finish.
 
         Returns ``{"session", "transcript", "reply", "audio"}`` where
@@ -607,7 +605,7 @@ class RealtimeSession:
         """
         self.append_audio(pcm)
         self.commit()
-        out: t.Dict[str, t.Any] = {
+        out: dict[str, t.Any] = {
             "session": None,
             "transcript": "",
             "reply": "",
@@ -639,17 +637,15 @@ class RealtimeSession:
         """Close the socket (best effort; idempotent)."""
         sock = getattr(self, "_sock", None)
         if sock is not None:
-            try:
+            # Best-effort goodbye frame; a dead socket must not raise
+            # out of close().
+            with contextlib.suppress(Exception):
                 self._send_frame(b"", opcode=0x8)
-            except Exception:
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 sock.close()
-            except Exception:
-                pass
             self._sock = None
 
-    def __enter__(self) -> "RealtimeSession":
+    def __enter__(self) -> RealtimeSession:
         return self
 
     def __exit__(self, *exc: t.Any) -> None:

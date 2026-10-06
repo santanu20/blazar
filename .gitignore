@@ -29,3 +29,4 @@ bench-artifacts/*/corpus.txt
 # playwright-cli session scratch: console/page snapshots from local
 # browser validation runs — debugging-only, regenerable on demand.
 .playwright-cli/
+*.egg-info/
