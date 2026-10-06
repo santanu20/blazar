@@ -452,6 +452,9 @@ async fn client__well_known__capability_discovery() {
         "/v1/systemone",
         "/completion",
         "/embeddings",
+        "/rerank",
+        "/reranking",
+        "/v1/chat/completions/{id}",
     ] {
         assert!(openai_eps.contains(&path), "census missing {path}");
     }
@@ -732,6 +735,38 @@ async fn client__native_modelless_surfaces__query_target_forwards() {
         200,
         "?model= must resolve the native /completion target"
     );
+    ts.state.sup.shutdown_all().await.unwrap();
+    stub.shutdown().await;
+}
+
+/// llama-server treats /rerank, /reranking, /v1/rerank and /v1/reranking
+/// as ONE endpoint; every spelling must forward to the child (rerank
+/// bodies carry the model, so resolution is the normal body-model path).
+#[tokio::test]
+async fn client__rerank_alias_spellings__forward_to_child() {
+    let stub = support::spawn_remote_stub().await;
+    let cfg = support::config_with_keys();
+    let cfg = support::with_remote(cfg, "far", &stub.base);
+    let ts = start(cfg).await;
+    let c = client();
+    for path in ["/rerank", "/reranking", "/v1/rerank", "/v1/reranking"] {
+        let r = c
+            .post(format!("{}{path}", ts.base))
+            .bearer_auth("plm_admin")
+            .json(&serde_json::json!({
+                "model": "far:m1",
+                "query": "what is a panda?",
+                "documents": ["hi", "it is a bear"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            200,
+            "{path}: upstream rerank spelling must forward"
+        );
+    }
     ts.state.sup.shutdown_all().await.unwrap();
     stub.shutdown().await;
 }

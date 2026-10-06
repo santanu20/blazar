@@ -1028,6 +1028,8 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
     "/responses/input_tokens",
     "/v1/rerank",
     "/v1/reranking",
+    "/rerank",
+    "/reranking",
     "/props",
     "/slots",
     "/v1/stream",

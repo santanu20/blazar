@@ -330,7 +330,13 @@ fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
         .route("/props", get(props).post(props))
         .route("/v1/stream", get(stream_list).delete(stream_delete))
         .route("/v1/streams/lookup", post(streams_lookup))
+        .route("/v1/rerank", post(reranking))
         .route("/v1/reranking", post(reranking))
+        // Bare upstream-native rerank paths (no /v1 prefix) share the
+        // same handler; llama-server treats all spellings as one
+        // endpoint.
+        .route("/rerank", post(reranking))
+        .route("/reranking", post(reranking))
         .route("/models", get(router_models))
         .route("/models/unload", post(models_unload))
         .with_state(alias.to_string())

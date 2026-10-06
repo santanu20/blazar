@@ -13,7 +13,7 @@
     {"method": "POST", "upstream_path": "/detokenize",                        "blazar_route": "/detokenize"},
     {"method": "POST", "upstream_path": "/apply-template",                    "blazar_route": "/apply-template"},
     {"method": "POST", "upstream_path": "/embedding",                         "exemption": "legacy deprecated alias upstream; the /v1/embeddings dialect is the served surface on this gateway"},
-    {"method": "POST", "upstream_path": "/reranking",                         "blazar_route": "/v1/rerank", "aliases": ["/v1/reranking"]},
+    {"method": "POST", "upstream_path": "/reranking",                         "blazar_route": "/v1/rerank", "aliases": ["/v1/reranking", "/rerank", "/reranking"]},
     {"method": "POST", "upstream_path": "/infill",                            "blazar_route": "/infill"},
     {"method": "GET",  "upstream_path": "/props",                             "blazar_route": "/props"},
     {"method": "POST", "upstream_path": "/props",                             "blazar_route": "/props"},

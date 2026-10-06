@@ -3684,6 +3684,15 @@ def phase_inventory() -> None:
             f"-> {route}"
             + (f" (+aliases {', '.join(ep['aliases'])})" if ep.get("aliases") else ""),
         )
+        # Aliases are client-facing paths too: an alias listed but not
+        # mounted is exactly the drift this phase exists to catch.
+        for alias in ep.get("aliases", []):
+            check(
+                "inventory",
+                f"{label}: alias {alias} mounted",
+                alias in mounted,
+                f"-> {alias}",
+            )
 
 
 def phase_manifests() -> None:
@@ -5308,7 +5317,13 @@ def _eng_store() -> tuple[list[dict], dict]:
     install state, which every lane pick resolves against."""
     db = sqlite3.connect(os.path.join(SANDBOX.data_dir, "blazar.db"))
     models = [
-        dict(zip(("name", "repo", "quant", "path", "bytes", "components", "arch"), r, strict=True))
+        dict(
+            zip(
+                ("name", "repo", "quant", "path", "bytes", "components", "arch"),
+                r,
+                strict=True,
+            )
+        )
         for r in db.execute(
             "SELECT name, repo, quant, path, bytes, components, arch FROM models"
         )
@@ -6126,7 +6141,11 @@ def _eng_embeddings(lane: str, embed_row: dict | None) -> None:
     c = vec(v3)
     if st3 == 200 and c is not None and not zero:
         nc = sum(x * x for x in c) ** 0.5
-        cos_diff = sum(x * y for x, y in zip(a, c, strict=True)) / (na * nc) if na and nc else 0.0
+        cos_diff = (
+            sum(x * y for x, y in zip(a, c, strict=True)) / (na * nc)
+            if na and nc
+            else 0.0
+        )
         check(
             ph,
             "embeddings distinct-input separability",

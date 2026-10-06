@@ -283,6 +283,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/completions", post(openai::openai_proxy))
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/rerank", post(openai::openai_proxy))
+        // Upstream-native bare rerank paths: llama-server documents POST
+        // /reranking as canonical with /rerank as its alias, so clients
+        // speaking the raw upstream dialect hit these without the /v1
+        // prefix. Same passthrough handler as the prefixed forms.
+        .route("/rerank", post(openai::openai_proxy))
+        .route("/reranking", post(openai::openai_proxy))
         .route("/v1/messages", post(anthropic::messages))
         // Full upstream API surface (routes verified in upstream server.cpp):
         // Responses API (current-gen OpenAI clients), audio transcriptions
@@ -942,9 +948,11 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
         // engine-scoped surfaces — the census is the machine-readable
         // discovery contract and must not lag the router.
         "endpoints": {
-            "openai": ["/v1/chat/completions", "/v1/chat/completions/control",
+            "openai": ["/v1/chat/completions", "/v1/chat/completions/{id}",
+                       "/v1/chat/completions/control",
                        "/v1/chat/completions/input_tokens",
                        "/v1/completions", "/v1/embeddings", "/v1/rerank", "/v1/reranking",
+                       "/rerank", "/reranking",
                        "/v1/responses", "/v1/responses/{id}", "/v1/conversations/{id}",
                        "/v1/responses/input_tokens",
                        "/v1/messages", "/v1/messages/count_tokens", "/v1/models",
