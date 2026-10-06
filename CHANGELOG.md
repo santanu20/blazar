@@ -6,6 +6,10 @@ tracked here.
 
 ## [Unreleased]
 
+### Added
+
+- **Python SDK on PyPI as `blazar-sdk`.** `pip install blazar-sdk` now installs the zero-dependency client (the import package stays `blazar`; PyPI's `blazar` belongs to the unrelated OpenStack reservation service). Packaging fixed along the way: the distribution was still declared `blazar` at version 0.1.0 while the code was 0.3.1 — the version is now single-sourced from `blazar/__version__` so packaging can never drift from code again. A dedicated `sdk-v*` tag lane (own version line, independent of the Rust workspace releases) builds the wheel, import-smokes it on a clean interpreter, publishes via PyPI trusted publishing (OIDC — no tokens stored anywhere), and verifies the public PyPI JSON API serves the tagged version before going green.
+
 ## [0.21.1] - 2026-10-06
 
 ### Fixed

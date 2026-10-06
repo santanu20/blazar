@@ -1,0 +1,105 @@
+# Python SDK release lane. Triggered by `sdk-v*` tags (own version
+# line: the SDK is 0.x while the Rust workspace is 0.2x — coupling
+# them to one tag would force version gymnastics, so they release
+# independently). Publishes to PyPI as `blazar-sdk` via trusted
+# publishing (OIDC): no tokens live in this repo or GitHub secrets.
+#
+# ONE-TIME SETUP (repo owner, PyPI side — the workflow teaches this
+# on failure too): pypi.org -> account -> Publishing -> add a GitHub
+# publisher with owner `santanu20`, repository `blazar`, workflow
+# filename `pypi-release.yml`, environment `pypi`. Until that
+# registration exists, the publish step below fails with 403.
+#
+# Verification follows the repo's release mandate: after upload, the
+# public PyPI JSON API must serve the tagged version.
+
+name: pypi-release
+
+on:
+  push:
+    tags: ['sdk-v*']
+
+permissions: {}
+
+jobs:
+  build:
+    name: build + smoke (sdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Tag matches the SDK version
+        run: |
+          tag="${GITHUB_REF_NAME#sdk-v}"
+          code="$(python3 -c 'import sys; sys.path.insert(0, "sdk/python"); import blazar; print(blazar.__version__)')"
+          if [ "$tag" != "$code" ]; then
+            echo "::error::tag sdk-v$tag does not match blazar.__version__ $code" >&2
+            exit 1
+          fi
+          echo "tag sdk-v$tag == __version__ $code OK"
+      - name: Build sdist + wheel
+        run: |
+          python3 -m pip install --quiet build
+          python3 -m build --outdir dist sdk/python
+      - name: Import smoke on a clean interpreter
+        run: |
+          python3 -m pip install --quiet dist/*.whl
+          BLAZAR_TAG="${GITHUB_REF_NAME#sdk-v}" python3 - <<'EOF'
+          import os
+          import blazar
+          tag = os.environ["BLAZAR_TAG"]
+          assert blazar.__version__ == tag, (blazar.__version__, tag)
+          from blazar import Client
+          print(f"wheel imports as blazar {blazar.__version__}, Client exported")
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdk-dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish pypi + verify
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted publishing: the OIDC token is the only credential.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdk-dist
+          path: dist
+      - name: Skip if this version is already on PyPI
+        run: |
+          tag="${GITHUB_REF_NAME#sdk-v}"
+          current="$(curl -sf -A "blazar-release-check" \
+            https://pypi.org/pypi/blazar-sdk/json \
+            | jq -r '.info.version')" || current="none"
+          if [ "$current" = "$tag" ]; then
+            echo "::warning::blazar-sdk $tag is already the newest version on PyPI — skipping upload"
+            echo "SKIP_UPLOAD=true" >> "$GITHUB_ENV"
+          fi
+      - name: Publish to PyPI
+        if: env.SKIP_UPLOAD != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+      - name: Verify PyPI serves the tagged version
+        run: |
+          tag="${GITHUB_REF_NAME#sdk-v}"
+          for i in $(seq 1 30); do
+            current="$(curl -sf -A "blazar-release-check" \
+              https://pypi.org/pypi/blazar-sdk/json \
+              | jq -r '.info.version')" || current="none"
+            if [ "$current" = "$tag" ]; then
+              echo "pypi: blazar-sdk $tag OK"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::pypi.org still serves blazar-sdk $current — expected $tag" >&2
+          exit 1

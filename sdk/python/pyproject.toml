@@ -1,6 +1,5 @@
 [project]
-name = "blazar"
-version = "0.1.0"
+name = "blazar-sdk"
 description = "Zero-dependency Python client for Blazar, the local model server"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -10,18 +9,26 @@ keywords = ["llm", "local", "inference", "blazar", "openai-compatible"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+# The import package stays `blazar`; the distribution name is
+# `blazar-sdk` because PyPI's `blazar` belongs to the OpenStack
+# reservation service. Version is single-sourced from
+# blazar/__init__.py so code and packaging can never drift.
+dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://github.com/santanu20/blazar"
 
-[build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+[tool.setuptools.dynamic]
+version = { attr = "blazar.__version__" }
 
 [tool.setuptools]
 packages = ["blazar"]
+
+[build-system]
+# setuptools >= 77 understands SPDX license expressions above.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"

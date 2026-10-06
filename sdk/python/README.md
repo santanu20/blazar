@@ -4,10 +4,14 @@ Zero-dependency Python client for [Blazar](https://github.com/santanu20/blazar),
 the local model server. Standard library only.
 
 ```bash
-pip install .        # from a checkout of this repository
+pip install blazar-sdk   # from PyPI
+pip install .            # from a checkout of this repository
 ```
 
-Or drop `blazar/__init__.py` on `PYTHONPATH` — there is nothing to build.
+The distribution is named `blazar-sdk`; the import package is `blazar`
+(PyPI's `blazar` belongs to the unrelated OpenStack reservation
+service). You can also drop `blazar/__init__.py` on `PYTHONPATH` —
+there is nothing to build.
 
 ## Usage
 
