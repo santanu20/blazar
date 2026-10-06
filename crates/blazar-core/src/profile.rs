@@ -7577,7 +7577,9 @@ mod tests {
         i.mmproj_path = Some(mmp);
         let p = compile(&i, &TuningOverrides::default()).unwrap();
         assert!(
-            p.argv.windows(2).any(|w| w[0] == "--gpu-layers" && w[1] == "999"),
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "999"),
             "held-back (lazy) mmproj must not push the spawn into auto: {:?}",
             p.argv
         );
@@ -7590,14 +7592,14 @@ mod tests {
         i2.mmproj_force = true;
         let p2 = compile(&i2, &TuningOverrides::default()).unwrap();
         assert!(
-            p2.argv.windows(2).any(|w| w[0] == "--gpu-layers" && w[1] == "auto"),
+            p2.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-layers" && w[1] == "auto"),
             "attached mmproj must keep the capacity charge: {:?}",
             p2.argv
         );
         assert!(
-            p2.warnings
-                .iter()
-                .any(|w| w.contains("exceed VRAM")),
+            p2.warnings.iter().any(|w| w.contains("exceed VRAM")),
             "attached overflow must warn: {:?}",
             p2.warnings
         );
