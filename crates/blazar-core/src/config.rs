@@ -1645,7 +1645,7 @@ pub struct MistralrsTuning {
     /// 32 on CUDA).
     pub pa_block_size: Option<u32>,
     /// `--pa-cache-type`: paged KV quantization (upstream default
-    /// `auto`; e.g. `f16`, `q8_0`).
+    /// `auto`; accepted values `auto`, `f8e4m3` on current builds).
     pub pa_cache_type: Option<String>,
     /// `--pa-context-len`: allocate paged KV for this context length
     /// instead of a VRAM fraction.
@@ -1738,6 +1738,17 @@ impl MistralrsTuning {
         {
             return Err(CoreError::Config(format!(
                 "{where_}.mtp_draft_sampling must be one of [\"auto\", \"greedy\", \"probabilistic\"], got {s:?}"
+            )));
+        }
+        // Mirrors the installed mistral.rs `--pa-cache-type` grammar —
+        // rejecting at config-write time beats an opaque engine death at
+        // spawn (the 502 still teaches the accepted values if a future
+        // engine build widens the set before this list catches up).
+        if let Some(s) = &self.pa_cache_type
+            && !["auto", "f8e4m3"].contains(&s.as_str())
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.pa_cache_type must be one of [\"auto\", \"f8e4m3\"], got {s:?}"
             )));
         }
         if let Some(layers) = &self.device_layers {
@@ -5230,13 +5241,14 @@ default_ctx = 16384
         // per-overlay.
         let full = "[mistralrs]\nmax_batch_size = 4\nmax_prefill_chunk_tokens = 1024\n\
                     max_decode_steps_before_prefill = 16\nprefix_cache_n = 0\n\
-                    pa_block_size = 64\npa_cache_type = \"bf16\"\npa_context_len = 4096\n\
+                    pa_block_size = 64\npa_cache_type = \"f8e4m3\"\npa_context_len = 4096\n\
                     lora_max_rank = 64\nlora_max_adapters = 2\nlora_max_bytes = 1073741824\n\
                     mtp = true\nmtp_model = \"mtp-draft\"\nmtp_n_predict = 3\n\
                     mtp_draft_sampling = \"greedy\"\nencoder_cache_memory_mb = 512\n\
                     max_num_images = 2\nmax_image_length = 1024\ndisable_metrics = true\n\
                     disable_access_log = true\ndevice_layers = \"0:12;1:24\"\n";
         Config::from_toml(full).unwrap();
+        Config::from_toml("[mistralrs]\npa_cache_type = \"auto\"\n").unwrap();
         Config::from_toml("[model_overrides.m.mistralrs]\nmax_batch_size = 2\n").unwrap();
 
         // Floors name the field.
@@ -5265,10 +5277,29 @@ default_ctx = 16384
             ("mtp_model", "[mistralrs]\nmtp_model = \"orphan-draft\"\n"),
             ("device_layers", "[mistralrs]\ndevice_layers = \"0-12\"\n"),
             ("device_layers", "[mistralrs]\ndevice_layers = \"all\"\n"),
+            // pa_cache_type is an engine enum (auto | f8e4m3), not a free
+            // KV-cache dtype string — anything else dies at child boot.
+            ("pa_cache_type", "[mistralrs]\npa_cache_type = \"q4k\"\n"),
         ] {
             let err = Config::from_toml(raw).unwrap_err().to_string();
             assert!(err.contains(field), "{field}: {err}");
         }
+    }
+
+    #[test]
+    fn unit__rope_freq_knobs__parsed_and_default_none() {
+        // All three ride the engine/model defaults when unset.
+        let d = Config::default();
+        assert_eq!(d.rope_freq_base, None);
+        assert_eq!(d.rope_freq_scale, None);
+        assert_eq!(d.checkpoint_min_step, None);
+        let cfg = Config::from_toml(
+            "rope_freq_base = 1000000.0\nrope_freq_scale = 0.5\ncheckpoint_min_step = 256\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.rope_freq_base, Some(1_000_000.0));
+        assert_eq!(cfg.rope_freq_scale, Some(0.5));
+        assert_eq!(cfg.checkpoint_min_step, Some(256));
     }
 
     #[test]

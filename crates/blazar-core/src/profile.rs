@@ -2652,6 +2652,7 @@ fn compile_mistralrs(
     let mut slots = input.overlay.slots.unwrap_or(input.config.slots);
     let mut argv: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    push_nonllama_vocab_teaching(input.config, "mistralrs", &mut warnings);
     if input
         .overlay
         .deterministic
@@ -3040,9 +3041,21 @@ fn compile_mistralrs(
     }
 
     // Layer mapping pin: emit only with a teaching nudge on single-GPU
-    // boxes (mirrors the sglang parallelism pins).
+    // boxes (mirrors the sglang parallelism pins). A MULTI-ord split on
+    // a single-GPU box is a hard refuse, not a warning — the engine
+    // accepts the grammar and then dies at weight load (live-proven on
+    // v0.9.4: exit 1 right after DType selection), so failing at profile
+    // time beats a 502 crash-and-retry cycle.
     if let Some(layers) = &tun.device_layers {
         if input.hardware.gpus.len() < 2 {
+            if layers.contains(';') {
+                return Err(format!(
+                    "mistralrs.device_layers {layers:?} maps layers onto multiple \
+                     GPU ordinals but this box has a single GPU — the engine dies at \
+                     load; use one \"ORD:NUM\" pair or drop the pin for automatic \
+                     mapping"
+                ));
+            }
             warnings.push(
                 "mistralrs.device_layers set but this box has a single GPU — a manual \
                  layer split only makes sense multi-GPU; drop the pin for automatic \
@@ -3780,9 +3793,11 @@ fn compile_mlx(input: &ProfileInput<'_>) -> Result<Profile, String> {
         }
     }
     let argv = mlx_extra_args(input)?;
+    let mut warnings: Vec<String> = Vec::new();
+    push_nonllama_vocab_teaching(input.config, "mlx", &mut warnings);
     Ok(Profile {
         argv,
-        warnings: Vec::new(),
+        warnings,
         ctx: 0,
         gpu: "auto",
         kv_est_bytes: None,
@@ -4775,6 +4790,72 @@ fn push_sglang_vocab_teaching(input: &ProfileInput<'_>, warnings: &mut Vec<Strin
                 .into(),
         );
     }
+    push_nonllama_vocab_teaching(input.config, "sglang", warnings);
+}
+
+/// llama-server-only knobs set at the GLOBAL config level: every entry
+/// compiles to a llama-server flag the other engine dialects have no
+/// counterpart for. Listed here so non-llama lanes can teach the silent
+/// no-op instead of letting the config look accepted.
+fn llama_vocab_knobs_set(config: &Config) -> Vec<&'static str> {
+    let mut set = Vec::new();
+    if !config.cache_type_k.is_empty() {
+        set.push("cache_type_k");
+    }
+    if !config.cache_type_v.is_empty() {
+        set.push("cache_type_v");
+    }
+    if config.batch_size > 0 {
+        set.push("batch_size");
+    }
+    if config.ubatch_size > 0 || config.ubatch_auto {
+        set.push("ubatch_size/ubatch_auto");
+    }
+    if config.threads_batch > 0 || config.threads_http > 0 {
+        set.push("threads_batch/threads_http");
+    }
+    if config.flash_attention.is_some() {
+        set.push("flash_attention");
+    }
+    if config.cont_batching.is_some() {
+        set.push("cont_batching");
+    }
+    if config.swa_full {
+        set.push("swa_full");
+    }
+    if config.ctx_checkpoints > 0 || config.checkpoint_min_step.is_some() {
+        set.push("ctx_checkpoints/checkpoint_min_step");
+    }
+    if config.keep_tokens > 0 {
+        set.push("keep_tokens");
+    }
+    if config.cache_reuse > 0 {
+        set.push("cache_reuse");
+    }
+    if config.slot_prompt_similarity != 0.0 {
+        set.push("slot_prompt_similarity");
+    }
+    if config.rope_freq_base.is_some() || config.rope_freq_scale.is_some() {
+        set.push("rope_freq_base/rope_freq_scale");
+    }
+    set
+}
+
+/// One aggregated teaching line for llama-server-only knobs that are set
+/// globally while the model serves on a non-llama dialect (sglang,
+/// mistral.rs, mlx). Without it the knobs no-op silently and the config
+/// looks accepted.
+fn push_nonllama_vocab_teaching(config: &Config, lane: &str, warnings: &mut Vec<String>) {
+    let set = llama_vocab_knobs_set(config);
+    if set.is_empty() {
+        return;
+    }
+    warnings.push(format!(
+        "llama-server-only knobs {} are ignored on the {lane} engine — they apply to the \
+         GGUF (llama-server) lane; see the {lane} tuning tables for the lane-native \
+         equivalents",
+        set.join(", ")
+    ));
 }
 
 /// The fit ladder orchestrator: resolves the KV estimates, picks the
@@ -10827,7 +10908,7 @@ mod tests {
             max_decode_steps_before_prefill: Some(16),
             prefix_cache_n: Some(0),
             pa_block_size: Some(64),
-            pa_cache_type: Some("bf16".into()),
+            pa_cache_type: Some("f8e4m3".into()),
             pa_context_len: Some(4096),
             lora_max_rank: Some(64),
             lora_max_adapters: Some(2),
@@ -10866,7 +10947,7 @@ mod tests {
             ("--max-decode-steps-before-prefill", "16"),
             ("--prefix-cache-n", "0"),
             ("--pa-block-size", "64"),
-            ("--pa-cache-type", "bf16"),
+            ("--pa-cache-type", "f8e4m3"),
             ("--pa-context-len", "4096"),
             ("--lora-max-rank", "64"),
             ("--lora-max-adapters", "2"),
