@@ -139,6 +139,8 @@ jobs:
           name: release-gate-test
           path: test.log
           if-no-files-found: ignore
+      - name: Docs site version matches the tag
+        run: python3 scripts/sync_docs_version.py --check --expect "${GITHUB_REF_NAME#v}"
 
   release:
     needs: [build, checks]
@@ -330,3 +332,59 @@ jobs:
             Start-Sleep -Seconds 30
           }
           & "$env:LOCALAPPDATA\Programs\blazar\blazar.exe" --version
+
+  # The release is not done when the pipeline goes green — it is done
+  # when the PUBLIC surfaces carry the new version. This job checks the
+  # three publication planes from the outside, exactly like a user
+  # would see them: crates.io registry state, the GitHub release flags,
+  # and the live Pages site. Any stale surface fails the run loudly
+  # instead of shipping a release the repo forgot to propagate.
+  verify-publication:
+    name: verify publication (crates + release + pages)
+    needs: [release, publish-crates, installer-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify crates.io carries the tag
+        env:
+          CRATES: 'blazar-core blazar-runtime blazar-gateway blazar'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for name in $CRATES; do
+            ok=0
+            for i in $(seq 1 30); do
+              current="$(curl -sf -A "blazar-release-check" \
+                "https://crates.io/api/v1/crates/$name" \
+                | jq -r '.crate.max_stable_version')" || current="none"
+              if [ "$current" = "$tag" ]; then
+                echo "crates.io: $name $tag OK"
+                ok=1
+                break
+              fi
+              sleep 10
+            done
+            if [ "$ok" != 1 ]; then
+              echo "::error::crates.io still serves $name $current — expected $tag"
+              exit 1
+            fi
+          done
+      - name: Verify the GitHub release is published and latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --json isDraft,isLatest \
+            | jq -e '.isDraft == false and .isLatest == true' >/dev/null \
+            || { echo "::error::release $GITHUB_REF_NAME is not published-and-latest"; exit 1; }
+          echo "release $GITHUB_REF_NAME: published + latest OK"
+      - name: Verify the Pages site carries the tag
+        run: |
+          site="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
+          for i in $(seq 1 30); do
+            if curl -sf "$site" | grep -qE "v${GITHUB_REF_NAME#v}\b"; then
+              echo "pages: $site serves v${GITHUB_REF_NAME#v} OK"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$site does not mention v${GITHUB_REF_NAME#v} — docs sync or Pages build lagged; run scripts/sync_docs_version.py and check the Pages deployment"
+          exit 1

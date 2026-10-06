@@ -8,7 +8,7 @@ permalink: /
 <section class="hero">
   <div class="hero-inner">
     <div>
-      <span class="hero-eyebrow">v0.19.0 · one Rust binary · Apache-2.0 / MIT</span>
+      <span class="hero-eyebrow">v0.21.1 · one Rust binary · Apache-2.0 / MIT</span>
       <h1>The control plane for <span class="grad">local AI inference</span>.</h1>
       <p class="hero-lede">
         Unified APIs. Intelligent routing. Resource-aware scheduling. Multi-engine serving.
@@ -42,17 +42,17 @@ permalink: /
     <div class="term-bar"><i></i><i></i><i></i><span class="term-title">sh — blazar quickstart</span></div>
     <pre class="term-body"><span class="c"># install (macOS, Linux, WSL)</span>
 <span class="p">$</span> curl --proto '=https' --tlsv1.2 -fsSL \
-    https://raw.githubusercontent.com/santanu20/blazar/v0.19.0/scripts/install.sh | sh
+    https://raw.githubusercontent.com/santanu20/blazar/v0.21.1/scripts/install.sh | sh
 
 <span class="c"># windows powershell</span>
-<span class="p">$</span> irm https://raw.githubusercontent.com/santanu20/blazar/v0.19.0/scripts/install.ps1 | iex
+<span class="p">$</span> irm https://raw.githubusercontent.com/santanu20/blazar/v0.21.1/scripts/install.ps1 | iex
 
 <span class="c"># find, pull, serve, run</span>
 <span class="p">$</span> blazar search qwen3 instruct   <span class="c"># find models on Hugging Face</span>
 <span class="p">$</span> blazar pull qwen3-0.6b         <span class="c"># registry shortname</span>
 <span class="p">$</span> blazar serve                   <span class="c"># gateway on http://127.0.0.1:11435</span>
 <span class="p">$</span> blazar run qwen3-0.6b          <span class="c"># interactive REPL</span>
-<span class="o">blazar 0.19.0 — powered by upstream llama.cpp, mistral.rs and SGLang</span></pre>
+<span class="o">blazar 0.21.1 — powered by upstream llama.cpp, mistral.rs and SGLang</span></pre>
   </div>
   <p class="hero-meta" style="margin-top:14px">
     also available: <code>cargo install blazar</code> ·
