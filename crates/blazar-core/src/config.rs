@@ -2762,19 +2762,6 @@ impl Config {
         o.ctx.unwrap_or(self.default_ctx)
     }
 
-    /// Effective lazy-mode for a model: overlay wins over global default.
-    #[must_use]
-    pub fn effective_lazy_mode(&self, model: &str) -> &str {
-        match self
-            .model_overrides
-            .get(model)
-            .and_then(|o| o.lazy_mode.as_deref())
-        {
-            Some(m) => m,
-            None => self.lazy_mode.as_str(),
-        }
-    }
-
     /// Effective late-chunking mode for a model: overlay wins (default off).
     #[must_use]
     pub fn effective_late_chunking(&self, model: &str) -> bool {
@@ -2794,19 +2781,6 @@ impl Config {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         overlay.unwrap_or(self.rpc_servers.trim())
-    }
-
-    /// Effective spec mode for a model: overlay wins over global default.
-    #[must_use]
-    pub fn effective_spec(&self, model: &str) -> &str {
-        match self
-            .model_overrides
-            .get(model)
-            .and_then(|o| o.spec.as_deref())
-        {
-            Some(s) => s,
-            None => self.spec.as_str(),
-        }
     }
 
     /// True when the RAW text still carries legacy `api_keys` (needs
@@ -5336,7 +5310,6 @@ default_ctx = 16384
         );
         assert_eq!(cfg.effective_ctx("qwen3-coder-30b"), 32768);
         assert_eq!(cfg.effective_ctx("other-model"), cfg.default_ctx);
-        assert_eq!(cfg.effective_spec("qwen3-coder-30b"), "auto");
     }
 
     #[test]
