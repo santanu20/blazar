@@ -182,8 +182,13 @@ const SLOTS_STREAK_TICKS: u32 = 6;
 /// LC4: max in-memory slots bump (`tune --slots` for higher). Raised
 /// 4 → 8 on 2026-09-12: the np8 shape measured +19% system t/s and a
 /// 5.4x concurrency TTFT-p99 win over np4 under 8-stream load
-/// (scaling flag-space study, flagprobe 2026-09-12).
-const SLOTS_ADOPT_CAP: u32 = 8;
+/// (scaling flag-space study, flagprobe 2026-09-12). Raised 8 → 16 on
+/// 2026-10-06: the flagship concurrency ladder proved the cap was the
+/// binding constraint under 16-stream sustained load (adoption could
+/// never reach the demanded shape), and the reshape re-spends the same
+/// total-ctx budget across slots, so the ceiling is scheduling policy,
+/// not a VRAM guard (the profile walk still caps what the card hosts).
+const SLOTS_ADOPT_CAP: u32 = 16;
 /// Quiet reaper ticks before an adoption decays back to the natural
 /// shape (30 x 10s = 5 min of zero pressure and zero in-flight). The
 /// asymmetry vs [`SLOTS_STREAK_TICKS`] is deliberate anti-flap hysteresis:
@@ -10167,7 +10172,7 @@ mod routing_tests {
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "1".into()];
         sup.instances.insert("m".into(), inst);
-        for _ in 0..10 {
+        for _ in 0..20 {
             sup.note_slot_pressure("m");
         }
         for _ in 0..SLOTS_STREAK_TICKS {
@@ -10176,7 +10181,7 @@ mod routing_tests {
         assert_eq!(
             sup.adopted_slots.get("m").map(|v| *v),
             Some(SLOTS_ADOPT_CAP),
-            "10 parked waiters on a 1-slot child must adopt straight to the cap"
+            "20 parked waiters on a 1-slot child must adopt straight to the cap"
         );
         kill_all(&[ph]);
     }
@@ -10337,9 +10342,9 @@ mod routing_tests {
         let mut sup = routing_sup(1);
         sup.config.adaptive_slots = true;
         sup.config.slots = 0;
-        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 17);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
-            vec!["llama-server".into(), "-np".into(), "8".into()];
+            vec!["llama-server".into(), "-np".into(), "16".into()];
         sup.instances.insert("m".into(), inst);
         for _ in 0..(SLOTS_STREAK_TICKS * 2) {
             sup.adaptive_slots_tick();
