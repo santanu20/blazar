@@ -6,6 +6,8 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-06
+
 ### Added
 
 - **Bare rerank alias routes + census truth (audit 2026-10-06).** llama-server documents `POST /reranking` as canonical with `/rerank` as its alias; upstream-native clients calling the bare (no `/v1`) spellings got a 404. Both are now mounted on the same passthrough lane as the prefixed forms (one endpoint, four spellings — pinned end-to-end by a compat test against the live forwarding path). The inventory drift guard got teeth: `aliases` entries in `docs/upstream-api-inventory.json` were display-only — `scripts/validate.py --phase=inventory` now fails when a listed alias is not a mounted route. The `/api/version` endpoint census also lagged the router: `POST /v1/chat/completions/{id}` (chat-completion update) was routed since the OpenAI-parity wave but never advertised; the census now carries it alongside the bare rerank spellings.

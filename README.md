@@ -92,14 +92,14 @@ The engines still perform inference. **Blazar is the control plane around them**
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/santanu20/blazar/v0.20.0/scripts/install.sh \
+  https://raw.githubusercontent.com/santanu20/blazar/v0.21.0/scripts/install.sh \
   | BLAZAR_REPO=santanu20/blazar sh
 ```
 
 #### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/santanu20/blazar/v0.20.0/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/santanu20/blazar/v0.21.0/scripts/install.ps1 | iex
 ```
 
 Also available: `cargo install blazar`, or [build from source](#installation).
@@ -282,7 +282,7 @@ Loopback by default; optional scoped API keys (`keys add/rotate`), TLS, explicit
 
 ## Benchmark snapshot
 
-The latest committed campaign (September 29, 2026; RTX 4070 Laptop 8 GiB, i7-14650HX, Linux Mint 22.3) is published with full receipts in [`BENCHMARK.md`](BENCHMARK.md). It ran against Blazar `0.13.0`; current release is `0.20.0`. These are measured results from one configuration — evidence, not universal guarantees.
+The latest committed campaign (September 29, 2026; RTX 4070 Laptop 8 GiB, i7-14650HX, Linux Mint 22.3) is published with full receipts in [`BENCHMARK.md`](BENCHMARK.md). It ran against Blazar `0.13.0`; current release is `0.21.0`. These are measured results from one configuration — evidence, not universal guarantees.
 
 | Workload | Blazar | Reference | Interpretation |
 |---|---:|---:|---|
