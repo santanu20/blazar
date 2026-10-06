@@ -77,8 +77,10 @@ struct HttpSession {
     state: tokio::sync::Mutex<HttpState>,
 }
 
+// Boxed: the stdio Mutex dwarfs HttpSession, and an unboxed enum this
+// size penalizes every registry entry (clippy::large_enum_variant).
 enum Transport {
-    Stdio(tokio::sync::Mutex<Option<Session>>),
+    Stdio(Box<tokio::sync::Mutex<Option<Session>>>),
     Http(HttpSession),
 }
 
@@ -114,7 +116,7 @@ impl Registry {
                             inited: false,
                         }),
                     }),
-                    None => Transport::Stdio(tokio::sync::Mutex::new(None)),
+                    None => Transport::Stdio(Box::new(tokio::sync::Mutex::new(None))),
                 };
                 (cfg.name.clone(), Arc::new(Entry { cfg, transport }))
             })
