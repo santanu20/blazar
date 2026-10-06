@@ -239,14 +239,29 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
-          cargo publish -p blazar-core
+          # Per-crate idempotency: a partially-completed earlier run may
+          # have already uploaded the leading crates. Only the explicit
+          # "already uploaded" outcome is tolerated — every other
+          # failure prints the full log and fails the job.
+          publish_crate() {
+            name="$1"
+            if cargo publish -p "$name" > "/tmp/publish-$name.log" 2>&1; then
+              echo "published $name"
+            elif grep -q "already uploaded" "/tmp/publish-$name.log"; then
+              echo "::warning::$name $tag is already on crates.io — skipping"
+            else
+              cat "/tmp/publish-$name.log"
+              exit 1
+            fi
+          }
+          publish_crate blazar-core
           # the registry index needs a moment before downstream crates resolve it
           sleep 45
-          cargo publish -p blazar-runtime
+          publish_crate blazar-runtime
           sleep 45
-          cargo publish -p blazar-gateway
+          publish_crate blazar-gateway
           sleep 45
-          cargo publish -p blazar
+          publish_crate blazar
 
   # Real-OS validation of the just-published installers: download via the
   # GitHub API, sha256-verify, extract, PATH, service lane. Engine
