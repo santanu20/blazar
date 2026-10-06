@@ -191,6 +191,18 @@ jobs:
               --notes-file notes.md \
               --generate-notes
           fi
+          # Re-pushing a tag (delete + re-create) drops the existing
+          # release to DRAFT on GitHub's side, and the clobber-upload
+          # branch above never re-publishes it. Heal the flags
+          # unconditionally — idempotent on the happy path. Latest is
+          # claimed only when this tag is the repo's newest, so healing
+          # an old tag cannot steal the marker from a newer release.
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+          newest="$(git ls-remote --tags --refs origin 'refs/tags/v*' \
+            | sed 's|.*refs/tags/v||' | sort -V | tail -1)"
+          if [ "$GITHUB_REF_NAME" = "v$newest" ]; then
+            gh release edit "$GITHUB_REF_NAME" --latest
+          fi
 
   # crates.io update rides the same chain: tag == workspace version,
   # suite green (via release gate above), then publish in dependency
