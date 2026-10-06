@@ -25,8 +25,6 @@ import re
 import sys
 from pathlib import Path
 
-import tomllib
-
 REPO = Path(__file__).resolve().parent.parent
 
 # (file, pattern with one version group, what it is) — every pattern
@@ -62,14 +60,31 @@ VERSION_SPOTS: list[tuple[str, str, str]] = [
 
 
 def workspace_version() -> str:
-    with (REPO / "Cargo.toml").open("rb") as fh:
-        manifest = tomllib.load(fh)
-    # Root manifest carries the version under [workspace.package]; a
+    # Parsed by hand rather than with tomllib: the release-gate runners
+    # ship Python 3.10, where tomllib does not exist yet. The root
+    # manifest carries the version under [workspace.package]; a
     # plain-package layout would put it under [package] directly.
-    try:
-        return manifest["workspace"]["package"]["version"]
-    except KeyError:
-        return manifest["package"]["version"]
+    text = (REPO / "Cargo.toml").read_text(encoding="utf-8")
+    for section in ("workspace.package", "package"):
+        header = re.search(
+            rf"^\[{re.escape(section)}\]\s*$",
+            text,
+            re.MULTILINE,
+        )
+        if header is None:
+            continue
+        body = text[header.end() :]
+        end = re.search(r"^\[", body, re.MULTILINE)
+        version = re.search(
+            r'^version\s*=\s*"([^"]+)"',
+            body[: end.start()] if end else body,
+            re.MULTILINE,
+        )
+        if version is not None:
+            return version.group(1)
+    raise SystemExit(
+        "Cargo.toml: no version found under [workspace.package] or [package]"
+    )
 
 
 def check_or_sync(target: str, check_only: bool) -> int:
