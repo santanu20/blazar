@@ -6,9 +6,28 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-10-07
+
 ### Added
 
 - **Python SDK on PyPI as `blazar-sdk`.** `pip install blazar-sdk` now installs the zero-dependency client (the import package stays `blazar`; PyPI's `blazar` belongs to the unrelated OpenStack reservation service). Packaging fixed along the way: the distribution was still declared `blazar` at version 0.1.0 while the code was 0.3.1 — the version is now single-sourced from `blazar/__version__` so packaging can never drift from code again. A dedicated `sdk-v*` tag lane (own version line, independent of the Rust workspace releases) builds the wheel, import-smokes it on a clean interpreter, publishes via PyPI trusted publishing (OIDC — no tokens stored anywhere), and verifies the public PyPI JSON API serves the tagged version before going green.
+- **RoPE frequency and checkpoint-spacing knobs.** `rope_freq_base`, `rope_freq_scale` and `checkpoint_min_step` are first-class config keys (global and per-model overlay), pushed to llama.cpp lanes via the gated flags `--rope-freq-base`, `--rope-freq-scale` and `--checkpoint-min-step`. `None` (the default) keeps the values baked into the checkpoint. `validate.py` covers the new knobs with fixtures.
+- **Checkpoint-declared quantization in the CLI.** `blazar model list/show/json` for safetensors checkpoints now read `quant_method` from the model's config.json (top-level or `quantization_config` nesting; torchao/awq/gptq) instead of guessing from the directory name — the name-derived column reported torchao int4 checkpoints as BF16. GGUF and MLX models are unaffected.
+- **Config documentation drift gate.** `scripts/check_config_doc_drift.py` parses the `Config` struct fields (brace-depth, comment-aware) and fails CI when `docs/config-code-paths.md` (now 205 fields) falls out of sync with the code.
+
+### Fixed
+
+- **mmproj VRAM no longer double-charges the offload envelope.** The auto GPU-offload solver reserved projector bytes even when the vision projector was deliberately held back for lazy attach, pushing real 8 GiB-card demand into the under-offload band (a 5878 MiB model profile landed as ~999 layers-off). `resolve_gpu_offload` now charges mmproj bytes only when the projector actually rides the spawn (explicit `-mm`, `mmproj_force`, Attach policy, or engine flag), keeping the 85% pin envelope honest. Pinned by `unit__gpu_layers_pin_ignores_held_back_mmproj`.
+- **mistral.rs lane: hard guard + grammar + vocab teaching.** Multi-ordinal `device_layers` on a single-GPU machine now fails at profile compile with an actionable message (the engine previously died at load with none). `pa_cache_type` is validated against the installed mistral.rs grammar (`auto`, `f8e4m3`) at config-write time. Llama.cpp-only knobs set on mistral.rs/MLX/SGLang models are now taught via `llama_vocab_knobs_set()` vocabulary teaching instead of silently no-oping, and the MLX profile carries the resulting warnings.
+
+### Changed
+
+- **Slot adoption cap raised 8 → 16.** The supervisor's adopt cap is a scheduling policy, not a VRAM guard; at 8 it was the binding constraint under 16-stream load. Tests rescaled to the new cap.
+- **Benchmark suite refresh.** Chart/matrix/selftest pipeline rework; two new Oct 6 campaigns (`20261006-matched-conc`, `20261006-perf-lanes`) with full reproducibility receipts; regenerated plots and reports for prior campaigns; INDEX/BENCHMARK/README tables refreshed (1.4% gateway overhead, ITL p99 25.8 ms vs 75 ms for Ollama, 96.3 t/s at C8 matched-slots).
+
+### Removed
+
+- **Dead helpers `effective_lazy_mode` / `effective_spec`.** Both lost their last callers (verified by repo-wide search); their unit tests went with them.
 
 ## [0.21.1] - 2026-10-06
 
