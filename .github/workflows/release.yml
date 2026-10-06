@@ -247,7 +247,7 @@ jobs:
             name="$1"
             if cargo publish -p "$name" > "/tmp/publish-$name.log" 2>&1; then
               echo "published $name"
-            elif grep -q "already uploaded" "/tmp/publish-$name.log"; then
+            elif grep -qE "already (uploaded|exists on crates\.io)" "/tmp/publish-$name.log"; then
               echo "::warning::$name $tag is already on crates.io — skipping"
             else
               cat "/tmp/publish-$name.log"
