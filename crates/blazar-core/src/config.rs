@@ -2495,9 +2495,14 @@ impl fmt::Display for Config {
 /// - write is temp-file + atomic rename (a crash mid-write never leaves
 ///   a truncated config behind);
 /// - the temp name is unique per writer, so concurrent writers (CLI vs
-///   daemon, parallel CLIs) never steal each other's rename.
+///   daemon, parallel CLIs) never steal each other's rename;
+/// - copy and rename retry on Windows sharing violations: a concurrent
+///   writer, antivirus, or the search indexer can briefly hold the file
+///   open, and unlike POSIX rename, Windows refuses the replace while
+///   that lasts (live case: 8 parallel writers on windows-latest CI).
 pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
     static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if path.exists() {
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2517,8 +2522,11 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
                 let _ = std::fs::remove_file(baks.remove(0).path());
             }
         }
-        let bak = path.with_file_name(format!("config.toml.bak-{ms}"));
-        std::fs::copy(path, &bak)?;
+        // Backup name is unique per writer: two writers inside the same
+        // millisecond would otherwise copy into the SAME backup path and
+        // the loser dies with a Windows sharing violation on the open.
+        let bak = path.with_file_name(format!("config.toml.bak-{ms}.{}.{seq}", std::process::id()));
+        retry_on_sharing_violation(|| std::fs::copy(path, &bak))?;
     }
     // Unique-per-writer temp name. A FIXED name makes two concurrent
     // writers race on write+rename — the loser's rename finds the temp
@@ -2528,14 +2536,48 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
     // separates processes, the counter separates writers inside one.
     // A crashed writer can orphan its temp; the residue is bounded and
     // a later same-pid writer harmlessly overwrites it.
-    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path
         .file_name()
         .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned());
     let tmp = path.with_file_name(format!("{name}.tmp-write.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, path)?;
+    retry_on_sharing_violation(|| std::fs::rename(&tmp, path))?;
     Ok(())
+}
+
+/// Windows refuses to replace or copy a file that another holder (a
+/// concurrent writer, antivirus, search indexer) still has open,
+/// reporting `ERROR_SHARING_VIOLATION`. On every other OS error code 32
+/// means something else entirely (EPIPE on Linux) and must not be
+/// retried, so the check only ever matches on Windows.
+fn is_sharing_violation(err: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(32)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Bounded retry for transient Windows sharing locks: at most 8 attempts
+/// with linear backoff (10ms step, ~360ms total worst case), then the
+/// last error surfaces unchanged — loud, never a silent give-up.
+fn retry_on_sharing_violation<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_sharing_violation(&e) && attempt < MAX_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 impl Config {
@@ -6304,8 +6346,9 @@ mod persist_tests {
             })
             .count();
         assert_eq!(tmp_residue, 0, "temp files must be renamed away");
-        // Backups exist and never exceed keep-5 (same-ms writes may
-        // collapse onto one name, so only bound the range).
+        // Backups exist, keep-5 enforced, and — since every writer's
+        // backup name is unique (pid + per-writer counter) — no two
+        // writes ever collapse onto one backup name.
         let baks = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(std::result::Result::ok)
@@ -6315,6 +6358,6 @@ mod persist_tests {
                     .starts_with("config.toml.bak-")
             })
             .count();
-        assert!((1..=5).contains(&baks), "baks = {baks}");
+        assert_eq!(baks, 5, "7 writes -> keep-5 backups, one per writer");
     }
 }
