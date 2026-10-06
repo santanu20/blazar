@@ -372,10 +372,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release view "$GITHUB_REF_NAME" --json isDraft,isLatest \
-            | jq -e '.isDraft == false and .isLatest == true' >/dev/null \
-            || { echo "::error::release $GITHUB_REF_NAME is not published-and-latest"; exit 1; }
-          echo "release $GITHUB_REF_NAME: published + latest OK"
+          tag="$GITHUB_REF_NAME"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .draft | grep -q true; then
+            echo "::error::release $tag is still a draft"
+            exit 1
+          fi
+          owner="${GITHUB_REPOSITORY%%/*}"
+          name="${GITHUB_REPOSITORY#*/}"
+          latest="$(gh api graphql -f query="query { repository(owner:\"$owner\", name:\"$name\") { latestRelease { tagName } } }" \
+            --jq .data.repository.latestRelease.tagName)"
+          if [ "$latest" != "$tag" ]; then
+            echo "::error::latest release is $latest — expected $tag"
+            exit 1
+          fi
+          echo "release $tag: published + latest OK"
       - name: Verify the Pages site carries the tag
         run: |
           site="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
