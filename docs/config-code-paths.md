@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) — 184 fields, 0 dead
+## Config (top-level keys) — 205 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -215,6 +215,24 @@ token quality are surfaced as drift.
 | tensor_split | String::new() | engine-argv + runtime/gateway | `blazar-core/src/profile.rs:673` in `the`; `blazar-core/src/profile.rs:676` in `the`; `blazar-runtime/src/supervisor.rs:3301` in `spawn_instance_forced` |
 | models_autoload | None | runtime/gateway | `blazar-runtime/src/supervisor.rs:2515` in `spawn_router_instance`; `blazar-runtime/src/supervisor.rs:2521` in `spawn_router_instance` |
 
+| ubatch_auto | false | engine-argv + runtime/gateway | `crates/blazar-core/src/config.rs:4144` in `apply_env` (`BLAZAR_UBATCH_AUTO`); `crates/blazar-core/src/profile.rs:4811` in `llama_vocab_knobs_set`; `crates/blazar-gateway/src/ollama.rs:4102` (shown in /api/show only when on) |
+| deterministic_isolate | false | runtime/gateway + gateway-http | `crates/blazar-runtime/src/supervisor.rs:6467` in `deterministic_isolate` (override merge); `crates/blazar-gateway/src/proxy.rs:2401` (parks normal traffic while a temp-0 seeded run holds the lane) |
+| cache_type_k | "f16".to_string() | engine-argv + gateway-http | `crates/blazar-core/src/config.rs:2887` in `effective_cache_type_kv` → `--cache-type-k` in `compile` (`crates/blazar-core/src/profile.rs:601`); session identity `crates/blazar-core/src/session_identity.rs:65`; `/api/explain` `crates/blazar-gateway/src/explain.rs:342` |
+| cache_type_v | "f16".to_string() | engine-argv + gateway-http | `crates/blazar-core/src/config.rs:2887` in `effective_cache_type_kv` → `--cache-type-v` in `compile` (`crates/blazar-core/src/profile.rs:601`) |
+| whisper_vad_model | — | runtime/gateway | `crates/blazar-gateway/src/whisper.rs:615` (resolves to a spawn-ready VAD path; teaches where to place it when missing) |
+| whisper_extra_args | — | engine-argv | `crates/blazar-gateway/src/whisper.rs:673` (appended after gateway pins, user wins last); `crates/blazar-gateway/src/whisper.rs:860` (validated against the installed whisper-server --help before spawn — unknown flags are refused, not silently dropped) |
+| sdcpp_qwen_prefix_cache_type | — | engine-argv | `crates/blazar-core/src/profile.rs:3393` (composes into model args; teaches on conflict with user extra args) |
+| sdcpp_extra_args | — | engine-argv | `crates/blazar-core/src/profile.rs:3597` in `sdcpp_extra_args` (appended at `:3241`, user wins last over profile posture) |
+| failover | Vec::new() | gateway-http | `crates/blazar-gateway/src/failover.rs:92` (chains built from `[[failover]]`; first healthy member serves the alias) |
+| mcp | Vec::new() | gateway-http | `crates/blazar-gateway/src/state.rs:333` in `crate::mcp::Registry::from_config` |
+| mcp_default | — | gateway-http | `crates/blazar-core/src/config.rs:3096` in `Config::validate` (must name a configured server or "all"/"none"); consumed via `Registry::from_config` second arg |
+| remote_fallback | default_remote_fallback() | gateway-http | `crates/blazar-gateway/src/remotes.rs:680` (kill switch: remote fallback only when remotes exist AND this is on) |
+| rope_freq_base | — | engine-argv | `crates/blazar-core/src/profile.rs:2031` in `compile` (push_gated `--rope-freq-base`, RoPE theta) |
+| rope_freq_scale | — | engine-argv | `crates/blazar-core/src/profile.rs:2031` in `compile` (push_gated `--rope-freq-scale`, inverse ctx-expand factor) |
+| checkpoint_min_step | — | engine-argv | `crates/blazar-core/src/profile.rs:2031` in `compile` (push_gated `--checkpoint-min-step`) |
+| preload | Vec::new() | runtime/gateway | `crates/blazar-gateway/src/lib.rs:1281` (F1: listed models spawn at startup, one at a time; TLS branch `:1335`) |
+| warm_on_pull | false | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:6036` in effective `warm_on_pull` (per-model override wins) |
+| idle_ram_warm | true | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:5639` (idle warm to RAM unless `load_mode = "direct-io"`) |
 ## MistralrsTuning ([mistralrs]) — 21 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
@@ -241,7 +259,7 @@ token quality are surfaced as drift.
 | disable_access_log | — | cli + engine-argv | `blazar-cli/src/main.rs:9127` in `knob_hint_block`; `blazar-core/src/profile.rs:2754` in `compile_mistralrs`; `blazar-core/src/profile.rs:2759` in `compile_mistralrs` |
 | device_layers | — | cli + engine-argv | `blazar-cli/src/main.rs:9127` in `knob_hint_block`; `blazar-cli/src/main.rs:12900` in `unit__known_config_key__dotted_table_paths`; `blazar-core/src/profile.rs:2767` in `compile_mistralrs`; `blazar-core/src/profile.rs:2770` in `compile_mistralrs` |
 
-## SglangTuning ([sglang]) — 50 fields, 0 dead
+## SglangTuning ([sglang]) — 51 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -296,7 +314,8 @@ token quality are surfaced as drift.
 | max_lora_rank | — | cli + engine-argv | `blazar-cli/src/main.rs:9115` in `knob_hint_block`; `blazar-core/src/profile.rs:4217` in `compile_sglang`; `blazar-core/src/profile.rs:4221` in `compile_sglang` |
 | lora_backend | — | engine-argv + cli | `blazar-core/src/profile.rs:4227` in `compile_sglang`; `blazar-core/src/profile.rs:4231` in `compile_sglang`; `blazar-cli/src/main.rs:9115` in `knob_hint_block` |
 
-## ModelOverride ([models."name"]) — 33 fields, 0 dead
+| is_embedding | — | engine-argv | `crates/blazar-core/src/profile.rs:4290` in `compile_sglang` (Some(true) → embedding-lane argv posture + teaching at `:4300`) |
+## ModelOverride ([models."name"]) — 37 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -334,6 +353,10 @@ token quality are surfaced as drift.
 | mistralrs | — | other + engine-argv + runtime/gateway + gateway-http + cli | `blazar-core/src/engine_kind.rs:40` in `as_str`; `blazar-core/src/engine_kind.rs:201` in `fmt`; `blazar-core/src/profile.rs:232` in `compile`; `blazar-core/src/profile.rs:2505` in `compile_mistralrs`; `blazar-runtime/src/hf.rs:1905` in `pull_locked`; `blazar-runtime/src/engine_impl.rs:790` in `spawn`; `blazar-gateway/tests/gateway.rs:2693` in `e2e__llamacpp_only_gate__non_llamacpp_kinds_get_teaching_400`; `blazar-gateway/tests/gateway.rs:2695` in `e2e__llamacpp_only_gate__non_llamacpp_kinds_get_teaching_400`; `blazar-cli/src/main.rs:750` in `?`; `blazar-cli/src/main.rs:2435` in `doctor_group` |
 | engine | — | runtime/gateway + other + engine-argv + gateway-http + cli | `blazar-runtime/src/piper.rs:14` in `?`; `blazar-runtime/src/piper.rs:200` in `install`; `blazar-core/src/session_identity.rs:52` in `build`; `blazar-core/src/session_identity.rs:56` in `build`; `blazar-core/src/profile.rs:233` in `compile`; `blazar-core/src/profile.rs:234` in `compile`; `blazar-gateway/src/preflight.rs:123` in `enforce_prompt_fits`; `blazar-gateway/src/preflight.rs:126` in `enforce_prompt_fits`; `blazar-cli/src/main.rs:17` in `?`; `blazar-cli/src/main.rs:21` in `?` |
 
+| deterministic_isolate | — | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:6467` in `deterministic_isolate` (per-model wins over global) |
+| cache_type_k | — | engine-argv | `crates/blazar-core/src/config.rs:2887` in `effective_cache_type_kv` (per-model per-phase K type; None inherits global) |
+| cache_type_v | — | engine-argv | `crates/blazar-core/src/config.rs:2887` in `effective_cache_type_kv` (V side) |
+| warm_on_pull | — | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:6036` in effective `warm_on_pull` (per-model wins) |
 ## SamplerDefaults ([sampler]) — 18 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
