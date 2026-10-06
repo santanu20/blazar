@@ -6,6 +6,13 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-10-06
+
+### Fixed
+
+- **Concurrent config writes on Windows.** `persist_config` could fail one writer with a Windows sharing violation in two ways: two writers inside the same millisecond collided on one backup path (`config.toml.bak-<ms>`), and the copy/rename pair had no tolerance for a file being briefly held open by antivirus, the search indexer, or a concurrent writer — Windows, unlike POSIX rename, refuses the replace while that lasts. Backup names are now unique per writer (pid + per-writer counter), and copy/rename retry `ERROR_SHARING_VIOLATION` a bounded 8 times with linear backoff before surfacing the error unchanged. POSIX paths are untouched (the retry check only matches on Windows). Pinned by the concurrent-writers test, green on Linux, macOS, and Windows CI.
+- **Release pipeline: draft-release healing.** Re-pushing a tag (delete + re-create) makes GitHub drop the existing release to a draft, and the asset-upload path never re-published it — v0.21.0 sat invisible with v0.20.0 still marked Latest until it was healed by hand. `release.yml` now clears the draft flag after every upload/create and claims `latest` when the tag is the repository's newest.
+
 ## [0.21.0] - 2026-10-06
 
 ### Added
