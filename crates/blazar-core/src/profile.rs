@@ -5908,6 +5908,47 @@ fn spec_draft_will_attach(input: &ProfileInput<'_>) -> bool {
         <= card_free_bytes
 }
 
+/// True when the projector actually rides THIS spawn. Mirrors the argv
+/// mmproj block in `compile` (explicit `-mm` arg, caller force, or attach
+/// policy with engine flag support) — keep the two in lockstep. Skip and
+/// Lazy policies hold the projector back, and an engine without the flag
+/// cannot load it; charging its bytes then would falsely drop
+/// `--gpu-layers` into the engine `auto` band.
+fn mmproj_rides_spawn(input: &ProfileInput<'_>) -> bool {
+    let explicit_mm = overlay_extra_mmproj(input).is_some();
+    if explicit_mm || input.mmproj_force {
+        return true;
+    }
+    match mmproj_policy_effective(input.config, input.model_name, input.overlay) {
+        crate::config::MmprojPolicy::Skip | crate::config::MmprojPolicy::Lazy => false,
+        crate::config::MmprojPolicy::Attach => {
+            input.mmproj_path.is_some()
+                && (input.supported_flags.contains("--mmproj")
+                    || input.supported_flags.contains("-mm"))
+        }
+    }
+}
+
+/// Explicit `-mm/--mmproj` projector path from either extra-args lane
+/// (model overlay first, then the config's overlay row for the model).
+fn overlay_extra_mmproj(input: &ProfileInput<'_>) -> Option<String> {
+    input
+        .overlay
+        .extra_args
+        .as_deref()
+        .and_then(find_mmproj_arg)
+        .map(str::to_string)
+        .or_else(|| {
+            input
+                .config
+                .overlay_for(input.model_name)
+                .extra_args
+                .as_deref()
+                .and_then(find_mmproj_arg)
+                .map(str::to_string)
+        })
+}
+
 fn resolve_gpu_offload(
     input: &ProfileInput<'_>,
     ctx: u32,
@@ -5917,10 +5958,22 @@ fn resolve_gpu_offload(
     if !input.hardware.has_gpu() {
         return ("0", "cpu");
     }
-    let mmproj = input
-        .mmproj_path
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map_or(0, |m| m.len());
+    // Charge the projector only when it rides this spawn (Skip/Lazy hold
+    // it back; the engine cannot load what argv never passes). Charging
+    // held-back projector bytes pushed real fits past the 85% pin line
+    // into the engine `auto` band, whose live fitter under-offloads onto
+    // the CPU — live-repro'd on qwen3.5-9b: lazy mmproj 879 MiB charged
+    // against a 7807 MiB free card turned a 5878 MiB real demand
+    // (weights+KV) into "auto", parking layers on CPU for -18% decode
+    // throughput while the card sat at 80%.
+    let mmproj = if mmproj_rides_spawn(input) {
+        input
+            .mmproj_path
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(0, |m| m.len())
+    } else {
+        0
+    };
     let resident = input.model_bytes.saturating_add(mmproj);
     let kv = kv_f16_bytes(input, ctx).unwrap_or(0);
     if resident > vram_bytes {
@@ -7375,6 +7428,60 @@ mod tests {
         // 5. From<bool> spelling: true = Attach, false = Skip
         assert_eq!(MmprojPolicy::from(true), MmprojPolicy::Attach);
         assert_eq!(MmprojPolicy::from(false), MmprojPolicy::Skip);
+    }
+
+    #[test]
+    fn unit__gpu_layers_pin_ignores_held_back_mmproj() {
+        // Live-repro'd regression (2026-10-06, qwen3.5-9b on an 8 GiB
+        // card): the DEFAULT lazy policy spawns text-only, but the pin
+        // envelope still charged the projector — 879 MiB of held-back
+        // bytes pushed a 5878 MiB real demand past 85% of the 7807 MiB
+        // free card, `--gpu-layers` fell into the engine `auto` band,
+        // and the engine's live fitter parked layers on the CPU for
+        // -18% decode throughput (itl 63 vs 54 ms at C=8) while the card
+        // sat at 80%. Held-back projectors must not consume the pin
+        // budget; attached ones still must.
+        let g = meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let base = Config::default();
+        // Sparse 20 GiB projector: weights (5000 MiB) + KV sit far below
+        // 85% of 24 GiB, but any spawn that CHARGES it overflows the card.
+        let mmp = std::env::temp_dir().join("blazar-test-heldback-mmproj.gguf");
+        let f = std::fs::File::create(&mmp).unwrap();
+        f.set_len(20 * 1024 * 1024 * 1024).unwrap();
+        drop(f);
+        let mmp = mmp.to_str().unwrap();
+
+        // 1. Lazy default: projector held back -> not charged -> full pin
+        let mut i = input(&g, &hw, &base, &ALL_FLAGS);
+        i.mmproj_path = Some(mmp);
+        let p = compile(&i, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.windows(2).any(|w| w[0] == "--gpu-layers" && w[1] == "999"),
+            "held-back (lazy) mmproj must not push the spawn into auto: {:?}",
+            p.argv
+        );
+        assert!(p.warnings.iter().any(|w| w.contains("mmproj lazy")));
+
+        // 2. Forced attach: projector rides -> charged -> partial split
+        //    with the teaching warning (pin budget honesty preserved)
+        let mut i2 = input(&g, &hw, &base, &ALL_FLAGS);
+        i2.mmproj_path = Some(mmp);
+        i2.mmproj_force = true;
+        let p2 = compile(&i2, &TuningOverrides::default()).unwrap();
+        assert!(
+            p2.argv.windows(2).any(|w| w[0] == "--gpu-layers" && w[1] == "auto"),
+            "attached mmproj must keep the capacity charge: {:?}",
+            p2.argv
+        );
+        assert!(
+            p2.warnings
+                .iter()
+                .any(|w| w.contains("exceed VRAM")),
+            "attached overflow must warn: {:?}",
+            p2.warnings
+        );
+        let _ = std::fs::remove_file(mmp);
     }
 
     #[test]
