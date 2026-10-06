@@ -1,78 +1,105 @@
 # Blazar benchmark matrix
 
-- **date**: 2026-09-29 10:34:21
+- **date**: 2026-10-06 16:00:26
 - **model**: `qwen3-1.7b.d` (3890 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: inventory, ollama-host, piper, sglang-0.5.19
-- **harness**: bench_matrix v2 — `--model qwen3-1.7b --engines sglang-0.5.19 --artifacts-dir bench-artifacts/20260928-sglang-safetensors --md bench-artifacts/20260928-sglang-safetensors/BENCHMARK.md`
+- **harness**: bench_matrix v4 — `--model qwen3-1.7b --engines sglang-0.5.19 --artifacts-dir bench-artifacts/20260928-sglang-safetensors --md bench-artifa`
 - **blazar**: `blazar 0.13.0` (sandbox daemon binary)
+- **quality lane**: not-measured — no quality rows in this campaign (lane not reached for the selected providers/engines)
 - all blazar-owned rows measured by `blazar 0.13.0`
 
-## Speed (serving, streaming)
+## Notable findings
 
-| engine | kind | provider | params | ttft p50 (ms) | ttft p99 (ms) | itl p50 (ms) | itl p99 (ms) | decode t/s | prefill t/s (cold) | prefill t/s (cached) | tokens src |
-|---||---||---||---||---||---||---||---||---||---||---||
-| sglang-0.5.19 | sglang | blazar | config=default | 33 | 33 | 15 | 15 | 67.6 | 7471.1 | 10985.4 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=single-stream | 33 | 33 | 15 | 15 | 67.6 | 6300.3 | 11048.7 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=kv_unified_on | 33 | 33 | 15 | 16 | 67.6 | 6315.2 | 11080.0 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=kv_unified_off | 33 | 33 | 15 | 15 | 67.6 | 7322.9 | 10927.9 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=spec_off | 33 | 33 | 15 | 15 | 67.6 | 6507.5 | 10897.4 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=deterministic_on | 59 | 62 | 25 | 27 | 39.5 | 4788.8 | 6273.0 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=radix_session_on | 33 | 34 | 15 | 15 | 67.7 | 7395.2 | 11005.0 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=chunked_prefill_4096 | 33 | 33 | 15 | 15 | 67.6 | 6342.4 | 10988.9 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=page_64 | 33 | 34 | 15 | 16 | 67.6 | 7125.1 | 10669.5 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=torch_compile_on | 32 | 33 | 15 | 15 | 68.7 | 6973.2 | 11274.0 | chunks |
-| ollama-host | ollama | ollama | reference=True ⚠ serves 'qwen3:1.7b' — t/s NOT comparable | 33 | 39 | 6 | 7 | 157.5 | 3705.1 | 60940.3 | engine_counters |
-| sglang-0.5.19 | sglang | ctxcurve-blazar | ctx=2048 | 33 | 34 | 15 | 15 | 67.7 | 7182.3 | 10907.4 | chunks |
-| sglang-0.5.19 | sglang | ctxcurve-blazar | ctx=8192 | 33 | 33 | 15 | 15 | 67.6 | 6341.9 | 11111.5 | chunks |
-| sglang-0.5.19 | sglang | ctxcurve-blazar | ctx=16384 | 33 | 33 | 15 | 15 | 67.6 | 7557.6 | 11140.6 | chunks |
-| ollama-host | ollama | ctxcurve-ollama | ctx=2048 | 43 | - | - | - | 156.5 | - | - | - |
-| ollama-host | ollama | ctxcurve-ollama | ctx=8192 | 40 | - | - | - | 156.3 | - | - | - |
-| ollama-host | ollama | ctxcurve-ollama | ctx=16384 | 42 | - | - | - | 157.4 | - | - | - |
-| sglang-0.5.19 | sglang | blazar | config=kv_dtype_bf16 | 33 | 34 | 15 | 15 | 67.7 | 7216.5 | 10941.7 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=kv_dtype_e4m3 | 33 | 34 | 15 | 16 | 67.4 | 6344.3 | 10978.3 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=cg_bs_16 | 33 | 34 | 15 | 15 | 67.6 | 7301.1 | 10972.5 | chunks |
-| sglang-0.5.19 | sglang | blazar | config=cg_bs_256 | 33 | 33 | 15 | 15 | 67.6 | 7229.4 | 10967.7 | chunks |
+- 2 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior — see Failed cells.
 
-## Resources & cold start
+## Charts
 
-| engine | provider | params | load s | daemon boot s | cold 1st req s | GPU peak (MiB) | GPU power (W) | RSS peak (MiB) | teardown |
+- deterministic SVG renders of the cells below; source of truth is `cells.jsonl`, charts live in `plots/`.
+
+### Single-stream decode throughput (chart)
+
+<p align="center"><img src="plots/speed-single-stream.svg" alt="Single-stream decode throughput (chart)"></p>
+
+_Median decode t/s per runtime and engine; whiskers span the interquartile range of the 5 runs; the dashed line marks the fastest direct engine. Higher is better. Source: 20260928-sglang-safetensors/cells.jsonl._
+
+### Concurrency scaling (chart)
+
+<p align="center"><img src="plots/concurrency-throughput.svg" alt="Concurrency scaling (chart)"></p>
+
+_Aggregate system tokens/s as parallel streams are added; flat-to-rising means the scheduler keeps the device saturated. Higher is better. Source: 20260928-sglang-safetensors/cells.jsonl._
+
+### Concurrency tail latency (chart)
+
+<p align="center"><img src="plots/concurrency-ttft.svg" alt="Concurrency tail latency (chart)"></p>
+
+_Worst-case first-token wait per stream as concurrency rises (log scale) - the tail the scheduler must bound. Lower is better. Source: 20260928-sglang-safetensors/cells.jsonl._
+
+### Resource cost vs concurrency (chart)
+
+<p align="center"><img src="plots/concurrency-vram.svg" alt="Resource cost vs concurrency (chart)"></p>
+
+_Peak VRAM footprint as parallel streams (and their KV caches) stack up. Source: 20260928-sglang-safetensors/cells.jsonl._
+
+### Long-context degradation (chart)
+
+<p align="center"><img src="plots/ctx-curve.svg" alt="Long-context degradation (chart)"></p>
+
+_Single-stream decode t/s as prompt context grows (log x-axis) - KV-cache pressure made visible. Source: 20260928-sglang-safetensors/cells.jsonl._
+
+### Memory vs context (chart)
+
+<p align="center"><img src="plots/vram-vs-context.svg" alt="Memory vs context (chart)"></p>
+
+_Peak VRAM as prompt context grows (log x-axis) - the KV-cache slope that sets the usable context ceiling. Source: 20260928-sglang-safetensors/cells.jsonl._
+
+### Lifecycle: cold start and idle wake (chart)
+
+<p align="center"><img src="plots/lifecycle-cold-idle.svg" alt="Lifecycle: cold start and idle wake (chart)"></p>
+
+_Seconds to first token after a cold start (page cache dropped) and after idle-policy expiry; blazar keeps weights resident while ollama reloads from disk. Warm-daemon ollama caveat applies. Lower is better. Source: 20260928-sglang-safetensors/cells.jsonl._
+
+## Speed (single-stream, medians)
+
+| engine | provider | params | n | ttft p50 (ms) | ttft p99 (ms) | itl p99 (ms) | decode t/s | prefill t/s (cached) | VRAM peak (MiB) |
 |---||---||---||---||---||---||---||---||---||
-| sglang-0.5.19 | blazar | config=default | - | 0.55 | 32.31 | 6470 | 55.1 | - | ok |
-| sglang-0.5.19 | blazar | config=single-stream | - | 0.53 | 31.24 | 6340 | 55.1 | - | ok |
-| sglang-0.5.19 | blazar | config=kv_unified_on | - | 0.53 | 30.24 | 6450 | 55.6 | - | ok |
-| sglang-0.5.19 | blazar | config=kv_unified_off | - | 0.53 | 31.25 | 6490 | 55.6 | - | ok |
-| sglang-0.5.19 | blazar | config=spec_off | - | 0.52 | 31.29 | 6482 | 56.0 | - | ok |
-| sglang-0.5.19 | blazar | config=deterministic_on | - | 0.52 | 36.14 | 6742 | 55.4 | - | ok |
-| sglang-0.5.19 | blazar | config=radix_session_on | - | 0.53 | 30.24 | 6484 | 55.1 | - | ok |
-| sglang-0.5.19 | blazar | config=chunked_prefill_4096 | - | 0.53 | 37.3 | 6738 | 55.9 | - | ok |
-| sglang-0.5.19 | blazar | config=page_64 | - | 0.53 | 32.17 | 6490 | 55.5 | - | ok |
-| sglang-0.5.19 | blazar | config=torch_compile_on | - | 0.52 | 99.36 | 7070 | 55.0 | - | ok |
-| ollama-host | ollama | reference=True | - | - | - | 2320 | 54.9 | - | ok |
-| sglang-0.5.19 | ctxcurve-blazar | ctx=2048 | - | - | - | 4792 | - | - | ok |
-| sglang-0.5.19 | ctxcurve-blazar | ctx=8192 | - | - | - | 5490 | - | - | ok |
-| sglang-0.5.19 | ctxcurve-blazar | ctx=16384 | - | - | - | 6470 | - | - | ok |
-| ollama-host | ctxcurve-ollama | ctx=2048 | 2.55 | - | - | 1588 | - | - | ok |
-| ollama-host | ctxcurve-ollama | ctx=8192 | 2.95 | - | - | 2322 | - | - | ok |
-| ollama-host | ctxcurve-ollama | ctx=16384 | 2.03 | - | - | 3234 | - | - | ok |
-| sglang-0.5.19 | blazar | config=kv_dtype_bf16 | - | 0.55 | 34.3 | 6416 | 55.3 | - | ok |
-| sglang-0.5.19 | blazar | config=kv_dtype_e4m3 | - | 0.52 | 33.97 | 6474 | 55.1 | - | ok |
-| sglang-0.5.19 | blazar | config=cg_bs_16 | - | 0.53 | 31.28 | 6470 | 55.6 | - | ok |
-| sglang-0.5.19 | blazar | config=cg_bs_256 | - | 0.52 | 33.26 | 6804 | 55.2 | - | ok |
+| ollama-host | ctxcurve-ollama | ctx=16384 | 1 | 42 | - | - | 157.4 | - | 3234 |
+| ollama-host | ctxcurve-ollama | ctx=2048 | 1 | 43 | - | - | 156.5 | - | 1588 |
+| ollama-host | ctxcurve-ollama | ctx=8192 | 1 | 40 | - | - | 156.3 | - | 2322 |
+| ollama-host | ollama | reference=True NOTE: serves 'qwen3:1.7b' - t/s NOT comparable | 1 | 33 | 39 | 7 | 157.5 | 60940.3 | 2320 |
+| sglang-0.5.19 | blazar | config=cg_bs_16 | 1 | 33 | 34 | 15 | 67.6 | 10972.5 | 6470 |
+| sglang-0.5.19 | blazar | config=cg_bs_256 | 1 | 33 | 33 | 15 | 67.6 | 10967.7 | 6804 |
+| sglang-0.5.19 | blazar | config=chunked_prefill_4096 | 1 | 33 | 33 | 15 | 67.6 | 10988.9 | 6738 |
+| sglang-0.5.19 | blazar | config=default | 1 | 33 | 33 | 15 | 67.6 | 10985.4 | 6470 |
+| sglang-0.5.19 | blazar | config=deterministic_on | 1 | 59 | 62 | 27 | 39.5 | 6273.0 | 6742 |
+| sglang-0.5.19 | blazar | config=kv_dtype_bf16 | 1 | 33 | 34 | 15 | 67.7 | 10941.7 | 6416 |
+| sglang-0.5.19 | blazar | config=kv_dtype_e4m3 | 1 | 33 | 34 | 16 | 67.4 | 10978.3 | 6474 |
+| sglang-0.5.19 | blazar | config=kv_unified_off | 1 | 33 | 33 | 15 | 67.6 | 10927.9 | 6490 |
+| sglang-0.5.19 | blazar | config=kv_unified_on | 1 | 33 | 33 | 16 | 67.6 | 11080.0 | 6450 |
+| sglang-0.5.19 | blazar | config=page_64 | 1 | 33 | 34 | 16 | 67.6 | 10669.5 | 6490 |
+| sglang-0.5.19 | blazar | config=radix_session_on | 1 | 33 | 34 | 15 | 67.7 | 11005.0 | 6484 |
+| sglang-0.5.19 | blazar | config=single-stream | 1 | 33 | 33 | 15 | 67.6 | 11048.7 | 6340 |
+| sglang-0.5.19 | blazar | config=spec_off | 1 | 33 | 33 | 15 | 67.6 | 10897.4 | 6482 |
+| sglang-0.5.19 | blazar | config=torch_compile_on | 1 | 32 | 33 | 15 | 68.7 | 11274.0 | 7070 |
+| sglang-0.5.19 | ctxcurve-blazar | ctx=16384 | 1 | 33 | 33 | 15 | 67.6 | 11140.6 | 6470 |
+| sglang-0.5.19 | ctxcurve-blazar | ctx=2048 | 1 | 33 | 34 | 15 | 67.7 | 10907.4 | 4792 |
+| sglang-0.5.19 | ctxcurve-blazar | ctx=8192 | 1 | 33 | 33 | 15 | 67.6 | 11111.5 | 5490 |
 
-## Concurrency (parallel streams)
+## Concurrency (parallel streams, medians)
 
-| engine | provider | streams | sys t/s | sum stream t/s | ttft max (ms) | ttft spread (ms) | itl p99 (ms) | ok/errors | wall (s) |
-|---||---||---||---||---||---||---||---||---||
-| sglang-0.5.19 | conc-blazar | conc=4 rounds=3 | 254.0 | 771.1 | 41 | 8.6 | 16.38 | 12/0 | 6.05 |
-| ollama-host | conc-ollama | conc=4 rounds=3 | 122.2 | 1869.2 | 5066 | 5021.9 | 7.86 | 12/0 | 12.57 |
-- sys t/s = total tokens / wall (true system throughput); sum stream t/s = sum of per-stream rates. sum >> sys means streams were serialized (queued on a single slot) rather than served concurrently.
+| provider | engine | params | n | sys t/s | ttft max (ms) | itl p99 (ms) | ok/errors |
+|---||---||---||---||---||---||---||---||
+| conc-blazar | sglang-0.5.19 | conc=4 rounds=3 | 1 | 254.0 | 41 | 16 | 12/0 |
+| conc-ollama | ollama-host | conc=4 rounds=3 | 1 | 122.2 | 5066 | 8 | 12/0 |
+- sys t/s = total tokens / wall (true system throughput); flat sys t/s with growing ttft max means streams queued on a fixed slot count instead of being served concurrently.
 
 
 ## Quality — perplexity (identical pinned args)
 
-| engine | perplexity | ± err | wall (s) | note |
+| engine | perplexity | +/- err | wall (s) | note |
 |---|---|---|---|---|
+| sglang-0.5.19 | - | - | - | no llama-perplexity binary on this box |
+| sglang-0.5.19 | - | - | - | no PPL line in llama-perplexity output (exit 1); tail: " model from ~/.local/share/blazar/models/qwen3-1.7b.d\n0.00.566.159 E llama_model_load_from_file_impl: failed to load model\n0.00.566.164 E cmn  common_init_: failed to load model '~/.local/share/blazar/models/qwen3-1.7b.d'\n0.00.566.173 E llama_perplexity: unable to load model\n" |
 | sglang-0.5.19 | - | - | - | lower = better text fit |
 - corpus: deterministic offline repo text (code-heavy) — PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
 
@@ -101,18 +128,16 @@
 
 **product** (engine/gateway behavior):
 
-- `sglang-0.5.19` / blazar / {'config': 'mem_frac_0.90'}: cold probe failed: HTTP Error 502: Bad Gateway
-- `sglang-0.5.19` / blazar / {'config': 'hicache_on'}: cold probe failed: HTTP Error 502: Bad Gateway
-- `sglang-0.5.19` / blazar / {'config': 'memory_saver_on'}: cold probe failed: HTTP Error 502: Bad Gateway
+- `sglang-0.5.19` / blazar (7 cells): cold probe failed: HTTP Error 502: Bad Gateway [{'config': 'mem_frac_0.90'}; {'config': 'hicache_on'}; {'config': 'memory_saver_on'}; {'config': 'mem_frac_0.90'}; +3 more]
+- `sglang-0.5.19` / ppl / {'ppl': 2048}: no llama-perplexity binary on this box
+- `sglang-0.5.19` / ppl / {'ppl': 2048}: no PPL line in llama-perplexity output (exit 1); tail: " model from ~/.local/share/blazar/models/qwen3-1.7b.d\n0.00.566.159 E llama_model_load_from_file_impl...
+
+**environment** (box/co-residency guards — NOT blazar defects):
+
+- `sglang-0.5.19` / blazar (2 cells): GPU memory floor exceeded before cell [{'config': 'mem_frac_0.90'}; {'config': 'hicache_on'}]
 
 ## Reading this report
 
-- `direct` = raw child spawn on a probed free port (no gateway).
-- `blazar` = full gateway path inside a sandboxed daemon (profile compiler, routing, auth); `child_argv` in cells.jsonl holds the resolved engine argv.
-- `ollama` = HTTP-only reference against the host service, one cell.
-- decode counts ALL emitted tokens (content + reasoning/thinking); `usage`/engine counters are authoritative when present (`tokens src`).
-- prefill t/s (cold) = prompt tokens / first-token time on an uncached token-targeted prompt; (cached) = same prompt re-sent (child prompt-cache path). ollama prefill uses engine-side prompt_eval counters, which EXCLUDE template tokens — ollama prefill reads high relative to the 512-token lanes.
-- blazar speed rows show the resolved slot/context shape (`child: np=… ctx=…`) parsed from the recorded child argv — auto-slots may differ from the direct rows' explicit np.
-- decode-lane TTFT rides the child's prompt cache after run 1 (warm path); the prefill-lane cold/cached pair is the honest cache story at real prompt sizes.
-- GPU/power peaks sampled at ~1.2 s cadence (max across NVIDIA GPUs); very short bursts may undersample.
-- Cells append to `cells.jsonl` and resume across reruns (keyed on engine/provider/params/model/harness-version).
+- `direct` = raw child spawn on a probed free port (no gateway); `blazar` = full gateway path inside a sandboxed daemon (resolved engine argv in `child_argv`); `ollama` = HTTP-only reference against the host service.
+- decode counts ALL emitted tokens (content + reasoning); engine `usage` counters are authoritative when present. GPU/power peaks sampled at ~1.2 s cadence.
+- per-run spread, cold-start/resource detail, and every raw cell live in `cells.jsonl`; tables here are per-config medians.

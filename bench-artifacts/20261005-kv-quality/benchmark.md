@@ -1,29 +1,49 @@
 # Blazar benchmark matrix
 
-- **date**: 2026-10-05 15:45:00
+- **date**: 2026-10-06 16:00:26
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11393-cuda, inventory, ollama-host
-- **harness**: bench_matrix v4 — `--artifacts-dir bench-artifacts/20261005-kv-quality --model qwen3.5-9b --engines b11393-cuda --providers blazar --skip-ppl --skip-greedy --skip-tools --skip-features --skip-conc --skip-idle --skip-reshape --skip-ctxcurve --skip-variants --skip-media --runs 1`
+- **harness**: bench_matrix v4 — `--artifacts-dir bench-artifacts/20261005-kv-quality --model qwen3.5-9b --engines b11393-cuda --providers blazar --skip-p`
 - **blazar**: `blazar 0.20.0` (sandbox daemon binary)
 - **quality lane**: ran — 1 scored row(s); suites: code, instruct, multilingual, niah, reason, safety, schema
 - all blazar-owned rows measured by `blazar 0.20.0`
 
-## Speed (serving, streaming)
+## Charts
 
-| engine | kind | provider | params | ttft p50 (ms) | ttft p99 (ms) | itl p50 (ms) | itl p99 (ms) | decode t/s | prefill t/s (cold) | prefill t/s (cached) | tokens src |
-|---||---||---||---||---||---||---||---||---||---||---||
-| b11393-cuda | llamacpp | blazar | config=default child: np=4 ctx=65536 | 180 | 180 | 25 | 26 | 40.6 | 1309.9 | 1309.9 | chunks |
-| b11393-cuda | llamacpp | blazar | config=single-stream child: np=1 ctx=16384 | 127 | 127 | 24 | 26 | 41.3 | 1328.2 | 1328.2 | chunks |
-| ollama-host | ollama | ollama | reference=True NOTE: serves 'qwen3.5:9b' - t/s NOT comparable | 123 | 123 | 25 | 75 | 40.5 | 1409.5 | 1409.5 | engine_counters |
+- deterministic SVG renders of the cells below; source of truth is `cells.jsonl`, charts live in `plots/`.
 
-## Resources & cold start
+### Single-stream decode throughput (chart)
 
-| engine | provider | params | load s | daemon boot s | cold 1st req s | GPU peak (MiB) | GPU power (W) | RSS peak (MiB) | teardown |
+<p align="center"><img src="plots/speed-single-stream.svg" alt="Single-stream decode throughput (chart)"></p>
+
+_Median decode t/s per runtime and engine; whiskers span the interquartile range of the 5 runs; the dashed line marks the fastest direct engine. Higher is better. Source: 20261005-kv-quality/cells.jsonl._
+
+### Lifecycle: cold start and idle wake (chart)
+
+<p align="center"><img src="plots/lifecycle-cold-idle.svg" alt="Lifecycle: cold start and idle wake (chart)"></p>
+
+_Seconds to first token after a cold start (page cache dropped) and after idle-policy expiry; blazar keeps weights resident while ollama reloads from disk. Warm-daemon ollama caveat applies. Lower is better. Source: 20261005-kv-quality/cells.jsonl._
+
+### Quality suites (chart)
+
+<p align="center"><img src="plots/quality-suites.svg" alt="Quality suites (chart)"></p>
+
+_Deterministic-checker pass rates per suite (reasoning, instruction following, code, schema, needle-in-haystack, multilingual, safety) across runtimes on the identical seeded task set. Source: 20261005-kv-quality/cells.jsonl._
+
+### KV-quant perplexity (chart)
+
+<p align="center"><img src="plots/ppl-kv.svg" alt="KV-quant perplexity (chart)"></p>
+
+_Perplexity per KV-cache quantization configuration (whiskers: standard error); the dashed line marks the unquantized f16 run. Lower is better; compare only within one context rung. Source: 20261005-kv-quality/cells.jsonl._
+
+## Speed (single-stream, medians)
+
+| engine | provider | params | n | ttft p50 (ms) | ttft p99 (ms) | itl p99 (ms) | decode t/s | prefill t/s (cached) | VRAM peak (MiB) |
 |---||---||---||---||---||---||---||---||---||
-| b11393-cuda | blazar | config=default | - | 0.54 | 7.7 | 6332 | 55.1 | 1724 | ok |
-| b11393-cuda | blazar | config=single-stream | - | 0.53 | 5.31 | 6070 | 55.1 | 1683 | ok |
-| ollama-host | ollama | reference=True | - | - | - | 6566 | 55.2 | - | ok |
+| b11393-cuda | blazar | config=default child: np=4 ctx=65536 | 1 | 180 | 180 | 26 | 40.6 | 1309.9 | 6332 |
+| b11393-cuda | blazar | config=single-stream child: np=1 ctx=16384 | 1 | 127 | 127 | 26 | 41.3 | 1328.2 | 6070 |
+| ollama-host | ollama | reference=True NOTE: serves 'qwen3.5:9b' - t/s NOT comparable | 1 | 123 | 123 | 75 | 40.5 | 1409.5 | 6566 |
 
 ## Quality — perplexity (identical pinned args)
 
@@ -57,12 +77,6 @@
 
 ## Reading this report
 
-- `direct` = raw child spawn on a probed free port (no gateway).
-- `blazar` = full gateway path inside a sandboxed daemon (profile compiler, routing, auth); `child_argv` in cells.jsonl holds the resolved engine argv.
-- `ollama` = HTTP-only reference against the host service, one cell.
-- decode counts ALL emitted tokens (content + reasoning/thinking); `usage`/engine counters are authoritative when present (`tokens src`).
-- prefill t/s (cold) = prompt tokens / first-token time on an uncached token-targeted prompt; (cached) = same prompt re-sent (child prompt-cache path). ollama prefill uses engine-side prompt_eval counters, which EXCLUDE template tokens — ollama prefill reads high relative to the 512-token lanes.
-- blazar speed rows show the resolved slot/context shape (`child: np=… ctx=…`) parsed from the recorded child argv — auto-slots may differ from the direct rows' explicit np.
-- decode-lane TTFT rides the child's prompt cache after run 1 (warm path); the prefill-lane cold/cached pair is the honest cache story at real prompt sizes.
-- GPU/power peaks sampled at ~1.2 s cadence (max across NVIDIA GPUs); very short bursts may undersample.
-- Cells append to `cells.jsonl` and resume across reruns (keyed on engine/provider/params/model/harness-version).
+- `direct` = raw child spawn on a probed free port (no gateway); `blazar` = full gateway path inside a sandboxed daemon (resolved engine argv in `child_argv`); `ollama` = HTTP-only reference against the host service.
+- decode counts ALL emitted tokens (content + reasoning); engine `usage` counters are authoritative when present. GPU/power peaks sampled at ~1.2 s cadence.
+- per-run spread, cold-start/resource detail, and every raw cell live in `cells.jsonl`; tables here are per-config medians.

@@ -2,20 +2,28 @@
 
 | Campaign | Date | Lanes | Cells | blazar |
 |---|---|---|---:|---|
-| 20260923-media-v2 | 20260923 | media | 5 | 0.10.0 |
-| 20260924-all-engines | 20260924 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 64 | 0.11.0 |
-| 20260924-text-frontier | 20260924 | blazar,cold,conc,direct,features,greedy,greedy_gw,idle,ollama | 28 | 0.11.0 |
-| 20260926-sdcpp-lane | 20260926 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 52 | 0.11.0 |
+| 20260923-media | 20260923 | media | 4 | blazar 0.10.0 |
+| 20260923-media-v2 | 20260923 | media | 5 | blazar 0.10.0 |
+| 20260924-all-engines | 20260924 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 105 | blazar 0.11.0 |
+| 20260924-text-frontier | 20260924 | blazar,cold,conc,direct,features,greedy,greedy_gw,idle,ollama | 28 | blazar 0.11.0 |
+| 20260926-sdcpp-lane | 20260926 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 58 | blazar 0.11.0 |
 | 20260927-ab-regression | 20260927 | ab,dense,default,regression | 4 | 0.12.0 |
-| 20260927-best-of-n | 20260927 | bestof | 15 | 0.12.0 |
+| 20260927-best-of-n | 20260927 | ? | 15 | 0.12.0 |
 | 20260927-fix12-live-proofs | 20260927 | bestof-degrade,bank-multislot | 2 | 0.12.0 |
 | 20260927-kv-continuity | 20260927 | bank,restore,diffkv,preload,ramwarm | 5 | 0.12.0 |
 | 20260927-spec-governor | 20260927 | governor | 1 | 0.12.0 |
-| 20260927-spec-ngram-default | 20260927 | dense,ngram | 24 | 0.12.0 |
+| 20260927-spec-ngram-default | 20260927 | ? | 25 | 0.12.0 |
 | 20260927-wave5-live-proofs | 20260927 | a2-rate,a3-cascade,d1-ubatch,ab-dense | 3 | 0.12.0 |
-| 20260928-gguf-full | 20260928 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 83 | 0.13.0 |
-| 20260928-sglang-safetensors | 20260928 | blazar,cold,conc,ctxcurve,features,idle,media,ollama,ppl,reshape,tools | 36 | 0.13.0 |
-| 20260929-f1f2f3-livecheck | 20260929 | blazar,cold,conc,ollama,reshape | 19 | 0.13.0 |
+| 20260928-gguf-full | 20260928 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 83 | blazar 0.13.0 |
+| 20260928-sglang-safetensors | 20260928 | blazar,cold,conc,ctxcurve,features,idle,media,ollama,ppl,reshape,tools | 44 | blazar 0.13.0 |
+| 20260929-f1f2f3-livecheck | 20260929 | blazar,cold,conc,ollama,reshape | 22 | blazar 0.13.0 |
 | 20260929-flagship-gguf | 20260929 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,greedy_ollama,idle,media,ollama,ppl,reshape,tools | 101 | 0.13.0 |
-| 20260929-sglang-safetensors | 20260929 | blazar,cold,conc,ctxcurve,features,greedy_ollama,idle,media,ollama,ppl,reshape,tools | 48 | 0.13.0 |
+| 20260929-sglang-safetensors | 20260929 | blazar,cold,conc,ctxcurve,features,greedy_ollama,idle,media,ollama,ppl,reshape,tools | 48 | blazar 0.13.0 |
+| 20261005-kv-quality | 20261005 | blazar,cold,ollama,ppl,quality | 8 | blazar 0.20.0 |
+| 20261005-kv-quality-r2 | 20261005 | blazar,cold,ollama,quality | 5 | blazar 0.20.0 |
+| 20261005-kv-quality-r3 | 20261005 | blazar,cold,conc,ollama,quality | 12 | blazar 0.20.0 |
+| 20261005-kv-quality-r4 | 20261005 | blazar,cold,ollama,quality | 5 | blazar 0.20.0 |
+| 20261005-kv-quality-r5 | 20261005 | blazar,cold,ollama,quality | 5 | blazar 0.20.0 |
 | 20261005-tts-stt-video-sota | 20261005 | tts,stt,images,variations,video,realtime,diarized,sdk,bootflags,streaming | 28 | 0.20.0 |
+| 20261006-matched-conc | 20261006 | blazar,cold,conc,direct,ollama | 24 | blazar 0.21.1 |
+| 20261006-perf-lanes | 20261006 | blazar,cold,conc,ctxcurve,direct,idle,ollama,tools | 22 | blazar 0.21.1 |

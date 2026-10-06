@@ -2825,8 +2825,16 @@ def run_direct_conc_cell(
     model_name: str,
     cfg: dict,
     stage_root: Path,
+    rounds: int = 1,
 ) -> dict:
-    """Concurrency lane on a direct child (np sized to the level)."""
+    """Concurrency lane on a direct child (np sized to the level).
+
+    `rounds` mirrors the gateway cells' sustained-load profile: the direct
+    lane historically ran a single burst, which measures llama-server's
+    fresh-cache best case — the gateway lanes' multi-round medians then
+    looked artificially worse (live-verified 2026-10-06: direct C=8 round
+    0 = 134 t/s / 49ms ttfb, rounds 1+ = ~122 t/s / ~530ms ttfb; the
+    first-burst number is not a sustained rate)."""
     port = free_port()
     staged = None
     if eng.kind == "mistralrs":
@@ -2866,7 +2874,7 @@ def run_direct_conc_cell(
                 "max_tokens": 8,
             },
         )
-        rec.update(conc_suite(port, body_model, level, cfg["tg"]))
+        rec.update(conc_suite(port, body_model, level, cfg["tg"], rounds=rounds))
         # resource/power telemetry for the resource-cost-vs-concurrency
         # lane — same fold shape as the speed cell (before teardown so
         # the power window is the cell's serving life, not teardown)
@@ -4740,10 +4748,25 @@ def quality_overall_rate(rec: dict) -> float | None:
 
 
 def run_blazar_conc_cell(
-    eng: Engine, model_name: str, level: int, cfg: dict, rounds: int = 1
+    eng: Engine,
+    model_name: str,
+    level: int,
+    cfg: dict,
+    rounds: int = 1,
+    blazar_cfg: dict | None = None,
+    expect_slots: int | None = None,
 ) -> dict:
     """Concurrency lane through the full gateway path (admission,
-    queueing, slot leases — Blazar's scheduling surface)."""
+    queueing, slot leases — Blazar's scheduling surface).
+
+    blazar_cfg pins gateway config knobs (the matched lane passes
+    slots=level + kv_unified=false so the gateway child mirrors the
+    direct lane's -np sizing; the default lane passes None so the
+    profile's own slot policy — adaptive adoption included — stays in
+    play). expect_slots, when set, hard-asserts the resolved child
+    argv carries that slot count: a pin the profile compiler silently
+    dropped fails the cell loudly instead of publishing a mismatched
+    number."""
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     # F139: the module cache returns the FIRST import on later campaigns
@@ -4766,7 +4789,9 @@ def run_blazar_conc_cell(
             # same ownership fix as run_blazar_cell: start() must be
             # covered by the finally that calls daemon.stop()
             daemon.start(
-                cfg=with_engine_pin({"port": V.PORT}, model_name, eng),
+                cfg=with_engine_pin(
+                    {"port": V.PORT, **(blazar_cfg or {})}, model_name, eng
+                ),
                 floor_model=model_name,
             )
             port = V.PORT
@@ -4799,6 +4824,24 @@ def run_blazar_conc_cell(
             capture_child_argv(rec, eng)
             if rec.get("error"):
                 return rec
+            if (
+                expect_slots is not None
+                and eng.kind == "llamacpp"
+                and rec.get("child_argv")
+            ):
+                argv = rec["child_argv"]
+                np_ok = any(
+                    a == "-np" and argv[i + 1] == str(expect_slots)
+                    for i, a in enumerate(argv[:-1])
+                )
+                if not np_ok:
+                    return {
+                        "error": (
+                            f"slots pin did not reach the child: expected "
+                            f"-np {expect_slots}, child argv is "
+                            f"{' '.join(argv)}"
+                        )
+                    }
             rec.update(conc_suite(port, model_name, level, cfg["tg"], rounds=rounds))
         finally:
             rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
@@ -5978,39 +6021,29 @@ def _child_shape(r: dict) -> str:
     return " ".join(bits)
 
 
-def _speed_row(r: dict) -> str:
+def _agg_med(rows: list[dict], key: str, nd: int | None = None):
+    """Median of a field across a cell group, None when unmeasured.
+    nd=None keeps ints (latencies); floats round to nd decimals."""
+    vals = [r[key] for r in rows if r.get(key) is not None]
+    if not vals:
+        return None
+    vals.sort()
+    m = len(vals) // 2
+    med = vals[m] if len(vals) % 2 else (vals[m - 1] + vals[m]) / 2
+    if nd is None:
+        return round(med)
+    return round(med, nd)
+
+
+def _speed_params(r: dict) -> str:
+    """Cell config identity: request params + resolved child shape."""
     pa = " ".join(f"{kk}={vv}" for kk, vv in (r.get("params") or {}).items()) or "-"
     shape = _child_shape(r)
     if shape:
         pa += f" child: {shape}"
     if r.get("reference_note"):
         pa += f" NOTE: serves '{r['ollama_model']}' - t/s NOT comparable"
-    return "| {t} | {k} | {p} | {pa} | {a} | {ap} | {i} | {ip} | {d} | {pc} | {pk} | {s} |".format(
-        t=r.get("tag", "-"),
-        k=r.get("kind", "-"),
-        p=r.get("provider", "-"),
-        pa=pa,
-        a=fmt(round(r["ttft_ms_p50"]) if r.get("ttft_ms_p50") is not None else None),
-        ap=fmt(round(r["ttft_ms_p99"]) if r.get("ttft_ms_p99") is not None else None),
-        i=fmt(round(r["itl_p50_ms"]) if r.get("itl_p50_ms") is not None else None),
-        ip=fmt(round(r["itl_p99_ms"]) if r.get("itl_p99_ms") is not None else None),
-        d=fmt(
-            round(r["decode_tps_p50"], 1)
-            if r.get("decode_tps_p50") is not None
-            else None
-        ),
-        pc=fmt(
-            round(r["prefill_tps_cold"], 1)
-            if r.get("prefill_tps_cold") is not None
-            else None
-        ),
-        pk=fmt(
-            round(r["prefill_tps_cached"], 1)
-            if r.get("prefill_tps_cached") is not None
-            else None
-        ),
-        s=r.get("tokens_source", "-"),
-    )
+    return pa
 
 
 def _env_failure(err: str) -> bool:
@@ -6039,30 +6072,55 @@ def _findings(records: list[dict]) -> list[str]:
                 return r
         return None
 
-    # gateway-vs-direct decode parity per engine
+    # gateway-vs-direct decode parity per engine: ONE summary line per
+    # tag, outliers itemized — config-sweep campaigns emit dozens of
+    # per-knob rows and the parity band is the story, not each knob
+    parity_by_tag: dict[str, list[tuple[str, float]]] = {}
     for r in records:
         tag = r.get("tag")
         if r.get("provider") != "blazar" or "decode_tps_p50" not in r or tag is None:
             continue
         d = speed_ok("direct", tag)
         if d and d.get("decode_tps_p50"):
-            gw = r["decode_tps_p50"]
-            base = d["decode_tps_p50"]
-            delta = (gw - base) / base * 100.0
-            verdict = (
-                "parity" if abs(delta) <= 5 else ("regression" if delta < 0 else "gain")
+            label = (
+                r.get("params", {}).get("config")
+                or " ".join(f"{kk}={vv}" for kk, vv in (r.get("params") or {}).items())
+                or "default"
             )
-            out.append(
-                f"- gateway vs direct decode (`{tag}`): {gw:.1f} vs {base:.1f} t/s "
-                f"= {delta:+.1f}% ({verdict})."
+            delta = (
+                (r["decode_tps_p50"] - d["decode_tps_p50"])
+                / d["decode_tps_p50"]
+                * 100.0
             )
-    # concurrency: system throughput vs direct
+            parity_by_tag.setdefault(tag, []).append((label, delta))
+    for tag, pairs in sorted(parity_by_tag.items()):
+        deltas = sorted(delta for _, delta in pairs)
+        in_band = [x for x in deltas if abs(x) <= 5]
+        outliers = sorted(
+            ((label, delta) for label, delta in pairs if abs(delta) > 5),
+            key=lambda p: p[1],
+        )
+        line = (
+            f"- gateway vs direct decode (`{tag}`, {len(deltas)} configs): "
+            f"median {deltas[len(deltas) // 2]:+.1f}%, "
+            f"{len(in_band)}/{len(deltas)} within ±5% (parity)"
+        )
+        if outliers:
+            line += "; outliers: " + ", ".join(
+                f"{label} {delta:+.1f}%" for label, delta in outliers
+            )
+        out.append(line + ".")
+    # concurrency: system throughput vs direct AT THE SAME LEVEL
     for r in records:
         tag = r.get("tag")
         if r.get("provider") != "conc-blazar" or "sys_tps" not in r or tag is None:
             continue
         for drec in records:
-            if drec.get("provider") == "conc-direct" and drec.get("tag") == tag:
+            if (
+                drec.get("provider") == "conc-direct"
+                and drec.get("tag") == tag
+                and drec.get("conc_level") == r.get("conc_level")
+            ):
                 sysd = drec.get("sys_tps") or (
                     round(drec["total_tokens"] / drec["conc_wall_s"], 2)
                     if drec.get("total_tokens") and drec.get("conc_wall_s")
@@ -6079,6 +6137,38 @@ def _findings(records: list[dict]) -> list[str]:
                             if ratio < 0.6
                             else "."
                         )
+                    )
+                break
+    # matched-slots twin: the same gateway path with slots pinned to the
+    # stream count (the direct lane's own sizing) — the fairness answer
+    # to the default lane's scheduling-policy gap above
+    for r in records:
+        tag = r.get("tag")
+        if (
+            r.get("provider") != "conc-blazar-matched"
+            or "sys_tps" not in r
+            or tag is None
+        ):
+            continue
+        for drec in records:
+            if (
+                drec.get("provider") == "conc-direct"
+                and drec.get("tag") == tag
+                and drec.get("conc_level") == r.get("conc_level")
+            ):
+                sysd = drec.get("sys_tps") or (
+                    round(drec["total_tokens"] / drec["conc_wall_s"], 2)
+                    if drec.get("total_tokens") and drec.get("conc_wall_s")
+                    else None
+                )
+                if sysd:
+                    ratio = r["sys_tps"] / sysd
+                    out.append(
+                        f"- concurrency system throughput (`{tag}`, "
+                        f"{r.get('conc_level')} streams, matched slots): "
+                        f"{r['sys_tps']:.1f} vs direct {sysd:.1f} t/s = "
+                        f"{ratio:.2f}x (gateway at the direct lane's own "
+                        "slot count)."
                     )
                 break
     # variant axes deltas vs same-engine baseline
@@ -6142,9 +6232,16 @@ def write_markdown_report(
     ref_tag: str | None,
     blazar_version: str = "unknown",
     quality_status: dict | None = None,
+    charts: list[tuple[str, str, str]] | None = None,
 ) -> None:
-    """Human-first markdown report: environment, speed, resources,
-    concurrency, quality, features, failures."""
+    """Slim campaign report: env header, findings, embedded charts, then
+    per-config MEDIAN tables (speed, concurrency) plus quality, feature
+    matrix and failures. One row per (engine, provider, config) — repeats
+    collapse to medians, per-run spread and cold-start detail stay in
+    cells.jsonl. charts: (section, filename, caption) triples from
+    render_campaign_charts — each becomes an embedded <img> pointing at
+    plots/ beside this report (None = no plottable lane, section
+    omitted)."""
     md: list[str] = []
     md.append("# Blazar benchmark matrix\n")
     md.append(f"- **date**: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -6167,7 +6264,8 @@ def write_markdown_report(
     blazar_owned = [
         r
         for r in records
-        if r.get("provider") in ("blazar", "conc-blazar", "greedy_gw")
+        if r.get("provider")
+        in ("blazar", "conc-blazar", "conc-blazar-matched", "greedy_gw")
     ]
     stamps = sorted({v for r in blazar_owned if (v := r.get("blazar_version"))})
     unstamped = sum(1 for r in blazar_owned if not r.get("blazar_version"))
@@ -6192,102 +6290,92 @@ def write_markdown_report(
         md.extend(findings)
         md.append("")
 
-    speed = [r for r in records if "ttft_ms_p50" in r]
-    if speed:
-        md.append("## Speed (serving, streaming)\n")
+    # Charts first: one plot per comparison axis; the tables below carry
+    # the exact numbers, cells.jsonl the full per-cell receipts.
+    if charts:
+        md.append("## Charts\n")
         md.append(
-            "| engine | kind | provider | params | ttft p50 (ms) | ttft p99 (ms) "
-            "| itl p50 (ms) | itl p99 (ms) | decode t/s | prefill t/s (cold) "
-            "| prefill t/s (cached) | tokens src |"
+            "- deterministic SVG renders of the cells below; source of "
+            "truth is `cells.jsonl`, charts live in `plots/`.\n"
         )
-        md.append("|---|" * 11 + "|")
-        for r in speed:
-            md.append(_speed_row(r))
-        md.append("")
+        for section, fname, caption in charts:
+            md.append(f"### {section}\n")
+            md.append(
+                f'<p align="center"><img src="plots/{fname}" alt="{section}"></p>\n'
+            )
+            md.append(f"_{caption}_\n")
 
-    res = [
-        r
-        for r in records
-        if any(
-            k in r for k in ("load_s", "daemon_boot_s", "gpu_peak_mib", "rss_peak_mib")
-        )
-        and "ttft_ms_p50" in r
-    ]
-    if res:
-        md.append("## Resources & cold start\n")
+    # One row per (engine, provider, config): repeats of the same config
+    # collapse to their median — per-run spread stays in cells.jsonl.
+    speed = [r for r in records if "ttft_ms_p50" in r]
+    speed_groups: dict[tuple, list[dict]] = {}
+    for r in speed:
+        pa = _speed_params(r)
+        key = (r.get("tag", "-"), r.get("provider", "-"), pa)
+        speed_groups.setdefault(key, []).append(r)
+    if speed_groups:
+        md.append("## Speed (single-stream, medians)\n")
         md.append(
-            "| engine | provider | params | load s | daemon boot s | cold 1st req s "
-            "| GPU peak (MiB) | GPU power (W) | RSS peak (MiB) | teardown |"
+            "| engine | provider | params | n | ttft p50 (ms) | ttft p99 (ms) "
+            "| itl p99 (ms) | decode t/s | prefill t/s (cached) | VRAM peak (MiB) |"
         )
         md.append("|---|" * 9 + "|")
-        for r in res:
-            pa = (
-                " ".join(f"{kk}={vv}" for kk, vv in (r.get("params") or {}).items())
-                or "-"
-            )
-            g = r.get("gpu_peak_mib")
+        for t, p, pa in sorted(speed_groups):
+            rows = speed_groups[(t, p, pa)]
             md.append(
-                "| {t} | {p} | {pa} | {ls} | {db} | {cr} | {g} | {w} | {rss} | {td} |".format(
-                    t=r.get("tag", "-"),
-                    p=r.get("provider", "-"),
+                "| {t} | {p} | {pa} | {n} | {a} | {ap} | {ip} | {d} | {pk} | {g} |".format(
+                    t=t,
+                    p=p,
                     pa=pa,
-                    ls=fmt(r.get("load_s")),
-                    db=fmt(r.get("daemon_boot_s")),
-                    cr=fmt(r.get("cold_first_request_s")),
-                    g=fmt(round(g) if g else None),
-                    w=fmt(round(pw, 1) if (pw := r.get("gpu_power_peak_w")) else None),
-                    rss=fmt(
-                        round(r.get("rss_peak_mib", 0))
-                        if r.get("rss_peak_mib")
-                        else None
-                    ),
-                    td="ok" if r.get("teardown_ok") else "FAIL",
+                    n=len(rows),
+                    a=fmt(_agg_med(rows, "ttft_ms_p50")),
+                    ap=fmt(_agg_med(rows, "ttft_ms_p99")),
+                    ip=fmt(_agg_med(rows, "itl_p99_ms")),
+                    d=fmt(_agg_med(rows, "decode_tps_p50", 1)),
+                    pk=fmt(_agg_med(rows, "prefill_tps_cached", 1)),
+                    g=fmt(_agg_med(rows, "gpu_peak_mib")),
                 )
             )
         md.append("")
 
     conc = [r for r in records if "conc_level" in r]
-    if conc:
-        md.append("## Concurrency (parallel streams)\n")
+    conc_groups: dict[tuple, list[dict]] = {}
+    for r in conc:
+        # legacy cells.jsonl rows (pre-sys_tps) recompute from stored
+        # totals so old artifacts still render honestly
+        if r.get("sys_tps") is None and r.get("total_tokens") and r.get("conc_wall_s"):
+            r = {**r, "sys_tps": round(r["total_tokens"] / r["conc_wall_s"], 2)}
+        pa = " ".join(f"{kk}={vv}" for kk, vv in (r.get("params") or {}).items()) or "-"
+        key = (r.get("provider", "-"), r.get("tag", "-"), pa)
+        conc_groups.setdefault(key, []).append(r)
+    if conc_groups:
+        md.append("## Concurrency (parallel streams, medians)\n")
         md.append(
-            "| engine | provider | streams | sys t/s | sum stream t/s "
-            "| ttft max (ms) | ttft spread (ms) | itl p99 (ms) | ok/errors "
-            "| wall (s) |"
+            "| provider | engine | params | n | sys t/s | ttft max (ms) "
+            "| itl p99 (ms) | ok/errors |"
         )
-        md.append("|---|" * 9 + "|")
-        for r in conc:
-            pa = (
-                " ".join(f"{kk}={vv}" for kk, vv in (r.get("params") or {}).items())
-                or "-"
-            )
-            # legacy cells.jsonl rows (pre-sys_tps) recompute from stored
-            # totals so old artifacts still render honestly
-            sys_tps = r.get("sys_tps")
-            if sys_tps is None and r.get("total_tokens") and r.get("conc_wall_s"):
-                sys_tps = round(r["total_tokens"] / r["conc_wall_s"], 2)
-            sum_tps = r.get("sum_stream_tps") or r.get("agg_decode_tps")
+        md.append("|---|" * 8 + "|")
+        for p, t, pa in sorted(conc_groups):
+            rows = conc_groups[(p, t, pa)]
+            ok = sum(x.get("conc_ok") or 0 for x in rows)
+            errs = sum(x.get("conc_errors") or 0 for x in rows)
             md.append(
-                f"| {r.get('tag', '-')} | {r.get('provider', '-')} | {pa} "
-                f"| {fmt_r(sys_tps)} | {fmt_r(sum_tps)} "
-                f"| {fmt(r.get('ttft_max_ms'))} "
-                f"| {fmt(r.get('ttft_spread_ms'))} | {fmt(r.get('itl_p99_ms'))} "
-                f"| {r.get('conc_ok', '-')}/{r.get('conc_errors', '-')} "
-                f"| {fmt(r.get('conc_wall_s'))} |"
+                "| {p} | {t} | {pa} | {n} | {s} | {tt} | {ip} | {ok}/{e} |".format(
+                    p=p,
+                    t=t,
+                    pa=pa,
+                    n=len(rows),
+                    s=fmt_r(_agg_med(rows, "sys_tps", 1)),
+                    tt=fmt(_agg_med(rows, "ttft_max_ms")),
+                    ip=fmt(_agg_med(rows, "itl_p99_ms")),
+                    ok=ok,
+                    e=errs,
+                )
             )
         md.append(
-            "- sys t/s = total tokens / wall (true system throughput); "
-            "sum stream t/s = sum of per-stream rates. sum >> sys means "
-            "streams were serialized (queued on a single slot) rather than "
-            "served concurrently.\n"
-        )
-        md.append("")
-
-    # reshape lane: the sustained-load no-lag proof - the campaign report
-    # must surface it, not only the full publication render
-    if any(r.get("provider") == "reshape" for r in records):
-        md.append("## Adaptive reshape under sustained load\n")
-        md.append(
-            campaign_scoped(reshape_table(records), "adaptive reshape", "this campaign")
+            "- sys t/s = total tokens / wall (true system throughput);"
+            " flat sys t/s with growing ttft max means streams queued on"
+            " a fixed slot count instead of being served concurrently.\n"
         )
         md.append("")
 
@@ -6382,61 +6470,59 @@ def write_markdown_report(
     if failed:
         prod = [r for r in failed if not _env_failure(r["error"])]
         env = [r for r in failed if _env_failure(r["error"])]
+
+        def failed_line(
+            tag: str, provider: str, params_list: list[str], head: str
+        ) -> str:
+            # first line of the error, capped — the full string lives in
+            # cells.jsonl; identical (tag, provider, error) failures collapse
+            # into one counted line so systemic breakage reads as one row
+            if len(params_list) == 1:
+                return f"- `{tag}` / {provider} / {params_list[0]}: {head}"
+            shown = "; ".join(params_list[:4])
+            extra = len(params_list) - 4
+            more = f"; +{extra} more" if extra > 0 else ""
+            return f"- `{tag}` / {provider} ({len(params_list)} cells): {head} [{shown}{more}]"
+
+        def failed_rows(rows: list[dict]) -> list[str]:
+            grouped: dict[tuple[str, str, str], list[str]] = {}
+            for r in rows:
+                head = str(r["error"]).strip().splitlines()[0]
+                if len(head) > 160:
+                    head = head[:157] + "..."
+                key = (str(r.get("tag")), str(r.get("provider")), head)
+                grouped.setdefault(key, []).append(str(r.get("params")))
+            return [
+                failed_line(tag, provider, params, head)
+                for (tag, provider, head), params in grouped.items()
+            ]
+
         md.append("## Failed cells\n")
         if prod:
             md.append("**product** (engine/gateway behavior):\n")
-            for r in prod:
-                md.append(
-                    f"- `{r.get('tag')}` / {r.get('provider')} /"
-                    f" {r.get('params')}: {r['error']}"
-                )
+            md.extend(failed_rows(prod))
         if env:
             md.append(
                 "\n**environment** (box/co-residency guards — NOT blazar defects):\n"
             )
-            for r in env:
-                md.append(
-                    f"- `{r.get('tag')}` / {r.get('provider')} /"
-                    f" {r.get('params')}: {r['error']}"
-                )
+            md.extend(failed_rows(env))
         md.append("")
 
     md.append("## Reading this report\n")
-    md.append("- `direct` = raw child spawn on a probed free port (no gateway).")
     md.append(
-        "- `blazar` = full gateway path inside a sandboxed daemon"
-        " (profile compiler, routing, auth); `child_argv` in cells.jsonl"
-        " holds the resolved engine argv."
-    )
-    md.append("- `ollama` = HTTP-only reference against the host service, one cell.")
-    md.append(
-        "- decode counts ALL emitted tokens (content + reasoning/thinking);"
-        " `usage`/engine counters are authoritative when present (`tokens src`)."
+        "- `direct` = raw child spawn on a probed free port (no gateway);"
+        " `blazar` = full gateway path inside a sandboxed daemon"
+        " (resolved engine argv in `child_argv`); `ollama` = HTTP-only"
+        " reference against the host service."
     )
     md.append(
-        "- prefill t/s (cold) = prompt tokens / first-token time on an"
-        " uncached token-targeted prompt; (cached) = same prompt re-sent"
-        " (child prompt-cache path). ollama prefill uses engine-side"
-        " prompt_eval counters, which EXCLUDE template tokens — ollama"
-        " prefill reads high relative to the 512-token lanes."
+        "- decode counts ALL emitted tokens (content + reasoning);"
+        " engine `usage` counters are authoritative when present."
+        " GPU/power peaks sampled at ~1.2 s cadence."
     )
     md.append(
-        "- blazar speed rows show the resolved slot/context shape"
-        " (`child: np=… ctx=…`) parsed from the recorded child argv —"
-        " auto-slots may differ from the direct rows' explicit np."
-    )
-    md.append(
-        "- decode-lane TTFT rides the child's prompt cache after run 1"
-        " (warm path); the prefill-lane cold/cached pair is the honest"
-        " cache story at real prompt sizes."
-    )
-    md.append(
-        "- GPU/power peaks sampled at ~1.2 s cadence (max across NVIDIA"
-        " GPUs); very short bursts may undersample."
-    )
-    md.append(
-        "- Cells append to `cells.jsonl` and resume across reruns (keyed on"
-        " engine/provider/params/model/harness-version)."
+        "- per-run spread, cold-start/resource detail, and every raw cell"
+        " live in `cells.jsonl`; tables here are per-config medians."
     )
     path.write_text("\n".join(md) + "\n")
 
@@ -6531,7 +6617,11 @@ def main() -> int:
         "--providers",
         nargs="*",
         default=["direct", "blazar", "ollama"],
-        choices=["direct", "blazar", "ollama"],
+        choices=["direct", "blazar", "ollama", "blazar-matched"],
+        help="blazar-matched: concurrency lane through the gateway with "
+        "slots pinned to the stream count (mirrors the direct lane's "
+        "-np sizing; the default blazar lane keeps the profile's own "
+        "slot policy so adaptive behavior stays measurable)",
     )
     ap.add_argument("--pp", type=int, default=DEFAULT_PP, help="prefill prompt tokens")
     ap.add_argument("--tg", type=int, default=DEFAULT_TG)
@@ -6717,6 +6807,20 @@ def main() -> int:
         args.skip_idle = True
         args.skip_ctxcurve = True
         args.skip_variants = True
+
+    # ollama and the blazar gateway are the always-on reference lanes:
+    # every text campaign carries them so plots and tables always show
+    # blazar vs ollama vs engine lanes, no matter which --providers the
+    # operator picked (media-only campaigns are excluded above).
+    if not args.media_only and not args.render_only:
+        always = {"blazar", "ollama"} - set(args.providers)
+        if always:
+            args.providers = list(args.providers) + sorted(always)
+            log(
+                "always-on reference lanes added: "
+                + ", ".join(sorted(always))
+                + " (blazar gateway + ollama)"
+            )
 
     if args.render_only:
         cache = Path.home() / ".cache/blazar-bench-matrix"
@@ -7667,11 +7771,11 @@ def main() -> int:
                 for eng in text_engines:
                     if eng.kind != "llamacpp":
                         continue
-                    params = {"conc": level}
+                    params = {"conc": level, "rounds": args.conc_rounds}
                     key = cell_key(eng.tag, "conc-direct", params, model.name)
                     if key in done:
                         continue
-                    log(f"[conc direct {eng.tag} x{level}]")
+                    log(f"[conc direct {eng.tag} x{level} x{args.conc_rounds}r]")
                     if not mem_guard(2048, f"pre-conc {eng.tag}"):
                         emit(
                             eng.tag,
@@ -7684,7 +7788,14 @@ def main() -> int:
                         continue
                     try:
                         rec = run_direct_conc_cell(
-                            eng, model, own_mmproj, level, model_name, cfg, stage_root
+                            eng,
+                            model,
+                            own_mmproj,
+                            level,
+                            model_name,
+                            cfg,
+                            stage_root,
+                            rounds=args.conc_rounds,
                         )
                     except Exception as exc:
                         rec = {"error": f"conc cell crashed: {exc}"}
@@ -7713,6 +7824,47 @@ def main() -> int:
                     except Exception as exc:
                         rec = {"error": f"conc cell crashed: {exc}"}
                     emit(eng.tag, eng.kind, "conc-blazar", params, key, rec)
+            if "blazar-matched" in args.providers:
+                # fairness twin of the direct lane: same slot count as
+                # the direct child's -np (adaptive slot adoption is
+                # disabled by a manual pin, so this is deterministic);
+                # the default conc-blazar lane above stays untouched so
+                # the production slot policy remains measurable
+                for eng in text_engines:
+                    if eng.kind != "llamacpp":
+                        continue
+                    params = {
+                        "conc": level,
+                        "rounds": args.conc_rounds,
+                        "slots": level,
+                    }
+                    key = cell_key(eng.tag, "conc-blazar-matched", params, model.name)
+                    if key in done:
+                        continue
+                    log(f"[conc blazar-matched {eng.tag} x{level} slots={level}]")
+                    if not mem_guard(2048.0, f"pre-conc-blazar-matched {eng.tag}"):
+                        emit(
+                            eng.tag,
+                            eng.kind,
+                            "conc-blazar-matched",
+                            params,
+                            key,
+                            {"error": "GPU memory floor exceeded before cell"},
+                        )
+                        continue
+                    try:
+                        rec = run_blazar_conc_cell(
+                            eng,
+                            gw_model_name,
+                            level,
+                            cfg,
+                            rounds=args.conc_rounds,
+                            blazar_cfg={"slots": level, "kv_unified": False},
+                            expect_slots=level,
+                        )
+                    except Exception as exc:
+                        rec = {"error": f"conc cell crashed: {exc}"}
+                    emit(eng.tag, eng.kind, "conc-blazar-matched", params, key, rec)
             if "ollama" in args.providers:
                 params = {"conc": level, "rounds": args.conc_rounds}
                 key = cell_key("ollama-host", "conc-ollama", params, model.name)
@@ -8250,6 +8402,12 @@ def main() -> int:
         json.dumps({"status": qstat["status"], "detail": qstat["detail"]}, indent=2)
         + "\n"
     )
+    # Chart set + campaign index ride EVERY campaign exit, not just --md
+    # publication runs: a focused campaign (--skip-* heavy) still owns its
+    # plots/ dir and its INDEX.md row. Rendered once here and passed to
+    # both writers so the publication path never re-renders.
+    campaign_charts = render_campaign_charts(all_records, art)
+    update_campaign_index(art, all_records, blazar_version)
     write_markdown_report(
         md_path,
         all_records,
@@ -8260,11 +8418,17 @@ def main() -> int:
         ref_tag,
         blazar_version,
         quality_status=qstat,
+        charts=campaign_charts,
     )
     log(f"report  -> {md_path}")
     if args.md:
         write_publication_report(
-            all_records, art, Path(args.md), argv_summary, quality_status=qstat
+            all_records,
+            art,
+            Path(args.md),
+            argv_summary,
+            quality_status=qstat,
+            charts=campaign_charts,
         )
         log(f"report -> {args.md}")
     write_speed_table(all_records, art / "summary.txt")
@@ -8292,6 +8456,19 @@ def main() -> int:
 # ---------------------------------------------------------------------------
 
 
+# Kind-driven display names: cells carry both `tag` and `kind`, so a label
+# can always say WHAT engine family a build tag belongs to — "v0.9.4" alone
+# is a version with no engine, "mistral.rs v0.9.4" is a lane identity.
+KIND_DISPLAY = {
+    "llamacpp": "llama.cpp",
+    "mistralrs": "mistral.rs",
+    "whisper": "whisper.cpp",
+    "sdcpp": "stable-diffusion.cpp",
+    "sglang": "sglang",
+    "piper": "piper",
+    "mlx": "MLX",
+}
+
 ENGINE_LABELS = {
     "b10809": "llama.cpp b10809 (Vulkan)",
     "b10809-cuda": "llama.cpp b10809 (CUDA build)",
@@ -8304,6 +8481,18 @@ ENGINE_LABELS = {
     # piper`); the bare "piper" key covers the pre-lane legacy label.
     "piper": "piper TTS (engines lane)",
 }
+
+
+def engine_label(tag: str | None, kind: str | None = None) -> str:
+    """Human label for an engine build tag: explicit override first (special
+    builds with backend notes), then kind prefix + tag (self-describing for
+    any future build), then the raw tag."""
+    t = tag or "?"
+    if t in ENGINE_LABELS:
+        return ENGINE_LABELS[t]
+    k = KIND_DISPLAY.get(kind or "")
+    return f"{k} {t}" if k else t
+
 
 # Hardware rows describe the measuring host (this repo's reference box);
 # the volatile rows (runtimes, model) are DERIVED from the cells at render
@@ -8320,7 +8509,9 @@ TEST_BED = [
 
 def derived_test_bed_rows(recs: list[dict], blazar_ver: str) -> list[tuple[str, str]]:
     """Runtimes and model come from the cells themselves, never hardcoded."""
-    engines = sorted({engine_label(r.get("tag", "?")) for r in recs if r.get("tag")})
+    engines = sorted(
+        {engine_label(r.get("tag", "?"), r.get("kind")) for r in recs if r.get("tag")}
+    )
     models = sorted({r.get("model", "?") for r in recs if r.get("model")})
     return [
         ("Runtimes compared", f"blazar {blazar_ver} gateway - " + " - ".join(engines)),
@@ -8393,17 +8584,15 @@ def child_shape(rec: dict) -> str:
     return f"{np_}x{ctx}" if ctx else np_
 
 
-def engine_label(tag: str) -> str:
-    return ENGINE_LABELS.get(tag, tag)
-
-
 def speed_table(recs: list[dict]) -> str:
     rows = []
     for r in recs:
         if r.get("provider") == "blazar" and "error" not in r:
             rows.append(
                 (
-                    speed_row_name(r, f"blazar gateway - {engine_label(r['tag'])}"),
+                    speed_row_name(
+                        r, f"blazar gateway - {engine_label(r['tag'], r.get('kind'))}"
+                    ),
                     child_shape(r) or "engine-scheduled",
                     r.get("decode_tps_p50"),
                     r.get("decode_tps_per_w_net"),
@@ -8426,7 +8615,7 @@ def speed_table(recs: list[dict]) -> str:
         ):
             rows.append(
                 (
-                    f"direct engine - {engine_label(r['tag'])}",
+                    f"direct engine - {engine_label(r['tag'], r.get('kind'))}",
                     "1x16384",
                     r.get("decode_tps_p50"),
                     r.get("decode_tps_per_w_net"),
@@ -8498,13 +8687,25 @@ def conc_table(recs: list[dict]) -> str:
     rows = []
     for r in recs:
         prov = r.get("provider")
-        if prov not in ("conc-blazar", "conc-direct", "conc-ollama") or "error" in r:
+        if (
+            prov
+            not in (
+                "conc-blazar",
+                "conc-blazar-matched",
+                "conc-direct",
+                "conc-ollama",
+            )
+            or "error" in r
+        ):
             continue
         if prov == "conc-blazar":
-            name = f"blazar gateway - {engine_label(r['tag'])}"
+            name = f"blazar gateway - {engine_label(r['tag'], r.get('kind'))}"
+            shape = child_shape(r) or "engine-scheduled"
+        elif prov == "conc-blazar-matched":
+            name = f"blazar gateway (matched slots) - {engine_label(r['tag'], r.get('kind'))}"
             shape = child_shape(r) or "engine-scheduled"
         elif prov == "conc-direct":
-            name = f"direct engine - {engine_label(r['tag'])}"
+            name = f"direct engine - {engine_label(r['tag'], r.get('kind'))}"
             shape = child_shape(r) or (
                 f"{r.get('params', {}).get('np')} slots"
                 if r.get("params", {}).get("np")
@@ -8567,7 +8768,7 @@ def ppl_table(recs: list[dict]) -> str:
         else:
             provenance = "unstamped (pre-stamping campaign)"
         rung = str(r.get("params", {}).get("ppl_kv", "f16"))
-        rows.append((engine_label(r["tag"]), rung, cell, provenance))
+        rows.append((engine_label(r["tag"], r.get("kind")), rung, cell, provenance))
     if not rows:
         return "_Not measured._"
     head = (
@@ -8587,7 +8788,7 @@ def reshape_table(recs: list[dict]) -> str:
         "|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for r in sorted(rows, key=lambda r: r.get("tag") or ""):
-        name = f"blazar gateway - {engine_label(r.get('tag', ''))}"
+        name = f"blazar gateway - {engine_label(r.get('tag', ''), r.get('kind'))}"
         if r.get("note"):
             # Structured lane boundary (e.g. slot-less engine kinds):
             # one n/a row carrying the recorded reason, not a fake NO.
@@ -8636,7 +8837,7 @@ def reshape_table(recs: list[dict]) -> str:
         ]
         excerpt = (focus or [re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in tail])[-12:]
         tail_text = "\n".join(excerpt)
-        label = engine_label(r.get("tag", ""))
+        label = engine_label(r.get("tag", ""), r.get("kind"))
         out.append(
             f"\n<details><summary>daemon tail (slots/reshape) - {label}</summary>\n\n"
             f"```\n{tail_text}\n```\n\n</details>"
@@ -8682,7 +8883,7 @@ def greedy_table(recs: list[dict]) -> str:
         if r.get("provider") == "greedy":
             rows.append(
                 (
-                    f"{engine_label(r['tag'])} vs same-engine reference (direct)",
+                    f"{engine_label(r['tag'], r.get('kind'))} vs same-engine reference (direct)",
                     r.get("exact_matches"),
                     r.get("prompts"),
                     r.get("ratio_mean"),
@@ -8693,7 +8894,7 @@ def greedy_table(recs: list[dict]) -> str:
         if r.get("provider") == "greedy_gw":
             rows.append(
                 (
-                    f"{engine_label(r['tag'])} through blazar gateway vs direct",
+                    f"{engine_label(r['tag'], r.get('kind'))} through blazar gateway vs direct",
                     r.get("exact_matches"),
                     r.get("prompts"),
                     r.get("ratio_mean"),
@@ -8749,7 +8950,7 @@ def variant_table(recs: list[dict]) -> str:
         pc = r.get("prefill_tps_cold") or 0.0
         rows.append(
             (
-                engine_label(r["tag"]),
+                engine_label(r["tag"], r.get("kind")),
                 axis,
                 str(p[axis]),
                 d,
@@ -9076,7 +9277,7 @@ def config_axes_table(recs: list[dict]) -> str:
         qout = "same" if q and qb and q == qb else "DRIFT" if q and qb else "-"
         rows.append(
             (
-                engine_label(r["tag"]),
+                engine_label(r["tag"], r.get("kind")),
                 name,
                 pfmt(d),
                 f"{dd:+.1f}%" if not math.isnan(dd) else "-",
@@ -9143,7 +9344,7 @@ def conc_axes_table(recs: list[dict]) -> str:
         )
         rows.append(
             (
-                engine_label(r["tag"]),
+                engine_label(r["tag"], r.get("kind")),
                 name,
                 pfmt(s),
                 f"{sd:+.1f}%" if not math.isnan(sd) else "-",
@@ -9249,7 +9450,7 @@ def quality_table(recs: list[dict]) -> str:
         eng = (
             "ollama daemon"
             if prov == "quality-ollama"
-            else engine_label(r.get("tag", "?"))
+            else engine_label(r.get("tag", "?"), r.get("kind"))
         )
         cfg = str(r.get("params", {}).get("config", "default"))
         rows.append((fams[prov], eng, cfg, *cells, overall, conc))
@@ -9279,6 +9480,7 @@ def quality_verdicts(recs: list[dict]) -> list[str]:
     def _cfg(r: dict) -> str:
         return str(r.get("params", {}).get("config", "default"))
 
+    kinds = {str(r.get("tag")): r.get("kind") for r in cells if r.get("tag")}
     for tag in sorted({str(r.get("tag")) for r in cells}):
         d = [
             quality_overall_rate(r)
@@ -9298,7 +9500,7 @@ def quality_verdicts(recs: list[dict]) -> list[str]:
         if d and b:
             dm, bm = d[0], b[0]
             out.append(
-                f"Gateway parity on {engine_label(tag)}: overall pass "
+                f"Gateway parity on {engine_label(tag, kinds.get(tag))}: overall pass "
                 f"{dm:.1f}% direct vs {bm:.1f}% through blazar "
                 f"({bm - dm:+.1f} pp) on the identical seeded task set."
             )
@@ -9326,7 +9528,7 @@ def quality_verdicts(recs: list[dict]) -> list[str]:
                         else "degraded"
                     )
                     out.append(
-                        f"Quality under load on {engine_label(tag)}: "
+                        f"Quality under load on {engine_label(tag, kinds.get(tag))}: "
                         f"{cpass}/{ctot} at C={r.get('quality_conc_level')} "
                         f"({crate:.1f}%) vs {serial:.1f}% serial on the same "
                         f"fast subset - {held}."
@@ -9381,7 +9583,7 @@ def qc_drift_gate(recs: list[dict]) -> list[str]:
         # so match the longest allowlisted axis the label extends
         if not any(name == a or str(name).startswith(f"{a}_") for a in KNOWN_DRIFT):
             offenders.append(
-                f"{engine_label(r['tag'])} {name}: greedy output drifted vs "
+                f"{engine_label(r['tag'], r.get('kind'))} {name}: greedy output drifted vs "
                 f"default (head: {r.get('qc_head', '')!r})"
             )
     # quality-rate drift: the 20-prompt greedy fingerprint cannot see a
@@ -9407,7 +9609,7 @@ def qc_drift_gate(recs: list[dict]) -> list[str]:
             continue
         if base - cur > QUALITY_DRIFT_TOLERANCE_PP:
             offenders.append(
-                f"{engine_label(r['tag'])} {name}: suite pass-rate dropped "
+                f"{engine_label(r['tag'], r.get('kind'))} {name}: suite pass-rate dropped "
                 f"{base - cur:.1f} pp vs default ({base:.1f}% -> {cur:.1f}%, "
                 f"tolerance {QUALITY_DRIFT_TOLERANCE_PP:.1f} pp)"
             )
@@ -9445,7 +9647,11 @@ def media_axes_table(recs: list[dict]) -> str:
         if r.get("note"):
             # knob detected inert (profiler skip) — a Δ% against the
             # default would be noise dressed up as a config effect
-            notes.append(ascii_note(f"{engine_label(r['tag'])} {name}: {r['note']}"))
+            notes.append(
+                ascii_note(
+                    f"{engine_label(r['tag'], r.get('kind'))} {name}: {r['note']}"
+                )
+            )
             dp = "inert"
         else:
             td = (
@@ -9456,7 +9662,7 @@ def media_axes_table(recs: list[dict]) -> str:
             dp = f"{td:+.1f}%" if not math.isnan(td) else "-"
         rows.append(
             (
-                engine_label(r["tag"]),
+                engine_label(r["tag"], r.get("kind")),
                 name,
                 pfmt(t),
                 dp,
@@ -9478,7 +9684,7 @@ def features_table(recs: list[dict]) -> str:
     feats: dict[str, dict] = {}
     for r in recs:
         if r.get("provider") == "features":
-            feats[engine_label(r["tag"])] = r.get("features", {})
+            feats[engine_label(r["tag"], r.get("kind"))] = r.get("features", {})
     if not feats:
         return "_Not measured._"
     names = sorted({k for f in feats.values() for k in f})
@@ -9507,7 +9713,9 @@ def coldstart_table(recs: list[dict]) -> str:
 
     rows = [
         (
-            speed_row_name(r, f"blazar gateway - {engine_label(r['tag'])}"),
+            speed_row_name(
+                r, f"blazar gateway - {engine_label(r['tag'], r.get('kind'))}"
+            ),
             r.get("daemon_boot_s"),
             r.get("cold_first_request_s"),
             r.get("cold_ttft_ms"),
@@ -9519,7 +9727,7 @@ def coldstart_table(recs: list[dict]) -> str:
     ]
     rows += [
         (
-            f"direct engine - {engine_label(r['tag'])}",
+            f"direct engine - {engine_label(r['tag'], r.get('kind'))}",
             None,
             None,
             None,
@@ -9565,7 +9773,7 @@ def idle_wake_table(recs: list[dict]) -> str:
         if prov == "idle-blazar" and "error" not in r:
             rows.append(
                 (
-                    f"blazar - {engine_label(r['tag'])}",
+                    f"blazar - {engine_label(r['tag'], r.get('kind'))}",
                     r.get("idle_policy", "sleep ladder"),
                     r.get("slept"),
                     r.get("idle_wake_ttft_ms"),
@@ -9621,7 +9829,7 @@ def ctxcurve_table(recs: list[dict]) -> str:
         if prov == "ctxcurve-blazar" and "error" not in r:
             rows.append(
                 (
-                    f"blazar - {engine_label(r['tag'])}",
+                    f"blazar - {engine_label(r['tag'], r.get('kind'))}",
                     r.get("ctx"),
                     r.get("decode_tps_p50"),
                     r.get("decode_tps_per_w_net"),
@@ -10299,13 +10507,16 @@ def text_findings(recs: list[dict]) -> list[tuple[str | None, str]]:
     )
 
     # F7 - mistral.rs paged-attention fit on tight cards.
-    mistral = next((r for r in ok if "mistral" in engine_label(r.get("tag", ""))), None)
+    mistral = next(
+        (r for r in ok if "mistral" in engine_label(r.get("tag", ""), r.get("kind"))),
+        None,
+    )
     backed = None
     if mistral:
         pa_refused = [
             r
             for r in recs
-            if "mistral" in engine_label(r.get("tag", ""))
+            if "mistral" in engine_label(r.get("tag", ""), r.get("kind"))
             and "Num GPU blocks is 0" in str(r.get("error", ""))
         ]
         refused_note = ""
@@ -10374,7 +10585,7 @@ def text_findings(recs: list[dict]) -> list[tuple[str | None, str]]:
     if resh:
         bits = []
         for r in sorted(resh, key=lambda r: r.get("tag") or ""):
-            label = engine_label(r.get("tag", ""))
+            label = engine_label(r.get("tag", ""), r.get("kind"))
             if r.get("reshape_observed"):
                 if r.get("requests_failed", 0) == 0:
                     bits.append(
@@ -10502,7 +10713,16 @@ def conc_frontier(recs: list[dict]) -> tuple[str, list[str]]:
     names: dict[tuple[str, str], str] = {}
     for r in recs:
         prov = r.get("provider")
-        if prov not in ("conc-blazar", "conc-direct", "conc-ollama") or "error" in r:
+        if (
+            prov
+            not in (
+                "conc-blazar",
+                "conc-blazar-matched",
+                "conc-direct",
+                "conc-ollama",
+            )
+            or "error" in r
+        ):
             continue
         if prov == "conc-ollama":
             gkey = (prov, "")
@@ -10511,8 +10731,14 @@ def conc_frontier(recs: list[dict]) -> tuple[str, list[str]]:
             # one group per engine: two gateway engines must never merge
             # into one row set (the label would lie about whose numbers)
             gkey = (prov, r.get("tag") or "?")
-            prefix = "blazar gateway" if prov == "conc-blazar" else "direct engine"
-            name = f"{prefix} - {engine_label(r['tag'])}"
+            prefix = (
+                "blazar gateway (matched slots)"
+                if prov == "conc-blazar-matched"
+                else "blazar gateway"
+                if prov == "conc-blazar"
+                else "direct engine"
+            )
+            name = f"{prefix} - {engine_label(r['tag'], r.get('kind'))}"
         names[gkey] = name
         groups.setdefault(gkey, []).append(r)
     if not groups:
@@ -10751,6 +10977,7 @@ def write_publication_report(
     argv_summary: str | None = None,
     slim: bool = False,
     quality_status: dict | None = None,
+    charts: list[tuple[str, str, str]] | None = None,
 ) -> None:
     """Publication-format report.
 
@@ -10759,7 +10986,9 @@ def write_publication_report(
     the relative comparisons while the tables and cells.jsonl stay the
     receipts. slim=True (appended chapters) additionally drops the
     globally-duplicated Test bed / Methodology / Caveats / Reproduce
-    sections — the main publication already carries them.
+    sections — the main publication already carries them. charts: pass
+    the caller's render_campaign_charts result to avoid a duplicate
+    render (None = render here, e.g. --render-only and chapter paths).
     """
     versions = {
         r.get("blazar_version", "").strip().removeprefix("blazar ")
@@ -10774,7 +11003,11 @@ def write_publication_report(
     # whether a lane was measured (absent lane -> section says so).
     charts = {
         fname: (sec, cap)
-        for sec, fname, cap in render_campaign_charts(recs, artifacts_dir)
+        for sec, fname, cap in (
+            charts
+            if charts is not None
+            else render_campaign_charts(recs, artifacts_dir)
+        )
     }
 
     def chart_block(fname: str) -> list[str]:

@@ -1,38 +1,38 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="358" viewBox="0 0 880 358" role="img">
 <text x="0" y="16" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#111111">Decode throughput vs context length</text>
 <text x="0" y="34" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#777777">Qwen3.5-9B-Q4_K_M.gguf · 2026-09-29 · 20260929-flagship-gguf</text>
-<line x1="58" y1="282.8" x2="725.6" y2="282.8" stroke="#EBEBEB" stroke-width="1"/>
+<line x1="58" y1="282.8" x2="657.4" y2="282.8" stroke="#EBEBEB" stroke-width="1"/>
 <text x="50" y="286.8" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">20</text>
-<line x1="58" y1="234.5" x2="725.6" y2="234.5" stroke="#EBEBEB" stroke-width="1"/>
+<line x1="58" y1="234.5" x2="657.4" y2="234.5" stroke="#EBEBEB" stroke-width="1"/>
 <text x="50" y="238.5" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">25</text>
-<line x1="58" y1="186.3" x2="725.6" y2="186.3" stroke="#EBEBEB" stroke-width="1"/>
+<line x1="58" y1="186.3" x2="657.4" y2="186.3" stroke="#EBEBEB" stroke-width="1"/>
 <text x="50" y="190.3" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">30</text>
-<line x1="58" y1="138.0" x2="725.6" y2="138.0" stroke="#EBEBEB" stroke-width="1"/>
+<line x1="58" y1="138.0" x2="657.4" y2="138.0" stroke="#EBEBEB" stroke-width="1"/>
 <text x="50" y="142.0" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">35</text>
-<line x1="58" y1="89.7" x2="725.6" y2="89.7" stroke="#EBEBEB" stroke-width="1"/>
+<line x1="58" y1="89.7" x2="657.4" y2="89.7" stroke="#EBEBEB" stroke-width="1"/>
 <text x="50" y="93.7" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">40</text>
-<text x="126.9" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">2000</text>
-<text x="355.1" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">5000</text>
-<text x="527.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">1e4</text>
-<text x="700.5" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">20000</text>
+<text x="119.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">2000</text>
+<text x="324.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">5000</text>
+<text x="479.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">1e4</text>
+<text x="634.9" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">20000</text>
 <line x1="58" y1="56" x2="58" y2="296" stroke="#C9C9C9" stroke-width="1"/>
-<line x1="58" y1="296" x2="725.6" y2="296" stroke="#C9C9C9" stroke-width="1"/>
+<line x1="58" y1="296" x2="657.4" y2="296" stroke="#C9C9C9" stroke-width="1"/>
 <text x="58" y="46" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#777777">decode t/s</text>
-<text x="391.8" y="330" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#777777" text-anchor="middle">context tokens (log)</text>
-<polyline points="132.8,79.8 478.1,83.3 650.8,84.0" fill="none" stroke="#0072B2" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="132.8" cy="79.8" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
-<circle cx="478.1" cy="83.3" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
-<circle cx="650.8" cy="84.0" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
-<text x="659.8" y="88.0" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#0072B2" font-weight="600">blazar · b11202-cuda</text>
-<polyline points="132.8,296.0 478.1,293.0 650.8,295.0" fill="none" stroke="#0072B2" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="132.8" cy="296.0" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
-<circle cx="478.1" cy="293.0" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
-<circle cx="650.8" cy="295.0" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
-<text x="659.8" y="299.0" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#0072B2" font-weight="600">blazar · v0.9.4</text>
-<polyline points="132.8,84.5 478.1,84.4 650.8,83.2" fill="none" stroke="#009E73" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="132.8" cy="84.5" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
-<circle cx="478.1" cy="84.4" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
-<circle cx="650.8" cy="83.2" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
-<text x="659.8" y="87.2" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#009E73" font-weight="600">ollama · ollama-host</text>
+<text x="357.7" y="330" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#777777" text-anchor="middle">context tokens (log)</text>
+<polyline points="125.1,79.8 435.2,83.3 590.3,84.0" fill="none" stroke="#0072B2" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="125.1" cy="79.8" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="435.2" cy="83.3" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="590.3" cy="84.0" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<text x="599.3" y="88.0" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#0072B2" font-weight="600">blazar · llama.cpp b11202-cuda</text>
+<polyline points="125.1,296.0 435.2,293.0 590.3,295.0" fill="none" stroke="#0072B2" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="125.1" cy="296.0" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="435.2" cy="293.0" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="590.3" cy="295.0" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<text x="599.3" y="299.0" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#0072B2" font-weight="600">blazar · mistral.rs v0.9.4</text>
+<polyline points="125.1,84.5 435.2,84.4 590.3,83.2" fill="none" stroke="#009E73" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="125.1" cy="84.5" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="435.2" cy="84.4" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="590.3" cy="83.2" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<text x="599.3" y="87.2" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#009E73" font-weight="600">ollama · ollama-host</text>
 <text x="0" y="352" font-family="Helvetica, Arial, sans-serif" font-size="10.5" fill="#999999">Long-context points, log x-axis. Higher is better.</text>
 </svg>

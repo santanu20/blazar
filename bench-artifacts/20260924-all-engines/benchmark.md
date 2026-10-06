@@ -1,122 +1,155 @@
 # Blazar benchmark matrix
 
-- **date**: 2026-09-25 01:25:35
-- **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5417 MiB)
-- **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 580.178.04
+- **date**: 2026-10-06 16:00:26
+- **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
+- **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11147-cuda, b5130, inventory, master-890-74988b2, ollama-host, piper, v0.9.3
-- **harness**: bench_matrix v2 — `--blazar-bin target/release/blazar --model Qwen3.5-9B --providers blazar --skip-media --skip-ppl --skip-ctxcurve --skip-tools --skip-greedy --artifacts-dir bench-artifacts/20260924-all-engines --md BENCHMARK.md`
+- **harness**: bench_matrix v4 — `regenerated (slim format)`
 - **blazar**: `blazar 0.11.0` (sandbox daemon binary)
+- **quality lane**: not-measured — no quality rows in this campaign (lane not reached for the selected providers/engines)
 - all blazar-owned rows measured by `blazar 0.11.0`
 
 ## Notable findings
 
-- gateway vs direct decode (`b11147-cuda`): 41.0 vs 41.7 t/s = -1.7% (parity).
-- gateway vs direct decode (`b11147-cuda`): 41.1 vs 41.7 t/s = -1.5% (parity).
-- gateway vs direct decode (`v0.9.3`): 40.9 vs 19.6 t/s = +109.1% (gain).
-- gateway vs direct decode (`v0.9.3`): 40.9 vs 19.6 t/s = +109.3% (gain).
-- gateway vs direct decode (`v0.9.3`): 40.9 vs 19.6 t/s = +109.1% (gain).
+- gateway vs direct decode (`b11147-cuda`, 2 configs): median -1.5%, 2/2 within ±5% (parity).
+- gateway vs direct decode (`v0.9.3`, 3 configs): median +109.1%, 0/3 within ±5% (parity); outliers: default +109.1%, single-stream +109.1%, paged_attn_off +109.3%.
 - concurrency system throughput (`b11147-cuda`, 1 streams): 39.2 vs direct 38.8 t/s = 1.01x.
-- concurrency system throughput (`b11147-cuda`, 2 streams): 39.6 vs direct 38.8 t/s = 1.02x.
-- concurrency system throughput (`b11147-cuda`, 4 streams): 39.8 vs direct 38.8 t/s = 1.02x.
-- concurrency system throughput (`b11147-cuda`, 8 streams): 39.5 vs direct 38.8 t/s = 1.02x.
+- concurrency system throughput (`b11147-cuda`, 2 streams): 39.6 vs direct 71.0 t/s = 0.56x — serialized/queued or wall-inflated (see note).
+- concurrency system throughput (`b11147-cuda`, 4 streams): 39.8 vs direct 110.7 t/s = 0.36x — serialized/queued or wall-inflated (see note).
+- concurrency system throughput (`b11147-cuda`, 8 streams): 39.5 vs direct 133.5 t/s = 0.30x — serialized/queued or wall-inflated (see note).
 - kv=q8_0 (`b11147-cuda`): decode -1.3% vs baseline
 - spec=ngram-simple (`b11147-cuda`): decode -2.4% vs baseline
 - mmproj=True (`b11147-cuda`): decode -1.7% vs baseline
 - gateway greedy transparency (`b11147-cuda`): 20/20 exact vs same-engine direct — transparent.
-- 1 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior — see Failed cells.
+- 5 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior — see Failed cells.
 
-## Speed (serving, streaming)
+## Charts
 
-| engine | kind | provider | params | ttft p50 (ms) | ttft p99 (ms) | itl p50 (ms) | itl p99 (ms) | decode t/s | prefill t/s (cold) | prefill t/s (cached) | tokens src |
-|---||---||---||---||---||---||---||---||---||---||---||
-| b11147-cuda | llamacpp | direct | ctx=4096 np=1 | 110 | 114 | 24 | 25 | 41.7 | 1342.6 | 8201.4 | chunks |
-| b11147-cuda | llamacpp | direct | ctx=4096 np=4 | 109 | 112 | 24 | 25 | 41.5 | 1364.6 | 8307.5 | chunks |
-| b11147-cuda | llamacpp | direct | ctx=16384 np=1 | 109 | 112 | 24 | 25 | 41.5 | 1367.9 | 8292.5 | chunks |
-| b11147-cuda | llamacpp | direct | ctx=16384 np=4 | 108 | 112 | 24 | 25 | 41.5 | 1407.7 | 8209.3 | chunks |
-| b11147-cuda | llamacpp | direct | ctx=4096 kv=q8_0 np=1 | 108 | 119 | 24 | 25 | 41.1 | 1374.1 | 8312.1 | chunks |
-| b11147-cuda | llamacpp | direct | ctx=4096 np=1 spec=ngram-simple | 118 | 122 | 25 | 25 | 40.7 | 1343.9 | 7642.3 | chunks |
-| b11147-cuda | llamacpp | direct | ctx=4096 mmproj=True np=1 | 116 | 121 | 24 | 26 | 41.0 | 1339.0 | 7727.7 | chunks |
-| b11147-cuda | llamacpp | blazar | config=default child: np=1 ctx=16384 | 120 | 123 | 24 | 25 | 41.0 | 1365.6 | 7505.3 | chunks |
-| b11147-cuda | llamacpp | blazar | config=single-stream child: np=1 ctx=16384 | 118 | 124 | 24 | 25 | 41.1 | 1317.7 | 7309.2 | chunks |
-| v0.9.3 | mistralrs | blazar | config=default child: np=2 ctx=8192 | 125 | 129 | 24 | 26 | 40.9 | 1338.7 | 7538.8 | chunks |
-| v0.9.3 | mistralrs | blazar | config=paged_attn_off child: np=2 ctx=8192 | 122 | 125 | 24 | 25 | 40.9 | 1326.5 | 7556.7 | chunks |
-| v0.9.3 | mistralrs | blazar | config=single-stream child: np=1 ctx=16384 | 124 | 127 | 24 | 26 | 40.9 | 1333.3 | 7244.6 | chunks |
-| ollama-host | ollama | ollama | reference=True ⚠ serves 'qwen3.5:9b' — t/s NOT comparable | 127 | 133 | 25 | 75 | 40.6 | 1364.7 | 8357.6 | engine_counters |
-| v0.9.3 | mistralrs | direct | ctx=4096 np=1 pa=off | 124 | 137 | 50 | 64 | 19.6 | 221.7 | 244.1 | chunks |
-| ollama-host | ollama | ctxcurve-ollama | ctx=2048 | 168 | - | - | - | 40.2 | - | - | - |
-| ollama-host | ollama | ctxcurve-ollama | ctx=8192 | 149 | - | - | - | 40.3 | - | - | - |
-| ollama-host | ollama | ctxcurve-ollama | ctx=16384 | 135 | - | - | - | 40.7 | - | - | - |
-| b11147-cuda | llamacpp | ctxcurve-blazar | ctx=2048 child: np=3 ctx=6144 | 132 | 203 | 24 | 32 | 40.6 | 1287.9 | 6536.9 | chunks |
-| b11147-cuda | llamacpp | ctxcurve-blazar | ctx=8192 child: np=1 ctx=8192 | 125 | 331 | 24 | 26 | 41.0 | 1321.8 | 7010.5 | chunks |
-| b11147-cuda | llamacpp | ctxcurve-blazar | ctx=16384 child: np=1 ctx=16384 | 126 | 328 | 24 | 26 | 40.9 | 1301.0 | 7545.5 | chunks |
-| v0.9.3 | mistralrs | ctxcurve-blazar | ctx=2048 child: np=4 ctx=8192 | 125 | 180 | 24 | 26 | 40.9 | 1329.7 | 7486.6 | chunks |
-| v0.9.3 | mistralrs | ctxcurve-blazar | ctx=8192 child: np=1 ctx=8192 | 128 | 328 | 24 | 26 | 41.0 | 1311.9 | 7148.8 | chunks |
-| v0.9.3 | mistralrs | ctxcurve-blazar | ctx=16384 child: np=1 ctx=16384 | 124 | 325 | 24 | 26 | 40.9 | 1314.5 | 7500.3 | chunks |
+- deterministic SVG renders of the cells below; source of truth is `cells.jsonl`, charts live in `plots/`.
 
-## Resources & cold start
+### Single-stream decode throughput (chart)
 
-| engine | provider | params | load s | daemon boot s | cold 1st req s | GPU peak (MiB) | GPU power (W) | RSS peak (MiB) | teardown |
+<p align="center"><img src="plots/speed-single-stream.svg" alt="Single-stream decode throughput (chart)"></p>
+
+_Median decode t/s per runtime and engine; whiskers span the interquartile range of the 5 runs; the dashed line marks the fastest direct engine. Higher is better. Source: 20260924-all-engines/cells.jsonl._
+
+### Gateway overhead (chart)
+
+<p align="center"><img src="plots/gateway-overhead.svg" alt="Gateway overhead (chart)"></p>
+
+_Decode t/s delta of routing through blazar relative to driving the same engine build directly; left of zero means the gateway path won. Source: 20260924-all-engines/cells.jsonl._
+
+### Concurrency scaling (chart)
+
+<p align="center"><img src="plots/concurrency-throughput.svg" alt="Concurrency scaling (chart)"></p>
+
+_Aggregate system tokens/s as parallel streams are added; flat-to-rising means the scheduler keeps the device saturated. Higher is better. Source: 20260924-all-engines/cells.jsonl._
+
+### Concurrency tail latency (chart)
+
+<p align="center"><img src="plots/concurrency-ttft.svg" alt="Concurrency tail latency (chart)"></p>
+
+_Worst-case first-token wait per stream as concurrency rises (log scale) - the tail the scheduler must bound. Lower is better. Source: 20260924-all-engines/cells.jsonl._
+
+### Resource cost vs concurrency (chart)
+
+<p align="center"><img src="plots/concurrency-vram.svg" alt="Resource cost vs concurrency (chart)"></p>
+
+_Peak VRAM footprint as parallel streams (and their KV caches) stack up. Source: 20260924-all-engines/cells.jsonl._
+
+### Long-context degradation (chart)
+
+<p align="center"><img src="plots/ctx-curve.svg" alt="Long-context degradation (chart)"></p>
+
+_Single-stream decode t/s as prompt context grows (log x-axis) - KV-cache pressure made visible. Source: 20260924-all-engines/cells.jsonl._
+
+### Memory vs context (chart)
+
+<p align="center"><img src="plots/vram-vs-context.svg" alt="Memory vs context (chart)"></p>
+
+_Peak VRAM as prompt context grows (log x-axis) - the KV-cache slope that sets the usable context ceiling. Source: 20260924-all-engines/cells.jsonl._
+
+### Lifecycle: cold start and idle wake (chart)
+
+<p align="center"><img src="plots/lifecycle-cold-idle.svg" alt="Lifecycle: cold start and idle wake (chart)"></p>
+
+_Seconds to first token after a cold start (page cache dropped) and after idle-policy expiry; blazar keeps weights resident while ollama reloads from disk. Warm-daemon ollama caveat applies. Lower is better. Source: 20260924-all-engines/cells.jsonl._
+
+### KV-quant perplexity (chart)
+
+<p align="center"><img src="plots/ppl-kv.svg" alt="KV-quant perplexity (chart)"></p>
+
+_Perplexity per KV-cache quantization configuration (whiskers: standard error); the dashed line marks the unquantized f16 run. Lower is better; compare only within one context rung. Source: 20260924-all-engines/cells.jsonl._
+
+## Speed (single-stream, medians)
+
+| engine | provider | params | n | ttft p50 (ms) | ttft p99 (ms) | itl p99 (ms) | decode t/s | prefill t/s (cached) | VRAM peak (MiB) |
 |---||---||---||---||---||---||---||---||---||
-| b11147-cuda | direct | ctx=4096 np=1 | 4.04 | - | - | 5319 | 55.9 | 5718 | ok |
-| b11147-cuda | direct | ctx=4096 np=4 | 2.01 | - | - | 5459 | 55.2 | 5770 | ok |
-| b11147-cuda | direct | ctx=16384 np=1 | 2.01 | - | - | 5709 | 55.9 | 5770 | ok |
-| b11147-cuda | direct | ctx=16384 np=4 | 2.01 | - | - | 5847 | 55.5 | 5770 | ok |
-| b11147-cuda | direct | ctx=4096 kv=q8_0 np=1 | 2.02 | - | - | 5261 | 56.0 | 5770 | ok |
-| b11147-cuda | direct | ctx=4096 np=1 spec=ngram-simple | 2.54 | - | - | 5319 | 57.3 | 5771 | ok |
-| b11147-cuda | direct | ctx=4096 mmproj=True np=1 | 3.01 | - | - | 6439 | 55.2 | 5776 | ok |
-| b11147-cuda | blazar | config=default | - | 0.53 | 5.0 | 5715 | 56.3 | 1992 | ok |
-| b11147-cuda | blazar | config=single-stream | - | 0.53 | 5.29 | 5715 | 56.3 | 1993 | ok |
-| v0.9.3 | blazar | config=default | - | 0.52 | 5.0 | 5501 | 55.6 | 1990 | ok |
-| v0.9.3 | blazar | config=paged_attn_off | - | 0.52 | 5.0 | 5501 | 55.4 | 1990 | ok |
-| v0.9.3 | blazar | config=single-stream | - | 0.52 | 4.97 | 5715 | 55.5 | 1993 | ok |
-| ollama-host | ollama | reference=True | - | - | - | 6626 | 55.5 | - | ok |
-| v0.9.3 | direct | ctx=4096 np=1 pa=off | 7.52 | - | - | 6914 | 41.9 | 7443 | ok |
-| ollama-host | ctxcurve-ollama | ctx=2048 | 7.91 | - | - | 6338 | - | - | ok |
-| ollama-host | ctxcurve-ollama | ctx=8192 | 6.44 | - | - | 6446 | - | - | ok |
-| ollama-host | ctxcurve-ollama | ctx=16384 | 5.71 | - | - | 6622 | - | - | ok |
-| b11147-cuda | ctxcurve-blazar | ctx=2048 | - | - | - | 5486 | - | - | ok |
-| b11147-cuda | ctxcurve-blazar | ctx=8192 | - | - | - | 5452 | - | - | ok |
-| b11147-cuda | ctxcurve-blazar | ctx=16384 | - | - | - | 5710 | - | - | ok |
-| v0.9.3 | ctxcurve-blazar | ctx=2048 | - | - | - | 5596 | - | - | ok |
-| v0.9.3 | ctxcurve-blazar | ctx=8192 | - | - | - | 5452 | - | - | ok |
-| v0.9.3 | ctxcurve-blazar | ctx=16384 | - | - | - | 5841 | - | - | ok |
+| b11147-cuda | blazar | config=default child: np=1 ctx=16384 | 1 | 120 | 123 | 25 | 41.0 | 7505.3 | 5715 |
+| b11147-cuda | blazar | config=single-stream child: np=1 ctx=16384 | 1 | 118 | 124 | 25 | 41.1 | 7309.2 | 5715 |
+| b11147-cuda | ctxcurve-blazar | ctx=16384 child: np=1 ctx=16384 | 1 | 126 | 328 | 26 | 40.9 | 7545.5 | 5710 |
+| b11147-cuda | ctxcurve-blazar | ctx=2048 child: np=3 ctx=6144 | 1 | 132 | 203 | 32 | 40.6 | 6536.9 | 5486 |
+| b11147-cuda | ctxcurve-blazar | ctx=8192 child: np=1 ctx=8192 | 1 | 125 | 331 | 26 | 41.0 | 7010.5 | 5452 |
+| b11147-cuda | direct | ctx=16384 np=1 | 1 | 109 | 112 | 25 | 41.5 | 8292.5 | 5709 |
+| b11147-cuda | direct | ctx=16384 np=4 | 1 | 108 | 112 | 25 | 41.5 | 8209.3 | 5847 |
+| b11147-cuda | direct | ctx=4096 kv=q8_0 np=1 | 1 | 108 | 119 | 25 | 41.1 | 8312.1 | 5261 |
+| b11147-cuda | direct | ctx=4096 mmproj=True np=1 | 1 | 116 | 121 | 26 | 41.0 | 7727.7 | 6439 |
+| b11147-cuda | direct | ctx=4096 np=1 | 1 | 110 | 114 | 25 | 41.7 | 8201.4 | 5319 |
+| b11147-cuda | direct | ctx=4096 np=1 spec=ngram-simple | 1 | 118 | 122 | 25 | 40.7 | 7642.3 | 5319 |
+| b11147-cuda | direct | ctx=4096 np=4 | 1 | 109 | 112 | 25 | 41.5 | 8307.5 | 5459 |
+| ollama-host | ctxcurve-ollama | ctx=16384 | 1 | 135 | - | - | 40.7 | - | 6622 |
+| ollama-host | ctxcurve-ollama | ctx=2048 | 1 | 168 | - | - | 40.2 | - | 6338 |
+| ollama-host | ctxcurve-ollama | ctx=8192 | 1 | 149 | - | - | 40.3 | - | 6446 |
+| ollama-host | ollama | reference=True NOTE: serves 'qwen3.5:9b' - t/s NOT comparable | 1 | 127 | 133 | 75 | 40.6 | 8357.6 | 6626 |
+| v0.9.3 | blazar | config=default child: np=2 ctx=8192 | 1 | 125 | 129 | 26 | 40.9 | 7538.8 | 5501 |
+| v0.9.3 | blazar | config=paged_attn_off child: np=2 ctx=8192 | 1 | 122 | 125 | 25 | 40.9 | 7556.7 | 5501 |
+| v0.9.3 | blazar | config=single-stream child: np=1 ctx=16384 | 1 | 124 | 127 | 26 | 40.9 | 7244.6 | 5715 |
+| v0.9.3 | ctxcurve-blazar | ctx=16384 child: np=1 ctx=16384 | 1 | 124 | 325 | 26 | 40.9 | 7500.3 | 5841 |
+| v0.9.3 | ctxcurve-blazar | ctx=2048 child: np=4 ctx=8192 | 1 | 125 | 180 | 26 | 40.9 | 7486.6 | 5596 |
+| v0.9.3 | ctxcurve-blazar | ctx=8192 child: np=1 ctx=8192 | 1 | 128 | 328 | 26 | 41.0 | 7148.8 | 5452 |
+| v0.9.3 | direct | ctx=4096 np=1 pa=off | 1 | 124 | 137 | 64 | 19.6 | 244.1 | 6914 |
 
-## Concurrency (parallel streams)
+## Concurrency (parallel streams, medians)
 
-| engine | provider | streams | sys t/s | sum stream t/s | ttft max (ms) | ttft spread (ms) | itl p99 (ms) | ok/errors | wall (s) |
-|---||---||---||---||---||---||---||---||---||
-| b11147-cuda | conc-direct | conc=1 | 38.8 | 40.8 | 179 | 0.0 | 28.25 | 1/0 | 3.3 |
-| b11147-cuda | conc-blazar | conc=1 rounds=3 | 39.2 | 123.2 | 309 | 201.9 | 26.74 | 3/0 | 9.8 |
-| v0.9.3 | conc-blazar | conc=1 rounds=3 | 39.4 | 123.3 | 209 | 101.0 | 26.76 | 3/0 | 9.75 |
-| ollama-host | conc-ollama | conc=1 rounds=3 | 22.6 | 120.9 | 7206 | 7094.7 | 75.47 | 3/0 | 16.98 |
-| b11147-cuda | conc-direct | conc=2 | 71.0 | 73.9 | 164 | 0.6 | 28.56 | 2/0 | 3.6 |
-| b11147-cuda | conc-blazar | conc=2 rounds=3 | 39.6 | 246.5 | 3497 | 3384.8 | 25.45 | 6/0 | 19.41 |
-| v0.9.3 | conc-blazar | conc=2 rounds=3 | 68.1 | 219.1 | 381 | 182.9 | 29.24 | 6/0 | 11.28 |
-| ollama-host | conc-ollama | conc=2 rounds=3 | 30.8 | 243.9 | 8723 | 8617.8 | 74.59 | 6/0 | 24.92 |
-| b11147-cuda | conc-direct | conc=4 | 110.7 | 115.9 | 241 | 14.1 | 37.39 | 4/0 | 4.63 |
-| b11147-cuda | conc-blazar | conc=4 rounds=3 | 39.8 | 494.0 | 9901 | 9789.9 | 25.5 | 12/0 | 38.61 |
-| v0.9.3 | conc-blazar | conc=4 rounds=3 | 69.2 | 439.8 | 4145 | 3946.1 | 29.05 | 12/0 | 22.21 |
-| ollama-host | conc-ollama | conc=4 rounds=3 | 34.0 | 485.8 | 15846 | 15732.0 | 74.98 | 12/0 | 45.23 |
-| b11147-cuda | conc-direct | conc=8 | 133.5 | 141.2 | 477 | 11.3 | 60.49 | 8/0 | 7.67 |
-| b11147-cuda | conc-blazar | conc=8 rounds=3 | 39.5 | 982.3 | 23007 | 22887.6 | 26.01 | 24/0 | 77.86 |
-| v0.9.3 | conc-blazar | conc=8 rounds=3 | 68.7 | 874.4 | 11871 | 11659.1 | 29.36 | 24/0 | 44.71 |
-| ollama-host | conc-ollama | conc=8 rounds=3 | 36.3 | 972.4 | 29036 | 28922.8 | 74.81 | 24/0 | 84.64 |
-- sys t/s = total tokens / wall (true system throughput); sum stream t/s = sum of per-stream rates. sum >> sys means streams were serialized (queued on a single slot) rather than served concurrently.
+| provider | engine | params | n | sys t/s | ttft max (ms) | itl p99 (ms) | ok/errors |
+|---||---||---||---||---||---||---||---||
+| conc-blazar | b11147-cuda | conc=1 rounds=3 | 1 | 39.2 | 309 | 27 | 3/0 |
+| conc-blazar | b11147-cuda | conc=2 rounds=3 | 1 | 39.6 | 3497 | 25 | 6/0 |
+| conc-blazar | b11147-cuda | conc=4 rounds=3 | 1 | 39.8 | 9901 | 26 | 12/0 |
+| conc-blazar | b11147-cuda | conc=8 rounds=3 | 1 | 39.5 | 23007 | 26 | 24/0 |
+| conc-blazar | v0.9.3 | conc=1 rounds=3 | 1 | 39.4 | 209 | 27 | 3/0 |
+| conc-blazar | v0.9.3 | conc=2 rounds=3 | 1 | 68.1 | 381 | 29 | 6/0 |
+| conc-blazar | v0.9.3 | conc=4 rounds=3 | 1 | 69.2 | 4145 | 29 | 12/0 |
+| conc-blazar | v0.9.3 | conc=8 rounds=3 | 1 | 68.7 | 11871 | 29 | 24/0 |
+| conc-direct | b11147-cuda | conc=1 | 1 | 38.8 | 179 | 28 | 1/0 |
+| conc-direct | b11147-cuda | conc=2 | 1 | 71.0 | 164 | 29 | 2/0 |
+| conc-direct | b11147-cuda | conc=4 | 1 | 110.7 | 241 | 37 | 4/0 |
+| conc-direct | b11147-cuda | conc=8 | 1 | 133.5 | 477 | 60 | 8/0 |
+| conc-ollama | ollama-host | conc=1 rounds=3 | 1 | 22.6 | 7206 | 75 | 3/0 |
+| conc-ollama | ollama-host | conc=2 rounds=3 | 1 | 30.8 | 8723 | 75 | 6/0 |
+| conc-ollama | ollama-host | conc=4 rounds=3 | 1 | 34.0 | 15846 | 75 | 12/0 |
+| conc-ollama | ollama-host | conc=8 rounds=3 | 1 | 36.3 | 29036 | 75 | 24/0 |
+- sys t/s = total tokens / wall (true system throughput); flat sys t/s with growing ttft max means streams queued on a fixed slot count instead of being served concurrently.
 
 
 ## Quality — perplexity (identical pinned args)
 
-| engine | perplexity | ± err | wall (s) | note |
+| engine | perplexity | +/- err | wall (s) | note |
 |---|---|---|---|---|
 | v0.9.3 | - | - | - | llama-perplexity is llama-server-family only |
 | b11147-cuda | 16.7503 | 0.87774 | 8.6 | lower = better text fit |
+| v0.9.3 | - | - | - | llama-perplexity is llama-server-family only |
+| v0.9.3 | - | - | - | llama-perplexity is llama-server-family only |
+| v0.9.3 | - | - | - | llama-perplexity is llama-server-family only |
+| v0.9.3 | - | - | - | llama-perplexity is llama-server-family only |
+| v0.9.3 | - | - | - | llama-perplexity is llama-server-family only |
 - corpus: deterministic offline repo text (code-heavy) — PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
 
-## Quality — greedy parity vs `b11147-cuda`-direct (backend numerics)
+## Quality — greedy parity vs `reference`-direct (backend numerics)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
-| b11147-cuda *(self — trivially 1.0) | 20/20 | 1.0 | 1.0 | 798.5 |
+| b11147-cuda | 20/20 | 1.0 | 1.0 | 798.5 |
 | v0.9.3 | 0/20 | 0.5261 | 0.0 | 0.0 |
 
 ## Quality — gateway transparency (blazar path vs direct, same engine)
@@ -150,24 +183,19 @@
 
 **product** (engine/gateway behavior):
 
-- `v0.9.3` / direct / {'ctx': 4096, 'np': 1}: child exited rc=1 during load; last output: Error: Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/context size or disable PagedAttention. | 
-- `v0.9.3` / direct / {'ctx': 4096, 'np': 4}: child exited rc=1 during load; last output: Error: Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/context size or disable PagedAttention. | 
-- `v0.9.3` / direct / {'ctx': 16384, 'np': 1}: child exited rc=1 during load; last output: Error: Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/context size or disable PagedAttention. | 
-- `v0.9.3` / direct / {'ctx': 16384, 'np': 4}: child exited rc=1 during load; last output: Error: Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/context size or disable PagedAttention. | 
-- `v0.9.3` / ppl / {'ppl': 2048}: llama-perplexity is llama-server-family only
+- `v0.9.3` / direct (32 cells): child exited rc=1 during load; last output: Error: Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/co... [{'ctx': 4096, 'np': 1}; {'ctx': 4096, 'np': 4}; {'ctx': 16384, 'np': 1}; {'ctx': 16384, 'np': 4}; +28 more]
+- `v0.9.3` / ppl (6 cells): llama-perplexity is llama-server-family only [{'ppl': 2048}; {'ppl': 2048}; {'ppl': 2048}; {'ppl': 2048}; +2 more]
+- `b11147-cuda` / tools / {'tools': True}: tools lane: every scenario failed transport — {"error":{"code":404,"message":"model \"Qwen3.5-9B-Q4_K_M.gguf\" not found; try `blazar list`","type":"blazar_e...
+- `v0.9.3` / tools (2 cells): tools lane: every scenario failed transport — {"error":{"code":404,"message":"model \"default\" not found; try `blazar list`","type":"blazar_error"}} [{'tools': True}; {'tools': True}]
+- `v0.9.3` / tools / {'tools': True}: tools cell crashed: '<=' not supported between instances of 'list' and 'set'
 
 **environment** (box/co-residency guards — NOT blazar defects):
 
-- `v0.9.3` / reshape / {'reshape': True}: reshape cell crashed: MemAvailable 6986 MiB < needed ~7795 MiB (model 5417 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop it for the validation window.
+- `v0.9.3` / direct (4 cells): GPU memory floor exceeded before cell [{'ctx': 4096, 'np': 1}; {'ctx': 4096, 'np': 4}; {'ctx': 16384, 'np': 1}; {'ctx': 16384, 'np': 4}]
+- `v0.9.3` / reshape / {'reshape': True}: reshape cell crashed: MemAvailable 6986 MiB < needed ~7795 MiB (model 5417 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop...
 
 ## Reading this report
 
-- `direct` = raw child spawn on a probed free port (no gateway).
-- `blazar` = full gateway path inside a sandboxed daemon (profile compiler, routing, auth); `child_argv` in cells.jsonl holds the resolved engine argv.
-- `ollama` = HTTP-only reference against the host service, one cell.
-- decode counts ALL emitted tokens (content + reasoning/thinking); `usage`/engine counters are authoritative when present (`tokens src`).
-- prefill t/s (cold) = prompt tokens / first-token time on an uncached token-targeted prompt; (cached) = same prompt re-sent (child prompt-cache path). ollama prefill uses engine-side prompt_eval counters, which EXCLUDE template tokens — ollama prefill reads high relative to the 512-token lanes.
-- blazar speed rows show the resolved slot/context shape (`child: np=… ctx=…`) parsed from the recorded child argv — auto-slots may differ from the direct rows' explicit np.
-- decode-lane TTFT rides the child's prompt cache after run 1 (warm path); the prefill-lane cold/cached pair is the honest cache story at real prompt sizes.
-- GPU/power peaks sampled at ~1.2 s cadence (max across NVIDIA GPUs); very short bursts may undersample.
-- Cells append to `cells.jsonl` and resume across reruns (keyed on engine/provider/params/model/harness-version).
+- `direct` = raw child spawn on a probed free port (no gateway); `blazar` = full gateway path inside a sandboxed daemon (resolved engine argv in `child_argv`); `ollama` = HTTP-only reference against the host service.
+- decode counts ALL emitted tokens (content + reasoning); engine `usage` counters are authoritative when present. GPU/power peaks sampled at ~1.2 s cadence.
+- per-run spread, cold-start/resource detail, and every raw cell live in `cells.jsonl`; tables here are per-config medians.

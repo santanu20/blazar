@@ -38,8 +38,38 @@ FAMILY_COLOR = {
     "blazar": "#0072B2",  # blue
     "direct": "#E69F00",  # orange
     "ollama": "#009E73",  # bluish green
+    # slots-pinned gateway twin: a blazar-adjacent hue that never
+    # collides with the default gateway series it sits beside
+    "blazar-matched": "#882255",  # wine
 }
 ALT_COLORS = ("#CC79A7", "#56B4E9", "#999999")  # reddish purple, sky, grey
+
+# concurrency-panel legend labels per provider family (provider minus
+# the "conc-" prefix); families absent from this map render as-is
+CONC_FAM_LABEL = {
+    "blazar-matched": "blazar (matched slots)",
+}
+
+# Engine-family display names, mirroring bench_matrix KIND_DISPLAY: a raw
+# build tag ("v0.9.4", "b11429-cuda") says nothing about WHICH engine it
+# is, so every chart label prefixes the kind from the cell itself.
+KIND_PREFIX = {
+    "llamacpp": "llama.cpp",
+    "mistralrs": "mistral.rs",
+    "whisper": "whisper.cpp",
+    "sdcpp": "stable-diffusion.cpp",
+    "sglang": "sglang",
+    "piper": "piper",
+    "mlx": "MLX",
+}
+
+
+def engine_name(r: dict) -> str:
+    """Display name for a cell's engine build: kind prefix + tag, falling
+    back to the raw tag when the cell predates kind stamping."""
+    tag = str(r.get("tag", "?"))
+    k = KIND_PREFIX.get(str(r.get("kind") or ""))
+    return f"{k} {tag}" if k else tag
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +199,7 @@ def hbar_svg(
     baseline: tuple[str, float] | None = None,
     signed: bool = False,
     footnote: str | None = None,
+    value_nd: int = 1,
 ) -> str:
     """Sorted horizontal bars with direct value labels and IQR whiskers.
 
@@ -260,7 +291,7 @@ def hbar_svg(
         doc.append(
             f'<text x="{lbl_x:.1f}" y="{cy + 4:.1f}"{anchor} '
             f'font-family="{MONO}" font-size="{VALUE_PX}" fill="{INK}" '
-            f'font-weight="600">{_esc(_fmt(val))} {_esc(unit)}</text>'
+            f'font-weight="600">{_esc(_fmt(val, value_nd))} {_esc(unit)}</text>'
         )
     fy = plot_top + len(rows) * row_h + 34
     doc.append(
@@ -656,6 +687,7 @@ _CHART_FILES = frozenset(
         "quality-parity.svg",
         "quality-config.svg",
         "quality-tradeoff.svg",
+        "ppl-kv.svg",
     }
 )
 
@@ -682,12 +714,21 @@ def render_campaign_charts(
     src = f"Source: {campaign}/cells.jsonl."
     charts: list[tuple[str, str, str]] = []
 
-    def emit(fname: str, svg: str) -> str:
+    def panel(
+        fname: str, svg: str | None, section: str, caption: str, skip: str
+    ) -> None:
+        """Single registration point: write the SVG and index it for
+        embedding, or log why the lane produced no chart (a legitimately
+        unmeasured lane is a skip, not an error)."""
+        if svg is None:
+            print(skip)
+            return
         (plots / fname).write_text(svg, encoding="utf-8")
-        return fname
+        charts.append((section, fname, caption))
 
     # (a) single-stream decode bars + IQR, baseline = fastest direct engine
     speed = _ok_speed_rows(recs)
+    speed_svg = None
     if speed:
         rows = []
         for r in speed:
@@ -696,7 +737,7 @@ def render_campaign_charts(
             lo = _pctl(runs, 0.25) if runs else v
             hi = _pctl(runs, 0.75) if runs else v
             fam = r.get("provider") or "?"
-            rows.append((f"{fam} · {r.get('tag', '?')}", v, lo, hi, fam))
+            rows.append((f"{fam} · {engine_name(r)}", v, lo, hi, fam))
         fams = sorted({fam for _, _, _, _, fam in rows})
         color_of = {}
         for fam in fams:
@@ -713,28 +754,23 @@ def render_campaign_charts(
             if directs
             else None
         )
-        emit(
-            "speed-single-stream.svg",
-            hbar_svg(
-                "Single-stream decode throughput",
-                prov,
-                bars,
-                "t/s",
-                baseline=base,
-                footnote="Bars: median of 5 runs. Whiskers: interquartile range. Higher is better.",
-            ),
+        speed_svg = hbar_svg(
+            "Single-stream decode throughput",
+            prov,
+            bars,
+            "t/s",
+            baseline=base,
+            footnote="Bars: median of 5 runs. Whiskers: interquartile range. Higher is better.",
         )
-        charts.append(
-            (
-                "Single-stream decode throughput (chart)",
-                "speed-single-stream.svg",
-                "Median decode t/s per runtime and engine; whiskers span the "
-                "interquartile range of the 5 runs; the dashed line marks the "
-                f"fastest direct engine. Higher is better. {src}",
-            )
-        )
-    else:
-        print("charts: skip speed bars (no comparable single-stream cells)")
+    panel(
+        "speed-single-stream.svg",
+        speed_svg,
+        "Single-stream decode throughput (chart)",
+        "Median decode t/s per runtime and engine; whiskers span the "
+        "interquartile range of the 5 runs; the dashed line marks the "
+        f"fastest direct engine. Higher is better. {src}",
+        "charts: skip speed bars (no comparable single-stream cells)",
+    )
 
     # (a2) gateway overhead: signed % decode-t/s delta, blazar vs direct on
     # the same engine build (tag); negative = blazar faster
@@ -745,6 +781,9 @@ def render_campaign_charts(
                 acc.setdefault(str(r.get("tag")), []).append(float(r["decode_tps_p50"]))
         return {t: _median(v) for t, v in acc.items()}
 
+    # display names for bars grouped by raw tag (grouping keys stay raw
+    # so the direct/blazar set intersection is untouched)
+    tag_display = {str(r.get("tag")): engine_name(r) for r in recs if r.get("tag")}
     direct_med = _tps_by_tag("direct")
     blazar_med = _tps_by_tag("blazar")
     overhead = [
@@ -757,31 +796,31 @@ def render_campaign_charts(
     ]
     if overhead:
         overhead.sort(key=lambda kv: kv[1])
-        bars = [(tag, d, d, d, FAMILY_COLOR["blazar"]) for tag, d in overhead]
-        emit(
-            "gateway-overhead.svg",
-            hbar_svg(
-                "Gateway overhead vs direct engine",
-                prov,
-                bars,
-                "%",
-                signed=True,
-                footnote="Signed decode t/s delta, blazar vs the direct "
-                "engine on the same engine build and model. Left of zero "
-                "= blazar faster.",
-            ),
-        )
-        charts.append(
-            (
-                "Gateway overhead (chart)",
-                "gateway-overhead.svg",
-                "Decode t/s delta of routing through blazar relative to "
-                "driving the same engine build directly; left of zero means "
-                f"the gateway path won. {src}",
-            )
+        bars = [
+            (tag_display.get(tag, tag), d, d, d, FAMILY_COLOR["blazar"])
+            for tag, d in overhead
+        ]
+        overhead_svg = hbar_svg(
+            "Gateway overhead vs direct engine",
+            prov,
+            bars,
+            "%",
+            signed=True,
+            footnote="Signed decode t/s delta, blazar vs the direct "
+            "engine on the same engine build and model. Left of zero "
+            "= blazar faster.",
         )
     else:
-        print("charts: skip gateway overhead (no blazar/direct pair per tag)")
+        overhead_svg = None
+    panel(
+        "gateway-overhead.svg",
+        overhead_svg,
+        "Gateway overhead (chart)",
+        "Decode t/s delta of routing through blazar relative to "
+        "driving the same engine build directly; left of zero means "
+        f"the gateway path won. {src}",
+        "charts: skip gateway overhead (no blazar/direct pair per tag)",
+    )
 
     # (b)/(c) concurrency panels: throughput and worst-case TTFT vs level
     conc = [
@@ -792,7 +831,7 @@ def render_campaign_charts(
     if conc:
         keys = sorted(
             {
-                (str(r.get("provider")).removeprefix("conc-"), str(r.get("tag", "?")))
+                (str(r.get("provider")).removeprefix("conc-"), engine_name(r))
                 for r in conc
             }
         )
@@ -819,7 +858,7 @@ def render_campaign_charts(
         }
         for r in conc:
             fam = str(r.get("provider")).removeprefix("conc-")
-            key = (fam, str(r.get("tag", "?")))
+            key = (fam, engine_name(r))
             lvl = r.get("params", {}).get("conc")
             if lvl is None:
                 continue
@@ -835,7 +874,7 @@ def render_campaign_charts(
                 power_pts[key].append((float(lvl), float(r["gpu_power_peak_w"])))
             if r.get("conc_errors"):
                 err_pts[key].append((float(lvl), float(r["conc_errors"])))
-        labels = {k: f"{k[0]} · {k[1]}" for k in keys}
+        labels = {k: f"{CONC_FAM_LABEL.get(k[0], k[0])} · {k[1]}" for k in keys}
 
         def series_of(pts: dict) -> list:
             out = []
@@ -844,29 +883,29 @@ def render_campaign_charts(
                     out.append((labels[k], sorted(pts[k]), fam_color[k]))
             return out
 
-        if any(tp_pts.values()):
-            emit(
-                "concurrency-throughput.svg",
-                line_svg(
-                    "System throughput vs concurrency",
-                    prov,
-                    series_of(tp_pts),
-                    "concurrent streams",
-                    "system t/s",
-                    footnote="Each point: one sustained-load lane cell. Higher is better.",
-                ),
+        tp_svg = (
+            line_svg(
+                "System throughput vs concurrency",
+                prov,
+                series_of(tp_pts),
+                "concurrent streams",
+                "system t/s",
+                footnote="Each point: one sustained-load lane cell. Higher is better.",
             )
-            charts.append(
-                (
-                    "Concurrency scaling (chart)",
-                    "concurrency-throughput.svg",
-                    "Aggregate system tokens/s as parallel streams are added; "
-                    "flat-to-rising means the scheduler keeps the device "
-                    f"saturated. Higher is better. {src}",
-                )
-            )
-        else:
-            print("charts: skip concurrency throughput panel (no sys_tps cells)")
+            if any(tp_pts.values())
+            else None
+        )
+        panel(
+            "concurrency-throughput.svg",
+            tp_svg,
+            "Concurrency scaling (chart)",
+            "Aggregate system tokens/s as parallel streams are added; "
+            "flat-to-rising means the scheduler keeps the device "
+            f"saturated. Higher is better. {src}",
+            "charts: skip concurrency throughput panel (no sys_tps cells)",
+        )
+        ttft_svg = None
+        queue_cap = ""
         if any(ttft_pts.values()):
             ttft_series = series_of(ttft_pts)
             queue_foot = "Worst stream per level, log scale. Lower is better."
@@ -890,103 +929,93 @@ def render_campaign_charts(
                     " Dashed curves carry the median time-to-first-byte, "
                     "which upper-bounds queue wait under burst arrival."
                 )
-            emit(
-                "concurrency-ttft.svg",
-                line_svg(
-                    "Worst-case first-token latency vs concurrency",
-                    prov,
-                    ttft_series,
-                    "concurrent streams",
-                    "TTFT max ms (log)",
-                    log_y=True,
-                    footnote=queue_foot,
-                ),
+            ttft_svg = line_svg(
+                "Worst-case first-token latency vs concurrency",
+                prov,
+                ttft_series,
+                "concurrent streams",
+                "TTFT max ms (log)",
+                log_y=True,
+                footnote=queue_foot,
             )
-            charts.append(
-                (
-                    "Concurrency tail latency (chart)",
-                    "concurrency-ttft.svg",
-                    "Worst-case first-token wait per stream as concurrency "
-                    "rises (log scale) - the tail the scheduler must bound. "
-                    f"Lower is better.{queue_cap} {src}",
-                )
-            )
-        else:
-            print("charts: skip concurrency TTFT panel (no ttft_max_ms cells)")
+        panel(
+            "concurrency-ttft.svg",
+            ttft_svg,
+            "Concurrency tail latency (chart)",
+            "Worst-case first-token wait per stream as concurrency "
+            "rises (log scale) - the tail the scheduler must bound. "
+            f"Lower is better.{queue_cap} {src}"
+            if ttft_svg is not None
+            else "",
+            "charts: skip concurrency TTFT panel (no ttft_max_ms cells)",
+        )
 
         # (c2) resource cost vs concurrency: VRAM, GPU power, error counts
-        if any(vram_pts.values()):
-            emit(
-                "concurrency-vram.svg",
-                line_svg(
-                    "GPU memory vs concurrency",
-                    prov,
-                    series_of(vram_pts),
-                    "concurrent streams",
-                    "VRAM peak MiB",
-                    footnote="Peak device memory per sustained-load cell.",
-                ),
+        vram_svg = (
+            line_svg(
+                "GPU memory vs concurrency",
+                prov,
+                series_of(vram_pts),
+                "concurrent streams",
+                "VRAM peak MiB",
+                footnote="Peak device memory per sustained-load cell.",
             )
-            charts.append(
-                (
-                    "Resource cost vs concurrency (chart)",
-                    "concurrency-vram.svg",
-                    "Peak VRAM footprint as parallel streams (and their KV "
-                    f"caches) stack up. {src}",
-                )
+            if any(vram_pts.values())
+            else None
+        )
+        panel(
+            "concurrency-vram.svg",
+            vram_svg,
+            "Resource cost vs concurrency (chart)",
+            "Peak VRAM footprint as parallel streams (and their KV "
+            f"caches) stack up. {src}",
+            "charts: skip conc VRAM panel (no gpu_peak_mib in conc cells)",
+        )
+        power_svg = (
+            line_svg(
+                "GPU power vs concurrency",
+                prov,
+                series_of(power_pts),
+                "concurrent streams",
+                "GPU power peak W",
+                footnote="Peak board power per sustained-load cell.",
             )
-        else:
-            print("charts: skip conc VRAM panel (no gpu_peak_mib in conc cells)")
-        if any(power_pts.values()):
-            emit(
-                "concurrency-power.svg",
-                line_svg(
-                    "GPU power vs concurrency",
-                    prov,
-                    series_of(power_pts),
-                    "concurrent streams",
-                    "GPU power peak W",
-                    footnote="Peak board power per sustained-load cell.",
-                ),
+            if any(power_pts.values())
+            else None
+        )
+        panel(
+            "concurrency-power.svg",
+            power_svg,
+            "Resource cost vs concurrency (chart)",
+            "Peak GPU board power per concurrency level - the energy "
+            f"price of keeping the device saturated. {src}",
+            "charts: skip conc power panel (no gpu_power_peak_w in conc cells)",
+        )
+        # a lane that never failed renders no errors panel on purpose;
+        # the skip line then reports the zero-failure cell count
+        err_svg = (
+            line_svg(
+                "Failed requests vs concurrency",
+                prov,
+                series_of(err_pts),
+                "concurrent streams",
+                "failed requests",
+                footnote="Requests that returned an error or timed out "
+                "per sustained-load cell. Lower is better (zero is the "
+                "goal).",
             )
-            charts.append(
-                (
-                    "Resource cost vs concurrency (chart)",
-                    "concurrency-power.svg",
-                    "Peak GPU board power per concurrency level - the energy "
-                    f"price of keeping the device saturated. {src}",
-                )
-            )
-        else:
-            print("charts: skip conc power panel (no gpu_power_peak_w in conc cells)")
-        if any(err_pts.values()):
-            emit(
-                "concurrency-errors.svg",
-                line_svg(
-                    "Failed requests vs concurrency",
-                    prov,
-                    series_of(err_pts),
-                    "concurrent streams",
-                    "failed requests",
-                    footnote="Requests that returned an error or timed out "
-                    "per sustained-load cell. Lower is better (zero is the "
-                    "goal).",
-                ),
-            )
-            charts.append(
-                (
-                    "Reliability vs concurrency (chart)",
-                    "concurrency-errors.svg",
-                    "Failed requests per concurrency level; lanes that never "
-                    f"failed are omitted. Lower is better. {src}",
-                )
-            )
-        else:
-            n_conc_cells = len(conc)
-            print(
-                f"charts: zero failed requests across {n_conc_cells} conc "
-                "cells - errors panel omitted"
-            )
+            if any(err_pts.values())
+            else None
+        )
+        panel(
+            "concurrency-errors.svg",
+            err_svg,
+            "Reliability vs concurrency (chart)",
+            "Failed requests per concurrency level; lanes that never "
+            f"failed are omitted. Lower is better. {src}",
+            f"charts: zero failed requests across {len(conc)} conc "
+            "cells - errors panel omitted",
+        )
     else:
         print("charts: skip concurrency panels (no conc cells)")
 
@@ -1004,7 +1033,7 @@ def render_campaign_charts(
             {
                 (
                     str(r.get("provider")).removeprefix("ctxcurve-"),
-                    str(r.get("tag", "?")),
+                    engine_name(r),
                 )
                 for r in ctx
             }
@@ -1013,7 +1042,7 @@ def render_campaign_charts(
         for r in ctx:
             key = (
                 str(r.get("provider")).removeprefix("ctxcurve-"),
-                str(r.get("tag", "?")),
+                engine_name(r),
             )
             pts[key].append((float(r["ctx"]), float(r["decode_tps_p50"])))
         series = [
@@ -1021,29 +1050,27 @@ def render_campaign_charts(
             for k in keys
             if pts[k]
         ]
-        if series:
-            emit(
-                "ctx-curve.svg",
-                line_svg(
-                    "Decode throughput vs context length",
-                    prov,
-                    series,
-                    "context tokens (log)",
-                    "decode t/s",
-                    log_x=True,
-                    footnote="Long-context points, log x-axis. Higher is better.",
-                ),
+        ctx_svg = (
+            line_svg(
+                "Decode throughput vs context length",
+                prov,
+                series,
+                "context tokens (log)",
+                "decode t/s",
+                log_x=True,
+                footnote="Long-context points, log x-axis. Higher is better.",
             )
-            charts.append(
-                (
-                    "Long-context degradation (chart)",
-                    "ctx-curve.svg",
-                    "Single-stream decode t/s as prompt context grows (log "
-                    f"x-axis) - KV-cache pressure made visible. {src}",
-                )
-            )
-        else:
-            print("charts: skip ctx curve (no plottable points)")
+            if series
+            else None
+        )
+        panel(
+            "ctx-curve.svg",
+            ctx_svg,
+            "Long-context degradation (chart)",
+            "Single-stream decode t/s as prompt context grows (log "
+            f"x-axis) - KV-cache pressure made visible. {src}",
+            "charts: skip ctx curve (no plottable points)",
+        )
 
         # (d2) memory pressure: peak VRAM along the same context ladder
         vram_ctx: dict[tuple[str, str], list[tuple[float, float]]] = {}
@@ -1052,7 +1079,7 @@ def render_campaign_charts(
                 continue
             key = (
                 str(r.get("provider")).removeprefix("ctxcurve-"),
-                str(r.get("tag", "?")),
+                engine_name(r),
             )
             vram_ctx.setdefault(key, []).append(
                 (float(r["ctx"]), float(r["gpu_peak_mib"]))
@@ -1062,31 +1089,29 @@ def render_campaign_charts(
             for k in sorted(vram_ctx)
             if vram_ctx[k]
         ]
-        if vram_series:
-            emit(
-                "vram-vs-context.svg",
-                line_svg(
-                    "GPU memory vs context length",
-                    prov,
-                    vram_series,
-                    "context tokens (log)",
-                    "VRAM peak MiB",
-                    log_x=True,
-                    footnote="Peak device memory per context cell, log "
-                    "x-axis. The KV-cache slope is the capacity ceiling.",
-                ),
+        vram_ctx_svg = (
+            line_svg(
+                "GPU memory vs context length",
+                prov,
+                vram_series,
+                "context tokens (log)",
+                "VRAM peak MiB",
+                log_x=True,
+                footnote="Peak device memory per context cell, log "
+                "x-axis. The KV-cache slope is the capacity ceiling.",
             )
-            charts.append(
-                (
-                    "Memory vs context (chart)",
-                    "vram-vs-context.svg",
-                    "Peak VRAM as prompt context grows (log x-axis) - the "
-                    "KV-cache slope that sets the usable context ceiling. "
-                    f"{src}",
-                )
-            )
-        else:
-            print("charts: skip vram-vs-context (no gpu_peak_mib in ctxcurve cells)")
+            if vram_series
+            else None
+        )
+        panel(
+            "vram-vs-context.svg",
+            vram_ctx_svg,
+            "Memory vs context (chart)",
+            "Peak VRAM as prompt context grows (log x-axis) - the "
+            "KV-cache slope that sets the usable context ceiling. "
+            f"{src}",
+            "charts: skip vram-vs-context (no gpu_peak_mib in ctxcurve cells)",
+        )
     else:
         print("charts: skip ctx curve (no ctxcurve cells)")
 
@@ -1121,6 +1146,8 @@ def render_campaign_charts(
         ("idle wake to first token", idle_blazar, idle_ollama),
     ]
     life_rows_spec = [(label, a, b) for label, a, b in life_rows_spec if a or b]
+    life_svg = None
+    warm_note = False
     if life_rows_spec:
         ca, cb = FAMILY_COLOR["blazar"], FAMILY_COLOR["ollama"]
         rows = [
@@ -1139,31 +1166,30 @@ def render_campaign_charts(
         foot = "Dots: median across cells, log scale. Lower is better."
         if warm_note:
             foot += " ollama cold row reflects a warm daemon (no service restart in this campaign)."
-        emit(
-            "lifecycle-cold-idle.svg",
-            dumbbell_svg(
-                "Cold start and idle wake",
-                prov,
-                rows,
-                "s",
-                "blazar",
-                "ollama",
-                footnote=foot,
-            ),
-        )
-        charts.append(
-            (
-                "Lifecycle: cold start and idle wake (chart)",
-                "lifecycle-cold-idle.svg",
-                "Seconds to first token after a cold start (page cache "
-                "dropped) and after idle-policy expiry; blazar keeps weights "
-                "resident while ollama reloads from disk. "
-                + ("Warm-daemon ollama caveat applies. " if warm_note else "")
-                + f"Lower is better. {src}",
-            )
+        life_svg = dumbbell_svg(
+            "Cold start and idle wake",
+            prov,
+            rows,
+            "s",
+            "blazar",
+            "ollama",
+            footnote=foot,
         )
     else:
-        print("charts: skip lifecycle panel (no cold/idle cells)")
+        life_svg = None
+    panel(
+        "lifecycle-cold-idle.svg",
+        life_svg,
+        "Lifecycle: cold start and idle wake (chart)",
+        "Seconds to first token after a cold start (page cache "
+        "dropped) and after idle-policy expiry; blazar keeps weights "
+        "resident while ollama reloads from disk. "
+        + ("Warm-daemon ollama caveat applies. " if warm_note else "")
+        + f"Lower is better. {src}"
+        if life_svg is not None
+        else "",
+        "charts: skip lifecycle panel (no cold/idle cells)",
+    )
 
     # (f) quality suites: checker-verified correctness on the same seeded
     # task set across providers. Embed is a per-engine parity metric
@@ -1217,6 +1243,7 @@ def render_campaign_charts(
             if r.get(f"quality_{s}_rate") is not None
         }
     )
+    suites_svg = None
     if suites_seen:
         rows = []
         for s in suites_seen:
@@ -1234,33 +1261,28 @@ def render_campaign_charts(
                         )
                     )
         if rows:
-            emit(
-                "quality-suites.svg",
-                hbar_svg(
-                    "Quality suite pass rates",
-                    prov,
-                    rows,
-                    "%",
-                    baseline=("100 % pass", 100.0),
-                    footnote="Checker-verified pass rate per suite and "
-                    "runtime, same seeded task set. Higher is better; "
-                    "ollama row is its own same-family model build.",
-                ),
+            suites_svg = hbar_svg(
+                "Quality suite pass rates",
+                prov,
+                rows,
+                "%",
+                baseline=("100 % pass", 100.0),
+                footnote="Checker-verified pass rate per suite and "
+                "runtime, same seeded task set. Higher is better; "
+                "ollama row is its own same-family model build.",
             )
-            charts.append(
-                (
-                    "Quality suites (chart)",
-                    "quality-suites.svg",
-                    "Deterministic-checker pass rates per suite (reasoning, "
-                    "instruction following, code, schema, needle-in-haystack, "
-                    "multilingual, safety) across runtimes on the identical "
-                    f"seeded task set. {src}",
-                )
-            )
-        else:
-            print("charts: skip quality suites (no rate fields)")
-    else:
-        print("charts: skip quality suites (no quality cells)")
+    panel(
+        "quality-suites.svg",
+        suites_svg,
+        "Quality suites (chart)",
+        "Deterministic-checker pass rates per suite (reasoning, "
+        "instruction following, code, schema, needle-in-haystack, "
+        "multilingual, safety) across runtimes on the identical "
+        f"seeded task set. {src}",
+        "charts: skip quality suites (no rate fields)"
+        if suites_seen
+        else "charts: skip quality suites (no quality cells)",
+    )
 
     # (f2) gateway quality parity: blazar minus direct, percentage points
     q_pairs: list[tuple[str, float]] = []
@@ -1280,33 +1302,29 @@ def render_campaign_charts(
             d = [v for v in d if v is not None]
             if b and d:
                 q_pairs.append((f"{suite} · {tag}", _median(b) - _median(d)))
+    parity_svg = None
     if q_pairs:
         q_pairs.sort(key=lambda kv: kv[1])
         bars = [(lbl, d, d, d, FAMILY_COLOR["blazar"]) for lbl, d in q_pairs]
-        emit(
-            "quality-parity.svg",
-            hbar_svg(
-                "Gateway quality parity (blazar - direct)",
-                prov,
-                bars,
-                "pp",
-                signed=True,
-                footnote="Pass-rate delta in percentage points through the "
-                "gateway vs the same engine driven directly. Zero axis = "
-                "transparent routing.",
-            ),
+        parity_svg = hbar_svg(
+            "Gateway quality parity (blazar - direct)",
+            prov,
+            bars,
+            "pp",
+            signed=True,
+            footnote="Pass-rate delta in percentage points through the "
+            "gateway vs the same engine driven directly. Zero axis = "
+            "transparent routing.",
         )
-        charts.append(
-            (
-                "Gateway quality parity (chart)",
-                "quality-parity.svg",
-                "Per-suite pass-rate delta of routing through blazar vs the "
-                "same engine build driven directly; bars hugging the zero "
-                f"axis are the gateway being output-transparent. {src}",
-            )
-        )
-    else:
-        print("charts: skip quality parity (no blazar/direct pair)")
+    panel(
+        "quality-parity.svg",
+        parity_svg,
+        "Gateway quality parity (chart)",
+        "Per-suite pass-rate delta of routing through blazar vs the "
+        "same engine build driven directly; bars hugging the zero "
+        f"axis are the gateway being output-transparent. {src}",
+        "charts: skip quality parity (no blazar/direct pair)",
+    )
 
     # (f3) quality vs configuration knob: overall-rate delta per axis cell
     q_axes = [
@@ -1324,33 +1342,29 @@ def render_campaign_charts(
         cur = q_overall(r)
         if base and cur is not None:
             cfg_rows.append((f"{tag} · {q_cfg(r)}", cur - _median(base)))
+    cfg_svg = None
     if cfg_rows:
         cfg_rows.sort(key=lambda kv: kv[1])
         bars = [(lbl, d, d, d, FAMILY_COLOR["blazar"]) for lbl, d in cfg_rows]
-        emit(
-            "quality-config.svg",
-            hbar_svg(
-                "Quality vs gateway configuration",
-                prov,
-                bars,
-                "pp",
-                signed=True,
-                footnote="Overall suite pass-rate delta per gateway config "
-                "knob vs the default config, same seed and tasks. Left of "
-                "zero = the knob costs correctness.",
-            ),
+        cfg_svg = hbar_svg(
+            "Quality vs gateway configuration",
+            prov,
+            bars,
+            "pp",
+            signed=True,
+            footnote="Overall suite pass-rate delta per gateway config "
+            "knob vs the default config, same seed and tasks. Left of "
+            "zero = the knob costs correctness.",
         )
-        charts.append(
-            (
-                "Quality vs configuration (chart)",
-                "quality-config.svg",
-                "Overall pass-rate delta per gateway knob (KV quantization, "
-                "attention, batching) against the default config on the "
-                f"identical seeded task set. {src}",
-            )
-        )
-    else:
-        print("charts: skip quality config (no axis cells)")
+    panel(
+        "quality-config.svg",
+        cfg_svg,
+        "Quality vs configuration (chart)",
+        "Overall pass-rate delta per gateway knob (KV quantization, "
+        "attention, batching) against the default config on the "
+        f"identical seeded task set. {src}",
+        "charts: skip quality config (no axis cells)",
+    )
 
     # (f4) quality/latency tradeoff quadrant: speed delta vs quality delta
     trade: list[tuple[float, float, str, str]] = []
@@ -1395,33 +1409,83 @@ def render_campaign_charts(
                     f"{tag} · {label}",
                 )
             )
+    trade_svg = None
     if trade:
-        emit(
-            "quality-tradeoff.svg",
-            scatter_svg(
-                "Quality / latency tradeoff per configuration",
-                prov,
-                trade,
-                "decode t/s delta vs default (%)",
-                "overall pass-rate delta (pp)",
-                footnote="Each dot is one gateway config knob: x = speed "
-                "delta, y = quality delta vs the default. Top-right = "
-                "strictly better; bottom-right = speed bought with "
-                "correctness.",
+        trade_svg = scatter_svg(
+            "Quality / latency tradeoff per configuration",
+            prov,
+            trade,
+            "decode t/s delta vs default (%)",
+            "overall pass-rate delta (pp)",
+            footnote="Each dot is one gateway config knob: x = speed "
+            "delta, y = quality delta vs the default. Top-right = "
+            "strictly better; bottom-right = speed bought with "
+            "correctness.",
+        )
+    panel(
+        "quality-tradeoff.svg",
+        trade_svg,
+        "Quality / latency tradeoff (chart)",
+        "Per-knob tradeoff against the default configuration: "
+        "horizontal axis is decode-speed delta, vertical axis is "
+        "overall checker pass-rate delta. A configuration is "
+        "production-ready only when its quality delta stays within "
+        f"tolerance. {src}",
+        "charts: skip quality tradeoff (no joined speed+quality axis cells)",
+    )
+
+    # (g) KV-quant perplexity bars: ppl per cache-type config, f16 baseline.
+    # Cross-context ppl values are NOT comparable, so each label carries its
+    # context rung; the dashed baseline is the unquantized (f16) run and only
+    # deltas within one rung are meaningful.
+    ppl_cells = [
+        r
+        for r in recs
+        if r.get("provider") == "ppl"
+        and "error" not in r
+        and r.get("perplexity") is not None
+    ]
+    ppl_svg = None
+    if ppl_cells:
+        ppl_bars = []
+        f16_base = None
+        for r in sorted(
+            ppl_cells,
+            key=lambda r: (
+                str(r.get("tag", "?")),
+                float(r.get("params", {}).get("ppl") or 0),
+                str(r.get("params", {}).get("ppl_kv") or "f16"),
             ),
+        ):
+            kv = str(r.get("params", {}).get("ppl_kv") or "f16")
+            rung = r.get("params", {}).get("ppl")
+            lbl = f"{engine_name(r)} · {kv}" + (f" @{rung}" if rung else "")
+            v = float(r["perplexity"])
+            err = abs(float(r.get("ppl_error") or 0.0))
+            ppl_bars.append((lbl, v, v - err, v + err, _series_color("ppl", 0)))
+            if kv == "f16" and f16_base is None:
+                f16_base = ("f16 baseline", v)
+        ppl_bars.sort(key=lambda b: b[1])
+        ppl_svg = hbar_svg(
+            "KV-cache quantization perplexity",
+            prov,
+            ppl_bars,
+            "ppl",
+            baseline=f16_base,
+            footnote="llama-perplexity on the offline corpus; whiskers: "
+            "± standard error. Lower is better; values from different "
+            "context rungs are not comparable.",
+            value_nd=2,
         )
-        charts.append(
-            (
-                "Quality / latency tradeoff (chart)",
-                "quality-tradeoff.svg",
-                "Per-knob tradeoff against the default configuration: "
-                "horizontal axis is decode-speed delta, vertical axis is "
-                "overall checker pass-rate delta. A configuration is "
-                "production-ready only when its quality delta stays within "
-                f"tolerance. {src}",
-            )
-        )
-    else:
-        print("charts: skip quality tradeoff (no joined speed+quality axis cells)")
+    panel(
+        "ppl-kv.svg",
+        ppl_svg,
+        "KV-quant perplexity (chart)",
+        "Perplexity per KV-cache quantization configuration (whiskers: "
+        "standard error); the dashed line marks the unquantized f16 "
+        "run. Lower is better; compare only within one context "
+        f"rung. {src}",
+        "charts: skip ppl bars (no ppl cells)",
+    )
 
     return charts

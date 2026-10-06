@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="358" viewBox="0 0 880 358" role="img">
+<text x="0" y="16" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#111111">Worst-case first-token latency vs concurrency</text>
+<text x="0" y="34" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#777777">Qwen3.5-9B-Q4_K_M.gguf · 2026-09-24 · 20260924-all-engines</text>
+<line x1="58" y1="304.1" x2="725.6" y2="304.1" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="308.1" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">1e2</text>
+<line x1="58" y1="208.4" x2="725.6" y2="208.4" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="212.4" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">1e3</text>
+<line x1="58" y1="112.8" x2="725.6" y2="112.8" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="116.8" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">1e4</text>
+<line x1="58" y1="17.1" x2="725.6" y2="17.1" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="21.1" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">1e5</text>
+<text x="147.3" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">2.0</text>
+<text x="325.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">4.0</text>
+<text x="504.3" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">6.0</text>
+<text x="682.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">8.0</text>
+<line x1="58" y1="56" x2="58" y2="296" stroke="#C9C9C9" stroke-width="1"/>
+<line x1="58" y1="296" x2="725.6" y2="296" stroke="#C9C9C9" stroke-width="1"/>
+<text x="58" y="46" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#777777">TTFT max ms (log)</text>
+<text x="391.8" y="330" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#777777" text-anchor="middle">concurrent streams</text>
+<polyline points="58.0,257.2 147.3,156.4 325.8,113.2 682.8,78.1" fill="none" stroke="#0072B2" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="58.0" cy="257.2" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="147.3" cy="156.4" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="325.8" cy="113.2" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="682.8" cy="78.1" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<text x="691.8" y="82.1" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#0072B2" font-weight="600">blazar · b11147-cuda</text>
+<polyline points="58.0,273.5 147.3,248.5 325.8,149.3 682.8,105.6" fill="none" stroke="#CC79A7" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="58.0" cy="273.5" r="4" fill="#FFFFFF" stroke="#CC79A7" stroke-width="2"/>
+<circle cx="147.3" cy="248.5" r="4" fill="#FFFFFF" stroke="#CC79A7" stroke-width="2"/>
+<circle cx="325.8" cy="149.3" r="4" fill="#FFFFFF" stroke="#CC79A7" stroke-width="2"/>
+<circle cx="682.8" cy="105.6" r="4" fill="#FFFFFF" stroke="#CC79A7" stroke-width="2"/>
+<text x="691.8" y="109.6" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#CC79A7" font-weight="600">blazar · v0.9.3</text>
+<polyline points="58.0,279.9 147.3,283.5 325.8,267.5 682.8,239.2" fill="none" stroke="#E69F00" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="58.0" cy="279.9" r="4" fill="#FFFFFF" stroke="#E69F00" stroke-width="2"/>
+<circle cx="147.3" cy="283.5" r="4" fill="#FFFFFF" stroke="#E69F00" stroke-width="2"/>
+<circle cx="325.8" cy="267.5" r="4" fill="#FFFFFF" stroke="#E69F00" stroke-width="2"/>
+<circle cx="682.8" cy="239.2" r="4" fill="#FFFFFF" stroke="#E69F00" stroke-width="2"/>
+<text x="691.8" y="243.2" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#E69F00" font-weight="600">direct · b11147-cuda</text>
+<polyline points="58.0,126.4 147.3,118.4 325.8,93.6 682.8,68.5" fill="none" stroke="#009E73" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="58.0" cy="126.4" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="147.3" cy="118.4" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="325.8" cy="93.6" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="682.8" cy="68.5" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<text x="691.8" y="72.5" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#009E73" font-weight="600">ollama · ollama-host</text>
+<text x="0" y="352" font-family="Helvetica, Arial, sans-serif" font-size="10.5" fill="#999999">Worst stream per level, log scale. Lower is better.</text>
+</svg>

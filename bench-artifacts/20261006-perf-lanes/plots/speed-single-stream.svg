@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="162" viewBox="0 0 880 162" role="img">
+<text x="0" y="16" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#111111">Single-stream decode throughput</text>
+<text x="0" y="34" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#777777">Qwen3.5-9B-Q4_K_M.gguf · 2026-10-06 · 20261006-perf-lanes</text>
+<line x1="218.6" y1="56" x2="218.6" y2="116" stroke="#EBEBEB" stroke-width="1"/>
+<text x="218.6" y="132" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">0.0</text>
+<line x1="346.9" y1="56" x2="346.9" y2="116" stroke="#EBEBEB" stroke-width="1"/>
+<text x="346.9" y="132" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">10</text>
+<line x1="475.2" y1="56" x2="475.2" y2="116" stroke="#EBEBEB" stroke-width="1"/>
+<text x="475.2" y="132" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">20</text>
+<line x1="603.6" y1="56" x2="603.6" y2="116" stroke="#EBEBEB" stroke-width="1"/>
+<text x="603.6" y="132" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">30</text>
+<line x1="731.9" y1="56" x2="731.9" y2="116" stroke="#EBEBEB" stroke-width="1"/>
+<text x="731.9" y="132" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">40</text>
+<line x1="751.2" y1="52" x2="751.2" y2="116" stroke="#555555" stroke-width="1.4" stroke-dasharray="5 4"/>
+<text x="751.2" y="48" font-family="Helvetica, Arial, sans-serif" font-size="10.5" fill="#555555" text-anchor="middle">fastest direct 41.5 t/s</text>
+<text x="210.60000000000002" y="68.0" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#222222" text-anchor="end">direct · llama.cpp b11429-cuda</text>
+<rect x="218.6" y="58.0" width="532.6" height="16" rx="2.5" fill="#E69F00"/>
+<line x1="751.1" y1="64.0" x2="751.4" y2="64.0" stroke="#333333" stroke-width="1.2"/>
+<line x1="751.1" y1="60.5" x2="751.1" y2="67.5" stroke="#333333" stroke-width="1.2"/>
+<line x1="751.4" y1="60.5" x2="751.4" y2="67.5" stroke="#333333" stroke-width="1.2"/>
+<text x="759.4" y="68.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#222222" font-weight="600">41.5 t/s</text>
+<text x="210.60000000000002" y="98.0" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#222222" text-anchor="end">blazar · llama.cpp b11429-cuda</text>
+<rect x="218.6" y="88.0" width="522.2" height="16" rx="2.5" fill="#0072B2"/>
+<line x1="740.6" y1="94.0" x2="741.0" y2="94.0" stroke="#333333" stroke-width="1.2"/>
+<line x1="740.6" y1="90.5" x2="740.6" y2="97.5" stroke="#333333" stroke-width="1.2"/>
+<line x1="741.0" y1="90.5" x2="741.0" y2="97.5" stroke="#333333" stroke-width="1.2"/>
+<text x="749.0" y="98.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#222222" font-weight="600">40.7 t/s</text>
+<line x1="218.6" y1="132" x2="794.0" y2="132" stroke="#C9C9C9" stroke-width="1"/>
+<text x="0" y="152.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" fill="#999999">Bars: median of 5 runs. Whiskers: interquartile range. Higher is better.</text>
+</svg>

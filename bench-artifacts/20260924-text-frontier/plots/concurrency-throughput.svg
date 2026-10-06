@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="358" viewBox="0 0 880 358" role="img">
+<text x="0" y="16" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#111111">System throughput vs concurrency</text>
+<text x="0" y="34" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#777777">Qwen3.5-9B-Q4_K_M.gguf · 2026-09-24 · 20260924-text-frontier</text>
+<line x1="58" y1="259.8" x2="725.6" y2="259.8" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="263.8" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">40</text>
+<line x1="58" y1="218.9" x2="725.6" y2="218.9" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="222.9" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">60</text>
+<line x1="58" y1="177.9" x2="725.6" y2="177.9" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="181.9" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">80</text>
+<line x1="58" y1="137.0" x2="725.6" y2="137.0" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="141.0" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">100</text>
+<line x1="58" y1="96.1" x2="725.6" y2="96.1" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="100.1" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">120</text>
+<text x="147.3" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">2.0</text>
+<text x="325.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">4.0</text>
+<text x="504.3" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">6.0</text>
+<text x="682.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">8.0</text>
+<line x1="58" y1="56" x2="58" y2="296" stroke="#C9C9C9" stroke-width="1"/>
+<line x1="58" y1="296" x2="725.6" y2="296" stroke="#C9C9C9" stroke-width="1"/>
+<text x="58" y="46" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#777777">system t/s</text>
+<text x="391.8" y="330" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#777777" text-anchor="middle">concurrent streams</text>
+<polyline points="58.0,262.5 147.3,261.9 325.8,261.3 682.8,261.3" fill="none" stroke="#0072B2" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="58.0" cy="262.5" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="147.3" cy="261.9" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="325.8" cy="261.3" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="682.8" cy="261.3" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<text x="691.8" y="265.3" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#0072B2" font-weight="600">blazar · b11147-cuda</text>
+<polyline points="58.0,262.3 147.3,198.7 325.8,120.1 682.8,72.2" fill="none" stroke="#E69F00" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="58.0" cy="262.3" r="4" fill="#FFFFFF" stroke="#E69F00" stroke-width="2"/>
+<circle cx="147.3" cy="198.7" r="4" fill="#FFFFFF" stroke="#E69F00" stroke-width="2"/>
+<circle cx="325.8" cy="120.1" r="4" fill="#FFFFFF" stroke="#E69F00" stroke-width="2"/>
+<circle cx="682.8" cy="72.2" r="4" fill="#FFFFFF" stroke="#E69F00" stroke-width="2"/>
+<text x="691.8" y="76.2" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#E69F00" font-weight="600">direct · b11147-cuda</text>
+<polyline points="58.0,296.0 147.3,283.4 325.8,275.0 682.8,269.9" fill="none" stroke="#009E73" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="58.0" cy="296.0" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="147.3" cy="283.4" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="325.8" cy="275.0" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="682.8" cy="269.9" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<text x="691.8" y="273.9" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#009E73" font-weight="600">ollama · ollama-host</text>
+<text x="0" y="352" font-family="Helvetica, Arial, sans-serif" font-size="10.5" fill="#999999">Each point: one sustained-load lane cell. Higher is better.</text>
+</svg>

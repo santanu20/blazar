@@ -976,24 +976,32 @@ _charts_recs = [
         {"ctx": 16384, "np": 1},
         decode_tps_p50=95.0,
         decode_tps_runs=[94.0, 95.0, 96.0, 95.5, 95.2],
+        ttft_ms_p50=180.0,
+        ttft_ms_p99=310.0,
+        gpu_peak_mib=5100.0,
     ),
     rec(
         "direct",
         {"ctx": 8192, "np": 1},
         decode_tps_p50=90.0,
+        ttft_ms_p50=170.0,
     ),  # off-headline shape: excluded from the chart
     rec(
         "blazar",
         {},
         decode_tps_p50=104.8,
         decode_tps_runs=[104.0, 104.8, 105.6, 104.4, 104.9],
+        ttft_ms_p50=190.0,
+        ttft_ms_p99=330.0,
+        gpu_peak_mib=5900.0,
     ),
     rec(
         "blazar",
         {"config": "kv"},
         decode_tps_p50=120.0,
+        ttft_ms_p50=200.0,
     ),  # variant axis row: chart shows default lanes only
-    rec("ollama", {}, decode_tps_p50=41.5),
+    rec("ollama", {}, decode_tps_p50=41.5, ttft_ms_p50=210.0),
     rec(
         "ollama", {}, decode_tps_p50=30.0, reference_note="different model"
     ),  # not comparable: must not chart
@@ -1090,6 +1098,20 @@ _charts_recs = [
     ),
     rec("idle-blazar", {"policy": "sleep"}, idle_wake_ttft_ms=140.0),
     rec("idle-ollama", {"policy": "keep_alive"}, idle_wake_ttft_ms=5200.0),
+    # ppl lane: f16 + two KV-quant configs at one context rung (2048)
+    rec("ppl", {"ppl": 2048}, perplexity=5.3738, ppl_error=0.22409),
+    rec(
+        "ppl",
+        {"ppl": 2048, "ppl_kv": "q8_0/q8_0"},
+        perplexity=5.3615,
+        ppl_error=0.22315,
+    ),
+    rec(
+        "ppl",
+        {"ppl": 2048, "ppl_kv": "q4_0/q4_0"},
+        perplexity=5.3711,
+        ppl_error=0.22331,
+    ),
 ]
 
 with tempfile.TemporaryDirectory() as td:
@@ -1112,6 +1134,7 @@ with tempfile.TemporaryDirectory() as td:
         "ctx-curve.svg",
         "vram-vs-context.svg",
         "lifecycle-cold-idle.svg",
+        "ppl-kv.svg",
     }, names
     for name in names:
         b1 = first[name]
@@ -1157,7 +1180,71 @@ with tempfile.TemporaryDirectory() as td:
     # captions carry provenance + source pointer
     joined = " ".join(c for _, _, c in ch1)
     assert "camp-a/cells.jsonl" in joined, "caption must cite the campaign receipt"
-    print("render_campaign_charts: 10 charts, deterministic, exclusions OK")
+    # ppl panel: KV-quant bars, ± ppl_error whiskers, f16 dashed baseline,
+    # lower-is-better, and the cross-rung incomparability caveat
+    ppl_svg = (a1 / "plots" / "ppl-kv.svg").read_text()
+    assert "KV-cache quantization perplexity" in ppl_svg, "ppl title missing"
+    assert ">5.37 ppl<" in ppl_svg and ">5.36 ppl<" in ppl_svg, "ppl bars missing"
+    assert "f16 baseline" in ppl_svg, "f16 dashed baseline missing"
+    assert "not comparable" in ppl_svg, "cross-rung caveat missing"
+    ppl_cap = next(c for s, f, c in ch1 if f == "ppl-kv.svg")
+    assert "Lower is better" in ppl_cap and "standard error" in ppl_cap
+    # artifact-report embed: write_markdown_report carries the same chart
+    # set as relative plots/ links (campaign exit path for non---md runs)
+    _model = a1 / "m.gguf"
+    _model.write_bytes(_synthetic_gguf([("general.architecture", "qwen35")]))
+    bm.write_markdown_report(
+        a1 / "benchmark.md",
+        _charts_recs,
+        _model,
+        [],
+        {},
+        "selftest --argv",
+        None,
+        "blazar 0.0.0",
+        charts=ch1,
+    )
+    emb = (a1 / "benchmark.md").read_text()
+    assert '<img src="plots/ppl-kv.svg"' in emb, "artifact report must embed charts"
+    assert '<img src="plots/speed-single-stream.svg"' in emb
+    assert "## Charts" in emb
+    # slim format: per-config median tables, no per-cell resource dump
+    assert "## Speed (single-stream, medians)" in emb
+    assert "| n |" in emb, "median tables must show the cell count"
+    assert "## Resources & cold start" not in emb, "resource dump retired"
+    assert "prefill t/s (cold)" not in emb, "slim speed table drops cold-prefill col"
+    assert emb.count("\n| ") < 3 * len(_charts_recs), (
+        "tables must aggregate, not emit one row per cell"
+    )
+    # failed-cell lines are capped to the first line, 160 chars (the full
+    # error stays in cells.jsonl)
+    _fail_recs = [
+        *_charts_recs,
+        rec("direct", {}, error="E" * 400 + "\nstack continues here"),
+        rec("direct", {"ctx": 8192}, error="oom guard tripped"),
+        rec("direct", {"ctx": 16384}, error="oom guard tripped"),
+    ]
+    bm.write_markdown_report(
+        a1 / "benchmark.md",
+        _fail_recs,
+        _model,
+        [],
+        {},
+        "selftest --argv",
+        None,
+        "blazar 0.0.0",
+        charts=ch1,
+    )
+    emb = (a1 / "benchmark.md").read_text()
+    assert emb.count("E" * 161) == 0, "failed-cell error strings must be capped"
+    assert "..." in emb and "stack continues here" not in emb, (
+        "only the first error line may surface"
+    )
+    assert emb.count("oom guard tripped") == 1 and "(2 cells)" in emb, (
+        "identical failures must collapse into one counted line"
+    )
+    print("render_campaign_charts: 11 charts, deterministic, exclusions OK")
+    print("write_markdown_report: chart embed (plots/ links) OK")
 
 # write_publication_report: charts embed with location-relative links;
 # retired tables are gone but verdicts/receipts stay; slim chapters drop
@@ -1184,6 +1271,24 @@ with tempfile.TemporaryDirectory() as td:
     out = Path(td) / "BENCHMARK.md"
     bm.write_publication_report(_pub_recs, art, out, None)
     pub = out.read_text()
+    # charts passthrough: a pre-rendered chart set must embed unchanged
+    # (campaign main() renders once and hands the same list to both
+    # writers) — plot bytes stay identical, no re-render occurs
+    plots_before = {
+        f.name: f.read_bytes() for f in sorted((art / "plots").glob("*.svg"))
+    }
+    assert plots_before, "publication render must leave plots behind"
+    passthrough = [
+        ("Passthrough panel (chart)", "speed-single-stream.svg", "handed in caption")
+    ]
+    bm.write_publication_report(_pub_recs, art, out, None, charts=passthrough)
+    pub2 = out.read_text()
+    assert plots_before == {
+        f.name: f.read_bytes() for f in sorted((art / "plots").glob("*.svg"))
+    }, "passthrough charts must not rewrite plots"
+    assert "Passthrough panel (chart)" in pub2, "passthrough section missing"
+    assert pub2.count('src="camp/plots/speed-single-stream.svg"') >= 1
+    print("write_publication_report: charts passthrough (no double render) OK")
     assert '<p align="center"><img src="camp/plots/speed-single-stream.svg"' in pub, (
         "chart embed must use a location-relative forward-slash path"
     )
