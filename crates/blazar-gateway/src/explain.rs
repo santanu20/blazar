@@ -465,15 +465,18 @@ fn kv_advisory(
     })
 }
 
-/// Measured KV-quant quality receipts, compiled in from
+/// Measured KV-quant quality receipts, compiled in from the crate-local
 /// `registry/kv-quant-quality.json` (populated by the ppl A/B campaign:
 /// llama-perplexity on a fixed corpus, identical ctx, only the cache
-/// types varied). The ladder ordering above is documented llama.cpp
-/// behavior; these receipts are the measured proof for the exact
-/// checkpoints that were benched, with conditions stamped in the
-/// artifact the `source` field names. Unknown model = honest null — a
-/// number borrowed from a different checkpoint would be fabrication.
-const KV_QUALITY_RECEIPTS: &str = include_str!("../../../registry/kv-quant-quality.json");
+/// types varied). The file must live inside the crate root: `cargo
+/// publish` tarballs only the package directory, so a path escaping the
+/// crate breaks the packaged build. The ladder ordering above is
+/// documented llama.cpp behavior; these receipts are the measured proof
+/// for the exact checkpoints that were benched, with conditions stamped
+/// in the artifact the `source` field names. Unknown model = honest
+/// null — a number borrowed from a different checkpoint would be
+/// fabrication.
+const KV_QUALITY_RECEIPTS: &str = include_str!("../registry/kv-quant-quality.json");
 
 fn kv_quality_receipts() -> &'static Value {
     static PARSED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
