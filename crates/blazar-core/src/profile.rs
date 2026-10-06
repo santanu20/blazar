@@ -2023,6 +2023,42 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push(format_trimmed(config.yarn_beta_slow));
     }
 
+    // --- 16c. RoPE frequency overrides (None = values baked into the
+    // weights). Independent of YaRN: NTK-aware base tweaks and the
+    // linear scale factor answer a different question than the YaRN
+    // mix. Manifest-gated so an engine without the flags teaches
+    // instead of dying at boot.
+    if let Some(base) = config.rope_freq_base {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "rope_freq_base",
+            "--rope-freq-base",
+            &[format_trimmed(base)],
+        );
+    }
+    if let Some(scale) = config.rope_freq_scale {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "rope_freq_scale",
+            "--rope-freq-scale",
+            &[format_trimmed(scale)],
+        );
+    }
+    if let Some(step) = config.checkpoint_min_step {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "checkpoint_min_step",
+            "--checkpoint-min-step",
+            &[step.to_string()],
+        );
+    }
+
     // --- 17. fine-grained MoE expert offload (count beats the boolean
     // rule-7 heuristic when the user knows their split).
     let cpu_moe_n = config.effective_cpu_moe_n(input.model_name);
@@ -6482,6 +6518,9 @@ mod tests {
             "--ctx-size",
             "--threads",
             "--gpu-layers",
+            "--rope-freq-base",
+            "--rope-freq-scale",
+            "--checkpoint-min-step",
             "--cache-reuse",
             "--cache-idle-slots",
             "--no-cache-idle-slots",
@@ -7623,6 +7662,148 @@ mod tests {
         assert!(p.warnings.iter().any(|w| w.contains("--kv-unified")));
         assert!(p.warnings.iter().any(|w| w.contains("--swa-full")));
         assert!(p.warnings.iter().any(|w| w.contains("--load-mode")));
+    }
+
+    /// `RoPE` frequency + checkpoint-spacing knobs: first-class config
+    /// (previously extra_args-only), manifest-gated like every other knob.
+    #[test]
+    fn unit__rope_freq_and_checkpoint_knobs__emitted_and_gated() {
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let cfg = Config {
+            rope_freq_base: Some(1_000_000.0),
+            rope_freq_scale: Some(0.5),
+            checkpoint_min_step: Some(256),
+            ..Config::default()
+        };
+        let p = compile(
+            &input(&meta(), &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        for pair in [
+            ("--rope-freq-base", "1000000"),
+            ("--rope-freq-scale", "0.5"),
+            ("--checkpoint-min-step", "256"),
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w == [pair.0, pair.1]),
+                "missing {pair:?}"
+            );
+        }
+
+        // Engine build without the flags: knobs warn, never silently no-op.
+        let mut flags = full_flags();
+        flags.remove("--rope-freq-base");
+        flags.remove("--rope-freq-scale");
+        flags.remove("--checkpoint-min-step");
+        let p = compile(
+            &input(&meta(), &hw, &cfg, &flags),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        for flag in [
+            "--rope-freq-base",
+            "--rope-freq-scale",
+            "--checkpoint-min-step",
+        ] {
+            assert!(!p.argv.contains(&flag.to_string()));
+            assert!(p.warnings.iter().any(|w| w.contains(flag)), "{flag}");
+        }
+    }
+
+    /// `device_layers` pinning multiple GPU ordinals on a single-GPU box:
+    /// the engine dies at load (live-proven), so compile refuses
+    /// pre-spawn instead of letting the child crash into a 502.
+    #[test]
+    fn unit__device_layers__multi_ordinal_single_gpu_refused_pre_spawn() {
+        let g = meta();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let cfg = Config {
+            mistralrs: MistralrsTuning {
+                device_layers: Some("0:10;1:18".into()),
+                ..full_mistralrs_tuning()
+            },
+            ..Config::default()
+        };
+        let flags = mistralrs_knobs_flags();
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("single GPU") && err.contains("device_layers"),
+            "refusal must name the knob and the cause: {err}"
+        );
+
+        // Single-ordinal pin on the same box stays a warning + emit
+        // (pinned by unit__mistralrs_knobs__emit_across_all_families).
+    }
+
+    /// llama-server-only knobs set GLOBALLY while the model serves on a
+    /// non-llama dialect: one aggregated teaching line names them, per
+    /// lane; an unset config stays silent (no false-positive noise).
+    #[test]
+    fn unit__nonllama_vocab_teaching__names_set_knobs_per_lane() {
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let hf = hf_meta();
+        let cfg = Config {
+            batch_size: 512,
+            flash_attention: Some(false),
+            ..Config::default()
+        };
+
+        // sglang lane.
+        let p = compile(
+            &sglang_input(&hf, &hw, &cfg, 8_000 * MIB),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        let w = p
+            .warnings
+            .iter()
+            .find(|w| w.contains("llama-server-only knobs"))
+            .expect("sglang lane must teach");
+        assert!(
+            w.contains("batch_size") && w.contains("flash_attention"),
+            "{w}"
+        );
+        assert!(w.contains("sglang"), "{w}");
+
+        // mistralrs lane (GGUF is a legal mistral.rs payload).
+        let g = meta();
+        let flags = mistralrs_knobs_flags();
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("llama-server-only knobs")
+                    && w.contains("batch_size")
+                    && w.contains("mistralrs"))
+        );
+
+        // mlx lane.
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.engine_kind = crate::engine_kind::EngineKind::Mlx;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("llama-server-only knobs") && w.contains("mlx"))
+        );
+
+        // Unset config: no teaching on any lane (noise guard).
+        let quiet = Config::default();
+        let p = compile(
+            &sglang_input(&hf, &hw, &quiet, 8_000 * MIB),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            !p.warnings
+                .iter()
+                .any(|w| w.contains("llama-server-only knobs"))
+        );
     }
 
     #[test]

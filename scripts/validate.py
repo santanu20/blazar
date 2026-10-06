@@ -342,7 +342,7 @@ def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
 # )
 #
 # # ---------------------------------------------------------------------------
-# # TOPLEVEL_KNOBS manifest: all 134 Config fields.
+# # TOPLEVEL_KNOBS manifest: all 205 Config fields.
 # # option=True  -> Option<T>, absent from fresh `config list` until set
 # # container=True -> keys / remotes / engine_env / model_overrides section
 # # tier  -> evidence class (see module docstring); group -> knobs_argv batch
@@ -2042,6 +2042,185 @@ _K = [
         None,
         "whisper stream chunk cadence 1_000..=120_000 ms; echo + boot",
     ),
+    # config-audit wave backfill (2026-10-07): gate (b) went RED on the
+    # three always-serialized containers; the Options were invisible
+    # holes in the (c0) full-manifest denominator.
+    (
+        "failover",
+        False,
+        True,
+        "roundtrip",
+        None,
+        "ordered [[failover]] chains; gateway alias served by first healthy member (failover.rs); always-serialized empty vec",
+    ),
+    (
+        "keep_tags",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "model retention tags shielding rows from fork/GC cleanup; fresh-visible default",
+    ),
+    (
+        "mcp",
+        False,
+        True,
+        "roundtrip",
+        None,
+        "[[mcp]] server table; Registry::from_config at boot (state.rs)",
+    ),
+    (
+        "mcp_default",
+        True,
+        False,
+        "boundary",
+        None,
+        "default MCP exposure; validated against known servers or all/none",
+    ),
+    (
+        "capability_registry_url",
+        True,
+        False,
+        "boundary",
+        None,
+        "remote capability-registry URL; unset in sandbox (no egress)",
+    ),
+    (
+        "checkpoint_min_step",
+        True,
+        False,
+        "argv",
+        "G5",
+        "--checkpoint-min-step (ctx-checkpoint guard floor; config-audit wave)",
+    ),
+    (
+        "flash_attention",
+        True,
+        False,
+        "argv",
+        "G5",
+        "Some(true)/Some(false) -> --flash-attn on/off; None = auto posture",
+    ),
+    (
+        "rope_freq_base",
+        True,
+        False,
+        "argv",
+        "G5",
+        "--rope-freq-base (RoPE theta; config-audit wave)",
+    ),
+    (
+        "rope_freq_scale",
+        True,
+        False,
+        "argv",
+        "G5",
+        "--rope-freq-scale (inverse ctx-expand factor; config-audit wave)",
+    ),
+    (
+        "sdcpp_cache_mode",
+        True,
+        False,
+        "argv",
+        "G5",
+        "sdcpp cache mode passthrough (compile_sdcpp)",
+    ),
+    (
+        "sdcpp_cache_option",
+        True,
+        False,
+        "argv",
+        "G5",
+        "sdcpp cache option passthrough (compile_sdcpp)",
+    ),
+    (
+        "sdcpp_conditioning_cache_size",
+        True,
+        False,
+        "argv",
+        "G5",
+        "sdcpp conditioning cache sizing (compile_sdcpp)",
+    ),
+    (
+        "sdcpp_extra_args",
+        True,
+        False,
+        "argv",
+        "G5",
+        "user argv tokens appended last (user wins over posture; compile_sdcpp)",
+    ),
+    (
+        "sdcpp_max_vram",
+        True,
+        False,
+        "argv",
+        "G5",
+        "sdcpp VRAM ceiling passthrough (compile_sdcpp)",
+    ),
+    (
+        "sdcpp_model_args",
+        True,
+        False,
+        "argv",
+        "G5",
+        "sdcpp --model-arg tokens (compose w/ prefix cache policy; compile_sdcpp)",
+    ),
+    (
+        "sdcpp_params_backend",
+        True,
+        False,
+        "argv",
+        "G5",
+        "sdcpp params backend selection (compile_sdcpp)",
+    ),
+    (
+        "sdcpp_qwen_prefix_cache_type",
+        True,
+        False,
+        "argv",
+        "G5",
+        "qwen prefix cache type composed into model args w/ conflict teaching",
+    ),
+    (
+        "sdcpp_split_mode",
+        True,
+        False,
+        "argv",
+        "G5",
+        "sdcpp layer split mode (compile_sdcpp)",
+    ),
+    (
+        "sdcpp_tae",
+        True,
+        False,
+        "argv",
+        "G5",
+        "sdcpp tae selection (compile_sdcpp)",
+    ),
+    (
+        "sdcpp_tensor_type_rules",
+        True,
+        False,
+        "argv",
+        "G5",
+        "sdcpp per-tensor type override rules (compile_sdcpp)",
+    ),
+    (
+        "whisper_extra_args",
+        True,
+        False,
+        "argv",
+        "G5",
+        "whisper-server argv tokens, help-validated pre-spawn; appended last",
+    ),
+    (
+        "whisper_vad_model",
+        True,
+        False,
+        "argv",
+        "G5",
+        "VAD model resolved to a spawn-ready path w/ placement teaching",
+    ),
 ]
 
 TOPLEVEL_KNOBS = [
@@ -2056,7 +2235,7 @@ CONTAINER_KNOBS = [k["name"] for k in TOPLEVEL_KNOBS if k["container"]]
 FRESH_VISIBLE_KNOBS = [k["name"] for k in TOPLEVEL_KNOBS if not k["option"]]
 
 # ---------------------------------------------------------------------------
-# MODEL_OVERRIDE manifest: all 26 ModelOverride fields + 18 SamplerDefaults
+# MODEL_OVERRIDE manifest: all 37 ModelOverride fields + 18 SamplerDefaults
 # leaves. Evidence = overlay round-trip (gate d) + argv/wave lanes noted.
 # ---------------------------------------------------------------------------
 
@@ -2102,6 +2281,48 @@ MODEL_OVERRIDE_FIELDS = [
         "wave: model_overrides.rpc_servers -> child --rpc (F2 rpc battery)",
     ),
     ("lazy_mode", "roundtrip echo + argv: --lazy-mode on deviation from auto"),
+    # config-audit wave backfill (2026-10-07): same F146 class — lanes ran
+    # inline while the manifest denominator undercounted.
+    (
+        "cache_type_k",
+        "per-model K cache type; wins over global via effective_cache_type_kv",
+    ),
+    (
+        "cache_type_v",
+        "per-model V cache type; wins over global via effective_cache_type_kv",
+    ),
+    (
+        "decode_policy",
+        "same knob as top-level decode_policy, per-model pin",
+    ),
+    (
+        "mistralrs",
+        "per-model [mistralrs] tuning table (profile ladder compiles)",
+    ),
+    (
+        "mmproj",
+        "attach tri-state: true spawns with the row mmproj, false suppresses",
+    ),
+    (
+        "prompt_recipe",
+        "same knob as top-level prompt_recipe, per-model pin",
+    ),
+    (
+        "raw_lane_max_tokens",
+        "raw-lane token ceiling, per-model pin (validated range)",
+    ),
+    (
+        "reasoning",
+        "per-model reasoning posture override",
+    ),
+    (
+        "sglang",
+        "per-model [sglang] tuning table (profile ladder compiles)",
+    ),
+    (
+        "warm_on_pull",
+        "per-model spawn-after-pull; supervisor override wins",
+    ),
 ]
 
 SAMPLER_FIELDS = [
@@ -11071,6 +11292,36 @@ def _full_toplevel() -> dict:
         ],
         "rpc_servers": "",
         "cache_ram_mb": 1024,
+        # config-audit wave backfill: three always-serialized containers
+        # (gate-b RED) + Option knobs counting for the (c0) denominator.
+        "failover": [],
+        "keep_tags": [],
+        "mcp": [],
+        "mcp_default": "none",
+        # Options deliberately omitted at boot (None counts for c0):
+        # capability_registry_url (sandbox has no egress), rope_freq_base/
+        # rope_freq_scale (model-specific rope tuning), flash_attention
+        # (None = auto posture), checkpoint_min_step (guard floor only
+        # matters when ctx_checkpoints is set), the sdcpp passthrough
+        # knobs, and the whisper extras (help-validated at spawn).
+        "capability_registry_url": None,
+        "checkpoint_min_step": None,
+        "flash_attention": None,
+        "rope_freq_base": None,
+        "rope_freq_scale": None,
+        "sdcpp_cache_mode": None,
+        "sdcpp_cache_option": None,
+        "sdcpp_conditioning_cache_size": None,
+        "sdcpp_extra_args": None,
+        "sdcpp_max_vram": None,
+        "sdcpp_model_args": None,
+        "sdcpp_params_backend": None,
+        "sdcpp_qwen_prefix_cache_type": None,
+        "sdcpp_split_mode": None,
+        "sdcpp_tae": None,
+        "sdcpp_tensor_type_rules": None,
+        "whisper_extra_args": None,
+        "whisper_vad_model": None,
         "cpu_range": "",
         "poll": 77,
         "reasoning_format": "deepseek",
@@ -11210,7 +11461,7 @@ def _full_toplevel() -> dict:
 
 
 def _overlay_a() -> dict:
-    """All 20 ModelOverride fields + 18 sampler leaves (chat_template side of XOR)."""
+    """All 28 ModelOverride fields + 18 sampler leaves (chat_template side of XOR)."""
     return {
         "ctx": 3072,
         "slots": 1,
@@ -11231,6 +11482,14 @@ def _overlay_a() -> dict:
         "pin": True,
         "chat_template": "chatml",
         "spm_infill": True,
+        "decode_policy": "free",
+        "prompt_recipe": "child",
+        "raw_lane_max_tokens": 2048,
+        "reasoning": "",
+        "warm_on_pull": False,
+        "mmproj": False,
+        "sglang": {},
+        "mistralrs": {},
         "sampler_defaults": {
             "temperature": 0.7,
             "top_k": 40,
@@ -11259,6 +11518,8 @@ def _overlay_b() -> dict:
     ov = _overlay_a()
     ov.pop("chat_template")
     ov["chat_template_file"] = os.path.join(SANDBOX.root, "template.tmpl")
+    ov["cache_type_k"] = "q8_0"
+    ov["cache_type_v"] = "q4_0"
     open(ov["chat_template_file"], "w").close()
     return ov
 

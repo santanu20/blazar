@@ -881,6 +881,22 @@ pub struct Config {
     #[serde(default)]
     pub yarn_beta_slow: f64,
 
+    // ---- RoPE frequency overrides (independent of YaRN; None = take
+    // the values baked into the model weights).
+    /// `--rope-freq-base`: `RoPE` base frequency (theta), used by
+    /// NTK-aware scaling. None = loaded from model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_freq_base: Option<f64>,
+    /// `--rope-freq-scale`: `RoPE` frequency scaling factor, expands
+    /// context by a factor of 1/N. None = engine default (1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_freq_scale: Option<f64>,
+    /// `--checkpoint-min-step N`: minimum spacing between rolling
+    /// context checkpoints in tokens (upstream default 8192, 0 = no
+    /// minimum). None = engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_min_step: Option<u32>,
+
     // ---- scheduling extras (server-level).
     /// Strict CPU placement for the main model (upstream: 0|1).
     #[serde(default)]
@@ -2427,6 +2443,9 @@ impl Default for Config {
             yarn_attn_factor: 0.0,
             yarn_beta_fast: 0.0,
             yarn_beta_slow: 0.0,
+            rope_freq_base: None,
+            rope_freq_scale: None,
+            checkpoint_min_step: None,
             cpu_strict: false,
             prio: 0,
             prio_batch: 0,
