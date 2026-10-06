@@ -6869,6 +6869,25 @@ fn model_type_label(path: &str) -> String {
     }
 }
 
+/// `quant_method` from a safetensors checkpoint's config.json (e.g.
+/// `torchao`, `awq`, `gptq`) — top-level key or the transformers
+/// `quantization_config.quant_method` nesting (where torchao lives).
+/// The store's `quant` column is derived from the repo NAME and lies
+/// for these rows (a torchao int4 dir registers as BF16 — live-proven
+/// when sglang refused the weights); the checkpoint's own declaration
+/// is the truth. GGUF rows have no config.json and MLX layouts carry
+/// no `quant_method`, so both keep their existing labels.
+fn hf_quant_method(path: &str) -> Option<String> {
+    let cfg: serde_json::Value = serde_json::from_reader(
+        std::fs::File::open(std::path::Path::new(path).join("config.json")).ok()?,
+    )
+    .ok()?;
+    cfg.get("quant_method")
+        .or_else(|| cfg.get("quantization_config")?.get("quant_method"))?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Char-safe truncation with a trailing ellipsis. Byte-slicing here (the
 /// old form) panicked on multibyte names; chars never split.
 fn trunc_ellipsis(s: &str, cap: usize) -> String {
@@ -7090,6 +7109,10 @@ fn list_json_row(
         .map(|r| r.kind.as_str());
     let mut row = serde_json::json!({
         "name": m.name,
+        // Checkpoint-declared quant_method when present (torchao/awq/gptq
+        // safetensors dirs), null otherwise — the name-derived quant
+        // column lies for those rows (see hf_quant_method).
+        "quant_method": hf_quant_method(&m.path),
         "quant": m.quant,
         "bytes": m.bytes,
         "mmproj_bytes": mmproj_bytes,
@@ -7192,9 +7215,13 @@ fn list(json: bool) -> Result<()> {
             // load this arch — the cell gets a dagger and the footer
             // teaches the fork-lane rescue.
             let engine_cell = engine_cell_with_gap(&engine_rows, &engine, m, &mut arch_gaps);
+            // QUANT cell: the checkpoint's own quant_method declaration
+            // beats the name-derived column for safetensors dirs (the
+            // column reads BF16 for torchao/awq int4 weights).
+            let quant = hf_quant_method(&m.path).unwrap_or_else(|| m.quant.clone());
             [
                 m.name.clone(),
-                m.quant.clone(),
+                quant,
                 humansize(m.bytes),
                 vision,
                 m.arch.clone().unwrap_or_else(|| "?".to_string()),
@@ -7263,6 +7290,7 @@ fn show(model: &str, json: bool) -> Result<()> {
                 "name": row.name,
                 "repo": row.repo,
                 "quant": row.quant,
+                "quant_method": hf_quant_method(&row.path),
                 "path": row.path,
                 "bytes": row.bytes,
                 "shards": row.shards,
@@ -7284,6 +7312,9 @@ fn show(model: &str, json: bool) -> Result<()> {
         ("size", humansize(row.bytes)),
         ("shards", row.shards.to_string()),
     ];
+    if let Some(qm) = hf_quant_method(&row.path) {
+        fields.push(("quant_method", qm));
+    }
     if let Some(mm) = &row.mmproj_path {
         fields.push(("mmproj", mm.clone()));
     }
@@ -17977,6 +18008,51 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__hf_quant_method__read_from_checkpoint_config_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let row = |name: &str| {
+            let p = tmp.path().join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        // torchao-style row: the checkpoint declares quant_method inside
+        // the transformers quantization_config nesting.
+        let torchao = row("m1");
+        std::fs::write(
+            std::path::Path::new(&torchao).join("config.json"),
+            r#"{"quantization_config": {"quant_method": "torchao"}, "model_type": "qwen3"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hf_quant_method(&torchao).as_deref(),
+            Some("torchao"),
+            "safetensors checkpoint must self-report"
+        );
+        // gptq-style row: top-level quant_method (older layout).
+        let gptq = row("m5");
+        std::fs::write(
+            std::path::Path::new(&gptq).join("config.json"),
+            r#"{"quant_method": "gptq", "model_type": "qwen3"}"#,
+        )
+        .unwrap();
+        assert_eq!(hf_quant_method(&gptq).as_deref(), Some("gptq"));
+        // GGUF row: no config.json at all.
+        assert_eq!(hf_quant_method(&row("m2")), None);
+        // MLX-style row: config.json exists but carries no quant_method.
+        let mlx = row("m3");
+        std::fs::write(
+            std::path::Path::new(&mlx).join("config.json"),
+            r#"{"model_type": "qwen2"}"#,
+        )
+        .unwrap();
+        assert_eq!(hf_quant_method(&mlx), None);
+        // Malformed config.json: unknown, never a store-killer.
+        let bad = row("m4");
+        std::fs::write(std::path::Path::new(&bad).join("config.json"), "{not json").unwrap();
+        assert_eq!(hf_quant_method(&bad), None);
+    }
 
     #[test]
     fn unit__write_engine_check_marker__replaces_whole_file_atomically() {
