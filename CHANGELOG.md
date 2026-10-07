@@ -6,6 +6,10 @@ tracked here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Schema-level one-active-engine invariant.** The `engines` table now carries a partial unique index (`one_active_engine` on `active WHERE active = 1`), so overlapping active flags are rejected by SQLite itself, not only by transaction discipline in `set_active_engine`. Legacy stores that somehow accumulated double-active rows are repaired at migration (keeper picked by the same lane preference `heal_active_engine` uses; all-lazy actives land at zero-active). Upserting an engine row with `active = true` now demotes any other active row in the same transaction — production paths already activated exclusively through `set_active_engine`, so observable behavior is unchanged. Declared foreign keys stay deliberately out: model-keyed evidence tables (bench history, capability certs, results, profiles) must outlive model deletion, and `job_events` already cascades manually in the correct order. Schema note: this migration and the evidence-axes migration both claim `user_version` 13 on their branches; whichever merges second rebases to 14.
+
 ## [0.22.0] - 2026-10-07
 
 ### Added

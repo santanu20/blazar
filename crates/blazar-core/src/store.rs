@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 use crate::dirs::BlazarDirs;
 use crate::engine_kind::EngineKind;
@@ -33,7 +33,7 @@ pub struct Store {
 // cards — the id→metadata mapping behind POST /v1/chat/completions/{id}).
 // Cards exist ONLY for completions created with a `metadata` field;
 // the cap prunes oldest-first so the table stays bounded.
-const SCHEMA_VERSION: i32 = 12;
+const SCHEMA_VERSION: i32 = 13;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -621,9 +621,82 @@ impl Store {
                     )?;
                 }
             }
-            self.conn
-                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            // v12→v13: the `one_active_engine` partial unique index moves
+            // the one-serving-engine invariant into the DATABASE (a
+            // second active row becomes an impossibility, not a
+            // discipline). The index deliberately does NOT live in
+            // SCHEMA_SQL (same pattern as idx_responses_conversation
+            // above): on an upgrade database the batch runs before this
+            // block, and legacy stores can hold double-active flags —
+            // CREATE UNIQUE INDEX would abort the batch before the
+            // repair below could clean them. Repair keeps the row
+            // heal_active_engine would pick (llamacpp first, then
+            // mistral.rs/sglang, newest within the kind — rank mirrored
+            // from there; keep the two in step); all-lazy actives demote
+            // to zero-active, the same state heal lands on for an
+            // audio-only box. Repair + index + stamp share one
+            // transaction: a mid-failure rolls back to v12 and the next
+            // open retries the whole step.
+            self.migrate_v13_one_active_engine()?;
         }
+        Ok(())
+    }
+
+    /// v12→v13: repair legacy overlapping `active` flags, then create the
+    /// `one_active_engine` partial unique index — all in ONE transaction
+    /// (mid-failure rolls back to v12, the next open retries). The index
+    /// lives here instead of `SCHEMA_SQL` on purpose: the schema batch
+    /// replays before repair could run, and a `CREATE UNIQUE INDEX` would
+    /// abort on legacy double-active rows.
+    fn migrate_v13_one_active_engine(&self) -> CoreResult<()> {
+        let v13 = self.conn.unchecked_transaction()?;
+        let active_count: i64 =
+            v13.query_row("SELECT COUNT(*) FROM engines WHERE active = 1", [], |r| {
+                r.get(0)
+            })?;
+        if active_count > 1 {
+            let rank = |kind: &str| match kind {
+                "llamacpp" => 2,
+                "mistralrs" | "sglang" => 1,
+                _ => 0,
+            };
+            let actives: Vec<(String, String, i64)> = v13
+                .prepare("SELECT tag, kind, installed_at FROM engines WHERE active = 1")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            // max_by with (rank, installed_at) mirrors
+            // heal_active_engine's max_by_key pick; the last maximum
+            // wins ties, so equal ranks resolve to the newest row.
+            let keeper = actives
+                .iter()
+                .max_by(|a, b| (rank(a.1.as_str()), a.2).cmp(&(rank(b.1.as_str()), b.2)));
+            match keeper {
+                Some((tag, kind, _)) if rank(kind.as_str()) > 0 => {
+                    v13.execute(
+                        "UPDATE engines SET active = 0 WHERE active = 1 AND tag != ?1",
+                        params![tag],
+                    )?;
+                    tracing::warn!(
+                        "repaired {active_count} overlapping active engine flags — kept {tag} (heal_active_engine preference)"
+                    );
+                }
+                _ => {
+                    v13.execute("UPDATE engines SET active = 0", [])?;
+                    tracing::warn!(
+                        "repaired {active_count} overlapping active engine flags — all lazy lanes; store lands at zero-active until the next heal"
+                    );
+                }
+            }
+        }
+        v13.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS one_active_engine \
+             ON engines(active) WHERE active = 1",
+            [],
+        )?;
+        v13.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        v13.commit()?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -1225,14 +1298,62 @@ impl Store {
         &self.conn
     }
 
-    pub fn upsert_engine(&self, e: &EngineRow) -> CoreResult<()> {
-        self.conn.execute(
-            "INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind)
+    /// Engine-row upsert statement. The conflict-update deliberately
+    /// ignores `active`: row refreshes never move the serving flag —
+    /// only `set_active_engine` (and boot heal) do.
+    const UPSERT_ENGINE_SQL: &str =
+        "INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(tag) DO UPDATE SET
                asset = excluded.asset, sha256 = excluded.sha256,
                installed_at = excluded.installed_at, manifest = excluded.manifest,
-               kind = excluded.kind",
+               kind = excluded.kind";
+
+    pub fn upsert_engine(&self, e: &EngineRow) -> CoreResult<()> {
+        // The v13 one_active_engine partial index makes a second active
+        // row a database impossibility, so an active upsert must demote
+        // every OTHER row in the same transaction as the write (a crash
+        // between the two would otherwise land the store at zero-active
+        // — the exact F120 class set_active_engine already guards).
+        if e.active {
+            let tx = self.conn.unchecked_transaction()?;
+            // Demote others only when this write actually claims the
+            // active slot: a NEW row (INSERT path), or a row that
+            // already holds the flag (cleanup no-op — the demote's
+            // `tag != ?` excludes it). A conflict-update on an INACTIVE
+            // row ignores `active` by contract above, so demoting
+            // others there would strand the store at zero-active for
+            // nothing — skip it and keep today's end state.
+            let already_inactive = tx
+                .query_row(
+                    "SELECT active FROM engines WHERE tag = ?1",
+                    params![e.tag],
+                    |r| r.get::<_, i64>(0),
+                )
+                .is_ok_and(|a| a == 0);
+            if !already_inactive {
+                tx.execute(
+                    "UPDATE engines SET active = 0 WHERE active = 1 AND tag != ?1",
+                    params![e.tag],
+                )?;
+            }
+            tx.execute(
+                Self::UPSERT_ENGINE_SQL,
+                params![
+                    e.tag,
+                    e.asset,
+                    e.sha256,
+                    e.installed_at,
+                    i64::from(e.active),
+                    e.manifest,
+                    e.kind
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+        self.conn.execute(
+            Self::UPSERT_ENGINE_SQL,
             params![
                 e.tag,
                 e.asset,
@@ -1823,11 +1944,10 @@ mod tests {
 
         // Unknown id: Ok(None) — the API layer turns this into the
         // teaching 404, not a store error.
-        assert!(
-            s.update_completion_card("chatcmpl-nope", "{}", 1)
-                .unwrap()
-                .is_none()
-        );
+        assert!(s
+            .update_completion_card("chatcmpl-nope", "{}", 1)
+            .unwrap()
+            .is_none());
         assert!(s.get_completion_card("chatcmpl-nope").unwrap().is_none());
     }
 
@@ -1905,10 +2025,9 @@ mod tests {
         assert!(s.set_job_state("job_1", "running", None, None).unwrap());
         s.append_job_event("job_1", "progress", Some(r#"{"pct":50}"#))
             .unwrap();
-        assert!(
-            s.set_job_state("job_1", "completed", Some(r#"{"text":"hi"}"#), None)
-                .unwrap()
-        );
+        assert!(s
+            .set_job_state("job_1", "completed", Some(r#"{"text":"hi"}"#), None)
+            .unwrap());
         // Unknown id: the contract returns false, not an error.
         assert!(!s.set_job_state("job_9", "completed", None, None).unwrap());
 
@@ -2319,6 +2438,153 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         s.put_bench_result("m1", "lane-a", "[]").unwrap();
         assert!(s.latest_bench_result("m1", None).unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__one_active_engine__index_rejects_raw_double_active() {
+        // The partial unique index is the schema-level guard: even a raw
+        // SQL writer bypassing every Store method cannot create two
+        // active engines.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let s = Store::open(&dirs).unwrap();
+        s.upsert_engine(&engine_row("a", 10, true, EngineKind::LlamaCpp))
+            .unwrap();
+        let dup = s.conn().execute(
+            "INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind) \
+             VALUES ('b', 'cpu', 'x', 20, 1, '{}', 'llamacpp')",
+            [],
+        );
+        // SQLite reports partial-index violations in column form (probe:
+        // "UNIQUE constraint failed: t.a" for an index on t.a WHERE a=1).
+        let err = dup.expect_err("second active row must be rejected");
+        assert!(err
+            .to_string()
+            .contains("UNIQUE constraint failed: engines.active"));
+    }
+
+    #[test]
+    fn unit__upsert_engine__active_upsert_demotes_prior() {
+        // Upserting a fresh active engine demotes the previous active in
+        // the same transaction; conflict-upserts of an already-inactive
+        // row never resurrect a zero-active store (legacy end states).
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let s = Store::open(&dirs).unwrap();
+        s.upsert_engine(&engine_row("a", 10, true, EngineKind::LlamaCpp))
+            .unwrap();
+        s.upsert_engine(&engine_row("b", 20, true, EngineKind::Sglang))
+            .unwrap();
+        let active: String = s
+            .conn()
+            .query_row("SELECT tag FROM engines WHERE active = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(active, "b");
+        // Conflict-reupsert of the demoted 'a' with active=true: the row
+        // exists and is inactive — the guard skips the demote so 'b'
+        // stays active, and the conflict-update itself ignores active.
+        s.upsert_engine(&engine_row("a", 30, true, EngineKind::LlamaCpp))
+            .unwrap();
+        let active: String = s
+            .conn()
+            .query_row("SELECT tag FROM engines WHERE active = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(active, "b");
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v12_to_v13_repairs_double_active() {
+        // Simulate a v12 database with two active engines (possible only
+        // via legacy writers predating the index): migration repairs to a
+        // single active engine picked with heal_active_engine's
+        // preference — lane rank beats installed_at, so the older
+        // llamacpp lane wins over the newer whisper lane.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS one_active_engine; \
+                     INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind) \
+                     VALUES ('old-w', 'cpu', 'x', 200, 1, '{}', 'whisper'); \
+                     INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind) \
+                     VALUES ('keep-l', 'cpu', 'x', 100, 1, '{}', 'llamacpp'); \
+                     PRAGMA user_version = 12;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&dirs).unwrap();
+        let v: i32 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let active: String = s
+            .conn()
+            .query_row("SELECT tag FROM engines WHERE active = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(active, "keep-l");
+        // The index is live post-migration: raw double-active writes die.
+        let dup = s
+            .conn()
+            .execute("UPDATE engines SET active = 1 WHERE tag = 'old-w'", []);
+        assert!(dup.is_err());
+        // Reopen is idempotent — nothing left to repair or create.
+        drop(s);
+        let s = Store::open(&dirs).unwrap();
+        let v: i32 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v12_to_v13_all_lazy_lands_zero_active() {
+        // Overlapping actives with no text lane: migration demotes all of
+        // them, matching what heal_active_engine would decide — the store
+        // stays at zero-active until the next heal picks a lane.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS one_active_engine; \
+                     INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind) \
+                     VALUES ('w1', 'cpu', 'x', 200, 1, '{}', 'whisper'); \
+                     INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind) \
+                     VALUES ('w2', 'cpu', 'x', 300, 1, '{}', 'whisper'); \
+                     PRAGMA user_version = 12;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&dirs).unwrap();
+        let active: i64 = s
+            .conn()
+            .query_row("SELECT COUNT(*) FROM engines WHERE active = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(active, 0);
+        let v: i32 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
     }
 
     #[test]
@@ -2733,28 +2999,24 @@ mod tests {
             last_used_at: 0,
         };
         // The live incident rows: awq/gptq/fp8 dirs quantize true.
-        assert!(
-            row(
-                "qwen2.5-0.5b-instruct-awq",
-                "qwen/qwen2.5-0.5b-instruct-awq",
-                "/models/qwen2.5-0.5b-instruct-awq.d"
-            )
-            .is_quantized_safetensors()
-        );
+        assert!(row(
+            "qwen2.5-0.5b-instruct-awq",
+            "qwen/qwen2.5-0.5b-instruct-awq",
+            "/models/qwen2.5-0.5b-instruct-awq.d"
+        )
+        .is_quantized_safetensors());
         assert!(row("m-gptq", "r", "/models/m-gptq.d").is_quantized_safetensors());
         assert!(row("m-fp8-dynamic", "r", "/models/m-fp8-dynamic.d").is_quantized_safetensors());
         // Word boundary: 'hawk' embeds awq as a substring but splits
         // into its own token — stays a normal lane.
         assert!(!row("hawk", "r", "/models/hawk.d").is_quantized_safetensors());
         // Plain BF16 dir: the lane mistral.rs serves perfectly.
-        assert!(
-            !row(
-                "qwen2.5-0.5b-instruct",
-                "qwen/qwen2.5-0.5b-instruct",
-                "/models/qwen2.5-0.5b-instruct.d"
-            )
-            .is_quantized_safetensors()
-        );
+        assert!(!row(
+            "qwen2.5-0.5b-instruct",
+            "qwen/qwen2.5-0.5b-instruct",
+            "/models/qwen2.5-0.5b-instruct.d"
+        )
+        .is_quantized_safetensors());
         // GGUF never counts, even when the filename carries a token.
         assert!(!row("m-awq", "r", "/models/m-awq-q4_k_m.gguf").is_quantized_safetensors());
         // Repo token alone (a dir renamed clean) still signals.
