@@ -14,6 +14,7 @@ tracked here.
 - **RoPE frequency and checkpoint-spacing knobs.** `rope_freq_base`, `rope_freq_scale` and `checkpoint_min_step` are first-class config keys (global and per-model overlay), pushed to llama.cpp lanes via the gated flags `--rope-freq-base`, `--rope-freq-scale` and `--checkpoint-min-step`. `None` (the default) keeps the values baked into the checkpoint. `validate.py` covers the new knobs with fixtures.
 - **Checkpoint-declared quantization in the CLI.** `blazar model list/show/json` for safetensors checkpoints now read `quant_method` from the model's config.json (top-level or `quantization_config` nesting; torchao/awq/gptq) instead of guessing from the directory name — the name-derived column reported torchao int4 checkpoints as BF16. GGUF and MLX models are unaffected.
 - **Config documentation drift gate.** `scripts/check_config_doc_drift.py` parses the `Config` struct fields (brace-depth, comment-aware) and fails CI when `docs/config-code-paths.md` (now 205 fields) falls out of sync with the code.
+- **Remote URL scheme ladder.** `[[remotes]]` URLs are classified at boot: `https://` accepted everywhere; cleartext HTTP accepted on loopback, warned on private/LAN addresses, and refused for public hosts or hostnames (hostname ≠ `localhost` counts as public — no DNS at validation). Per-remote `allow_insecure_http = true` downgrades the refusal to a loud warning for labs that must reach a legacy cleartext endpoint.
 
 ### Fixed
 
@@ -22,6 +23,7 @@ tracked here.
 
 ### Changed
 
+- **Public cleartext-HTTP remotes are refused at boot.** A `[[remotes]]` entry pointing at a non-private `http://` host previously booted silently with its bearer key exposed on the network path; the scheme ladder now refuses it with a teaching error (escape hatch: that remote's `allow_insecure_http = true`, or use `https://` / an IP literal). Loopback and LAN HTTP remotes keep booting — LAN gains a warning line in the daemon log. Note for downgrade: an older binary reading a config that sets `allow_insecure_http` fails on the unknown field — remove the key when rolling back.
 - **Slot adoption cap raised 8 → 16.** The supervisor's adopt cap is a scheduling policy, not a VRAM guard; at 8 it was the binding constraint under 16-stream load. Tests rescaled to the new cap.
 - **Benchmark suite refresh.** Chart/matrix/selftest pipeline rework; two new Oct 6 campaigns (`20261006-matched-conc`, `20261006-perf-lanes`) with full reproducibility receipts; regenerated plots and reports for prior campaigns; INDEX/BENCHMARK/README tables refreshed (1.4% gateway overhead, ITL p99 25.8 ms vs 75 ms for Ollama, 96.3 t/s at C8 matched-slots).
 

@@ -252,6 +252,7 @@ pub fn with_remote(mut cfg: Config, name: &str, url: &str) -> Config {
         name: name.to_string(),
         url: url.to_string(),
         key: String::new(),
+        allow_insecure_http: false,
     });
     cfg
 }
