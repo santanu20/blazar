@@ -7577,10 +7577,15 @@ fn scorecard_caps_rows(caps_raw: &str) -> Option<Vec<(String, String)>> {
         ]
         .iter()
         .map(|k| {
-            (
-                (*k).to_string(),
-                caps[*k]["status"].as_str().unwrap_or("-").to_string(),
-            )
+            let verdict = &caps[*k];
+            let status = verdict["status"].as_str().unwrap_or("-").to_string();
+            // Evidence counter from the failure-KB: repeated doctor runs
+            // accumulate n_runs per probe; surface it once it means
+            // something (>1). Legacy certs without counters render bare.
+            match verdict["n_runs"].as_u64() {
+                Some(n) if n > 1 => ((*k).to_string(), format!("{status} ×{n}")),
+                _ => ((*k).to_string(), status),
+            }
         })
         .collect(),
     )
@@ -19650,6 +19655,22 @@ mod tests {
             "absent probe renders as a gap, never a guess"
         );
         assert_eq!(rows[3].1, "FAIL");
+    }
+
+    #[test]
+    fn unit__scorecard_caps_rows__evidence_suffix_only_when_repeated() {
+        // Failure-KB counters: >1 renders " ×N"; 1 and legacy-absent
+        // render bare so old certificates stay byte-identical.
+        let caps = r#"{"caps":{"chat":{"status":"PASS","n_runs":3},
+                              "json":{"status":"PASS"},
+                              "tools":{"status":"FAIL","n_runs":1}}}"#;
+        let rows = scorecard_caps_rows(caps).expect("caps parse");
+        assert_eq!(rows[0].1, "PASS ×3", "repeated evidence is surfaced");
+        assert_eq!(
+            rows[2].1, "PASS",
+            "legacy cert without counters renders bare"
+        );
+        assert_eq!(rows[3].1, "FAIL", "single-run probe renders bare");
     }
 
     #[test]

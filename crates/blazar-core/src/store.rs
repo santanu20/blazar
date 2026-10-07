@@ -1088,6 +1088,26 @@ impl Store {
         Ok(())
     }
 
+    /// Exact-pair read for evidence accumulation: `(tested_at, caps_json)`
+    /// for one `(model, engine_tag)` — deliberately NOT latest-wins. A
+    /// certificate from a different lane is not prior evidence for this
+    /// lane, so the caller must ask for the pair it is about to write.
+    pub fn get_model_caps_pair(
+        &self,
+        model: &str,
+        engine_tag: &str,
+    ) -> CoreResult<Option<(i64, String)>> {
+        match self.conn.query_row(
+            "SELECT tested_at, caps_json FROM model_caps WHERE model = ?1 AND engine_tag = ?2",
+            params![model, engine_tag],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(pair) => Ok(Some(pair)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(other) => Err(other.into()),
+        }
+    }
+
     pub fn get_model_caps(&self, model: &str) -> CoreResult<Option<(String, String)>> {
         // Latest verification wins: certs are keyed (model, engine_tag),
         // so a model served by two lanes carries two rows — admission
@@ -2233,6 +2253,42 @@ mod tests {
         assert_eq!(caps_json, "{\"caps\":{}}");
         // Undated view stays consistent with the dated one.
         assert_eq!(s.get_model_caps("m1").unwrap().unwrap().0, tag);
+    }
+
+    #[test]
+    fn unit__model_caps_pair__exact_pair_not_latest_wins() {
+        let (_tmp, s) = tmp_store();
+        assert!(
+            s.get_model_caps_pair("m1", "lane-a").unwrap().is_none(),
+            "no row exists yet"
+        );
+        s.put_model_caps(
+            "m1",
+            "lane-a",
+            "{\"caps\":{\"chat\":{\"status\":\"PASS\"}}}",
+        )
+        .unwrap();
+        s.put_model_caps(
+            "m1",
+            "lane-b",
+            "{\"caps\":{\"chat\":{\"status\":\"FAIL\"}}}",
+        )
+        .unwrap();
+        // The exact pair returns ITS OWN row even though lane-b is newer
+        // (latest-wins would hand back lane-b — wrong for evidence
+        // accumulation, where a different lane is not prior evidence).
+        let (tested_at, caps_json) = s
+            .get_model_caps_pair("m1", "lane-a")
+            .unwrap()
+            .expect("lane-a pair exists");
+        assert!(tested_at > 1_700_000_000);
+        assert!(caps_json.contains("\"PASS\""));
+        let (_, latest) = s
+            .get_model_caps_pair("m1", "lane-b")
+            .unwrap()
+            .expect("lane-b pair exists");
+        assert!(latest.contains("\"FAIL\""));
+        assert!(s.get_model_caps_pair("m1", "lane-z").unwrap().is_none());
     }
 
     #[test]

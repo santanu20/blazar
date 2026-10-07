@@ -677,14 +677,30 @@ async fn run_probes(
         |r| r.engine.clone(),
     );
 
-    let cert = json!({
+    // Failure-KB accumulation: fetch what this exact (model, engine_tag)
+    // pair already holds BEFORE building the new cert (a different lane's
+    // row is not prior evidence for this lane).
+    let prior = state
+        .with_store(|s| s.get_model_caps_pair(&model, &engine_tag))
+        .and_then(Result::ok)
+        .flatten();
+    let now = blazar_core::store::unix_now();
+    let mut cert = json!({
         "object": "blazar.model-doctor",
         "model": model,
         "engine_tag": engine_tag,
-        "tested_at": blazar_core::store::unix_now(),
+        "tested_at": now,
         "total_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "caps": Value::Object(caps),
     });
+    // Fold this run into the prior evidence so repeated qualification
+    // runs count instead of silently overwriting (statuses stay
+    // latest-wins; counters record how many runs back they go).
+    merge_evidence(
+        prior.as_ref().map(|(t, j)| (*t, j.as_str())),
+        &mut cert,
+        now,
+    );
     if let Some(err) = state
         .with_store(|s| {
             s.put_model_caps(
@@ -707,11 +723,125 @@ fn verdict_json(v: &Verdict) -> Value {
     json!({"status": v.status, "receipt": v.receipt})
 }
 
+/// Fold a fresh certificate into the prior evidence held for the same
+/// `(model, engine_tag)` pair: stamp an `evidence` block
+/// `{n_runs, first_seen, last_seen}` onto the cert and per-probe `n_runs`
+/// counters onto each verdict. Statuses and receipts stay latest-wins —
+/// the counters record how many runs back the evidence goes, nothing
+/// more. A legacy prior without counters still counts as exactly one
+/// earlier run (the row itself is the proof); a probe absent from the
+/// prior cert starts again at 1.
+fn merge_evidence(prior: Option<(i64, &str)>, cert: &mut Value, now: i64) {
+    let prior_cert = prior.map(|(tested_at, caps_json)| {
+        let v: Value = serde_json::from_str(caps_json).unwrap_or(Value::Null);
+        (tested_at, v)
+    });
+    let (n_runs, first_seen) = match &prior_cert {
+        None => (1u64, now),
+        Some((tested_at, v)) => match v["evidence"]["n_runs"].as_u64() {
+            Some(n) => (
+                n.saturating_add(1),
+                v["evidence"]["first_seen"].as_i64().unwrap_or(*tested_at),
+            ),
+            None => (2, *tested_at),
+        },
+    };
+    if let Some(caps) = cert.get_mut("caps").and_then(Value::as_object_mut) {
+        for (k, verdict) in caps.iter_mut() {
+            let prior_n = match &prior_cert {
+                Some((_, pv)) => {
+                    let probe = &pv["caps"][k.as_str()];
+                    match probe["n_runs"].as_u64() {
+                        Some(n) => n,
+                        // legacy verdict = one earlier run; absent probe = none
+                        None => u64::from(probe.get("status").is_some()),
+                    }
+                }
+                None => 0,
+            };
+            if let Some(obj) = verdict.as_object_mut() {
+                obj.insert("n_runs".to_string(), json!(prior_n.saturating_add(1)));
+            }
+        }
+    }
+    cert["evidence"] = json!({
+        "n_runs": n_runs,
+        "first_seen": first_seen,
+        "last_seen": now,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(non_snake_case)]
 
     use super::*;
+
+    /// Minimal cert builder mirroring the shape `run_probes` writes.
+    fn fresh_cert() -> Value {
+        json!({
+            "object": "blazar.model-doctor",
+            "model": "m1",
+            "engine_tag": "lane-a",
+            "tested_at": 1_791_000_000,
+            "caps": {
+                "chat": {"status": "PASS", "receipt": "ok"},
+                "tools": {"status": "FAIL", "receipt": "bad args"}
+            }
+        })
+    }
+
+    #[test]
+    fn unit__merge_evidence__first_run_counts_one() {
+        let mut cert = fresh_cert();
+        merge_evidence(None, &mut cert, 1_791_000_500);
+        assert_eq!(cert["evidence"]["n_runs"], 1);
+        assert_eq!(cert["evidence"]["first_seen"], 1_791_000_500);
+        assert_eq!(cert["evidence"]["last_seen"], 1_791_000_500);
+        assert_eq!(cert["caps"]["chat"]["n_runs"], 1);
+        assert_eq!(cert["caps"]["tools"]["n_runs"], 1);
+        // Statuses untouched by evidence stamping.
+        assert_eq!(cert["caps"]["chat"]["status"], "PASS");
+    }
+
+    #[test]
+    fn unit__merge_evidence__second_run_accumulates_and_preserves_first_seen() {
+        // Run 1 lands with evidence; run 2 folds into it.
+        let mut first = fresh_cert();
+        merge_evidence(None, &mut first, 1_791_000_000);
+        let prior_json = first.to_string();
+        let mut second = fresh_cert();
+        // The verdict flipped between runs — statuses stay latest-wins.
+        second["caps"]["tools"]["status"] = json!("PASS");
+        merge_evidence(
+            Some((1_791_000_000, prior_json.as_str())),
+            &mut second,
+            1_791_000_900,
+        );
+        assert_eq!(second["evidence"]["n_runs"], 2);
+        assert_eq!(second["evidence"]["first_seen"], 1_791_000_000);
+        assert_eq!(second["evidence"]["last_seen"], 1_791_000_900);
+        assert_eq!(second["caps"]["chat"]["n_runs"], 2);
+        assert_eq!(second["caps"]["tools"]["n_runs"], 2);
+        assert_eq!(second["caps"]["tools"]["status"], "PASS");
+    }
+
+    #[test]
+    fn unit__merge_evidence__legacy_prior_counts_as_one_earlier_run() {
+        // Pre-KB cert: no evidence block, no per-probe counters.
+        let legacy = r#"{"object":"blazar.model-doctor","tested_at":1789000000,
+                         "caps":{"chat":{"status":"PASS","receipt":"ok"}}}"#;
+        let mut cert = fresh_cert();
+        merge_evidence(Some((1_789_000_000, legacy)), &mut cert, 1_791_000_000);
+        assert_eq!(
+            cert["evidence"]["n_runs"], 2,
+            "the legacy row itself proves one earlier run"
+        );
+        assert_eq!(cert["evidence"]["first_seen"], 1_789_000_000);
+        // chat existed in the legacy cert → 2; tools did not → 1.
+        assert_eq!(cert["caps"]["chat"]["n_runs"], 2);
+        assert_eq!(cert["caps"]["tools"]["n_runs"], 1);
+    }
 
     #[test]
     fn unit__judge_chat__pass_fail_shapes() {
