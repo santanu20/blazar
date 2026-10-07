@@ -158,7 +158,7 @@ blazar connect opencode --write --all-models   # agent-harness menu in one write
 blazar connect pi --write                     # pi / oh-my-pi, same treatment
 ```
 
-`connect` configures Codex, Claude Code, Continue, Cline, Open WebUI, opencode, and pi (oh my pi) to talk to Blazar — capability-driven model menus included (`--all-models` lists every certified chat model; the default pick follows the chat+tools > chat > uncertified ladder). Harnesses without a `connect` lane still work: point any OpenAI-compatible client at `http://127.0.0.1:11435/v1`, any Ollama client at the gateway root, or any Anthropic SDK client at `http://127.0.0.1:11435`.
+`connect` configures Codex, Claude Code, Continue, Cline, Open WebUI, opencode, and pi (oh my pi) to talk to Blazar — capability-driven model menus included (`--all-models` lists every certified chat model; the default pick follows the chat+tools > chat > uncertified ladder). Harnesses without a `connect` lane still work: point any OpenAI-compatible client at `http://127.0.0.1:11435/v1`, any Ollama client at the gateway root, or any Anthropic SDK client at `http://127.0.0.1:11435`. Every gateway-rendered error carries a stable machine-readable `blazar_code` (see `docs/error-codes.md` or `GET /api/errors`), so clients can branch on causes instead of parsing messages.
 
 ### MCP tool calling for any client
 
