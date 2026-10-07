@@ -30,6 +30,7 @@ rustls = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 iai-callgrind = { workspace = true }
+proptest = "1.11.0"
 
 [[bench]]
 name = "micro"
