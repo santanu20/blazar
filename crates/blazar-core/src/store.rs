@@ -154,6 +154,14 @@ CREATE TABLE IF NOT EXISTS completion_cards (
 );
 ";
 
+/// One `bench_history` row reduced to what lane calibration needs: the
+/// llama-bench decode median (`tg128`) for a measured model.
+#[derive(Debug, Clone)]
+pub struct BenchHistoryLaneRow {
+    pub model: String,
+    pub tg_tokens_per_sec: f64,
+}
+
 /// Row shapes shared across crates.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EngineRow {
@@ -1353,6 +1361,45 @@ impl Store {
         }
     }
 
+    /// Decode-throughput history for one engine lane, oldest first.
+    /// llama-bench rows carry the `tg128` median; HTTP-lane rows mirror
+    /// their `gen_tps` into the same column (both are decode t/s on the
+    /// lane, and both calibrate the predictor — failed HTTP probes write
+    /// 0.0, which the predictor's positivity filter drops). History for
+    /// deleted models is included — callers join `get_model` for sizes
+    /// and skip what is gone.
+    /// Every `bench_history` row with a decode-rate reading, oldest first.
+    /// Engine updates prune old `engines` rows, so retired tags survive only
+    /// here; calibration falls back to this when the active lane is empty.
+    pub fn bench_history_all(&self) -> CoreResult<Vec<BenchHistoryLaneRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, tg_tokens_per_sec FROM bench_history \
+             WHERE tg_tokens_per_sec IS NOT NULL ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(BenchHistoryLaneRow {
+                model: r.get(0)?,
+                tg_tokens_per_sec: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn bench_history_for_lane(&self, engine_tag: &str) -> CoreResult<Vec<BenchHistoryLaneRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, tg_tokens_per_sec FROM bench_history \
+             WHERE engine_tag = ?1 AND tg_tokens_per_sec IS NOT NULL \
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map([engine_tag], |r| {
+            Ok(BenchHistoryLaneRow {
+                model: r.get(0)?,
+                tg_tokens_per_sec: r.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
+    }
+
     pub fn active_engine(&self) -> CoreResult<Option<EngineRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines WHERE active = 1",
@@ -2233,6 +2280,53 @@ mod tests {
         assert_eq!(caps_json, "{\"caps\":{}}");
         // Undated view stays consistent with the dated one.
         assert_eq!(s.get_model_caps("m1").unwrap().unwrap().0, tag);
+    }
+
+    #[test]
+    fn unit__bench_history_for_lane__reads_llama_and_http_rows_skips_nothing() {
+        let (_tmp, s) = tmp_store();
+        assert!(s.bench_history_for_lane("lane-x").unwrap().is_empty());
+        s.record_bench("lane-x", "m1", 41.5, 1200.0, 4096).unwrap();
+        s.record_bench("lane-y", "other", 99.0, 99.0, 4096).unwrap();
+        s.record_http_bench(&HttpBenchRecord {
+            engine_tag: "lane-x".into(),
+            model: "m2".into(),
+            kind: "probe".into(),
+            ttft_ms: Some(120.0),
+            gen_tps: Some(38.0),
+            prompt_tps: Some(800.0),
+            images_per_sec: None,
+            detail_json: None,
+        })
+        .unwrap();
+        let rows = s.bench_history_for_lane("lane-x").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.model.as_str(), r.tg_tokens_per_sec))
+                .collect::<Vec<_>>(),
+            vec![("m1", 41.5), ("m2", 38.0)],
+            "lane-scoped, oldest first, llama-bench + HTTP mirror rows both included"
+        );
+    }
+
+    #[test]
+    fn unit__bench_history_all__spans_retired_lanes_oldest_first() {
+        let (_tmp, s) = tmp_store();
+        assert!(s.bench_history_all().unwrap().is_empty());
+        // Retired engine tags (rows whose engines entry no longer exists)
+        // must still feed machine-level calibration.
+        s.record_bench("b11202-cuda", "m1", 41.5, 1200.0, 4096)
+            .unwrap();
+        s.record_bench("b11417-cuda", "m2", 42.5, 1200.0, 4096)
+            .unwrap();
+        s.record_bench("sglang-0.5", "m3", 30.0, 900.0, 4096)
+            .unwrap();
+        let rows = s.bench_history_all().unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.model.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3"],
+            "all rows across every tag, oldest first"
+        );
     }
 
     #[test]

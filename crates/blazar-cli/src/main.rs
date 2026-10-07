@@ -7414,6 +7414,48 @@ fn group_bench_rows(rows: &[blazar_runtime::bench::BenchRow]) -> Vec<BenchTestRo
         .collect()
 }
 
+/// Prediction for a model with no measurement on record: calibrates the
+/// active lane's effective bandwidth from its bench history and divides
+/// by the target's size. `None` when there is nothing to calibrate from
+/// (the honest "no basis" case, not a guess).
+fn predict_for_plan(
+    store: &Store,
+    row: &blazar_core::store::ModelRow,
+) -> Option<(String, blazar_core::predict::Prediction)> {
+    let engine = store.active_engine().ok().flatten()?;
+    // Exact-lane history first; engine updates prune old engine rows, so a
+    // long-lived store keeps its bench_history under retired tags — fall
+    // back to every row on the machine. The returned basis label names
+    // WHICH set backed the prediction so it never overstates precision.
+    let lane = store.bench_history_for_lane(&engine.tag).ok()?;
+    let (history, basis_lane) = if lane.is_empty() {
+        (
+            store.bench_history_all().ok()?,
+            format!("{} (all recorded lanes)", engine.tag),
+        )
+    } else {
+        (lane, engine.tag.clone())
+    };
+    let samples = history
+        .iter()
+        .filter_map(|h| {
+            let bytes = store
+                .get_model(&h.model)
+                .ok()
+                .flatten()
+                .and_then(|r| u64::try_from(r.bytes.max(0)).ok())?;
+            Some(blazar_core::predict::CalibSample {
+                model: h.model.clone(),
+                tg_tokens_per_sec: h.tg_tokens_per_sec,
+                bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let target_bytes = u64::try_from(row.bytes.max(0)).ok()?;
+    let prediction = blazar_core::predict::predict_decode_tps(&samples, target_bytes, &row.name)?;
+    Some((basis_lane, prediction))
+}
+
 /// Where a model's measured performance comes from, newest wins:
 /// a tuned launch profile (richer: score + rows, written by `tune`)
 /// or the plain-bench record (rows only, written by `bench`).
@@ -7741,9 +7783,22 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
 
     let measured = resolve_measured(&store, &row.name)?;
     let cert = store.get_model_caps_dated(&row.name)?;
+    // Predictions only fill the gap — never override a measurement.
+    let predicted = match &measured {
+        Measured::Absent => predict_for_plan(&store, &row),
+        _ => None,
+    };
 
     if json {
         let measured_json = measured_json_value(&measured);
+        let predicted_json = predicted.as_ref().map(|(tag, p)| {
+            serde_json::json!({
+                "decode_tps": p.decode_tps,
+                "method": p.method,
+                "n_samples": p.n_samples,
+                "lane": tag,
+            })
+        });
         let cert_json = cert.as_ref().map(|(tag, tested_at, caps_json)| {
             serde_json::json!({
                 "engine": tag,
@@ -7764,6 +7819,7 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
                 },
                 "decision": decision,
                 "measured": measured_json,
+                "predicted": predicted_json,
                 "certificate": cert_json,
             })
         );
@@ -7825,9 +7881,18 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
                 println!("  {line}");
             }
         }
-        Measured::Absent => {
-            println!("  no benchmark on record — run: blazar bench {}", row.name);
-        }
+        Measured::Absent => match &predicted {
+            Some((tag, p)) => {
+                // Display rounding of a strictly positive prediction.
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let tps = p.decode_tps.round() as u64;
+                println!(
+                    "  decode ~{tps} t/s (predicted — basis: {} measured model(s) on lane {tag}; verify with: blazar bench {})",
+                    p.n_samples, row.name
+                );
+            }
+            None => println!("  no benchmark on record — run: blazar bench {}", row.name),
+        },
     }
 
     println!();
