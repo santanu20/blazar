@@ -141,6 +141,8 @@ jobs:
           if-no-files-found: ignore
       - name: Docs site version matches the tag
         run: python3 scripts/sync_docs_version.py --check --expect "${GITHUB_REF_NAME#v}"
+      - name: Config doc matches the Config struct
+        run: python3 scripts/check_config_doc_drift.py
 
   release:
     needs: [build, checks]
