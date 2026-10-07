@@ -1,8 +1,9 @@
 //! `blazar` — multi-engine local inference platform (llama.cpp, mistral.rs, `SGLang`).
 //!
-//! Local-only by design: no telemetry, no cloud endpoints; the only
-//! outbound traffic is user-initiated engine/model downloads. Powered by
-//! upstream llama.cpp, mistral.rs and `SGLang` — unmodified.
+//! Local-first by design: no telemetry, no cloud endpoints; outbound
+//! traffic is user-initiated (engine/model downloads, plus optional
+//! federation peers you configure). Powered by upstream llama.cpp,
+//! mistral.rs and `SGLang` — unmodified.
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -30,7 +31,7 @@ use blazar_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
     name = "blazar",
     version,
     about = "multi-engine local inference: llama.cpp, mistral.rs and SGLang orchestrated behind one OpenAI + Ollama + Anthropic gateway",
-    after_help = "Quickstart: blazar pull <model> · blazar run <model> · blazar doctor\n\nLocal-only: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang — unmodified."
+    after_help = "Quickstart: blazar pull <model> · blazar run <model> · blazar doctor\n\nLocal-first: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang — unmodified."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -60,7 +61,7 @@ enum Cmd {
         #[arg(short = 'f', long)]
         file: Option<PathBuf>,
     },
-    /// Push a model to a registry — refused: blazar is local-only by design
+    /// Push a model to a registry — refused: no cloud registry by design
     Push { model: String },
     /// Manage API keys (list / add / rm / rotate against the running daemon)
     Keys {
@@ -988,7 +989,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         &["why", "explain", "model-doctor", "route", "watch"],
     ),
     (
-        "Refused by design (local-only)",
+        "Refused by design (no cloud services)",
         &["push", "signin", "login", "signout", "logout"],
     ),
     ("General", &["connect", "help"]),
@@ -1053,7 +1054,7 @@ fn render_grouped_help() -> String {
     .unwrap();
     writeln!(
         out,
-        "\nLocal-only: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang — unmodified."
+        "\nLocal-first: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang — unmodified."
     )
     .unwrap();
     out
@@ -8513,8 +8514,8 @@ async fn run_dispatch(
     Ok(())
 }
 
-/// ollama cloud commands are refused, loudly: blazar is local-only by
-/// design and silently no-op-ing would hide the difference.
+/// ollama cloud commands are refused, loudly: blazar runs no cloud
+/// services by design and silently no-op-ing would hide the difference.
 fn cloud_refusal(cmd: &str, model: &str) -> Result<()> {
     let what = if model.is_empty() {
         cmd.to_string()
@@ -8522,7 +8523,7 @@ fn cloud_refusal(cmd: &str, model: &str) -> Result<()> {
         format!("{cmd} {model}")
     };
     Err(anyhow!(
-        "blazar {what}: refused — blazar is local-only by design (no registry, no cloud accounts). \
+        "blazar {what}: refused — blazar runs no cloud services by design (no registry, no cloud accounts). \
 Pull models straight from Hugging Face: blazar pull <owner/repo:QUANT> \
 · discover GGUFs first: blazar search <terms>"
     ))
