@@ -7510,6 +7510,60 @@ fn measured_json_value(measured: &Measured) -> Option<serde_json::Value> {
 /// Bench row reduced for display: `(test name, mean t/s, first ctx)`.
 type BenchTestRow = (String, f64, Option<u64>);
 
+/// Execution Score VECTOR for `scorecard`: measured throughput and verified
+/// capability composed per-axis. Deliberately never a scalar composite —
+/// latency, throughput, and correctness trade off against each other
+/// (Pareto), and collapsing them into one number would hide exactly the
+/// trade-off the control plane exists to surface. Each throughput axis
+/// names the bench test it came from (`basis`); the capability fraction
+/// counts only PASS/FAIL verdicts (N/A probes are out of scope for the
+/// lane, not failures). Axes without persisted evidence yet — sentinel
+/// runtime quality, workload class — are omitted rather than fabricated.
+fn execution_score_vector(measured: &Measured, caps_json: Option<&str>) -> serde_json::Value {
+    // Nested fn (not closure): returns a borrow of the test name, and a
+    // closure cannot be lifetime-generic over its inputs.
+    fn best_of<'t>(prefix: &str, tests: &'t [BenchTestRow]) -> Option<(&'t str, f64)> {
+        tests
+            .iter()
+            .filter(|(name, _, _)| name.starts_with(prefix))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(name, t_per_s, _)| (name.as_str(), *t_per_s))
+    }
+    let (decode, prompt) = match measured {
+        Measured::Absent => (None, None),
+        Measured::Tuned { tests, .. } | Measured::Benched { tests, .. } => {
+            (best_of("tg", tests), best_of("pp", tests))
+        }
+    };
+    let capability = caps_json
+        .and_then(scorecard_caps_rows)
+        .map(|rows| {
+            let pass = rows.iter().filter(|(_, s)| s == "PASS").count();
+            let fail = rows.iter().filter(|(_, s)| s == "FAIL").count();
+            let counted = pass + fail;
+            #[allow(clippy::cast_precision_loss)] // ratio of small counts
+            let ratio = pass as f64 / counted as f64;
+            let fraction = if counted == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(ratio)
+            };
+            serde_json::json!({
+                "pass": pass,
+                "fail": fail,
+                "fraction": fraction,
+            })
+        })
+        .filter(|c| c["pass"].as_u64().unwrap_or(0) + c["fail"].as_u64().unwrap_or(0) > 0);
+    serde_json::json!({
+        "decode_t_per_s": decode.map(|(_, t)| t),
+        "decode_basis": decode.map(|(n, _)| n),
+        "prompt_t_per_s": prompt.map(|(_, t)| t),
+        "prompt_basis": prompt.map(|(n, _)| n),
+        "capability": capability,
+    })
+}
+
 /// Identity rows shared by `plan` MODEL and `scorecard` (`show()`
 /// layout): repo/quant/size always; `params`/`arch`/`ctx_train` only
 /// when known. `with_name` prefixes the model row — scorecard headers
@@ -8064,6 +8118,46 @@ llama-bench measures generative decode; embedding speed is per-request in /metri
 /// certificate with its test date). Read-only: no probes, no benches, no
 /// spawns. Missing records print honest gap rows with the command that
 /// fills them.
+/// `scorecard --json` arm, extracted: the card's JSON shape (identity,
+/// performance, quality, execution vector) in one place so the human
+/// renderer stays readable.
+fn scorecard_json(
+    row: &blazar_core::store::ModelRow,
+    measured: &Measured,
+    caps: Option<&(String, i64, String)>,
+) {
+    let identity = serde_json::json!({
+        "name": row.name,
+        "repo": row.repo,
+        "quant": row.quant,
+        "size_bytes": row.bytes,
+        "params_b": row.params,
+        "arch": row.arch,
+        "ctx_train": row.ctx_train,
+        "mmproj": row.mmproj_path,
+    });
+    let performance = measured_json_value(measured);
+    let quality = caps.map(|(tag, tested_at, caps_json)| {
+        serde_json::json!({
+            "engine": tag,
+            "verified_at": epoch_to_utc_date(*tested_at),
+            "probes": scorecard_caps_rows(caps_json),
+        })
+    });
+    let execution_score =
+        execution_score_vector(measured, caps.map(|(_, _, caps_json)| caps_json.as_str()));
+    println!(
+        "{}",
+        serde_json::json!({
+            "object": "blazar.scorecard",
+            "identity": identity,
+            "performance": performance,
+            "quality": quality,
+            "execution_score": execution_score,
+        })
+    );
+}
+
 fn scorecard(model: &str, json: bool) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
@@ -8074,33 +8168,7 @@ fn scorecard(model: &str, json: bool) -> Result<()> {
     let caps = store.get_model_caps_dated(&row.name).ok().flatten();
 
     if json {
-        let identity = serde_json::json!({
-            "name": row.name,
-            "repo": row.repo,
-            "quant": row.quant,
-            "size_bytes": row.bytes,
-            "params_b": row.params,
-            "arch": row.arch,
-            "ctx_train": row.ctx_train,
-            "mmproj": row.mmproj_path,
-        });
-        let performance = measured_json_value(&measured);
-        let quality = caps.map(|(tag, tested_at, caps_json)| {
-            serde_json::json!({
-                "engine": tag,
-                "verified_at": epoch_to_utc_date(tested_at),
-                "probes": scorecard_caps_rows(&caps_json),
-            })
-        });
-        println!(
-            "{}",
-            serde_json::json!({
-                "object": "blazar.scorecard",
-                "identity": identity,
-                "performance": performance,
-                "quality": quality,
-            })
-        );
+        scorecard_json(&row, &measured, caps.as_ref());
         return Ok(());
     }
 
@@ -8165,7 +8233,48 @@ fn scorecard(model: &str, json: bool) -> Result<()> {
             row.name
         ),
     }
+
+    // Execution VECTOR: per-axis composition of the two sections above.
+    let vector = execution_score_vector(&measured, caps.as_ref().map(|(_, _, j)| j.as_str()));
+    print_execution_vector(&vector, &row.name);
     Ok(())
+}
+
+/// Human rendering of the execution vector card section: per-axis lines
+/// whose parenthetical names the bench test behind each number, so a
+/// prediction can never masquerade as a measurement here.
+fn print_execution_vector(vector: &serde_json::Value, model: &str) {
+    println!();
+    println!("execution vector  (per-axis — axes trade off, there is no single score)");
+    let axis =
+        |label: &str, value: &serde_json::Value, basis: &serde_json::Value, hint: &str| match (
+            value.as_f64(),
+            basis.as_str(),
+        ) {
+            (Some(v), Some(b)) => println!("  {label:<12}  {v:.1}  ({b})"),
+            _ => println!("  {label:<12}  —  ({hint})"),
+        };
+    let bench_hint = format!("no benchmark — run: blazar bench {model}");
+    axis(
+        "decode",
+        &vector["decode_t_per_s"],
+        &vector["decode_basis"],
+        &bench_hint,
+    );
+    axis(
+        "prompt",
+        &vector["prompt_t_per_s"],
+        &vector["prompt_basis"],
+        &bench_hint,
+    );
+    match vector["capability"].as_object() {
+        Some(cap) => println!(
+            "  capability   {}/{} pass",
+            cap["pass"],
+            cap["pass"].as_u64().unwrap_or(0) + cap["fail"].as_u64().unwrap_or(0)
+        ),
+        None => println!("  capability   —  (no certificate — run: blazar model-doctor {model})"),
+    }
 }
 
 /// Thousands-suffixed context/token counts (`8K`, `32K`) — keeps the card
@@ -18368,6 +18477,61 @@ mod tests {
         assert_eq!(parse_systemd_state("failed"), SystemdUnitState::Failed);
         assert_eq!(parse_systemd_state("inactive"), SystemdUnitState::Inactive);
         assert_eq!(parse_systemd_state("reloading"), SystemdUnitState::Unknown);
+    }
+
+    #[test]
+    fn unit__execution_score_vector__max_mean_and_basis_labels() {
+        let measured = Measured::Tuned {
+            tag: "b11429-cuda".into(),
+            updated_at: 1_700_000_000,
+            score: 41.5,
+            tests: vec![
+                ("tg32".to_string(), 30.0, None),
+                ("tg128".to_string(), 41.5, None),
+                ("pp512".to_string(), 1213.0, Some(512)),
+            ],
+        };
+        let caps_json = r#"{"caps":{
+            "chat":{"status":"PASS"},"stream":{"status":"PASS"},
+            "json":{"status":"PASS"},"tools":{"status":"PASS"},
+            "embeddings":{"status":"PASS"},"think":{"status":"FAIL"},
+            "classify":{"status":"N/A"},"vision":{"status":"N/A"}}}"#;
+        let v = execution_score_vector(&measured, Some(caps_json));
+        // Best (max-mean) test per axis, named — never an unlabeled number.
+        assert_eq!(v["decode_t_per_s"].as_f64(), Some(41.5));
+        assert_eq!(v["decode_basis"].as_str(), Some("tg128"));
+        assert_eq!(v["prompt_t_per_s"].as_f64(), Some(1213.0));
+        assert_eq!(v["prompt_basis"].as_str(), Some("pp512"));
+        // N/A probes are out of scope, not failures: 5/6 counted.
+        assert_eq!(v["capability"]["pass"].as_u64(), Some(5));
+        assert_eq!(v["capability"]["fail"].as_u64(), Some(1));
+        let fraction = v["capability"]["fraction"].as_f64().unwrap();
+        assert!((fraction - 5.0 / 6.0).abs() < 1e-9, "got {fraction}");
+        // No scalar composite key exists anywhere in the vector.
+        assert!(v.get("score").is_none() && v.get("total").is_none());
+    }
+
+    #[test]
+    fn unit__execution_score_vector__absent_is_nulls_not_zeros() {
+        let v = execution_score_vector(&Measured::Absent, None);
+        assert!(v["decode_t_per_s"].is_null() && v["decode_basis"].is_null());
+        assert!(v["prompt_t_per_s"].is_null() && v["prompt_basis"].is_null());
+        assert!(v["capability"].is_null());
+    }
+
+    #[test]
+    fn unit__execution_score_vector__capability_counts_only_real_verdicts() {
+        // A lane where every probe is N/A carries no capability signal:
+        // counted = 0 must render null, not a fabricated fraction.
+        let caps_json = r#"{"caps":{"classify":{"status":"N/A"},"vision":{"status":"N/A"}}}"#;
+        let measured = Measured::Benched {
+            tag: "lane".into(),
+            updated_at: 1_700_000_000,
+            tests: vec![("tg128".to_string(), 12.0, None)],
+        };
+        let v = execution_score_vector(&measured, Some(caps_json));
+        assert!(v["capability"].is_null());
+        assert_eq!(v["decode_t_per_s"].as_f64(), Some(12.0));
     }
 
     #[test]
