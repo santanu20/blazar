@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::TraceId;
 use crate::proxy::{
     admission_gate_slo, affinity_hash_bytes, ensure_with_admission, exclusive_intent_bytes,
-    openai_error, path_and_query, proxy_request,
+    openai_error, openai_error_code, path_and_query, proxy_request,
 };
 use crate::queue::Priority;
 use crate::state::AppState;
@@ -587,7 +587,10 @@ pub async fn openai_proxy(
             && !crate::preflight::is_capability_probe(&headers)
             && let Some(msg) = crate::preflight::capability_cert_refusal(&state, &model, cap_needs)
         {
-            return openai_error(400, &msg);
+            return openai_error_code(
+                crate::error_codes::BlazarCode::CapabilityVerifiedFailed,
+                &msg,
+            );
         }
         let eff = crate::preflight::admission_ctx(&state, &model);
         if let Err(resp) = crate::preflight::enforce_prompt_fits(&state, &model, &v, eff).await {

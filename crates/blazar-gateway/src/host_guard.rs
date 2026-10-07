@@ -174,7 +174,7 @@ pub async fn host_guard_mw(
     tracing::warn!("host guard: rejected Host {host:?} on loopback bind (possible DNS rebinding)");
     (
         axum::http::StatusCode::FORBIDDEN,
-        axum::Json(serde_json::json!({"error": {"message": format!("unrecognized Host header {host:?} for a loopback server (possible DNS rebinding); bind blazar to your LAN address or set host accordingly"), "type": "blazar_error", "code": 403}})),
+        axum::Json(serde_json::json!({"error": {"message": format!("unrecognized Host header {host:?} for a loopback server (possible DNS rebinding); bind blazar to your LAN address or set host accordingly"), "type": "blazar_error", "code": 403, "blazar_code": "HOST_FORBIDDEN"}})),
     )
         .into_response()
 }

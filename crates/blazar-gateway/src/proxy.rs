@@ -292,9 +292,9 @@ pub async fn ensure_with_admission(
         .with_store(|s| resolve_model(s, model))
         .ok_or_else(|| Box::new(openai_error(500, "store unavailable")))?
         .map_err(|e| match e.as_str() {
-            msg if msg.contains("not found") || msg.contains("ambiguous") => {
-                Box::new(openai_error(StatusCode::NOT_FOUND.as_u16(), msg))
-            }
+            msg if msg.contains("not found") || msg.contains("ambiguous") => Box::new(
+                openai_error_code(crate::error_codes::BlazarCode::ModelNotFound, msg),
+            ),
             msg => Box::new(openai_error(500, msg)),
         })?;
     // Disk intelligence: stamp spawn activity so `blazar prune --unused`
@@ -309,8 +309,8 @@ pub async fn ensure_with_admission(
     // sd-server for it would "succeed" and then 404 every chat-shaped
     // route the caller could possibly use.
     if row.has_component_set() && !allow_diffusion {
-        return Err(Box::new(openai_error(
-            StatusCode::BAD_REQUEST.as_u16(),
+        return Err(Box::new(openai_error_code(
+            crate::error_codes::BlazarCode::DiffusionTextRefusal,
             &crate::images::diffusion_text_refusal(&row.name),
         )));
     }
@@ -318,8 +318,8 @@ pub async fn ensure_with_admission(
     // a model with no projector sidecar would reach the lane and die
     // inside the engine with a buried 500 hint. The row already knows.
     if needs_vision && row.mmproj_path.is_none() {
-        return Err(Box::new(openai_error(
-            StatusCode::BAD_REQUEST.as_u16(),
+        return Err(Box::new(openai_error_code(
+            crate::error_codes::BlazarCode::VisionProjectorMissing,
             &crate::preflight::vision_missing_refusal(&row.name),
         )));
     }
@@ -466,37 +466,57 @@ pub fn affinity_hash_bytes(body: &[u8]) -> Option<PrefixKey> {
 
 #[must_use]
 pub fn supervision_error(e: &SupervisionError) -> Response {
+    use crate::error_codes::BlazarCode as C;
     match e {
-        SupervisionError::ModelNotFound(m) => openai_error(404, &format!("no such model: {m}")),
+        SupervisionError::ModelNotFound(m) => {
+            openai_error_code(C::ModelNotFound, &format!("no such model: {m}"))
+        }
         // Wrong-lane model (safetensors dir on llama.cpp, GGUF on
         // sglang): the message carries the engine-kind remedy.
-        SupervisionError::UnsupportedModel(m) => openai_error(400, m),
-        SupervisionError::ModelLoadTimeout(m) => openai_error(
-            503,
+        SupervisionError::UnsupportedModel(m) => openai_error_code(C::ModelUnsupportedEngine, m),
+        SupervisionError::ModelLoadTimeout(m) => openai_error_code(
+            C::ModelLoadTimeout,
             &format!("model {m} failed to become healthy (model_load_timeout); check `blazar ps`"),
         ),
-        SupervisionError::CircuitOpen(m) => openai_error(
-            503,
+        SupervisionError::CircuitOpen(m) => openai_error_code(
+            C::EngineCircuitOpen,
             &format!("circuit open for {m}: engine keeps crashing; run `blazar ps --reset`"),
         ),
-        SupervisionError::AllSlotsBusy => openai_error(503, "all slots busy"),
+        SupervisionError::AllSlotsBusy => openai_error_code(C::AllSlotsBusy, "all slots busy"),
         // Physically unschedulable load: teaching refusal with numbers,
         // served immediately — queueing this could only burn the caller's
         // two-minute admission budget for a verdict known at entry.
-        SupervisionError::ModelTooLarge(m) => openai_error(503, m),
+        SupervisionError::ModelTooLarge(m) => openai_error_code(C::ModelTooLarge, m),
         // J3 memory floor: the box is exhausted, not broken — 507 until
         // co-resident engines free their memory (the message names them).
-        SupervisionError::InsufficientMemory(m) => openai_error(507, m),
-        SupervisionError::EngineCrashed(m) => openai_error(502, &format!("engine crashed: {m}")),
-        SupervisionError::Internal(e) => openai_error(500, &format!("{e:#}")),
+        SupervisionError::InsufficientMemory(m) => openai_error_code(C::InsufficientMemory, m),
+        SupervisionError::EngineCrashed(m) => {
+            openai_error_code(C::EngineCrashed, &format!("engine crashed: {m}"))
+        }
+        SupervisionError::Internal(e) => openai_error_code(C::Internal, &format!("{e:#}")),
     }
 }
 
-/// OpenAI-shaped error body.
+/// OpenAI-shaped error body with a PRECISE stable code (typed choke
+/// points). See `error_codes` for the catalog and the generic lane.
+#[must_use]
+pub fn openai_error_code(code: crate::error_codes::BlazarCode, message: &str) -> Response {
+    crate::error_codes::error_response(code, message)
+}
+
+/// OpenAI-shaped error body. The `blazar_code` field is derived from
+/// the (normalized) HTTP status — generic but stable; typed call
+/// sites use [`openai_error_code`] for precise codes.
 #[must_use]
 pub fn openai_error(status: u16, message: &str) -> Response {
+    let effective = if StatusCode::from_u16(status).is_ok() {
+        status
+    } else {
+        500
+    };
     let body = serde_json::json!({
-        "error": {"message": message, "type": "blazar_error", "code": status}
+        "error": {"message": message, "type": "blazar_error", "code": effective,
+                  "blazar_code": crate::error_codes::generic_for_status(effective).as_str()}
     });
     (
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),

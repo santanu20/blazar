@@ -825,7 +825,8 @@ pub(crate) fn caller_tool_results(all_calls: &[Value], mcp_calls: &[Value]) -> V
 }
 
 fn teaching_error(status: StatusCode, msg: &str) -> Response {
-    let body = json!({"error": {"message": msg, "type": "blazar_error"}});
+    let body = json!({"error": {"message": msg, "type": "blazar_error",
+        "blazar_code": crate::error_codes::generic_for_status(status.as_u16()).as_str()}});
     Response::builder()
         .status(status)
         .header("content-type", "application/json")

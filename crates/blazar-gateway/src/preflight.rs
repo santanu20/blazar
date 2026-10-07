@@ -160,8 +160,8 @@ pub async fn enforce_prompt_fits(
             "estimated"
         };
         Err(Box::new(
-            crate::proxy::openai_error(
-                400,
+            crate::proxy::openai_error_code(
+                crate::error_codes::BlazarCode::PromptTooLong,
                 &format!(
                     "prompt {tokens} tokens ({how}) exceeds the {effective_ctx}-token context for \
                      {model:?} — the engine would silently truncate it. Shorten the prompt, raise \

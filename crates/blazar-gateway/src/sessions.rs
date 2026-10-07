@@ -96,7 +96,7 @@ pub async fn pin_mw(
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 axum::Json(serde_json::json!({
-                    "error": {"type": "blazar_error", "code": 413, "message": format!(
+                    "error": {"type": "blazar_error", "code": 413, "blazar_code": "PAYLOAD_TOO_LARGE", "message": format!(
                         "x-blazar-session pinning buffers the request body (cap {PIN_BODY_CAP} bytes): {e} — resend without the header or shrink the body"
                     )}
                 })),

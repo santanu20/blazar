@@ -50,7 +50,7 @@ impl Rejection {
             Self::Scope { name, model } => (
                 StatusCode::FORBIDDEN,
                 axum::Json(serde_json::json!({
-                    "error": {"type": "blazar_key_scope", "code": 403,
+                    "error": {"type": "blazar_key_scope", "code": 403, "blazar_code": "KEY_SCOPE_FORBIDDEN",
                         "message": format!("key {name:?} is not scoped for model {model:?}"),
                         "key": name}
                 })),
@@ -67,7 +67,7 @@ impl Rejection {
                     ("x-blazar-key", name.clone()),
                 ],
                 axum::Json(serde_json::json!({
-                    "error": {"type": "blazar_key_rate", "code": 429,
+                    "error": {"type": "blazar_key_rate", "code": 429, "blazar_code": "RATE_LIMITED",
                         "message": format!("key {name:?} exceeded its {kind} budget"),
                         "retry_after_secs": retry_after_secs}
                 })),
