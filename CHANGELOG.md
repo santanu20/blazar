@@ -6,6 +6,10 @@ tracked here.
 
 ## [Unreleased]
 
+### Added
+
+- **MCP stdio sandbox options.** `[[mcp]]` servers can now declare `env_clear` (start the child from an empty environment instead of inheriting the daemon's), `allowed_env` (the only parent variables it may re-inherit), `cwd` (pin the working directory), and `max_output_bytes` (cap on one stdout protocol message, minimum 1024). Invalid combinations are refused at boot with teaching errors (e.g. `allowed_env` without `env_clear`, sandbox options on a url server). stdio children's stderr is now piped and logged at `warn` with a hard bound (first 32 KiB per server) instead of being discarded. Existing configurations behave exactly as before: every option is opt-in and defaults off.
+
 ## [0.22.0] - 2026-10-07
 
 ### Added
