@@ -143,10 +143,37 @@ jobs:
         run: python3 scripts/sync_docs_version.py --check --expect "${GITHUB_REF_NAME#v}"
       - name: Config doc matches the Config struct
         run: python3 scripts/check_config_doc_drift.py
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          cargo install cargo-cyclonedx --locked
+          # Pin the SBOM's embedded timestamp to the commit so gate
+          # re-runs produce byte-identical output (cargo-cyclonedx
+          # honors SOURCE_DATE_EPOCH). Split export: shellcheck SC2155.
+          epoch="$(git log -1 --pretty=%ct)"
+          export SOURCE_DATE_EPOCH="$epoch"
+          # Emits <override>.json per workspace crate (manifest-path
+          # does not scope it); only the CLI crate's file is the
+          # shipped binary's closure — the siblings stay untracked.
+          cargo cyclonedx --manifest-path crates/blazar-cli/Cargo.toml \
+            -f json --spec-version 1.5 --override-filename blazar-sbom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-sbom
+          path: crates/blazar-cli/blazar-sbom.json
+          if-no-files-found: error
 
   release:
     needs: [build, checks]
     runs-on: ubuntu-latest
+    permissions:
+      # A job-level permissions block REPLACES the workflow-level one
+      # (unlisted scopes become none), so contents must be re-declared:
+      # the gh release create/upload/edit calls below all need it.
+      contents: write
+      # Minimum the attestation action needs: mint an OIDC token
+      # proving this job's identity, and persist the attestations.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -182,7 +209,23 @@ jobs:
           inference engine (\`llama-server\`) is NOT bundled: run
           \`blazar engine update\` after install to fetch the official upstream
           build for your GPU.
+
+          ## Provenance & SBOM
+
+          Every release asset carries a GitHub artifact attestation (SLSA
+          build provenance). Verify any downloaded asset with:
+
+              gh attestation verify <asset-file> --repo ${GITHUB_REPOSITORY}
+
+          \`blazar-$GITHUB_REF_NAME-sbom.cdx.json\` is a CycloneDX 1.5 SBOM
+          covering the shipped binary's full dependency closure.
           EOF
+          # Attach the SBOM under a tag-scoped name alongside the archives
+          # (both upload branches below glob dist/*, so this must precede
+          # them; a missing artifact fails loudly here). Renamed to the
+          # .cdx.json convention cargo-cyclonedx's override flag can't
+          # produce.
+          mv dist/blazar-sbom.json "dist/blazar-${GITHUB_REF_NAME}-sbom.cdx.json"
           # Idempotent publish: a re-run (re-run-failed-jobs or a fresh run on
           # the same tag) must not die on "a release with the same tag name
           # already exists" — that stranded v0.12.0 with a published release
@@ -207,6 +250,16 @@ jobs:
           if [ "$GITHUB_REF_NAME" = "v$newest" ]; then
             gh release edit "$GITHUB_REF_NAME" --latest
           fi
+
+      # Must stay the LAST step of this job: subject-path resolves
+      # against dist/, which is fully populated only after the SBOM
+      # artifact download + rename and the archive uploads above.
+      # Re-runs mint a fresh attestation per asset — old records remain
+      # valid, verification matches any one of them.
+      - name: Attest build provenance (archives + SBOM)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: 'dist/*'
 
   # crates.io update rides the same chain: tag == workspace version,
   # suite green (via release gate above), then publish in dependency
