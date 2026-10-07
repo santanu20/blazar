@@ -1,15 +1,15 @@
 {
- "generated": "2026-10-04T20:19:15+00:00",
+ "generated": "2026-10-07T17:53:02+00:00",
  "generator": "python3 scripts/validate.py --update-goldens",
  "items": {
-  "api.ps.row": "b2e5f475169aadfc087928942eb3666fdf8532b2eccf98916c3441d249344c73",
+  "api.ps.row": "88c9801405c70a909e15d4c2f4e47c639824a6655f0d97337ed64ab21ae1d8df",
   "api.version": "79e663ab87dd1e0f3be4b006cb1ce9ab4841ea53eefe4cc33f949d91a0d3b51a",
   "chat.sse-final-keys": "3b4e5535f31a42b2c0a4b499f0c1932737308c8541f39bb3c887f1b5a0ede997",
   "completions.bash": "5f9cafa6b207a2a6199482e4d167a6542069343c42af33f54ddcc926f8c17ec0",
   "completions.fish": "2061dc8c072d84770a5c6c52f08f2fbfc88426ba304a3308d385f5f1da864d15",
   "completions.powershell": "b281db74638d7313e6a9b3c866e5cf6aef9d6d648aa699d322d2d543017a46ab",
   "completions.zsh": "512ecc497ae2a1e10f7cf397225d7b838998e79feb37bbd143847a3fdbaa67ff",
-  "config.fresh-keys": "a16636e87d9a7b01dddaa847dbbff59ec15b0722f2eff86e0e3dcbc6615dd030",
+  "config.fresh-keys": "82f25858d1f6deee88d3b5ba90452b9f00b5cc79346829f4b27a3148ce78a541",
   "doctor.check-names": "b2cfa542ed71d699901d3f1fb92e16366067f690c9fc2acef02477a449898cf8",
   "header.keys": "b0fe68a7cc7edf348b6478e081eee45c9e4c2575d721611ca3a8933c3acd92fd",
   "header.list": "27b844224d35e58465aac141a9cf8f8b32ff7ff22f0421e303e5acdafb42456c",
