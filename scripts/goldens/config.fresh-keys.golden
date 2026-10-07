@@ -36,6 +36,7 @@ engine_asset
 engine_check_secs
 engine_env
 engine_routing
+failover
 fork_retire_days
 host
 idle_ram_warm
@@ -43,6 +44,7 @@ idle_sleep_secs
 idle_timeout_secs
 image_max_tokens
 image_min_tokens
+keep_tags
 keep_tokens
 keys
 kv_unified_per_slot
@@ -52,6 +54,7 @@ load_mode
 lora_init_without_apply
 main_gpu
 max_loaded_models
+mcp
 media_job_wait_secs
 mistralrs
 mmproj_auto
