@@ -287,6 +287,23 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Qualify a model end-to-end and emit a Passport: refreshes missing
+    /// or stale evidence (capability certificate via model-doctor, a
+    /// default bench — never tune, that is an expensive search), then
+    /// assembles identity + engine + hardware + profile + measured +
+    /// capabilities into one portable object; absent axes stay labeled
+    Certify {
+        model: String,
+        /// NDJSON-shaped single JSON object (the Passport) instead of the card
+        #[arg(long)]
+        json: bool,
+        /// Write the Passport JSON to this file (atomic replace)
+        #[arg(long)]
+        export: Option<PathBuf>,
+        /// Re-run bench + certificate even when present and fresh
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Persist config migrations (legacy `api_keys` -> [[keys]]), with a
     /// timestamped backup; idempotent
     Migrate,
@@ -964,6 +981,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "bench",
             "tune",
             "scorecard",
+            "certify",
             "drafts",
             "coreside",
         ],
@@ -1951,6 +1969,12 @@ blazar mmproj <model> <mmproj.gguf path>"
         Cmd::Scorecard { model, json } => scorecard(&resolve_model_cli(&model), json),
         Cmd::Plan { model, json } => plan_cmd(&model, json).await,
         Cmd::Autopilot { apply } => autopilot(apply).await,
+        Cmd::Certify {
+            model,
+            json,
+            export,
+            refresh,
+        } => certify(&resolve_model_cli(&model), json, export, refresh).await,
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
         Cmd::Lora { cmd } => lora_cmd(cmd),
         Cmd::Search {
@@ -8052,6 +8076,280 @@ llama-bench measures generative decode; embedding speed is per-request in /metri
             match outcome {
                 Ok(()) => println!("  done"),
                 Err(e) => println!("  failed: {e:#} — continuing with the remaining work"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Passport schema version. Additive-only contract: later versions may
+/// add fields, never remove or repurpose them, so exported files stay
+/// readable by future blazar releases.
+const PASSPORT_SCHEMA_VERSION: u64 = 1;
+
+/// Assemble a Passport v1 from the store's current state. Pure over the
+/// store (no runs, no prints): `certify` calls it after refreshing
+/// evidence, unit tests seed stores directly. Absent axes are explicit
+/// `null`s — the card layer turns those into labeled gap rows.
+fn assemble_passport(
+    store: &Store,
+    name: &str,
+    now: i64,
+    notes: &[String],
+) -> Result<serde_json::Value> {
+    let row = store.get_model(name)?.ok_or_else(|| no_such_model(name))?;
+    let measured = resolve_measured(store, &row.name)?;
+    let caps = store.get_model_caps_dated(&row.name).ok().flatten();
+    let engine = store.active_engine().ok().flatten();
+
+    let identity = serde_json::json!({
+        "name": row.name,
+        "repo": row.repo,
+        "quant": row.quant,
+        "size_bytes": row.bytes,
+        "params_b": row.params,
+        "arch": row.arch,
+        "ctx_train": row.ctx_train,
+        "mmproj": row.mmproj_path,
+    });
+    // Engine block = the serving lane (active engine); per-axis engine
+    // tags live in their own sections — evidence may predate a lane
+    // switch and the passport must not paper over that.
+    let engine_json = engine.as_ref().map(|e| {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&e.manifest).unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "tag": e.tag,
+            "kind": format!("{:?}", e.kind),
+            "sha256": e.sha256,
+            "build_number": manifest.get("build_number").cloned().unwrap_or(serde_json::Value::Null),
+            "version_raw": manifest.get("version_raw").cloned().unwrap_or(serde_json::Value::Null),
+            "source": manifest.get("source").cloned().unwrap_or(serde_json::Value::Null),
+        })
+    });
+    let hardware_json = engine.as_ref().map(|e| {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&e.manifest).unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "devices": manifest.get("devices").cloned().unwrap_or(serde_json::Value::Null),
+            "total_vram_mib": blazar_runtime::probe_hardware(None).total_vram_mib(),
+        })
+    });
+    let profile_json = engine.as_ref().and_then(|e| {
+        store
+            .get_profile(&row.name, &e.tag)
+            .ok()
+            .flatten()
+            .map(|p| {
+                serde_json::json!({
+                    "engine_tag": p.engine_tag,
+                    "argv": serde_json::from_str::<serde_json::Value>(&p.args_json)
+                        .unwrap_or(serde_json::Value::String(p.args_json.clone())),
+                    "updated_at": epoch_to_utc_date(p.updated_at),
+                })
+            })
+    });
+    let measured_json = measured_json_value(&measured);
+    let capabilities_json = caps.map(|(tag, tested_at, caps_json)| {
+        serde_json::json!({
+            "engine": tag,
+            "verified_at": epoch_to_utc_date(tested_at),
+            "probes": scorecard_caps_rows(&caps_json),
+        })
+    });
+    Ok(serde_json::json!({
+        "object": "blazar.passport",
+        "schema_version": PASSPORT_SCHEMA_VERSION,
+        "identity": identity,
+        "engine": engine_json,
+        "hardware": hardware_json,
+        "profile": profile_json,
+        "measured": measured_json,
+        "capabilities": capabilities_json,
+        "verification": {
+            "blazar_version": env!("CARGO_PKG_VERSION"),
+            "generated_at": epoch_to_utc_date(now),
+            "engine_digest": engine.as_ref().map(|e| e.sha256.clone()),
+            "notes": notes,
+        },
+    }))
+}
+
+/// `blazar certify <model>` — qualify a model and emit a Passport.
+///
+/// Runs the evidence work autopilot would recommend — a default bench
+/// and the model-doctor capability certificate (stale past 30 days) —
+/// then assembles one portable object: identity, engine, hardware,
+/// profile, measured axis, verified capabilities, verification block.
+/// `tune` is deliberately not auto-run (expensive search); it surfaces
+/// as a note instead. The human card is a projection of the assembled
+/// object, so card / `--json` / `--export` cannot drift apart. Absent
+/// axes stay labeled with the command that fills them — never hidden.
+async fn certify(name: &str, json: bool, export: Option<PathBuf>, refresh: bool) -> Result<()> {
+    let d = dirs();
+    let store = Store::open(&d)?;
+    let row = store.get_model(name)?.ok_or_else(|| no_such_model(name))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .cast_signed();
+
+    // Staleness policy is the shared autopilot core, not a copy: bench
+    // on absence, certificate on absence or age, tune never (note only).
+    let bench_at = store
+        .latest_bench_result(&row.name, None)
+        .ok()
+        .flatten()
+        .map(|(_, _, at)| at);
+    let tuned_at = store
+        .active_engine()
+        .ok()
+        .flatten()
+        .and_then(|e| store.get_profile(&row.name, &e.tag).ok().flatten())
+        .map(|p| p.updated_at);
+    let cert_at = store
+        .get_model_caps_dated(&row.name)
+        .ok()
+        .flatten()
+        .map(|(_, tested, _)| tested);
+    let arch_class = bench_arch_refusal(row.arch.as_deref());
+    let benchable = matches!(run_lane(&row), RunLane::Text)
+        && arch_class.is_none()
+        && std::path::Path::new(&row.path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(class) = arch_class {
+        notes.push(format!(
+            "bench: not applicable — encoder-only class '{class}'; \
+llama-bench measures generative decode"
+        ));
+    }
+    let effective_bench_at = if refresh { None } else { bench_at };
+    let effective_cert_at = if refresh { None } else { cert_at };
+    let recs = autopilot_recs(
+        &row.name,
+        benchable,
+        effective_bench_at,
+        tuned_at,
+        effective_cert_at,
+        now,
+    );
+    for r in &recs {
+        if r.cmd.starts_with("blazar tune ") {
+            notes.push(format!("{} — {} ({})", r.cmd, r.why, r.datum));
+            continue;
+        }
+        // Progress goes to stderr: stdout is the artifact (card or JSON)
+        // and must stay machine-parseable for `--json`/`--export`.
+        eprintln!("running: {}", r.cmd);
+        let outcome: Result<()> = if r.cmd.starts_with("blazar bench ") {
+            bench(&row.name)
+        } else {
+            model_doctor_cmd(&row.name, false).await
+        };
+        match outcome {
+            Ok(()) => eprintln!("  done"),
+            Err(e) => eprintln!("  failed: {e:#} — passport assembled without this axis"),
+        }
+    }
+
+    // Re-read after the runs above: axes may have just been filled, and
+    // the passport must describe the store's actual final state.
+    let passport = assemble_passport(&store, name, now, &notes)?;
+
+    if let Some(path) = &export {
+        // Atomic export: a partially written passport file must never be
+        // observable — write beside the target, then rename over it.
+        let tmp = path.with_extension("passport-tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(&passport)?)?;
+        std::fs::rename(&tmp, path)?;
+        eprintln!("passport written: {}", path.display());
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&passport)?);
+        return Ok(());
+    }
+
+    // Human card: a projection of the assembled passport object.
+    let ident = &passport["identity"];
+    println!(
+        "passport v{} — {}",
+        PASSPORT_SCHEMA_VERSION,
+        ident["name"].as_str().unwrap_or("")
+    );
+    if let Some(repo) = ident["repo"].as_str() {
+        println!("  repo      {repo}");
+    }
+    if let Some(quant) = ident["quant"].as_str() {
+        println!("  quant     {quant}");
+    }
+    if let Some(arch) = ident["arch"].as_str() {
+        println!("  arch      {arch}");
+    }
+    println!();
+    match passport["engine"].as_object() {
+        Some(e) => {
+            // build_number is numeric in the manifest JSON; accept both
+            // shapes so the card never shows "?" for a present field.
+            let build = match &e["build_number"] {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                _ => "?".to_string(),
+            };
+            println!(
+                "engine     {} ({}, build {build})",
+                e["tag"].as_str().unwrap_or("?"),
+                e["kind"].as_str().unwrap_or("?")
+            );
+        }
+        None => println!("engine     absent — run: blazar engine update"),
+    }
+    if let Some(hw) = passport["hardware"].as_object() {
+        let vram = hw["total_vram_mib"].as_u64().unwrap_or(0);
+        println!("hardware   {vram} MiB VRAM");
+    }
+    match passport["profile"].as_object() {
+        Some(p) => println!(
+            "profile    tuned {} ({})",
+            p["updated_at"].as_str().unwrap_or("?"),
+            p["engine_tag"].as_str().unwrap_or("?")
+        ),
+        None => println!("profile    absent — run: blazar tune {name}"),
+    }
+    match passport["measured"].as_object() {
+        Some(m) => {
+            let n = m["tests"].as_array().map(|t| t.len()).unwrap_or(0);
+            println!(
+                "measured   {} test(s) at {} ({})",
+                n,
+                m["measured_at"].as_str().unwrap_or("?"),
+                m["engine"].as_str().unwrap_or("?")
+            );
+        }
+        None if !benchable => println!("measured   not applicable (encoder-only class)"),
+        None => println!("measured   absent — run: blazar bench {name}"),
+    }
+    match passport["capabilities"].as_object() {
+        Some(c) => println!(
+            "caps       verified {} ({})",
+            c["verified_at"].as_str().unwrap_or("?"),
+            c["engine"].as_str().unwrap_or("?")
+        ),
+        None => println!("caps       absent — run: blazar doctor --model {name}"),
+    }
+    let v = &passport["verification"];
+    println!(
+        "verified   blazar {} at {}",
+        v["blazar_version"].as_str().unwrap_or("?"),
+        v["generated_at"].as_str().unwrap_or("?")
+    );
+    if let Some(notes) = v["notes"].as_array() {
+        for note in notes {
+            if let Some(note) = note.as_str() {
+                println!("note       {note}");
             }
         }
     }
@@ -18106,6 +18404,162 @@ mod tests {
             installed_engine_kinds(&[]).is_empty(),
             "no engines installed must yield no kinds"
         );
+    }
+
+    fn passport_dirs(tmp: &tempfile::TempDir) -> BlazarDirs {
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        std::fs::create_dir_all(&dirs.data_dir).unwrap();
+        dirs
+    }
+
+    fn passport_model_row() -> blazar_core::ModelRow {
+        blazar_core::ModelRow {
+            name: "tiny".to_string(),
+            repo: "acme/tiny".to_string(),
+            quant: "Q4_0".to_string(),
+            path: "tiny.gguf".to_string(),
+            bytes: 1000,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: Some("qwen3".to_string()),
+            params: Some(0.6),
+            ctx_train: Some(40960),
+            pulled_at: 1,
+            last_used_at: 1,
+        }
+    }
+
+    #[test]
+    fn unit__assemble_passport__absent_axes_are_explicit_nulls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&passport_dirs(&tmp)).unwrap();
+        store.upsert_model(&passport_model_row()).unwrap();
+        let pp = assemble_passport(&store, "tiny", 1_700_000_000, &[]).unwrap();
+        assert_eq!(pp["object"], "blazar.passport");
+        assert_eq!(
+            pp["schema_version"], 1,
+            "schema_version is a fixed constant"
+        );
+        assert_eq!(pp["identity"]["name"], "tiny");
+        // No engine installed, no evidence on record: every axis is an
+        // explicit null the card turns into a labeled gap row — never a
+        // missing key or a fabricated value.
+        assert!(pp["engine"].is_null());
+        assert!(pp["hardware"].is_null());
+        assert!(pp["profile"].is_null());
+        assert!(pp["measured"].is_null());
+        assert!(pp["capabilities"].is_null());
+        assert_eq!(
+            pp["verification"]["blazar_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(pp["verification"]["engine_digest"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn unit__assemble_passport__full_axes_and_per_axis_engine_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&passport_dirs(&tmp)).unwrap();
+        store.upsert_model(&passport_model_row()).unwrap();
+        let manifest = r#"{"build_number": 11429, "version_raw": "b11429",
+            "source": "github", "devices": [{"name": "RTX Test"}]}"#;
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: "b11429-cuda".to_string(),
+                asset: String::new(),
+                sha256: "digest-a".to_string(),
+                installed_at: 1,
+                active: false,
+                manifest: manifest.to_string(),
+                kind: EngineKind::LlamaCpp,
+            })
+            .unwrap();
+        store.set_active_engine("b11429-cuda").unwrap();
+        let rows = vec![blazar_runtime::bench::BenchRow {
+            ts: 41.5,
+            test: "pp512".to_string(),
+            n_ctx: Some(512),
+            n_threads: Some(8),
+            type_k: None,
+            type_v: None,
+            n_prompt: None,
+            n_gen: None,
+            flash_attn: None,
+            n_batch: None,
+        }];
+        store
+            .put_bench_result(
+                "tiny",
+                "b11429-cuda",
+                &serde_json::to_string(&rows).unwrap(),
+            )
+            .unwrap();
+        // Certificate from a DIFFERENT engine tag on purpose: evidence
+        // may predate a lane switch — the passport surfaces the real
+        // per-axis tag instead of copying the active engine's.
+        store
+            .put_model_caps("tiny", "b11338-cuda", r#"{"chat": {"status": "pass"}}"#)
+            .unwrap();
+
+        let pp =
+            assemble_passport(&store, "tiny", 1_700_000_000, &["note one".to_string()]).unwrap();
+        assert_eq!(pp["engine"]["tag"], "b11429-cuda");
+        assert_eq!(pp["engine"]["kind"], "LlamaCpp");
+        assert_eq!(pp["engine"]["build_number"], 11429);
+        assert!(pp["hardware"]["total_vram_mib"].is_u64());
+        assert_eq!(pp["measured"]["engine"], "b11429-cuda");
+        assert_eq!(pp["measured"]["tests"].as_array().map(Vec::len), Some(1));
+        assert_eq!(pp["capabilities"]["engine"], "b11338-cuda");
+        assert!(pp["capabilities"]["probes"].is_array());
+        assert_eq!(pp["verification"]["engine_digest"], "digest-a");
+        assert_eq!(
+            pp["verification"]["notes"]
+                .as_array()
+                .and_then(|n| n.first())
+                .and_then(serde_json::Value::as_str),
+            Some("note one")
+        );
+    }
+
+    #[test]
+    fn unit__assemble_passport__profile_axis_reads_active_engine_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&passport_dirs(&tmp)).unwrap();
+        store.upsert_model(&passport_model_row()).unwrap();
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: "b11429-cuda".to_string(),
+                asset: String::new(),
+                sha256: String::new(),
+                installed_at: 1,
+                active: false,
+                manifest: String::new(),
+                kind: EngineKind::LlamaCpp,
+            })
+            .unwrap();
+        store.set_active_engine("b11429-cuda").unwrap();
+        store
+            .upsert_profile(&blazar_core::ProfileRow {
+                model_name: "tiny".to_string(),
+                engine_tag: "b11429-cuda".to_string(),
+                args_hash: "h1".to_string(),
+                args_json: r#"["--ctx", "4096"]"#.to_string(),
+                benchmark_json: None,
+                updated_at: 123,
+            })
+            .unwrap();
+        let pp = assemble_passport(&store, "tiny", 1_700_000_000, &[]).unwrap();
+        assert_eq!(pp["profile"]["engine_tag"], "b11429-cuda");
+        assert_eq!(pp["profile"]["argv"][0], "--ctx");
+        // No bench on record: tuned profile present but the measured
+        // axis stays null — the two axes are independent evidence.
+        assert!(pp["measured"].is_null());
     }
 
     #[test]
