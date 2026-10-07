@@ -6,6 +6,10 @@ tracked here.
 
 ## [Unreleased]
 
+### Added
+
+- **Grouped config sections (optional spelling).** `config.toml` may group related flat keys under `[gateway]`, `[routing]`, `[resources]`, `[speculative]`, `[diffusion]`, `[whisper]`, `[vision]`, `[yarn]`, `[reasoning]` or `[observability]`; the loader hoists them onto the same flat keys before parsing. Root-plus-section double-spelling and keys placed in the wrong group are refused with teaching errors; unknown groups remain hard errors; the flat form stays canonical for every tool.
+
 ## [0.22.0] - 2026-10-07
 
 ### Added
