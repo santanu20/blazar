@@ -1,1 +1,0 @@
-{"error":{"code":400,"message":"response_format=diarized_json applies to the buffered lanes — the SSE stream emits its own segment events and carries no speaker labels: drop stream or pick verbose_json","type":"blazar_error"}}

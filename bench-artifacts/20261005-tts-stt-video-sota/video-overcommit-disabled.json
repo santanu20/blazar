@@ -1,1 +1,0 @@
-{"error":{"code":400,"message":"operator disabled the per-request VRAM overcommit lever (BLAZAR_VRAM_OVERCOMMIT=0) — remaining levers: fewer frames (video_frames/duration), smaller size, or freeing GPU memory held by other processes","type":"blazar_error"}}

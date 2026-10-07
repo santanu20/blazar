@@ -1,1 +1,0 @@
---artifacts-dir bench-artifacts/20261005-kv-quality-r2 --model qwen3.5-9b --engines b11393-cuda --providers blazar --skip-ppl --skip-greedy --skip-tools --skip-features --skip-conc --skip-idle --skip-reshape --skip-ctxcurve --skip-variants --skip-media --runs 1

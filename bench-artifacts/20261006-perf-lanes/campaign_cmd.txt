@@ -1,1 +1,0 @@
---artifacts-dir bench-artifacts/20261006-perf-lanes --engines b11429-cuda --skip-ppl --skip-greedy --skip-quality --skip-reshape --skip-features --skip-variants --skip-media --fresh

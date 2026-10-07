@@ -18,13 +18,19 @@ __pycache__/
 # nuclear-audit working ledgers
 /.audit/
 
-# bench campaign scratch: staging symlinks point at user-local models,
-# stderr logs are debugging-only — receipts are cells.jsonl/summary/png.
-# corpus.txt is regenerable harness output (deterministic repo-text ppl
-# corpus) that captures working-tree prose incl. machine paths.
-bench-artifacts/*/staging/
-bench-artifacts/*/cells-stderr/
-bench-artifacts/*/corpus.txt
+# bench campaign payloads (raw cells.jsonl, charts, media outputs,
+# dumps) do not belong in git — the repo keeps only the summary layer:
+# INDEX.md, per-campaign reports (*/*.md), and root receipt JSONs.
+# One full payload snapshot is preserved on the bench-archive GitHub
+# release; regenerate charts with scripts/bench_charts.py from cells.
+# staging/ symlinks point at user-local models; cells-stderr/ is
+# debugging-only; corpus.txt captures working-tree prose incl.
+# machine paths.
+bench-artifacts/**
+!bench-artifacts/**/
+!bench-artifacts/INDEX.md
+!bench-artifacts/**/*.md
+!bench-artifacts/*.json
 
 # playwright-cli session scratch: console/page snapshots from local
 # browser validation runs — debugging-only, regenerable on demand.

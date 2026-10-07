@@ -86,7 +86,10 @@ different engine, the same gateway behavior.
 
 ## Reproduce
 
-The harness, raw cells (JSONL), and per-campaign reports ship in the repo
-under `bench-artifacts/`; the full methodology, checker-verified quality
+The harness and per-campaign reports ship in the repo
+under `bench-artifacts/` (summary layer: reports + `INDEX.md`); raw
+cells (JSONL), charts, and media payloads live on the
+[bench-archive release](https://github.com/santanu20/blazar/releases/tag/bench-archive-2026-10).
+The full methodology, checker-verified quality
 suites, and every caveat are documented in
 [BENCHMARK.md](https://github.com/santanu20/blazar/blob/main/BENCHMARK.md#reproduce).
