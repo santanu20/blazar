@@ -2,6 +2,7 @@
 
 | Campaign | Date | Lanes | Cells | blazar |
 |---|---|---|---:|---|
+| 2026-10-07-overhead | 2026 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 34 | mixed |
 | 20260923-media | 20260923 | media | 4 | blazar 0.10.0 |
 | 20260923-media-v2 | 20260923 | media | 5 | blazar 0.10.0 |
 | 20260924-all-engines | 20260924 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 105 | blazar 0.11.0 |
