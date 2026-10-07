@@ -11,6 +11,7 @@ pub mod capacity;
 pub mod cascade;
 pub mod classify;
 pub mod console;
+pub mod error_codes;
 pub mod explain;
 pub mod fabric;
 pub mod federation;
@@ -121,7 +122,7 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
                 None => {
                     return (
                         StatusCode::UNAUTHORIZED,
-                        axum::Json(serde_json::json!({"error": {"message": "missing or invalid API key (Authorization: Bearer or x-api-key)", "type": "blazar_error", "code": 401}})),
+                        axum::Json(serde_json::json!({"error": {"message": "missing or invalid API key (Authorization: Bearer or x-api-key)", "type": "blazar_error", "code": 401, "blazar_code": "UNAUTHORIZED"}})),
                     )
                         .into_response();
                 }
@@ -471,6 +472,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(sessions::list))
         .route("/api/why", get(ollama::why))
         .route("/api/watch", get(ollama::watch))
+        // Machine-readable stable error-code catalog (self-describing
+        // API contract; codes are additive-only once shipped).
+        .route("/api/errors", get(error_codes::errors_catalog))
         .route(
             "/api/keys",
             get(keys_list).post(keys_add).delete(keys_remove),
@@ -630,7 +634,8 @@ fn error_response(code: u16, msg: &str) -> Response {
     (
         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         axum::Json(
-            serde_json::json!({"error": {"message": msg, "type": "blazar_error", "code": code}}),
+            serde_json::json!({"error": {"message": msg, "type": "blazar_error", "code": code,
+                "blazar_code": error_codes::generic_for_status(code).as_str()}}),
         ),
     )
         .into_response()
