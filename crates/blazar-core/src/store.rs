@@ -33,7 +33,7 @@ pub struct Store {
 // cards — the id→metadata mapping behind POST /v1/chat/completions/{id}).
 // Cards exist ONLY for completions created with a `metadata` field;
 // the cap prunes oldest-first so the table stays bounded.
-const SCHEMA_VERSION: i32 = 12;
+const SCHEMA_VERSION: i32 = 13;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -96,7 +96,9 @@ CREATE TABLE IF NOT EXISTS bench_history (
     gen_tps REAL,                    -- HTTP lane: generation t/s (usage)
     prompt_tps REAL,                 -- HTTP lane: prompt t/s (usage)
     images_per_sec REAL,             -- HTTP image lane: images/s
-    detail TEXT                      -- HTTP lane: probe params JSON
+    detail TEXT,                     -- HTTP lane: probe params JSON
+    quant TEXT,                      -- v13 evidence axis: model quantization
+    hw_fingerprint TEXT              -- v13 evidence axis: canonical hw string
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id            TEXT PRIMARY KEY,
@@ -136,6 +138,8 @@ CREATE TABLE IF NOT EXISTS model_caps (
     engine_tag TEXT NOT NULL,
     tested_at  INTEGER NOT NULL,
     caps_json  TEXT NOT NULL,
+    quant          TEXT,
+    hw_fingerprint TEXT,
     PRIMARY KEY (model, engine_tag)
 );
 CREATE TABLE IF NOT EXISTS bench_results (
@@ -143,6 +147,10 @@ CREATE TABLE IF NOT EXISTS bench_results (
     engine_tag   TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     updated_at   INTEGER NOT NULL,
+    quant          TEXT,
+    hw_fingerprint TEXT,
+    workload       TEXT,
+    profile_hash   TEXT,
     PRIMARY KEY (model, engine_tag)
 );
 CREATE TABLE IF NOT EXISTS completion_cards (
@@ -378,6 +386,62 @@ pub struct BenchResultRow {
     pub engine_tag: String,
     pub payload_json: String,
     pub updated_at: i64,
+    /// v13 evidence axes — `None` on every row written before the
+    /// columns existed (honest unknowns, never backfilled guesses).
+    pub quant: Option<String>,
+    pub hw_fingerprint: Option<String>,
+    pub workload: Option<String>,
+    pub profile_hash: Option<String>,
+}
+
+/// v13 knowledge-graph evidence axes stamped on measurement rows so each
+/// row is self-contained (model × engine × quant × hardware) without a
+/// join against `models`. Fill-at-write is best-effort: a caller that
+/// cannot see an axis passes `None` and the row honestly records the
+/// gap. `workload` is reserved for the upcoming workload classifier.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EvidenceAxes {
+    pub quant: Option<String>,
+    pub hw_fingerprint: Option<String>,
+    pub workload: Option<String>,
+    pub profile_hash: Option<String>,
+}
+
+impl EvidenceAxes {
+    /// Canonical hardware fingerprint, `gpu=<name>|vram_mib=<n>|cpu=<arch>`.
+    /// Flat by design — one GROUP BY key in SQL, diffable in a terminal,
+    /// and extendable later without breaking existing rows. Callers own
+    /// assembly (they hold the engine manifest / probe context); the
+    /// store only owns the format.
+    #[must_use]
+    pub fn hw_fingerprint(gpu: Option<&str>, vram_mib: Option<u64>, arch: &str) -> Option<String> {
+        let gpu = gpu?.trim();
+        if gpu.is_empty() {
+            return None;
+        }
+        // Unknown VRAM omits the segment rather than fabricating
+        // vram_mib=0 — the string stays honest and groupable.
+        match vram_mib {
+            Some(vram) => format!("gpu={gpu}|vram_mib={vram}|cpu={arch}"),
+            None => format!("gpu={gpu}|cpu={arch}"),
+        }
+        .into()
+    }
+
+    /// Fingerprint from an engine row's `manifest` JSON column
+    /// (devices[0] name + total_mib). None for unparseable or
+    /// device-less manifests — the row then honestly records no
+    /// hardware axis instead of guessing.
+    #[must_use]
+    pub fn hw_fingerprint_from_manifest(manifest_json: &str) -> Option<String> {
+        let m = serde_json::from_str::<serde_json::Value>(manifest_json).ok()?;
+        let d = m["devices"].as_array()?.first()?;
+        Self::hw_fingerprint(
+            d["name"].as_str(),
+            d["total_mib"].as_u64(),
+            std::env::consts::ARCH,
+        )
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -614,6 +678,47 @@ impl Store {
                     "images_per_sec REAL",
                     "detail TEXT",
                 ] {
+                    let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
+                    self.conn.execute(
+                        &format!("ALTER TABLE bench_history ADD COLUMN {name} {ty}"),
+                        [],
+                    )?;
+                }
+            }
+            // v12→v13: knowledge-graph evidence axes. Every measurement
+            // table gains nullable axis columns so a row is self-contained
+            // (model × engine × quant × hw), independent of joins against
+            // `models` (which a later `blazar rm` would break). Fresh
+            // databases get them from SCHEMA_SQL; existing stores take
+            // additive ALTERs. No backfill: rows written before v13 keep
+            // NULL axes — honest unknowns, never guessed.
+            let caps_cols = self.table_columns("model_caps")?;
+            if !caps_cols.contains(&"quant".to_string()) {
+                for col in ["quant TEXT", "hw_fingerprint TEXT"] {
+                    let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
+                    self.conn.execute(
+                        &format!("ALTER TABLE model_caps ADD COLUMN {name} {ty}"),
+                        [],
+                    )?;
+                }
+            }
+            let results_cols = self.table_columns("bench_results")?;
+            if !results_cols.contains(&"quant".to_string()) {
+                for col in [
+                    "quant TEXT",
+                    "hw_fingerprint TEXT",
+                    "workload TEXT",
+                    "profile_hash TEXT",
+                ] {
+                    let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
+                    self.conn.execute(
+                        &format!("ALTER TABLE bench_results ADD COLUMN {name} {ty}"),
+                        [],
+                    )?;
+                }
+            }
+            if !bench_cols.contains(&"quant".to_string()) {
+                for col in ["quant TEXT", "hw_fingerprint TEXT"] {
                     let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
                     self.conn.execute(
                         &format!("ALTER TABLE bench_history ADD COLUMN {name} {ty}"),
@@ -1078,12 +1183,27 @@ impl Store {
     // ---- model capability certificates (v8) ---------------------------
 
     pub fn put_model_caps(&self, model: &str, engine_tag: &str, caps_json: &str) -> CoreResult<()> {
+        self.put_model_caps_with_axes(model, engine_tag, caps_json, &EvidenceAxes::default())
+    }
+
+    /// v13 axes-bearing variant: upserts the cert with its evidence axes.
+    /// Upsert semantics: a re-write with empty axes deliberately clears
+    /// the axis columns — the row IS the latest measurement, and stale
+    /// axes from an older write must not survive a newer one.
+    pub fn put_model_caps_with_axes(
+        &self,
+        model: &str,
+        engine_tag: &str,
+        caps_json: &str,
+        axes: &EvidenceAxes,
+    ) -> CoreResult<()> {
         self.conn.execute(
-            "INSERT INTO model_caps (model, engine_tag, tested_at, caps_json)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO model_caps (model, engine_tag, tested_at, caps_json, quant, hw_fingerprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(model, engine_tag) DO UPDATE SET
-               tested_at = excluded.tested_at, caps_json = excluded.caps_json",
-            params![model, engine_tag, unix_now(), caps_json],
+               tested_at = excluded.tested_at, caps_json = excluded.caps_json,
+               quant = excluded.quant, hw_fingerprint = excluded.hw_fingerprint",
+            params![model, engine_tag, unix_now(), caps_json, axes.quant, axes.hw_fingerprint],
         )?;
         Ok(())
     }
@@ -1110,9 +1230,18 @@ impl Store {
     /// Same record as [`get_model_caps`] with its `tested_at` epoch stamp —
     /// scorecards cite the verification date, so it travels with the caps.
     pub fn get_model_caps_dated(&self, model: &str) -> CoreResult<Option<(String, i64, String)>> {
+        self.get_model_caps_dated_with_axes(model)
+            .map(|o| o.map(|(tag, at, caps, _)| (tag, at, caps)))
+    }
+
+    /// v13 axes-bearing variant of [`get_model_caps_dated`].
+    pub fn get_model_caps_dated_with_axes(
+        &self,
+        model: &str,
+    ) -> CoreResult<Option<(String, i64, String, EvidenceAxes)>> {
         self.conn
             .query_row(
-                "SELECT engine_tag, tested_at, caps_json FROM model_caps WHERE model = ?1 \
+                "SELECT engine_tag, tested_at, caps_json, quant, hw_fingerprint FROM model_caps WHERE model = ?1 \
                  ORDER BY tested_at DESC LIMIT 1",
                 params![model],
                 |r| {
@@ -1120,6 +1249,12 @@ impl Store {
                         r.get::<_, String>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
+                        EvidenceAxes {
+                            quant: r.get(3)?,
+                            hw_fingerprint: r.get(4)?,
+                            workload: None,
+                            profile_hash: None,
+                        },
                     ))
                 },
             )
@@ -1141,12 +1276,36 @@ impl Store {
         engine_tag: &str,
         payload_json: &str,
     ) -> CoreResult<()> {
+        self.put_bench_result_with_axes(model, engine_tag, payload_json, &EvidenceAxes::default())
+    }
+
+    /// v13 axes-bearing variant: same upsert semantics as
+    /// [`put_bench_result`], with the row's evidence axes attached. A
+    /// re-write with empty axes clears them (latest write = the truth).
+    pub fn put_bench_result_with_axes(
+        &self,
+        model: &str,
+        engine_tag: &str,
+        payload_json: &str,
+        axes: &EvidenceAxes,
+    ) -> CoreResult<()> {
         self.conn.execute(
-            "INSERT INTO bench_results (model, engine_tag, payload_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO bench_results (model, engine_tag, payload_json, updated_at, quant, hw_fingerprint, workload, profile_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(model, engine_tag) DO UPDATE SET
-               payload_json = excluded.payload_json, updated_at = excluded.updated_at",
-            params![model, engine_tag, payload_json, unix_now()],
+               payload_json = excluded.payload_json, updated_at = excluded.updated_at,
+               quant = excluded.quant, hw_fingerprint = excluded.hw_fingerprint,
+               workload = excluded.workload, profile_hash = excluded.profile_hash",
+            params![
+                model,
+                engine_tag,
+                payload_json,
+                unix_now(),
+                axes.quant,
+                axes.hw_fingerprint,
+                axes.workload,
+                axes.profile_hash
+            ],
         )?;
         Ok(())
     }
@@ -1179,11 +1338,46 @@ impl Store {
             })
     }
 
+    /// v13 axes-bearing variant of [`latest_bench_result`].
+    pub fn latest_bench_result_with_axes(
+        &self,
+        model: &str,
+        engine_tag: Option<&str>,
+    ) -> CoreResult<Option<(String, String, i64, EvidenceAxes)>> {
+        self.conn
+            .query_row(
+                "SELECT engine_tag, payload_json, updated_at, quant, hw_fingerprint, workload, profile_hash
+                 FROM bench_results
+                 WHERE model = ?1 AND (?2 IS NULL OR engine_tag = ?2)
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![model, engine_tag],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        EvidenceAxes {
+                            quant: r.get(3)?,
+                            hw_fingerprint: r.get(4)?,
+                            workload: r.get(5)?,
+                            profile_hash: r.get(6)?,
+                        },
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.into()),
+            })
+    }
+
     /// Every plain-bench payload on record — one query for the console's
     /// Benchmarks view instead of a per-model lookup per row.
     pub fn list_bench_results(&self) -> CoreResult<Vec<BenchResultRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT model, engine_tag, payload_json, updated_at FROM bench_results
+            "SELECT model, engine_tag, payload_json, updated_at, quant, hw_fingerprint, workload, profile_hash
+             FROM bench_results
              ORDER BY model, engine_tag",
         )?;
         let rows = stmt
@@ -1193,6 +1387,10 @@ impl Store {
                     engine_tag: r.get(1)?,
                     payload_json: r.get(2)?,
                     updated_at: r.get(3)?,
+                    quant: r.get(4)?,
+                    hw_fingerprint: r.get(5)?,
+                    workload: r.get(6)?,
+                    profile_hash: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1628,10 +1826,23 @@ impl Store {
         pp: f64,
         ctx: i64,
     ) -> CoreResult<()> {
+        self.record_bench_with_axes(engine_tag, model, tg, pp, ctx, &EvidenceAxes::default())
+    }
+
+    /// v13 axes-bearing variant of [`record_bench`].
+    pub fn record_bench_with_axes(
+        &self,
+        engine_tag: &str,
+        model: &str,
+        tg: f64,
+        pp: f64,
+        ctx: i64,
+        axes: &EvidenceAxes,
+    ) -> CoreResult<()> {
         self.conn.execute(
-            "INSERT INTO bench_history (ts, engine_tag, model, tg_tokens_per_sec, pp_tokens_per_sec, ctx) \
-             VALUES (unixepoch(), ?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![engine_tag, model, tg, pp, ctx],
+            "INSERT INTO bench_history (ts, engine_tag, model, tg_tokens_per_sec, pp_tokens_per_sec, ctx, quant, hw_fingerprint) \
+             VALUES (unixepoch(), ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![engine_tag, model, tg, pp, ctx, axes.quant, axes.hw_fingerprint],
         )?;
         Ok(())
     }
@@ -1641,11 +1852,20 @@ impl Store {
     /// lanes; the kind + detail columns carry what the llama-bench row
     /// never had (dialect, probe parameters, TTFT).
     pub fn record_http_bench(&self, rec: &HttpBenchRecord) -> CoreResult<()> {
+        self.record_http_bench_with_axes(rec, &EvidenceAxes::default())
+    }
+
+    /// v13 axes-bearing variant of [`record_http_bench`].
+    pub fn record_http_bench_with_axes(
+        &self,
+        rec: &HttpBenchRecord,
+        axes: &EvidenceAxes,
+    ) -> CoreResult<()> {
         self.conn.execute(
             "INSERT INTO bench_history \
              (ts, engine_tag, model, tg_tokens_per_sec, pp_tokens_per_sec, ctx, \
-              kind, ttft_ms, gen_tps, prompt_tps, images_per_sec, detail) \
-             VALUES (unixepoch(), ?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9)",
+              kind, ttft_ms, gen_tps, prompt_tps, images_per_sec, detail, quant, hw_fingerprint) \
+             VALUES (unixepoch(), ?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 rec.engine_tag,
                 rec.model,
@@ -1656,6 +1876,8 @@ impl Store {
                 rec.prompt_tps,
                 rec.images_per_sec,
                 rec.detail_json,
+                axes.quant,
+                axes.hw_fingerprint,
             ],
         )?;
         Ok(())
@@ -2319,6 +2541,227 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         s.put_bench_result("m1", "lane-a", "[]").unwrap();
         assert!(s.latest_bench_result("m1", None).unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v12_to_v13() {
+        // Simulate a v12 database: the three measurement tables without
+        // the v13 evidence-axes columns, one legacy row each, version 12.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch(
+                    "DROP TABLE bench_history; CREATE TABLE bench_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, engine_tag TEXT NOT NULL, model TEXT NOT NULL, tg_tokens_per_sec REAL, pp_tokens_per_sec REAL, ctx INTEGER, kind TEXT, ttft_ms REAL, gen_tps REAL, prompt_tps REAL, images_per_sec REAL, detail TEXT); \
+                     DROP TABLE model_caps; CREATE TABLE model_caps (model TEXT NOT NULL, engine_tag TEXT NOT NULL, tested_at INTEGER NOT NULL, caps_json TEXT NOT NULL, PRIMARY KEY (model, engine_tag)); \
+                     DROP TABLE bench_results; CREATE TABLE bench_results (model TEXT NOT NULL, engine_tag TEXT NOT NULL, payload_json TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (model, engine_tag)); \
+                     INSERT INTO bench_results (model, engine_tag, payload_json, updated_at) VALUES ('m1', 'lane-a', '[]', 11); \
+                     INSERT INTO model_caps (model, engine_tag, tested_at, caps_json) VALUES ('m1', 'lane-a', 11, '{}'); \
+                     PRAGMA user_version = 12;",
+                )
+                .unwrap();
+        }
+        // Reopen: migrate() adds the axes columns, keeps legacy rows with
+        // NULL axes (honest — axes capture starts at v13), stamps v13.
+        // A second reopen proves the ALTERs are presence-gated no-ops.
+        for _ in 0..2 {
+            let s = Store::open(&dirs).unwrap();
+            let v: i32 = s
+                .conn()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            for (table, want) in [
+                ("bench_history", vec!["quant", "hw_fingerprint"]),
+                ("model_caps", vec!["quant", "hw_fingerprint"]),
+                (
+                    "bench_results",
+                    vec!["quant", "hw_fingerprint", "workload", "profile_hash"],
+                ),
+            ] {
+                let have = s.table_columns(table).unwrap();
+                for col in want {
+                    assert!(
+                        have.iter().any(|c| c == col),
+                        "{table} lacks {col} after migration"
+                    );
+                }
+            }
+            let (_, _, at, axes) = s
+                .latest_bench_result_with_axes("m1", None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(at, 11);
+            assert_eq!(axes, EvidenceAxes::default(), "legacy row keeps NULL axes");
+            let (_, _, _, caps_axes) = s.get_model_caps_dated_with_axes("m1").unwrap().unwrap();
+            assert_eq!(caps_axes, EvidenceAxes::default());
+        }
+    }
+
+    #[test]
+    fn unit__store_evidence_axes__bench_results_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let s = Store::open(&dirs).unwrap();
+        let axes = EvidenceAxes {
+            quant: Some("Q4_K_M".into()),
+            hw_fingerprint: Some("gpu=RTX 4070|vram_mib=8192|cpu=x86_64".into()),
+            workload: None,
+            profile_hash: Some("ab12".into()),
+        };
+        s.put_bench_result_with_axes("m1", "lane-a", "[]", &axes)
+            .unwrap();
+        let (_, _, _, read) = s
+            .latest_bench_result_with_axes("m1", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, axes);
+        // Upsert semantics: a later write with empty axes overwrites the
+        // stored axes — the row IS the latest measurement, not a merge.
+        s.put_bench_result("m1", "lane-a", "[2]").unwrap();
+        let (tag, payload, _, empty) = s
+            .latest_bench_result_with_axes("m1", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!((tag.as_str(), payload.as_str()), ("lane-a", "[2]"));
+        assert_eq!(empty, EvidenceAxes::default());
+        // Pinned-lane lookups behave exactly like the pre-axes reader.
+        s.put_bench_result_with_axes("m1", "lane-b", "[]", &axes)
+            .unwrap();
+        let (tag_b, _, _, axes_b) = s
+            .latest_bench_result_with_axes("m1", Some("lane-b"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (tag_b.as_str(), axes_b.quant.as_deref()),
+            ("lane-b", Some("Q4_K_M"))
+        );
+        // The legacy reader still returns the same 3-tuple shape.
+        let legacy = s
+            .latest_bench_result("m1", Some("lane-b"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.0, "lane-b");
+    }
+
+    #[test]
+    fn unit__store_evidence_axes__model_caps_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let s = Store::open(&dirs).unwrap();
+        let axes = EvidenceAxes {
+            quant: Some("Q4_0".into()),
+            hw_fingerprint: Some("gpu=RTX 4070|vram_mib=8192|cpu=x86_64".into()),
+            workload: None,
+            profile_hash: None,
+        };
+        s.put_model_caps_with_axes("m1", "lane-a", "{}", &axes)
+            .unwrap();
+        let (_, _, caps, read) = s.get_model_caps_dated_with_axes("m1").unwrap().unwrap();
+        assert_eq!((caps.as_str(), read.quant.as_deref()), ("{}", Some("Q4_0")));
+        // Old writer delegates with empty axes and overwrites them.
+        s.put_model_caps("m1", "lane-a", "{2}").unwrap();
+        let (_, _, caps2, empty) = s.get_model_caps_dated_with_axes("m1").unwrap().unwrap();
+        assert_eq!(caps2.as_str(), "{2}");
+        assert_eq!(empty, EvidenceAxes::default());
+        // The pre-axes reader keeps its exact 3-tuple contract.
+        let (_, _, caps3) = s.get_model_caps_dated("m1").unwrap().unwrap();
+        assert_eq!(caps3.as_str(), "{2}");
+    }
+
+    #[test]
+    fn unit__store_evidence_axes__bench_history_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let s = Store::open(&dirs).unwrap();
+        let axes = EvidenceAxes {
+            quant: Some("Q4_K_M".into()),
+            hw_fingerprint: Some("gpu=RTX 4070|vram_mib=8192|cpu=x86_64".into()),
+            workload: None,
+            profile_hash: None,
+        };
+        s.record_bench_with_axes("lane-a", "m1", 41.5, 1213.0, 4096, &axes)
+            .unwrap();
+        let (quant, hw): (Option<String>, Option<String>) = s
+            .conn()
+            .query_row(
+                "SELECT quant, hw_fingerprint FROM bench_history WHERE model = 'm1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (quant.as_deref(), hw.as_deref()),
+            (
+                Some("Q4_K_M"),
+                Some("gpu=RTX 4070|vram_mib=8192|cpu=x86_64")
+            )
+        );
+        // Old writer delegates with empty axes (append-only: NULL row).
+        s.record_bench("lane-a", "m1", 40.0, 1100.0, 4096).unwrap();
+        let nulls: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bench_history WHERE model = 'm1' AND quant IS NULL AND hw_fingerprint IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1);
+    }
+
+    #[test]
+    fn unit__evidence_axes__fingerprint_format_is_canonical() {
+        // Canonical flat string — the format other code groups by in SQL.
+        assert_eq!(
+            EvidenceAxes::hw_fingerprint(Some("NVIDIA RTX 4070 Laptop GPU"), Some(8192), "x86_64")
+                .as_deref(),
+            Some("gpu=NVIDIA RTX 4070 Laptop GPU|vram_mib=8192|cpu=x86_64")
+        );
+        // Missing or blank GPU name → not a fingerprint at all.
+        assert_eq!(
+            EvidenceAxes::hw_fingerprint(None, Some(8192), "x86_64"),
+            None
+        );
+        assert_eq!(
+            EvidenceAxes::hw_fingerprint(Some("  "), Some(8192), "x86_64"),
+            None
+        );
+        // VRAM unknown is still a fingerprint (partial but groupable).
+        assert_eq!(
+            EvidenceAxes::hw_fingerprint(Some("RTX 4070"), None, "aarch64").as_deref(),
+            Some("gpu=RTX 4070|cpu=aarch64")
+        );
+        // Manifest parsing: first device name + total_mib + host arch.
+        let manifest = r#"{"devices":[{"name":"NVIDIA GeForce RTX 4070 Laptop GPU","total_mib":8192,"free_mib":8192}]}"#;
+        let fp = EvidenceAxes::hw_fingerprint_from_manifest(manifest).unwrap();
+        assert_eq!(
+            fp,
+            format!(
+                "gpu=NVIDIA GeForce RTX 4070 Laptop GPU|vram_mib=8192|cpu={}",
+                std::env::consts::ARCH
+            )
+        );
+        // Broken manifests degrade to None, never a wrong fingerprint.
+        assert_eq!(EvidenceAxes::hw_fingerprint_from_manifest("not json"), None);
+        assert_eq!(EvidenceAxes::hw_fingerprint_from_manifest("{}"), None);
+        assert_eq!(
+            EvidenceAxes::hw_fingerprint_from_manifest(r#"{"devices":[]}"#),
+            None
+        );
     }
 
     #[test]

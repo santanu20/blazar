@@ -156,6 +156,10 @@ mod tests {
             engine_tag: "e1".into(),
             payload_json: bench_row_payload("pp512"),
             updated_at: 100,
+            quant: None,
+            hw_fingerprint: None,
+            workload: None,
+            profile_hash: None,
         }];
         // Same (model, lane) profile with a tuned score + a profile-only
         // lane that has never been plain-benched.

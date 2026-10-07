@@ -685,12 +685,34 @@ async fn run_probes(
         "total_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "caps": Value::Object(caps),
     });
+    // v13 evidence axes: model quant + hardware fingerprint of the lane
+    // that ran the probes, so the cert row stands alone without a join.
+    let axes = state
+        .with_store(|s| {
+            let quant = s.get_model(&model).ok().flatten().map(|r| r.quant);
+            let hw_fingerprint = s.list_engines().ok().and_then(|engines| {
+                engines
+                    .into_iter()
+                    .find(|e| e.tag == engine_tag)
+                    .and_then(|e| {
+                        blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&e.manifest)
+                    })
+            });
+            blazar_core::store::EvidenceAxes {
+                quant,
+                hw_fingerprint,
+                workload: None,
+                profile_hash: None,
+            }
+        })
+        .unwrap_or_default();
     if let Some(err) = state
         .with_store(|s| {
-            s.put_model_caps(
+            s.put_model_caps_with_axes(
                 cert["model"].as_str().unwrap_or_default(),
                 &engine_tag,
                 &cert.to_string(),
+                &axes,
             )
             .err()
         })
