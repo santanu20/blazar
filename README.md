@@ -102,7 +102,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 irm https://raw.githubusercontent.com/santanu20/blazar/v0.22.0/scripts/install.ps1 | iex
 ```
 
-Also available: `cargo install blazar`, or [build from source](#installation).
+Also available: `cargo binstall blazar` for the prebuilt binary, `cargo install blazar` to compile it, or [build from source](#installation).
 
 The Blazar binary and inference engines are separate artifacts. The installer can bootstrap the default engine; manage it explicitly with `blazar engine update`. Set `BLAZAR_INSTALL_ENGINE=0` to skip engine bootstrap.
 
@@ -386,6 +386,13 @@ Full CLI surface: `blazar --help`. Complete route contract: [`docs/4.API_SPEC.md
 
 ```sh
 cargo install blazar
+```
+
+With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) the same crate name
+downloads the release binary instead of compiling:
+
+```sh
+cargo binstall blazar
 ```
 
 ### Build from source
