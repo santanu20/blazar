@@ -203,25 +203,32 @@ async fn recv_rsp(
     Ok(body)
 }
 
+/// Real-wire b11429 worker double, shared by the rpc_fleet and
+/// supervisor test suites so every fleet-aware decision is pinned
+/// against the actual protocol, not a mock of it (H7). Binds an
+/// ephemeral loopback port; answers the three commands this crate
+/// sends; `received` captures every request byte for framing pins.
 #[cfg(test)]
-#[allow(non_snake_case)] // repo convention: unit__scenario__expected
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use super::{CMD_DEVICE_COUNT, CMD_GET_DEVICE_MEMORY, CMD_HELLO};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    /// A faithful b11429 server side for the three commands this
-    /// client uses, parameterized for fault injection (version to
-    /// advertise, device count, per-device memory, whether to drop
-    /// mid-conversation). Returns the bound endpoint plus every
-    /// request byte it received, for framing pins.
-    struct FakeWorker {
-        endpoint: String,
-        received: Arc<std::sync::Mutex<Vec<u8>>>,
+    pub(crate) struct FakeWorker {
+        pub(crate) endpoint: String,
+        pub(crate) received: Arc<std::sync::Mutex<Vec<u8>>>,
     }
 
-    async fn spawn_fake(
+    pub(crate) enum FakeBehavior {
+        Normal,
+        DropOnMemory,
+    }
+
+    /// Parameterized for fault injection: protocol version to
+    /// advertise, per-device `(free, total)` memory in bytes, and
+    /// whether to drop the connection mid-conversation.
+    pub(crate) async fn spawn_fake(
         major: u8,
         minor: u8,
         patch: u8,
@@ -287,16 +294,18 @@ mod tests {
         FakeWorker { endpoint, received }
     }
 
-    enum FakeBehavior {
-        Normal,
-        DropOnMemory,
-    }
-
     async fn write_rsp(sock: &mut TcpStream, body: &[u8]) {
         let mut rsp = (body.len() as u64).to_le_bytes().to_vec();
         rsp.extend_from_slice(body);
         let _ = sock.write_all(&rsp).await;
     }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)] // repo convention: unit__scenario__expected
+mod tests {
+    use super::*;
+    use crate::rpc_fleet::test_support::{FakeBehavior, spawn_fake};
 
     #[tokio::test]
     async fn unit__query_worker__hello_count_and_memory_roundtrip() {
