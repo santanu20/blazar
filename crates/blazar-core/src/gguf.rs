@@ -795,6 +795,7 @@ pub fn is_gguf_container(path: &Path) -> bool {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// GGUF v3 fixture builder: header + arbitrary KV pairs.
     fn build_gguf(kvs: &[(&str, GgufValue)]) -> Vec<u8> {
@@ -1495,6 +1496,38 @@ mod tests {
         // Provable split (qwen35 interval): no lint noise.
         let (q, _) = parse_metadata(&build_gguf(&qwen35_mla())).unwrap();
         assert!(!q.lint().iter().any(|w| w.contains("hybrid-linear")));
+    }
+
+    proptest::proptest! {
+        /// The engine store downloads GGUF files from arbitrary mirrors;
+        /// corrupted or hostile bytes must classify as Err, never panic.
+        #[test]
+        #[allow(non_snake_case)] // unit__ prefix matches the suite convention
+        fn unit__gguf_arbitrary_bytes__err_or_ok_never_panic(bytes in proptest::collection::vec(proptest::arbitrary::any::<u8>(), 0..=512)) {
+            let _ = parse_metadata(&bytes);
+        }
+
+        /// Any truncation of a VALID file must fail: the parser walks the
+        /// exact byte layout, so a prefix shorter than the full buffer can
+        /// never satisfy it. Guards against short-read acceptance bugs.
+        #[test]
+        #[allow(non_snake_case)] // unit__ prefix matches the suite convention
+        fn unit__gguf_valid_file_truncated__always_err(seed in proptest::arbitrary::any::<u64>()) {
+            let full = build_gguf(&qwen_like());
+            let cut = usize::try_from(seed % full.len() as u64).expect("len fits usize");
+            prop_assert!(parse_metadata(&full[..cut]).is_err(), "cut at {cut} must not parse");
+        }
+
+        /// Arbitrary string payloads inside a well-formed header round-trip
+        /// losslessly: whatever bytes decode, the architecture value the
+        /// caller sees equals the bytes the fixture wrote.
+        #[test]
+        #[allow(non_snake_case)] // unit__ prefix matches the suite convention
+        fn unit__gguf_string_payload__round_trips_lossless(arch in ".{0,64}") {
+            let kvs = vec![("general.architecture", GgufValue::String(arch.clone()))];
+            let (meta, _) = parse_metadata(&build_gguf(&kvs)).unwrap();
+            prop_assert_eq!(meta.architecture, arch);
+        }
     }
 }
 

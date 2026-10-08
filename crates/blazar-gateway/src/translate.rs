@@ -1384,6 +1384,8 @@ pub(crate) fn iso_now() -> String {
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
+    use proptest::prelude::*;
+
     #[test]
     fn unit__line_buffer__split_utf8_char_across_chunks() {
         // F70 pin: a multi-byte char split across TCP chunk boundaries
@@ -2497,5 +2499,88 @@ mod tests {
         let fin = String::from_utf8(f.finish()).unwrap();
         // Unterminated think on choice 0 drops at finish; nothing held.
         assert_eq!(fin, "");
+    }
+
+    /// Recursive arbitrary-JSON strategy for the message-transform
+    /// properties: null/bool/number/string leaves, nested arrays and
+    /// objects up to depth 4.
+    fn arb_json() -> impl proptest::strategy::Strategy<Value = serde_json::Value> {
+        use proptest::prelude::*;
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(serde_json::Value::from),
+            any::<String>().prop_map(serde_json::Value::String),
+        ];
+        leaf.prop_recursive(3, 4, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(serde_json::Value::Array),
+                proptest::collection::vec((any::<String>(), inner), 0..4)
+                    .prop_map(|pairs| { serde_json::Value::Object(pairs.into_iter().collect()) }),
+            ]
+        })
+    }
+
+    proptest::proptest! {
+        /// Client-supplied base64 is untrusted input: on arbitrary strings
+        /// image_data_url must stay total (never panic) and every Ok path
+        /// must be a well-formed data: URL — known mime, no whitespace in
+        /// the payload (the forwarded engine URL would break on it).
+        #[test]
+        #[allow(non_snake_case)] // unit__ prefix matches the suite convention
+        fn unit__image_data_url__arbitrary_input_total_and_clean(s in "\\PC{0,64}") {
+            match super::image_data_url(&s) {
+                Err(_) => {}
+                Ok(url) => {
+                    let mimes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+                    let matched = mimes.iter().find_map(|m| url.strip_prefix(&format!("data:{m};base64,")));
+                    let (mime, payload) = match matched {
+                        Some(p) => (mimes.iter().find(|m| url.contains(&format!("data:{m};"))).copied().unwrap_or(""), p),
+                        None => panic!("bad data url shape: {url}"),
+                    };
+                    prop_assert!(mimes.contains(&mime), "unknown mime: {mime}");
+                    prop_assert!(!payload.chars().any(char::is_whitespace), "payload not cleaned");
+                }
+            }
+        }
+
+        /// A valid PNG-magic payload — with arbitrary whitespace woven
+        /// through it, as real client encoders emit — must classify as
+        /// image/png with the payload equal to the whitespace-stripped
+        /// original.
+        #[test]
+        #[allow(non_snake_case)] // unit__ prefix matches the suite convention
+        fn unit__image_data_url__png_with_woven_whitespace_still_png(seed in proptest::arbitrary::any::<u64>()) {
+            // "iVBORw0KGgoA" decodes to 89 50 4E 47 ... = PNG magic.
+            let png = "iVBORw0KGgoAAAA";
+            let mut woven = String::new();
+            for (i, c) in png.chars().enumerate() {
+                if (seed >> (i % 64)) & 1 == 1 && i > 0 {
+                    woven.push(if (seed >> ((i + 3) % 64)) & 1 == 1 { '\n' } else { ' ' });
+                }
+                woven.push(c);
+            }
+            let url = super::image_data_url(&woven).expect("woven png must classify");
+            prop_assert!(url.starts_with("data:image/png;base64,"));
+            let payload = url.trim_start_matches("data:image/png;base64,");
+            prop_assert_eq!(payload, png);
+        }
+
+        /// Message-image translation is total over arbitrary JSON and
+        /// shape-preserving: arrays map 1:1 per message, non-arrays pass
+        /// through verbatim. Panics or length changes here corrupt
+        /// conversations wholesale.
+        #[test]
+        #[allow(non_snake_case)] // unit__ prefix matches the suite convention
+        fn unit__translate_message_images__total_and_shape_preserving(v in arb_json()) {
+            let out = super::translate_message_images(&v).expect("transform must stay total");
+            match v {
+                Value::Array(msgs) => {
+                    let out_list = out.as_array().expect("array input must map to array");
+                    prop_assert_eq!(msgs.len(), out_list.len(), "per-message 1:1 mapping");
+                }
+                other => prop_assert_eq!(out, other, "non-array input passes through verbatim"),
+            }
+        }
     }
 }

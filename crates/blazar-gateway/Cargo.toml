@@ -44,6 +44,7 @@ blazar-runtime = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
 tempfile = "3"
 libc = { workspace = true }
+proptest = "1.11.0"
 
 [lints]
 workspace = true
