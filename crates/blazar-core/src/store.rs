@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 use crate::dirs::BlazarDirs;
 use crate::engine_kind::EngineKind;
@@ -1216,6 +1216,26 @@ impl Store {
         Ok(())
     }
 
+    /// Exact-pair read for evidence accumulation: `(tested_at, caps_json)`
+    /// for one `(model, engine_tag)` — deliberately NOT latest-wins. A
+    /// certificate from a different lane is not prior evidence for this
+    /// lane, so the caller must ask for the pair it is about to write.
+    pub fn get_model_caps_pair(
+        &self,
+        model: &str,
+        engine_tag: &str,
+    ) -> CoreResult<Option<(i64, String)>> {
+        match self.conn.query_row(
+            "SELECT tested_at, caps_json FROM model_caps WHERE model = ?1 AND engine_tag = ?2",
+            params![model, engine_tag],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(pair) => Ok(Some(pair)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(other) => Err(other.into()),
+        }
+    }
+
     pub fn get_model_caps(&self, model: &str) -> CoreResult<Option<(String, String)>> {
         // Latest verification wins: certs are keyed (model, engine_tag),
         // so a model served by two lanes carries two rows — admission
@@ -2092,11 +2112,10 @@ mod tests {
 
         // Unknown id: Ok(None) — the API layer turns this into the
         // teaching 404, not a store error.
-        assert!(
-            s.update_completion_card("chatcmpl-nope", "{}", 1)
-                .unwrap()
-                .is_none()
-        );
+        assert!(s
+            .update_completion_card("chatcmpl-nope", "{}", 1)
+            .unwrap()
+            .is_none());
         assert!(s.get_completion_card("chatcmpl-nope").unwrap().is_none());
     }
 
@@ -2174,10 +2193,9 @@ mod tests {
         assert!(s.set_job_state("job_1", "running", None, None).unwrap());
         s.append_job_event("job_1", "progress", Some(r#"{"pct":50}"#))
             .unwrap();
-        assert!(
-            s.set_job_state("job_1", "completed", Some(r#"{"text":"hi"}"#), None)
-                .unwrap()
-        );
+        assert!(s
+            .set_job_state("job_1", "completed", Some(r#"{"text":"hi"}"#), None)
+            .unwrap());
         // Unknown id: the contract returns false, not an error.
         assert!(!s.set_job_state("job_9", "completed", None, None).unwrap());
 
@@ -2549,6 +2567,42 @@ mod tests {
             vec!["m1", "m2", "m3"],
             "all rows across every tag, oldest first"
         );
+    }
+
+    #[test]
+    fn unit__model_caps_pair__exact_pair_not_latest_wins() {
+        let (_tmp, s) = tmp_store();
+        assert!(
+            s.get_model_caps_pair("m1", "lane-a").unwrap().is_none(),
+            "no row exists yet"
+        );
+        s.put_model_caps(
+            "m1",
+            "lane-a",
+            "{\"caps\":{\"chat\":{\"status\":\"PASS\"}}}",
+        )
+        .unwrap();
+        s.put_model_caps(
+            "m1",
+            "lane-b",
+            "{\"caps\":{\"chat\":{\"status\":\"FAIL\"}}}",
+        )
+        .unwrap();
+        // The exact pair returns ITS OWN row even though lane-b is newer
+        // (latest-wins would hand back lane-b — wrong for evidence
+        // accumulation, where a different lane is not prior evidence).
+        let (tested_at, caps_json) = s
+            .get_model_caps_pair("m1", "lane-a")
+            .unwrap()
+            .expect("lane-a pair exists");
+        assert!(tested_at > 1_700_000_000);
+        assert!(caps_json.contains("\"PASS\""));
+        let (_, latest) = s
+            .get_model_caps_pair("m1", "lane-b")
+            .unwrap()
+            .expect("lane-b pair exists");
+        assert!(latest.contains("\"FAIL\""));
+        assert!(s.get_model_caps_pair("m1", "lane-z").unwrap().is_none());
     }
 
     #[test]
@@ -3270,28 +3324,24 @@ mod tests {
             last_used_at: 0,
         };
         // The live incident rows: awq/gptq/fp8 dirs quantize true.
-        assert!(
-            row(
-                "qwen2.5-0.5b-instruct-awq",
-                "qwen/qwen2.5-0.5b-instruct-awq",
-                "/models/qwen2.5-0.5b-instruct-awq.d"
-            )
-            .is_quantized_safetensors()
-        );
+        assert!(row(
+            "qwen2.5-0.5b-instruct-awq",
+            "qwen/qwen2.5-0.5b-instruct-awq",
+            "/models/qwen2.5-0.5b-instruct-awq.d"
+        )
+        .is_quantized_safetensors());
         assert!(row("m-gptq", "r", "/models/m-gptq.d").is_quantized_safetensors());
         assert!(row("m-fp8-dynamic", "r", "/models/m-fp8-dynamic.d").is_quantized_safetensors());
         // Word boundary: 'hawk' embeds awq as a substring but splits
         // into its own token — stays a normal lane.
         assert!(!row("hawk", "r", "/models/hawk.d").is_quantized_safetensors());
         // Plain BF16 dir: the lane mistral.rs serves perfectly.
-        assert!(
-            !row(
-                "qwen2.5-0.5b-instruct",
-                "qwen/qwen2.5-0.5b-instruct",
-                "/models/qwen2.5-0.5b-instruct.d"
-            )
-            .is_quantized_safetensors()
-        );
+        assert!(!row(
+            "qwen2.5-0.5b-instruct",
+            "qwen/qwen2.5-0.5b-instruct",
+            "/models/qwen2.5-0.5b-instruct.d"
+        )
+        .is_quantized_safetensors());
         // GGUF never counts, even when the filename carries a token.
         assert!(!row("m-awq", "r", "/models/m-awq-q4_k_m.gguf").is_quantized_safetensors());
         // Repo token alone (a dir renamed clean) still signals.
