@@ -1264,6 +1264,14 @@ pub struct ModelOverride {
     /// fleet-wide config change. Empty/None = inherit the global.
     #[serde(default)]
     pub rpc_servers: Option<String>,
+    /// Per-model `--tensor-split` ratios: comma-separated positive
+    /// numbers apportioning weights+KV across devices (local GPUs +
+    /// RPC workers, in device order). Replaces (not merges) the
+    /// global `tensor_split` for this model — C6: a fleet box with a
+    /// idle second card can host one fat model split while the rest
+    /// keep whole-device placement. Empty/None = inherit the global.
+    #[serde(default)]
+    pub tensor_split: Option<String>,
     /// Per-model projector policy (None = the global default, `lazy`).
     /// `true`/`"attach"` spawns with the row's mmproj as before;
     /// `false`/`"skip"` spawns text-only and vision fails loudly;
@@ -2783,6 +2791,21 @@ impl Config {
         overlay.unwrap_or(self.rpc_servers.trim())
     }
 
+    /// Effective `--tensor-split` ratios for a model (C6): a non-empty
+    /// overlay replaces the global value; empty/absent inherits it.
+    #[must_use]
+    pub fn effective_tensor_split(&self, model: &str) -> &str {
+        // Same borrow discipline as effective_rpc_servers: borrow the
+        // stored overlay, not overlay_for's owned clone.
+        let overlay = self
+            .model_overrides
+            .get(model)
+            .and_then(|o| o.tensor_split.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        overlay.unwrap_or(self.tensor_split.trim())
+    }
+
     /// True when the RAW text still carries legacy `api_keys` (needs
     /// `blazar migrate` to persist the canonical form).
     #[must_use]
@@ -3890,16 +3913,11 @@ impl Config {
             )));
         }
         if !self.tensor_split.is_empty() {
-            for part in self.tensor_split.split(',') {
-                let ok = part
-                    .trim()
-                    .parse::<f64>()
-                    .is_ok_and(|v| v.is_finite() && v > 0.0);
-                if !ok {
-                    return Err(CoreError::Config(format!(
-                        "tensor_split entries must be positive numbers (e.g. \"3,1\"), got {part:?}"
-                    )));
-                }
+            validate_tensor_split(&self.tensor_split, "tensor_split")?;
+        }
+        for (model, overlay) in &self.model_overrides {
+            if let Some(ts) = &overlay.tensor_split {
+                validate_tensor_split(ts, &format!("model_overrides.{model:?}.tensor_split"))?;
             }
         }
         let effort = self.reasoning_effort.trim();
@@ -4228,6 +4246,26 @@ fn parse_u64(key: &str, raw: &str) -> CoreResult<u64> {
 fn parse_i64(key: &str, raw: &str) -> CoreResult<i64> {
     raw.parse::<i64>()
         .map_err(|e| CoreError::Config(format!("invalid {key} {raw:?}: {e}")))
+}
+/// `tensor_split` syntax shared by the global knob and every per-model
+/// overlay: comma-separated positive finite numbers (ratios, e.g. "3,1").
+/// A blank value means unset (the C6 inherit path), so it validates clean.
+fn validate_tensor_split(value: &str, origin: &str) -> CoreResult<()> {
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    for part in value.split(',') {
+        let ok = part
+            .trim()
+            .parse::<f64>()
+            .is_ok_and(|v| v.is_finite() && v > 0.0);
+        if !ok {
+            return Err(CoreError::Config(format!(
+                "{origin} entries must be positive numbers (e.g. \"3,1\"), got {part:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 fn parse_f64(key: &str, raw: &str) -> CoreResult<f64> {
     raw.parse::<f64>()
@@ -6105,6 +6143,53 @@ key = "plm_admin"
             ..Config::default()
         };
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn unit__tensor_split_overlay__validated_and_replaces_with_empty_inherit() {
+        // Invalid overlay value fails loudly, naming the model.
+        let c = Config {
+            model_overrides: std::collections::BTreeMap::from([(
+                "qwen3-8b".to_string(),
+                ModelOverride {
+                    tensor_split: Some("3,zero".into()),
+                    ..ModelOverride::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("model_overrides.\"qwen3-8b\".tensor_split"),
+            "{err}"
+        );
+
+        // C6: non-empty overlay replaces the global; empty/absent inherits.
+        let c = Config {
+            tensor_split: "1,1".into(),
+            model_overrides: std::collections::BTreeMap::from([
+                (
+                    "split-model".to_string(),
+                    ModelOverride {
+                        tensor_split: Some("3,1".into()),
+                        ..ModelOverride::default()
+                    },
+                ),
+                (
+                    "blank-overlay".to_string(),
+                    ModelOverride {
+                        tensor_split: Some("   ".into()),
+                        ..ModelOverride::default()
+                    },
+                ),
+            ]),
+            ..Config::default()
+        };
+        c.validate().unwrap();
+        assert_eq!(c.effective_tensor_split("split-model"), "3,1");
+        assert_eq!(c.effective_tensor_split("blank-overlay"), "1,1");
+        assert_eq!(c.effective_tensor_split("unlisted"), "1,1");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-08T02:52:25+00:00",
+ "generated": "2026-10-08T03:19:11+00:00",
  "generator": "python3 scripts/validate.py --update-goldens",
  "items": {
   "api.ps.row": "88c9801405c70a909e15d4c2f4e47c639824a6655f0d97337ed64ab21ae1d8df",

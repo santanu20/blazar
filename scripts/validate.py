@@ -2280,6 +2280,10 @@ MODEL_OVERRIDE_FIELDS = [
         "rpc_servers",
         "wave: model_overrides.rpc_servers -> child --rpc (F2 rpc battery)",
     ),
+    (
+        "tensor_split",
+        "model_overrides.tensor_split -> child --tensor-split 3,1 alongside --rpc (F2 rpc battery)",
+    ),
     ("lazy_mode", "roundtrip echo + argv: --lazy-mode on deviation from auto"),
     # config-audit wave backfill (2026-10-07): same F146 class — lanes ran
     # inline while the manifest denominator undercounted.
@@ -8252,7 +8256,15 @@ def phase_wave() -> None:
             d.start(
                 {
                     "port": PORT,
-                    "model_overrides": {f_small: {"rpc_servers": rpc_target}},
+                    # One boot proves the whole per-model fleet story:
+                    # rpc workers joined AND manual ratios apportioned
+                    # across them (local GPU + worker = 2 devices).
+                    "model_overrides": {
+                        f_small: {
+                            "rpc_servers": rpc_target,
+                            "tensor_split": "3,1",
+                        }
+                    },
                 },
                 floor_model=f_small,
             )
@@ -8273,6 +8285,16 @@ def phase_wave() -> None:
                     for i in range(len(rargv) - 1)
                 ),
                 f"load_st={st} pid={rpid} rpc={[a for a in rargv if a == '--rpc']}",
+            )
+            check(
+                "wave",
+                "model_overrides.tensor_split -> child --tensor-split 3,1",
+                st == 200
+                and any(
+                    rargv[i] == "--tensor-split" and rargv[i + 1] == "3,1"
+                    for i in range(len(rargv) - 1)
+                ),
+                f"load_st={st} pid={rpid} tensor_split={[a for a in rargv if a.startswith('--tensor')] or 'MISSING'}",
             )
         finally:
             if rpc_proc.poll() is None:
@@ -8397,6 +8419,15 @@ def phase_wave() -> None:
         "phase 8 battery F argv",
         any(
             rargv[i] == "--rpc" and rargv[i + 1] == rpc_target
+            for i in range(len(rargv) - 1)
+        ),
+    )
+    cov(
+        "model_overrides.tensor_split",
+        "per-model --tensor-split emission alongside --rpc",
+        "phase 8 battery F argv",
+        any(
+            rargv[i] == "--tensor-split" and rargv[i + 1] == "3,1"
             for i in range(len(rargv) - 1)
         ),
     )

@@ -357,6 +357,7 @@ token quality are surfaced as drift.
 | cache_type_k | — | engine-argv | `crates/blazar-core/src/config.rs:2887` in `effective_cache_type_kv` (per-model per-phase K type; None inherits global) |
 | cache_type_v | — | engine-argv | `crates/blazar-core/src/config.rs:2887` in `effective_cache_type_kv` (V side) |
 | warm_on_pull | — | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:6036` in effective `warm_on_pull` (per-model wins) |
+| tensor_split | — | engine-argv + runtime/gateway | `crates/blazar-core/src/config.rs` in `effective_tensor_split` (per-model wins; empty = inherit global; also feeds the auto tensor-split stand-down gates in `crates/blazar-runtime/src/supervisor.rs`) |
 ## SamplerDefaults ([sampler]) — 18 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |

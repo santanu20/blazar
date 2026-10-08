@@ -3841,9 +3841,9 @@ impl Supervisor {
             None
         };
         let manual_split_spanning = !sglang_lane
-            && (!self.config.tensor_split.is_empty()
+            && (!self.config.effective_tensor_split(name).is_empty()
                 || self.config.effective_devices(name).len() > 1);
-        let parallel_pins_unset = self.config.tensor_split.is_empty()
+        let parallel_pins_unset = self.config.effective_tensor_split(name).is_empty()
             && self.config.effective_devices(name).is_empty()
             && self.config.main_gpu == blazar_core::Config::default().main_gpu
             && !tun_probe.parallel_pinned();
@@ -4135,7 +4135,7 @@ impl Supervisor {
         // Last-resort auto tensor-split (#28c): only when EVERY manual
         // pin is unset (tensor_split / devices / non-default main_gpu)
         // and the measured pool says weights+KV fit ONLY when spread.
-        let split_pinned = !self.config.tensor_split.is_empty()
+        let split_pinned = !self.config.effective_tensor_split(name).is_empty()
             || !self.config.effective_devices(name).is_empty()
             || self.config.main_gpu != blazar_core::Config::default().main_gpu;
         if !split_pinned && self.hardware.has_gpu() {
