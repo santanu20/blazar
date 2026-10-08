@@ -291,10 +291,9 @@ const RPC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 
 /// Preflight every `--rpc` endpoint in the FINAL child argv (all
 /// occurrences — config knob, model overlay and `extra_args` can each
-/// add one). TCP-connect each in parallel; a failed connect means
-// upstream's eager connect would SIGABRT the child at argv-parse.
-/// Returns the offending entries (`host:port (reason)`), empty when
-/// every endpoint answered or no `--rpc` flag is present.
+/// add one): upstream's eager connect would SIGABRT the child at
+/// argv-parse. Returns the offending entries (`host:port (reason)`),
+/// empty when every endpoint answered or no `--rpc` flag is present.
 async fn probe_rpc_endpoints(argv: &[String]) -> Vec<String> {
     let targets: Vec<String> = argv
         .windows(2)
@@ -304,7 +303,16 @@ async fn probe_rpc_endpoints(argv: &[String]) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    let probes = targets.into_iter().map(|target| async move {
+    probe_rpc_targets(&targets).await
+}
+
+/// TCP-probe raw `host:port` RPC worker targets in parallel (2s
+/// budget each — see [`RPC_PROBE_TIMEOUT`]). Shared by the spawn
+/// preflight (argv form above) and CLI-side diagnostics such as
+/// `blazar doctor`'s fleet check. Returns the offending entries
+/// (`host:port (reason)`), empty when every target answered.
+pub async fn probe_rpc_targets(targets: &[String]) -> Vec<String> {
+    let probes = targets.iter().map(|target| async move {
         let (host, port) = match target.rsplit_once(':') {
             Some((h, p)) if !h.is_empty() => match p.parse::<u16>() {
                 Ok(p) => (h.to_string(), p),
@@ -1698,6 +1706,31 @@ mod tests {
         let dead = probe_rpc_endpoints(&argv).await;
         assert_eq!(dead.len(), 1, "{dead:?}");
         assert!(dead[0].contains("(unreachable)"), "{dead:?}");
+    }
+
+    #[tokio::test]
+    async fn unit__probe_rpc_targets__malformed_entries_reported_without_connect() {
+        // Doctor feeds raw config strings to the target-level probe —
+        // malformed entries must be named, not parsed loosely or skipped.
+        let alive = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = alive.local_addr().unwrap().port();
+        let targets = vec![
+            format!("127.0.0.1:{port}"),
+            "no-colon-here".to_string(),
+            "host:notaport".to_string(),
+        ];
+        let dead = probe_rpc_targets(&targets).await;
+        assert_eq!(dead.len(), 2, "{dead:?}");
+        assert!(
+            dead[0].contains("no-colon-here (malformed host:port)"),
+            "{dead:?}"
+        );
+        assert!(
+            dead[1].contains("host:notaport (malformed port)"),
+            "{dead:?}"
+        );
     }
 
     #[tokio::test]

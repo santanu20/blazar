@@ -112,6 +112,13 @@ pub fn find_perplexity_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
     find_engine_tool(dirs, "llama-perplexity")
 }
 
+/// Locate `ggml-rpc-server` — the RPC worker binary every engine
+/// tarball ships (`BUILD_TARGETS`) that `blazar rpc worker` execs on
+/// machines donating their GPUs to a remote gateway's `rpc_servers`.
+pub fn find_rpc_server_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
+    find_engine_tool(dirs, "ggml-rpc-server")
+}
+
 /// Fixed calibration corpus for the `--verify` gate: ~8.5KB of DIVERSE
 /// one-pass natural text (no repeated sentences, no RNG) so perplexity
 /// sits in a realistic range and quantization damage is actually
@@ -557,5 +564,51 @@ mod tests {
         )
         .unwrap();
         assert!(find_imatrix_bin(&dirs).is_ok());
+    }
+
+    #[test]
+    fn unit__find_rpc_server_bin__nested_layout_found_and_absence_teaches() {
+        use blazar_core::engine_kind::EngineKind;
+        use blazar_core::store::EngineRow;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("c"),
+            data_dir: tmp.path().join("d"),
+        };
+        // A llamacpp engine WITHOUT the worker binary: must teach the
+        // install path, not panic or return a path that does not exist.
+        let store = Store::open(&dirs).unwrap();
+        let nested = dirs
+            .data_dir
+            .join("engines")
+            .join("b11429-cuda")
+            .join("llama-b11429");
+        std::fs::create_dir_all(&nested).unwrap();
+        store
+            .upsert_engine(&EngineRow {
+                tag: "b11429-cuda".into(),
+                asset: String::new(),
+                sha256: String::new(),
+                installed_at: 10,
+                active: true,
+                manifest: "{}".into(),
+                kind: EngineKind::LlamaCpp,
+            })
+            .unwrap();
+        let err = find_rpc_server_bin(&dirs).unwrap_err().to_string();
+        assert!(
+            err.contains("ggml-rpc-server") && err.contains("engine update"),
+            "teaching error must name the tool and the fix, got: {err}"
+        );
+        // Tarball layout: the worker sits next to llama-server under
+        // the versioned inner dir — same walk as the quantize family.
+        std::fs::write(
+            nested.join(crate::tool_file_name("ggml-rpc-server")),
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
+        let bin = find_rpc_server_bin(&dirs).unwrap();
+        assert_eq!(bin, nested.join(crate::tool_file_name("ggml-rpc-server")));
     }
 }
