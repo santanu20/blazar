@@ -3,10 +3,11 @@ name = "blazar"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Multi-engine local inference platform: one `blazar` binary serving llama.cpp, mistral.rs, SGLang, and MLX through OpenAI- and ollama-compatible APIs"
+description = "The control plane for local AI inference: one Rust binary uniting OpenAI, Ollama, and Anthropic APIs over llama.cpp, mistral.rs, SGLang, and MLX engines, with resource-aware orchestration and multimodal serving"
 repository = "https://github.com/santanu20/blazar"
-homepage = "https://github.com/santanu20/blazar"
-readme = "README.md"
+homepage = "https://santanu20.github.io/blazar/"
+documentation = "https://santanu20.github.io/blazar/"
+readme = "../../README.md"
 keywords = ["llm", "inference", "ollama", "openai", "local-ai"]
 categories = ["command-line-utilities", "science"]
 
