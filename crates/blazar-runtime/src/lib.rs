@@ -26,6 +26,7 @@ pub mod piper;
 pub mod probe;
 pub mod quantize;
 pub mod registry;
+pub mod rpc_fleet;
 pub mod sessionreg;
 pub mod storage;
 pub mod supervisor;

@@ -677,6 +677,19 @@ enum RpcCmd {
         #[arg(long, default_value_t = 50052)]
         port: u16,
     },
+    /// Query RPC workers for reachability, protocol version and
+    /// per-device free/total memory — the fleet detail `doctor` only
+    /// reachability-checks. Exit code 1 when any endpoint fails.
+    Status {
+        /// Workers to query, as `host:port`. Default: every endpoint
+        /// configured across `rpc_servers`, model overlays and
+        /// `sdcpp_rpc_servers`.
+        endpoints: Vec<String>,
+        /// Emit one JSON object per endpoint (same shape as
+        /// `doctor --json`) instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2176,7 +2189,90 @@ async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
                 }
             }
         }
+        RpcCmd::Status { endpoints, json } => rpc_status(&endpoints, json).await,
     }
+}
+
+/// `blazar rpc status` — fleet detail beyond doctor's reachability
+/// check: protocol version and per-device free/total memory for every
+/// endpoint (explicit args win; otherwise the configured fleet).
+/// Queries run concurrently so one dead host's 2s connect budget
+/// cannot serialize the whole report. Exit code 1 when any endpoint
+/// failed — every result is still printed first.
+async fn rpc_status(explicit: &[String], json: bool) -> Result<()> {
+    let targets: Vec<String> = if explicit.is_empty() {
+        let cfg = config()?;
+        collect_rpc_fleet_targets(&cfg)
+    } else {
+        explicit.to_vec()
+    };
+    if targets.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"status": "ok", "detail": "no RPC workers configured — local devices only"})
+            );
+        } else {
+            println!("no RPC workers configured — local devices only (see rpc_servers)");
+        }
+        return Ok(());
+    }
+    let results = futures::future::join_all(
+        targets
+            .iter()
+            .map(|t| blazar_runtime::rpc_fleet::query_worker(t)),
+    )
+    .await;
+
+    if json {
+        for (endpoint, result) in targets.iter().zip(&results) {
+            match result {
+                Ok(info) => println!(
+                    "{}",
+                    serde_json::json!({
+                        "endpoint": endpoint,
+                        "status": "ok",
+                        "proto": format!("{}.{}.{}", info.proto_major, info.proto_minor, info.proto_patch),
+                        "devices": info.devices.iter().map(|d| serde_json::json!({
+                            "index": d.index,
+                            "free_mib": d.free_bytes / (1024 * 1024),
+                            "total_mib": d.total_bytes / (1024 * 1024),
+                        })).collect::<Vec<_>>(),
+                    })
+                ),
+                Err(e) => println!(
+                    "{}",
+                    serde_json::json!({"endpoint": endpoint, "status": "error", "error": e})
+                ),
+            }
+        }
+    } else {
+        println!("rpc fleet: {} worker(s)", targets.len());
+        for (endpoint, result) in targets.iter().zip(&results) {
+            match result {
+                Ok(info) => {
+                    println!(
+                        "\n  {}  protocol {}.{}.{}",
+                        endpoint, info.proto_major, info.proto_minor, info.proto_patch
+                    );
+                    for d in &info.devices {
+                        let free_mib = d.free_bytes / (1024 * 1024);
+                        let total_mib = d.total_bytes / (1024 * 1024);
+                        let pct = (100 * free_mib).checked_div(total_mib).unwrap_or(0);
+                        println!(
+                            "    device {}  {:>6} / {:>6} MiB free  ({pct}% free)",
+                            d.index, free_mib, total_mib
+                        );
+                    }
+                }
+                Err(e) => println!("\n  {}", err_line(e)),
+            }
+        }
+    }
+    if results.iter().any(Result::is_err) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Resolve which shutdown signal ended the foreground worker run, as
@@ -3279,7 +3375,12 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
 /// doctor names the dead endpoint(s) with the same fix hint. Mirrors
 /// `blazar_runtime::engine_impl::probe_rpc_endpoints` semantics
 /// (2s TCP probe per target, parallel).
-async fn doctor_rpc_fleet(cfg: &Config) -> Vec<Check> {
+/// Deduped RPC worker endpoints from every config knob that can point
+/// at a fleet: global `rpc_servers`, per-model overlays, and the image
+/// lane's `sdcpp_rpc_servers`. One list behind doctor's fleet check
+/// and `rpc status`, so the two can never disagree about what the
+/// fleet is.
+fn collect_rpc_fleet_targets(cfg: &Config) -> Vec<String> {
     let mut targets: Vec<String> = Vec::new();
     let mut push = |list: &str| {
         for target in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -3297,6 +3398,11 @@ async fn doctor_rpc_fleet(cfg: &Config) -> Vec<Check> {
     for target in &cfg.sdcpp_rpc_servers {
         push(target);
     }
+    targets
+}
+
+async fn doctor_rpc_fleet(cfg: &Config) -> Vec<Check> {
+    let targets = collect_rpc_fleet_targets(cfg);
     if targets.is_empty() {
         return vec![Check::ok(
             "rpc fleet",
@@ -22115,6 +22221,29 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(checks[0].ok, "{}", checks[0].detail);
         assert!(checks[0].detail.contains("local devices only"));
+    }
+
+    #[test]
+    fn unit__collect_rpc_fleet_targets__dedupes_and_skips_empty_entries() {
+        let cfg = Config {
+            rpc_servers: "127.0.0.1:50052, 127.0.0.1:50052 ,".to_string(),
+            model_overrides: [(
+                "some-model".to_string(),
+                blazar_core::config::ModelOverride {
+                    rpc_servers: Some("10.0.0.4:50052".to_string()),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            sdcpp_rpc_servers: vec!["10.0.0.4:50052".to_string()],
+            ..Config::default()
+        };
+        assert_eq!(
+            collect_rpc_fleet_targets(&cfg),
+            vec!["127.0.0.1:50052".to_string(), "10.0.0.4:50052".to_string()]
+        );
+        assert!(collect_rpc_fleet_targets(&Config::default()).is_empty());
     }
 
     #[tokio::test]
