@@ -3424,7 +3424,8 @@ async fn doctor_rpc_fleet(cfg: &Config) -> Vec<Check> {
             "rpc fleet",
             format!(
                 "unreachable: {} — serves pinned to them are refused at spawn; start the \
-                 worker (`blazar rpc worker` on that host) or fix rpc_servers",
+                 worker (`blazar rpc worker` on that host) or fix rpc_servers; \
+                 `blazar rpc status` reports per-device memory across the fleet",
                 dead.join(", ")
             ),
         )]
@@ -22300,6 +22301,11 @@ mod tests {
         );
         assert!(
             checks[0].detail.contains("blazar rpc worker"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(
+            checks[0].detail.contains("blazar rpc status"),
             "{}",
             checks[0].detail
         );
