@@ -437,7 +437,7 @@ impl EvidenceAxes {
     }
 
     /// Fingerprint from an engine row's `manifest` JSON column
-    /// (devices[0] name + total_mib). None for unparseable or
+    /// (devices[0] name + `total_mib`). None for unparseable or
     /// device-less manifests — the row then honestly records no
     /// hardware axis instead of guessing.
     #[must_use]
@@ -693,47 +693,10 @@ impl Store {
                     )?;
                 }
             }
-            // v13: knowledge-graph evidence axes. Every measurement
-            // table gains nullable axis columns so a row is self-contained
-            // (model × engine × quant × hw), independent of joins against
-            // `models` (which a later `blazar rm` would break). Fresh
-            // databases get them from SCHEMA_SQL; existing stores take
-            // additive ALTERs. No backfill: rows written before v13 keep
-            // NULL axes — honest unknowns, never guessed.
-            let caps_cols = self.table_columns("model_caps")?;
-            if !caps_cols.contains(&"quant".to_string()) {
-                for col in ["quant TEXT", "hw_fingerprint TEXT"] {
-                    let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
-                    self.conn.execute(
-                        &format!("ALTER TABLE model_caps ADD COLUMN {name} {ty}"),
-                        [],
-                    )?;
-                }
-            }
-            let results_cols = self.table_columns("bench_results")?;
-            if !results_cols.contains(&"quant".to_string()) {
-                for col in [
-                    "quant TEXT",
-                    "hw_fingerprint TEXT",
-                    "workload TEXT",
-                    "profile_hash TEXT",
-                ] {
-                    let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
-                    self.conn.execute(
-                        &format!("ALTER TABLE bench_results ADD COLUMN {name} {ty}"),
-                        [],
-                    )?;
-                }
-            }
-            if !bench_cols.contains(&"quant".to_string()) {
-                for col in ["quant TEXT", "hw_fingerprint TEXT"] {
-                    let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
-                    self.conn.execute(
-                        &format!("ALTER TABLE bench_history ADD COLUMN {name} {ty}"),
-                        [],
-                    )?;
-                }
-            }
+            // v13 + v14 step migrations live in their own functions
+            // directly below; ordering matters (axes columns first,
+            // then the one-active-engine index).
+            self.migrate_v13_evidence_axes()?;
             // v14: the `one_active_engine` partial unique index moves
             // the one-serving-engine invariant into the DATABASE (a
             // second active row becomes an impossibility, not a
@@ -751,6 +714,52 @@ impl Store {
             // transaction: a mid-failure rolls back and the next
             // open retries the whole step.
             self.migrate_v14_one_active_engine()?;
+        }
+        Ok(())
+    }
+
+    /// v13: knowledge-graph evidence axes. Every measurement
+    /// table gains nullable axis columns so a row is self-contained
+    /// (model × engine × quant × hw), independent of joins against
+    /// `models` (which a later `blazar rm` would break). Fresh
+    /// databases get them from SCHEMA_SQL; existing stores take
+    /// additive ALTERs. No backfill: rows written before v13 keep
+    /// `NULL` axes — honest unknowns, never guessed.
+    fn migrate_v13_evidence_axes(&self) -> CoreResult<()> {
+        let caps_cols = self.table_columns("model_caps")?;
+        if !caps_cols.contains(&"quant".to_string()) {
+            for col in ["quant TEXT", "hw_fingerprint TEXT"] {
+                let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
+                self.conn.execute(
+                    &format!("ALTER TABLE model_caps ADD COLUMN {name} {ty}"),
+                    [],
+                )?;
+            }
+        }
+        let results_cols = self.table_columns("bench_results")?;
+        if !results_cols.contains(&"quant".to_string()) {
+            for col in [
+                "quant TEXT",
+                "hw_fingerprint TEXT",
+                "workload TEXT",
+                "profile_hash TEXT",
+            ] {
+                let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
+                self.conn.execute(
+                    &format!("ALTER TABLE bench_results ADD COLUMN {name} {ty}"),
+                    [],
+                )?;
+            }
+        }
+        let bench_cols = self.table_columns("bench_history")?;
+        if !bench_cols.contains(&"quant".to_string()) {
+            for col in ["quant TEXT", "hw_fingerprint TEXT"] {
+                let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
+                self.conn.execute(
+                    &format!("ALTER TABLE bench_history ADD COLUMN {name} {ty}"),
+                    [],
+                )?;
+            }
         }
         Ok(())
     }

@@ -8369,6 +8369,32 @@ fn assemble_passport(
     }))
 }
 
+/// Execute the certification recommendations: `bench` and `model-doctor`
+/// run for real (progress on stderr — stdout is the artifact);
+/// `tune` is deliberately skipped (expensive search) and recorded as a
+/// note. Failures leave a note too — the passport assembles without
+/// that axis rather than failing the whole command.
+async fn run_certify_recs(recs: &[AutopilotRec], name: &str, notes: &mut Vec<String>) {
+    for r in recs {
+        if r.cmd.starts_with("blazar tune ") {
+            notes.push(format!("{} — {} ({})", r.cmd, r.why, r.datum));
+            continue;
+        }
+        // Progress goes to stderr: stdout is the artifact (card or JSON)
+        // and must stay machine-parseable for `--json`/`--export`.
+        eprintln!("running: {}", r.cmd);
+        let outcome: Result<()> = if r.cmd.starts_with("blazar bench ") {
+            bench(name)
+        } else {
+            model_doctor_cmd(name, false).await
+        };
+        match outcome {
+            Ok(()) => eprintln!("  done"),
+            Err(e) => eprintln!("  failed: {e:#} — passport assembled without this axis"),
+        }
+    }
+}
+
 /// `blazar certify <model>` — qualify a model and emit a Passport.
 ///
 /// Runs the evidence work autopilot would recommend — a default bench
@@ -8431,24 +8457,7 @@ llama-bench measures generative decode"
         effective_cert_at,
         now,
     );
-    for r in &recs {
-        if r.cmd.starts_with("blazar tune ") {
-            notes.push(format!("{} — {} ({})", r.cmd, r.why, r.datum));
-            continue;
-        }
-        // Progress goes to stderr: stdout is the artifact (card or JSON)
-        // and must stay machine-parseable for `--json`/`--export`.
-        eprintln!("running: {}", r.cmd);
-        let outcome: Result<()> = if r.cmd.starts_with("blazar bench ") {
-            bench(&row.name)
-        } else {
-            model_doctor_cmd(&row.name, false).await
-        };
-        match outcome {
-            Ok(()) => eprintln!("  done"),
-            Err(e) => eprintln!("  failed: {e:#} — passport assembled without this axis"),
-        }
-    }
+    run_certify_recs(&recs, &row.name, &mut notes).await;
 
     // Re-read after the runs above: axes may have just been filled, and
     // the passport must describe the store's actual final state.
@@ -8468,6 +8477,15 @@ llama-bench measures generative decode"
     }
 
     // Human card: a projection of the assembled passport object.
+    print_certify_card(&passport, name, benchable);
+    Ok(())
+}
+
+/// Render the human card from the assembled passport — a projection,
+/// never a second source of truth: every line reads the same JSON the
+/// `--json`/`--export` paths emit, with `absent — run: …` gap rows for
+/// axes the store could not fill.
+fn print_certify_card(passport: &serde_json::Value, name: &str, benchable: bool) {
     let ident = &passport["identity"];
     println!(
         "passport v{} — {}",
@@ -8515,7 +8533,7 @@ llama-bench measures generative decode"
     }
     match passport["measured"].as_object() {
         Some(m) => {
-            let n = m["tests"].as_array().map(|t| t.len()).unwrap_or(0);
+            let n = m["tests"].as_array().map_or(0, std::vec::Vec::len);
             println!(
                 "measured   {} test(s) at {} ({})",
                 n,
@@ -8547,7 +8565,6 @@ llama-bench measures generative decode"
             }
         }
     }
-    Ok(())
 }
 
 /// `blazar scorecard <model>`: one-page card assembled purely from stored
