@@ -12,9 +12,9 @@ Unified OpenAI · Ollama · Anthropic gateway &nbsp;·&nbsp; Multi-engine servin
 
 <div align="center">
 
-<img src="docs/assets/BLAZAR_Banner.webp" alt="Blazar — the control plane for local AI inference" width="896"/>
+![Blazar — the control plane for local AI inference](https://raw.githubusercontent.com/santanu20/blazar/main/docs/assets/BLAZAR_Banner.webp)
 
-![Blazar in action](docs/assets/blazar-demo.svg)
+![Blazar in action](https://raw.githubusercontent.com/santanu20/blazar/main/docs/assets/blazar-demo.svg)
 
 *Live CLI session: single-shot generation, the engine panel with speculation state, the installed-lane inventory, and the routing decision for a model — all from one daemon.*
 
