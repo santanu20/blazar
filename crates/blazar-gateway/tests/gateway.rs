@@ -4634,6 +4634,10 @@ async fn e2e__mcp__status_plane_and_stream_guard() {
             url: None,
             env: std::collections::HashMap::new(),
             timeout_secs: 30,
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
         }],
         ..Config::default()
     };

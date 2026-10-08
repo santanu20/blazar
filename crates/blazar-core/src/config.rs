@@ -2029,6 +2029,29 @@ pub struct McpServer {
     /// Per `tools/call` timeout in seconds (1..=600). Default 30.
     #[serde(default = "default_mcp_timeout_secs")]
     pub timeout_secs: u64,
+    /// Security boundary (stdio only): start the child from an EMPTY
+    /// environment instead of inheriting the daemon's. With it, the child
+    /// sees only what `env` sets below, what `allowed_env` re-inherits,
+    /// and nothing else. Off by default — existing servers keep today's
+    /// inherit-everything behavior.
+    #[serde(default)]
+    pub env_clear: bool,
+    /// Parent variables an `env_clear` server may re-inherit, e.g.
+    /// `["PATH", "HOME"]`. Meaningful only together with `env_clear`;
+    /// names not set in the parent are skipped. Explicit `env` entries
+    /// always win over an inherited variable of the same name.
+    #[serde(default)]
+    pub allowed_env: Vec<String>,
+    /// Pin the child's working directory (stdio only). The spawn refuses
+    /// with a teaching error when the directory does not exist.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Cap on a single stdout protocol message in bytes (stdio only),
+    /// guarding against a runaway server streaming an unbounded line
+    /// into gateway memory. Minimum 1024; unset = uncapped (today's
+    /// behavior).
+    #[serde(default)]
+    pub max_output_bytes: Option<u64>,
 }
 
 fn default_mcp_timeout_secs() -> u64 {
@@ -3090,6 +3113,34 @@ impl Config {
                 return Err(CoreError::Config(format!(
                     "mcp server '{}' timeout_secs must be in 1..=600",
                     srv.name
+                )));
+            }
+            if srv.env_clear && srv.url.is_some() {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' sets env_clear on a url server: the sandbox options (env_clear, allowed_env, cwd, max_output_bytes) are stdio-only",
+                    srv.name
+                )));
+            }
+            if !srv.env_clear && !srv.allowed_env.is_empty() {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' lists allowed_env without env_clear: allowed_env only takes effect when env_clear scrubs the inherited environment first",
+                    srv.name
+                )));
+            }
+            if let Some(cwd) = &srv.cwd
+                && cwd.trim().is_empty()
+            {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' cwd must be a non-empty directory path",
+                    srv.name
+                )));
+            }
+            if let Some(cap) = srv.max_output_bytes
+                && cap < 1024
+            {
+                return Err(CoreError::Config(format!(
+                    "mcp server '{}' max_output_bytes must be >= 1024 (got {})",
+                    srv.name, cap
                 )));
             }
         }
@@ -5624,6 +5675,10 @@ default_ctx = 16384
             url: None,
             env: std::collections::HashMap::new(),
             timeout_secs: default_mcp_timeout_secs(),
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
         };
         cfg.mcp.push(stdio.clone());
         cfg.validate().expect("stdio-only server is valid");
@@ -5648,6 +5703,10 @@ default_ctx = 16384
             url: Some("not-a-url".into()),
             env: std::collections::HashMap::new(),
             timeout_secs: default_mcp_timeout_secs(),
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
         };
         cfg.mcp[0] = bad.clone();
         assert!(cfg.validate().is_err(), "relative url must be rejected");
@@ -5655,6 +5714,63 @@ default_ctx = 16384
         cfg.mcp[0] = bad;
         cfg.validate()
             .expect("http(s) url with host is valid, command empty");
+    }
+
+    #[test]
+    fn unit__validation__mcp_sandbox_options() {
+        let hardened = || McpServer {
+            name: "s".into(),
+            command: vec!["sleep".into(), "600".into()],
+            url: None,
+            env: std::collections::HashMap::new(),
+            timeout_secs: default_mcp_timeout_secs(),
+            env_clear: true,
+            allowed_env: vec!["PATH".into()],
+            cwd: Some("/".into()),
+            max_output_bytes: Some(4096),
+        };
+        let mut cfg = Config::default();
+        cfg.mcp.push(hardened());
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("hardened stdio server is valid: {e}"));
+
+        // Sandbox options are stdio-only.
+        cfg.mcp[0] = {
+            let mut s = hardened();
+            s.command.clear();
+            s.url = Some("http://127.0.0.1:8808/mcp".into());
+            s.allowed_env.clear();
+            s
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("stdio-only"), "{err}");
+
+        // allowed_env without env_clear does nothing — refuse loudly.
+        cfg.mcp[0] = {
+            let mut s = hardened();
+            s.env_clear = false;
+            s
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("only takes effect when env_clear"), "{err}");
+
+        // cwd must name a real directory path, not an empty string.
+        cfg.mcp[0] = {
+            let mut s = hardened();
+            s.cwd = Some("   ".into());
+            s
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("non-empty directory path"), "{err}");
+
+        // Output cap floor: 1024 bytes.
+        cfg.mcp[0] = {
+            let mut s = hardened();
+            s.max_output_bytes = Some(512);
+            s
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("must be >= 1024 (got 512)"), "{err}");
     }
 
     #[test]
@@ -5666,6 +5782,10 @@ default_ctx = 16384
             url: None,
             env: std::collections::HashMap::new(),
             timeout_secs: default_mcp_timeout_secs(),
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
         });
         for good in ["all", "none", "fetch"] {
             cfg.mcp_default = Some(good.into());

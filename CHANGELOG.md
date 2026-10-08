@@ -9,6 +9,7 @@ tracked here.
 ### Added
 
 - **Stable error codes + `GET /api/errors` catalog.** Every gateway-rendered OpenAI-shaped error now carries a `blazar_code` string (`MODEL_NOT_FOUND`, `ENGINE_CIRCUIT_OPEN`, `INSUFFICIENT_MEMORY`, …) that is additive-only and never renames or renumbers, alongside the existing `message`/`type`/`code` fields (numeric `code` stays the HTTP status). Typed choke points (supervision lifecycle, admission/preflight teaching refusals, auth and key-budget middleware, host guard) emit precise codes; all other `openai_error` sites derive a generic-but-stable code from the status, so the field is present on every path. `GET /api/errors` serves the machine-readable versioned catalog, and `docs/error-codes.md` mirrors it behind a drift-pin unit test. Engine-child errors forwarded verbatim and the Ollama-dialect lane keep their own shapes.
+- **MCP stdio sandbox options.** `[[mcp]]` servers can now declare `env_clear` (start the child from an empty environment instead of inheriting the daemon's), `allowed_env` (the only parent variables it may re-inherit), `cwd` (pin the working directory), and `max_output_bytes` (cap on one stdout protocol message, minimum 1024). Invalid combinations are refused at boot with teaching errors (e.g. `allowed_env` without `env_clear`, sandbox options on a url server). stdio children's stderr is now piped and logged at `warn` with a hard bound (first 32 KiB per server) instead of being discarded. Existing configurations behave exactly as before: every option is opt-in and defaults off.
 
 ## [0.22.0] - 2026-10-07
 

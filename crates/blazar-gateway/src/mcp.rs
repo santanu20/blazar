@@ -50,6 +50,8 @@ struct Session {
     stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
     next_id: u64,
     tools: Vec<McpTool>,
+    /// Per-line stdout byte cap (`max_output_bytes`); `None` = uncapped.
+    line_cap: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -344,19 +346,70 @@ impl Registry {
 // stdio transport
 // ---------------------------------------------------------------------------
 
+/// Teaching-check the pinned working directory BEFORE spawn: fail fast
+/// with a remedy instead of surfacing an opaque io error from the child.
+fn check_cwd(cfg: &McpServer) -> Result<(), String> {
+    let Some(dir) = &cfg.cwd else { return Ok(()) };
+    let meta = std::fs::metadata(dir).map_err(|e| {
+        format!(
+            "mcp server '{}' cwd '{dir}' unusable: {e} — fix the path or remove cwd",
+            cfg.name
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "mcp server '{}' cwd '{dir}' is not a directory",
+            cfg.name
+        ));
+    }
+    Ok(())
+}
+
+/// Spawn failure with the `env_clear` remedy appended: a scrubbed child
+/// cannot find PATH-resolved binaries unless PATH is allowlisted back.
+fn spawn_error(cfg: &McpServer, e: &std::io::Error) -> String {
+    let mut m = format!("spawn {}: {e}", cfg.command[0]);
+    if cfg.env_clear {
+        m.push_str(
+            " — env_clear scrubbed the inherited environment; if the binary \
+             lives on PATH, add \"PATH\" to allowed_env (Windows also needs \
+             \"SYSTEMROOT\")",
+        );
+    }
+    m
+}
+
 async fn spawn_session(cfg: &McpServer) -> Result<Session, String> {
     if cfg.command.is_empty() {
         return Err("empty command".into());
     }
     let mut cmd = tokio::process::Command::new(&cfg.command[0]);
+    // Sandbox precedence: scrubbed env first, then allowlisted parent
+    // variables, then explicit `env` entries last so user-set values
+    // always win over an inherited variable of the same name.
+    if cfg.env_clear {
+        cmd.env_clear();
+        for key in &cfg.allowed_env {
+            if let Ok(v) = std::env::var(key) {
+                cmd.env(key, v);
+            }
+        }
+    }
+    check_cwd(cfg)?;
+    if let Some(dir) = &cfg.cwd {
+        cmd.current_dir(dir);
+    }
     cmd.args(&cfg.command[1..])
         .envs(&cfg.env)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn {}: {e}", cfg.command[0]))?;
+        // Piped + drained below: server diagnostics become visible in
+        // gateway logs instead of vanishing, with a hard log bound.
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| spawn_error(cfg, &e))?;
+    if let Some(stderr) = child.stderr.take() {
+        spawn_stderr_drain(stderr, &cfg.name);
+    }
     let stdin = child.stdin.take().ok_or("no stdin pipe")?;
     let stdout = child.stdout.take().ok_or("no stdout pipe")?;
     let mut session = Session {
@@ -365,6 +418,7 @@ async fn spawn_session(cfg: &McpServer) -> Result<Session, String> {
         stdout: tokio::io::BufReader::new(stdout),
         next_id: 1,
         tools: Vec::new(),
+        line_cap: cfg.max_output_bytes,
     };
     let init = async {
         let id = session.next_id;
@@ -429,6 +483,95 @@ async fn spawn_session(cfg: &McpServer) -> Result<Session, String> {
     }
 }
 
+/// Log a bounded slice of a child's stderr (first 32 KiB per server) and
+/// count the rest — diagnostics without a memory or log-flood hazard.
+fn spawn_stderr_drain(stderr: tokio::process::ChildStderr, server: &str) {
+    let server = server.to_string();
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut stderr = stderr;
+        let mut chunk = [0u8; 2048];
+        let mut logged_chunks: u32 = 0;
+        let mut suppressed_chunks: u64 = 0;
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if logged_chunks < 16 {
+                        let text = String::from_utf8_lossy(&chunk[..n]);
+                        tracing::warn!(server = %server, "mcp stderr: {}", text.trim_end());
+                        logged_chunks += 1;
+                    } else {
+                        suppressed_chunks += 1;
+                    }
+                }
+            }
+        }
+        if suppressed_chunks > 0 {
+            tracing::warn!(
+                server = %server,
+                chunks = suppressed_chunks,
+                "mcp stderr suppressed after log bound"
+            );
+        }
+    });
+}
+
+/// Read one newline-terminated line into `buf` (terminator included in
+/// `buf`, excluded from the cap). A line whose content exceeds `cap`
+/// bytes fails loudly instead of buffering a runaway server's output.
+/// Mirrors `read_line` semantics: returns 0 on clean EOF with nothing
+/// buffered, byte count otherwise.
+async fn read_capped_line<R>(
+    reader: &mut R,
+    buf: &mut String,
+    cap: u64,
+    what: &str,
+) -> Result<usize, String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+    // 32-bit targets cannot address a u64-sized cap; saturate instead.
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let pending = reader
+            .fill_buf()
+            .await
+            .map_err(|e| format!("read {what}: {e}"))?;
+        if pending.is_empty() {
+            let produced =
+                String::from_utf8(line).map_err(|_| format!("{what} line is not valid utf-8"))?;
+            let n = produced.len();
+            buf.push_str(&produced);
+            return Ok(n);
+        }
+        if let Some(i) = pending.iter().position(|&b| b == b'\n') {
+            if line.len() + i > cap {
+                return Err(format!(
+                    "{what} line exceeds max_output_bytes cap ({cap} bytes)"
+                ));
+            }
+            line.extend_from_slice(&pending[..=i]);
+            reader.consume(i + 1);
+            let produced =
+                String::from_utf8(line).map_err(|_| format!("{what} line is not valid utf-8"))?;
+            let n = produced.len();
+            buf.push_str(&produced);
+            return Ok(n);
+        }
+        if line.len() + pending.len() > cap {
+            return Err(format!(
+                "{what} line exceeds max_output_bytes cap ({cap} bytes)"
+            ));
+        }
+        let chunk_len = pending.len();
+        line.extend_from_slice(pending);
+        reader.consume(chunk_len);
+    }
+}
+
 /// One JSON-RPC request over the session, skipping server-initiated
 /// notifications (no matching id) until the answer arrives.
 async fn rpc_call(
@@ -447,11 +590,14 @@ async fn rpc_call(
     let mut buf = String::new();
     loop {
         buf.clear();
-        let n = session
-            .stdout
-            .read_line(&mut buf)
-            .await
-            .map_err(|e| format!("read {method}: {e}"))?;
+        let n = match session.line_cap {
+            Some(cap) => read_capped_line(&mut session.stdout, &mut buf, cap, method).await?,
+            None => session
+                .stdout
+                .read_line(&mut buf)
+                .await
+                .map_err(|e| format!("read {method}: {e}"))?,
+        };
         if n == 0 {
             return Err(format!("server closed stdout during {method}"));
         }
@@ -1045,6 +1191,79 @@ pub async fn mcp_status(State(state): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn unit__read_capped_line__boundary_exact_and_over() {
+        let mut reader =
+            tokio::io::BufReader::new(std::io::Cursor::new(b"abcd\n toolong\n".to_vec()));
+        let mut buf = String::new();
+        // Content of exactly `cap` bytes passes; the terminator is free.
+        let n = read_capped_line(&mut reader, &mut buf, 4, "tools/list")
+            .await
+            .expect("line at exactly the cap passes");
+        assert_eq!(buf, "abcd\n");
+        assert_eq!(n, 5);
+        // One content byte over the cap fails loudly, naming the cap.
+        buf.clear();
+        let err = read_capped_line(&mut reader, &mut buf, 4, "tools/list")
+            .await
+            .expect_err("line over the cap must fail");
+        assert!(
+            err.contains("exceeds max_output_bytes cap (4 bytes)"),
+            "{err}"
+        );
+    }
+
+    #[allow(non_snake_case)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unit__spawn_session__env_clear_scrubs_and_allowlist_readds() {
+        // Child dumps its environment to a file inside the pinned cwd and
+        // exits; MCP init then fails fast on stdout EOF, so the test
+        // observes exactly what the scrubbed child saw.
+        let dir = std::env::temp_dir().join("blazar-mcp-env-probe");
+        std::fs::create_dir_all(&dir).expect("probe dir");
+        let out = dir.join("env-probe.out");
+        let _ = std::fs::remove_file(&out);
+        let mut env = std::collections::HashMap::new();
+        env.insert("BLAZAR_MCP_PROBE_EXPLICIT".to_string(), "set".to_string());
+        let cfg = McpServer {
+            name: "probe".into(),
+            command: vec!["/bin/sh".into(), "-c".into(), "env > env-probe.out".into()],
+            url: None,
+            env,
+            timeout_secs: 30,
+            env_clear: true,
+            // PATH is the one guaranteed-present parent variable (the
+            // test runner itself needs it); it doubles as the re-inherit
+            // probe while HOME proves the scrub.
+            allowed_env: vec!["PATH".into()],
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            max_output_bytes: Some(65536),
+        };
+        let Err(err) = spawn_session(&cfg).await else {
+            panic!("probe child exits immediately; init must fail")
+        };
+        assert!(
+            err.contains("initialize") || err.contains("closed stdout"),
+            "unexpected init failure shape: {err}"
+        );
+        let seen = std::fs::read_to_string(&out).expect("child wrote env dump");
+        assert!(
+            seen.contains("BLAZAR_MCP_PROBE_EXPLICIT=set"),
+            "explicit env survives:\n{seen}"
+        );
+        assert!(
+            seen.contains("PATH="),
+            "allowed_env re-inherits PATH:\n{seen}"
+        );
+        assert!(
+            !seen.contains("HOME="),
+            "inherited HOME must be scrubbed:\n{seen}"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
 
     #[allow(non_snake_case)]
     #[test]
