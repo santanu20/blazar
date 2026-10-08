@@ -7607,6 +7607,43 @@ def wave_replica_rows(model: str) -> list[dict]:
     return [r for r in ps_rows() if str(ps_field(r, "name", "model") or "") == model]
 
 
+def whisper_tags(root: str) -> list[str]:
+    """Engine tags that ship a whisper-server binary under a root.
+
+    Whisper servers install under engines/<tag>/<release-dir>/whisper-server
+    (live shape: engines/b5130/whisper-bin-ubuntu-x64); the old whisper/bin
+    root stays as a legacy fallback. Shared by the commands-phase pin tests
+    and the wave-phase 501 boundary guard."""
+    tags: list[str] = []
+    if not os.path.isdir(root):
+        return tags
+    for e in sorted(os.listdir(root)):
+        ed = os.path.join(root, e)
+        if not os.path.isdir(ed):
+            continue
+        for sub in os.listdir(ed):
+            sd = os.path.join(ed, sub)
+            if os.path.isdir(sd) and any(
+                n.startswith("whisper-server") for n in os.listdir(sd)
+            ):
+                tags.append(e)
+                break
+    return tags
+
+
+def whisper_lane_live() -> bool:
+    """True when this box can actually transcribe: whisper engine
+    installed AND at least one model blob pulled. The wave-phase 501
+    teaching contract is only observable when one of them is missing."""
+    data = SANDBOX.data_dir
+    engine = bool(
+        whisper_tags(os.path.join(data, "engines"))
+        or whisper_tags(os.path.join(data, "whisper", "bin"))
+    )
+    model = bool(sorted((Path(data) / "whisper").rglob("*.bin")))
+    return engine and model
+
+
 def phase_wave() -> None:
     print("\n== phase 8: wave battery (replicas/preload/keys/whisper/gauges) ==")
     d = DAEMON
@@ -7828,20 +7865,32 @@ def phase_wave() -> None:
         f"status={st}",
     )
 
-    st, raw = http_multipart(
-        "/v1/audio/transcriptions", {"model": "whisper-1"}, "file", tiny_wav(), "t.wav"
-    )
-    check(
-        "wave",
-        "whisper lane -> 501 teaching (install/pull hints)",
-        # F166 + teaching_detail (gateway whisper.rs) has TWO halves:
-        # server missing -> `blazar whisper --install`; server present
-        # but no model -> `blazar whisper --pull`. The sandbox engines
-        # copy tracks the real box, so state decides which hint fires —
-        # either one proves the 501 teaching contract.
-        st == 501 and (b"whisper --install" in raw or b"whisper --pull" in raw),
-        f"status={st}",
-    )
+    if whisper_lane_live():
+        boundary(
+            "wave",
+            "whisper lane -> 501 teaching (install/pull hints)",
+            "whisper engine + model live on this box — the lane transcribes "
+            "(200), so the missing-piece teaching is not observable here",
+        )
+    else:
+        st, raw = http_multipart(
+            "/v1/audio/transcriptions",
+            {"model": "whisper-1"},
+            "file",
+            tiny_wav(),
+            "t.wav",
+        )
+        check(
+            "wave",
+            "whisper lane -> 501 teaching (install/pull hints)",
+            # F166 + teaching_detail (gateway whisper.rs) has TWO halves:
+            # server missing -> `blazar whisper --install`; server present
+            # but no model -> `blazar whisper --pull`. The sandbox engines
+            # copy tracks the real box, so state decides which hint fires —
+            # either one proves the 501 teaching contract.
+            st == 501 and (b"whisper --install" in raw or b"whisper --pull" in raw),
+            f"status={st}",
+        )
 
     st, _, v = http_json("POST", "/api/embed", {"model": small, "input": "hi"})
     txt = json.dumps(v) if not isinstance(v, str) else v
@@ -10049,30 +10098,10 @@ def phase_commands() -> None:
         )
 
         # pin lifecycle: standalone flag path (no install/net), real tag
-        # dir from the sandbox install above. Whisper servers install
-        # under engines/<tag>/<release-dir>/whisper-server (live shape:
-        # engines/b5130/whisper-bin-ubuntu-x64); the old whisper/bin
-        # root stays as a legacy fallback.
-        def _whisper_tags(root: str) -> list[str]:
-            tags: list[str] = []
-            if not os.path.isdir(root):
-                return tags
-            for e in sorted(os.listdir(root)):
-                ed = os.path.join(root, e)
-                if not os.path.isdir(ed):
-                    continue
-                for sub in os.listdir(ed):
-                    sd = os.path.join(ed, sub)
-                    if os.path.isdir(sd) and any(
-                        n.startswith("whisper-server") for n in os.listdir(sd)
-                    ):
-                        tags.append(e)
-                        break
-            return tags
-
+        # dir from the sandbox install above.
         eng_root = os.path.join(SANDBOX.data_dir, "engines")
         legacy_root = os.path.join(SANDBOX.data_dir, "whisper", "bin")
-        tag = next(iter(_whisper_tags(eng_root) or _whisper_tags(legacy_root)), "")
+        tag = next(iter(whisper_tags(eng_root) or whisper_tags(legacy_root)), "")
         pin_ok = False
         if tag:
             p = cli("whisper", "--pin", tag)
