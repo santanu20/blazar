@@ -2320,7 +2320,10 @@ async fn rpc_worker_shutdown() -> i32 {
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.map(|_| 130).unwrap_or(130)
+        // Ctrl-C is the only console signal here; any outcome exits with the
+        // conventional 130 (128 + SIGINT) the unix branch above also uses.
+        let _ = tokio::signal::ctrl_c().await;
+        130
     }
 }
 
