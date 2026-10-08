@@ -7626,10 +7626,56 @@ async fn daemon_base_if_up() -> Option<String> {
         .then_some(base)
 }
 
+/// Classify a DECISION axis by where its value came from — the honesty
+/// contract of `blazar plan`: nothing renders unlabeled. `live` =
+/// observed on the running child, `predicted` = planner/fit estimate,
+/// `config` = explicit user setting, `decision` = routing choice,
+/// `unknown` = the card lacked the field (loud fallback, never a guess).
+fn evidence_class(axis: &str, v: &serde_json::Value) -> &'static str {
+    fn src(x: &serde_json::Value) -> &str {
+        x.as_str().unwrap_or("")
+    }
+    match axis {
+        "context" => {
+            let s = src(&v["context"]["effective_source"]);
+            if s.contains("live child") || s == "mlx_lm" {
+                "live"
+            } else if s.contains("estimate") || s.contains("spawn planner") {
+                "predicted"
+            } else if s.contains("config") || s.contains("model_overrides") {
+                "config"
+            } else {
+                "unknown"
+            }
+        }
+        "kv" => match src(&v["cache"]["kv_k"]) {
+            "" => "unknown",
+            "auto ladder" | "mlx runtime" => "predicted",
+            _ => "config",
+        },
+        "spec" => {
+            let s = src(&v["speculation"]["source"]);
+            if s.contains("live child") {
+                "live"
+            } else if s.contains("config") || s.contains("model_overrides") {
+                "config"
+            } else {
+                "unknown"
+            }
+        }
+        // The slots census is an observation either way — "cold" is the
+        // observed absence of a resident child, not an estimate.
+        "warm" => "live",
+        "engine" => "decision",
+        _ => "unknown",
+    }
+}
+
 /// The `blazar plan` DECISION block, rendered from the daemon's live
 /// `/api/explain` card — the same card `run` will act on, never a
 /// client-side re-derivation. Pure over the card value; missing fields
-/// render as `unknown`.
+/// render as `unknown`. Every line carries its evidence class suffix so
+/// a prediction never renders as if it were a measurement.
 fn plan_decision_lines(v: &serde_json::Value) -> Vec<String> {
     let or_unknown =
         |x: &serde_json::Value| x.as_str().map_or_else(|| "unknown".into(), str::to_string);
@@ -7642,29 +7688,33 @@ fn plan_decision_lines(v: &serde_json::Value) -> Vec<String> {
         .map_or_else(|| "cold".to_string(), |n| format!("resident ({n} slot(s))"));
     vec![
         format!(
-            "engine      {} ({}) — {}",
+            "engine      {} ({}) — {} — {}",
             or_unknown(&e["tag"]),
             or_unknown(&e["kind"]),
-            or_unknown(&e["reason"])
+            or_unknown(&e["reason"]),
+            evidence_class("engine", v),
         ),
         format!(
-            "context     {} ({})",
+            "context     {} ({}) — {}",
             c["effective"]
                 .as_u64()
                 .map_or_else(|| "unknown".into(), |n| n.to_string()),
-            or_unknown(&c["effective_source"])
+            or_unknown(&c["effective_source"]),
+            evidence_class("context", v),
         ),
         format!(
-            "kv          {}/{}",
+            "kv          {}/{} — {}",
             or_unknown(&ca["kv_k"]),
-            or_unknown(&ca["kv_v"])
+            or_unknown(&ca["kv_v"]),
+            evidence_class("kv", v),
         ),
         format!(
-            "spec        {} ({})",
+            "spec        {} ({}) — {}",
             or_unknown(&sp["mode"]),
-            or_unknown(&sp["source"])
+            or_unknown(&sp["source"]),
+            evidence_class("spec", v),
         ),
-        format!("warm        {warm}"),
+        format!("warm        {warm} — {}", evidence_class("warm", v)),
     ]
 }
 
@@ -7788,6 +7838,22 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
                     "mmproj": row.mmproj_path,
                 },
                 "decision": decision,
+                "decision_evidence": decision.as_ref().map(|card| {
+                    serde_json::json!({
+                        "engine": evidence_class("engine", card),
+                        "context": evidence_class("context", card),
+                        "kv": evidence_class("kv", card),
+                        "spec": evidence_class("spec", card),
+                        "warm": evidence_class("warm", card),
+                    })
+                }),
+                "evidence_legend": serde_json::json!({
+                    "live": "observed on the running child",
+                    "predicted": "planner or fit estimate",
+                    "config": "explicit setting",
+                    "decision": "routing choice",
+                    "unknown": "field missing from the card",
+                }),
                 "measured": measured_json,
                 "certificate": cert_json,
             })
@@ -7808,6 +7874,9 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
     println!("DECISION");
     match (&decision, &base) {
         (Some(card), _) => {
+            println!(
+                "  evidence: live = observed on the running child · predicted = planner/fit estimate · config = explicit setting · decision = routing choice"
+            );
             for line in plan_decision_lines(card) {
                 println!("  {line}");
             }
@@ -16387,12 +16456,13 @@ async fn fit(target: &str, json: bool) -> Result<()> {
                 r.bytes + storage::REQUIRED_SLACK_BYTES,
                 disk_free,
             ));
+            v["evidence"] = serde_json::json!("predicted");
             println!("{v}");
         }
         return Ok(());
     }
     println!(
-        "fit preview for {} (local VRAM: {})",
+        "fit preview for {} (local VRAM: {}) — predicted, analytic estimates, not measured",
         parsed.repo,
         humansize(i64::try_from(vram_bytes).unwrap_or(i64::MAX))
     );
@@ -20146,6 +20216,80 @@ mod tests {
             lines[4].contains("cold"),
             "no live slots means cold: {lines:?}"
         );
+    }
+
+    #[test]
+    fn unit__evidence_class__known_vocabulary_and_fallbacks() {
+        // Pins the EXACT source strings the gateway's explain card emits
+        // (explain.rs context/speculation/cache blocks). If the gateway
+        // vocabulary drifts, this breaks loudly instead of silently
+        // mislabeling evidence.
+        let live_ctx = serde_json::json!({
+            "context": {"effective_source": "live child argv"},
+        });
+        assert_eq!(evidence_class("context", &live_ctx), "live");
+        let mlx = serde_json::json!({
+            "context": {"effective_source": "mlx_lm"},
+        });
+        assert_eq!(evidence_class("context", &mlx), "live");
+        let cold = serde_json::json!({
+            "context": {"effective_source":
+                "config estimate — model not resident; the spawn-time planner may shrink it to fit VRAM"},
+        });
+        assert_eq!(evidence_class("context", &cold), "predicted");
+        let cfg_ctx = serde_json::json!({
+            "context": {"effective_source": "config default_ctx = 4096"},
+        });
+        assert_eq!(evidence_class("context", &cfg_ctx), "config");
+        let override_ctx = serde_json::json!({
+            "context": {"effective_source": "model_overrides.m.ctx"},
+        });
+        assert_eq!(evidence_class("context", &override_ctx), "config");
+
+        let auto_ladder = serde_json::json!({"cache": {"kv_k": "auto ladder"}});
+        assert_eq!(evidence_class("kv", &auto_ladder), "predicted");
+        let mlx_kv = serde_json::json!({"cache": {"kv_k": "mlx runtime"}});
+        assert_eq!(evidence_class("kv", &mlx_kv), "predicted");
+        let explicit_kv = serde_json::json!({"cache": {"kv_k": "q8_0", "kv_v": "q8_0"}});
+        assert_eq!(evidence_class("kv", &explicit_kv), "config");
+
+        let live_spec = serde_json::json!({"speculation": {"source": "live child"}});
+        assert_eq!(evidence_class("spec", &live_spec), "live");
+        let cfg_spec = serde_json::json!({"speculation": {"source": "config spec = auto"}});
+        assert_eq!(evidence_class("spec", &cfg_spec), "config");
+
+        let card = serde_json::json!({});
+        assert_eq!(evidence_class("warm", &card), "live");
+        assert_eq!(evidence_class("engine", &card), "decision");
+        // Loud fallbacks: absent fields and unknown axes never guess.
+        assert_eq!(evidence_class("context", &card), "unknown");
+        assert_eq!(evidence_class("kv", &card), "unknown");
+        assert_eq!(evidence_class("spec", &card), "unknown");
+        assert_eq!(evidence_class("nonesuch", &card), "unknown");
+    }
+
+    #[test]
+    fn unit__plan_decision_lines__evidence_suffixes() {
+        let card = serde_json::json!({
+            "engine": {"tag": "b11370-cuda", "kind": "llamacpp", "reason": "active lane"},
+            "context": {"effective": 32768, "effective_source": "config default_ctx = 32768"},
+            "cache": {"kv_k": "auto ladder", "kv_v": "auto ladder"},
+            "speculation": {"mode": "auto", "source": "config spec = auto"},
+            "slots": {"live": 2},
+        });
+        let lines = plan_decision_lines(&card);
+        assert!(lines[0].ends_with("— decision"), "{lines:?}");
+        assert!(lines[1].ends_with("— config"), "{lines:?}");
+        assert!(lines[2].ends_with("— predicted"), "{lines:?}");
+        assert!(lines[3].ends_with("— config"), "{lines:?}");
+        assert!(
+            lines[4].ends_with("resident (2 slot(s)) — live"),
+            "{lines:?}"
+        );
+        // Absent card: every axis degrades to unknown, never silent.
+        let empty = plan_decision_lines(&serde_json::json!({}));
+        assert!(empty[1].ends_with("— unknown"), "{empty:?}");
+        assert!(empty[4].ends_with("cold — live"), "{empty:?}");
     }
 
     #[test]
