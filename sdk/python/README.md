@@ -18,7 +18,7 @@ there is nothing to build.
 ```python
 from blazar import Client
 
-blazar = Client()  # BLAZAR_URL env or http://127.0.0.1:11434; Client("http://host:port") wins
+blazar = Client()  # BLAZAR_URL env or http://127.0.0.1:11435; Client("http://host:port") wins
 
 reply = blazar.chat("qwen3-0.6b:q4_0", [{"role": "user", "content": "hi"}])
 print(reply["choices"][0]["message"]["content"])

@@ -6,7 +6,7 @@ Standard library only — `pip install` nothing.
 
     from blazar import Client
 
-    blazar = Client()                      # http://127.0.0.1:11434
+    blazar = Client()                      # http://127.0.0.1:11435
     reply = blazar.chat("qwen3-0.6b:q4_0",
                         [{"role": "user", "content": "hi"}])
     print(reply["choices"][0]["message"]["content"])
@@ -70,7 +70,7 @@ class BlazarError(RuntimeError):
 class Client:
     """Synchronous Blazar client.
 
-    :param base_url: gateway origin, default ``http://127.0.0.1:11434``
+    :param base_url: gateway origin, default ``http://127.0.0.1:11435``
     :param api_key:  bearer key when the gateway runs with named keys
     :param timeout:  per-request timeout in seconds (streaming readers
                      inherit the same deadline)
@@ -85,7 +85,7 @@ class Client:
         import os
 
         self.base_url = (
-            base_url or os.environ.get("BLAZAR_URL") or "http://127.0.0.1:11434"
+            base_url or os.environ.get("BLAZAR_URL") or "http://127.0.0.1:11435"
         ).rstrip("/")
         self.api_key = api_key or os.environ.get("BLAZAR_API_KEY")
         self.timeout = timeout
