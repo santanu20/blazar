@@ -1082,6 +1082,8 @@ _COMMAND_ATTRS = {
     "plan": (False, False, False, False, True),
     "scorecard": (False, False, False, False, True),
     "autopilot": (False, False, False, False, True),
+    "certify": (True, True, False, False, True),
+    "classify": (False, False, False, False, True),
     "config.preset": (False, False, False, False, True),
     "run.intent": (False, False, False, False, True),
     "why.default": (True, False, False, False, True),
@@ -11471,10 +11473,12 @@ def _full_toplevel() -> dict:
         ],
         "rpc_servers": "",
         "cache_ram_mb": 1024,
-        # config-audit wave backfill: three always-serialized containers
+        # config-audit wave backfill: always-serialized containers
         # (gate-b RED) + Option knobs counting for the (c0) denominator.
+        # keep_tags is a usize retention count (floor 1), not a list —
+        # 2 = fresh build plus one rollback anchor.
         "failover": [],
-        "keep_tags": [],
+        "keep_tags": 2,
         "mcp": [],
         "mcp_default": "none",
         # Options deliberately omitted at boot (None counts for c0):
