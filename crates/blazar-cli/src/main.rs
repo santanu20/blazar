@@ -12282,12 +12282,26 @@ a long CUDA init. Embedding/rerank speed is measured live per request (/metrics,
         );
     }
     // Persist for scorecards and `plan` MEASURED — durable per
-    // (model, lane): re-benching the same pair is unnecessary.
+    // (model, lane): re-benching the same pair is unnecessary. The v13
+    // evidence axes make the row self-contained (quant + hardware
+    // fingerprint + the tuned profile's args hash when one exists).
     match bench_lane_engine(&store) {
         Some(engine) => {
             let payload =
                 serde_json::to_string(&rows).map_err(|e| anyhow!("serializing bench rows: {e}"))?;
-            store.put_bench_result(&row.name, &engine.tag, &payload)?;
+            let axes = blazar_core::store::EvidenceAxes {
+                quant: Some(row.quant.clone()),
+                hw_fingerprint: blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(
+                    &engine.manifest,
+                ),
+                workload: None,
+                profile_hash: store
+                    .get_profile(&row.name, &engine.tag)
+                    .ok()
+                    .flatten()
+                    .map(|p| p.args_hash),
+            };
+            store.put_bench_result_with_axes(&row.name, &engine.tag, &payload, &axes)?;
         }
         None => println!("note: no llamacpp engine row on record — result not persisted"),
     }
