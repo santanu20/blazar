@@ -1205,6 +1205,7 @@ mod tests {
                 name: "vllm".into(),
                 url: "http://10.0.0.4:8000".into(),
                 key: String::new(),
+                allow_insecure_http: false,
             }],
             ..Config::default()
         };
@@ -1404,6 +1405,7 @@ mod tests {
             name: "peer".into(),
             url: "http://127.0.0.1:1".into(),
             key: String::new(),
+            allow_insecure_http: false,
         }];
         assert!(fallback_enabled(&cfg), "armed by default with a remote");
         cfg.remote_fallback = false;
@@ -1421,6 +1423,7 @@ mod tests {
             name: "peer".into(),
             url: "http://127.0.0.1:1".into(),
             key: String::new(),
+            allow_insecure_http: false,
         };
         note_remote_latency(&map, &r, 1000.0);
         assert_eq!(

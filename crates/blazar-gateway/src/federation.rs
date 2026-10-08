@@ -463,6 +463,7 @@ mod tests {
             name: name.into(),
             url: format!("http://{name}.local:11434"),
             key: String::new(),
+            allow_insecure_http: false,
         }
     }
 

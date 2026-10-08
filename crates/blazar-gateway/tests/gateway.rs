@@ -3532,11 +3532,13 @@ async fn e2e__remote_failover_circuit_and_lb() {
                 name: "r".into(),
                 url: "http://127.0.0.1:1".into(),
                 key: String::new(),
+                allow_insecure_http: false,
             },
             blazar_core::config::Remote {
                 name: "r".into(),
                 url: target.base.clone(),
                 key: String::new(),
+                allow_insecure_http: false,
             },
         ],
         ..Config::default()

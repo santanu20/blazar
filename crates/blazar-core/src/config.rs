@@ -1966,6 +1966,94 @@ pub struct Remote {
     /// Optional bearer key for the remote (empty = none).
     #[serde(default)]
     pub key: String,
+    /// Escape hatch for the scheme ladder: a cleartext-HTTP remote that
+    /// is not loopback is refused at boot by default. Setting this makes
+    /// it a loud warning instead — for labs that genuinely must talk to
+    /// a public HTTP endpoint. Prefer https:// or an IP literal.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+}
+
+/// Transport-safety verdict for one `[[remotes]]` URL, enforced in
+/// `Config::validate`. Computed without DNS (validation stays offline
+/// and instant): any hostname other than `localhost` counts as public.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteSchemePolicy {
+    /// `https://` — encrypted on any network.
+    HttpsOk,
+    /// `http://` to a loopback address — never leaves the machine.
+    LoopbackHttpOk,
+    /// `http://` to a private/link-local address — the bearer key
+    /// travels in cleartext on the LAN.
+    LanHttpWarn,
+    /// `http://` to anything else (or a non-http(s) URL) — refused.
+    InsecureHttpRefused,
+}
+
+/// Classify a remote URL into the scheme ladder. Total: anything it
+/// cannot parse lands on the refused rung; `Config::validate` turns
+/// that into a teaching error.
+#[must_use]
+pub fn remote_scheme_policy(url: &str) -> RemoteSchemePolicy {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return RemoteSchemePolicy::InsecureHttpRefused;
+    };
+    if scheme.eq_ignore_ascii_case("https") {
+        return RemoteSchemePolicy::HttpsOk;
+    }
+    if !scheme.eq_ignore_ascii_case("http") {
+        return RemoteSchemePolicy::InsecureHttpRefused;
+    }
+    let Some(host) = remote_host(rest) else {
+        return RemoteSchemePolicy::InsecureHttpRefused;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return RemoteSchemePolicy::LoopbackHttpOk;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            if ip.is_loopback() {
+                RemoteSchemePolicy::LoopbackHttpOk
+            } else if ip.is_private() || ip.is_link_local() {
+                RemoteSchemePolicy::LanHttpWarn
+            } else {
+                RemoteSchemePolicy::InsecureHttpRefused
+            }
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let seg = ip.segments()[0];
+            let unique_local = (seg & 0xfe00) == 0xfc00; // fc00::/7
+            let link_local = (seg & 0xffc0) == 0xfe80; // fe80::/10
+            if ip.is_loopback() {
+                RemoteSchemePolicy::LoopbackHttpOk
+            } else if unique_local || link_local {
+                RemoteSchemePolicy::LanHttpWarn
+            } else {
+                RemoteSchemePolicy::InsecureHttpRefused
+            }
+        }
+        // Not an IP and not localhost: without DNS we must assume public.
+        Err(_) => RemoteSchemePolicy::InsecureHttpRefused,
+    }
+}
+
+/// Extract the host from everything after `scheme://`, handling
+/// userinfo, ports, `[IPv6]:port` (with zone-id), and trailing
+/// path/query. Empty hosts return `None` (refused rung).
+fn remote_host(after_scheme: &str) -> Option<&str> {
+    let authority = after_scheme.split(['/', '?']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        // Drop any IPv6 zone-id (`[fe80::1%eth0]`).
+        rest[..end].split('%').next().unwrap_or("")
+    } else if authority.matches(':').count() > 1 {
+        // Bare IPv6 literal without brackets (e.g. a pasted `::1`).
+        authority
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    if host.is_empty() { None } else { Some(host) }
 }
 
 /// One hop of a failover chain: either a locally served model or a
@@ -3338,6 +3426,38 @@ impl Config {
                 d,
                 known.join(", ")
             )));
+        }
+        // Scheme ladder: the bearer `key` must never travel in
+        // cleartext off-machine. Loopback HTTP is fine (never leaves
+        // the host), LAN HTTP earns a warning, public HTTP is refused
+        // unless the operator explicitly opts in per remote.
+        for remote in &self.remotes {
+            match remote_scheme_policy(&remote.url) {
+                RemoteSchemePolicy::HttpsOk | RemoteSchemePolicy::LoopbackHttpOk => {}
+                RemoteSchemePolicy::LanHttpWarn => {
+                    tracing::warn!(
+                        target: "blazar::config",
+                        "remote '{}' uses cleartext HTTP on a private address ({}): its bearer key travels unencrypted on the LAN — prefer https://",
+                        remote.name,
+                        remote.url
+                    );
+                }
+                RemoteSchemePolicy::InsecureHttpRefused => {
+                    if remote.allow_insecure_http {
+                        tracing::warn!(
+                            target: "blazar::config",
+                            "remote '{}' allows insecure cleartext HTTP to a non-private address ({}): its bearer key is visible on the network path — remove allow_insecure_http and use https://",
+                            remote.name,
+                            remote.url
+                        );
+                    } else {
+                        return Err(CoreError::Config(format!(
+                            "remote '{}' url ({}) sends its bearer key in cleartext to a non-private address — use https://, target a loopback/private IP literal, or set that remote's allow_insecure_http = true to accept the risk",
+                            remote.name, remote.url
+                        )));
+                    }
+                }
+            }
         }
         if self.default_ctx == 0 {
             return Err(CoreError::Config("default_ctx must be > 0".into()));
@@ -5646,6 +5766,73 @@ default_ctx = 16384
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("idle_timeout_secs"));
+    }
+
+    #[test]
+    fn unit__remote_scheme_policy__ladder_rungs_and_edge_cases() {
+        use RemoteSchemePolicy::*;
+        let cases: &[(&str, RemoteSchemePolicy)] = &[
+            ("https://gpu.example.net:9443/base", HttpsOk),
+            ("HTTPS://UPPER.CASE:9443/x", HttpsOk),
+            ("http://localhost:11434", LoopbackHttpOk),
+            ("http://127.0.0.1:11434/v1", LoopbackHttpOk),
+            ("http://user:secret@192.168.1.9:8000/api", LanHttpWarn),
+            ("http://10.0.0.4:8000", LanHttpWarn),
+            ("http://169.254.7.7:80", LanHttpWarn),
+            ("http://[::1]:9000", LoopbackHttpOk),
+            ("http://[fe80::1%eth0]:9000", LanHttpWarn),
+            ("http://[fd00::5]:8000", LanHttpWarn),
+            ("http://8.8.8.8:443", InsecureHttpRefused),
+            (
+                "http://gpu-node.example.internal:11434",
+                InsecureHttpRefused,
+            ),
+            ("ftp://127.0.0.1/x", InsecureHttpRefused),
+            ("http://", InsecureHttpRefused),
+            ("not-a-url", InsecureHttpRefused),
+        ];
+        for (url, want) in cases {
+            let got = remote_scheme_policy(url);
+            assert_eq!(&got, want, "url {url:?} classified {got:?}, want {want:?}");
+        }
+    }
+
+    #[test]
+    fn unit__validation__remote_scheme_ladder_enforced() {
+        let remote = |url: &str, allow: bool| Remote {
+            name: "peer".into(),
+            url: url.into(),
+            key: String::new(),
+            allow_insecure_http: allow,
+        };
+        for url in [
+            "https://gpu.example.net",
+            "http://127.0.0.1:11434",
+            "http://10.0.0.4:8000",
+        ] {
+            let cfg = Config {
+                remotes: vec![remote(url, false)],
+                ..Config::default()
+            };
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{url} must validate: {e}"));
+        }
+        let cfg = Config {
+            remotes: vec![remote("http://8.8.8.8:443", false)],
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("peer"), "error names the remote: {err}");
+        assert!(
+            err.contains("allow_insecure_http"),
+            "error teaches the escape hatch: {err}"
+        );
+        let cfg = Config {
+            remotes: vec![remote("http://8.8.8.8:443", true)],
+            ..Config::default()
+        };
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("explicit opt-in must validate: {e}"));
     }
 
     #[test]
