@@ -2633,6 +2633,185 @@ fn retry_on_sharing_violation<T>(mut op: impl FnMut() -> std::io::Result<T>) -> 
     }
 }
 
+/// Optional hierarchy: config sections that alias flat root keys. A config
+/// may group keys under these tables (`[gateway]` …) instead of the flat
+/// root; the loader hoists them back to root before deserializing, so the
+/// flat spelling stays the canonical form (`to_toml` always writes flat).
+/// Membership is an exact allowlist — a key under a section that is not
+/// listed here fails loud with the section's members, instead of silently
+/// ignoring the typo.
+const SECTION_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "gateway",
+        &[
+            "host",
+            "port",
+            "log_level",
+            "no_host",
+            "cors_origins",
+            "tls_cert",
+            "tls_key",
+            "sse_ping_interval",
+            "server_timeout_secs",
+            "audit_log",
+        ],
+    ),
+    (
+        "routing",
+        &[
+            "engine_routing",
+            "router",
+            "router_max_models",
+            "failover",
+            "remote_fallback",
+            "cache_reuse",
+        ],
+    ),
+    (
+        "resources",
+        &[
+            "default_ctx",
+            "max_loaded_models",
+            "idle_sleep_secs",
+            "idle_timeout_secs",
+            "cache_ram_mb",
+            "cpu_range",
+            "numa",
+        ],
+    ),
+    (
+        "speculative",
+        &[
+            "spec",
+            "spec_autopull",
+            "spec_auto_ngram",
+            "spec_auto_manage",
+            "spec_draft_cpu_range",
+            "spec_draft_cpu_strict",
+            "spec_draft_cpu_strict_batch",
+            "spec_draft_device",
+            "spec_draft_ngl",
+            "spec_draft_threads",
+            "spec_draft_threads_batch",
+            "spec_draft_p_min",
+            "spec_draft_p_split",
+            "spec_draft_poll",
+            "spec_draft_poll_batch",
+            "spec_draft_prio",
+            "spec_draft_prio_batch",
+            "spec_draft_type_k",
+            "spec_draft_type_v",
+            "spec_draft_override_tensor",
+            "spec_draft_n_cpu_moe",
+            "spec_draft_cpu_moe",
+            "spec_draft_backend_sampling",
+        ],
+    ),
+    (
+        "diffusion",
+        &[
+            "sdcpp_child_header_timeout_secs",
+            "sdcpp_cache_mode",
+            "sdcpp_cache_option",
+            "sdcpp_conditioning_cache_size",
+            "sdcpp_extra_args",
+            "sdcpp_flash_attention",
+            "sdcpp_max_vram",
+            "sdcpp_model_args",
+            "sdcpp_params_backend",
+            "sdcpp_qwen_prefix_cache_type",
+            "sdcpp_rpc_servers",
+            "sdcpp_sage_attn",
+            "sdcpp_split_mode",
+            "sdcpp_tae",
+            "sdcpp_tensor_type_rules",
+            "sdcpp_vae_tiling",
+        ],
+    ),
+    (
+        "whisper",
+        &[
+            "whisper_idle_secs",
+            "whisper_stream_chunk_ms",
+            "whisper_vad_model",
+            "whisper_extra_args",
+        ],
+    ),
+    (
+        "vision",
+        &[
+            "image_max_tokens",
+            "image_min_tokens",
+            "mtmd_batch_max_tokens",
+            "mmproj_auto",
+            "mmproj_device",
+            "mmproj_offload",
+            "mmproj_policy",
+        ],
+    ),
+    (
+        "yarn",
+        &[
+            "yarn_orig_ctx",
+            "yarn_ext_factor",
+            "yarn_attn_factor",
+            "yarn_beta_fast",
+            "yarn_beta_slow",
+        ],
+    ),
+    (
+        "reasoning",
+        &[
+            "reasoning",
+            "reasoning_format",
+            "reasoning_budget",
+            "reasoning_budget_message",
+            "reasoning_effort",
+            "reasoning_preserve",
+        ],
+    ),
+    ("observability", &["otlp_endpoint", "otlp_service"]),
+];
+
+/// Hoist known section tables (see [`SECTION_FIELDS`]) to their flat root
+/// keys. Unknown tables pass through untouched; a non-table value under a
+/// known section name is likewise left for the deserializer to judge. The
+/// same key at root AND inside its section is ambiguous and refused;
+/// sections are removed once hoisted, so the pass is idempotent.
+fn flatten_hierarchy(table: &mut toml::Table) -> CoreResult<()> {
+    for (section, members) in SECTION_FIELDS {
+        // Only a table under a known section name participates; anything
+        // else (missing, scalar, array) is left for the deserializer to
+        // judge under the existing rules.
+        if !table.get(*section).is_some_and(toml::Value::is_table) {
+            continue;
+        }
+        let Some(entries) = table.remove(*section).and_then(|v| v.as_table().cloned()) else {
+            continue;
+        };
+        for (key, value) in entries {
+            if !members.contains(&key.as_str()) {
+                let home = SECTION_FIELDS
+                    .iter()
+                    .find(|(_, ms)| ms.contains(&key.as_str()))
+                    .map(|(s, _)| format!(" (it belongs to [{s}])"))
+                    .unwrap_or_default();
+                let listed = members.join(", ");
+                return Err(CoreError::Config(format!(
+                    "[{section}] does not accept {key:?}{home} — members: {listed}"
+                )));
+            }
+            if table.contains_key(&key) {
+                return Err(CoreError::Config(format!(
+                    "{key} is set both at the root and inside [{section}] — keep one spelling"
+                )));
+            }
+            table.insert(key, value);
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     /// Load config from `<config_dir>/config.toml`, creating it with defaults
     /// if absent. Then apply `BLAZAR_*` env overrides.
@@ -2667,6 +2846,7 @@ impl Config {
                 .unwrap_or_default();
             let mut table = probe.clone();
             table.remove("api_keys");
+            flatten_hierarchy(&mut table)?;
             let mut cfg = Self::deserialize_with_defaults(&table)?;
             cfg.keys = legacy
                 .iter()
@@ -2692,7 +2872,10 @@ impl Config {
             // after an upgrade — while genuinely-unknown keys (typos)
             // still fail loud.
             let stripped = Self::strip_removed_knobs(raw)?;
-            toml::from_str(&stripped).map_err(|e| CoreError::Config(format!("parse: {e}")))?
+            let mut user_table =
+                toml::from_str(&stripped).map_err(|e| CoreError::Config(format!("parse: {e}")))?;
+            flatten_hierarchy(&mut user_table)?;
+            user_table
         };
         let cfg = Self::deserialize_with_defaults(&user_table)?;
         cfg.validate()?;
@@ -4453,6 +4636,97 @@ mod tests {
         assert!(cfg.adaptive_slots, "adaptive_slots must default ON");
         assert!(cfg.warmup);
         assert_eq!(cfg.raw_lane_max_tokens, 2048);
+    }
+
+    #[test]
+    fn unit__flatten_hierarchy__sections_parse_identical_to_flat() {
+        let nested = Config::from_toml(
+            "[gateway]\nhost = \"127.0.0.1\"\nport = 11500\n\n[resources]\ndefault_ctx = 4096\nmax_loaded_models = 3\n",
+        )
+        .expect("nested sections parse");
+        let flat = Config::from_toml(
+            "host = \"127.0.0.1\"\nport = 11500\ndefault_ctx = 4096\nmax_loaded_models = 3\n",
+        )
+        .expect("flat spelling parses");
+        assert_eq!(
+            nested.to_toml().expect("serialize"),
+            flat.to_toml().expect("serialize")
+        );
+    }
+
+    #[test]
+    fn unit__flatten_hierarchy__prefix_families_hoist() {
+        let nested = Config::from_toml(
+            "[speculative]\nspec_draft_p_min = 0.9\n\n[diffusion]\nsdcpp_max_vram = \"2048\"\n",
+        )
+        .expect("prefix-family sections parse");
+        let flat = Config::from_toml("spec_draft_p_min = 0.9\nsdcpp_max_vram = \"2048\"\n")
+            .expect("flat spelling parses");
+        assert_eq!(
+            nested.to_toml().expect("serialize"),
+            flat.to_toml().expect("serialize")
+        );
+    }
+
+    #[test]
+    fn unit__flatten_hierarchy__root_and_section_collision_refused() {
+        let err = Config::from_toml("port = 11500\n[gateway]\nport = 11501\n")
+            .expect_err("same key twice must refuse");
+        let err = err.to_string();
+        assert!(
+            err.contains("both at the root and inside [gateway]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__flatten_hierarchy__foreign_key_names_home_section() {
+        let err = Config::from_toml("[gateway]\ndefault_ctx = 4096\n")
+            .expect_err("foreign key in section must refuse");
+        let err = err.to_string();
+        assert!(err.contains("does not accept \"default_ctx\""), "{err}");
+        assert!(err.contains("(it belongs to [resources])"), "{err}");
+        assert!(err.contains("members: host, port"), "{err}");
+    }
+
+    #[test]
+    fn unit__flatten_hierarchy__empty_section_is_noop_and_unknown_sections_stay_loud() {
+        let emptied = Config::from_toml("[gateway]\n").expect("empty section hoists nothing");
+        assert_eq!(
+            emptied.to_toml().expect("serialize"),
+            Config::default().to_toml().expect("serialize")
+        );
+        // An unrecognized table is not ours to flatten: it keeps today's
+        // loud unknown-field failure, naming the offender.
+        let err = Config::from_toml("[not_a_section]\nfoo = 1\n")
+            .expect_err("unknown section stays a hard error");
+        assert!(err.to_string().contains("not_a_section"), "{err:#}");
+    }
+
+    #[test]
+    fn unit__flatten_hierarchy__section_members_are_real_config_keys() {
+        // Drift pin: every allowlisted member must be an actual Config
+        // field, so a renamed or removed field breaks this test instead of
+        // silently stranding its section entry. The defaults table cannot
+        // prove this (Option fields skip-serialize when None), so the
+        // deserializer itself is the oracle: a member that exists but
+        // takes a different type fails with a TYPE error, while a member
+        // that does not exist fails with "unknown field".
+        for (section, members) in SECTION_FIELDS {
+            for member in *members {
+                match Config::from_toml(&format!("{member} = 0\n")) {
+                    // The field exists and even accepted the zero — fine.
+                    Ok(_) => {}
+                    Err(err) => {
+                        let err = err.to_string();
+                        assert!(
+                            !err.contains("unknown field"),
+                            "[{section}] lists {member:?} but Config has no such field: {err}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
