@@ -1,1 +1,0 @@
---artifacts-dir bench-artifacts/20261006-matched-conc --engines b11429-cuda --providers direct blazar blazar-matched --conc-sweep 1,2,4,8 --conc-rounds 3 --skip-ppl --skip-greedy --skip-tools --skip-reshape --skip-features --skip-idle --skip-ctxcurve --skip-quality --skip-variants --skip-media --fresh

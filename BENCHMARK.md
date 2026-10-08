@@ -462,6 +462,23 @@ _These knobs crashed the engine child on this test bed; the crash signature is t
 - All GPU rows measured on AC power at bounded load; rows record load average and power state (battery runs are rejected by the harness).
 - Numbers are medians of 5 runs on one hybrid laptop; expect absolute shifts on other hardware, ratios to travel better.
 
+## Artifact policy
+
+The repo tracks the summary layer only: `bench-artifacts/INDEX.md`,
+per-campaign reports (`bench-artifacts/*/*.md`), and root receipt JSONs.
+Raw payloads (cells.jsonl, charts, media outputs, dumps) are gitignored;
+the full snapshot through 2026-10-07 lives on the
+[bench-archive-2026-10 release](https://github.com/santanu20/blazar/releases/tag/bench-archive-2026-10),
+and git history carries everything prior. Regenerate charts from a
+campaign's `cells.jsonl` with `python3 scripts/bench_charts.py`.
+
+Publish a new campaign's payload alongside its report:
+
+```bash
+tar -czf /tmp/bench-<campaign>.tar.gz -C bench-artifacts <campaign>/
+gh release upload bench-archive-2026-10 /tmp/bench-<campaign>.tar.gz --clobber --repo santanu20/blazar
+```
+
 ## Reproduce
 
 ```bash
