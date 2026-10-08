@@ -2858,6 +2858,9 @@ class Sandbox:
             elif k == "remotes":
                 for entry in v:
                     tables.append(("remotes", entry))
+            elif k == "mcp":
+                for entry in v:
+                    tables.append(("mcp", entry))
             elif isinstance(v, dict):
                 # Top-level container struct (e.g. [semantic_cache]):
                 # render as a TOML table section, never a quoted string.
@@ -2879,7 +2882,9 @@ class Sandbox:
         for name, tbl in tables:
             # "keys"/"remotes" are arrays-of-tables ([[keys]]/[[remotes]]);
             # everything else a plain table.
-            header = f"[[{name}]]" if name in ("keys", "remotes") else f"[{name}]"
+            header = (
+                f"[[{name}]]" if name in ("keys", "remotes", "mcp") else f"[{name}]"
+            )
             body += f"\n{header}\n"
             for k, v in tbl.items():
                 if isinstance(v, bool):
@@ -9119,6 +9124,180 @@ def _hf_smallest_mmproj(repo: str) -> tuple[str, int]:
     return fname, int(size)
 
 
+def phase_evidence() -> None:
+    print("\n== phase evidence: error catalog, passports, labels, hard gates ==")
+    d = DAEMON
+    d.start({"port": PORT})
+
+    # -- error-code catalog surface ---------------------------------------
+    status, _hdrs, body = http("GET", "/api/errors")
+    cat: dict = {}
+    try:
+        cat = json.loads(body)
+    except Exception:
+        cat = {}
+    codes = cat.get("codes", []) if isinstance(cat, dict) else []
+    mn = next((c for c in codes if c.get("code") == "MODEL_NOT_FOUND"), {})
+    check(
+        "evidence",
+        "errors-catalog",
+        status == 200
+        and isinstance(cat.get("catalog_version"), int)
+        and cat.get("catalog_version", 0) >= 1
+        and len(codes) >= 25
+        and isinstance(mn.get("http"), int)
+        and bool(mn.get("description"))
+        and bool(mn.get("remediation")),
+        f"{status} catalog_version={cat.get('catalog_version')} codes={len(codes)}",
+    )
+
+    st, _h, b = http("POST", "/v1/chat/completions", {"model": "no-such-model-xyz"})
+    err: dict = {}
+    try:
+        err = json.loads(b).get("error", {})
+    except Exception:
+        err = {}
+    check(
+        "evidence",
+        "blazar-code-unknown-model",
+        st == 404
+        and err.get("blazar_code") == "MODEL_NOT_FOUND"
+        and err.get("code") == 404,
+        f"{st} blazar_code={err.get('blazar_code')}",
+    )
+
+    st, _h, b = http("POST", "/api/chat", {"model": "no-such-model-xyz"})
+    check(
+        "evidence",
+        "ollama-dialect-purity",
+        st == 404 and b"blazar_code" not in b,
+        f"{st} ollama lane carries no blazar_code",
+    )
+
+    st, _h, b = http("GET", "/api/version", headers={"Host": "evil.example.com"})
+    check(
+        "evidence",
+        "host-guard",
+        st == 403 and b"HOST_FORBIDDEN" in b,
+        f"{st} host guard teaching body",
+    )
+
+    # -- evidence CLI surfaces (certify / plan / scorecard) ----------------
+    p = cli("certify", MODEL, "--json", timeout=360)
+    passport: dict = {}
+    try:
+        passport = json.loads(p.stdout)
+    except Exception:
+        passport = {}
+    ver = passport.get("verification", {}) if isinstance(passport, dict) else {}
+    check(
+        "evidence",
+        "certify-passport-json",
+        p.returncode == 0
+        and passport.get("object") == "blazar.passport"
+        and passport.get("schema_version") == 1
+        and bool(ver.get("blazar_version")),
+        f"rc{p.returncode} schema={passport.get('schema_version')}",
+    )
+
+    p = cli("plan", MODEL, "--json", timeout=120)
+    plan: dict = {}
+    try:
+        plan = json.loads(p.stdout)
+    except Exception:
+        plan = {}
+    legend = plan.get("evidence_legend", {}) if isinstance(plan, dict) else {}
+    check(
+        "evidence",
+        "plan-evidence-labels",
+        p.returncode == 0
+        and "decision_evidence" in plan
+        and isinstance(legend, dict)
+        and len(legend) == 5
+        and "predicted" in plan,
+        f"rc{p.returncode} legend={len(legend)} (predicted key is additive, null when measured)",
+    )
+
+    p = cli("scorecard", MODEL, "--json", timeout=120)
+    card: dict = {}
+    try:
+        card = json.loads(p.stdout)
+    except Exception:
+        card = {}
+    vec = card.get("execution_score", {}) if isinstance(card, dict) else {}
+    check(
+        "evidence",
+        "scorecard-execution-vector",
+        p.returncode == 0
+        and isinstance(vec, dict)
+        and "decode_t_per_s" in vec
+        and "capability" in vec
+        and "score" not in vec
+        and "total" not in vec,
+        f"rc{p.returncode} vector axes present, no scalar",
+    )
+
+    # -- hard gates: sandbox + ladder refusals, hierarchy boot -------------
+    d.stop()
+    try:
+        d.start(
+            {
+                "port": PORT,
+                "mcp": [{"name": "r", "url": "http://127.0.0.1:9", "env_clear": True}],
+            }
+        )
+        refused = ""
+    except RuntimeError as e:
+        refused = str(e)
+    check(
+        "evidence",
+        "mcp-sandbox-stdio-only-refusal",
+        "stdio-only" in refused,
+        refused.strip().splitlines()[-1][:160]
+        if refused.strip()
+        else "booted (NOT refused)",
+    )
+
+    try:
+        d.start(
+            {
+                "port": PORT,
+                "remotes": [{"name": "p", "url": "http://8.8.8.8:443", "key": "k"}],
+            }
+        )
+        ladder = ""
+    except RuntimeError as e:
+        ladder = str(e)
+    check(
+        "evidence",
+        "tls-ladder-public-http-refusal",
+        ("cleartext" in ladder or "non-private" in ladder)
+        and "allow_insecure_http" in ladder,
+        ladder.strip().splitlines()[-1][:160]
+        if ladder.strip()
+        else "booted (NOT refused)",
+    )
+
+    d.start(
+        {
+            # Root `port` is injected by Daemon.start (setdefault); the
+            # [gateway] section must not repeat it — the collision rule
+            # refuses both spellings, so prove hierarchy with section-only
+            # keys (host here, default_ctx under [resources]).
+            "gateway": {"host": "127.0.0.1"},
+            "resources": {"default_ctx": 2048},
+        }
+    )
+    st, _h, b = http("GET", "/api/version")
+    check(
+        "evidence",
+        "config-hierarchy-nested-boot",
+        st == 200,
+        f"daemon booted from [gateway]/[resources] sections, /api/version {st}",
+    )
+    d.stop()
+
+
 def phase_commands() -> None:
     print("\n== phase commands: every CLI path, real (no-mock) ==")
     # The user's real store may hold a partial/local engine active; pin a
@@ -13416,6 +13595,7 @@ def main() -> int:
         ("auth", phase_auth),
         ("wave", phase_wave),
         ("commands", phase_commands),
+        ("evidence", phase_evidence),
         ("realuser", phase_realuser),
         ("knobs_argv", phase_knobs_argv),
         ("knobs_behavior", phase_knobs_behavior),
