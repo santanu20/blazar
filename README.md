@@ -248,7 +248,7 @@ A SQLite ledger survives restarts: durable jobs (events/cancel/artifacts, `aband
 
 ### Federation
 
-Peers publish `/api/capacity`; picks prefer warm models, then queue wait, then free VRAM. `warm`, `replicate`, `route` manage placement; non-Blazar remotes degrade to pass-through peers. → [`7.SETUP.md`](docs/7.SETUP.md)
+Strictly opt-in: without `[[remotes]]`, nothing leaves the machine. Peers publish `/api/capacity`; picks prefer warm models, then queue wait, then free VRAM. `warm`, `replicate`, `route` manage placement; non-Blazar remotes degrade to pass-through peers. → [`7.SETUP.md`](docs/7.SETUP.md)
 
 ### Advanced orchestration
 
