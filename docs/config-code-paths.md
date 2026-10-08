@@ -315,7 +315,7 @@ token quality are surfaced as drift.
 | lora_backend | — | engine-argv + cli | `blazar-core/src/profile.rs:4227` in `compile_sglang`; `blazar-core/src/profile.rs:4231` in `compile_sglang`; `blazar-cli/src/main.rs:9115` in `knob_hint_block` |
 
 | is_embedding | — | engine-argv | `crates/blazar-core/src/profile.rs:4290` in `compile_sglang` (Some(true) → embedding-lane argv posture + teaching at `:4300`) |
-## ModelOverride ([models."name"]) — 37 fields, 0 dead
+## ModelOverride ([models."name"]) — 38 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|

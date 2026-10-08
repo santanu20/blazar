@@ -203,7 +203,7 @@ async fn recv_rsp(
     Ok(body)
 }
 
-/// Real-wire b11429 worker double, shared by the rpc_fleet and
+/// Real-wire b11429 worker double, shared by the `rpc_fleet` and
 /// supervisor test suites so every fleet-aware decision is pinned
 /// against the actual protocol, not a mock of it (H7). Binds an
 /// ephemeral loopback port; answers the three commands this crate
