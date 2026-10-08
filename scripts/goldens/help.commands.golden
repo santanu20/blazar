@@ -33,6 +33,7 @@ quantize
 replicate
 rm
 route
+rpc
 run
 scorecard
 search

@@ -79,7 +79,7 @@ pub(crate) fn with_spawn_retry<T>(
 /// supervisor's graceful terminate lane, same net the doc above
 /// describes for Windows.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn parent_death_tie(_cmd: &mut Command) {}
+pub fn parent_death_tie(_cmd: &mut Command) {}
 
 /// Tie a spawned child's lifetime to the spawning PROCESS: when the
 /// parent dies for any reason — crash, SIGKILL, terminal close, runtime
@@ -101,7 +101,7 @@ pub(crate) fn parent_death_tie(_cmd: &mut Command) {}
 /// neither symbol on macOS); other platforms compile the no-op above.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)] // one prctl flag arm + one ppid read in the forked child
-pub(crate) fn parent_death_tie(cmd: &mut Command) {
+pub fn parent_death_tie(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
     let parent = std::process::id();
     // SAFETY: closure body is async-signal-safe (prctl + _exit only);

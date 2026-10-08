@@ -807,6 +807,48 @@ fn plan_auto_tensor_split(
     )
 }
 
+/// Reachable remote-VRAM pool for one spawn's fit verdicts. Device
+/// TOTALS (not free) feed the admission denominator — remote
+/// residents (other clients sharing the worker) are invisible from
+/// here, and the upstream engine re-judges placement against live
+/// free memory at load time, owning that failure window. `skipped`
+/// carries endpoint-prefixed reasons for warn logs; the spawn-time
+/// TCP preflight owns the loud refusal for a fleet the child cannot
+/// actually join.
+#[derive(Debug, Default)]
+struct RpcFleetPool {
+    budget_bytes: u64,
+    free_bytes: u64,
+    reachable_workers: usize,
+    skipped: Vec<String>,
+}
+
+/// Query every endpoint CONCURRENTLY (one dead worker costs one
+/// connect timeout, not N) and aggregate the devices that answered
+/// over the same wire client `blazar rpc status` uses.
+async fn query_rpc_fleet_pool(endpoints: &[String]) -> RpcFleetPool {
+    let answered = futures::future::join_all(
+        endpoints
+            .iter()
+            .map(|ep| async move { crate::rpc_fleet::query_worker(ep).await }),
+    )
+    .await;
+    let mut pool = RpcFleetPool::default();
+    for result in answered {
+        match result {
+            Ok(info) => {
+                pool.reachable_workers += 1;
+                for dev in &info.devices {
+                    pool.budget_bytes = pool.budget_bytes.saturating_add(dev.total_bytes);
+                    pool.free_bytes = pool.free_bytes.saturating_add(dev.free_bytes);
+                }
+            }
+            Err(why) => pool.skipped.push(why),
+        }
+    }
+    pool
+}
+
 /// Demand-shard plan for the sglang lane: tensor-parallel rank count the
 /// supervisor may emit when weights+KV exceed every single card but fit
 /// the cards per-rank. Input is the per-card capacity list the caller
@@ -2144,11 +2186,49 @@ impl Supervisor {
         best
     }
 
+    /// Refuse-fast verdict for a blocked spawn: `Some(cap)` when no
+    /// arrangement of the box can EVER hold this floor — waiting or
+    /// evicting cannot change it, so the caller refuses with numbers
+    /// instead of queueing a request that can only time out. Sharded
+    /// spawns AND rpc-fleet spawns judge the summed pool (local
+    /// candidates + reachable remote totals): neither lands on a
+    /// single card, so the largest-card question would mis-teach.
+    /// `None` = queueable pressure, or a pool that cannot be judged
+    /// (fail open; the spawn-time probe owns that refuse).
+    fn impossible_floor(
+        &self,
+        name: &str,
+        incoming_bytes: u64,
+        spanning: bool,
+        rpc_budget_bytes: u64,
+    ) -> Option<u64> {
+        if !spanning && rpc_budget_bytes == 0 {
+            return self.largest_card_budget(name, incoming_bytes);
+        }
+        let combined: Option<u64> = self
+            .admission_candidates(name)
+            .iter()
+            .map(|c| self.device_budget_bytes(c))
+            .try_fold(0u64, |acc, b| b.map(|v| acc.saturating_add(v)))
+            .map(|local| local.saturating_add(rpc_budget_bytes))
+            .filter(|sum| *sum > 0);
+        combined.filter(|sum| incoming_bytes > *sum)
+    }
+
     /// `spanning` = the spawn will SHARD across cards (sglang manual
     /// `tp_size > 1`, a plannable auto TP, or an llamacpp tensor split):
     /// per-card fit is then the wrong question (no single card ever holds
-    /// the whole floor), so only the aggregate belt may block it.
-    fn admission_blocked(&self, name: &str, incoming_bytes: u64, spanning: bool) -> bool {
+    /// the whole floor), so only the aggregate belt may block it. An
+    /// `rpc_budget_bytes > 0` fleet spawn is the same shape — the child
+    /// places across local+remote devices — so it judges the summed
+    /// local+remote pool too.
+    fn admission_blocked(
+        &self,
+        name: &str,
+        incoming_bytes: u64,
+        spanning: bool,
+        rpc_budget_bytes: u64,
+    ) -> bool {
         if self
             .instance_cap()
             .is_some_and(|cap| self.instances.len() >= cap)
@@ -2158,15 +2238,25 @@ impl Supervisor {
         if !self.bytes_admission_active() || self.instances.is_empty() {
             return false;
         }
+        let fleet_budget = self.vram_budget_bytes().saturating_add(rpc_budget_bytes);
         if spanning {
             // Sharded spawn: judge the summed pool only — mirroring the
             // candidates-empty formula (per-card admission would refuse
             // a load the shard plan can actually place).
-            return self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
+            return self.resident_bytes().saturating_add(incoming_bytes) > fleet_budget;
+        }
+        if rpc_budget_bytes > 0 {
+            // RPC-fleet spawn: upstream distributes the child across
+            // local+remote devices by its own free-memory ordering, so
+            // the per-card question is as wrong as it is for sharding —
+            // judge the summed pool instead. Local residents count
+            // against it; remote residents are invisible (documented
+            // crudeness, conservative in the local direction).
+            return self.resident_bytes().saturating_add(incoming_bytes) > fleet_budget;
         }
         let candidates = self.admission_candidates(name);
         if candidates.is_empty() {
-            return self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
+            return self.resident_bytes().saturating_add(incoming_bytes) > fleet_budget;
         }
         // A card missing from the census cannot be judged — fail open on
         // it (J3 owns the honest spawn-time refusal), never strand the
@@ -2179,8 +2269,35 @@ impl Supervisor {
             .iter()
             .any(|c| self.device_budget_bytes(c).is_none());
         let aggregate_exceeded = self.unplaced_gpu_bytes() > 0
-            && self.resident_bytes().saturating_add(incoming_bytes) > self.vram_budget_bytes();
+            && self.resident_bytes().saturating_add(incoming_bytes) > fleet_budget;
         !any_card_fits || aggregate_exceeded
+    }
+
+    /// Last-resort auto tensor-split decision (#28c): fire only when
+    /// EVERY manual pin is unset (`tensor_split` / `devices` /
+    /// non-default `main_gpu`) and the measured pool says weights+KV
+    /// fit ONLY when spread. RPC exclusion: split ratios map
+    /// POSITIONALLY onto the
+    /// child's device order and remote RPC devices register BEFORE
+    /// local cards (live-verified at engine b11429) — local-only
+    /// ratios would land on the wrong devices, so with `rpc_servers`
+    /// configured the upstream engine's own free-memory distribution
+    /// owns placement and Blazar emits no ratios at all.
+    fn auto_split_plan(
+        &self,
+        name: &str,
+        model_bytes_mib: u64,
+        candidate_kv_mib: u64,
+        hw: &blazar_core::Hardware,
+        rpc_configured: bool,
+    ) -> Option<String> {
+        let split_pinned = !self.config.effective_tensor_split(name).is_empty()
+            || !self.config.effective_devices(name).is_empty()
+            || self.config.main_gpu != blazar_core::Config::default().main_gpu;
+        if split_pinned || rpc_configured || !self.hardware.has_gpu() {
+            return None;
+        }
+        plan_auto_tensor_split(&hw.gpus, model_bytes_mib, candidate_kv_mib)
     }
 
     /// Session-pin window (R3); zero = feature off.
@@ -3841,9 +3958,9 @@ impl Supervisor {
             None
         };
         let manual_split_spanning = !sglang_lane
-            && (!self.config.tensor_split.is_empty()
+            && (!self.config.effective_tensor_split(name).is_empty()
                 || self.config.effective_devices(name).len() > 1);
-        let parallel_pins_unset = self.config.tensor_split.is_empty()
+        let parallel_pins_unset = self.config.effective_tensor_split(name).is_empty()
             && self.config.effective_devices(name).is_empty()
             && self.config.main_gpu == blazar_core::Config::default().main_gpu
             && !tun_probe.parallel_pinned();
@@ -3910,8 +4027,40 @@ impl Supervisor {
             lane_allows_vk,
             argv_device_free,
         );
+        // RPC fleet pool (llamacpp lane, `rpc_servers` configured): the
+        // child's placement pool extends beyond the local census, so the
+        // fit verdicts below must judge the whole pool. Upstream
+        // distributes across local+remote devices by its own free-memory
+        // ordering — RPC devices register FIRST in the tensor-split
+        // mapping (live-verified at engine b11429) — so Blazar judges
+        // FIT but never emits cross-fleet split ratios. Queried once
+        // per spawn attempt, concurrently; a worker unreachable here is
+        // skipped with a warn (its VRAM simply doesn't count) — the
+        // spawn preflight owns the loud refusal if it is still down
+        // when the child launches.
+        let rpc_configured = engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp
+            && !self.config.effective_rpc_servers(name).is_empty();
+        let rpc_pool = if rpc_configured {
+            let targets: Vec<String> = self
+                .config
+                .effective_rpc_servers(name)
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            query_rpc_fleet_pool(&targets).await
+        } else {
+            RpcFleetPool::default()
+        };
+        for why in &rpc_pool.skipped {
+            tracing::warn!(
+                model = name,
+                worker = %why,
+                "rpc worker unreachable at spawn planning — its VRAM is not counted"
+            );
+        }
         loop {
-            if !self.admission_blocked(name, incoming_bytes, spanning) {
+            if !self.admission_blocked(name, incoming_bytes, spanning, rpc_pool.budget_bytes) {
                 break;
             }
             match self.blocked_action(key, captive) {
@@ -3930,22 +4079,19 @@ impl Supervisor {
                     // than every card is physically unschedulable — no
                     // queue wait can ever change it, so refuse fast with
                     // numbers. Genuinely-evictable pressure keeps the
-                    // queueable AllSlotsBusy. A SHARDING spawn judges the
-                    // summed pool instead: refuse fast only when even the
-                    // combined cards cannot hold it empty.
+                    // queueable AllSlotsBusy. A SHARDING or RPC-FLEET
+                    // spawn judges the summed pool instead: refuse fast
+                    // only when even the combined cards cannot hold it
+                    // empty.
                     #[allow(clippy::cast_precision_loss)] // display-only GiB rounding
                     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-                    let impossible = if spanning {
-                        let combined: Option<u64> = self
-                            .admission_candidates(name)
-                            .iter()
-                            .map(|c| self.device_budget_bytes(c))
-                            .try_fold(0u64, |acc, b| b.map(|v| acc.saturating_add(v)))
-                            .filter(|sum| *sum > 0);
-                        combined.filter(|sum| incoming_bytes > *sum)
-                    } else {
-                        self.largest_card_budget(name, incoming_bytes)
-                    };
+                    let fleet_spanning = spanning || rpc_pool.budget_bytes > 0;
+                    let impossible = self.impossible_floor(
+                        name,
+                        incoming_bytes,
+                        spanning,
+                        rpc_pool.budget_bytes,
+                    );
                     if let Some(cap) = impossible {
                         let per_rank_note = spanning_ranks.map(|n| {
                             #[allow(clippy::cast_precision_loss)]
@@ -3958,8 +4104,16 @@ impl Supervisor {
                              this. Use a smaller quant (`blazar fit`), lower the ctx/slots, \
                              or serve on a larger card",
                             gib(incoming_bytes),
-                            if spanning {
-                                format!("every GPU budget combined ({:.1} GiB)", gib(cap))
+                            if fleet_spanning {
+                                format!(
+                                    "every GPU budget combined ({:.1} GiB{})",
+                                    gib(cap),
+                                    if rpc_pool.budget_bytes > 0 {
+                                        " incl. the rpc fleet"
+                                    } else {
+                                        ""
+                                    }
+                                )
                             } else {
                                 format!("every GPU budget (largest card {:.1} GiB)", gib(cap))
                             },
@@ -4010,11 +4164,19 @@ impl Supervisor {
         // alone exceed free VRAM — the child will either spill layers to
         // CPU (slow) or die mid-load. Teaching warn only: partial offload
         // is legitimate, probe failure is skipped, never blocks a spawn.
+        // Free VRAM counts the reachable rpc fleet too: a model that
+        // fits only with remote workers is the intended configuration,
+        // not a spill.
         if let Some(f) = &fresh
             && self.config.spawn_mem_guard
             && self.hardware.has_gpu()
         {
-            let free_vram: u64 = f.gpus.iter().map(|g| g.free_mib).sum();
+            let free_vram: u64 = f
+                .gpus
+                .iter()
+                .map(|g| g.free_mib)
+                .sum::<u64>()
+                .saturating_add(rpc_pool.free_bytes / (1024 * 1024));
             let weights_mib = model_bytes / (1024 * 1024);
             if free_vram > 0 && weights_mib > free_vram * 95 / 100 {
                 tracing::warn!(
@@ -4132,24 +4294,21 @@ impl Supervisor {
             blazar_core::profile::estimate_kv_vram_charge(&probe, tuning.ctx)
                 .map_or(0, |b| b / (1024 * 1024))
         };
-        // Last-resort auto tensor-split (#28c): only when EVERY manual
-        // pin is unset (tensor_split / devices / non-default main_gpu)
-        // and the measured pool says weights+KV fit ONLY when spread.
-        let split_pinned = !self.config.tensor_split.is_empty()
-            || !self.config.effective_devices(name).is_empty()
-            || self.config.main_gpu != blazar_core::Config::default().main_gpu;
-        if !split_pinned && self.hardware.has_gpu() {
-            let hw = fresh.as_ref().unwrap_or(&self.hardware);
-            if let Some(ratios) =
-                plan_auto_tensor_split(&hw.gpus, model_bytes / (1024 * 1024), candidate_kv_mib)
-            {
-                tracing::info!(
-                    model = name,
-                    ratios = %ratios,
-                    "auto tensor-split: weights+KV exceed the best single card's free VRAM but fit the discrete cards combined (manual pins unset; split trades inter-card bandwidth for capacity)"
-                );
-                auto_split = Some(ratios);
-            }
+        // Last-resort auto tensor-split (#28c): the decision fn carries
+        // the full gate contract (manual pins, rpc exclusion).
+        if let Some(ratios) = self.auto_split_plan(
+            name,
+            model_bytes / (1024 * 1024),
+            candidate_kv_mib,
+            fresh.as_ref().unwrap_or(&self.hardware),
+            rpc_configured,
+        ) {
+            tracing::info!(
+                model = name,
+                ratios = %ratios,
+                "auto tensor-split: weights+KV exceed the best single card's free VRAM but fit the discrete cards combined (manual pins unset; split trades inter-card bandwidth for capacity)"
+            );
+            auto_split = Some(ratios);
         }
         // Auto tensor-parallelism (sglang): same last-resort posture —
         // every manual parallel pin unset, and the MEASURED pool says
@@ -7812,6 +7971,20 @@ mod routing_tests {
     /// GPU supervisor with one 8188 MiB card — the 2026-09-11 crash box
     /// shape (`NVRM NO_MEMORY` storm from a weights-only admission).
     fn gpu_sup() -> (Supervisor, tempfile::TempDir) {
+        gpu_sup_with(
+            vec![GpuInfo {
+                name: "g".into(),
+                description: "S".into(),
+                total_mib: 8_188,
+                free_mib: 8_188,
+            }],
+            Config::default(),
+        )
+    }
+
+    /// `gpu_sup` with a caller-supplied census and config — the rpc
+    /// fleet pool tests need multi-card boxes and `rpc_servers` set.
+    fn gpu_sup_with(gpus: Vec<GpuInfo>, config: Config) -> (Supervisor, tempfile::TempDir) {
         let bus = EventBus::default();
         let root = tempfile::TempDir::new().unwrap();
         let dirs = BlazarDirs {
@@ -7821,17 +7994,12 @@ mod routing_tests {
         std::fs::create_dir_all(&dirs.config_dir).unwrap();
         let sup = Supervisor::new(
             dirs,
-            Config::default(),
+            config,
             bus,
             Hardware {
                 physical_cores: 1,
                 total_ram_mib: 16_000,
-                gpus: vec![GpuInfo {
-                    name: "g".into(),
-                    description: "S".into(),
-                    total_mib: 8_188,
-                    free_mib: 8_188,
-                }],
+                gpus,
             },
             Arc::new(FakeEngine(Manifest {
                 tag: "fake".into(),
@@ -8256,7 +8424,7 @@ mod routing_tests {
         sup.instances.insert("big".to_string(), big);
         let floor = blazar_core::profile::admission_floor_bytes(500 * 1024 * 1024, 0);
         assert!(
-            sup.admission_blocked("other", floor, false),
+            sup.admission_blocked("other", floor, false, 0),
             "precondition: the small model does not fit alongside big"
         );
         assert_eq!(
@@ -8281,11 +8449,11 @@ mod routing_tests {
         let (sup, _root) = gpu_sup();
         let floor = blazar_core::profile::admission_floor_bytes(8_000 * 1024 * 1024, 0);
         // Empty GPU box: any single model admits (J3 owns honest refusal).
-        assert!(!sup.admission_blocked("big", floor, false));
+        assert!(!sup.admission_blocked("big", floor, false, 0));
         // Occupied and over budget: blocked.
         let (big, _pid) = gpu_instance("big", 5_800 * 1024 * 1024, 6_000);
         sup.instances.insert("big".to_string(), big);
-        assert!(sup.admission_blocked("other", floor, false));
+        assert!(sup.admission_blocked("other", floor, false, 0));
         // Occupied but within budget: not blocked. The tiny floor
         // carries the fixed KV (512 MiB) + spawn overhead (700 MiB)
         // charge, so "fits" means weights + 1212 MiB under headroom.
@@ -8295,7 +8463,143 @@ mod routing_tests {
             (50 + 512 + 700) * 1024 * 1024,
             "floor arithmetic this test relies on"
         );
-        assert!(!sup.admission_blocked("other", tiny_floor, false));
+        assert!(!sup.admission_blocked("other", tiny_floor, false, 0));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__admission_blocked__rpc_fleet_pool_widens_the_belt() {
+        let (sup, _root) = gpu_sup();
+        let (big, pid) = gpu_instance("big", 5_800 * 1024 * 1024, 6_000);
+        sup.instances.insert("big".to_string(), big);
+        let floor = blazar_core::profile::admission_floor_bytes(4_000 * 1024 * 1024, 0);
+        assert!(
+            sup.admission_blocked("other", floor, false, 0),
+            "local-only: resident 6000 MiB + 5212 MiB floor exceeds the 8188 MiB card"
+        );
+        let fleet = 16_384 * 1024 * 1024;
+        assert!(
+            !sup.admission_blocked("other", floor, false, fleet),
+            "same pressure with a 16 GiB remote worker: the fleet pool admits it"
+        );
+        let huge = blazar_core::profile::admission_floor_bytes(24_000 * 1024 * 1024, 0);
+        assert!(
+            sup.admission_blocked("other", huge, false, fleet),
+            "floor beyond even the fleet sum stays blocked (honest ceiling)"
+        );
+        let _ = pid;
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__impossible_floor__rpc_fleet_extends_the_combined_denominator() {
+        let (sup, _root) = gpu_sup();
+        let mib = |m: u64| m * 1024 * 1024;
+        // 6000 MiB weights -> 7212 MiB floor: fits the 8188 MiB card
+        // empty, so never impossible.
+        let fits = blazar_core::profile::admission_floor_bytes(6_000 * 1024 * 1024, 0);
+        assert_eq!(sup.impossible_floor("other", fits, false, 0), None);
+        // 9000 MiB weights -> 10212 MiB floor: beyond the local card.
+        let over_local = blazar_core::profile::admission_floor_bytes(9_000 * 1024 * 1024, 0);
+        assert_eq!(
+            sup.impossible_floor("other", over_local, false, 0),
+            Some(mib(8_188)),
+            "local-only non-spanning keeps the largest-card verdict"
+        );
+        let remote = mib(4_096);
+        assert_eq!(
+            sup.impossible_floor("other", over_local, false, remote),
+            None,
+            "fleet pool (8188 local + 4096 remote) holds it: queueable, not impossible"
+        );
+        let giant = blazar_core::profile::admission_floor_bytes(24_000 * 1024 * 1024, 0);
+        assert_eq!(
+            sup.impossible_floor("other", giant, false, remote),
+            Some(mib(8_188) + remote),
+            "the refusal cap reports the fleet sum"
+        );
+        // Spanning regression pin (rpc 0): the combined-candidates math
+        // is byte-identical to the pre-extraction refuse arm.
+        assert_eq!(
+            sup.impossible_floor("other", giant, true, 0),
+            Some(mib(8_188))
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__auto_split_plan__rpc_fleet_configured_suppresses_ratio_emission() {
+        let gpus = vec![
+            GpuInfo {
+                name: "a".into(),
+                description: "A".into(),
+                total_mib: 8_188,
+                free_mib: 5_000,
+            },
+            GpuInfo {
+                name: "b".into(),
+                description: "B".into(),
+                total_mib: 3_996,
+                free_mib: 3_000,
+            },
+        ];
+        let (sup, _root) = gpu_sup_with(gpus.clone(), Config::default());
+        let hw = Hardware {
+            physical_cores: 1,
+            total_ram_mib: 16_000,
+            gpus,
+        };
+        // 7000 MiB weights + 500 MiB KV: over the best single free card
+        // (5000), within the combined pool (8000) — a local box splits.
+        assert_eq!(
+            sup.auto_split_plan("m", 7_000, 500, &hw, false),
+            Some("1,1".to_string()),
+            "no-rpc box keeps the last-resort local split"
+        );
+        // Same box with the rpc fleet configured: split ratios map
+        // POSITIONALLY onto an RPC-FIRST device order upstream, so
+        // local-only ratios would land on the wrong devices —
+        // suppressed; the engine's own distribution owns placement.
+        assert_eq!(
+            sup.auto_split_plan("m", 7_000, 500, &hw, true),
+            None,
+            "rpc fleet configured: no local-only ratio emission"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__query_rpc_fleet_pool__aggregates_reachable_workers_and_skips_dead() {
+        use crate::rpc_fleet::test_support::{FakeBehavior, spawn_fake};
+        let live = spawn_fake(7, 0, 0, vec![(6 << 20, 8 << 20)], FakeBehavior::Normal).await;
+        // A port that answers nothing: bind, note, drop.
+        let dead_port = {
+            let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let pool =
+            query_rpc_fleet_pool(&[live.endpoint.clone(), format!("127.0.0.1:{dead_port}")]).await;
+        assert_eq!(pool.reachable_workers, 1);
+        assert_eq!(
+            pool.budget_bytes,
+            8 << 20,
+            "device totals feed the denominator"
+        );
+        assert_eq!(pool.free_bytes, 6 << 20, "device free feeds the J3 warn");
+        assert_eq!(
+            pool.skipped.len(),
+            1,
+            "dead endpoint is skipped, not fatal: {pool:?}"
+        );
+        assert!(
+            pool.skipped[0].contains("unreachable"),
+            "{}",
+            pool.skipped[0]
+        );
     }
 
     /// Two-card fake box whose descriptions differ from the census ids —
@@ -8406,7 +8710,7 @@ mod routing_tests {
         sup.instances.insert("big0".to_string(), big0);
         // One card loaded: a 5000 MiB floor still fits the EMPTY card —
         // per-device and the old aggregate pool agree here.
-        assert!(!sup.admission_blocked("other", mib(5_000), false));
+        assert!(!sup.admission_blocked("other", mib(5_000), false, 0));
         let (big1, _p1) = placed_gpu_instance(
             "big1",
             mib(100).cast_signed(),
@@ -8419,7 +8723,7 @@ mod routing_tests {
         // even though the summed pool (12_000 resident + 3000 floor <=
         // 16_376) still says room — the exact one-card collision the
         // aggregate admission used to wave through.
-        assert!(sup.admission_blocked("other", mib(3_000), false));
+        assert!(sup.admission_blocked("other", mib(3_000), false, 0));
     }
 
     #[tokio::test]
@@ -8455,7 +8759,7 @@ mod routing_tests {
             "NVIDIA GeForce RTX 4070",
         );
         sup.instances.insert("big0".to_string(), big0);
-        assert!(sup.admission_blocked("other", mib(9_000), false));
+        assert!(sup.admission_blocked("other", mib(9_000), false, 0));
         assert!(sup.largest_card_budget("other", mib(9_000)).is_some());
     }
 
@@ -8659,13 +8963,13 @@ mod routing_tests {
         sup.instances.insert("big0".to_string(), big0);
         // Single-rank: a 9000 MiB floor fits neither card next to the
         // resident — blocked (per-card question, as before).
-        assert!(sup.admission_blocked("other", mib(9_000), false));
+        assert!(sup.admission_blocked("other", mib(9_000), false, 0));
         // Sharding spawn: per-card fit is the wrong question; the summed
         // pool (6000 resident + 9000 incoming = 15000 <= 16376) holds.
-        assert!(!sup.admission_blocked("other", mib(9_000), true));
+        assert!(!sup.admission_blocked("other", mib(9_000), true, 0));
         // ...but the aggregate belt still catches a floor that crosses
         // the summed pool even with the resident evicted later.
-        assert!(sup.admission_blocked("other", mib(12_000), true));
+        assert!(sup.admission_blocked("other", mib(12_000), true, 0));
     }
 
     #[tokio::test]
@@ -8727,17 +9031,17 @@ mod routing_tests {
         sup.instances.insert("b".to_string(), b);
         // GPU0 6000+3000 over; GPU1 5000+3000 = 8000 <= 8188 → fits; the
         // only fitting card is GPU1.
-        assert!(!sup.admission_blocked("other", mib(3_000), false));
+        assert!(!sup.admission_blocked("other", mib(3_000), false, 0));
         // A concurrent spawn holds GPU1's remaining headroom for its
         // pick→insert window (the settling child is not yet a counted
         // resident): 5000 + 200 reserved + 3000 floor > 8188 → the next
         // admission must see the collision the resident sum alone misses.
         let r = sup.reserve_device("GPU1", mib(200));
-        assert!(sup.admission_blocked("other", mib(3_000), false));
+        assert!(sup.admission_blocked("other", mib(3_000), false, 0));
         // Releasing the reservation reopens the card — Drop is the only
         // release path, so the guard's lifetime IS the spawn window.
         drop(r);
-        assert!(!sup.admission_blocked("other", mib(3_000), false));
+        assert!(!sup.admission_blocked("other", mib(3_000), false, 0));
     }
 
     #[tokio::test]

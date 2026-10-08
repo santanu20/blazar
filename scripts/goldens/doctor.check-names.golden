@@ -17,6 +17,7 @@ model types
 models
 port
 routing
+rpc fleet
 sentinel
 sglang fit
 store

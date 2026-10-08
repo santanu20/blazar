@@ -733,10 +733,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             ));
         }
     }
-    if !config.tensor_split.is_empty() {
+    let tensor_split = config.effective_tensor_split(input.model_name);
+    if !tensor_split.is_empty() {
         if input.supported_flags.contains("--tensor-split") {
             argv.push("--tensor-split".into());
-            argv.push(config.tensor_split.clone());
+            argv.push(tensor_split.to_string());
         } else {
             warnings.push(format!(
                 "tensor_split set but engine {} lacks --tensor-split; run: blazar engine update",
@@ -6928,6 +6929,7 @@ mod tests {
         spm_infill: None,
         late_chunking: None,
         rpc_servers: None,
+        tensor_split: None,
         deterministic: None,
         mmproj: None,
         sglang: None,
@@ -9764,6 +9766,57 @@ mod tests {
             p.argv
                 .windows(2)
                 .any(|w| w[0] == "--lora-scaled" && w[1] == "/loras/b.bin:0.5")
+        );
+    }
+
+    #[test]
+    fn unit__tensor_split__per_model_override_replaces_global_and_empty_inherits() {
+        // C6: a non-empty per-model tensor_split replaces the global
+        // ratios; an empty/absent overlay inherits them untouched.
+        let cfg = Config {
+            tensor_split: "1,1".into(),
+            model_overrides: std::collections::BTreeMap::from([(
+                "qwen3-8b".to_string(),
+                ModelOverride {
+                    tensor_split: Some("3,1".into()),
+                    ..ModelOverride::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tensor-split" && w[1] == "3,1")
+        );
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tensor-split" && w[1] == "1,1")
+        );
+
+        // Overlay present but empty -> global inherited.
+        let cfg = Config {
+            tensor_split: "1,1".into(),
+            model_overrides: std::collections::BTreeMap::from([(
+                "qwen3-8b".to_string(),
+                ModelOverride {
+                    tensor_split: Some("   ".into()),
+                    ..ModelOverride::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        let inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tensor-split" && w[1] == "1,1")
         );
     }
 

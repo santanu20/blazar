@@ -542,6 +542,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// Run a ggml RPC worker: expose this machine's GPUs to a remote
+    /// gateway's `rpc_servers` (distributed llama.cpp inference —
+    /// weights and KV split across local + remote devices in
+    /// proportion to each device's free memory). The RPC protocol
+    /// has NO authentication: only ever expose it on a trusted
+    /// network.
+    Rpc {
+        #[command(subcommand)]
+        cmd: RpcCmd,
+    },
     /// Diagnose the local setup: config, engine, keys, remotes, whisper,
     /// hardware, disk, models
     /// Local-state diagnostics, grouped (SYSTEM/GPU/ENGINES/MODELS/
@@ -665,6 +675,38 @@ enum SessionCmd {
     List {
         /// Model whose checkpoints to list
         model: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RpcCmd {
+    /// Start a foreground ggml-rpc-server exposing this machine's
+    /// devices on the given endpoint (Ctrl-C stops it; the exit code
+    /// is the worker's own). The gateway box points its `rpc_servers`
+    /// (or a model's `rpc_servers` overlay) at this host:port.
+    Worker {
+        /// Address to bind. Default is loopback-only; a remote
+        /// gateway needs `0.0.0.0` (all interfaces) or this box's
+        /// LAN address — deliberately opt-in because the RPC
+        /// protocol has no authentication.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind (upstream default 50052)
+        #[arg(long, default_value_t = 50052)]
+        port: u16,
+    },
+    /// Query RPC workers for reachability, protocol version and
+    /// per-device free/total memory — the fleet detail `doctor` only
+    /// reachability-checks. Exit code 1 when any endpoint fails.
+    Status {
+        /// Workers to query, as `host:port`. Default: every endpoint
+        /// configured across `rpc_servers`, model overlays and
+        /// `sdcpp_rpc_servers`.
+        endpoints: Vec<String>,
+        /// Emit one JSON object per endpoint (same shape as
+        /// `doctor --json`) instead of the human table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -991,6 +1033,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         "Engine & Config",
         &[
             "engine",
+            "rpc",
             "config",
             "keys",
             "whisper",
@@ -2081,6 +2124,7 @@ blazar mmproj <model> <mmproj.gguf path>"
         Cmd::Signout => cloud_refusal("signout", ""),
         Cmd::Logout => cloud_refusal("logout", ""),
         Cmd::Session { cmd } => session_cmd(cmd).await,
+        Cmd::Rpc { cmd } => rpc_cmd(cmd).await,
         Cmd::Doctor { flat, json, fix } => doctor(flat, json, fix).await,
         Cmd::ModelDoctor { model, json } => model_doctor_cmd(&model, json).await,
         Cmd::Warm { model } => warm_cmd(&model).await,
@@ -2113,6 +2157,170 @@ blazar mmproj <model> <mmproj.gguf path>"
         }
         Cmd::Explain { model, json } => explain(&model, json).await,
         Cmd::Watch => watch().await,
+    }
+}
+
+/// `blazar rpc …` — RPC fleet utilities. The worker is a foreground
+/// proxy: it resolves the ggml-rpc-server binary shipped inside an
+/// installed llama.cpp engine dir (active lane first) and runs it with
+/// inherited stdio, so the worker's own banner, device list and logs
+/// stream straight to the user's terminal.
+///
+/// Two independent nets keep the worker from outliving this CLI (a
+/// lone orphaned worker keeps holding GPU/VRAM and its port —
+/// live-verified failure before these existed):
+///
+/// 1. On INT/TERM/HUP the CLI kills the worker and exits with the
+///    conventional 128+signal code. This runs on every OS.
+/// 2. On Linux the worker is additionally tied to this process with
+///    `PR_SET_PDEATHSIG`, so even a `SIGKILL`ed or crashed CLI takes the
+///    worker down with it (kernel-delivered; see
+///    `blazar_runtime::parent_death_tie`).
+async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
+    match cmd {
+        RpcCmd::Worker { host, port } => {
+            let bin = blazar_runtime::quantize::find_rpc_server_bin(&dirs())?;
+            // Progress lines to STDERR: stdout stays clean for any
+            // scripting around the worker's own output.
+            eprintln!("rpc worker: {}", bin.display());
+            eprintln!("endpoint {host}:{port} — point the gateway's rpc_servers here");
+            eprintln!("no authentication: expose on trusted networks only");
+            let mut child_cmd = std::process::Command::new(&bin);
+            child_cmd
+                .arg("--host")
+                .arg(&host)
+                .arg("--port")
+                .arg(port.to_string())
+                .current_dir(bin.parent().unwrap_or(std::path::Path::new(".")));
+            blazar_runtime::parent_death_tie(&mut child_cmd);
+            // kill_on_drop is the panic-path net; the select arms below
+            // cover every orderly exit explicitly.
+            let mut child = tokio::process::Command::from(child_cmd)
+                .kill_on_drop(true)
+                .spawn()
+                .with_context(|| format!("exec {}", bin.display()))?;
+            tokio::select! {
+                status = child.wait() => {
+                    let status = status?;
+                    if !status.success() {
+                        std::process::exit(status.code().unwrap_or(1));
+                    }
+                    Ok(())
+                }
+                code = rpc_worker_shutdown() => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    std::process::exit(code);
+                }
+            }
+        }
+        RpcCmd::Status { endpoints, json } => rpc_status(&endpoints, json).await,
+    }
+}
+
+/// `blazar rpc status` — fleet detail beyond doctor's reachability
+/// check: protocol version and per-device free/total memory for every
+/// endpoint (explicit args win; otherwise the configured fleet).
+/// Queries run concurrently so one dead host's 2s connect budget
+/// cannot serialize the whole report. Exit code 1 when any endpoint
+/// failed — every result is still printed first.
+async fn rpc_status(explicit: &[String], json: bool) -> Result<()> {
+    let targets: Vec<String> = if explicit.is_empty() {
+        let cfg = config()?;
+        collect_rpc_fleet_targets(&cfg)
+    } else {
+        explicit.to_vec()
+    };
+    if targets.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"status": "ok", "detail": "no RPC workers configured — local devices only"})
+            );
+        } else {
+            println!("no RPC workers configured — local devices only (see rpc_servers)");
+        }
+        return Ok(());
+    }
+    let results = futures::future::join_all(
+        targets
+            .iter()
+            .map(|t| blazar_runtime::rpc_fleet::query_worker(t)),
+    )
+    .await;
+
+    if json {
+        for (endpoint, result) in targets.iter().zip(&results) {
+            match result {
+                Ok(info) => println!(
+                    "{}",
+                    serde_json::json!({
+                        "endpoint": endpoint,
+                        "status": "ok",
+                        "proto": format!("{}.{}.{}", info.proto_major, info.proto_minor, info.proto_patch),
+                        "devices": info.devices.iter().map(|d| serde_json::json!({
+                            "index": d.index,
+                            "free_mib": d.free_bytes / (1024 * 1024),
+                            "total_mib": d.total_bytes / (1024 * 1024),
+                        })).collect::<Vec<_>>(),
+                    })
+                ),
+                Err(e) => println!(
+                    "{}",
+                    serde_json::json!({"endpoint": endpoint, "status": "error", "error": e})
+                ),
+            }
+        }
+    } else {
+        println!("rpc fleet: {} worker(s)", targets.len());
+        for (endpoint, result) in targets.iter().zip(&results) {
+            match result {
+                Ok(info) => {
+                    println!(
+                        "\n  {}  protocol {}.{}.{}",
+                        endpoint, info.proto_major, info.proto_minor, info.proto_patch
+                    );
+                    for d in &info.devices {
+                        let free_mib = d.free_bytes / (1024 * 1024);
+                        let total_mib = d.total_bytes / (1024 * 1024);
+                        let pct = (100 * free_mib).checked_div(total_mib).unwrap_or(0);
+                        println!(
+                            "    device {}  {:>6} / {:>6} MiB free  ({pct}% free)",
+                            d.index, free_mib, total_mib
+                        );
+                    }
+                }
+                Err(e) => println!("\n  {}", err_line(e)),
+            }
+        }
+    }
+    if results.iter().any(Result::is_err) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Resolve which shutdown signal ended the foreground worker run, as
+/// the conventional 128+signal exit code. Unlike the daemon's
+/// hot-reload-on-HUP semantics, any of the three signals ends the
+/// worker: it is a stateless proxy with nothing to reload, and HUP is
+/// how a closed terminal says the session is gone.
+async fn rpc_worker_shutdown() -> i32 {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        tokio::select! {
+            _ = int.recv() => 130,
+            _ = term.recv() => 143,
+            _ = hup.recv() => 129,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.map(|_| 130).unwrap_or(130)
     }
 }
 
@@ -2927,6 +3135,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
             }
             checks.extend(doctor_config_pins(&cfg));
             checks.extend(doctor_chunking(&cfg));
+            checks.extend(doctor_rpc_fleet(&cfg).await);
         }
         Err(e) => {
             checks.push(Check::fail(
@@ -3184,6 +3393,70 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
     checks
 }
 
+/// RPC fleet: every configured `--rpc` endpoint (llamacpp global
+/// `rpc_servers`, every model overlay's `rpc_servers`, and the
+/// sdcpp `sdcpp_rpc_servers` list) must answer — the spawn preflight
+/// will refuse any serve pinned to a dead worker moments later, so
+/// doctor names the dead endpoint(s) with the same fix hint. Mirrors
+/// `blazar_runtime::engine_impl::probe_rpc_endpoints` semantics
+/// (2s TCP probe per target, parallel).
+/// Deduped RPC worker endpoints from every config knob that can point
+/// at a fleet: global `rpc_servers`, per-model overlays, and the image
+/// lane's `sdcpp_rpc_servers`. One list behind doctor's fleet check
+/// and `rpc status`, so the two can never disagree about what the
+/// fleet is.
+fn collect_rpc_fleet_targets(cfg: &Config) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    let mut push = |list: &str| {
+        for target in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if !targets.contains(&target.to_string()) {
+                targets.push(target.to_string());
+            }
+        }
+    };
+    push(&cfg.rpc_servers);
+    for overlay in cfg.model_overrides.values() {
+        if let Some(list) = overlay.rpc_servers.as_deref() {
+            push(list);
+        }
+    }
+    for target in &cfg.sdcpp_rpc_servers {
+        push(target);
+    }
+    targets
+}
+
+async fn doctor_rpc_fleet(cfg: &Config) -> Vec<Check> {
+    let targets = collect_rpc_fleet_targets(cfg);
+    if targets.is_empty() {
+        return vec![Check::ok(
+            "rpc fleet",
+            "no --rpc workers configured — local devices only".to_string(),
+        )];
+    }
+    let dead = blazar_runtime::engine_impl::probe_rpc_targets(&targets).await;
+    if dead.is_empty() {
+        vec![Check::ok(
+            "rpc fleet",
+            format!(
+                "{} RPC worker(s) reachable ({})",
+                targets.len(),
+                targets.join(", ")
+            ),
+        )]
+    } else {
+        vec![Check::fail(
+            "rpc fleet",
+            format!(
+                "unreachable: {} — serves pinned to them are refused at spawn; start the \
+                 worker (`blazar rpc worker` on that host) or fix rpc_servers; \
+                 `blazar rpc status` reports per-device memory across the fleet",
+                dead.join(", ")
+            ),
+        )]
+    }
+}
+
 fn doctor_group(name: &str) -> &'static str {
     match name {
         "hardware" | "gpu driver" | "gpu vram" | "gpu fit" | "gpu arch match" => "GPU",
@@ -3207,7 +3480,8 @@ fn doctor_group(name: &str) -> &'static str {
         | "engine retention"
         | "whisper lane"
         | "whisper currency"
-        | "whisper models" => "ENGINES",
+        | "whisper models"
+        | "rpc fleet" => "ENGINES",
         "models" | "unmanaged files" | "model types" => "MODELS",
         "ccache" => "CHANNELS",
         "disk" | "store" | "sentinel" | "daemon uptime" | "tempdir hygiene" | "bench baseline"
@@ -22806,7 +23080,9 @@ mod tests {
         // The boot sweep used to reap a user-run ggml-rpc-server as an
         // "orphaned engine" (engines-dir exe, no blazar parent), killing
         // the endpoint `rpc_servers` depends on at every daemon start.
-        // blazar never execs this binary — a live one is a deliberate
+        // The daemon never spawns this binary — `blazar rpc worker`
+        // execs it in the FOREGROUND CLI only, which dies with its
+        // terminal — so a worker with no blazar parent is a deliberate
         // co-tenant: advisory in doctor, never SIGTERMed.
         assert!(matches!(
             classify_gpu_tenant(rpc.to_str().unwrap(), &engines, false),
@@ -22818,6 +23094,101 @@ mod tests {
             classify_gpu_tenant(rpc.to_str().unwrap(), &engines, true),
             GpuTenantClass::Owned
         ));
+    }
+
+    #[tokio::test]
+    async fn unit__doctor_rpc_fleet__unconfigured_is_local_only_ok() {
+        let checks = doctor_rpc_fleet(&Config::default()).await;
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].ok, "{}", checks[0].detail);
+        assert!(checks[0].detail.contains("local devices only"));
+    }
+
+    #[test]
+    fn unit__collect_rpc_fleet_targets__dedupes_and_skips_empty_entries() {
+        let cfg = Config {
+            rpc_servers: "127.0.0.1:50052, 127.0.0.1:50052 ,".to_string(),
+            model_overrides: [(
+                "some-model".to_string(),
+                blazar_core::config::ModelOverride {
+                    rpc_servers: Some("10.0.0.4:50052".to_string()),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            sdcpp_rpc_servers: vec!["10.0.0.4:50052".to_string()],
+            ..Config::default()
+        };
+        assert_eq!(
+            collect_rpc_fleet_targets(&cfg),
+            vec!["127.0.0.1:50052".to_string(), "10.0.0.4:50052".to_string()]
+        );
+        assert!(collect_rpc_fleet_targets(&Config::default()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn unit__doctor_rpc_fleet__dedupes_across_all_three_knobs() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = format!("127.0.0.1:{port}");
+        let cfg = Config {
+            rpc_servers: format!("{endpoint}, {endpoint}"),
+            model_overrides: [(
+                "some-model".to_string(),
+                blazar_core::config::ModelOverride {
+                    rpc_servers: Some(endpoint.clone()),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            sdcpp_rpc_servers: vec![endpoint.clone()],
+            ..Config::default()
+        };
+        let checks = doctor_rpc_fleet(&cfg).await;
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].ok, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains("1 RPC worker"),
+            "{}",
+            checks[0].detail
+        );
+        // The listener must outlive the probe (kernel backlog completes
+        // the connect handshake; no accept needed).
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn unit__doctor_rpc_fleet__dead_endpoint_fails_with_fix_hint() {
+        // Bind then drop: the port is closed again (same trick as
+        // engine_impl's dead_port helper).
+        let port = {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let cfg = Config {
+            rpc_servers: format!("127.0.0.1:{port}"),
+            ..Config::default()
+        };
+        let checks = doctor_rpc_fleet(&cfg).await;
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].ok, "{}", checks[0].detail);
+        assert!(
+            checks[0].detail.contains(&format!("127.0.0.1:{port}")),
+            "{}",
+            checks[0].detail
+        );
+        assert!(
+            checks[0].detail.contains("blazar rpc worker"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(
+            checks[0].detail.contains("blazar rpc status"),
+            "{}",
+            checks[0].detail
+        );
     }
 
     #[cfg(unix)]

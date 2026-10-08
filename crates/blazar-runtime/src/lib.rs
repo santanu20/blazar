@@ -26,6 +26,7 @@ pub mod piper;
 pub mod probe;
 pub mod quantize;
 pub mod registry;
+pub mod rpc_fleet;
 pub mod sessionreg;
 pub mod storage;
 pub mod supervisor;
@@ -52,6 +53,7 @@ pub use engine_impl::{
 pub use events::{BlazarEvent, EventBus, InstanceState};
 pub use hf::{PullOutcome, PullTarget, Puller, parse_pull_target, registry_name};
 pub use models::{instance_running, remove_model};
+pub use probe::parent_death_tie;
 pub use probe::probe_hardware;
 pub use supervisor::{
     EngineRef, PrefixKey, PsRow, ROUTER_KEY, SupervisionError, Supervisor, resolve_draft_path,
