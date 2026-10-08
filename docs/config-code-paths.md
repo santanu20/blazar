@@ -381,7 +381,7 @@ token quality are surfaced as drift.
 | mirostat | — | gateway-http + engine-argv | `blazar-gateway/src/translate.rs:74` in `apply_ollama_options`; `blazar-gateway/src/translate.rs:1167` in `unit__sampler_options__native_passthrough_table`; `blazar-core/src/profile.rs:2019` in `the`; `blazar-core/src/profile.rs:5213` in `push_spec_args` |
 | seed | — | engine-argv + runtime/gateway + gateway-http + cli | `blazar-core/src/profile.rs:2020` in `the`; `blazar-core/src/profile.rs:2921` in `compile_sdcpp`; `blazar-runtime/src/hf_parallel.rs:261` in `try_parallel`; `blazar-runtime/src/hf_parallel.rs:292` in `try_parallel`; `blazar-gateway/src/translate.rs:43` in `apply_ollama_options`; `blazar-gateway/src/translate.rs:1236` in `unit__chat_to_openai__sampling_and_schema`; `blazar-cli/tests/config_set.rs:25` in `seed`; `blazar-cli/tests/config_set.rs:38` in `e2e__config_set_string_value_quoted_and_placed_above_tables` |
 
-## Remote ([[remotes]]) — 3 fields, 0 dead
+## Remote ([[remotes]]) — 4 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -389,6 +389,7 @@ token quality are surfaced as drift.
 | url | — | runtime/gateway + gateway-http + cli | `blazar-runtime/src/whisper.rs:724` in `ensure`; `blazar-runtime/src/whisper.rs:736` in `ensure`; `blazar-gateway/src/otlp.rs:76` in `run`; `blazar-gateway/src/otlp.rs:100` in `run`; `blazar-cli/src/main.rs:3216` in `doctor_remotes`; `blazar-cli/src/main.rs:3224` in `doctor_remotes` |
 | key | — | other + gateway-http + runtime/gateway + engine-argv + cli | `blazar-core/examples/slots_probe.rs:53` in `main`; `blazar-core/src/gguf.rs:625` in `parse_metadata`; `blazar-gateway/src/otlp.rs:146` in `encode`; `blazar-gateway/src/otlp.rs:155` in `encode`; `blazar-runtime/src/quantize.rs:162` in `find_perplexity_bin`; `blazar-runtime/src/supervisor.rs:156` in `model_of_key`; `blazar-core/src/profile.rs:2982` in `push_generation_defaults`; `blazar-core/src/profile.rs:2989` in `push_generation_defaults`; `blazar-cli/tests/config_set.rs:48` in `e2e__config_set_string_value_quoted_and_placed_above_tables`; `blazar-cli/tests/config_set.rs:52` in `e2e__config_set_string_value_quoted_and_placed_above_tables` |
 
+| allow_insecure_http | false | runtime/gateway | `blazar-core/src/config.rs` in `validate` (insecure-cleartext guard at the non-private-address check) |
 ## ApiKey ([[api_keys]]) — 8 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
