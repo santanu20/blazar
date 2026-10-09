@@ -119,6 +119,54 @@ pub struct ParsedToolCall {
 /// output is honest visible content, never a fabricated call.
 #[must_use]
 pub fn parse_completion(text: &str) -> (String, Vec<ParsedToolCall>) {
+    parse_completion_with_tools(text, &[])
+}
+
+/// `parse_completion` plus recognition of marker-less JSON calls.
+///
+/// Weak-template models on non-grammar lanes (mlx-lm has no GBNF
+/// enforcement, so the rendered prompt's `<tool_call>` teaching is only
+/// a suggestion) sometimes answer with the bare call object —
+/// `{"name": "get_weather", "arguments": {...}}` — no envelope, no
+/// markers. When the request declared tools and the whole remaining
+/// content parses as a call object naming one of THOSE tools, it is a
+/// tool call the model wanted to make, surfaced as one.
+///
+/// Gated on the declared tool names for a reason: a plain-chat request
+/// that legitimately asks for a JSON object with `name`/`arguments`
+/// fields must keep its answer as content. Only a name the SAME request
+/// declared as a tool can be lifted, and only when no envelope call was
+/// found (envelopes always win — they are the unambiguous dialect).
+#[must_use]
+pub fn parse_completion_with_tools(
+    text: &str,
+    tool_names: &[String],
+) -> (String, Vec<ParsedToolCall>) {
+    let (mut content, mut calls) = parse_completion_envelopes(text);
+    if calls.is_empty() && !tool_names.is_empty() {
+        let trimmed = content.trim();
+        let shape_ok = serde_json::from_str::<Value>(trimmed).ok().filter(|v| {
+            let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+            !name.is_empty()
+                && tool_names.iter().any(|n| n == name)
+                && v.get("arguments").is_some_and(Value::is_object)
+        });
+        if let Some(v) = shape_ok {
+            calls.push(ParsedToolCall {
+                name: v
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                arguments: v.get("arguments").cloned().unwrap_or(Value::Null),
+            });
+            content.clear();
+        }
+    }
+    (content, calls)
+}
+
+fn parse_completion_envelopes(text: &str) -> (String, Vec<ParsedToolCall>) {
     let mut content = String::with_capacity(text.len());
     let mut calls = Vec::new();
     let mut rest = text;
@@ -359,12 +407,12 @@ pub fn to_completion_request(
 /// `<tool_call>` blocks become structured `tool_calls`, usage rides
 /// through untouched.
 #[must_use]
-pub fn raw_json_to_chat(raw: &Value) -> Value {
+pub fn raw_json_to_chat(raw: &Value, tool_names: &[String]) -> Value {
     let text = raw
         .pointer("/choices/0/text")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let (content, calls) = parse_completion(text);
+    let (content, calls) = parse_completion_with_tools(text, tool_names);
     let message = if calls.is_empty() {
         json!({"role": "assistant", "content": content})
     } else {
@@ -424,6 +472,10 @@ struct Adapt {
     /// Usage from the child's final frame, forwarded so the
     /// downstream accounting stays intact.
     usage: Option<Value>,
+    /// Tool names the adapted request declared — the gate for lifting
+    /// a marker-less whole-JSON call out of content (see
+    /// `parse_completion_with_tools`).
+    tool_names: Vec<String>,
     done: bool,
 }
 
@@ -445,8 +497,20 @@ fn process_frame(st: &mut Adapt, frame: &Value) {
         // leak mid-stream; the holdback guards a tag split across
         // deltas.
         let hold = partial_tag_holdback(&st.whole);
-        let first_tag = st.whole.find(TOOL_CALL_OPEN).unwrap_or(st.whole.len());
-        let safe_end = first_tag.min(st.whole.len() - hold);
+        let mut safe_end = st.whole.find(TOOL_CALL_OPEN).unwrap_or(st.whole.len());
+        // Bare-JSON call candidate: with tools declared, a generation
+        // whose first non-whitespace character is `{` may be a whole
+        // marker-less call object — hold it back from that brace so it
+        // is never streamed as prose AND delivered as a call. Stream
+        // end decides: lifted -> structured call only; not a call ->
+        // the held bytes flush as ordinary content (finish()).
+        if !st.tool_names.is_empty() && safe_end == st.whole.len() {
+            let trimmed = st.whole.trim_start();
+            if trimmed.starts_with('{') {
+                safe_end = st.whole.len() - trimmed.len();
+            }
+        }
+        let safe_end = safe_end.min(st.whole.len() - hold);
         if safe_end > st.emitted {
             let out_text = st.whole[st.emitted..safe_end].to_string();
             st.emitted = safe_end;
@@ -462,7 +526,7 @@ fn process_payload(st: &mut Adapt, payload: &str) {
     }
 }
 fn finish(st: &mut Adapt) {
-    let (cleaned, calls) = parse_completion(&st.whole);
+    let (cleaned, calls) = parse_completion_with_tools(&st.whole, &st.tool_names);
     // Trailing prose (or malformed-block text the parser keeps
     // visible) — the cleaned string's prefix below `emitted` was
     // already streamed (identical bytes: nothing before the first
@@ -486,6 +550,7 @@ fn finish(st: &mut Adapt) {
 
 pub fn raw_sse_to_chat_sse<S>(
     upstream: S,
+    tool_names: Vec<String>,
 ) -> impl futures::Stream<Item = std::io::Result<axum::body::Bytes>>
 where
     S: futures::Stream<Item = std::io::Result<axum::body::Bytes>> + Unpin,
@@ -498,6 +563,7 @@ where
         emitted: 0,
         whole: String::new(),
         usage: None,
+        tool_names,
         done: false,
     };
     let mut upstream = upstream;
@@ -641,7 +707,7 @@ mod tests {
     use serde_json::json;
 
     async fn collect_sse(frames: Vec<std::io::Result<axum::body::Bytes>>) -> (String, bool) {
-        let mut out = raw_sse_to_chat_sse(futures::stream::iter(frames));
+        let mut out = raw_sse_to_chat_sse(futures::stream::iter(frames), Vec::new());
         let mut items = Vec::new();
         while let Some(item) = out.next().await {
             items.push(item);
@@ -672,7 +738,7 @@ mod tests {
                 "connection reset mid-body",
             )),
         ]);
-        let mut out = raw_sse_to_chat_sse(frames);
+        let mut out = raw_sse_to_chat_sse(frames, Vec::new());
         let mut items = Vec::new();
         while let Some(item) = out.next().await {
             items.push(item);
@@ -913,6 +979,126 @@ mod tests {
         let (c, calls) = parse_completion("ok<tool_call>\n{\"name\": \"x\"");
         assert_eq!(calls.len(), 0);
         assert!(c.contains("<tool_call>"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__parse__bare_json_call_lifts_only_for_declared_tool() {
+        // Live mlx-lm shape: weak-template models answer with the bare
+        // call object — no envelope. Declared name lifts into a call.
+        let tools = vec!["get_weather".to_string()];
+        let (c, calls) = parse_completion_with_tools(
+            "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}",
+            &tools,
+        );
+        assert_eq!(c, "", "the call is not prose: {c}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments, json!({"city": "Paris"}));
+
+        // UNdeclared name: a plain answer mentioning a same-shaped
+        // object must stay content.
+        let (c, calls) = parse_completion_with_tools(
+            "{\"name\": \"something_else\", \"arguments\": {}}",
+            &tools,
+        );
+        assert_eq!(calls.len(), 0);
+        assert!(c.contains("something_else"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__parse__bare_json_never_lifts_without_tools_or_on_mixed_prose() {
+        // No declared tools -> no lift, whatever the text looks like.
+        let (c, calls) = parse_completion_with_tools("{\"name\": \"f\", \"arguments\": {}}", &[]);
+        assert_eq!(calls.len(), 0);
+        assert!(c.starts_with('{'));
+
+        // Prose around the JSON: only a whole-content call lifts —
+        // mixed output is honest content.
+        let tools = vec!["f".to_string()];
+        let (c, calls) = parse_completion_with_tools(
+            "Here is the call: {\"name\": \"f\", \"arguments\": {}}",
+            &tools,
+        );
+        assert_eq!(calls.len(), 0);
+        assert!(c.contains("Here is the call"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__parse__envelope_beats_bare_json() {
+        let tools = vec!["get_weather".to_string()];
+        let (c, calls) = parse_completion_with_tools(
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>",
+            &tools,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({"city": "Oslo"}));
+        assert_eq!(c, "");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__raw_json_to_chat__bare_json_call_shapes_tool_calls() {
+        let raw = json!({
+            "choices": [{"index": 0, "text": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Berlin\"}}"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 9}
+        });
+        let chat = raw_json_to_chat(&raw, &["get_weather".to_string()]);
+        assert_eq!(
+            chat.pointer("/choices/0/message/tool_calls/0/function/name"),
+            Some(&json!("get_weather"))
+        );
+        assert_eq!(
+            chat.pointer("/choices/0/finish_reason"),
+            Some(&json!("tool_calls"))
+        );
+        assert_eq!(chat.pointer("/choices/0/message/content"), Some(&json!("")));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__sse_adapter__bare_json_call_lifts_at_stream_end() {
+        // Weak-template lane (mlx-lm, no grammar enforcement): the whole
+        // generation is the bare call object. The streaming adapter must
+        // hold it back (nothing may leak as prose) and emit it as a
+        // structured tool_calls chunk at stream end.
+        let frame = |text: &str| {
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices": [{"text": text}]})
+            )
+        };
+        let frames = vec![
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(frame(
+                "{\"name\": \"get_weather\", ",
+            ))),
+            Ok(axum::body::Bytes::from(frame(
+                "\"arguments\": {\"city\": \"Oslo\"}}",
+            ))),
+            Ok(axum::body::Bytes::from("data: [DONE]\n\n")),
+        ];
+        let mut out = raw_sse_to_chat_sse(
+            futures::stream::iter(frames),
+            vec!["get_weather".to_string()],
+        );
+        let mut joined = String::new();
+        while let Some(item) = out.next().await {
+            joined.push_str(&String::from_utf8_lossy(item.as_ref().unwrap()));
+        }
+        assert!(
+            joined.contains("\"tool_calls\""),
+            "structured call must be emitted: {joined}"
+        );
+        assert!(
+            joined.contains("get_weather"),
+            "call name present: {joined}"
+        );
+        assert!(
+            !joined.contains("\"content\":\"{"),
+            "the bare JSON must not leak into content: {joined}"
+        );
     }
 
     #[test]

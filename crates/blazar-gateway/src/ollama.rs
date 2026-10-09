@@ -1915,6 +1915,18 @@ async fn proxy_core_chat(
                 .as_ref()
                 .is_some_and(|v| !crate::prompt_recipe::has_images(v))
     };
+    // Tool names the recipe adapters may lift a marker-less JSON call
+    // for — read from the PRE-render chat body: `to_completion_request`
+    // bakes the descriptors into the prompt text, so the re-rendered
+    // bytes no longer carry a machine-readable `tools` array.
+    let recipe_tool_names = if ollama_compat {
+        serde_json::from_slice::<serde_json::Value>(&openai_body)
+            .ok()
+            .and_then(|v| crate::prompt_recipe::extract_tool_names(&v))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let openai_body: Vec<u8> = if ollama_compat {
         let parsed = serde_json::from_slice::<serde_json::Value>(&openai_body)
             .unwrap_or(serde_json::Value::Null);
@@ -2106,7 +2118,7 @@ async fn proxy_core_chat(
         // shape before every downstream concern (cache observability,
         // enforce, translation) — they see a native chat response.
         let openai = if ollama_compat {
-            crate::prompt_recipe::raw_json_to_chat(&openai)
+            crate::prompt_recipe::raw_json_to_chat(&openai, &recipe_tool_names)
         } else {
             openai
         };
@@ -2307,6 +2319,7 @@ async fn proxy_core_chat(
         Box::pin(crate::prompt_recipe::raw_sse_to_chat_sse(
             resp.bytes_stream()
                 .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string()))),
+            recipe_tool_names.clone(),
         ))
     } else {
         Box::pin(
