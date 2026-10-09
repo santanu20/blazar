@@ -6,6 +6,31 @@ tracked here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Live device census for `tune` fit verdicts** — the daemon-less tune path read
+  `free_mib` from the stored engine manifest (a snapshot frozen at probe time), so a
+  pin like `--ctx 4096` could be refused against long-gone VRAM pressure ("exceeds
+  the 940 MiB VRAM" on an idle card). Tune now takes the same live
+  `--list-devices` census precedence the daemon serves with (live engine census,
+  manifest snapshot only as fallback), shared through one helper so the two paths
+  cannot drift.
+- **Markdown-fence normalization for structured output** — lanes without decoder-level JSON
+  grammar (mlx, mistralrs native, the recipe raw lane) still decorated their output with a
+  ```` ```json ```` fence under a strict `response_format` demand; the gateway now strips the
+  whole-content fence (every choice's `message.content`) on both serving cores before the
+  response reaches the client, so the "content parses as JSON" contract holds on every lane.
+  Plain-chat fences are preserved — the demand is what licenses the strip.
+
+- **`ollama_compat` recipe now recognizes marker-less JSON tool calls.** Weak-template models on lanes without grammar enforcement (mlx-lm has no GBNF, so the rendered prompt's `<tool_call>` teaching is only a suggestion) answer with the bare call object — `{"name": ..., "arguments": {...}}` — which the recipe passed through as prose, so `model-doctor` certified the model tools-incapable and tool traffic never saw a structured call. When the request declared tools and the whole generation parses as a call object naming one of THOSE tools, it is lifted into a structured `tool_calls` (enveloped calls always win; streaming holds a generation that starts with `{` back until stream end so a call is never delivered twice — as prose and as a call). A plain-chat answer that merely looks like a call object never lifts: the gate is the request's own declared tool names.
+- **`model-doctor` capability probes retry stochastic elicitation.** The tools and JSON verdicts drew once; a single prose draw certified a capable model as `tools=FAIL`, and the certificate gate then 400-blocked working tool traffic (`CAPABILITY_VERIFIED_FAILED`). Probes now draw up to 3 times — the first non-FAIL settles it (existence, not reliability: a PASS on any draw means the capability exists), and only repeated FAILs certify FAIL.
+- **sglang tool-call detector is now derived from the model's architecture.** The lane used to pass `--tool-call-parser auto`, but upstream 0.5.21's template sniff only recognizes qwen templates carrying an `enable_thinking` toggle (qwen3-style) — qwen2-family templates matched no rule, the parser resolved to disabled, and a tool-calling model's `<tool_call>` markers were served as plain prose (HTTP 200, `tool_calls` never populated). The detector is now named per family the way upstream's own detection table maps it (`qwen3*` → `qwen`, `qwen3*coder` → `qwen3_coder`, `qwen2*` → `qwen25`), unknown families keep `auto`. Pinned by a new `tests/sglang.rs` argv battery.
+- **`model_overrides.<model>.extra_args` no longer silently drops flags the argv builder owns but does not emit.** The mistral.rs forwarding loop skipped a static owned-flag list unconditionally, while `--tok-model-id` is only emitted in the multimodal branch — so a compile-validated user pair for a text GGUF (the escape hatch for the mistral.rs sliding-window-attention refusal) was accepted by validation and then discarded at spawn. The skip-list is now derived from what the builder actually emitted: builder-emitted flags still win (a derived multimodal id beats the user pair, exactly once), and owned-but-not-emitted flags ride through as the intended escape hatch.
+
+### Added
+
+- **Weights-manifest admission teaching.** Spawn admission now reads `model.safetensors.index.json`, not just `config.json` declarations: tensors named `*.packed` mark a custom quant code store (PolarQuant/EOQ-style research formats that only the repo's own Python loader can dequantize), which is refused on every engine lane with the evidence and levers named instead of an opaque weight-load death. A vision-tower config without `preprocessor_config.json` now distinguishes a genuinely incomplete multimodal pull (re-pull advice) from a text-only quant of a multimodal base — a vestigial tower declaration where re-pulling the same repo can never produce the artifact (export-as-text-only or serve-an-official-build advice).
+
 ## [0.23.0] - 2026-10-08
 
 ### Added
