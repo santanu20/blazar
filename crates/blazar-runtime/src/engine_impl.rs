@@ -1098,7 +1098,38 @@ impl SglangEngine {
 /// owns: model dir, loopback bind, port, public name. The per-child
 /// `--api-key` secret is appended by the supervisor's child-auth mint
 /// (same as llamacpp) — one choke point, not engine business.
-fn sglang_argv(
+/// Tool-call detector for the sglang lane, derived from the model's
+/// architecture rather than upstream's `--tool-call-parser auto`.
+///
+/// `auto` resolves the detector by sniffing the chat template at server
+/// start, but its qwen rule only fires on templates carrying an
+/// `enable_thinking` toggle (sglang 0.5.21 `_is_qwen3`) — qwen2-family
+/// templates have none, so the resolver disables the parser and the
+/// model's `<tool_call>` markers ship as plain prose. The store's arch
+/// row already names the family in either spelling (GGUF short form
+/// `qwen2`/`qwen3vl`, HF class `Qwen2ForCausalLM`), and each family's
+/// marker dialect is stable, so the detector is named here the way
+/// upstream's own detection table maps it. Families without an
+/// evidenced gap keep `auto` — their vocab-sentinel rules work.
+fn sglang_tool_call_parser(arch: Option<&str>) -> &'static str {
+    let Some(arch) = arch.map(str::to_lowercase) else {
+        return "auto";
+    };
+    if arch.starts_with("qwen3") {
+        if arch.contains("coder") {
+            "qwen3_coder"
+        } else {
+            "qwen"
+        }
+    } else if arch.starts_with("qwen2") {
+        "qwen25"
+    } else {
+        "auto"
+    }
+}
+
+#[must_use]
+pub fn sglang_argv(
     model: &blazar_core::ModelRow,
     profile: &Profile,
     endpoint: &Endpoint,
@@ -1122,12 +1153,12 @@ fn sglang_argv(
         // tool_call_parser = None (verified against the installed
         // 0.5.21 ServerArgs default), which serves a tool-calling
         // model's `<tool_call>` markers as plain prose — the request
-        // succeeds, the structured tool_calls never appear. `auto`
-        // picks the detector from the model's own chat template
-        // (qwen → Qwen25Detector etc.), so no arch mapping is needed
-        // here and unknown families keep upstream behavior.
+        // succeeds, the structured tool_calls never appear. The
+        // detector is derived from the arch row because upstream's
+        // `auto` template-sniff cannot see qwen2-family templates
+        // (see sglang_tool_call_parser).
         "--tool-call-parser".to_string(),
-        "auto".to_string(),
+        sglang_tool_call_parser(model.arch.as_deref()).to_string(),
         "--served-model-name".to_string(),
         // sglang asserts on ':' (its LoRA model:adapter syntax) before
         // the model loads; the gateway's request-body stamp derives
