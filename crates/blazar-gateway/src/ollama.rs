@@ -1927,6 +1927,19 @@ async fn proxy_core_chat(
     } else {
         Vec::new()
     };
+    // JSON demand fact, captured from the FINAL pre-render chat body:
+    // recipe re-rendering bakes descriptors into prompt text and drops
+    // `response_format`, and the ollama-dialect translator has already
+    // normalized `format`/`structured_outputs` into the OpenAI field by
+    // this point. Read BEFORE the re-render below, applied at the
+    // response seam after `raw_json_to_chat`.
+    let structured_json = serde_json::from_slice::<serde_json::Value>(&openai_body)
+        .ok()
+        .and_then(|v| {
+            crate::proxy::structured_output_kind(Some(&v))
+                .map(|k| k == "json_schema" || k == "json_object")
+        })
+        .unwrap_or(false);
     let openai_body: Vec<u8> = if ollama_compat {
         let parsed = serde_json::from_slice::<serde_json::Value>(&openai_body)
             .unwrap_or(serde_json::Value::Null);
@@ -2117,11 +2130,19 @@ async fn proxy_core_chat(
         // Raw-completion lane: adapt the text completion into the chat
         // shape before every downstream concern (cache observability,
         // enforce, translation) — they see a native chat response.
-        let openai = if ollama_compat {
+        let mut openai = if ollama_compat {
             crate::prompt_recipe::raw_json_to_chat(&openai, &recipe_tool_names)
         } else {
             openai
         };
+        // JSON-fence normalization: lanes without decoder-level grammar
+        // (recipe raw lane, mlx/mistralrs native) decorate JSON with a
+        // markdown fence even under a strict `response_format` demand —
+        // strip it so the content contract (parses as JSON) holds on
+        // every lane. Only under the demand; plain chat fences stay.
+        if structured_json {
+            crate::proxy::normalize_json_fences(&mut openai);
+        }
         // Cache observability (R6): classify this completed response
         // warm/cold from its usage object before translation.
         match openai.get("usage") {

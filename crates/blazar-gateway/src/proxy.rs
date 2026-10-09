@@ -1165,7 +1165,27 @@ pub async fn proxy_request(
         .unwrap_or(model)
         .to_string();
     let restamp = !enforce_oversized && status.is_success() && child_model_stamp(engine).is_some();
-    if sentinel_active || want_choice_verify || (suppress_think && !sse) || (restamp && !sse) {
+    // JSON-fence normalization (deliverable-side): a `response_format`
+    // JSON demand on a lane without decoder-level grammar still comes
+    // back markdown-fenced — strip the whole-content fence in the
+    // buffered branch so the contract "content parses as JSON" holds on
+    // every lane. `gbnf` demands never fence (decoder-constrained) and
+    // stay out of this path. Plain chat fences are PRESERVED — the
+    // demand is what licenses the strip.
+    let json_fence = !sse
+        && !enforce_oversized
+        && status.is_success()
+        && is_chat_path(path_query)
+        && matches!(
+            structured_output_kind(parsed.as_ref()),
+            Some("json_schema" | "json_object")
+        );
+    if sentinel_active
+        || want_choice_verify
+        || (suppress_think && !sse)
+        || (restamp && !sse)
+        || json_fence
+    {
         let ctx = if sentinel_active {
             let (ctx, warnings) = sentinel::request_ctx(
                 state,
@@ -1321,10 +1341,13 @@ pub async fn proxy_request(
                 // Same contract as the ollama lanes: when the caller did not
                 // ask for thinking, strip raw <think> blocks before the body
                 // reaches the client. Parse failure fails open (original body).
-                let buf = if suppress_think || restamp {
+                let buf = if suppress_think || restamp || json_fence {
                     match serde_json::from_slice::<serde_json::Value>(&buf) {
                         Ok(mut v) => {
                             let mut touched = false;
+                            if json_fence {
+                                touched |= normalize_json_fences(&mut v);
+                            }
                             if restamp
                                 && let Some(m) = v.get_mut("model")
                                 && m.is_string()
@@ -2116,6 +2139,64 @@ pub fn structured_output_kind(v: Option<&serde_json::Value>) -> Option<&'static 
         return Some("gbnf");
     }
     None
+}
+
+/// Strip a WHOLE-CONTENT markdown fence (```` ```json … ``` ````) down to
+/// the fenced body. Only fires when the trimmed content both starts with
+/// an opening fence (info string tolerated) and ends with a closing one —
+/// prose-wrapped fences, unterminated fences, and fence-free strings come
+/// back verbatim. `gbnf`-constrained lanes never need this (the decoder
+/// cannot emit fences); `response_format` lanes without decoder-level
+/// grammar (mlx, mistralrs native) decorate their JSON anyway.
+#[must_use]
+pub fn strip_json_fence(content: &str) -> &str {
+    let t = content.trim();
+    let Some(after_open) = t.strip_prefix("```") else {
+        return content;
+    };
+    // Opening fence may carry an info string (`json`, `JSON`, …) up to
+    // the first newline; a fence with no newline treats the rest as body.
+    let body = match after_open.find('\n') {
+        Some(nl) => &after_open[nl + 1..],
+        None => after_open,
+    };
+    let Some(body) = body.strip_suffix("```") else {
+        return content;
+    };
+    body.trim()
+}
+
+/// Strip whole-content fences from every choice's `message.content` in a
+/// chat-completion response — the deliverable-side normalization for a
+/// request that demanded JSON via `response_format` (see
+/// [`structured_output_kind`]). Returns whether anything changed so
+/// callers skip a pointless re-serialization.
+pub fn normalize_json_fences(v: &mut serde_json::Value) -> bool {
+    let Some(choices) = v
+        .get_mut("choices")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut touched = false;
+    for choice in choices.iter_mut() {
+        let Some(message) = choice.get_mut("message") else {
+            continue;
+        };
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        let Some(text) = content.as_str() else {
+            continue;
+        };
+        let stripped = strip_json_fence(text);
+        if stripped != text {
+            let owned = stripped.to_string();
+            *content = serde_json::Value::String(owned);
+            touched = true;
+        }
+    }
+    touched
 }
 
 /// Classify a fully-buffered non-stream chat body (enforce path) from
@@ -3069,6 +3150,54 @@ mod cache_obs_tests {
     }
 
     // --- record_buffered_chat -------------------------------------------
+
+    #[test]
+    fn unit__strip_json_fence__whole_content_variants() {
+        // canonical decorated shape
+        assert_eq!(
+            strip_json_fence("```json\n{\"city\": \"Oslo\"}\n```"),
+            "{\"city\": \"Oslo\"}"
+        );
+        // bare fence, no info string
+        assert_eq!(strip_json_fence("```\n42\n```"), "42");
+        // fence with no newline after the info string
+        assert_eq!(strip_json_fence("```{\"a\": 1}```"), "{\"a\": 1}");
+        // surrounding whitespace tolerated
+        assert_eq!(
+            strip_json_fence("  ```json\n{\"a\": 1}\n```  "),
+            "{\"a\": 1}"
+        );
+        // NOT whole-content: prose-wrapped fences stay verbatim
+        let prose = "Here you go:\n```json\n{\"a\": 1}\n```";
+        assert_eq!(strip_json_fence(prose), prose);
+        // unterminated fence stays (broken output, client sees raw truth)
+        let open = "```json\n{\"a\": 1}";
+        assert_eq!(strip_json_fence(open), open);
+        // fence-free content untouched
+        assert_eq!(strip_json_fence("{\"a\": 1}"), "{\"a\": 1}");
+        assert_eq!(strip_json_fence(""), "");
+        assert_eq!(strip_json_fence("plain text"), "plain text");
+    }
+
+    #[test]
+    fn unit__normalize_json_fences__strips_every_choice_under_demand() {
+        use serde_json::json;
+        let mut v = json!({"choices": [
+            {"index": 0, "message": {"role": "assistant", "content": "```json\n{\"a\": 1}\n```"}},
+            {"index": 1, "message": {"role": "assistant", "content": "{\"b\": 2}"}},
+            {"index": 2, "message": {"role": "assistant", "content": null}}
+        ]});
+        assert!(normalize_json_fences(&mut v));
+        assert_eq!(v["choices"][0]["message"]["content"], json!("{\"a\": 1}"));
+        // unfenced and non-string contents ride through untouched
+        assert_eq!(v["choices"][1]["message"]["content"], json!("{\"b\": 2}"));
+        assert!(v["choices"][2]["message"]["content"].is_null());
+        // idempotent on a second pass
+        assert!(!normalize_json_fences(&mut v));
+        // no choices array = no-op
+        let mut bare = json!({"error": "x"});
+        assert!(!normalize_json_fences(&mut bare));
+    }
 
     #[test]
     fn unit__structured_output_kind__dialect_vocabulary() {
