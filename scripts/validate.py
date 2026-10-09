@@ -114,7 +114,7 @@ def _listed_model_names(list_stdout: str) -> set[str]:
     return names
 
 
-def _resolve_store_row(name: str) -> tuple[str, str]:
+def _resolve_store_row(name: str) -> tuple[str, str, bool]:
     """Map a requested model name to the store row that will serve it.
 
     The gateway resolves request names exact -> unique bare prefix
@@ -123,19 +123,24 @@ def _resolve_store_row(name: str) -> tuple[str, str]:
     instance-keyed check misses while serving still passes — the fixture
     inventory drifts (rows get re-pulled under fuller names), so a
     hardcoded default rots. Mirrors the product ladder: exact match
-    wins, one prefix match adopts the row name, ambiguity/miss keeps
-    the raw name (phases fail loudly with the store listing).
+    wins, one prefix match adopts the row name, ambiguity/miss reports
+    ok=False and main() exits at startup — a name the gateway itself
+    would 404 must not ride into the phases as a 58-check cascade.
     """
     rows = _store_model_rows()
     if name in rows or not rows:
-        return name, ""
+        return name, "", True
     prefixed = [r for r in rows if r.startswith(name)]
     if len(prefixed) == 1:
-        return prefixed[0], f"{name} -> store row {prefixed[0]} (unique prefix)"
-    return name, (
-        f"no exact store row '{name}' (candidates: {', '.join(sorted(rows))})"
-        if not prefixed
-        else f"'{name}' is an ambiguous prefix of {prefixed} (pass BLAZAR_VALIDATE_MODEL)"
+        return prefixed[0], f"{name} -> store row {prefixed[0]} (unique prefix)", True
+    return (
+        name,
+        (
+            f"no exact store row '{name}' (candidates: {', '.join(sorted(rows))})"
+            if not prefixed
+            else f"'{name}' is an ambiguous prefix of {prefixed} (pass BLAZAR_VALIDATE_MODEL)"
+        ),
+        False,
     )
 
 
@@ -145,7 +150,7 @@ def _resolve_store_row(name: str) -> tuple[str, str]:
 # (child_pid/wait_loaded bind MODEL at definition) carry the ROW name;
 # the raw request dialect keeps its own coverage via the explicit
 # prefix-alias routing check in phase 3.
-MODEL, _MODEL_NOTE = _resolve_store_row(
+MODEL, _MODEL_NOTE, _MODEL_OK = _resolve_store_row(
     os.environ.get("BLAZAR_VALIDATE_MODEL", "qwen2.5-0.5b")
 )
 # Second DISTINCT model for lanes that structurally need two models live at
@@ -1024,6 +1029,8 @@ _COMMAND_ATTRS = {
     "run.repl.ctrl-d": (True, True, False, False, True),
     "run.repl.ctrl-c": (True, True, False, False, True),
     "run.single.nocap": (True, True, False, False, True),
+    "rpc.status": (False, False, False, False, True),
+    "rpc.worker": (False, False, False, False, True),
     "bench": (False, False, False, False, True),
     "tune.search": (False, False, True, False, False),
     "tune.ctx": (False, False, True, False, False),
@@ -5540,7 +5547,9 @@ ENG_TOOL_CALC = {
 # Embedder/reranker families never serve chat; "rerank" models are not
 # embedders either — both stay out of the chat-lane and embedding picks.
 ENG_EMBEDDER_RE = re.compile(r"bge|embed|minilm|e5", re.IGNORECASE)
-ENG_NON_CHAT_RE = re.compile(r"bge|embed|minilm|e5|rerank", re.IGNORECASE)
+ENG_NON_CHAT_RE = re.compile(
+    r"bge|embed|minilm|e5|rerank|whisper|piper|speech|tts", re.IGNORECASE
+)
 ENG_QUANTIZED_ST_RE = re.compile(r"\b(?:awq|gptq|fp8)\b", re.IGNORECASE)
 
 
@@ -5610,6 +5619,8 @@ def _eng_pick_safetensors_dir(rows: list[dict]) -> dict | None:
             return False
         if "mlx" in f"{r['name']} {r['repo']} {r['path']}".lower():
             return False
+        if ENG_NON_CHAT_RE.search(f"{r['name']} {r['repo']}"):
+            return False
         if ENG_QUANTIZED_ST_RE.search(f"{r['name']} {r['repo']}"):
             return False
         try:
@@ -5620,7 +5631,46 @@ def _eng_pick_safetensors_dir(rows: list[dict]) -> dict | None:
     return _eng_smallest([r for r in rows if is_plain_dir(r)])
 
 
-def _eng_pick_mlx(rows: list[dict]) -> dict | None:
+def _eng_tools_pass_models() -> set[str]:
+    """Model names with a tools=PASS capability certificate (any engine).
+
+    The engines battery's tool cells measure the lane's raw emission and
+    the relay — a fixture that provably cannot emit parseable tool calls
+    (cert FAIL) turns them into draw lottery, so lane pickers prefer
+    certified-tool-capable fixtures when one exists. Certificates come
+    from the sandbox DB copy of the user's store (model_caps, written by
+    `blazar model-doctor`)."""
+    names: set[str] = set()
+    try:
+        db = sqlite3.connect(os.path.join(SANDBOX.data_dir, "blazar.db"))
+        for model, caps_json in db.execute("SELECT model, caps_json FROM model_caps"):
+            try:
+                caps = json.loads(caps_json or "{}").get("caps", {})
+            except ValueError:
+                continue
+            if caps.get("tools", {}).get("status") == "PASS":
+                names.add(model)
+        db.close()
+    except sqlite3.Error:
+        pass
+    return names
+
+
+def _eng_pick_mlx(rows: list[dict], tools_pass: set[str] | None = None) -> dict | None:
+    """MLX-lane fixture: smallest CERTIFIED tool-capable row first, then
+    MODEL, else the smallest MLX row.
+
+    The certification preference outranks the MODEL pin: sub-1B quants
+    sit below the tool-calling floor (measured live 2026-10-08:
+    qwen2.5-0.5b-4bit answers tool requests in prose even through the
+    recipe lane — retry x3, no lift shape), and the lane battery's tool
+    cells measuring a proven-incapable fixture degrade into draw
+    lottery. A certified row IS the canonical known-good fixture for
+    this lane; MODEL is the fallback when nothing is certified (the
+    battery then honestly reports the floor, not a false lane defect).
+    """
+    tools_pass = tools_pass or set()
+
     def is_mlx(r: dict) -> bool:
         return (
             Path(r["path"]).is_dir()
@@ -5628,7 +5678,17 @@ def _eng_pick_mlx(rows: list[dict]) -> dict | None:
             and not _eng_has_components(r)
         )
 
-    return _eng_smallest([r for r in rows if is_mlx(r)])
+    cands = [r for r in rows if is_mlx(r)]
+    certified = [r for r in cands if r["name"] in tools_pass]
+    if certified:
+        return _eng_smallest(certified)
+    exact = [r for r in cands if r["name"] == MODEL]
+    if exact:
+        return exact[0]
+    prefixed = [r for r in cands if r["name"].startswith(MODEL)]
+    if len(prefixed) == 1:
+        return prefixed[0]
+    return _eng_smallest(cands)
 
 
 def _eng_pick_embed(rows: list[dict]) -> dict | None:
@@ -5883,11 +5943,18 @@ def _eng_tool_battery(lane: str, model: str) -> None:
                 }
             ],
         }
-        if lane != "mlx":
+        if lane not in ("mlx", "sglang"):
             # mlx: forced choice is gateway-refused by design (mlx-lm
             # ignores tool_choice entirely) — a forced T8 would never see
             # SSE. T8 on mlx exercises the same delta-assembly path with a
             # voluntary call instead.
+            # sglang: the upstream 0.5.21 forced path (required or dict
+            # pin) emits the call with COMPLETE-EMPTY arguments "{}" in a
+            # single delta — no fragments ever flow, so a forced T8
+            # measures nothing about assembly. Voluntary calls emit real
+            # argument fragments, which is exactly what this check must
+            # prove the relay assembles. The forcing contract itself is
+            # pinned by T3/T4 (call present, upstream args behavior).
             t8_body["tool_choice"] = "required"
         done, collected = sse_collect(
             "/v1/chat/completions",
@@ -6573,6 +6640,17 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
     if kind == "mistralrs":
         # The GGUF loader maps override ctx -> --max-model-len and
         # --max-num-batched-tokens = max(4096, ctx) (engine_impl tests).
+        #
+        # No user-extra_args argv cell on this lane, deliberately: the
+        # only owned-but-unemitted manifest flag is --tok-model-id,
+        # and pointing it at the fixture's original repo makes the
+        # load depend on tokenizer/config consistency between the GGUF
+        # packaging and that repo (live-proven failure: qwen2.5-0.5b
+        # GGUF carries output.weight while the original config.json
+        # sets tie_word_embeddings=true — mistral.rs aborts). The
+        # ride/dedup contract for user extra_args is pinned at unit
+        # tier instead (tests/mistralrs.rs, text-GGUF + derived-wins
+        # cases).
         return {
             "cfg": {},
             "override": {"ctx": 8192},
@@ -6583,7 +6661,7 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
             "presence": [],
             "soft_pairs": [],
             "soft_skip": [],
-            "note": "",
+            "note": "user extra_args ride pinned at unit tier (fixture tokenizer consistency is not blazar's contract)",
         }
     if kind == "mlx":
         # mlx_argv is a fixed spine; extra_args tokens are flag-validated
@@ -6746,12 +6824,13 @@ def phase_engines() -> None:
             d.stop()
 
     gguf = _eng_pick_gguf_chat(rows)
+    tools_pass = _eng_tools_pass_models()
     text_lanes = [
         # (kind, pin value written into model_overrides, model row, load budget s)
         ("llamacpp", None, gguf, 300),
         ("mistralrs", "mistralrs", gguf, 300),
         ("sglang", "sglang", _eng_pick_safetensors_dir(rows), 420),
-        ("mlx", "mlx", _eng_pick_mlx(rows), 300),
+        ("mlx", "mlx", _eng_pick_mlx(rows, tools_pass), 300),
     ]
     try:
         for kind, pin, model_row, load_budget in text_lanes:
@@ -10741,6 +10820,13 @@ def phase_commands() -> None:
         if p.returncode != 0 and ("cmake" in out.lower() or "toolchain" in out.lower()):
             regb("engine.build", f"no local build toolchain: {out.strip()[:120]}")
             return
+        if p.returncode != 0 and ("rate limited" in out.lower() or "403" in out):
+            # engine.build clones from GitHub; the anonymous API quota
+            # (60 req/hr) shared with every other lane's release lookups
+            # exhausts on heavy windows — same environment class the
+            # install/download lanes already boundary-classify.
+            regb("engine.build", f"blocked this window: {out.strip()[:120]}")
+            return
         reg(
             "engine.build",
             p.returncode == 0,
@@ -10806,6 +10892,85 @@ def phase_commands() -> None:
 
     lane("engine.install", _engine_install)
 
+    # -- A1c: gate-fill commands (2026-10-09) — rpc.* shipped in 0.23.0
+    # ahead of the registry (gates a/a2 + CONFIG COVERAGE fallback rows
+    # poisoned by manifest_ok=False), and certify/classify/tune.ctx sat
+    # in the manifest without battery evidence rows. Every probe below
+    # is a real invocation. ------------------------------------------
+    p = cli("rpc", "status")
+    out = p.stdout + p.stderr
+    reg(
+        "rpc.status",
+        p.returncode == 0 and "local devices only" in out,
+        f"rc={p.returncode} fleet head={out.strip().splitlines()[0][:70]!r}",
+    )
+
+    # Real foreground worker on a free port: bind, answer a TCP probe,
+    # then SIGTERM — the documented shutdown contract maps TERM to 143
+    # (128+15), the same mapping the unix rpc worker pins in tests.
+    rpc_port = _free_port()
+    worker = subprocess.Popen(
+        [PAL, "rpc", "worker", "--port", str(rpc_port)],
+        env=SANDBOX.env(None),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    import socket as _socket
+
+    worker_up = False
+    _deadline = time.time() + 20
+    while time.time() < _deadline:
+        if worker.poll() is not None:
+            break
+        try:
+            with _socket.create_connection(("127.0.0.1", rpc_port), timeout=1):
+                worker_up = True
+                break
+        except OSError:
+            time.sleep(0.5)
+    worker.terminate()
+    try:
+        worker_rc = worker.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        worker.kill()
+        worker_rc = worker.wait()
+    reg(
+        "rpc.worker",
+        worker_up and worker_rc == 143,
+        f"bind+connect={worker_up} rc={worker_rc} (TERM=143)",
+    )
+
+    p = cli("certify", MODEL, "--json", timeout=600)
+    try:
+        passport = json.loads(p.stdout)
+    except ValueError:
+        passport = {}
+    reg(
+        "certify",
+        p.returncode == 0 and "capabilities" in passport and "identity" in passport,
+        f"rc={p.returncode} passport keys={sorted(passport)[:6]}",
+    )
+
+    p = cli("classify", "bogus-model-x", "hi", "--labels", "safe,unsafe")
+    out = p.stdout + p.stderr
+    reg(
+        "classify",
+        p.returncode != 0 and "not found" in out and "blazar list" in out,
+        f"rc={p.returncode} teach={out.strip()[:90]!r}",
+    )
+
+    p = cli("tune", MODEL, "--ctx", "4096", timeout=600)
+    out = p.stdout + p.stderr
+    # Full CUDA bundles adopt the measured ctx (rc0); slim server-only
+    # assets refuse with the llama-bench teaching — both are the real
+    # behavior of this box's engine set, and the row reports which.
+    reg(
+        "tune.ctx",
+        (p.returncode == 0 and "ctx" in out.lower()) or ("llama-bench" in out),
+        f"rc={p.returncode} head={out.strip().splitlines()[0][:70]!r}",
+    )
+
     def _tts_state():
         p = cli("tts", "--list")
         reg(
@@ -10819,12 +10984,22 @@ def phase_commands() -> None:
             p.returncode != 0 and "not installed" in (p.stdout + p.stderr),
             f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
         )
+        # Deterministic under a POPULATED voice store too: the heavy
+        # tts.pull lane may have run first and pulled en_US-amy-medium,
+        # which would make a bare probe synthesize instead of refuse.
+        # A bogus voice id refuses through the resolver in both states.
         p = cli(
-            "tts", "validation probe", "--out", os.path.join(SANDBOX.root, "tts.wav")
+            "tts",
+            "validation probe",
+            "--voice",
+            "en_ZZ-bogus-x",
+            "--out",
+            os.path.join(SANDBOX.root, "tts.wav"),
         )
+        out = (p.stdout + p.stderr).lower()
         reg(
             "tts.synthesize.no-voice",
-            p.returncode != 0 and "no voice" in (p.stdout + p.stderr).lower(),
+            p.returncode != 0 and ("no voice" in out or "not pulled" in out),
             f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
         )
         # --no-play was removed from the product surface (clap rejects it);
@@ -11829,6 +12004,11 @@ def _env_valid_value(var: str, rust_type: str | None) -> str:
         "REASONING_FORMAT": "deepseek",
         "SERVER_TOOLS_RUNTIME": "docker:alpine",
         "SPEC": "auto",
+        # passthrough-argv knobs: config.validate() requires the first
+        # token to be a flag (bare tokens are positionals — rejected with
+        # "must start with a flag token"); the generic placeholder trips it.
+        "SDCPP_EXTRA_ARGS": "--validate-probe 1",
+        "WHISPER_EXTRA_ARGS": "--validate-probe 1",
         # range-floored numeric: must be >= 1000 per config.validate()
         "WHISPER_STREAM_CHUNK_MS": "2000",
     }
@@ -13574,6 +13754,15 @@ def main() -> int:
     print(f"binary={PAL} model={MODEL} fast={FAST}")
     if _MODEL_NOTE:
         print(f"model resolution: {_MODEL_NOTE}")
+    if not _MODEL_OK:
+        # An ambiguous/missing fixture name 404s at the gateway's own
+        # resolution ladder, so every MODEL-keyed phase would fail in a
+        # confusing cascade (58-check incident 2026-10-09: the store
+        # gained qwen2.5-0.5b-instruct-4bit beside -instruct and the
+        # default 'qwen2.5-0.5b' turned ambiguous). One actionable
+        # startup error beats dozens of knock-on fails mid-run.
+        print("pass BLAZAR_VALIDATE_MODEL=<exact store row listed above>")
+        return 2
     # A dead GH_TOKEN is worse than none (401 "Bad credentials" on every
     # authed call: engine-check marker, whisper install, engine update,
     # doctor currency probes). Validate once up front; drop it if invalid
