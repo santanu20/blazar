@@ -3843,6 +3843,22 @@ impl Supervisor {
                 model.path
             )));
         }
+        // Code-store admission (lane-agnostic, same teach-at-the-door
+        // shape as the diffusion guard above): `.packed` tensor names
+        // in the repo's index mark custom research quant formats
+        // (PolarQuant/EOQ-style) that only the repo's own Python
+        // loader can dequantize — every lane would die at weight load
+        // with an opaque engine error, so the gate refuses at the
+        // route decision naming the evidence and the levers.
+        if let blazar_core::hfmeta::ModelMeta::Hf(_) = meta_box.borrow_meta()
+            && let Some(teach) =
+                blazar_core::hfmeta::code_store_teach(std::path::Path::new(&model.path))
+        {
+            return Err(SupervisionError::UnsupportedModel(format!(
+                "{}: {teach}",
+                model.path
+            )));
+        }
         // SGLang lane admission (config facts that predict engine death —
         // same teach-at-the-door pattern as the diffusion guard above): a
         // quant_method this build cannot load crashes the server during

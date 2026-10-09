@@ -253,15 +253,85 @@ pub fn sglang_lane_teach(meta: &HfMeta, dir: &Path) -> Option<String> {
         ));
     }
     if meta.vision_tower && !dir.join("preprocessor_config.json").is_file() {
+        // Weight evidence splits the remedy. Visual tensors in the
+        // index (or no index to read) mean a genuinely incomplete
+        // multimodal pull — re-pulling can complete it. Zero visual
+        // tensors mean a text-only quant of a multimodal base: the
+        // tower declaration is vestigial, so re-pulling this same repo
+        // can never produce the artifact.
+        let vestigial = matches!(safetensors_index_facts(dir), Some(facts) if facts.visual == 0);
+        let remedy = if vestigial {
+            "the weights carry no vision tensors — a text-only quant of a \
+             multimodal base with a vestigial tower declaration, so re-pulling \
+             this repo can never produce the artifact. Export the model as \
+             text-only (drop the vision keys from config.json) or serve an \
+             official build of the base model"
+        } else {
+            "Re-pull the complete repo (blazar pull <model>), or serve on a \
+             lane that tolerates the missing artifact"
+        };
         return Some(format!(
             "multimodal config (vision tower declared) but {} lacks \
-             preprocessor_config.json — the engine's processor init dies at spawn. \
-             Re-pull the complete repo (blazar pull <model>), or serve on a lane \
-             that tolerates the missing artifact",
+             preprocessor_config.json — the engine's processor init dies at \
+             spawn. {remedy}",
             dir.display()
         ));
     }
     None
+}
+
+/// Tensor-name facts from `model.safetensors.index.json` (the repo's
+/// own weight manifest): how many tensors are bit-packed quant codes
+/// (`.packed` suffix) and how many belong to a vision tower. `None`
+/// when the index is absent, unreadable, malformed, or carries an
+/// empty `weight_map` — an unknown manifest (a download in flight or
+/// a single-file repo), never "no packed tensors".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SafetensorsIndexFacts {
+    pub(crate) packed: usize,
+    pub(crate) visual: usize,
+}
+
+#[must_use]
+pub(crate) fn safetensors_index_facts(dir: &Path) -> Option<SafetensorsIndexFacts> {
+    let raw = std::fs::read_to_string(dir.join("model.safetensors.index.json")).ok()?;
+    let index: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let map = index.get("weight_map")?.as_object()?;
+    if map.is_empty() {
+        return None;
+    }
+    let mut facts = SafetensorsIndexFacts::default();
+    for key in map.keys() {
+        if key.ends_with(".packed") {
+            facts.packed += 1;
+        } else if key.contains("visual") || key.contains("vision") {
+            facts.visual += 1;
+        }
+    }
+    Some(facts)
+}
+
+/// Lane-agnostic admission teaching: refuse custom quant code stores
+/// whose tensors are bit-packed codes (`.packed` suffix in the index)
+/// that only the repo's own Python loader can dequantize (live shape:
+/// PolarQuant/EOQ research repos). Every engine lane dies at weight
+/// load with an opaque engine error; the gate names the evidence and
+/// the levers instead. `None` = no objection (standard weights, or no
+/// index to read — single-file repos are beyond this gate's sight).
+#[must_use]
+pub fn code_store_teach(dir: &Path) -> Option<String> {
+    let packed = safetensors_index_facts(dir)?.packed;
+    if packed == 0 {
+        return None;
+    }
+    Some(format!(
+        "custom quant code store: {packed} tensors named `*.packed` in \
+         model.safetensors.index.json — bit-packed research formats load only \
+         through the repo's own Python dequantizer, which no engine lane \
+         embeds. Export standard safetensors weights (run the repo's loader, \
+         save the dequantized model), or serve an official quant of the same \
+         base model"
+    ))
 }
 
 /// Root-level `.safetensors` weights of an HF model dir — the pull
@@ -592,5 +662,119 @@ mod tests {
         // Live shape of the WORKING bf16 control: tower + artifact = pass.
         let full = write_dir(&[("preprocessor_config.json", "{}")]);
         assert_eq!(sglang_lane_teach(&tower, full.path()), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__safetensors_index_facts__counts_packed_and_visual() {
+        // Live shape of the EOQ repo: packed codes beside plain
+        // weights, vision towers under family-specific prefixes.
+        let dir = write_dir(&[(
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "model.layers.0.self_attn.q_proj.weight.packed":"model-00001.safetensors",
+                "model.layers.0.self_attn.q_proj.weight.norms":"model-00001.safetensors",
+                "visual.encoder.layer.0.weight":"model-00001.safetensors",
+                "vision_tower.patch_embed.weight":"model-00001.safetensors",
+                "model.layers.1.mlp.gate_proj.weight":"model-00001.safetensors"}}"#,
+        )]);
+        let facts = safetensors_index_facts(dir.path()).expect("facts parsed");
+        assert_eq!(facts.packed, 1);
+        assert_eq!(facts.visual, 2);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__safetensors_index_facts__absent_malformed_empty_are_unknown() {
+        let bare = write_dir(&[]);
+        assert_eq!(safetensors_index_facts(bare.path()), None);
+        let junk = write_dir(&[("model.safetensors.index.json", "not json")]);
+        assert_eq!(safetensors_index_facts(junk.path()), None);
+        // An empty weight_map is a download in flight, not "no facts".
+        let empty = write_dir(&[("model.safetensors.index.json", r#"{"weight_map":{}}"#)]);
+        assert_eq!(safetensors_index_facts(empty.path()), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__code_store_teach__packed_tensors_refuse_with_levers() {
+        let dir = write_dir(&[(
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "model.layers.0.self_attn.q_proj.weight.packed":"m.safetensors",
+                "lm_head.weight.packed":"m.safetensors"}}"#,
+        )]);
+        let teach = code_store_teach(dir.path()).expect("code store refuses");
+        assert!(teach.contains("2 tensors"), "{teach}");
+        assert!(teach.contains("*.packed"), "{teach}");
+        assert!(teach.contains("no engine lane"), "{teach}");
+        assert!(
+            !teach.contains("blazar pull"),
+            "re-pull is a dead end for a code store: {teach}"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__code_store_teach__gptq_style_and_standard_pass() {
+        // GPTQ/AWQ/FP8 quantized repos use these suffixes — they are
+        // engine-loadable and must not read as code stores.
+        let gptq = write_dir(&[(
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "model.layers.0.self_attn.q_proj.qweight":"m.safetensors",
+                "model.layers.0.self_attn.q_proj.qzeros":"m.safetensors",
+                "model.layers.0.self_attn.q_proj.scales":"m.safetensors",
+                "model.layers.0.self_attn.q_proj.g_idx":"m.safetensors",
+                "model.layers.1.mlp.down_proj.weight_scale_inv":"m.safetensors"}}"#,
+        )]);
+        assert_eq!(code_store_teach(gptq.path()), None);
+        // No index (single-file repo): beyond the gate's sight.
+        let bare = write_dir(&[]);
+        assert_eq!(code_store_teach(bare.path()), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_lane_teach__vestigial_tower_teaches_export_not_repull() {
+        // Live shape of the EOQ artifact: tower declared, text-only
+        // weights — re-pulling can never produce the processor file.
+        let tower = HfMeta {
+            vision_tower: true,
+            ..Default::default()
+        };
+        let dir = write_dir(&[(
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "model.layers.0.self_attn.q_proj.weight":"m.safetensors",
+                "lm_head.weight":"m.safetensors"}}"#,
+        )]);
+        let teach = sglang_lane_teach(&tower, dir.path()).expect("vestigial tower refuses");
+        assert!(teach.contains("vestigial"), "{teach}");
+        assert!(teach.contains("text-only"), "{teach}");
+        assert!(
+            !teach.contains("Re-pull"),
+            "re-pull advice is wrong for a vestigial tower: {teach}"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_lane_teach__incomplete_multimodal_keeps_repull_advice() {
+        // Visual tensors present: a genuinely incomplete multimodal
+        // pull — the original re-pull remedy still applies.
+        let tower = HfMeta {
+            vision_tower: true,
+            ..Default::default()
+        };
+        let dir = write_dir(&[(
+            "model.safetensors.index.json",
+            r#"{"weight_map":{
+                "model.layers.0.self_attn.q_proj.weight":"m.safetensors",
+                "visual.encoder.layer.0.weight":"m.safetensors"}}"#,
+        )]);
+        let teach = sglang_lane_teach(&tower, dir.path()).expect("incomplete multimodal refuses");
+        assert!(teach.contains("Re-pull"), "{teach}");
+        assert!(teach.contains("blazar pull"), "{teach}");
     }
 }
