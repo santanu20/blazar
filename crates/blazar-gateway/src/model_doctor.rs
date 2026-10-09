@@ -12,6 +12,7 @@
 //! plane. The finished certificate is also upserted into `model_caps`
 //! where routing surfaces can read it without scraping job history.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -36,6 +37,15 @@ const OVERALL_CAP: Duration = Duration::from_secs(600);
 /// Probe replies are tiny by construction; anything larger means the lane
 /// misbehaved and gets truncated, not buffered whole.
 const PROBE_BODY_CAP: usize = 4 * 1024 * 1024;
+/// Borderline models draw unlucky: a small quant answers the tool probe
+/// in prose on one sample and emits a perfect call on the identically
+/// shaped retry (measured live 2026-10-08, qwen2.5-1.5b-4bit on mlx).
+/// The certificate's question is existence — CAN this lane elicit the
+/// behavior — not per-draw reliability, so elicitation probes retry and
+/// PASS on any success. Reliability is the scorecard's axis; a
+/// single-draw FAIL here blocks live traffic via `CAPABILITY_VERIFIED_FAILED`
+/// on a configuration that works.
+const ELICIT_ATTEMPTS: usize = 3;
 
 static SEQ: AtomicU64 = AtomicU64::new(1);
 static BOOT_NANOS: OnceLock<u128> = OnceLock::new();
@@ -241,6 +251,25 @@ fn judge_embed(code: u16, body: &[u8]) -> Verdict {
 // ---------------------------------------------------------------------------
 // Probe transport — direct handler invocation through the real path.
 // ---------------------------------------------------------------------------
+
+/// Run an elicitation probe up to [`ELICIT_ATTEMPTS`] times, returning
+/// the first PASS or the last FAIL. Non-FAIL verdicts short-circuit: a
+/// lane that honestly answers N/A will not change its mind on retry, and
+/// a PASS already settles the existence question.
+async fn elicit_with_retry<F, Fut>(probe: F) -> Verdict
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Verdict>,
+{
+    let mut verdict = fail("probe never ran".to_string());
+    for _ in 0..ELICIT_ATTEMPTS {
+        verdict = probe().await;
+        if verdict.status != "FAIL" {
+            return verdict;
+        }
+    }
+    verdict
+}
 
 async fn call_chat(state: &Arc<AppState>, body: Value) -> (u16, Option<String>, Bytes) {
     // Tag every probe with the model-doctor header: the certificate
@@ -510,10 +539,11 @@ async fn run_probes(
         if row_cancelled(&state) {
             return;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            fail("overall time budget exhausted".to_string())
-        } else {
+        elicit_with_retry(|| async {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return fail("overall time budget exhausted".to_string());
+            }
             let body = json!({
                 "model": model,
                 "stream": false,
@@ -526,12 +556,12 @@ async fn run_probes(
                 },
                 "options": {"num_predict": 32},
             });
-            match tokio::time::timeout(PROBE_TIMEOUT.min(remaining), call_chat(&state, body)).await
-            {
+            match tokio::time::timeout(PROBE_TIMEOUT.min(remaining), call_chat(&state, body)).await {
                 Ok((code, _, bytes)) => judge_json(code, &bytes),
                 Err(_) => fail(format!("no completion within {}s", PROBE_TIMEOUT.as_secs())),
             }
-        }
+        })
+        .await
     };
     state.jobs.record_event(
         &state,
@@ -546,10 +576,11 @@ async fn run_probes(
         if row_cancelled(&state) {
             return;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            fail("overall time budget exhausted".to_string())
-        } else {
+        elicit_with_retry(|| async {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return fail("overall time budget exhausted".to_string());
+            }
             let body = json!({
                 "model": model,
                 "stream": false,
@@ -568,12 +599,12 @@ async fn run_probes(
                 }}],
                 "options": {"num_predict": 64},
             });
-            match tokio::time::timeout(PROBE_TIMEOUT.min(remaining), call_chat(&state, body)).await
-            {
+            match tokio::time::timeout(PROBE_TIMEOUT.min(remaining), call_chat(&state, body)).await {
                 Ok((code, _, bytes)) => judge_tools(code, &bytes),
                 Err(_) => fail(format!("no completion within {}s", PROBE_TIMEOUT.as_secs())),
             }
-        }
+        })
+        .await
     };
     state.jobs.record_event(
         &state,
@@ -917,6 +948,58 @@ mod tests {
         let v = judge_tools(200, prose);
         assert_eq!(v.status, "FAIL");
         assert!(v.receipt.contains("no tool_calls"));
+    }
+
+    #[tokio::test]
+    async fn unit__elicit_with_retry__passes_on_any_success() {
+        // Borderline fixture: prose on the first draw, a call on the
+        // second — the retry must settle the existence question PASS.
+        for fail_before_pass in 0..ELICIT_ATTEMPTS {
+            let draws = AtomicU64::new(0);
+            let v = elicit_with_retry(|| async {
+                if draws.fetch_add(1, Ordering::Relaxed) < fail_before_pass as u64 {
+                    fail("prose".to_string())
+                } else {
+                    pass("200, 1 tool call".to_string())
+                }
+            })
+            .await;
+            assert_eq!(v.status, "PASS", "fail_before_pass={fail_before_pass}");
+            assert_eq!(
+                draws.load(Ordering::Relaxed),
+                fail_before_pass as u64 + 1,
+                "must stop at the first PASS"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unit__elicit_with_retry__exhausts_to_last_fail() {
+        let draws = AtomicU64::new(0);
+        let v = elicit_with_retry(|| async {
+            draws.fetch_add(1, Ordering::Relaxed);
+            fail(format!("prose {}", draws.load(Ordering::Relaxed)))
+        })
+        .await;
+        assert_eq!(v.status, "FAIL");
+        assert_eq!(draws.load(Ordering::Relaxed), ELICIT_ATTEMPTS as u64);
+        assert_eq!(
+            v.receipt,
+            format!("prose {ELICIT_ATTEMPTS}"),
+            "last verdict kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__elicit_with_retry__na_short_circuits_without_retry() {
+        let draws = AtomicU64::new(0);
+        let v = elicit_with_retry(|| async {
+            draws.fetch_add(1, Ordering::Relaxed);
+            na("lane does not serve this".to_string())
+        })
+        .await;
+        assert_eq!(v.status, "N/A");
+        assert_eq!(draws.load(Ordering::Relaxed), 1, "N/A must not be retried");
     }
 
     #[test]
