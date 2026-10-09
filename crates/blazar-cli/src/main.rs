@@ -12856,7 +12856,14 @@ aborts on this family. Profile pins for it would measure nothing",
         cfg = config()?;
         println!("model_overrides.{model}.spec = {mode}");
     }
-    let hw = blazar_runtime::probe_hardware(Some(&manifest));
+    // Live device census, not the stored-manifest snapshot: the tune
+    // fit verdicts read free_mib, which goes stale the moment a
+    // neighbour spawn holds VRAM (frozen snapshot once refused a
+    // 4096 pin against 940 MiB on an idle card).
+    let hw = blazar_runtime::probe::live_census_hardware(
+        std::path::Path::new(&manifest.server_path),
+        &manifest,
+    );
     let gguf = blazar_core::read_metadata_file(std::path::Path::new(&row.path))?;
     let overlay = cfg.overlay_for(model);
     let loras: Vec<(String, f64)> = store

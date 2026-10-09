@@ -242,6 +242,38 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
     hardware_with(gpus)
 }
 
+/// Census precedence shared by the daemon's live path and daemon-less
+/// CLI verbs (`tune`): a live engine `--list-devices` census when one
+/// exists, else the stored-manifest snapshot. `free_mib` is volatile
+/// state, not device identity — a manifest snapshot goes stale the
+/// moment a neighbour spawn holds VRAM (live repro 2026-10-09:
+/// `tune --ctx 4096` refused a fit against a frozen 940 MiB free
+/// snapshot on an idle 7.6 GiB-free card).
+#[must_use]
+pub fn hardware_census(live: Vec<GpuInfo>, manifest: &Manifest) -> Hardware {
+    if live.is_empty() {
+        return probe_hardware(Some(manifest));
+    }
+    hardware_with(live)
+}
+
+/// [`hardware_census`] with the live leg gathered from the engine
+/// binary itself. The subprocess census is not unit-testable; tests
+/// exercise [`hardware_census`] directly with a fabricated live list.
+#[must_use]
+pub fn live_census_hardware(server_path: &std::path::Path, manifest: &Manifest) -> Hardware {
+    let live = crate::engine::manifest::run_list_devices(server_path)
+        .into_iter()
+        .map(|d| GpuInfo {
+            name: d.name,
+            description: d.description,
+            total_mib: d.total_mib,
+            free_mib: d.free_mib,
+        })
+        .collect();
+    hardware_census(live, manifest)
+}
+
 /// Best-effort `nvidia-smi` device census. None/skip on any failure —
 /// never a guessed entry. Rows come back in PCI bus order, the contract
 /// `spanning_spawn_env` pairs with `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
@@ -500,6 +532,59 @@ mod tests {
         // asserting the sysinfo-only merge at the composition point.
         let cpu_only = hardware_with(Vec::new());
         assert_eq!(cpu_only.gpus.len(), 0);
+    }
+
+    #[test]
+    fn unit__hardware_census__live_list_wins_over_stale_manifest_snapshot() {
+        // The stored manifest froze 940 MiB free while a neighbour spawn
+        // held VRAM; the live census sees the card idle again. Capacity
+        // verdicts must read the live number.
+        let m = Manifest {
+            tag: "t".into(),
+            build_number: 1,
+            version_raw: "version: 1".into(),
+            devices: vec![crate::engine::manifest::DeviceDesc {
+                name: "RTX 4070".into(),
+                description: "NVIDIA CUDA".into(),
+                total_mib: 8_188,
+                free_mib: 940,
+            }],
+            flags: std::collections::BTreeSet::default(),
+            spec_types: vec![],
+            server_path: "/x".into(),
+            ..Default::default()
+        };
+        let live = vec![GpuInfo {
+            name: "RTX 4070".into(),
+            description: "NVIDIA CUDA".into(),
+            total_mib: 8_188,
+            free_mib: 7_643,
+        }];
+        let hw = hardware_census(live, &m);
+        assert_eq!(hw.gpus.len(), 1);
+        assert_eq!(hw.gpus[0].free_mib, 7_643, "live census must win");
+    }
+
+    #[test]
+    fn unit__hardware_census__empty_live_falls_back_to_manifest_snapshot() {
+        let m = Manifest {
+            tag: "t".into(),
+            build_number: 1,
+            version_raw: "version: 1".into(),
+            devices: vec![crate::engine::manifest::DeviceDesc {
+                name: "RTX 4070".into(),
+                description: "NVIDIA CUDA".into(),
+                total_mib: 8_188,
+                free_mib: 940,
+            }],
+            flags: std::collections::BTreeSet::default(),
+            spec_types: vec![],
+            server_path: "/x".into(),
+            ..Default::default()
+        };
+        let hw = hardware_census(Vec::new(), &m);
+        assert_eq!(hw.gpus.len(), 1);
+        assert_eq!(hw.gpus[0].free_mib, 940, "snapshot is the fallback");
     }
 
     #[test]

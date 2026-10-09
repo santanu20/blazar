@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 
 use blazar_core::profile::{self, ComponentArg, Endpoint, ProfileInput};
 use blazar_core::store::Store;
-use blazar_core::{BlazarDirs, Config, GpuInfo, Hardware, ModelRow};
+use blazar_core::{BlazarDirs, Config, Hardware, ModelRow};
 
 /// Borrow a store row's diffusion component set for `ProfileInput` (the
 /// spawn sites own the Vec; the input borrows it).
@@ -5937,24 +5937,13 @@ drop them from rpc_servers in config.toml",
     /// request is already being served.
     fn live_hardware_with(engine: &Arc<dyn Engine>) -> Hardware {
         let manifest = engine.capabilities();
-        let live = if engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp {
-            crate::engine::manifest::run_list_devices(std::path::Path::new(&manifest.server_path))
-        } else {
-            Vec::new()
-        };
-        if live.is_empty() {
-            return crate::probe::probe_hardware(Some(manifest));
+        if engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp {
+            return crate::probe::live_census_hardware(
+                std::path::Path::new(&manifest.server_path),
+                manifest,
+            );
         }
-        let gpus = live
-            .iter()
-            .map(|d| GpuInfo {
-                name: d.name.clone(),
-                description: d.description.clone(),
-                total_mib: d.total_mib,
-                free_mib: d.free_mib,
-            })
-            .collect();
-        crate::probe::hardware_with(gpus)
+        crate::probe::hardware_census(Vec::new(), manifest)
     }
 
     /// (at most once per minute — the probe spawns `--list-devices`) and
@@ -7159,7 +7148,7 @@ async fn terminate_group(pid: u32, grace: Duration, child: &mut ChildHandle) -> 
 mod routing_tests {
     use super::*;
     use crate::engine::manifest::Manifest;
-    use blazar_core::{ModelOverride, Profile};
+    use blazar_core::{GpuInfo, ModelOverride, Profile};
 
     #[test]
     fn unit__slot_reported_tokens__distinguishes_zero_from_missing() {
