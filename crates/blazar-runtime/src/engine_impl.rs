@@ -730,29 +730,26 @@ pub fn mistralrs_argv(
     mistralrs_tuning_passthrough(&profile.argv, flags, &mut argv);
     // User extra_args ride profile.argv after compile-time strict
     // validation (manifest-gated, reserved-flag refusal). Forward them
-    // verbatim here — skipping everything this function owns or the
-    // tuning passthrough already translated — with the spawn-time
-    // manifest check as belt-and-braces against stale profiles.
-    let owned: &[&str] = &[
-        "-m",
-        "-f",
-        "--host",
-        "--port",
-        "--no-ui",
-        "--max-model-len",
-        "--max-num-batched-tokens",
-        "--max-seqs",
-        "--mmproj",
-        "--tok-model-id",
-        "-np",
-        "--paged-attn",
-        "--pa-memory-fraction",
-    ];
+    // verbatim here, skipping every token this argv builder already
+    // emitted — where the builder fired (ctx-scaled --max-model-len,
+    // the derived multimodal --tok-model-id, the tuning passthrough)
+    // its value wins. An owned flag the builder did NOT emit is
+    // exactly the user escape hatch: a text GGUF cannot encode whether
+    // sliding-window attention is required, the mistral.rs loader
+    // demands `--tok-model-id <hf-repo>` for it, and dropping the
+    // user's pair would strand an override compile-time validation
+    // already accepted. The manifest check below stays as
+    // belt-and-braces against stale profiles.
+    let emitted: std::collections::HashSet<String> = argv
+        .iter()
+        .filter(|t| t.starts_with('-'))
+        .cloned()
+        .collect();
     for (i, tok) in profile.argv.iter().enumerate() {
         let t = tok.as_str();
         if !t.starts_with('-')
             || t.starts_with("--parallel=")
-            || owned.contains(&t)
+            || emitted.contains(t)
             || blazar_core::profile::MISTRALRS_TUNING_BOOL_FLAGS.contains(&t)
             || blazar_core::profile::MISTRALRS_TUNING_VALUE_FLAGS.contains(&t)
         {

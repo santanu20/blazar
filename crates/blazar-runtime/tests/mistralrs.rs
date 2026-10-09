@@ -285,6 +285,84 @@ fn unit__mistralrs_argv__multimodal_gguf_rides_derived_tok_model_id() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn unit__mistralrs_argv__text_gguf_user_tok_model_id_rides() {
+    // Text GGUFs carry no mmproj, so the builder never derives
+    // --tok-model-id; the user's extra_args pair (the SWA escape hatch
+    // for Mistral-family GGUFs whose metadata cannot encode sliding
+    // window attention) must survive the owned-flag skip and reach the
+    // child verbatim.
+    let m = model("/store/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf", None);
+    let mut f = flags(true);
+    f.insert("--tok-model-id".to_string());
+    let argv = mistralrs_argv(
+        &m,
+        &profile(0, &["--tok-model-id", "mistralai/Mistral-7B-Instruct-v0.3"]),
+        &Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 8123,
+        },
+        &f,
+    );
+    let i = argv
+        .iter()
+        .position(|a| a == "--tok-model-id")
+        .expect("user tok-model-id rides the text GGUF argv");
+    assert_eq!(argv[i + 1], "mistralai/Mistral-7B-Instruct-v0.3");
+    assert_eq!(
+        argv.iter()
+            .filter(|a| a.as_str() == "--tok-model-id")
+            .count(),
+        1,
+        "exactly one emission, no duplicate"
+    );
+}
+
+#[test]
+fn unit__mistralrs_argv__derived_tok_model_id_wins_over_user_extra() {
+    // When the builder CAN derive the id (multimodal GGUF with
+    // general.basename), the derived value wins and the user's
+    // extra_args pair is skipped — no duplicate emission, no override
+    // of the computed identity.
+    let dir = std::env::temp_dir().join(format!("blazar-mrs-tokid-win-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let gguf = dir.join("model.gguf");
+    std::fs::write(
+        &gguf,
+        gguf_bytes(&[
+            ("general.architecture", "qwen35"),
+            ("general.basename", "Qwen_Qwen3.5"),
+            ("general.size_label", "9B"),
+        ]),
+    )
+    .expect("gguf fixture");
+    let mut f = flags(false);
+    f.insert("--tok-model-id".to_string());
+    let m = model(gguf.to_str().unwrap_or(""), Some("/store/mmproj.gguf"));
+    let argv = mistralrs_argv(
+        &m,
+        &profile(0, &["--tok-model-id", "user/repo-that-must-not-win"]),
+        &Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 8123,
+        },
+        &f,
+    );
+    let i = argv
+        .iter()
+        .position(|a| a == "--tok-model-id")
+        .expect("derived id present");
+    assert_eq!(argv[i + 1], "Qwen/Qwen3.5-9B");
+    assert_eq!(
+        argv.iter()
+            .filter(|a| a.as_str() == "--tok-model-id")
+            .count(),
+        1,
+        "derived emission only"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn integration__mistralrs_health__waits_for_models_loaded() {
     let api = MockServer::start().await;
