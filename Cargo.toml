@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.23.0"
+version = "0.24.0"
 edition = "2024"
 # Floor is sysinfo 0.39 (MSRV 1.95); edition 2024 itself needs >=1.85.
 rust-version = "1.95"
@@ -18,9 +18,9 @@ license = "MIT OR Apache-2.0"
 libc = "0.2.189"
 # Path for local dev; the version is what crates.io resolves once published.
 # Bump these in lockstep with workspace.package.version on every release.
-blazar-core = { path = "crates/blazar-core", version = "0.23.0" }
-blazar-runtime = { path = "crates/blazar-runtime", version = "0.23.0" }
-blazar-gateway = { path = "crates/blazar-gateway", version = "0.23.0" }
+blazar-core = { path = "crates/blazar-core", version = "0.24.0" }
+blazar-runtime = { path = "crates/blazar-runtime", version = "0.24.0" }
+blazar-gateway = { path = "crates/blazar-gateway", version = "0.24.0" }
 
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json", "ws"] }

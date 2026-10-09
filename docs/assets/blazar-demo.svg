@@ -27,7 +27,7 @@
 <text x="299.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar run — single-shot generation (llama.cpp lane)</text>
 <text x="299.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar run — single-shot generation (llama.cpp lane)</text>
 <text x="299.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar run — single-shot generation (llama.cpp lane)</text>
-<text x="30.0" y="65.0" font-size="12.5" fill="#8b949e" font-weight="400">blazar 0.23.0 — powered by upstream llama.cpp, mistral.rs and SGLang</text>
+<text x="30.0" y="65.0" font-size="12.5" fill="#8b949e" font-weight="400">blazar 0.24.0 — powered by upstream llama.cpp, mistral.rs and SGLang</text>
 <text x="30.0" y="84.0" font-size="12.5" fill="#e6edf3" font-weight="400"></text>
 <text x="30.0" y="103.0" font-size="12.5" fill="#3fb950" font-weight="400">$ blazar run qwen3-0.6b &quot;Explain what a local inference engine does, in</text>
 <text x="30.0" y="122.0" font-size="12.5" fill="#e6edf3" font-weight="400">one sentence.&quot; --max-tokens 60</text>

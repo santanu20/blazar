@@ -6,6 +6,8 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-09
+
 ### Fixed
 
 - **Live device census for `tune` fit verdicts** — the daemon-less tune path read
