@@ -438,11 +438,13 @@ mod tests {
     fn unit__reclaim_marker_orphans__marked_decends_term_ignoring_killed() {
         let (tmp, d) = dirs();
         let marker = d.data_dir.display().to_string();
-        // Marked, TERM-ignoring decoy: bash stays resident (no exec) so
-        // the trap survives; sleep runs as its child.
+        // Single-process decoy: `exec` replaces bash with sleep in the
+        // SAME pid, and an ignored signal disposition survives exec — so
+        // exactly one TERM-immune marked process exists for the sweep to
+        // kill (a forked sleep child would leak into the next sweep).
         let mut stubborn = std::process::Command::new("bash")
             .arg("-c")
-            .arg("trap '' TERM; sleep 300")
+            .arg("trap '' TERM; exec sleep 300")
             .env(ORPHAN_MARKER_ENV, &marker)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

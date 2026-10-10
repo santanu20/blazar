@@ -1952,7 +1952,11 @@ async fn run(cmd: Cmd) -> Result<()> {
             // stays soft here: a name that matches neither a row nor a
             // pulled voice falls through to run_dispatch, which owns
             // the pull-teaching error.
-            let ensured = ensure_run_model(&model).await;
+            // Boxed: this future carries the whole REPL setup surface and
+            // crosses clippy's 16 KiB large-futures ceiling on Windows
+            // (larger enum layouts than Linux); the heap indirection is
+            // once-per-invocation and free.
+            let ensured = Box::pin(ensure_run_model(&model)).await;
             let model_ref: &str = ensured.as_deref().unwrap_or(&model);
             let row = Store::open(&dirs())
                 .ok()

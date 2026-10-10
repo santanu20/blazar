@@ -64,8 +64,8 @@ previous wave hides the re-spawn cost from the user.
 
 Primary sources: docs.vllm.ai sleep_mode feature page; NVIDIA Triton server
 docs (model_configuration.md, ModelWarmup); KServe scaling docs; Ollama
-keep_alive FAQ. Extracts cached at `/tmp/opencode/` during research (not
-shipped).
+keep_alive FAQ. Working extracts were kept in local scratch during research
+and are not part of the tree.
 
 ## Verification ledger
 
