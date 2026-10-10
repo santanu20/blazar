@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) — 205 fields, 0 dead
+## Config (top-level keys) — 230 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -233,7 +233,33 @@ token quality are surfaced as drift.
 | preload | Vec::new() | runtime/gateway | `crates/blazar-gateway/src/lib.rs:1281` (F1: listed models spawn at startup, one at a time; TLS branch `:1335`) |
 | warm_on_pull | false | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:6036` in effective `warm_on_pull` (per-model override wins) |
 | idle_ram_warm | true | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:5639` (idle warm to RAM unless `load_mode = "direct-io"`) |
-## MistralrsTuning ([mistralrs]) — 21 fields, 0 dead
+| whisper_beam_size | — | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1057` (pushed as `--beam-size`); recipe preset `crates/blazar-runtime/src/whisper.rs:1380` |
+| whisper_best_of | — | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1060` (pushed as `--best-of`); recipe preset `:1381` |
+| whisper_entropy_thold | — | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1063` (pushed as `--entropy-thold`); recipe preset `:1382` |
+| whisper_logprob_thold | — | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1066` (pushed as `--logprob-thold`); recipe preset `:1383` |
+| whisper_word_thold | — | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1069` (pushed as `--word-thold`); recipe preset `:1384` |
+| whisper_diarize | false | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1072` (pushes `--diarize`); recipe preset `:1385` |
+| whisper_tinydiarize | false | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1075` (pushes `--tinydiarize`); recipe preset `:1386` |
+| whisper_vad_threshold | — | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1078` (VAD gate threshold); recipe preset `:1387` |
+| whisper_vad_min_speech_duration_ms | — | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1081`; recipe preset `:1388` |
+| whisper_vad_min_silence_duration_ms | — | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1084`; recipe preset `:1389` |
+| mlx | MlxTuning::default() | other + engine-argv | `crates/blazar-core/src/profile.rs:3965` in `compile_mlx` (per-model override merged via `MlxTuning::effective`) |
+| sdcpp_control_net | — | engine-argv | `crates/blazar-core/src/profile.rs:3477` (knob table → `--control-net`) |
+| sdcpp_ip_adapter | — | engine-argv | `crates/blazar-core/src/profile.rs:3482` (→ `--ip-adapters`) |
+| sdcpp_clip_vision | — | engine-argv | `crates/blazar-core/src/profile.rs:3487` (→ `--clip-vision`) |
+| sdcpp_motion_module | — | engine-argv | `crates/blazar-core/src/profile.rs:3492` (→ `--motion-module`) |
+| sdcpp_photo_maker | — | engine-argv | `crates/blazar-core/src/profile.rs:3497` (→ `--photo-maker`) |
+| sdcpp_pulid_weights | — | engine-argv | `crates/blazar-core/src/profile.rs:3502` (PuLID identity-preserving weights) |
+| sdcpp_upscale_model | — | engine-argv | `crates/blazar-core/src/profile.rs:3507` (→ `--upscale-model`) |
+| sdcpp_lora_model_dir | — | engine-argv | `crates/blazar-core/src/profile.rs:3512` (→ `--lora-model-dir`) |
+| sdcpp_hires_upscalers_dir | — | engine-argv | `crates/blazar-core/src/profile.rs:3517` (→ `--hires-fix-upscalers-dir`) |
+| sdcpp_embd_dir | — | engine-argv | `crates/blazar-core/src/profile.rs:3519` (→ `--embd-dir`) |
+| sdcpp_audio_encoder | — | engine-argv | `crates/blazar-core/src/profile.rs:3523` (audio diffusion encoder weights) |
+| sdcpp_high_noise_diffusion_model | — | engine-argv | `crates/blazar-core/src/profile.rs:3528` (high-noise MMDiT companion) |
+| sdcpp_uncond_diffusion_model | — | engine-argv | `crates/blazar-core/src/profile.rs:3533` (uncond branch for cfg-distilled flows) |
+| sdcpp_backend | — | engine-argv | `crates/blazar-core/src/profile.rs:3535` (→ `--backend`, per-device placement map) |
+
+## MistralrsTuning ([mistralrs]) — 27 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -259,7 +285,14 @@ token quality are surfaced as drift.
 | disable_access_log | — | cli + engine-argv | `blazar-cli/src/main.rs:9127` in `knob_hint_block`; `blazar-core/src/profile.rs:2754` in `compile_mistralrs`; `blazar-core/src/profile.rs:2759` in `compile_mistralrs` |
 | device_layers | — | cli + engine-argv | `blazar-cli/src/main.rs:9127` in `knob_hint_block`; `blazar-cli/src/main.rs:12900` in `unit__known_config_key__dotted_table_paths`; `blazar-core/src/profile.rs:2767` in `compile_mistralrs`; `blazar-core/src/profile.rs:2770` in `compile_mistralrs` |
 
-## SglangTuning ([sglang]) — 51 fields, 0 dead
+| pa_memory_mb | — | engine-argv + cli | `crates/blazar-core/src/profile.rs:2518` (per-model override first, global fallback — absolute paged-KV MiB); hint block `crates/blazar-cli/src/main.rs:13886` |
+| chat_template | "{{}}".to_string() | engine-argv | `crates/blazar-core/src/profile.rs:2197` (pushed as `--chat-template`; skipped with a teaching warning when the engine manifest lacks the flag) |
+| isq | — | engine-argv | `crates/blazar-core/src/profile.rs:3108` (in-memory quantization level, e.g. Q4K) |
+| imatrix | — | engine-argv | `crates/blazar-core/src/profile.rs:3118` (importance-matrix file for the isq workflow) |
+| calibration_file | — | engine-argv | `crates/blazar-core/src/profile.rs:3128` (calibration prompts feeding imatrix generation); hint block `crates/blazar-cli/src/main.rs:13890` |
+| isq_organization | — | engine-argv | `crates/blazar-core/src/profile.rs:3138` (`default` or `moqe` weight organization); hint block `crates/blazar-cli/src/main.rs:13891` |
+
+## SglangTuning ([sglang]) — 62 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -315,7 +348,19 @@ token quality are surfaced as drift.
 | lora_backend | — | engine-argv + cli | `blazar-core/src/profile.rs:4227` in `compile_sglang`; `blazar-core/src/profile.rs:4231` in `compile_sglang`; `blazar-cli/src/main.rs:9115` in `knob_hint_block` |
 
 | is_embedding | — | engine-argv | `crates/blazar-core/src/profile.rs:4290` in `compile_sglang` (Some(true) → embedding-lane argv posture + teaching at `:4300`) |
-## ModelOverride ([models."name"]) — 38 fields, 0 dead
+| spec_algorithm | "ngram".to_string() | engine-argv | `crates/blazar-core/src/profile.rs:5150` (draft-free self-speculation arm of the speculative ladder; validated against the knob's allowed set) |
+| spec_num_steps | Some(0) | engine-argv | `crates/blazar-core/src/profile.rs:5194` (draft depth; 0 = engine default) |
+| spec_num_draft_tokens | Some(0) | engine-argv | `crates/blazar-core/src/profile.rs:5204` (tokens per draft step; 0 = engine default) |
+| speculative_eagle_topk | Some(4) | engine-argv | `crates/blazar-core/src/profile.rs:5110` (EAGLE top-k; rides the draft-pair lane) |
+| speculative_accept_threshold_single | Some(0.1) | engine-argv | `crates/blazar-core/src/profile.rs:5120` |
+| speculative_accept_threshold_acc | Some(0.95) | engine-argv | `crates/blazar-core/src/profile.rs:5130` |
+| mm_attention_backend | — | engine-argv | `crates/blazar-core/src/profile.rs:4762` (multimodal attention override) |
+| retraction_policy | — | engine-argv | `crates/blazar-core/src/profile.rs:4767` (decode retraction on preemption) |
+| enable_two_batch_overlap | — | engine-argv | `crates/blazar-core/src/profile.rs:4890` (TBO, micro-batch overlap) |
+| enable_tf32_matmul | — | engine-argv | `crates/blazar-core/src/profile.rs:4903` (TF32 matmul toggle) |
+| enable_priority_scheduling | Some(true) | engine-argv | `crates/blazar-core/src/profile.rs:4916` (request priority scheduling) |
+
+## ModelOverride ([models."name"]) — 39 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -358,6 +403,8 @@ token quality are surfaced as drift.
 | cache_type_v | — | engine-argv | `crates/blazar-core/src/config.rs:2887` in `effective_cache_type_kv` (V side) |
 | warm_on_pull | — | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:6036` in effective `warm_on_pull` (per-model wins) |
 | tensor_split | — | engine-argv + runtime/gateway | `crates/blazar-core/src/config.rs` in `effective_tensor_split` (per-model wins; empty = inherit global; also feeds the auto tensor-split stand-down gates in `crates/blazar-runtime/src/supervisor.rs`) |
+| mlx | — | engine-argv | `crates/blazar-core/src/profile.rs:3965` in `compile_mlx` (`MlxTuning::effective(input.overlay.mlx.as_ref(), &input.config.mlx)`) |
+
 ## SamplerDefaults ([sampler]) — 18 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |

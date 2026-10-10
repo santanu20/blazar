@@ -1048,6 +1048,17 @@ def sudo_systemctl(*args: str, password: str | None = None) -> bool:
     return out.returncode == 0
 
 
+def pin_active_engine(con, where, param):
+    """Flip the engines.active pin without tripping the global
+    one_active_engine partial index. A single UPDATE is checked
+    per-row as it scans: activating row N while a later-rowid row
+    still holds active=1 fires a transient UNIQUE violation (live:
+    pinning sglang-0.5.21 while b11429-cuda rode a higher rowid).
+    Deactivate-first, then activate, is order-proof."""
+    con.execute("UPDATE engines SET active = 0 WHERE active = 1")
+    con.execute(f"UPDATE engines SET active = 1 WHERE {where}", (param,))
+
+
 def sandbox_model_files(sb, model_name: str) -> tuple[Path | None, Path | None]:
     """(weights file, mmproj file) from the sandbox store row — the cold
     probe drops the page cache on BOTH: a cold VL spawn reads the
@@ -1363,10 +1374,7 @@ def media_family(
         # routes by endpoint, never by the active flag. Pinning the audio
         # lane active instead makes the daemon teaching-refuse to boot
         # ("audio lane cannot back model serving", live 2026-09-28).
-        con.execute(
-            "UPDATE engines SET active = (kind = ?)",
-            (activate_kinds[0],),
-        )
+        pin_active_engine(con, "kind = ?", activate_kinds[0])
         con.commit()
         con.close()
         real_data = Path.home() / ".local/share/blazar"
@@ -3035,7 +3043,7 @@ def run_blazar_cell(
     sampler.start()
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
-        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        pin_active_engine(con, "tag = ?", eng.tag)
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
@@ -3223,7 +3231,7 @@ def run_conc_axis_cell(
     sampler.start()
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
-        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        pin_active_engine(con, "tag = ?", eng.tag)
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
@@ -3440,8 +3448,7 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
     sb = V.Sandbox()
     con = sqlite3.connect(f"file:{Path(sb.data_dir) / 'blazar.db'}?mode=rw", uri=True)
     try:
-        con.execute("UPDATE engines SET active = 0")
-        con.execute("UPDATE engines SET active = 1 WHERE tag = ?", (eng.tag,))
+        pin_active_engine(con, "tag = ?", eng.tag)
         con.commit()
     finally:
         con.close()
@@ -3623,7 +3630,7 @@ def run_tools_cell(eng: Engine, model_name: str) -> dict:
     sb = V.Sandbox()
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
-        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        pin_active_engine(con, "tag = ?", eng.tag)
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
@@ -4601,7 +4608,7 @@ def run_quality_blazar_cell(
     sampler.start()
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
-        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        pin_active_engine(con, "tag = ?", eng.tag)
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
@@ -4780,7 +4787,7 @@ def run_blazar_conc_cell(
     sampler.start()
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
-        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        pin_active_engine(con, "tag = ?", eng.tag)
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
@@ -4908,7 +4915,7 @@ def run_blazar_idle_cell(
     sampler.start()
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
-        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        pin_active_engine(con, "tag = ?", eng.tag)
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
@@ -5156,7 +5163,7 @@ def run_blazar_ctx_cell(eng: Engine, model_name: str, ctx: int, cfg: dict) -> di
     sampler.start()
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
-        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        pin_active_engine(con, "tag = ?", eng.tag)
         con.commit()
         con.close()
         daemon = V.Daemon(sb)
@@ -5800,7 +5807,7 @@ def run_greedy_gateway_cell(
     sb = V.Sandbox()
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
-        con.execute("UPDATE engines SET active = (tag = ?)", (eng.tag,))
+        pin_active_engine(con, "tag = ?", eng.tag)
         con.commit()
         con.close()
         daemon = V.Daemon(sb)

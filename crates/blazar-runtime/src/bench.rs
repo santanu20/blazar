@@ -118,6 +118,41 @@ pub fn strip_for_load(base_argv: &[String]) -> Vec<String> {
     argv
 }
 
+/// Base argv for the spec-axis searches: drop endpoint/session pairs and
+/// ALL persisted speculation PAIRS (spec type, typed ngram knobs, lookup
+/// cache). The lookup cache would leak drafts between candidates and any
+/// inherited spec type would cross-contaminate the compared axis.
+#[must_use]
+pub fn strip_spec_axis(base_argv: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut it = base_argv.iter().peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--host"
+            | "--port"
+            | "--slot-save-path"
+            | "--lookup-cache-dynamic"
+            | "--spec-type"
+            | "--spec-ngram-simple-size-m"
+            | "--spec-ngram-simple-size-n"
+            | "--spec-ngram-simple-min-hits"
+            | "--spec-ngram-map-k-size-m"
+            | "--spec-ngram-map-k-size-n"
+            | "--spec-ngram-map-k-min-hits"
+            | "--spec-ngram-map-k4v-size-m"
+            | "--spec-ngram-map-k4v-size-n"
+            | "--spec-ngram-map-k4v-min-hits"
+            | "--spec-ngram-mod-n-match"
+            | "--spec-ngram-mod-n-max"
+            | "--spec-ngram-mod-n-min" => {
+                let _ = it.next(); // consume the value
+            }
+            _ => argv.push(a.clone()),
+        }
+    }
+    argv
+}
+
 /// Locate a llama-bench in an installed engine directory. Engine assets
 /// unpack into either the classic `llama-<tag>` dir or vendor-suffixed
 /// per-arch dirs (`llama-bNNNN-bin-ubuntu-cuda-13.0-sm89-x64`), so the
@@ -302,35 +337,7 @@ impl Tuner<'_> {
         let mut out = Vec::new();
         for &(m, h) in candidates {
             let port = ephemeral_port()?;
-            // Strip endpoint/session/persisted-spec PAIRS: the lookup
-            // cache would leak drafts between candidates and contaminate
-            // the comparison.
-            let mut argv: Vec<String> = Vec::new();
-            let mut it = base_argv.iter().peekable();
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--host"
-                    | "--port"
-                    | "--slot-save-path"
-                    | "--lookup-cache-dynamic"
-                    | "--spec-type"
-                    | "--spec-ngram-simple-size-m"
-                    | "--spec-ngram-simple-size-n"
-                    | "--spec-ngram-simple-min-hits"
-                    | "--spec-ngram-map-k-size-m"
-                    | "--spec-ngram-map-k-size-n"
-                    | "--spec-ngram-map-k-min-hits"
-                    | "--spec-ngram-map-k4v-size-m"
-                    | "--spec-ngram-map-k4v-size-n"
-                    | "--spec-ngram-map-k4v-min-hits"
-                    | "--spec-ngram-mod-n-match"
-                    | "--spec-ngram-mod-n-max"
-                    | "--spec-ngram-mod-n-min" => {
-                        let _ = it.next(); // consume the value
-                    }
-                    _ => argv.push(a.clone()),
-                }
-            }
+            let mut argv = strip_spec_axis(base_argv);
             argv.extend([
                 "--host".to_string(),
                 "127.0.0.1".to_string(),
@@ -368,6 +375,70 @@ impl Tuner<'_> {
         }
         if out.is_empty() {
             anyhow::bail!("no ngram candidates ran ({candidates:?})");
+        }
+        Ok(out)
+    }
+
+    /// Spec-mode race (`tune --spec-race`): spawn the real llama-server
+    /// once per candidate mode — dense (no speculation), ngram
+    /// (`--spec-type ngram-simple` at engine defaults), dflash
+    /// (`--spec-type draft-dflash`, draft-free block speculation) — and
+    /// measure single-stream wall tokens/s. Phase one of the two-phase
+    /// spec search: the winning mode (if ngram) goes to [`Self::ngram_search`]
+    /// for (`size_m`, `min_hits`) refinement; dflash and dense carry no
+    /// refinable knobs on this axis. Only modes the engine's manifest
+    /// advertises may race — the caller filters before invoking.
+    pub fn spec_mode_race(
+        &self,
+        base_argv: &[String],
+        modes: &[String],
+        idle_secs: u64,
+    ) -> Result<Vec<(String, f64)>> {
+        let server_bin = self
+            .bench_bin
+            .parent()
+            .map(|p| p.join("llama-server"))
+            .filter(|p| p.exists())
+            .ok_or_else(|| anyhow!("llama-server not found next to llama-bench"))?;
+        let mut out = Vec::new();
+        for mode in modes {
+            let port = ephemeral_port()?;
+            let mut argv = strip_spec_axis(base_argv);
+            argv.extend([
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+            ]);
+            match mode.as_str() {
+                "dense" => {}
+                "ngram" => {
+                    argv.extend(["--spec-type".to_string(), "ngram-simple".to_string()]);
+                }
+                "dflash" => {
+                    argv.extend(["--spec-type".to_string(), "draft-dflash".to_string()]);
+                }
+                other => anyhow::bail!("spec race: unknown mode {other:?}"),
+            }
+            let mut child = spawn_search_server(&server_bin, &argv)?;
+            let ok = wait_ready(&mut child, port, 120.0);
+            let tps = if ok {
+                drive_concurrent(port, 1).ok()
+            } else {
+                None
+            };
+            // Single pid we spawned; never a group.
+            let _ = child.kill();
+            let _ = child.wait();
+            let Some(t) = tps else {
+                anyhow::bail!("spec race: server in mode {mode} never became ready or served");
+            };
+            println!("  spec mode {mode}: {t:.1} tok/s");
+            out.push((mode.clone(), t));
+            std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
+        }
+        if out.is_empty() {
+            anyhow::bail!("no spec modes ran ({modes:?})");
         }
         Ok(out)
     }
@@ -892,6 +963,121 @@ fn ephemeral_port() -> Result<u16> {
     Ok(l.local_addr().context("local addr")?.port())
 }
 
+/// Strip-and-rebind for the sglang spec race: the compiled base argv
+/// carries the connection quintet plus any user spec pins, and every arm
+/// must own its speculation axis outright — dense re-keeps the user's
+/// attention pin (their real dense config), ngram carries the working
+/// recipe (`NGRAM` + triton attention; the flashinfer verify kernels JIT
+/// and die at graph capture with the default backend — live receipt
+/// 2026-10-09, sglang 0.5.21 bundle). Port and served name are rebound
+/// per arm so each child owns its ephemeral endpoint and answers to the
+/// search lane's fixed model id.
+fn sglang_race_argv(
+    base: &[String],
+    mode: &str,
+    port: u16,
+    flags: &std::collections::BTreeSet<String>,
+) -> Result<Vec<String>> {
+    const STRIP_PAIRS: [&str; 6] = [
+        "--port",
+        "--served-model-name",
+        "--speculative-algorithm",
+        "--speculative-num-steps",
+        "--speculative-num-draft-tokens",
+        "--speculative-draft-model-path",
+    ];
+    let mut attention_pin: Option<[String; 2]> = None;
+    let mut out: Vec<String> = Vec::with_capacity(base.len() + 6);
+    let mut i = 0;
+    while i < base.len() {
+        let flag = base[i].as_str();
+        let value = base.get(i + 1);
+        if flag == "--attention-backend"
+            && let Some(v) = value
+        {
+            attention_pin = Some([flag.to_string(), v.clone()]);
+            i += 2;
+            continue;
+        }
+        if STRIP_PAIRS.contains(&flag) && value.is_some() {
+            i += 2;
+            continue;
+        }
+        out.push(base[i].clone());
+        i += 1;
+    }
+    match mode {
+        "dense" => {
+            if let Some([flag, value]) = attention_pin {
+                out.extend([flag, value]);
+            }
+        }
+        "ngram" => {
+            anyhow::ensure!(
+                flags.contains("--speculative-algorithm"),
+                "sglang spec race: engine lacks --speculative-algorithm"
+            );
+            anyhow::ensure!(
+                flags.contains("--attention-backend"),
+                "sglang spec race: engine lacks --attention-backend (triton pin impossible)"
+            );
+            out.push("--speculative-algorithm".into());
+            out.push("NGRAM".into());
+            out.extend(["--attention-backend".to_string(), "triton".to_string()]);
+        }
+        other => anyhow::bail!("sglang spec race: unknown mode {other:?}"),
+    }
+    out.extend([
+        "--port".to_string(),
+        port.to_string(),
+        "--served-model-name".to_string(),
+        "replica-search".to_string(),
+    ]);
+    Ok(out)
+}
+
+/// sglang-lane sibling of [`Tuner::spec_mode_race`]: dense vs draft-free
+/// NGRAM on real `sglang-server` spawns, single-stream greedy wall tok/s.
+/// Free function on purpose — the llamacpp race derives its server from
+/// `bench_bin`; here the caller hands the engine wrapper
+/// (`manifest.server_path`) directly. Ready wait is longer than the
+/// llama lane: a cold sglang child pays torch import plus CUDA-graph
+/// capture before /health (measured 31–43 s on the 0.5.21 bundle).
+#[allow(clippy::missing_panics_doc)] // no panics; clippy sees through the helper only
+pub fn sglang_spec_mode_race(
+    server_bin: &std::path::Path,
+    base_argv: &[String],
+    modes: &[String],
+    flags: &std::collections::BTreeSet<String>,
+    idle_secs: u64,
+) -> Result<Vec<(String, f64)>> {
+    let mut out = Vec::new();
+    for mode in modes {
+        let port = ephemeral_port()?;
+        let argv = sglang_race_argv(base_argv, mode, port, flags)?;
+        let mut child = spawn_search_server(server_bin, &argv)?;
+        let ok = wait_ready(&mut child, port, 240.0);
+        let tps = if ok {
+            drive_concurrent(port, 1).ok()
+        } else {
+            None
+        };
+        // Single pid we spawned; never a group.
+        let _ = child.kill();
+        let _ = child.wait();
+        let Some(t) = tps else {
+            anyhow::bail!("sglang spec race: server in mode {mode} never became ready or served");
+        };
+        println!("  sglang spec mode {mode}: {t:.1} tok/s");
+        out.push((mode.clone(), t));
+        std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
+    }
+    if out.is_empty() {
+        anyhow::bail!("no sglang spec modes ran ({modes:?})");
+    }
+    Ok(out)
+}
+
 /// Spawn a search-lane llama-server: stdio-silent and tied to THIS
 /// process's lifetime. Every normal loop path kills the child it
 /// spawned; the kernel tie covers the abnormal ones — the CLI dying
@@ -993,10 +1179,15 @@ fn drive_concurrent(port: u16, clients: u32) -> Result<f64> {
 }
 
 /// One blocking non-stream chat; returns completion tokens from usage.
+/// Greedy on purpose: deterministic receipts for every search lane, and
+/// a speculating engine's verify path only stays kernel-prebuilt for
+/// greedy decode on some bundles (a sampled first request can JIT-fail
+/// the whole child — live receipt, sglang 0.5.21, 2026-10-09).
 #[allow(clippy::items_after_statements)] // io trait imports sit near their single use
 fn chat_completion_tokens(port: u16, content: &str) -> Result<u64> {
     let body = serde_json::json!({
         "model": "replica-search", "max_tokens": 64, "stream": false,
+        "temperature": 0.0,
         "messages": [{"role": "user", "content": content}],
     });
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port))
@@ -1203,6 +1394,149 @@ mod tests {
             flash_attn: None,
             n_batch: None,
         }
+    }
+
+    #[test]
+    fn unit__strip_spec_axis__drops_endpoint_and_all_spec_pairs() {
+        let base = [
+            "--model",
+            "/m.gguf",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "1",
+            "--lookup-cache-dynamic",
+            "/c",
+            "--spec-type",
+            "ngram-simple",
+            "--spec-ngram-simple-size-m",
+            "16",
+            "--spec-ngram-simple-size-n",
+            "8",
+            "--spec-ngram-simple-min-hits",
+            "2",
+            "--spec-ngram-mod-n-match",
+            "24",
+            "--spec-ngram-map-k4v-size-m",
+            "12",
+            "--threads",
+            "4",
+        ]
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+        let out = strip_spec_axis(&base);
+        assert_eq!(out, ["--model", "/m.gguf", "--threads", "4"]);
+    }
+
+    fn race_flags() -> std::collections::BTreeSet<String> {
+        [
+            "--speculative-algorithm",
+            "--speculative-num-steps",
+            "--speculative-num-draft-tokens",
+            "--speculative-draft-model-path",
+            "--attention-backend",
+        ]
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn unit__sglang_race_argv__ngram_forces_triton_strips_spec_pins() {
+        let base = [
+            "--model-path",
+            "/m.d",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "1",
+            "--served-model-name",
+            "qwen",
+            "--speculative-algorithm",
+            "EAGLE3",
+            "--speculative-draft-model-path",
+            "/draft.d",
+            "--speculative-num-steps",
+            "3",
+            "--attention-backend",
+            "flashinfer",
+            "--mem-fraction-static",
+            "0.45",
+        ]
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+        let out = sglang_race_argv(&base, "ngram", 4242, &race_flags()).unwrap();
+        assert_eq!(
+            out,
+            [
+                "--model-path",
+                "/m.d",
+                "--host",
+                "127.0.0.1",
+                "--mem-fraction-static",
+                "0.45",
+                "--speculative-algorithm",
+                "NGRAM",
+                "--attention-backend",
+                "triton",
+                "--port",
+                "4242",
+                "--served-model-name",
+                "replica-search",
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__sglang_race_argv__dense_keeps_user_attention_pin() {
+        let base = [
+            "--model-path",
+            "/m.d",
+            "--port",
+            "1",
+            "--served-model-name",
+            "qwen",
+            "--speculative-algorithm",
+            "NGRAM",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--attention-backend",
+            "triton",
+        ]
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+        let out = sglang_race_argv(&base, "dense", 4243, &race_flags()).unwrap();
+        // Dense drops every speculation flag but must keep the user's
+        // real attention pin — that IS their dense config.
+        assert_eq!(
+            out,
+            [
+                "--model-path",
+                "/m.d",
+                "--attention-backend",
+                "triton",
+                "--port",
+                "4243",
+                "--served-model-name",
+                "replica-search",
+            ]
+        );
+        assert!(!out.contains(&"--speculative-algorithm".to_string()));
+    }
+
+    #[test]
+    fn unit__sglang_race_argv__ngram_refused_without_manifest_flags() {
+        let base: Vec<String> = vec!["--model-path".into(), "/m.d".into()];
+        let mut flags = race_flags();
+        flags.remove("--attention-backend");
+        let err = sglang_race_argv(&base, "ngram", 1, &flags).unwrap_err();
+        assert!(
+            err.to_string().contains("--attention-backend"),
+            "error must name the missing flag: {err}"
+        );
     }
 
     #[test]

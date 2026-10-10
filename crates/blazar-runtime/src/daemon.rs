@@ -162,6 +162,172 @@ pub fn validate_parent_death_guard() {
 #[cfg(not(target_os = "linux"))]
 pub fn validate_parent_death_guard() {}
 
+/// Environment stamp naming the data dir whose daemon spawns a process.
+/// Every engine child inherits it at exec; the boot reclaim sweep matches
+/// it to find children whose daemon died without teardown. The value is
+/// the plain data-dir path (not secret): it identifies ownership, like a
+/// pidfile that survives inside the child itself.
+pub const ORPHAN_MARKER_ENV: &str = "BLAZAR_DAEMON_DATA_DIR";
+
+/// Stamp this daemon's data dir into the process environment BEFORE any
+/// engine child can be spawned, so every child (engine servers, whisper,
+/// piper, and their subprocesses — env is inherited down the whole tree)
+/// carries the marker at exec. Idempotent overwrite: a daemon re-exec'd
+/// by a gateway auto-start chain inherits a stale marker from its parent
+/// and must correct it before propagating it further.
+///
+/// The kernel keeps `/proc/<pid>/environ` at exec-time values, so this
+/// set does NOT make the daemon itself visible to the sweep — only its
+/// children, which is exactly the ownership question.
+#[allow(unsafe_code)] // one env::set_var at serve() entry; SAFETY below
+pub fn set_orphan_marker(data_dir: &std::path::Path) {
+    // SAFETY: called once at serve() entry, before any task that reads
+    // this key exists (only the boot reclaim reads it, on this same
+    // thread, later). No other code reads or writes ORPHAN_MARKER_ENV
+    // concurrently.
+    unsafe { std::env::set_var(ORPHAN_MARKER_ENV, data_dir) };
+}
+
+/// Exact-token marker test over raw `/proc/<pid>/environ` bytes
+/// (NUL-separated KEY=VALUE tokens). Exact token compare means a data
+/// dir that is a prefix of another can never alias it.
+#[cfg(target_os = "linux")]
+fn environ_marks_owner(env: &[u8], data_dir: &std::path::Path) -> bool {
+    let wanted = format!("{}={}", ORPHAN_MARKER_ENV, data_dir.display());
+    env.split(|b| *b == 0).any(|tok| tok == wanted.as_bytes())
+}
+
+/// Read `/proc/<pid>/environ` and test the marker. `None` = unreadable
+/// (not our process, or gone): never a match.
+#[cfg(target_os = "linux")]
+fn pid_marks_owner(pid: u32, data_dir: &std::path::Path) -> bool {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .is_ok_and(|env| environ_marks_owner(&env, data_dir))
+}
+
+/// Every live process whose exec-time env carries OUR data-dir marker.
+/// The sweep runs while this daemon holds [`DaemonLock`], so a match can
+/// only be a stray from a dead predecessor — never a sibling's child
+/// (a live sibling would hold the lock). Linux-only: `/proc`-based, in
+/// parity with PDEATHSIG being Linux-only.
+#[cfg(target_os = "linux")]
+fn marker_orphan_pids(data_dir: &std::path::Path) -> Vec<u32> {
+    let own_pid = std::process::id();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            (pid > 1 && pid != own_pid).then_some(pid)
+        })
+        .filter(|pid| pid_marks_owner(*pid, data_dir))
+        .collect()
+}
+
+/// Escalate already-TERMed stray pids: poll liveness for `grace`, then
+/// SIGKILL every survivor whose identity check still passes. Returns the
+/// pids that needed the KILL. Shared by the marker reclaim and the
+/// pidfile sweep — both signal SIGTERM without waiting and need the same
+/// teeth against children that hang in graceful shutdown.
+#[cfg(unix)]
+#[allow(unsafe_code)] // two audited libc::kill calls on exact pids below
+pub(crate) fn escalate_orphans(
+    pids: &[u32],
+    grace: std::time::Duration,
+    still_ours: impl Fn(u32) -> bool,
+) -> Vec<u32> {
+    let deadline = std::time::Instant::now() + grace;
+    let stragglers = loop {
+        let alive: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| process_alive_by_pid(*pid))
+            .collect();
+        if alive.is_empty() || std::time::Instant::now() >= deadline {
+            break alive;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    for pid in &stragglers {
+        // Identity re-check right before the irreversible signal: a pid
+        // that exited and got recycled within the grace window must never
+        // receive our KILL.
+        if !still_ours(*pid) {
+            continue;
+        }
+        tracing::warn!("orphan child pid {pid} ignored SIGTERM; SIGKILL");
+        // SAFETY: single positive pid that passed the identity check one
+        // line above; kill signals exactly that pid, no group.
+        unsafe {
+            libc::kill(i32::try_from(*pid).unwrap_or(-1), libc::SIGKILL);
+        }
+    }
+    stragglers
+}
+
+/// Reclaim engine children orphaned by a dead predecessor daemon: every
+/// live process carrying our data-dir marker gets SIGTERM, a bounded
+/// grace window, then SIGKILL. Runs at `serve()` boot after
+/// [`DaemonLock::acquire`] — the lock guarantees no live daemon owns
+/// these processes. Returns one human-readable line per reclaimed pid.
+#[cfg(target_os = "linux")]
+#[must_use = "the caller prints each line as preflight evidence"]
+pub fn reclaim_marker_orphans(data_dir: &std::path::Path) -> Vec<String> {
+    reclaim_marker_orphans_with_grace(data_dir, std::time::Duration::from_secs(10))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // two audited libc::kill calls below
+fn reclaim_marker_orphans_with_grace(
+    data_dir: &std::path::Path,
+    grace: std::time::Duration,
+) -> Vec<String> {
+    let pids = marker_orphan_pids(data_dir);
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for pid in &pids {
+        // Guard the irreversible signal with a fresh identity read: the
+        // scan snapshot can be stale by one syscall.
+        if !pid_marks_owner(*pid, data_dir) {
+            continue;
+        }
+        tracing::warn!(
+            "reclaiming orphan engine child pid {pid} (marker {}) — its daemon died without teardown",
+            data_dir.display()
+        );
+        // SAFETY: single positive pid whose exec-time env still carries
+        // our marker, re-read above; kill signals exactly that pid.
+        unsafe {
+            libc::kill(i32::try_from(*pid).unwrap_or(-1), libc::SIGTERM);
+        }
+        lines.push(format!("pid {pid} (marker {})", data_dir.display()));
+    }
+    let killed = escalate_orphans(&pids, grace, |pid| pid_marks_owner(pid, data_dir));
+    if !killed.is_empty() {
+        lines.push(format!(
+            "{} straggler(s) needed SIGKILL: {}",
+            killed.len(),
+            killed
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn reclaim_marker_orphans(_data_dir: &std::path::Path) -> Vec<String> {
+    // No /proc environ off Linux; the pidfile sweep plus the engine
+    // children's own shutdown handling remain the covering nets (same
+    // posture as PDEATHSIG being Linux-only).
+    Vec::new()
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)] // existence probe via signal 0 to one exact pid
 fn process_alive(pid: u32) -> bool {
@@ -262,5 +428,94 @@ mod tests {
         assert_ne!(lock.pid(), 4_190_403);
         drop(lock);
         assert!(!d.run_dir().join("blazar.pid").exists());
+    }
+
+    // V3 (escalation): a child that ignores SIGTERM must die to the KILL
+    // arm within the grace window.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit__reclaim_marker_orphans__marked_decends_term_ignoring_killed() {
+        let (tmp, d) = dirs();
+        let marker = d.data_dir.display().to_string();
+        // Marked, TERM-ignoring decoy: bash stays resident (no exec) so
+        // the trap survives; sleep runs as its child.
+        let mut stubborn = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 300")
+            .env(ORPHAN_MARKER_ENV, &marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("stubborn decoy");
+        // Unmarked control: the sweep must never touch it.
+        let mut control = std::process::Command::new("sleep")
+            .arg("300")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("control decoy");
+
+        let lines =
+            reclaim_marker_orphans_with_grace(&d.data_dir, std::time::Duration::from_secs(1));
+        assert_eq!(
+            lines.len(),
+            2,
+            "reclaim line + straggler summary: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("SIGKILL"),
+            "escalation must be reported: {lines:?}"
+        );
+        // Reap before liveness asserts: a KILLed child of THIS test
+        // process is a zombie until waited on, and kill(pid,0) happily
+        // reports zombies alive (real orphans reparent to init, which
+        // reaps them — this dance is test-only).
+        let mut exited = None;
+        for _ in 0..50 {
+            if let Some(status) = stubborn.try_wait().unwrap() {
+                exited = Some(status);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            exited.is_some(),
+            "TERM-ignoring decoy must be KILLed (still running after grace + poll)"
+        );
+        assert!(
+            process_alive_by_pid(control.id()),
+            "unmarked control must survive"
+        );
+        let _ = control.kill();
+        let _ = control.wait();
+
+        // V2 (idempotency): nothing left to reclaim.
+        let again =
+            reclaim_marker_orphans_with_grace(&d.data_dir, std::time::Duration::from_secs(1));
+        assert!(again.is_empty(), "second sweep must be a no-op: {again:?}");
+        drop(tmp);
+    }
+
+    // Pure marker semantics: exact NUL-token equality, so a data dir that
+    // is a prefix of another can never alias it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit__environ_marks_owner__exact_token_no_prefix_alias() {
+        let env = format!(
+            "PATH=/usr/bin\0{}=/srv/blazar\0HOME=/root\0",
+            ORPHAN_MARKER_ENV
+        );
+        assert!(environ_marks_owner(
+            env.as_bytes(),
+            std::path::Path::new("/srv/blazar")
+        ));
+        assert!(!environ_marks_owner(
+            env.as_bytes(),
+            std::path::Path::new("/srv/blazar-team")
+        ));
+        assert!(!environ_marks_owner(
+            env.as_bytes(),
+            std::path::Path::new("/srv")
+        ));
     }
 }

@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use crate::config::{Config, DEFAULT_CACHE_RAM_MB, MmprojPolicy, ModelOverride};
-use crate::config::{MistralrsTuning, SglangTuning};
+use crate::config::{MistralrsTuning, MlxTuning, SglangTuning};
 use crate::gguf::GgufMeta;
 use crate::hardware::GpuInfo;
 use crate::hardware::Hardware;
@@ -2454,6 +2454,12 @@ pub const MISTRALRS_TUNING_VALUE_FLAGS: &[&str] = &[
     "--pa-block-size",
     "--pa-cache-type",
     "--pa-context-len",
+    "--pa-memory-mb",
+    "--chat-template",
+    "--isq",
+    "--imatrix",
+    "--calibration-file",
+    "--isq-organization",
     "--lora",
     "--lora-max-rank",
     "--lora-max-adapters",
@@ -2500,6 +2506,19 @@ fn hf_kv_bytes(kv: &crate::hfmeta::KvGeom, ctx: u64, elem: u64) -> Option<u64> {
     )
 }
 
+/// Effective absolute paged-KV pin (MiB): per-model `[mistralrs]`
+/// override wins over the global table. Both `--pa-memory-fraction`
+/// emission sites yield to it (upstream refuses the pair on one
+/// command line).
+fn mistralrs_pa_mb_pin(input: &ProfileInput<'_>) -> Option<u64> {
+    input
+        .overlay
+        .mistralrs
+        .as_ref()
+        .and_then(|t| t.pa_memory_mb)
+        .or(input.config.mistralrs.pa_memory_mb)
+}
+
 /// Derive `--pa-memory-fraction` from what the spawn actually NEEDS,
 /// not from what the card happens to have. Two candidates, min wins:
 ///
@@ -2520,6 +2539,7 @@ fn hf_kv_bytes(kv: &crate::hfmeta::KvGeom, ctx: u64, elem: u64) -> Option<u64> {
 /// the engine lacks the flag, or (no geometry AND single-tenant —
 /// nothing to correct). `forced_on`: `mistralrs_paged_attn = true` was
 /// pinned — never emit a conflicting `--paged-attn off`, warn instead.
+#[allow(clippy::too_many_lines)] // one derivation, two documented candidates; splitting scatters the math
 #[allow(clippy::cast_precision_loss)] // MiB-scale integers: 52-bit f64 mantissa is exact here
 fn derive_pa_fraction(
     input: &ProfileInput<'_>,
@@ -2533,6 +2553,16 @@ fn derive_pa_fraction(
     const MISTRALRS_RUNTIME_FLOOR_MIB: i64 = 512;
     const MIB: u64 = 1024 * 1024;
     if input.config.mistralrs_pa_memory_fraction.is_some() {
+        return;
+    }
+    // Absolute-MiB pin wins over any derived fraction (upstream clap
+    // conflict — see the pa-memory-fraction emission site above).
+    if mistralrs_pa_mb_pin(input).is_some() {
+        warnings.push(
+            "mistralrs.pa_memory_mb set: skipping derived --pa-memory-fraction (upstream \
+             refuses both on one command line)"
+                .into(),
+        );
         return;
     }
     if !input.supported_flags.contains("--pa-memory-fraction") {
@@ -2681,8 +2711,19 @@ fn compile_mistralrs(
     // Paged-KV budget: upstream's 0.90 default hard-fails at load
     // ("Num GPU blocks is 0", live-proven with a 9B vision model on an
     // 8 GB card) — an explicit fraction reclaims the balance for KV.
+    // An absolute `--pa-memory-mb` pin and any fraction are mutually
+    // exclusive upstream (clap conflict, live-proven 2026-10-10:
+    // spawn dies with "cannot be used with"); the absolute pin wins
+    // and both fraction sources stay silent.
+    let pa_mb_pin = mistralrs_pa_mb_pin(input);
     if let Some(frac) = input.config.mistralrs_pa_memory_fraction {
-        if input.supported_flags.contains("--pa-memory-fraction") {
+        if pa_mb_pin.is_some() {
+            warnings.push(
+                "mistralrs.pa_memory_mb set: skipping --pa-memory-fraction (upstream refuses \
+                 both on one command line)"
+                    .into(),
+            );
+        } else if input.supported_flags.contains("--pa-memory-fraction") {
             argv.push("--pa-memory-fraction".into());
             argv.push(format!("{frac}"));
         } else {
@@ -2883,6 +2924,16 @@ fn compile_mistralrs(
             &[n.to_string()],
         );
     }
+    if let Some(mb) = tun.pa_memory_mb {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.pa_memory_mb",
+            "--pa-memory-mb",
+            &[mb.to_string()],
+        );
+    }
 
     // LoRA family: --enable-lora (dynamic serving switch) leads; the
     // runtime limits only take effect with it or a preloaded adapter —
@@ -3038,6 +3089,60 @@ fn compile_mistralrs(
             "mistralrs.disable_access_log",
             "--disable-access-log",
             &[],
+        );
+    }
+    if let Some(t) = &tun.chat_template {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.chat_template",
+            "--chat-template",
+            std::slice::from_ref(t),
+        );
+    }
+    // In-situ quantization family: loading-time weight quantization.
+    // ISQ only ever shrinks the resident set below the on-disk bytes
+    // admission charges, so the fit ladder stays conservative — no
+    // reserve adjustment needed (documented on the config knob).
+    if let Some(level) = &tun.isq {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.isq",
+            "--isq",
+            std::slice::from_ref(level),
+        );
+    }
+    if let Some(path) = &tun.imatrix {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.imatrix",
+            "--imatrix",
+            std::slice::from_ref(path),
+        );
+    }
+    if let Some(path) = &tun.calibration_file {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.calibration_file",
+            "--calibration-file",
+            std::slice::from_ref(path),
+        );
+    }
+    if let Some(org) = &tun.isq_organization {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "mistralrs.isq_organization",
+            "--isq-organization",
+            std::slice::from_ref(org),
         );
     }
 
@@ -3288,6 +3393,7 @@ fn push_generation_defaults(
 /// BEFORE user `extra_args`, so an explicit user flag still wins
 /// last-wins. Every default is off — unset knobs compile byte-identical
 /// argv to before this surface existed.
+#[allow(clippy::too_many_lines)]
 fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &mut Vec<String>) {
     let cfg = input.config;
     if let Some(mode) = cfg.sdcpp_cache_mode.as_ref() {
@@ -3365,6 +3471,68 @@ fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings:
             "--tensor-type-rules",
             cfg.sdcpp_tensor_type_rules.as_deref(),
         ),
+        (
+            "control_net",
+            "--control-net",
+            cfg.sdcpp_control_net.as_deref(),
+        ),
+        (
+            "ip_adapter",
+            "--ip-adapter",
+            cfg.sdcpp_ip_adapter.as_deref(),
+        ),
+        (
+            "clip_vision",
+            "--clip_vision",
+            cfg.sdcpp_clip_vision.as_deref(),
+        ),
+        (
+            "motion_module",
+            "--motion-module",
+            cfg.sdcpp_motion_module.as_deref(),
+        ),
+        (
+            "photo_maker",
+            "--photo-maker",
+            cfg.sdcpp_photo_maker.as_deref(),
+        ),
+        (
+            "pulid_weights",
+            "--pulid-weights",
+            cfg.sdcpp_pulid_weights.as_deref(),
+        ),
+        (
+            "upscale_model",
+            "--upscale-model",
+            cfg.sdcpp_upscale_model.as_deref(),
+        ),
+        (
+            "lora_model_dir",
+            "--lora-model-dir",
+            cfg.sdcpp_lora_model_dir.as_deref(),
+        ),
+        (
+            "hires_upscalers_dir",
+            "--hires-upscalers-dir",
+            cfg.sdcpp_hires_upscalers_dir.as_deref(),
+        ),
+        ("embd_dir", "--embd-dir", cfg.sdcpp_embd_dir.as_deref()),
+        (
+            "audio_encoder",
+            "--audio-encoder",
+            cfg.sdcpp_audio_encoder.as_deref(),
+        ),
+        (
+            "high_noise_diffusion_model",
+            "--high-noise-diffusion-model",
+            cfg.sdcpp_high_noise_diffusion_model.as_deref(),
+        ),
+        (
+            "uncond_diffusion_model",
+            "--uncond-diffusion-model",
+            cfg.sdcpp_uncond_diffusion_model.as_deref(),
+        ),
+        ("backend", "--backend", cfg.sdcpp_backend.as_deref()),
     ] {
         if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
             push_gated(input, argv, warnings, key, flag, &[v.trim().to_string()]);
@@ -3793,8 +3961,14 @@ fn compile_mlx(input: &ProfileInput<'_>) -> Result<Profile, String> {
             ));
         }
     }
-    let argv = mlx_extra_args(input)?;
     let mut warnings: Vec<String> = Vec::new();
+    let tun = MlxTuning::effective(input.overlay.mlx.as_ref(), &input.config.mlx);
+    let mut argv: Vec<String> = Vec::new();
+    push_mlx_pins(input, &tun, &mut argv, &mut warnings);
+    // User extra_args ride after the knobs: on a repeat flag the later
+    // token wins in argparse, so an explicit extra_args pin always
+    // overrides the knob's value (same last-wins contract as sglang).
+    argv.extend(mlx_extra_args(input)?);
     push_nonllama_vocab_teaching(input.config, "mlx", &mut warnings);
     Ok(Profile {
         argv,
@@ -3804,6 +3978,77 @@ fn compile_mlx(input: &ProfileInput<'_>) -> Result<Profile, String> {
         kv_est_bytes: None,
         ctx_autofit: None,
     })
+}
+
+/// Flag-gated emission of the `[mlx]` tuning knobs: a knob may target a
+/// newer mlx-lm than the installed engine, so an unadvertised flag
+/// warns-and-skips instead of erroring the whole spawn (same contract
+/// as `push_tuned` for sglang, with the engine named correctly).
+#[allow(clippy::too_many_lines)]
+fn push_mlx_pins(
+    input: &ProfileInput<'_>,
+    tun: &MlxTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let emit = |flag: &str, value: &str, argv: &mut Vec<String>, warnings: &mut Vec<String>| {
+        if input.supported_flags.contains(flag) {
+            argv.push(flag.to_string());
+            if !value.is_empty() {
+                argv.push(value.to_string());
+            }
+        } else {
+            warnings.push(format!(
+                "mlx knob set but this mlx engine lacks {flag}; \
+                 skipped (blazar engine install updates it)"
+            ));
+        }
+    };
+    if let Some(path) = &tun.draft_model {
+        emit("--draft-model", path, argv, warnings);
+    }
+    if let Some(n) = tun.num_draft_tokens {
+        emit("--num-draft-tokens", &n.to_string(), argv, warnings);
+    }
+    if let Some(bits) = tun.kv_bits {
+        emit("--kv-bits", &bits.to_string(), argv, warnings);
+    }
+    if let Some(n) = tun.kv_group_size {
+        emit("--kv-group-size", &n.to_string(), argv, warnings);
+    }
+    if let Some(n) = tun.quantized_kv_start {
+        emit("--quantized-kv-start", &n.to_string(), argv, warnings);
+    }
+    if let Some(n) = tun.prefill_step_size {
+        emit("--prefill-step-size", &n.to_string(), argv, warnings);
+    }
+    if let Some(n) = tun.prompt_cache_size {
+        emit("--prompt-cache-size", &n.to_string(), argv, warnings);
+    }
+    if let Some(b) = tun.prompt_cache_bytes {
+        emit("--prompt-cache-bytes", &b.to_string(), argv, warnings);
+    }
+    if let Some(n) = tun.decode_concurrency {
+        emit("--decode-concurrency", &n.to_string(), argv, warnings);
+    }
+    if let Some(n) = tun.prompt_concurrency {
+        emit("--prompt-concurrency", &n.to_string(), argv, warnings);
+    }
+    if let Some(name) = &tun.chat_template {
+        emit("--chat-template", name, argv, warnings);
+    }
+    if let Some(args) = &tun.chat_template_args {
+        emit("--chat-template-args", args, argv, warnings);
+    }
+    if tun.use_default_chat_template == Some(true) {
+        emit("--use-default-chat-template", "", argv, warnings);
+    }
+    if tun.trust_remote_code == Some(true) {
+        emit("--trust-remote-code", "", argv, warnings);
+    }
+    if let Some(path) = &tun.adapter_path {
+        emit("--adapter-path", path, argv, warnings);
+    }
 }
 
 /// Strict manifest-gated `extra_args` passthrough for the mlx dialect:
@@ -3856,13 +4101,22 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     let slots = sglang_resolve_slots(input, &mut argv, &mut warnings);
     // --- loras: PEFT adapters only; the gguf/.bin gate errors here.
     push_sglang_loras(input, &mut argv, &mut warnings)?;
-    // --- speculative pair: EAGLE3 dirs; the GGUF-draft gate teaches here.
-    push_sglang_speculative(input, &mut argv, &mut warnings);
+    // --- speculative: draft-free knobs (ngram) or the EAGLE3
+    // pair; the engage verdict feeds the fit ladder's verify reserve.
+    let spec_engaged = push_sglang_speculative(input, &tun, &mut argv, &mut warnings);
     // --- llama-vocabulary knobs that do NOT translate: teach here.
     push_sglang_vocab_teaching(input, &mut warnings);
     // --- the fit ladder: tier selection + mem-fraction derive.
-    let (gpu_label, kv_est_bytes) =
-        sglang_run_fit_ladder(input, &tun, hf, ctx, slots, &mut argv, &mut warnings)?;
+    let (gpu_label, kv_est_bytes) = sglang_run_fit_ladder(
+        input,
+        &tun,
+        hf,
+        ctx,
+        slots,
+        spec_engaged,
+        &mut argv,
+        &mut warnings,
+    )?;
 
     // HiCache viability gates refuse impossible host-RAM tiers.
     push_sglang_hicache(input, &tun, &mut argv, &mut warnings)?;
@@ -3882,6 +4136,8 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     push_sglang_scheduler_observability(input, &tun, &mut argv, &mut warnings);
 
     push_sglang_graph_capture(input, &tun, &mut argv, &mut warnings);
+
+    push_sglang_prefill_capture(input, &tun, &mut argv, &mut warnings);
 
     push_sglang_parallel_sizes(input, &tun, &mut argv, &mut warnings);
 
@@ -3911,11 +4167,20 @@ fn push_sglang_graph_capture(
 ) {
     if let Some(list) = &tun.cuda_graph_bs {
         let tokens: Vec<String> = list.iter().map(ToString::to_string).collect();
+        // 0.5.21 split the combined list flag: this knob has always
+        // meant request-count capture sizes, so it maps to the decode
+        // half of the split surface (the prefill half is aggregate-token
+        // buckets, derived in `push_sglang_prefill_capture`).
+        let flag = if input.supported_flags.contains("--cuda-graph-bs-decode") {
+            "--cuda-graph-bs-decode"
+        } else {
+            "--cuda-graph-bs"
+        };
         push_tuned_list(
             argv,
             input.supported_flags,
             "sglang.cuda_graph_bs",
-            "--cuda-graph-bs",
+            flag,
             &tokens,
             warnings,
         );
@@ -4203,15 +4468,32 @@ fn push_sglang_lifecycle_hygiene(
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
-    if tun.sleep_on_idle == Some(true) {
-        push_tuned(
+    match tun.sleep_on_idle {
+        // Explicit opt-out: the busy-poll posture is the user's call.
+        Some(false) => {}
+        // Explicit request keeps the tuned-knob contract (warn + skip on
+        // engines without the flag — the user asked for it by name).
+        Some(true) => push_tuned(
             argv,
             input.supported_flags,
             "sglang.sleep_on_idle",
             "--sleep-on-idle",
             "",
             warnings,
-        );
+        ),
+        // Default-on: the scheduler's idle busy-poll burns ~1 core on a
+        // laptop battery for nothing; ZMQ blocking sleep collapses it.
+        // This is a default posture, not a user request, so unsupported
+        // engines skip silently (no per-spawn warn noise), and a user
+        // extra_args pin stands the emission down (no duplicate flag).
+        None => {
+            if input.supported_flags.contains("--sleep-on-idle")
+                && !overlay_pins_flag(input, "--sleep-on-idle")
+                && !argv_has_flag(argv, "--sleep-on-idle")
+            {
+                argv.push("--sleep-on-idle".into());
+            }
+        }
     }
     if tun.memory_saver == Some(true) {
         push_tuned(
@@ -4470,9 +4752,25 @@ fn push_sglang_string_pins(
     tun_str("--quantization", &tun.quantization, warnings);
     tun_str("--kv-cache-dtype", &tun.kv_cache_dtype, warnings);
     tun_str("--schedule-policy", &tun.schedule_policy, warnings);
+    // Multimodal attention runs its own backend selection; the list is
+    // long and hardware-specific (sdpa/fa3/fa4/triton_attn/...), so the
+    // engine's argparse owns rejection — no blazar-side vocabulary.
+    // (grammar-backend stays in push_sglang_cache_policy with the other
+    // structured-output knobs — exactly one emission site per flag.)
+    tun_str(
+        "--mm-attention-backend",
+        &tun.mm_attention_backend,
+        warnings,
+    );
+    // Retraction decides WHICH running requests give back their pages
+    // when the KV pool runs dry mid-decode.
+    tun_str("--retraction-policy", &tun.retraction_policy, warnings);
 }
 
 /// Numeric and boolean tuning singles (flag-gated, warn-skip).
+// One cohesive scalar-pin table: split-surface decode mapping keeps
+// the legacy and 0.5.21 arms side by side in one readable block.
+#[allow(clippy::too_many_lines)]
 fn push_sglang_scalar_pins(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
@@ -4540,11 +4838,18 @@ fn push_sglang_scalar_pins(
         );
     }
     if let Some(v) = tun.cuda_graph_max_bs {
+        // request-count ceiling: the decode half of the 0.5.21 split
+        // surface (same mapping as the capture-list knob above)
+        let flag = if input.supported_flags.contains("--cuda-graph-max-bs-decode") {
+            "--cuda-graph-max-bs-decode"
+        } else {
+            "--cuda-graph-max-bs"
+        };
         push_tuned(
             argv,
             input.supported_flags,
             "sglang.cuda_graph_max_bs",
-            "--cuda-graph-max-bs",
+            flag,
             &v.to_string(),
             warnings,
         );
@@ -4575,6 +4880,45 @@ fn push_sglang_scalar_pins(
             input.supported_flags,
             "sglang.torch_compile",
             "--enable-torch-compile",
+            "",
+            warnings,
+        );
+    }
+    // Two-batch overlap only pays off with tensor/pipeline parallelism
+    // (it overlaps the bubble between micro-batches); harmless to emit
+    // otherwise, but the doc steers users to it for tp/pp > 1.
+    if tun.enable_two_batch_overlap == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.enable_two_batch_overlap",
+            "--enable-two-batch-overlap",
+            "",
+            warnings,
+        );
+    }
+    // TF32 matmuls trade ~3 decimal digits of fp32 precision for
+    // Ampere+ tensor-core throughput. Opt-in: numerical work that
+    // cares should leave it off.
+    if tun.enable_tf32_matmul == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.enable_tf32_matmul",
+            "--enable-tf32-matmul",
+            "",
+            warnings,
+        );
+    }
+    // Priority scheduling is the engine-required companion of
+    // retraction_policy = "priority" (config validation enforces the
+    // pair; both emit independently so each stays usable alone).
+    if tun.enable_priority_scheduling == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.enable_priority_scheduling",
+            "--enable-priority-scheduling",
             "",
             warnings,
         );
@@ -4732,20 +5076,144 @@ fn push_sglang_loras(
     Ok(())
 }
 
-/// Speculative pair: sglang rows resolve `spec = "eagle3"`-class drafts
-/// as safetensors dirs; the manifest carries no `spec_types` for sglang
-/// (no --spec-type flag upstream), so the pair gates on flags. A GGUF
-/// file is never a valid EAGLE draft here: sglang's loader treats
-/// unknown-path drafts as HF repo ids and dies in
-/// `download_weights_from_hf` — the shared spec catalog pairs a text
-/// model with a small GGUF (fine for llama.cpp's EAGLE lane), so the
-/// format gate must live at the engine boundary (2026-09-30 receipt:
-/// qwen3-1.7b + pulled Qwen3-0.6B-f16.gguf -> EAGLE3 draft -> 502).
-fn push_sglang_speculative(
+/// Speculative decoding for the sglang lane. Two lanes:
+/// (1) draft-free self-speculation via the `sglang.spec_algorithm` knob
+///     ("ngram" -> NGRAM): the context drafts from itself, no weights
+///     to pull, no admission change beyond verify-KV. DFLASH is not
+///     knob-reachable: sglang 0.5.21 hard-requires a draft model path
+///     for it (2026-10-09 live receipt: `ValueError` at spawn), so it
+///     belongs to the draft-pair lane when that grows DFLASH pairs;
+/// (2) the EAGLE3 draft pair via the resolved `draft_path` — sglang rows
+///     resolve `spec = "eagle3"`-class drafts as safetensors dirs; the
+///     manifest carries no `spec_types` for sglang (no --spec-type flag
+///     upstream), so both lanes gate on flags. A GGUF file is never a
+///     valid EAGLE draft here: sglang's loader treats unknown-path
+///     drafts as HF repo ids and dies in `download_weights_from_hf` —
+///     the shared spec catalog pairs a text model with a small GGUF
+///     (fine for llama.cpp's EAGLE lane), so the format gate must live
+///     at the engine boundary (2026-09-30 receipt: qwen3-1.7b + pulled
+///     Qwen3-0.6B-f16.gguf -> EAGLE3 draft -> 502).
+/// An explicit algorithm pin owns the spawn: a resolved draft pair
+/// stands down with a warning (user pin > catalog pair). Returns true
+/// when speculation engaged — the fit ladder holds back a verify-KV and
+/// Spec-depth knobs shared by every engaging speculation arm (the
+/// explicit `spec_algorithm` pin and the resolved EAGLE3 draft pair).
+/// Emitted ONLY when speculation engaged: dense spawns stay
+/// byte-identical, and a stray `--speculative-*` flag on a dense
+/// spawn would change engine behavior on a path the user never chose.
+fn push_sglang_spec_depth_knobs(
     input: &ProfileInput<'_>,
+    tun: &SglangTuning,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
+    if let Some(v) = tun.speculative_eagle_topk {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.speculative_eagle_topk",
+            "--speculative-eagle-topk",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.speculative_accept_threshold_single {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.speculative_accept_threshold_single",
+            "--speculative-accept-threshold-single",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.speculative_accept_threshold_acc {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.speculative_accept_threshold_acc",
+            "--speculative-accept-threshold-acc",
+            &v.to_string(),
+            warnings,
+        );
+    }
+}
+
+/// draft-graph reserve for engaged spawns (self-drafting still pays
+/// verification: every accepted draft token is re-attended).
+fn push_sglang_speculative(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if let Some(algorithm) = tun.spec_algorithm.as_deref() {
+        // blazar spelling -> upstream enum. Config validation rejects
+        // unknown spellings at load; this arm is the defensive net for
+        // programmatically built tunings (tests, future callers).
+        let upstream = match algorithm {
+            "ngram" => Some("NGRAM"),
+            "dflash" => {
+                warnings.push(
+                    "sglang.spec_algorithm \"dflash\" needs --speculative-draft-model-path \
+                     on sglang 0.5.21 (2026-10-09 live receipt: `ValueError` at spawn); \
+                     spawning dense — use \"ngram\" for draft-free speculation"
+                        .to_string(),
+                );
+                None
+            }
+            other => {
+                warnings.push(format!(
+                    "sglang.spec_algorithm {other:?} is not a draft-free algorithm \
+                     (supported: ngram); spawning dense — the EAGLE family \
+                     rides the draft-pair lane (spec = \"eagle3\")"
+                ));
+                None
+            }
+        };
+        let Some(upstream) = upstream else {
+            return false;
+        };
+        if !input.supported_flags.contains("--speculative-algorithm") {
+            warnings.push(format!(
+                "sglang.spec_algorithm {algorithm} set but this engine lacks \
+                 --speculative-algorithm; spawning dense (a blazar engine update \
+                 revives it)"
+            ));
+            return false;
+        }
+        if input.draft_path.is_some() {
+            warnings.push(
+                "sglang.spec_algorithm pin overrides the resolved EAGLE3 draft \
+                 pair — the explicit knob owns the spawn"
+                    .into(),
+            );
+        }
+        argv.push("--speculative-algorithm".into());
+        argv.push(upstream.into());
+        if let Some(v) = tun.spec_num_steps {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "sglang.spec_num_steps",
+                "--speculative-num-steps",
+                &v.to_string(),
+                warnings,
+            );
+        }
+        if let Some(v) = tun.spec_num_draft_tokens {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "sglang.spec_num_draft_tokens",
+                "--speculative-num-draft-tokens",
+                &v.to_string(),
+                warnings,
+            );
+        }
+        push_sglang_spec_depth_knobs(input, tun, argv, warnings);
+        return true;
+    }
     if let Some(draft) = input.draft_path {
         if draft
             .rsplit_once('.')
@@ -4765,6 +5233,8 @@ fn push_sglang_speculative(
             argv.push("EAGLE3".into());
             argv.push("--speculative-draft-model-path".into());
             argv.push(draft.to_string());
+            push_sglang_spec_depth_knobs(input, tun, argv, warnings);
+            return true;
         } else {
             warnings.push(format!(
                 "spec draft {draft} resolved but this sglang engine lacks the \
@@ -4772,6 +5242,7 @@ fn push_sglang_speculative(
             ));
         }
     }
+    false
 }
 
 /// llama-vocabulary knobs that do NOT translate: `cache_type` is
@@ -4863,12 +5334,14 @@ fn push_nonllama_vocab_teaching(config: &Config, lane: &str, warnings: &mut Vec<
 /// serving tier (see `sglang_gpu_fit`), derives mem-fraction-static,
 /// and hands the CPU lane its `--device cpu` teaching. Returns the
 /// profile's gpu label and KV estimate.
+#[allow(clippy::too_many_arguments)]
 fn sglang_run_fit_ladder(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
     hf: &HfMeta,
     ctx: u32,
     slots: u32,
+    spec_engaged: bool,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) -> Result<(&'static str, Option<u64>), String> {
@@ -4923,6 +5396,11 @@ fn sglang_run_fit_ladder(
                     &geom,
                     fit.kv_est_bytes,
                     fit.offload_gb,
+                    if spec_engaged {
+                        SGLANG_SPEC_VERIFY_RESERVE_MIB
+                    } else {
+                        0
+                    },
                 );
             }
         }
@@ -5207,6 +5685,7 @@ fn sglang_tier_c_host_offload(
 /// or the hard band — an over-budget pin is a mid-boot crash (capture
 /// assert → `kill_process_tree` → opaque 502), never a usable
 /// configuration.
+#[allow(clippy::too_many_arguments)]
 fn sglang_push_mem_fraction(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
@@ -5215,11 +5694,14 @@ fn sglang_push_mem_fraction(
     geom: &SglangFitGeometry,
     kv_est_bytes: Option<u64>,
     offload_total_gb: f32,
+    spec_verify_reserve_mib: u64,
 ) {
     let (vram, weights) = (geom.vram, geom.weights);
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let gpu_static = weights.saturating_sub((f64::from(offload_total_gb) * 1e9).round() as u64);
-    let static_demand = gpu_static.saturating_add(kv_est_bytes.unwrap_or(0));
+    let static_demand = gpu_static
+        .saturating_add(kv_est_bytes.unwrap_or(0))
+        .saturating_add(Hardware::bytes(spec_verify_reserve_mib));
     let ceiling = if vram > 0 {
         let reserve_vram = vram.saturating_sub(Hardware::bytes(SGLANG_ACTIVATION_RESERVE_MIB));
         #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
@@ -5259,6 +5741,15 @@ fn sglang_push_mem_fraction(
     }
 }
 
+/// Extra static VRAM held back when speculation engages: every verify
+/// round re-attends the drafted tokens, so the KV pool and the
+/// draft/verify CUDA graphs grow beyond the dense ladder's accounting
+/// (self-drafting algorithms pay it too — the drafts are free, the
+/// verification is not). A conservative pre-receipt margin until the
+/// live concurrency-ladder run calibrates it; too much only costs KV
+/// headroom, too little is an OOM at graph capture.
+const SGLANG_SPEC_VERIFY_RESERVE_MIB: u64 = 256;
+
 /// Captured-graph memory slope: MiB of CUDA-graph pool per captured batch
 /// size, per GiB of weights. Calibrated from a live receipt — the bs-256
 /// capture pool measured +334 MiB beside 3.9 GiB weights (sglang 0.5.19,
@@ -5288,6 +5779,137 @@ fn sglang_graph_bs_ceiling(headroom_bytes: u64, weights: u64) -> u32 {
     ((headroom_mib * 0.5) / sglang_graph_per_size_mib(weights)).clamp(4.0, 256.0) as u32
 }
 
+/// Chunked-prefill size the ladder plans around when nothing pins it.
+/// Matches both the tight-tier posture below and the measured upstream
+/// default on 8 GiB-class cards (live `/get_server_info` receipt,
+/// qwen3-1.7b, sglang 0.5.21, 2026-10-09: `chunked_prefill_size: 2048`).
+const SGLANG_DEFAULT_CHUNKED_PREFILL: u32 = 2048;
+
+/// Prefill capture buckets for the split flag surface (sglang 0.5.21+),
+/// derived from the effective chunk size. Prefill `bs` counts aggregate
+/// TOKENS, not requests — the breakable backend composes smaller
+/// captures — so a 3-rung ladder ending at the chunk boundary covers
+/// every shape the scheduler can emit. Receipt (instrumented A/B,
+/// qwen3-1.7b, RTX 4070 8 GiB, 2026-10-09): [256, 1024, 2048] vs the
+/// upstream 42-shape ladder — identical temp-0 output hash, identical
+/// 6.4k-token prefill latency and 66 tok/s decode, capture 17.1s -> 5.5s.
+fn sglang_prefill_graph_buckets(chunk: u32) -> Vec<u32> {
+    let mut buckets = [chunk / 8, chunk / 2, chunk].map(|b| b.max(1)).to_vec();
+    buckets.dedup();
+    buckets
+}
+
+/// `extra_args` tokens naming `flag` (either `--flag value` or
+/// `--flag=value` grammar).
+fn overlay_pins_flag(input: &ProfileInput<'_>, flag: &str) -> bool {
+    input.overlay.extra_args.as_ref().is_some_and(|args| {
+        args.iter()
+            .any(|a| a.split('=').next().unwrap_or(a) == flag)
+    })
+}
+
+/// True when argv already carries `flag` from an earlier emission pass
+/// (the ladder runs before the knob pins; duplicates would shadow).
+fn argv_has_flag(argv: &[String], flag: &str) -> bool {
+    argv.iter()
+        .any(|a| a.split('=').next().unwrap_or(a) == flag)
+}
+
+/// User-level pins that own the prefill capture shape. Any of these in
+/// `extra_args` stands the derived bucket list down: last-one-wins argv
+/// would only shadow our tokens, and an explicit shape (list, config
+/// JSON, backend choice, or disabling prefill graphs outright) is the
+/// user's call to make.
+const SGLANG_PREFILL_GRAPH_PIN_FLAGS: &[&str] = &[
+    "--cuda-graph-bs-prefill",
+    "--cuda-graph-max-bs-prefill",
+    "--cuda-graph-config",
+    "--cuda-graph-backend-prefill",
+    "--disable-prefill-cuda-graph",
+];
+
+/// Derived prefill capture list on the split surface:
+/// `--cuda-graph-bs-prefill <chunk/8> <chunk/2> <chunk>` plus the chunk
+/// pin that makes the top bucket the exact chunk boundary. The legacy
+/// combined-flag surface (0.5.19 and older) keeps its existing posture —
+/// the combined `--cuda-graph-max-bs` cap keeps covering prefill there —
+/// so this emits nothing when the split flag is missing.
+fn push_sglang_prefill_capture(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if !input.supported_flags.contains("--cuda-graph-bs-prefill") {
+        return;
+    }
+    if SGLANG_PREFILL_GRAPH_PIN_FLAGS
+        .iter()
+        .any(|f| overlay_pins_flag(input, f))
+        || tun.cuda_graph_backend_prefill.is_some()
+    {
+        return;
+    }
+    let chunk = sglang_effective_chunked_prefill(input, tun);
+    let tokens: Vec<String> = sglang_prefill_graph_buckets(chunk)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    push_tuned_list(
+        argv,
+        input.supported_flags,
+        "fit ladder",
+        "--cuda-graph-bs-prefill",
+        &tokens,
+        warnings,
+    );
+    // top-bucket == chunk holds by construction only if the chunk we
+    // derived from is actually pinned: the knob pin, a user pin, or the
+    // tight-tier emission already in argv each suffice.
+    if tun.chunked_prefill_size.is_none()
+        && !overlay_pins_flag(input, "--chunked-prefill-size")
+        && !argv_has_flag(argv, "--chunked-prefill-size")
+    {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "fit ladder",
+            "--chunked-prefill-size",
+            &chunk.to_string(),
+            warnings,
+        );
+    }
+}
+
+/// Effective chunked-prefill size: knob pin > `extra_args` pin > the
+/// ladder default. The prefill bucket derive and the chunk pin must
+/// agree on this value or the capture ladder's top rung stops matching
+/// the chunk boundary.
+fn sglang_effective_chunked_prefill(input: &ProfileInput<'_>, tun: &SglangTuning) -> u32 {
+    if let Some(v) = tun.chunked_prefill_size {
+        // absurd pins (>4G tokens) saturate; upstream argparse rejects
+        // them loudly rather than us silently substituting a default
+        return u32::try_from(v).unwrap_or(u32::MAX);
+    }
+    if let Some(args) = &input.overlay.extra_args {
+        let mut it = args.iter().peekable();
+        while let Some(a) = it.next() {
+            if let Some(v) = a.strip_prefix("--chunked-prefill-size=")
+                && let Ok(n) = v.parse::<u32>()
+            {
+                return n;
+            }
+            if a == "--chunked-prefill-size"
+                && let Some(v) = it.peek()
+                && let Ok(n) = v.parse::<u32>()
+            {
+                return n;
+            }
+        }
+    }
+    SGLANG_DEFAULT_CHUNKED_PREFILL
+}
+
 /// Tight-fit tail knobs for ladder Tiers B/C. The cuda-graph capture list
 /// follows actual concurrency instead of a flat cap: auto slots (0) get
 /// the memory-bound ceiling, explicit slots get `min(slots, ceiling)`, and
@@ -5313,7 +5935,15 @@ fn sglang_tight_fit_knobs(
         } else {
             slots.min(ceiling)
         };
-        if flags.contains("--cuda-graph-max-bs") {
+        // 0.5.21 split the combined cap: decode takes a request-count
+        // ceiling, prefill takes aggregate-token buckets (derived in
+        // `push_sglang_prefill_capture`). Same derivation, either flag.
+        let cap_flag = if flags.contains("--cuda-graph-max-bs-decode") {
+            "--cuda-graph-max-bs-decode"
+        } else {
+            "--cuda-graph-max-bs"
+        };
+        if flags.contains(cap_flag) {
             // Same derivation the doctor "sglang fit" check surfaces;
             // fire it only where the flag actually lands in argv.
             #[allow(clippy::cast_possible_truncation)]
@@ -5327,7 +5957,7 @@ fn sglang_tight_fit_knobs(
             argv,
             flags,
             "fit ladder",
-            "--cuda-graph-max-bs",
+            cap_flag,
             &bs.to_string(),
             warnings,
         );
@@ -5338,7 +5968,7 @@ fn sglang_tight_fit_knobs(
             flags,
             "fit ladder",
             "--chunked-prefill-size",
-            "2048",
+            &SGLANG_DEFAULT_CHUNKED_PREFILL.to_string(),
             warnings,
         );
     }
@@ -6914,6 +7544,7 @@ mod tests {
         override_tensor: None,
         devices: None,
         mistralrs: None,
+        mlx: None,
         engine: None,
         warmup: None,
         reasoning_budget: None,
@@ -10936,6 +11567,12 @@ mod tests {
             "--pa-block-size",
             "--pa-cache-type",
             "--pa-context-len",
+            "--pa-memory-mb",
+            "--chat-template",
+            "--isq",
+            "--imatrix",
+            "--calibration-file",
+            "--isq-organization",
             "--lora-max-rank",
             "--lora-max-adapters",
             "--lora-max-bytes",
@@ -10965,6 +11602,12 @@ mod tests {
             pa_block_size: Some(64),
             pa_cache_type: Some("f8e4m3".into()),
             pa_context_len: Some(4096),
+            pa_memory_mb: Some(8192),
+            chat_template: Some("chatml".into()),
+            isq: Some("q4k".into()),
+            imatrix: Some("/models/imatrix.gguf".into()),
+            calibration_file: Some("/models/calib.txt".into()),
+            isq_organization: Some("moqe".into()),
             lora_max_rank: Some(64),
             lora_max_adapters: Some(2),
             lora_max_bytes: Some(1_073_741_824),
@@ -11004,6 +11647,12 @@ mod tests {
             ("--pa-block-size", "64"),
             ("--pa-cache-type", "f8e4m3"),
             ("--pa-context-len", "4096"),
+            ("--pa-memory-mb", "8192"),
+            ("--chat-template", "chatml"),
+            ("--isq", "q4k"),
+            ("--imatrix", "/models/imatrix.gguf"),
+            ("--calibration-file", "/models/calib.txt"),
+            ("--isq-organization", "moqe"),
             ("--lora-max-rank", "64"),
             ("--lora-max-adapters", "2"),
             ("--lora-max-bytes", "1073741824"),
@@ -13496,6 +14145,20 @@ mod tests {
             "--conditioning-cache-size",
             "--model-args",
             "--tensor-type-rules",
+            "--control-net",
+            "--ip-adapter",
+            "--clip_vision",
+            "--motion-module",
+            "--photo-maker",
+            "--pulid-weights",
+            "--upscale-model",
+            "--lora-model-dir",
+            "--hires-upscalers-dir",
+            "--embd-dir",
+            "--audio-encoder",
+            "--high-noise-diffusion-model",
+            "--uncond-diffusion-model",
+            "--backend",
         ]
         .into_iter()
         .map(str::to_string)
@@ -13589,6 +14252,20 @@ mod tests {
             sdcpp_conditioning_cache_size: Some(8),
             sdcpp_model_args: Some("qwen_image_2_1_prefix_cache=true".to_string()),
             sdcpp_tensor_type_rules: Some("model.=q6_k".to_string()),
+            sdcpp_control_net: Some("/models/controlnet.safetensors".to_string()),
+            sdcpp_ip_adapter: Some("/models/ip-adapter.safetensors".to_string()),
+            sdcpp_clip_vision: Some("/models/clip_vision.safetensors".to_string()),
+            sdcpp_motion_module: Some("/models/motion-module.safetensors".to_string()),
+            sdcpp_photo_maker: Some("/models/photomaker-v2.bin".to_string()),
+            sdcpp_pulid_weights: Some("/models/pulid-flux.safetensors".to_string()),
+            sdcpp_upscale_model: Some("/models/realesrgan-x4.pth".to_string()),
+            sdcpp_lora_model_dir: Some("/models/loras".to_string()),
+            sdcpp_hires_upscalers_dir: Some("/models/upscalers".to_string()),
+            sdcpp_embd_dir: Some("/models/embeddings".to_string()),
+            sdcpp_audio_encoder: Some("/models/wav2vec2.bin".to_string()),
+            sdcpp_high_noise_diffusion_model: Some("/models/hn-dit.safetensors".to_string()),
+            sdcpp_uncond_diffusion_model: Some("/models/uncond-dit.safetensors".to_string()),
+            sdcpp_backend: Some("clip=cpu,vae=cuda0".to_string()),
             ..Config::default()
         };
         let sd_flags = sd_tuning_flags();
@@ -13608,6 +14285,20 @@ mod tests {
             ["--conditioning-cache-size", "8"],
             ["--model-args", "qwen_image_2_1_prefix_cache=true"],
             ["--tensor-type-rules", "model.=q6_k"],
+            ["--control-net", "/models/controlnet.safetensors"],
+            ["--ip-adapter", "/models/ip-adapter.safetensors"],
+            ["--clip_vision", "/models/clip_vision.safetensors"],
+            ["--motion-module", "/models/motion-module.safetensors"],
+            ["--photo-maker", "/models/photomaker-v2.bin"],
+            ["--pulid-weights", "/models/pulid-flux.safetensors"],
+            ["--upscale-model", "/models/realesrgan-x4.pth"],
+            ["--lora-model-dir", "/models/loras"],
+            ["--hires-upscalers-dir", "/models/upscalers"],
+            ["--embd-dir", "/models/embeddings"],
+            ["--audio-encoder", "/models/wav2vec2.bin"],
+            ["--high-noise-diffusion-model", "/models/hn-dit.safetensors"],
+            ["--uncond-diffusion-model", "/models/uncond-dit.safetensors"],
+            ["--backend", "clip=cpu,vae=cuda0"],
         ] {
             assert!(
                 p.argv.windows(2).any(|w| w == pair),
@@ -14377,6 +15068,8 @@ mod tests {
             "--max-running-requests",
             "--speculative-algorithm",
             "--speculative-draft-model-path",
+            "--speculative-num-steps",
+            "--speculative-num-draft-tokens",
             "--kv-cache-dtype",
             "--cpu-offload-gb",
             "--mem-fraction-static",
@@ -14427,6 +15120,42 @@ mod tests {
     }
 
     static SGLANG_FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(sglang_flags);
+    static MLX_FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(mlx_flags);
+
+    /// The verified sglang 0.5.21 surface (probe receipt: engines.manifest
+    /// in blazar.db, 2026-10-09): the combined cuda-graph flags split —
+    /// `--cuda-graph-bs`/`--cuda-graph-max-bs` are gone, decode and
+    /// prefill each take their own list/ceiling, and prefill `bs` counts
+    /// aggregate tokens, not requests. Otherwise identical to 0.5.19.
+    fn sglang_flags_0521() -> BTreeSet<String> {
+        let mut flags = sglang_flags();
+        flags.remove("--cuda-graph-max-bs");
+        for flag in [
+            "--cuda-graph-bs-decode",
+            "--cuda-graph-bs-prefill",
+            "--cuda-graph-max-bs-decode",
+            "--cuda-graph-max-bs-prefill",
+            "--cuda-graph-config",
+            "--disable-prefill-cuda-graph",
+            "--sleep-on-idle",
+            // Depth knobs verified live on the installed 0.5.21 --help;
+            // the 0.5.19-era base stays without them (warn-skip path).
+            "--grammar-backend",
+            "--mm-attention-backend",
+            "--retraction-policy",
+            "--enable-two-batch-overlap",
+            "--enable-tf32-matmul",
+            "--enable-priority-scheduling",
+            "--speculative-eagle-topk",
+            "--speculative-accept-threshold-single",
+            "--speculative-accept-threshold-acc",
+        ] {
+            flags.insert(flag.to_string());
+        }
+        flags
+    }
+
+    static SGLANG_FLAGS_0521: LazyLock<BTreeSet<String>> = LazyLock::new(sglang_flags_0521);
 
     fn sglang_input<'a>(
         hf: &'a crate::hfmeta::HfMeta,
@@ -14776,6 +15505,319 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // sglang: split cuda-graph surface (0.5.21) — prefill bucket derive
+    // ------------------------------------------------------------------
+
+    /// Tier A on the split surface: full-VRAM fits derive no decode
+    /// ceiling, but the prefill capture ladder collapses from the
+    /// upstream 42-shape sweep to the 3-bucket chunk ladder, with the
+    /// chunk pin making the top bucket the exact chunk boundary.
+    #[test]
+    fn unit__sglang__split_surface_tier_a_derives_prefill_buckets() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS_0521.clone();
+        let overlay = sglang_ctx_overlay();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.windows(4).any(|w| {
+                w[0] == "--cuda-graph-bs-prefill"
+                    && w[1] == "256"
+                    && w[2] == "1024"
+                    && w[3] == "2048"
+            }),
+            "prefill bucket ladder missing: {:?}",
+            p.argv
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--chunked-prefill-size" && w[1] == "2048")
+        );
+        // Tier A never asked for a decode ceiling
+        assert!(!p.argv.iter().any(|a| a == "--cuda-graph-max-bs-decode"));
+    }
+
+    /// Tier B on the split surface: the headroom ceiling lands on the
+    /// decode flag, the prefill buckets ride alongside, and the chunk
+    /// pin appears exactly once (tight-fit emitted it first — the
+    /// prefill derive must not duplicate it).
+    #[test]
+    fn unit__sglang__split_surface_tier_b_decode_ceiling_and_single_chunk_pin() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS_0521.clone();
+        let overlay = sglang_ctx_overlay();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 9_500 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        // same headroom math as the legacy Tier B receipt: ceiling 10
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cuda-graph-max-bs-decode" && w[1] == "10")
+        );
+        assert!(p.argv.windows(4).any(|w| {
+            w[0] == "--cuda-graph-bs-prefill" && w[1] == "256" && w[2] == "1024" && w[3] == "2048"
+        }));
+        assert_eq!(
+            p.argv
+                .iter()
+                .filter(|a| *a == "--chunked-prefill-size")
+                .count(),
+            1,
+            "chunk pin duplicated: {:?}",
+            p.argv
+        );
+    }
+
+    /// The capture-list knob has always meant request counts: on the
+    /// split surface it lands on the decode flag, never the retired
+    /// combined one.
+    #[test]
+    fn unit__sglang__split_surface_capture_list_knob_maps_to_decode() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS_0521.clone();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                cuda_graph_bs: Some(vec![1, 2]),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let idx = p
+            .argv
+            .iter()
+            .position(|a| a == "--cuda-graph-bs-decode")
+            .expect("decode list flag");
+        assert_eq!(&p.argv[idx + 1..idx + 3], &["1", "2"]);
+        assert!(!p.argv.iter().any(|a| a == "--cuda-graph-bs"));
+    }
+
+    /// The scalar ceiling knob follows the same decode mapping on the
+    /// split surface.
+    #[test]
+    fn unit__sglang__split_surface_max_bs_knob_maps_to_decode() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS_0521.clone();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                cuda_graph_max_bs: Some(32),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cuda-graph-max-bs-decode" && w[1] == "32")
+        );
+        assert!(!p.argv.iter().any(|a| a == "--cuda-graph-max-bs"));
+    }
+
+    /// A user `extra_args` pin owns the prefill capture shape: the
+    /// derived buckets stand down and the pin passes through untouched
+    /// (no shadow, no duplicate flag).
+    #[test]
+    fn unit__sglang__split_surface_extra_args_pin_suppresses_derived_buckets() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS_0521.clone();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            extra_args: Some(vec![
+                "--cuda-graph-bs-prefill".into(),
+                "512".into(),
+                "2048".into(),
+            ]),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let idx = p
+            .argv
+            .iter()
+            .position(|a| a == "--cuda-graph-bs-prefill")
+            .expect("user prefill pin");
+        assert_eq!(&p.argv[idx + 1..idx + 3], &["512", "2048"]);
+        assert_eq!(
+            p.argv
+                .iter()
+                .filter(|a| *a == "--cuda-graph-bs-prefill")
+                .count(),
+            1,
+            "derived buckets shadowed the user pin: {:?}",
+            p.argv
+        );
+    }
+
+    /// The chunk knob sizes the whole ladder: top bucket == pinned
+    /// chunk, and the knob's own scalar pin is the only chunk token in
+    /// argv (the prefill derive defers to it).
+    #[test]
+    fn unit__sglang__split_surface_chunk_knob_sizes_bucket_ladder() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS_0521.clone();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                chunked_prefill_size: Some(4096),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.windows(4).any(|w| {
+                w[0] == "--cuda-graph-bs-prefill"
+                    && w[1] == "512"
+                    && w[2] == "2048"
+                    && w[3] == "4096"
+            }),
+            "bucket ladder must end at the pinned chunk: {:?}",
+            p.argv
+        );
+        assert_eq!(
+            p.argv
+                .iter()
+                .filter(|a| *a == "--chunked-prefill-size")
+                .count(),
+            1
+        );
+    }
+
+    /// Default posture: the scheduler's idle busy-poll burns ~1 core, so
+    /// an unpinned profile emits `--sleep-on-idle` exactly once on the
+    /// 0.5.21 surface, with no warning (default posture, not a request).
+    #[test]
+    fn unit__sglang__split_surface_sleep_on_idle_default_on() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS_0521.clone();
+        let overlay = sglang_ctx_overlay();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(
+            p.argv.iter().filter(|a| *a == "--sleep-on-idle").count(),
+            1,
+            "sleep-on-idle must be default-on exactly once: {:?}",
+            p.argv
+        );
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("sleep_on_idle")),
+            "default posture must not warn: {:?}",
+            p.warnings
+        );
+    }
+
+    /// `sleep_on_idle = false` is the explicit opt-out: the busy-poll
+    /// posture is the user's call.
+    #[test]
+    fn unit__sglang__split_surface_sleep_on_idle_opt_out() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS_0521.clone();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                sleep_on_idle: Some(false),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a == "--sleep-on-idle"),
+            "explicit opt-out must stand the emission down: {:?}",
+            p.argv
+        );
+    }
+
+    /// A user `extra_args` pin owns the flag: the default emission stands
+    /// down so the pin is never duplicated.
+    #[test]
+    fn unit__sglang__split_surface_sleep_on_idle_extra_args_pin_wins() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS_0521.clone();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            extra_args: Some(vec!["--sleep-on-idle".into()]),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(
+            p.argv.iter().filter(|a| *a == "--sleep-on-idle").count(),
+            1,
+            "user pin must not be duplicated: {:?}",
+            p.argv
+        );
+    }
+
+    /// Pre-split engines without the flag skip silently: a default
+    /// posture must not manufacture per-spawn warn noise.
+    #[test]
+    fn unit__sglang__legacy_surface_sleep_on_idle_silent_absence() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let flags = SGLANG_FLAGS.clone();
+        let overlay = sglang_ctx_overlay();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| *a == "--sleep-on-idle"),
+            "flag absent from manifest — nothing to emit"
+        );
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("sleep_on_idle")),
+            "silent skip for default posture: {:?}",
+            p.warnings
+        );
+    }
+
     #[test]
     fn unit__sglang__tier_c_explicit_slots_covered_by_ceiling() {
         let cfg = Config::default();
@@ -15050,6 +16092,556 @@ mod tests {
             p.warnings
                 .iter()
                 .any(|w| w.contains("GGUF file") && w.contains("safetensors dirs"))
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__draft_free_ngram_emits_knobs() {
+        // The draft-free lane: NGRAM self-speculation from the sglang
+        // tuning knobs — no draft model flag, steps/draft-tokens ride
+        // their own flags.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("ngram".into()),
+                spec_num_steps: Some(3),
+                spec_num_draft_tokens: Some(4),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "NGRAM")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-num-steps" && w[1] == "3")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-num-draft-tokens" && w[1] == "4")
+        );
+        assert!(
+            !p.argv
+                .contains(&"--speculative-draft-model-path".to_string())
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__dflash_warns_dense_needs_draft_model() {
+        // sglang 0.5.21 DFLASH hard-requires --speculative-draft-model-path
+        // (2026-10-09 live receipt: `ValueError` at spawn). The knob lane
+        // exposes only draft-free algorithms, so the pin warns and stays
+        // dense rather than emitting a spawn that cannot come up.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dflash".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.windows(2).any(|w| w[0] == "--speculative-algorithm"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("dflash") && w.contains("draft-model-path"))
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__algorithm_flag_missing_warns_dense() {
+        // An engine without --speculative-algorithm must stay dense with
+        // a teaching warning — never a spawn-time argparse death.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("ngram".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut flags = sglang_flags();
+        flags.remove("--speculative-algorithm");
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--speculative-algorithm"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("lacks --speculative-algorithm"))
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__secondary_knob_missing_warns_still_engages() {
+        // Steps/draft-tokens gate per-flag (push_tuned): an engine with
+        // the algorithm but not a secondary flag still engages, warning
+        // about the skipped knob.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("ngram".into()),
+                spec_num_steps: Some(3),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut flags = sglang_flags();
+        flags.remove("--speculative-num-steps");
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "NGRAM")
+        );
+        assert!(!p.argv.contains(&"--speculative-num-steps".to_string()));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("sglang.spec_num_steps") && w.contains("lacks"))
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__pin_overrides_draft_pair() {
+        // Explicit knob owns the spawn: a resolved EAGLE3 draft pair
+        // stands down (with a warning) under a pinned algorithm.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("ngram".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let draft = format!("/tmp/blazar-draft-pin-wins-{}.d", std::process::id());
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "NGRAM")
+        );
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "EAGLE3")
+        );
+        assert!(
+            !p.argv
+                .contains(&"--speculative-draft-model-path".to_string())
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("overrides the resolved EAGLE3 draft pair"))
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__mem_fraction_reserves_when_engaged() {
+        // Engaged speculation must reserve MORE static VRAM (verify-KV +
+        // draft graphs) than the identical dense spawn: the fraction is
+        // demand-derived, so engaged > dense by the reserve margin.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let frac_of = |tuning: Option<crate::config::SglangTuning>| {
+            let overlay = ModelOverride {
+                ctx: Some(32_768),
+                sglang: tuning,
+                ..DEFAULT_OVERLAY.clone()
+            };
+            let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+            inp.overlay = &overlay;
+            let p = compile(&inp, &TuningOverrides::default()).unwrap();
+            p.argv
+                .windows(2)
+                .find(|w| w[0] == "--mem-fraction-static")
+                .map(|w| w[1].parse::<f64>().unwrap())
+                .unwrap()
+        };
+        let dense = frac_of(None);
+        let engaged = frac_of(Some(crate::config::SglangTuning {
+            spec_algorithm: Some("ngram".into()),
+            ..crate::config::SglangTuning::default()
+        }));
+        assert!(
+            engaged > dense,
+            "engaged fraction {engaged} must exceed dense {dense}"
+        );
+    }
+
+    #[test]
+    fn unit__sglang_depth__string_pins_emitted() {
+        // grammar-backend rides the cache-policy stage; mm-attention-backend
+        // and retraction-policy join the string-pin table. Depth knobs are
+        // 0.5.21-surface: race on the 0521 fixture (0.5.19 base warn-skips —
+        // pinned by unit__sglang__new_knobs_warn_skip_on_old_engine).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                grammar_backend: Some("xgrammar".into()),
+                mm_attention_backend: Some("fa3".into()),
+                retraction_policy: Some("priority".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let flags = SGLANG_FLAGS_0521.clone();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for (flag, value) in [
+            ("--grammar-backend", "xgrammar"),
+            ("--mm-attention-backend", "fa3"),
+            ("--retraction-policy", "priority"),
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w[0] == flag && w[1] == value),
+                "expected {flag} {value} in {:?}",
+                p.argv
+            );
+        }
+    }
+
+    #[test]
+    fn unit__sglang_depth__bool_pins_gated_on_true() {
+        // TBO and TF32 are store_true-class flags: Some(true) emits,
+        // Some(false) and None stay silent (never --enable-* false).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                enable_two_batch_overlap: Some(true),
+                enable_tf32_matmul: Some(true),
+                enable_priority_scheduling: Some(true),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let flags = SGLANG_FLAGS_0521.clone();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.contains(&"--enable-two-batch-overlap".to_string()));
+        assert!(p.argv.contains(&"--enable-tf32-matmul".to_string()));
+        assert!(p.argv.contains(&"--enable-priority-scheduling".to_string()));
+
+        let off = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                enable_two_batch_overlap: Some(false),
+                enable_tf32_matmul: Some(false),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &off;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--enable-two-batch-overlap".to_string()));
+        assert!(!p.argv.contains(&"--enable-tf32-matmul".to_string()));
+    }
+
+    #[test]
+    fn unit__sglang_depth__spec_knobs_only_when_engaged() {
+        // Depth knobs (eagle-topk, accept thresholds) ride ONLY an
+        // engaging speculation arm: a dense spawn with stray depth
+        // pins stays byte-identical dense — no orphan --speculative-*
+        // flags on a path the user never chose.
+        let depth = crate::config::SglangTuning {
+            speculative_eagle_topk: Some(4),
+            speculative_accept_threshold_single: Some(0.1),
+            speculative_accept_threshold_acc: Some(0.2),
+            ..crate::config::SglangTuning::default()
+        };
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+
+        let dense = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(depth.clone()),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &dense;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a.starts_with("--speculative-")),
+            "dense spawn must carry no speculative flags: {:?}",
+            p.argv
+        );
+
+        let engaged = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("ngram".into()),
+                ..depth
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let flags = SGLANG_FLAGS_0521.clone();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &engaged;
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-eagle-topk" && w[1] == "4")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-accept-threshold-single" && w[1] == "0.1")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-accept-threshold-acc" && w[1] == "0.2")
+        );
+    }
+
+    /// Verified mlx-lm 0.32.0 server flag surface (the knobs blazar
+    /// emits; the full surface is larger).
+    fn mlx_flags() -> BTreeSet<String> {
+        [
+            "--adapter-path",
+            "--chat-template",
+            "--chat-template-args",
+            "--decode-concurrency",
+            "--draft-model",
+            "--kv-bits",
+            "--kv-group-size",
+            "--num-draft-tokens",
+            "--prefill-step-size",
+            "--prompt-cache-bytes",
+            "--prompt-cache-size",
+            "--prompt-concurrency",
+            "--quantized-kv-start",
+            "--trust-remote-code",
+            "--use-default-chat-template",
+        ]
+        .iter()
+        .map(|f| (*f).to_string())
+        .collect()
+    }
+
+    fn mlx_input<'a>(
+        hf: &'a crate::hfmeta::HfMeta,
+        hw: &'a Hardware,
+        cfg: &'a Config,
+        overlay: &'a ModelOverride,
+    ) -> ProfileInput<'a> {
+        ProfileInput {
+            engine_kind: crate::engine_kind::EngineKind::Mlx,
+            model_name: "qwen3.5-9b-4bit",
+            instance_key: "qwen3.5-9b-4bit",
+            model_path: "/models/qwen3.5-9b-4bit.d",
+            model_bytes: 5_000 * MIB,
+            meta: ModelMeta::Hf(hf),
+            hardware: hw,
+            config: cfg,
+            overlay,
+            spec_mode: "off",
+            loras: &[],
+            draft_path: None,
+            draft_gguf: None,
+            mmproj_path: None,
+            components: &[],
+            mmproj_force: false,
+            engine_tag: "mlx-test",
+            supported_flags: &MLX_FLAGS,
+            spec_types: &[],
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 12346,
+            },
+            data_dir: "/tmp/blazar-test-data",
+            cache_hit_rate: None,
+            resident_ram_mib: 0,
+            device_hint: None,
+            engine_census: hw.gpus.clone(),
+            sibling_devices: Vec::new(),
+            auto_tensor_split: None,
+            auto_tp_size: None,
+        }
+    }
+
+    #[test]
+    fn unit__mlx_knobs__defaults_emit_nothing() {
+        // Dense byte-parity: a default config must produce an empty argv
+        // so existing spawns are unchanged by the knob surface.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let inp = mlx_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.is_empty(),
+            "default mlx knobs must emit nothing, got {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__mlx_knobs__emission_order_and_bool_gating() {
+        let cfg = Config {
+            mlx: crate::config::MlxTuning {
+                draft_model: Some("/models/qwen3-0.5b-4bit.d".into()),
+                num_draft_tokens: Some(3),
+                kv_bits: Some(4),
+                prefill_step_size: Some(512),
+                trust_remote_code: Some(true),
+                // false = explicit opt-out: no flag emitted.
+                use_default_chat_template: Some(false),
+                ..crate::config::MlxTuning::default()
+            },
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let inp = mlx_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(
+            p.argv,
+            vec![
+                "--draft-model",
+                "/models/qwen3-0.5b-4bit.d",
+                "--num-draft-tokens",
+                "3",
+                "--kv-bits",
+                "4",
+                "--prefill-step-size",
+                "512",
+                "--trust-remote-code",
+            ],
+            "knobs emit in struct order; false bools emit nothing"
+        );
+    }
+
+    #[test]
+    fn unit__mlx_knobs__missing_flag_warns_and_skips() {
+        let cfg = Config {
+            mlx: crate::config::MlxTuning {
+                kv_bits: Some(4),
+                decode_concurrency: Some(4),
+                ..crate::config::MlxTuning::default()
+            },
+            ..Config::default()
+        };
+        let mut flags = mlx_flags();
+        flags.remove("--kv-bits");
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let mut inp = mlx_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        inp.supported_flags = &flags;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.contains(&"--kv-bits".to_string()),
+            "unadvertised flag must not emit"
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--decode-concurrency" && w[1] == "4"),
+            "advertised sibling knob still emits"
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("--kv-bits")),
+            "missing flag must warn: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__mlx_knobs__overlay_replaces_global_and_extra_args_ride_last() {
+        // Whole-struct replace semantics: the overlay's kv_bits (8) wins
+        // over the global (4); extra_args ride after the knobs so a
+        // repeated flag last-wins in argparse.
+        let cfg = Config {
+            mlx: crate::config::MlxTuning {
+                kv_bits: Some(4),
+                prompt_cache_size: Some(16),
+                ..crate::config::MlxTuning::default()
+            },
+            ..Config::default()
+        };
+        let overlay = ModelOverride {
+            mlx: Some(crate::config::MlxTuning {
+                kv_bits: Some(8),
+                ..crate::config::MlxTuning::default()
+            }),
+            extra_args: Some(vec!["--kv-bits".to_string(), "6".to_string()]),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let inp = mlx_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        // Global-only knob dropped by the replace; overlay knob present;
+        // extra_args duplicate rides after (argparse last-wins).
+        assert_eq!(
+            p.argv,
+            vec!["--kv-bits", "8", "--kv-bits", "6"],
+            "overlay replaces global; extra_args last-wins"
+        );
+    }
+
+    #[test]
+    fn unit__mlx_knobs__gguf_refused_with_teaching() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let g = meta();
+        let mut inp = mlx_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        inp.meta = ModelMeta::Gguf(&g);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("GGUF") && err.contains("llamacpp"),
+            "error must teach the lane switch: {err}"
         );
     }
 

@@ -2762,8 +2762,13 @@ pub async fn embeddings(
                 };
             }
             let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
-            // mistral.rs children register models as `default` (see proxy.rs).
-            if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+            // Per-engine child stamp with the sglang `base:adapter`
+            // variant override (see proxy.rs::child_model_stamp_for).
+            if let Some(stamp) = crate::proxy::child_model_stamp_for(
+                &state,
+                &engine,
+                openai_req.get("model").and_then(Value::as_str),
+            ) {
                 crate::proxy::set_child_model(&mut openai_req, &stamp);
             }
             let resp = match crate::proxy::child_send(
@@ -2922,8 +2927,13 @@ pub async fn embed(
             }
             let url = format!("{}/v1/embeddings", child_base(&engine.endpoint));
             let mut openai_req = json!({"model": model, "input": inputs});
-            // mistral.rs children register models as `default` (see proxy.rs).
-            if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+            // Per-engine child stamp with the sglang `base:adapter`
+            // variant override (see proxy.rs::child_model_stamp_for).
+            if let Some(stamp) = crate::proxy::child_model_stamp_for(
+                &state,
+                &engine,
+                openai_req.get("model").and_then(Value::as_str),
+            ) {
                 crate::proxy::set_child_model(&mut openai_req, &stamp);
             }
             let resp = match crate::proxy::child_send(
@@ -3073,9 +3083,14 @@ pub async fn rerank(
         guard,
         (async {
             let url = format!("{}/v1/rerank", child_base(&engine.endpoint));
-            // mistral.rs children register models as `default` (see
-            // proxy.rs) — F28: rerank lane now rewrites like every other.
-            if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+            // Per-engine child stamp with the sglang `base:adapter`
+            // variant override (see proxy.rs::child_model_stamp_for)
+            // — F28: rerank lane rewrites like every other.
+            if let Some(stamp) = crate::proxy::child_model_stamp_for(
+                &state,
+                &engine,
+                forward.get("model").and_then(Value::as_str),
+            ) {
                 crate::proxy::set_child_model(&mut forward, &stamp);
             }
             let resp = match crate::proxy::child_send(
@@ -3295,8 +3310,13 @@ pub async fn generate(
     }
     state.sup.note_prefix_hit(&engine.name);
     let model_name = row.name.clone();
-    // mistral.rs children register models as `default` (see proxy.rs).
-    if let Some(stamp) = crate::proxy::child_model_stamp(&engine) {
+    // Per-engine child stamp with the sglang `base:adapter` variant
+    // override (see proxy.rs::child_model_stamp_for).
+    if let Some(stamp) = crate::proxy::child_model_stamp_for(
+        &state,
+        &engine,
+        openai_req.get("model").and_then(Value::as_str),
+    ) {
         crate::proxy::set_child_model(&mut openai_req, &stamp);
     }
     // Think-dialect bridge (see /api/chat): generate rides the same child

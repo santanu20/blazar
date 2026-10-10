@@ -160,10 +160,67 @@ pub fn split_lora_suffix(requested: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Registered adapter name for a `model+adapter` request stem. The
+/// sglang lane registers adapters as `--lora-paths <name>=<path>` where
+/// `<name>` is the adapter path's file stem, and the engine then picks
+/// the adapter per request by that exact name (its native
+/// `base:adapter` model syntax). This mirrors the supervisor's lane
+/// resolution (file-name OR file-stem match, exactly one) so every
+/// spelling it accepts maps to the name the child actually registered —
+/// including the dotted-directory edge (`.../my.adapter.v2` matches a
+/// `+my.adapter.v2` request but registers as `my.adapter`).
+/// `None` = no unambiguous match (the caller's own teaching covers it).
+#[must_use]
+pub fn lora_registered_name(rows: &[crate::store::LoraRow], stem: &str) -> Option<String> {
+    let matches: Vec<&crate::store::LoraRow> = rows
+        .iter()
+        .filter(|l| {
+            let p = std::path::Path::new(&l.path);
+            p.file_name().is_some_and(|s| s == stem) || p.file_stem().is_some_and(|s| s == stem)
+        })
+        .collect();
+    match matches.as_slice() {
+        [only] => std::path::Path::new(&only.path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__lora_registered_name__stem_matching_and_dotted_edge() {
+        let row = |id: i64, path: &str| crate::store::LoraRow {
+            id,
+            model_name: "m".into(),
+            path: path.into(),
+            scale: 1.0,
+        };
+        let rows = vec![
+            row(1, "/models/adapters/anonymizer"),
+            row(2, "/models/adapters/my.adapter.v2"),
+        ];
+        // Plain stem → the registered (file-stem) name.
+        assert_eq!(
+            lora_registered_name(&rows, "anonymizer").as_deref(),
+            Some("anonymizer")
+        );
+        // Dotted directory: a file-name spelling registers under the
+        // file STEM — the colon stamp must use that name.
+        assert_eq!(
+            lora_registered_name(&rows, "my.adapter.v2").as_deref(),
+            Some("my.adapter")
+        );
+        // No match and ambiguous matches resolve to nothing (the
+        // caller's own teaching covers those).
+        assert_eq!(lora_registered_name(&rows, "absent"), None);
+        let dup = vec![row(3, "/a/x"), row(4, "/b/x")];
+        assert_eq!(lora_registered_name(&dup, "x"), None);
+    }
 
     #[test]
     fn unit__split_lora_suffix__variants_and_degenerates() {

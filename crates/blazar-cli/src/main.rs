@@ -246,6 +246,12 @@ enum Cmd {
         /// as the global ngram_* config (requires/sets spec = "ngram")
         #[arg(long)]
         ngram: bool,
+        /// Live speculation-mode race: dense vs ngram vs dflash real
+        /// children, single-stream wall tok/s; adopts the winning mode
+        /// (vs dense by >5%) as the model's spec override — ngram wins
+        /// then refine via --ngram
+        #[arg(long = "spec-race")]
+        race: bool,
         /// Live warmup A/B: spawn the model twice (with/without
         /// --no-warmup), measure ready+first-chat, and adopt
         /// `model_overrides.<model>.warmup = false` only if >5% faster
@@ -719,7 +725,8 @@ enum EngineCmd {
     /// b-tag is upstream truth; CUDA prebuilts publish on an overlay
     /// cadence). To compile the true latest locally, use
     /// `blazar engine build cuda`. Activates the installed tag;
-    /// restart the daemon so running spawns pick it up.
+    /// restart the daemon so running spawns pick it up. The positional
+    /// `all` (or `--all`) updates every installed lane instead.
     Update {
         /// Engine lane to update: llamacpp (default) | sglang | mistralrs | sdcpp
         #[arg(long, default_value = "llamacpp")]
@@ -1993,6 +2000,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             spec,
             slots,
             ngram,
+            race,
             load,
             replicas,
             cache_reuse,
@@ -2004,6 +2012,7 @@ blazar mmproj <model> <mmproj.gguf path>"
                 spec,
                 slots,
                 ngram,
+                race,
                 load,
                 replicas,
                 cache_reuse,
@@ -2020,7 +2029,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             refresh,
         } => certify(&resolve_model_cli(&model), json, export, refresh).await,
         Cmd::Engine { cmd } => engine_cmd(cmd).await,
-        Cmd::Lora { cmd } => lora_cmd(cmd),
+        Cmd::Lora { cmd } => lora_cmd(cmd).await,
         Cmd::Search {
             query,
             format,
@@ -3737,12 +3746,16 @@ fn sweep_orphaned_gpu_engines(d: &BlazarDirs) {
     let mut mib = 0u64;
     for t in orphaned {
         // Pid-recycling guard: the classification snapshot can be stale
-        // by one syscall — confirm the exe is still ours before the
-        // irreversible step.
-        let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", t.pid)) else {
+        // by one syscall — confirm the child is still ours before the
+        // irreversible step. argv[0] of /proc/<pid>/cmdline, NOT
+        // readlink(/proc/<pid>/exe): venv interpreters are symlinks, so
+        // the exe resolves to the base python OUTSIDE the engines dir —
+        // the exact blindness that let venv engine orphans survive.
+        let Ok(cmdline) = std::fs::read(format!("/proc/{}/cmdline", t.pid)) else {
             continue;
         };
-        if !exe.starts_with(&engines_dir) {
+        let argv0 = String::from_utf8_lossy(cmdline.split(|b| *b == 0).next().unwrap_or_default());
+        if !Path::new(argv0.as_ref()).starts_with(&engines_dir) {
             continue;
         }
         if unsafe { libc::kill(t.pid as libc::pid_t, libc::SIGTERM) } == 0 {
@@ -6493,6 +6506,10 @@ async fn serve() -> Result<()> {
     banner();
     blazar_runtime::validate_parent_death_guard();
     let d = dirs();
+    // Ownership stamp for the boot orphan reclaim: must land in the env
+    // BEFORE any engine child can be spawned, and correct any stale
+    // marker inherited from a gateway auto-start parent.
+    blazar_runtime::set_orphan_marker(&d.data_dir);
     d.ensure().ok();
     let cfg = config()?;
     // A live peer owning the daemon lock is the same hard singleton
@@ -6511,6 +6528,12 @@ async fn serve() -> Result<()> {
         Err(e) => return Err(e),
     };
     rotate_daemon_log(&d);
+    // Primary orphan reclaim: children stamped with OUR data-dir marker
+    // whose daemon died (SIGKILL bypasses every atexit path). The lock
+    // above guarantees no live sibling owns them. TERM → grace → KILL.
+    for line in blazar_runtime::reclaim_marker_orphans(&d.data_dir) {
+        println!("preflight: reclaimed orphan engine child: {line}");
+    }
     let store = Store::open(&d)?;
     // Boot preflight (1/2): adopt model files that live in the models dir
     // without a store row — the uninstall-keeps-models / reinstall case.
@@ -8540,7 +8563,10 @@ llama-bench measures generative decode; embedding speed is per-request in /metri
             let outcome: Result<()> = if r.cmd.starts_with("blazar bench ") {
                 bench(name)
             } else if r.cmd.starts_with("blazar tune ") {
-                tune_full(name, false, None, None, None, false, false, false, false).await
+                tune_full(
+                    name, false, None, None, None, false, false, false, false, false,
+                )
+                .await
             } else {
                 model_doctor_cmd(name, false).await
             };
@@ -11664,6 +11690,25 @@ async fn run_repl(model: &str, no_draft: bool, priority: Option<&str>) -> Result
         }
         None => println!("profile: unavailable (daemon did not answer the explain card)"),
     }
+    // Pre-spawn: warm the lane while the user types. The banner is the
+    // earliest proof of intent, so a detached /api/warm (wait:true,
+    // reply discarded) rides the standard admission path — the first
+    // real turn then coalesces onto the same in-flight load instead of
+    // paying the cold start after the prompt is submitted. Silent by
+    // design: admission failures surface on the first turn through the
+    // normal teaching path.
+    {
+        let base = base.clone();
+        let model_at_banner = model.clone();
+        tokio::spawn(async move {
+            let _ = cli_http()
+                .post(format!("{base}/api/warm"))
+                .timeout(Duration::from_secs(600))
+                .json(&serde_json::json!({ "model": model_at_banner, "wait": true }))
+                .send()
+                .await;
+        });
+    }
     loop {
         let line = match repl_read_turn(&mut rl) {
             ReplRead::Exit => break,
@@ -12786,6 +12831,142 @@ a long CUDA init. Embedding/rerank speed is measured live per request (/metrics,
 // Lane switches mirroring the clap flags one-to-one; a flags struct would
 // just re-spell the same four booleans.
 #[allow(clippy::fn_params_excessive_bools)]
+/// sglang-lane `--spec-race`: dense vs draft-free NGRAM on real
+/// `sglang-server` spawns, raced at the daemon's own compiled argv so
+/// the numbers reflect the exact profile a serve would use. Adoption
+/// is NOT automatic (unlike the llamacpp race): the per-model
+/// `[sglang]` overlay replaces the whole tuning struct, so a partial
+/// write would silently drop sibling pins — print the exact adopt
+/// commands and let the user own the edit.
+fn sglang_spec_race_lane(
+    d: &BlazarDirs,
+    store: &Store,
+    model: &str,
+    row: &blazar_core::ModelRow,
+) -> Result<()> {
+    // Mirror the llamacpp lane's engine pick: active row when it is the
+    // right kind, else the first installed one, loudly.
+    let engine_row = store
+        .active_engine()?
+        .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::Sglang)
+        .or_else(|| {
+            let picked = store
+                .list_engines()
+                .ok()?
+                .into_iter()
+                .find(|e| e.kind == blazar_core::engine_kind::EngineKind::Sglang)?;
+            println!(
+                "note: active engine is not the sglang lane; racing on {tag}",
+                tag = picked.tag
+            );
+            Some(picked)
+        })
+        .ok_or_else(|| {
+            anyhow!("no sglang engine installed — `blazar engine install --kind sglang` first")
+        })?;
+    let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
+    manifest.anchor_server_path(&d.data_dir);
+    // Live device census: race verdicts read free MiB, which a
+    // neighbour spawn can invalidate between arms.
+    let hw = blazar_runtime::probe::live_census_hardware(
+        std::path::Path::new(&manifest.server_path),
+        &manifest,
+    );
+    let cfg = config()?;
+    let hf = blazar_core::read_hf_config(std::path::Path::new(&row.path))
+        .map_err(|e| anyhow!("read hf config for {}: {e}", row.path))?;
+    let overlay = cfg.overlay_for(model);
+    let loras: Vec<(String, f64)> = store
+        .list_loras(Some(model))?
+        .into_iter()
+        .map(|l| (l.path, l.scale))
+        .collect();
+    let spec_mode = overlay.spec.clone().unwrap_or_else(|| cfg.spec.clone());
+    let draft = blazar_runtime::resolve_draft_path(store, model, &spec_mode);
+    let data_dir = d.data_dir.to_string_lossy();
+    let input = blazar_runtime::bench::build_input(
+        model,
+        &row.path,
+        u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
+        blazar_core::ModelMeta::Hf(&hf),
+        &hw,
+        &cfg,
+        &overlay,
+        &loras,
+        draft.as_deref(),
+        &engine_row.tag,
+        &manifest.flags,
+        &manifest.spec_types,
+        blazar_core::Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 0,
+        },
+        &data_dir,
+        blazar_core::engine_kind::EngineKind::Sglang,
+    );
+    let base = blazar_core::profile::compile(&input, &blazar_core::TuningOverrides::default())
+        .map_err(|e| anyhow!("profile: {e}"))?;
+    let base_argv = blazar_runtime::engine_impl::sglang_argv(
+        row,
+        &base,
+        &blazar_core::Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 0,
+        },
+    );
+    // NGRAM needs both the speculation flag and the attention-backend
+    // flag (the working recipe pins triton — flashinfer verify kernels
+    // JIT-crash the 0.5.21 bundle at graph capture). Never invent
+    // flags the engine does not advertise.
+    let mut race_modes = vec!["dense".to_string()];
+    if manifest.flags.contains("--speculative-algorithm")
+        && manifest.flags.contains("--attention-backend")
+    {
+        race_modes.push("ngram".to_string());
+    } else {
+        println!("note: engine lacks the speculation flags — racing dense only");
+    }
+    println!("sglang spec race: live servers across {race_modes:?} (~2 min each) ...");
+    let rows = blazar_runtime::bench::sglang_spec_mode_race(
+        std::path::Path::new(&manifest.server_path),
+        &base_argv,
+        &race_modes,
+        &manifest.flags,
+        10,
+    )?;
+    println!("{:<8} {:>14}", "mode", "tok/s");
+    for (mode, tps) in &rows {
+        println!("{mode:<8} {tps:>14.1}");
+    }
+    let (best_mode, best_tps) = rows.iter().fold((String::new(), 0.0), |acc, r| {
+        if r.1 > acc.1 { (r.0.clone(), r.1) } else { acc }
+    });
+    let dense_tps = rows.iter().find(|r| r.0 == "dense").map_or(0.0, |r| r.1);
+    if best_mode != "dense" && best_tps > dense_tps * 1.05 {
+        println!(
+            "{}",
+            ok_line(&format!(
+                "ngram wins ({best_tps:.1} tok/s, +{:.0}% over dense) — adopt with:",
+                (best_tps / dense_tps - 1.0) * 100.0
+            ))
+        );
+        println!("  blazar config set sglang.spec_algorithm ngram");
+        println!("  blazar config set sglang.attention_backend triton");
+        println!(
+            "caveat: on the 0.5.21 bundle speculation serves greedy requests only \
+             (non-greedy drives a flashinfer verify JIT that crashes the child)"
+        );
+    } else {
+        println!(
+            "no spec mode beat dense by >5% (best {best_tps:.1} vs dense {dense_tps:.1}) — \
+             speculation stays off"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // lane-dispatch shape: one entry fn, sequential lane blocks
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)] // lane flags mirror the CLI flags 1:1
 async fn tune_full(
     model: &str,
     search: bool,
@@ -12793,6 +12974,7 @@ async fn tune_full(
     spec: Option<String>,
     slots: Option<u32>,
     ngram: bool,
+    race: bool,
     load: bool,
     replicas: bool,
     cache_reuse: bool,
@@ -12812,6 +12994,35 @@ aborts on this family. Profile pins for it would measure nothing",
             row.name,
             row.arch.as_deref().unwrap_or("?")
         );
+    }
+    // HF safetensors dirs are the sglang lane's models: the GGUF read
+    // below dies cryptically on a directory, and no llama-bench lane
+    // exists for them. Route to the sglang spec race when asked;
+    // otherwise teach instead of failing on read_metadata_file.
+    let model_path = std::path::Path::new(&row.path);
+    if model_path.is_dir() && !row.has_component_set() {
+        if row.is_mlx() {
+            anyhow::bail!(
+                "blazar tune {}: MLX dirs serve on the mlx lane, which has no \
+                 tune surface yet (no llama-bench lane, no spec race)",
+                row.name
+            );
+        }
+        if let Some(mode) = &spec {
+            println!(
+                "note: --spec {mode} pins the llamacpp spec family; the sglang lane \
+                 reads [sglang] spec_algorithm instead — pin not persisted"
+            );
+        }
+        if !race {
+            anyhow::bail!(
+                "blazar tune {}: safetensors dirs tune via the sglang spec race — \
+                 rerun with --spec-race (dense vs NGRAM on live spawns); the other \
+                 tune lanes drive llama-bench and need a GGUF model",
+                row.name
+            );
+        }
+        return sglang_spec_race_lane(&d, &store, model, &row);
     }
     // The bench lane drives llama-bench, so the engine row must be a
     // llamacpp lane — the ACTIVE row may be any kind (a store flipped
@@ -13092,6 +13303,78 @@ aborts on this family. Profile pins for it would measure nothing",
             );
         } else {
             println!("no clear winner (best {best_tps:.1} vs {second:.1}) — engine defaults stay");
+        }
+    }
+    if race {
+        // Live speculation-mode race: dense vs ngram vs dflash, one real
+        // child each at engine defaults, single-stream wall tok/s (spec
+        // decoding is a c=1 win; concurrency would mask it). Only modes
+        // the engine's parsed manifest advertises may race — spec flags
+        // are never invented for an engine that lacks them.
+        let mut race_modes = vec!["dense".to_string()];
+        if manifest.spec_types.iter().any(|s| s == "ngram-simple") {
+            race_modes.push("ngram".to_string());
+        }
+        if manifest.spec_types.iter().any(|s| s == "draft-dflash") {
+            race_modes.push("dflash".to_string());
+        }
+        let overlay_race = cfg.overlay_for(model);
+        let input_race = blazar_runtime::bench::build_input(
+            model,
+            &row.path,
+            u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
+            blazar_core::ModelMeta::Gguf(&gguf),
+            &hw,
+            &cfg,
+            &overlay_race,
+            &loras,
+            None,
+            &engine_row.tag,
+            &manifest.flags,
+            &manifest.spec_types,
+            blazar_core::Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            &data_dir,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+        );
+        let base_race =
+            blazar_core::profile::compile(&input_race, &blazar_core::TuningOverrides::default())
+                .map_err(|e| anyhow!("profile: {e}"))?;
+        println!("spec race: live servers across {race_modes:?} (~1 min each) ...");
+        let rows = tuner.spec_mode_race(&base_race.argv, &race_modes, 1)?;
+        println!("{:<8} {:>14}", "mode", "tok/s");
+        for (mode, tps) in &rows {
+            println!("{mode:<8} {tps:>14.1}");
+        }
+        let (best_mode, best_tps) = rows.iter().fold((String::new(), 0.0), |acc, r| {
+            if r.1 > acc.1 { (r.0.clone(), r.1) } else { acc }
+        });
+        let dense_tps = rows.iter().find(|r| r.0 == "dense").map_or(0.0, |r| r.1);
+        // Adopt against the DENSE baseline — the honest question is
+        // "does speculation beat no speculation at all", not "which
+        // speculation is least bad".
+        if best_mode != "dense" && best_tps > dense_tps * 1.05 {
+            set_model_override(model, "spec", &format!("\"{best_mode}\""))?;
+            cfg = config()?;
+            adopted_any = true;
+            println!(
+                "{}",
+                ok_line(&format!(
+                    "adopted model_overrides.{model}.spec = {best_mode} \
+                     ({best_tps:.1} tok/s, +{:.0}% over dense)",
+                    (best_tps / dense_tps - 1.0) * 100.0
+                ))
+            );
+            if best_mode == "ngram" {
+                println!("next: `blazar tune {model} --ngram` refines (size_m, min_hits)");
+            }
+        } else {
+            println!(
+                "no spec mode beat dense by >5% (best {best_tps:.1} vs dense {dense_tps:.1}) — \
+                 spec stays as configured"
+            );
         }
     }
     if load || replicas || cache_reuse {
@@ -13499,6 +13782,60 @@ fn resolve_model_and_engine(
 /// override-table skeleton. Key sets are pinned to the config schema by
 /// `unit__knob_hint_block__keys_match_config_schema` (stale keys fail
 /// the probe ladder; NEW knobs need a line here — keep families short).
+/// Sglang knob-hint family lines — every `SglangTuning` field must appear
+/// here exactly once (`unit__knob_hint_block__covers_every_tuning_field`
+/// pins the lockstep). Example values must survive `Config::from_toml`
+/// validation.
+fn sglang_hint_families() -> Vec<&'static str> {
+    vec![
+        "attention_backend = \"triton\"    sampling_backend = \"pytorch\"",
+        "tool_call_parser = \"\"    reasoning_parser = \"\"    tokenizer_path = \"\"",
+        "dtype = \"bfloat16\"    quantization = \"\"    kv_cache_dtype = \"auto\"",
+        "mem_fraction_static = 0.85    cpu_offload_gb = 0    page_size = 1",
+        "schedule_policy = \"fcfs\"    schedule_conservativeness = 1.0",
+        "chunked_prefill_size = 8192    max_prefill_tokens = 16384    stream_interval = 1",
+        "random_seed = 0    cuda_graph_max_bs = 8    cuda_graph_bs = [1, 2, 4]",
+        "cuda_graph_backend_prefill = \"breakable\"    # full|breakable|tc_piecewise|disabled — disabled unsticks laptop prefill capture",
+        "max_total_tokens = 4096    hicache_enable = false    hicache_ratio = 2.0    hicache_size = 0    is_embedding = false",
+        "metrics = false    skip_warmup = false    torch_compile = false",
+        "tokenizer_mode = \"auto\"    tokenizer_backend = \"huggingface\"",
+        "tokenizer_worker_num = 1    detokenizer_worker_num = 1",
+        "dynamic_batch_tokenizer = false    dynamic_batch_tokenizer_batch_size = 32",
+        "dynamic_batch_tokenizer_batch_timeout = 2.0",
+        "grammar_backend = \"xgrammar\"    radix_eviction_policy = \"lru\"",
+        "session_radix_cache = false    mixed_chunk = false    sleep_on_idle = false",
+        "memory_saver = false    watchdog_timeout = 300.0    cache_report = false",
+        "batch_notify_size = 16    scheduler_recv_interval = 1",
+        "tp_size = 1    dp_size = 1    pp_size = 1    ep_size = 1",
+        "max_lora_rank = 16    lora_backend = \"\"",
+        "spec_algorithm = \"ngram\"    # prompt-based draft-free speculation; pair with attention_backend triton when flashinfer verify JIT fails; delete the line to disable",
+        "spec_num_steps = 3    spec_num_draft_tokens = 4    # delete the lines for engine defaults",
+        "speculative_eagle_topk = 4    # EAGLE-family tree fanout; rides the engaged spec arm only",
+        "speculative_accept_threshold_single = 0.1    speculative_accept_threshold_acc = 0.2",
+        "mm_attention_backend = \"sdpa\"    # multimodal verify attention; long hardware-specific vocab, engine rejects bad values",
+        "retraction_policy = \"length\"    # which running requests give back KV pages; length or priority",
+        "enable_two_batch_overlap = false    # TBO overlap; pays off with tensor/pipeline parallelism",
+        "enable_tf32_matmul = false    # TF32 fp32 matmuls on Ampere and newer; speed over fp32 digits",
+        "enable_priority_scheduling = false    # schedule by request priority; required companion of retraction_policy priority",
+    ]
+}
+
+/// MLX knob-hint family lines — same lockstep contract as the sglang
+/// family: every `MlxTuning` field appears exactly once, example values
+/// survive `Config::from_toml` validation, comments carry no ` = `.
+fn mlx_hint_families() -> Vec<&'static str> {
+    vec![
+        "draft_model = \"mlx-community/Qwen3-0.6B-4bit\"    # speculative draft; pull it first",
+        "num_draft_tokens = 4    # tokens proposed per verify round; 0 disables drafting",
+        "kv_bits = 8    # KV cache quantization; disables batching upstream",
+        "kv_group_size = 64    quantized_kv_start = 5000    # token position where KV quant begins",
+        "prefill_step_size = 2048    prompt_cache_size = 16    prompt_cache_bytes = 8589934592",
+        "decode_concurrency = 4    prompt_concurrency = 8",
+        "chat_template = \"\"    chat_template_args = \"\"    use_default_chat_template = false",
+        "trust_remote_code = false    adapter_path = \"\"",
+    ]
+}
+
 fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag: &str) -> String {
     use blazar_core::engine_kind::EngineKind;
     let mut out: Vec<String> = vec![format!(
@@ -13539,37 +13876,19 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         out.push(knob("cache_type = \"\""));
     } else {
         let table_families = match kind {
-            EngineKind::Sglang => Some((
-                "sglang",
-                vec![
-                    "attention_backend = \"triton\"    sampling_backend = \"pytorch\"",
-                    "tool_call_parser = \"\"    reasoning_parser = \"\"    tokenizer_path = \"\"",
-                    "dtype = \"bfloat16\"    quantization = \"\"    kv_cache_dtype = \"auto\"",
-                    "mem_fraction_static = 0.85    cpu_offload_gb = 0    page_size = 1",
-                    "schedule_policy = \"fcfs\"    schedule_conservativeness = 1.0",
-                    "chunked_prefill_size = 8192    max_prefill_tokens = 16384    stream_interval = 1",
-                    "random_seed = 0    cuda_graph_max_bs = 8    cuda_graph_bs = [1, 2, 4]",
-                    "cuda_graph_backend_prefill = \"breakable\"    # full|breakable|tc_piecewise|disabled — disabled unsticks laptop prefill capture",
-                    "max_total_tokens = 4096    hicache_enable = false    hicache_ratio = 2.0    hicache_size = 0    is_embedding = false",
-                    "metrics = false    skip_warmup = false    torch_compile = false",
-                    "tokenizer_mode = \"auto\"    tokenizer_backend = \"huggingface\"",
-                    "tokenizer_worker_num = 1    detokenizer_worker_num = 1",
-                    "dynamic_batch_tokenizer = false    dynamic_batch_tokenizer_batch_size = 32",
-                    "dynamic_batch_tokenizer_batch_timeout = 2.0",
-                    "grammar_backend = \"xgrammar\"    radix_eviction_policy = \"lru\"",
-                    "session_radix_cache = false    mixed_chunk = false    sleep_on_idle = false",
-                    "memory_saver = false    watchdog_timeout = 300.0    cache_report = false",
-                    "batch_notify_size = 16    scheduler_recv_interval = 1",
-                    "tp_size = 1    dp_size = 1    pp_size = 1    ep_size = 1",
-                    "max_lora_rank = 16    lora_backend = \"\"",
-                ],
-            )),
+            EngineKind::Sglang => Some(("sglang", sglang_hint_families())),
             EngineKind::MistralRs => Some((
                 "mistralrs",
                 vec![
                     "max_batch_size = 1    max_prefill_chunk_tokens = 512",
                     "max_decode_steps_before_prefill = 8    prefix_cache_n = 16",
                     "pa_block_size = 32    pa_cache_type = \"auto\"    pa_context_len = 4096",
+                    "pa_memory_mb = 8192    # absolute paged-KV MiB; the pin for shared GPUs",
+                    "chat_template = \"chatml\"    # overrides the checkpoint template",
+                    "isq = \"q4k\"    # in-process quantization at load; shrinks the resident set",
+                    "imatrix = \"/models/imatrix.gguf\"    # importance matrix, sharpens ISQ k-quants",
+                    "calibration_file = \"/models/calib.txt\"    # calibration prompts for the imatrix workflow",
+                    "isq_organization = \"default\"    # default or moqe",
                     "enable_lora = false    lora_max_rank = 16    lora_max_adapters = 16    lora_max_bytes = 8",
                     "mtp = true    mtp_model = \"draft.gguf\"    mtp_n_predict = 1    mtp_draft_sampling = \"auto\"",
                     "encoder_cache_memory_mb = 512    max_num_images = 1    max_image_length = 1024",
@@ -13590,11 +13909,9 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
             // body, not config knobs — same request-driven discipline
             // as the other audio lane.
             EngineKind::Piper => Some(("piper", vec![])),
-            // MLX lane has no config table yet — extra flags ride the
-            // generic model_overrides.argv passthrough, so no table
-            // header is advertised here (a hinted-but-unsettable table
-            // would be a lie).
-            EngineKind::Mlx => None,
+            // MLX lane knobs ride the [mlx] table (MlxTuning): draft
+            // speculation, KV quantization, concurrency and cache sizing.
+            EngineKind::Mlx => Some(("mlx", mlx_hint_families())),
         };
         if let Some((table, families)) = table_families {
             out.push(format!("# [model_overrides.\"{model}\".{table}]"));
@@ -14119,6 +14436,22 @@ fn engine_regression_gate(
     Ok(())
 }
 
+/// Resolve the update-everything intent for `blazar engine update`: the
+/// `--all` flag, or the positional keyword `all` (an ergonomic alias —
+/// users type `engine update all` reflexively). A pinned tag alongside
+/// the flag-shaped intent stays an error: `--all` walks every lane, so
+/// a tag has nothing to pin.
+fn resolve_engine_update_all(flag: bool, tag: Option<&str>) -> Result<bool> {
+    let positional_all = tag == Some("all");
+    if (flag || positional_all) && tag.is_some_and(|t| t != "all") {
+        anyhow::bail!(
+            "engine update --all walks every installed lane — drop the pinned tag \
+             (or drop --all)"
+        );
+    }
+    Ok(flag || positional_all)
+}
+
 #[allow(clippy::too_many_lines)] // command dispatch: one arm per engine subcommand
 async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
     let d = dirs();
@@ -14130,13 +14463,12 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             check,
             all,
         } => {
-            if all {
-                if tag.is_some() {
-                    anyhow::bail!(
-                        "engine update --all walks every installed lane — drop the pinned tag \
-                         (or drop --all)"
-                    );
-                }
+            // Positional `all` reads as the update-everything intent —
+            // no engine tag is ever the bare word `all` (llama.cpp b-tags,
+            // sglang/mlx version tags), and sending it to the release
+            // lookup produces the confusing "release all not found".
+            let wants_all = resolve_engine_update_all(all, tag.as_deref())?;
+            if wants_all {
                 engine_update_all(&d, no_gate, check).await?;
             } else {
                 let engine_kind: EngineKind = kind
@@ -16436,7 +16768,53 @@ fn validate_lora_attach(
     Ok(())
 }
 
-fn lora_cmd(cmd: LoraCmd) -> Result<()> {
+/// Follow-through for `lora add`/`lora rm` when the daemon is up:
+/// hot-attach (or detach) the adapter on a resident sglang base child
+/// without a respawn. Best-effort — a down daemon, a non-resident
+/// model, or a lane that bakes adapters at spawn defers to the next
+/// spawn (the store row drives it). Prints ONLY the actionable
+/// outcomes: a hot attach/detach line, or a child-side refusal (e.g.
+/// adapter rank above the spawn-time `--max-lora-rank`).
+async fn notify_lora_sync(model: &str, action: &str, lora_name: &str, lora_path: &str) {
+    let Some(base) = daemon_base_if_up().await else {
+        return;
+    };
+    let body = serde_json::json!({
+        "model": model,
+        "action": action,
+        "lora_name": lora_name,
+        "lora_path": lora_path,
+    });
+    let Ok(resp) = cli_http()
+        .post(format!("{base}/api/lora/sync"))
+        .timeout(Duration::from_secs(130))
+        .json(&body)
+        .send()
+        .await
+    else {
+        return;
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return;
+    };
+    let Some(detail) = v["detail"].as_str() else {
+        return;
+    };
+    match v["status"].as_str() {
+        Some("ok") if detail.starts_with("hot:") => {
+            println!("{}", ok_line(&format!("daemon: {detail}")));
+        }
+        Some("child_error") => {
+            eprintln!(
+                "{}",
+                dim_line(&format!("daemon: adapter not live — {detail}"))
+            );
+        }
+        _ => {}
+    }
+}
+
+async fn lora_cmd(cmd: LoraCmd) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
     match cmd {
@@ -16449,9 +16827,25 @@ fn lora_cmd(cmd: LoraCmd) -> Result<()> {
                 "{}",
                 ok_line(&format!("lora #{id} attached to {model} (scale {scale})"))
             );
+            // Resident sglang children pick the adapter up live; the
+            // adapter registers under its directory's file stem.
+            let lora_name = std::path::Path::new(&path).file_stem().map_or_else(
+                || path.display().to_string(),
+                |s| s.to_string_lossy().into_owned(),
+            );
+            notify_lora_sync(&model, "add", &lora_name, &path.display().to_string()).await;
         }
         LoraCmd::Rm { id } => {
+            // Capture the row before the delete — the daemon sync names
+            // the adapter by its path's file stem.
+            let removed = store.list_loras(None)?.into_iter().find(|l| l.id == id);
             if store.delete_lora(id)? {
+                if let Some(l) = removed {
+                    let lora_name = std::path::Path::new(&l.path)
+                        .file_stem()
+                        .map_or_else(|| l.path.clone(), |s| s.to_string_lossy().into_owned());
+                    notify_lora_sync(&l.model_name, "rm", &lora_name, "").await;
+                }
                 println!("{}", ok_line(&format!("lora #{id} removed")));
             } else {
                 return Err(anyhow!("no lora #{id}"));
@@ -19784,6 +20178,20 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)]
+    fn unit__resolve_engine_update_all__flag_and_positional_keyword() {
+        // The exact user trap this guards: `engine update all` must walk
+        // every lane, not look up a release tagged "all".
+        assert!(resolve_engine_update_all(false, Some("all")).unwrap());
+        assert!(resolve_engine_update_all(true, None).unwrap());
+        // A real tag pins one lane; bare update updates the default lane.
+        assert!(!resolve_engine_update_all(false, Some("b11515")).unwrap());
+        assert!(!resolve_engine_update_all(false, None).unwrap());
+        // Flag-shaped intent plus a pinned tag stays an error.
+        assert!(resolve_engine_update_all(true, Some("b11515")).is_err());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__engine_arch_gap__silent_for_non_llamacpp_kind() {
         // sglang/mistralrs arch strings are HF names in a different
         // domain — the ggml arch-set check must not fire for them.
@@ -21393,6 +21801,7 @@ mod tests {
             EngineKind::Sglang,
             EngineKind::MistralRs,
             EngineKind::LlamaCpp,
+            EngineKind::Mlx,
         ] {
             let block = knob_hint_block("m", kind, "t-test");
             assert!(block.starts_with("# --- blazar knob hints for m"));
@@ -21447,6 +21856,7 @@ mod tests {
         for (kind, struct_name) in [
             (EngineKind::Sglang, "SglangTuning"),
             (EngineKind::MistralRs, "MistralrsTuning"),
+            (EngineKind::Mlx, "MlxTuning"),
         ] {
             let fields = struct_fields(struct_name);
             let keys = hint_keys(&knob_hint_block("m", kind, "t"));

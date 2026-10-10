@@ -465,6 +465,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/generate", post(ollama::generate))
         .route("/api/evict", post(ollama::evict))
         .route("/api/warm", post(federation::warm))
+        .route("/api/lora/sync", post(federation::lora_sync))
         .route(
             "/api/session",
             post(ollama::session).get(ollama::session_list),
@@ -991,7 +992,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/api/model-doctor", "/api/model-doctor/{model}",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],
-            "blazar": ["/api/evict", "/api/warm", "/api/session", "/api/sessions", "/api/why",
+            "blazar": ["/api/evict", "/api/warm", "/api/lora/sync", "/api/session", "/api/sessions", "/api/why",
                         "/api/watch", "/api/keys", "/api/keys/rotate",
                         "/.well-known/blazar", "/metrics", "/healthz", "/health"],
         },

@@ -57,6 +57,7 @@ max_loaded_models
 mcp
 media_job_wait_secs
 mistralrs
+mlx
 mmproj_auto
 mmproj_device
 mmproj_offload
@@ -152,8 +153,10 @@ video_timestamp_interval
 warm_on_pull
 warm_peg
 warmup
+whisper_diarize
 whisper_idle_secs
 whisper_stream_chunk_ms
+whisper_tinydiarize
 yarn_attn_factor
 yarn_beta_fast
 yarn_beta_slow

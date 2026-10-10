@@ -4,7 +4,220 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
-## [Unreleased]
+## [0.25.0] - 2026-10-10
+
+### Fixed
+
+- **Validation harness: registry tracks the new mlx/whisper/spec-race
+  surface.** A full sweep on the tree (mlx tuning table, whisper
+  diarize knobs, `tune --spec-race` lane) failed 9 checks that were all
+  registry drift, not product bugs: the knob table, fresh-list gate,
+  and full-manifest boot now carry `mlx`/`whisper_diarize`/
+  `whisper_tinydiarize` with honest coverage rows; `--spec-race` maps
+  to the spec-lane evidence; the four shell-completion and fresh-keys
+  goldens are regenerated against the new CLI surface (diff verified to
+  be exactly the added keys/flags); and per-lane argv soft-pairs accept
+  surface-spelling alternatives so the sglang battery honors
+  `cuda_graph_max_bs` on both the legacy `--cuda-graph-max-bs` and the
+  split `--cuda-graph-max-bs-decode` surface. Re-validated: gates 7/7,
+  golds 19/19, all engine batteries 0 fail.
+- **Validation harness: argv-shape phases pin a llamacpp fixture.** Pinning
+  `BLAZAR_VALIDATE_MODEL` to a safetensors-dir row (mlx/sglang lanes) used
+  to cascade 19 FAILs through every llama-server argv battery — those
+  phases trusted the pinned row to route llamacpp. The config-flow,
+  wave, parity, and spec-decoding batteries now resolve their own GGUF
+  chat fixture (`llama_fixture()`, honoring the pin whenever the pinned
+  row is itself a GGUF, smallest non-embedder otherwise) for chat,
+  model-overlay keys, pidfile/ps lookups, and daemon floor; lane-neutral
+  phases keep riding the pinned row. A startup note names the split when
+  the pin rides a non-llamacpp lane, and a missing GGUF row registers an
+  honest boundary instead of a fail cascade. Live-proven: the mlx-dir pin
+  that failed 19 checks now runs the config matrix clean (20 pass,
+  0 fail) on the fixture.
+- **`blazar engine update all` walks every lane instead of hunting a
+  phantom release.** The positional slot is a tag, so the bare word
+  `all` rode the llamacpp lane into a GitHub release lookup and died
+  with "release all not found" — the update-everything intent lives
+  behind `--all`, which nobody remembers mid-command. The positional
+  `all` is now accepted as the same intent (no engine tag is ever the
+  bare word `all`), with the flag-plus-pinned-tag conflict still an
+  error and a decision-fn unit test pinning all four shapes.
+- **Daemon restart reclaims orphaned engine children.** A daemon that
+  died without teardown (session `blazar serve` killed, crash, closed
+  terminal) left engine children holding GPU memory and ports — the
+  preflight sweeps only SIGTERM'd and walked away, and the nvidia-smi
+  guard compared the symlink-resolved `/proc/<pid>/exe`, never matching
+  venv engines. `serve()` now stamps children with a
+  `BLAZAR_DAEMON_DATA_DIR` exec-env marker (inherited by subprocess
+  trees, immune to setproctitle renames) and reclaims every marked
+  stray at boot after the daemon lock: SIGTERM, a bounded 10 s grace,
+  then SIGKILL, identity re-verified before each irreversible signal.
+  The legacy pidfile sweep gains the same TERM→grace→KILL ladder and
+  the GPU-sweep pid guard reads `cmdline` argv[0] so venv engines
+  become visible. Linux-only marker scan (PDEATHSIG parity), live
+  proven on the production binary: a TERM-immune marked decoy is
+  SIGKILLed at exactly the 10 s grace, and a warm sglang orphan plus
+  its scheduler grandchild are reclaimed within 2 s of unit start with
+  the GPU returned to idle.
+- **sglang cold start: derived prefill CUDA-graph buckets.** Upstream 0.5.21's
+  breakable prefill graphs capture 35+ aggregate-token buckets by default —
+  7–17 s of capture per spawn that a single-user 8 GB card never rides on, and
+  the old planner capped nothing on a comfortable fit (Tier A). All VRAM tiers
+  now derive `--cuda-graph-bs-prefill <chunk/8> <chunk/2> <chunk>` from the
+  effective chunked-prefill size (2048 → [256, 1024, 2048], pinning
+  `--chunked-prefill-size` when unset): ~5 s off every spawn, with the
+  controlled A/B proving the graph-flag axis temp-0-output-neutral (identical
+  quality sha, prefill latency, and decode tps across six configurations).
+  User pins win — `extra_args` or tuning knobs holding any graph-shape flag
+  suppress derived emission — and engines on the legacy 0.5.19 flag surface
+  keep byte-identical argv (knob mapping on the split surface:
+  `cuda_graph_bs`→`--cuda-graph-bs-decode`, `cuda_graph_max_bs`→
+  `--cuda-graph-max-bs-decode`).
+- **REPL pre-spawns the model at banner time.** `blazar run <model>` now
+  fire-and-forgets a low-priority `/api/warm` the moment the banner prints, so
+  the engine loads while the user is still typing; the first real turn
+  coalesces onto the in-flight load instead of paying it. Silent on error —
+  the first message surfaces any teaching that matters.
+- **Warm-peg probes the surface the child actually serves.** The post-spawn
+  warmup peg assumed `/v1/chat/completions` everywhere, so embedding,
+  reranking, and classifier children answered 500/404 and re-warned every few
+  minutes (and mlx children 404'd harder: the flat model name was treated as a
+  hub repo id and fetched live → 401). The peg now reads the spawned argv:
+  `--reranking` children are probed on `/rerank`, other `--embeddings`
+  children on `/v1/embeddings` then `/v1/systemone`, and the served-model
+  stamp is echoed so routed children resolve the model locally. mlx children
+  additionally get `HF_HUB_OFFLINE=1` pinned into their env (a user-set value
+  survives): a bare-name request now fails fast (~50 ms, local cache-miss
+  message) instead of reaching out to the hub.
+- **Child-auth refuses the pretend argv key.** Engines with only `--api-key`
+  (sglang 0.5.21) no longer mint a per-child key: `/proc/<pid>/cmdline` is
+  world-readable, so the argv lane guarded nothing while publishing the
+  `plm_` secret to every local process. Such children now run with no key
+  and one INFO line naming the real boundary (loopback bind + random port +
+  residency-bounded — same posture as the auth-less mlx/freetoken lanes).
+  The llamacpp `--api-key-file` lane (0600 keyfile, path-only argv) is
+  unchanged, and a future engine gaining the file flag flips to it with no
+  blazar-side change.
+- **sglang children sleep when idle.** The sglang scheduler busy-polled at
+  ~1 core while resident-and-idle (measured on a laptop 4070: 101% of one
+  core, continuous). `--sleep-on-idle` (ZMQ blocking sleep) is now
+  default-on for engines whose manifest carries it, silently skipped
+  elsewhere; `sleep_on_idle = false` opts out and an `extra_args` pin wins.
+  Idle CPU after: 1% of one core; first-token latency after idle unchanged
+  (47–63 ms band, temp-0 output identical across the sleep boundary).
+- **sglang LoRA variants ride the base child, with the adapter actually
+  applied.** A `model+adapter` request used to spawn a dedicated child (a
+  second full copy of the base weights in VRAM) whose body carried the `+`
+  spelling — a form sglang's per-request adapter selection never matches
+  (it reads the colon syntax `base:adapter` alone), so the child silently
+  answered with base weights. Variant lanes now alias onto the base
+  instance (one child, one warm KV cache, shared loading coalescing; the
+  stem is validated through the same lane-resolution teachings, stale
+  adapter-less residents are evicted), and   the gateway stamps the
+  child-visible model as `base:<adapter>` so the engine selects the
+  weights the caller asked for — proven live on one child at temp 0
+  (identical prompt: colon-stamped body answers with adapter behavior,
+  plain body with base). `blazar lora add/rm` additionally hot-attach and
+  detach adapters on a resident, adapter-capable child through the engine's
+  own admin endpoints (no respawn, ~20–40 ms; everything else defers to the
+  next spawn and says so). llamacpp/mistralrs keep their dedicated variant
+  children — their adapters are baked into spawn argv.
+- **Warm-peg probes are greedy.** The warm-peg chat body carried no
+  `temperature`, so engines sampled at their default (non-greedy) —
+  invisible on dense paths, but a speculating engine's verify path
+  JIT-compiles sampling kernels on first non-greedy request, and on the
+  sglang 0.5.21 bundle that JIT build fails and takes the child down
+  before any user traffic. The probe now pins `temperature: 0.0`
+  (greedy decode never touches the verify-sampling path), so a speculating
+  child warms exactly like a dense one.
+
+### Added
+
+- **sglang speculation knobs (opt-in).** `[sglang]` gains
+  `spec_algorithm = "ngram"` plus `spec_num_steps` /
+  `spec_num_draft_tokens`: draft-free prompt-lookup speculation on the
+  sglang lane, emitted only when the engine's parsed manifest advertises
+  the flags. An explicit pin overrides the resolved EAGLE3 draft pair
+  (warning says so); engaging speculation adds a conservative verify-KV /
+  graph memory reserve to the VRAM fit ladder so admission stays honest;
+  dense spawns are byte-identical to before. DFLASH is deliberately not
+  offered as a knob — sglang 0.5.21 hard-requires a draft-model path for
+  it (live receipt), keeping it in the draft-pair lane. Defaults stay
+  off: measured live (qwen3-1.7b, RTX 4070), ngram lost to dense at
+  every concurrency (−16% C1, −44% C8 aggregate, +12 s cold) with
+  perfect temp-0 output parity — receipts in
+  `bench-artifacts/20261009-sglang-spec/`. Bundle constraint while the
+  flashinfer JIT defect stands: greedy requests only, and pair with
+  `attention_backend = "triton"`.
+- **`blazar tune <model> --spec-race`.** Races dense vs ngram vs dflash
+  on real llama-server spawns (single-stream wall tok/s) and adopts a
+  mode only when it beats dense by >5% — measured adoption, never
+  assumed. On qwen3.5-9b (Q4_K_M) dense won (36.7 vs 35.5 vs 23.9
+  tok/s) and the race correctly changed nothing. The shared spec-flag
+  stripping (endpoint + spec axis) is factored into one place so the
+  n-gram refine lane and the mode race can never cross-contaminate a
+  measurement. Safetensors dirs now have a tune path too: they race
+  dense vs NGRAM on their own `sglang-server` spawns at the daemon's
+  compiled argv (previously `tune` died cryptically trying to read a
+  directory as GGUF; MLX dirs teach that their lane has no tune
+  surface). The sglang race never auto-adopts — the per-model
+  `[sglang]` overlay replaces the whole tuning struct, so it prints
+  the exact `config set` commands instead. Live receipts:
+  qwen3-1.7b +7% ngram on repetitive search prompts but −16% @C1 on
+  diverse probes and −44% @C8 aggregate (see
+  `bench-artifacts/20261009-sglang-spec/`) — the gain is
+  workload-dependent, which is exactly why adoption is measured and
+  manual on that lane.
+- **Full-utilization knob wave across the engine lanes** (all opt-in,
+  defaults emit nothing — dense argv byte-identical; every flag is
+  manifest-gated: an engine that lacks it gets a warn-and-skip, never
+  an invented flag):
+  - **`[mlx]` tuning table** — the mlx-lm lane had zero first-class
+    knobs; it now exposes `draft_model` + `num_draft_tokens`
+    (speculative decoding), `kv_bits`/`kv_group_size`/
+    `quantized_kv_start` (KV quantization; upstream disables batching
+    with kv-bits set), `prefill_step_size`, `prompt_cache_size`/
+    `prompt_cache_bytes`, `decode_concurrency`/`prompt_concurrency`,
+    chat-template knobs, `trust_remote_code`, `adapter_path` — per-model
+    via `model_overrides.<name>.mlx`. Validation floors match the
+    installed mlx_lm 0.32.0 source (e.g. `quantized_kv_start` is a
+    token position — 0 is valid; `num_draft_tokens` 0 = drafting off).
+  - **`[sglang]` depth knobs** — `grammar_backend` (validated but
+    previously never emitted — dead knob, now wired),
+    `mm_attention_backend`, `retraction_policy` (with its
+    engine-required companion `enable_priority_scheduling`, enforced
+    at config-validate from a live spawn receipt),
+    `enable_two_batch_overlap`, `enable_tf32_matmul`, and the
+    speculative depth family `speculative_eagle_topk` +
+    `speculative_accept_threshold_single`/`_acc` (emitted only when a
+    spec arm engages — dense spawns stay clean).
+  - **`[mistralrs]` v0.9.4 additions** — `pa_memory_mb` (absolute
+    paged-KV MiB; both `--pa-memory-fraction` emission sites yield to
+    it — upstream refuses the pair on one command line, live-proven)
+    and `chat_template`. Translator lists re-verified flag-by-flag
+    against the live v0.9.4 serve surface: nothing stale.
+  - **Second wave — remaining lanes.** whisper: first-class decode/VAD
+    knobs (`whisper_beam_size`/`best_of`/`entropy_thold`/
+    `logprob_thold`/`word_thold`, `whisper_diarize`/`tinydiarize`,
+    `whisper_vad_threshold` + min-speech/min-silence ms — VAD tuning
+    requires `whisper_vad_model`, enforced at validate); knobs ride
+    spawn argv after the VAD block, surface-gated per engine, and
+    double-setting one via `whisper_extra_args` is refused with
+    teaching (unpinned knob flags stay legal there). Live-proven:
+    piper-TTS wav in, `--beam-size 5` child, exact transcript out.
+    sdcpp: 14 component knobs (`sdcpp_control_net`, `sdcpp_ip_adapter`
+    + required `sdcpp_clip_vision` pair (config-enforced),
+    `sdcpp_motion_module` AnimateDiff video, `sdcpp_photo_maker`,
+    `sdcpp_pulid_weights`, `sdcpp_upscale_model` Real-ESRGAN, dir
+    knobs `sdcpp_lora_model_dir`/`hires_upscalers_dir`/`embd_dir`,
+    `sdcpp_audio_encoder` Wan2.2 S2V, Ideogram4 CFG pair, per-module
+    `sdcpp_backend` placement) — manifest-gated, assets never
+    auto-pulled. mistralrs: ISQ family `isq`/`imatrix`/
+    `calibration_file`/`isq_organization` (load-time quantization;
+    admission stays checkpoint-based = conservative) — live-proven
+    `--isq q8_0` child answering at temp 0.
+  Live spawn proofs for the lanes (argv read from `/proc/<pid>/
+  cmdline` or daemon.log, temp-0 completions): `bench-artifacts/20261010-engine-utilization/`.
 
 ## [0.24.0] - 2026-10-09
 

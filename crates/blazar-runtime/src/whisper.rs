@@ -813,6 +813,7 @@ impl WhisperRuntime {
         lib_dir: &Path,
         ready_timeout: std::time::Duration,
         vad_model: Option<&Path>,
+        knobs: &[String],
         extra: &[String],
     ) -> Result<u16> {
         let mut slot = self.child.lock().await;
@@ -859,17 +860,44 @@ impl WhisperRuntime {
         // binary's own --help surface (fail-open when the surface cannot
         // be captured) — the engine exits at boot on a bad flag, which
         // would surface as an opaque health timeout instead of a teaching.
-        if !extra.is_empty()
+        // A flag a first-class config knob already pins may not ALSO ride
+        // extra_args — double-flagging makes the winner build-defined.
+        // Unpinned knob flags stay legal in extra_args (pre-existing
+        // configs ride them; the knobs just add a first-class path).
+        let pinned: std::collections::BTreeSet<&str> = knobs
+            .iter()
+            .filter(|t| t.starts_with('-'))
+            .map(|t| t.split('=').next().unwrap_or(t))
+            .collect();
+        for tok in extra {
+            if tok.starts_with('-') {
+                let flag = tok.split('=').next().unwrap_or(tok);
+                if pinned.contains(flag) {
+                    return Err(anyhow!(
+                        "whisper_extra_args carries '{flag}', which a first-class whisper \
+                         config knob already pins — unset the knob or drop the extra_args entry"
+                    ));
+                }
+            }
+        }
+        let mut gated: Vec<&str> = Vec::new();
+        for tok in extra {
+            if tok.starts_with('-') {
+                gated.push(tok.split('=').next().unwrap_or(tok));
+            }
+        }
+        for tok in knobs {
+            if tok.starts_with('-') {
+                gated.push(tok.split('=').next().unwrap_or(tok));
+            }
+        }
+        if !gated.is_empty()
             && let Some(surface) = help_flag_surface(bin).await
         {
-            for tok in extra {
-                if !tok.starts_with('-') {
-                    continue; // value token riding its preceding flag
-                }
-                let flag = tok.split('=').next().unwrap_or(tok);
+            for flag in gated {
                 if !surface.contains(flag) {
                     return Err(anyhow!(
-                        "whisper_extra_args flag '{flag}' is not in this whisper-server's \
+                        "whisper flag '{flag}' is not in this whisper-server's \
                          --help surface — the engine would refuse to boot; fix the spelling \
                          or unset the knob"
                     ));
@@ -877,7 +905,7 @@ impl WhisperRuntime {
             }
         }
         let port = ephemeral_port()?;
-        let argv = server_args(port, model_path, vad_model, extra)
+        let argv = server_args(port, model_path, vad_model, knobs, extra)
             .map_err(|e| anyhow!("whisper_extra_args: {e}"))?;
         let mut std_cmd = std::process::Command::new(bin);
         std_cmd
@@ -1004,6 +1032,61 @@ fn ephemeral_port() -> Result<u16> {
 /// port bookkeeping, model loading, VAD), so they are refused, not overridden.
 const RESERVED_WHISPER_FLAGS: [&str; 5] = ["--host", "--port", "--model", "--vad", "--vad-model"];
 
+/// First-class whisper decode/VAD knob flags the gateway may pin from
+/// config ((`whisper_beam_size` and friends)). Kept as a const so the
+/// `extra_args` conflict check and the unit tests share one source.
+pub const WHISPER_KNOB_FLAGS: &[&str] = &[
+    "--beam-size",
+    "--best-of",
+    "--entropy-thold",
+    "--logprob-thold",
+    "--word-thold",
+    "--diarize",
+    "--tinydiarize",
+    "--vad-threshold",
+    "--vad-min-speech-duration-ms",
+    "--vad-min-silence-duration-ms",
+];
+
+/// Compose the first-class decode/VAD knobs from config into spawn argv
+/// tokens, in a fixed order. Only set knobs emit — an all-default config
+/// yields an empty vec (spawn argv byte-identical to before the knobs).
+#[must_use]
+pub fn knob_args(cfg: &blazar_core::Config) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(n) = cfg.whisper_beam_size {
+        out.extend(["--beam-size".into(), n.to_string()]);
+    }
+    if let Some(n) = cfg.whisper_best_of {
+        out.extend(["--best-of".into(), n.to_string()]);
+    }
+    if let Some(v) = cfg.whisper_entropy_thold {
+        out.extend(["--entropy-thold".into(), v.to_string()]);
+    }
+    if let Some(v) = cfg.whisper_logprob_thold {
+        out.extend(["--logprob-thold".into(), v.to_string()]);
+    }
+    if let Some(v) = cfg.whisper_word_thold {
+        out.extend(["--word-thold".into(), v.to_string()]);
+    }
+    if cfg.whisper_diarize {
+        out.push("--diarize".into());
+    }
+    if cfg.whisper_tinydiarize {
+        out.push("--tinydiarize".into());
+    }
+    if let Some(v) = cfg.whisper_vad_threshold {
+        out.extend(["--vad-threshold".into(), v.to_string()]);
+    }
+    if let Some(ms) = cfg.whisper_vad_min_speech_duration_ms {
+        out.extend(["--vad-min-speech-duration-ms".into(), ms.to_string()]);
+    }
+    if let Some(ms) = cfg.whisper_vad_min_silence_duration_ms {
+        out.extend(["--vad-min-silence-duration-ms".into(), ms.to_string()]);
+    }
+    out
+}
+
 /// Child argv: loopback bind is a security invariant (upstream has no
 /// auth flag — see `WhisperRuntime` doc); pinned by unit test. VAD
 /// (PR4083 era) is argv-level: `--vad --vad-model <ggml>` skips
@@ -1014,6 +1097,7 @@ fn server_args(
     port: u16,
     model_path: &Path,
     vad_model: Option<&Path>,
+    knobs: &[String],
     extra: &[String],
 ) -> Result<Vec<String>, String> {
     let model_arg = argv_model_path(model_path);
@@ -1030,6 +1114,7 @@ fn server_args(
         args.push("--vad-model".into());
         args.push(vad.display().to_string());
     }
+    args.extend(knobs.iter().cloned());
     for tok in extra {
         if tok.starts_with('-') {
             let flag = tok.split('=').next().unwrap_or(tok);
@@ -1202,6 +1287,7 @@ mod tests {
             Path::new("/data/whisper/models/ggml-base.bin"),
             None,
             &[],
+            &[],
         )
         .expect("no extra args always builds");
         assert_eq!(
@@ -1225,6 +1311,7 @@ mod tests {
             Path::new("/data/whisper/models/ggml-base.bin"),
             Some(Path::new("/engines/b5130/silero-vad-v5.ggml")),
             &[],
+            &[],
         )
         .expect("no extra args always builds");
         let tail: Vec<&str> = args[6..].iter().map(String::as_str).collect();
@@ -1246,6 +1333,7 @@ mod tests {
             49199,
             Path::new("/data/whisper/models/ggml-base.bin"),
             Some(Path::new("/engines/b5130/silero-vad-v5.ggml")),
+            &[],
             &extra,
         )
         .expect("non-pin extra rides");
@@ -1258,6 +1346,7 @@ mod tests {
             49199,
             Path::new("/m/ggml-base.bin"),
             None,
+            &[],
             &["4".to_string()],
         )
         .expect("value token rides");
@@ -1274,11 +1363,84 @@ mod tests {
                 49199,
                 Path::new("/m/ggml-base.bin"),
                 None,
+                &[],
                 &[pin.to_string()],
             )
             .expect_err("pins must be refused, not overridden");
             assert!(err.contains("reserved"), "pin {pin}: {err}");
         }
+    }
+
+    #[test]
+    fn unit__knob_args__emission_order_and_bool_gating() {
+        // All-decoder-knobs config emits in the fixed composer order;
+        // booleans emit bare; an all-default config emits nothing
+        // (spawn argv stays byte-identical to the pre-knob surface).
+        let mut cfg = blazar_core::Config::default();
+        cfg.whisper_beam_size = Some(5);
+        cfg.whisper_best_of = Some(3);
+        cfg.whisper_entropy_thold = Some(2.8);
+        cfg.whisper_logprob_thold = Some(-1.0);
+        cfg.whisper_word_thold = Some(0.02);
+        cfg.whisper_diarize = true;
+        cfg.whisper_tinydiarize = false;
+        cfg.whisper_vad_threshold = Some(0.6);
+        cfg.whisper_vad_min_speech_duration_ms = Some(150);
+        cfg.whisper_vad_min_silence_duration_ms = Some(80);
+        let knobs = knob_args(&cfg);
+        assert_eq!(
+            knobs,
+            vec![
+                "--beam-size".to_string(),
+                "5".to_string(),
+                "--best-of".to_string(),
+                "3".to_string(),
+                "--entropy-thold".to_string(),
+                "2.8".to_string(),
+                "--logprob-thold".to_string(),
+                "-1".to_string(),
+                "--word-thold".to_string(),
+                "0.02".to_string(),
+                "--diarize".to_string(),
+                "--vad-threshold".to_string(),
+                "0.6".to_string(),
+                "--vad-min-speech-duration-ms".to_string(),
+                "150".to_string(),
+                "--vad-min-silence-duration-ms".to_string(),
+                "80".to_string(),
+            ],
+            "composer emits set knobs in fixed order; false bools emit nothing"
+        );
+        assert!(
+            knob_args(&blazar_core::Config::default()).is_empty(),
+            "default config must not move the spawn argv"
+        );
+    }
+
+    #[test]
+    fn unit__server_args__knobs_ride_after_vad_before_extra() {
+        let knobs = vec!["--beam-size".to_string(), "5".to_string()];
+        let extra = vec!["--detect-language".to_string()];
+        let args = server_args(
+            49199,
+            Path::new("/data/whisper/models/ggml-base.bin"),
+            Some(Path::new("/engines/b5130/silero-vad-v5.ggml")),
+            &knobs,
+            &extra,
+        )
+        .expect("knobs + extra ride");
+        assert_eq!(
+            args[6..],
+            vec![
+                "--vad".to_string(),
+                "--vad-model".to_string(),
+                "/engines/b5130/silero-vad-v5.ggml".to_string(),
+                "--beam-size".to_string(),
+                "5".to_string(),
+                "--detect-language".to_string(),
+            ],
+            "argv order: base, VAD, first-class knobs, user extra (last-wins override)"
+        );
     }
 
     #[test]

@@ -670,6 +670,7 @@ async fn forward_local_raw(
             lib_dir,
             std::time::Duration::from_mins(2),
             vad_model.as_deref(),
+            &whisper::knob_args(&state.config),
             state.config.whisper_extra_args.as_deref().unwrap_or(&[]),
         )
         .await
@@ -1130,6 +1131,7 @@ async fn forward_local_stream(
                 &lib_dir,
                 std::time::Duration::from_mins(2),
                 vad_model.as_deref(),
+                &whisper::knob_args(&task_state.config),
                 task_state
                     .config
                     .whisper_extra_args

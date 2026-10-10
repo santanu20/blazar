@@ -41,8 +41,8 @@ mod test_env;
 
 pub use bench::{BenchRow, Tuner, parse_bench_json};
 pub use daemon::{
-    DaemonLock, LockHeld, process_alive_by_pid, validate_parent_death_guard,
-    wait_for_shutdown_signal,
+    DaemonLock, LockHeld, process_alive_by_pid, reclaim_marker_orphans, set_orphan_marker,
+    validate_parent_death_guard, wait_for_shutdown_signal,
 };
 pub use engine::gh::GhClient;
 pub use engine::manifest::{Manifest, Vendor, predicted_rescue_lane, probe as probe_manifest};

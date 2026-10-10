@@ -422,6 +422,47 @@ fn split_replica(key: &str) -> Option<(&str, u32)> {
 
 use crate::engine_impl::{ChildHandle, Engine};
 
+/// Child surface a warm-peg should probe, derived from the spawn argv.
+/// Generative children answer /v1/chat/completions; llama.cpp spawns
+/// built for embeddings (`--embeddings`) reject chat BY DESIGN (their
+/// context is not a generation context), so the peg asks the surface
+/// the child actually serves. Live-proven 2026-10-09: bge-small-en
+/// answers /v1/embeddings only, bge-reranker-v2-m3 answers /rerank
+/// (plus /v1/embeddings), and the laya classifier — whose pooling head
+/// makes /v1/embeddings 400 — answers llama-server's native
+/// /v1/systemone.
+#[derive(Debug, PartialEq, Eq)]
+enum WarmPegSurface {
+    Chat,
+    Rerank,
+    /// /v1/embeddings first; a classifier whose pooling rejects the
+    /// OAI embeddings shape falls through to /v1/systemone.
+    EmbeddingsThenSystemone,
+}
+
+fn warm_peg_surface(argv: &[String]) -> WarmPegSurface {
+    if argv.iter().any(|a| a == "--reranking") {
+        WarmPegSurface::Rerank
+    } else if argv.iter().any(|a| a == "--embeddings") {
+        WarmPegSurface::EmbeddingsThenSystemone
+    } else {
+        WarmPegSurface::Chat
+    }
+}
+
+/// The model id the CHILD serves — what goes in a probe body's `model`
+/// field. `mlx_lm` resolves unrecognized names through the HF hub at
+/// REQUEST time (live-proven: a bare `qwen2.5-0.5b-instruct-4bit` body
+/// field made it fetch huggingface.co/api/models/<name> → 401 → every
+/// chat 404s), so the peg echoes the exact id the spawn argv passed:
+/// sglang's `--served-model-name`, else mlx's `--model`. llama.cpp
+/// children (`-m <gguf>`, no served-name flag) accept the flat name —
+/// no echo needed.
+fn warm_peg_served_model(argv: &[String]) -> Option<String> {
+    argv.windows(2)
+        .find_map(|w| (w[0] == "--served-model-name" || w[0] == "--model").then(|| w[1].clone()))
+}
+
 /// Post-spawn warm-peg for JIT-class engines (sglang): the child's
 /// /health flips 200 BEFORE residual warmup drains — the first user
 /// request then eats a ~30s queue (measured live: first post-boot TTFT
@@ -435,6 +476,7 @@ use crate::engine_impl::{ChildHandle, Engine};
 /// child — the next request pays the JIT instead.
 async fn warm_peg_child(
     model: &str,
+    argv: &[String],
     endpoint: &blazar_core::Endpoint,
     auth: Option<&str>,
     concurrency: usize,
@@ -456,11 +498,28 @@ async fn warm_peg_child(
     // transport; sglang spawns never carry unix endpoints (its engine
     // guard rejects them), so dialing here is always well-formed.
     let (client, base) = child_dial(endpoint);
+    // Probe under the id the child actually serves (see
+    // warm_peg_served_model) and against the surface this spawn's
+    // class serves. Non-generative children have no decode batch
+    // shapes to peg — one probe of their surface is the whole peg.
+    let served = warm_peg_served_model(argv);
+    let body_model = served.as_deref().unwrap_or(model);
+    let surface = warm_peg_surface(argv);
+    if surface != WarmPegSurface::Chat {
+        warm_peg_surface_probe(model, body_model, &client, &base, auth, surface).await;
+        return;
+    }
     let url = format!("{base}/v1/chat/completions");
+    // Greedy probe on purpose: the peg's job is decode/graph warmup, not
+    // sampling coverage. Speculative lanes route non-greedy sampling through
+    // spec-verify kernels that JIT-compile on first use (sglang NGRAM ->
+    // flashinfer top_k_renorm_probs; broken toolchain on the 0.5.21 bundle
+    // kills the child), while greedy decode never touches that path.
     let body = serde_json::json!({
-        "model": model,
+        "model": body_model,
         "messages": [{ "role": "user", "content": "Reply with: OK" }],
         "max_tokens": 4,
+        "temperature": 0.0,
         "stream": false,
     });
     let started = std::time::Instant::now();
@@ -532,6 +591,87 @@ async fn warm_peg_child(
             started.elapsed().as_secs_f32()
         );
     }
+}
+
+/// One bounded probe against the surface a non-generative child
+/// serves (embeddings / rerank / systemone), in ladder order until the
+/// first 2xx. Same contract as the chat peg: warn-and-continue — a
+/// failed probe never fails an otherwise healthy child.
+async fn warm_peg_surface_probe(
+    model: &str,
+    body_model: &str,
+    client: &reqwest::Client,
+    base: &str,
+    auth: Option<&str>,
+    surface: WarmPegSurface,
+) {
+    let ladder: Vec<(&str, serde_json::Value)> = match surface {
+        WarmPegSurface::Rerank => vec![(
+            "/rerank",
+            serde_json::json!({ "model": body_model, "query": "warm", "documents": ["warm", "peg"] }),
+        )],
+        WarmPegSurface::EmbeddingsThenSystemone => vec![
+            (
+                "/v1/embeddings",
+                serde_json::json!({ "model": body_model, "input": "warm" }),
+            ),
+            // Classifier fallback (pooling head absent → embeddings 400):
+            // llama-server's native decision surface, minimal choice body.
+            (
+                "/v1/systemone",
+                serde_json::json!({
+                    "model": body_model,
+                    "state": "warm",
+                    "questions": { "q1": {
+                        "type": "choice",
+                        "instructions": "warm peg",
+                        "criteria": { "a": "a", "b": "b" },
+                    } },
+                }),
+            ),
+        ],
+        // The chat surface is pegged by the single+burst flow above;
+        // this helper is never handed a Chat plan.
+        WarmPegSurface::Chat => return,
+    };
+    let mut last_status: Option<u16> = None;
+    for (path, body) in &ladder {
+        let mut req = client
+            .post(format!("{base}{path}"))
+            .json(body)
+            .timeout(std::time::Duration::from_secs(90));
+        if let Some(secret) = auth {
+            req = req.bearer_auth(secret);
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    target: "blazar::warmpeg",
+                    model,
+                    surface = path,
+                    "warm-peg ok — child surface answered; no decode shapes to peg on this class"
+                );
+                return;
+            }
+            Ok(resp) => last_status = Some(resp.status().as_u16()),
+            // Transport failure: the child is unreachable/dying — the
+            // chat peg would have warned the same way. Stop the ladder.
+            Err(e) => {
+                tracing::warn!(
+                    target: "blazar::warmpeg",
+                    model,
+                    "warm-peg surface probe {path} failed: {e:#} — leaving warmup to the first request"
+                );
+                return;
+            }
+        }
+    }
+    tracing::warn!(
+        target: "blazar::warmpeg",
+        model,
+        "warm-peg surface probes exhausted (last HTTP {}) — leaving warmup to the first request",
+        last_status.map_or("n/a".to_string(), |s| s.to_string())
+    );
 }
 
 /// Typed failures the gateway maps onto HTTP statuses.
@@ -2430,6 +2570,29 @@ impl Supervisor {
             return Box::pin(self.ensure_routed(ROUTER_KEY, None)).await;
         }
 
+        // SGLang LoRA variants ride the BASE child: the engine selects
+        // adapters per request through its native `base:adapter` model
+        // syntax, so a dedicated variant child would re-load the full
+        // base weights into VRAM a second time — and the legacy `+stem`
+        // body stamp selected NO adapter there (the child answered with
+        // base weights). llamacpp/mistralrs keep the dedicated variant
+        // child (`--lora-file` is baked into spawn argv). Aliasing
+        // BEFORE replica-key derivation shares one instance, one warm
+        // KV cache, and one loading-coalescing slot across base and
+        // variant traffic.
+        let aliased_base;
+        let name = match blazar_core::catalog::split_lora_suffix(name) {
+            (base, Some(stem)) => {
+                aliased_base = if self.sglang_variant_rides_base(base, stem).await? {
+                    base.to_string()
+                } else {
+                    name.to_string()
+                };
+                aliased_base.as_str()
+            }
+            _ => name,
+        };
+
         let key = self.replica_key(name, prefix);
         let result = self.ensure_key_opts(&key, captive).await;
         // Best-effort affinity record: pin this prefix to the replica
@@ -2530,6 +2693,158 @@ impl Supervisor {
                 let vision_key = format!("{}@vision", self.replica_key(name, prefix));
                 Box::pin(self.ensure_key(&vision_key)).await
             }
+        }
+    }
+
+    /// Should this `model+adapter` request ride the sglang base child?
+    /// `Ok(true)` = alias to the base lane. The adapter stem is
+    /// validated with the SAME resolver the spawn uses, so missing,
+    /// ambiguous, and absent-on-disk rows teach byte-identically to the
+    /// variant-child lane. A resident base child spawned before any
+    /// adapter was attached (no `--enable-lora` in its argv) cannot
+    /// serve variants — it is evicted first and the ensure that follows
+    /// respawns with every row adapter attached (same respawn contract
+    /// as the lazy-projector path; the KV bank carries the
+    /// conversation). `Ok(false)` = any other engine, or a routing pick
+    /// that cannot be resolved here: keep the legacy dedicated variant
+    /// child, byte-identical behavior.
+    async fn sglang_variant_rides_base(
+        &self,
+        base: &str,
+        stem: &str,
+    ) -> Result<bool, SupervisionError> {
+        use blazar_core::engine_kind::EngineKind;
+        let store =
+            Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+        let Ok(Some(row)) = store.get_model(base) else {
+            // Unknown base: the spawn path delivers the resolver's own
+            // teaching (candidates list) — do not shadow it here.
+            return Ok(false);
+        };
+        let overlay = self.config.overlay_for(base);
+        match self.resolve_routed_engine(&store, &overlay, &row) {
+            Ok(Some((engine, _))) if engine.kind() == EngineKind::Sglang => {}
+            // Non-sglang lane, global-engine mode, or a bad pin the
+            // spawn will teach about: legacy variant-child behavior.
+            _ => return Ok(false),
+        }
+        let rows = store
+            .list_loras(Some(base))
+            .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+        Self::resolve_lora_lane(&rows, base, Some(stem))?;
+        // Collect first, evict after: the dashmap shard read-ref must
+        // never live across the await points in `evict`.
+        let stale: Vec<String> = self
+            .instances
+            .iter()
+            .filter(|entry| {
+                let inst = entry.value();
+                model_of_key(entry.key()) == base
+                    && inst.kind == EngineKind::Sglang
+                    && !inst.argv.windows(2).any(|w| w[0] == "--enable-lora")
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in &stale {
+            tracing::info!(
+                model = base,
+                "lora variant +{stem} requested — respawning adapter-less instance \
+                 {key} to attach adapters (one child serves base and variants)"
+            );
+            self.evict(key).await.map_err(|e| {
+                SupervisionError::Internal(anyhow!("pre-lora evict failed for {key}: {e}"))
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// Hot-attach (or detach) a `LoRA` adapter on a *resident* sglang base
+    /// child without a respawn — the engine exposes admin endpoints
+    /// `/load_lora_adapter` / `/unload_lora_adapter` (probe-verified in
+    /// 0.5.21). The verdict string is user-facing (CLI prints it).
+    /// Non-sglang lanes, missing residents, and adapter-less spawns
+    /// defer to the next spawn; store rows are the source of truth and
+    /// every spawn already attaches all of them.
+    pub async fn lora_hot_attach(
+        &self,
+        model: &str,
+        attach: bool,
+        lora_name: &str,
+        lora_path: &str,
+    ) -> Result<String, String> {
+        use blazar_core::engine_kind::EngineKind;
+        let mut target: Option<(blazar_core::Endpoint, Option<String>, String)> = None;
+        let mut deferred = String::from(
+            "model not resident — the next spawn attaches the store row automatically",
+        );
+        for entry in &self.instances {
+            if model_of_key(entry.key()) != model {
+                continue;
+            }
+            let inst = entry.value();
+            if inst.kind != EngineKind::Sglang {
+                deferred = format!(
+                    "resident {} child bakes adapters into its spawn argv — the next \
+                     respawn attaches the store row",
+                    inst.kind.as_str()
+                );
+                continue;
+            }
+            if !inst.argv.windows(2).any(|w| w[0] == "--enable-lora") {
+                deferred = format!(
+                    "resident child {key} predates adapters (no --enable-lora) — \
+                     `blazar stop {model}` then re-request attaches them now",
+                    key = entry.key()
+                );
+                continue;
+            }
+            target = Some((
+                inst.endpoint.clone(),
+                inst.auth.clone(),
+                entry.key().clone(),
+            ));
+            break;
+        }
+        let Some((endpoint, auth, key)) = target else {
+            return Ok(deferred);
+        };
+        let (client, base) = child_dial(&endpoint);
+        let (path, payload) = if attach {
+            (
+                "/load_lora_adapter",
+                serde_json::json!({"lora_name": lora_name, "lora_path": lora_path}),
+            )
+        } else {
+            (
+                "/unload_lora_adapter",
+                serde_json::json!({"lora_name": lora_name}),
+            )
+        };
+        let mut req = client
+            .post(format!("{base}{path}"))
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(120));
+        if let Some(secret) = &auth {
+            req = req.bearer_auth(secret);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("child {path} request failed: {e}"))?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if status.is_success() {
+            Ok(format!(
+                "hot: adapter {lora_name} {} resident {key}",
+                if attach { "live on" } else { "detached from" }
+            ))
+        } else {
+            let detail = body
+                .get("message")
+                .or_else(|| body.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("no detail");
+            Err(format!("child {path} answered {status}: {detail}"))
         }
     }
 
@@ -2923,12 +3238,13 @@ impl Supervisor {
     }
 
     /// Mint a per-child auth secret (child `--api-key` hardening).
-    /// `--api-key-file` is preferred when the engine has it: the secret
-    /// then lives in a 0600 file, not on the child's `/proc` cmdline.
-    /// The argv fallback (`--api-key <secret>`) still closes the open
-    /// child, just less privately. Engines with neither flag warn-skip
-    /// (same contract as every other manifest-gated emission) instead
-    /// of breaking the spawn.
+    /// `--api-key-file` is the only private lane: the secret lives in a
+    /// 0600 run-dir file, never on the child's `/proc` cmdline. An
+    /// argv-only engine gets NO mint — `/proc/<pid>/cmdline` is
+    /// world-readable, so `--api-key <secret>` guards nothing while
+    /// exposing the secret to every local process. Engines with
+    /// neither flag warn-skip (same contract as every other
+    /// manifest-gated emission) instead of breaking the spawn.
     fn mint_child_auth(
         &self,
         key: &str,
@@ -2966,7 +3282,25 @@ impl Supervisor {
             );
             return Ok(None);
         }
-        // Entropy failure is a hard error, never a silently weaker key.
+        if !manifest.flags.contains("--api-key-file") {
+            // Only the argv flag exists. /proc/<pid>/cmdline is
+            // world-readable on stock Linux, so `--api-key <secret>`
+            // guards nothing while leaking the mint to every local
+            // process. Refuse the pretend lane — the boundary stays
+            // 127.0.0.1 + a random port, identical to engines with no
+            // auth flag surface. A future engine update gaining
+            // --api-key-file flips this to the keyfile lane with no
+            // blazar-side change.
+            tracing::info!(
+                model = key,
+                "child_auth: engine {} offers only --api-key (world-readable via /proc \
+                 cmdline) — no mint; child boundary stays loopback + random port",
+                manifest.tag
+            );
+            return Ok(None);
+        }
+        // Keyfile lane: entropy failure is a hard error, never a
+        // silently weaker key.
         let mut raw = [0u8; 24];
         getrandom::fill(&mut raw)
             .map_err(|e| SupervisionError::Internal(anyhow!("child_auth entropy: {e}")))?;
@@ -2975,37 +3309,22 @@ impl Supervisor {
         for b in &raw {
             let _ = write!(secret, "{b:02x}");
         }
-        if manifest.flags.contains("--api-key-file") {
-            let path = self.dirs.run_dir().join(format!("{key}.apikey"));
-            std::fs::write(&path, &secret).map_err(|e| {
-                SupervisionError::Internal(anyhow!("write {}: {e}", path.display()))
-            })?;
-            #[cfg(unix)]
+        let path = self.dirs.run_dir().join(format!("{key}.apikey"));
+        std::fs::write(&path, &secret)
+            .map_err(|e| SupervisionError::Internal(anyhow!("write {}: {e}", path.display())))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                {
-                    tracing::warn!(target: "blazar::supervisor", error = %e, "apikey chmod 0600 failed");
-                }
+                tracing::warn!(target: "blazar::supervisor", error = %e, "apikey chmod 0600 failed");
             }
-            Ok(Some(ChildAuth {
-                argv: vec!["--api-key-file".into(), path.display().to_string()],
-                secret,
-                keyfile: Some(path),
-            }))
-        } else {
-            tracing::warn!(
-                model = key,
-                "child_auth: engine lacks --api-key-file; falling back to --api-key \
-                 (secret visible in /proc/<pid>/cmdline)"
-            );
-            Ok(Some(ChildAuth {
-                argv: vec!["--api-key".into(), secret.clone()],
-                secret,
-                keyfile: None,
-            }))
         }
+        Ok(Some(ChildAuth {
+            argv: vec!["--api-key-file".into(), path.display().to_string()],
+            secret,
+            keyfile: Some(path),
+        }))
     }
 
     /// Router-mode spawn: ONE child, no `-m`, `--models-preset` INI
@@ -4703,6 +5022,7 @@ impl Supervisor {
                         if kind == blazar_core::engine_kind::EngineKind::Sglang {
                             warm_peg_child(
                                 &model.name,
+                                &argv,
                                 &endpoint,
                                 auth.as_ref().map(|a| a.secret.as_str()),
                                 peg_n,
@@ -4710,11 +5030,18 @@ impl Supervisor {
                             .await;
                         } else {
                             let model_name = model.name.clone();
+                            let argv_snapshot = argv.clone();
                             let endpoint = endpoint.clone();
                             let secret = auth.as_ref().map(|a| a.secret.clone());
                             tokio::spawn(async move {
-                                warm_peg_child(&model_name, &endpoint, secret.as_deref(), peg_n)
-                                    .await;
+                                warm_peg_child(
+                                    &model_name,
+                                    &argv_snapshot,
+                                    &endpoint,
+                                    secret.as_deref(),
+                                    peg_n,
+                                )
+                                .await;
                             });
                         }
                     }
@@ -6822,10 +7149,14 @@ drop them from rpc_servers in config.toml",
 
     /// Startup sweep: a SIGKILL'd daemon leaves engine children behind
     /// (own process groups). `<run>/<model>.pid` markers whose recorded
-    /// process is still alive get a single-pid TERM; markers are cleared.
-    /// The daemon's own `blazar.pid` and pull locks are NOT engines.
+    /// process is still alive get a single-pid TERM followed by the
+    /// shared TERM→grace→KILL escalation (a child hung in graceful
+    /// shutdown must not survive the sweep that came for it); markers
+    /// are cleared. The daemon's own `blazar.pid` and pull locks are NOT
+    /// engines.
     pub fn sweep_orphans(&self) -> Vec<String> {
         let mut swept = Vec::new();
+        let mut termed: Vec<u32> = Vec::new();
         let Ok(entries) = std::fs::read_dir(self.dirs.run_dir()) else {
             return swept;
         };
@@ -6849,10 +7180,15 @@ drop them from rpc_servers in config.toml",
                 unsafe {
                     libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGTERM);
                 }
+                termed.push(pid);
                 swept.push(format!("{name}={pid}"));
             }
             let _ = std::fs::remove_file(e.path());
         }
+        // Pidfile strays carry no env marker (they predate it): identity
+        // is liveness-only here — the marker file was already consumed.
+        #[cfg(unix)]
+        crate::daemon::escalate_orphans(&termed, self.shutdown_grace, |_| true);
         swept
     }
 
@@ -7557,14 +7893,15 @@ mod routing_tests {
 
     /// Child-auth mint matrix: the manifest's parsed flag surface decides
     /// the lane. `--api-key-file` (llama-server today) keeps the secret out
-    /// of argv entirely; an argv-only engine (sglang 0.5.19) gets the
-    /// warned fallback; gaining the file flag on an engine update flips
-    /// the lane with no blazar-side change.
+    /// of argv entirely; an argv-only engine (sglang 0.5.21) gets NO mint —
+    /// /proc cmdline is world-readable, so a pretend key only leaks it;
+    /// gaining the file flag on an engine update flips the lane with no
+    /// blazar-side change.
     #[allow(non_snake_case)]
-    // One cohesive lane scenario: argv fallback + three gate variants.
+    // One cohesive lane scenario: keyfile lane + four gate variants.
     #[allow(clippy::too_many_lines)]
     #[test]
-    fn unit__mint_child_auth__keyfile_lane_argv_fallback_and_gates() {
+    fn unit__mint_child_auth__keyfile_lane_argv_refused_and_gates() {
         use blazar_core::engine_kind::EngineKind as K;
         let root = tempfile::TempDir::new().unwrap();
         let dirs = BlazarDirs {
@@ -7628,14 +7965,18 @@ mod routing_tests {
             assert_eq!(mode & 0o777, 0o600, "keyfile must be owner-only");
         }
 
-        // Argv fallback (sglang today): secret rides argv, no keyfile.
-        let argv_lane = auto
-            .mint_child_auth("m2", &tcp, &manifest(&["--api-key"]), K::LlamaCpp)
-            .unwrap()
-            .unwrap();
-        assert_eq!(argv_lane.argv[0], "--api-key");
-        assert_eq!(argv_lane.argv[1], argv_lane.secret);
-        assert!(argv_lane.keyfile.is_none());
+        // Argv-only engine (sglang today): /proc cmdline is world-readable,
+        // so the argv lane is refused outright — no mint, no leak, no
+        // keyfile written.
+        assert!(
+            auto.mint_child_auth("m2", &tcp, &manifest(&["--api-key"]), K::LlamaCpp)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !dirs.run_dir().join("m2.apikey").exists(),
+            "refused lane must not mint a keyfile"
+        );
 
         // Engine update gaining --api-key-file flips the lane on its own.
         let flipped = auto
@@ -7884,6 +8225,44 @@ mod routing_tests {
             })),
         );
         (sup, root, bus)
+    }
+
+    // V3 escalation parity for the pidfile sweep: a marker-file stray
+    // that ignores SIGTERM must die to the KILL arm, not survive the
+    // sweep that found it (the exact m0500 orphan survival mode).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit__sweep_orphans__term_ignoring_stray_is_killed() {
+        let (sup, _root) = gpu_sup();
+        let mut stubborn = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 300")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("stubborn decoy");
+        let pidfile = sup.dirs.run_dir().join("m.pid");
+        std::fs::create_dir_all(sup.dirs.run_dir()).unwrap();
+        std::fs::write(&pidfile, format!("{}\n", stubborn.id())).unwrap();
+
+        let swept = sup.sweep_orphans();
+        assert_eq!(swept, vec![format!("m.pid={}", stubborn.id())]);
+        assert!(!pidfile.exists(), "marker consumed");
+        // Reap before the liveness assert: a KILLed child of THIS test
+        // process is a zombie until waited on; kill(pid,0) reports
+        // zombies alive (real orphans reparent to init, which reaps).
+        let mut exited = None;
+        for _ in 0..50 {
+            if let Some(status) = stubborn.try_wait().unwrap() {
+                exited = Some(status);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            exited.is_some(),
+            "TERM-ignoring stray must be KILLed within the grace window"
+        );
     }
 
     #[test]
@@ -8401,6 +8780,7 @@ mod routing_tests {
         let started = std::time::Instant::now();
         warm_peg_child(
             "m",
+            &[],
             &Endpoint::Unix {
                 socket: "/tmp/blazar-test.sock".into(),
             },
@@ -8415,6 +8795,183 @@ mod routing_tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "unix guard returns without HTTP"
         );
+    }
+
+    /// sglang variant aliasing: the `model+adapter` request must ride
+    /// the BASE child on the sglang lane (validated stem, stale
+    /// adapter-less residents evicted), and stay on the dedicated
+    /// variant child everywhere else.
+    #[tokio::test]
+    async fn unit__sglang_variant_rides_base__validates_stems_and_respawns_stale() {
+        use blazar_core::engine_kind::EngineKind;
+        let (sup, root) = gpu_sup();
+        // Model: a safetensors DIRECTORY (the format fact that routes
+        // auto-mode serving to sglang when that lane is installed).
+        let model_dir = root.path().join("m.d");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        // Adapter present on disk (resolve_lora_lane checks existence).
+        let adapter = root.path().join("adapters").join("anonymizer");
+        std::fs::create_dir_all(&adapter).unwrap();
+        let store = Store::open(&sup.dirs).unwrap();
+        store
+            .upsert_model(&blazar_core::ModelRow {
+                name: "m".into(),
+                repo: "m".into(),
+                quant: "BF16".into(),
+                path: model_dir.to_string_lossy().into_owned(),
+                bytes: 1,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+                last_used_at: 0,
+            })
+            .unwrap();
+        // No engines installed: routing stays global/indeterminate —
+        // the legacy dedicated variant child must be kept.
+        assert!(
+            !sup.sglang_variant_rides_base("m", "anonymizer")
+                .await
+                .unwrap(),
+            "empty roster keeps the variant child"
+        );
+        // Install the sglang lane (valid manifest, kind override).
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                kind: EngineKind::Sglang,
+                manifest: serde_json::to_string(&crate::engine::manifest::Manifest {
+                    tag: "sglang-t".into(),
+                    ..Default::default()
+                })
+                .unwrap(),
+                ..lane_row("sglang-t", &[], 1000)
+            })
+            .unwrap();
+        // Missing adapter stem: the variant-child teaching fires
+        // IDENTICALLY (attach remedy names the `+stem` request form).
+        let err = sup
+            .sglang_variant_rides_base("m", "absent")
+            .await
+            .unwrap_err();
+        match &err {
+            SupervisionError::ModelNotFound(msg) => assert!(
+                msg.contains("blazar lora add") && msg.contains("m+absent"),
+                "teaching lost the remedy: {msg}"
+            ),
+            other => panic!("expected ModelNotFound teaching, got {other:?}"),
+        }
+        // Attached + on disk: alias fires.
+        store
+            .add_lora("m", &adapter.to_string_lossy(), 1.0)
+            .unwrap();
+        assert!(
+            sup.sglang_variant_rides_base("m", "anonymizer")
+                .await
+                .unwrap(),
+            "sglang lane + valid stem aliases to the base child"
+        );
+        // A resident base child WITHOUT --enable-lora cannot serve
+        // variants: the alias evicts it so the ensure that follows
+        // respawns with every row adapter attached.
+        let (mut stale, stale_pid) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut stale).unwrap().kind = EngineKind::Sglang;
+        Arc::get_mut(&mut stale).unwrap().argv =
+            vec!["python".into(), "-m".into(), "sglang.launch_server".into()];
+        sup.instances.insert("m".to_string(), stale);
+        assert!(
+            sup.sglang_variant_rides_base("m", "anonymizer")
+                .await
+                .unwrap(),
+            "stale resident still aliases (after eviction)"
+        );
+        assert!(
+            !sup.instances.contains_key("m"),
+            "adapter-less resident must be evicted for the respawn"
+        );
+        // An adapter-CAPABLE resident stays: it already serves every
+        // attached adapter through per-request selection.
+        let (mut capable, capable_pid) = fake_instance("m", InstanceState::Ready, 0);
+        {
+            let inst = Arc::get_mut(&mut capable).unwrap();
+            inst.kind = EngineKind::Sglang;
+            inst.argv = vec![
+                "python".into(),
+                "--enable-lora".into(),
+                "--lora-paths".into(),
+                format!("anonymizer={}", adapter.to_string_lossy()),
+            ];
+        }
+        sup.instances.insert("m".to_string(), capable);
+        assert!(
+            sup.sglang_variant_rides_base("m", "anonymizer")
+                .await
+                .unwrap()
+        );
+        assert!(sup.instances.contains_key("m"), "capable resident stays");
+        kill_all(&[stale_pid, capable_pid]);
+    }
+
+    #[test]
+    fn unit__warm_peg_surface__argv_markers_pick_the_served_endpoint() {
+        // Generative spawn (llama.cpp -m, no embedding markers): chat.
+        let chat = vec!["-m".to_string(), "m.gguf".to_string()];
+        assert_eq!(
+            super::warm_peg_surface(&chat),
+            super::WarmPegSurface::Chat,
+            "no embedding markers -> chat surface"
+        );
+        // Native embedder / parity arm: embeddings first, systemone
+        // held as the classifier fallback.
+        let embed = vec![
+            "--embeddings".to_string(),
+            "--pooling".to_string(),
+            "cls".to_string(),
+        ];
+        assert_eq!(
+            super::warm_peg_surface(&embed),
+            super::WarmPegSurface::EmbeddingsThenSystemone,
+            "--embeddings -> embeddings ladder"
+        );
+        // Reranker carries both markers; --reranking owns the surface.
+        let rerank = vec!["--embeddings".to_string(), "--reranking".to_string()];
+        assert_eq!(
+            super::warm_peg_surface(&rerank),
+            super::WarmPegSurface::Rerank,
+            "--reranking wins over --embeddings"
+        );
+    }
+
+    #[test]
+    fn unit__warm_peg_served_model__echoes_sglang_and_mlx_ids_ignores_llamacpp() {
+        // sglang: --served-model-name is the child-served id.
+        let sglang = vec![
+            "--model-path".to_string(),
+            "/models/q.d".to_string(),
+            "--served-model-name".to_string(),
+            "q-flat".to_string(),
+        ];
+        assert_eq!(
+            super::warm_peg_served_model(&sglang).as_deref(),
+            Some("q-flat")
+        );
+        // mlx: --model (the full dir path) is the served id.
+        let mlx = vec![
+            "--model".to_string(),
+            "/models/q.d".to_string(),
+            "--port".to_string(),
+            "46523".to_string(),
+        ];
+        assert_eq!(
+            super::warm_peg_served_model(&mlx).as_deref(),
+            Some("/models/q.d")
+        );
+        // llama.cpp: -m is not a served-name flag — flat name applies.
+        let llamacpp = vec!["-m".to_string(), "m.gguf".to_string()];
+        assert_eq!(super::warm_peg_served_model(&llamacpp), None);
     }
 
     #[tokio::test]

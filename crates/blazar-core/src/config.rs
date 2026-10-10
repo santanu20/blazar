@@ -439,6 +439,58 @@ pub struct Config {
     /// boot). Unset = today's argv, unchanged.
     #[serde(default)]
     pub whisper_extra_args: Option<Vec<String>>,
+    /// Beam size for the whisper-server decoder (`--beam-size`).
+    /// Upstream default -1 = greedy; a beam (2..5 typical) trades decode
+    /// speed for accuracy on noisy audio. Unset = engine default.
+    #[serde(default)]
+    pub whisper_beam_size: Option<i32>,
+    /// Best-of candidates the decoder keeps (`--best-of`, upstream
+    /// default 2) when sampling without a beam. Unset = engine default.
+    #[serde(default)]
+    pub whisper_best_of: Option<i32>,
+    /// Decoder entropy threshold (`--entropy-thold`, upstream default
+    /// 2.40): segments above it count as failed and trigger the
+    /// temperature-fallback ladder. Unset = engine default.
+    #[serde(default)]
+    pub whisper_entropy_thold: Option<f64>,
+    /// Decoder log-prob threshold (`--logprob-thold`, upstream default
+    /// -1.00): same fail/fallback role as the entropy threshold, on the
+    /// average log-probability axis. Unset = engine default.
+    #[serde(default)]
+    pub whisper_logprob_thold: Option<f64>,
+    /// Word-timestamp probability threshold (`--word-thold`, upstream
+    /// default 0.01) for word-level timing output. Unset = engine
+    /// default.
+    #[serde(default)]
+    pub whisper_word_thold: Option<f64>,
+    /// Stereo speaker diarization (`--diarize`): whisper.cpp separates
+    /// speakers only for stereo input recorded with each speaker on
+    /// its own channel. Off by default.
+    #[serde(default)]
+    pub whisper_diarize: bool,
+    /// Tiny diarization (`--tinydiarize`, turns on `turn` tokens in the
+    /// transcript): requires a `*-tdrz` model file (e.g.
+    /// `ggml-tiny.en-tdrz.bin`); the engine errors on mismatched
+    /// models. Off by default.
+    #[serde(default)]
+    pub whisper_tinydiarize: bool,
+    /// VAD speech probability threshold (`--vad-threshold`, upstream
+    /// default 0.50): higher = fewer, longer segments; lower = more,
+    /// shorter segments. Only read when `whisper_vad_model` is set —
+    /// a threshold without VAD is a config error, not a silent no-op.
+    /// Unset = engine default.
+    #[serde(default)]
+    pub whisper_vad_threshold: Option<f64>,
+    /// VAD minimum speech segment length (`--vad-min-speech-duration-ms`,
+    /// upstream default 250): shorter detected speech bursts are
+    /// dropped. Requires `whisper_vad_model`. Unset = engine default.
+    #[serde(default)]
+    pub whisper_vad_min_speech_duration_ms: Option<u32>,
+    /// VAD minimum silence that ends a segment
+    /// (`--vad-min-silence-duration-ms`, upstream default 100).
+    /// Requires `whisper_vad_model`. Unset = engine default.
+    #[serde(default)]
+    pub whisper_vad_min_silence_duration_ms: Option<u32>,
     /// Capability-lane registry URL (curated fork lanes for GGUF
     /// architectures mainline llama.cpp can't load yet). `None` = the
     /// default registry; `Some("")` disables registry lookups entirely
@@ -514,6 +566,14 @@ pub struct Config {
     /// explicitly (explicit user pin always wins over the ladder).
     #[serde(default)]
     pub sglang: SglangTuning,
+    /// mlx engine tuning knobs (global defaults; per-model
+    /// `model_overrides.<name>.mlx` replaces this whole struct when
+    /// present). Every field maps 1:1 to a `mlx_lm.server` flag and is
+    /// emitted only when the active engine's capability manifest
+    /// advertises it — unknown-on-this-version flags skip with a
+    /// warning instead of erroring.
+    #[serde(default)]
+    pub mlx: MlxTuning,
     /// Slot prompt-similarity threshold (`--slot-prompt-similarity`):
     /// how closely a request's prompt must match a slot's cached prompt to
     /// reuse it (prefix affinity at slots > 1). 0 = emit nothing (upstream
@@ -631,15 +691,13 @@ pub struct Config {
     /// engine defaults.
     #[serde(default)]
     pub sdcpp_model_args: Option<String>,
-    /// Engine-boot flag passthrough for sd-server children — the
-    /// addon-model levers with no first-class knob (`--control-net`,
-    /// `--ip-adapter`, `--photo-maker`, `--motion-module`,
-    /// `--upscale-model`, `--lora-model-dir`, `--backend`, ...).
-    /// Blazar's launch pins are refused here; flags are validated
-    /// against the installed sdcpp engine's probed manifest at child
-    /// compile. Merges UNDER per-model `model_overrides.<m>.extra_args`
-    /// (an overlay flag wins over the config-level flag, with a
-    /// warning). Unset = engine defaults.
+    /// Engine-boot flag passthrough for sd-server children — the levers
+    /// with no first-class knob. Blazar's launch pins and the
+    /// first-class component knobs are refused here; flags are
+    /// validated against the installed sdcpp engine's probed manifest
+    /// at child compile. Merges UNDER per-model
+    /// `model_overrides.<m>.extra_args` (an overlay flag wins over the
+    /// config-level flag, with a warning). Unset = engine defaults.
     #[serde(default)]
     pub sdcpp_extra_args: Option<Vec<String>>,
     /// Per-tensor quantization overrides for sd-server children
@@ -648,6 +706,77 @@ pub struct Config {
     /// independently for tighter VRAM budgets. Unset = checkpoint types.
     #[serde(default)]
     pub sdcpp_tensor_type_rules: Option<String>,
+    /// Control-Net model path for sd-server children (`--control-net`):
+    /// structural conditioning (pose/edges/depth) driven per request by
+    /// a `--control-image`. Unset = no control net.
+    #[serde(default)]
+    pub sdcpp_control_net: Option<String>,
+    /// IP-Adapter model path (`--ip-adapter`): image-prompt conditioning
+    /// (style/identity transfer from a reference image, per-request
+    /// `--ip-adapter-image`). Requires `sdcpp_clip_vision` — config
+    /// validation rejects the pair otherwise (upstream hard-requires
+    /// it). Unset = no IP-Adapter.
+    #[serde(default)]
+    pub sdcpp_ip_adapter: Option<String>,
+    /// CLIP-vision encoder path (`--clip_vision`): the image encoder
+    /// IP-Adapter conditions on. Only meaningful together with
+    /// `sdcpp_ip_adapter`. Unset = none.
+    #[serde(default)]
+    pub sdcpp_clip_vision: Option<String>,
+    /// `AnimateDiff` motion module path (`--motion-module`, `SD 1.5`
+    /// checkpoints only): turns the image lane into a video lane.
+    /// Unset = stills only.
+    #[serde(default)]
+    pub sdcpp_motion_module: Option<String>,
+    /// `PhotoMaker` weights path (`--photo-maker`): identity-preserving
+    /// face customization from a reference portrait. Unset = none.
+    #[serde(default)]
+    pub sdcpp_photo_maker: Option<String>,
+    /// `PuLID` weights path (`--pulid-weights`, Flux checkpoints):
+    /// identity-consistent generation from an ID embedding. Unset =
+    /// none.
+    #[serde(default)]
+    pub sdcpp_pulid_weights: Option<String>,
+    /// Real-ESRGAN upscale model path ((`--upscale-model`)): server-side
+    /// hires fix upscaling, sized per request by upscale repeats/tile.
+    /// Unset = no upscale stage.
+    #[serde(default)]
+    pub sdcpp_upscale_model: Option<String>,
+    /// `LoRA` directory for sd-server children (`--lora-model-dir`): the
+    /// directory the engine scans for per-request `--lora` references
+    /// (comma weights supported). Unset = working directory.
+    #[serde(default)]
+    pub sdcpp_lora_model_dir: Option<String>,
+    /// Highres-fix upscaler directory (`--hires-upscalers-dir`): where
+    /// the engine looks for upscalers during hires fix. Unset =
+    /// working directory.
+    #[serde(default)]
+    pub sdcpp_hires_upscalers_dir: Option<String>,
+    /// Textual-inversion embeddings directory (`--embd-dir`). Unset =
+    /// working directory.
+    #[serde(default)]
+    pub sdcpp_embd_dir: Option<String>,
+    /// Audio encoder path (`--audio-encoder`, wav2vec2 for Wan2.2
+    /// speech-to-video): sound-conditioned video generation. Unset =
+    /// none.
+    #[serde(default)]
+    pub sdcpp_audio_encoder: Option<String>,
+    /// Standalone high-noise diffusion model path
+    /// (`--high-noise-diffusion-model`, Ideogram4-class CFG split):
+    /// paired with the base model for two-stage guided sampling. Unset =
+    /// single-model CFG.
+    #[serde(default)]
+    pub sdcpp_high_noise_diffusion_model: Option<String>,
+    /// Standalone unconditional diffusion model path
+    /// (`--uncond-diffusion-model`): the negative-guidance half of the
+    /// CFG split. Unset = single-model CFG.
+    #[serde(default)]
+    pub sdcpp_uncond_diffusion_model: Option<String>,
+    /// Per-module runtime backend assignment (`--backend`, e.g. `cpu`
+    /// or `clip=cpu,vae=cuda0,diffusion=vulkan0`): overrides the
+    /// auto-picked device per component. Unset = automatic placement.
+    #[serde(default)]
+    pub sdcpp_backend: Option<String>,
     /// Gateway-side wait budget for synchronous and streaming media
     /// jobs (image/video generations polled to completion): after this
     /// many seconds the gateway answers 504 while the engine child may
@@ -1293,6 +1422,11 @@ pub struct ModelOverride {
     /// `mistralrs` engine.
     #[serde(default)]
     pub mistralrs: Option<MistralrsTuning>,
+    /// mlx tuning override; replaces the global `[mlx]` struct for
+    /// this model. Ignored unless the active engine is an `mlx`
+    /// engine.
+    #[serde(default)]
+    pub mlx: Option<MlxTuning>,
     /// Pin this model to one engine — an exact engine tag (`b10980-cuda`)
     /// or a kind (`llamacpp` / `sglang` / `mistralrs`). Wins over both
     /// `[engine_routing]` modes; a tag that is not installed fails loudly
@@ -1464,6 +1598,81 @@ pub struct SglangTuning {
     pub max_lora_rank: Option<u32>,
     /// `--lora-backend` (pytorch, flashinfer).
     pub lora_backend: Option<String>,
+    /// `--speculative-algorithm` ("ngram" -> NGRAM): prompt-based
+    /// draft-free self-speculation — the drafter is the context itself
+    /// (n-gram lookup), so there are no draft weights to pull and no
+    /// admission charge beyond verify-KV. DFLASH is deliberately not
+    /// offered: sglang 0.5.21 hard-requires --speculative-draft-model-path
+    /// for it (2026-10-09 live receipt: `ValueError` at spawn), which puts
+    /// it in the draft-pair lane, not the knob lane.
+    /// Verified output stays distribution-identical to dense decode
+    /// (rejection sampling); bench before adopting at scale —
+    /// verification overhead can regress non-repetitive workloads and
+    /// C >= 2 aggregate throughput. 2026-10-09 live receipts
+    /// (qwen3-1.7b, RTX 4070): ngram lost to dense at every concurrency
+    /// (-16% C1, -44% C8, +12s cold), so the default stays off — this
+    /// knob is opt-in. Bundle constraint: greedy (temperature 0)
+    /// requests only; non-greedy sampling drives the flashinfer
+    /// verify kernel through a JIT path whose bundled toolchain
+    /// mismatch crashes the engine (Ninja build failed) on the
+    /// sglang 0.5.21 venv. Pair with `attention_backend = "triton"`
+    /// (flashinfer attention verify kernels hit the same JIT defect
+    /// at graph capture). The EAGLE family rides the
+    /// draft-pair lane (`spec = "eagle3"` + a pulled safetensors
+    /// draft), not this knob.
+    pub spec_algorithm: Option<String>,
+    /// `--speculative-num-steps`: draft tokens proposed per verify
+    /// round.
+    pub spec_num_steps: Option<u32>,
+    /// `--speculative-num-draft-tokens`: token slots verified per
+    /// round; upstream relates it to `num_steps` per algorithm and
+    /// enforces its own grammar at spawn.
+    pub spec_num_draft_tokens: Option<u32>,
+    /// `--speculative-eagle-topk`: EAGLE-family draft-tree fanout —
+    /// how many candidate heads the draft step expands per level.
+    /// Depth knob for the EAGLE3 draft-pair lane (and any future
+    /// draft-model algorithm); meaningless without speculation
+    /// engaged, which the profile compiler guarantees by emitting it
+    /// only alongside `--speculative-algorithm`.
+    pub speculative_eagle_topk: Option<u32>,
+    /// `--speculative-accept-threshold-single` (0.0..=1.0): accept a
+    /// draft token when its target probability clears the bar.
+    /// Lower = more aggressive acceptance (faster, drifts further
+    /// from the dense distribution in expectation; rejection
+    /// sampling keeps it lossless only at the upstream defaults).
+    pub speculative_accept_threshold_single: Option<f64>,
+    /// `--speculative-accept-threshold-acc` (0.0..=1.0): raises a
+    /// draft token's accept probability from p to min(1, p / t) —
+    /// the cumulative counterpart of the single-token threshold.
+    pub speculative_accept_threshold_acc: Option<f64>,
+    /// `--mm-attention-backend`: multimodal attention backend. No
+    /// blazar-side choice list — the upstream enum is long,
+    /// hardware-specific, and still growing; the engine's own
+    /// argparse rejects typos at spawn (fail fast, no silent pass).
+    pub mm_attention_backend: Option<String>,
+    /// `--retraction-policy` (`length` / `priority`): which requests
+    /// give back decode slots when the KV cache runs full under
+    /// saturation. `priority` honors per-request scheduling
+    /// priority; `length` retracts the longest sequences first
+    /// (upstream default).
+    pub retraction_policy: Option<String>,
+    /// `--enable-two-batch-overlap`: overlap the compute of
+    /// consecutive micro-batches (TBO) to hide communication under
+    /// tensor/pipeline parallelism. Payoff grows with tp/pp > 1;
+    /// on a single 8 GB card it mostly adds capture-time memory.
+    pub enable_two_batch_overlap: Option<bool>,
+    /// `--enable-tf32-matmul`: allow TF32 (19-bit mantissa math) for
+    /// float32 matmuls on Ampere+ — faster fp32 paths, bitwise
+    /// different from strict fp32. Off keeps strict fp32.
+    pub enable_tf32_matmul: Option<bool>,
+    /// `--enable-priority-scheduling`: schedule by request priority
+    /// instead of arrival order. Required companion of
+    /// `retraction_policy = "priority"` — sglang 0.5.21 refuses the
+    /// pair at spawn otherwise (2026-10-10 live receipt: engine dies
+    /// during load with "retraction-policy priority requires
+    /// enable-priority-scheduling"); `validate` enforces it here so
+    /// the config fails fast before any spawn.
+    pub enable_priority_scheduling: Option<bool>,
 }
 
 impl SglangTuning {
@@ -1536,6 +1745,20 @@ impl SglangTuning {
                 "{where_}.max_total_tokens must be >= 1, got 0"
             )));
         }
+        if let Some(t) = self.speculative_accept_threshold_single
+            && !(0.0..=1.0).contains(&t)
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.speculative_accept_threshold_single must be 0.0..=1.0, got {t}"
+            )));
+        }
+        if let Some(t) = self.speculative_accept_threshold_acc
+            && !(0.0..=1.0).contains(&t)
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.speculative_accept_threshold_acc must be 0.0..=1.0, got {t}"
+            )));
+        }
         Ok(())
     }
 
@@ -1584,6 +1807,27 @@ impl SglangTuning {
         ) {
             return Err(e);
         }
+        if let Some(e) = choice("spec_algorithm", &self.spec_algorithm, &["ngram"]) {
+            return Err(e);
+        }
+        if let Some(e) = choice(
+            "retraction_policy",
+            &self.retraction_policy,
+            &["length", "priority"],
+        ) {
+            return Err(e);
+        }
+        // Cross-field dependency verified live on 0.5.21: the engine
+        // refuses `--retraction-policy priority` without
+        // `--enable-priority-scheduling` during load; catch it here so
+        // the config fails fast instead of a spawn-time crash.
+        if self.retraction_policy.as_deref() == Some("priority")
+            && self.enable_priority_scheduling != Some(true)
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.retraction_policy = \"priority\" requires {where_}.enable_priority_scheduling = true (engine prerequisite)"
+            )));
+        }
         Ok(())
     }
 
@@ -1608,6 +1852,9 @@ impl SglangTuning {
             ("pp_size", self.pp_size),
             ("ep_size", self.ep_size),
             ("max_lora_rank", self.max_lora_rank),
+            ("spec_num_steps", self.spec_num_steps),
+            ("spec_num_draft_tokens", self.spec_num_draft_tokens),
+            ("speculative_eagle_topk", self.speculative_eagle_topk),
         ] {
             if let Some(e) = min_one_u32(field, v) {
                 return Err(e);
@@ -1629,10 +1876,111 @@ impl SglangTuning {
     }
 }
 
+/// mlx-lm server tuning knobs. All-`Option` on purpose: `None` never
+/// emits a flag (upstream default applies); emission is
+/// manifest-flag-gated at profile-compile with the usual warn-skip.
+/// Grammar mirrors the installed mlx-lm 0.32.0 `--help`. Sampling
+/// defaults (`--temp` and friends) are deliberately not here: the
+/// gateway owns sampling per request, same as the llama lane.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MlxTuning {
+    /// `--draft-model`: path to a smaller MLX model that drafts tokens
+    /// for speculative decoding (the target model verifies). The draft
+    /// must share the target's tokenizer; pull it like any other model
+    /// and point this at its directory.
+    pub draft_model: Option<String>,
+    /// `--num-draft-tokens`: how many tokens the draft proposes per
+    /// verify round. Only meaningful with `draft_model`.
+    pub num_draft_tokens: Option<u32>,
+    /// `--kv-bits`: KV cache quantization width (e.g. 4 or 8) —
+    /// shrinks memory so longer contexts fit in unified memory.
+    /// Trade-off straight from upstream help: this DISABLES BATCHING
+    /// (the server serves one request at a time).
+    pub kv_bits: Option<u32>,
+    /// `--kv-group-size`: number of KV head groups sharing one
+    /// quantization scale. Only meaningful with `kv_bits`.
+    pub kv_group_size: Option<u32>,
+    /// `--quantized-kv-start`: layer index where KV quantization
+    /// begins (earlier layers stay full precision). Only meaningful
+    /// with `kv_bits`.
+    pub quantized_kv_start: Option<u32>,
+    /// `--prefill-step-size`: tokens per prefill chunk (upstream
+    /// default 2048). Smaller steps cut peak memory and first-token
+    /// latency on long prompts.
+    pub prefill_step_size: Option<u32>,
+    /// `--prompt-cache-size`: maximum number of distinct KV caches the
+    /// server keeps for prompt reuse; oldest evict.
+    pub prompt_cache_size: Option<u32>,
+    /// `--prompt-cache-bytes`: byte ceiling for the prompt cache pool.
+    pub prompt_cache_bytes: Option<u64>,
+    /// `--decode-concurrency`: concurrent decode workers.
+    pub decode_concurrency: Option<u32>,
+    /// `--prompt-concurrency`: concurrent prefill workers.
+    pub prompt_concurrency: Option<u32>,
+    /// `--chat-template`: name of a non-default chat template, or a
+    /// path to one.
+    pub chat_template: Option<String>,
+    /// `--chat-template-args`: JSON kwargs passed to the chat
+    /// template renderer.
+    pub chat_template_args: Option<String>,
+    /// `--use-default-chat-template`: force the model's own default
+    /// template over the server's builtin.
+    pub use_default_chat_template: Option<bool>,
+    /// `--trust-remote-code`: allow models with custom Python code.
+    pub trust_remote_code: Option<bool>,
+    /// `--adapter-path`: `LoRA` adapter directory applied at spawn.
+    pub adapter_path: Option<String>,
+}
+
+impl MlxTuning {
+    /// Per-model resolution: override replaces global (not merges),
+    /// mirroring the sglang/mistralrs tuning structs.
+    #[must_use]
+    pub fn effective(override_: Option<&MlxTuning>, global: &MlxTuning) -> MlxTuning {
+        override_.cloned().unwrap_or_else(|| global.clone())
+    }
+
+    /// `>= 1` floors for counts and sizes; catches zero typos at
+    /// config-write time instead of an opaque server death at spawn.
+    fn validate(&self, where_: &str) -> Result<(), CoreError> {
+        let min_one_u32 = |field: &str, v: Option<u32>| -> Option<CoreError> {
+            v.filter(|n| *n == 0)
+                .map(|_| CoreError::Config(format!("{where_}.{field} must be >= 1, got 0")))
+        };
+        for (field, v) in [
+            ("kv_bits", self.kv_bits),
+            ("kv_group_size", self.kv_group_size),
+            ("prefill_step_size", self.prefill_step_size),
+            ("prompt_cache_size", self.prompt_cache_size),
+            ("decode_concurrency", self.decode_concurrency),
+            ("prompt_concurrency", self.prompt_concurrency),
+        ] {
+            if let Some(e) = min_one_u32(field, v) {
+                return Err(e);
+            }
+        }
+        // num_draft_tokens and quantized_kv_start legitimately accept 0
+        // upstream: the request validator floors num_draft_tokens at 0
+        // (0 = propose nothing, speculation off while the draft model
+        // stays loaded), and quantized-kv-start is a token POSITION with
+        // default 5000 (0 = quantize from the first token).
+        if let Some(b) = self.prompt_cache_bytes
+            && b == 0
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.prompt_cache_bytes must be >= 1, got 0"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// mistral.rs `serve` tuning knobs. All-`Option` on purpose: `None`
 /// never emits a flag (upstream default applies); emission is
 /// manifest-flag-gated at profile-compile with the usual warn-skip.
-/// Grammar mirrors the installed v0.9.3 `mistralrs serve --help`.
+/// Grammar mirrors the installed v0.9.4 `mistralrs serve --help`
+/// (verified live: every translator flag exists on bare `serve`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MistralrsTuning {
@@ -1658,6 +2006,11 @@ pub struct MistralrsTuning {
     /// `--pa-context-len`: allocate paged KV for this context length
     /// instead of a VRAM fraction.
     pub pa_context_len: Option<u64>,
+    /// `--pa-memory-mb` (v0.9.4): absolute paged-KV pool in MiB instead
+    /// of the VRAM-fraction derive — the pin to reach for when the GPU
+    /// is shared with non-inference residents and a fraction would
+    /// overcommit.
+    pub pa_memory_mb: Option<u64>,
     /// `--enable-lora`: enable dynamic `LoRA` serving without preloading
     /// an adapter. `LoRA` runtime limits only take effect with this or a
     /// preloaded adapter (upstream rejects bare limits).
@@ -1692,6 +2045,27 @@ pub struct MistralrsTuning {
     pub disable_metrics: Option<bool>,
     /// `--disable-access-log`: turn the child's HTTP access log off.
     pub disable_access_log: Option<bool>,
+    /// `--chat-template` (v0.9.4): override the checkpoint's chat
+    /// template. Blazar's `model_overrides` `chat_template` XOR
+    /// `chat_template_file` grammar stays llamacpp-dialect; this knob
+    /// is the mistralrs-lane equivalent for template-name pins.
+    pub chat_template: Option<String>,
+    /// `--isq`: in-situ quantization target applied while weights load
+    /// (numeric level `2..8` or a quant name like `q4k`, `q8_0`).
+    /// Shrinks the resident model below its on-disk size, so blazar's
+    /// admission (which charges the checkpoint bytes) stays
+    /// conservative — the fit ladder over-reserves rather than
+    /// under-reserving. Engine-owned vocabulary: an unknown level fails
+    /// loudly at spawn with upstream's own error.
+    pub isq: Option<String>,
+    /// `--imatrix`: importance-matrix file that steers `isq`
+    /// quantization toward lower-loss weight groups. Unset = plain ISQ.
+    pub imatrix: Option<String>,
+    /// `--calibration-file`: calibration data for imatrix generation.
+    /// Unset = none.
+    pub calibration_file: Option<String>,
+    /// `--isq-organization`: ISQ layout strategy — `default` or `moqe`.
+    pub isq_organization: Option<String>,
     /// `--device-layers`: layer mapping `ORD:NUM;...` (e.g.
     /// `0:10;1:20`). Single-GPU boxes get a teaching warning.
     pub device_layers: Option<String>,
@@ -1724,6 +2098,7 @@ impl MistralrsTuning {
             ),
             ("pa_block_size", self.pa_block_size == Some(0)),
             ("pa_context_len", self.pa_context_len == Some(0)),
+            ("pa_memory_mb", self.pa_memory_mb == Some(0)),
             ("lora_max_rank", self.lora_max_rank == Some(0)),
             ("lora_max_adapters", self.lora_max_adapters == Some(0)),
             ("lora_max_bytes", self.lora_max_bytes == Some(0)),
@@ -1757,6 +2132,16 @@ impl MistralrsTuning {
         {
             return Err(CoreError::Config(format!(
                 "{where_}.pa_cache_type must be one of [\"auto\", \"f8e4m3\"], got {s:?}"
+            )));
+        }
+        // ISQ layout strategy: engine-owned quant levels (`isq`) stay
+        // unvalidated on purpose (the accepted set widens with engine
+        // builds); the organization switch is a fixed two-value enum.
+        if let Some(s) = &self.isq_organization
+            && !["default", "moqe"].contains(&s.as_str())
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.isq_organization must be one of [\"default\", \"moqe\"], got {s:?}"
             )));
         }
         if let Some(layers) = &self.device_layers {
@@ -2440,6 +2825,16 @@ impl Default for Config {
             whisper_stream_chunk_ms: default_whisper_stream_chunk_ms(),
             whisper_vad_model: None,
             whisper_extra_args: None,
+            whisper_beam_size: None,
+            whisper_best_of: None,
+            whisper_entropy_thold: None,
+            whisper_logprob_thold: None,
+            whisper_word_thold: None,
+            whisper_diarize: false,
+            whisper_tinydiarize: false,
+            whisper_vad_threshold: None,
+            whisper_vad_min_speech_duration_ms: None,
+            whisper_vad_min_silence_duration_ms: None,
             sdcpp_qwen_prefix_cache_type: None,
             capability_registry_url: None,
             fork_retire_days: default_fork_retire_days(),
@@ -2452,6 +2847,7 @@ impl Default for Config {
             mistralrs_paged_attn: None,
             mistralrs: MistralrsTuning::default(),
             sglang: SglangTuning::default(),
+            mlx: MlxTuning::default(),
             spec: "auto".to_string(),
             spec_autopull: false,
             spec_auto_ngram: true,
@@ -2491,6 +2887,20 @@ impl Default for Config {
             sdcpp_model_args: None,
             sdcpp_extra_args: None,
             sdcpp_tensor_type_rules: None,
+            sdcpp_control_net: None,
+            sdcpp_ip_adapter: None,
+            sdcpp_clip_vision: None,
+            sdcpp_motion_module: None,
+            sdcpp_photo_maker: None,
+            sdcpp_pulid_weights: None,
+            sdcpp_upscale_model: None,
+            sdcpp_lora_model_dir: None,
+            sdcpp_hires_upscalers_dir: None,
+            sdcpp_embd_dir: None,
+            sdcpp_audio_encoder: None,
+            sdcpp_high_noise_diffusion_model: None,
+            sdcpp_uncond_diffusion_model: None,
+            sdcpp_backend: None,
             media_job_wait_secs: 900,
             sentinel_enforce: false,
             audit_log: true,
@@ -2807,20 +3217,34 @@ const SECTION_FIELDS: &[(&str, &[&str])] = &[
         "diffusion",
         &[
             "sdcpp_child_header_timeout_secs",
+            "sdcpp_audio_encoder",
+            "sdcpp_backend",
             "sdcpp_cache_mode",
             "sdcpp_cache_option",
+            "sdcpp_clip_vision",
             "sdcpp_conditioning_cache_size",
+            "sdcpp_control_net",
+            "sdcpp_embd_dir",
             "sdcpp_extra_args",
             "sdcpp_flash_attention",
+            "sdcpp_high_noise_diffusion_model",
+            "sdcpp_hires_upscalers_dir",
+            "sdcpp_ip_adapter",
+            "sdcpp_lora_model_dir",
             "sdcpp_max_vram",
             "sdcpp_model_args",
+            "sdcpp_motion_module",
             "sdcpp_params_backend",
+            "sdcpp_photo_maker",
+            "sdcpp_pulid_weights",
             "sdcpp_qwen_prefix_cache_type",
             "sdcpp_rpc_servers",
             "sdcpp_sage_attn",
             "sdcpp_split_mode",
             "sdcpp_tae",
             "sdcpp_tensor_type_rules",
+            "sdcpp_uncond_diffusion_model",
+            "sdcpp_upscale_model",
             "sdcpp_vae_tiling",
         ],
     ),
@@ -2831,6 +3255,16 @@ const SECTION_FIELDS: &[(&str, &[&str])] = &[
             "whisper_stream_chunk_ms",
             "whisper_vad_model",
             "whisper_extra_args",
+            "whisper_beam_size",
+            "whisper_best_of",
+            "whisper_entropy_thold",
+            "whisper_logprob_thold",
+            "whisper_word_thold",
+            "whisper_diarize",
+            "whisper_tinydiarize",
+            "whisper_vad_threshold",
+            "whisper_vad_min_speech_duration_ms",
+            "whisper_vad_min_silence_duration_ms",
         ],
     ),
     (
@@ -3672,6 +4106,7 @@ impl Config {
         }
         self.sglang.validate("sglang")?;
         self.mistralrs.validate("mistralrs")?;
+        self.mlx.validate("mlx")?;
         for (name, o) in &self.model_overrides {
             if let Some(t) = &o.sglang {
                 t.validate(&format!("model_overrides.{name}.sglang"))?;
@@ -3825,6 +4260,7 @@ impl Config {
             )));
         }
         self.validate_sdcpp_tuning()?;
+        self.validate_whisper_tuning()?;
         if self.media_job_wait_secs != 0 && !(5..=86_400).contains(&self.media_job_wait_secs) {
             return Err(CoreError::Config(format!(
                 "media_job_wait_secs must be 0 (no cap) or 5..=86400, got {}",
@@ -3834,11 +4270,81 @@ impl Config {
         Ok(())
     }
 
+    /// Whisper decode/VAD knobs: floors mirror the upstream defaults'
+    /// own valid ranges (-1 beam = greedy sentinel, so a SET beam must
+    /// be a real beam >= 1); VAD thresholds are probabilities; the VAD
+    /// tuning knobs are hard errors without a VAD model — a silent
+    /// no-op would hide that half the configuration is inert.
+    fn validate_whisper_tuning(&self) -> CoreResult<()> {
+        if self.whisper_beam_size == Some(0) {
+            return Err(CoreError::Config(
+                "whisper_beam_size must be >= 1 (unset = engine greedy default)".into(),
+            ));
+        }
+        if self.whisper_best_of.is_some_and(|n| n < 1) {
+            return Err(CoreError::Config(
+                "whisper_best_of must be >= 1, got a smaller value".into(),
+            ));
+        }
+        for (field, value) in [
+            ("whisper_vad_threshold", self.whisper_vad_threshold),
+            (
+                "whisper_vad_min_speech_duration_ms",
+                self.whisper_vad_min_speech_duration_ms.map(f64::from),
+            ),
+            (
+                "whisper_vad_min_silence_duration_ms",
+                self.whisper_vad_min_silence_duration_ms.map(f64::from),
+            ),
+        ] {
+            if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                return Err(CoreError::Config(format!(
+                    "{field} must be a finite non-negative number"
+                )));
+            }
+        }
+        if self
+            .whisper_vad_threshold
+            .is_some_and(|t| !(0.0..=1.0).contains(&t))
+        {
+            return Err(CoreError::Config(
+                "whisper_vad_threshold must be within 0.0..=1.0".into(),
+            ));
+        }
+        let vad_on = self
+            .whisper_vad_model
+            .as_deref()
+            .is_some_and(|m| !m.trim().is_empty());
+        let vad_knob_set = self.whisper_vad_threshold.is_some()
+            || self.whisper_vad_min_speech_duration_ms.is_some()
+            || self.whisper_vad_min_silence_duration_ms.is_some();
+        if vad_knob_set && !vad_on {
+            return Err(CoreError::Config(
+                "whisper_vad_threshold / whisper_vad_min_speech_duration_ms / \
+                 whisper_vad_min_silence_duration_ms require whisper_vad_model — \
+                 set the Silero VAD model or drop the VAD tuning knobs"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// sd-server tuning knobs share one home, extracted from
     /// `validate_time_bounds` to stay under its line budget: cache
     /// mode/option shapes, per-device VRAM budgets, weight-placement
     /// vocabularies, and the conditioning-cache bound.
     fn validate_sdcpp_tuning(&self) -> CoreResult<()> {
+        // IP-Adapter conditioning is meaningless without its CLIP-vision
+        // encoder — upstream refuses the pair at boot; refusing at
+        // config-write time teaches the fix in the error itself.
+        if self.sdcpp_ip_adapter.is_some() && self.sdcpp_clip_vision.is_none() {
+            return Err(CoreError::Config(
+                "sdcpp_ip_adapter requires sdcpp_clip_vision (the IP-Adapter \
+                 conditions on CLIP-vision image embeddings) — set both or drop \
+                 sdcpp_ip_adapter"
+                    .into(),
+            ));
+        }
         let sdcpp_cache_modes: &[&str] = &[
             "easycache",
             "ucache",
@@ -5080,6 +5586,246 @@ mod tests {
         let _ = std::fs::write(&good, b"ggml");
         assert!(cfg.validate().is_ok());
         let _ = std::fs::remove_file(&d);
+    }
+
+    #[test]
+    fn unit__sglang_tuning__spec_algorithm_vocabulary_and_floors() {
+        // Draft-free algorithms only: eagle family rides the resolved
+        // draft-pair lane, so a bare string pin cannot request it;
+        // dflash needs --speculative-draft-model-path upstream
+        // (2026-10-09 receipt) and is rejected the same way.
+        SglangTuning {
+            spec_algorithm: Some("ngram".into()),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap_or_else(|e| panic!("spec_algorithm ngram must validate: {e}"));
+        for bad in ["eagle", "EAGLE3", "dspark", "mtp", "dflash"] {
+            assert!(
+                SglangTuning {
+                    spec_algorithm: Some(bad.into()),
+                    ..Default::default()
+                }
+                .validate("sglang")
+                .is_err(),
+                "spec_algorithm {bad} must be rejected"
+            );
+        }
+        // Zero counts are configuration typos, not valid knobs.
+        for tun in [
+            SglangTuning {
+                spec_num_steps: Some(0),
+                ..Default::default()
+            },
+            SglangTuning {
+                spec_num_draft_tokens: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                tun.validate("sglang").is_err(),
+                "zero spec counts must be rejected"
+            );
+        }
+        SglangTuning {
+            spec_num_steps: Some(3),
+            spec_num_draft_tokens: Some(4),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap();
+    }
+
+    #[test]
+    fn unit__sglang_tuning__depth_knob_validation() {
+        // retraction_policy is a closed upstream vocabulary; the accept
+        // thresholds are probabilities (0..=1); eagle-topk is a count.
+        // priority retraction carries an engine-required companion
+        // (enable_priority_scheduling), enforced here so the config
+        // fails before any spawn.
+        SglangTuning {
+            retraction_policy: Some("priority".into()),
+            enable_priority_scheduling: Some(true),
+            speculative_eagle_topk: Some(4),
+            speculative_accept_threshold_single: Some(0.1),
+            speculative_accept_threshold_acc: Some(0.95),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap();
+        SglangTuning {
+            retraction_policy: Some("length".into()),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap();
+        assert!(
+            SglangTuning {
+                retraction_policy: Some("priority".into()),
+                ..Default::default()
+            }
+            .validate("sglang")
+            .is_err(),
+            "priority retraction without enable_priority_scheduling must be rejected"
+        );
+        for bad in ["random", "fcfs", ""] {
+            assert!(
+                SglangTuning {
+                    retraction_policy: Some(bad.into()),
+                    ..Default::default()
+                }
+                .validate("sglang")
+                .is_err(),
+                "retraction_policy {bad:?} must be rejected"
+            );
+        }
+        for (single, acc) in [(Some(-0.1), None), (Some(1.5), None), (None, Some(2.0))] {
+            assert!(
+                SglangTuning {
+                    speculative_accept_threshold_single: single,
+                    speculative_accept_threshold_acc: acc,
+                    ..Default::default()
+                }
+                .validate("sglang")
+                .is_err(),
+                "thresholds {single:?}/{acc:?} outside 0..=1 must be rejected"
+            );
+        }
+        assert!(
+            SglangTuning {
+                speculative_eagle_topk: Some(0),
+                ..Default::default()
+            }
+            .validate("sglang")
+            .is_err(),
+            "eagle-topk 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn unit__whisper_tuning__knob_validation() {
+        // A set beam must be a real beam (0 is the sentinel-free invalid);
+        // VAD thresholds are probabilities; VAD tuning without a VAD
+        // model is a hard error (the knobs would be silently inert).
+        let bad = [
+            Config {
+                whisper_beam_size: Some(0),
+                ..Config::default()
+            },
+            Config {
+                whisper_vad_threshold: Some(1.5),
+                whisper_vad_model: Some("silero-vad-v5.ggml".into()),
+                ..Config::default()
+            },
+            Config {
+                whisper_vad_min_speech_duration_ms: Some(100),
+                ..Config::default()
+            },
+        ];
+        for cfg in &bad {
+            assert!(
+                cfg.validate().is_err(),
+                "expected rejection: {:?}",
+                cfg.validate().err()
+            );
+        }
+        let good = Config {
+            whisper_vad_model: Some("silero-vad-v5.ggml".into()),
+            whisper_vad_threshold: Some(0.45),
+            whisper_vad_min_silence_duration_ms: Some(120),
+            whisper_beam_size: Some(5),
+            whisper_diarize: true,
+            ..Config::default()
+        };
+        assert!(good.validate().is_ok(), "{:?}", good.validate().err());
+    }
+
+    #[test]
+    fn unit__sdcpp_components__ip_adapter_requires_clip_vision() {
+        // Upstream refuses --ip-adapter without --clip_vision at boot;
+        // blazar refuses at config-write time with the fix in the error.
+        let lone = Config {
+            sdcpp_ip_adapter: Some("/models/ip-adapter.safetensors".into()),
+            ..Config::default()
+        };
+        let err = lone.validate().unwrap_err().to_string();
+        assert!(err.contains("sdcpp_clip_vision"), "{err}");
+        let pair = Config {
+            sdcpp_ip_adapter: Some("/models/ip-adapter.safetensors".into()),
+            sdcpp_clip_vision: Some("/models/clip_vision.safetensors".into()),
+            ..Config::default()
+        };
+        assert!(pair.validate().is_ok(), "{:?}", pair.validate().err());
+    }
+
+    #[test]
+    fn unit__mlx_tuning__floors_and_unknown_field_rejected() {
+        // Zero counts/sizes are configuration typos, not valid knobs.
+        for field in [
+            MlxTuning {
+                kv_bits: Some(0),
+                ..Default::default()
+            },
+            MlxTuning {
+                kv_group_size: Some(0),
+                ..Default::default()
+            },
+            MlxTuning {
+                prefill_step_size: Some(0),
+                ..Default::default()
+            },
+            MlxTuning {
+                prompt_cache_size: Some(0),
+                ..Default::default()
+            },
+            MlxTuning {
+                prompt_cache_bytes: Some(0),
+                ..Default::default()
+            },
+            MlxTuning {
+                decode_concurrency: Some(0),
+                ..Default::default()
+            },
+            MlxTuning {
+                prompt_concurrency: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                field.validate("mlx").is_err(),
+                "zero mlx counts must be rejected"
+            );
+        }
+        // 0 is legitimate upstream for these two (verified in the
+        // installed mlx_lm 0.32.0 source): num_draft_tokens floors at 0
+        // server-side (0 = no drafting), quantized_kv_start is a token
+        // position with default 5000.
+        MlxTuning {
+            num_draft_tokens: Some(0),
+            quantized_kv_start: Some(0),
+            ..Default::default()
+        }
+        .validate("mlx")
+        .unwrap();
+        MlxTuning {
+            draft_model: Some("/models/qwen3-0.5b-4bit.d".into()),
+            num_draft_tokens: Some(3),
+            kv_bits: Some(4),
+            kv_group_size: Some(32),
+            quantized_kv_start: Some(8),
+            prefill_step_size: Some(512),
+            prompt_cache_size: Some(16),
+            prompt_cache_bytes: Some(1 << 30),
+            decode_concurrency: Some(4),
+            prompt_concurrency: Some(4),
+            ..Default::default()
+        }
+        .validate("mlx")
+        .unwrap();
+        // Unknown keys fail loudly at parse (deny_unknown_fields) —
+        // typos must not silently no-op.
+        let bad = toml::from_str::<MlxTuning>(r"typo_field = 1");
+        assert!(bad.is_err(), "unknown mlx knob must be rejected");
     }
 
     #[test]

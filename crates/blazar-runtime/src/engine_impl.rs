@@ -1427,6 +1427,14 @@ impl Engine for MlxEngine {
         endpoint: &Endpoint,
         spawn_env: &[(String, String)],
     ) -> Result<ChildHandle> {
+        // mlx_lm resolves an unrecognized request-body `model` through
+        // the HF hub at REQUEST time (live-proven 2026-10-09: a bare
+        // name made it fetch huggingface.co/api/models/<name> → 401 →
+        // every chat 404s). blazar only ever serves local model dirs
+        // here, so a hub round-trip mid-request is never useful — pin
+        // offline so any stray name fails fast and locally instead of
+        // phoning home. A user-set value always survives.
+        const HF_HUB_OFFLINE: &str = "HF_HUB_OFFLINE";
         if matches!(endpoint, Endpoint::Unix { .. }) {
             return Err(anyhow!(
                 "mlx engines have no unix-socket transport; set \
@@ -1489,6 +1497,13 @@ impl Engine for MlxEngine {
                     tracing::debug!("mlx spawn: CUDA_HOME -> engine-local cuda-home");
                 }
             }
+        }
+        // A stray bare model name now fails fast and locally (const
+        // pinned at the top of this spawn).
+        let have_user =
+            env.iter().any(|(k, _)| k == HF_HUB_OFFLINE) || std::env::var(HF_HUB_OFFLINE).is_ok();
+        if !have_user {
+            env.push((HF_HUB_OFFLINE.to_string(), "1".to_string()));
         }
         // spawn_env applies last: a pinned CUDA_VISIBLE_DEVICES pair
         // survives the LD_LIBRARY_PATH surgery above.

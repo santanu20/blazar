@@ -884,6 +884,20 @@ pub async fn proxy_request(
     let url = format!("{base}{path_query}");
     let began = std::time::Instant::now();
 
+    // SGLang LoRA-variant stamp (`base:adapter` — the engine's own
+    // per-request adapter selection), computed from the body's model
+    // spelling; recomputed on the mid-request respawn retry below so
+    // the fresh child sees the identical body.
+    let variant_stamp = sglang_variant_stamp(
+        state,
+        engine,
+        parsed
+            .as_ref()
+            .and_then(|v| v.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .or(Some(model)),
+    );
+
     // Child-boundary body mutations, composed on the hot lane's single
     // parse: R6 include_usage forcing (stream warm/cold classification
     // data; ollama lane does the same in its translator), the per-engine
@@ -891,7 +905,13 @@ pub async fn proxy_request(
     // serialization — a chain of per-mutator re-serializations would
     // silently drop whichever mutations ran first (each rebuilt the body
     // from the ORIGINAL parse, not its predecessor's output).
-    let body = apply_child_request_mutations(engine, path_query, body, parsed.as_ref());
+    let body = apply_child_request_mutations_stamped(
+        engine,
+        path_query,
+        body,
+        parsed.as_ref(),
+        variant_stamp.as_deref(),
+    );
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
     // coalesce AT THE CHILD-CALL BOUNDARY. Two acquisition phases:
@@ -1003,11 +1023,21 @@ pub async fn proxy_request(
                         "proxy {path_query}: child died mid-request; retrying once on respawned lane {}",
                         fresh.key
                     );
-                    let retry_body = apply_child_request_mutations(
+                    let retry_stamp = sglang_variant_stamp(
+                        state,
+                        &fresh,
+                        parsed
+                            .as_ref()
+                            .and_then(|v| v.get("model"))
+                            .and_then(serde_json::Value::as_str)
+                            .or(Some(model)),
+                    );
+                    let retry_body = apply_child_request_mutations_stamped(
                         &fresh,
                         path_query,
                         body_snapshot.clone(),
                         parsed.as_ref(),
+                        retry_stamp.as_deref(),
                     );
                     body_snapshot = retry_body.clone();
                     match forward_once(state, &fresh, method, &fresh_url, headers, retry_body).await
@@ -1867,9 +1897,23 @@ pub(crate) fn child_model_stamp_predicted(
     lane.tag.as_ref()?;
     match lane.kind {
         EngineKind::MistralRs => Some("default".to_string()),
-        EngineKind::Sglang => Some(blazar_core::engine_kind::sglang_child_model_name(
-            model_name,
-        )),
+        EngineKind::Sglang => {
+            // Router-mode variant requests ride the base child and name
+            // the adapter through sglang's own `base:adapter` syntax.
+            // The stem is used as spelled: this is a PRE-spawn
+            // prediction (store rows are not re-read here); the
+            // supervisor validates the adapter at ensure time.
+            let (base, stem) = blazar_core::catalog::split_lora_suffix(model_name);
+            match stem {
+                Some(stem) => Some(format!(
+                    "{}:{stem}",
+                    blazar_core::engine_kind::sglang_child_model_name(base)
+                )),
+                None => Some(blazar_core::engine_kind::sglang_child_model_name(
+                    model_name,
+                )),
+            }
+        }
         // same mlx contract as `child_model_stamp` — the spawn-time
         // prediction must equal what the running child registers.
         EngineKind::Mlx => Some(model_path.to_string()),
@@ -1994,6 +2038,58 @@ pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<String> {
     }
 }
 
+/// sglang variant stamp: a `model+adapter` request riding the base
+/// child must NAME the adapter in the child's native `base:adapter`
+/// model syntax — the engine's own per-request adapter selection; the
+/// caller's `+stem` spelling selects nothing there. The registered
+/// adapter name is the adapter path's file stem (see
+/// `profile::push_sglang_loras`), resolved through the same matching the
+/// supervisor's lane resolution accepts (file-name OR file-stem), so
+/// every accepted spelling maps to the name the child registered.
+/// `None` = not an sglang variant (the caller keeps the plain stamp).
+pub(crate) fn sglang_variant_stamp(
+    state: &Arc<AppState>,
+    engine: &EngineRef,
+    requested_model: Option<&str>,
+) -> Option<String> {
+    use blazar_core::engine_kind::EngineKind;
+    if engine.kind != EngineKind::Sglang {
+        return None;
+    }
+    let requested = requested_model?;
+    let (base, stem) = blazar_core::catalog::split_lora_suffix(requested);
+    let stem = stem?;
+    // The base half may arrive in any spelling the resolver accepts
+    // (tag alias, prefix); canonicalize before comparing to the
+    // child's registered name so `m1:q4+ad` stamps `m1:ad`.
+    let canonical = state
+        .with_store(|s| resolve_model(s, base))
+        .and_then(std::result::Result::ok);
+    if canonical
+        .as_ref()
+        .is_some_and(|row| row.name != engine.name)
+    {
+        return None;
+    }
+    let rows = state
+        .with_store(|s| s.list_loras(Some(&engine.name)))
+        .and_then(std::result::Result::ok)?;
+    let registered = blazar_core::catalog::lora_registered_name(&rows, stem)?;
+    Some(format!("{}:{registered}", engine.name))
+}
+
+/// Per-engine child stamp with the sglang LoRA-variant override folded
+/// in — the single derivation every direct-stamp callsite should use:
+/// a `base+adapter` request on the sglang lane stamps the engine's
+/// native `base:adapter` form, everything else keeps the plain stamp.
+pub(crate) fn child_model_stamp_for(
+    state: &Arc<AppState>,
+    engine: &EngineRef,
+    requested_model: Option<&str>,
+) -> Option<String> {
+    sglang_variant_stamp(state, engine, requested_model).or_else(|| child_model_stamp(engine))
+}
+
 /// One parse, one `Value`, one serialization for ALL child-boundary body
 /// mutations, in order: `R6` `include_usage` forcing (chat streams), the
 /// per-engine model stamp (`child_model_stamp`), and the mistral.rs
@@ -2005,16 +2101,35 @@ pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<String> {
 /// the ORIGINAL parse, silently dropping every earlier mutation
 /// (mistral.rs chats lost their `default` model stamp whenever the think
 /// bridge fired, and stamped lanes lost `include_usage`).
+/// Plain-stamp convenience wrapper — test-call sites and any lane
+/// without a variant stamp to thread.
+#[cfg(test)]
 pub(crate) fn apply_child_request_mutations(
     engine: &EngineRef,
     path_query: &str,
     body: axum::body::Bytes,
     parsed: Option<&serde_json::Value>,
 ) -> axum::body::Bytes {
+    apply_child_request_mutations_stamped(engine, path_query, body, parsed, None)
+}
+
+/// [`apply_child_request_mutations`] with an explicit model-stamp
+/// override: the hot proxy lanes pass the sglang LoRA-variant colon
+/// stamp (see [`sglang_variant_stamp`]) here; `None` keeps the plain
+/// per-engine stamp.
+pub(crate) fn apply_child_request_mutations_stamped(
+    engine: &EngineRef,
+    path_query: &str,
+    body: axum::body::Bytes,
+    parsed: Option<&serde_json::Value>,
+    variant_stamp: Option<&str>,
+) -> axum::body::Bytes {
     let path = path_query.split('?').next().unwrap_or(path_query);
     let usage_lane = path.ends_with("/chat/completions");
     let think_lane = engine.kind == EngineKind::MistralRs && is_chat_path(path_query);
-    let stamp = child_model_stamp(engine);
+    let stamp = variant_stamp
+        .map(str::to_string)
+        .or_else(|| child_model_stamp(engine));
     if body.is_empty() || !(usage_lane || think_lane || stamp.is_some()) {
         return body;
     }
@@ -3131,6 +3246,38 @@ mod cache_obs_tests {
         assert_eq!(
             v.pointer("/stream_options/include_usage"),
             Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn unit__mutations__sglang_variant_stamp_overrides_registered_name() {
+        // A `base+stem` request riding the base child: the child must see
+        // the colon form (`base:adapter`) so sglang's native LoRA
+        // resolution selects the adapter — NOT the plain registration
+        // name the engine-wide stamp would emit.
+        let body = json!({
+            "model": "qwen3-1.7b+eternis-anonymizer",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let pre = body.clone();
+        let out = apply_child_request_mutations_stamped(
+            &eng(EngineKind::Sglang),
+            "/v1/chat/completions",
+            json_body(&body),
+            Some(&pre),
+            Some("qwen3-1.7b:eternis-anonymizer-qwen3-1"),
+        );
+        let v = parse(&out);
+        assert_eq!(
+            v["model"],
+            json!("qwen3-1.7b:eternis-anonymizer-qwen3-1"),
+            "variant stamp (colon form) must win over the registration-name stamp"
+        );
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&json!(true)),
+            "usage flag must survive the variant stamp"
         );
     }
 

@@ -133,6 +133,49 @@ async fn boxed_to_api_error(boxed: Box<Response>) -> Response {
 ///   ensure through the standard admission path (low priority,
 ///   interactive class — never starves real traffic; concurrent loads
 ///   of the same model coalesce), then reports the live child state.
+///
+/// `POST /api/lora/sync` — CLI `blazar lora add/rm` follow-through after
+/// the store write: hot-attach (or detach) the adapter on a RESIDENT
+/// sglang base child through the engine's admin endpoints, no respawn.
+/// Best-effort by design: nothing resident (or a lane that bakes
+/// adapters at spawn) defers to the next spawn, which the store row
+/// already drives — the response `detail` says which happened.
+pub async fn lora_sync(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return api_error(400, &e.to_string()),
+    };
+    let (Some(model), Some(action), Some(lora_name)) = (
+        v["model"].as_str(),
+        v["action"].as_str(),
+        v["lora_name"].as_str(),
+    ) else {
+        return api_error(400, "missing 'model', 'action' or 'lora_name'");
+    };
+    let attach = match action {
+        "add" => true,
+        "rm" => false,
+        other => return api_error(400, &format!("unknown action {other:?} (add|rm)")),
+    };
+    let lora_path = v["lora_path"].as_str().unwrap_or_default();
+    if attach && lora_path.is_empty() {
+        return api_error(400, "action 'add' requires 'lora_path'");
+    }
+    match state
+        .sup
+        .lora_hot_attach(model, attach, lora_name, lora_path)
+        .await
+    {
+        // 200 on child refusal too: the store row is already updated,
+        // the verdict line is the CLI's output, not an API failure.
+        Ok(detail) => {
+            axum::Json(serde_json::json!({"status": "ok", "detail": detail})).into_response()
+        }
+        Err(detail) => axum::Json(serde_json::json!({"status": "child_error", "detail": detail}))
+            .into_response(),
+    }
+}
+
 pub async fn warm(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let v: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,

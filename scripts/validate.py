@@ -2230,6 +2230,31 @@ _K = [
         "G5",
         "VAD model resolved to a spawn-ready path w/ placement teaching",
     ),
+    (
+        "whisper_diarize",
+        False,
+        False,
+        "argv",
+        "G5",
+        "whisper-server --diarize presence knob (false at fresh defaults)",
+    ),
+    (
+        "whisper_tinydiarize",
+        False,
+        False,
+        "argv",
+        "G5",
+        "whisper-server --tinydiarize presence knob (false at fresh defaults)",
+    ),
+    (
+        "mlx",
+        False,
+        True,
+        "boundary",
+        None,
+        "mlx engine tuning section (1:1 mlx_lm.server flags, validated "
+        "against the installed build's manifest; lane battery rides it)",
+    ),
 ]
 
 TOPLEVEL_KNOBS = [
@@ -4037,6 +4062,18 @@ def phase_config() -> None:
     )
     d = DAEMON
     clamp_expected = int(total_mem_mib() * 0.30)
+    # Lane contract: this phase asserts llama-server argv, so it rides the
+    # llamacpp fixture even when MODEL pins a safetensors-dir row.
+    lm_row = llama_fixture()
+    if lm_row is None:
+        boundary(
+            "config",
+            "config-flow matrix",
+            "no GGUF chat row on this box — the llama-server argv matrix "
+            "needs a llamacpp-lane fixture",
+        )
+        return
+    lm = lm_row["name"]
 
     # Group A: sizing + tuning flags.
     d.start(
@@ -4051,10 +4088,11 @@ def phase_config() -> None:
             "cpu_moe_n": 2,
             "cpu_ffn_n": 1,
             "override_tensor": [".ffn_.*_exps.=CPU"],
-        }
+        },
+        floor_model=lm,
     )
-    chat("Say ok")
-    pid = child_pid()
+    chat("Say ok", model=lm)
+    pid = child_pid(lm)
     argv = child_argv(pid) if pid else []
 
     def has(flag: str, val: str | None = None) -> bool:
@@ -4066,7 +4104,7 @@ def phase_config() -> None:
         except ValueError:
             return False
 
-    row = wait_loaded()
+    row = wait_loaded(lm)
     ctx_now = row_ctx(row or {}) if row else None
     # ps ctx = PER-SLOT ctx by design (profile.rs: --ctx-size is the total,
     # upstream divides it across -np slots; Profile.ctx/ps report what ONE
@@ -4168,10 +4206,10 @@ def phase_config() -> None:
             pass
     emitted = None
     for i, dev in enumerate(device_names[:2]):
-        d.start({"default_ctx": 2048, "devices": [dev]})
+        d.start({"default_ctx": 2048, "devices": [dev]}, floor_model=lm)
         try:
-            chat("Say ok", timeout=150)
-            pid = child_pid()
+            chat("Say ok", model=lm, timeout=150)
+            pid = child_pid(lm)
             argv = child_argv(pid) if pid else []
             if dev in argv:
                 emitted = dev
@@ -4215,7 +4253,7 @@ def phase_config() -> None:
             f"boundary: active={_ec_kind}",
         )
     else:
-        d.start({"default_ctx": 2048, "engine_check_secs": 5})
+        d.start({"default_ctx": 2048, "engine_check_secs": 5}, floor_model=lm)
         marker = os.path.join(SANDBOX.data_dir, "run", "engine-check.json")
         deadline = time.time() + 45
         marker_ok = False
@@ -4269,7 +4307,7 @@ def phase_config() -> None:
                 )
 
     # ps rows carry the resolved GPU-offload label.
-    chat("Say ok")
+    chat("Say ok", model=lm)
     rows = ps_rows()
     gpu = rows and ps_field(rows[0], "blazar_gpu", "gpu")
     check(
@@ -4288,10 +4326,11 @@ def phase_config() -> None:
             "spec_cache": True,
             "ctx_extend": 2.0,
             "sessions": True,
-        }
+        },
+        floor_model=lm,
     )
-    chat("Say ok")
-    pid = child_pid()
+    chat("Say ok", model=lm)
+    pid = child_pid(lm)
     argv = child_argv(pid) if pid else []
     joined = " ".join(argv)
     check(
@@ -4354,9 +4393,10 @@ def phase_config() -> None:
             "default_ctx": 2048,
         },
         env_extra=None,
+        floor_model=lm,
     )
-    chat("Say ok")
-    pid = child_pid()
+    chat("Say ok", model=lm)
+    pid = child_pid(lm)
     argv = child_argv(pid) if pid else []
     try:
         i = argv.index("--cache-ram")
@@ -4371,9 +4411,11 @@ def phase_config() -> None:
     )
     cov("cache_ram_mb clamp", f"--cache-ram {clamp_expected}", f"got {got}")
 
-    d.start({"default_ctx": 2048}, env_extra={"BLAZAR_DEFAULT_CTX": "4096"})
-    chat("Say ok")
-    row = wait_loaded()
+    d.start(
+        {"default_ctx": 2048}, env_extra={"BLAZAR_DEFAULT_CTX": "4096"}, floor_model=lm
+    )
+    chat("Say ok", model=lm)
+    row = wait_loaded(lm)
     ctx_now = row_ctx(row or {})
     check(
         "config",
@@ -4383,9 +4425,11 @@ def phase_config() -> None:
     )
     cov("BLAZAR_* env overrides", "env wins over file", f"ps ctx={ctx_now}")
 
-    d.start({"default_ctx": 2048, "model_overrides": {MODEL: {"ctx": 3072}}})
-    chat("Say ok")
-    row = wait_loaded()
+    d.start(
+        {"default_ctx": 2048, "model_overrides": {lm: {"ctx": 3072}}}, floor_model=lm
+    )
+    chat("Say ok", model=lm)
+    row = wait_loaded(lm)
     ctx_now = row_ctx(row or {})
     check(
         "config",
@@ -4395,9 +4439,9 @@ def phase_config() -> None:
     )
     cov("model_overrides", "per-model ctx wins", f"ps ctx={ctx_now}")
 
-    d.start({"engine_env": {"BLAZAR_VALIDATE_PROBE": "xyz-marker"}})
-    chat("Say ok")
-    pid = child_pid()
+    d.start({"engine_env": {"BLAZAR_VALIDATE_PROBE": "xyz-marker"}}, floor_model=lm)
+    chat("Say ok", model=lm)
+    pid = child_pid(lm)
     env = child_environ(pid) if pid else {}
     check(
         "config",
@@ -5607,6 +5651,29 @@ def _eng_pick_gguf_chat(rows: list[dict]) -> dict | None:
     return _eng_smallest(cands)
 
 
+_LLAMA_FIXTURE_ROW: dict | None = None
+_LLAMA_FIXTURE_RESOLVED = False
+
+
+def llama_fixture() -> dict | None:
+    """Llama-lane fixture for the argv-shape phases (config-flow matrix,
+    parity flag battery, spec ngram spawn check). Those phases assert
+    llama-server argv, so they must ride the llamacpp lane even when
+    BLAZAR_VALIDATE_MODEL pins a safetensors-dir row for the model-driven
+    phases — _eng_pick_gguf_chat honors MODEL whenever MODEL is itself a
+    GGUF row, so a GGUF pin still controls the fixture."""
+    global _LLAMA_FIXTURE_ROW, _LLAMA_FIXTURE_RESOLVED
+    if not _LLAMA_FIXTURE_RESOLVED:
+        # Rich rows from the sandbox store copy (_eng_store); resolves
+        # only once the sandbox exists — phases run post-sandbox, and a
+        # premature call yields None (phases register a boundary row)
+        # rather than half-state.
+        if SANDBOX is not None:
+            _LLAMA_FIXTURE_ROW = _eng_pick_gguf_chat(_eng_store()[0])
+        _LLAMA_FIXTURE_RESOLVED = True
+    return _LLAMA_FIXTURE_ROW
+
+
 def _eng_pick_safetensors_dir(rows: list[dict]) -> dict | None:
     """Plain HF safetensors dir (sglang/mlx-class loaders): a directory
     of *.safetensors without the mlx marker, a component set, or a
@@ -6613,10 +6680,11 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
     if kind == "sglang":
         # Global SglangTuning knobs + the override ctx pin; ctx=8192
         # shrinks the KV pool vs the default context (cheaper load,
-        # same asserted surface). cuda_graph_max_bs is soft: newer
-        # sglang builds dropped --cuda-graph-max-bs upstream — the
-        # schema keeps the knob for older installs and the daemon log
-        # names the skip on new ones.
+        # same asserted surface). cuda_graph_max_bs is soft with two
+        # surface spellings: legacy builds emit --cuda-graph-max-bs,
+        # split-surface builds (0.5.21+) map the knob to the decode
+        # half --cuda-graph-max-bs-decode; installs that carry neither
+        # name the skip in the daemon log.
         cfg = {
             "sglang": {
                 "stream_interval": 9,
@@ -6633,7 +6701,9 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
                 ("--context-length", "8192"),
             ],
             "presence": ["--reasoning-parser"],
-            "soft_pairs": [("--cuda-graph-max-bs", "8")],
+            "soft_pairs": [
+                (("--cuda-graph-max-bs", "--cuda-graph-max-bs-decode"), "8")
+            ],
             "soft_skip": ["lacks --cuda-graph-max-bs; skipped"],
             "note": "",
         }
@@ -6702,7 +6772,11 @@ def _eng_argv_check(
 
     Soft pairs are install-gated knobs: satisfied by the argv pair OR by
     the daemon log naming the skip (the engine install's supported_flags
-    probe dropped the flag — correct behavior, must be loud).
+    probe dropped the flag — correct behavior, must be loud). A soft
+    pair's flag may be a tuple of surface-spelling alternatives: the
+    knob maps to whichever flag the installed build's manifest carries
+    (e.g. cuda_graph_max_bs -> --cuda-graph-max-bs on legacy sglang,
+    --cuda-graph-max-bs-decode on the split 0.5.21+ surface).
     """
     pid = child_pid(model)
     if pid is None:
@@ -6730,9 +6804,12 @@ def _eng_argv_check(
                 log_text = f.read()
         except OSError:
             log_text = ""
-        for flag, value in soft_pairs:
+        for pair in soft_pairs:
+            flag, value = pair
+            spellings = (flag,) if isinstance(flag, str) else tuple(flag)
             in_argv = any(
-                argv[i] == flag and i + 1 < len(argv) and argv[i + 1] == value
+                argv[i] == f and i + 1 < len(argv) and argv[i + 1] == value
+                for f in spellings
                 for i in range(len(argv))
             )
             if in_argv:
@@ -7462,15 +7539,29 @@ def phase_behavior() -> None:
         )
     # speculative decode e2e: ngram self-speculation needs no draft model.
     d.start({"port": PORT, "spec": "ngram"})
-    chat("Write the numbers from 1 to 10, one per line.", extra={"max_tokens": 64})
-    argv = child_argv(child_pid()) if child_pid() else []
-    joined = " ".join(argv)
-    check(
-        "behavior",
-        "spec=ngram: child spawned with --spec-type ngram and serves chat",
-        "--spec-type" in joined and "ngram" in joined,
-        joined[joined.find("--spec") :][:80] if "--spec" in joined else "missing",
-    )
+    lm_row = llama_fixture()
+    if lm_row is None:
+        boundary(
+            "behavior",
+            "spec=ngram: child spawned with --spec-type ngram",
+            "no GGUF chat row on this box — ngram spawn argv is llama-lane",
+        )
+    else:
+        chat(
+            "Write the numbers from 1 to 10, one per line.",
+            extra={"max_tokens": 64},
+            model=lm_row["name"],
+        )
+        argv = (
+            child_argv(child_pid(lm_row["name"])) if child_pid(lm_row["name"]) else []
+        )
+        joined = " ".join(argv)
+        check(
+            "behavior",
+            "spec=ngram: child spawned with --spec-type ngram and serves chat",
+            "--spec-type" in joined and "ngram" in joined,
+            joined[joined.find("--spec") :][:80] if "--spec" in joined else "missing",
+        )
     # router mode.
     d.start({"port": PORT, "router": True})
     st, _, _ = chat("Say ok")
@@ -7733,7 +7824,18 @@ def whisper_lane_live() -> bool:
 def phase_wave() -> None:
     print("\n== phase 8: wave battery (replicas/preload/keys/whisper/gauges) ==")
     d = DAEMON
-    small = MODEL  # fixture-drift fix: honor BLAZAR_VALIDATE_MODEL like every other phase (default is still qwen2.5-0.5b-instruct)
+    lm_row = llama_fixture()
+    if lm_row is None:
+        boundary(
+            "wave",
+            "wave battery",
+            "no GGUF chat row on this box — the llama-server flag battery "
+            "needs a llamacpp-lane fixture",
+        )
+        return
+    # argv-shape battery: rides the llamacpp fixture (honors
+    # BLAZAR_VALIDATE_MODEL whenever that row is itself a GGUF).
+    small = lm_row["name"]
     big = BIG  # second DISTINCT model (default qwen3.5-9b)
 
     # -- battery A: replicas + slots/pin/cache_idle_slots overlays ----------
@@ -8700,7 +8802,18 @@ def phase_wave() -> None:
 def phase_parity() -> None:
     print("\n== phase 9: parity battery (templates/samplers/scoped surfaces) ==")
     d = DAEMON
-    small = MODEL  # fixture-drift fix: honor BLAZAR_VALIDATE_MODEL like every other phase (default is still qwen2.5-0.5b-instruct)
+    lm_row = llama_fixture()
+    if lm_row is None:
+        boundary(
+            "parity",
+            "parity battery",
+            "no GGUF chat row on this box — the llama-server flag battery "
+            "needs a llamacpp-lane fixture",
+        )
+        return
+    # argv-shape battery: rides the llamacpp fixture (honors
+    # BLAZAR_VALIDATE_MODEL whenever that row is itself a GGUF).
+    small = lm_row["name"]
 
     # -- battery A: overlay sampler_defaults + chat_template reach argv -----
     d.start(
@@ -11740,6 +11853,9 @@ def _full_toplevel() -> dict:
         "sdcpp_tensor_type_rules": None,
         "whisper_extra_args": None,
         "whisper_vad_model": None,
+        "whisper_diarize": False,
+        "whisper_tinydiarize": False,
+        "mlx": {},
         "cpu_range": "",
         "poll": 77,
         "reasoning_format": "deepseek",
@@ -12325,6 +12441,22 @@ def phase_gates() -> None:
         ("max_loaded_models", "needs 2+ concurrently-loaded models (RAM)"),
         ("child_transport", "unix transport unsupported on this build"),
         ("rpc_servers", "needs a 2nd box running rpc llama-server"),
+        (
+            "whisper_diarize",
+            "whisper lane is audio-fixture gated in sandbox; --diarize "
+            "emission unit-tier (whisper knob_args), default false here",
+        ),
+        (
+            "whisper_tinydiarize",
+            "whisper lane is audio-fixture gated in sandbox; --tinydiarize "
+            "emission unit-tier (whisper knob_args), default false here",
+        ),
+        (
+            "mlx",
+            "table serializes in fresh list + full-manifest boot (gates b/c); "
+            "per-knob flags validated against the installed mlx-lm manifest "
+            "at spawn — engines/mlx battery rides defaults",
+        ),
     ):
         cov(b_knob, f"boundary: {why}", "documented boundary", ok=True)
     if knob_entry("models_autoload")["name"] not in covered:
@@ -12992,6 +13124,7 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--search": "tune.search",
         "--ctx": "tune.ctx",
         "--spec": "tune.spec",
+        "--spec-race": "tune.spec",
         "--slots": "tune.slots",
         "--ngram": "tune.ngram",
         "--load": "tune.load",
@@ -13794,6 +13927,17 @@ def main() -> int:
             USER_CONFIG_SHA = hashlib.sha256(f.read()).hexdigest()
     SANDBOX = Sandbox()
     DAEMON = Daemon(SANDBOX)
+    # Lane note (sandbox store now exists): argv-shape phases pin their
+    # own GGUF fixture when MODEL rides another lane.
+    _mrow = next((r for r in _eng_store()[0] if r["name"] == MODEL), None)
+    if _mrow and not str(_mrow["path"]).lower().endswith(".gguf"):
+        _lf = llama_fixture()
+        if _lf:
+            print(
+                f"note: {MODEL} rides a non-llamacpp lane — llama-server argv "
+                f"phases pin GGUF fixture {_lf['name']}; model-driven phases "
+                f"continue on {MODEL}"
+            )
 
     cleaned = False
 
