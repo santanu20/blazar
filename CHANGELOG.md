@@ -4,7 +4,7 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
-## [Unreleased]
+## [0.26.0] - 2026-10-10
 
 ### Added
 
