@@ -321,6 +321,7 @@ fn reclaim_marker_orphans_with_grace(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[must_use = "the caller prints each line as preflight evidence"]
 pub fn reclaim_marker_orphans(_data_dir: &std::path::Path) -> Vec<String> {
     // No /proc environ off Linux; the pidfile sweep plus the engine
     // children's own shutdown handling remain the covering nets (same
@@ -501,10 +502,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn unit__environ_marks_owner__exact_token_no_prefix_alias() {
-        let env = format!(
-            "PATH=/usr/bin\0{}=/srv/blazar\0HOME=/root\0",
-            ORPHAN_MARKER_ENV
-        );
+        let env = format!("PATH=/usr/bin\0{ORPHAN_MARKER_ENV}=/srv/blazar\0HOME=/root\0");
         assert!(environ_marks_owner(
             env.as_bytes(),
             std::path::Path::new("/srv/blazar")

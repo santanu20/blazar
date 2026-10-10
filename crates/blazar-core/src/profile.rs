@@ -14228,6 +14228,9 @@ mod tests {
     }
 
     #[test]
+    // One assertion row per sdcpp companion knob — the matrix is the
+    // point; splitting it would hide knob coverage per surface.
+    #[allow(clippy::too_many_lines)]
     fn unit__compile_sdcpp__tuning_knobs_emitted_and_gated() {
         // Every set knob lands on the argv manifest-gated, and an engine
         // lacking a flag degrades to a warning instead of dying.

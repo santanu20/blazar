@@ -1376,17 +1376,19 @@ mod tests {
         // All-decoder-knobs config emits in the fixed composer order;
         // booleans emit bare; an all-default config emits nothing
         // (spawn argv stays byte-identical to the pre-knob surface).
-        let mut cfg = blazar_core::Config::default();
-        cfg.whisper_beam_size = Some(5);
-        cfg.whisper_best_of = Some(3);
-        cfg.whisper_entropy_thold = Some(2.8);
-        cfg.whisper_logprob_thold = Some(-1.0);
-        cfg.whisper_word_thold = Some(0.02);
-        cfg.whisper_diarize = true;
-        cfg.whisper_tinydiarize = false;
-        cfg.whisper_vad_threshold = Some(0.6);
-        cfg.whisper_vad_min_speech_duration_ms = Some(150);
-        cfg.whisper_vad_min_silence_duration_ms = Some(80);
+        let cfg = blazar_core::Config {
+            whisper_beam_size: Some(5),
+            whisper_best_of: Some(3),
+            whisper_entropy_thold: Some(2.8),
+            whisper_logprob_thold: Some(-1.0),
+            whisper_word_thold: Some(0.02),
+            whisper_diarize: true,
+            whisper_tinydiarize: false,
+            whisper_vad_threshold: Some(0.6),
+            whisper_vad_min_speech_duration_ms: Some(150),
+            whisper_vad_min_silence_duration_ms: Some(80),
+            ..blazar_core::Config::default()
+        };
         let knobs = knob_args(&cfg);
         assert_eq!(
             knobs,
