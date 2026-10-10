@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use blazar_core::BlazarDirs;
 use blazar_core::engine_kind::EngineKind;
-use blazar_core::profile::{Endpoint, Profile};
+use blazar_core::profile::{CapacityStatus, Endpoint, Profile};
 use blazar_core::store::ModelRow;
 use blazar_runtime::EventBus;
 use blazar_runtime::engine::gh::GhClient;
@@ -50,6 +50,7 @@ fn profile(ctx: u32, argv: &[&str]) -> Profile {
         gpu: "auto",
         kv_est_bytes: None,
         ctx_autofit: None,
+        capacity: CapacityStatus::default(),
     }
 }
 

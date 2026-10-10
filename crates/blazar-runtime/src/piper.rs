@@ -9,6 +9,7 @@
 //! like every other kind; a legacy `data/piper` tree predating that
 //! lane stays a read-only serving source until adopted.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -724,6 +725,30 @@ fn synthesis_argv(
     argv.push(espeak_data.display().to_string());
     argv.extend(option_argv(opts));
     argv
+}
+
+/// Emission truth for the piper lane: every flag token a synthesis
+/// spawn can carry, across both output dialects (WAV and raw) with the
+/// full [`SpeakOptions`] surface engaged. Feeds the knob registry
+/// (`crate::knob_registry::lane_flags`); paths are fixtures — only the
+/// flag tokens matter.
+#[must_use]
+pub fn knob_surface() -> Vec<String> {
+    let opts = SpeakOptions {
+        speed: Some(1.0),
+        speaker: Some(0),
+        noise_scale: Some(0.667),
+        noise_w: Some(0.8),
+        sentence_silence: Some(0.2),
+    };
+    let onnx = Path::new("/models/voice.onnx");
+    let espeak = Path::new("/models/espeak-ng-data");
+    let tokens: BTreeSet<String> = synthesis_argv(onnx, espeak, &opts, false)
+        .into_iter()
+        .chain(synthesis_argv(onnx, espeak, &opts, true))
+        .filter(|t| blazar_core::knob_registry::is_flag_token(t))
+        .collect();
+    tokens.into_iter().collect()
 }
 
 async fn synthesize_inner(

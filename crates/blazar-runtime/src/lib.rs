@@ -21,6 +21,7 @@ pub mod engine_impl;
 pub mod events;
 pub mod hf;
 pub mod hf_parallel;
+pub mod knob_registry;
 pub mod models;
 pub mod piper;
 pub mod probe;

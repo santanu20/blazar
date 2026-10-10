@@ -67,6 +67,18 @@ impl EngineKind {
         matches!(self, EngineKind::Whisper | EngineKind::Piper)
     }
 
+    /// Whether this engine's HTTP surface carries the llama-server
+    /// `/slots/{id}?action=save|restore` checkpoint API the session
+    /// bank speaks. Only `llama-server` (and router fronts built on
+    /// it) implements it; every other lane's children would just 404,
+    /// so the supervisor skips banking there instead of issuing dead
+    /// requests. Extend the match when a lane grows the API — the
+    /// predicate is the single gate both bank paths read.
+    #[must_use]
+    pub fn supports_slot_banks(self) -> bool {
+        matches!(self, EngineKind::LlamaCpp)
+    }
+
     /// Format+policy-driven route for `[engine_routing] mode = "auto"`:
     /// pick the serving engine for one model from the installed kinds.
     ///

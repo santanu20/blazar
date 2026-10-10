@@ -1130,6 +1130,42 @@ fn server_args(
     Ok(args)
 }
 
+/// Emission-truth flag surface for the whisper lane: the argv the
+/// gateway really composes when every decode/VAD knob is set and a VAD
+/// model is present (transport pins included). Sorted and deduplicated
+/// so the committed registry JSON is stable. Feeds
+/// `blazar_runtime::knob_registry::lane_flags`, which is what
+/// `scripts/first_class_flags.json` is generated from.
+#[must_use]
+pub fn knob_surface() -> Vec<String> {
+    let cfg = blazar_core::Config {
+        whisper_beam_size: Some(5),
+        whisper_best_of: Some(3),
+        whisper_entropy_thold: Some(2.8),
+        whisper_logprob_thold: Some(-1.0),
+        whisper_word_thold: Some(0.02),
+        whisper_diarize: true,
+        whisper_tinydiarize: true,
+        whisper_vad_threshold: Some(0.5),
+        whisper_vad_min_speech_duration_ms: Some(250),
+        whisper_vad_min_silence_duration_ms: Some(100),
+        ..blazar_core::Config::default()
+    };
+    let argv = server_args(
+        49_199,
+        Path::new("/models/whisper/ggml-base.bin"),
+        Some(Path::new("/models/whisper/silero-vad-v5.ggml")),
+        &knob_args(&cfg),
+        &[],
+    )
+    .expect("all-knob fixture never trips the reserved-flag guard");
+    let surface: std::collections::BTreeSet<String> = argv
+        .into_iter()
+        .filter(|t| t.starts_with('-') && (t.len() < 2 || !t.as_bytes()[1].is_ascii_digit()))
+        .collect();
+    surface.into_iter().collect()
+}
+
 /// Extract the long-flag surface from a `--help` dump. Tokens are shaped
 /// `--flag` / `--flag-name` and must be word-delimited on both sides — a
 /// `--` inside prose or a value (`path--to--x`, bare `--`) is not a flag.

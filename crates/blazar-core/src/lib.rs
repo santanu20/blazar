@@ -12,6 +12,7 @@ pub mod fs_safety;
 pub mod gguf;
 pub mod hardware;
 pub mod hfmeta;
+pub mod knob_registry;
 pub mod predict;
 pub mod profile;
 pub mod session_identity;

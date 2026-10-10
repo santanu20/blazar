@@ -1379,7 +1379,12 @@ impl MlxEngine {
 /// installed mlx-lm build supports `--api-key` — probed at install) is
 /// appended by the supervisor's child-auth mint, same as the other
 /// lanes: one choke point, not engine business.
-fn mlx_argv(model: &blazar_core::ModelRow, profile: &Profile, endpoint: &Endpoint) -> Vec<String> {
+#[must_use]
+pub fn mlx_argv(
+    model: &blazar_core::ModelRow,
+    profile: &Profile,
+    endpoint: &Endpoint,
+) -> Vec<String> {
     let port = match endpoint {
         Endpoint::Tcp { port, .. } => *port,
         // Supervisor rejects unix endpoints for mlx engines before

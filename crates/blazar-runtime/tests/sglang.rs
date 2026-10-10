@@ -3,7 +3,7 @@
 //! and the base spawn shape (forced loopback, served-model-name).
 #![allow(non_snake_case)] // house test-naming: unit__subject__behavior
 
-use blazar_core::profile::{Endpoint, Profile};
+use blazar_core::profile::{CapacityStatus, Endpoint, Profile};
 use blazar_core::store::ModelRow;
 use blazar_runtime::engine_impl::sglang_argv;
 
@@ -34,6 +34,7 @@ fn profile() -> Profile {
         gpu: "auto",
         kv_est_bytes: None,
         ctx_autofit: None,
+        capacity: CapacityStatus::default(),
     }
 }
 

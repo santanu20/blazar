@@ -180,6 +180,46 @@ pub struct Profile {
     /// telemetry can distinguish "ctx 4096 because user pinned" from
     /// "ctx 4096 because auto-fit traded depth for concurrency".
     pub ctx_autofit: Option<(u32, u32)>,
+    /// How `ctx` / `kv_est_bytes` must be read on this lane — see
+    /// [`CapacityStatus`]. Keeps "engine owns memory" lanes from being
+    /// read as "capacity unknown" (they are neither zero nor unlimited).
+    pub capacity: CapacityStatus,
+}
+
+/// How a lane's context/KV capacity is governed — the difference between
+/// "Blazar compiled a window" and "the engine runtime owns memory".
+///
+/// This is the observability contract for lanes like MLX: reporting
+/// `ctx: 0, kv: None` there reads as *unknown*, inviting wrong
+/// conclusions (unlimited? broken probe?). The runtime-managed variant
+/// states the actual design: the engine sizes its own caches, and the
+/// profile's `ctx` is the model's trained-window ceiling used as a fit
+/// bound for request admission — never an allocation Blazar makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CapacityStatus {
+    /// Blazar-compiled lane: `ctx` is the allocated context window and
+    /// `kv_est_bytes` (when GGUF geometry allows an estimate) is the
+    /// planned KV-cache footprint at that window.
+    #[default]
+    Compiled,
+    /// Runtime-managed lane: the engine owns memory admission internally.
+    /// `ctx` carries the model's trained-window ceiling (fit bound for
+    /// request preflight); `kv_est_bytes` stays `None` because the
+    /// runtime sizes its caches itself — unknown is NOT unlimited, and
+    /// residency accounting uses the measured settle footprint instead.
+    RuntimeManaged,
+}
+
+impl CapacityStatus {
+    /// `ps` label: `Some("runtime-managed")` on runtime lanes, `None` on
+    /// compiled lanes so their JSON stays byte-identical.
+    #[must_use]
+    pub fn ps_label(self) -> Option<&'static str> {
+        match self {
+            CapacityStatus::Compiled => None,
+            CapacityStatus::RuntimeManaged => Some("runtime-managed"),
+        }
+    }
 }
 
 /// Tuning knobs the bench grid may override; None = use heuristic value.
@@ -2346,6 +2386,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // ctx to earn parallel slots; telemetry (`ps`, events) uses this
         // to surface the trade instead of silently shrinking ctx.
         ctx_autofit: rs.autofit,
+        capacity: CapacityStatus::Compiled,
     })
 }
 
@@ -3227,6 +3268,7 @@ fn compile_mistralrs(
         gpu: "auto",
         kv_est_bytes: None,
         ctx_autofit: None,
+        capacity: CapacityStatus::Compiled,
     })
 }
 
@@ -3348,10 +3390,13 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
     Ok(Profile {
         argv,
         warnings,
+        // ctx is not a concept for image lanes (no token-window
+        // admission); 0 keeps preflight out of the way.
         ctx: 0,
         gpu: offload.gpu,
         kv_est_bytes: None,
         ctx_autofit: None,
+        capacity: CapacityStatus::Compiled,
     })
 }
 
@@ -3970,13 +4015,28 @@ fn compile_mlx(input: &ProfileInput<'_>) -> Result<Profile, String> {
     // overrides the knob's value (same last-wins contract as sglang).
     argv.extend(mlx_extra_args(input)?);
     push_nonllama_vocab_teaching(input.config, "mlx", &mut warnings);
+    // Observability contract: mlx_lm owns memory admission inside its
+    // runtime, so there is no compiled ctx window or planned KV bytes to
+    // report. What the profile CAN state exactly is the model's trained
+    // window (`max_position_embeddings`, from config.json at pull time):
+    // request preflight uses it as the fit ceiling, and `ps` shows the
+    // lane as runtime-managed instead of silently reading as unknown.
+    // Absent metadata honestly degrades to 0 (admission falls back to
+    // the configured default), never to a fabricated guess.
+    let ceiling = match input.meta {
+        ModelMeta::Hf(h) => h
+            .ctx_train
+            .map_or(0, |t| u32::try_from(t).unwrap_or(u32::MAX)),
+        ModelMeta::Gguf(_) => 0,
+    };
     Ok(Profile {
         argv,
         warnings,
-        ctx: 0,
+        ctx: ceiling,
         gpu: "auto",
         kv_est_bytes: None,
         ctx_autofit: None,
+        capacity: CapacityStatus::RuntimeManaged,
     })
 }
 
@@ -4153,6 +4213,7 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
         gpu: gpu_label,
         kv_est_bytes,
         ctx_autofit: None,
+        capacity: CapacityStatus::Compiled,
     })
 }
 
@@ -16646,6 +16707,51 @@ mod tests {
             err.contains("GGUF") && err.contains("llamacpp"),
             "error must teach the lane switch: {err}"
         );
+    }
+
+    /// P1-2 contract: the mlx lane is runtime-managed, not unknown. The
+    /// profile must state the trained-window ceiling (from config.json
+    /// metadata) as the fit bound, keep KV unclaimed, and label the lane
+    /// so observers read "engine owns memory" instead of guessing.
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__mlx_capacity__ceiling_from_metadata_and_runtime_managed_label() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta(); // ctx_train = 32768
+        let inp = mlx_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(p.ctx, 32_768, "ctx = trained-window ceiling");
+        assert_eq!(p.capacity, CapacityStatus::RuntimeManaged);
+        assert!(p.kv_est_bytes.is_none(), "KV sizing belongs to the runtime");
+        assert_eq!(
+            CapacityStatus::RuntimeManaged.ps_label(),
+            Some("runtime-managed")
+        );
+        // Compiled lanes (the default reading) carry no ps label so
+        // their JSON stays byte-identical.
+        assert_eq!(CapacityStatus::Compiled.ps_label(), None);
+        assert_eq!(
+            CapacityStatus::default(),
+            CapacityStatus::Compiled,
+            "Profile::default() keeps compiled semantics"
+        );
+    }
+
+    /// Honest degradation: a safetensors row without config.json ctx
+    /// metadata must NOT fabricate a ceiling — 0 keeps admission on the
+    /// configured default (the pre-B behavior), just explicitly labeled.
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__mlx_capacity__missing_metadata_degrades_to_zero_not_a_guess() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut hf = hf_meta();
+        hf.ctx_train = None;
+        let inp = mlx_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(p.ctx, 0);
+        assert_eq!(p.capacity, CapacityStatus::RuntimeManaged);
     }
 
     #[test]

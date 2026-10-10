@@ -309,6 +309,7 @@ mod tests {
             idle_secs: 4,
             in_flight: 1,
             ctx: 16384,
+            capacity: None,
             slots: Some(2),
             slots_configured: Some(2),
             gpu: "full".to_string(),

@@ -2023,6 +2023,10 @@ async fn e2e__ps_and_show() {
     assert_eq!(ps["models"][0]["name"], "m1");
     assert_eq!(ps["models"][0]["blazar_state"], "ready");
     assert_eq!(ps["models"][0]["blazar_ctx"], 16384);
+    // Compiled lanes (this stub runs the llama dialect) must stay
+    // byte-identical: the capacity key is additive, runtime-managed
+    // lanes only.
+    assert!(ps["models"][0].get("blazar_capacity").is_none());
 
     let show_body = serde_json::json!({"model": "m1"});
     let s: serde_json::Value = c

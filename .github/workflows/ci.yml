@@ -100,6 +100,11 @@ jobs:
       # docs/config-code-paths.md (or vice versa). Pure stdlib (re/sys/
       # pathlib), so it runs on any runner python.
       - run: python3 scripts/check_config_doc_drift.py
+      # Engine capability coverage: fails when docs/engine-coverage.md
+      # drifts from the manifest fixtures or the emission-truth registry
+      # (scripts/first_class_flags.json). Pure stdlib, no store needed —
+      # the committed fixtures are the CI input.
+      - run: python3 scripts/engine_coverage.py --check
       # Renderer self-test: campaign-scoped findings/frontier/index paths a
       # media-only artifact cannot reach; pure-fixture, no GPU needed.
       - run: python3 scripts/bench_render_selftest.py

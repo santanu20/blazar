@@ -485,6 +485,13 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
             if let Some(flag) = sleeping.get(&p.endpoint) {
                 row["blazar_sleeping"] = json!(flag);
             }
+            // Runtime-managed lanes only: states HOW ctx/kv must be read
+            // there (engine owns memory; ctx is the trained-window fit
+            // ceiling, not a compiled allocation). Compiled lanes stay
+            // byte-identical — their reading is already the default.
+            if let Some(cap) = p.capacity {
+                row["blazar_capacity"] = json!(cap);
+            }
             row
         })
         .collect();

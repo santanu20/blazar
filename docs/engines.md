@@ -81,6 +81,25 @@ Apple-Silicon-native (and CUDA-backed) serving for mlx-community quantized
 directories. Installed as a pip environment (`mlx-lm`) and managed like any
 other lane.
 
+Memory and context on this lane are **runtime-managed**: `mlx_lm` sizes its
+own caches and decides residency inside its runtime. Blazar's contract with
+observers is explicit about what that means:
+
+- `ps` shows `blazar_capacity: "runtime-managed"` — the lane is neither
+  unknown-capacity nor unlimited; the engine owns memory admission.
+- `blazar_ctx` reports the model's trained window (`max_position_embeddings`
+  from config.json, pulled at model download) as a **fit ceiling**: prompt
+  preflight bounds requests by it, but it is not an allocation Blazar makes
+  and no ctx flag is passed to the server. Rows without config.json metadata
+  honestly report `0` and admission falls back to the configured default.
+- KV-cache estimate stays unset (`kv_est_bytes: null`) because the runtime,
+  not Blazar, sizes the caches — co-residency planning uses the measured
+  settle footprint (weights + actual card delta) instead, the same bytes
+  admission that gates every other lane.
+- Session banking (KV checkpoint save/restore) is a llama-server `/slots`
+  API and is not invoked on this lane; conversation warmth comes from the
+  engine's own prompt cache (`--prompt-cache-*` knobs tune it).
+
 ### stable-diffusion.cpp
 
 Diffusion images (and video component sets) on CPU or GPU, including Vulkan

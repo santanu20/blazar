@@ -279,6 +279,9 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
                 "slots_configured": p.slots_configured,
                 "in_flight": p.in_flight,
                 "ctx": p.ctx,
+                // Runtime-managed lanes only — see ollama::ps; keeps a
+                // mlx ceiling from reading as a compiled window here too.
+                "capacity": p.capacity,
                 "gpu": p.gpu,
                 "device": p.device,
                 "pid": p.pid,

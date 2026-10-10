@@ -763,6 +763,10 @@ pub struct Instance {
     pub argv: Vec<String>,
     pub model: ModelRow,
     pub profile_ctx: u32,
+    /// How `profile_ctx`/`kv_est_bytes` must be read on this lane
+    /// (compiled window vs engine-runtime-managed ceiling) — carried so
+    /// `ps` observers never read a runtime-managed lane as "unknown".
+    pub capacity: blazar_core::profile::CapacityStatus,
     /// Resolved offload label from the compiled profile ("full" | "cpu" |
     /// "partial" | "auto") — what `ps` shows so silent CPU fallback is
     /// never silent.
@@ -1708,6 +1712,12 @@ pub struct PsRow {
     pub idle_secs: u64,
     pub in_flight: i64,
     pub ctx: u32,
+    /// Capacity semantics of `ctx` on this row: `None` = compiled
+    /// window (default reading), `Some("runtime-managed")` = the lane's
+    /// engine owns memory admission and `ctx` is the model's trained
+    /// ceiling used as a fit bound. Emitted additively so compiled
+    /// lanes' JSON stays byte-identical.
+    pub capacity: Option<&'static str>,
     /// Slot shape of the spawned child, parsed from its own argv
     /// (`-np`/`--parallel`) — the same source of truth the adaptive
     /// tick reads. `None` when the argv carries no slot flag (router
@@ -3606,6 +3616,7 @@ impl Supervisor {
                         argv,
                         model: synthetic_model.clone(),
                         profile_ctx: 0,
+                        capacity: blazar_core::profile::CapacityStatus::Compiled,
                         gpu: "router".to_string(),
                         device: None,
                         device_id: None,
@@ -4984,6 +4995,7 @@ impl Supervisor {
                         &endpoint,
                         profile.ctx,
                         auth.as_ref().map(|a| a.secret.as_str()),
+                        engine.kind(),
                     )
                     .await;
 
@@ -5078,6 +5090,7 @@ impl Supervisor {
                         argv,
                         model,
                         profile_ctx: profile.ctx,
+                        capacity: profile.capacity,
                         gpu: profile.gpu.to_string(),
                         device: if profile.gpu == "cpu" {
                             None
@@ -5864,8 +5877,16 @@ drop them from rpc_servers in config.toml",
         endpoint: &blazar_core::Endpoint,
         ctx: u32,
         auth: Option<&str>,
+        kind: blazar_core::engine_kind::EngineKind,
     ) {
         if !self.config.session_bank {
+            return;
+        }
+        // Engine capability gate: `/slots/{id}?action=restore` is a
+        // llama-server API. On lanes without it the sweep below would
+        // post dead requests (or silently skip) — the honest behavior
+        // is to not look for banks at all.
+        if !kind.supports_slot_banks() {
             return;
         }
         // The bank set of this shape: slot 0's legacy `_auto-<ctx>` plus
@@ -6015,6 +6036,20 @@ drop them from rpc_servers in config.toml",
     /// banks hundreds of tokens (live-probed on b11202).
     async fn bank_save(&self, inst: &Arc<Instance>) {
         if !self.config.session_bank || inst.in_flight.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        // Engine capability gate: the save sweep speaks llama-server's
+        // `/slots/{id}?action=save`. On any other lane each evict would
+        // burn up to 2 s of timeout per slot against an endpoint that
+        // 404s — skip the sweep and say why once, so the absence of
+        // session continuity is explicit rather than silent.
+        if !inst.kind.supports_slot_banks() {
+            tracing::debug!(
+                target: "blazar::bank",
+                model = %inst.name,
+                engine = inst.kind.as_str(),
+                "session bank skipped: engine kind lacks the /slots checkpoint API"
+            );
             return;
         }
         let slots = self.instance_slot_count(inst);
@@ -7122,6 +7157,7 @@ drop them from rpc_servers in config.toml",
                     idle_secs: i.last_used.read().expect("idle lock").elapsed().as_secs(),
                     in_flight: i.in_flight.load(Ordering::SeqCst),
                     ctx: i.profile_ctx,
+                    capacity: i.capacity.ps_label(),
                     slots: argv_np(&i.argv),
                     slots_configured: if i.name == ROUTER_KEY {
                         None
@@ -8438,6 +8474,7 @@ mod routing_tests {
                 last_used_at: 0,
             },
             profile_ctx: 8,
+            capacity: blazar_core::profile::CapacityStatus::Compiled,
             gpu: "full".into(),
             device: None,
             device_id: None,
@@ -9716,12 +9753,30 @@ mod routing_tests {
         load: i64,
         endpoint: Endpoint,
     ) -> (Arc<Instance>, u32) {
+        fake_instance_of_kind(
+            key,
+            state,
+            load,
+            endpoint,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+        )
+    }
+
+    /// Same fabricated child as [`fake_instance_at`], with a caller-chosen
+    /// engine kind (capability-gate tests need non-llama lanes).
+    fn fake_instance_of_kind(
+        key: &str,
+        state: InstanceState,
+        load: i64,
+        endpoint: Endpoint,
+        kind: blazar_core::engine_kind::EngineKind,
+    ) -> (Arc<Instance>, u32) {
         let proc = dummy_process();
         let pid = proc.id().expect("fabricated child pid");
         let inst = Instance {
             name: key.to_string(),
             engine_tag: "test-engine".to_string(),
-            kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+            kind,
             endpoint: endpoint.clone(),
             state: std::sync::RwLock::new(state),
             last_used: std::sync::RwLock::new(Instant::now()),
@@ -9747,6 +9802,7 @@ mod routing_tests {
                 last_used_at: 0,
             },
             profile_ctx: 8,
+            capacity: blazar_core::profile::CapacityStatus::Compiled,
             gpu: "cpu".into(),
             device: None,
             device_id: None,
@@ -12129,6 +12185,150 @@ mod routing_tests {
         assert_eq!(
             Supervisor::bank_slot_of(OsStr::new("_auto-16384.identity.json"), 16384),
             None
+        );
+    }
+
+    /// Capability truth table for the session-bank sweep: only
+    /// llama-server speaks `/slots/{id}?action=save|restore`.
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[test]
+    fn unit__bank_capability__only_llama_family_supports_slot_banks() {
+        use blazar_core::engine_kind::EngineKind;
+        assert!(EngineKind::LlamaCpp.supports_slot_banks());
+        for kind in [
+            EngineKind::MistralRs,
+            EngineKind::Sglang,
+            EngineKind::SdCpp,
+            EngineKind::Whisper,
+            EngineKind::Piper,
+            EngineKind::Mlx,
+        ] {
+            assert!(
+                !kind.supports_slot_banks(),
+                "{} must not advertise /slots banking",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// The capability gate is the first thing `bank_save` checks: a
+    /// non-llama instance never dials the endpoint, so eviction on
+    /// unsupported lanes costs zero HTTP (previously up to 2 s of
+    /// timeout per slot against an endpoint that 404s).
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__bank_capability__unsupported_kind_skips_save() {
+        use blazar_core::engine_kind::EngineKind;
+        let (sup, _root) = gpu_sup();
+        assert!(sup.config.session_bank, "default config must bank");
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "n_saved": 5
+                })),
+            )
+            // expect(0) also switches the server into recording mode,
+            // which verify() turns into the zero-dial assertion.
+            .expect(0)
+            .mount(&server)
+            .await;
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: server.address().port(),
+        };
+        let (inst, pid) =
+            fake_instance_of_kind("m", InstanceState::Ready, 0, endpoint, EngineKind::Sglang);
+        sup.bank_save(&inst).await;
+        server.verify().await;
+        assert!(
+            !sup.bank_file("m", 8).exists(),
+            "unsupported kind must not leave bank artifacts"
+        );
+        kill_all(&[pid]);
+    }
+
+    /// The supported lane keeps its contract: a llama instance's save
+    /// sweep posts the ctx-scoped slot-0 checkpoint exactly once.
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__bank_capability__supported_kind_saves() {
+        let (sup, _root) = gpu_sup();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/slots/0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "n_saved": 5
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: server.address().port(),
+        };
+        let (inst, pid) = fake_instance_at("m", InstanceState::Ready, 0, endpoint);
+        sup.bank_save(&inst).await;
+        server.verify().await;
+        let hits = server
+            .received_requests()
+            .await
+            .expect("expect() mock keeps recording on");
+        let url = hits[0].url.as_str();
+        assert!(
+            url.contains("action=save") && url.contains("filename=_auto-8"),
+            "save must target the ctx-scoped slot-0 checkpoint, got {url}"
+        );
+        kill_all(&[pid]);
+    }
+
+    /// Same gate on the in-spawn restore path: an on-disk bank for an
+    /// unsupported kind is left cold (no dial), while the supported
+    /// kind restores it (legacy banks without an identity manifest
+    /// proceed by design).
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__bank_capability__restore_gate_by_kind() {
+        use blazar_core::engine_kind::EngineKind;
+        let (sup, _root) = gpu_sup();
+        let file = sup.bank_file("m", 8);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"kv").unwrap();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "n_restored": 2
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: server.address().port(),
+        };
+        sup.bank_restore_sync("m", &endpoint, 8, None, EngineKind::Sglang)
+            .await;
+        let hits_so_far = server
+            .received_requests()
+            .await
+            .expect("expect() mock keeps recording on");
+        assert_eq!(hits_so_far.len(), 0, "unsupported kind must not restore");
+        sup.bank_restore_sync("m", &endpoint, 8, None, EngineKind::LlamaCpp)
+            .await;
+        server.verify().await;
+        let hits = server
+            .received_requests()
+            .await
+            .expect("expect() mock keeps recording on");
+        assert_eq!(hits.len(), 1, "supported kind restores the bank set");
+        let url = hits[0].url.as_str();
+        assert!(
+            url.contains("action=restore") && url.contains("filename=_auto-8"),
+            "restore must target the ctx-scoped checkpoint, got {url}"
         );
     }
 }
