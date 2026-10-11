@@ -8,30 +8,51 @@ emission-truth registry.
 - registry: `scripts/first_class_flags.json` (live emission;
   regenerate via `cargo run -p blazar-runtime --example
   knob_registry`)
+- receipts: `scripts/certification_receipts.json` (live-engine runs
+  that upgrade first-class flags to certified)
 - gate: `python3 scripts/engine_coverage.py --check` fails CI when
-  the doc drifts from either input. No timestamps — the bytes are
+  the doc drifts from any input. No timestamps — the bytes are
   the contract.
 
 | Disposition | Meaning |
 |---|---|
+| certified | first-class + live-engine receipt (behavior proven) |
 | first-class | Blazar pins it from a config knob or derivation |
 | passthrough | reachable via `extra_args`, no first-class knob |
 | intentionally-unsupported | gateway-owned; `extra_args` refuses it |
-| unverified | lane has no emission-truth registry yet |
+| not-applicable | not a capability Blazar could integrate |
+| unverified | no verified reach through Blazar on this lane |
+
+Policy: promotion from passthrough to a first-class knob requires
+workload evidence — a receipt linking the flag to a live-engine
+run. Emission tests gate the *how*; receipts gate the *why*.
 
 ## 2023.11.14-2 (piper) — 16 flags probed
 
-**first-class: 9 · passthrough: 0 · intentionally-unsupported: 0 · unverified: 7**
+**certified: 0 · first-class: 9 · passthrough: 0 · intentionally-unsupported: 0 · not-applicable: 7 · unverified: 0**
 
 Registry lane `piper` pins 10 first-class flags (compile + spawn-time emission).
 
-Unverified (no first-class emission and no `extra_args` path on this lane): --config, --debug, --help, --json-input, --output_dir, --quiet, --tashkeel_model
+### Not applicable (deliberate, per-flag reasons)
+
+- --config: config-file input competes with Blazar's composed argv
+- --debug: interactive CLI ergonomics, not a synthesis capability
+- --help: interactive CLI ergonomics, not a synthesis capability
+- --json-input: stdin JSON request surface; Blazar feeds plain text lines
+- --output_dir: directory batch output; Blazar always names explicit files (--output_file / --output_raw)
+- --quiet: long-form alias of the first-class -q the lane emits
+- --tashkeel_model: Arabic diacritization; needs a separate model asset and an Arabic voice, and the lane has no extra_args surface
 
 ## b11539-cuda (llamacpp) — 329 flags probed
 
-**first-class: 70 · passthrough: 259 · intentionally-unsupported: 0 · unverified: 0**
+**certified: 2 · first-class: 68 · passthrough: 259 · intentionally-unsupported: 0 · not-applicable: 0 · unverified: 0**
 
 Registry lane `llamacpp` pins 73 first-class flags (compile + spawn-time emission).
+
+### Certified against a live engine
+
+- `--cache-type-k` [`bench-artifacts/20261005-kv-quality/benchmark.md`](bench-artifacts/20261005-kv-quality/benchmark.md) — q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)
+- `--cache-type-v` [`bench-artifacts/20261005-kv-quality/benchmark.md`](bench-artifacts/20261005-kv-quality/benchmark.md) — q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)
 
 ### Passthrough families
 
@@ -48,9 +69,13 @@ Registry lane `llamacpp` pins 73 first-class flags (compile + spawn-time emissio
 
 ## b5454 (whisper) — 54 flags probed
 
-**first-class: 15 · passthrough: 39 · intentionally-unsupported: 0 · unverified: 0**
+**certified: 1 · first-class: 14 · passthrough: 39 · intentionally-unsupported: 0 · not-applicable: 0 · unverified: 0**
 
 Registry lane `whisper` pins 15 first-class flags (compile + spawn-time emission).
+
+### Certified against a live engine
+
+- `--beam-size` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) — beam-5 child; piper-TTS wav transcribed exactly
 
 ### Passthrough families
 
@@ -61,9 +86,14 @@ Registry lane `whisper` pins 15 first-class flags (compile + spawn-time emission
 
 ## master-951-f89d9b1 (sdcpp) — 158 flags probed
 
-**first-class: 41 · passthrough: 112 · intentionally-unsupported: 5 · unverified: 0**
+**certified: 2 · first-class: 39 · passthrough: 112 · intentionally-unsupported: 5 · not-applicable: 0 · unverified: 0**
 
 Registry lane `sdcpp` pins 41 first-class flags (compile + spawn-time emission).
+
+### Certified against a live engine
+
+- `--hires-upscalers-dir` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) — RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048
+- `--upscale-model` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) — RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048
 
 ### Passthrough families
 
@@ -79,9 +109,13 @@ Scope disposition: knob emission is pinned by the registry; per-component behavi
 
 ## mlx-0.32.0 (mlx) — 27 flags probed
 
-**first-class: 18 · passthrough: 9 · intentionally-unsupported: 0 · unverified: 0**
+**certified: 1 · first-class: 17 · passthrough: 9 · intentionally-unsupported: 0 · not-applicable: 0 · unverified: 0**
 
 Registry lane `mlx` pins 18 first-class flags (compile + spawn-time emission).
+
+### Certified against a live engine
+
+- `--kv-bits` [`bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md`](bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md) — A/B on qwen2.5-0.5b: 1.9x slower decode, 108MiB saved - memory lever, opt-in
 
 ### Passthrough families
 
@@ -89,9 +123,15 @@ Registry lane `mlx` pins 18 first-class flags (compile + spawn-time emission).
 
 ## sglang-0.5.21 (sglang) — 556 flags probed
 
-**first-class: 70 · passthrough: 485 · intentionally-unsupported: 1 · unverified: 0**
+**certified: 3 · first-class: 67 · passthrough: 485 · intentionally-unsupported: 1 · not-applicable: 0 · unverified: 0**
 
 Registry lane `sglang` pins 70 first-class flags (compile + spawn-time emission).
+
+### Certified against a live engine
+
+- `--enable-lora` [`docs/research/2026-10-09-sglang-lora-one-child.md`](docs/research/2026-10-09-sglang-lora-one-child.md) — one-child colon routing + hot-attach via /api/lora/sync on the same pid
+- `--lora-paths` [`docs/research/2026-10-09-sglang-lora-one-child.md`](docs/research/2026-10-09-sglang-lora-one-child.md) — one-child colon routing + hot-attach via /api/lora/sync on the same pid
+- `--speculative-algorithm` [`bench-artifacts/20261009-sglang-spec/live_battery.json`](bench-artifacts/20261009-sglang-spec/live_battery.json) — ngram live battery: gain is workload-dependent (never default-on)
 
 ### Passthrough families
 
@@ -113,9 +153,13 @@ Scope disposition: Blazar integrates the SGLang server launch path, not a separa
 
 ## v0.9.4 (mistralrs) — 93 flags probed
 
-**first-class: 36 · passthrough: 57 · intentionally-unsupported: 0 · unverified: 0**
+**certified: 1 · first-class: 35 · passthrough: 57 · intentionally-unsupported: 0 · not-applicable: 0 · unverified: 0**
 
 Registry lane `mistralrs` pins 39 first-class flags (compile + spawn-time emission).
+
+### Certified against a live engine
+
+- `--isq` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) — live child --isq q8_0 (qwen3-1.7b temp-0 200 OK); admission stays checkpoint-based
 
 ### Passthrough families
 

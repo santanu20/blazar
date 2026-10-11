@@ -3992,10 +3992,15 @@ fn push_tuned_list(
 /// No GPU at all → `--device cpu` lane with a loud warning.
 #[allow(clippy::too_many_lines)]
 /// mlx-lm launch profile: the connection quintet (--model/--host/--port)
-/// is owned by `MlxEngine::build_argv` (same split as the sglang fork);
-/// mlx manages context and memory inside its own runtime, so this profile
-/// carries no ctx/KV numbers — only the strict manifest-gated
-/// `extra_args` passthrough with the launch pins reserved.
+/// is owned by `MlxEngine::build_argv` (same split as the sglang fork).
+/// Context and memory stay runtime-managed inside mlx-lm: the profile
+/// reports the model's trained context ceiling as `ctx` (0 when metadata
+/// is absent) and marks capacity `RuntimeManaged` — `kv_est_bytes` and
+/// `ctx_autofit` stay unset because admission is settle-based bytes
+/// accounting, not pre-computed KV geometry. First-class tuning knobs
+/// ([`MlxTuning`]) are pinned by `push_mlx_pins`; the strict
+/// manifest-gated `extra_args` passthrough remains with the launch pins
+/// reserved.
 fn compile_mlx(input: &ProfileInput<'_>) -> Result<Profile, String> {
     match input.meta {
         ModelMeta::Hf(_) => {}

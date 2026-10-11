@@ -4,6 +4,11 @@ engine-advertised flag, anchored to emission truth instead of source-literal
 grepping (the old method drifted within one release).
 
 Disposition pipeline (first match wins):
+  certified                 first-class AND backed by a live-engine receipt
+                            in scripts/certification_receipts.json (a
+                            benchmark or end-to-end run against a real
+                            model on this hardware). Emission alone proves
+                            the argv; the receipt proves the behavior.
   first-class               Blazar pins the flag from config knobs or
                             derivations — it appears in
                             scripts/first_class_flags.json, which is
@@ -24,12 +29,22 @@ Disposition pipeline (first match wins):
                             sdcpp / mlx; reserved-checked on whisper).
                             Grouped into keyword families for readability
                             only — the disposition is uniform.
+  not-applicable            the flag is not a capability Blazar could
+                            integrate: CLI ergonomics, alternative input
+                            surfaces, or an alias of a flag the lane
+                            already emits. Per-flag reasons live in
+                            NOT_APPLICABLE below and render in the doc.
   unverified                no verified way to reach the flag through
                             Blazar: either the lane has no
                             emission-truth registry entry yet, or the
                             flag is not first-class AND the lane has no
                             extra_args surface. Said out loud, not
                             guessed.
+
+Policy: promotion from passthrough to a first-class knob requires
+workload evidence — a receipt in scripts/certification_receipts.json
+linking the flag to a live-engine run. Emission tests gate the "how",
+receipts gate the "why".
 
 A flag that is BOTH reserved and in the registry (e.g. mistral.rs
 --max-model-len) lands first-class: Blazar derives it; the reserved
@@ -74,6 +89,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 REGISTRY = REPO / "scripts" / "first_class_flags.json"
 FIXTURES = REPO / "scripts" / "manifest_flag_fixtures.json"
+RECEIPTS_FILE = REPO / "scripts" / "certification_receipts.json"
 DOC = REPO / "docs" / "engine-coverage.md"
 DOC_HEADER = "# Engine capability coverage"
 
@@ -143,6 +159,30 @@ LANES_WITHOUT_REGISTRY: set[str] = set()
 # so a non-first-class flag is unreachable, not passthrough. Piper is a
 # one-shot synthesizer spawn (no config knob, no user argv tail).
 LANES_WITHOUT_EXTRA_ARGS: set[str] = {"piper"}
+
+# Flags that are not capabilities Blazar could integrate — CLI ergonomics,
+# alternative input surfaces, or long-form aliases of flags the lane
+# already emits. The reason is rendered per flag in the doc. Tashkeel is
+# the one deliberate hold-out: a real capability, but it needs a separate
+# model asset and an Arabic voice, and this lane has no extra_args
+# surface — revisit when tashkeel models enter the store.
+NOT_APPLICABLE: dict[str, dict[str, str]] = {
+    "piper": {
+        "--config": ("config-file input competes with Blazar's composed argv"),
+        "--debug": "interactive CLI ergonomics, not a synthesis capability",
+        "--help": "interactive CLI ergonomics, not a synthesis capability",
+        "--json-input": ("stdin JSON request surface; Blazar feeds plain text lines"),
+        "--output_dir": (
+            "directory batch output; Blazar always names explicit files "
+            "(--output_file / --output_raw)"
+        ),
+        "--quiet": "long-form alias of the first-class -q the lane emits",
+        "--tashkeel_model": (
+            "Arabic diacritization; needs a separate model asset and an "
+            "Arabic voice, and the lane has no extra_args surface"
+        ),
+    },
+}
 
 # Passthrough readability families (keyword grouping only). Order matters:
 # first match wins.
@@ -294,11 +334,44 @@ def load_fixtures() -> list[dict[str, object]]:
     return doc["engines"]
 
 
-def disposition(lane: str, flag: str, registry: dict[str, list[str]]) -> str:
+def load_receipts() -> dict[str, dict[str, dict[str, str]]]:
+    """Receipt index: lane -> flag -> {receipt, note}.
+
+    A receipt is a repo-relative path to a live-engine run (benchmark
+    artifact or research note) that exercised the flag end-to-end. It
+    upgrades a first-class flag to certified; it can never upgrade a
+    non-emitted flag.
+    """
+    doc = json.loads(RECEIPTS_FILE.read_text())
+    if doc.get("version") != 1:
+        raise SystemExit(f"{RECEIPTS_FILE}: unsupported schema version")
+    index: dict[str, dict[str, dict[str, str]]] = {}
+    for entry in doc["receipts"]:
+        lane = str(entry["lane"])
+        flag = str(entry["flag"])
+        if lane in index and flag in index[lane]:
+            raise SystemExit(f"{RECEIPTS_FILE}: duplicate {lane} {flag}")
+        index.setdefault(lane, {})[flag] = {
+            "receipt": str(entry["receipt"]),
+            "note": str(entry.get("note", "")),
+        }
+    return index
+
+
+def disposition(
+    lane: str,
+    flag: str,
+    registry: dict[str, list[str]],
+    receipts: dict[str, dict[str, dict[str, str]]],
+) -> str:
     if lane in LANES_WITHOUT_REGISTRY:
         return "unverified"
     if flag in registry.get(lane, []):
+        if flag in receipts.get(lane, {}):
+            return "certified"
         return "first-class"
+    if flag in NOT_APPLICABLE.get(lane, {}):
+        return "not-applicable"
     if flag in RESERVED.get(lane, []):
         return "intentionally-unsupported"
     if lane in LANES_WITHOUT_EXTRA_ARGS:
@@ -325,7 +398,10 @@ class EngineAudit:
     flags: dict[str, str]
 
 
-def audit(registry: dict[str, list[str]]) -> list[EngineAudit]:
+def audit(
+    registry: dict[str, list[str]],
+    receipts: dict[str, dict[str, dict[str, str]]],
+) -> list[EngineAudit]:
     out: list[EngineAudit] = []
     for engine in load_fixtures():
         lane = str(engine["kind"])
@@ -333,7 +409,7 @@ def audit(registry: dict[str, list[str]]) -> list[EngineAudit]:
         if not isinstance(raw_flags, list):
             raise SystemExit(f"fixture {engine['tag']}: flags must be a list")
         flags = sorted({str(f) for f in raw_flags})
-        rows = {f: disposition(lane, f, registry) for f in flags}
+        rows = {f: disposition(lane, f, registry, receipts) for f in flags}
         counts: dict[str, int] = {}
         for d in rows.values():
             counts[d] = counts.get(d, 0) + 1
@@ -341,7 +417,11 @@ def audit(registry: dict[str, list[str]]) -> list[EngineAudit]:
     return out
 
 
-def render_markdown(audited: list[EngineAudit], registry: dict[str, list[str]]) -> str:
+def render_markdown(
+    audited: list[EngineAudit],
+    registry: dict[str, list[str]],
+    receipts: dict[str, dict[str, dict[str, str]]],
+) -> str:
     lines = [
         DOC_HEADER,
         "",
@@ -353,16 +433,24 @@ def render_markdown(audited: list[EngineAudit], registry: dict[str, list[str]]) 
         "- registry: `scripts/first_class_flags.json` (live emission;",
         "  regenerate via `cargo run -p blazar-runtime --example",
         "  knob_registry`)",
+        "- receipts: `scripts/certification_receipts.json` (live-engine runs",
+        "  that upgrade first-class flags to certified)",
         "- gate: `python3 scripts/engine_coverage.py --check` fails CI when",
-        "  the doc drifts from either input. No timestamps — the bytes are",
+        "  the doc drifts from any input. No timestamps — the bytes are",
         "  the contract.",
         "",
         "| Disposition | Meaning |",
         "|---|---|",
+        "| certified | first-class + live-engine receipt (behavior proven) |",
         "| first-class | Blazar pins it from a config knob or derivation |",
         "| passthrough | reachable via `extra_args`, no first-class knob |",
         "| intentionally-unsupported | gateway-owned; `extra_args` refuses it |",
-        "| unverified | lane has no emission-truth registry yet |",
+        "| not-applicable | not a capability Blazar could integrate |",
+        "| unverified | no verified reach through Blazar on this lane |",
+        "",
+        "Policy: promotion from passthrough to a first-class knob requires",
+        "workload evidence — a receipt linking the flag to a live-engine",
+        "run. Emission tests gate the *how*; receipts gate the *why*.",
         "",
     ]
     for engine in audited:
@@ -375,9 +463,11 @@ def render_markdown(audited: list[EngineAudit], registry: dict[str, list[str]]) 
         summary = " · ".join(
             f"{d}: {counts.get(d, 0)}"
             for d in (
+                "certified",
                 "first-class",
                 "passthrough",
                 "intentionally-unsupported",
+                "not-applicable",
                 "unverified",
             )
         )
@@ -389,6 +479,18 @@ def render_markdown(audited: list[EngineAudit], registry: dict[str, list[str]]) 
                 f"Registry lane `{lane}` pins {reg_n} first-class flags "
                 "(compile + spawn-time emission)."
             )
+            lines.append("")
+        certified_hit = {
+            f: receipts[lane][f] for f, d in sorted(flags.items()) if d == "certified"
+        }
+        if certified_hit:
+            lines.append("### Certified against a live engine")
+            lines.append("")
+            for flag, meta in certified_hit.items():
+                note = f" — {meta['note']}" if meta["note"] else ""
+                lines.append(
+                    f"- `{flag}` [`{meta['receipt']}`]({meta['receipt']}){note}"
+                )
             lines.append("")
         by_fam: dict[str, list[str]] = {}
         for flag, d in sorted(flags.items()):
@@ -411,6 +513,13 @@ def render_markdown(audited: list[EngineAudit], registry: dict[str, list[str]]) 
                 "Intentionally-unsupported (gateway-owned, refused in "
                 "`extra_args`): " + ", ".join(reserved_hit)
             )
+            lines.append("")
+        na_hit = [f for f, d in sorted(flags.items()) if d == "not-applicable"]
+        if na_hit:
+            lines.append("### Not applicable (deliberate, per-flag reasons)")
+            lines.append("")
+            for f in na_hit:
+                lines.append(f"- {f}: {NOT_APPLICABLE[lane][f]}")
             lines.append("")
         if lane in LANES_WITHOUT_REGISTRY:
             lines.append(
@@ -460,7 +569,8 @@ def cmd_refresh(store: Path) -> int:
         return 1
     FIXTURES.write_text(json.dumps({"version": 1, "engines": engines}, indent=2) + "\n")
     registry = load_registry()
-    DOC.write_text(render_markdown(audit(registry), registry))
+    receipts = load_receipts()
+    DOC.write_text(render_markdown(audit(registry, receipts), registry, receipts))
     print(f"{FIXTURES}: {len(engines)} engines")
     print(f"{DOC}: regenerated")
     return 0
@@ -480,6 +590,24 @@ def cmd_check() -> int:
         return 1
     if not fixtures:
         problems.append("fixtures hold no engines")
+    try:
+        receipts = load_receipts()
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
+        print(f"FAIL receipts: {e}", file=sys.stderr)
+        return 1
+    for lane, flags in receipts.items():
+        if lane not in registry:
+            problems.append(f"receipt lane {lane} missing from registry")
+            continue
+        for flag, meta in flags.items():
+            if flag not in registry[lane]:
+                problems.append(
+                    f"receipt {lane} {flag} is not emitted by the registry lane"
+                )
+            if not (REPO / meta["receipt"]).is_file():
+                problems.append(
+                    f"receipt {lane} {flag}: missing artifact {meta['receipt']}"
+                )
     for engine in fixtures:
         lane = str(engine["kind"])
         if lane in LANES_WITHOUT_REGISTRY:
@@ -489,7 +617,7 @@ def cmd_check() -> int:
     if not DOC.is_file():
         problems.append(f"{DOC} missing (run --markdown)")
     else:
-        want = render_markdown(audit(registry), registry)
+        want = render_markdown(audit(registry, receipts), registry, receipts)
         have = DOC.read_text()
         if have != want:
             problems.append(
@@ -531,9 +659,10 @@ def main() -> int:
         return cmd_refresh(Path(args.refresh))
 
     registry = load_registry()
-    audited = audit(registry)
+    receipts = load_receipts()
+    audited = audit(registry, receipts)
     if args.markdown:
-        DOC.write_text(render_markdown(audited, registry))
+        DOC.write_text(render_markdown(audited, registry, receipts))
         print(f"{DOC}: regenerated")
         return 0
     if args.json:
@@ -543,13 +672,15 @@ def main() -> int:
     for engine in audited:
         counts = engine.counts
         print(f"\n== {engine.tag} ({engine.kind}) — {engine.total} flags probed")
-        print(f"   first-class: {counts.get('first-class', 0)}")
-        print(f"   passthrough: {counts.get('passthrough', 0)}")
-        print(
-            f"   intentionally-unsupported: "
-            f"{counts.get('intentionally-unsupported', 0)}"
-        )
-        print(f"   unverified: {counts.get('unverified', 0)}")
+        for d in (
+            "certified",
+            "first-class",
+            "passthrough",
+            "intentionally-unsupported",
+            "not-applicable",
+            "unverified",
+        ):
+            print(f"   {d}: {counts.get(d, 0)}")
     return 0
 
 
