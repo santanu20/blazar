@@ -131,14 +131,6 @@ pub async fn messages(
             "max_tokens is required and must be a non-negative integer",
         );
     }
-    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
-        && let Some(entry) = state.keys.entry(&key.name)
-        && let Err(rej) = state.keys.check(&entry, &model)
-    {
-        return rej.to_response();
-    }
-    // F53: charge AFTER translate_request validation — 400s must
-    // not consume a request from the key's budget.
     let stream = parsed
         .get("stream")
         .and_then(Value::as_bool)
@@ -161,8 +153,13 @@ pub async fn messages(
             "best_of requires stream=false — a winner cannot be judged before completion",
         );
     }
-    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k) {
-        state.keys.charge_request(&key.name);
+    // F53 + BLZ-3: atomic admission AFTER validation so 400s consume
+    // no budget, with the gates and the charge in one lock step.
+    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
+        && let Some(entry) = state.keys.entry(&key.name)
+        && let Err(rej) = state.keys.admit(&entry, &model)
+    {
+        return rej.to_response();
     }
     if let Some(err) = state.sentinel.strict_tool_def_error_cached(&openai_body) {
         return anthropic_error(
@@ -420,11 +417,9 @@ pub async fn count_tokens(
     // outside their scope through this lane.
     if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
         && let Some(entry) = state.keys.entry(&key.name)
+        && let Err(rej) = state.keys.admit(&entry, &model)
     {
-        if let Err(rej) = state.keys.check(&entry, &model) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(&key.name);
+        return rej.to_response();
     }
     let mut text = String::new();
     if let Some(sys) = parsed.get("system")

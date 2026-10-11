@@ -13,14 +13,15 @@
 
 use crate::state::AppState;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use blazar_core::BlazarDirs;
+use blazar_core::config::BatchLimits;
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Upload size cap: kept just under the gateway's 50 MiB default body
@@ -30,18 +31,18 @@ const MAX_UPLOAD_BYTES: usize = 48 * 1024 * 1024;
 /// lane is a different surface).
 const SUPPORTED_ENDPOINT: &str = "/v1/chat/completions";
 /// Ids are short random hex so they sort/echo like upstream (`file-…`,
-/// `batch-…`).
+/// `batch-…`). BLZ-6: 48 bits from the OS CSPRNG — the previous
+/// nanos-XOR-counter scheme was predictable, and ids must stay
+/// unguessable even with object authz in place.
 pub(crate) fn short_id(prefix: &str) -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos()),
-    )
-    // u128 nanos fit u64 until year 2554; the xor only needs entropy.
-    .unwrap_or(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{:012x}", nanos ^ n.rotate_left(17))
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 6];
+    getrandom::fill(&mut bytes).expect("OS entropy source");
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(hex, "{b:02x}");
+    }
+    format!("{prefix}-{hex}")
 }
 
 fn now_secs() -> u64 {
@@ -86,11 +87,255 @@ fn err(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+/// BLZ-1: the creating key's name, stamped into meta JSON as `_owner`
+/// (underscore = internal, never part of a public wire shape). `None`
+/// on the open gateway — such objects stay visible to every caller.
+fn owner_name(key_ext: Option<&Extension<crate::keys::KeyCtx>>) -> Option<String> {
+    key_ext.map(|k| k.name.clone())
+}
+
+/// BLZ-1: does `key` see meta stamped with `_owner`? Missing/null
+/// `_owner` (legacy or open-gateway object) is visible to all.
+fn meta_allows(m: &Value, key: Option<&crate::keys::KeyCtx>) -> bool {
+    crate::keys::owner_allows(m["_owner"].as_str(), key)
+}
+
+/// Drop the internal `_owner` stamp before a meta object reaches the
+/// wire — public shapes stay byte-identical to pre-scope responses.
+fn strip_owner(mut v: Value) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        o.remove("_owner");
+    }
+    v
+}
+
+// ---------- BLZ-6: storage quotas + retention ----------
+
+/// OpenAI-dialect terminal statuses — a batch in any of these states has
+/// no worker left and can never make progress again. The superset covers
+/// statuses upstream clients echo back in listings.
+fn openai_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "canceled" | "expired" | "succeeded" | "errored"
+    )
+}
+
+/// Is this batch meta (either dialect) finished with its work?
+fn batch_terminal(m: &Value) -> bool {
+    if m["dialect"] == "anthropic" {
+        m["internal_status"] == "ended"
+    } else {
+        m["status"].as_str().is_some_and(openai_terminal)
+    }
+}
+
+/// Current on-disk footprint of the batch store: total bytes plus a
+/// per-owner breakdown (uploads without an `_owner` stamp — open-gateway
+/// or legacy — count toward the global total only).
+fn stored_bytes(dirs: &BlazarDirs) -> (u64, HashMap<String, u64>) {
+    let mut total = 0u64;
+    let mut per_owner: HashMap<String, u64> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(files_dir(dirs)) else {
+        return (0, per_owner);
+    };
+    for e in entries.flatten() {
+        let Some(name) = e.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        if !name.ends_with(".meta.json") {
+            continue;
+        }
+        let Some(m) = read_json(&e.path()) else {
+            continue;
+        };
+        // Meta records the upload size; fall back to the data file when
+        // an older meta lacks the field.
+        let bytes = m["bytes"].as_u64().unwrap_or_else(|| {
+            let id = name.trim_end_matches(".meta.json");
+            std::fs::metadata(files_dir(dirs).join(format!("{id}.jsonl"))).map_or(0, |md| md.len())
+        });
+        total = total.saturating_add(bytes);
+        if let Some(owner) = m["_owner"].as_str() {
+            *per_owner.entry(owner.to_string()).or_insert(0) += bytes;
+        }
+    }
+    (total, per_owner)
+}
+
+/// Would `incoming` more bytes for `owner` exceed a configured store
+/// quota? `None` = allowed. Zero quotas (the defaults) mean unlimited,
+/// preserving pre-BLZ-6 behavior exactly.
+fn store_quota_refusal(
+    dirs: &BlazarDirs,
+    limits: &BatchLimits,
+    owner: Option<&str>,
+    incoming: u64,
+) -> Option<(StatusCode, String)> {
+    if limits.max_store_bytes_total == 0 && limits.max_store_bytes_per_key == 0 {
+        return None;
+    }
+    let (total, per_owner) = stored_bytes(dirs);
+    if limits.max_store_bytes_total > 0
+        && total.saturating_add(incoming) > limits.max_store_bytes_total
+    {
+        return Some((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "upload exceeds the global batch store quota: {total} bytes stored + {incoming} incoming exceeds the {}-byte cap",
+                limits.max_store_bytes_total
+            ),
+        ));
+    }
+    if limits.max_store_bytes_per_key > 0
+        && let Some(owner) = owner
+    {
+        let used = per_owner.get(owner).copied().unwrap_or(0);
+        if used.saturating_add(incoming) > limits.max_store_bytes_per_key {
+            return Some((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "upload exceeds the per-key batch store quota: {used} bytes stored + {incoming} incoming exceeds the {}-byte cap for key '{owner}'",
+                    limits.max_store_bytes_per_key
+                ),
+            ));
+        }
+    }
+    None
+}
+
+/// Batches still running for `owner`, across both dialects.
+fn active_batch_count(dirs: &BlazarDirs, owner: &str) -> u64 {
+    let Ok(entries) = std::fs::read_dir(batches_dir(dirs)) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| read_json(&e.path()))
+        .filter(|m| m["_owner"].as_str() == Some(owner) && !batch_terminal(m))
+        .count()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// Retention sweep — BLZ-6. Runs inline at upload/batch-create time (no
+/// timer thread to leak or race a daemon stop). Conservative by contract:
+/// a batch is removed only when its status is TERMINAL and its finalize
+/// (or creation) stamp is older than the retention window — in-flight
+/// work is never touched. Output files ride along with their batch; an
+/// input/output file is removed only when NO surviving batch references
+/// it and its own `created_at` ages out. Every removal is logged;
+/// per-entry errors are logged and skipped so one bad row cannot wedge
+/// the lane. `retention_secs == 0` disables the sweep (retain forever).
+fn sweep_expired(dirs: &BlazarDirs, retention_secs: u64, now: u64) {
+    if retention_secs == 0 {
+        return;
+    }
+    let cutoff = now.saturating_sub(retention_secs);
+
+    // Pass 1: classify every batch meta and collect the file ids that
+    // SURVIVING batches still reference (those files stay no matter
+    // their age).
+    let mut referenced: HashSet<String> = HashSet::new();
+    let mut expired: Vec<(String, Option<String>)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(batches_dir(dirs)) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let Some(m) = read_json(&e.path()) else {
+            continue;
+        };
+        let terminal = batch_terminal(&m);
+        let stamp = if m["dialect"] == "anthropic" {
+            m["ended_at_secs"]
+                .as_u64()
+                .or_else(|| m["created_at_secs"].as_u64())
+        } else {
+            m["finalized_at"]
+                .as_u64()
+                .or_else(|| m["created_at"].as_u64())
+        };
+        if terminal && stamp.is_some_and(|s| s < cutoff) {
+            expired.push((
+                m["id"].as_str().unwrap_or_default().to_string(),
+                m["output_file_id"].as_str().map(String::from),
+            ));
+        } else {
+            if let Some(i) = m["input_file_id"].as_str() {
+                referenced.insert(i.to_string());
+            }
+            if let Some(o) = m["output_file_id"].as_str() {
+                referenced.insert(o.to_string());
+            }
+        }
+    }
+
+    // Pass 2: remove expired batch metas and their output files. The
+    // output file is uniquely owned by its batch, so it rides along.
+    for (id, output_id) in expired {
+        if let Err(e) = std::fs::remove_file(batch_meta(dirs, &id)) {
+            tracing::warn!(target: "blazar::batch", batch = %id, error = %e, "retention sweep: batch meta removal failed");
+            continue;
+        }
+        tracing::info!(target: "blazar::batch", batch = %id, "retention sweep removed expired batch");
+        if let Some(output_id) = output_id {
+            remove_store_file(dirs, &output_id);
+        }
+    }
+
+    // Pass 3: orphaned files — no surviving batch references them and
+    // their own created_at has aged out.
+    let Ok(files) = std::fs::read_dir(files_dir(dirs)) else {
+        return;
+    };
+    for f in files.flatten() {
+        let Some(name) = f.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        if !name.ends_with(".meta.json") {
+            continue;
+        }
+        let Some(m) = read_json(&f.path()) else {
+            continue;
+        };
+        let Some(id) = m["id"].as_str() else {
+            continue;
+        };
+        if referenced.contains(id) {
+            continue;
+        }
+        if m["created_at"].as_u64().is_some_and(|t| t < cutoff) {
+            remove_store_file(dirs, id);
+        }
+    }
+}
+
+/// Remove one file's data + meta pair, logging the removal (BLZ-6 —
+/// deletions must be observable, and so must failed deletions: the
+/// "removed" line only fires when something actually went away).
+fn remove_store_file(dirs: &BlazarDirs, id: &str) {
+    let mut removed_any = false;
+    for suffix in [".jsonl", ".meta.json"] {
+        let p = files_dir(dirs).join(format!("{id}{suffix}"));
+        match std::fs::remove_file(&p) {
+            Ok(()) => removed_any = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(target: "blazar::batch", file = %id, error = %e, "retention sweep: file removal failed");
+            }
+        }
+    }
+    if removed_any {
+        tracing::info!(target: "blazar::batch", file = %id, "retention sweep removed expired file");
+    }
+}
+
 /// `POST /v1/files` — multipart upload with a `file` part (and optional
 /// `purpose` form field, accepted and recorded). Returns an OpenAI-style
 /// file object.
 pub async fn upload_file(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -129,6 +374,18 @@ pub async fn upload_file(
     {
         return err(StatusCode::BAD_REQUEST, "only purpose=batch is supported");
     }
+    // BLZ-6: refresh retention first so the quota check counts live data,
+    // then enforce the configured store quotas on the incoming bytes.
+    sweep_expired(&state.dirs, state.config.batch.retention_secs, now_secs());
+    let owner = owner_name(key_ext.as_ref());
+    if let Some((status, message)) = store_quota_refusal(
+        &state.dirs,
+        &state.config.batch,
+        owner.as_deref(),
+        file.data.len() as u64,
+    ) {
+        return err(status, &message);
+    }
     let id = short_id("file");
     let dir = files_dir(&state.dirs);
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -155,6 +412,7 @@ pub async fn upload_file(
         "created_at": now_secs(),
         "filename": filename,
         "purpose": purpose.unwrap_or_else(|| "batch".into()),
+        "_owner": owner_name(key_ext.as_ref()),
     });
     if let Err(e) = write_json(&dir.join(format!("{id}.meta.json")), &obj) {
         tracing::error!(target: "blazar::batch", file = %id, error = %e, "file meta write failed");
@@ -163,7 +421,7 @@ pub async fn upload_file(
             &format!("write file meta: {e}"),
         );
     }
-    (StatusCode::OK, axum::Json(obj)).into_response()
+    (StatusCode::OK, axum::Json(strip_owner(obj))).into_response()
 }
 
 fn file_meta(dirs: &BlazarDirs, id: &str) -> Option<Value> {
@@ -173,6 +431,7 @@ fn file_meta(dirs: &BlazarDirs, id: &str) -> Option<Value> {
 /// `GET /v1/files/{id}` — file metadata.
 pub async fn get_file(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     if !id
@@ -182,14 +441,18 @@ pub async fn get_file(
         return err(StatusCode::BAD_REQUEST, "invalid file id");
     }
     match file_meta(&state.dirs, &id) {
-        Some(v) => (StatusCode::OK, axum::Json(v)).into_response(),
-        None => err(StatusCode::NOT_FOUND, "unknown file id"),
+        // BLZ-1: a foreign file reads exactly like an unknown one.
+        Some(v) if meta_allows(&v, key_ext.as_deref()) => {
+            (StatusCode::OK, axum::Json(strip_owner(v))).into_response()
+        }
+        _ => err(StatusCode::NOT_FOUND, "unknown file id"),
     }
 }
 
 /// `GET /v1/files/{id}/content` — raw stored JSONL.
 pub async fn get_file_content(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     if !id
@@ -197,6 +460,12 @@ pub async fn get_file_content(
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return err(StatusCode::BAD_REQUEST, "invalid file id");
+    }
+    // BLZ-1: gate on the meta before serving the bytes — the content
+    // route and the meta route must agree on visibility.
+    match file_meta(&state.dirs, &id) {
+        Some(v) if meta_allows(&v, key_ext.as_deref()) => {}
+        _ => return err(StatusCode::NOT_FOUND, "unknown file id"),
     }
     match std::fs::read(files_dir(&state.dirs).join(format!("{id}.jsonl"))) {
         Ok(bytes) => (
@@ -212,6 +481,7 @@ pub async fn get_file_content(
 /// `POST /v1/batches` — validate the input file and spawn the worker.
 pub async fn create_batch(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -231,6 +501,10 @@ pub async fn create_batch(
     let Some(meta) = file_meta(&state.dirs, input_file_id) else {
         return err(StatusCode::NOT_FOUND, "unknown input_file_id");
     };
+    // BLZ-1: a batch may only consume an input file its key can read.
+    if !meta_allows(&meta, key_ext.as_deref()) {
+        return err(StatusCode::NOT_FOUND, "unknown input_file_id");
+    }
     let input_path = files_dir(&state.dirs).join(format!("{input_file_id}.jsonl"));
     let Ok(lines) = std::fs::read_to_string(&input_path) else {
         return err(StatusCode::NOT_FOUND, "input file content missing");
@@ -238,6 +512,22 @@ pub async fn create_batch(
     let total = lines.lines().filter(|l| !l.trim().is_empty()).count();
     if total == 0 {
         return err(StatusCode::BAD_REQUEST, "input file has no request lines");
+    }
+    // BLZ-6: refresh retention, then enforce the per-key concurrent-batch
+    // bound before spawning another worker.
+    sweep_expired(&state.dirs, state.config.batch.retention_secs, now_secs());
+    if let Some(owner) = owner_name(key_ext.as_ref())
+        && state.config.batch.max_active_batches_per_key > 0
+        && active_batch_count(&state.dirs, &owner)
+            >= u64::from(state.config.batch.max_active_batches_per_key)
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "key '{owner}' is already running the configured maximum of {} concurrent batches",
+                state.config.batch.max_active_batches_per_key
+            ),
+        );
     }
 
     let id = short_id("batch");
@@ -249,7 +539,8 @@ pub async fn create_batch(
         "endpoint": endpoint,
         "status": "in_progress",
         "input_file_id": input_file_id,
-        "input_file": meta,
+        "input_file": strip_owner(meta),
+        "_owner": owner_name(key_ext.as_ref()),
         "output_file_id": Value::Null,
         "created_at": created,
         "metadata": req.get("metadata").cloned().unwrap_or(json!({})),
@@ -291,10 +582,11 @@ pub async fn create_batch(
         host,
         port,
         auth_headers,
+        max_output_bytes: state.config.batch.max_output_bytes_per_batch,
     };
     tokio::spawn(async move { run_batch(dirs, job, lines).await });
 
-    (StatusCode::OK, axum::Json(batch)).into_response()
+    (StatusCode::OK, axum::Json(strip_owner(batch))).into_response()
 }
 
 /// POST one request body through the gateway's own listener, forwarding
@@ -336,8 +628,11 @@ struct BatchJob {
     host: String,
     port: u16,
     auth_headers: Vec<(String, String)>,
+    /// BLZ-6: cumulative output cap (0 = unlimited).
+    max_output_bytes: u64,
 }
 
+#[allow(clippy::too_many_lines)] // one cohesive replay loop
 async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
     let BatchJob {
         id,
@@ -345,6 +640,7 @@ async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
         host,
         port,
         auth_headers,
+        max_output_bytes,
     } = job;
     let job_ref = BatchJob {
         id: id.clone(),
@@ -352,6 +648,7 @@ async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
         host: host.clone(),
         port,
         auth_headers: Vec::new(),
+        max_output_bytes,
     };
     // Output lands in files/ as {output_id}.jsonl — same lookup path the
     // GET /v1/files/{id}/content route serves uploads from.
@@ -365,6 +662,9 @@ async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
         .unwrap_or_default();
     let mut completed = 0u64;
     let mut failed = 0u64;
+    // BLZ-6: cumulative output size, enforced inside write_row against
+    // the per-batch cap.
+    let mut written = 0u64;
     // F74: stream rows straight to disk instead of accumulating the whole
     // output in memory (a 48 MiB input can inflate far beyond that with
     // response bodies; a crash also loses everything buffered so far).
@@ -406,6 +706,7 @@ async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
                     &job_ref,
                     completed,
                     failed,
+                    &mut written,
                 ) {
                     continue;
                 }
@@ -421,6 +722,7 @@ async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
                 &job_ref,
                 completed,
                 failed,
+                &mut written,
             ) {
                 continue;
             }
@@ -432,7 +734,15 @@ async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
         } else {
             failed += 1;
         }
-        if !write_row(&mut writer, &row, &dirs, &job_ref, completed, failed) {
+        if !write_row(
+            &mut writer,
+            &row,
+            &dirs,
+            &job_ref,
+            completed,
+            failed,
+            &mut written,
+        ) {
             return;
         }
     }
@@ -476,7 +786,9 @@ async fn replay_to_row(
 }
 
 /// Append one JSONL row to the output writer; false = abort the batch
-/// (output write failed — F76: disk errors must not masquerade as success).
+/// (output write failed — F76: disk errors must not masquerade as
+/// success; or the row pushed cumulative output past the BLZ-6
+/// per-batch byte cap).
 fn write_row(
     writer: &mut std::io::BufWriter<std::fs::File>,
     row: &str,
@@ -484,10 +796,21 @@ fn write_row(
     job: &BatchJob,
     completed: u64,
     failed: u64,
+    written: &mut u64,
 ) -> bool {
     if let Err(e) = writeln!(writer, "{row}") {
         tracing::error!(target: "blazar::batch", batch = %job.id, error = %e, "batch output write failed");
         fail_batch(dirs, job, &format!("output write: {e}"));
+        return false;
+    }
+    *written = written.saturating_add(row.len() as u64 + 1);
+    if job.max_output_bytes > 0 && *written > job.max_output_bytes {
+        tracing::warn!(target: "blazar::batch", batch = %job.id, written, cap = job.max_output_bytes, "batch output exceeded the per-batch byte cap");
+        fail_batch(
+            dirs,
+            job,
+            "output exceeded the configured max_output_bytes_per_batch cap",
+        );
         return false;
     }
     update_progress(dirs, &job.id, completed, failed);
@@ -590,6 +913,7 @@ fn write_final_meta(
 /// `GET /v1/batches/{id}` — live batch object.
 pub async fn get_batch(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     if !id
@@ -599,13 +923,19 @@ pub async fn get_batch(
         return err(StatusCode::BAD_REQUEST, "invalid batch id");
     }
     match read_json(&batch_meta(&state.dirs, &id)) {
-        Some(v) => (StatusCode::OK, axum::Json(v)).into_response(),
-        None => err(StatusCode::NOT_FOUND, "unknown batch id"),
+        // BLZ-1: a foreign batch reads exactly like an unknown one.
+        Some(v) if meta_allows(&v, key_ext.as_deref()) => {
+            (StatusCode::OK, axum::Json(strip_owner(v))).into_response()
+        }
+        _ => err(StatusCode::NOT_FOUND, "unknown batch id"),
     }
 }
 
 /// `GET /v1/batches` — list all batches (newest first).
-pub async fn list_batches(State(state): State<std::sync::Arc<AppState>>) -> Response {
+pub async fn list_batches(
+    State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+) -> Response {
     let mut rows: Vec<Value> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(batches_dir(&state.dirs)) {
         for e in entries.flatten() {
@@ -615,8 +945,11 @@ pub async fn list_batches(State(state): State<std::sync::Arc<AppState>>) -> Resp
                     .extension()
                     .is_some_and(|e| e == "json")
                 && let Some(v) = read_json(&e.path())
+                // BLZ-1: data-layer filter — only this key's batches (and
+                // legacy null-owner rows) reach the listing.
+                && meta_allows(&v, key_ext.as_deref())
             {
-                rows.push(v);
+                rows.push(strip_owner(v));
             }
         }
     }
@@ -632,6 +965,7 @@ pub async fn list_batches(State(state): State<std::sync::Arc<AppState>>) -> Resp
 /// lands asynchronously (`cancelled` once the current item finishes).
 pub async fn cancel_batch(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     // F77: same charset contract as get_batch — an unvalidated id would
@@ -644,9 +978,12 @@ pub async fn cancel_batch(
     }
     let path = batch_meta(&state.dirs, &id);
     match read_json(&path) {
-        Some(mut m) => {
+        // BLZ-1: cancelling another key's batch reads as unknown.
+        Some(mut m) if meta_allows(&m, key_ext.as_deref()) => {
             let status = m["status"].as_str().unwrap_or("").to_string();
-            if status == "completed" || status == "cancelled" {
+            if matches!(status.as_str(), "completed" | "cancelled" | "failed") {
+                // "failed" included: the worker is gone, so a cancel flag
+                // would wedge the status at "cancelling" forever.
                 return err(StatusCode::BAD_REQUEST, "batch already finished");
             }
             m["status"] = json!("cancelling");
@@ -656,9 +993,9 @@ pub async fn cancel_batch(
                     &format!("persist cancel: {e}"),
                 );
             }
-            (StatusCode::OK, axum::Json(m)).into_response()
+            (StatusCode::OK, axum::Json(strip_owner(m))).into_response()
         }
-        None => err(StatusCode::NOT_FOUND, "unknown batch id"),
+        _ => err(StatusCode::NOT_FOUND, "unknown batch id"),
     }
 }
 
@@ -764,6 +1101,8 @@ struct AnthropicBatchJob {
     host: String,
     port: u16,
     auth_headers: Vec<(String, String)>,
+    /// BLZ-6: cumulative output cap (0 = unlimited).
+    max_output_bytes: u64,
 }
 
 /// Progress update: mutates only the counts so a concurrent cancel flag
@@ -845,6 +1184,8 @@ async fn run_anthropic_batch(dirs: BlazarDirs, job: AnthropicBatchJob, input: St
     let mut succeeded = 0u64;
     let mut errored = 0u64;
     let mut canceled = 0u64;
+    // BLZ-6: cumulative output size against the per-batch cap.
+    let mut written = 0u64;
     let mut remaining: u64 = input
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -875,6 +1216,7 @@ async fn run_anthropic_batch(dirs: BlazarDirs, job: AnthropicBatchJob, input: St
                 |v| v["custom_id"].as_str().unwrap_or("request").to_string(),
             ));
             canceled += 1;
+            written = written.saturating_add(row.len() as u64 + 1);
             if writeln!(writer, "{row}").is_err() {
                 break;
             }
@@ -917,6 +1259,18 @@ async fn run_anthropic_batch(dirs: BlazarDirs, job: AnthropicBatchJob, input: St
                 anthropic_row_errored(&custom_id, "api_error", &format!("loopback call: {e}"))
             }
         };
+        written = written.saturating_add(row.len() as u64 + 1);
+        if job.max_output_bytes > 0 && written > job.max_output_bytes {
+            tracing::warn!(target: "blazar::batch", batch = %job.id, written, cap = job.max_output_bytes, "anthropic batch output exceeded the per-batch byte cap");
+            let truncation = anthropic_row_errored(
+                "batch",
+                "api_error",
+                "batch output exceeded the configured max_output_bytes_per_batch cap; results truncated",
+            );
+            let _ = writeln!(writer, "{truncation}");
+            errored += 1;
+            break;
+        }
         if writeln!(writer, "{row}").is_err() {
             tracing::error!(target: "blazar::batch", batch = %job.id, "anthropic output write failed");
             break;
@@ -940,6 +1294,7 @@ async fn run_anthropic_batch(dirs: BlazarDirs, job: AnthropicBatchJob, input: St
 #[allow(clippy::too_many_lines)] // one cohesive validation + spawn path
 pub async fn anthropic_batches_create(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -1003,7 +1358,37 @@ pub async fn anthropic_batches_create(
     }
 
     // Internal JSONL: one {custom_id, params} line per request, stored in
-    // the same files/ pool the OpenAI lane uses.
+    // the same files/ pool the OpenAI lane uses. BLZ-6: retention refresh
+    // + store quotas + the per-key concurrent-batch bound apply to this
+    // dialect too — it writes the same disk.
+    sweep_expired(&state.dirs, state.config.batch.retention_secs, now_secs());
+    let owner = owner_name(key_ext.as_ref());
+    if let Some(owner) = &owner
+        && state.config.batch.max_active_batches_per_key > 0
+        && active_batch_count(&state.dirs, owner)
+            >= u64::from(state.config.batch.max_active_batches_per_key)
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "key '{owner}' is already running the configured maximum of {} concurrent batches",
+                state.config.batch.max_active_batches_per_key
+            ),
+        );
+    }
+    let lines: Vec<String> = requests
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap_or_default())
+        .collect();
+    let input_bytes: u64 = lines.iter().map(|l| l.len() as u64 + 1).sum();
+    if let Some((status, message)) = store_quota_refusal(
+        &state.dirs,
+        &state.config.batch,
+        owner.as_deref(),
+        input_bytes,
+    ) {
+        return err(status, &message);
+    }
     let input_id = short_id("file");
     let input_path = files_dir(&state.dirs).join(format!("{input_id}.jsonl"));
     if let Err(e) = std::fs::create_dir_all(files_dir(&state.dirs)) {
@@ -1012,10 +1397,6 @@ pub async fn anthropic_batches_create(
             &format!("create batch dir: {e}"),
         );
     }
-    let lines: Vec<String> = requests
-        .iter()
-        .map(|r| serde_json::to_string(r).unwrap_or_default())
-        .collect();
     if let Err(e) = std::fs::write(&input_path, lines.join("\n") + "\n") {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1031,6 +1412,7 @@ pub async fn anthropic_batches_create(
         "id": id,
         "internal_status": "in_progress",
         "cancel_requested": false,
+        "_owner": owner_name(key_ext.as_ref()),
         "created_at_secs": now_secs(),
         "ended_at_secs": Value::Null,
         "cancel_initiated_at_secs": Value::Null,
@@ -1073,6 +1455,7 @@ pub async fn anthropic_batches_create(
         host,
         port,
         auth_headers,
+        max_output_bytes: state.config.batch.max_output_bytes_per_batch,
     };
     tokio::spawn(async move { run_anthropic_batch(dirs, job, lines.join("\n")).await });
 
@@ -1087,7 +1470,11 @@ pub async fn anthropic_batches_create(
 
 /// Load an anthropic-dialect batch meta or produce the error response.
 #[allow(clippy::result_large_err)] // Response is the handlers' currency here
-fn anthropic_meta(state: &std::sync::Arc<AppState>, id: &str) -> Result<Value, Response> {
+fn anthropic_meta(
+    state: &std::sync::Arc<AppState>,
+    id: &str,
+    key: Option<&crate::keys::KeyCtx>,
+) -> Result<Value, Response> {
     if !id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -1095,9 +1482,10 @@ fn anthropic_meta(state: &std::sync::Arc<AppState>, id: &str) -> Result<Value, R
         return Err(err(StatusCode::BAD_REQUEST, "invalid message batch id"));
     }
     match read_json(&batch_meta(&state.dirs, id)) {
-        Some(m) if m["dialect"] == "anthropic" => Ok(m),
-        // An OpenAI-dialect batch under the same routes is indistinguishable
-        // from an unknown id — same 404.
+        // BLZ-1: every anthropic route funnels through here — gate once,
+        // and a foreign batch stays indistinguishable from an unknown id
+        // (an OpenAI-dialect batch under these routes reads the same way).
+        Some(m) if m["dialect"] == "anthropic" && meta_allows(&m, key) => Ok(m),
         _ => Err(err(
             StatusCode::NOT_FOUND,
             "unknown message batch id (message batches use the /v1/messages/batches routes)",
@@ -1108,16 +1496,20 @@ fn anthropic_meta(state: &std::sync::Arc<AppState>, id: &str) -> Result<Value, R
 /// `GET /v1/messages/batches/{id}` — idempotent poll target.
 pub async fn anthropic_batches_get(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    match anthropic_meta(&state, &id) {
+    match anthropic_meta(&state, &id, key_ext.as_deref()) {
         Ok(m) => (StatusCode::OK, axum::Json(anthropic_public_shape(&m))).into_response(),
         Err(resp) => resp,
     }
 }
 
 /// `GET /v1/messages/batches` — newest first.
-pub async fn anthropic_batches_list(State(state): State<std::sync::Arc<AppState>>) -> Response {
+pub async fn anthropic_batches_list(
+    State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+) -> Response {
     let mut rows: Vec<Value> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(batches_dir(&state.dirs)) {
         for e in entries.flatten() {
@@ -1127,6 +1519,9 @@ pub async fn anthropic_batches_list(State(state): State<std::sync::Arc<AppState>
                     .is_some_and(|x| x == "json")
                 && let Some(v) = read_json(&e.path())
                 && v["dialect"] == "anthropic"
+                // BLZ-1: data-layer filter, same visibility law as the
+                // OpenAI listing.
+                && meta_allows(&v, key_ext.as_deref())
             {
                 rows.push(anthropic_public_shape(&v));
             }
@@ -1155,9 +1550,10 @@ pub async fn anthropic_batches_list(State(state): State<std::sync::Arc<AppState>
 /// lands asynchronously (`ended` once the in-flight request finishes).
 pub async fn anthropic_batches_cancel(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let mut m = match anthropic_meta(&state, &id) {
+    let mut m = match anthropic_meta(&state, &id, key_ext.as_deref()) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
@@ -1183,9 +1579,10 @@ pub async fn anthropic_batches_cancel(
 /// readable through `expires_at`; upstream semantics, documented honestly).
 pub async fn anthropic_batches_delete(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let mut m = match anthropic_meta(&state, &id) {
+    let mut m = match anthropic_meta(&state, &id, key_ext.as_deref()) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
@@ -1203,9 +1600,10 @@ pub async fn anthropic_batches_delete(
 /// file once the batch has ended.
 pub async fn anthropic_batches_results(
     State(state): State<std::sync::Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let m = match anthropic_meta(&state, &id) {
+    let m = match anthropic_meta(&state, &id, key_ext.as_deref()) {
         Ok(m) => m,
         Err(resp) => return resp,
     };
@@ -1245,6 +1643,20 @@ mod tests {
         assert!(a.starts_with("file-"));
         assert!(b.starts_with("batch-"));
         assert_ne!(a, short_id("file"));
+        // BLZ-6: ids come from the OS CSPRNG — lowercase hex, and a run of
+        // a thousand must never collide (predictable ids are not secrets).
+        for id in [&a, &b] {
+            let tail = &id[id.find('-').unwrap() + 1..];
+            assert_eq!(tail.len(), 12, "id: {id}");
+            assert!(
+                tail.bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(seen.insert(short_id("file")));
+        }
     }
 
     #[test]
@@ -1388,6 +1800,7 @@ mod tests {
             // Never contacted: the cancel flag precedes the first replay.
             port: 1,
             auth_headers: Vec::new(),
+            max_output_bytes: 0,
         };
         run_anthropic_batch(dirs.clone(), job, input.to_string()).await;
 
@@ -1410,5 +1823,251 @@ mod tests {
             assert_eq!(r["result"]["type"], "canceled", "row: {r:?}");
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------- BLZ-6 test fixtures ----------
+
+    /// Scratch store with both directories created; caller cleans up.
+    fn scratch_dirs(tag: &str) -> BlazarDirs {
+        let tmp = std::env::temp_dir().join(format!("blazar-batch6-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dirs = BlazarDirs {
+            config_dir: tmp.clone(),
+            data_dir: tmp,
+        };
+        std::fs::create_dir_all(files_dir(&dirs)).unwrap();
+        std::fs::create_dir_all(batches_dir(&dirs)).unwrap();
+        dirs
+    }
+
+    fn write_store_file(
+        dirs: &BlazarDirs,
+        id: &str,
+        owner: Option<&str>,
+        bytes: u64,
+        created_at: u64,
+    ) {
+        std::fs::write(
+            files_dir(dirs).join(format!("{id}.jsonl")),
+            vec![b'x'; usize::try_from(bytes).unwrap_or(usize::MAX)],
+        )
+        .unwrap();
+        let meta = json!({
+            "id": id, "object": "file", "bytes": bytes, "created_at": created_at,
+            "filename": format!("{id}.jsonl"), "purpose": "batch", "_owner": owner,
+        });
+        std::fs::write(
+            files_dir(dirs).join(format!("{id}.meta.json")),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)] // flat fixture: every knob explicit
+    fn write_openai_batch(
+        dirs: &BlazarDirs,
+        id: &str,
+        status: &str,
+        input: &str,
+        output: Option<&str>,
+        owner: &str,
+        created_at: u64,
+        finalized_at: Option<u64>,
+    ) {
+        let meta = json!({
+            "id": id, "status": status, "input_file_id": input,
+            "output_file_id": output, "created_at": created_at,
+            "finalized_at": finalized_at, "_owner": owner,
+        });
+        std::fs::write(
+            batch_meta(dirs, id),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Retention sweep pins: removal requires TERMINAL status AND an aged
+    /// stamp; in-flight batches and their referenced files survive; orphaned
+    /// files age out on their own `created_at`; output files ride along with
+    /// their expired batch.
+    #[test]
+    fn unit__sweep_expired__terminal_and_age_gated() {
+        let dirs = scratch_dirs("sweep");
+        // now = 10_000, retention = 1_000 → cutoff = 9_000.
+        let now = 10_000_u64;
+
+        // Terminal + old (finalized 8_000): swept, output rides along.
+        write_store_file(&dirs, "file-gone", Some("alpha"), 10, 7_000);
+        write_store_file(&dirs, "file-out", None, 10, 7_000);
+        write_openai_batch(
+            &dirs,
+            "batch-old",
+            "completed",
+            "file-gone",
+            Some("file-out"),
+            "alpha",
+            7_000,
+            Some(8_000),
+        );
+
+        // In-flight + old: NEVER touched (binding contract).
+        write_store_file(&dirs, "file-live", Some("alpha"), 10, 1_000);
+        write_openai_batch(
+            &dirs,
+            "batch-live",
+            "in_progress",
+            "file-live",
+            None,
+            "alpha",
+            1_000,
+            None,
+        );
+
+        // Terminal but FRESH (finalized 9_500): kept.
+        write_openai_batch(
+            &dirs,
+            "batch-fresh",
+            "completed",
+            "file-live2",
+            None,
+            "alpha",
+            9_000,
+            Some(9_500),
+        );
+
+        // Orphaned old file (no batch references it): aged out alone.
+        write_store_file(&dirs, "file-orphan", None, 10, 8_000);
+        // Orphaned FRESH file: kept.
+        write_store_file(&dirs, "file-fresh", None, 10, 9_500);
+
+        sweep_expired(&dirs, 1_000, now);
+
+        let batches: Vec<String> = std::fs::read_dir(batches_dir(&dirs))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !batches.iter().any(|b| b.starts_with("batch-old")),
+            "{batches:?}"
+        );
+        assert!(
+            batches.iter().any(|b| b.starts_with("batch-live")),
+            "{batches:?}"
+        );
+        assert!(
+            batches.iter().any(|b| b.starts_with("batch-fresh")),
+            "{batches:?}"
+        );
+
+        let files: Vec<String> = std::fs::read_dir(files_dir(&dirs))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !files.iter().any(|f| f.starts_with("file-out.")),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with("file-orphan.")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.starts_with("file-live.")),
+            "{files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.starts_with("file-fresh.")),
+            "{files:?}"
+        );
+        // The expired batch's INPUT file was released by its removal and
+        // its own created_at (7_000) is past cutoff → orphan pass removes it.
+        assert!(
+            !files.iter().any(|f| f.starts_with("file-gone.")),
+            "{files:?}"
+        );
+
+        // retention 0 = disabled: nothing is ever removed.
+        write_openai_batch(
+            &dirs,
+            "batch-old2",
+            "expired",
+            "file-fresh",
+            None,
+            "alpha",
+            1_000,
+            Some(1_000),
+        );
+        sweep_expired(&dirs, 0, now);
+        assert!(batch_meta(&dirs, "batch-old2").exists());
+
+        let _ = std::fs::remove_dir_all(files_dir(&dirs).parent().unwrap());
+    }
+
+    /// Quota pins: per-key caps key-scoped owners, the global cap catches
+    /// everyone (including open-gateway uploads), zero quotas = unlimited.
+    #[test]
+    fn unit__store_quota_refusal__per_key_and_total() {
+        let dirs = scratch_dirs("quota");
+        write_store_file(&dirs, "f-alpha", Some("alpha"), 100, 1);
+        write_store_file(&dirs, "f-legacy", None, 50, 1);
+
+        let unlimited = BatchLimits::default();
+        assert!(store_quota_refusal(&dirs, &unlimited, Some("alpha"), 1_000_000).is_none());
+
+        let per_key = BatchLimits {
+            max_store_bytes_per_key: 150,
+            ..BatchLimits::default()
+        };
+        assert!(
+            store_quota_refusal(&dirs, &per_key, Some("alpha"), 50).is_none(),
+            "150 == cap, at-cap is allowed"
+        );
+        let refused = store_quota_refusal(&dirs, &per_key, Some("alpha"), 51).unwrap();
+        assert_eq!(refused.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(refused.1.contains("per-key"), "{}", refused.1);
+        // Another key is unaffected by alpha's usage.
+        assert!(store_quota_refusal(&dirs, &per_key, Some("beta"), 150).is_none());
+        // Open-gateway uploads skip the per-key leg entirely.
+        assert!(store_quota_refusal(&dirs, &per_key, None, 1_000).is_none());
+
+        let total = BatchLimits {
+            max_store_bytes_total: 150,
+            ..BatchLimits::default()
+        };
+        let refused = store_quota_refusal(&dirs, &total, None, 1).unwrap();
+        assert_eq!(refused.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(refused.1.contains("global"), "{}", refused.1);
+
+        let _ = std::fs::remove_dir_all(files_dir(&dirs).parent().unwrap());
+    }
+
+    /// Active-batch pins: only NON-terminal batches of the SAME owner
+    /// count, across both dialects.
+    #[test]
+    fn unit__active_batch_count__owner_scoped_non_terminal() {
+        let dirs = scratch_dirs("active");
+        write_openai_batch(&dirs, "b-run", "in_progress", "f", None, "alpha", 1, None);
+        write_openai_batch(&dirs, "b-done", "completed", "f", None, "alpha", 1, Some(2));
+        // Anthropic dialect: ended = terminal, in_progress = active.
+        for (id, status, owner) in [
+            ("msg_run", "in_progress", "alpha"),
+            ("msg_done", "ended", "beta"),
+            ("msg_beta", "in_progress", "beta"),
+        ] {
+            let meta = json!({
+                "dialect": "anthropic", "id": id, "internal_status": status,
+                "created_at_secs": 1_u64, "ended_at_secs": Value::Null, "_owner": owner,
+            });
+            std::fs::write(
+                batch_meta(&dirs, id),
+                serde_json::to_vec_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(active_batch_count(&dirs, "alpha"), 2);
+        assert_eq!(active_batch_count(&dirs, "beta"), 1);
+        assert_eq!(active_batch_count(&dirs, "nobody"), 0);
+
+        let _ = std::fs::remove_dir_all(files_dir(&dirs).parent().unwrap());
     }
 }

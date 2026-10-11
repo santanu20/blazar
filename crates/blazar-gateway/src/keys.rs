@@ -27,6 +27,82 @@ pub struct KeyCtx {
     pub weight: u32,
 }
 
+/// BLZ-2: control-plane authorization. Fleet-level and mutating
+/// operations (failover pinning, replication fan-out, live-adapter
+/// surgery, adapter listing) change what serves traffic or touch every
+/// peer, so they demand an unscoped (admin) key whenever keys exist.
+/// On the open gateway (no keys) they stay open — the auth
+/// middleware's documented trust boundary applies unchanged.
+pub fn control_plane_authorized(
+    keys: &KeysLimiter,
+    key: Option<&KeyCtx>,
+) -> Result<(), (u16, String)> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let Some(k) = key else {
+        return Err((401, "missing bearer token".into()));
+    };
+    let scoped = keys
+        .entries()
+        .into_iter()
+        .find(|e| e.name == k.name)
+        .is_some_and(|e| !e.models.is_empty());
+    if scoped {
+        Err((
+            403,
+            format!(
+                "key {:?} is model-scoped; control-plane operations require an unscoped (admin) key",
+                k.name
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// BLZ-2: pure model-scope predicate for model-specific control
+/// actions (warm). Authorization only — no quota accounting: warm is
+/// an operator nudge, not an inference request.
+pub fn scope_permits(
+    keys: &KeysLimiter,
+    key: Option<&KeyCtx>,
+    model: &str,
+) -> Result<(), (u16, String)> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let Some(k) = key else {
+        return Err((401, "missing bearer token".into()));
+    };
+    let Some(entry) = keys.entries().into_iter().find(|e| e.name == k.name) else {
+        return Err((401, "unknown key".into()));
+    };
+    if entry.models.is_empty() || entry.models.iter().any(|m| scope_matches(m, model)) {
+        Ok(())
+    } else {
+        Err((
+            403,
+            format!("key {:?} is not scoped for model {:?}", k.name, model),
+        ))
+    }
+}
+
+/// BLZ-1 object-level authorization: may `key` see a durable row created
+/// by `owner`? `None` owner rows are pre-scope legacy (or open-gateway)
+/// and stay visible to every caller; a keyless request implies keys are
+/// not configured at all (the auth middleware inserts `KeyCtx` whenever
+/// they are), which is the same open-gateway posture.
+#[must_use]
+pub fn owner_allows(owner: Option<&str>, key: Option<&KeyCtx>) -> bool {
+    match (owner, key) {
+        (Some(o), Some(k)) => o == k.name,
+        // Open-gateway rows and keyless callers both admit; only a
+        // keyed caller meeting a foreign owner is refused.
+        _ => true,
+    }
+}
+
 /// Why a request was rejected (mapped to a response by the caller).
 #[derive(Debug)]
 pub enum Rejection {
@@ -269,46 +345,45 @@ impl KeysLimiter {
         before != entries.len()
     }
 
-    /// Admission check: model scope, then rpm, then tpm, then the daily
-    /// budget. Pure read (the rpm/tpm windows are advanced at charge time,
-    /// so a checked-but-aborted request never consumed budget).
-    pub fn check(&self, key: &blazar_core::ApiKey, model: &str) -> Result<(), Rejection> {
+    /// Atomic admission (BLZ-3): model scope, then the rpm/tpm/daily
+    /// gates, then the request charge — all under ONE lock acquisition.
+    /// The old read-then-charge pair let N concurrent requests all pass
+    /// the same pre-charge window and overshoot the rpm ceiling; here a
+    /// request is only admitted when its own charge lands in the same
+    /// critical section, so the window count the gates evaluate is
+    /// exact at every decision.
+    ///
+    /// Token budgets stay measured-usage accounting (charged at
+    /// completion via `charge_tokens`): they throttle with completion
+    /// lag rather than reserving upfront. The strict in-flight bound
+    /// for hard spending control is the `max_concurrent` cap leased at
+    /// auth time.
+    pub fn admit(&self, key: &blazar_core::ApiKey, model: &str) -> Result<(), Rejection> {
         if !key.models.is_empty() && !key.models.iter().any(|m| scope_matches(m, model)) {
             return Err(Rejection::Scope {
                 name: key.name.clone(),
                 model: model.to_string(),
             });
         }
-        if key.rpm == 0 && key.tpm == 0 && key.daily_tokens == 0 {
-            return Ok(());
-        }
         let now = Instant::now();
         let today = utc_day(SystemTime::now());
         let mut states = self.states.lock().expect("keys state poisoned");
         let st = states.entry(key.name.clone()).or_default();
         st.roll_day(&today);
-        if key.rpm > 0
-            && st
-                .rpm
-                .iter()
-                .filter(|t| now.duration_since(**t) < WINDOW)
-                .count()
-                >= usize::try_from(key.rpm).unwrap_or(usize::MAX)
-        {
-            let oldest = st
-                .rpm
-                .iter()
-                .find(|t| now.duration_since(**t) < WINDOW)
-                .map_or(1, |t| {
-                    WINDOW
-                        .checked_sub(now.duration_since(*t))
-                        .unwrap_or(WINDOW)
-                        .as_secs()
-                        .max(1)
-                });
+        prune_window(&mut st.rpm, now);
+        if key.rpm > 0 && st.rpm.len() >= usize::try_from(key.rpm).unwrap_or(usize::MAX) {
+            // Window is pruned, so the first entry IS the oldest
+            // in-window charge; the caller waits for it to age out.
+            let retry_after_secs = st.rpm.first().map_or(1, |t| {
+                WINDOW
+                    .checked_sub(now.duration_since(*t))
+                    .unwrap_or(WINDOW)
+                    .as_secs()
+                    .max(1)
+            });
             return Err(Rejection::Rate {
                 kind: "requests-per-minute",
-                retry_after_secs: oldest,
+                retry_after_secs,
                 name: key.name.clone(),
             });
         }
@@ -343,21 +418,12 @@ impl KeysLimiter {
                 name: key.name.clone(),
             });
         }
-        Ok(())
-    }
-
-    /// Count one admitted request. Called once per request after the
-    /// scope/rate check passes — exact for every route, body-free.
-    pub fn charge_request(&self, name: &str) {
-        let now = Instant::now();
-        let today = utc_day(SystemTime::now());
-        let mut states = self.states.lock().expect("keys state poisoned");
-        let st = states.entry(name.to_string()).or_default();
-        st.roll_day(&today);
-        prune_window(&mut st.rpm, now);
+        // Granted: the charge lands inside the same critical section
+        // the gates just evaluated, closing the check/charge race.
         st.rpm.push(now);
         st.requests += 1;
         st.dirty = true;
+        Ok(())
     }
 
     /// Add measured tokens for a finished chat-family request (exact
@@ -754,6 +820,63 @@ mod tests {
     use super::*;
     use blazar_core::ApiKey;
 
+    /// BLZ-2 truth table: control-plane routes demand an unscoped key
+    /// the moment any keys exist; the open gateway stays open.
+    #[test]
+    fn unit__control_plane__unscoped_key_required_when_keys_exist() {
+        let ctx = |name: &str| KeyCtx {
+            name: name.into(),
+            weight: 1,
+        };
+        // Open gateway: no keys configured, everything passes.
+        let open = KeysLimiter::loaded(None, Vec::new());
+        assert!(super::control_plane_authorized(&open, None).is_ok());
+        assert!(super::control_plane_authorized(&open, Some(&ctx("anyone"))).is_ok());
+        // Keyed gateway: unscoped admin passes, scoped refused, missing 401.
+        let keyed = KeysLimiter::loaded(
+            None,
+            vec![key("admin", 0, 0, 0, &[]), key("scoped", 0, 0, 0, &["m1"])],
+        );
+        assert!(super::control_plane_authorized(&keyed, Some(&ctx("admin"))).is_ok());
+        let (code, msg) = super::control_plane_authorized(&keyed, Some(&ctx("scoped")))
+            .expect_err("scoped key must be refused");
+        assert_eq!(code, 403);
+        assert!(msg.contains("unscoped (admin)"), "{msg}");
+        let (code, _) = super::control_plane_authorized(&keyed, None).expect_err("no key");
+        assert_eq!(code, 401);
+    }
+
+    /// BLZ-2 truth table: warm-style model-specific actions pass on a
+    /// pure scope check — allowlist match or admin, never quota.
+    #[test]
+    fn unit__scope_permits__model_specific_control_actions() {
+        let ctx = |name: &str| KeyCtx {
+            name: name.into(),
+            weight: 1,
+        };
+        let open = KeysLimiter::loaded(None, Vec::new());
+        assert!(super::scope_permits(&open, None, "anything").is_ok());
+        let keyed = KeysLimiter::loaded(
+            None,
+            vec![
+                key("admin", 0, 0, 0, &[]),
+                key("scoped", 0, 0, 0, &["m1", "fam:*"]),
+            ],
+        );
+        assert!(super::scope_permits(&keyed, Some(&ctx("admin")), "m2").is_ok());
+        assert!(super::scope_permits(&keyed, Some(&ctx("scoped")), "m1").is_ok());
+        assert!(super::scope_permits(&keyed, Some(&ctx("scoped")), "fam:x").is_ok());
+        let (code, msg) = super::scope_permits(&keyed, Some(&ctx("scoped")), "m2")
+            .expect_err("out-of-scope model");
+        assert_eq!(code, 403);
+        assert!(msg.contains("not scoped"), "{msg}");
+        let (code, _) = super::scope_permits(&keyed, None, "m1").expect_err("no key");
+        assert_eq!(code, 401);
+        let (code, _) = super::scope_permits(&keyed, Some(&ctx("ghost")), "m1")
+            .expect_err("unknown key fails closed");
+        assert_eq!(code, 401);
+    }
+
     fn key(name: &str, rpm: u32, tpm: u64, daily: u64, models: &[&str]) -> ApiKey {
         ApiKey {
             name: name.into(),
@@ -883,23 +1006,23 @@ mod tests {
     fn unit__scope__wildcard_prefix_matching() {
         let lim = KeysLimiter::loaded(None, Vec::new());
         let k = key("ci", 0, 0, 0, &["qwen3*", "vllm:*"]);
-        assert!(lim.check(&k, "qwen3.5-9b").is_ok());
-        assert!(lim.check(&k, "vllm:whatever").is_ok());
-        assert!(lim.check(&k, "qwen2.5-0.5b-instruct").is_err());
+        assert!(lim.admit(&k, "qwen3.5-9b").is_ok());
+        assert!(lim.admit(&k, "vllm:whatever").is_ok());
+        assert!(lim.admit(&k, "qwen2.5-0.5b-instruct").is_err());
         // Exact patterns still work; '*' alone = everything.
         let k = key("ci", 0, 0, 0, &["m1"]);
-        assert!(lim.check(&k, "m1").is_ok());
-        assert!(lim.check(&k, "m1x").is_err());
+        assert!(lim.admit(&k, "m1").is_ok());
+        assert!(lim.admit(&k, "m1x").is_err());
         let k = key("ci", 0, 0, 0, &["*"]);
-        assert!(lim.check(&k, "anything").is_ok());
+        assert!(lim.admit(&k, "anything").is_ok());
     }
 
     #[test]
     fn unit__scope__rejects_unlisted_model() {
         let lim = KeysLimiter::loaded(None, Vec::new());
         let k = key("ci", 0, 0, 0, &["a", "b"]);
-        assert!(lim.check(&k, "a").is_ok());
-        let err = lim.check(&k, "c").unwrap_err();
+        assert!(lim.admit(&k, "a").is_ok());
+        let err = lim.admit(&k, "c").unwrap_err();
         assert!(matches!(err, Rejection::Scope { .. }));
         let resp = err.to_response();
         assert_eq!(resp.status(), 403);
@@ -909,11 +1032,9 @@ mod tests {
     fn unit__rpm__rejects_at_window_cap() {
         let lim = KeysLimiter::loaded(None, Vec::new());
         let k = key("ci", 2, 0, 0, &[]);
-        assert!(lim.check(&k, "m").is_ok());
-        lim.charge_request("ci");
-        assert!(lim.check(&k, "m").is_ok());
-        lim.charge_request("ci");
-        let err = lim.check(&k, "m").unwrap_err();
+        assert!(lim.admit(&k, "m").is_ok());
+        assert!(lim.admit(&k, "m").is_ok());
+        let err = lim.admit(&k, "m").unwrap_err();
         assert!(matches!(
             err,
             Rejection::Rate {
@@ -925,13 +1046,42 @@ mod tests {
     }
 
     #[test]
+    fn unit__rpm__admission_is_atomic_under_a_concurrent_burst() {
+        // BLZ-3 pin: gates and the charge land in one lock step, so a
+        // burst of threads racing the same rpm-limited key admits
+        // EXACTLY rpm requests — never more. The old check/charge pair
+        // let every racer pass the same pre-charge window.
+        let rpm: u32 = 5;
+        let racers = 4 * rpm as usize;
+        let lim = KeysLimiter::loaded(None, Vec::new());
+        let k = key("ci", rpm, 0, 0, &[]);
+        let barrier = std::sync::Barrier::new(racers);
+        let admitted = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..racers {
+                s.spawn(|| {
+                    barrier.wait();
+                    if lim.admit(&k, "m").is_ok() {
+                        admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::SeqCst),
+            rpm as usize,
+            "exactly the cap is admitted, the rest are rejected"
+        );
+    }
+
+    #[test]
     fn unit__daily_budget__blocks_after_quota() {
         let lim = KeysLimiter::loaded(None, Vec::new());
         let k = key("ci", 0, 0, 100, &[]);
         lim.charge_tokens("ci", 60);
-        assert!(lim.check(&k, "m").is_ok()); // 60 < 100
+        assert!(lim.admit(&k, "m").is_ok()); // 60 < 100
         lim.charge_tokens("ci", 40);
-        let err = lim.check(&k, "m").unwrap_err();
+        let err = lim.admit(&k, "m").unwrap_err();
         assert!(matches!(
             err,
             Rejection::Rate {
@@ -979,7 +1129,7 @@ mod tests {
         // Leases are in-flight, not tokens: the daily budget check is
         // unaffected by held slots.
         assert!(matches!(
-            lim.check(&k, "m"),
+            lim.admit(&k, "m"),
             Err(Rejection::Rate {
                 kind: "daily token budget",
                 ..

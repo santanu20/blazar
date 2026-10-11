@@ -989,6 +989,122 @@ async fn e2e__num_ctx_ladder_serves_q4_hostable_shape() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__control_plane__scoped_key_refused_admin_key_passes() {
+    // BLZ-2 regression: model-scoped keys must not reach control-plane
+    // mutators (failover pinning, adapter surgery, replication fan-out)
+    // regardless of the chain/model named; admin keys keep going and the
+    // open gateway is untouched.
+    let cfg = Config {
+        keys: vec![
+            blazar_core::ApiKey {
+                name: "admin".into(),
+                key: "admin-secret".into(),
+                ..blazar_core::ApiKey::default()
+            },
+            blazar_core::ApiKey {
+                name: "scoped".into(),
+                key: "scoped-secret".into(),
+                models: vec!["m1".into()],
+                ..blazar_core::ApiKey::default()
+            },
+        ],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let scoped = |r: reqwest::RequestBuilder| r.bearer_auth("scoped-secret");
+    let admin = |r: reqwest::RequestBuilder| r.bearer_auth("admin-secret");
+
+    // Scoped key: 403 from the guard itself — before any chain or model
+    // resolution, so existence never leaks through the error shape.
+    for (label, req) in [
+        ("pin", scoped(c.post(format!("{}/api/failover/nonexistent/pin", ts.base))).json(
+            &serde_json::json!({"target": 0}),
+        )),
+        (
+            "unpin",
+            scoped(c.post(format!("{}/api/failover/nonexistent/unpin", ts.base))),
+        ),
+        (
+            "lora-sync",
+            scoped(c.post(format!("{}/api/lora/sync", ts.base))).json(
+                &serde_json::json!({"model": "m1", "action": "add", "lora_name": "x", "lora_path": "/p"}),
+            ),
+        ),
+        (
+            "replicate",
+            scoped(c.post(format!("{}/api/replicate", ts.base)))
+                .json(&serde_json::json!({"model": "m1"})),
+        ),
+        (
+            "adapters",
+            scoped(c.get(format!("{}/v1/adapters", ts.base))),
+        ),
+    ] {
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), 403, "{label}: scoped key must be refused");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // failover answers in the OpenAI error shape, federation routes
+        // in the ollama {"error": "<msg>"} shape — accept either.
+        let msg = body["error"]["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .or_else(|| body["detail"].as_str())
+            .unwrap_or_default();
+        assert!(msg.contains("unscoped"), "{label}: {msg}");
+    }
+
+    // Warm is model-specific: out-of-scope model and unverifiable names
+    // are refused for the scoped key; the in-scope notify contract holds.
+    let out_of_scope = scoped(c.post(format!("{}/api/warm", ts.base)))
+        .json(&serde_json::json!({"model": "m2", "wait": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out_of_scope.status(), 403);
+    let unknown = scoped(c.post(format!("{}/api/warm", ts.base)))
+        .json(&serde_json::json!({"model": "no-such-model", "wait": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 403);
+    let in_scope = scoped(c.post(format!("{}/api/warm", ts.base)))
+        .json(&serde_json::json!({"model": "m1", "wait": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(in_scope.status(), 200);
+
+    // Admin key passes the guard and keeps the long-standing contracts:
+    // unknown chains 404 (not 403), unknown warm names still notify ok.
+    let admin_pin = admin(c.post(format!("{}/api/failover/nonexistent/pin", ts.base)))
+        .json(&serde_json::json!({"target": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_pin.status(), 404);
+    let admin_warm = admin(c.post(format!("{}/api/warm", ts.base)))
+        .json(&serde_json::json!({"model": "no-such-model", "wait": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_warm.status(), 200);
+    ts.state.sup.shutdown_all().await.unwrap();
+
+    // Open gateway (no keys): the guard is inert — same unknown-chain 404.
+    let ts_open = start(Config::default()).await;
+    let open_pin = c
+        .post(format!("{}/api/failover/nonexistent/pin", ts_open.base))
+        .json(&serde_json::json!({"target": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(open_pin.status(), 404);
+    ts_open.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__auth_bearer_required_when_keys_set() {
     let cfg = Config {
         keys: vec![blazar_core::ApiKey {
@@ -1034,6 +1150,382 @@ async fn e2e__auth_bearer_required_when_keys_set() {
             .unwrap()
             .status(),
         200
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__cors_preflight__answered_before_auth_when_keys_set() {
+    // BLZ-5 regression: a browser preflight carries no bearer token, so
+    // it must be answered by the CORS layer (200 + allow headers), not
+    // rejected by auth with a bare 401. The CORS layer sits outside
+    // auth precisely for this.
+    let cfg = Config {
+        keys: vec![blazar_core::ApiKey {
+            name: "admin".into(),
+            key: "secret-1".into(),
+            ..blazar_core::ApiKey::default()
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let preflight = c
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/v1/chat/completions", ts.base),
+        )
+        .header("Origin", "http://localhost:3000")
+        .header("Access-Control-Request-Method", "POST")
+        .header(
+            "Access-Control-Request-Headers",
+            "authorization,content-type",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        preflight.status(),
+        200,
+        "preflight must reach CORS, not auth"
+    );
+    assert!(
+        preflight
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "preflight answer must carry CORS allow headers"
+    );
+    // Disallowed origins get no CORS grant — the browser blocks them —
+    // but the request still must not leak an auth 401 body shape.
+    let evil = c
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/v1/chat/completions", ts.base),
+        )
+        .header("Origin", "https://evil.example")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !evil.headers().contains_key("access-control-allow-origin"),
+        "disallowed origin must not receive a CORS grant"
+    );
+    // A real request without a key is still 401 — auth remains armed.
+    let no_key = c.get(format!("{}/api/tags", ts.base)).send().await.unwrap();
+    assert_eq!(no_key.status(), 401);
+    // ...and a permitted-origin 401 carries CORS headers so browser
+    // clients can read the error body instead of an opaque failure.
+    let no_key_origin = c
+        .get(format!("{}/api/tags", ts.base))
+        .header("Origin", "http://localhost:3000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_key_origin.status(), 401);
+    assert!(
+        no_key_origin
+            .headers()
+            .contains_key("access-control-allow-origin"),
+        "allowed-origin auth rejection should stay readable by the browser"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+#[allow(clippy::too_many_lines)] // one exhaustive two-key walkthrough, splitting muddies the scenario
+async fn e2e__object_authz__batch_files_two_key_isolation() {
+    // BLZ-1: batch-plane durable resources (uploaded files, batches) carry
+    // the creating key's name in their on-disk meta; a second valid key
+    // must read, consume, cancel and list them exactly like an unknown
+    // id — 404s, no `_owner` leak on the wire, nothing in the listing.
+    let cfg = Config {
+        keys: vec![
+            blazar_core::ApiKey {
+                name: "alpha".into(),
+                key: "alpha-secret".into(),
+                ..blazar_core::ApiKey::default()
+            },
+            blazar_core::ApiKey {
+                name: "beta".into(),
+                key: "beta-secret".into(),
+                ..blazar_core::ApiKey::default()
+            },
+        ],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let boundary = "X-BLAZAR-BLZ1-FILES";
+    let jsonl = "{\"custom_id\":\"r1\",\"params\":{\"model\":\"m\",\"messages\":[]}}\n";
+    let multipart = format!(
+        "--{boundary}\r\ncontent-disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n\
+         --{boundary}\r\ncontent-disposition: form-data; name=\"file\"; \
+         filename=\"in.jsonl\"\r\ncontent-type: application/jsonl\r\n\r\n{jsonl}\r\n\
+         --{boundary}--\r\n"
+    );
+    // alpha uploads the input file.
+    let up = c
+        .post(format!("{}/v1/files", ts.base))
+        .bearer_auth("alpha-secret")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(multipart)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(up.status(), 200);
+    let file_obj: serde_json::Value = up.json().await.unwrap();
+    let file_id = file_obj["id"].as_str().unwrap().to_string();
+    assert!(
+        file_obj.get("_owner").is_none(),
+        "internal owner stamp must never reach the wire"
+    );
+    // alpha reads its own file meta + content.
+    assert_eq!(
+        c.get(format!("{}/v1/files/{file_id}", ts.base))
+            .bearer_auth("alpha-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        c.get(format!("{}/v1/files/{file_id}/content", ts.base))
+            .bearer_auth("alpha-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    // beta reads the SAME ids as unknown: meta, content, and as a batch
+    // input — 404 everywhere, no existence leak.
+    for path in [
+        format!("/v1/files/{file_id}"),
+        format!("/v1/files/{file_id}/content"),
+    ] {
+        assert_eq!(
+            c.get(format!("{}{path}", ts.base))
+                .bearer_auth("beta-secret")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404,
+            "foreign key must read the file as unknown: {path}"
+        );
+    }
+    let steal = c
+        .post(format!("{}/v1/batches", ts.base))
+        .bearer_auth("beta-secret")
+        .json(&serde_json::json!({
+            "input_file_id": file_id,
+            "endpoint": "/v1/chat/completions",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(steal.status(), 404, "foreign key cannot consume the file");
+    // alpha creates a batch from its own file (worker needs no engine for
+    // the row to exist; replay failures land in the output rows).
+    let batch = c
+        .post(format!("{}/v1/batches", ts.base))
+        .bearer_auth("alpha-secret")
+        .json(&serde_json::json!({
+            "input_file_id": file_id,
+            "endpoint": "/v1/chat/completions",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(batch.status(), 200);
+    let batch_obj: serde_json::Value = batch.json().await.unwrap();
+    let batch_id = batch_obj["id"].as_str().unwrap().to_string();
+    // beta: get + cancel + list all blind to alpha's batch.
+    assert_eq!(
+        c.get(format!("{}/v1/batches/{batch_id}", ts.base))
+            .bearer_auth("beta-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        c.post(format!("{}/v1/batches/{batch_id}/cancel", ts.base))
+            .bearer_auth("beta-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let beta_list: serde_json::Value = c
+        .get(format!("{}/v1/batches", ts.base))
+        .bearer_auth("beta-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let beta_ids: Vec<&str> = beta_list["data"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !beta_ids.contains(&batch_id.as_str()),
+        "foreign key's listing must not contain alpha's batch"
+    );
+    // alpha still sees its own batch.
+    assert_eq!(
+        c.get(format!("{}/v1/batches/{batch_id}", ts.base))
+            .bearer_auth("alpha-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__object_authz__anthropic_batches_two_key_isolation() {
+    // BLZ-1, anthropic dialect: get/cancel/delete/results funnel through
+    // one gated meta loader; listings filter at the data layer.
+    let cfg = Config {
+        keys: vec![
+            blazar_core::ApiKey {
+                name: "alpha".into(),
+                key: "alpha-secret".into(),
+                ..blazar_core::ApiKey::default()
+            },
+            blazar_core::ApiKey {
+                name: "beta".into(),
+                key: "beta-secret".into(),
+                ..blazar_core::ApiKey::default()
+            },
+        ],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let create = c
+        .post(format!("{}/v1/messages/batches", ts.base))
+        .bearer_auth("alpha-secret")
+        .json(&serde_json::json!({
+            "requests": [{
+                "custom_id": "r1",
+                "params": {"model": "m", "messages": [{"role": "user", "content": "x"}]},
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 200);
+    let obj: serde_json::Value = create.json().await.unwrap();
+    let id = obj["id"].as_str().unwrap().to_string();
+    // beta: every route reads the batch as unknown.
+    for (method, path) in [
+        ("GET", format!("/v1/messages/batches/{id}")),
+        ("POST", format!("/v1/messages/batches/{id}/cancel")),
+        ("DELETE", format!("/v1/messages/batches/{id}")),
+        ("GET", format!("/v1/messages/batches/{id}/results")),
+    ] {
+        let r = c
+            .request(method.parse().unwrap(), format!("{}{path}", ts.base))
+            .bearer_auth("beta-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "foreign key blind: {path}");
+    }
+    let beta_list: serde_json::Value = c
+        .get(format!("{}/v1/messages/batches", ts.base))
+        .bearer_auth("beta-secret")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let beta_ids: Vec<&str> = beta_list["data"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(!beta_ids.contains(&id.as_str()));
+    // alpha still polls its own batch.
+    assert_eq!(
+        c.get(format!("{}/v1/messages/batches/{id}", ts.base))
+            .bearer_auth("alpha-secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__batch_quota__keyed_upload_refused_beyond_store_cap() {
+    // BLZ-6: per-key batch storage quota is enforced at upload time.
+    // At-cap uploads still land (refusal starts only past the cap);
+    // the next upload is a 413 naming the per-key limit.
+    let cfg = Config {
+        keys: vec![blazar_core::ApiKey {
+            name: "alpha".into(),
+            key: "alpha-secret".into(),
+            ..blazar_core::ApiKey::default()
+        }],
+        batch: blazar_core::config::BatchLimits {
+            max_store_bytes_per_key: 16,
+            ..blazar_core::config::BatchLimits::default()
+        },
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let boundary = "X-BLAZAR-BLZ6-QUOTA";
+    let upload = |body: &'static str| {
+        format!(
+            "--{boundary}\r\ncontent-disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n\
+             --{boundary}\r\ncontent-disposition: form-data; name=\"file\"; \
+             filename=\"in.jsonl\"\r\ncontent-type: application/jsonl\r\n\r\n{body}\r\n\
+             --{boundary}--\r\n"
+        )
+    };
+    let post = |multipart: String| {
+        c.post(format!("{}/v1/files", ts.base))
+            .bearer_auth("alpha-secret")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(multipart)
+    };
+    // 8-byte jsonl line: 0 + 8 = 8 <= 16.
+    let first = post(upload("{\"a\":1}\n")).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    // At cap: 8 stored + 8 incoming = 16, still allowed.
+    let second = post(upload("{\"b\":2}\n")).send().await.unwrap();
+    assert_eq!(second.status(), 200, "at-cap upload must land");
+    // 16 stored + 8 incoming = 24 > 16 -> refused with the per-key reason.
+    let third = post(upload("{\"c\":3}\n")).send().await.unwrap();
+    assert_eq!(third.status(), 413);
+    let body = third.text().await.unwrap();
+    assert!(
+        body.contains("per-key"),
+        "413 body must name the per-key limit: {body}"
     );
     ts.state.sup.shutdown_all().await.unwrap();
 }

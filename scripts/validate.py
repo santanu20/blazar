@@ -1336,6 +1336,14 @@ _K = [
         "R4 opt-in semantic cache container; full-manifest boot w/ enabled=false (enabled=true requires model)",
     ),
     (
+        "batch",
+        False,
+        True,
+        "roundtrip",
+        None,
+        "BLZ-6 batch storage limits container; full-manifest boot with the all-default (unlimited) table",
+    ),
+    (
         "rpc_servers",
         False,
         False,
@@ -11764,6 +11772,7 @@ def _full_toplevel() -> dict:
         "mistralrs_paged_attn": False,
         "reasoning": "",
         "sglang": {},
+        "batch": {},
         "lazy_mode": "auto",
         "deterministic": False,
         "deterministic_isolate": False,

@@ -990,11 +990,10 @@ pub async fn chat(
         // `remote:model` string (same semantics as the OpenAI lane's
         // split: a scope entry like `my-remote:*` admits, anything
         // else rejects).
-        if let Some((name, entry)) = &key_entry {
-            if let Err(rej) = state.keys.check(entry, &model_field) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(name);
+        if let Some((_name, entry)) = &key_entry
+            && let Err(rej) = state.keys.admit(entry, &model_field)
+        {
+            return rej.to_response();
         }
         let prefix = crate::proxy::affinity_hash(&req);
         let mut out = match crate::remotes::select_remote(&state, &model_field, prefix.as_ref()) {
@@ -1060,11 +1059,10 @@ pub async fn chat(
 
     // Key admission already ran above (F11 hoist) — scope check against
     // the RESOLVED row name + request-count charge for the local lane.
-    if let Some((name, entry)) = &key_entry {
-        if let Err(rej) = state.keys.check(entry, &row.name) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(name);
+    if let Some((_name, entry)) = &key_entry
+        && let Err(rej) = state.keys.admit(entry, &row.name)
+    {
+        return rej.to_response();
     }
     // Agent-client cache teaching (advisory, never mutates `req`): flag
     // a conversation whose system-prompt/tools fingerprint churns turn
@@ -2708,11 +2706,9 @@ pub async fn embeddings(
     // their exact token count below).
     if let Some(Extension(k)) = &key_ext
         && let Some(entry) = state.keys.entry(&k.name)
+        && let Err(rej) = state.keys.admit(&entry, &row.name)
     {
-        if let Err(rej) = state.keys.check(&entry, &row.name) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(&k.name);
+        return rej.to_response();
     }
     // Request-level admission (chat parity): embeddings are cheap but
     // still occupy child slots — park at the ceiling instead of piling
@@ -2862,11 +2858,9 @@ pub async fn embed(
     };
     if let Some(Extension(k)) = &key_ext
         && let Some(entry) = state.keys.entry(&k.name)
+        && let Err(rej) = state.keys.admit(&entry, &row.name)
     {
-        if let Err(rej) = state.keys.check(&entry, &row.name) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(&k.name);
+        return rej.to_response();
     }
     // Request-level admission (chat parity): embeddings are cheap but
     // still occupy child slots — park at the ceiling instead of piling
@@ -3048,11 +3042,9 @@ pub async fn rerank(
     };
     if let Some(Extension(k)) = &key_ext
         && let Some(entry) = state.keys.entry(&k.name)
+        && let Err(rej) = state.keys.admit(&entry, &row.name)
     {
-        if let Err(rej) = state.keys.check(&entry, &row.name) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(&k.name);
+        return rej.to_response();
     }
     // Request-level admission (chat parity): embeddings are cheap but
     // still occupy child slots — park at the ceiling instead of piling
@@ -3173,11 +3165,10 @@ pub async fn generate(
         Some(Err(e)) => return api_error(404, &e),
         None => return api_error(500, "store unavailable"),
     };
-    if let Some((name, entry)) = &key_entry {
-        if let Err(rej) = state.keys.check(entry, &row.name) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(name);
+    if let Some((_name, entry)) = &key_entry
+        && let Err(rej) = state.keys.admit(entry, &row.name)
+    {
+        return rej.to_response();
     }
     // Think-capability gate (ollama parity), same as /api/chat. Both
     // think gates run BEFORE translation — the translator maps `think`
@@ -3982,10 +3973,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // sweep, which is exactly the signal an operator wants.
     let durable_jobs_active = state
         .with_store(|s| {
-            s.list_jobs(Some("queued"), None, 1000)
+            s.list_jobs(Some("queued"), None, 1000, None)
                 .unwrap_or_default()
                 .len()
-                + s.list_jobs(Some("running"), None, 1000)
+                + s.list_jobs(Some("running"), None, 1000, None)
                     .unwrap_or_default()
                     .len()
         })

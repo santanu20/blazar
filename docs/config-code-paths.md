@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) — 230 fields, 0 dead
+## Config (top-level keys) — 231 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -92,6 +92,7 @@ token quality are surfaced as drift.
 | fork_retire_days | default_fork_retire_days() | runtime/gateway + cli | `blazar-runtime/src/engine/mod.rs:2175` in `refresh_supersede_state`; `blazar-runtime/src/engine/mod.rs:2182` in `refresh_supersede_state`; `blazar-cli/src/main.rs:10738` in `refresh_after_lane_change`; `blazar-cli/src/main.rs:10896` in `engine_install_lane` |
 | keep_tags | default_keep_tags() (= DEFAULT_KEEP_TAGS, 2) | runtime + cli | `blazar-runtime/src/engine/mod.rs` in `effective_keep_tags` (validated read at prune time); consumed by `EngineManager::prune`, `whisper.rs`/`piper.rs` `prune`, `main.rs` `doctor_engine_retention` |
 | semantic_cache | SemanticCacheConfig::default() | gateway-http | `blazar-gateway/src/lib.rs:842` in `well_known`; `blazar-gateway/src/lib.rs:843` in `well_known` |
+| batch | BatchLimits::default() | gateway-http | `blazar-gateway/src/batch.rs:368` in `upload_file`; `blazar-gateway/src/batch.rs:504` in `create_batch`; `blazar-gateway/src/batch.rs:1341` in `anthropic_batches_create` |
 | devices | Vec::new() | runtime/gateway + engine-argv + cli | `blazar-runtime/src/whisper.rs:1252` in `unit__server_bin__relative_row_anchors_to_data_dir`; `blazar-runtime/src/engine_impl.rs:199` in `enumerate_devices`; `blazar-core/src/profile.rs:626` in `the`; `blazar-core/src/profile.rs:627` in `the`; `blazar-cli/src/main.rs:3486` in `doctor_engine`; `blazar-cli/src/main.rs:3492` in `doctor_engine` |
 | engine_check_secs | default_engine_check_secs() | cli | `blazar-cli/src/main.rs:4064` in `currency_verdict`; `blazar-cli/src/main.rs:5035` in `serve` |
 | mistralrs_pa_memory_fraction | None | engine-argv + cli | `blazar-core/src/profile.rs:2283` in `derive_pa_fraction`; `blazar-core/src/profile.rs:2335` in `derive_pa_fraction`; `blazar-cli/src/main.rs:12853` in `unit__known_config_key__defaults_options_and_typos` |
@@ -475,5 +476,15 @@ token quality are surfaced as drift.
 | ttl_secs | default_semantic_ttl_secs() | gateway-http | `blazar-gateway/src/ollama.rs:950` in `chat` |
 | threshold | default_semantic_threshold() | gateway-http + engine-argv + runtime/gateway | `blazar-gateway/src/ollama.rs:951` in `chat`; `blazar-gateway/src/ollama.rs:977` in `chat`; `blazar-core/src/profile.rs:2018` in `the`; `blazar-core/src/profile.rs:5212` in `push_spec_args`; `blazar-runtime/src/supervisor.rs:7535` in `unit__adaptive_slots__adopts_after_streak_and_respects_manual` |
 | max_entries | default_semantic_max_entries() | gateway-http | `blazar-gateway/src/semcache.rs:116` in `store`; `blazar-gateway/src/semcache.rs:124` in `store` |
+
+## BatchLimits ([batch]) — 5 fields, 0 dead
+
+| field | default | lane | consumption site (fn) |
+|---|---|---|---|
+| max_store_bytes_per_key | 0 | gateway-http | `blazar-gateway/src/batch.rs:172` in `store_quota_refusal`; `blazar-gateway/src/batch.rs:187` in `store_quota_refusal`; `blazar-gateway/src/batch.rs:191` in `store_quota_refusal` |
+| max_store_bytes_total | 0 | gateway-http | `blazar-gateway/src/batch.rs:172` in `store_quota_refusal`; `blazar-gateway/src/batch.rs:176` in `store_quota_refusal`; `blazar-gateway/src/batch.rs:183` in `store_quota_refusal` |
+| max_active_batches_per_key | 0 | gateway-http | `blazar-gateway/src/batch.rs:506` in `create_batch`; `blazar-gateway/src/batch.rs:508` in `create_batch`; `blazar-gateway/src/batch.rs:1344` in `anthropic_batches_create`; `blazar-gateway/src/batch.rs:1346` in `anthropic_batches_create` |
+| max_output_bytes_per_batch | 0 | gateway-http | `blazar-gateway/src/batch.rs:571` in `create_batch`; `blazar-gateway/src/batch.rs:1432` in `anthropic_batches_create`; enforced in `write_row` (`blazar-gateway/src/batch.rs:789`) and `run_anthropic_batch` (`blazar-gateway/src/batch.rs:1245`) |
+| retention_secs | 86400 | gateway-http | `blazar-gateway/src/batch.rs:368` in `upload_file`; `blazar-gateway/src/batch.rs:504` in `create_batch`; `blazar-gateway/src/batch.rs:1341` in `anthropic_batches_create`; sweep body `blazar-gateway/src/batch.rs:227` in `sweep_expired` |
 
 _Total: 0 dead fields across all structs._

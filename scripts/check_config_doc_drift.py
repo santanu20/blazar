@@ -84,6 +84,7 @@ def main() -> int:
         "WarmPeg": "WarmPeg",
         "EngineRouting": "EngineRouting",
         "SemanticCacheConfig": "SemanticCacheConfig",
+        "BatchLimits": "BatchLimits",
     }
     failures = 0
     for sec, struct in tracked.items():
@@ -96,7 +97,9 @@ def main() -> int:
         missing = [f for f in code_fields if f not in doc_fields]
         extra = [f for f in sorted(doc_fields) if f not in code_fields]
         # claimed count in the section header, if present
-        hm = re.search(rf"^##\s+{re.escape(sec)}[^\n]*?(\d+)\s+fields", md, re.MULTILINE)
+        hm = re.search(
+            rf"^##\s+{re.escape(sec)}[^\n]*?(\d+)\s+fields", md, re.MULTILINE
+        )
         claimed = int(hm.group(1)) if hm else None
         problems = []
         if missing:

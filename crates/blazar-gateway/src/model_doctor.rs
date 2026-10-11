@@ -321,7 +321,11 @@ async fn call_embed(state: &Arc<AppState>, body: Value) -> (u16, Bytes) {
 
 /// POST /api/model-doctor {"model": "..."} — queue the probe run as a
 /// durable job; poll `/v1/jobs/{id}` for the certificate.
-pub async fn run(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+pub async fn run(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+    body: Bytes,
+) -> Response {
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return crate::error_response(400, &format!("invalid JSON: {e}")),
@@ -376,6 +380,7 @@ pub async fn run(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         "doctor",
         Some(&model),
         json!({ "model": model }),
+        key_ext.as_deref().map(|k| k.name.as_str()),
     );
     tokio::spawn(run_probes(
         Arc::clone(&state),

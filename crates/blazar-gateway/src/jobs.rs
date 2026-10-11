@@ -18,6 +18,7 @@
 //! stays authoritative while it lives.
 
 use crate::state::AppState;
+use axum::Extension;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
@@ -132,6 +133,8 @@ impl JobRuntime {
     /// Insert the job row at submit time. `request_json` must carry
     /// everything a cancel needs to redispatch (engine name for
     /// child-owned lanes) and everything a resubmit needs to teach.
+    /// `owner` is the creating key's name (BLZ-1); `None` means the
+    /// open-gateway/no-keys mode and stays visible to every caller.
     #[allow(clippy::needless_pass_by_value)] // stored verbatim into the ledger row
     pub fn record_created(
         &self,
@@ -140,6 +143,7 @@ impl JobRuntime {
         kind: &str,
         model: Option<&str>,
         request_json: serde_json::Value,
+        owner: Option<&str>,
     ) {
         let now = blazar_core::store::unix_now();
         let row = JobRow {
@@ -153,6 +157,7 @@ impl JobRuntime {
             artifact_path: None,
             created_at: now,
             updated_at: now,
+            owner: owner.map(str::to_string),
         };
         if let Some(err) = state.with_store(|s| s.insert_job(&row).err()).flatten() {
             tracing::warn!(target: "blazar::jobs", job = %id, %err, "job ledger insert failed — live lane continues, record not durable");
@@ -402,12 +407,24 @@ fn remove_pruned_artifact_files(paths: &[String]) {
 }
 
 /// GET /v1/jobs?state=&kind=&limit= — the durable ledger, newest first.
+/// Keyed callers see their own rows plus legacy NULL-owner rows (BLZ-1);
+/// keyless listing implies no keys are configured (open gateway).
 #[allow(clippy::unused_async)] // axum's Handler trait requires async fns
-pub async fn jobs_list(State(state): State<Arc<AppState>>, Query(q): Query<ListQuery>) -> Response {
+pub async fn jobs_list(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ListQuery>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+) -> Response {
+    let owner = key_ext.as_deref().map(|k| k.name.as_str());
     let rows = state
         .with_store(|s| {
-            s.list_jobs(q.state.as_deref(), q.kind.as_deref(), q.limit.unwrap_or(50))
-                .unwrap_or_default()
+            s.list_jobs(
+                q.state.as_deref(),
+                q.kind.as_deref(),
+                q.limit.unwrap_or(50),
+                owner,
+            )
+            .unwrap_or_default()
         })
         .unwrap_or_default();
     let data: Vec<serde_json::Value> = rows.iter().map(row_payload).collect();
@@ -423,7 +440,11 @@ pub async fn jobs_list(State(state): State<Arc<AppState>>, Query(q): Query<ListQ
 /// dispatch to their lane for fresh state (audio registry, live child
 /// poll for image/video), mirroring whatever terminal state comes back.
 #[allow(clippy::single_match_else)] // two response-shaped arms read clearer than if-let-else across 20 lines
-pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<String>) -> Response {
+pub async fn jobs_get(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+) -> Response {
     if !job_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -436,6 +457,11 @@ pub async fn jobs_get(State(state): State<Arc<AppState>>, Path(job_id): Path<Str
     else {
         return not_found(&job_id);
     };
+    // Foreign-owned rows answer as if they never existed — a 404 leaks
+    // neither the id nor the fact that another key owns it (BLZ-1).
+    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+        return not_found(&job_id);
+    }
     if !matches!(row.state.as_str(), "queued" | "running") {
         return axum::Json(row_payload(&row)).into_response();
     }
@@ -517,6 +543,7 @@ pub(crate) fn mirror_child_terminal(state: &AppState, id: &str, child_job: &serd
 pub async fn jobs_cancel(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
 ) -> Response {
     if !job_id
         .chars()
@@ -530,6 +557,10 @@ pub async fn jobs_cancel(
     else {
         return not_found(&job_id);
     };
+    // Only the owning key may cancel (BLZ-1); 404 for anyone else.
+    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+        return not_found(&job_id);
+    }
     if !matches!(row.state.as_str(), "queued" | "running") {
         return axum::Json(row_payload(&row)).into_response();
     }
@@ -580,6 +611,7 @@ pub async fn jobs_cancel(
 pub async fn jobs_events(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
 ) -> Response {
     if !job_id
         .chars()
@@ -587,18 +619,20 @@ pub async fn jobs_events(
     {
         return crate::proxy::openai_error(400, "invalid job id");
     }
+    // The row is the authorization anchor; events always imply one
+    // (insert_job stamps 'created' in the same transaction).
+    let Some(row) = state
+        .with_store(|s| s.get_job(&job_id).ok().flatten())
+        .flatten()
+    else {
+        return not_found(&job_id);
+    };
+    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+        return not_found(&job_id);
+    }
     let events = state
         .with_store(|s| s.job_events(&job_id, 1000).ok().unwrap_or_default())
         .unwrap_or_default();
-    if events.is_empty() {
-        // Absent events and absent row are the same story to a client.
-        let known = state
-            .with_store(|s| s.get_job(&job_id).ok().flatten())
-            .flatten();
-        if known.is_none() {
-            return not_found(&job_id);
-        }
-    }
     let data: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
@@ -631,6 +665,7 @@ pub async fn jobs_events(
 pub async fn jobs_artifact(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
 ) -> Response {
     if !job_id
         .chars()
@@ -644,6 +679,11 @@ pub async fn jobs_artifact(
     else {
         return not_found(&job_id);
     };
+    // Spilled results are caller-visible output — same owner gate as the
+    // row itself (BLZ-1).
+    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+        return not_found(&job_id);
+    }
     let Some(path) = row.artifact_path else {
         return crate::proxy::openai_error(
             404,
@@ -692,6 +732,7 @@ mod tests {
             artifact_path: None,
             created_at: 100,
             updated_at: 200,
+            owner: None,
         }
     }
 

@@ -520,6 +520,12 @@ pub struct Config {
     /// must stay off (per-request `x-blazar-cache: off` escape hatch).
     #[serde(default)]
     pub semantic_cache: SemanticCacheConfig,
+    /// BLZ-6 bounds for the filesystem-backed batch/file store. All
+    /// quotas default to 0 = unlimited (the long-standing behavior);
+    /// the retention sweep is always-on and conservative — terminal
+    /// batches and orphaned uploads only, never in-flight work.
+    #[serde(default)]
+    pub batch: BatchLimits,
     /// Explicit engine device selection (`--device <name>` per entry), for
     /// multi-GPU boxes where auto-pick lands on the wrong card. Names come
     /// from `blazar doctor`'s device list. Empty = engine auto.
@@ -2743,6 +2749,53 @@ pub enum RoutingMode {
     Auto,
 }
 
+/// `[batch]` — BLZ-6 disk bounds for the batch/file store. Quotas are
+/// opt-in (0 = unlimited, the historical behavior); the retention sweep
+/// defaults to the advertised 24h window and only removes terminal
+/// batches and orphaned uploads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchLimits {
+    /// Stored-bytes cap per key (uploads + outputs; 0 = unlimited).
+    /// Open-gateway callers share no principal, so only the global cap
+    /// applies when no key is presented.
+    #[serde(default)]
+    pub max_store_bytes_per_key: u64,
+    /// Fleet-wide stored-bytes cap across every key (0 = unlimited).
+    #[serde(default)]
+    pub max_store_bytes_total: u64,
+    /// Per-key cap on non-terminal batches (0 = unlimited).
+    #[serde(default)]
+    pub max_active_batches_per_key: u32,
+    /// Cumulative output-bytes cap per batch (0 = unlimited). The worker
+    /// aborts the batch as `failed` once its results file crosses the
+    /// cap — a runaway response body can otherwise balloon a modest
+    /// input into unbounded disk use.
+    #[serde(default)]
+    pub max_output_bytes_per_batch: u64,
+    /// Seconds a terminal batch (or orphaned upload) survives before
+    /// the sweep removes it. Default 24h, matching the advertised
+    /// Anthropic retention window.
+    #[serde(default = "default_batch_retention_secs")]
+    pub retention_secs: u64,
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        Self {
+            max_store_bytes_per_key: 0,
+            max_store_bytes_total: 0,
+            max_active_batches_per_key: 0,
+            max_output_bytes_per_batch: 0,
+            retention_secs: default_batch_retention_secs(),
+        }
+    }
+}
+
+fn default_batch_retention_secs() -> u64 {
+    24 * 60 * 60
+}
+
 /// `[engine_routing]` `policy` — which engine wins when the format
 /// overlaps (safetensors is the only weighted fork in v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2840,6 +2893,7 @@ impl Default for Config {
             fork_retire_days: default_fork_retire_days(),
             keep_tags: default_keep_tags(),
             semantic_cache: SemanticCacheConfig::default(),
+            batch: BatchLimits::default(),
             remote_fallback: default_remote_fallback(),
             devices: Vec::new(),
             engine_check_secs: default_engine_check_secs(),
@@ -3086,6 +3140,17 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
         // the loser dies with a Windows sharing violation on the open.
         let bak = path.with_file_name(format!("config.toml.bak-{ms}.{}.{seq}", std::process::id()));
         retry_on_sharing_violation(|| std::fs::copy(path, &bak))?;
+        // fs::copy duplicates the permission bits, so a backup of a
+        // previously-loose config would keep the loose mode (BLZ-4):
+        // re-armor every backup explicitly. A concurrent writer's prune
+        // may remove THIS backup first — a stalled writer's timestamp
+        // makes it sort oldest — and a pruned backup has nothing left
+        // to armor: NotFound there is vacuous completion, not failure.
+        if let Err(e) = restrict_to_owner(&bak)
+            && bak.exists()
+        {
+            return Err(e);
+        }
     }
     // Unique-per-writer temp name. A FIXED name makes two concurrent
     // writers race on write+rename — the loser's rename finds the temp
@@ -3100,7 +3165,29 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
         .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned());
     let tmp = path.with_file_name(format!("{name}.tmp-write.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, body)?;
+    // The persisted TOML carries `[[keys]]` bearer secrets: the temp is
+    // armed owner-only BEFORE the rename so the final inode (rename
+    // preserves the temp's mode) never depends on umask (BLZ-4).
+    restrict_to_owner(&tmp)?;
     retry_on_sharing_violation(|| std::fs::rename(&tmp, path))?;
+    Ok(())
+}
+
+/// Owner-only (0600) permission for credential-bearing files (BLZ-4).
+/// Unix-only and fallible on purpose: a silent chmod failure would be a
+/// hidden privacy regression on the secrets file, so callers propagate
+/// it. Windows relies on user-profile ACLs and takes the no-op.
+#[cfg(unix)]
+fn restrict_to_owner(path: &std::path::Path) -> CoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &std::path::Path) -> CoreResult<()> {
     Ok(())
 }
 
@@ -7794,5 +7881,49 @@ mod persist_tests {
             })
             .count();
         assert_eq!(baks, 5, "7 writes -> keep-5 backups, one per writer");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unit__persist_config__secrets_files_are_owner_only() {
+        // BLZ-4 pin: the persisted config carries [[keys]] bearer
+        // secrets; the file, and every backup, must be 0600 regardless
+        // of how permissive the surrounding directory/umask is.
+        use std::os::unix::fs::PermissionsExt;
+        fn world_bits(p: &std::path::Path) -> u32 {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately loose parent: proves the modes come from
+        // persist_config, not from an inherited restrictive default.
+        std::fs::set_permissions(dir.path(), {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(dir.path()).unwrap().permissions();
+            p.set_mode(0o777);
+            p
+        })
+        .unwrap();
+        let path = dir.path().join("config.toml");
+        persist_config(&path, "port = 11434\n").unwrap();
+        persist_config(&path, "port = 11435\n").unwrap(); // forces a backup
+        assert_eq!(world_bits(&path), 0o600, "final config is owner-only");
+        let baks: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak-")
+            })
+            .collect();
+        assert!(!baks.is_empty(), "second write produced a backup");
+        for b in &baks {
+            assert_eq!(
+                world_bits(&b.path()),
+                0o600,
+                "backup {} is owner-only",
+                b.path().display()
+            );
+        }
     }
 }

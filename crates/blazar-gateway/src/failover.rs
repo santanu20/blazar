@@ -322,8 +322,14 @@ pub async fn detail(
 pub async fn pin(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
     axum::extract::Path(chain): axum::extract::Path<String>,
+    key: Option<axum::extract::Extension<crate::keys::KeyCtx>>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
+    // BLZ-2: pinning re-routes serving traffic for every caller of the
+    // chain — a fleet-level decision, so it takes an admin key.
+    if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key.as_deref()) {
+        return crate::proxy::openai_error(code, &msg);
+    }
     let target = match serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v.get("target").and_then(serde_json::Value::as_u64))
@@ -354,7 +360,13 @@ pub async fn pin(
 pub async fn unpin(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
     axum::extract::Path(chain): axum::extract::Path<String>,
+    key: Option<axum::extract::Extension<crate::keys::KeyCtx>>,
 ) -> axum::response::Response {
+    // BLZ-2: unpinning hands the chain back to automatic resolution for
+    // every caller — same fleet-level standing as pinning.
+    if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key.as_deref()) {
+        return crate::proxy::openai_error(code, &msg);
+    }
     let alias = match state.failover.chain_json(&chain) {
         Some(v) => v["alias"].as_str().unwrap_or_default().to_string(),
         None => {

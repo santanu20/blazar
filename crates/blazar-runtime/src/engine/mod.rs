@@ -187,6 +187,18 @@ fn retire_engine_dir(data_dir: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     if !dir.exists() {
         return Ok(None);
     }
+    // BLZ-7: the same containment preflight the explicit remove path
+    // uses. Renaming an engine dir that resolves outside the data root
+    // (symlinked engines dir) would move foreign ground into an aside
+    // name, and the guarded cleanup after a successful install would
+    // then refuse to delete it — both copies stranded, neither ours.
+    if !path_is_within(data_dir, dir) {
+        return Err(anyhow!(
+            "engine dir {} resolves outside the data root (symlinked engines \
+             dir?) — unhook the link or remove the dir manually, then retry",
+            dir.display()
+        ));
+    }
     let engines = dir.parent().context("engine dir has no parent")?;
     let tag = dir
         .file_name()
@@ -207,14 +219,17 @@ fn retire_engine_dir(data_dir: &Path, dir: &Path) -> Result<Option<PathBuf>> {
             // the same tag are already undefined — both write this same
             // final dir.) Containment: an aside resolving outside the
             // data root is skipped, not deleted through the link.
-            if matches!(
-                remove_dir_within(data_dir, &entry.path()),
-                Ok(GuardedRemoval::Removed)
-            ) {
-                tracing::warn!(
-                    "skipped stale aside {} — resolves outside the data root",
-                    entry.path().display()
-                );
+            match remove_dir_within(data_dir, &entry.path()) {
+                Ok(GuardedRemoval::Removed | GuardedRemoval::Absent) => {}
+                Ok(GuardedRemoval::Escaped) => {
+                    tracing::warn!(
+                        "left stale aside {} in place — it resolves outside the data root",
+                        entry.path().display()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("cannot sweep stale aside {} ({e})", entry.path().display());
+                }
             }
         }
     }
@@ -4321,5 +4336,68 @@ mod supersede_floor_tests {
         assert!(allows(11_350, Some(11_349)));
         // Unstamped floor (offline build / legacy row): legacy rule.
         assert!(allows(1, None));
+    }
+}
+
+/// BLZ-7 regression pins: the retire/aside machinery must never move
+/// or unlink anything that resolves outside the data root, even when
+/// the managed engines dir itself is a symlink to foreign ground.
+#[cfg(test)]
+mod retire_containment_tests {
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    use super::*;
+
+    /// BLZ-7: an engine dir reached through a symlinked engines dir
+    /// that resolves outside the data root must NOT be renamed into an
+    /// aside — the install aborts loudly instead of stranding foreign
+    /// copies that guarded cleanup would later refuse to touch.
+    #[cfg(unix)]
+    #[test]
+    fn unit__retire_engine_dir__refuses_dir_outside_the_data_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let foreign = tmp.path().join("foreign-engines");
+        std::fs::create_dir_all(foreign.join("b1-cuda")).unwrap();
+        std::fs::write(foreign.join("b1-cuda/manifest.json"), b"{}").unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::os::unix::fs::symlink(&foreign, data.join("engines")).unwrap();
+
+        let dir = data.join("engines/b1-cuda");
+        let err = retire_engine_dir(&data, &dir)
+            .expect_err("external engine dir must be refused")
+            .to_string();
+        assert!(err.contains("outside the data root"), "{err}");
+        // Nothing moved: the tag dir is untouched through the link and
+        // no aside name appeared on the foreign side.
+        assert!(dir.join("manifest.json").is_file());
+        let mut names: Vec<String> = std::fs::read_dir(&foreign)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["b1-cuda".to_string()]);
+    }
+
+    /// In-ground behavior stays intact: a crashed run's aside is swept
+    /// before the rename, and the tag dir moves to a fresh aside.
+    #[cfg(unix)]
+    #[test]
+    fn unit__retire_engine_dir__sweeps_stale_asides_and_retires_in_ground_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let engines = data.join("engines");
+        std::fs::create_dir_all(engines.join("b1-cuda")).unwrap();
+        let stale = engines.join(format!("{RETIRED_ENGINE_PREFIX}b1-cuda-111"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("junk.bin"), b"x").unwrap();
+
+        let aside = retire_engine_dir(&data, &engines.join("b1-cuda"))
+            .unwrap()
+            .expect("existing dir retires into an aside");
+        assert!(!stale.exists(), "crashed-run aside is swept");
+        assert!(aside.is_dir());
+        assert!(aside.starts_with(&engines));
+        assert!(!engines.join("b1-cuda").exists(), "tag dir moved aside");
     }
 }

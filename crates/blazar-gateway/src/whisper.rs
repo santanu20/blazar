@@ -856,6 +856,9 @@ struct AudioJobEntry {
     handle: Option<tokio::task::JoinHandle<()>>,
     seq: u64,
     created_at: u64,
+    /// Creating key's name (BLZ-1); `None` = open gateway. Mirrors the
+    /// durable row written at submit time.
+    owner: Option<String>,
 }
 
 /// Gateway-owned async audio jobs. Every method takes the inner lock
@@ -900,7 +903,9 @@ impl AudioJobs {
 
     /// Reserve a job id and Queued slot. Called just before the task
     /// spawns; `set_handle` attaches the `JoinHandle` right after.
-    fn reserve(&self) -> String {
+    /// `owner` is the creating key's name (BLZ-1), `None` in open-gateway
+    /// mode.
+    fn reserve(&self, owner: Option<&str>) -> String {
         let mut store = self.inner.lock().expect("audio jobs lock");
         store.seq += 1;
         let id = format!("aj{}-{}", store.boot_nanos, store.seq);
@@ -918,9 +923,17 @@ impl AudioJobs {
                 handle: None,
                 seq,
                 created_at,
+                owner: owner.map(str::to_string),
             },
         );
         id
+    }
+
+    /// The creating key of a live registry entry. Outer `None` = no such
+    /// job in this gateway's memory; inner `None` = open-gateway entry.
+    pub fn owner_of(&self, id: &str) -> Option<Option<String>> {
+        let store = self.inner.lock().expect("audio jobs lock");
+        store.jobs.get(id).map(|e| e.owner.clone())
     }
 
     fn set_handle(&self, id: &str, handle: tokio::task::JoinHandle<()>) {
@@ -1276,8 +1289,9 @@ fn submit_async(
     force_translate: bool,
     gran: Option<Granularity>,
     diarize: bool,
+    owner: Option<&str>,
 ) -> Response {
-    let id = state.audio_jobs.reserve();
+    let id = state.audio_jobs.reserve(owner);
     // Durable ledger write-through: the row outlives the gateway, the
     // input artifact makes a resubmit after an abandon possible without
     // re-uploading (bounded — oversized uploads skip the copy, the row
@@ -1302,6 +1316,7 @@ fn submit_async(
         "audio",
         field(&parts, "model").as_deref(),
         request,
+        owner,
     );
     state
         .jobs
@@ -1372,12 +1387,26 @@ fn submit_async(
 pub async fn audio_jobs_get(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(job_id): axum::extract::Path<String>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
 ) -> Response {
     if !job_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return openai_error(400, "invalid job id");
+    }
+    // Live registry first, then the durable row — either way the owner
+    // gate answers 404 for a foreign key before any payload leaks (BLZ-1).
+    if let Some(owner) = state.audio_jobs.owner_of(&job_id) {
+        if !crate::keys::owner_allows(owner.as_deref(), key_ext.as_deref()) {
+            return openai_error(404, "job not found");
+        }
+    } else if let Some(row) = state
+        .with_store(|s| s.get_job(&job_id).ok().flatten())
+        .flatten()
+        && !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref())
+    {
+        return openai_error(404, "job not found");
     }
     if let Some(payload) = state.audio_jobs.payload(&job_id) {
         return Response::builder()
@@ -1412,6 +1441,7 @@ pub async fn audio_jobs_get(
 pub async fn audio_jobs_cancel(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(job_id): axum::extract::Path<String>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
 ) -> Response {
     if !job_id
         .chars()
@@ -1419,7 +1449,18 @@ pub async fn audio_jobs_cancel(
     {
         return openai_error(400, "invalid job id");
     }
-    // cancel() performs the abort side effect (a terminal/unknown job is
+    // Owner gate before the abort side effect — a foreign key must not
+    // cancel (BLZ-1); registry first, durable row as after-restart truth.
+    let entry_owner: Option<String> = match state.audio_jobs.owner_of(&job_id) {
+        Some(owner) => owner,
+        None => state
+            .with_store(|s| s.get_job(&job_id).ok().flatten())
+            .flatten()
+            .and_then(|row| row.owner),
+    };
+    if !crate::keys::owner_allows(entry_owner.as_deref(), key_ext.as_deref()) {
+        return openai_error(404, "job not found");
+    } // cancel() performs the abort side effect (a terminal/unknown job is
     // a no-op); either way the answer is the job's current state — 200
     // with the payload, 404 when no such job exists.
     if state.audio_jobs.cancel(&job_id) == Some(true) {
@@ -1578,11 +1619,9 @@ pub async fn audio_transcriptions(
     {
         if let Some(Extension(k)) = &key_ext
             && let Some(entry) = state.keys.entry(&k.name)
+            && let Err(rej) = state.keys.admit(&entry, model)
         {
-            if let Err(rej) = state.keys.check(&entry, model) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&k.name);
+            return rej.to_response();
         }
         return crate::remotes::forward_with_health(
             &state,
@@ -1666,6 +1705,7 @@ pub async fn audio_transcriptions(
                 false,
                 gran,
                 diarize,
+                key_ext.as_deref().map(|k| k.name.as_str()),
             );
         }
         return forward_local(
@@ -1719,11 +1759,9 @@ pub async fn audio_translations(
     {
         if let Some(Extension(k)) = &key_ext
             && let Some(entry) = state.keys.entry(&k.name)
+            && let Err(rej) = state.keys.admit(&entry, model)
         {
-            if let Err(rej) = state.keys.check(&entry, model) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&k.name);
+            return rej.to_response();
         }
         return crate::remotes::forward_with_health(
             &state,
@@ -1802,6 +1840,7 @@ pub async fn audio_translations(
                 true,
                 gran,
                 diarize,
+                key_ext.as_deref().map(|k| k.name.as_str()),
             );
         }
         return forward_local(
@@ -2078,7 +2117,7 @@ mod tests {
     #[test]
     fn unit__audio_jobs__lifecycle_and_payload_shapes() {
         let jobs = AudioJobs::new();
-        let id = jobs.reserve();
+        let id = jobs.reserve(None);
         assert_eq!(
             jobs.payload(&id).unwrap()["status"],
             "queued",
@@ -2097,7 +2136,7 @@ mod tests {
         assert_eq!(jobs.payload(&id).unwrap()["status"], "completed");
 
         // Non-JSON body replays as a raw string under "result".
-        let id2 = jobs.reserve();
+        let id2 = jobs.reserve(None);
         jobs.mark_running(&id2);
         jobs.finish(&id2, 200, "text/plain", b"plain text".to_vec());
         assert_eq!(
@@ -2106,7 +2145,7 @@ mod tests {
         );
 
         // Failed jobs surface the sync lane's error message verbatim.
-        let id3 = jobs.reserve();
+        let id3 = jobs.reserve(None);
         jobs.mark_running(&id3);
         jobs.fail(&id3, "whisper-server: boom".into());
         let failed = jobs.payload(&id3).unwrap();
@@ -2115,13 +2154,30 @@ mod tests {
 
         // Cancel of a live job flips it to cancelled, second cancel is
         // a no-op, and unknown ids have no payload.
-        let id4 = jobs.reserve();
+        let id4 = jobs.reserve(None);
         jobs.mark_running(&id4);
         assert_eq!(jobs.cancel(&id4), Some(true));
         assert_eq!(jobs.cancel(&id4), Some(false), "terminal cancel idempotent");
         assert_eq!(jobs.payload(&id4).unwrap()["status"], "cancelled");
         assert!(jobs.payload("aj-nonexistent").is_none());
         assert_eq!(jobs.cancel("aj-nonexistent"), None);
+    }
+
+    /// BLZ-1: the registry stamps the reserving key's name; `owner_of`
+    /// distinguishes `no such job` (outer `None`) from an `open-gateway
+    /// job` (inner `None`) so the handler gate never confuses the two.
+    #[test]
+    fn unit__audio_jobs__owner_stamp_and_lookup() {
+        let jobs = AudioJobs::new();
+        let open = jobs.reserve(None);
+        let keyed = jobs.reserve(Some("alpha"));
+        assert_eq!(jobs.owner_of(&open), Some(None), "open-gateway job");
+        assert_eq!(
+            jobs.owner_of(&keyed),
+            Some(Some("alpha".into())),
+            "key-scoped job"
+        );
+        assert_eq!(jobs.owner_of("aj-nonexistent"), None, "no such job");
     }
 
     /// At the cap the registry evicts the oldest TERMINAL job first and
@@ -2131,11 +2187,11 @@ mod tests {
         let jobs = AudioJobs::new();
         // One live job reserved early, then a wave of terminal jobs past
         // the cap — the early live one must survive every eviction.
-        let live = jobs.reserve();
+        let live = jobs.reserve(None);
         jobs.mark_running(&live);
         let mut first_terminal = String::new();
         for i in 0..=MAX_AUDIO_JOBS {
-            let id = jobs.reserve();
+            let id = jobs.reserve(None);
             if i == 0 {
                 first_terminal = id.clone();
             }
@@ -2158,11 +2214,11 @@ mod tests {
     fn unit__audio_jobs__active_count_tracks_live_only() {
         let jobs = AudioJobs::new();
         assert_eq!(jobs.active_count(), 0, "empty registry");
-        let a = jobs.reserve();
+        let a = jobs.reserve(None);
         assert_eq!(jobs.active_count(), 1, "queued counts as active");
         jobs.mark_running(&a);
         assert_eq!(jobs.active_count(), 1, "running still one active");
-        let b = jobs.reserve();
+        let b = jobs.reserve(None);
         jobs.mark_running(&b);
         assert_eq!(jobs.active_count(), 2, "second live job counted");
         jobs.finish(&a, 200, "application/json", Vec::new());
@@ -2170,7 +2226,7 @@ mod tests {
         jobs.fail(&b, "boom".into());
         assert_eq!(jobs.active_count(), 0, "failed drops out");
         // Cancelled path too.
-        let c = jobs.reserve();
+        let c = jobs.reserve(None);
         jobs.cancel(&c);
         assert_eq!(jobs.active_count(), 0, "cancelled drops out");
     }

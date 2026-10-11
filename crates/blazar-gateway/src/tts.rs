@@ -373,11 +373,9 @@ pub async fn audio_speech(
     if split_remote(voice, &state.config).is_some() {
         if let Some(Extension(k)) = &key_ext
             && let Some(entry) = state.keys.entry(&k.name)
+            && let Err(rej) = state.keys.admit(&entry, voice)
         {
-            if let Err(rej) = state.keys.check(&entry, voice) {
-                return rej.to_response();
-            }
-            state.keys.charge_request(&k.name);
+            return rej.to_response();
         }
         return crate::remotes::forward_with_health(
             &state,

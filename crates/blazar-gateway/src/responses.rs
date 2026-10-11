@@ -30,6 +30,10 @@ pub struct StoredResponse {
     /// Chained requests inherit the previous response's value so a whole
     /// thread lands under one listing handle.
     pub conversation: String,
+    /// BLZ-1: creating key's name; `None` on the open gateway. GET and
+    /// `previous_response_id` chain lookups enforce it so one key cannot
+    /// read or continue another key's thread.
+    pub owner: Option<String>,
     /// v10: the exact completed body JSON when the gateway kept it
     /// (background mode always). The RAM registry never reads it —
     /// only `to_row` carries it into the ledger for GET fidelity.
@@ -132,6 +136,7 @@ impl ResponsesRegistry {
                 .output_tokens
                 .map(|v| u64::try_from(v).unwrap_or(u64::MAX)),
             ts,
+            owner: row.owner,
             // Inheritance matters: a chained request must land in the same
             // conversation listing even after a restart. The exact body is
             // deliberately NOT promoted — GET reads the row for fidelity,
@@ -158,6 +163,7 @@ impl ResponsesRegistry {
                 .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
             ts: i64::try_from(r.ts).unwrap_or(i64::MAX),
             conversation: r.conversation.clone(),
+            owner: r.owner.clone(),
             body_json: r.body_json.clone(),
         }
     }
@@ -202,6 +208,7 @@ mod tests {
                     output_tokens: None,
                     ts: unix_now(),
                     conversation: String::new(),
+                    owner: None,
                     body_json: None,
                 },
             );
@@ -221,6 +228,7 @@ mod tests {
             output_tokens: None,
             ts: 0,
             conversation: String::new(),
+            owner: None,
             body_json: None,
         };
         let chained = ResponsesRegistry::chain_input(
@@ -253,6 +261,7 @@ mod tests {
             output_tokens: Some(2),
             ts,
             conversation: String::new(),
+            owner: None,
             body_json: None,
         }
     }
@@ -312,6 +321,7 @@ mod tests {
                 .map(|v| u64::try_from(v).unwrap_or(u64::MAX)),
             ts: u64::try_from(row.ts.max(0)).unwrap_or(0),
             conversation: String::new(),
+            owner: None,
             body_json: None,
         };
         assert_eq!(back.model, sr.model);

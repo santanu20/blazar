@@ -23,7 +23,7 @@
 //!   answer (`target: "none"` with the teaching reason).
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use blazar_core::config::Remote;
@@ -140,7 +140,16 @@ async fn boxed_to_api_error(boxed: Box<Response>) -> Response {
 /// Best-effort by design: nothing resident (or a lane that bakes
 /// adapters at spawn) defers to the next spawn, which the store row
 /// already drives — the response `detail` says which happened.
-pub async fn lora_sync(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+pub async fn lora_sync(
+    State(state): State<Arc<AppState>>,
+    key: Option<Extension<crate::keys::KeyCtx>>,
+    body: Bytes,
+) -> Response {
+    // BLZ-2: hot attach/detach mutates a live child's adapter set —
+    // control-plane standing required.
+    if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key.as_deref()) {
+        return api_error(code, &msg);
+    }
     let v: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return api_error(400, &e.to_string()),
@@ -176,7 +185,54 @@ pub async fn lora_sync(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
     }
 }
 
-pub async fn warm(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+/// BLZ-2 gate for [`warm`]: model-specific control action, so a scoped
+/// key may only warm models inside its allowlist — checked against the
+/// canonical store name so tag aliases cannot sidestep the scope. An
+/// unresolvable name is refused for scoped keys (the scope cannot be
+/// verified) while admin keys keep the long-standing pull-notify
+/// contract. `Some(response)` = refused.
+fn warm_scope_gate(
+    state: &AppState,
+    key: Option<&crate::keys::KeyCtx>,
+    model: &str,
+) -> Option<Response> {
+    let canonical = state
+        .with_store(|s| resolve_model(s, model))
+        .and_then(std::result::Result::ok)
+        .map(|row| row.name);
+    match canonical.as_deref() {
+        Some(name) => {
+            if let Err((code, msg)) = crate::keys::scope_permits(&state.keys, key, name) {
+                return Some(api_error(code, &msg));
+            }
+        }
+        None => {
+            if let Some(k) = key {
+                let scoped = state
+                    .keys
+                    .entries()
+                    .into_iter()
+                    .any(|e| e.name == k.name && !e.models.is_empty());
+                if scoped {
+                    return Some(api_error(
+                        403,
+                        &format!(
+                            "key {:?} cannot warm unknown model {model:?} — not in the store, so its scope cannot be checked",
+                            k.name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub async fn warm(
+    State(state): State<Arc<AppState>>,
+    key: Option<Extension<crate::keys::KeyCtx>>,
+    body: Bytes,
+) -> Response {
     let v: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return api_error(400, &e.to_string()),
@@ -184,6 +240,9 @@ pub async fn warm(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let Some(model) = v["model"].as_str().map(str::to_string) else {
         return api_error(400, "missing 'model'");
     };
+    if let Some(resp) = warm_scope_gate(&state, key.as_deref(), &model) {
+        return resp;
+    }
     if !v["wait"].as_bool().unwrap_or(false) {
         // Notify mode: byte-identical to the long-standing pull-notify
         // contract — detached, policy-gated, always "ok".
@@ -266,7 +325,17 @@ pub async fn warm(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
 /// Per-peer results are reported verbatim; a non-Blazar remote answers
 /// 404/405 on `/api/warm` and is called out as such, never silently
 /// dropped.
-pub async fn replicate(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+#[allow(clippy::too_many_lines)] // one flat fan-out handler, the guard pushed it past the lint
+pub async fn replicate(
+    State(state): State<Arc<AppState>>,
+    key: Option<Extension<crate::keys::KeyCtx>>,
+    body: Bytes,
+) -> Response {
+    // BLZ-2: replication fans load work out to every named peer — a
+    // fleet-level action, never a scoped key's to start.
+    if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key.as_deref()) {
+        return api_error(code, &msg);
+    }
     let v: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),

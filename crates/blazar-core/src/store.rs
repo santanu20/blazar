@@ -33,7 +33,12 @@ pub struct Store {
 // cards — the id→metadata mapping behind POST /v1/chat/completions/{id}).
 // Cards exist ONLY for completions created with a `metadata` field;
 // the cap prunes oldest-first so the table stays bounded.
-const SCHEMA_VERSION: i32 = 14;
+/// v15: BLZ-1 object ownership — `jobs.owner` + `responses.owner` (the
+/// creating key's name, for object-level authorization). Bump exists so
+/// v14 stores re-enter the migration block and take the two ALTERs;
+/// without it they sat at the latest version and every owner INSERT
+/// failed (the model-doctor poll 404 on upgraded stores).
+const SCHEMA_VERSION: i32 = 15;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -109,6 +114,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     result_json   TEXT,               -- terminal payload (small, inline)
     error         TEXT,
     artifact_path TEXT,               -- larger result/input file, relative to data_dir
+    owner         TEXT,               -- BLZ-1: creating key name; NULL = open gateway or pre-scoping legacy
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );
@@ -131,6 +137,7 @@ CREATE TABLE IF NOT EXISTS responses (
     output_tokens INTEGER,
     ts            INTEGER NOT NULL,
     conversation  TEXT NOT NULL DEFAULT '',  -- v10: grouping key for /v1/conversations
+    owner         TEXT,                            -- BLZ-1: creating key name; NULL = open gateway or pre-scoping legacy
     body_json     TEXT                            -- v10: exact completed body (background mode fidelity)
 );
 CREATE TABLE IF NOT EXISTS model_caps (
@@ -483,6 +490,10 @@ pub struct JobRow {
     pub result_json: Option<String>,
     pub error: Option<String>,
     pub artifact_path: Option<String>,
+    /// BLZ-1: creating key's name. `None` = open gateway or a legacy
+    /// row from before scoping existed (visible to all callers).
+    #[serde(default)]
+    pub owner: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -525,6 +536,10 @@ pub struct StoredResponseRow {
     /// v10: grouping key set when the request carried `conversation`
     /// (or inherited it through a `previous_response_id` chain).
     pub conversation: String,
+    /// BLZ-1: creating key's name. `None` = open gateway or a legacy
+    /// row from before scoping existed (visible to all callers).
+    #[serde(default)]
+    pub owner: Option<String>,
     /// v10: the exact completed body JSON when the gateway kept it
     /// (background mode always; foreground when cheap). `None` on
     /// pre-v10 rows — GET reconstructs the shape instead.
@@ -574,6 +589,7 @@ impl Store {
         Ok(names)
     }
 
+    #[allow(clippy::too_many_lines)] // one flat additive-migration ladder, not logic
     fn migrate(&self) -> CoreResult<()> {
         let version: i32 = self
             .conn
@@ -654,6 +670,22 @@ impl Store {
                 "CREATE INDEX IF NOT EXISTS idx_responses_conversation ON responses(conversation, ts)",
                 [],
             )?;
+            // BLZ-1: jobs and responses grew `owner` (the creating key's
+            // name, for object-level authorization). Nullable on purpose:
+            // NULL = created on an open gateway or before scoping existed,
+            // and those rows stay visible to every caller (documented
+            // legacy trust boundary; fresh keyed rows always carry an
+            // owner). No backfill is owed or possible — ownership was
+            // never recorded.
+            if !resp_cols.contains(&"owner".to_string()) {
+                self.conn
+                    .execute("ALTER TABLE responses ADD COLUMN owner TEXT", [])?;
+            }
+            let job_cols = self.table_columns("jobs")?;
+            if !job_cols.contains(&"owner".to_string()) {
+                self.conn
+                    .execute("ALTER TABLE jobs ADD COLUMN owner TEXT", [])?;
+            }
             // v8→v9: models gained `last_used_at` (disk intelligence:
             // `blazar prune --unused` ages models out by spawn activity).
             // Fresh databases get it from SCHEMA_SQL; v8 databases take the
@@ -829,8 +861,8 @@ impl Store {
     pub fn insert_job(&self, job: &JobRow) -> CoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO jobs (id, kind, model, state, request_json, result_json, error, artifact_path, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO jobs (id, kind, model, state, request_json, result_json, error, artifact_path, created_at, updated_at, owner)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 job.id,
                 job.kind,
@@ -841,7 +873,8 @@ impl Store {
                 job.error,
                 job.artifact_path,
                 job.created_at,
-                job.updated_at
+                job.updated_at,
+                job.owner
             ],
         )?;
         tx.execute(
@@ -918,7 +951,7 @@ impl Store {
     pub fn get_job(&self, id: &str) -> CoreResult<Option<JobRow>> {
         self.conn
             .query_row(
-                "SELECT id, kind, model, state, request_json, result_json, error, artifact_path, created_at, updated_at FROM jobs WHERE id = ?1",
+                "SELECT id, kind, model, state, request_json, result_json, error, artifact_path, created_at, updated_at, owner FROM jobs WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(JobRow {
@@ -932,6 +965,7 @@ impl Store {
                         artifact_path: r.get(7)?,
                         created_at: r.get(8)?,
                         updated_at: r.get(9)?,
+                        owner: r.get(10)?,
                     })
                 },
             )
@@ -943,16 +977,19 @@ impl Store {
     }
 
     /// Newest-first job listing. `state`/`kind` filter, `limit` clamped
-    /// to 1..=1000 (the admin plane, not a firehose).
+    /// to 1..=1000 (the admin plane, not a firehose). `owner` scopes the
+    /// listing to the calling key; legacy rows with a NULL owner stay
+    /// visible to every caller (BLZ-1: open-gateway continuity).
     pub fn list_jobs(
         &self,
         state: Option<&str>,
         kind: Option<&str>,
         limit: u64,
+        owner: Option<&str>,
     ) -> CoreResult<Vec<JobRow>> {
         let limit = limit.clamp(1, 1000);
         let mut sql = String::from(
-            "SELECT id, kind, model, state, request_json, result_json, error, artifact_path, created_at, updated_at FROM jobs",
+            "SELECT id, kind, model, state, request_json, result_json, error, artifact_path, created_at, updated_at, owner FROM jobs",
         );
         let mut conds: Vec<&str> = Vec::new();
         // Owned SQL values: filter strings are pattern-scoped borrows, so the
@@ -965,6 +1002,10 @@ impl Store {
         if let Some(k) = kind {
             conds.push("kind = ?");
             binds.push(rusqlite::types::Value::Text(k.to_string()));
+        }
+        if let Some(o) = owner {
+            conds.push("(owner IS NULL OR owner = ?)");
+            binds.push(rusqlite::types::Value::Text(o.to_string()));
         }
         if !conds.is_empty() {
             sql.push_str(" WHERE ");
@@ -988,6 +1029,7 @@ impl Store {
                 artifact_path: r.get(7)?,
                 created_at: r.get(8)?,
                 updated_at: r.get(9)?,
+                owner: r.get(10)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1080,15 +1122,33 @@ impl Store {
 
     // ---- durable responses (v8) --------------------------------------
 
+    /// Shared row mapper for the 10-column `responses` SELECT shape
+    /// (positional order fixed across get/list queries).
+    fn map_response_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredResponseRow> {
+        Ok(StoredResponseRow {
+            id: r.get(0)?,
+            model: r.get(1)?,
+            input_json: r.get(2)?,
+            output_json: r.get(3)?,
+            input_tokens: r.get(4)?,
+            output_tokens: r.get(5)?,
+            ts: r.get(6)?,
+            conversation: r.get(7)?,
+            body_json: r.get(8)?,
+            owner: r.get(9)?,
+        })
+    }
+
     pub fn put_response(&self, r: &StoredResponseRow) -> CoreResult<()> {
         self.conn.execute(
-            "INSERT INTO responses (id, model, input_json, output_json, input_tokens, output_tokens, ts, conversation, body_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO responses (id, model, input_json, output_json, input_tokens, output_tokens, ts, conversation, body_json, owner)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET
                model = excluded.model, input_json = excluded.input_json,
                output_json = excluded.output_json, input_tokens = excluded.input_tokens,
                output_tokens = excluded.output_tokens, ts = excluded.ts,
-               conversation = excluded.conversation, body_json = excluded.body_json",
+               conversation = excluded.conversation, body_json = excluded.body_json,
+               owner = excluded.owner",
             params![
                 r.id,
                 r.model,
@@ -1098,7 +1158,8 @@ impl Store {
                 r.output_tokens,
                 r.ts,
                 r.conversation,
-                r.body_json
+                r.body_json,
+                r.owner
             ],
         )?;
         Ok(())
@@ -1107,7 +1168,7 @@ impl Store {
     pub fn get_response(&self, id: &str) -> CoreResult<Option<StoredResponseRow>> {
         self.conn
             .query_row(
-                "SELECT id, model, input_json, output_json, input_tokens, output_tokens, ts, conversation, body_json FROM responses WHERE id = ?1",
+                "SELECT id, model, input_json, output_json, input_tokens, output_tokens, ts, conversation, body_json, owner FROM responses WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(StoredResponseRow {
@@ -1120,6 +1181,7 @@ impl Store {
                         ts: r.get(6)?,
                         conversation: r.get(7)?,
                         body_json: r.get(8)?,
+                        owner: r.get(9)?,
                     })
                 },
             )
@@ -1130,26 +1192,28 @@ impl Store {
             })
     }
 
-    /// Every stored response grouped under `conversation`, oldest first —
-    /// the listing behind `GET /v1/conversations/{id}`.
-    pub fn list_conversation(&self, conversation: &str) -> CoreResult<Vec<StoredResponseRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, model, input_json, output_json, input_tokens, output_tokens, ts, conversation, body_json
-             FROM responses WHERE conversation = ?1 ORDER BY ts ASC, id ASC",
-        )?;
-        let rows = stmt.query_map(params![conversation], |r| {
-            Ok(StoredResponseRow {
-                id: r.get(0)?,
-                model: r.get(1)?,
-                input_json: r.get(2)?,
-                output_json: r.get(3)?,
-                input_tokens: r.get(4)?,
-                output_tokens: r.get(5)?,
-                ts: r.get(6)?,
-                conversation: r.get(7)?,
-                body_json: r.get(8)?,
-            })
-        })?;
+    /// Every visible stored response grouped under `conversation`, oldest
+    /// first — the listing behind `GET /v1/conversations/{id}`. `owner`
+    /// scopes the rows to the calling key; legacy NULL-owner rows stay
+    /// visible to every caller (BLZ-1).
+    pub fn list_conversation(
+        &self,
+        conversation: &str,
+        owner: Option<&str>,
+    ) -> CoreResult<Vec<StoredResponseRow>> {
+        let mut sql = String::from(
+            "SELECT id, model, input_json, output_json, input_tokens, output_tokens, ts, conversation, body_json, owner
+             FROM responses WHERE conversation = ?1",
+        );
+        if owner.is_some() {
+            sql.push_str(" AND (owner IS NULL OR owner = ?2)");
+        }
+        sql.push_str(" ORDER BY ts ASC, id ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = match owner {
+            Some(o) => stmt.query_map(params![conversation, o], Self::map_response_row)?,
+            None => stmt.query_map(params![conversation], Self::map_response_row)?,
+        };
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1157,13 +1221,21 @@ impl Store {
         Ok(out)
     }
 
-    /// Prune every response in `conversation` (DELETE endpoint). Returns
-    /// the number of rows removed so the API can say what it did.
-    pub fn delete_conversation(&self, conversation: &str) -> CoreResult<u64> {
-        let n = self.conn.execute(
-            "DELETE FROM responses WHERE conversation = ?1",
-            params![conversation],
-        )?;
+    /// Prune the visible responses in `conversation` (DELETE endpoint).
+    /// With `owner`, only that key's rows go — a mixed-owner conversation
+    /// is deleted piecemeal, mirroring the row-level visibility contract.
+    /// Returns the number of rows removed so the API can say what it did.
+    pub fn delete_conversation(&self, conversation: &str, owner: Option<&str>) -> CoreResult<u64> {
+        let n = match owner {
+            Some(o) => self.conn.execute(
+                "DELETE FROM responses WHERE conversation = ?1 AND (owner IS NULL OR owner = ?2)",
+                params![conversation, o],
+            )?,
+            None => self.conn.execute(
+                "DELETE FROM responses WHERE conversation = ?1",
+                params![conversation],
+            )?,
+        };
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
@@ -2308,6 +2380,7 @@ mod tests {
             artifact_path: None,
             created_at: updated_at,
             updated_at,
+            owner: None,
         }
     }
 
@@ -2345,14 +2418,87 @@ mod tests {
         // sit strictly in the future to be the newest deterministically.
         s.insert_job(&job_row("job_2", "image", "completed", unix_now() + 10))
             .unwrap();
-        let listed = s.list_jobs(Some("completed"), None, 10).unwrap();
+        let listed = s.list_jobs(Some("completed"), None, 10, None).unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, "job_2");
-        let listed = s.list_jobs(None, Some("image"), 10).unwrap();
+        let listed = s.list_jobs(None, Some("image"), 10, None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "job_2");
-        let listed = s.list_jobs(None, None, 1).unwrap();
+        let listed = s.list_jobs(None, None, 1, None).unwrap();
         assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn unit__owner_scope__list_jobs_filters_foreign_rows() {
+        // BLZ-1: owner-scoped listing sees own rows + legacy NULL-owner
+        // rows only; the operator plane passes None and sees everything.
+        let (_t, s) = tmp_store();
+        let mut legacy = job_row("legacy", "audio", "completed", 1000);
+        legacy.owner = None;
+        let mut alpha = job_row("alpha_job", "audio", "completed", 2000);
+        alpha.owner = Some("alpha".into());
+        let mut beta = job_row("beta_job", "audio", "completed", 3000);
+        beta.owner = Some("beta".into());
+        s.insert_job(&legacy).unwrap();
+        s.insert_job(&alpha).unwrap();
+        s.insert_job(&beta).unwrap();
+
+        let all = s.list_jobs(None, None, 10, None).unwrap();
+        assert_eq!(all.len(), 3, "operator listing unscoped");
+        let seen: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            seen.contains(&"legacy") && seen.contains(&"alpha_job") && seen.contains(&"beta_job")
+        );
+
+        let for_alpha = s.list_jobs(None, None, 10, Some("alpha")).unwrap();
+        assert_eq!(for_alpha.len(), 2, "own + legacy");
+        assert!(
+            for_alpha.iter().all(|r| r.id != "beta_job"),
+            "foreign rows filtered at the data layer"
+        );
+
+        let for_gamma = s.list_jobs(None, None, 10, Some("gamma")).unwrap();
+        assert_eq!(for_gamma.len(), 1, "only the legacy row is shared");
+        assert_eq!(for_gamma[0].id, "legacy");
+
+        // Roundtrip: the owner survives insert → get.
+        let got = s.get_job("alpha_job").unwrap().unwrap();
+        assert_eq!(got.owner.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn unit__owner_scope__conversation_rows_filter_and_delete_scoped() {
+        // BLZ-1: a mixed-owner conversation lists per caller and a scoped
+        // delete removes only the rows that caller can see.
+        let (_t, s) = tmp_store();
+        let row = |id: &str, owner: Option<&str>| StoredResponseRow {
+            id: id.into(),
+            model: "m".into(),
+            input_json: "[]".into(),
+            output_json: "[]".into(),
+            input_tokens: None,
+            output_tokens: None,
+            ts: 1,
+            conversation: "conv-1".into(),
+            body_json: None,
+            owner: owner.map(str::to_string),
+        };
+        s.put_response(&row("r_legacy", None)).unwrap();
+        s.put_response(&row("r_alpha", Some("alpha"))).unwrap();
+        s.put_response(&row("r_beta", Some("beta"))).unwrap();
+
+        let alpha_rows = s.list_conversation("conv-1", Some("alpha")).unwrap();
+        assert_eq!(alpha_rows.len(), 2);
+        assert!(alpha_rows.iter().all(|r| r.id != "r_beta"));
+
+        let unscoped = s.list_conversation("conv-1", None).unwrap();
+        assert_eq!(unscoped.len(), 3, "open-gateway / operator view");
+
+        let deleted = s.delete_conversation("conv-1", Some("alpha")).unwrap();
+        assert_eq!(deleted, 2, "legacy + own row removed");
+        let left = s.list_conversation("conv-1", Some("beta")).unwrap();
+        assert_eq!(left.len(), 1, "beta's row survives alpha's delete");
+        assert_eq!(left[0].id, "r_beta");
     }
 
     #[test]
@@ -2499,6 +2645,7 @@ mod tests {
             ts,
             conversation: String::new(),
             body_json: None,
+            owner: None,
         };
         let now = unix_now();
         s.put_response(&row("r_old_ttl", now - 7200)).unwrap();
@@ -2794,6 +2941,69 @@ mod tests {
             (profiles[0].model_name.as_str(), profiles[0].updated_at),
             ("m1", 7)
         );
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v14_to_v15() {
+        // Simulate a v14 database: jobs and responses without the BLZ-1
+        // `owner` columns, user_version 14 — the exact shape every store
+        // upgraded from v0.26.0 has. (The live repro: a v14 store skipped
+        // the whole migration block, so every owner INSERT failed and the
+        // model-doctor poll 404'd.)
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch(
+                    "DROP TABLE jobs; CREATE TABLE jobs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, model TEXT, state TEXT NOT NULL, request_json TEXT NOT NULL DEFAULT '{}', result_json TEXT, error TEXT, artifact_path TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL); \
+                     DROP TABLE responses; CREATE TABLE responses (id TEXT PRIMARY KEY, model TEXT NOT NULL, input_json TEXT NOT NULL, output_json TEXT NOT NULL, input_tokens INTEGER, output_tokens INTEGER, ts INTEGER NOT NULL, conversation TEXT NOT NULL DEFAULT '', body_json TEXT); \
+                     PRAGMA user_version = 14;",
+                )
+                .unwrap();
+        }
+        // Reopen: migrate() adds both owner columns, stamps the current
+        // version, and owner-bearing writes round-trip on the upgraded
+        // store. The second reopen proves presence-gated no-ops.
+        for pass in 0..2 {
+            let s = Store::open(&dirs).unwrap();
+            let v: i32 = s
+                .conn()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            assert!(
+                s.table_columns("jobs")
+                    .unwrap()
+                    .contains(&"owner".to_string())
+            );
+            assert!(
+                s.table_columns("responses")
+                    .unwrap()
+                    .contains(&"owner".to_string())
+            );
+            if pass == 0 {
+                s.insert_job(&JobRow {
+                    id: "doc_up_1".into(),
+                    kind: "doc".into(),
+                    model: Some("m1".into()),
+                    state: "completed".into(),
+                    request_json: "{}".into(),
+                    result_json: None,
+                    error: None,
+                    artifact_path: None,
+                    owner: Some("alpha".into()),
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+                let upgraded = s.get_job("doc_up_1").unwrap().unwrap();
+                assert_eq!(upgraded.owner.as_deref(), Some("alpha"));
+            }
+        }
     }
 
     #[test]
@@ -3235,31 +3445,32 @@ mod tests {
             ts,
             conversation: conv.into(),
             body_json: None,
+            owner: None,
         };
         // Same conversation, distinct timestamps; ordering must be ts ASC.
         s.put_response(&row("r2", "conv-a", 200)).unwrap();
         s.put_response(&row("r1", "conv-a", 100)).unwrap();
         s.put_response(&row("other", "conv-b", 150)).unwrap();
 
-        let listed = s.list_conversation("conv-a").unwrap();
+        let listed = s.list_conversation("conv-a", None).unwrap();
         assert_eq!(
             listed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["r1", "r2"],
             "conversation listing is chronological"
         );
         assert!(
-            s.list_conversation("missing").unwrap().is_empty(),
+            s.list_conversation("missing", None).unwrap().is_empty(),
             "missing conversation lists nothing"
         );
 
-        let deleted = s.delete_conversation("conv-a").unwrap();
+        let deleted = s.delete_conversation("conv-a", None).unwrap();
         assert_eq!(deleted, 2);
         assert!(
-            s.list_conversation("conv-a").unwrap().is_empty(),
+            s.list_conversation("conv-a", None).unwrap().is_empty(),
             "deleted conversation lists nothing"
         );
         // Other conversations untouched.
-        assert_eq!(s.list_conversation("conv-b").unwrap().len(), 1);
+        assert_eq!(s.list_conversation("conv-b", None).unwrap().len(), 1);
     }
 
     #[test]

@@ -1040,6 +1040,7 @@ pub async fn generations(
                 "/sdcpp/v1/img_gen",
                 false,
                 load_ms,
+                key_ext.as_deref().map(|k| k.name.as_str()),
             )
             .await
         }
@@ -1065,6 +1066,9 @@ fn request_echo(v: &serde_json::Value) -> serde_json::Value {
 /// Native-dialect delivery shared by the three non-plain modes:
 /// submit once, then hand back an async handle, a mapped sync answer,
 /// or an `SSE` progress relay. Admission was charged at submit.
+// One flat delivery helper per generation surface; the owner ride-along
+// is the BLZ-1 spine, grouping the rest is churn, not clarity.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_native(
     state: Arc<AppState>,
     engine: blazar_runtime::EngineRef,
@@ -1073,6 +1077,7 @@ async fn deliver_native(
     native_path: &str,
     video: bool,
     load_ms: u128,
+    owner: Option<&str>,
 ) -> Response {
     let submitted = match submit_native_job(
         &state,
@@ -1103,6 +1108,7 @@ async fn deliver_native(
             "load_ms": load_ms,
             "request": request_echo(parsed),
         }),
+        owner,
     );
     state.jobs.record_running(&state, job_id);
     match mode {
@@ -1302,6 +1308,7 @@ pub async fn video_generations(
         "/sdcpp/v1/vid_gen",
         true,
         load_ms,
+        key_ext.as_deref().map(|k| k.name.as_str()),
     )
     .await
 }
@@ -1544,6 +1551,7 @@ pub async fn variations(
         "/sdcpp/v1/img_gen",
         false,
         load_ms,
+        key_ext.as_deref().map(|k| k.name.as_str()),
     )
     .await
 }
@@ -2423,11 +2431,15 @@ fn video_row(state: &AppState, id: &str) -> Option<blazar_core::store::JobRow> {
 pub async fn videos_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<VideoListQuery>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
 ) -> Response {
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
+    // Owner-scoped listing: a keyed caller sees their videos plus legacy
+    // NULL-owner rows (BLZ-1).
+    let owner = key_ext.as_deref().map(|k| k.name.as_str());
     let rows = state
         .with_store(|s| {
-            s.list_jobs(None, Some("video"), limit + 1)
+            s.list_jobs(None, Some("video"), limit + 1, owner)
                 .unwrap_or_default()
         })
         .unwrap_or_default();
@@ -2462,7 +2474,11 @@ pub async fn videos_list(
 
 /// GET /v1/videos/{id} — the Sora video object, live-polled while
 /// in flight.
-pub async fn video_get(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub async fn video_get(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+) -> Response {
     if !id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -2472,6 +2488,9 @@ pub async fn video_get(State(state): State<Arc<AppState>>, Path(id): Path<String
     let Some(row) = video_row(&state, &id) else {
         return openai_error(404, &format!("video {id} not found"));
     };
+    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+        return openai_error(404, &format!("video {id} not found"));
+    }
     let fresh = freshen_video_row(&state, &row).await;
     let refetched = state
         .with_store(|s| s.get_job(&id).ok().flatten())
@@ -2483,7 +2502,11 @@ pub async fn video_get(State(state): State<Arc<AppState>>, Path(id): Path<String
 /// GET /v1/videos/{id}/content — the rendered bytes. Sora semantics:
 /// 404 until the render is completed, then the container the engine
 /// produced (webm today; webp/avi when asked via `output_format`).
-pub async fn video_content(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub async fn video_content(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+) -> Response {
     if !id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -2493,6 +2516,11 @@ pub async fn video_content(State(state): State<Arc<AppState>>, Path(id): Path<St
     let Some(row) = video_row(&state, &id) else {
         return openai_error(404, &format!("video {id} not found"));
     };
+    // Rendered bytes are the caller's output — owner gate before the
+    // download (BLZ-1).
+    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+        return openai_error(404, &format!("video {id} not found"));
+    }
     match completed_video_bytes(&row) {
         Ok((bytes, mime)) => Response::builder()
             .status(200)
@@ -2536,7 +2564,11 @@ pub async fn video_content(State(state): State<Arc<AppState>>, Path(id): Path<St
 /// purged so `/content` 404s afterward, matching the `video.deleted`
 /// claim instead of leaving a zombie download behind. Idempotent on
 /// every state.
-pub async fn video_delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub async fn video_delete(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+) -> Response {
     if !id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -2546,6 +2578,10 @@ pub async fn video_delete(State(state): State<Arc<AppState>>, Path(id): Path<Str
     let Some(row) = video_row(&state, &id) else {
         return openai_error(404, &format!("video {id} not found"));
     };
+    // Only the owning key may cancel or purge (BLZ-1).
+    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+        return openai_error(404, &format!("video {id} not found"));
+    }
     match row.state.as_str() {
         "queued" | "running" => {
             let engine = row
@@ -3649,6 +3685,7 @@ mod tests {
             artifact_path: None,
             created_at: 1000,
             updated_at: 1005,
+            owner: None,
         }
     }
 

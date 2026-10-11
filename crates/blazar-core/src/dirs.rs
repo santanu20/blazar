@@ -100,6 +100,17 @@ impl BlazarDirs {
     /// Ensure all data subdirectories exist (config dir included).
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;
+        // The config dir holds the persisted `[[keys]]` bearer secrets:
+        // pin it owner-only so a permissive umask or a pre-existing
+        // loose mode never exposes them to other local users (BLZ-4).
+        // Runs on every boot, so old installs heal on upgrade.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&self.config_dir)?.permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&self.config_dir, perms)?;
+        }
         std::fs::create_dir_all(self.models_dir())?;
         std::fs::create_dir_all(self.engines_dir())?;
         std::fs::create_dir_all(self.run_dir())?;
@@ -107,5 +118,38 @@ impl BlazarDirs {
         std::fs::create_dir_all(self.sessions_dir())?;
         std::fs::create_dir_all(self.voices_dir())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlazarDirs;
+
+    #[test]
+    #[cfg(unix)]
+    #[allow(non_snake_case)] // house test naming: unit__area__behavior
+    fn unit__dirs_ensure__config_dir_is_owner_only() {
+        // BLZ-4 pin: the config dir holds the persisted [[keys]] bearer
+        // secrets and must end 0700 — including when a pre-existing
+        // install left it world-readable (the heal-on-boot case).
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("blazar"),
+            data_dir: root.path().join("share"),
+        };
+        // Pre-existing loose install: 0777 config dir from an old
+        // umask-dependent create.
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        let mut loose = std::fs::metadata(&dirs.config_dir).unwrap().permissions();
+        loose.set_mode(0o777);
+        std::fs::set_permissions(&dirs.config_dir, loose).unwrap();
+        dirs.ensure().unwrap();
+        let mode = std::fs::metadata(&dirs.config_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "config dir must be owner-only after ensure");
     }
 }

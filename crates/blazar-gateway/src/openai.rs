@@ -144,11 +144,9 @@ pub async fn embeddings(
     // Per-key admission mirrors the proxy path (scope + rpm + count).
     if let Some(Extension(k)) = &key_ext
         && let Some(entry) = state.keys.entry(&k.name)
+        && let Err(rej) = state.keys.admit(&entry, &model)
     {
-        if let Err(rej) = state.keys.check(&entry, &model) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(&k.name);
+        return rej.to_response();
     }
     let req: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -492,11 +490,9 @@ pub async fn openai_proxy(
     // Per-key admission: model scope + rate limits + request accounting.
     if let Some(key) = key_ext.as_ref().map(|Extension(k)| k)
         && let Some(entry) = state.keys.entry(&key.name)
+        && let Err(rej) = state.keys.admit(&entry, &model)
     {
-        if let Err(rej) = state.keys.check(&entry, &model) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(&key.name);
+        return rej.to_response();
     }
     // Remote routing: `<remote-name>:<model>` never loads locally.
     if crate::remotes::split_remote(&model, &state.config).is_some() {
@@ -811,15 +807,19 @@ pub(crate) fn cloud_tool_gate(parsed: &serde_json::Value) -> Option<String> {
 
 /// `GET /v1/conversations/{id}` — list the stored responses grouped
 /// under one conversation handle (ledger-backed, survives restarts).
+/// BLZ-1: scoped to the calling key; rows the key cannot see are
+/// filtered at the data layer (`owner IS NULL` stays visible to all).
 pub async fn conversations_get(
     State(state): State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     if id.is_empty() || id.len() > 128 {
         return openai_error(400, "invalid conversation id");
     }
+    let owner = key_ext.as_deref().map(|k| k.name.clone());
     let rows = state
-        .with_store(|s| s.list_conversation(&id).ok())
+        .with_store(|s| s.list_conversation(&id, owner.as_deref()).ok())
         .flatten()
         .unwrap_or_default();
     if rows.is_empty() {
@@ -856,14 +856,18 @@ pub async fn conversations_get(
 /// conversation (the in-memory registry re-populates on demand from
 /// remaining ledger rows; here there are none, so chains into this
 /// conversation now 404 with the standard teaching message).
+/// BLZ-1: only rows the calling key can see are deleted; rows owned
+/// by other keys survive in place.
 pub async fn conversations_delete(
     State(state): State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     if id.is_empty() || id.len() > 128 {
         return openai_error(400, "invalid conversation id");
     }
-    match state.with_store(|s| s.delete_conversation(&id)) {
+    let owner = key_ext.as_deref().map(|k| k.name.clone());
+    match state.with_store(|s| s.delete_conversation(&id, owner.as_deref())) {
         Some(Ok(n)) => (
             StatusCode::OK,
             axum::Json(serde_json::json!({
@@ -933,12 +937,24 @@ pub async fn chat_completion_update(
 /// answer through the job plane's state machine instead.
 pub async fn responses_get(
     State(state): State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     // Exact-body fidelity first (background always, foreground since v10).
     let row = state
         .with_store(|s| s.get_response(&id).ok().flatten())
         .flatten();
+    // BLZ-1: every read path below (ledger body, job plane, memory) is
+    // scoped to the calling key; a foreign id reads exactly like an
+    // expired one — the shared 404 leaks no existence.
+    if let Some(r) = &row
+        && !crate::keys::owner_allows(r.owner.as_deref(), key_ext.as_deref())
+    {
+        return openai_error(
+            404,
+            "response not found — expired (24h TTL), pruned (ledger cap), streamed, or store:false",
+        );
+    }
     if let Some(r) = &row
         && let Some(bj) = &r.body_json
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(bj)
@@ -951,6 +967,7 @@ pub async fn responses_get(
         && let Some(job) = state
             .with_store(|s| s.get_job(&id).ok().flatten())
             .flatten()
+        && crate::keys::owner_allows(job.owner.as_deref(), key_ext.as_deref())
     {
         return match job.state.as_str() {
             "queued" | "running" => (
@@ -986,19 +1003,22 @@ pub async fn responses_get(
                 .into_response(),
         };
     }
-    let found = state.stored_response(&id).map(|s| {
-        serde_json::json!({
-            "id": id,
-            "model": s.model,
-            "input": s.input_items,
-            "output": s.output_items,
-            "usage": {
-                "input_tokens": s.input_tokens,
-                "output_tokens": s.output_tokens,
-            },
-            "stored_at": s.ts,
-        })
-    });
+    let found = state
+        .stored_response(&id)
+        .filter(|s| crate::keys::owner_allows(s.owner.as_deref(), key_ext.as_deref()))
+        .map(|s| {
+            serde_json::json!({
+                "id": id,
+                "model": s.model,
+                "input": s.input_items,
+                "output": s.output_items,
+                "usage": {
+                    "input_tokens": s.input_tokens,
+                    "output_tokens": s.output_tokens,
+                },
+                "stored_at": s.ts,
+            })
+        });
     match found {
         Some(v) => (StatusCode::OK, axum::Json(v)).into_response(),
         None => openai_error(
@@ -1224,11 +1244,9 @@ pub async fn scoped_proxy(
     // Per-key admission (same contract as openai_proxy).
     if let Some(key) = key_ext.as_ref().map(|Extension(k)| k)
         && let Some(entry) = state.keys.entry(&key.name)
+        && let Err(rej) = state.keys.admit(&entry, &model)
     {
-        if let Err(rej) = state.keys.check(&entry, &model) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(&key.name);
+        return rej.to_response();
     }
     if crate::remotes::split_remote(&model, &state.config).is_some() {
         return crate::remotes::forward_with_health(
@@ -1313,11 +1331,9 @@ pub async fn responses_api(
         .unwrap_or_default();
     if let Some(key) = key_ext.as_ref().map(|Extension(k)| k)
         && let Some(entry) = state.keys.entry(&key.name)
+        && let Err(rej) = state.keys.admit(&entry, &model)
     {
-        if let Err(rej) = state.keys.check(&entry, &model) {
-            return rej.to_response();
-        }
-        state.keys.charge_request(&key.name);
+        return rej.to_response();
     }
     // Remote routing first (registry chaining is local-only today).
     if crate::remotes::split_remote(&model, &state.config).is_some() {
@@ -1395,13 +1411,18 @@ pub async fn responses_api(
     let mut inherited_model = None;
     let mut inherited_conversation = None;
     if let Some(pid) = previous {
-        let found = state.stored_response(&pid).map(|s| {
-            (
-                crate::responses::ResponsesRegistry::chain_input(&s, &parsed["input"]),
-                s.model.clone(),
-                s.conversation.clone(),
-            )
-        });
+        let found = state
+            .stored_response(&pid)
+            // BLZ-1: another key's thread id is indistinguishable from an
+            // expired one — same 404 below, no existence leak.
+            .filter(|s| crate::keys::owner_allows(s.owner.as_deref(), key_ext.as_deref()))
+            .map(|s| {
+                (
+                    crate::responses::ResponsesRegistry::chain_input(&s, &parsed["input"]),
+                    s.model.clone(),
+                    s.conversation.clone(),
+                )
+            });
         let Some((chained, prev_model, prev_conversation)) = found else {
             return openai_error(
                 404,
@@ -1534,6 +1555,7 @@ pub async fn responses_api(
                 "conversation": conversation,
                 "background": true,
             }),
+            key_ext.as_deref().map(|k| k.name.as_str()),
         );
         let st = Arc::clone(&state);
         let eng = engine.clone();
@@ -1812,6 +1834,7 @@ async fn buffered_response_roundtrip(
             output_tokens: out_tok,
             ts: crate::responses::unix_now(),
             conversation: conversation.to_string(),
+            owner: key_ext.as_deref().map(|k| k.name.clone()),
             body_json: serde_json::to_string(&out).ok(),
         },
     );
@@ -1885,11 +1908,19 @@ fn adapters_target<'a>(
 /// upstream server.cpp).
 pub async fn lora_adapters(
     State(state): State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
     uri: Uri,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // BLZ-2: the adapter surface mutates (POST) or inspects (GET) an
+    // arbitrarily chosen live child — control-plane standing required
+    // for both; the target picker is not scope-aware.
+    if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key_ext.as_deref())
+    {
+        return openai_error(code, &msg);
+    }
     let store_first = match state.with_store(|s| s.list_models().ok()) {
         Some(list) => list.and_then(|v| v.into_iter().next().map(|m| m.name)),
         None => return openai_error(500, "store unavailable"),

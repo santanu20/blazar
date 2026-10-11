@@ -521,6 +521,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Hardening: 50 MiB request ceiling (audio uploads fit; nothing
         // legit is larger locally).
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
+        // Auth inside request_log (F64): rejected secrets are still
+        // access-logged and traced — brute-force probing no longer
+        // flies blind. Sits INSIDE CORS: browser preflights carry no
+        // bearer, so the CORS layer answers them before auth runs, and
+        // auth's 401s flow back out through CORS, letting permitted
+        // origins read the error body instead of an opaque network
+        // failure.
+        .layer(middleware::from_fn_with_state(state.clone(), auth))
         // CORS: browser origins are gated to the local set by default
         // (localhost/127.0.0.1/[::1]/0.0.0.0 on any port plus desktop
         // webview schemes), so a page on some other site cannot read
@@ -529,8 +537,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Headers stay `Any` on purpose: the origin gate already limits
         // callers to the local user's own pages, and SDK header
         // families (x-stainless-*) evolve independently of us.
-        // Sits OUTSIDE auth (F64): browser preflights carry no bearer
-        // and must get a CORS answer, not a bare 401.
+        // Sits OUTSIDE auth: preflights carry no bearer token and must
+        // get a CORS answer (BLZ-5), not a bare 401 from auth.
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(cors_allow_origin(&state.config.cors_origins))
@@ -544,10 +552,6 @@ pub fn router(state: Arc<AppState>) -> Router {
                     "x-blazar-trace-id",
                 )]),
         )
-        // Auth INSIDE request_log + CORS (F64): rejected secrets are
-        // still access-logged and traced — brute-force probing no
-        // longer flies blind.
-        .layer(middleware::from_fn_with_state(state.clone(), auth))
         // Host guard: DNS-rebinding defense (ollama CVE-2024-28224
         // class). Armed only on loopback binds — a non-loopback bind
         // is a deliberate LAN exposure decision. Preflights (OPTIONS)

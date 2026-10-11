@@ -319,9 +319,8 @@ impl AppState {
             return Ok(());
         };
         self.keys
-            .check(&entry, model)
+            .admit(&entry, model)
             .map_err(|rej| Box::new(rej.to_response()))?;
-        self.keys.charge_request(&k.name);
         Ok(())
     }
 

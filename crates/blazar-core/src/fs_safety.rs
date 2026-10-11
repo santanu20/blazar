@@ -37,7 +37,10 @@ pub enum GuardedRemoval {
 /// [`GuardedRemoval::Escaped`] instead of a deletion on foreign ground.
 /// A symlink at the final component is removed as a link
 /// (`remove_file`, falling back to `remove_dir` for Windows directory
-/// reparse points); its target is never touched.
+/// reparse points); its target is never traversed — but the link is
+/// only unlinked when its parent resolves inside the anchor, so a
+/// final link living on foreign ground (reached through an external
+/// symlinked managed dir) is left in place as `Escaped`.
 ///
 /// IO failures propagate for the caller's existing posture: fatal for
 /// explicit prunes, logged-and-skipped for fail-open sweeps. A missing
@@ -52,6 +55,14 @@ pub fn remove_dir_within(anchor: &Path, target: &Path) -> std::io::Result<Guarde
         Err(e) => return Err(e),
     };
     if meta.file_type().is_symlink() {
+        // BLZ-7: unlink the link only when it LIVES inside the anchor.
+        // Canonicalize the parent — a final link reached through an
+        // external symlinked managed dir would otherwise be unlinked
+        // on foreign ground. The link's own target is never traversed.
+        let parent_inside = target.parent().is_some_and(|p| path_is_within(anchor, p));
+        if !parent_inside {
+            return Ok(GuardedRemoval::Escaped);
+        }
         // Unlink the link itself. `remove_dir` on a Windows directory
         // symlink removes the reparse point, not its target — try it
         // when the plain unlink is refused.
@@ -190,5 +201,30 @@ mod tests {
             GuardedRemoval::Removed
         );
         assert!(!dir.exists());
+    }
+
+    /// BLZ-7: a final-component symlink reached through an external
+    /// symlinked managed dir LIVES on foreign ground — unlinking it
+    /// through the link must be refused (`Escaped`), link and target
+    /// both survive.
+    #[cfg(unix)]
+    #[test]
+    fn unit__remove_dir_within__final_symlink_under_external_parent_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let anchor = tmp.path().join("data");
+        let foreign = tmp.path().join("foreign");
+        tree(&foreign);
+        std::fs::create_dir_all(&anchor).unwrap();
+        std::os::unix::fs::symlink(&foreign, anchor.join("engines")).unwrap();
+        let target_file = foreign.join("linked.txt");
+        std::fs::write(&target_file, b"x").unwrap();
+        let link = anchor.join("engines/tag-link");
+        std::os::unix::fs::symlink(&target_file, &link).unwrap();
+        assert_eq!(
+            remove_dir_within(&anchor, &link).unwrap(),
+            GuardedRemoval::Escaped
+        );
+        assert!(link.exists(), "the link on foreign ground stays in place");
+        assert!(target_file.is_file(), "link target survives regardless");
     }
 }
