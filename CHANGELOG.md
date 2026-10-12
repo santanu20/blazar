@@ -4,6 +4,30 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Changed
+
+- **Two byte-identical relay/mutation fast paths, from the 2026-10-12
+  e2e perf audit** (`docs/research/2026-10-12-e2e-perf-audit.md`).
+  Profiling attributed the remaining single-stream overhead and found
+  two code-level slices that could be removed without touching a
+  single output byte: the SSE think-suppression filter now skips its
+  full parse for line-complete, marker-free chunks (a raw-byte scan
+  for `<t`/`</`/`<"`/`\u` gates it; a real 384-token dump contained
+  none), and the request-mutation stage no longer deep-clones JSON
+  bodies that no mutator would touch — four read-only predicates
+  pre-check the borrowed value, each conservative in the "needed"
+  direction. Effect: the relay-side parse cluster disappears from the
+  profile (`SseThinkFilter::feed` 1.48% → 0.37%) and non-mutating
+  requests skip a clone+serialize round trip. Verified by seven new
+  unit pins (byte-exact passthrough, marker-after-skip, bare-`<`
+  tails, `\u003c` escapes, cross-chunk reassembly, no-op-body corpus,
+  predicate==mutator corpus), 2146/2146 workspace tests, and an A/B
+  campaign where every gateway cell stayed inside the run-to-run band
+  the direct control lane itself moved in, with greedy
+  gateway-transparency unchanged at 14/20 exact (ratio 0.941).
+
 ## [0.26.0] - 2026-10-10
 
 ### Added
