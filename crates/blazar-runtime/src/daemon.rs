@@ -458,6 +458,25 @@ mod tests {
             .spawn()
             .expect("control decoy");
 
+        // The sweep can only see the marker once execve has stamped it
+        // into /proc/<pid>/environ — between fork and exec the decoy
+        // still shows this process's unmarked env, and under heavy CPU
+        // load that window outlives the spawn call. Production never
+        // races this (the boot sweep meets children exec'd long ago);
+        // wait for the precondition the sweep actually depends on.
+        let mut marker_visible = false;
+        for _ in 0..500 {
+            if pid_marks_owner(stubborn.id(), &d.data_dir) {
+                marker_visible = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            marker_visible,
+            "decoy never exposed its marker (exec blocked >5s?) — sweep would race it"
+        );
+
         let lines =
             reclaim_marker_orphans_with_grace(&d.data_dir, std::time::Duration::from_secs(1));
         assert_eq!(
