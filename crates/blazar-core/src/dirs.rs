@@ -123,6 +123,7 @@ impl BlazarDirs {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::BlazarDirs;
 
     #[test]

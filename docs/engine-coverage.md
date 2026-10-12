@@ -131,7 +131,7 @@ Registry lane `sglang` pins 70 first-class flags (compile + spawn-time emission)
 
 - `--enable-lora` [`docs/research/2026-10-09-sglang-lora-one-child.md`](docs/research/2026-10-09-sglang-lora-one-child.md) — one-child colon routing + hot-attach via /api/lora/sync on the same pid
 - `--lora-paths` [`docs/research/2026-10-09-sglang-lora-one-child.md`](docs/research/2026-10-09-sglang-lora-one-child.md) — one-child colon routing + hot-attach via /api/lora/sync on the same pid
-- `--speculative-algorithm` [`bench-artifacts/20261009-sglang-spec/live_battery.json`](bench-artifacts/20261009-sglang-spec/live_battery.json) — ngram live battery: gain is workload-dependent (never default-on)
+- `--speculative-algorithm` [`bench-artifacts/20261009-sglang-spec/spec_race_lane.md`](bench-artifacts/20261009-sglang-spec/spec_race_lane.md) — live sglang-0.5.21 spec battery: ngram exercised via --speculative-algorithm; +7% on repetitive search prompts, negative on diverse traffic - gain is workload-dependent, kept opt-in (raw cells: live_battery.json, bench-archive release)
 
 ### Passthrough families
 

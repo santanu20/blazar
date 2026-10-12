@@ -1,65 +1,65 @@
 {
-  "version": 1,
-  "receipts": [
-    {
-      "lane": "llamacpp",
-      "flag": "--cache-type-k",
-      "receipt": "bench-artifacts/20261005-kv-quality/benchmark.md",
-      "note": "q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)"
-    },
-    {
-      "lane": "llamacpp",
-      "flag": "--cache-type-v",
-      "receipt": "bench-artifacts/20261005-kv-quality/benchmark.md",
-      "note": "q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)"
-    },
-    {
-      "lane": "sglang",
-      "flag": "--enable-lora",
-      "receipt": "docs/research/2026-10-09-sglang-lora-one-child.md",
-      "note": "one-child colon routing + hot-attach via /api/lora/sync on the same pid"
-    },
-    {
-      "lane": "sglang",
-      "flag": "--lora-paths",
-      "receipt": "docs/research/2026-10-09-sglang-lora-one-child.md",
-      "note": "one-child colon routing + hot-attach via /api/lora/sync on the same pid"
-    },
-    {
-      "lane": "sglang",
-      "flag": "--speculative-algorithm",
-      "receipt": "bench-artifacts/20261009-sglang-spec/live_battery.json",
-      "note": "ngram live battery: gain is workload-dependent (never default-on)"
-    },
-    {
-      "lane": "mlx",
-      "flag": "--kv-bits",
-      "receipt": "bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md",
-      "note": "A/B on qwen2.5-0.5b: 1.9x slower decode, 108MiB saved - memory lever, opt-in"
-    },
-    {
-      "lane": "mistralrs",
-      "flag": "--isq",
-      "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md",
-      "note": "live child --isq q8_0 (qwen3-1.7b temp-0 200 OK); admission stays checkpoint-based"
-    },
-    {
-      "lane": "whisper",
-      "flag": "--beam-size",
-      "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md",
-      "note": "beam-5 child; piper-TTS wav transcribed exactly"
-    },
-    {
-      "lane": "sdcpp",
-      "flag": "--upscale-model",
-      "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md",
-      "note": "RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048"
-    },
-    {
-      "lane": "sdcpp",
-      "flag": "--hires-upscalers-dir",
-      "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md",
-      "note": "RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048"
-    }
-  ]
+ "version": 1,
+ "receipts": [
+  {
+   "lane": "llamacpp",
+   "flag": "--cache-type-k",
+   "receipt": "bench-artifacts/20261005-kv-quality/benchmark.md",
+   "note": "q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)"
+  },
+  {
+   "lane": "llamacpp",
+   "flag": "--cache-type-v",
+   "receipt": "bench-artifacts/20261005-kv-quality/benchmark.md",
+   "note": "q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)"
+  },
+  {
+   "lane": "sglang",
+   "flag": "--enable-lora",
+   "receipt": "docs/research/2026-10-09-sglang-lora-one-child.md",
+   "note": "one-child colon routing + hot-attach via /api/lora/sync on the same pid"
+  },
+  {
+   "lane": "sglang",
+   "flag": "--lora-paths",
+   "receipt": "docs/research/2026-10-09-sglang-lora-one-child.md",
+   "note": "one-child colon routing + hot-attach via /api/lora/sync on the same pid"
+  },
+  {
+   "lane": "sglang",
+   "flag": "--speculative-algorithm",
+   "receipt": "bench-artifacts/20261009-sglang-spec/spec_race_lane.md",
+   "note": "live sglang-0.5.21 spec battery: ngram exercised via --speculative-algorithm; +7% on repetitive search prompts, negative on diverse traffic - gain is workload-dependent, kept opt-in (raw cells: live_battery.json, bench-archive release)"
+  },
+  {
+   "lane": "mlx",
+   "flag": "--kv-bits",
+   "receipt": "bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md",
+   "note": "A/B on qwen2.5-0.5b: 1.9x slower decode, 108MiB saved - memory lever, opt-in"
+  },
+  {
+   "lane": "mistralrs",
+   "flag": "--isq",
+   "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md",
+   "note": "live child --isq q8_0 (qwen3-1.7b temp-0 200 OK); admission stays checkpoint-based"
+  },
+  {
+   "lane": "whisper",
+   "flag": "--beam-size",
+   "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md",
+   "note": "beam-5 child; piper-TTS wav transcribed exactly"
+  },
+  {
+   "lane": "sdcpp",
+   "flag": "--upscale-model",
+   "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md",
+   "note": "RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048"
+  },
+  {
+   "lane": "sdcpp",
+   "flag": "--hires-upscalers-dir",
+   "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md",
+   "note": "RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048"
+  }
+ ]
 }

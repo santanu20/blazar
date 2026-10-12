@@ -3186,7 +3186,11 @@ fn restrict_to_owner(path: &std::path::Path) -> CoreResult<()> {
     Ok(())
 }
 
+// Unix-less builds have no mode bits to strip, so this arm is always
+// `Ok` (clippy would flag the wrapper as unnecessary); the uniform
+// `CoreResult` keeps every call site platform-agnostic.
 #[cfg(not(unix))]
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn restrict_to_owner(_path: &std::path::Path) -> CoreResult<()> {
     Ok(())
 }
