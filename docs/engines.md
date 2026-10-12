@@ -100,6 +100,15 @@ observers is explicit about what that means:
   API and is not invoked on this lane; conversation warmth comes from the
   engine's own prompt cache (`--prompt-cache-*` knobs tune it).
 
+Known upstream issue: mlx-lm 0.32.0 can silently drop a tool call — the
+response reports `finish_reason: "tool_calls"` while `message.tool_calls`
+is missing and the generated text is lost (the model emitted call markers
+but the parser rejected the text between them; most visible with small
+quantized models). Upstream fix pending in
+[ml-explore/mlx-lm#1957](https://github.com/ml-explore/mlx-lm/pull/1957);
+until it lands and the lane's engine is refreshed, tool-call traffic on
+this lane may hit it.
+
 ### stable-diffusion.cpp
 
 Diffusion images (and video component sets) on CPU or GPU, including Vulkan
