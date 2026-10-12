@@ -33,3 +33,5 @@
 | 20261009-sglang-lora-one-child | 20261009 | sglang,lora,variant-routing,hot-attach,single-child | 2 | dev (pre-0.25) |
 | 20261009-sglang-rebaseline | 20261009 | blazar,cold,conc,ollama | 12 | blazar 0.24.0 |
 | 20261009-orphan-reclaim | 20261009 | orphan,reclaim,sigkill,lifecycle,session-daemon | 4 | dev (pre-0.25) |
+| 20261012-e2e-perf-audit | 20261012 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 23 | 0.26.0 |
+| 20261012-e2e-perf-audit-postfix | 20261012 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 23 | 0.26.0 |
