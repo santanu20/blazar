@@ -4342,7 +4342,8 @@ mod supersede_floor_tests {
 /// BLZ-7 regression pins: the retire/aside machinery must never move
 /// or unlink anything that resolves outside the data root, even when
 /// the managed engines dir itself is a symlink to foreign ground.
-#[cfg(test)]
+/// Symlink fixtures need unix; the whole module sits out on Windows.
+#[cfg(all(test, unix))]
 mod retire_containment_tests {
     #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     use super::*;
@@ -4351,7 +4352,6 @@ mod retire_containment_tests {
     /// that resolves outside the data root must NOT be renamed into an
     /// aside — the install aborts loudly instead of stranding foreign
     /// copies that guarded cleanup would later refuse to touch.
-    #[cfg(unix)]
     #[test]
     fn unit__retire_engine_dir__refuses_dir_outside_the_data_root() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4381,7 +4381,6 @@ mod retire_containment_tests {
 
     /// In-ground behavior stays intact: a crashed run's aside is swept
     /// before the rename, and the tag dir moves to a fresh aside.
-    #[cfg(unix)]
     #[test]
     fn unit__retire_engine_dir__sweeps_stale_asides_and_retires_in_ground_dir() {
         let tmp = tempfile::tempdir().unwrap();
