@@ -2133,12 +2133,29 @@ pub(crate) fn apply_child_request_mutations_stamped(
     if body.is_empty() || !(usage_lane || think_lane || stamp.is_some()) {
         return body;
     }
-    let mut v = match parsed.cloned() {
+    // Decide before cloning: the deep `Value` clone is only worth its
+    // cost when some mutator will actually fire. Checking the change
+    // predicates on the borrowed parse keeps no-op bodies — plain
+    // non-stream chats, already-conforming streams — byte-identical
+    // without paying clone + re-serialization for nothing.
+    let mut owned_parse: Option<serde_json::Value> = None;
+    let v_ref: &serde_json::Value = match parsed {
         Some(v) => v,
         None => match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(v) => v,
+            Ok(v) => owned_parse.insert(v),
             Err(_) => return body, // fail-open: the child reports its own error
         },
+    };
+    let needed = (usage_lane
+        && (include_usage_needed(v_ref) || normalize_system_first_needed(v_ref)))
+        || stamp.as_deref().is_some_and(|s| stamp_needed(v_ref, s))
+        || (think_lane && normalize_think_needed(v_ref));
+    if !needed {
+        return body;
+    }
+    let mut v = match owned_parse {
+        Some(v) => v,
+        None => parsed.expect("parsed borrowed above").clone(),
     };
     let mut changed = false;
     if usage_lane {
@@ -2157,6 +2174,86 @@ pub(crate) fn apply_child_request_mutations_stamped(
     match serde_json::to_vec(&v) {
         Ok(bytes) => axum::body::Bytes::from(bytes),
         Err(_) => body,
+    }
+}
+
+/// Read-only mirror of [`include_usage_in_value`]'s change decision —
+/// keep the two in lockstep (the unit pins assert predicate and
+/// mutator agree on the shared corpus).
+fn include_usage_needed(v: &serde_json::Value) -> bool {
+    v.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+        && v.pointer("/stream_options/include_usage")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+}
+
+/// Read-only mirror of [`normalize_system_first_in_value`]'s change
+/// decision: any non-empty plain-string system text with the list not
+/// already conforming (zero texts, or exactly one text sitting first)
+/// means the hoist/merge will rewrite the list.
+fn normalize_system_first_needed(v: &serde_json::Value) -> bool {
+    let Some(messages) = v.get("messages").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let mut texts = 0usize;
+    for m in messages {
+        if !is_system_message(m) {
+            continue;
+        }
+        match m.get("content").and_then(serde_json::Value::as_str) {
+            Some(t) if !t.is_empty() => texts += 1,
+            Some(_) => {}
+            // Structured (or missing) system content poisons the merge —
+            // the mutator leaves the list untouched.
+            None => return false,
+        }
+    }
+    !(texts == 0 || (texts == 1 && messages.first().is_some_and(is_system_message)))
+}
+
+/// Read-only mirror of [`set_child_model`]'s change decision.
+fn stamp_needed(v: &serde_json::Value, stamp: &str) -> bool {
+    match v.get("model").and_then(serde_json::Value::as_str) {
+        Some(current) => current != stamp,
+        None => false,
+    }
+}
+
+/// Read-only mirror of [`normalize_think_in_value`]'s change decision
+/// for the mistral.rs think bridge.
+fn normalize_think_needed(v: &serde_json::Value) -> bool {
+    if !v.is_object() {
+        return false;
+    }
+    let effort = v
+        .get("reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let kwargs_on = v
+        .pointer("/chat_template_kwargs/thinking")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            v.pointer("/chat_template_kwargs/enable_thinking")
+                .and_then(serde_json::Value::as_bool)
+        });
+    let top_level = v
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool);
+    if let Some(effort) = effort.filter(|e| !e.is_empty()) {
+        let mapped = match effort.as_str() {
+            "minimal" => "off",
+            "max" => "xhigh",
+            other => other,
+        };
+        (v.get("enable_thinking").is_none() && kwargs_on != Some(false))
+            || v.get("reasoning_effort")
+                .and_then(serde_json::Value::as_str)
+                != Some(mapped)
+    } else {
+        match kwargs_on.or(top_level) {
+            Some(on) => top_level != Some(on),
+            None => true,
+        }
     }
 }
 
@@ -3170,6 +3267,123 @@ mod cache_obs_tests {
             None,
         );
         assert_eq!(out, orig, "child remains the judge of odd bodies");
+    }
+
+    // --- clone-elision contract ------------------------------------------
+    // The pre-clone change predicates must fire exactly when their
+    // mutators mutate: a false negative would silently drop a needed
+    // mutation (behavior change), a false positive only wastes the old
+    // clone. These pins hold predicate and mutator in lockstep.
+
+    #[test]
+    fn unit__mutations__no_op_bodies_byte_identical_via_predicate_skip() {
+        use blazar_core::engine_kind::EngineKind as K;
+        // Every body here is a no-op on its lane: conforming streams,
+        // non-stream chats, system-list shapes the hoist leaves alone,
+        // and stamps already matching the child's registered name.
+        // (Stamped/think lanes carry their own no-op cases below — a
+        // body that only settles SOME lanes would false-fail here.)
+        let llama_bodies = [
+            json!({"model": "m", "messages": [], "stream": false}),
+            json!({"stream": true, "stream_options": {"include_usage": true}, "messages": [
+                {"role": "system", "content": "a"},
+                {"role": "user", "content": "hi"},
+            ]}),
+            json!({"stream": true, "stream_options": {"include_usage": true}, "messages": [
+                {"role": "system", "content": "a"},
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "hi"},
+            ]}),
+            json!({"stream": true, "stream_options": {"include_usage": true}, "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "structured"}]},
+                {"role": "user", "content": "hi"},
+            ]}),
+        ];
+        for body in &llama_bodies {
+            let bytes = json_body(body);
+            let pre = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+            let out = apply_child_request_mutations(
+                &eng(K::LlamaCpp),
+                "/v1/chat/completions",
+                bytes.clone(),
+                pre.as_ref(),
+            );
+            assert_eq!(out, bytes, "no-op body must stay byte-identical: {body}");
+        }
+        // Stamps already in place: byte-identical on every stamped lane.
+        let stamped = [
+            (
+                K::MistralRs,
+                json!({"model": "default", "enable_thinking": true,
+                                   "chat_template_kwargs": {"thinking": true}}),
+            ),
+            (K::Sglang, json!({"model": "qwen2.5-0.5b-instruct-awq"})),
+            (
+                K::Mlx,
+                json!({"model": "/models/qwen2.5-0.5b-instruct-4bit.d"}),
+            ),
+        ];
+        for (kind, body) in &stamped {
+            let bytes = json_body(body);
+            let out = apply_child_request_mutations(
+                &eng(*kind),
+                "/v1/chat/completions",
+                bytes.clone(),
+                None,
+            );
+            assert_eq!(out, bytes, "settled lane no-op: {body} / {kind:?}");
+        }
+    }
+
+    #[test]
+    fn unit__mutations__predicates_mirror_mutators_on_corpus() {
+        let corpus = [
+            json!({}),
+            json!({"stream": true}),
+            json!({"stream": false}),
+            json!({"stream": true, "stream_options": {"include_usage": true}}),
+            json!({"stream": true, "stream_options": {"include_usage": false}}),
+            json!({"messages": []}),
+            json!({"messages": [{"role": "system", "content": "a"}]}),
+            json!({"messages": [{"role": "user", "content": "hi"}, {"role": "system", "content": "s"}]}),
+            json!({"messages": [{"role": "user", "content": "hi"}, {"role": "system", "content": ""}]}),
+            json!({"messages": [{"role": "system", "content": "a"}, {"role": "system", "content": "b"}]}),
+            json!({"messages": [{"role": "system", "content": [{"type": "text"}]}, {"role": "system", "content": "b"}]}),
+            json!({"messages": [{"role": "system"}]}),
+            json!({"model": "default"}),
+            json!({"model": "other"}),
+            json!({"model": 42}),
+            json!({"reasoning_effort": "minimal"}),
+            json!({"reasoning_effort": "max"}),
+            json!({"reasoning_effort": "high", "enable_thinking": true}),
+            json!({"enable_thinking": true}),
+            json!({"enable_thinking": false, "chat_template_kwargs": {"thinking": false}}),
+            json!({"chat_template_kwargs": {"thinking": true}, "enable_thinking": true}),
+            json!({"chat_template_kwargs": {"enable_thinking": true}, "enable_thinking": false}),
+            json!("not an object"),
+        ];
+        for v in &corpus {
+            assert_eq!(
+                include_usage_needed(v),
+                include_usage_in_value(&mut v.clone()),
+                "include_usage predicate/mutator drift: {v}"
+            );
+            assert_eq!(
+                normalize_system_first_needed(v),
+                normalize_system_first_in_value(&mut v.clone()),
+                "system_first predicate/mutator drift: {v}"
+            );
+            assert_eq!(
+                stamp_needed(v, "default"),
+                set_child_model(&mut v.clone(), "default"),
+                "stamp predicate/mutator drift: {v}"
+            );
+            assert_eq!(
+                normalize_think_needed(v),
+                normalize_think_in_value(EngineKind::MistralRs, &mut v.clone()),
+                "think predicate/mutator drift: {v}"
+            );
+        }
     }
 
     // --- apply_child_request_mutations: composition pins ------------------

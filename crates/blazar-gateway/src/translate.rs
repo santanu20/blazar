@@ -1046,6 +1046,24 @@ impl ThinkSplitter {
         let held = std::mem::take(&mut self.held);
         if self.in_think { String::new() } else { held }
     }
+
+    /// No pending think state: not inside a block and nothing held.
+    /// A marker-free delta fed to a settled splitter returns verbatim.
+    fn settled(&self) -> bool {
+        !self.in_think && self.held.is_empty()
+    }
+}
+
+/// Conservative byte scan for anything that could make a data frame
+/// non-verbatim under the think filter: a literal `<think>`/`</think>`
+/// marker or a partial marker prefix (a `<` that could grow into one
+/// at a content end, or any `\u` escape — which could spell `<` as
+/// `\u003c`). Marker-free prose never trips it; marker-carrying or
+/// escape-carrying chunks fall through to the full per-frame parse.
+fn marker_risk(chunk: &[u8]) -> bool {
+    chunk
+        .windows(2)
+        .any(|w| matches!(w, b"<t" | b"</" | b"<\"" | b"\\u"))
 }
 
 /// Length of the longest proper prefix of `marker` that the string
@@ -1184,6 +1202,21 @@ impl SseThinkFilter {
     /// forward (possibly empty when everything is held or suppressed).
     /// Incomplete trailing lines stay buffered until the next chunk.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        // Identity fast path: with no buffered partial line, every
+        // splitter settled, the chunk ending on a line boundary, and no
+        // marker-risk bytes anywhere, every line provably passes through
+        // verbatim — skip the per-frame JSON parse entirely. This is
+        // the steady state for engines that never emit think markers;
+        // the scan costs nanoseconds against the ~microsecond parse it
+        // replaces, and any marker/escape/hold condition falls through
+        // to the full pipeline below with unchanged behavior.
+        if self.buf.is_empty()
+            && chunk.last() == Some(&b'\n')
+            && self.splitters.values().all(ThinkSplitter::settled)
+            && !marker_risk(chunk)
+        {
+            return chunk.to_vec();
+        }
         self.buf.push_str(&String::from_utf8_lossy(chunk));
         let mut out = Vec::new();
         while let Some(nl) = self.buf.find('\n') {
@@ -2378,6 +2411,107 @@ mod tests {
         let mut f = SseThinkFilter::new();
         let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
         assert_eq!(f.feed(raw.as_bytes()), raw.as_bytes());
+        assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_think_filter__marker_free_chunks_skip_parse_byte_exact() {
+        // Steady-state decode traffic: content with quotes, code-style
+        // comparisons, and tag-ish text — none of it marker-risk. The
+        // fast path must return each chunk byte-for-byte and leave the
+        // filter inert at finish.
+        let mut f = SseThinkFilter::new();
+        let frames = [
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a < b and x<y holds\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<div class=\\\"x\\\">\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done.\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        for frame in frames {
+            assert_eq!(f.feed(frame.as_bytes()), frame.as_bytes());
+        }
+        assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_think_filter__skip_then_marker_chunk_still_suppresses() {
+        // Fast-path chunks must not poison later marker handling: the
+        // splitter map stays empty on skips, and the first real marker
+        // chunk still opens (and here never closes) a think block.
+        let mut f = SseThinkFilter::new();
+        let plain = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        assert_eq!(f.feed(plain.as_bytes()), plain.as_bytes());
+        let open =
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>secret\"}}]}\n\n";
+        let out = f.feed(open.as_bytes());
+        assert!(
+            !String::from_utf8_lossy(&out).contains("secret"),
+            "think content suppressed after skip-prefixed stream: {out:?}"
+        );
+        // Inside the block: marker-free chunks must NOT take the skip
+        // path (in_think splitters are unsettled) — suppression holds.
+        let mid =
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"still hidden\"}}]}\n\n";
+        let out = f.feed(mid.as_bytes());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("still hidden"),
+            "in-think content suppressed: {text}"
+        );
+        assert!(
+            text.contains("\"content\":\"\""),
+            "frame shape kept: {text}"
+        );
+        assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_think_filter__content_ending_with_lt_takes_full_path() {
+        // A trailing `<` in content is a held partial-marker prefix:
+        // the chunk carries `"<"` before the closing quote, which the
+        // risk scan catches so the buffered pipeline (and its hold)
+        // runs exactly as before the fast path existed.
+        let mut f = SseThinkFilter::new();
+        let part = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"abc<\"}}]}\n\n";
+        let out = String::from_utf8_lossy(&f.feed(part.as_bytes())).into_owned();
+        assert!(
+            out.contains("\"content\":\"abc\"") && !out.contains("abc<"),
+            "held `<` deferred out of the frame: {out}"
+        );
+        let rest = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\">done\"}}]}\n\ndata: [DONE]\n\n";
+        let out = f.feed(rest.as_bytes());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("\"content\":\"<>done\""),
+            "held `<` rejoins next delta: {text}"
+        );
+    }
+
+    #[test]
+    fn unit__sse_think_filter__escaped_unicode_takes_full_path() {
+        // `\u` escapes could spell `<` as `\u003c` and hide a marker
+        // from the byte scan — such chunks must not skip. The parse
+        // resolves them to plain text, which passes through verbatim.
+        let mut f = SseThinkFilter::new();
+        let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\u003cb\\u003e bold \\u003c/b\\u003e\"}}]}\n\n";
+        assert_eq!(f.feed(raw.as_bytes()), raw.as_bytes());
+        assert_eq!(f.finish(), b"");
+    }
+
+    #[test]
+    fn unit__sse_think_filter__partial_line_chunk_buffers_not_skips() {
+        // A chunk not ending on a line boundary must buffer through
+        // the full path (skip requires a complete final line), keeping
+        // cross-chunk frame reassembly intact.
+        let mut f = SseThinkFilter::new();
+        assert_eq!(f.feed(b"data: {\"choices\":[{\"index\":0"), b"");
+        // The buffered partial reassembles with the tail into complete
+        // lines; identity filtering forwards them verbatim.
+        let tail = b",\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let expect = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        assert_eq!(f.feed(tail), expect);
         assert_eq!(f.finish(), b"");
     }
 
