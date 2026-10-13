@@ -562,11 +562,11 @@ async fn e2e__n_choices_out_of_range_fails_fast_unbilled() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn e2e__systemone_is_llamacpp_only_and_teaches_on_other_lanes() {
-    // TypeSafe System One is a llama-server child surface; with a non-llamacpp
-    // lane active the gate must teach (naming the kind), and with llamacpp
-    // active the gate stays silent (any later error must not carry the
-    // teaching) — mirrors the /props gate pin.
+async fn e2e__systemone_gate_per_lane_llamacpp_sglang_pass_mistralrs_teaches() {
+    // TypeSafe System One is a llama-server child surface that a live
+    // sglang 0.5.21 child also serves (probe receipt 2026-10-12), so
+    // those two lanes pass the gate; a mistralrs lane still gets the
+    // teaching refusal naming the kind.
     let ts = start(Config::default()).await;
     let c = client();
     let body = serde_json::json!({
@@ -610,12 +610,41 @@ async fn e2e__systemone_is_llamacpp_only_and_teaches_on_other_lanes() {
         .send()
         .await
         .unwrap();
+    let text = r.text().await.unwrap();
+    assert!(
+        !text.contains("llama-server-only"),
+        "sglang serves systemone (0.5.21 probe): gate must stay silent, any \
+         later error is routing's own voice: {text}"
+    );
+
+    ts.state
+        .with_store(|s| {
+            s.upsert_engine(&blazar_core::EngineRow {
+                tag: "mistralrs-t".into(),
+                asset: "stub".into(),
+                sha256: "flip".into(),
+                installed_at: 3,
+                active: true,
+                manifest: "{}".into(),
+                kind: blazar_core::engine_kind::EngineKind::MistralRs,
+            })
+            .unwrap();
+            s.set_active_engine("mistralrs-t").unwrap();
+        })
+        .unwrap();
+    let r = c
+        .post(format!("{}/v1/systemone", ts.base))
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 400);
     let v: serde_json::Value = r.json().await.unwrap();
     let msg = v["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        msg.contains("llama-server-only") && msg.contains("sglang"),
-        "sglang systemone teaching: {msg}"
+        msg.contains("llama-server-only") && msg.contains("mistralrs"),
+        "mistralrs systemone teaching: {msg}"
     );
 }
 

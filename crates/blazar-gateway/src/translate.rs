@@ -776,7 +776,13 @@ impl LineBuffer {
             return String::new();
         };
         let complete: Vec<u8> = self.buf.drain(..=nl).collect();
-        String::from_utf8_lossy(&complete).into_owned()
+        // In-place decode: valid UTF-8 moves the buffer into the String
+        // with no copy (the lossy path validates AND clones). Invalid
+        // sequences take the same U+FFFD replacement as before.
+        match String::from_utf8(complete) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }
     }
 }
 
@@ -1060,7 +1066,11 @@ impl ThinkSplitter {
 /// at a content end, or any `\u` escape — which could spell `<` as
 /// `\u003c`). Marker-free prose never trips it; marker-carrying or
 /// escape-carrying chunks fall through to the full per-frame parse.
-fn marker_risk(chunk: &[u8]) -> bool {
+/// Also reused as the no-op proof for complete non-stream bodies
+/// (`finalize_buffered_body`): no risk bytes anywhere means no decoded
+/// string in the body can contain `<think>`, so suppression is
+/// provably an identity on every content field.
+pub(crate) fn marker_risk(chunk: &[u8]) -> bool {
     chunk
         .windows(2)
         .any(|w| matches!(w, b"<t" | b"</" | b"<\"" | b"\\u"))
@@ -1115,24 +1125,40 @@ pub fn request_think_on(body: &[u8]) -> bool {
 /// Strip raw think blocks from a complete ollama-shaped response
 /// (chat `message.content` and generate `response` — whichever key
 /// exists). Idempotent: an already-split response passes through.
-pub fn suppress_raw_think_response(v: &mut Value) {
+/// Returns whether any content string actually changed so callers can
+/// skip a pointless re-serialization of untouched bodies.
+pub fn suppress_raw_think_response(v: &mut Value) -> bool {
+    let mut changed = false;
     if let Some(choices) = v.get_mut("choices").and_then(Value::as_array_mut) {
         for choice in choices {
             if let Some(Value::String(content)) =
                 choice.get_mut("message").and_then(|m| m.get_mut("content"))
             {
-                *content = suppress_think_text(content);
+                let filtered = suppress_think_text(content);
+                if filtered != *content {
+                    *content = filtered;
+                    changed = true;
+                }
             }
         }
     }
     if let Some(Value::String(response)) = v.get_mut("response") {
-        *response = suppress_think_text(response);
+        let filtered = suppress_think_text(response);
+        if filtered != *response {
+            *response = filtered;
+            changed = true;
+        }
     }
     // Ollama chat shape (non-stream): the content lives on a top-level
     // `message` object, not under `choices`.
     if let Some(Value::String(content)) = v.get_mut("message").and_then(|m| m.get_mut("content")) {
-        *content = suppress_think_text(content);
+        let filtered = suppress_think_text(content);
+        if filtered != *content {
+            *content = filtered;
+            changed = true;
+        }
     }
+    changed
 }
 
 /// Whether a chat request asks for thinking in ANY dialect the gateway
@@ -2338,6 +2364,49 @@ mod tests {
         assert_eq!(
             suppress_think_text(&suppress_think_text("a<think>b</think>c")),
             "ac"
+        );
+    }
+
+    #[test]
+    fn unit__suppress_raw_think_response__reports_whether_changed() {
+        // Clean content on every shape: no change reported, value intact.
+        let mut clean = json!({
+            "choices": [{"message": {"content": "plain"}}],
+            "response": "plain",
+            "message": {"content": "plain"},
+        });
+        assert!(!suppress_raw_think_response(&mut clean));
+        assert_eq!(clean["choices"][0]["message"]["content"], json!("plain"));
+
+        // Markers on any shape: change reported per content site.
+        let mut marked = json!({
+            "choices": [{"message": {"content": "<think>x</think>y"}}],
+            "response": "<think>r</think>z",
+            "message": {"content": "<think>m</think>n"},
+        });
+        assert!(suppress_raw_think_response(&mut marked));
+        assert_eq!(marked["choices"][0]["message"]["content"], json!("y"));
+        assert_eq!(marked["response"], json!("z"));
+        assert_eq!(marked["message"]["content"], json!("n"));
+
+        // Partial-marker tails ("<th" at end) are literal text: one-shot
+        // feed+finish returns them unchanged — no false positive.
+        let mut tail = json!({"choices": [{"message": {"content": "abc<th"}}]});
+        assert!(!suppress_raw_think_response(&mut tail));
+        assert_eq!(tail["choices"][0]["message"]["content"], json!("abc<th"));
+    }
+
+    #[test]
+    fn unit__line_buffer__inplace_utf8_matches_lossy_semantics() {
+        // Valid multibyte decodes identically to the lossy path.
+        let mut lb = LineBuffer::new();
+        assert_eq!(lb.feed("héllo ✓ 你好\n".as_bytes()), "héllo ✓ 你好\n");
+        // Invalid bytes take the same U+FFFD replacement the lossy
+        // decoder produced.
+        let mut lb2 = LineBuffer::new();
+        assert_eq!(
+            lb2.feed(b"bad \xff\xff tail\n"),
+            "bad \u{fffd}\u{fffd} tail\n"
         );
     }
 

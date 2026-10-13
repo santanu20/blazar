@@ -1371,36 +1371,13 @@ pub async fn proxy_request(
                 // Same contract as the ollama lanes: when the caller did not
                 // ask for thinking, strip raw <think> blocks before the body
                 // reaches the client. Parse failure fails open (original body).
-                let buf = if suppress_think || restamp || json_fence {
-                    match serde_json::from_slice::<serde_json::Value>(&buf) {
-                        Ok(mut v) => {
-                            let mut touched = false;
-                            if json_fence {
-                                touched |= normalize_json_fences(&mut v);
-                            }
-                            if restamp
-                                && let Some(m) = v.get_mut("model")
-                                && m.is_string()
-                                && m.as_str() != Some(caller_model.as_str())
-                            {
-                                *m = serde_json::Value::String(caller_model.clone());
-                                touched = true;
-                            }
-                            if suppress_think {
-                                crate::translate::suppress_raw_think_response(&mut v);
-                                touched = true; // legacy think path always re-serializes
-                            }
-                            if touched {
-                                serde_json::to_vec(&v).unwrap_or_else(|_| buf.to_vec())
-                            } else {
-                                buf.to_vec()
-                            }
-                        }
-                        Err(_) => buf.to_vec(),
-                    }
-                } else {
-                    buf.to_vec()
-                };
+                let buf = finalize_buffered_body(
+                    &buf,
+                    suppress_think,
+                    restamp,
+                    json_fence,
+                    &caller_model,
+                );
                 let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(buf) })
                     .chain(futures::stream::unfold(body_guard, |g| async {
                         drop(g);
@@ -2409,6 +2386,56 @@ pub fn normalize_json_fences(v: &mut serde_json::Value) -> bool {
         }
     }
     touched
+}
+
+/// Final buffered-body bytes for the guarded non-stream lanes (think
+/// suppression, model restamp, JSON-fence normalization — applied in
+/// that order, one parse, one conditional re-serialization).
+///
+/// Zero-parse fast path: a think-only lane (no restamp, no fence
+/// demand) whose body carries no marker-risk bytes provably cannot
+/// contain `<think>` in any decoded string, so suppression is an
+/// identity and the engine's ORIGINAL bytes ship untouched — no parse,
+/// no re-serialization, no key reordering. The same holds after the
+/// parse when nothing changed (`touched` is accurate per mutator), so
+/// clean bodies keep engine byte order even when a risk byte forced
+/// the full path. Parse failure fails open (original body).
+fn finalize_buffered_body(
+    buf: &[u8],
+    suppress_think: bool,
+    restamp: bool,
+    json_fence: bool,
+    caller_model: &str,
+) -> Vec<u8> {
+    if !(suppress_think || restamp || json_fence) {
+        return buf.to_vec();
+    }
+    if suppress_think && !restamp && !json_fence && !crate::translate::marker_risk(buf) {
+        return buf.to_vec();
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(buf) else {
+        return buf.to_vec();
+    };
+    let mut touched = false;
+    if json_fence {
+        touched |= normalize_json_fences(&mut v);
+    }
+    if restamp
+        && let Some(m) = v.get_mut("model")
+        && m.is_string()
+        && m.as_str() != Some(caller_model)
+    {
+        *m = serde_json::Value::String(caller_model.to_string());
+        touched = true;
+    }
+    if suppress_think {
+        touched |= crate::translate::suppress_raw_think_response(&mut v);
+    }
+    if touched {
+        serde_json::to_vec(&v).unwrap_or_else(|_| buf.to_vec())
+    } else {
+        buf.to_vec()
+    }
 }
 
 /// Classify a fully-buffered non-stream chat body (enforce path) from
@@ -3597,6 +3624,60 @@ mod cache_obs_tests {
         assert_eq!(structured_output_kind(None), None);
         // empty grammar = absent
         assert_eq!(structured_output_kind(Some(&json!({"grammar": ""}))), None);
+    }
+
+    #[test]
+    fn unit__finalize_buffered_body__marker_free_body_ships_engine_bytes() {
+        // Engine-original key order (deliberately NOT alphabetical) with
+        // marker-free content: the zero-parse fast path must return the
+        // exact input bytes — no parse, no re-serialization, no reorder.
+        let raw = br#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"clean prose answer"},"finish_reason":"stop"}],"model":"m","usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
+        assert_eq!(
+            finalize_buffered_body(raw, true, false, false, "m"),
+            raw.to_vec()
+        );
+    }
+
+    #[test]
+    fn unit__finalize_buffered_body__think_markers_still_suppress() {
+        let raw = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"<think>why</think>answer"}}],"model":"m"}"#;
+        let out = finalize_buffered_body(raw, true, false, false, "m");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], json!("answer"));
+    }
+
+    #[test]
+    fn unit__finalize_buffered_body__risk_bearing_clean_body_keeps_engine_bytes() {
+        // HTML-ish content trips the risk scan (full path runs), but
+        // suppression changes nothing — accurate `touched` keeps the
+        // engine's original byte order instead of re-serializing.
+        let raw = br#"{"zz":{"a":1},"choices":[{"index":0,"message":{"role":"assistant","content":"<div>hi</div> done"}}],"model":"m"}"#;
+        assert_eq!(
+            finalize_buffered_body(raw, true, false, false, "m"),
+            raw.to_vec()
+        );
+    }
+
+    #[test]
+    fn unit__finalize_buffered_body__restamp_lane_and_fail_open_unchanged() {
+        // Restamp fires: model rewritten to the caller's spelling.
+        let raw = br#"{"model":"default","choices":[]}"#;
+        let out = finalize_buffered_body(raw, false, true, false, "my-model");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], json!("my-model"));
+        // Model already correct: no mutation, original bytes ship.
+        let raw = br#"{"model":"my-model","choices":[]}"#;
+        assert_eq!(
+            finalize_buffered_body(raw, false, true, false, "my-model"),
+            raw.to_vec()
+        );
+        // No guarded lane: unparseable bodies pass through untouched.
+        for flags in [(false, false, false), (true, false, false)] {
+            assert_eq!(
+                finalize_buffered_body(b"not json", flags.0, flags.1, flags.2, "m"),
+                b"not json".to_vec()
+            );
+        }
     }
 
     #[test]
