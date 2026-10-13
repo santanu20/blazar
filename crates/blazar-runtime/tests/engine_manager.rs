@@ -399,6 +399,14 @@ async fn integration__latest_btag_from_list() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__rate_limit__gh_token_hint() {
+    // Env mutation helper follows the tests-dir edition-2024 pattern
+    // (nextest runs one test per process — std's safety condition).
+    fn set_env(key: &str, value: &str) {
+        #[expect(unsafe_code)]
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
     let api = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/repos/ggml-org/llama.cpp/releases"))
@@ -408,14 +416,6 @@ async fn integration__rate_limit__gh_token_hint() {
     // The anonymous web fallback must be pinned to a dead surface —
     // unset/ambient BLAZAR_ATOM_BASE would hit the real feed and turn
     // the rate limit into a successful (network-dependent) listing.
-    // Env mutation helper follows the tests-dir edition-2024 pattern
-    // (nextest runs one test per process — std's safety condition).
-    fn set_env(key: &str, value: &str) {
-        #[expect(unsafe_code)]
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
     let web = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(500))

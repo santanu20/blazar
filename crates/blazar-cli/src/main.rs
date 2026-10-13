@@ -6947,9 +6947,8 @@ fn stop_outcome(
             StopOutcome::AlreadyStoppedStale(signaled)
         }
     } else {
-        let (serving_pid, serving_path) = pidfile_now
-            .map(|(pid, path)| (Some(pid), path))
-            .unwrap_or((None, None));
+        let (serving_pid, serving_path) =
+            pidfile_now.map_or((None, None), |(pid, path)| (Some(pid), path));
         StopOutcome::StillServing {
             signaled,
             serving_pid,
@@ -6958,6 +6957,10 @@ fn stop_outcome(
     }
 }
 
+// One drain-and-classify sequence: signal, grace-poll the port,
+// re-read the pidfile, classify, report. The ordering IS the contract —
+// splitting it would hide the grace-window/pidfile-re-read dependency.
+#[allow(clippy::too_many_lines)]
 async fn stop() -> Result<()> {
     let d = dirs();
     let pidfile = d.run_dir().join("blazar.pid");
@@ -7073,12 +7076,8 @@ async fn stop() -> Result<()> {
                 "{base} still serves after signalling pid {signaled} — pidfile now names pid {} \
                  ({binary_note}): started by another invocation or binary; stop it from there, or \
                  `kill {}`",
-                serving_pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "?".into()),
-                serving_pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| signaled.to_string())
+                serving_pid.map_or_else(|| "?".into(), |p| p.to_string()),
+                serving_pid.map_or_else(|| signaled.to_string(), |p| p.to_string())
             ))
         }
     }
@@ -7428,6 +7427,9 @@ fn import(
 /// hub cache, LM Studio) with the command that adopts each — the pull
 /// and import lanes byte-verify before linking, so scanning never
 /// touches the other runtime's files.
+// Keeps Result<()> to sit uniformly in the import dispatch arm (same
+// shape as every file-import sibling; discovery itself is infallible).
+#[allow(clippy::unnecessary_wraps)]
 fn import_scan(json: bool) -> Result<()> {
     let rows = blazar_runtime::scan::scan_reusable_models();
     if json {
