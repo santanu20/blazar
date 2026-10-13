@@ -5,7 +5,7 @@
 //! `llama-{tag}-bin-{asset}.tar.gz|.zip` and expose `digest:
 //! sha256:...` — verified before extraction.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use blazar_core::config::UpdateChannel;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -14,6 +14,114 @@ use super::build::parse_version_pair;
 use super::net_probe::{self, Attempt};
 
 pub const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
+
+/// Base for the no-API release surfaces (the `releases.atom` feed and
+/// the `releases/expanded_assets/{tag}` HTML table). These ride
+/// github.com — a different, far more generous rate budget than
+/// api.github.com — and serve as the anonymous fallback when the API
+/// 403s. Mirrors/tests override it with `BLAZAR_ATOM_BASE` (same knob
+/// class as `BLAZAR_GH_BASE`).
+fn web_base() -> String {
+    std::env::var("BLAZAR_ATOM_BASE").unwrap_or_else(|_| "https://github.com".into())
+}
+
+/// A 403/429 from api.github.com is an IP-budget exhaustion, not a
+/// repo problem — exactly the error class the web fallback covers.
+fn is_rate_limited(e: &anyhow::Error) -> bool {
+    e.to_string().contains("rate limited")
+}
+
+/// Synthesized prerelease flag for web-fallback releases: llama.cpp
+/// `bNNNNN` tags are the prerelease firehose (API truth, verified
+/// 2026-09-05); every other tag shape is a regular release.
+fn web_prerelease(tag: &str) -> bool {
+    tag.len() > 1 && tag.starts_with('b') && tag[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Percent-decode an asset-name path segment from the asset-table
+/// href (spaces arrive as %20, `+` as %2B, ...).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let hex = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Tags from a `releases.atom` document: (tag, ISO-8601 updated). The
+/// feed lists the ~10 most recent releases; the tag is the last path
+/// segment of each entry's `<id>` (e.g.
+/// `tag:github.com,2008:Repository/612354784/b11574`). Plain string
+/// scanning — the feed is flat and machine-generated, so an XML
+/// dependency would buy nothing.
+fn parse_atom_tags(body: &str) -> Vec<(String, Option<String>)> {
+    body.split("<entry>")
+        .skip(1)
+        .filter_map(|entry| {
+            let id = entry.split("</id>").next()?;
+            let tag = id.rsplit('/').next()?.trim().trim_end_matches('<');
+            if tag.is_empty() {
+                return None;
+            }
+            let updated = entry
+                .split("<updated>")
+                .nth(1)
+                .and_then(|rest| rest.split("</updated>").next())
+                .map(str::to_string);
+            Some((tag.to_string(), updated))
+        })
+        .collect()
+}
+
+/// Assets from a `releases/expanded_assets/{tag}` HTML table: every
+/// `href=".../releases/download/{tag}/{name}"` is one asset row. The
+/// table does not carry digests (GitHub only puts those in the API), so
+/// synthesized assets are `digest: None` — the installer's existing
+/// "unverified" path, the same mark pip-installed engine lanes carry.
+fn parse_asset_hrefs(body: &str, tag: &str, base: &str) -> Vec<GhAsset> {
+    let marker = "/releases/download/";
+    let mut assets = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("href=\"") {
+        rest = &rest[i + 6..];
+        let Some(end) = rest.find('"') else { break };
+        let href = &rest[..end];
+        let Some(di) = href.find(marker) else {
+            continue;
+        };
+        let after = &href[di + marker.len()..];
+        // href shape: {tag}/{name} — only this release's rows.
+        let Some(name) = after.strip_prefix(&format!("{tag}/")) else {
+            continue;
+        };
+        assets.push(GhAsset {
+            name: percent_decode(name),
+            digest: None,
+            size: None,
+            browser_download_url: format!("{base}{href}"),
+        });
+    }
+    assets
+}
 
 /// Parallel byte-range connections for release-asset downloads — the
 /// same lane and default the model-pull client uses (see `hf_parallel`).
@@ -210,6 +318,26 @@ impl GhClient {
     }
 
     pub async fn list_releases_repo(&self, repo: &str) -> Result<Vec<GhRelease>> {
+        match self.list_releases_api(repo).await {
+            Ok(r) => Ok(r),
+            Err(e) if is_rate_limited(&e) => {
+                tracing::info!(
+                    "GitHub API rate limited — listing {repo} via releases.atom \
+                     (anonymous web surface, no API budget)"
+                );
+                self.list_releases_via_web(repo).await.map_err(|web| {
+                    anyhow!(
+                        "GitHub API rate limited and the anonymous \
+                             releases.atom fallback failed: {web:#} — set GH_TOKEN \
+                             for 5000 req/hr"
+                    )
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn list_releases_api(&self, repo: &str) -> Result<Vec<GhRelease>> {
         let url = self
             .base
             .join(&format!("repos/{repo}/releases?per_page=30"))
@@ -262,6 +390,139 @@ impl GhClient {
     }
 
     pub async fn release_by(&self, repo: &str, version: Option<&str>) -> Result<GhRelease> {
+        match self.release_by_api(repo, version).await {
+            Ok(r) => Ok(r),
+            Err(e) if is_rate_limited(&e) => {
+                tracing::info!(
+                    "GitHub API rate limited — resolving {repo} {} via the \
+                     anonymous web surface (releases.atom)",
+                    version.unwrap_or("latest")
+                );
+                self.release_by_web(repo, version).await.map_err(|web| {
+                    anyhow!(
+                        "GitHub API rate limited and the anonymous \
+                             releases.atom fallback failed: {web:#} — set GH_TOKEN \
+                             for 5000 req/hr"
+                    )
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The web-surface variant of [`Self::release_by`]: `None` picks the
+    /// newest non-prerelease from the atom feed; a pinned version tries
+    /// its (v-normalized) tag's asset table directly — the feed only
+    /// carries recent tags, so old pins must bypass it.
+    async fn release_by_web(&self, repo: &str, version: Option<&str>) -> Result<GhRelease> {
+        match version {
+            None => {
+                let releases = self.list_releases_via_web(repo).await?;
+                releases
+                    .into_iter()
+                    .find(|r| !r.prerelease)
+                    .ok_or_else(|| anyhow!("no non-prerelease releases in {repo} feed"))
+            }
+            Some(v) => {
+                // Same normalization ladder as the API path: bare
+                // semver pins name the v-prefixed tag first.
+                let mut candidates: Vec<String> = Vec::new();
+                if v.starts_with(|c: char| c.is_ascii_digit()) {
+                    candidates.push(format!("v{v}"));
+                }
+                candidates.push(v.to_string());
+                for tag in candidates {
+                    if let Some(assets) = self.web_assets(repo, &tag).await? {
+                        return Ok(GhRelease {
+                            tag_name: tag.clone(),
+                            prerelease: web_prerelease(&tag),
+                            assets,
+                            published_at: None,
+                        });
+                    }
+                }
+                bail!("{repo} release {v} has no asset table on the web surface")
+            }
+        }
+    }
+
+    /// The asset table for one tag via the anonymous web surface.
+    /// `Ok(None)` on 404 — a tag without assets or a tag that does not
+    /// exist are both "not installable from here".
+    async fn web_assets(&self, repo: &str, tag: &str) -> Result<Option<Vec<GhAsset>>> {
+        let base = web_base();
+        let url = format!("{base}/{repo}/releases/expanded_assets/{tag}");
+        let resp = tokio::time::timeout(net_probe::PROBE_ATTEMPT_CAP, self.http.get(&url).send())
+            .await
+            .context("asset table request timed out")?
+            .context("asset table request failed")?;
+        match resp.status() {
+            reqwest::StatusCode::OK => Ok(Some(parse_asset_hrefs(
+                &resp.text().await.context("decode asset table")?,
+                tag,
+                &base,
+            ))),
+            reqwest::StatusCode::NOT_FOUND => Ok(None),
+            other => bail!("asset table for {tag} returned {other}"),
+        }
+    }
+
+    /// Releases via the anonymous web surface: the atom feed's recent
+    /// tags (newest first), each with its asset table fetched in
+    /// parallel. Digests do not exist on this surface — synthesized
+    /// assets are `digest: None` and install as "unverified", the same
+    /// mark pip-installed engine lanes carry.
+    async fn list_releases_via_web(&self, repo: &str) -> Result<Vec<GhRelease>> {
+        let base = web_base();
+        let feed = format!("{base}/{repo}/releases.atom");
+        let body = tokio::time::timeout(net_probe::PROBE_ATTEMPT_CAP, self.http.get(&feed).send())
+            .await
+            .context("releases feed request timed out")?
+            .context("releases feed request failed")?
+            .error_for_status()
+            .with_context(|| format!("releases feed for {repo}"))?
+            .text()
+            .await
+            .context("decode releases feed")?;
+        let tags = parse_atom_tags(&body);
+        if tags.is_empty() {
+            bail!("releases feed for {repo} listed no entries");
+        }
+        let futs: Vec<_> = tags
+            .iter()
+            .map(|(tag, _)| {
+                let http = self.http.clone();
+                let base = base.clone();
+                let repo = repo.to_string();
+                let tag = tag.clone();
+                async move {
+                    let url = format!("{base}/{repo}/releases/expanded_assets/{tag}");
+                    match tokio::time::timeout(net_probe::PROBE_ATTEMPT_CAP, http.get(&url).send())
+                        .await
+                    {
+                        Ok(Ok(resp)) if resp.status().is_success() => {
+                            let body = resp.text().await.unwrap_or_default();
+                            Some(parse_asset_hrefs(&body, &tag, &base))
+                        }
+                        _ => None,
+                    }
+                }
+            })
+            .collect();
+        Ok(futures::future::join_all(futs)
+            .await
+            .into_iter()
+            .zip(tags)
+            .map(|(assets, (tag, updated))| GhRelease {
+                prerelease: web_prerelease(&tag),
+                tag_name: tag,
+                assets: assets.unwrap_or_default(),
+                published_at: updated,
+            })
+            .collect())
+    }
+
+    async fn release_by_api(&self, repo: &str, version: Option<&str>) -> Result<GhRelease> {
         match version {
             None => {
                 self.release_by_path(&format!("repos/{repo}/releases/latest"))
@@ -1752,7 +2013,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration__list_releases_repo__rate_limit_fails_fast_without_retry() {
+    async fn integration__list_releases_repo__rate_limit_falls_back_once_then_teaches() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -1760,18 +2021,33 @@ mod tests {
             .respond_with(ResponseTemplate::new(403))
             .mount(&server)
             .await;
+        // A dead web surface: the anonymous fallback gets exactly one
+        // shot here, then the combined error teaches GH_TOKEN.
+        let web = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&web)
+            .await;
+        let saved = std::env::var("BLAZAR_ATOM_BASE").ok();
+        crate::test_env::set_env("BLAZAR_ATOM_BASE", web.uri());
         let gh = GhClient::with_base(&server.uri(), None).unwrap();
         let err = gh
             .list_releases_repo(LLAMA_CPP_REPO)
             .await
             .unwrap_err()
             .to_string();
-        assert_eq!(
-            err,
-            "GitHub API rate limited (403 Forbidden). Set GH_TOKEN for 5000 req/hr"
+        crate::test_env::remove_env("BLAZAR_ATOM_BASE");
+        if let Some(v) = saved {
+            crate::test_env::set_env("BLAZAR_ATOM_BASE", v);
+        }
+        assert!(
+            err.contains("rate limited") && err.contains("GH_TOKEN"),
+            "combined teaching error: {err}"
         );
-        // Re-issuing past a 403 is what the rate limit asks us not to do.
+        // Re-issuing past a 403 is what the rate limit asks us not to
+        // do — the API took exactly one hit, the web fallback one more.
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(web.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3033,5 +3309,192 @@ mod tests {
             "error names the metadata source: {err}"
         );
         assert!(!dest.exists(), "partial file removed");
+    }
+
+    #[test]
+    fn unit__percent_decode__passthrough_and_escapes() {
+        assert_eq!(
+            percent_decode("llama-b11574-bin-ubuntu-cuda-12.8-x64.tar.gz"),
+            "llama-b11574-bin-ubuntu-cuda-12.8-x64.tar.gz"
+        );
+        assert_eq!(percent_decode("my%20asset.zip"), "my asset.zip");
+        assert_eq!(percent_decode("plus%2Bslash%2F.bin"), "plus+slash/.bin");
+        // Truncated escapes and stray % pass through untouched.
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn unit__parse_atom_tags__extracts_tags_newest_first() {
+        // Shape captured live from ggml-org/llama.cpp releases.atom
+        // (2026-10-12, while api.github.com 403'd the same IP).
+        let feed = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "<feed xmlns=\"http://www.w3.org/2005/Atom\">",
+            "<entry><id>tag:github.com,2008:Repository/612354784/b11574</id>",
+            "<updated>2026-10-12T15:16:58Z</updated></entry>",
+            "<entry><id>tag:github.com,2008:Repository/612354784/b11571</id>",
+            "<updated>2026-10-11T18:02:11Z</updated></entry>",
+            "<entry><id>tag:github.com,2008:Repository/612354784/v0.6.0</id>",
+            "<updated>2026-10-01T09:00:00Z</updated></entry>",
+            "</feed>"
+        );
+        let tags = parse_atom_tags(feed);
+        assert_eq!(tags.len(), 3);
+        assert_eq!(
+            tags[0],
+            ("b11574".into(), Some("2026-10-12T15:16:58Z".into()))
+        );
+        assert_eq!(tags[1].0, "b11571");
+        assert_eq!(tags[2].0, "v0.6.0");
+        assert_eq!(parse_atom_tags("<feed></feed>").len(), 0);
+    }
+
+    #[test]
+    fn unit__parse_asset_hrefs__names_urls_and_filtering() {
+        // Shape captured live from releases/expanded_assets/b11574
+        // (2026-10-12): hrefs are root-relative download links inside
+        // markup; only this tag's rows count.
+        let html = concat!(
+            "<div class=\"Box\">",
+            "<a href=\"/ggml-org/llama.cpp/releases/download/b11574/llama-b11574-bin-ubuntu-cuda-12.8-x64.tar.gz\">x</a>",
+            "<a href=\"/ggml-org/llama.cpp/releases/download/b11574/my%20companion.zip\">y</a>",
+            "<a href=\"/ggml-org/llama.cpp/releases/download/b11573/other-tag.tar.gz\">z</a>",
+            "<a href=\"/ggml-org/llama.cpp/blob/master/README.md\">w</a>",
+            "</div>"
+        );
+        let assets = parse_asset_hrefs(html, "b11574", "https://github.com");
+        assert_eq!(assets.len(), 2, "other-tag and blob rows excluded");
+        assert_eq!(
+            assets[0].name,
+            "llama-b11574-bin-ubuntu-cuda-12.8-x64.tar.gz"
+        );
+        assert_eq!(
+            assets[0].browser_download_url,
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11574/llama-b11574-bin-ubuntu-cuda-12.8-x64.tar.gz"
+        );
+        assert_eq!(assets[1].name, "my companion.zip", "percent-decoded");
+        assert!(
+            assets
+                .iter()
+                .all(|a| a.digest.is_none() && a.size.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__list_releases_repo__api_rate_limit_falls_back_to_atom() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let api = MockServer::start().await;
+        let web = MockServer::start().await;
+        // The API is hard-rate-limited for this IP.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&api)
+            .await;
+        // The anonymous web surface serves the feed and two asset
+        // tables (b-tag present, v-tag table missing -> empty assets).
+        Mock::given(method("GET"))
+            .and(path("/test/repo/releases.atom"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "<feed><entry><id>tag:github.com,2008:Repository/1/b11574</id>",
+                "<updated>2026-10-12T15:16:58Z</updated></entry>",
+                "<entry><id>tag:github.com,2008:Repository/1/v0.6.0</id>",
+                "<updated>2026-10-01T09:00:00Z</updated></entry></feed>",
+            )))
+            .mount(&web)
+            .await;
+        Mock::given(method("GET")).and(path("/test/repo/releases/expanded_assets/b11574"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<a href=\"/test/repo/releases/download/b11574/llama-b11574-bin-ubuntu-cuda-12.8-x64.tar.gz\">x</a>",
+            ))
+            .mount(&web)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/test/repo/releases/expanded_assets/v0.6.0"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&web)
+            .await;
+
+        let saved = std::env::var("BLAZAR_ATOM_BASE").ok();
+        crate::test_env::set_env("BLAZAR_ATOM_BASE", web.uri());
+        let gh = GhClient::with_base(&api.uri(), None).unwrap();
+        let releases = gh
+            .list_releases_repo("test/repo")
+            .await
+            .expect("web fallback");
+        crate::test_env::remove_env("BLAZAR_ATOM_BASE");
+        if let Some(v) = saved {
+            crate::test_env::set_env("BLAZAR_ATOM_BASE", v);
+        }
+
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].tag_name, "b11574");
+        assert!(releases[0].prerelease, "b-tags are the prerelease firehose");
+        assert_eq!(releases[0].assets.len(), 1);
+        assert_eq!(
+            releases[0].assets[0].name,
+            "llama-b11574-bin-ubuntu-cuda-12.8-x64.tar.gz"
+        );
+        assert_eq!(releases[1].tag_name, "v0.6.0");
+        assert!(!releases[1].prerelease);
+        assert!(releases[1].assets.is_empty(), "404 table = no assets");
+    }
+
+    #[tokio::test]
+    async fn integration__release_by__rate_limit_resolves_latest_and_pins_via_web() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let api = MockServer::start().await;
+        let web = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&api)
+            .await;
+        let feed = concat!(
+            "<feed><entry><id>tag:github.com,2008:Repository/1/b11574</id>",
+            "<updated>2026-10-12T15:16:58Z</updated></entry>",
+            "<entry><id>tag:github.com,2008:Repository/1/v0.6.0</id>",
+            "<updated>2026-10-01T09:00:00Z</updated></entry></feed>",
+        );
+        Mock::given(method("GET"))
+            .and(path("/test/repo/releases.atom"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(feed))
+            .mount(&web)
+            .await;
+        Mock::given(method("GET")).and(path("/test/repo/releases/expanded_assets/b11574"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<a href=\"/test/repo/releases/download/b11574/llama-b11574-bin-ubuntu-cuda-12.8-x64.tar.gz\">x</a>",
+            ))
+            .mount(&web)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/test/repo/releases/expanded_assets/v0.6.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<a href=\"/test/repo/releases/download/v0.6.0/nightly-tag.txt\">n</a>",
+            ))
+            .mount(&web)
+            .await;
+
+        let saved = std::env::var("BLAZAR_ATOM_BASE").ok();
+        crate::test_env::set_env("BLAZAR_ATOM_BASE", web.uri());
+        let gh = GhClient::with_base(&api.uri(), None).unwrap();
+        // Latest: the feed's newest NON-prerelease wins (v0.6.0).
+        let latest = gh
+            .release_by("test/repo", None)
+            .await
+            .expect("latest via web");
+        assert_eq!(latest.tag_name, "v0.6.0");
+        assert_eq!(latest.assets[0].name, "nightly-tag.txt");
+        // Pin: bare semver normalizes to the v-tag's asset table.
+        let pinned = gh
+            .release_by("test/repo", Some("0.6.0"))
+            .await
+            .expect("pin via web");
+        assert_eq!(pinned.tag_name, "v0.6.0");
+        crate::test_env::remove_env("BLAZAR_ATOM_BASE");
+        if let Some(v) = saved {
+            crate::test_env::set_env("BLAZAR_ATOM_BASE", v);
+        }
     }
 }
