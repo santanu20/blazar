@@ -264,6 +264,8 @@ def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
 #     "pull": (False, False, True, True, False),
 #     "import.hardlink": (False, False, False, False, True),
 #     "import.copy": (False, False, False, False, True),
+#     "import.scan": (False, False, False, False, True),
+#     "import.scan.json": (False, False, False, False, True),
 #     "mmproj.happy": (False, False, True, True, False),
 #     "mmproj.refusal": (False, False, False, False, True),
 #     "rm": (False, False, False, False, True),
@@ -1009,6 +1011,8 @@ _COMMAND_ATTRS = {
     "run.miss-pulls": (True, True, True, True, False),
     "import.hardlink": (False, False, False, False, True),
     "import.copy": (False, False, False, False, True),
+    "import.scan": (False, False, False, False, True),
+    "import.scan.json": (False, False, False, False, True),
     "mmproj.happy": (False, False, True, True, False),
     "mmproj.refusal": (False, False, False, False, True),
     "rm": (False, False, False, False, True),
@@ -6243,9 +6247,9 @@ def _eng_classify(lane: str, model: str) -> None:
         "labels": labels,
     }
     st, v = post(good)
-    if lane != "llamacpp":
-        # the systemone surface is llama-server-only: other lanes must
-        # teach, never leak a bare upstream 404/HTML error
+    if lane not in ("llamacpp", "sglang"):
+        # the systemone surface is llama-server-only on this lane: it
+        # must teach, never leak a bare upstream 404/HTML error
         txt = body_txt(v)
         check(
             ph,
@@ -6301,6 +6305,32 @@ def _eng_classify(lane: str, model: str) -> None:
             False,
             f"model={m} status={status} body={txt}",
         )
+
+    if lane == "sglang":
+        # 0.5.21+ serves typed decisions natively (live-probed
+        # 2026-10-12): classify rides /v1/decisions and must return the
+        # normalized card. Older sglang builds without the endpoint keep
+        # the llama-server-only teaching — both honest, logged as
+        # boundary.
+        txt = body_txt(v)
+        if st == 400 and "llama-server-only" in txt:
+            boundary(
+                ph,
+                "classify serves the sglang decisions lane",
+                f"engine predates /v1/decisions; teaching refusal intact: {txt}",
+            )
+            return
+        check(
+            ph,
+            "classify serves the sglang decisions lane",
+            st == 200,
+            f"status={st} body={txt}",
+        )
+        card_check(model, st, v)
+        # decisions is an any-chat-model surface: the llamacpp-only
+        # probes below (501 chat-model refusal, native decision-model
+        # discovery) do not apply on this lane.
+        return
 
     # a CHAT model on the llamacpp lane must get the honest 501 refusal —
     # the surface discriminates model class instead of serving garbage
@@ -9976,6 +10006,35 @@ def phase_commands() -> None:
         regb("import.hardlink", "model path unavailable in store DB")
         regb("import.copy", "model path unavailable in store DB")
 
+    # -- D2: import --scan (reuse discovery across other runtimes' stores;
+    # local disk reads only, so it also runs under FAST) ------------------
+    p = cli("import", "--scan")
+    reg(
+        "import.scan",
+        p.returncode == 0 and "SOURCE" in p.stdout and "MODEL" in p.stdout,
+        f"rc={p.returncode} lines={len(p.stdout.splitlines())}",
+    )
+    p = cli("import", "--scan", "--json")
+    try:
+        scan_rows = [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
+        shape_ok = all(
+            {"source", "id", "bytes", "suggestion"} <= set(r) for r in scan_rows
+        )
+    except json.JSONDecodeError:
+        scan_rows, shape_ok = [], False
+    if scan_rows:
+        reg(
+            "import.scan.json",
+            p.returncode == 0 and shape_ok,
+            f"rc={p.returncode} rows={len(scan_rows)}",
+        )
+    else:
+        regb(
+            "import.scan.json",
+            "no other-runtime models on disk — JSONL shape unexercisable "
+            "(table lane above still proves the scan path)",
+        )
+
     # -- E: mmproj (refusal always; happy via real HF projector) --------
     # Target BIG: attaching a projector is model-agnostic but the happy lane
     # was proven on the 9B — keep it pinned there even when MODEL is small.
@@ -13111,6 +13170,8 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--name": "import.hardlink",
         "--quant": "import.copy",
         "--copy": "import.copy",
+        "--scan": "import.scan",
+        "--json": "import.scan.json",
     },
     "create": {"--file": "create.happy"},
     "list": {"--json": "flag.list.--json"},

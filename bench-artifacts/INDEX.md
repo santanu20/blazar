@@ -29,9 +29,10 @@
 | 20261006-matched-conc | 20261006 | blazar,cold,conc,direct,ollama | 24 | blazar 0.21.1 |
 | 20261006-perf-lanes | 20261006 | blazar,cold,conc,ctxcurve,direct,idle,ollama,tools | 22 | blazar 0.21.1 |
 | 20261009-enterprise-perf-wave2 | 20261009 | sglang,idle-cpu,sleep-on-idle,wake-ttft,child-auth-argv-leak | 1 | dev (pre-0.25) |
+| 20261009-orphan-reclaim | 20261009 | orphan,reclaim,sigkill,lifecycle,session-daemon | 4 | dev (pre-0.25) |
 | 20261009-sglang-cold-start | 20261009 | sglang,cold-start,prefill-graphs,quality-parity,warm-peg,mlx-offline | 8 | dev (pre-0.25) |
 | 20261009-sglang-lora-one-child | 20261009 | sglang,lora,variant-routing,hot-attach,single-child | 2 | dev (pre-0.25) |
 | 20261009-sglang-rebaseline | 20261009 | blazar,cold,conc,ollama | 12 | blazar 0.24.0 |
-| 20261009-orphan-reclaim | 20261009 | orphan,reclaim,sigkill,lifecycle,session-daemon | 4 | dev (pre-0.25) |
 | 20261012-e2e-perf-audit | 20261012 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 23 | 0.26.0 |
 | 20261012-e2e-perf-audit-postfix | 20261012 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 23 | 0.26.0 |
+| 20261013-e2e-perf-audit-r2 | 20261013 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 23 | 0.26.0 |
