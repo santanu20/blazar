@@ -6,6 +6,42 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-13
+
+### Added
+
+- **`blazar import --scan` (with `--json`)** — the discovery half of
+  zero-redownload. Lists models already on disk from other runtimes —
+  an ollama store, the Hugging Face hub cache, or an LM Studio install
+  — with source, id, size, and the pull command that would adopt each
+  one. Discovery is read-only (sizes from manifests or `fs::metadata`,
+  nothing hashed or opened for write); adoption at pull/import time is
+  still gated by the pull lanes' byte-exact verification
+  (`size + sha256`, then hardlink). The local-store planner carries
+  projector (mmproj) blobs through the same checks. `--json` emits one
+  JSONL object per model. Registry hits are unit-pinned (verified
+  store, missing manifest, pin mismatch, size mismatch, sha mismatch,
+  missing projector, verified projector).
+- **Engine-download fallback for rate-limited GitHub.** When
+  api.github.com answers 403/429 (IP-budget exhaustion, not a repo
+  problem), release and asset resolution falls back to github.com's
+  web surfaces — the `releases.atom` feed and the
+  `releases/expanded_assets/{tag}` HTML table — which ride a separate,
+  far more generous budget. Prerelease flags are synthesized from tag
+  shape (llama.cpp `bNNNNN` = prerelease, matching API truth). Mirrors
+  and tests override the base with `BLAZAR_ATOM_BASE`, the same knob
+  class as `BLAZAR_GH_BASE`.
+- **Model modalities cache (store schema v16).** New
+  `model_modalities` table persists engine-advertised output
+  modalities per model (e.g. llama-server's `architecture` object
+  marking native decision models): the child is the source of truth,
+  the store is a cache overwritten on every child confirmation, and
+  `/v1/models` serves the cached set. Migration replays a
+  CREATE-TABLE-IF-NOT-EXISTS batch — no data rewrite.
+- **`doctor` daemon-skew check**: the running daemon's version is
+  compared against the current binary, surfacing stale-daemon states
+  that otherwise look like phantom bugs.
+
 ### Changed
 
 - **Two byte-identical relay/mutation fast paths, from the 2026-10-12
@@ -27,6 +63,26 @@ tracked here.
   campaign where every gateway cell stayed inside the run-to-run band
   the direct control lane itself moved in, with greedy
   gateway-transparency unchanged at 14/20 exact (ratio 0.941).
+- **Honest `blazar stop`.** A 10-second grace budget polls the port —
+  not the pid — while a draining daemon finishes in-flight work (image
+  generations run minutes); the pidfile is re-read after the window
+  because whoever still owns the port has usually re-stamped it, and
+  the outcome is classified (stopped / already-stopped-stale / failed)
+  instead of unconditionally reporting success.
+- **Non-stream relay fast path, proven byte-exact.** A suppress-only,
+  marker-free non-stream body now ships the engine's bytes untouched:
+  one parse, and the re-serialize step is skipped when nothing changed
+  (`suppress_raw_think_response` reports whether it mutated;
+  `finalize_buffered_body` takes the zero-parse path), while
+  `LineBuffer::feed` decodes chunks in place instead of cloning. Proven
+  live by a 4-way byte-parity probe (gateway ×2 vs direct child ×2,
+  only per-request-volatile timings masked): all four bodies
+  byte-identical — any gateway re-serialization would have reordered
+  keys and diverged. Full audit:
+  `docs/research/2026-10-13-e2e-perf-audit-r2.md` (streaming profile
+  flat at 96.8 µs/token daemon CPU, gateway overhead −6.8% unchanged,
+  C8 ITL p99 2× better than direct, greedy transparency in band,
+  validate battery 396/396).
 
 ## [0.26.0] - 2026-10-10
 
