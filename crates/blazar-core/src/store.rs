@@ -38,7 +38,7 @@ pub struct Store {
 /// v14 stores re-enter the migration block and take the two ALTERs;
 /// without it they sat at the latest version and every owner INSERT
 /// failed (the model-doctor poll 404 on upgraded stores).
-const SCHEMA_VERSION: i32 = 15;
+const SCHEMA_VERSION: i32 = 16;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS key_usage (
     requests INTEGER NOT NULL DEFAULT 0,
     tokens   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, name)
+);
+CREATE TABLE IF NOT EXISTS model_modalities (
+    model      TEXT PRIMARY KEY,     -- models.name (logical row key)
+    modalities TEXT NOT NULL,        -- JSON array of advertised modalities
+    seen_at    INTEGER NOT NULL      -- unix secs, last child confirmation
 );
 CREATE TABLE IF NOT EXISTS bench_history (
     id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -747,6 +752,11 @@ impl Store {
             // open retries the whole step.
             self.migrate_v14_one_active_engine()?;
         }
+        // v15→v16: `model_modalities` (engine-advertised output
+        // modalities, e.g. llama-server's architecture object marking
+        // native decision models) is CREATE-TABLE-IF-NOT-EXISTS in
+        // SCHEMA_SQL — nothing more to do here; the version bump
+        // replays the batch on existing stores.
         Ok(())
     }
 
@@ -1886,6 +1896,58 @@ impl Store {
         Ok(())
     }
 
+    /// Persist engine-advertised output modalities for a model row
+    /// (e.g. `["decisions"]` from llama-server's `architecture`
+    /// object). Overwrites on every child confirmation — the child is
+    /// the source of truth, the store is the cache.
+    pub fn set_model_modalities(&self, model: &str, modalities: &[String]) -> CoreResult<()> {
+        let json =
+            serde_json::to_string(modalities).map_err(|e| CoreError::Catalog(e.to_string()))?;
+        self.conn.execute(
+            "INSERT INTO model_modalities(model, modalities, seen_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(model) DO UPDATE SET modalities = ?2, seen_at = ?3",
+            params![model, json, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    /// Cached modalities for a model, `None` when no running child has
+    /// advertised them yet.
+    pub fn model_modalities(&self, model: &str) -> CoreResult<Option<Vec<String>>> {
+        let row: Result<String, rusqlite::Error> = self.conn.query_row(
+            "SELECT modalities FROM model_modalities WHERE model = ?1",
+            params![model],
+            |r| r.get(0),
+        );
+        let json: Option<String> = match row {
+            Ok(j) => Some(j),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(other) => return Err(other.into()),
+        };
+        json.map(|j| serde_json::from_str(&j).map_err(|e| CoreError::Catalog(e.to_string())))
+            .transpose()
+    }
+
+    /// The whole modalities cache in one read (model -> modalities),
+    /// for listing surfaces.
+    pub fn all_model_modalities(&self) -> CoreResult<Vec<(String, Vec<String>)>> {
+        self.conn
+            .prepare("SELECT model, modalities FROM model_modalities")?
+            .query_map([], |r| {
+                let model: String = r.get(0)?;
+                let json: String = r.get(1)?;
+                Ok((model, json))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(model, json)| {
+                serde_json::from_str(&json)
+                    .map(|modalities| (model, modalities))
+                    .map_err(|e| CoreError::Catalog(e.to_string()))
+            })
+            .collect()
+    }
+
     pub fn upsert_model(&self, m: &ModelRow) -> CoreResult<()> {
         // `#N` is the internal replica-key separator (supervisor B1):
         // a model literally named `x#2` would collide with replica keys.
@@ -2941,6 +3003,48 @@ mod tests {
             (profiles[0].model_name.as_str(), profiles[0].updated_at),
             ("m1", 7)
         );
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v15_to_v16_modalities() {
+        // Simulate a v15 database: no model_modalities table,
+        // user_version 15 — the shape every pre-decisions-discovery
+        // store has. Reopen replays SCHEMA_SQL (IF NOT EXISTS) and
+        // stamps 16; modalities writes round-trip on the upgraded
+        // store, and the second reopen proves the presence-gated no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE model_modalities; PRAGMA user_version = 15;")
+                .unwrap();
+        }
+        for pass in 0..2 {
+            let s = Store::open(&dirs).unwrap();
+            let v: i64 = s
+                .conn()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, i64::from(SCHEMA_VERSION));
+            assert!(
+                s.table_columns("model_modalities")
+                    .unwrap()
+                    .contains(&"model".to_string())
+            );
+            if pass == 0 {
+                s.set_model_modalities("m", &["decisions".into(), "text".into()])
+                    .unwrap();
+            }
+            assert_eq!(
+                s.model_modalities("m").unwrap(),
+                Some(vec!["decisions".to_string(), "text".to_string()])
+            );
+            assert_eq!(s.model_modalities("never-seen").unwrap(), None);
+        }
     }
 
     #[test]

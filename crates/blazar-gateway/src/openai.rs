@@ -36,12 +36,86 @@ fn body_has_tools(bytes: &[u8]) -> bool {
     bytes.windows(7).any(|w| w == b"\"tools\"")
 }
 
+/// Engine-advertised output modalities (llama-server b11572+
+/// `architecture` object — e.g. native decision models). Read the
+/// cache first; for a RUNNING llamacpp child with no cached row,
+/// ask the child once and persist (bounded probe, same posture as
+/// the `ps()` `/props` sleep check — listing waits at most the child's
+/// own answer, and a miss changes nothing).
+async fn model_modality_cache(
+    state: &Arc<AppState>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut modality_cache: std::collections::HashMap<String, Vec<String>> = state
+        .with_store(blazar_core::Store::all_model_modalities)
+        .and_then(Result::ok)
+        .map(|rows| rows.into_iter().collect())
+        .unwrap_or_default();
+    let uncached: Vec<_> = state
+        .sup
+        .live_http_endpoints()
+        .into_iter()
+        .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+        .filter(|e| !modality_cache.contains_key(&e.name))
+        .collect();
+    if !uncached.is_empty() {
+        let probe_futs: Vec<_> = uncached
+            .iter()
+            .map(|e| {
+                let base = crate::proxy::child_base(&e.endpoint);
+                let url = format!("{base}/v1/models");
+                let req = crate::proxy::child_auth(
+                    crate::state::child_client(state, &e.endpoint).get(&url),
+                    e,
+                );
+                let name = e.name.clone();
+                async move {
+                    match tokio::time::timeout(std::time::Duration::from_millis(1200), req.send())
+                        .await
+                    {
+                        Ok(Ok(resp)) if resp.status().is_success() => {
+                            let body = resp.json::<serde_json::Value>().await.ok()?;
+                            // The child serves exactly one model; its
+                            // first data entry is that model's card. A
+                            // 200 without output_modalities caches an
+                            // empty list — "none advertised" is a
+                            // valid, final answer (no re-probe).
+                            let card = body["data"].as_array()?.first()?;
+                            let modalities: Vec<String> = card["architecture"]["output_modalities"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|m| m.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            Some((name, modalities))
+                        }
+                        _ => None,
+                    }
+                }
+            })
+            .collect();
+        for (name, modalities) in futures::future::join_all(probe_futs)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            if let Some(Err(e)) = state.with_store(|s| s.set_model_modalities(&name, &modalities)) {
+                tracing::warn!("modalities cache write failed for {name}: {e}");
+            }
+            modality_cache.insert(name, modalities);
+        }
+    }
+    modality_cache
+}
+
 pub async fn models(State(state): State<Arc<AppState>>) -> Response {
     let list = match state.with_store(blazar_core::Store::list_models) {
         Some(Ok(l)) => l,
         Some(Err(e)) => return openai_error(500, &e.to_string()),
         None => return openai_error(500, "store unavailable"),
     };
+    let modality_cache = model_modality_cache(&state).await;
     let data: Vec<serde_json::Value> = list
         .iter()
         .map(|m| {
@@ -50,21 +124,29 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
             // nothing can serve it — the spawn path teaches on use.
             let engine =
                 crate::proxy::resolve_serving(&state, &m.name, &m.path).and_then(|lane| lane.tag);
+            // Blazar-native capability surface (audit MM13): vision from
+            // the row's mmproj sidecar, engine-advertised output
+            // modalities from the cache — union, deduped, sorted so the
+            // card is stable across calls.
+            let mut capabilities: Vec<String> = Vec::new();
+            if m.mmproj_path.is_some() {
+                capabilities.push("vision".to_string());
+            }
+            if let Some(mods) = modality_cache.get(&m.name) {
+                for c in mods {
+                    if !capabilities.contains(c) {
+                        capabilities.push(c.clone());
+                    }
+                }
+            }
+            capabilities.sort();
             json!({
                 "id": format!("{}:{}", m.name, m.quant.to_lowercase()),
                 "object": "model",
                 "owned_by": "blazar",
                 "created": m.pulled_at,
                 "engine": engine,
-                // Blazar-native modality discovery (audit MM13): mirrors
-                // the /api/show "vision" convention rather than guessing
-                // an upstream /v1/models field shape (upstream documents
-                // the capability in prose only, not a fixed schema).
-                "capabilities": if m.mmproj_path.is_some() {
-                    json!(["vision"])
-                } else {
-                    json!([])
-                },
+                "capabilities": capabilities,
             })
         })
         .collect();
@@ -1034,9 +1116,9 @@ fn extract_model(body: &[u8]) -> Option<String> {
 }
 
 /// Child surfaces only llama-server implements. A non-llamacpp child
-/// (mistralrs, sglang) would answer these with a bare 404/HTML error;
-/// Blazar teaches instead (fail fast, name the limitation, name the
-/// switch).
+/// (mistralrs, mlx, sdcpp) would answer these with a bare 404/HTML
+/// error; Blazar teaches instead (fail fast, name the limitation, name
+/// the switch).
 const LLAMACPP_ONLY_PATHS: &[&str] = &[
     "/tokenize",
     "/detokenize",
@@ -1058,6 +1140,35 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
     "/v1/stream",
     "/v1/streams/lookup",
 ];
+
+/// Surfaces a live sglang 0.5.21 child also serves (probe receipt
+/// 2026-10-12, booted qwen3-1.7b child): tokenize/detokenize, its own
+/// `/v1/systemone` dialect, and native cross-encoder `/v1/rerank`.
+/// Everything else in the list above stays gated for the sglang lane
+/// (404 on the probed child). Only release-verified surfaces ride here
+/// — nightly-only endpoints wait for a release.
+const SGLANG_SERVES_PATHS: &[&str] = &["/tokenize", "/detokenize", "/v1/systemone", "/v1/rerank"];
+
+/// True when the path is a llama-server child surface the given lane
+/// cannot serve: llamacpp serves everything; sglang serves the verified
+/// [`SGLANG_SERVES_PATHS`] subset; every other engine serves none of
+/// the list.
+fn path_gated_for(kind: blazar_core::engine_kind::EngineKind, path: &str) -> bool {
+    use blazar_core::engine_kind::EngineKind;
+    if kind == EngineKind::LlamaCpp {
+        return false;
+    }
+    if kind == EngineKind::Sglang
+        && SGLANG_SERVES_PATHS
+            .iter()
+            .any(|p| path == *p || path.starts_with(&format!("{p}/")))
+    {
+        return false;
+    }
+    LLAMACPP_ONLY_PATHS
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
+}
 
 /// `Some(teaching 400)` when the path is llama-server-only AND the engine
 /// the router will use for `model` is not llamacpp (mistralrs and sglang
@@ -1116,14 +1227,16 @@ fn mlx_forced_tool_choice_gate(
     ))
 }
 
+/// `Some(teaching 400)` when the path is a llama-server-only surface AND
+/// the engine the router will use for `model` does not serve it (see
+/// [`path_gated_for`] — the sglang release provably serves a subset).
+/// Keys on the ROUTED lane, not the global active row — auto-routing
+/// serves GGUF models on a llamacpp child regardless of which engine is
+/// globally active. Path matching covers sub-paths (`/slots/{id}`).
+/// `model: None` (no resolvable target) falls back to the global active
+/// kind, matching the pre-routing estimate.
 fn llamacpp_only_gate(state: &Arc<AppState>, uri: &Uri, model: Option<&str>) -> Option<Response> {
     let path = uri.path();
-    if !LLAMACPP_ONLY_PATHS
-        .iter()
-        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
-    {
-        return None;
-    }
     let kind = model
         .and_then(|m| crate::proxy::routed_kind_for(state, m))
         .or_else(|| {
@@ -1132,7 +1245,7 @@ fn llamacpp_only_gate(state: &Arc<AppState>, uri: &Uri, model: Option<&str>) -> 
                 .flatten()
                 .map(|r| r.kind)
         })?;
-    if kind == blazar_core::engine_kind::EngineKind::LlamaCpp {
+    if !path_gated_for(kind, path) {
         return None;
     }
     Some(openai_error(
@@ -2143,6 +2256,41 @@ mod tests {
         assert_eq!(v["chat_template_kwargs"]["reasoning_effort"], "low");
         // Top-level field stays (children that DO read it still can).
         assert_eq!(v["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn unit__path_gated_for__per_lane_truth_table() {
+        use blazar_core::engine_kind::EngineKind;
+        // llamacpp: everything passes (it is the reference surface set).
+        for p in LLAMACPP_ONLY_PATHS {
+            assert!(!path_gated_for(EngineKind::LlamaCpp, p), "{p}");
+        }
+        // sglang 0.5.21 live-probed subset: served, not gated.
+        for p in SGLANG_SERVES_PATHS {
+            assert!(!path_gated_for(EngineKind::Sglang, p), "{p}");
+        }
+        // sglang: everything else in the list stays gated, including
+        // the rerank aliases the child does not serve.
+        for p in ["/props", "/slots", "/infill", "/rerank", "/v1/reranking"] {
+            assert!(path_gated_for(EngineKind::Sglang, p), "{p}");
+        }
+        // Sub-path coverage keeps working for the gated remainder.
+        assert!(path_gated_for(EngineKind::Sglang, "/slots/0"));
+        // mistralrs/mlx: the full list gates, verified subset included.
+        for kind in [EngineKind::MistralRs, EngineKind::Mlx] {
+            for p in SGLANG_SERVES_PATHS {
+                assert!(path_gated_for(kind, p), "{kind:?} {p}");
+            }
+            assert!(path_gated_for(kind, "/props"));
+        }
+        // Unknown-to-the-list paths never gate on any lane.
+        for kind in [
+            EngineKind::LlamaCpp,
+            EngineKind::Sglang,
+            EngineKind::MistralRs,
+        ] {
+            assert!(!path_gated_for(kind, "/v1/chat/completions"));
+        }
     }
 
     #[test]
