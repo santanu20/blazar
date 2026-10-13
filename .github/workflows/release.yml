@@ -187,7 +187,25 @@ jobs:
           # of letting it fall back to `git` discovery (which fails here)
           GH_REPO: ${{ github.repository }}
         run: |
-          cat > notes.md <<EOF
+          # Release notes lead with the tagged version's CHANGELOG.md
+          # section — a release page that says nothing about what
+          # changed is a broken page. Fetched from the tagged ref
+          # (this job has no checkout); a tag without a matching
+          # CHANGELOG section fails the release loudly.
+          gh api "repos/${GITHUB_REPOSITORY}/contents/CHANGELOG.md?ref=${GITHUB_REF_NAME}" \
+            -q .content | base64 -d > changelog.md
+          python3 - <<'PY'
+          import os, re, sys
+          tag = os.environ["GITHUB_REF_NAME"]
+          ver = tag.lstrip("v")
+          text = open("changelog.md").read()
+          m = re.search(rf"^## \[{re.escape(ver)}\][^\n]*\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
+          if not m:
+              sys.exit(f"CHANGELOG.md has no [{ver}] section for tag {tag}")
+          open("notes-changelog.md", "w").write(
+              f"## What's new in {tag}\n\n{m.group(1).strip()}\n\n---\n\n")
+          PY
+          cat > notes-template.md <<EOF
           ## Install
 
           Linux / macOS (WSL included):
@@ -220,6 +238,7 @@ jobs:
           \`blazar-$GITHUB_REF_NAME-sbom.cdx.json\` is a CycloneDX 1.5 SBOM
           covering the shipped binary's full dependency closure.
           EOF
+          cat notes-changelog.md notes-template.md > notes.md
           # Attach the SBOM under a tag-scoped name alongside the archives
           # (both upload branches below glob dist/*, so this must precede
           # them; a missing artifact fails loudly here). Renamed to the
@@ -232,6 +251,13 @@ jobs:
           # and zero assets. If the object exists, clobber-upload into it.
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            # Notes heal, same idempotency class as the flag heals
+            # below: a release created before the changelog-injection
+            # (or by a re-pushed tag riding the old create) keeps its
+            # stale template-only notes otherwise.
+            gh release view "$GITHUB_REF_NAME" --json body -q .body \
+              | grep -q "## What's new" \
+              || gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
           else
             gh release create "$GITHUB_REF_NAME" dist/* \
               --title "$GITHUB_REF_NAME" \
