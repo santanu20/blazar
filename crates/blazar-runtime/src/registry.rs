@@ -270,6 +270,7 @@ impl Puller {
     /// projector; template/params/license/adapter layers are skipped with
     /// a log line — the GGUF's own chat template and sampler defaults are
     /// authoritative in blazar).
+    #[allow(clippy::too_many_lines)] // one cohesive lane: resolve → manifest → reuse-vs-network decision → materialize
     pub async fn pull_ollama(&self, input: &str) -> Result<PullOutcome> {
         let target = parse_registry_target(input)?;
         let name = registry_display_name(&target.repository, &target.tag);
@@ -306,7 +307,16 @@ impl Puller {
         )?
         .with_download_speed_limit(self.client.download_speed_limit_mb);
 
-        let plan = resolve_registry_plan(&client, &target, &name).await?;
+        // Local-first: a verified ollama store already on this machine
+        // satisfies the pull with zero network — same manifest semantics
+        // (shared layer selection), bytes gated by the identical
+        // size+sha256 check the download lane applies. Any store anomaly
+        // falls through to the network lane untouched.
+        let local = local_registry_hit(&target, &name);
+        let plan = match &local {
+            Some(hit) => hit.plan.clone(),
+            None => resolve_registry_plan(&client, &target, &name).await?,
+        };
         let RegistryPlan {
             model_layer,
             projector,
@@ -340,15 +350,66 @@ impl Puller {
                 &plan,
                 existing.as_ref(),
                 decision,
+                local.as_ref().and_then(|h| h.projector_blob.as_deref()),
             )
             .await?
         {
             return Ok(outcome);
         }
 
-        let (dest, model_plan, mmproj_dest) = self
-            .download_registry_layers(&client, &name, &target, model_layer, projector.as_ref())
-            .await?;
+        let (dest, model_plan, mmproj_dest) = match &local {
+            Some(hit) => {
+                // Zero-network lane: bring the verified blobs into the
+                // models dir under the exact names the download lane
+                // uses, so rows and reconcile behave identically.
+                let models_dir = self.dirs.models_dir();
+                std::fs::create_dir_all(&models_dir)?;
+                let model_plan = FilePlan {
+                    filename: format!("{name}.gguf"),
+                    bytes: hit.plan.model_layer.size,
+                    sha256: Some(strip_digest_prefix(&hit.plan.model_layer.digest)),
+                };
+                let dest = unique_dest(&models_dir, &model_plan.filename, &target.repository);
+                crate::hf::materialize_hub_hit(&hit.model_blob, &dest)
+                    .map_err(|e| anyhow!("linking local ollama blob for {name}: {e}"))?;
+                sweep_stale_part(&dest.display().to_string());
+                let mmproj_dest = hit
+                    .projector_blob
+                    .as_ref()
+                    .map(|src| {
+                        let dest = unique_dest(
+                            &models_dir,
+                            &format!("{name}-mmproj.gguf"),
+                            &target.repository,
+                        );
+                        crate::hf::materialize_hub_hit(src, &dest)
+                            .map_err(|e| anyhow!("linking local ollama mmproj for {name}: {e}"))?;
+                        Ok::<_, anyhow::Error>(dest)
+                    })
+                    .transpose()?;
+                tracing::info!(
+                    model = %name,
+                    "reused local ollama store blob (no download)"
+                );
+                let total = model_plan.bytes + hit.plan.projector.as_ref().map_or(0, |p| p.size);
+                self.bus.publish(BlazarEvent::PullProgress {
+                    name: name.clone(),
+                    downloaded: total,
+                    total,
+                });
+                (dest, model_plan, mmproj_dest)
+            }
+            None => {
+                self.download_registry_layers(
+                    &client,
+                    &name,
+                    &target,
+                    model_layer,
+                    projector.as_ref(),
+                )
+                .await?
+            }
+        };
 
         let row = registry_model_row(
             &name,
@@ -464,6 +525,7 @@ impl Puller {
     /// Act on the gate's decision for the registry lane. `Some(outcome)`
     /// = the pull already finished; `None` = proceed with the full
     /// download (pre-download pruning done here).
+    #[allow(clippy::too_many_arguments)] // the decision's full context: client, target, plan, row, decision, projector
     async fn handle_registry_repull_decision(
         &self,
         client: &HfClient,
@@ -472,6 +534,7 @@ impl Puller {
         plan: &RegistryPlan,
         existing: Option<&ModelRow>,
         decision: Repull,
+        local_mmproj: Option<&std::path::Path>,
     ) -> Result<Option<PullOutcome>> {
         let expected_repo = format!("registry.ollama.ai/{}:{}", target.repository, target.tag);
         if let Repull::Present(row) = decision {
@@ -502,6 +565,7 @@ impl Puller {
                     old,
                     plan,
                     plan.projector.as_ref().filter(|_| expected),
+                    local_mmproj,
                 )
                 .await?;
             Store::open(&self.dirs)?.upsert_model(&row)?;
@@ -539,6 +603,7 @@ impl Puller {
 
     /// Registry-lane sidecar-only pull: the model blob is intact and only
     /// the projector differs. Downloads (or drops) just the projector.
+    #[allow(clippy::too_many_arguments)] // same decision context as handle_registry_repull_decision
     async fn registry_delta_mmproj(
         &self,
         client: &HfClient,
@@ -547,6 +612,7 @@ impl Puller {
         old: &ModelRow,
         plan: &RegistryPlan,
         projector: Option<&RegistryLayer>,
+        local_mmproj: Option<&std::path::Path>,
     ) -> Result<ModelRow> {
         let models_dir = self.dirs.models_dir();
         std::fs::create_dir_all(&models_dir)?;
@@ -558,37 +624,46 @@ impl Puller {
                 sha256: Some(strip_digest_prefix(&p.digest)),
             };
             let dest = unique_dest(&models_dir, &plan.filename, &target.repository);
-            let url = client.blob_url(&target.repository, &p.digest)?;
-            let bar = indicatif::ProgressBar::new(p.size);
-            bar.set_style(
-                indicatif::ProgressStyle::default_bar()
-                    .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
-                    .expect("valid template"),
-            );
-            bar.set_message(format!("pull {name} mmproj (registry.ollama.ai)"));
-            let mut last_publish = 0u64;
-            let mut progress = |downloaded: u64, total: u64| {
-                bar.set_position(downloaded);
-                if downloaded.saturating_sub(last_publish) >= 16 << 20 || downloaded == total {
-                    last_publish = downloaded;
-                    self.bus.publish(BlazarEvent::PullProgress {
-                        name: name.to_string(),
-                        downloaded,
-                        total,
-                    });
-                }
-            };
-            client
-                .download_to(url, &plan, &dest, &mut progress)
-                .await
-                .inspect_err(|e| {
-                    self.bus.publish(BlazarEvent::PullFailed {
-                        name: name.to_string(),
-                        error: format!("mmproj: {e}"),
-                    });
-                })?;
-            bar.finish_and_clear();
-            mmproj_dest = Some(dest);
+            // A verified local projector blob satisfies the delta without
+            // touching the network; otherwise download as before.
+            if let Some(src) = local_mmproj.and_then(|src| crate::hf::reuse_byte_exact(src, &plan))
+            {
+                crate::hf::materialize_hub_hit(&src, &dest)
+                    .map_err(|e| anyhow!("linking local ollama mmproj for {name}: {e}"))?;
+                mmproj_dest = Some(dest);
+            } else {
+                let url = client.blob_url(&target.repository, &p.digest)?;
+                let bar = indicatif::ProgressBar::new(p.size);
+                bar.set_style(
+                    indicatif::ProgressStyle::default_bar()
+                        .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                        .expect("valid template"),
+                );
+                bar.set_message(format!("pull {name} mmproj (registry.ollama.ai)"));
+                let mut last_publish = 0u64;
+                let mut progress = |downloaded: u64, total: u64| {
+                    bar.set_position(downloaded);
+                    if downloaded.saturating_sub(last_publish) >= 16 << 20 || downloaded == total {
+                        last_publish = downloaded;
+                        self.bus.publish(BlazarEvent::PullProgress {
+                            name: name.to_string(),
+                            downloaded,
+                            total,
+                        });
+                    }
+                };
+                client
+                    .download_to(url, &plan, &dest, &mut progress)
+                    .await
+                    .inspect_err(|e| {
+                        self.bus.publish(BlazarEvent::PullFailed {
+                            name: name.to_string(),
+                            error: format!("mmproj: {e}"),
+                        });
+                    })?;
+                bar.finish_and_clear();
+                mmproj_dest = Some(dest);
+            }
         } else if let Some(old_mm) = &old.mmproj_path {
             // Tag dropped the projector: forget it from the row and
             // remove the dead sidecar file.
@@ -677,6 +752,7 @@ fn registry_model_row(
 /// What a registry pull needs after manifest resolution: the model layer
 /// (required), an optional projector layer, and the quant string from the
 /// config blob.
+#[derive(Clone)]
 struct RegistryPlan {
     model_layer: RegistryLayer,
     projector: Option<RegistryLayer>,
@@ -700,10 +776,42 @@ async fn resolve_registry_plan(
             .map_err(|e| anyhow!("{e} for {}:{}", target.repository, target.tag))?;
     }
 
+    let (model_layer, projector) = select_registry_layers(&manifest, target, name)?;
+
+    // Quant from the config blob (file_type, e.g. "Q4_K_M"); config
+    // trouble must not fail the pull — "registry" is the honest fallback.
+    let file_type = if let Some(cfg) = &manifest.config {
+        client
+            .registry_blob_json::<RegistryConfig>(&target.repository, &cfg.digest)
+            .await
+            .ok()
+            .and_then(|c| c.file_type)
+    } else {
+        None
+    };
+
+    Ok(RegistryPlan {
+        model_layer,
+        projector,
+        quant: registry_quant(file_type),
+    })
+}
+
+/// Model + projector layer selection, shared by the network lane and the
+/// local ollama-store reuse lane so the two can never disagree about what
+/// a manifest means. Unknown layer types are skipped with a log line
+/// (template, params, license, adapters — the GGUF is authoritative in
+/// blazar).
+fn select_registry_layers(
+    manifest: &RegistryManifest,
+    target: &RegistryTarget,
+    name: &str,
+) -> Result<(RegistryLayer, Option<RegistryLayer>)> {
     let model_layer = manifest
         .layers
         .iter()
-        .find(|l| l.media_type == OLLAMA_MODEL_LAYER);
+        .find(|l| l.media_type == OLLAMA_MODEL_LAYER)
+        .cloned();
     let Some(model_layer) = model_layer else {
         return Err(anyhow!(
             "manifest for {}:{} has no model layer",
@@ -727,34 +835,140 @@ async fn resolve_registry_plan(
             );
         }
     }
+    Ok((model_layer, projector))
+}
 
-    // Quant from the config blob (file_type, e.g. "Q4_K_M"); config
-    // trouble must not fail the pull — "registry" is the honest fallback.
-    let quant = if let Some(cfg) = &manifest.config {
-        client
-            .registry_blob_json::<RegistryConfig>(&target.repository, &cfg.digest)
-            .await
-            .ok()
-            .and_then(|c| c.file_type)
-            .filter(|q| {
-                !q.is_empty()
-                    && q.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-            })
-    } else {
-        None
-    }
-    .unwrap_or_else(|| "registry".to_string());
-
-    Ok(RegistryPlan {
-        model_layer: model_layer.clone(),
-        projector,
-        quant,
-    })
+/// Config-blob `file_type` → store-row quant, with the sanitize rules and
+/// the honest "registry" fallback shared by both lanes (a locally reused
+/// model must record the identical row a network pull would have).
+fn registry_quant(file_type: Option<String>) -> String {
+    file_type
+        .filter(|q| {
+            !q.is_empty()
+                && q.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        })
+        .unwrap_or_else(|| "registry".to_string())
 }
 
 fn strip_digest_prefix(digest: &str) -> String {
     digest.strip_prefix("sha256:").unwrap_or(digest).to_string()
+}
+
+// ------------------------------------------------------------------
+// Local ollama-store reuse: satisfy a registry pull from a store that is
+// already on this machine, with zero network. Mirrors the HF hub-cache
+// reuse posture byte-for-byte: same manifest semantics (shared layer
+// selection), same size+sha256 blob gate (`reuse_byte_exact`), same
+// hardlink-into-models-dir materialization, and any anomaly falls back
+// to the network lane unchanged.
+// ------------------------------------------------------------------
+
+/// A fully verified local hit: the manifest-derived plan plus the on-disk
+/// blob paths that passed the same gate the download lane applies to the
+/// bytes it fetches.
+struct LocalRegistryHit {
+    plan: RegistryPlan,
+    model_blob: PathBuf,
+    projector_blob: Option<PathBuf>,
+}
+
+/// Candidate ollama models directories, in probe order: `OLLAMA_MODELS`
+/// (the only override ollama itself honors), the per-user install
+/// (`~/.ollama/models`), then the standard Linux service install (ollama
+/// runs as its own user there, so the store lives under /usr/share).
+/// Non-existent roots are skipped by the caller — probing is read-only.
+pub(crate) fn ollama_store_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("OLLAMA_MODELS")
+        && !root.is_empty()
+    {
+        roots.push(PathBuf::from(root));
+    }
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".ollama").join("models"));
+    }
+    roots.push(PathBuf::from("/usr/share/ollama/.ollama/models"));
+    roots
+}
+
+/// `sha256:<hex>` descriptor digest → the store's blob file
+/// (`<root>/blobs/sha256-<hex>`; the colon becomes a dash on disk).
+pub(crate) fn ollama_blob_path(root: &std::path::Path, digest: &str) -> PathBuf {
+    root.join("blobs").join(digest.replace(':', "-"))
+}
+
+/// Resolve a pull entirely from a local ollama store when every byte
+/// verifies: manifest (and config blob, for the quant) parsed from disk,
+/// model and projector blobs gated by `reuse_byte_exact` against the
+/// descriptor size + digest. ANY anomaly — missing manifest, digest-pin
+/// mismatch, absent or corrupt blob — yields `None` and the caller falls
+/// back to the network lane. Mixing one verified local blob with one
+/// unverified one is refused for the same reason: the reuse gate must be
+/// all-or-nothing per pull.
+fn local_registry_plan_at(
+    root: &std::path::Path,
+    target: &RegistryTarget,
+    name: &str,
+) -> Option<LocalRegistryHit> {
+    let manifest_path = root
+        .join("manifests")
+        .join("registry.ollama.ai")
+        .join(&target.repository)
+        .join(&target.tag);
+    let raw = std::fs::read(&manifest_path).ok()?;
+    if let Some(pin) = &target.digest
+        && verify_manifest_pin(pin, &raw).is_err()
+    {
+        return None;
+    }
+    let manifest: RegistryManifest = serde_json::from_slice(&raw).ok()?;
+    let (model_layer, projector) = select_registry_layers(&manifest, target, name).ok()?;
+
+    let quant = manifest
+        .config
+        .as_ref()
+        .and_then(|cfg| std::fs::read(ollama_blob_path(root, &cfg.digest)).ok())
+        .and_then(|bytes| serde_json::from_slice::<RegistryConfig>(&bytes).ok())
+        .and_then(|c| c.file_type);
+
+    let model_plan = FilePlan {
+        filename: format!("{name}.gguf"),
+        bytes: model_layer.size,
+        sha256: Some(strip_digest_prefix(&model_layer.digest)),
+    };
+    let model_blob =
+        crate::hf::reuse_byte_exact(&ollama_blob_path(root, &model_layer.digest), &model_plan)?;
+    let projector_blob = projector.as_ref().and_then(|p| {
+        let plan = FilePlan {
+            filename: format!("{name}-mmproj.gguf"),
+            bytes: p.size,
+            sha256: Some(strip_digest_prefix(&p.digest)),
+        };
+        crate::hf::reuse_byte_exact(&ollama_blob_path(root, &p.digest), &plan)
+    });
+    if projector.is_some() && projector_blob.is_none() {
+        return None;
+    }
+
+    Some(LocalRegistryHit {
+        plan: RegistryPlan {
+            model_layer,
+            projector,
+            quant: registry_quant(quant),
+        },
+        model_blob,
+        projector_blob,
+    })
+}
+
+/// First verified hit across the candidate stores (env override first,
+/// then the standard install locations).
+fn local_registry_hit(target: &RegistryTarget, name: &str) -> Option<LocalRegistryHit> {
+    ollama_store_roots()
+        .into_iter()
+        .filter(|root| root.is_dir())
+        .find_map(|root| local_registry_plan_at(&root, target, name))
 }
 
 /// `@sha256:` content pin: the manifest body must hash to the pinned
@@ -1094,6 +1308,400 @@ mod tests {
         assert!(
             cdn_req.headers.get("authorization").is_none(),
             "token must NEVER reach the presigned CDN host"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Local ollama-store reuse: fixture store, resolver unit tests, and
+    // the zero-network / fallback-equivalence integration contracts.
+    // ------------------------------------------------------------------
+
+    /// Build a synthetic ollama models dir at `<tmp>/ollama-models` whose
+    /// manifest for `library/qwen3:0.6b` points at real, digest-honest
+    /// blobs. Mirrors the on-disk layout ollama itself writes:
+    /// `manifests/registry.ollama.ai/<ns>/<model>/<tag>` JSON plus
+    /// `blobs/sha256-<hex>` files. Returns the store root.
+    fn ollama_store_fixture(tmp: &std::path::Path, model_bytes: &[u8]) -> PathBuf {
+        let root = tmp.join("ollama-models");
+        let model_digest = format!("sha256:{}", hex(&Sha256::digest(model_bytes)));
+        let config_bytes = br#"{"file_type":"Q4_K_M"}"#.to_vec();
+        let config_digest = format!("sha256:{}", hex(&Sha256::digest(&config_bytes)));
+
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.ollama.image.config",
+                "digest": config_digest,
+                "size": config_bytes.len() as u64,
+            },
+            "layers": [
+                {
+                    "mediaType": OLLAMA_MODEL_LAYER,
+                    "digest": model_digest,
+                    "size": model_bytes.len() as u64,
+                },
+            ],
+        })
+        .to_string();
+
+        let manifest_dir = root
+            .join("manifests")
+            .join("registry.ollama.ai")
+            .join("library")
+            .join("qwen3");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        std::fs::write(manifest_dir.join("0.6b"), &manifest).unwrap();
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        std::fs::write(
+            root.join("blobs").join(model_digest.replace(':', "-")),
+            model_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("blobs").join(config_digest.replace(':', "-")),
+            &config_bytes,
+        )
+        .unwrap();
+        root
+    }
+
+    fn add_projector_blob(root: &std::path::Path, projector_bytes: &[u8]) -> String {
+        let proj_digest = format!("sha256:{}", hex(&Sha256::digest(projector_bytes)));
+        std::fs::write(
+            root.join("blobs").join(proj_digest.replace(':', "-")),
+            projector_bytes,
+        )
+        .unwrap();
+        let manifest_path = root
+            .join("manifests")
+            .join("registry.ollama.ai")
+            .join("library")
+            .join("qwen3")
+            .join("0.6b");
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest["layers"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "mediaType": OLLAMA_PROJECTOR_LAYER,
+                "digest": proj_digest,
+                "size": projector_bytes.len() as u64,
+            }));
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        proj_digest
+    }
+
+    #[test]
+    fn unit__local_registry_plan_at__verified_store_yields_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
+        let target = parse_registry_target("qwen3:0.6b").unwrap();
+
+        let hit =
+            local_registry_plan_at(&root, &target, "qwen3-0.6b").expect("verified store must hit");
+        assert_eq!(hit.plan.quant, "Q4_K_M");
+        assert_eq!(hit.plan.model_layer.size, gguf_seed_bytes().len() as u64);
+        assert_eq!(
+            hit.model_blob,
+            root.join("blobs").join(format!(
+                "sha256-{}",
+                strip_digest_prefix(&hit.plan.model_layer.digest)
+            ))
+        );
+        assert!(hit.projector_blob.is_none());
+        assert!(hit.plan.projector.is_none());
+    }
+
+    #[test]
+    fn unit__local_registry_plan_at__missing_manifest_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
+        let target = parse_registry_target("qwen3:9.9b").unwrap();
+        assert!(local_registry_plan_at(&root, &target, "qwen3-9.9b").is_none());
+    }
+
+    #[test]
+    fn unit__local_registry_plan_at__pin_mismatch_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
+        let wrong_pin = format!("sha256:{}", hex(&Sha256::digest(b"other-manifest")));
+        let target = parse_registry_target(&format!("qwen3:0.6b@{wrong_pin}")).unwrap();
+        assert!(local_registry_plan_at(&root, &target, "qwen3-0.6b").is_none());
+    }
+
+    #[test]
+    fn unit__local_registry_plan_at__blob_size_mismatch_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Manifest advertises the real size, but the blob on disk is
+        // short — the size gate must reject before any hashing matters.
+        let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
+        let m: RegistryManifest = serde_json::from_str(
+            &std::fs::read_to_string(
+                root.join("manifests")
+                    .join("registry.ollama.ai")
+                    .join("library")
+                    .join("qwen3")
+                    .join("0.6b"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let blob = root
+            .join("blobs")
+            .join(m.layers[0].digest.replace(':', "-"));
+        let truncated = &gguf_seed_bytes()[..8];
+        std::fs::write(&blob, truncated).unwrap();
+        let target = parse_registry_target("qwen3:0.6b").unwrap();
+        assert!(local_registry_plan_at(&root, &target, "qwen3-0.6b").is_none());
+    }
+
+    #[test]
+    fn unit__local_registry_plan_at__blob_sha_mismatch_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
+        let m: RegistryManifest = serde_json::from_str(
+            &std::fs::read_to_string(
+                root.join("manifests")
+                    .join("registry.ollama.ai")
+                    .join("library")
+                    .join("qwen3")
+                    .join("0.6b"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let blob = root
+            .join("blobs")
+            .join(m.layers[0].digest.replace(':', "-"));
+        // Same length, different bytes: only the sha256 gate catches it.
+        let mut tampered = gguf_seed_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] = tampered[last].wrapping_add(1);
+        std::fs::write(&blob, tampered).unwrap();
+        let target = parse_registry_target("qwen3:0.6b").unwrap();
+        assert!(local_registry_plan_at(&root, &target, "qwen3-0.6b").is_none());
+    }
+
+    #[test]
+    fn unit__local_registry_plan_at__missing_projector_blob_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
+        // Manifest promises a projector whose blob never landed: the hit
+        // must degrade to None (full network), never a mixed trust level.
+        let proj_digest = add_projector_blob(&root, b"projector-bytes");
+        std::fs::remove_file(root.join("blobs").join(proj_digest.replace(':', "-"))).unwrap();
+        let target = parse_registry_target("qwen3:0.6b").unwrap();
+        assert!(local_registry_plan_at(&root, &target, "qwen3-0.6b").is_none());
+    }
+
+    #[test]
+    fn unit__local_registry_plan_at__verified_projector_is_carried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
+        let proj_digest = add_projector_blob(&root, b"projector-bytes");
+        let target = parse_registry_target("qwen3:0.6b").unwrap();
+        let hit = local_registry_plan_at(&root, &target, "qwen3-0.6b")
+            .expect("store with verified projector must hit");
+        let projector = hit.plan.projector.as_ref().unwrap();
+        assert_eq!(projector.size, b"projector-bytes".len() as u64);
+        assert_eq!(
+            hit.projector_blob.as_deref(),
+            Some(
+                root.join("blobs")
+                    .join(proj_digest.replace(':', "-"))
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn unit__local_registry_plan_at__missing_config_blob_falls_back_to_registry_quant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
+        let m: RegistryManifest = serde_json::from_str(
+            &std::fs::read_to_string(
+                root.join("manifests")
+                    .join("registry.ollama.ai")
+                    .join("library")
+                    .join("qwen3")
+                    .join("0.6b"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(
+            root.join("blobs")
+                .join(m.config.as_ref().unwrap().digest.replace(':', "-")),
+        )
+        .unwrap();
+        let target = parse_registry_target("qwen3:0.6b").unwrap();
+        let hit =
+            local_registry_plan_at(&root, &target, "qwen3-0.6b").expect("model blob still hits");
+        assert_eq!(hit.plan.quant, "registry");
+    }
+
+    #[test]
+    fn unit__ollama_store_roots__env_override_probes_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_env::set_env("OLLAMA_MODELS", tmp.path().display().to_string());
+        let roots = ollama_store_roots();
+        crate::test_env::remove_env("OLLAMA_MODELS");
+        assert_eq!(roots.first(), Some(&tmp.path().to_path_buf()));
+    }
+
+    #[tokio::test]
+    async fn integration__registry_pull__local_ollama_store_hit_links_without_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        let content = gguf_seed_bytes();
+        let store_root = ollama_store_fixture(tmp.path(), &content);
+        crate::test_env::set_env("OLLAMA_MODELS", store_root.display().to_string());
+
+        // No mocks mounted at all: ANY registry request would 404 and
+        // fail the pull — the local hit must satisfy it entirely offline.
+        // (The registry base must be pinned to the empty mock too:
+        // `pull_ollama` builds its own client from the env, never
+        // `puller.client`.)
+        let api = wiremock::MockServer::start().await;
+        crate::test_env::set_env("BLAZAR_REGISTRY_BASE", format!("{}/v2/", api.uri()));
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client: registry_client(&api, None, vec![host_of(&api.uri())]),
+            bus: EventBus::default(),
+            force: false,
+        };
+        let outcome = puller.pull_ollama("qwen3:0.6b").await.unwrap();
+        crate::test_env::remove_env("BLAZAR_REGISTRY_BASE");
+        crate::test_env::remove_env("OLLAMA_MODELS");
+
+        assert!(!outcome.already_present);
+        let leaf = dirs.models_dir().join("qwen3-0.6b.gguf");
+        assert_eq!(outcome.row.path, leaf.display().to_string());
+        assert_eq!(std::fs::read(&leaf).unwrap(), content);
+        assert_eq!(
+            outcome.row.quant, "Q4_K_M",
+            "quant must come from the local config blob"
+        );
+        assert_eq!(outcome.row.arch.as_deref(), Some("qwen3"));
+        assert_eq!(
+            outcome.row.sha256.as_deref(),
+            Some(hex(&Sha256::digest(&content)).as_str())
+        );
+        let requests = api.received_requests().await.unwrap_or_default();
+        assert!(
+            requests.is_empty(),
+            "local hit must not touch the network (got {} requests)",
+            requests.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__registry_pull__local_corrupt_blob_falls_back_to_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        // Corrupt the local model blob (same length, different bytes) so
+        // the local gate refuses — the pull must then succeed through the
+        // ordinary network ladder, byte-identically.
+        let content = gguf_seed_bytes();
+        let store_root = ollama_store_fixture(tmp.path(), &content);
+        let m: RegistryManifest = serde_json::from_str(
+            &std::fs::read_to_string(
+                store_root
+                    .join("manifests")
+                    .join("registry.ollama.ai")
+                    .join("library")
+                    .join("qwen3")
+                    .join("0.6b"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let local_blob = store_root
+            .join("blobs")
+            .join(m.layers[0].digest.replace(':', "-"));
+        let mut tampered = content.clone();
+        let last = tampered.len() - 1;
+        tampered[last] = tampered[last].wrapping_add(1);
+        std::fs::write(&local_blob, tampered).unwrap();
+        crate::test_env::set_env("OLLAMA_MODELS", store_root.display().to_string());
+
+        // Network ladder serves the honest bytes: manifest + model blob +
+        // config blob endpoints.
+        let api = wiremock::MockServer::start().await;
+        let manifest_body = std::fs::read_to_string(
+            store_root
+                .join("manifests")
+                .join("registry.ollama.ai")
+                .join("library")
+                .join("qwen3")
+                .join("0.6b"),
+        )
+        .unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/library/qwen3/manifests/0.6b"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(manifest_body))
+            .mount(&api)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/v2/library/qwen3/blobs/{}",
+                m.layers[0].digest
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .mount(&api)
+            .await;
+        let config_digest = m.config.as_ref().unwrap().digest.clone();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/v2/library/qwen3/blobs/{config_digest}"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(br#"{"file_type":"Q4_K_M"}"#.to_vec()),
+            )
+            .mount(&api)
+            .await;
+
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client: registry_client(&api, None, vec![host_of(&api.uri())]),
+            bus: EventBus::default(),
+            force: false,
+        };
+        // `pull_ollama` builds its own client from this env, so pin it to
+        // the mock or the fallback lane would hit the real registry.
+        crate::test_env::set_env("BLAZAR_REGISTRY_BASE", format!("{}/v2/", api.uri()));
+        let outcome = puller.pull_ollama("qwen3:0.6b").await.unwrap();
+        crate::test_env::remove_env("BLAZAR_REGISTRY_BASE");
+        crate::test_env::remove_env("OLLAMA_MODELS");
+
+        assert!(!outcome.already_present);
+        let leaf = dirs.models_dir().join("qwen3-0.6b.gguf");
+        assert_eq!(outcome.row.path, leaf.display().to_string());
+        assert_eq!(std::fs::read(&leaf).unwrap(), content);
+        // The fallback demonstrably used the network for the weights.
+        let blob_hits = api
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().contains("/blobs/"))
+            .count();
+        assert!(
+            blob_hits >= 1,
+            "corrupt local blob must fall back to network"
         );
     }
 }

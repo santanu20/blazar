@@ -405,8 +405,35 @@ async fn integration__rate_limit__gh_token_hint() {
         .respond_with(ResponseTemplate::new(403))
         .mount(&api)
         .await;
+    // The anonymous web fallback must be pinned to a dead surface —
+    // unset/ambient BLAZAR_ATOM_BASE would hit the real feed and turn
+    // the rate limit into a successful (network-dependent) listing.
+    // Env mutation helper follows the tests-dir edition-2024 pattern
+    // (nextest runs one test per process — std's safety condition).
+    fn set_env(key: &str, value: &str) {
+        #[expect(unsafe_code)]
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+    let web = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&web)
+        .await;
+    let saved = std::env::var("BLAZAR_ATOM_BASE").ok();
+    set_env("BLAZAR_ATOM_BASE", &web.uri());
     let gh = GhClient::with_base(&api.uri(), None).unwrap();
     let err = gh.list_releases().await.unwrap_err();
+    match saved {
+        Some(v) => set_env("BLAZAR_ATOM_BASE", &v),
+        None => {
+            #[expect(unsafe_code)]
+            unsafe {
+                std::env::remove_var("BLAZAR_ATOM_BASE");
+            }
+        }
+    }
     assert!(err.to_string().contains("GH_TOKEN"), "{err}");
 }
 

@@ -135,7 +135,8 @@ enum Cmd {
     },
     /// Import an existing GGUF file (hardlinks by default; --copy for a copy)
     Import {
-        path: PathBuf,
+        #[arg(required_unless_present = "scan")]
+        path: Option<PathBuf>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -145,6 +146,13 @@ enum Cmd {
         /// Vision projector GGUF to attach alongside the imported model
         #[arg(long)]
         mmproj: Option<PathBuf>,
+        /// List models already on disk from other runtimes (ollama, HF
+        /// hub cache, LM Studio) instead of importing a file
+        #[arg(long, conflicts_with_all = ["path", "name", "quant", "copy", "mmproj"])]
+        scan: bool,
+        /// --scan output as JSONL (one object per model)
+        #[arg(long, requires = "scan")]
+        json: bool,
     },
     /// Attach a vision projector (mmproj GGUF) to an existing model;
     /// refuses while the model is running — next spawn picks it up
@@ -1846,7 +1854,7 @@ async fn restart_daemon_impl() -> bool {
     // the daemon lock while the old owner is still finishing in-flight
     // work. A false "restarted" receipt here would be worse than an
     // honest warning.
-    if stop().is_ok()
+    if stop().await.is_ok()
         && wait_healthz_down(&base, &http, tokio_deadline(Duration::from_secs(10))).await
     {
         // The drain wait can outlast any reasonable inline poll (image
@@ -1918,7 +1926,14 @@ async fn run(cmd: Cmd) -> Result<()> {
             quant,
             copy,
             mmproj,
-        } => import(&path, name, quant, copy, mmproj.as_ref()),
+            scan: _,
+            json,
+        } => match path {
+            // clap guarantees the xor: a path requires no --scan, and
+            // --scan conflicts with every file-import flag (path=None).
+            Some(path) => import(&path, name, quant, copy, mmproj.as_ref()),
+            None => import_scan(json),
+        },
         Cmd::Mmproj { model, path } => mmproj_cmd(&resolve_model_cli(&model), &path),
         Cmd::Rm { models } => {
             let resolved: Vec<String> = models.iter().map(|m| resolve_model_cli(m)).collect();
@@ -3178,6 +3193,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_whisper_currency(&d).await);
     checks.extend(doctor_whisper_models(&d));
     checks.extend(doctor_binary_shadow());
+    checks.extend(doctor_daemon_skew(&d).await);
     checks.extend(doctor_app_currency().await);
     checks.extend(doctor_port().await);
     checks.extend(doctor_service());
@@ -5944,6 +5960,87 @@ fn ver_triple(v: &str) -> Option<(u64, u64, u64)> {
 /// the stale copy silently wins the daemon race (live incident class).
 /// Found by scanning PATH plus the usual suspects, versions compared by
 /// executing each candidate.
+/// Daemon-binary skew: when a daemon answers on the configured port,
+/// the binary it runs must be THIS CLI binary — any other copy
+/// (a stale `/usr/local/bin` install, a different worktree's build)
+/// silently serves older behavior while the user's CLI shows the new
+/// one. The exact resurrection path: `ensure_daemon` boots
+/// `current_exe()` whenever the port is free, so every binary on the
+/// box is one `blazar ps` away from re-grabbing the daemon slot.
+async fn doctor_daemon_skew(d: &BlazarDirs) -> Vec<Check> {
+    let Ok(cfg) = config() else {
+        return Vec::new(); // config problems get their own doctor row
+    };
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return Vec::new();
+    };
+    let base = daemon_base(&cfg);
+    if !daemon_healthy(&base, &http).await {
+        return Vec::new(); // daemon-down is doctor_port's row, not skew's
+    }
+    // Serving binary: /proc/<pid>/exe is ground truth (the pidfile can
+    // lie mid-race); daemon.path is the recorded fallback.
+    let pidfile = d.run_dir().join("blazar.pid");
+    let pid = std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i32>().ok());
+    #[cfg(unix)]
+    let serving = pid
+        .and_then(crate::signal_stop::proc_exe)
+        .or_else(|| std::fs::read_to_string(d.run_dir().join("daemon.path")).ok())
+        .map(|p| p.trim().to_string());
+    #[cfg(not(unix))]
+    let serving = std::fs::read_to_string(d.run_dir().join("daemon.path"))
+        .ok()
+        .map(|p| p.trim().to_string());
+    let canon = |p: &str| {
+        std::path::Path::new(p)
+            .canonicalize()
+            .ok()
+            .map(|c| c.display().to_string())
+    };
+    let cli = std::env::current_exe()
+        .ok()
+        .and_then(|c| c.canonicalize().ok())
+        .map(|c| c.display().to_string());
+    match (serving.as_deref().and_then(canon), cli.as_deref()) {
+        (Some(s), Some(c)) if s == c => vec![Check::ok(
+            "daemon binary",
+            format!("daemon runs this same CLI binary ({s})"),
+        )],
+        (Some(s), Some(c)) => vec![Check::warn(
+            "daemon binary",
+            format!(
+                "version skew: the serving daemon runs {s} but this CLI is {c} — \
+                 the daemon predates or postdates your CLI; `blazar stop && blazar \
+                 serve` from the binary you intend to run, or reinstall one copy"
+            ),
+        )],
+        // Unreadable sides are worth a row only when something IS serving.
+        _ => vec![Check::warn(
+            "daemon binary",
+            format!(
+                "daemon answers {} but its binary is undeterminable (pidfile {}, \
+                 daemon.path {}) — verify by hand: ps -p <pidfile pid>",
+                base,
+                if pid.is_some() {
+                    "readable"
+                } else {
+                    "missing/unparseable"
+                },
+                if serving.is_some() {
+                    "readable"
+                } else {
+                    "missing"
+                },
+            ),
+        )],
+    }
+}
+
 fn doctor_binary_shadow() -> Vec<Check> {
     #[cfg(unix)]
     const SUSPECTS: &[&str] = &["/usr/local/bin", "/usr/bin", "/snap/bin"];
@@ -6817,19 +6914,85 @@ async fn serve() -> Result<()> {
     Ok(())
 }
 
-fn stop() -> Result<()> {
+/// What a stop attempt should report, decided purely from observable
+/// facts — extracted so the branch logic is unit-testable without
+/// signals or sockets.
+#[derive(Debug, PartialEq, Eq)]
+enum StopOutcome {
+    /// The pidfile pid accepted TERM and the listener went quiet.
+    Stopped(i32),
+    /// The pidfile pid no longer existed and nothing serves the port.
+    AlreadyStoppedStale(i32),
+    /// TERM was delivered (or the pid was stale) but something still
+    /// answers /healthz — the pidfile now names it (pid + binary).
+    StillServing {
+        signaled: i32,
+        serving_pid: Option<i32>,
+        serving_path: Option<String>,
+    },
+}
+
+/// Pure: shape the stop verdict from the facts. The caller owns the
+/// messages; this owns the decision.
+fn stop_outcome(
+    signaled: i32,
+    term_hit_a_live_pid: bool,
+    port_quiet: bool,
+    pidfile_now: Option<(i32, Option<String>)>,
+) -> StopOutcome {
+    if port_quiet {
+        if term_hit_a_live_pid {
+            StopOutcome::Stopped(signaled)
+        } else {
+            StopOutcome::AlreadyStoppedStale(signaled)
+        }
+    } else {
+        let (serving_pid, serving_path) = pidfile_now
+            .map(|(pid, path)| (Some(pid), path))
+            .unwrap_or((None, None));
+        StopOutcome::StillServing {
+            signaled,
+            serving_pid,
+            serving_path,
+        }
+    }
+}
+
+async fn stop() -> Result<()> {
     let d = dirs();
     let pidfile = d.run_dir().join("blazar.pid");
     let pid: String = std::fs::read_to_string(&pidfile)
         .with_context(|| format!("no daemon pidfile at {}", pidfile.display()))?;
     let pid: i32 = pid.trim().parse().context("pidfile corrupted")?;
+    let cfg = config()?;
+    let base = daemon_base(&cfg);
+    // Short-timeout healthz probe: stop must not hang on a wedged
+    // daemon longer than its own grace budget.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("build stop health client")?;
+
     #[cfg(unix)]
-    signal_stop::term(pid);
+    let term_hit_a_live_pid = {
+        let out = signal_stop::term(pid)?;
+        if out.status.success() {
+            true
+        } else if String::from_utf8_lossy(&out.stderr).contains("No such process") {
+            false
+        } else {
+            return Err(anyhow!(
+                "kill -TERM {pid} failed: {} {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    };
     #[cfg(windows)]
     // F127: `taskkill` (no /F) asks for a close first; a console daemon
     // without a message pump ignores it, so finish with a hard kill after
     // a grace beat. Never a group — exact pid only, like the unix lane.
-    {
+    let term_hit_a_live_pid = {
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string()])
             .status();
@@ -6841,19 +7004,105 @@ fn stop() -> Result<()> {
                 .status()
                 .context("taskkill /F")?;
         }
+        true
+    };
+
+    // Grace budget: a draining daemon finishes in-flight work (image
+    // generations run minutes) before closing the listener — poll the
+    // port, not the pid, because the listener is what the next start
+    // and every CLI call actually contend with.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut port_quiet = false;
+    while tokio::time::Instant::now() < deadline {
+        if !daemon_healthy(&base, &http).await {
+            port_quiet = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    println!("{}", ok_line(&format!("signalled daemon pid {pid}")));
-    Ok(())
+
+    // The pidfile is re-read AFTER the grace window: whoever still owns
+    // the port has usually rewritten it (version-skew daemons each
+    // stamp their own boot).
+    let pidfile_now = std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .map(|p| {
+            (
+                p,
+                std::fs::read_to_string(d.run_dir().join("daemon.path")).ok(),
+            )
+        });
+
+    match stop_outcome(pid, term_hit_a_live_pid, port_quiet, pidfile_now) {
+        StopOutcome::Stopped(p) => {
+            println!("{}", ok_line(&format!("daemon stopped (pid {p})")));
+            Ok(())
+        }
+        StopOutcome::AlreadyStoppedStale(p) => {
+            println!(
+                "{}",
+                ok_line(&format!(
+                    "daemon already stopped (stale pidfile pid {p}); nothing serves {base}"
+                ))
+            );
+            Ok(())
+        }
+        StopOutcome::StillServing {
+            signaled,
+            serving_pid,
+            serving_path,
+        } => {
+            // Name the exact running binary when the kernel can (unix
+            // /proc exe link); the pidfile's recorded path is the
+            // fallback and, when both resolve, a disagreement between
+            // them is itself the diagnosis (recorded path went stale).
+            #[cfg(unix)]
+            let live_exe = serving_pid.and_then(signal_stop::proc_exe);
+            #[cfg(not(unix))]
+            let live_exe: Option<String> = None;
+            let binary_note = match (&live_exe, &serving_path) {
+                (Some(live), Some(recorded)) if live != recorded => {
+                    format!("binary {live} (pidfile recorded {recorded})")
+                }
+                (Some(live), _) => format!("binary {live}"),
+                (None, Some(recorded)) => format!("binary {recorded}"),
+                (None, None) => "binary ?".to_string(),
+            };
+            Err(anyhow!(
+                "{base} still serves after signalling pid {signaled} — pidfile now names pid {} \
+                 ({binary_note}): started by another invocation or binary; stop it from there, or \
+                 `kill {}`",
+                serving_pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                serving_pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| signaled.to_string())
+            ))
+        }
+    }
 }
 
 #[cfg(unix)]
 mod signal_stop {
+    /// Best-effort exact binary a live pid is running, via the kernel's
+    /// /proc link. `None` when the process is gone, the link is
+    /// unreadable, or /proc does not exist — callers degrade to their
+    /// recorded path string.
+    pub fn proc_exe(pid: i32) -> Option<String> {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|p| p.display().to_string())
+    }
+
     /// Stop the daemon by its exact pidfile pid (single-pid TERM; never a
-    /// process group).
-    pub fn term(pid: i32) {
-        let _ = std::process::Command::new("kill")
+    /// process group). The command's output comes back so the caller can
+    /// tell a stale pid ("No such process") from a refused one.
+    pub fn term(pid: i32) -> std::io::Result<std::process::Output> {
+        std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])
-            .status();
+            .output()
     }
 }
 
@@ -7172,6 +7421,116 @@ fn import(
     );
     println!("{}", ok_line("zero extra disk used (link, not copy)"));
     Ok(())
+}
+
+/// `blazar import --scan`: discovery half of the zero-redownload story.
+/// Lists models already on disk from other runtimes (ollama store, HF
+/// hub cache, LM Studio) with the command that adopts each — the pull
+/// and import lanes byte-verify before linking, so scanning never
+/// touches the other runtime's files.
+fn import_scan(json: bool) -> Result<()> {
+    let rows = blazar_runtime::scan::scan_reusable_models();
+    if json {
+        for row in &rows {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "source": row.source.to_string(),
+                    "id": row.id,
+                    "quant": row.quant,
+                    "bytes": row.bytes,
+                    "suggestion": row.suggestion,
+                })
+            );
+        }
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!(
+            "{}",
+            warn_line(
+                "no reusable models found — no ollama store, HF hub cache, \
+                 or LM Studio models on this machine"
+            )
+        );
+        return Ok(());
+    }
+    println!(
+        "{}",
+        bold_heading(&format!(
+            "reusable models on this machine ({}) — adopt without a re-download:",
+            rows.len()
+        ))
+    );
+    println!();
+    println!("{}", render_scan_table(&rows));
+    println!();
+    println!(
+        "{}",
+        dim_line(
+            "run the COMMAND column; reuse is byte-verified, the source file is never modified"
+        )
+    );
+    Ok(())
+}
+
+/// Fixed-shape scan listing: SOURCE MODEL QUANT SIZE COMMAND, widths
+/// sized to the data (model ids and commands capped so a deep LM Studio
+/// path cannot blow up the layout). Pure function — unit-tested.
+fn render_scan_table(rows: &[blazar_runtime::scan::ReusableModel]) -> String {
+    const MODEL_CAP: usize = 42;
+    const COMMAND_CAP: usize = 56;
+    fn truncate(text: &str, cap: usize) -> String {
+        if text.chars().count() <= cap {
+            return text.to_string();
+        }
+        let mut cut: String = text.chars().take(cap - 1).collect();
+        cut.push('…');
+        cut
+    }
+
+    let source_w = rows
+        .iter()
+        .map(|r| r.source.to_string().len())
+        .max()
+        .unwrap_or(6)
+        .max("SOURCE".len());
+    let model_w = rows
+        .iter()
+        .map(|r| r.id.chars().count().min(MODEL_CAP))
+        .max()
+        .unwrap_or(5)
+        .max("MODEL".len());
+    let quant_w = rows
+        .iter()
+        .map(|r| r.quant.as_deref().map_or(1, str::len))
+        .max()
+        .unwrap_or(5)
+        .max("QUANT".len());
+    let size_w = rows
+        .iter()
+        .map(|r| humansize(r.bytes.cast_signed()).len())
+        .max()
+        .unwrap_or(4)
+        .max("SIZE".len());
+
+    let mut out = format!(
+        "{:<source_w$}  {:<model_w$}  {:<quant_w$}  {:>size_w$}  COMMAND",
+        "SOURCE", "MODEL", "QUANT", "SIZE"
+    );
+    for row in rows {
+        let line = format!(
+            "{:<source_w$}  {:<model_w$}  {:<quant_w$}  {:>size_w$}  {}",
+            row.source.to_string(),
+            truncate(&row.id, MODEL_CAP),
+            row.quant.clone().unwrap_or_else(|| "-".to_string()),
+            humansize(row.bytes.cast_signed()),
+            truncate(&row.suggestion, COMMAND_CAP),
+        );
+        out.push('\n');
+        out.push_str(&line);
+    }
+    out
 }
 
 /// Display label for the on-disk model format. GGUF = single file; an
@@ -11282,7 +11641,7 @@ async fn whisper_search(d: &BlazarDirs, query: &str) -> Result<()> {
 /// `blazar stop` (daemon) vs `blazar stop MODEL` (unload now).
 async fn stop_cmd(model: Option<String>) -> Result<()> {
     let Some(model) = model else {
-        return stop();
+        return stop().await;
     };
     let base = ensure_daemon().await?;
     let resp = cli_http()
@@ -19755,6 +20114,49 @@ mod tests {
     }
 
     #[test]
+    fn unit__stop_outcome__matrix() {
+        use super::StopOutcome;
+        let pf = |pid: i32| Some((pid, Some("/usr/local/bin/blazar".to_string())));
+        // TERM landed on a live pid and the port went quiet: clean stop.
+        assert!(matches!(
+            stop_outcome(311, true, true, pf(311)),
+            StopOutcome::Stopped(311)
+        ));
+        // Port quiet but the pid was already gone: stale pidfile, still
+        // an honest success.
+        assert!(matches!(
+            stop_outcome(311, false, true, None),
+            StopOutcome::AlreadyStoppedStale(311)
+        ));
+        // Port still serving after grace: teaching branch, carrying the
+        // post-grace pidfile facts (or None when unreadable).
+        match stop_outcome(311, true, false, pf(412)) {
+            StopOutcome::StillServing {
+                signaled,
+                serving_pid,
+                serving_path,
+            } => {
+                assert_eq!(signaled, 311);
+                assert_eq!(serving_pid, Some(412));
+                assert_eq!(serving_path.as_deref(), Some("/usr/local/bin/blazar"));
+            }
+            other => panic!("expected StillServing, got {other:?}"),
+        }
+        match stop_outcome(311, false, false, None) {
+            StopOutcome::StillServing {
+                signaled,
+                serving_pid,
+                serving_path,
+            } => {
+                assert_eq!(signaled, 311);
+                assert_eq!(serving_pid, None);
+                assert_eq!(serving_path, None);
+            }
+            other => panic!("expected StillServing, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unit__systemd_poll_decision__only_activating_keeps_the_budget() {
         // A unit still activating may yet become our daemon.
         assert!(systemd_poll_decision(&SystemdUnitState::Activating));
@@ -20627,6 +21029,41 @@ mod tests {
         };
         let candidate = gap_engine_row("b2-cuda", EngineKind::LlamaCpp, &[]);
         engine_regression_gate(&mgr, &d, &candidate).unwrap();
+    }
+
+    #[test]
+    fn unit__render_scan_table__columns_aligned_and_long_ids_truncated() {
+        use blazar_runtime::scan::{ReusableModel, ReuseSource};
+        let rows = vec![
+            ReusableModel {
+                source: ReuseSource::Ollama,
+                id: "qwen3:0.6b".to_string(),
+                quant: Some("Q4_K_M".to_string()),
+                bytes: 522_000_000,
+                suggestion: "blazar pull qwen3:0.6b".to_string(),
+            },
+            ReusableModel {
+                source: ReuseSource::LmStudio,
+                id: "a-very-long-model-file-name-well-past-the-forty-two-column-cap.gguf"
+                    .to_string(),
+                quant: None,
+                bytes: 512,
+                suggestion: "blazar import /deep/lm-studio/path".to_string(),
+            },
+        ];
+        let table = render_scan_table(&rows);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("SOURCE") && lines[0].contains("COMMAND"));
+        // Right-aligned SIZE: the byte row's human size ends at the same
+        // column the header's SIZE does.
+        assert!(lines[1].ends_with("blazar pull qwen3:0.6b"));
+        assert!(lines[1].contains("Q4_K_M"));
+        // Long id capped at 42 chars (41 + ellipsis): the id's TAIL is
+        // dropped, quant gap shows `-`.
+        let lm = lines[2];
+        assert!(lm.contains('…') && !lm.contains("column-cap.gguf"), "{lm}");
+        assert!(lm.ends_with("blazar import /deep/lm-studio/path"));
     }
 
     #[test]

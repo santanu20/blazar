@@ -113,7 +113,13 @@ blazar search qwen3 instruct                        # find models on Hugging Fac
 blazar pull qwen3-0.6b                              # registry shortname
 blazar pull ggml-org/Qwen3-8B-GGUF:Q4_K_M           # Hugging Face GGUF
 blazar import /path/to/model.gguf --name mymodel    # existing local file
+blazar import --scan                                # list models reusable from ollama / HF cache / LM Studio
 ```
+
+Pulls never re-download what is already on disk: an existing ollama store, the
+Hugging Face hub cache, and LM Studio models are checked first (size + sha256
+byte-verified, then hardlinked) — a 10 GiB model already in ollama appears in
+blazar instantly at zero network cost.
 
 ### 3. Serve and run
 
@@ -352,6 +358,7 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | One-word config posture | `blazar config preset balanced` |
 | Observe → recommend per model | `blazar autopilot`, `blazar autopilot --apply` |
 | Pull / import models | `blazar pull <target>`, `blazar import <file> --name <name>` |
+| Reuse models from other runtimes | `blazar import --scan` (lists ollama / HF cache / LM Studio models; `blazar pull` links them byte-verified, no re-download) |
 | Inspect models | `blazar list`, `blazar show <model>`, `blazar ps` |
 | Stop / remove | `blazar stop` (daemon), `blazar rm <model>` |
 | Quantize / attach projector | `blazar quantize <model> <out-quant>`, `blazar mmproj <model> <mmproj.gguf path>` |

@@ -2998,7 +2998,7 @@ fn leaf_of(filename: &str) -> String {
 /// beats re-downloading the same bytes). Unknown published sha falls
 /// back to size-only, matching the download lane's own verification
 /// trust level.
-fn reuse_byte_exact(candidate: &Path, plan: &FilePlan) -> Option<PathBuf> {
+pub(crate) fn reuse_byte_exact(candidate: &Path, plan: &FilePlan) -> Option<PathBuf> {
     let meta = std::fs::metadata(candidate).ok()?;
     if !meta.is_file() || meta.len() != plan.bytes || plan.bytes == 0 {
         return None;
@@ -3030,7 +3030,7 @@ fn reuse_byte_exact(candidate: &Path, plan: &FilePlan) -> Option<PathBuf> {
 /// Hugging Face hub cache root, honoring the same environment overrides
 /// as `huggingface_hub` itself: `HF_HUB_CACHE`, then `HF_HOME/hub`, then the
 /// per-user default `~/.cache/huggingface/hub`.
-fn hf_hub_root() -> Option<PathBuf> {
+pub(crate) fn hf_hub_root() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("HF_HUB_CACHE")
         && !root.is_empty()
     {
@@ -3073,7 +3073,7 @@ fn hf_hub_candidates(repo: &str, filename: &str) -> Vec<PathBuf> {
 /// must unlink blazar's file, not the hub blob). Hardlink first — same
 /// filesystem, zero bytes copied — then a real copy when the cache lives
 /// on another filesystem, still far cheaper than re-downloading GiB.
-fn materialize_hub_hit(src: &Path, dest: &Path) -> std::io::Result<()> {
+pub(crate) fn materialize_hub_hit(src: &Path, dest: &Path) -> std::io::Result<()> {
     if std::fs::hard_link(src, dest).is_ok() {
         return Ok(());
     }
