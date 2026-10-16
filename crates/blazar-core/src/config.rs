@@ -1623,13 +1623,19 @@ pub struct SglangTuning {
     /// C >= 2 aggregate throughput. 2026-10-09 live receipts
     /// (qwen3-1.7b, RTX 4070): ngram lost to dense at every concurrency
     /// (-16% C1, -44% C8, +12s cold), so the default stays off — this
-    /// knob is opt-in. Bundle constraint: greedy (temperature 0)
-    /// requests only; non-greedy sampling drives the flashinfer
-    /// verify kernel through a JIT path whose bundled toolchain
-    /// mismatch crashes the engine (Ninja build failed) on the
-    /// sglang 0.5.21 venv. Pair with `attention_backend = "triton"`
-    /// (flashinfer attention verify kernels hit the same JIT defect
-    /// at graph capture). The EAGLE family rides the
+    /// knob is opt-in. Sampling is unconstrained: the 2026-10-09
+    /// greedy-only caveat (non-greedy verify sampling drove a
+    /// flashinfer JIT whose floating CUDA compiler trio mismatched
+    /// the torch wheels — "Ninja build failed") was root-caused and
+    /// fixed by pinning the venv's compiler trio to torch's line at
+    /// install; 2026-10-17 live receipts (qwen3-1.7b, NGRAM engaged,
+    /// fixed toolchain): temperature 0.7-1.0 requests complete on
+    /// both sampling backends (`pytorch` default and a
+    /// `sampling_backend = "flashinfer"` pin), coherent output, zero
+    /// JIT failures. The `attention_backend = "triton"` pairing note
+    /// retires with it — flashinfer backends work when pinned; the
+    /// global portability default still emits triton for toolchain-
+    /// less boxes. The EAGLE family rides the
     /// draft-pair lane (`spec = "eagle3"` + a pulled safetensors
     /// draft), not this knob. `"dflash"` (0.5.21+) additionally
     /// requires `spec_draft_path` — a safetensors draft dir the
