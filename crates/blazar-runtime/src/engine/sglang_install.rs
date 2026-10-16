@@ -170,7 +170,8 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
 
     let venv = dir.join("venv");
     let venv_python = venv.join("bin").join("python");
-    if uv_available() {
+    let use_uv = uv_available();
+    if use_uv {
         run_streaming(
             tokio::process::Command::new("uv")
                 .arg("venv")
@@ -230,6 +231,20 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
         )
         .await?;
     }
+
+    // The sglang wheels FLOAT the CUDA compiler dists (`nvidia-cuda-nvcc`,
+    // `nvidia-nvvm`, `nvidia-cuda-crt`): pip/uv resolves them to the newest
+    // CUDA line, while the torch wheel fixes the bundled CUDA headers to one
+    // exact line (torch 2.13+cu130 vs nvcc 13.4.92, live 2026-10-16). A
+    // mismatched pair poisons every flashinfer JIT compile twice over: the
+    // cccl header guard errors out at the #error comparing compiler to
+    // toolkit headers, and even past that the 13.4 cicc (from `nvidia-nvvm`)
+    // emits PTX .version 9.4 that the 13.0 ptxas rejects. Re-resolve the
+    // compiler trio onto torch's own CUDA line so the self-hosted JIT below
+    // is version-coherent end to end. `nvidia-cuda-nvdisasm` is deliberately
+    // not pinned: it has no wheels on older lines (>=13.2.51 only) and sits
+    // off the compile path (disassembly diagnostics only).
+    pin_jit_compiler_to_torch(&venv_python, use_uv).await?;
 
     // Shim: absolute venv python so the script works from any cwd; argv
     // passthrough keeps probe (--) and spawn argv identical in shape.
@@ -301,6 +316,76 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     .await
     .context("boot-smoke failed: the venv cannot import the sglang server entry chain — rerun manually to inspect: <engine>/venv/bin/python -c 'import sglang.srt.entrypoints.engine'")?;
     Ok(shim)
+}
+
+/// Pin specs aligning the floating CUDA compiler dists with torch's
+/// bundled CUDA line (`torch.version.cuda`, e.g. "13.0"): nvcc itself,
+/// the nvvm frontend (cicc + libdevice — a SEPARATE dist that emits the
+/// PTX), and the compilation runtime. Empty when `cuda` is not a
+/// `X.Y[.Z]` numeric line (cpu-only torch or an unexpected shape):
+/// there is nothing coherent to pin against.
+fn torch_cuda_pin_specs(cuda: &str) -> Vec<String> {
+    let mut parts = cuda.trim().split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        return Vec::new();
+    };
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.chars().all(|c| c.is_ascii_digit())
+        || !minor.chars().all(|c| c.is_ascii_digit())
+    {
+        return Vec::new();
+    }
+    let line = format!("{major}.{minor}.*");
+    ["nvidia-cuda-nvcc", "nvidia-nvvm", "nvidia-cuda-crt"]
+        .into_iter()
+        .map(|dist| format!("{dist}=={line}"))
+        .collect()
+}
+
+/// Re-resolve the CUDA compiler dists onto torch's own CUDA line after
+/// the sglang install (see the call site for the defect this prevents).
+/// A cpu-only/unreadable torch build skips the pin with a warning — the
+/// JIT has no bundled compiler to keep coherent in that case.
+async fn pin_jit_compiler_to_torch(venv_python: &Path, use_uv: bool) -> Result<()> {
+    let probe = tokio::process::Command::new(venv_python)
+        .arg("-c")
+        .arg("import torch; print(torch.version.cuda or '')")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("probe torch.version.cuda in the fresh sglang venv")?;
+    if !probe.status.success() {
+        anyhow::bail!(
+            "torch failed to import in the fresh sglang venv: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+    }
+    let cuda = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    let specs = torch_cuda_pin_specs(&cuda);
+    if specs.is_empty() {
+        tracing::warn!(
+            target: "blazar::engine",
+            "torch.version.cuda unreadable ({cuda:?}); skipping the CUDA compiler pin — flashinfer JIT coherency is not guaranteed"
+        );
+        return Ok(());
+    }
+    let mut cmd = if use_uv {
+        let mut c = tokio::process::Command::new("uv");
+        c.arg("pip").arg("install").arg("--python").arg(venv_python);
+        c
+    } else {
+        let mut c = tokio::process::Command::new(venv_python);
+        c.arg("-m").arg("pip").arg("install");
+        c
+    };
+    cmd.args(&specs);
+    run_streaming(
+        &mut cmd,
+        &format!("pin CUDA compiler dists to torch's cuda {cuda}"),
+        SGLANG_INSTALL_TIMEOUT_SECS,
+    )
+    .await
 }
 
 /// The venv's bundled CUDA toolkit ROOT when the sglang wheels pulled a
@@ -511,6 +596,40 @@ mod tests {
         assert_eq!(version_tuple("0.5.20rc1"), Some((0, 5, 20)));
         assert_eq!(version_tuple("1.2"), Some((1, 2, 0)));
         assert_eq!(version_tuple("latest"), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__torch_cuda_pin_specs__pins_the_compiler_trio_to_torchs_line() {
+        // The trio is complete in one shot: nvcc alone still dies (the
+        // separate nvidia-nvvm cicc emits newer PTX than the pinned ptxas
+        // accepts — live 2026-10-16: ".version 9.4; current is '9.0'").
+        assert_eq!(
+            torch_cuda_pin_specs("13.0"),
+            [
+                "nvidia-cuda-nvcc==13.0.*",
+                "nvidia-nvvm==13.0.*",
+                "nvidia-cuda-crt==13.0.*"
+            ]
+        );
+        // Three-component torch strings ("13.0.88") pin the same line.
+        assert_eq!(
+            torch_cuda_pin_specs("13.0.88"),
+            torch_cuda_pin_specs("13.0")
+        );
+        assert_eq!(
+            torch_cuda_pin_specs("12.8"),
+            [
+                "nvidia-cuda-nvcc==12.8.*",
+                "nvidia-nvvm==12.8.*",
+                "nvidia-cuda-crt==12.8.*"
+            ]
+        );
+        // Whitespace tolerated; anything not numeric X.Y[.Z] pins nothing.
+        assert_eq!(torch_cuda_pin_specs(" 12.8 "), torch_cuda_pin_specs("12.8"));
+        assert!(torch_cuda_pin_specs("").is_empty());
+        assert!(torch_cuda_pin_specs("None").is_empty());
+        assert!(torch_cuda_pin_specs("cuda-13").is_empty());
     }
 
     #[test]
