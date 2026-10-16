@@ -2448,6 +2448,33 @@ pub fn admission_floor_bytes(model_bytes: u64, mmproj_bytes: u64) -> u64 {
         .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES)
 }
 
+/// Effective host offload an sglang spawn will run with, in bytes. A
+/// manual `cpu_offload_gb` pin wins, ceil-quantized exactly like the
+/// flag emission in `sglang_gpu_fit` (the engine takes whole GB); with
+/// no pin the ladder's Tier C posture is assumed — ceil of the standing
+/// floor's deficit against the largest single-card budget. Sharing
+/// this with supervisor admission keeps the gate and the emitted argv
+/// from disagreeing about the spawn posture (2026-10-16: a 7.5 GiB
+/// model with a 4 GiB offload pin was refused as an 8.7 GiB
+/// "impossible floor" while its real VRAM demand was ~6 GiB).
+///
+/// Unpinned invariant: `floor - ceil(floor - budget) <= budget`, so an
+/// unpinned spawn can never refuse-fast on a single card — only a pin
+/// can demand more GPU than the ladder would leave behind.
+#[must_use]
+pub fn sglang_effective_offload_bytes(
+    standing_floor_bytes: u64,
+    largest_budget_bytes: u64,
+    manual_offload_gb: Option<f32>,
+) -> u64 {
+    match manual_offload_gb {
+        Some(pin) if pin > 0.0 => gb_to_bytes(pin.ceil()),
+        _ => gb_to_bytes(ceil_gb(
+            standing_floor_bytes.saturating_sub(largest_budget_bytes),
+        )),
+    }
+}
+
 /// VRAM that ctx-scaled compute buffers cost per token of TOTAL ctx on
 /// vulkan-class builds (mixed integrated+discrete census) when a
 /// projector is attached — the one combination whose allocation footprint
@@ -4167,21 +4194,14 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     // --- loras: PEFT adapters only; the gguf/.bin gate errors here.
     push_sglang_loras(input, &mut argv, &mut warnings)?;
     // --- speculative: draft-free knobs (ngram) or the EAGLE3
-    // pair; the engage verdict feeds the fit ladder's verify reserve.
-    let spec_engaged = push_sglang_speculative(input, &tun, &mut argv, &mut warnings);
+    // pair; the engage verdict (and draft dir) feeds the fit
+    // ladder's reserve and static-side draft charge.
+    let spec = push_sglang_speculative(input, &tun, &mut argv, &mut warnings);
     // --- llama-vocabulary knobs that do NOT translate: teach here.
     push_sglang_vocab_teaching(input, &mut warnings);
     // --- the fit ladder: tier selection + mem-fraction derive.
-    let (gpu_label, kv_est_bytes) = sglang_run_fit_ladder(
-        input,
-        &tun,
-        hf,
-        ctx,
-        slots,
-        spec_engaged,
-        &mut argv,
-        &mut warnings,
-    )?;
+    let (gpu_label, kv_est_bytes) =
+        sglang_run_fit_ladder(input, &tun, hf, ctx, slots, &spec, &mut argv, &mut warnings)?;
 
     // HiCache viability gates refuse impossible host-RAM tiers.
     push_sglang_hicache(input, &tun, &mut argv, &mut warnings)?;
@@ -5270,12 +5290,31 @@ fn sglang_spec_draft_dir<'a>(
     Some(draft)
 }
 
-fn push_sglang_speculative(
-    input: &ProfileInput<'_>,
-    tun: &SglangTuning,
+/// What the speculative stage decided: whether speculation engages and
+/// the draft-model dir it will load (None = dense, or draft-free
+/// self-drafting like ngram). The ladder charges the draft as
+/// static-side VRAM, so the resolution lives with the emitter — one
+/// truth for both.
+struct SpecEngagement<'a> {
+    engaged: bool,
+    draft_dir: Option<&'a str>,
+}
+
+impl SpecEngagement<'_> {
+    fn dense() -> Self {
+        SpecEngagement {
+            engaged: false,
+            draft_dir: None,
+        }
+    }
+}
+
+fn push_sglang_speculative<'a>(
+    input: &ProfileInput<'a>,
+    tun: &'a SglangTuning,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
-) -> bool {
+) -> SpecEngagement<'a> {
     if let Some(algorithm) = tun.spec_algorithm.as_deref() {
         // blazar spelling -> upstream enum. Config validation rejects
         // unknown spellings at load; this arm is the defensive net for
@@ -5293,7 +5332,7 @@ fn push_sglang_speculative(
                      (supported: ngram draft-free, dflash via spec_draft_path); spawning \
                      dense — the EAGLE family rides the draft-pair lane (spec = \"eagle3\")"
                 ));
-                return false;
+                return SpecEngagement::dense();
             }
         };
         if !input.supported_flags.contains("--speculative-algorithm") {
@@ -5302,11 +5341,11 @@ fn push_sglang_speculative(
                  --speculative-algorithm; spawning dense (a blazar engine update \
                  revives it)"
             ));
-            return false;
+            return SpecEngagement::dense();
         }
         let draft = if needs_draft {
             let Some(d) = sglang_spec_draft_dir(input, tun, warnings) else {
-                return false;
+                return SpecEngagement::dense();
             };
             Some(d)
         } else {
@@ -5336,7 +5375,10 @@ fn push_sglang_speculative(
             );
         }
         push_sglang_spec_depth_knobs(input, tun, argv, warnings);
-        return true;
+        return SpecEngagement {
+            engaged: true,
+            draft_dir: draft,
+        };
     }
     if let Some(draft) = input.draft_path {
         if draft
@@ -5358,7 +5400,10 @@ fn push_sglang_speculative(
             argv.push("--speculative-draft-model-path".into());
             argv.push(draft.to_string());
             push_sglang_spec_depth_knobs(input, tun, argv, warnings);
-            return true;
+            return SpecEngagement {
+                engaged: true,
+                draft_dir: Some(draft),
+            };
         } else {
             warnings.push(format!(
                 "spec draft {draft} resolved but this sglang engine lacks the \
@@ -5366,7 +5411,7 @@ fn push_sglang_speculative(
             ));
         }
     }
-    false
+    SpecEngagement::dense()
 }
 
 /// llama-vocabulary knobs that do NOT translate: `cache_type` is
@@ -5465,7 +5510,7 @@ fn sglang_run_fit_ladder(
     hf: &HfMeta,
     ctx: u32,
     slots: u32,
-    spec_engaged: bool,
+    spec: &SpecEngagement<'_>,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) -> Result<(&'static str, Option<u64>), String> {
@@ -5501,15 +5546,39 @@ fn sglang_run_fit_ladder(
             Some(kv16_v) => {
                 let kv8_v = kv8.unwrap_or(kv16_v / 2);
                 let weights = ceil_div(input.model_bytes, shard);
+                // Draft weights are STATIC-side: sglang loads them
+                // before sizing the KV pool and counts them in
+                // pre_model_load ("If using speculative decoding, draft
+                // weights are now counted" — kv_cache_configurator).
+                // Leaving them out of the derive lands the fraction
+                // under the engine's own minimum-viable floor and the
+                // spawn dies at alloc_memory_pool (2026-10-16 receipt:
+                // derive 0.605 vs minimum 0.6076). Unreadable dir fails
+                // open like the admission-side charge, with the same
+                // warn.
+                let draft_weights = if let Some(draft) = spec.draft_dir {
+                    crate::hfmeta::root_safetensors_bytes(std::path::Path::new(draft))
+                        .unwrap_or_else(|| {
+                            warnings.push(format!(
+                                "sglang draft dir {draft} unreadable at compile — \
+                                 mem-fraction derived draft-free; sizing may run tight"
+                            ));
+                            0
+                        })
+                } else {
+                    0
+                };
                 let geom = SglangFitGeometry {
                     shard,
                     vram,
                     budget,
                     weights,
+                    draft_weights,
                     kv16_v,
                     kv8_v,
                 };
-                let fit = sglang_gpu_fit(input, tun, argv, warnings, slots, ctx, &geom)?;
+                let fit =
+                    sglang_gpu_fit(input, tun, argv, warnings, slots, ctx, spec.engaged, &geom)?;
                 gpu_label = fit.gpu_label;
                 kv_est_bytes = fit.kv_est_bytes;
                 sglang_push_mem_fraction(
@@ -5520,8 +5589,8 @@ fn sglang_run_fit_ladder(
                     &geom,
                     fit.kv_est_bytes,
                     fit.offload_gb,
-                    if spec_engaged {
-                        SGLANG_SPEC_VERIFY_RESERVE_MIB
+                    if spec.engaged {
+                        SGLANG_SPEC_DYNAMIC_RESERVE_MIB
                     } else {
                         0
                     },
@@ -5556,6 +5625,9 @@ struct SglangFitGeometry {
     vram: u64,
     budget: u64,
     weights: u64,
+    /// Draft-model weights the spec lane loads before pool sizing —
+    /// static-side demand the derive must charge (0 when not engaged).
+    draft_weights: u64,
     kv16_v: u64,
     kv8_v: u64,
 }
@@ -5634,6 +5706,7 @@ fn sglang_shard_budget(input: &ProfileInput<'_>, tun: &SglangTuning) -> (u32, u6
 /// EVERY tier (the user asked for offload; the ladder only derives it
 /// when unpinned) and rides into the outcome for the mem-fraction
 /// derive.
+#[allow(clippy::too_many_arguments)]
 fn sglang_gpu_fit(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
@@ -5641,25 +5714,57 @@ fn sglang_gpu_fit(
     warnings: &mut Vec<String>,
     slots: u32,
     ctx: u32,
+    spec_engaged: bool,
     geom: &SglangFitGeometry,
 ) -> Result<SglangFitOutcome, String> {
     let mut offload_total_gb = 0.0f32;
     if let Some(pin) = tun.cpu_offload_gb {
+        // The engine flag is integer-GB (0.5.21 argparse rejects "5.5":
+        // invalid int value) — a fractional pin rounds UP, never down:
+        // under-offloading would OOM the spawn the pin exists to save.
+        let whole = pin.ceil();
+        // Equality is exact here by construction: ceil() is whole, so the
+        // comparison only answers "was the pin already whole" — no
+        // tolerance semantics involved.
+        #[allow(clippy::float_cmp)]
+        if whole != pin {
+            warnings.push(format!(
+                "sglang.cpu_offload_gb {pin} rounded up to {whole} — the \
+                 engine's --cpu-offload-gb accepts whole GB only"
+            ));
+        }
         push_tuned(
             argv,
             input.supported_flags,
             "sglang.cpu_offload_gb",
             "--cpu-offload-gb",
-            &format!("{pin}"),
+            &format!("{whole}"),
             warnings,
         );
-        offload_total_gb = pin;
+        offload_total_gb = whole;
     }
     let (weights, budget, kv16_v, kv8_v) = (geom.weights, geom.budget, geom.kv16_v, geom.kv8_v);
     if weights.saturating_add(kv16_v) <= budget {
         // Tier A: full GPU, f16 KV.
         if tun.kv_cache_dtype.is_none() && input.overlay.cache_type.is_none() {
             // f16 KV is the default; nothing to emit.
+        }
+        // A full fit still owes the spec lane an explicit graph ceiling:
+        // upstream's default 256 assumes dense decode graphs, and the
+        // verify graphs cost the draft-token multiple — on a
+        // near-full card that default alone can OOM the capture.
+        if spec_engaged {
+            let headroom = budget.saturating_sub(weights).saturating_sub(kv16_v);
+            sglang_tight_fit_knobs(
+                argv,
+                input.supported_flags,
+                slots,
+                headroom,
+                weights,
+                tun,
+                spec_engaged,
+                warnings,
+            );
         }
         Ok(SglangFitOutcome {
             gpu_label: "full",
@@ -5693,6 +5798,7 @@ fn sglang_gpu_fit(
             headroom,
             weights,
             tun,
+            spec_engaged,
             warnings,
         );
         Ok(SglangFitOutcome {
@@ -5701,7 +5807,7 @@ fn sglang_gpu_fit(
             offload_gb: offload_total_gb,
         })
     } else {
-        sglang_tier_c_host_offload(input, tun, argv, warnings, slots, ctx, geom)
+        sglang_tier_c_host_offload(input, tun, argv, warnings, slots, ctx, spec_engaged, geom)
     }
 }
 
@@ -5710,6 +5816,7 @@ fn sglang_gpu_fit(
 /// host budget matters: every TP rank offloads independently into the
 /// same host RAM. Tier D refusal when even that budget cannot absorb
 /// it.
+#[allow(clippy::too_many_arguments)]
 fn sglang_tier_c_host_offload(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
@@ -5717,6 +5824,7 @@ fn sglang_tier_c_host_offload(
     warnings: &mut Vec<String>,
     slots: u32,
     ctx: u32,
+    spec_engaged: bool,
     geom: &SglangFitGeometry,
 ) -> Result<SglangFitOutcome, String> {
     let (shard, budget, weights, kv8_v) = (geom.shard, geom.budget, geom.weights, geom.kv8_v);
@@ -5728,24 +5836,27 @@ fn sglang_tier_c_host_offload(
         .saturating_mul(4)
         .saturating_div(10)
         .saturating_div(u64::from(shard));
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let offload_bytes = (f64::from(offload_gb) * 1e9).round() as u64;
-    if offload_gb > 0.0 && offload_bytes <= Hardware::bytes(host_budget) {
-        let emitted = if let Some(pin) = tun.cpu_offload_gb {
-            pin
-        } else {
-            warnings.push(format!(
-                "fit ladder Tier C: weights {:.2} GiB + KV {:.2} GiB \
+    // The pin (already quantized to whole GB at its own emission
+    // site) overrides the ladder's derive for BOTH the flag and the
+    // headroom math — offload_bytes derived from the same value the
+    // engine receives keeps them from disagreeing.
+    let emitted = if let Some(pin) = tun.cpu_offload_gb {
+        pin.ceil()
+    } else {
+        warnings.push(format!(
+            "fit ladder Tier C: weights {:.2} GiB + KV {:.2} GiB \
                  exceed the {:.2} GiB usable VRAM — offloading \
                  {offload_gb} GB of weights to host RAM (decode \
                  speed drops roughly with the offloaded share); \
                  override with models.<name>.sglang.cpu_offload_gb",
-                bytes_gib(weights),
-                bytes_gib(kv8_v),
-                bytes_gib(budget),
-            ));
-            offload_gb
-        };
+            bytes_gib(weights),
+            bytes_gib(kv8_v),
+            bytes_gib(budget),
+        ));
+        offload_gb
+    };
+    let offload_bytes = gb_to_bytes(emitted);
+    if offload_bytes > 0 && offload_bytes <= Hardware::bytes(host_budget) {
         if tun.kv_cache_dtype.is_none() {
             push_tuned(
                 argv,
@@ -5756,14 +5867,19 @@ fn sglang_tier_c_host_offload(
                 warnings,
             );
         }
-        push_tuned(
-            argv,
-            input.supported_flags,
-            "fit ladder",
-            "--cpu-offload-gb",
-            &format!("{emitted}"),
-            warnings,
-        );
+        // The pin already emitted its flag at the top of `sglang_gpu_fit`
+        // — the pin site owns the flag so the argv never carries it
+        // twice. Only the ladder-derived path pushes here.
+        if tun.cpu_offload_gb.is_none() {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "fit ladder",
+                "--cpu-offload-gb",
+                &format!("{emitted}"),
+                warnings,
+            );
+        }
         // Graph slope follows the TOTAL model (activations need
         // capturing wherever the weights live); the headroom only
         // counts what stays on the GPU.
@@ -5776,6 +5892,7 @@ fn sglang_tier_c_host_offload(
             headroom,
             weights,
             tun,
+            spec_engaged,
             warnings,
         );
         Ok(SglangFitOutcome {
@@ -5801,14 +5918,22 @@ fn sglang_tier_c_host_offload(
     }
 }
 
-/// mem-fraction-static: the anti-OOM heart. Derived from what actually
-/// stays device-side (weights minus the EMITTED offload — pin or
-/// ladder-derived — plus KV). An explicit pin still passes governance:
-/// it may tighten or widen the derived fit, but never past the
-/// activation+graph reserve (`SGLANG_ACTIVATION_RESERVE_MIB` receipts)
-/// or the hard band — an over-budget pin is a mid-boot crash (capture
-/// assert → `kill_process_tree` → opaque 502), never a usable
-/// configuration.
+/// mem-fraction-static: the anti-OOM heart. sglang bounds only the
+/// static pool (weights + draft + KV) by the fraction; every dynamic
+/// allocation — CUDA graphs, the spec verify/prewarm chain,
+/// activations — lives in the `(1-frac)` remainder. So the spec
+/// reserve LOWERS THE CEILING: `frac <= (vram - reserves) / vram`
+/// guarantees the dynamic remainder is at least the reserves.
+/// (Charging the reserve into the numerator grows the static pool and
+/// shrinks the dynamic side — that inversion is what OOM'd the
+/// 2026-10-16 DFLASH spawn at `prewarm_sampling`.)
+/// Derived from what actually stays device-side (weights minus the
+/// EMITTED offload — pin or ladder-derived — plus KV). An explicit pin
+/// still passes governance: it may tighten or widen the derived fit,
+/// but never past the activation+graph reserve
+/// (`SGLANG_ACTIVATION_RESERVE_MIB` receipts) or the hard band — an
+/// over-budget pin is a mid-boot crash (capture assert ->
+/// `kill_process_tree` -> opaque 502), never a usable configuration.
 #[allow(clippy::too_many_arguments)]
 fn sglang_push_mem_fraction(
     input: &ProfileInput<'_>,
@@ -5818,19 +5943,32 @@ fn sglang_push_mem_fraction(
     geom: &SglangFitGeometry,
     kv_est_bytes: Option<u64>,
     offload_total_gb: f32,
-    spec_verify_reserve_mib: u64,
+    spec_dynamic_reserve_mib: u64,
 ) {
     let (vram, weights) = (geom.vram, geom.weights);
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let gpu_static = weights.saturating_sub((f64::from(offload_total_gb) * 1e9).round() as u64);
     let static_demand = gpu_static
         .saturating_add(kv_est_bytes.unwrap_or(0))
-        .saturating_add(Hardware::bytes(spec_verify_reserve_mib));
+        .saturating_add(geom.draft_weights);
+    // The dynamic side = vram * (1 - frac) must hold activations +
+    // graphs + the spec chain. Guaranteeing that means the RESERVE
+    // LOWERS THE CEILING (frac <= 1 - reserves/vram) — never a
+    // numerator add or a shrunken denominator: both RAISE frac, grow
+    // the static pool, and starve the dynamic side they claim to
+    // protect (that inversion OOM'd the 2026-10-16 DFLASH spawn at
+    // prewarm_sampling).
     let ceiling = if vram > 0 {
-        let reserve_vram = vram.saturating_sub(Hardware::bytes(SGLANG_ACTIVATION_RESERVE_MIB));
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-        let frac = (reserve_vram as f64 / vram as f64) as f32;
-        frac.clamp(SGLANG_MEM_FRACTION_MIN, SGLANG_MEM_FRACTION_MAX)
+        let reserves = Hardware::bytes(SGLANG_ACTIVATION_RESERVE_MIB)
+            .saturating_add(Hardware::bytes(spec_dynamic_reserve_mib));
+        if vram > reserves {
+            let reserve_vram = vram - reserves;
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let frac = (reserve_vram as f64 / vram as f64) as f32;
+            frac.clamp(SGLANG_MEM_FRACTION_MIN, SGLANG_MEM_FRACTION_MAX)
+        } else {
+            SGLANG_MEM_FRACTION_MIN
+        }
     } else {
         SGLANG_MEM_FRACTION_MAX
     };
@@ -5841,10 +5979,18 @@ fn sglang_push_mem_fraction(
                 "sglang.mem_fraction_static {pin:.3} clamped to \
                  {governed:.3}: the pin must leave \
                  {SGLANG_ACTIVATION_RESERVE_MIB} MiB of VRAM for \
-                 activations and CUDA-graph capture (receipt: \
+                 activations and CUDA-graph capture{} (receipt: \
                  0.90 on an 8 GiB card crashed in graph capture; \
                  sglang then SIGKILLs itself and the gateway \
-                 surfaces a 502)"
+                 surfaces a 502)",
+                if spec_dynamic_reserve_mib > 0 {
+                    format!(
+                        " plus {spec_dynamic_reserve_mib} MiB for the \
+                         speculative verify/prewarm chain"
+                    )
+                } else {
+                    String::new()
+                }
             ));
         }
         governed
@@ -5865,14 +6011,34 @@ fn sglang_push_mem_fraction(
     }
 }
 
-/// Extra static VRAM held back when speculation engages: every verify
-/// round re-attends the drafted tokens, so the KV pool and the
-/// draft/verify CUDA graphs grow beyond the dense ladder's accounting
-/// (self-drafting algorithms pay it too — the drafts are free, the
-/// verification is not). A conservative pre-receipt margin until the
-/// live concurrency-ladder run calibrates it; too much only costs KV
-/// headroom, too little is an OOM at graph capture.
-const SGLANG_SPEC_VERIFY_RESERVE_MIB: u64 = 256;
+/// VRAM that must stay OUT of the static pool when speculation engages:
+/// sglang bounds only weights+KV by `mem-fraction-static` — everything
+/// else (verify CUDA graphs, the DFLASH prewarm sampling chain, whose
+/// `(rows, vocab)` fp32 tensors scale with the decode-graph ceiling)
+/// allocates from the `(1-frac)` remainder (sglang 0.5.21
+/// `kv_cache_configurator._profile_available_bytes`: pool = free -
+/// pre*(1-frac)). Sized 256 MiB by two independent receipts:
+/// (a) the 2026-10-16 through-blazar prewarm OOM happened at an
+/// UNBOUNDED ceiling of 201 — after the ladder's x8 graph-ceiling
+/// division (tight cards derive 4-25) and the draft-weights static
+/// charge, the residual dynamic spec need is the prewarm tail, a few
+/// hundred MiB at these ceilings; (b) the follow-up live runs pushed
+/// the fraction ceiling below sglang's OWN minimum-viable floor
+/// (derive capped at 0.605 vs floor 0.6076) — the engine's live
+/// budget admitted `2000 MiB activations + ~300` as viable, i.e. it
+/// converges with `ACTIVATION_RESERVE` + 256, not + 1024. Too much
+/// reserve does not merely cost KV headroom: on tight cards it makes
+/// the clamp emit a fraction BELOW the engine floor and the spawn
+/// dies at `alloc_memory_pool`.
+pub const SGLANG_SPEC_DYNAMIC_RESERVE_MIB: u64 = 256;
+
+/// Verify-step CUDA graphs cost roughly the draft-token multiple of a
+/// dense decode graph: the 2026-10-16 receipt measured ~23 MiB per
+/// captured size beside 3.5 GiB on-GPU weights (23 buckets, 0.52 GiB
+/// verify pool) vs the dense slope's 2.51 MiB/size — a ~9x factor for
+/// the b16 draft class. First-order 8x until the concurrency-ladder
+/// run calibrates per algorithm.
+const SGLANG_SPEC_GRAPH_MULT: f64 = 8.0;
 
 /// Captured-graph memory slope: MiB of CUDA-graph pool per captured batch
 /// size, per GiB of weights. Calibrated from a live receipt — the bs-256
@@ -5893,14 +6059,23 @@ fn sglang_graph_per_size_mib(weights: u64) -> f64 {
 /// Memory-bound ceiling for the cuda-graph capture list: spend at most
 /// half the post-weights/KV headroom on captured graphs, never below the
 /// historical flat floor of 4, never above the upstream default of 256.
+/// Spec lanes pay the verify multiplier per captured size — the capture
+/// replays draft-token verification, not one dense step (2026-10-16
+/// receipt: ~23 MiB/size observed vs the dense 2.51).
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn sglang_graph_bs_ceiling(headroom_bytes: u64, weights: u64) -> u32 {
+fn sglang_graph_bs_ceiling(headroom_bytes: u64, weights: u64, spec_engaged: bool) -> u32 {
     let headroom_mib = f64::from(u32::try_from(headroom_bytes / (1024 * 1024)).unwrap_or(u32::MAX));
-    ((headroom_mib * 0.5) / sglang_graph_per_size_mib(weights)).clamp(4.0, 256.0) as u32
+    let per_size = sglang_graph_per_size_mib(weights)
+        * if spec_engaged {
+            SGLANG_SPEC_GRAPH_MULT
+        } else {
+            1.0
+        };
+    ((headroom_mib * 0.5) / per_size).clamp(4.0, 256.0) as u32
 }
 
 /// Chunked-prefill size the ladder plans around when nothing pins it.
@@ -6041,6 +6216,7 @@ fn sglang_effective_chunked_prefill(input: &ProfileInput<'_>, tun: &SglangTuning
 /// it. Explicit tuning pins (`cuda_graph_max_bs` / `cuda_graph_bs`) still win
 /// outright. Chunked prefill stays 2048 (the 8192 default's activation
 /// peaks are the Tier B/C hazard).
+#[allow(clippy::too_many_arguments)]
 fn sglang_tight_fit_knobs(
     argv: &mut Vec<String>,
     flags: &std::collections::BTreeSet<String>,
@@ -6048,12 +6224,21 @@ fn sglang_tight_fit_knobs(
     headroom_bytes: u64,
     weights: u64,
     tun: &SglangTuning,
+    spec_engaged: bool,
     warnings: &mut Vec<String>,
 ) {
     // Explicit pins win: either a max-bs scalar or an explicit capture
     // list suppresses the ladder's derived value.
     if tun.cuda_graph_max_bs.is_none() && tun.cuda_graph_bs.is_none() {
-        let ceiling = sglang_graph_bs_ceiling(headroom_bytes, weights);
+        // The spec chain (verify graphs + prewarm sampling) allocates
+        // from the same post-weights/KV headroom before any capture
+        // list may spend it.
+        let spendable = headroom_bytes.saturating_sub(if spec_engaged {
+            Hardware::bytes(SGLANG_SPEC_DYNAMIC_RESERVE_MIB)
+        } else {
+            0
+        });
+        let ceiling = sglang_graph_bs_ceiling(spendable, weights, spec_engaged);
         let bs = if slots == 0 {
             ceiling
         } else {
@@ -6073,8 +6258,13 @@ fn sglang_tight_fit_knobs(
             #[allow(clippy::cast_possible_truncation)]
             let headroom_mib = u32::try_from(headroom_bytes / (1024 * 1024)).unwrap_or(u32::MAX);
             warnings.push(format!(
-                "fit ladder: cuda-graph capture list <= {bs} (headroom {headroom_mib} MiB after weights+KV; {:.2} MiB per graph size at this model size)",
-                sglang_graph_per_size_mib(weights)
+                "fit ladder: cuda-graph capture list <= {bs} (headroom {headroom_mib} MiB after weights+KV; {:.2} MiB per graph size at this model size{})",
+                sglang_graph_per_size_mib(weights),
+                if spec_engaged {
+                    format!(", x{SGLANG_SPEC_GRAPH_MULT:.0} verify multiplier and {SGLANG_SPEC_DYNAMIC_RESERVE_MIB} MiB spec-chain reserve already deducted")
+                } else {
+                    String::new()
+                }
             ));
         }
         push_tuned(
@@ -6102,6 +6292,13 @@ fn sglang_tight_fit_knobs(
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn ceil_gb(bytes: u64) -> f32 {
     (bytes as f64 / 1e9).ceil().max(0.0) as f32
+}
+
+/// GB (f32 flag grammar) to bytes, 1e9-based like the engine's own GB
+/// units — not GiB — so admission arithmetic matches the emitted flag.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn gb_to_bytes(gb: f32) -> u64 {
+    (f64::from(gb) * 1e9).round() as u64
 }
 
 fn bytes_gib(bytes: u64) -> f64 {
@@ -12345,6 +12542,48 @@ mod tests {
     }
 
     #[test]
+    fn unit__sglang_effective_offload_bytes__pin_wins_quantized_up() {
+        // 4.5 pin -> ceil 5 GB, 1e9-based like the emitted flag: the
+        // admission subtraction must equal the argv the spawn runs with.
+        let mib = |m: u64| m * 1024 * 1024;
+        assert_eq!(
+            sglang_effective_offload_bytes(mib(9000), mib(8000), Some(4.5)),
+            5_000_000_000
+        );
+        // A whole pin passes through untouched.
+        assert_eq!(
+            sglang_effective_offload_bytes(mib(9000), mib(8000), Some(4.0)),
+            4_000_000_000
+        );
+    }
+
+    #[test]
+    fn unit__sglang_effective_offload_bytes__unpinned_derive_never_refuses() {
+        // Unpinned: offload = ceil(floor - largest budget), so the
+        // post-offload demand is always <= that budget — only a pin can
+        // leave more on the GPU than the ladder would. The 2026-10-16
+        // false-refusal class (floor 8.7 GiB vs 8.59 GiB card) dies here.
+        let mib = |m: u64| m * 1024 * 1024;
+        for (floor, budget) in [
+            (mib(9000), mib(8000)),
+            (mib(12_621), mib(8188)),
+            (mib(8680), mib(8188)),
+            (mib(20_000), mib(8188)),
+        ] {
+            let offload = sglang_effective_offload_bytes(floor, budget, None);
+            assert!(
+                floor.saturating_sub(offload) <= budget,
+                "floor {floor} with offload {offload} must fit budget {budget}"
+            );
+        }
+        // Fits empty-handed: no deficit, no offload.
+        assert_eq!(
+            sglang_effective_offload_bytes(mib(7900), mib(8188), None),
+            0
+        );
+    }
+
+    #[test]
     fn unit__estimate_kv_vram_charge__floor_vs_full() {
         // Posture-aware truth, two receipts. Geometry: 57344 B/token
         // x 16384 = 896 MiB full-charge. (a) Relocatable posture
@@ -16295,6 +16534,66 @@ mod tests {
     }
 
     #[test]
+    fn unit__sglang_spec__mem_fraction_charges_draft_weights() {
+        // Draft weights are static-side (sglang counts them in
+        // pre_model_load before sizing the KV pool). With a readable
+        // draft dir the derive must charge them; an unreadable one
+        // fails open, draft-free, with a teaching warn. 2026-10-16
+        // receipt: a draft-free derive emitted 0.605 against the
+        // engine's 0.6076 minimum-viable floor and the spawn died at
+        // alloc_memory_pool.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let draft_dir =
+            std::env::temp_dir().join(format!("blazar-test-draft-charge-{}", std::process::id()));
+        std::fs::create_dir_all(&draft_dir).unwrap();
+        let draft_file = draft_dir.join("draft.safetensors");
+        // Sparse file: the charge reads metadata length, not content.
+        std::fs::File::create(&draft_file)
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        // Toggle the knob lane itself: dflash without spec_draft_path
+        // spawns dense (warn + no charge); with it, the draft weights
+        // land in static_demand and the fraction rises by their share.
+        let tuning_of = |draft: Option<&str>| crate::config::SglangTuning {
+            spec_algorithm: Some("dflash".into()),
+            spec_draft_path: draft.map(str::to_string),
+            ..crate::config::SglangTuning::default()
+        };
+        let frac_of = |tuning: &crate::config::SglangTuning| {
+            let overlay = ModelOverride {
+                ctx: Some(32_768),
+                sglang: Some(tuning.clone()),
+                ..DEFAULT_OVERLAY.clone()
+            };
+            let mut inp = sglang_input(&hf, &hw, &cfg, 6_000 * MIB);
+            inp.overlay = &overlay;
+            inp.draft_path = None;
+            let p = compile(&inp, &TuningOverrides::default()).unwrap();
+            p.argv
+                .windows(2)
+                .find(|w| w[0] == "--mem-fraction-static")
+                .map(|w| w[1].parse::<f64>().unwrap())
+                .unwrap()
+        };
+        let missing = frac_of(&tuning_of(None));
+        let charged = frac_of(&tuning_of(draft_dir.to_str()));
+        assert!(
+            charged > missing,
+            "draft-charged fraction {charged} must exceed draft-free {missing}"
+        );
+        let expected_gain = 1024.0 / 12_000.0;
+        assert!(
+            (charged - missing - expected_gain).abs() < 0.005,
+            "fraction must rise by the draft share (~{expected_gain:.3}): got {charged} vs {missing}"
+        );
+        std::fs::remove_file(&draft_file).ok();
+        std::fs::remove_dir(&draft_dir).ok();
+    }
+
+    #[test]
     fn unit__sglang_spec__dflash_with_draft_dir_engages() {
         // The DFLASH knob lane: spec_algorithm = "dflash" +
         // spec_draft_path (safetensors dir) emits the algorithm, the
@@ -16483,20 +16782,35 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)] // fixture MiB math, display-only assertion
     fn unit__sglang_spec__mem_fraction_reserves_when_engaged() {
-        // Engaged speculation must reserve MORE static VRAM (verify-KV +
-        // draft graphs) than the identical dense spawn: the fraction is
-        // demand-derived, so engaged > dense by the reserve margin.
+        // sglang bounds only weights+KV by mem-fraction-static; the spec
+        // chain (verify CUDA graphs + DFLASH prewarm sampling) allocates
+        // from the (1-frac) DYNAMIC side. An engaged spawn must therefore
+        // leave MORE dynamic VRAM than the identical dense spawn: a LOWER
+        // fraction, by at least the reserve. (2026-10-16 receipt: the
+        // old numerator-charge form raised frac, shrank the dynamic pool,
+        // and the spawn OOM'd 446 MiB short at prewarm_sampling.)
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
-        let frac_of = |tuning: Option<crate::config::SglangTuning>| {
+        // The reserve lives in the CEILING, and the ceiling binds where
+        // the ladder's own budget never goes: an explicit pin (the live
+        // 2026-10-16 receipts were pin postures). Pin both runs at the
+        // same over-budget fraction; the dense run must clamp to
+        // (12000-2000)/12000 = 0.833 and the engaged run to
+        // (12000-2256)/12000 = 0.812 — a delta of exactly the reserve
+        // share. (Unpinned derives never reach either ceiling inside
+        // Tiers A/B: the tier budget already sits under the ceiling, so
+        // only a pin exercises this governance.)
+        let weights_bytes = 6_000 * MIB;
+        let frac_of = |tuning: crate::config::SglangTuning| {
             let overlay = ModelOverride {
                 ctx: Some(32_768),
-                sglang: tuning,
+                sglang: Some(tuning),
                 ..DEFAULT_OVERLAY.clone()
             };
-            let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+            let mut inp = sglang_input(&hf, &hw, &cfg, weights_bytes);
             inp.overlay = &overlay;
             let p = compile(&inp, &TuningOverrides::default()).unwrap();
             p.argv
@@ -16505,14 +16819,120 @@ mod tests {
                 .map(|w| w[1].parse::<f64>().unwrap())
                 .unwrap()
         };
-        let dense = frac_of(None);
-        let engaged = frac_of(Some(crate::config::SglangTuning {
+        let pin = 0.93;
+        let dense = frac_of(crate::config::SglangTuning {
+            mem_fraction_static: Some(pin),
+            ..crate::config::SglangTuning::default()
+        });
+        let engaged = frac_of(crate::config::SglangTuning {
+            mem_fraction_static: Some(pin),
             spec_algorithm: Some("ngram".into()),
             ..crate::config::SglangTuning::default()
-        }));
+        });
         assert!(
-            engaged > dense,
-            "engaged fraction {engaged} must exceed dense {dense}"
+            engaged < dense,
+            "engaged fraction {engaged} must sit below dense {dense}"
+        );
+        // The engaged clamp must bind by the spec share of the reserve
+        // (see fixture comment above for the arithmetic).
+        let dynamic_gain = (dense - engaged) * (12_000.0 * MIB as f64);
+        assert!(
+            dynamic_gain >= (SGLANG_SPEC_DYNAMIC_RESERVE_MIB as f64) * 1024.0 * 1024.0 * 0.9,
+            "engaged spawn must free >= the spec reserve of dynamic VRAM, freed {dynamic_gain} bytes"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped fixture math
+    fn unit__sglang__spec_lane_ceiling_pays_verify_mult_and_reserve() {
+        // The ceiling fn's contract is the verify multiplier: same
+        // headroom, same weights — the spec lane's capture ceiling lands
+        // at ~1/SGLANG_SPEC_GRAPH_MULT of the dense derive (both clamps
+        // respected). The spec-chain reserve deduction happens one level
+        // up, in `sglang_tight_fit_knobs`, before this fn is called.
+        let weights = 4_000 * MIB;
+        let headroom = 1_010 * MIB;
+        let dense = sglang_graph_bs_ceiling(headroom, weights, false);
+        let spec = sglang_graph_bs_ceiling(headroom, weights, true);
+        let per_size_dense = sglang_graph_per_size_mib(weights);
+        let per_size_spec = sglang_graph_per_size_mib(weights) * SGLANG_SPEC_GRAPH_MULT;
+        assert_eq!(dense, ((505.0) / per_size_dense).clamp(4.0, 256.0) as u32);
+        assert_eq!(spec, ((505.0) / per_size_spec).clamp(4.0, 256.0) as u32);
+        assert!(
+            spec < dense,
+            "spec ceiling {spec} must sit below dense {dense}"
+        );
+    }
+
+    #[test]
+    fn unit__sglang__offload_pin_emits_single_flag() {
+        // A cpu_offload_gb pin that also lands the ladder in Tier C
+        // used to emit --cpu-offload-gb twice (pin site + Tier C site).
+        // The pin site owns the flag: exactly one occurrence in argv.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                cpu_offload_gb: Some(4.0),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let count = p.argv.iter().filter(|a| *a == "--cpu-offload-gb").count();
+        assert_eq!(
+            count, 1,
+            "argv carried the flag {count} times: {:?}",
+            p.argv
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "4")
+        );
+    }
+
+    #[test]
+    fn unit__sglang__spec_tier_a_still_bounds_graph_ceiling() {
+        // Tier A (weights + f16 KV fit with room to spare) historically
+        // emitted no graph ceiling, leaving upstream's default 256 —
+        // fine dense, an OOM class on spec lanes where verify graphs
+        // cost the draft multiple. Engaged Tier A must emit an explicit
+        // bounded ceiling; dense Tier A keeps the historical silence
+        // (behavior preserved for the non-targeted path).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let has_ceiling = |tuning: Option<crate::config::SglangTuning>| {
+            let overlay = ModelOverride {
+                ctx: Some(4_096),
+                sglang: tuning,
+                ..DEFAULT_OVERLAY.clone()
+            };
+            let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+            inp.overlay = &overlay;
+            inp.supported_flags = &SGLANG_FLAGS_0521;
+            let p = compile(&inp, &TuningOverrides::default()).unwrap();
+            p.argv
+                .windows(2)
+                .find(|w| w[0] == "--cuda-graph-max-bs-decode")
+                .map(|w| w[1].parse::<u32>().unwrap())
+        };
+        assert!(
+            has_ceiling(Some(crate::config::SglangTuning {
+                spec_algorithm: Some("ngram".into()),
+                ..crate::config::SglangTuning::default()
+            }))
+            .is_some(),
+            "engaged Tier A must pin an explicit decode-graph ceiling"
+        );
+        assert!(
+            has_ceiling(None).is_none(),
+            "dense Tier A keeps its historical no-ceiling argv"
         );
     }
 
@@ -16927,6 +17347,46 @@ mod tests {
             p.argv
                 .windows(2)
                 .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.582")
+        );
+    }
+
+    #[test]
+    fn unit__sglang__fractional_offload_pin_rounds_up_to_whole_gb() {
+        // The engine flag is integer-GB (0.5.21 argparse: "invalid int
+        // value: '5.5'", live 2026-10-16) — a fractional pin must emit
+        // whole GB rounded UP (under-offloading OOMs the spawn) and
+        // teach, never silently pass the fraction through.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                cpu_offload_gb: Some(2.5),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "3"),
+            "fractional pin must emit ceil, got {:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2.5"),
+            "a fraction would be rejected by the engine's argparse"
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("rounded up to 3")),
+            "the quantize must teach: {:?}",
+            p.warnings
         );
     }
 

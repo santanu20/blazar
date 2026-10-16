@@ -1493,10 +1493,16 @@ pub struct SglangTuning {
     /// pin wins over the profile compiler's VRAM ladder.
     pub kv_cache_dtype: Option<String>,
     /// `--mem-fraction-static` (0.05..=0.95). Explicit pin wins over the
-    /// ladder's derived fraction.
+    /// ladder's derived fraction, but passes reserve governance: it is
+    /// clamped to a ceiling that keeps activations, CUDA-graph capture,
+    /// and (on spec lanes) the verify/prewarm chain inside the
+    /// `(1-frac)` dynamic remainder — the engine bounds only
+    /// weights+draft+KV by the fraction.
     pub mem_fraction_static: Option<f32>,
     /// `--cpu-offload-gb`: weights GBs pinned to host RAM (low-VRAM
-    /// ladder engages this automatically; an explicit pin wins).
+    /// ladder engages this automatically; an explicit pin wins). The
+    /// engine flag is integer-GB — fractional pins round UP at emission
+    /// with a teaching warning.
     pub cpu_offload_gb: Option<f32>,
     /// `--page-size` (tokens per KV page).
     pub page_size: Option<u64>,

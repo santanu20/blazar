@@ -76,6 +76,46 @@ pub fn resolve_draft_path(store: &Store, model: &str, spec_mode: &str) -> Option
     store.get_model(&draft_name).ok().flatten().map(|r| r.path)
 }
 
+/// Spec engagement for sglang admission: which draft dir (if any) the
+/// spawn will charge and whether speculative decoding engages at all.
+/// Mirrors `push_sglang_speculative` precedence — the knob lane
+/// (`spec_algorithm`) owns the spawn, else the resolved catalog pair;
+/// a GGUF path degrades to dense with a compile-side warning, so
+/// admission charges nothing for it either. Flag gates match compile:
+/// without the engine's spec flags the spawn runs dense.
+fn sglang_engaged_draft<'a>(
+    tun: &'a blazar_core::config::SglangTuning,
+    catalog_draft: Option<&'a str>,
+    spec_flag: bool,
+    draft_flag: bool,
+) -> (Option<&'a str>, bool) {
+    let is_gguf = |p: &str| {
+        p.rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("gguf"))
+    };
+    match tun.spec_algorithm.as_deref() {
+        // Draft-free self-speculation: engages with just the algorithm
+        // flag, no draft weights to charge.
+        Some("ngram") => (None, spec_flag),
+        Some("dflash") => {
+            // Both engine flags gate the draft: without either one
+            // compile degrades dense and the draft never loads.
+            let draft = tun
+                .spec_draft_path
+                .as_deref()
+                .filter(|p| !p.is_empty() && !is_gguf(p) && spec_flag && draft_flag);
+            (draft, draft.is_some())
+        }
+        // Unknown spellings warn+dense at compile (config validation
+        // rejects them at load) — nothing extra charges here.
+        Some(_) => (None, false),
+        None => {
+            let draft = catalog_draft.filter(|p| !is_gguf(p) && spec_flag && draft_flag);
+            (draft, draft.is_some())
+        }
+    }
+}
+
 /// Spec-mode resolution order for a spawn: a queued per-request override
 /// (`options.spec` / `X-Blazar-Spec`, consume-once) beats the model
 /// overlay, which beats the global config. Pure so the tiering is
@@ -4268,22 +4308,13 @@ impl Supervisor {
         // GPU charges MEASURED resident footprints (settle report) plus
         // the incoming model's admission floor — weights + projector +
         // KV floor + spawn overhead, the same standing charges the
-        // unified gpu-layers pin trusts. Weights-only planning
+        // unified gpu-layers pin trusts (sglang lane: plus the engaged
+        // draft pair and spec verify reserve, minus the host offload
+        // the spawn actually runs with). Weights-only planning
         // oversubscribed an 8 GiB card on 2026-09-11 (measured 7302 +
         // 977 actual vs 5854 weights-sum → NVRM NO_MEMORY crash-loop);
         // a cold box always admits one model, and the J3 spawn guard
         // owns the honest-refusal path for loads that cannot fit at all.
-        let incoming_bytes = {
-            let mmproj_bytes = model
-                .mmproj_path
-                .as_deref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map_or(0, |m| m.len());
-            blazar_core::profile::admission_floor_bytes(
-                u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX),
-                mmproj_bytes,
-            )
-        };
         // Parallelism-spanning preflight: will this spawn SHARD across
         // cards instead of landing on one? Per-card admission (and the
         // ModelTooLarge per-card verdict) is then the wrong question —
@@ -4298,6 +4329,71 @@ impl Supervisor {
             .sglang
             .clone()
             .unwrap_or_else(|| self.config.sglang.clone());
+        // Admission floor for the incoming spawn, and the offload /
+        // draft facts behind it. The sglang lane charges what the spawn
+        // will ACTUALLY put on the GPU: standing floor + engaged draft
+        // weights + spec verify reserve − the host offload it runs with
+        // (pin or Tier C derive, the same math the argv emission uses).
+        // Before 2026-10-16 both directions lied: a 4 GiB offload pin
+        // was ignored (7.5 GiB model refused as an 8.7 GiB "impossible
+        // floor" while its real posture needed ~6 GiB), and the draft
+        // pair loaded UNCOUNTED (oversubscribe risk). Other lanes keep
+        // the dense floor. `j3`-prefixed facts feed the spawn-time
+        // guards below so they judge the same posture.
+        let mmproj_bytes = model
+            .mmproj_path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(0, |m| m.len());
+        let row_weights = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX);
+        let (incoming_bytes, sglang_offload_bytes, j3_draft_bytes) = if sglang_lane {
+            let manifest = engine.capabilities();
+            let (draft_dir, spec_engaged) = sglang_engaged_draft(
+                &tun_probe,
+                draft_path.as_deref(),
+                manifest.flags.contains("--speculative-algorithm"),
+                manifest.flags.contains("--speculative-draft-model-path"),
+            );
+            let draft_bytes = draft_dir.map_or(0, |p| {
+                blazar_core::hfmeta::root_safetensors_bytes(std::path::Path::new(p)).unwrap_or_else(
+                    || {
+                        tracing::warn!(
+                            draft = p,
+                            "sglang draft dir unreadable at admission — charging dense-only"
+                        );
+                        0
+                    },
+                )
+            });
+            // Same spec-chain reserve the compile-side ladder deducts
+            // (verify graphs + prewarm sampling live in the dynamic
+            // pool); charged here as spawn demand so the gate agrees
+            // with what actually launches.
+            let reserve_bytes = u64::from(spec_engaged).saturating_mul(
+                blazar_core::profile::SGLANG_SPEC_DYNAMIC_RESERVE_MIB * 1024 * 1024,
+            );
+            let standing = blazar_core::profile::admission_floor_bytes(row_weights, mmproj_bytes)
+                .saturating_add(draft_bytes)
+                .saturating_add(reserve_bytes);
+            let largest_budget = self
+                .admission_candidates(name)
+                .iter()
+                .filter_map(|c| self.device_budget_bytes(c))
+                .max()
+                .unwrap_or(0);
+            let offload = blazar_core::profile::sglang_effective_offload_bytes(
+                standing,
+                largest_budget,
+                tun_probe.cpu_offload_gb,
+            );
+            (standing.saturating_sub(offload), offload, draft_bytes)
+        } else {
+            (
+                blazar_core::profile::admission_floor_bytes(row_weights, mmproj_bytes),
+                0,
+                0,
+            )
+        };
         let manual_tp = if sglang_lane {
             tun_probe.tp_size.filter(|n| *n > 1)
         } else {
@@ -4444,12 +4540,22 @@ impl Supervisor {
                             let per_rank = gib(incoming_bytes / u64::from(n));
                             format!(" even sharded across {n} cards ({per_rank:.1} GiB per rank)")
                         });
+                        #[allow(clippy::cast_precision_loss)] // display-only GB rounding
+                        let offload_note = if sglang_offload_bytes > 0 {
+                            format!(
+                                " after {:.1} GB host offload",
+                                sglang_offload_bytes as f64 / 1e9
+                            )
+                        } else {
+                            String::new()
+                        };
                         return Err(SupervisionError::ModelTooLarge(format!(
-                            "{name}: admission floor {:.1} GiB exceeds {}{} \
+                            "{name}: admission floor {:.1} GiB{} exceeds {}{} \
                              even with the box empty — waiting for a slot can never change \
                              this. Use a smaller quant (`blazar fit`), lower the ctx/slots, \
                              or serve on a larger card",
                             gib(incoming_bytes),
+                            offload_note,
                             if fleet_spanning {
                                 format!(
                                     "every GPU budget combined ({:.1} GiB{})",
@@ -4475,16 +4581,21 @@ impl Supervisor {
         // engine will thrash swap for minutes instead of loading — fail
         // fast with a named error. Floor = half the model + 512 MiB
         // (zero-false-positive: mmap streaming needs roughly that
-        // resident even in the best case).
+        // resident even in the best case) PLUS the sglang host offload:
+        // offloaded weights live resident in RAM, and an offload pin
+        // sized against total rather than AVAILABLE RAM OOM'd this box
+        // mid-load on 2026-10-16.
         if self.config.spawn_mem_guard {
             let avail = crate::probe::mem_available_mib();
             let model_mib = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX) / (1024 * 1024);
-            let need = (model_mib / 2) + 512;
+            let offload_mib = sglang_offload_bytes / (1024 * 1024);
+            let need = (model_mib / 2) + 512 + offload_mib;
             if avail < need {
                 return Err(SupervisionError::InsufficientMemory(format!(
                     "insufficient memory to load {:?}: MemAvailable {avail} MiB < floor {need} MiB \
-                     (model {} MiB). Stop co-resident engines (blazar ps / ollama stop) or free RAM; \
-                     disable this guard with spawn_mem_guard = false",
+                     (model {} MiB + {offload_mib} MiB host offload). Stop co-resident engines \
+                     (blazar ps / ollama stop) or free RAM; disable this guard with \
+                     spawn_mem_guard = false",
                     name,
                     model.bytes / (1024 * 1024)
                 )));
@@ -4507,9 +4618,11 @@ impl Supervisor {
             None
         };
         // Spawn-time VRAM preflight (J3): warn when even the weights
-        // alone exceed free VRAM — the child will either spill layers to
-        // CPU (slow) or die mid-load. Teaching warn only: partial offload
-        // is legitimate, probe failure is skipped, never blocks a spawn.
+        // the spawn keeps ON the GPU exceed free VRAM — for the sglang
+        // lane that is weights + draft pair − host offload, the same
+        // posture admission judged (raw weights would cry wolf on every
+        // offloaded spawn). Teaching warn only: partial offload is
+        // legitimate, probe failure is skipped, never blocks a spawn.
         // Free VRAM counts the reachable rpc fleet too: a model that
         // fits only with remote workers is the intended configuration,
         // not a spill.
@@ -4523,7 +4636,10 @@ impl Supervisor {
                 .map(|g| g.free_mib)
                 .sum::<u64>()
                 .saturating_add(rpc_pool.free_bytes / (1024 * 1024));
-            let weights_mib = model_bytes / (1024 * 1024);
+            let weights_mib = model_bytes
+                .saturating_add(j3_draft_bytes)
+                .saturating_sub(sglang_offload_bytes)
+                / (1024 * 1024);
             if free_vram > 0 && weights_mib > free_vram * 95 / 100 {
                 tracing::warn!(
                     model = name,
@@ -9009,6 +9125,66 @@ mod routing_tests {
         // llama.cpp: -m is not a served-name flag — flat name applies.
         let llamacpp = vec!["-m".to_string(), "m.gguf".to_string()];
         assert_eq!(super::warm_peg_served_model(&llamacpp), None);
+    }
+
+    #[test]
+    fn unit__sglang_engaged_draft__mirrors_compile_precedence() {
+        use blazar_core::config::SglangTuning;
+        let dflash = SglangTuning {
+            spec_algorithm: Some("dflash".into()),
+            spec_draft_path: Some("/models/qwen3-4b-dflash-b16.d".into()),
+            ..SglangTuning::default()
+        };
+        // Knob lane owns the spawn: draft charged, spec engaged.
+        assert_eq!(
+            super::sglang_engaged_draft(&dflash, Some("/models/catalog-pair.d"), true, true),
+            (Some("/models/qwen3-4b-dflash-b16.d"), true)
+        );
+        // Missing engine flags: compile degrades dense, so does admission.
+        assert_eq!(
+            super::sglang_engaged_draft(&dflash, None, false, true),
+            (None, false)
+        );
+        // ngram drafts from the context: engaged, nothing to charge.
+        let ngram = SglangTuning {
+            spec_algorithm: Some("ngram".into()),
+            ..SglangTuning::default()
+        };
+        assert_eq!(
+            super::sglang_engaged_draft(&ngram, None, true, false),
+            (None, true)
+        );
+        // No knob: the catalog pair rides in when the engine can serve it.
+        assert_eq!(
+            super::sglang_engaged_draft(
+                &SglangTuning::default(),
+                Some("/models/qwen3-8b-draft.d"),
+                true,
+                true
+            ),
+            (Some("/models/qwen3-8b-draft.d"), true)
+        );
+        // GGUF draft: compile refuses dense (teaching warn), admission
+        // charges nothing.
+        assert_eq!(
+            super::sglang_engaged_draft(
+                &SglangTuning::default(),
+                Some("/models/draft.gguf"),
+                true,
+                true
+            ),
+            (None, false)
+        );
+        // Knob dflash without a path: config validation rejects at load;
+        // the defensive net degrades dense.
+        let orphan = SglangTuning {
+            spec_algorithm: Some("dflash".into()),
+            ..SglangTuning::default()
+        };
+        assert_eq!(
+            super::sglang_engaged_draft(&orphan, None, true, true),
+            (None, false)
+        );
     }
 
     #[tokio::test]
