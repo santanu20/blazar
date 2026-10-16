@@ -250,15 +250,23 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     // passthrough keeps probe (--) and spawn argv identical in shape.
     // venv/bin goes first on PATH so JIT build tools shipped inside the
     // venv (ninja — flashinfer compiles kernels at runtime) resolve.
-    // The sglang wheels pull a `nvidia-cuda-nvcc` wheel whose nvcc MATCHES
-    // the bundled CUDA torch: put its bin dir ahead of the system PATH so
-    // flashinfer JIT self-hosts instead of dying on a system nvcc that
-    // mismatches the wheels (e.g. system 12.0 vs cu13 torch).
-    // SGLANG_CACHE_DIR scopes sglang's third-party JIT caches (triton,
-    // inductor, nv, flashinfer — all derived from it since v0.5.19,
-    // setdefault semantics) to the engine dir: compiled kernels survive
-    // restarts AND `engine rm` reclaims them; `:-` keeps an explicit
-    // user override in charge.
+    // The pin step above aligns the `nvidia-cuda-nvcc`/`nvidia-nvvm`/
+    // `nvidia-cuda-crt` trio with the bundled CUDA torch: put the toolkit's
+    // bin dir ahead of the system PATH so flashinfer JIT self-hosts instead
+    // of dying on a system nvcc that mismatches the wheels (e.g. system
+    // 12.0 vs cu13 torch).
+    // Two engine-scoped caches (see `wrapper_script`): SGLANG_CACHE_DIR
+    // covers sglang's own JIT caches (triton, inductor, nv — derived
+    // from it since v0.5.19). flashinfer is the exception: sglang only
+    // setdefaults FLASHINFER_WORKSPACE_BASE inside
+    // redirect_third_party_caches(), whose own docstring admits the
+    // redirect "silently does nothing if FlashInfer was imported — it
+    // resolves its workspace at import time"; any import order that
+    // touches flashinfer first freezes its cache at
+    // $HOME/.cache/flashinfer where `engine rm` cannot reclaim it (live
+    // 2026-10-16: kernels landed in BOTH dirs during the same runs).
+    // Exporting the base pre-exec closes every import order; `:-` on
+    // both keeps an explicit user override in charge.
     let cache = dir.join("cache");
     let shim = dir.join("sglang-server");
     let toolkit = bundled_cuda_toolkit_root(&venv);
@@ -275,15 +283,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
         cuda_home_export = format!("export CUDA_HOME=\"{}\"\n", root.display());
         path_prefix = format!("{}:{}", root.join("bin").display(), path_prefix);
     }
-    let script = format!(
-        "#!/bin/sh\nexport PATH=\"{}:$PATH\"\n{}export \
-         SGLANG_CACHE_DIR=\"${{SGLANG_CACHE_DIR:-{}}}\"\nexec \"{}\" -m \
-         sglang.launch_server \"$@\"\n",
-        path_prefix,
-        cuda_home_export,
-        cache.display(),
-        venv_python.display()
-    );
+    let script = wrapper_script(&path_prefix, &cuda_home_export, &cache, &venv_python);
     std::fs::create_dir_all(&cache).context("create engine cache dir")?;
     std::fs::write(&shim, script).context("write sglang-server shim")?;
     make_executable(&shim)?;
@@ -308,6 +308,9 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     if std::env::var_os("SGLANG_CACHE_DIR").is_none() {
         smoke.env("SGLANG_CACHE_DIR", &cache);
     }
+    if std::env::var_os("FLASHINFER_WORKSPACE_BASE").is_none() {
+        smoke.env("FLASHINFER_WORKSPACE_BASE", &cache);
+    }
     run_streaming(
         &mut smoke,
         "boot-smoke import sglang.srt.entrypoints.engine",
@@ -316,6 +319,30 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     .await
     .context("boot-smoke failed: the venv cannot import the sglang server entry chain — rerun manually to inspect: <engine>/venv/bin/python -c 'import sglang.srt.entrypoints.engine'")?;
     Ok(shim)
+}
+
+/// The `sglang-server` shim body: PATH puts the venv (and its pinned CUDA
+/// toolkit bin) ahead of system JIT tools, the two cache exports scope every
+/// JIT cache to the engine dir (sglang's triton/inductor/nv via
+/// `SGLANG_CACHE_DIR`; the flashinfer package's own
+/// `$BASE/.cache/flashinfer` via `FLASHINFER_WORKSPACE_BASE` — it resolves
+/// that constant at import time, so sglang's later setdefault of the same
+/// var arrives too late on some import paths), then exec the venv python.
+/// `${VAR:-}` keeps an explicit user override in charge of both.
+fn wrapper_script(
+    path_prefix: &str,
+    cuda_home_export: &str,
+    cache: &Path,
+    venv_python: &Path,
+) -> String {
+    let cache = cache.display();
+    let venv_python = venv_python.display();
+    format!(
+        "#!/bin/sh\nexport PATH=\"{path_prefix}:$PATH\"\n{cuda_home_export}export \
+         SGLANG_CACHE_DIR=\"${{SGLANG_CACHE_DIR:-{cache}}}\"\nexport \
+         FLASHINFER_WORKSPACE_BASE=\"${{FLASHINFER_WORKSPACE_BASE:-{cache}}}\"\nexec \
+         \"{venv_python}\" -m sglang.launch_server \"$@\"\n"
+    )
 }
 
 /// Pin specs aligning the floating CUDA compiler dists with torch's
@@ -596,6 +623,37 @@ mod tests {
         assert_eq!(version_tuple("0.5.20rc1"), Some((0, 5, 20)));
         assert_eq!(version_tuple("1.2"), Some((1, 2, 0)));
         assert_eq!(version_tuple("latest"), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__wrapper_script__scopes_both_jit_caches_to_the_engine_dir() {
+        let script = wrapper_script(
+            "/eng/venv/bin",
+            "export CUDA_HOME=\"/eng/venv/cu13\"\n",
+            Path::new("/eng/cache"),
+            Path::new("/eng/venv/bin/python"),
+        );
+        assert!(script.starts_with("#!/bin/sh\n"));
+        // flashinfer's cache root is its OWN env var (jit/env.py builds
+        // `$FLASHINFER_WORKSPACE_BASE/.cache/flashinfer` at import time);
+        // pin both exports so the escape to ~/.cache cannot regress
+        // silently.
+        assert!(script.contains("export SGLANG_CACHE_DIR=\"${SGLANG_CACHE_DIR:-/eng/cache}\""));
+        assert!(script.contains(
+            "export FLASHINFER_WORKSPACE_BASE=\"${FLASHINFER_WORKSPACE_BASE:-/eng/cache}\""
+        ));
+        // The toolkit-less variant must still be valid sh: no dangling
+        // blank line where the CUDA_HOME export would sit.
+        let bare = wrapper_script(
+            "/eng/venv/bin",
+            "",
+            Path::new("/eng/cache"),
+            Path::new("/eng/venv/bin/python"),
+        );
+        assert!(bare.contains("\nexport SGLANG_CACHE_DIR="));
+        assert!(!bare.contains("CUDA_HOME"));
+        assert!(script.contains("exec \"/eng/venv/bin/python\" -m sglang.launch_server \"$@\""));
     }
 
     #[test]
