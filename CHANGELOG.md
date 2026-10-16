@@ -15,6 +15,12 @@ tracked here.
 
 - llama.cpp engine channel at **b11588** (flag surface unchanged, 331 → 331 vs b11580).
 
+### Fixed
+
+- **Installer uninstall honors its redirection knobs.** `install.sh --uninstall` resolved the systemd unit path and `systemctl` binary independently of `BLAZAR_UNIT_PATH`/`BLAZAR_SYSTEMCTL`, so a knob-redirected (test/mirror) uninstall could disable and stop the host's real blazar service; both now resolve once and are honored by install and uninstall alike (matches `scripts/uninstall.sh`, which already did). Regression-covered in `tests/install_e2e.sh` (9h).
+- **Installer health poll proves daemon ownership.** `poll_healthz` treated any process answering `:PORT/healthz` as this install's daemon; on a box where another blazar instance already owns the port, a fresh install whose daemon exited (bind conflict / engine check) still reported "service active; blazar healthy". The poll now witnesses this install's daemon pid (pidfile, soaked 2 s to outrun the start race) and warns loudly when a foreign process owns the port.
+- README install snippets pinned **v0.24.0** while the latest release is v0.27.0; both curl and irm snippets now pin v0.27.0.
+
 ## [0.27.0] - 2026-10-13
 
 ### Added

@@ -437,6 +437,14 @@ SUDO="${BLAZAR_SUDO-sudo}"
 # itself fails with "cannot create /usr/local/bin (need sudo?)" when root
 # is genuinely unavailable — no fragile tty/sudo probing up front.
 
+# Unit path + systemctl binary, resolved ONCE: the install lane, the
+# --uninstall lane and healthz polling must all agree. Honoring
+# BLAZAR_UNIT_PATH/BLAZAR_SYSTEMCTL on removal is what keeps a
+# knob-redirected (test/mirror) uninstall from touching the host's real
+# unit and service manager.
+UNIT_PATH="${BLAZAR_UNIT_PATH:-/etc/systemd/system/blazar.service}"
+SYSTEMCTL="${BLAZAR_SYSTEMCTL:-systemctl}"
+
 # --uninstall: remove what install.sh put here (binary + units).
 # NEVER touches models or config — those are user data.
 if [ "$UNINSTALL" = 1 ]; then
@@ -447,10 +455,10 @@ if [ "$UNINSTALL" = 1 ]; then
             status "removed $BIN"
         fi
     done
-    if [ -f /etc/systemd/system/blazar.service ]; then
-        $SUDO systemctl disable --now blazar 2>/dev/null || true
-        $SUDO rm -f /etc/systemd/system/blazar.service && status "removed system unit"
-        $SUDO systemctl daemon-reload 2>/dev/null || true
+    if [ -f "$UNIT_PATH" ]; then
+        $SUDO "$SYSTEMCTL" disable --now blazar 2>/dev/null || true
+        $SUDO rm -f "$UNIT_PATH" && status "removed system unit"
+        $SUDO "$SYSTEMCTL" daemon-reload 2>/dev/null || true
     fi
     if [ -f "$USER_HOME/.config/systemd/user/blazar.service" ]; then
         systemctl --user disable --now blazar 2>/dev/null || true
@@ -645,7 +653,25 @@ poll_healthz() {
         sleep 1
     done
     if curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; then
-        status "service active; blazar healthy on :${PORT} ($1)"
+        # Port answered — but is THIS install's daemon the one answering?
+        # A co-tenant can own :PORT (another blazar instance, a manually
+        # started serve) while the just-installed daemon is about to die
+        # on the bind conflict or the engine check. The pidfile is the
+        # ownership witness, and it must SOAK: a just-spawned daemon is
+        # briefly alive even when it exits moments later, so liveness is
+        # re-checked after 2 s — the failure exits are immediate, a
+        # healthy daemon persists.
+        PIDFILE="$USER_HOME/.local/share/blazar/run/blazar.pid"
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+            sleep 2
+            if kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+                status "service active; blazar healthy on :${PORT} ($1)"
+            else
+                status "WARN: :${PORT} answered healthz but this install's daemon exited — another process owns the port; check: $1"
+            fi
+        else
+            status "WARN: :${PORT} answered healthz but this install's daemon is not running — another process owns the port; check: $1"
+        fi
     else
         status "service enabled; healthz not answering on :${PORT} yet — check: $1"
     fi
@@ -688,8 +714,8 @@ install_system() {
     # that home), so the unit never points at /root's empty store.
     SVC_USER="${BLAZAR_SERVICE_USER:-${SUDO_USER:-$(id -un)}}"
     SVC_GROUP="${BLAZAR_SERVICE_GROUP:-$(id -gn "$SVC_USER")}"
-    UNIT_PATH="${BLAZAR_UNIT_PATH:-/etc/systemd/system/blazar.service}"
-    SYSTEMCTL="${BLAZAR_SYSTEMCTL:-systemctl}"
+    # UNIT_PATH/SYSTEMCTL resolved once above the uninstall lane so every
+    # user of them agrees (knob-redirected tests never touch /etc).
     if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
         # SupplementaryGroups only for groups that exist on this box —
         # systemd rejects the whole unit when a listed group is missing

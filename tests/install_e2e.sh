@@ -566,6 +566,22 @@ sed 's/#.*$//' "$ROOT/scripts/install.sh" | grep -q 11434 &&
     bad "install.sh functionally references 11434" ||
     ok "install.sh polls 11435, never 11434"
 
+# 9h. install.sh --uninstall must honor the SAME redirection knobs the
+# install lane honors (BLAZAR_UNIT_PATH / BLAZAR_SYSTEMCTL). A hardcoded
+# /etc unit path plus a literal `systemctl` here once disabled the
+# HOST's real blazar service from a knob-redirected sandbox uninstall.
+stage_installed
+: > "$TMP/systemctl.log"
+env $UENV sh "$INSTALL_SH" --uninstall >/dev/null 2>&1 </dev/null && RC=0 || RC=$?
+[ "$RC" -eq 0 ] && ok "install.sh --uninstall exits 0" || bad "install.sh --uninstall exits 0"
+[ ! -e "$UNIT_OUT" ] && ok "install.sh --uninstall removes the redirected unit" || bad "install.sh --uninstall removes the redirected unit"
+if grep -qx 'disable --now blazar' "$TMP/systemctl.log" && grep -qx 'daemon-reload' "$TMP/systemctl.log"; then
+    ok "uninstall service-manager calls went through BLAZAR_SYSTEMCTL"
+else
+    bad "uninstall bypassed BLAZAR_SYSTEMCTL (host systemctl reachable)"
+fi
+[ -f "$TMP/home/.config/blazar/config.toml" ] && ok "install.sh --uninstall keeps config" || bad "install.sh --uninstall keeps config"
+
 # --- 10. data-dir ownership: the unit runs unprivileged ---------------------
 # The service-user data dir is created through sudo, so without an
 # explicit ownership hand-off it lands root-owned and the daemon dies
