@@ -5173,6 +5173,26 @@ fn push_sglang_spec_depth_knobs(
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
+    if let Some(v) = tun.spec_num_steps {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.spec_num_steps",
+            "--speculative-num-steps",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    if let Some(v) = tun.spec_num_draft_tokens {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.spec_num_draft_tokens",
+            "--speculative-num-draft-tokens",
+            &v.to_string(),
+            warnings,
+        );
+    }
     if let Some(v) = tun.speculative_eagle_topk {
         push_tuned(
             argv,
@@ -5207,6 +5227,49 @@ fn push_sglang_spec_depth_knobs(
 
 /// draft-graph reserve for engaged spawns (self-drafting still pays
 /// verification: every accepted draft token is re-attended).
+/// Resolve the draft dir for a draft-model algorithm on the knob lane:
+/// present + non-empty, not a GGUF file, and served by this engine.
+/// Every refusal teaches (warning) and returns None -> dense spawn.
+fn sglang_spec_draft_dir<'a>(
+    input: &ProfileInput<'_>,
+    tun: &'a SglangTuning,
+    warnings: &mut Vec<String>,
+) -> Option<&'a str> {
+    let Some(draft) = tun.spec_draft_path.as_deref().filter(|p| !p.is_empty()) else {
+        warnings.push(
+            "sglang.spec_algorithm \"dflash\" needs sglang.spec_draft_path — \
+             a safetensors draft dir; spawning dense (config validation \
+             normally catches this at load)"
+                .to_string(),
+        );
+        return None;
+    };
+    if draft
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("gguf"))
+    {
+        warnings.push(format!(
+            "spec draft {draft} is a GGUF file; sglang drafts must be HF \
+             safetensors dirs (the loader treats unknown paths as repo ids) — \
+             spawning dense"
+        ));
+        return None;
+    }
+    if !input
+        .supported_flags
+        .contains("--speculative-draft-model-path")
+    {
+        warnings.push(
+            "sglang.spec_algorithm \"dflash\" set but this engine lacks \
+             --speculative-draft-model-path; spawning dense (a blazar \
+             engine update revives it)"
+                .to_string(),
+        );
+        return None;
+    }
+    Some(draft)
+}
+
 fn push_sglang_speculative(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
@@ -5217,28 +5280,21 @@ fn push_sglang_speculative(
         // blazar spelling -> upstream enum. Config validation rejects
         // unknown spellings at load; this arm is the defensive net for
         // programmatically built tunings (tests, future callers).
-        let upstream = match algorithm {
-            "ngram" => Some("NGRAM"),
-            "dflash" => {
-                warnings.push(
-                    "sglang.spec_algorithm \"dflash\" needs --speculative-draft-model-path \
-                     on sglang 0.5.21 (2026-10-09 live receipt: `ValueError` at spawn); \
-                     spawning dense — use \"ngram\" for draft-free speculation"
-                        .to_string(),
-                );
-                None
-            }
+        // (upstream, needs_draft): ngram drafts from the context
+        // itself; dflash rides the EAGLE-family draft machinery and
+        // hard-requires a draft model (2026-10-09 live receipt:
+        // `ValueError` at spawn without the path).
+        let (upstream, needs_draft) = match algorithm {
+            "ngram" => ("NGRAM", false),
+            "dflash" => ("DFLASH", true),
             other => {
                 warnings.push(format!(
-                    "sglang.spec_algorithm {other:?} is not a draft-free algorithm \
-                     (supported: ngram); spawning dense — the EAGLE family \
-                     rides the draft-pair lane (spec = \"eagle3\")"
+                    "sglang.spec_algorithm {other:?} is not a knob-lane algorithm \
+                     (supported: ngram draft-free, dflash via spec_draft_path); spawning \
+                     dense — the EAGLE family rides the draft-pair lane (spec = \"eagle3\")"
                 ));
-                None
+                return false;
             }
-        };
-        let Some(upstream) = upstream else {
-            return false;
         };
         if !input.supported_flags.contains("--speculative-algorithm") {
             warnings.push(format!(
@@ -5248,6 +5304,14 @@ fn push_sglang_speculative(
             ));
             return false;
         }
+        let draft = if needs_draft {
+            let Some(d) = sglang_spec_draft_dir(input, tun, warnings) else {
+                return false;
+            };
+            Some(d)
+        } else {
+            None
+        };
         if input.draft_path.is_some() {
             warnings.push(
                 "sglang.spec_algorithm pin overrides the resolved EAGLE3 draft \
@@ -5257,22 +5321,16 @@ fn push_sglang_speculative(
         }
         argv.push("--speculative-algorithm".into());
         argv.push(upstream.into());
-        if let Some(v) = tun.spec_num_steps {
-            push_tuned(
-                argv,
-                input.supported_flags,
-                "sglang.spec_num_steps",
-                "--speculative-num-steps",
-                &v.to_string(),
-                warnings,
-            );
+        if let Some(draft) = draft {
+            argv.push("--speculative-draft-model-path".into());
+            argv.push(draft.to_string());
         }
-        if let Some(v) = tun.spec_num_draft_tokens {
+        if needs_draft && let Some(v) = tun.speculative_dflash_block_size {
             push_tuned(
                 argv,
                 input.supported_flags,
-                "sglang.spec_num_draft_tokens",
-                "--speculative-num-draft-tokens",
+                "sglang.speculative_dflash_block_size",
+                "--speculative-dflash-block-size",
                 &v.to_string(),
                 warnings,
             );
@@ -15136,6 +15194,7 @@ mod tests {
             "--context-length",
             "--max-running-requests",
             "--speculative-algorithm",
+            "--speculative-dflash-block-size",
             "--speculative-draft-model-path",
             "--speculative-num-steps",
             "--speculative-num-draft-tokens",
@@ -16209,9 +16268,10 @@ mod tests {
     #[test]
     fn unit__sglang_spec__dflash_warns_dense_needs_draft_model() {
         // sglang 0.5.21 DFLASH hard-requires --speculative-draft-model-path
-        // (2026-10-09 live receipt: `ValueError` at spawn). The knob lane
-        // exposes only draft-free algorithms, so the pin warns and stays
-        // dense rather than emitting a spawn that cannot come up.
+        // (2026-10-09 live receipt: `ValueError` at spawn). Without
+        // spec_draft_path the knob lane warns and stays dense rather
+        // than emitting a spawn that cannot come up (config validation
+        // normally rejects this at load; this is the compile-side net).
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
@@ -16230,7 +16290,89 @@ mod tests {
         assert!(
             p.warnings
                 .iter()
-                .any(|w| w.contains("dflash") && w.contains("draft-model-path"))
+                .any(|w| w.contains("dflash") && w.contains("spec_draft_path"))
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__dflash_with_draft_dir_engages() {
+        // The DFLASH knob lane: spec_algorithm = "dflash" +
+        // spec_draft_path (safetensors dir) emits the algorithm, the
+        // draft model path, and the dflash block-size knob; steps and
+        // draft-tokens ride their own flags like every engaged arm.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let draft_dir = "/models/qwen3-eagle3-head";
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dflash".into()),
+                spec_draft_path: Some(draft_dir.into()),
+                spec_num_steps: Some(4),
+                spec_num_draft_tokens: Some(8),
+                speculative_dflash_block_size: Some(64),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "DFLASH")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-draft-model-path" && w[1] == draft_dir)
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-dflash-block-size" && w[1] == "64")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-num-steps" && w[1] == "4")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-num-draft-tokens" && w[1] == "8")
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__dflash_gguf_draft_refused_dense() {
+        // Same loader receipt as the pair lane: a GGUF draft path on
+        // the dflash knob is refused with teaching (sglang drafts must
+        // be safetensors dirs), never forwarded to a spawn that dies
+        // in download_weights_from_hf.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dflash".into()),
+                spec_draft_path: Some("/models/Qwen3-0.6B-f16.gguf".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--speculative-algorithm"));
+        assert!(!p.argv.iter().any(|a| a == "--speculative-draft-model-path"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("GGUF file") && w.contains("safetensors dirs"))
         );
     }
 

@@ -251,6 +251,8 @@
       "--speculative-accept-threshold-acc",
       "--speculative-accept-threshold-single",
       "--speculative-algorithm",
+      "--speculative-dflash-block-size",
+      "--speculative-draft-model-path",
       "--speculative-eagle-topk",
       "--speculative-num-draft-tokens",
       "--speculative-num-steps",

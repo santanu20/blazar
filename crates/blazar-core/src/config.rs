@@ -1625,8 +1625,19 @@ pub struct SglangTuning {
     /// (flashinfer attention verify kernels hit the same JIT defect
     /// at graph capture). The EAGLE family rides the
     /// draft-pair lane (`spec = "eagle3"` + a pulled safetensors
-    /// draft), not this knob.
+    /// draft), not this knob. `"dflash"` (0.5.21+) additionally
+    /// requires `spec_draft_path` — a safetensors draft dir the
+    /// engine loads via `--speculative-draft-model-path`.
     pub spec_algorithm: Option<String>,
+    /// `--speculative-draft-model-path`: a safetensors draft dir for
+    /// draft-model algorithms on the knob lane (`spec_algorithm =
+    /// "dflash"`). The engine hard-requires it for DFLASH (2026-10-09
+    /// live receipt: `ValueError` at spawn without it) — DFLASH rides
+    /// the EAGLE-family draft machinery, so an EAGLE3-class head dir
+    /// is the artifact. GGUF drafts are llama.cpp-lane-only: sglang's
+    /// loader treats unknown paths as HF repo ids and dies in
+    /// `download_weights_from_hf` (2026-09-30 receipt).
+    pub spec_draft_path: Option<String>,
     /// `--speculative-num-steps`: draft tokens proposed per verify
     /// round.
     pub spec_num_steps: Option<u32>,
@@ -1651,6 +1662,10 @@ pub struct SglangTuning {
     /// draft token's accept probability from p to min(1, p / t) —
     /// the cumulative counterpart of the single-token threshold.
     pub speculative_accept_threshold_acc: Option<f64>,
+    /// `--speculative-dflash-block-size`: DFLASH block size in tokens.
+    /// Emitted only when the DFLASH algorithm engages via
+    /// `spec_algorithm = "dflash"` + `spec_draft_path`.
+    pub speculative_dflash_block_size: Option<u64>,
     /// `--mm-attention-backend`: multimodal attention backend. No
     /// blazar-side choice list — the upstream enum is long,
     /// hardware-specific, and still growing; the engine's own
@@ -1813,8 +1828,18 @@ impl SglangTuning {
         ) {
             return Err(e);
         }
-        if let Some(e) = choice("spec_algorithm", &self.spec_algorithm, &["ngram"]) {
+        if let Some(e) = choice("spec_algorithm", &self.spec_algorithm, &["ngram", "dflash"]) {
             return Err(e);
+        }
+        if self.spec_algorithm.as_deref() == Some("dflash")
+            && self.spec_draft_path.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(CoreError::Config(
+                "sglang.spec_algorithm \"dflash\" needs sglang.spec_draft_path — a \
+                 safetensors draft dir (sglang hard-requires the draft model; \
+                 2026-10-09 live receipt)"
+                    .into(),
+            ));
         }
         if let Some(e) = choice(
             "retraction_policy",
@@ -5681,17 +5706,33 @@ mod tests {
 
     #[test]
     fn unit__sglang_tuning__spec_algorithm_vocabulary_and_floors() {
-        // Draft-free algorithms only: eagle family rides the resolved
-        // draft-pair lane, so a bare string pin cannot request it;
-        // dflash needs --speculative-draft-model-path upstream
-        // (2026-10-09 receipt) and is rejected the same way.
+        // Draft-free ngram validates bare; dflash validates ONLY with
+        // a draft dir (the engine hard-requires the draft model,
+        // 2026-10-09 receipt); the EAGLE family rides the resolved
+        // draft-pair lane so a bare string pin cannot request it.
         SglangTuning {
             spec_algorithm: Some("ngram".into()),
             ..Default::default()
         }
         .validate("sglang")
         .unwrap_or_else(|e| panic!("spec_algorithm ngram must validate: {e}"));
-        for bad in ["eagle", "EAGLE3", "dspark", "mtp", "dflash"] {
+        SglangTuning {
+            spec_algorithm: Some("dflash".into()),
+            spec_draft_path: Some("/models/qwen3-eagle3-head".into()),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap_or_else(|e| panic!("spec_algorithm dflash + draft must validate: {e}"));
+        assert!(
+            SglangTuning {
+                spec_algorithm: Some("dflash".into()),
+                ..Default::default()
+            }
+            .validate("sglang")
+            .is_err(),
+            "spec_algorithm dflash without spec_draft_path must be rejected"
+        );
+        for bad in ["eagle", "EAGLE3", "dspark", "mtp"] {
             assert!(
                 SglangTuning {
                     spec_algorithm: Some(bad.into()),

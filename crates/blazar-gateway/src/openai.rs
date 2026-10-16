@@ -1135,19 +1135,30 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
     "/v1/reranking",
     "/rerank",
     "/reranking",
+    "/v1/score",
+    "/v1/decisions",
     "/props",
     "/slots",
     "/v1/stream",
     "/v1/streams/lookup",
 ];
 
-/// Surfaces a live sglang 0.5.21 child also serves (probe receipt
-/// 2026-10-12, booted qwen3-1.7b child): tokenize/detokenize, its own
-/// `/v1/systemone` dialect, and native cross-encoder `/v1/rerank`.
+/// Surfaces a live sglang 0.5.21 child also serves: tokenize/detokenize,
+/// its own `/v1/systemone` dialect, native cross-encoder `/v1/rerank`
+/// (probe receipt 2026-10-12, booted qwen3-1.7b child), and the
+/// scoring/decisions pair (source receipt 2026-10-13, installed 0.5.21
+/// `http_server.py`: `ScoringRequest`/`DecisionRequest` handlers).
 /// Everything else in the list above stays gated for the sglang lane
 /// (404 on the probed child). Only release-verified surfaces ride here
 /// — nightly-only endpoints wait for a release.
-const SGLANG_SERVES_PATHS: &[&str] = &["/tokenize", "/detokenize", "/v1/systemone", "/v1/rerank"];
+const SGLANG_SERVES_PATHS: &[&str] = &[
+    "/tokenize",
+    "/detokenize",
+    "/v1/systemone",
+    "/v1/rerank",
+    "/v1/score",
+    "/v1/decisions",
+];
 
 /// True when the path is a llama-server child surface the given lane
 /// cannot serve: llamacpp serves everything; sglang serves the verified

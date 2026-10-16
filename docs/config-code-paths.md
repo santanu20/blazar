@@ -293,7 +293,7 @@ token quality are surfaced as drift.
 | calibration_file | — | engine-argv | `crates/blazar-core/src/profile.rs:3128` (calibration prompts feeding imatrix generation); hint block `crates/blazar-cli/src/main.rs:13890` |
 | isq_organization | — | engine-argv | `crates/blazar-core/src/profile.rs:3138` (`default` or `moqe` weight organization); hint block `crates/blazar-cli/src/main.rs:13891` |
 
-## SglangTuning ([sglang]) — 62 fields, 0 dead
+## SglangTuning ([sglang]) — 64 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -350,11 +350,13 @@ token quality are surfaced as drift.
 
 | is_embedding | — | engine-argv | `crates/blazar-core/src/profile.rs:4290` in `compile_sglang` (Some(true) → embedding-lane argv posture + teaching at `:4300`) |
 | spec_algorithm | "ngram".to_string() | engine-argv | `crates/blazar-core/src/profile.rs:5150` (draft-free self-speculation arm of the speculative ladder; validated against the knob's allowed set) |
+| spec_draft_path | — | engine-argv | `crates/blazar-core/src/profile.rs:5216` (safetensors draft dir for `spec_algorithm = "dflash"`; required with it — sglang hard-requires `--speculative-draft-model-path`) |
 | spec_num_steps | Some(0) | engine-argv | `crates/blazar-core/src/profile.rs:5194` (draft depth; 0 = engine default) |
 | spec_num_draft_tokens | Some(0) | engine-argv | `crates/blazar-core/src/profile.rs:5204` (tokens per draft step; 0 = engine default) |
 | speculative_eagle_topk | Some(4) | engine-argv | `crates/blazar-core/src/profile.rs:5110` (EAGLE top-k; rides the draft-pair lane) |
 | speculative_accept_threshold_single | Some(0.1) | engine-argv | `crates/blazar-core/src/profile.rs:5120` |
 | speculative_accept_threshold_acc | Some(0.95) | engine-argv | `crates/blazar-core/src/profile.rs:5130` |
+| speculative_dflash_block_size | Some(0) | engine-argv | `crates/blazar-core/src/profile.rs:5275` (DFLASH block size; emitted only when the dflash arm engages) |
 | mm_attention_backend | — | engine-argv | `crates/blazar-core/src/profile.rs:4762` (multimodal attention override) |
 | retraction_policy | — | engine-argv | `crates/blazar-core/src/profile.rs:4767` (decode retraction on preemption) |
 | enable_two_batch_overlap | — | engine-argv | `crates/blazar-core/src/profile.rs:4890` (TBO, micro-batch overlap) |

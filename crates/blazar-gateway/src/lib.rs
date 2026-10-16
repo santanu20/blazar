@@ -284,6 +284,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/completions", post(openai::openai_proxy))
         .route("/v1/embeddings", post(openai::embeddings))
         .route("/v1/rerank", post(openai::openai_proxy))
+        // sglang-native scoring + decisions endpoints (0.5.21+, verified
+        // against the installed engine's http_server.py): score ranks
+        // query-item pairs in one request; decisions answers typed
+        // choice/score/yes-no questions via single-token label scoring.
+        .route("/v1/score", post(openai::openai_proxy))
+        .route("/v1/decisions", post(openai::openai_proxy))
         // Upstream-native bare rerank paths: llama-server documents POST
         // /reranking as canonical with /rerank as its alias, so clients
         // speaking the raw upstream dialect hit these without the /v1

@@ -437,6 +437,7 @@ const SGLANG_SUPPORTED: &[&str] = &[
     "--speculative-accept-threshold-acc",
     "--speculative-accept-threshold-single",
     "--speculative-algorithm",
+    "--speculative-dflash-block-size",
     "--speculative-draft-model-path",
     "--speculative-eagle-topk",
     "--speculative-num-draft-tokens",
@@ -1132,6 +1133,34 @@ fn sglang_profiles() -> Vec<Profile> {
             8_000 * MIB,
             &hw,
             &ngram,
+            &plain,
+            &flags,
+        ),
+        &TuningOverrides::default(),
+    );
+
+    // DFLASH draft-model posture: spec_algorithm = "dflash" +
+    // spec_draft_path (safetensors dir) rides the same engaged-arms
+    // knobs plus the dflash block size.
+    let dflash = Config {
+        sglang: SglangTuning {
+            spec_algorithm: Some("dflash".into()),
+            spec_draft_path: Some("/models/qwen3-eagle3-head".into()),
+            spec_num_steps: Some(4),
+            spec_num_draft_tokens: Some(8),
+            speculative_dflash_block_size: Some(64),
+            ..SglangTuning::default()
+        },
+        ..Config::default()
+    };
+    absorb(
+        &mut profiles,
+        &base_input(
+            EngineKind::Sglang,
+            ModelMeta::Hf(&hf),
+            8_000 * MIB,
+            &hw,
+            &dflash,
             &plain,
             &flags,
         ),
