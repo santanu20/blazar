@@ -163,7 +163,7 @@ pub fn extract_binary(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).context("open zip")?;
     for i in 0..zip.len() {
         let mut file = zip.by_index(i).context("zip entry")?;
-        if file.name() == "blazar.exe" {
+        if matches!(file.name().as_deref(), Ok("blazar.exe")) {
             let mut out = Vec::new();
             file.read_to_end(&mut out).context("read binary from zip")?;
             return Ok(out);
