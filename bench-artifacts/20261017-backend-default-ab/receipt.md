@@ -36,6 +36,6 @@ the engine.
 # arm A: no overlay (defaults)
 # arm B: [model_overrides."qwen3-1.7b".sglang] attention_backend="flashinfer" sampling_backend="flashinfer"
 sudo systemctl restart blazar
-python3 ab.py   # /tmp/opencode/ab.py pattern: stream + include_usage timing
+python3 harness.py   # streaming request with stream_options.include_usage for per-token timing
 curl -s :<engine_port>/get_server_info   # verify arm truth
 ```

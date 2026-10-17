@@ -123,9 +123,9 @@ Registry lane `mlx` pins 18 first-class flags (compile + spawn-time emission).
 
 ## sglang-0.5.21 (sglang) — 556 flags probed
 
-**certified: 3 · first-class: 67 · passthrough: 485 · intentionally-unsupported: 1 · not-applicable: 0 · unverified: 0**
+**certified: 3 · first-class: 69 · passthrough: 483 · intentionally-unsupported: 1 · not-applicable: 0 · unverified: 0**
 
-Registry lane `sglang` pins 70 first-class flags (compile + spawn-time emission).
+Registry lane `sglang` pins 72 first-class flags (compile + spawn-time emission).
 
 ### Certified against a live engine
 
@@ -135,7 +135,7 @@ Registry lane `sglang` pins 70 first-class flags (compile + spawn-time emission)
 
 ### Passthrough families
 
-- **uncategorized long-tail** (226): --abort-on-priority-when-disabled, --api-, --bf16-gemm-backend, --boundary-reduction, --c128-page-size, --chat-template (+220 more)
+- **uncategorized long-tail** (224): --abort-on-priority-when-disabled, --api-, --bf16-gemm-backend, --boundary-reduction, --c128-page-size, --chat-template (+218 more)
 - **scheduler/memory detail** (119): --attention-, --attention-context-parallel-size, --cuda-graph-, --cuda-graph-backend-decode, --cuda-graph-config, --cuda-graph-max-bs-prefill (+113 more)
 - **per-request/gateway-owned** (26): --admin-api-key, --allow-auto-truncate, --constrained-json-disable-any-whitespace, --constrained-json-max-whitespace-cnt, --constrained-json-whitespace-pattern, --enable-ssl-refresh (+20 more)
 - **observability** (25): --bucket-e2e-request-latency, --bucket-inter-token-latency, --bucket-time-to-first-token, --decode-log-interval, --enable-forward-pass-metrics, --enable-metrics-for-all-schedulers (+19 more)
