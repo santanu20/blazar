@@ -3891,6 +3891,82 @@ async fn e2e__openai_recipe_lane_unpinned_is_native_passthrough() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__openai_recipe_lane_unparseable_child_body_fails_closed() {
+    // A child answering the raw completion surface with 200 + non-JSON
+    // is a contract violation on the recipe lane; the dialect swap
+    // must fail CLOSED with a teaching 502 — never stream raw dialect
+    // bytes to a chat caller (silent corruption) and never hand back
+    // an adapted empty completion (masked failure).
+    let cfg = Config {
+        prompt_recipe: "ollama_compat".into(),
+        ..Config::default()
+    };
+    let ts = start_with(
+        cfg,
+        vec![("STUB_RAW_COMPLETION_MODE".into(), "garbage".into())],
+    )
+    .await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502, "fail closed, not fail open");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let text = body.to_string();
+    assert!(
+        text.contains("recipe lane") && text.contains("unparseable"),
+        "teaching message present: {body}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__openai_recipe_lane_child_error_passes_through_verbatim() {
+    // A child ERROR keeps its own status and body verbatim: the error
+    // dialect is shape-neutral. Adapting an error object into a chat
+    // completion (or rewriting the status) would mask the child's
+    // teaching — the caller must see exactly what the child said.
+    let cfg = Config {
+        prompt_recipe: "ollama_compat".into(),
+        ..Config::default()
+    };
+    let ts = start_with(
+        cfg,
+        vec![("STUB_RAW_COMPLETION_MODE".into(), "error".into())],
+    )
+    .await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "child status preserved");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["message"], "stub says no",
+        "child error body verbatim: {body}"
+    );
+    assert!(
+        body["choices"].is_null(),
+        "no adapted chat shape over the error: {body}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__sentinel__body_stall_fires_detection_and_bounded_close() {
     // Pin (live evidence: two 600 s zero-chunk hangs finished with NO
     // stall detection — finish null, detections [], prompt_tokens

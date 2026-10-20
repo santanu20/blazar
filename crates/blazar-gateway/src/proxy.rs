@@ -1239,12 +1239,14 @@ pub async fn proxy_request(
             Some("json_schema" | "json_object")
         );
     // Recipe lane (chat surface over the raw completion child): the
-    // dialect swap happens gateway-side, so a non-stream recipe
-    // response ALWAYS rides the buffered branch — streaming raw
+    // dialect swap happens gateway-side, so a SUCCESSFUL non-stream
+    // recipe response ALWAYS rides the buffered branch — streaming raw
     // completion bytes to a chat caller is silent dialect corruption.
+    // Child errors keep their own body and status verbatim (the error
+    // dialect is shape-neutral; adapting it would mask the teaching).
     // A declared-over-cap body is refused loudly rather than read:
     // the cap bounds the read, never the contract.
-    if recipe.is_some() && !sse && enforce_oversized {
+    if recipe.is_some() && !sse && status.is_success() && enforce_oversized {
         if let Some(s) = sniffer.take() {
             s.finish(&state.keys);
         }
@@ -1259,7 +1261,7 @@ pub async fn proxy_request(
         || (suppress_think && !sse)
         || (restamp && !sse)
         || json_fence
-        || (recipe.is_some() && !sse)
+        || (recipe.is_some() && !sse && status.is_success())
     {
         let ctx = if sentinel_active {
             let (ctx, warnings) = sentinel::request_ctx(
@@ -1534,12 +1536,15 @@ pub async fn proxy_request(
     // posture as the ollama recipe lane (which feeds its adapted chat
     // value to the sentinel). reqwest errors map to io::Error for the
     // adapter's Item contract; the truncated-stream discipline below
-    // emits the same legal-close terminal frames.
+    // emits the same legal-close terminal frames. SSE only: a
+    // non-stream body reaching this path is a child error passing
+    // through verbatim (error dialect is shape-neutral — adapting it
+    // would mask the teaching).
     let upstream = {
         let raw = resp
             .bytes_stream()
             .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
-        match recipe {
+        match recipe.filter(|_| sse) {
             Some(lane) => Box::pin(crate::prompt_recipe::raw_sse_to_chat_sse_stamped(
                 raw,
                 lane.tool_names,

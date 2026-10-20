@@ -891,6 +891,32 @@ async fn completions(
     let text = format!("stub:{state}:{prompt}");
     let tokens = i64::try_from(text.split_whitespace().count().max(1)).unwrap_or(1);
     let model = req.model.unwrap_or_else(|| state.clone());
+    // Failure-shape knobs for the recipe lane's fail-closed and
+    // error-passthrough contracts: `garbage` = 200 with a non-JSON
+    // body (dialect-swap must 502, never fail open); `error` = 400
+    // with a JSON error body (child teaching must pass through
+    // verbatim — status AND body — never be adapted into a chat
+    // shape that masks the message).
+    match std::env::var("STUB_RAW_COMPLETION_MODE").as_deref() {
+        Ok("garbage") => {
+            return axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "text/plain")
+                .body(axum::body::Body::from("not json at all"))
+                .unwrap();
+        }
+        Ok("error") => {
+            let body = serde_json::json!({
+                "error": {"message": "stub says no", "type": "stub_error"}
+            });
+            return axum::response::Response::builder()
+                .status(400)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+        }
+        _ => {}
+    }
     if req.stream {
         // Raw-completion SSE dialect: text deltas in choices[0].text,
         // usage as a bare final frame (when stream_options asked for
