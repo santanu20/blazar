@@ -3201,6 +3201,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_disk(&d));
     checks.extend(doctor_store(&d));
     checks.extend(doctor_models(&d));
+    checks.extend(doctor_recipe_lanes(&d));
     checks.extend(doctor_model_types(&d));
     checks.extend(doctor_sglang_fit(&d));
     checks.extend(doctor_sentinel(&d));
@@ -6558,6 +6559,82 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
         out.push(Check::warn(
             "unmanaged files",
             suffix.trim_start_matches(';').trim().to_string(),
+        ));
+    }
+    out
+}
+
+/// Recipe-lane posture (special-token hardening audit): models pinned
+/// to `prompt_recipe = "ollama_compat"` render their prompts
+/// gateway-side — message text can never forge chatml turn boundaries,
+/// on BOTH the ollama and `OpenAI` chat surfaces. Everything else keeps
+/// the engine-owned template (upstream behavior). MLX models on the
+/// default posture get an explicit advisory: the mlx chat template
+/// drops tool calls, and pinning the recipe restores grammar-forced
+/// tools end-to-end.
+fn doctor_recipe_lanes(d: &BlazarDirs) -> Vec<Check> {
+    let Ok(cfg) = config() else {
+        return Vec::new();
+    };
+    let models = Store::open(d)
+        .ok()
+        .and_then(|s| s.list_models().ok())
+        .unwrap_or_default();
+    if models.is_empty() {
+        return vec![Check::ok(
+            "prompt-recipe",
+            "no models yet (nothing to posture)".to_string(),
+        )];
+    }
+    let mut out = Vec::new();
+    let pinned: Vec<&str> = models
+        .iter()
+        .filter(|m| cfg.effective_prompt_recipe(&m.name) != "child")
+        .map(|m| m.name.as_str())
+        .collect();
+    if pinned.is_empty() {
+        out.push(Check::ok(
+            "prompt-recipe",
+            format!(
+                "default (engine-owned templates) on all {} model(s) — pin \
+                 [model_overrides.\"<name>\"] prompt_recipe = \"ollama_compat\" for the \
+                 gateway-rendered neutralized lane",
+                models.len()
+            ),
+        ));
+    } else {
+        out.push(Check::ok(
+            "prompt-recipe",
+            format!(
+                "{} pinned ollama_compat (gateway-rendered neutralized chatml on \
+                 /api/chat + /v1/chat/completions): {}",
+                pinned.len(),
+                pinned.join(", ")
+            ),
+        ));
+    }
+    let mlx_unpinned: Vec<&str> = models
+        .iter()
+        .filter(|m| {
+            // MLX checkpoint dir; whisper dirs ride the same suffix but
+            // never serve a chat surface — the tool-call advisory would
+            // be nonsense for them.
+            std::path::Path::new(&m.path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("d"))
+                && !m.path.contains("whisper")
+                && cfg.effective_prompt_recipe(&m.name) == "child"
+        })
+        .map(|m| m.name.as_str())
+        .collect();
+    if !mlx_unpinned.is_empty() {
+        out.push(Check::warn(
+            "prompt-recipe mlx",
+            format!(
+                "engine-owned template drops tool calls: {} — pin prompt_recipe = \
+                 \"ollama_compat\" to serve tools via the gateway grammar lane",
+                mlx_unpinned.join(", ")
+            ),
         ));
     }
     out
