@@ -759,6 +759,48 @@ pub async fn openai_proxy(
         );
     }
 
+    // Pinned-recipe lane (chat completions): the caller's chat body is
+    // rendered gateway-side (neutralized chatml — message text can
+    // never forge turn boundaries) and spoken to the child's raw
+    // completion surface. Fires when the model pins
+    // prompt_recipe=ollama_compat, or for mlx engines whose own chat
+    // template drops tool calls (the recipe grammar carries them).
+    // Mirrors the ollama lane's gate; image-bearing bodies stay on the
+    // native lane (vision content has no completion-dialect contract).
+    let recipe_lane = if uri.path().ends_with("/chat/completions") {
+        parsed_body
+            .as_ref()
+            .filter(|v| !crate::prompt_recipe::has_images(v))
+            .and_then(|v| {
+                let pinned = state.config.effective_prompt_recipe(&model_name)
+                    == crate::prompt_recipe::OLLAMA_COMPAT;
+                let mlx_tools = engine.kind == blazar_core::engine_kind::EngineKind::Mlx
+                    && v.get("tools")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|a| !a.is_empty());
+                (pinned || mlx_tools).then(|| crate::prompt_recipe::RecipeLane {
+                    tool_names: crate::prompt_recipe::extract_tool_names(v).unwrap_or_default(),
+                    stamp: crate::prompt_recipe::ChatStamp::new(&model_name),
+                })
+            })
+    } else {
+        None
+    };
+    // The adapter maps one raw completion to one chat choice — an n>1
+    // fan would silently drop choices the caller paid for.
+    if recipe_lane.is_some()
+        && parsed_body
+            .as_ref()
+            .and_then(|v| v.get("n"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|n| n > 1)
+    {
+        return openai_error(
+            400,
+            "recipe lane serves one choice per request — n>1 is unsupported with a pinned prompt_recipe",
+        );
+    }
+
     // MCP tool catalog (opt-in, chat lane): the selector rides the `mcp`
     // body field or `x-blazar-mcp` header. Resolved BEFORE single-flight
     // registers a leader — the mediated tool loop must not leave followers
@@ -772,6 +814,13 @@ pub async fn openai_proxy(
             Err(msg) => return openai_error(400, &msg),
         };
         if let Some(sel) = sel {
+            if recipe_lane.is_some() {
+                return openai_error(
+                    400,
+                    "mcp is not available on the recipe-rendered completion lane \
+                     (pinned recipe or mlx tool grammar) — clear the pin or use the chat lane",
+                );
+            }
             if v["stream"].as_bool().unwrap_or(false) {
                 return openai_error(
                     400,
@@ -836,6 +885,40 @@ pub async fn openai_proxy(
         Ok(g) => g,
         Err(resp) => return *resp,
     };
+    // Recipe lane swap: the chat body becomes the neutralized gateway
+    // render bound for the child's raw completion surface. The
+    // pre-admission single-flight, admission classification, and every
+    // response-side concern keep operating on the ORIGINAL chat body —
+    // only the child-bound bytes change dialect. OpenAI SDK
+    // compatibility: max_completion_tokens normalizes into the
+    // max_tokens slot the renderer reads (when the caller did not set
+    // both).
+    let (body, recipe) = match recipe_lane {
+        Some(lane) => {
+            let mut render_src = parsed_body.clone().unwrap_or(serde_json::Value::Null);
+            if render_src
+                .get("max_tokens")
+                .is_none_or(serde_json::Value::is_null)
+                && let Some(mct) = render_src.get("max_completion_tokens").cloned()
+            {
+                render_src["max_tokens"] = mct;
+            }
+            let stream = render_src
+                .get("stream")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let strict = state.config.effective_decode_policy(&model_name) == "strict";
+            let rendered = crate::prompt_recipe::to_completion_request(
+                &render_src,
+                stream,
+                state.config.effective_raw_lane_max_tokens(&model_name),
+                strict,
+            );
+            let bytes = serde_json::to_vec(&rendered).unwrap_or_default();
+            (axum::body::Bytes::from(bytes), Some(lane))
+        }
+        None => (body, None),
+    };
     proxy_request(
         &state,
         &engine,
@@ -850,6 +933,7 @@ pub async fn openai_proxy(
         key_ext.map(|Extension(k)| k),
         parsed_body,
         sf_gate,
+        recipe,
     )
     .await
 }
@@ -1430,6 +1514,7 @@ pub async fn scoped_proxy(
         key_ext.map(|Extension(k)| k),
         None,
         crate::proxy::SfGate::Ineligible,
+        None,
     )
     .await
 }
@@ -1641,6 +1726,7 @@ pub async fn responses_api(
             key_ext.map(|Extension(k)| k),
             None,
             crate::proxy::SfGate::Ineligible,
+            None,
         )
         .await;
         if stream && store {
@@ -2105,6 +2191,7 @@ pub async fn lora_adapters(
                 None,
                 None,
                 crate::proxy::SfGate::Ineligible,
+                None,
             )
             .await
         }

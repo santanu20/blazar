@@ -162,9 +162,7 @@ partial-tag holdback pin the streaming path. `cargo nextest -p blazar-gateway`: 
 ### 7.3 Deliberately excluded
 
 - Streaming JSON-fence normalization stays non-stream-only (enforce-posture decision, MEMORY.md).
-- OpenAI-lane equivalent injection: `/v1/chat/completions` forwards to the engine's own chat
-  template (engine-owned seam — mlx-lm/llama.cpp apply their own templating); out of scope for
-  the recipe layer, tracked as an upstream-engines concern.
+- ~~OpenAI-lane equivalent injection~~ — CLOSED 2026-10-21, see §7.5.
 
 ### 7.4 Upstream filing (§5.2) — duplicate check changed the plan
 
@@ -178,3 +176,51 @@ partial-tag holdback pin the streaming path. `cargo nextest -p blazar-gateway`: 
   public confidence-head measurements (+4–7% @ ~60 seqs/rank, +11.0% @ 96) as an existence
   proof for continuous-length verification:
   vllm-project/vllm#54082 (issuecomment-6294756765).
+
+### 7.5 Wave B (2026-10-21): recipe lane on /v1/chat/completions + doctor audit
+
+**Feature — gateway-rendered recipe lane on the OpenAI chat surface.** The neutralized
+renderer (§7.1) now also serves `/v1/chat/completions` under the same gate as the ollama
+lane: `prompt_recipe = "ollama_compat"` pinned for the model, OR (mlx engine AND a
+non-empty `tools` array), AND no images. The chat body is rendered gateway-side into the
+child's raw `/v1/completions` dialect; responses adapt back (non-stream: buffered
+translate + chat completion identity stamp; stream: per-frame SSE adaptation with stamped
+ids, usage frame, legal-close truncation). Response-side accounting (sentinel, sniffer,
+cache tap, metadata cards, think suppression, model re-stamp, JSON-fence strip) operates
+on the caller-dialect bytes — same posture as the ollama recipe lane. Refusals mirror the
+ollama posture: `n>1` and MCP selectors teach (400) instead of degrading. Default posture
+(recipe = "child", non-mlx-tools) is byte-identical passthrough, pinned by e2e test.
+
+**Root-cause fix found by live validation (wire capture).** The first live attempt 502'd
+deterministically: `apply_child_request_mutations_stamped` re-serializes from the hot
+lane's `parsed` chat body, so the mlx model-stamp mutator silently REPLACED the rendered
+completion body with the caller's chat dialect on the wire (mlx-lm closes the connection
+on a `messages`-shaped `/v1/completions` body — visible only via tcpdump: ack-then-FIN,
+zero response bytes). Fix: on the recipe lane the forwarded bytes are the mutation source
+of truth (no parse is handed over; every mutator is a documented no-op on the model-less
+completion body). The e2e stub suite could not catch this — the stub engine kind does not
+stamp models; only a live mlx child exercises the mutator.
+
+**Live validation receipts** (sandbox rig, qwen2.5-0.5b-instruct-4bit via mlx-0.32.0
+child, temp 0 seed 7, receipts under the rig dir):
+- Clean non-stream: `chat.completion` object, stamped `chatcmpl-` id, caller model
+  spelling, usage forwarded (pt 20 / ct 2), finish stop.
+- Forged turn-splicing message: pt 72 — the exact §7.1 neutralization signature (+25 over
+  the pre-fix 47); no fake-conversation continuation.
+- Stream: chat `delta.content` frames carrying one stamped id, final usage frame, bare
+  `data: [DONE]` terminator.
+- Unpinned model (mistral-7b via llamacpp): byte-faithful native passthrough (child's own
+  id format) — default lane untouched.
+- Tools request on the pinned lane: refused by the PRE-EXISTING capability-certificate
+  gate (this model's 2026-10-08 tool probe failed on mlx's template) — expected; note: a
+  re-probe under the pinned recipe lane would run grammar-forced and likely certify.
+  Tool parsing itself is pinned by unit + e2e stub tests.
+- Stub fixture gained llama-server-parity `/v1/completions` streaming (SSE text deltas,
+  `stream_options.include_usage` honored) so the streaming lane is e2e-pinned.
+- Test totals: blazar-gateway 725 → 735 (+5 unit, +5 e2e), clippy clean, fmt clean.
+
+**Doctor audit (wave C).** `blazar doctor` now reports the prompt-recipe posture: pinned
+models as ok rows (both surfaces named), and a warn advisory listing unpinned mlx models
+("engine-owned template drops tool calls — pin prompt_recipe for the grammar lane"),
+excluding whisper-family dirs. Validated against both the sandbox config (1 pinned) and
+the real store config.

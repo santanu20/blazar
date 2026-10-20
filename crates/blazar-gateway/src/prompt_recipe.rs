@@ -480,6 +480,71 @@ pub fn raw_json_to_chat(raw: &Value, tool_names: &[String]) -> Value {
     chat
 }
 
+/// Caller-facing identity stamped onto adapted chat payloads. The
+/// child raw-completion dialect carries no chat completion id/model/
+/// created, so the adapter fabricates them once per request and reuses
+/// the same values across every frame — matching how native chat
+/// children echo one id for the whole response.
+#[derive(Clone, Debug)]
+pub struct ChatStamp {
+    pub id: String,
+    pub model: String,
+    pub created: u64,
+}
+
+impl ChatStamp {
+    pub fn new(model: &str) -> Self {
+        // Sequence + nanos mix keeps ids unique even for two stamps
+        // minted inside one coarse clock tick.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let nanos = u64::try_from(since_epoch.as_nanos()).unwrap_or(u64::MAX);
+        Self {
+            id: format!(
+                "chatcmpl-{:x}",
+                nanos ^ (seq.wrapping_mul(0x9e37_79b9) << 20)
+            ),
+            model: model.to_string(),
+            created: since_epoch.as_secs(),
+        }
+    }
+
+    fn stamp_json(&self, object: &str) -> Value {
+        json!({
+            "id": self.id,
+            "object": object,
+            "model": self.model,
+            "created": self.created
+        })
+    }
+}
+
+/// Everything the proxy needs to run the pinned recipe lane on the
+/// `OpenAI` chat surface: the request's declared tool names (grammar
+/// emission + parse-lift gate) and the response identity merged into
+/// every adapted frame.
+#[derive(Clone, Debug)]
+pub struct RecipeLane {
+    pub tool_names: Vec<String>,
+    pub stamp: ChatStamp,
+}
+
+/// `raw_json_to_chat` plus the chat completion identity. The ollama
+/// lane keeps the unstamped original so its translated bytes do not
+/// shift by a single character.
+#[must_use]
+pub fn raw_json_to_chat_stamped(raw: &Value, tool_names: &[String], stamp: &ChatStamp) -> Value {
+    let mut chat = raw_json_to_chat(raw, tool_names);
+    let s = stamp.stamp_json("chat.completion");
+    for (k, v) in s.as_object().into_iter().flatten() {
+        chat[k] = v.clone();
+    }
+    chat
+}
+
 /// Streaming adapter: child raw-completion SSE in, chat-shaped SSE
 /// out. Child frames are PARSED (`data: {choices:[{text}...]}` lines),
 /// the text deltas forwarded as chat `delta.content` chunks minus a
@@ -510,6 +575,10 @@ struct Adapt {
     /// a marker-less whole-JSON call out of content (see
     /// `parse_completion_with_tools`).
     tool_names: Vec<String>,
+    /// Identity merged into every emitted data frame (chat lane).
+    /// `None` on the ollama lane, whose frames stay byte-identical to
+    /// before this field existed.
+    stamp: Option<Value>,
     done: bool,
 }
 
@@ -548,7 +617,8 @@ fn process_frame(st: &mut Adapt, frame: &Value) {
         if safe_end > st.emitted {
             let out_text = st.whole[st.emitted..safe_end].to_string();
             st.emitted = safe_end;
-            st.ready.push(sse_content_chunk(&out_text));
+            st.ready
+                .push(sse_content_chunk(&out_text, st.stamp.as_ref()));
         }
     }
 }
@@ -566,16 +636,20 @@ fn finish(st: &mut Adapt) {
     // already streamed (identical bytes: nothing before the first
     // tag is ever rewritten).
     if cleaned.len() > st.emitted {
-        let line = sse_content_chunk(&cleaned[st.emitted..]);
+        let line = sse_content_chunk(&cleaned[st.emitted..], st.stamp.as_ref());
         st.ready.push(line);
     }
     if !calls.is_empty() {
-        st.ready.push(sse_tool_calls_chunk(&calls));
+        st.ready
+            .push(sse_tool_calls_chunk(&calls, st.stamp.as_ref()));
     }
     if let Some(u) = st.usage.clone() {
         st.ready.push(format!(
             "data: {}\n\n",
-            serde_json::json!({"choices": [], "usage": u})
+            with_stamp(
+                serde_json::json!({"choices": [], "usage": u}),
+                st.stamp.as_ref()
+            )
         ));
     }
     st.ready.push("data: [DONE]\n\n".to_string());
@@ -589,6 +663,37 @@ pub fn raw_sse_to_chat_sse<S>(
 where
     S: futures::Stream<Item = std::io::Result<axum::body::Bytes>> + Unpin,
 {
+    raw_sse_to_chat_sse_inner(upstream, tool_names, None)
+}
+
+/// Stamped twin used by the `OpenAI` chat lane: identical adaptation,
+/// every `data:` frame additionally carries the request's chat
+/// completion identity. The stamp moves in by value: it is a one-shot
+/// mint whose data rides the stream state for the body's lifetime.
+#[allow(clippy::needless_pass_by_value)]
+pub fn raw_sse_to_chat_sse_stamped<S>(
+    upstream: S,
+    tool_names: Vec<String>,
+    stamp: ChatStamp,
+) -> impl futures::Stream<Item = std::io::Result<axum::body::Bytes>>
+where
+    S: futures::Stream<Item = std::io::Result<axum::body::Bytes>> + Unpin,
+{
+    raw_sse_to_chat_sse_inner(
+        upstream,
+        tool_names,
+        Some(stamp.stamp_json("chat.completion.chunk")),
+    )
+}
+
+fn raw_sse_to_chat_sse_inner<S>(
+    upstream: S,
+    tool_names: Vec<String>,
+    stamp: Option<Value>,
+) -> impl futures::Stream<Item = std::io::Result<axum::body::Bytes>>
+where
+    S: futures::Stream<Item = std::io::Result<axum::body::Bytes>> + Unpin,
+{
     use futures::StreamExt;
 
     let mut st = Adapt {
@@ -598,6 +703,7 @@ where
         whole: String::new(),
         usage: None,
         tool_names,
+        stamp,
         done: false,
     };
     let mut upstream = upstream;
@@ -663,7 +769,7 @@ where
                         target: "blazar::proxy",
                         "raw-lane upstream stream failed mid-body: {e} — closing legally with arrived bytes"
                     );
-                    st.ready.push(sse_truncated_chunk(&e));
+                    st.ready.push(sse_truncated_chunk(&e, st.stamp.as_ref()));
                     finish(&mut st);
                 }
                 std::task::Poll::Ready(None) => {
@@ -689,14 +795,31 @@ where
     })
 }
 
-fn sse_content_chunk(text: &str) -> String {
+/// Merge the stamp's top-level keys into a data-frame object. `None`
+/// is a no-op so unstamped (ollama-lane) frames keep their exact
+/// historical bytes.
+fn with_stamp(mut frame: Value, stamp: Option<&Value>) -> Value {
+    if let Some(s) = stamp
+        && let (Some(dst), Some(src)) = (frame.as_object_mut(), s.as_object())
+    {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    frame
+}
+
+fn sse_content_chunk(text: &str, stamp: Option<&Value>) -> String {
     format!(
         "data: {}\n\n",
-        serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}}]})
+        with_stamp(
+            serde_json::json!({"choices": [{"index": 0, "delta": {"content": text}}]}),
+            stamp
+        )
     )
 }
 
-fn sse_tool_calls_chunk(calls: &[ParsedToolCall]) -> String {
+fn sse_tool_calls_chunk(calls: &[ParsedToolCall], stamp: Option<&Value>) -> String {
     let chunks: Vec<serde_json::Value> = calls
         .iter()
         .enumerate()
@@ -713,24 +836,30 @@ fn sse_tool_calls_chunk(calls: &[ParsedToolCall]) -> String {
         .collect();
     format!(
         "data: {}\n\n",
-        serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": chunks}, "finish_reason": "tool_calls"}]})
+        with_stamp(
+            serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": chunks}, "finish_reason": "tool_calls"}]}),
+            stamp
+        )
     )
 }
 
 /// Terminal marker for a stream the child cut short mid-body: the
 /// content is truncated and the cause rides the chunk so downstream
 /// consumers see WHY instead of a silently short answer.
-fn sse_truncated_chunk(cause: &dyn std::fmt::Display) -> String {
+fn sse_truncated_chunk(cause: &dyn std::fmt::Display, stamp: Option<&Value>) -> String {
     format!(
         "data: {}\n\n",
-        serde_json::json!({
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "error",
-                "blazar": {"stream_truncated": true, "cause": format!("{cause}")}
-            }]
-        })
+        with_stamp(
+            serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "error",
+                    "blazar": {"stream_truncated": true, "cause": format!("{cause}")}
+                }]
+            }),
+            stamp
+        )
     )
 }
 
@@ -1227,6 +1356,163 @@ mod tests {
         assert_eq!(partial_tag_holdback("answer<tool"), 5);
         assert_eq!(partial_tag_holdback("answer."), 0);
         assert_eq!(partial_tag_holdback("<tool_call> full"), 0);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__chat_stamp__ids_unique_and_prefixed() {
+        let a = ChatStamp::new("m1");
+        let b = ChatStamp::new("m1");
+        assert!(a.id.starts_with("chatcmpl-"), "prefix: {}", a.id);
+        assert_ne!(a.id, b.id, "two stamps mint distinct ids");
+        assert_eq!(a.model, "m1");
+        assert!(a.created > 0, "unix seconds stamped");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__raw_json_to_chat_stamped__identity_and_object_fields() {
+        // The stamped twin is the ollama-lane shape PLUS the chat
+        // completion identity — choices/usage semantics unchanged.
+        let raw = json!({
+            "choices": [{"index": 0, "text": "hello", "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        });
+        let stamp = ChatStamp::new("m1");
+        let chat = raw_json_to_chat_stamped(&raw, &[], &stamp);
+        assert_eq!(chat["id"], json!(stamp.id));
+        assert_eq!(chat["object"], json!("chat.completion"));
+        assert_eq!(chat["model"], json!("m1"));
+        assert!(chat["created"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(chat["choices"][0]["message"]["content"], json!("hello"));
+        assert_eq!(chat["choices"][0]["finish_reason"], json!("stop"));
+        assert_eq!(chat["usage"]["prompt_tokens"], json!(3));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__raw_sse_stamped__every_frame_carries_identity() {
+        // Chat-lane streaming: content deltas, the closing usage frame,
+        // and a mid-body truncation all carry the SAME stamped identity
+        // (mirroring a native chat child, which echoes one id for the
+        // whole response); [DONE] stays a bare marker.
+        let stamp = ChatStamp::new("m1");
+        let frames = vec![
+            Ok(axum::body::Bytes::from_static(
+                b"data: {\"choices\":[{\"text\":\"he\"}]}\n\n",
+            )),
+            Ok(axum::body::Bytes::from_static(
+                b"data: {\"choices\":[{\"text\":\"llo\"}]}\n\n",
+            )),
+            Ok(axum::body::Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+            )),
+            Ok(axum::body::Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let mut out =
+            raw_sse_to_chat_sse_stamped(futures::stream::iter(frames), Vec::new(), stamp.clone());
+        let mut joined = String::new();
+        let mut all_ok = true;
+        while let Some(item) = out.next().await {
+            match item {
+                Ok(b) => joined.push_str(&String::from_utf8_lossy(&b)),
+                Err(_) => all_ok = false,
+            }
+        }
+        assert!(all_ok);
+        let data_frames: Vec<&str> = joined
+            .split("data: ")
+            .filter(|f| !f.trim().is_empty() && f.trim() != "[DONE]")
+            .collect();
+        assert!(data_frames.len() >= 3, "content + usage frames: {joined}");
+        for (i, frame) in data_frames.iter().enumerate() {
+            assert!(
+                frame.contains(&stamp.id),
+                "frame {i} carries the id: {frame}"
+            );
+            assert!(
+                frame.contains("\"chat.completion.chunk\""),
+                "frame {i} object kind: {frame}"
+            );
+            assert!(
+                frame.contains("\"model\":\"m1\""),
+                "frame {i} model: {frame}"
+            );
+        }
+        assert!(
+            joined.contains("\"content\":\"he\"") && joined.contains("\"content\":\"llo\""),
+            "deltas forwarded incrementally: {joined}"
+        );
+        assert!(
+            joined.contains("\"prompt_tokens\":5"),
+            "usage forwarded: {joined}"
+        );
+        assert!(
+            joined.trim_end().ends_with("data: [DONE]"),
+            "bare terminal marker: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__raw_sse_unstamped__frames_carry_no_identity() {
+        // Ollama-lane byte-parity pin: without a stamp the adapter's
+        // frames contain NO id/object/model/created — the historical
+        // bytes the ollama translator consumes are unchanged by the
+        // stamp plumbing.
+        let frames = vec![Ok(axum::body::Bytes::from_static(
+            b"data: {\"choices\":[{\"text\":\"hi\"}]}\n\n",
+        ))];
+        let mut out = raw_sse_to_chat_sse(futures::stream::iter(frames), Vec::new());
+        let mut joined = String::new();
+        while let Some(item) = out.next().await {
+            joined.push_str(&String::from_utf8_lossy(item.as_ref().unwrap()));
+        }
+        assert!(
+            joined.contains("\"delta\":{\"content\":\"hi\"}"),
+            "{joined}"
+        );
+        assert!(!joined.contains("\"id\""), "no id leaked: {joined}");
+        assert!(!joined.contains("\"object\""), "no object leaked: {joined}");
+        assert!(!joined.contains("\"model\""), "no model leaked: {joined}");
+        assert!(
+            !joined.contains("\"created\""),
+            "no created leaked: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__raw_sse_stamped__truncation_frame_carries_identity() {
+        // A child that dies mid-body on the chat lane still gets a
+        // legally-closed SSE whose terminal frame identifies the
+        // completion — a bare anonymous error frame would be
+        // unattributable for streaming clients.
+        let stamp = ChatStamp::new("m1");
+        let frames: Vec<std::io::Result<axum::body::Bytes>> = vec![
+            Ok(axum::body::Bytes::from_static(
+                b"data: {\"choices\":[{\"text\":\"par\"}]}\n\n",
+            )),
+            Err(std::io::Error::other("conn reset")),
+        ];
+        let mut out =
+            raw_sse_to_chat_sse_stamped(futures::stream::iter(frames), Vec::new(), stamp.clone());
+        let mut joined = String::new();
+        while let Some(item) = out.next().await {
+            joined.push_str(&String::from_utf8_lossy(
+                item.as_ref()
+                    .unwrap_or(&axum::body::Bytes::from_static(b"")),
+            ));
+        }
+        assert!(
+            joined.contains(&stamp.id),
+            "truncation frame identified: {joined}"
+        );
+        assert!(
+            joined.contains("stream_truncated"),
+            "truncation cause visible: {joined}"
+        );
+        assert!(joined.trim_end().ends_with("data: [DONE]"), "{joined}");
     }
 
     #[test]

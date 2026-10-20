@@ -864,12 +864,16 @@ struct CompletionRequest {
     pub prompt: serde_json::Value,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub stream_options: Option<serde_json::Value>,
 }
 
 async fn completions(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<CompletionRequest>,
-) -> axum::Json<serde_json::Value> {
+) -> axum::response::Response {
     let req_text = req
         .prompt
         .as_str()
@@ -886,11 +890,55 @@ async fn completions(
     };
     let text = format!("stub:{state}:{prompt}");
     let tokens = i64::try_from(text.split_whitespace().count().max(1)).unwrap_or(1);
+    let model = req.model.unwrap_or_else(|| state.clone());
+    if req.stream {
+        // Raw-completion SSE dialect: text deltas in choices[0].text,
+        // usage as a bare final frame (when stream_options asked for
+        // it), [DONE] terminator — the shape llama-server and mlx-lm
+        // speak on /v1/completions.
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .and_then(|o| o.get("include_usage"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let (first, second) = split_in_half(&text);
+        let mut events: Vec<String> = Vec::new();
+        for part in [first, second] {
+            let payload = serde_json::json!({
+                "choices": [{"index": 0, "text": part}],
+            });
+            events.push(format!("data: {payload}\n\n"));
+        }
+        if include_usage {
+            let usage = serde_json::json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": tokens,
+                    "completion_tokens": tokens,
+                    "total_tokens": tokens * 2,
+                },
+            });
+            events.push(format!("data: {usage}\n\n"));
+        }
+        events.push("data: [DONE]\n\n".to_string());
+        let stream = futures::stream::iter(
+            events
+                .into_iter()
+                .map(|e| Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(e))),
+        );
+        return axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap();
+    }
     axum::Json(serde_json::json!({
         "id": format!("cmpl-stub-{}", std::process::id()),
         "object": "text_completion",
         "created": 0_u64,
-        "model": req.model.unwrap_or_else(|| state.clone()),
+        "model": model,
         "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
         "usage": {
             "prompt_tokens": tokens,
@@ -898,6 +946,7 @@ async fn completions(
             "total_tokens": tokens * 2,
         },
     }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]

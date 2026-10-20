@@ -879,9 +879,22 @@ pub async fn proxy_request(
     // Pre-admission single-flight phase (chat lanes with a parsed body
     // acquire BEFORE slot admission so duplicates wait guard-free).
     sf_gate: SfGate,
+    // Pinned-recipe lane (chat surface speaking the neutralized
+    // gateway render over the child's raw completion surface). `Some`
+    // rewrites the FORWARD path to /v1/completions and adapts the
+    // child's raw responses back to chat; every response-side gate
+    // keeps operating on the client's own `path_query`.
+    recipe: Option<crate::prompt_recipe::RecipeLane>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
-    let url = format!("{base}{path_query}");
+    // Recipe lane forwards to the raw completion surface; everything
+    // else speaks the caller's dialect natively.
+    let fwd_path = if recipe.is_some() {
+        "/v1/completions"
+    } else {
+        path_query
+    };
+    let url = format!("{base}{fwd_path}");
     let began = std::time::Instant::now();
 
     // SGLang LoRA-variant stamp (`base:adapter` — the engine's own
@@ -905,11 +918,22 @@ pub async fn proxy_request(
     // serialization — a chain of per-mutator re-serializations would
     // silently drop whichever mutations ran first (each rebuilt the body
     // from the ORIGINAL parse, not its predecessor's output).
+    //
+    // Recipe lane: the contract here is body == serialize(parsed); the
+    // recipe's completion dialect BREAKS that invariant (parsed is the
+    // caller's chat shape, body is the gateway render), so the render
+    // must be the mutation source of truth — pass no parse and let the
+    // mutators evaluate the actual forwarded bytes (model-less
+    // completion body: every mutator is a documented no-op).
     let body = apply_child_request_mutations_stamped(
         engine,
-        path_query,
+        fwd_path,
         body,
-        parsed.as_ref(),
+        if recipe.is_some() {
+            None
+        } else {
+            parsed.as_ref()
+        },
         variant_stamp.as_deref(),
     );
 
@@ -1017,7 +1041,7 @@ pub async fn proxy_request(
             // error surfaced; the respawn is guaranteed a fresh lane.
             match respawn_lane(state, &engine.key).await {
                 Ok(fresh) => {
-                    let fresh_url = format!("{}{path_query}", child_base(&fresh.endpoint));
+                    let fresh_url = format!("{}{fwd_path}", child_base(&fresh.endpoint));
                     tracing::warn!(
                         model,
                         "proxy {path_query}: child died mid-request; retrying once on respawned lane {}",
@@ -1034,9 +1058,13 @@ pub async fn proxy_request(
                     );
                     let retry_body = apply_child_request_mutations_stamped(
                         &fresh,
-                        path_query,
+                        fwd_path,
                         body_snapshot.clone(),
-                        parsed.as_ref(),
+                        if recipe.is_some() {
+                            None
+                        } else {
+                            parsed.as_ref()
+                        },
                         retry_stamp.as_deref(),
                     );
                     body_snapshot = retry_body.clone();
@@ -1210,11 +1238,28 @@ pub async fn proxy_request(
             structured_output_kind(parsed.as_ref()),
             Some("json_schema" | "json_object")
         );
+    // Recipe lane (chat surface over the raw completion child): the
+    // dialect swap happens gateway-side, so a non-stream recipe
+    // response ALWAYS rides the buffered branch — streaming raw
+    // completion bytes to a chat caller is silent dialect corruption.
+    // A declared-over-cap body is refused loudly rather than read:
+    // the cap bounds the read, never the contract.
+    if recipe.is_some() && !sse && enforce_oversized {
+        if let Some(s) = sniffer.take() {
+            s.finish(&state.keys);
+        }
+        drop(sf); // F31: Drop removes the singleflight entry
+        return openai_error(
+            502,
+            "recipe lane: raw completion body exceeds enforce cap; refusing dialect swap",
+        );
+    }
     if sentinel_active
         || want_choice_verify
         || (suppress_think && !sse)
         || (restamp && !sse)
         || json_fence
+        || (recipe.is_some() && !sse)
     {
         let ctx = if sentinel_active {
             let (ctx, warnings) = sentinel::request_ctx(
@@ -1270,6 +1315,39 @@ pub async fn proxy_request(
                 return openai_error(502, &format!("engine body: {e}"));
             }
             Ok(buf) => {
+                // Recipe lane: translate the child's raw completion body
+                // into the chat dialect the caller speaks, then let every
+                // downstream concern (n-verify, sentinel, sniffing,
+                // telemetry, metadata, restamp, fence) operate on the
+                // caller-dialect bytes — the same posture as the ollama
+                // recipe lane. A body that does not round-trip fails
+                // CLOSED: the alternative (serving raw dialect to a chat
+                // caller) is silent corruption.
+                let buf = match &recipe {
+                    Some(lane) => {
+                        let adapted = serde_json::from_slice::<serde_json::Value>(&buf)
+                            .map_err(|e| format!("unparseable completion body: {e}"))
+                            .and_then(|raw| {
+                                serde_json::to_vec(&crate::prompt_recipe::raw_json_to_chat_stamped(
+                                    &raw,
+                                    &lane.tool_names,
+                                    &lane.stamp,
+                                ))
+                                .map_err(|e| format!("reserialize failed: {e}"))
+                            });
+                        match adapted {
+                            Ok(b) => axum::body::Bytes::from(b),
+                            Err(why) => {
+                                if let Some(s) = sniffer.take() {
+                                    s.finish(&state.keys);
+                                }
+                                drop(sf); // F31: Drop removes the singleflight entry
+                                return openai_error(502, &format!("recipe lane: {why}"));
+                            }
+                        }
+                    }
+                    None => buf,
+                };
                 if let Some(n) = n_asked {
                     if buf.len() > sentinel::ENFORCE_BODY_CAP {
                         tracing::warn!(
@@ -1450,7 +1528,33 @@ pub async fn proxy_request(
         None
     }));
     let restamp_stream = std::sync::Arc::clone(&restamp_cell);
-    let stream = resp.bytes_stream().flat_map(move |r| {
+    // Recipe lane: adapt the child's raw completion SSE into chat SSE
+    // BEFORE the evidence loop — sentinel/taps/sniffer/think-filter/
+    // restamper all observe the caller-dialect frames, the same
+    // posture as the ollama recipe lane (which feeds its adapted chat
+    // value to the sentinel). reqwest errors map to io::Error for the
+    // adapter's Item contract; the truncated-stream discipline below
+    // emits the same legal-close terminal frames.
+    let upstream = {
+        let raw = resp
+            .bytes_stream()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+        match recipe {
+            Some(lane) => Box::pin(crate::prompt_recipe::raw_sse_to_chat_sse_stamped(
+                raw,
+                lane.tool_names,
+                lane.stamp,
+            ))
+                as std::pin::Pin<
+                    Box<dyn futures::Stream<Item = std::io::Result<axum::body::Bytes>> + Send>,
+                >,
+            None => Box::pin(raw)
+                as std::pin::Pin<
+                    Box<dyn futures::Stream<Item = std::io::Result<axum::body::Bytes>> + Send>,
+                >,
+        }
+    };
+    let stream = upstream.flat_map(move |r| {
         match r {
             Ok(bytes) => {
                 let now = std::time::Instant::now();
