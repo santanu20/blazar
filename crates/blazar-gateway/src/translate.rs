@@ -2359,6 +2359,46 @@ mod tests {
     }
 
     #[test]
+    fn unit__think_splitter__every_two_way_split_never_leaks_or_loses() {
+        // Characterization sweep: the full open+close pattern fed as
+        // TWO deltas at EVERY split point — including every boundary
+        // inside both markers — must always yield exactly the outer
+        // text, never the markers, never the hidden block.
+        let text = "pre<think>hidden</think>post";
+        for split in 1..text.len() {
+            if !text.is_char_boundary(split) {
+                continue;
+            }
+            let (a, b) = text.split_at(split);
+            let mut sp = ThinkSplitter::new();
+            let mut emitted = sp.feed(a);
+            emitted.push_str(&sp.feed(b));
+            emitted.push_str(&sp.finish());
+            assert_eq!(emitted, "prepost", "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn unit__think_splitter__marker_free_text_identity_at_every_split() {
+        // Text with no COMPLETE marker — including partial-prefix
+        // lookalikes — is literal content at every two-way split: what
+        // went in comes out, byte for byte, via feed+finish.
+        let text = "a <th <thinkx < b <text </thi end";
+        assert!(!text.contains("<think>") && !text.contains("</think>"));
+        for split in 0..=text.len() {
+            if !text.is_char_boundary(split) {
+                continue;
+            }
+            let (a, b) = text.split_at(split);
+            let mut sp = ThinkSplitter::new();
+            let mut emitted = sp.feed(a);
+            emitted.push_str(&sp.feed(b));
+            emitted.push_str(&sp.finish());
+            assert_eq!(emitted, text, "split at byte {split}");
+        }
+    }
+
+    #[test]
     fn unit__suppress_think_text__idempotent_on_clean_text() {
         assert_eq!(suppress_think_text("clean"), "clean");
         assert_eq!(
