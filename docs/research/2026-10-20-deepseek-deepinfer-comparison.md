@@ -219,6 +219,21 @@ child, temp 0 seed 7, receipts under the rig dir):
   `stream_options.include_usage` honored) so the streaming lane is e2e-pinned.
 - Test totals: blazar-gateway 725 → 735 (+5 unit, +5 e2e), clippy clean, fmt clean.
 
+**Wave B follow-ups (2026-10-21, closed same session).**
+- *Probe rides the serving lane — true by construction, no code change.* `model-doctor`
+  probes call the gateway's own handlers (`ollama::chat` with the capability-stand-down
+  header), so an unpinned mlx model's tools probe flows the recipe lane automatically via
+  the mlx_tools gate — production routing and certification measure the same path.
+- *Cert flips — verified live, with an architectural caveat.* qwen3-1.7b (UNPINNED mlx)
+  certifies FULL PASS including tools (`200, 1 tool call(s), first: get_weather`) through
+  the auto-triggered recipe lane. qwen2.5-0.5b honestly FAILs (answers in prose, echoing
+  the rendered tools block) — because **mlx-lm ignores the GBNF `grammar` field on
+  `/v1/completions`** (live-proven: a literal-only grammar constraint request returned
+  free-form text). Recipe-lane tool calling on mlx is therefore prompt-taught format + parse-lift,
+  capability-bound per model; decoder-level grammar enforcement holds only on
+  llama.cpp-family children. qwen3-4b: 507 fit refusal (8 GB VRAM); granite-micro: crashes
+  at mlx load in this environment (not lane-related).
+
 **Doctor audit (wave C).** `blazar doctor` now reports the prompt-recipe posture: pinned
 models as ok rows (both surfaces named), and a warn advisory listing unpinned mlx models
 ("engine-owned template drops tool calls — pin prompt_recipe for the grammar lane"),
