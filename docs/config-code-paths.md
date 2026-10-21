@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) — 231 fields, 0 dead
+## Config (top-level keys) — 234 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -68,6 +68,8 @@ token quality are surfaced as drift.
 | swa_full | false | engine-argv | `blazar-core/src/profile.rs:1306` in `the`; `blazar-core/src/profile.rs:1310` in `the` |
 | ctx_checkpoints | 0 | engine-argv | `blazar-core/src/profile.rs:1313` in `the`; `blazar-core/src/profile.rs:1316` in `the` |
 | no_kv_offload | false | engine-argv | `blazar-core/src/profile.rs:1321` in `the`; `blazar-core/src/profile.rs:1325` in `the` |
+| offline | true | engine-argv | `blazar-core/src/profile.rs:1578` in `12c`; `blazar-core/src/config.rs` in `effective_offline` |
+| moe_cache_mib | 0 | engine-argv | `blazar-core/src/profile.rs:1587` in `12d`; `blazar-core/src/config.rs` in `effective_moe_cache_mib` |
 | load_mode | String::new() | engine-argv | `blazar-core/src/profile.rs:1328` in `the`; `blazar-core/src/profile.rs:1331` in `the` |
 | spawn_mem_guard | true | runtime/gateway | `blazar-runtime/src/supervisor.rs:3166` in `spawn_instance_forced`; `blazar-runtime/src/supervisor.rs:3174` in `spawn_instance_forced` |
 | session_bank | true | runtime/gateway + gateway-http | `blazar-runtime/src/supervisor.rs:4386` in `bank_restore_sync`; `blazar-runtime/src/supervisor.rs:4482` in `bank_save`; `blazar-gateway/src/lib.rs:839` in `well_known` |
@@ -133,6 +135,7 @@ token quality are surfaced as drift.
 | spec_draft_device | String::new() | engine-argv | `blazar-core/src/profile.rs:930` in `the`; `blazar-core/src/profile.rs:935` in `the` |
 | spec_draft_ngl | String::new() | engine-argv | `blazar-core/src/profile.rs:968` in `the`; `blazar-core/src/profile.rs:973` in `the` |
 | spec_draft_threads | 0 | engine-argv | `blazar-core/src/profile.rs:978` in `the`; `blazar-core/src/profile.rs:983` in `the` |
+| spec_draft_n_ubatch | 0 | engine-argv | `blazar-core/src/profile.rs:1227` in `11b` |
 | spec_draft_p_min | None | engine-argv | `blazar-core/src/profile.rs:988` in `the`; `blazar-core/src/profile.rs:993` in `the` |
 | spec_draft_p_split | None | engine-argv | `blazar-core/src/profile.rs:998` in `the`; `blazar-core/src/profile.rs:1003` in `the` |
 | spec_draft_poll | None | engine-argv | `blazar-core/src/profile.rs:1008` in `the`; `blazar-core/src/profile.rs:1010` in `the` |
@@ -363,7 +366,7 @@ token quality are surfaced as drift.
 | enable_tf32_matmul | — | engine-argv | `crates/blazar-core/src/profile.rs:4903` (TF32 matmul toggle) |
 | enable_priority_scheduling | Some(true) | engine-argv | `crates/blazar-core/src/profile.rs:4916` (request priority scheduling) |
 
-## ModelOverride ([models."name"]) — 39 fields, 0 dead
+## ModelOverride ([models."name"]) — 41 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -378,6 +381,8 @@ token quality are surfaced as drift.
 | prompt_recipe | — | engine-argv + gateway-http | `blazar-core/src/profile.rs:5689` in `input_named_with_spec`; `blazar-gateway/src/lib.rs:18` in `?`; `blazar-gateway/src/ollama.rs:1077` in `chat` |
 | decode_policy | — | engine-argv | `blazar-core/src/profile.rs:5690` in `input_named_with_spec` |
 | raw_lane_max_tokens | — | engine-argv | `blazar-core/src/profile.rs:5691` in `input_named_with_spec` |
+| offline | — | engine-argv | `blazar-core/src/config.rs` in `effective_offline` |
+| moe_cache_mib | — | engine-argv | `blazar-core/src/config.rs` in `effective_moe_cache_mib` |
 | kv_unified | — | other + engine-argv + cli | `blazar-core/src/session_identity.rs:32` in `?`; `blazar-core/src/session_identity.rs:61` in `build`; `blazar-core/src/profile.rs:360` in `compile`; `blazar-core/src/profile.rs:1288` in `the`; `blazar-cli/src/main.rs:12852` in `unit__known_config_key__defaults_options_and_typos` |
 | ctx_extend | — | engine-argv + cli | `blazar-core/src/profile.rs:1792` in `the`; `blazar-core/src/profile.rs:1793` in `the`; `blazar-cli/src/main.rs:12842` in `unit__known_config_key__defaults_options_and_typos` |
 | cpu_moe_n | — | engine-argv | `blazar-core/src/profile.rs:1829` in `the`; `blazar-core/src/profile.rs:1830` in `the` |
