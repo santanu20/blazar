@@ -20,8 +20,8 @@ re-diff).
 | OpenAI `/v1/chat/completions` (non-stream) | LIVE (2026-10-21: mistral-7b " Ok" pt11; recipe lane pt20/ct2 + chatcmpl stamp) | LEAD | Recipe lane (neutralized gateway render) is unique; ollama/vLLM have nothing equivalent — engine-owned templates everywhere |
 | OpenAI chat streaming (SSE) | LIVE (stamped delta frames + usage + `[DONE]`) | PARITY | vLLM equals on raw streaming; none match our legal-close truncation + think-filter simultaneously |
 | Ollama `/api/chat` + `/api/generate` | LIVE (mistral-7b, qwen via mlx child) | LEAD | Byte-compat incl. NDJSON streaming + think splitting; ollama parity is the floor, recipe lane exceeds it |
-| Anthropic `/v1/messages` | TEST-ONLY (conformance + gateway suites) | PARITY | Full dialect incl. count_tokens; no live receipt this cycle — cheap to take |
-| Cancellation / client disconnect | TEST-ONLY + upstream fix landed (llama.cpp #29707 router propagation in b11785) | PARITY→LEAD | Wire-level cancel through to child decode stop now rides upstream; no live receipt |
+| Anthropic `/v1/messages` | LIVE (2026-10-21 receipt: full dialect response — msg_ id, stop_reason end_turn, anthropic usage block; count_tokens 5/11 tok) | PARITY | Receipts: anth1.json + count_tokens on the rig |
+| Cancellation / client disconnect | LIVE (2026-10-21 receipt: /v1/requests listing mid-stream → /v1/requests/{id}/cancel → cancelled:true, stream frozen at 49,150 B within 2s, static 12s+) | PARITY→LEAD | In-flight introspection (partial_preview/bytes) + wire cancel both live |
 | Single-flight dedup | TEST-ONLY (suite) + live-adjacent (every live probe transits it) | LEAD | Neither ollama nor llama.cpp-server dedups identical in-flight chat requests |
 | Sentinel (output judging / enforce) | TEST-ONLY (sentinel.rs 41.7K suite) | LEAD | No competitor ships an output-quality gate at the proxy layer |
 | Think dialect (`<think>`/reasoning split) | TEST-ONLY (think_dialect.rs) + LIVE indirectly (recipe suppress posture) | PARITY | Matches ollama think fields + OpenAI reasoning summaries |
@@ -49,9 +49,9 @@ re-diff).
 | Component | E2E status | SOTA position | Notes |
 |---|---|---|---|
 | `/v1/responses` emulation | TEST-ONLY (conformance) | LEAD locally | Uniform cross-engine Responses incl. storage/previous_response_id — ollama/llama.cpp have none, vLLM partial; llama.cpp b11785 native /v1/responses is child-local only (tracked) |
-| `/v1/batches` + `/v1/files` | TEST-ONLY | PARITY | OpenAI-parity surface none of the local set ships |
-| Jobs framework (images/video/audio/jobs + events + artifacts) | LIVE for images (PNG receipt); TEST-ONLY for video/audio orchestration | LEAD locally | Unified async jobs across modalities is unique |
-| `/v1/requests` (async chat) | TEST-ONLY | PARITY+ | — |
+| `/v1/batches` + `/v1/files` | LIVE (2026-10-21: files upload 190 B JSONL → file-id; batch created → polled completed 1/1/0; full pipeline) | PARITY | OpenAI-parity surface none of the local set ships |
+| Jobs framework (images/video/audio/jobs + events + artifacts) | LIVE all three (images PNG; video 16-frame WebM in 150s via wan-2.1; audio jobs ride speech+transcription round-trip) | LEAD locally | Unified async jobs across modalities is unique |
+| `/v1/requests` (async chat) | LIVE (2026-10-21: listing + cancel exercised mid-stream; create-via-chat transitively live) | PARITY+ | — |
 
 ### Specialty inference
 
@@ -69,14 +69,14 @@ re-diff).
 |---|---|---|---|
 | Images generations/edits/variations/upscale + jobs | LIVE (qwen-image PNG, 512×512, params echo) | LEAD locally | Only local server with OpenAI images dialect over sdcpp |
 | Videos generations/jobs/content | TEST-ONLY (routes verified vs sdcpp master-982; no run this cycle) | LEAD locally | — |
-| Audio transcriptions/translations/speech/voices | TEST-ONLY this cycle (whisper+piper lanes verified in earlier sessions) | PARITY+ | ollama has none of speech/voices |
+| Audio transcriptions/translations/speech/voices | LIVE (2026-10-21 round-trip: piper speech 162 KB WAV → whisper transcription → exact text match; ggml-base lives in data/whisper/models) | PARITY+ | ollama has none of speech/voices |
 
 ### Sessions, cache, routing, ops
 
 | Component | E2E status | SOTA position | Notes |
 |---|---|---|---|
-| Sessions + prompt caching | TEST-ONLY (sessions.rs) | PARITY+ | — |
-| Semantic cache | TEST-ONLY (semcache.rs; off by default) | LEAD | nobody local has one |
+| Sessions + prompt caching | LIVE (2026-10-21: save/restore round-trip n_written 36 / n_read 36, sub-ms) | PARITY+ | Slot-checkpoint surface |
+| Semantic cache | LIVE (2026-10-21: miss→store→hit 0.9544 similarity on reworded prompt, cache_debug.cache_hit marker; off by default, x-blazar-cache header override) | LEAD | nobody local has one |
 | Engine routing (llamacpp/mlx/sglang/mistralrs/sdcpp/whisper/piper + federation/remotes) | LIVE (all four LLM engines live this cycle; remotes bypass documented) | LEAD | The core differentiator vs every competitor |
 | Supervisor (spawn/respawn/settle/warm-peg/idle-evict) | LIVE (respawn receipts, warm-peg, sleep/wake) | LEAD | — |
 | Admission/capacity (`/api/capacity`, fit gates) | LIVE (507 fit refusals observed honestly; 8GB ladder) | LEAD | ollama has no admission control |
