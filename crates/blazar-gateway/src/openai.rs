@@ -1520,11 +1520,15 @@ pub async fn scoped_proxy(
 }
 
 /// POST /v1/responses — proxied WITH gateway conversation state:
-/// `previous_response_id` chaining and `store` semantics that upstream
-/// llama-server does not implement (no storage server-side, verified).
-/// Non-streaming responses are stored (bounded LRU) and re-id'd so
-/// clients can chain; streaming responses consume stored context but
-/// are not themselves stored (warned via `x-blazar-warnings`).
+/// `previous_response_id` chaining and `store` semantics the rest of
+/// the engine fleet does not implement (sglang/mistralrs/mlx have no
+/// server-side storage; llama-server grew a native /v1/responses at
+/// b11785 but its storage story stays child-local and
+/// restart-transient — the gateway layer remains the uniform
+/// cross-engine contract). Non-streaming responses are stored (bounded
+/// LRU) and re-id'd so clients can chain; streaming responses consume
+/// stored context but are not themselves stored (warned via
+/// `x-blazar-warnings`).
 #[allow(clippy::too_many_lines)]
 pub async fn responses_api(
     State(state): State<Arc<AppState>>,
