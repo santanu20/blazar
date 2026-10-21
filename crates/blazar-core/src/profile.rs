@@ -167,6 +167,11 @@ pub struct Profile {
     /// ("auto" = tight fit left to the engine's layer juggling; "partial"
     /// = weights exceed VRAM, engine splits CPU+GPU).
     pub gpu: &'static str,
+    /// Counting VRAM (iGPU-excluded) of the compile host; 0 when a lane
+    /// compiles without hardware in hand. Cross-engine consumers scale
+    /// memory-shaped scheduling decisions by it instead of running
+    /// VRAM-blind — the mistral.rs paged-execution ladder is the first.
+    pub vram_mib: u64,
     /// Estimated f16-equivalent KV-cache bytes at the compiled ctx, after
     /// w KV quantization the profile chose (`q8_0` halves, `q4_0`
     /// quarters).
@@ -2414,6 +2419,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // bound prompts by what a slot can hold, not the total
         ctx: rs.per_slot_ctx,
         gpu: gpu_label,
+        vram_mib: input.hardware.total_vram_mib(),
         kv_est_bytes,
         // Some((per_slot_ctx, slots)) when auto-fit divided the default
         // ctx to earn parallel slots; telemetry (`ps`, events) uses this
@@ -3344,6 +3350,7 @@ fn compile_mistralrs(
         ctx,
         gpu: "auto",
         kv_est_bytes: None,
+        vram_mib: input.hardware.total_vram_mib(),
         ctx_autofit: None,
         capacity: CapacityStatus::Compiled,
     })
@@ -3470,6 +3477,7 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
         // ctx is not a concept for image lanes (no token-window
         // admission); 0 keeps preflight out of the way.
         ctx: 0,
+        vram_mib: input.hardware.total_vram_mib(),
         gpu: offload.gpu,
         kv_est_bytes: None,
         ctx_autofit: None,
@@ -4116,6 +4124,7 @@ fn compile_mlx(input: &ProfileInput<'_>) -> Result<Profile, String> {
         warnings,
         ctx: ceiling,
         gpu: "auto",
+        vram_mib: input.hardware.total_vram_mib(),
         kv_est_bytes: None,
         ctx_autofit: None,
         capacity: CapacityStatus::RuntimeManaged,
@@ -4286,6 +4295,7 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
         warnings,
         ctx,
         gpu: gpu_label,
+        vram_mib: input.hardware.total_vram_mib(),
         kv_est_bytes,
         ctx_autofit: None,
         capacity: CapacityStatus::Compiled,

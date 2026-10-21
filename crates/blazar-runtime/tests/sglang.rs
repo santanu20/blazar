@@ -32,6 +32,7 @@ fn profile() -> Profile {
         warnings: Vec::new(),
         ctx: 0,
         gpu: "auto",
+        vram_mib: 0,
         kv_est_bytes: None,
         ctx_autofit: None,
         capacity: CapacityStatus::default(),

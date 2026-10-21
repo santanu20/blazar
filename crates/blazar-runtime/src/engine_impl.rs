@@ -620,6 +620,38 @@ fn shard_of(name: &str, base: &str) -> bool {
     })
 }
 
+/// Paged-execution step ceiling for the mistral.rs lane, scaled by the
+/// card's VRAM: v0.9.5's executor reserves activation memory for the
+/// FULL `--max-num-batched-tokens` × `--max-seqs` envelope up front, so
+/// an unscaled envelope starves KV on small cards (live receipt
+/// 2026-10-21: 16k×32 reserved ~2178 MiB and a 512 MiB explicit
+/// `--kv-cache` still failed fit on 8 GB, while the engine's 4096-class
+/// defaults served the same model). An explicit `--kv-cache` pin
+/// (upstream #2502 workaround) tightens even big cards by one rung:
+/// the pin buys KV with the same activation headroom.
+fn paged_step_ceiling(step: u32, profile: &Profile) -> u32 {
+    let kv_pinned = profile.argv.iter().any(|a| a == "--kv-cache");
+    match profile.vram_mib {
+        // No hardware in hand (no GPU detected): keep the legacy
+        // envelope rather than guessing.
+        0 => step,
+        v if v >= 20_000 && !kv_pinned => step,
+        v if v >= 12_000 => step.min(8_192),
+        _ => step.min(4_096),
+    }
+}
+
+/// Paged-execution sequence ceiling, same scaling rationale as
+/// [`paged_step_ceiling`]: slots multiply the reserved activation
+/// envelope.
+fn paged_seqs_ceiling(seqs: u32, profile: &Profile) -> u32 {
+    match profile.vram_mib {
+        0 => seqs,
+        v if v >= 12_000 => seqs,
+        _ => seqs.min(16),
+    }
+}
+
 /// Translate a compiled llama.cpp-style profile into `mistralrs serve`
 /// argv. Only the knobs with a clean semantic mapping carry over
 /// (model file, port, ctx, parallelism, mmproj); llama.cpp-only tuning
@@ -669,13 +701,19 @@ pub fn mistralrs_argv(
     // any prompt longer than that dies as an HTTP 200 with an empty
     // choices array and `error: service_unavailable` (live-proven on
     // v0.9.3 — a real-world ~4.3k-token system prompt tripped it). Raise the
-    // step to the serving context so prefill is never chunk-starved.
+    // step to the serving context so prefill is never chunk-starved,
+    // scaled by the card: v0.9.5's paged executor reserves activation
+    // memory for the FULL envelope, and a 16k×32 envelope reserved
+    // ~2178 MiB, starving KV until even a 512 MiB explicit --kv-cache
+    // failed fit on an 8 GB card (live receipt, 2026-10-21) while the
+    // engine's own 4096-class defaults served the same model fine.
     if profile.ctx > 0 && flags.contains("--max-num-batched-tokens") {
         argv.push("--max-num-batched-tokens".into());
-        argv.push(profile.ctx.max(4096).to_string());
+        argv.push(paged_step_ceiling(profile.ctx.max(4096), profile).to_string());
     }
     // Parallelism: mine the compiled llama.cpp argv for `-np N` /
-    // `--parallel=N` (the profile's slot count).
+    // `--parallel=N` (the profile's slot count), ceilinged by the same
+    // envelope math.
     let np = profile
         .argv
         .windows(2)
@@ -689,7 +727,7 @@ pub fn mistralrs_argv(
         });
     if let Some(n) = np.filter(|_| flags.contains("--max-seqs")) {
         argv.push("--max-seqs".into());
-        argv.push(n.to_string());
+        argv.push(paged_seqs_ceiling(n, profile).to_string());
     }
     if let Some(mm) = model.mmproj_path.as_deref()
         && flags.contains("--mmproj")
@@ -2187,6 +2225,142 @@ mod tests {
             .position(|a| a == "--max-num-batched-tokens")
             .expect("GGUF rows raise the scheduler batch step");
         assert_eq!(argv[b + 1], "32768");
+    }
+
+    #[test]
+    fn unit__paged_envelope__small_card_steps_down_seq_cap() {
+        // The 8 GB receipt: a 16k×32 envelope reserved ~2178 MiB of
+        // activations and starved KV until even a pinned 512 MiB
+        // --kv-cache failed fit; 4096-class defaults served the same
+        // model. Small cards must step down to that class and cap
+        // slots at 16.
+        let row = mistralrs_row("/store/mistral-7b.gguf");
+        let flags = [
+            "--max-num-batched-tokens".to_string(),
+            "--max-seqs".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let mut p = mistralrs_profile();
+        p.ctx = 16_384;
+        p.vram_mib = 8_192;
+        p.argv = vec!["-np".into(), "32".into()];
+        let argv = mistralrs_argv(
+            &row,
+            &p,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let b = argv
+            .iter()
+            .position(|a| a == "--max-num-batched-tokens")
+            .unwrap();
+        assert_eq!(argv[b + 1], "4096", "stepped down to the serving class");
+        let s = argv.iter().position(|a| a == "--max-seqs").unwrap();
+        assert_eq!(argv[s + 1], "16", "slot count ceilinged");
+    }
+
+    #[test]
+    fn unit__paged_envelope__big_card_keeps_envelope() {
+        // >= 20 GB without an explicit KV pin: the compiled envelope
+        // rides unchanged (mid cards land on the 8192 rung).
+        let row = mistralrs_row("/store/mistral-7b.gguf");
+        let flags = ["--max-num-batched-tokens".to_string()]
+            .into_iter()
+            .collect();
+        let mut p = mistralrs_profile();
+        p.ctx = 16_384;
+        p.vram_mib = 24_000;
+        let argv = mistralrs_argv(
+            &row,
+            &p,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let b = argv
+            .iter()
+            .position(|a| a == "--max-num-batched-tokens")
+            .unwrap();
+        assert_eq!(argv[b + 1], "16384", "big card keeps the full envelope");
+        let mut mid = p.clone();
+        mid.vram_mib = 12_000;
+        let argv_mid = mistralrs_argv(
+            &row,
+            &mid,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let b = argv_mid
+            .iter()
+            .position(|a| a == "--max-num-batched-tokens")
+            .unwrap();
+        assert_eq!(argv_mid[b + 1], "8192", "mid card rides the 8192 rung");
+    }
+
+    #[test]
+    fn unit__paged_envelope__kv_pin_tightens_big_card() {
+        // An explicit --kv-cache (upstream #2502 workaround) buys KV
+        // with the same activation headroom: even a big card steps
+        // down one rung so the pin has room to land.
+        let row = mistralrs_row("/store/mistral-7b.gguf");
+        let flags = ["--max-num-batched-tokens".to_string()]
+            .into_iter()
+            .collect();
+        let mut p = mistralrs_profile();
+        p.ctx = 16_384;
+        p.vram_mib = 24_000;
+        p.argv = vec!["--kv-cache".into(), "1GiB".into()];
+        let argv = mistralrs_argv(
+            &row,
+            &p,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let b = argv
+            .iter()
+            .position(|a| a == "--max-num-batched-tokens")
+            .unwrap();
+        assert_eq!(argv[b + 1], "8192", "KV pin tightens the envelope one rung");
+    }
+
+    #[test]
+    fn unit__paged_envelope__unknown_hardware_keeps_legacy() {
+        // vram_mib = 0 (no GPU detected / no hardware in hand): the
+        // legacy envelope rides unchanged rather than guessing.
+        let row = mistralrs_row("/store/mistral-7b.gguf");
+        let flags = ["--max-num-batched-tokens".to_string()]
+            .into_iter()
+            .collect();
+        let mut p = mistralrs_profile();
+        p.ctx = 16_384;
+        p.vram_mib = 0;
+        p.argv = vec!["-np".into(), "32".into()];
+        let argv = mistralrs_argv(
+            &row,
+            &p,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let b = argv
+            .iter()
+            .position(|a| a == "--max-num-batched-tokens")
+            .unwrap();
+        assert_eq!(argv[b + 1], "16384", "legacy envelope preserved");
     }
 
     #[test]
