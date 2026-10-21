@@ -3316,8 +3316,6 @@ fn compile_mistralrs(
             "--paged-attn",
             "--pa-memory-fraction",
             "--gpu-memory-utilization",
-            "--kv-cache",
-            "--no-ui",
         ];
         for tok in extra {
             if !tok.starts_with('-') {
@@ -11742,6 +11740,37 @@ mod tests {
             "no silent drop: explicit pin warns when the engine has neither name: {:?} / {:?}",
             p_none.argv,
             p_none.warnings
+        );
+    }
+
+    #[test]
+    fn unit__mistralrs_extra_args__kv_cache_passes_manifest_gate() {
+        // --kv-cache sizes KV directly (the v0.9.5 workaround for
+        // upstream #2502's auto-sizing starvation on 8 GiB cards); no
+        // blazar knob emits it, so the extra_args lane IS its first
+        //-class path — it must clear the RESERVED check and ride the
+        // manifest gate like any user-facing engine flag. Regresion
+        // pin: a reserved-list edit once made this refuse.
+        let g = meta();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let cfg = Config::default();
+        let v095: BTreeSet<String> = ["--kv-cache", "--gpu-memory-utilization", "--paged-attn"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut inp = input(&g, &hw, &cfg, &v095);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let ov = ModelOverride {
+            extra_args: Some(vec!["--kv-cache".to_string(), "1GiB".to_string()]),
+            ..ModelOverride::default()
+        };
+        inp.overlay = &ov;
+        let p = compile(&inp, &TuningOverrides::default())
+            .expect("kv-cache is not blazar-owned; extra_args must pass");
+        assert!(
+            p.argv.windows(2).any(|w| w == ["--kv-cache", "1GiB"]),
+            "kv-cache rides after the pins: {:?}",
+            p.argv
         );
     }
 
