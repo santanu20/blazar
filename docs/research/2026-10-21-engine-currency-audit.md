@@ -122,3 +122,63 @@ unchanged upstream). Per-engine outcome:
 Net code change from the whole update: one knob (`spec_draft_n_ubatch`) — the audit's
 §2/§3 "ngram persistence + tuning" rows were overcounts (already first-class config),
 corrected above.
+
+## §6 Exhaustive surface re-diff (2026-10-21, second pass — "many API changes")
+
+Method: per engine, the binary's actual `--help` flag surface diffed against the union of
+Blazar-emitted flags (profile.rs string literals + knob registry + supervisor/engine_impl
+pushes), then every hit verified against dynamic construction and config exposure before
+classification. Raw diffs preserved under the session's scratch dir.
+
+**llama.cpp b11785 (336 flags):** ~160 first-pass "new" collapsed under verification to
+TWO real gaps, now landed:
+
+- `offline` (default true, `[model_overrides]` per-model opt-out) → emits `--offline`:
+  children are network-isolated by guarantee, not assumption. Silently skipped on engines
+  predating the flag. LIVE: child argv carries `--offline` and serves normally.
+- `moe_cache_mib` (0 = off) → `--moe-cache-mib N`: hot MoE experts staged on GPU while
+  weights stay in CPU RAM. LIVE: pinned 512 on a dense model reached the child and drew
+  the engine's own validation error ("MoE cache requires a MoE model") — plumbing proven;
+  use it on MoE lanes.
+
+Everything else classified NOT-gaps: `--fit`/`--kv-offload`/`--repack`/`--swa-checkpoints`
+default-ENABLED upstream (auto-utilized; we already wire the opt-outs `no_kv_offload`,
+`swa_full`, `ctx_checkpoints`); per-request sampler defaults are body params, not server
+flags; model-acquisition (`--hf-*`/`--model-url`) N/A (local store paths); `--draft-*`
+legacy spec family superseded by the wired `--spec-type` family (which also covers
+draft-mtp + typed ngram); `--gpt-oss-*`/`--fim-qwen-*`/`--vision-gemma-*` model presets;
+`--cors-*`/`--connect`/`--ssl-*`/`--agent` exposure anti-posture (default-disabled
+upstream); `--spec-synth-*` benchmarking-only; `--defrag-thold` deprecated; `--cpu-*`
+fine-pinning already achieved via our affinity machinery; WebUI/log-formatting families
+N/A (we capture child stdout).
+
+REST surface: b11785 serves `/v1/responses` (+`/input_tokens`) NATIVELY now — the
+gateway's emulation premise ("no storage server-side") is stale as a child-capability
+statement, but the emulation stays: it is the uniform cross-engine contract (sglang/
+mistralrs/mlx still lack Responses). New child endpoints noted as tracked-not-adopted:
+`/v1/realtime` (voice WS), `/v1/stream`+`/v1/streams/lookup` (server-side stream
+replay), `/v1/messages/count_tokens`, GCP-compat registration.
+
+**mlx-lm 0.32.2 (27 candidate flags): ALL FALSE GAPS.** `MlxTuning`/`push_mlx_pins`
+already wires draft-model, num-draft-tokens, kv-bits, kv-group-size, quantized-kv-start,
+prefill-step-size, prompt-cache-size/-bytes, decode/prompt-concurrency, chat-template(+args)
+— manifest-gated with warn-and-skip. The union-diff missed them only because the flags
+ride an `emit()` helper rather than raw string literals.
+
+**mistral.rs v0.5.5-serve (93 candidate flags):** families = LoRA (`--enable-lora`,
+`--lora`, adapters), ISQ (on-the-fly quant), device-layers/gpu-memory-utilization/dtype
+(memory split), code-exec/shell (sandbox — anti-posture), access-log/metrics telemetry,
+`--arch`/`--gqa`/`--imatrix` (model rebuild). All reachable TODAY via the designed
+`model_overrides.extra_args` escape hatch (manifest-gated); first-class knobs deferred
+until a user asks — the lane's tuning surface is already covered by our profile builder
+(pa-memory-fraction, max-seqs, etc. verified live last wave).
+
+**sglang 0.5.22:** re-confirmed auto-utilized (our argv is already launch_server
+grammar; nothing new requires wiring).
+
+**sdcpp master-982:** route table verified fully compatible last wave; the 158 help
+flags are per-request generation params (passed in img_gen/vid_gen bodies) plus
+model-file management owned by the gateway — no spawn-surface drift.
+
+Net code delta this pass: `offline` + `moe_cache_mib` (config/profile/knob-registry/
+fixture/tests, 1258 tests green, clippy+fmt clean).

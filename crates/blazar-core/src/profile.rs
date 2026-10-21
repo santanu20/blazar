@@ -1563,6 +1563,29 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             warnings.push("no_kv_offload skipped: engine lacks --no-kv-offload".into());
         }
     }
+    // --- 12c. network isolation: a local-model child never needs the
+    // network; --offline makes that a child-side guarantee (forces
+    // cache, fail-fast against accidental HF/toolchain fetches) instead
+    // of an assumption. Default on; silently skipped on engines built
+    // before the flag existed so default posture never breaks an older
+    // install.
+    if input.config.effective_offline(input.model_name)
+        && input.supported_flags.contains("--offline")
+    {
+        argv.push("--offline".into());
+    }
+    // --- 12d. MoE expert cache: hot experts staged on the GPU while
+    // their weights stay in CPU RAM (--cpu-moe lanes). 0 keeps the
+    // engine default (off).
+    let moe_cache_mib = input.config.effective_moe_cache_mib(input.model_name);
+    if moe_cache_mib > 0 {
+        if input.supported_flags.contains("--moe-cache-mib") {
+            argv.push("--moe-cache-mib".into());
+            argv.push(moe_cache_mib.to_string());
+        } else {
+            warnings.push("moe_cache_mib skipped: engine lacks --moe-cache-mib".into());
+        }
+    }
     if !input.config.load_mode.is_empty() {
         if input.supported_flags.contains("--load-mode") {
             argv.push("--load-mode".into());
@@ -7649,6 +7672,7 @@ mod tests {
             "--spec-draft-ngl",
             "--spec-draft-threads",
             "--spec-draft-n-ubatch",
+            "--moe-cache-mib",
             "--spec-draft-p-min",
             "--spec-draft-p-split",
             "--spec-draft-poll",
@@ -7896,6 +7920,8 @@ mod tests {
         deterministic: None,
         mmproj: None,
         sglang: None,
+        offline: None,
+        moe_cache_mib: None,
     };
 
     #[test]
@@ -9120,6 +9146,84 @@ mod tests {
         let p0 = compile(&inp0, &TuningOverrides::default()).unwrap();
         assert!(
             !p0.argv.contains(&"--spec-draft-n-ubatch".to_string()),
+            "engine default stays silent: {:?}",
+            p0.argv
+        );
+    }
+
+    #[test]
+    fn unit__offline__default_on_opt_out_silent_old_engine_skip() {
+        // Network isolation (upstream b11785 --offline): the default
+        // posture emits it on supporting engines, an explicit opt-out
+        // emits nothing, and an engine built before the flag skips
+        // SILENTLY — a default-on knob must never break an older
+        // install or spam its spawns with warnings.
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let cfg = Config {
+            slots: 1,
+            ..Config::default()
+        };
+        let mut modern = ALL_FLAGS.clone();
+        modern.insert("--offline".to_string());
+        let inp = input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &modern, &[]);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.contains(&"--offline".to_string()),
+            "default-on emits: {:?}",
+            p.argv
+        );
+        let cfg_off = Config {
+            slots: 1,
+            offline: false,
+            ..Config::default()
+        };
+        let inp2 = input_named_with_spec("qwen3-8b", &g, &hw, &cfg_off, &modern, &[]);
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p2.argv.contains(&"--offline".to_string()),
+            "explicit opt-out stays silent: {:?}",
+            p2.argv
+        );
+        let inp3 = input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &[]);
+        let p3 = compile(&inp3, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p3.argv.contains(&"--offline".to_string())
+                && !p3.warnings.iter().any(|w| w.contains("offline")),
+            "old engine skips silently, no warning spam: {:?} / {:?}",
+            p3.argv,
+            p3.warnings
+        );
+    }
+
+    #[test]
+    fn unit__moe_cache_mib__pinned_emits_default_silent() {
+        // MoE expert cache (upstream b11785 --moe-cache-mib): a pinned
+        // budget rides as MiB; the default (0) emits nothing.
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let cfg = Config {
+            moe_cache_mib: 512,
+            slots: 1,
+            ..Config::default()
+        };
+        let inp = input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &[]);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--moe-cache-mib" && w[1] == "512"),
+            "pinned budget emitted: {:?}",
+            p.argv
+        );
+        let cfg0 = Config {
+            slots: 1,
+            ..Config::default()
+        };
+        let inp0 = input_named_with_spec("qwen3-8b", &g, &hw, &cfg0, &ALL_FLAGS, &[]);
+        let p0 = compile(&inp0, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p0.argv.contains(&"--moe-cache-mib".to_string()),
             "engine default stays silent: {:?}",
             p0.argv
         );

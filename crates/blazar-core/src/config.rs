@@ -291,6 +291,17 @@ pub struct Config {
     /// (0 = off). Manifest-gated.
     #[serde(default)]
     pub ctx_checkpoints: u32,
+    /// `--offline`: llamacpp children run network-isolated (forces local
+    /// cache, blocks accidental HF/toolchain fetches). Local-model spawns
+    /// never need the network; opt out per model for URL-backed asset
+    /// flows. Manifest-gated (older engines skip silently).
+    #[serde(default = "default_true")]
+    pub offline: bool,
+    /// `--moe-cache-mib N`: GPU cache for `MoE` experts whose weights stay
+    /// in CPU `RAM` (`--cpu-moe` lanes); 0 = off (engine default).
+    /// Manifest-gated.
+    #[serde(default)]
+    pub moe_cache_mib: u64,
     /// `--no-kv-offload`: keep all KV on GPU — fail the load when it
     /// does not fit instead of spilling to CPU (latency determinism).
     #[serde(default)]
@@ -1333,6 +1344,12 @@ pub struct ModelOverride {
     /// Per-model unified-KV override (None = inherit).
     #[serde(default)]
     pub kv_unified: Option<bool>,
+    /// Per-model network-isolation override (None = inherit global).
+    #[serde(default)]
+    pub offline: Option<bool>,
+    /// Per-model `--moe-cache-mib` override (None = inherit global).
+    #[serde(default)]
+    pub moe_cache_mib: Option<u64>,
     /// Per-model `YaRN` context-extension factor (None = inherit global).
     pub ctx_extend: Option<f64>,
     /// Per-model `MoE` expert CPU-offload count (None = inherit global).
@@ -3016,6 +3033,8 @@ impl Default for Config {
             kv_unified_per_slot: 0,
             swa_full: false,
             ctx_checkpoints: 0,
+            offline: true,
+            moe_cache_mib: 0,
             no_kv_offload: false,
             load_mode: String::new(),
             spawn_mem_guard: true,
@@ -3748,6 +3767,27 @@ impl Config {
             .get(model)
             .and_then(|o| o.kv_unified)
             .or(self.kv_unified)
+    }
+
+    /// Effective `offline`: overlay beats global. The gateway pins
+    /// local-model children network-isolated unless explicitly opted
+    /// out — a child that never needs the network cannot leak through
+    /// one that does.
+    #[must_use]
+    pub fn effective_offline(&self, model: &str) -> bool {
+        self.model_overrides
+            .get(model)
+            .and_then(|o| o.offline)
+            .unwrap_or(self.offline)
+    }
+
+    /// Effective `--moe-cache-mib` expert-cache budget (0 = off).
+    #[must_use]
+    pub fn effective_moe_cache_mib(&self, model: &str) -> u64 {
+        self.model_overrides
+            .get(model)
+            .and_then(|o| o.moe_cache_mib)
+            .unwrap_or(self.moe_cache_mib)
     }
 
     /// Effective KV cache type: "" = auto ladder; explicit overlay beats

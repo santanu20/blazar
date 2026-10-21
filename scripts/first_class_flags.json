@@ -38,6 +38,7 @@
       "--no-mmproj-offload",
       "--no-reasoning-preserve",
       "--no-warmup",
+      "--offline",
       "--op-offload",
       "--poll-batch",
       "--pooling",
