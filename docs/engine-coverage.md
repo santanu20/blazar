@@ -45,9 +45,9 @@ Registry lane `piper` pins 10 first-class flags (compile + spawn-time emission).
 
 ## b11539-cuda (llamacpp) — 329 flags probed
 
-**certified: 2 · first-class: 68 · passthrough: 259 · intentionally-unsupported: 0 · not-applicable: 0 · unverified: 0**
+**certified: 2 · first-class: 69 · passthrough: 258 · intentionally-unsupported: 0 · not-applicable: 0 · unverified: 0**
 
-Registry lane `llamacpp` pins 73 first-class flags (compile + spawn-time emission).
+Registry lane `llamacpp` pins 75 first-class flags (compile + spawn-time emission).
 
 ### Certified against a live engine
 
@@ -58,7 +58,7 @@ Registry lane `llamacpp` pins 73 first-class flags (compile + spawn-time emissio
 
 - **serving detail** (72): --cache-idle-slots, --cache-list, --cache-prompt, --cache-reuse, --check-tensors, --completion-bash (+66 more)
 - **draft/speculative detail** (64): --cache-type-k-draft, --cache-type-v-draft, --cpu-mask-batch-draft, --cpu-mask-draft, --cpu-moe-draft, --cpu-range-draft (+58 more)
-- **uncategorized long-tail** (50): --adaptive-decay, --adaptive-target, --agent, --cpu-moe, --cpu-strict, --docker-repo (+44 more)
+- **uncategorized long-tail** (49): --adaptive-decay, --adaptive-target, --agent, --cpu-moe, --cpu-strict, --docker-repo (+43 more)
 - **per-request sampling** (24): --backend-sampling, --chat-template-file, --dry-sequence-breaker, --dynatemp-exp, --dynatemp-range, --grammar (+18 more)
 - **gateway-owned transport** (18): --api-key, --api-key-file, --api-prefix, --cors-credentials, --cors-headers, --cors-methods (+12 more)
 - **observability** (13): --log-colors, --log-disable, --log-file, --log-jsonl, --log-prefix, --log-prompts-dir (+7 more)
@@ -153,7 +153,7 @@ Scope disposition: Blazar integrates the SGLang server launch path, not a separa
 
 ## v0.9.4 (mistralrs) — 93 flags probed
 
-**certified: 1 · first-class: 35 · passthrough: 57 · intentionally-unsupported: 0 · not-applicable: 0 · unverified: 0**
+**certified: 1 · first-class: 34 · passthrough: 57 · intentionally-unsupported: 1 · not-applicable: 0 · unverified: 0**
 
 Registry lane `mistralrs` pins 39 first-class flags (compile + spawn-time emission).
 
@@ -169,5 +169,7 @@ Registry lane `mistralrs` pins 39 first-class flags (compile + spawn-time emissi
 - **observability** (4): --access-log-format, --access-log-health, --log, --topology
 - **ISQ/quantize tooling** (3): --from-uqff, --quant, --quantized-file
 - **gateway-owned** (2): --token-source, --tokenizer
+
+Intentionally-unsupported (gateway-owned, refused in `extra_args`): --pa-memory-fraction
 
 Fixtures refreshed from a live store via `--refresh`; they carry tag/kind/flags only (no machine paths). Dispositions are derived, never stored.
