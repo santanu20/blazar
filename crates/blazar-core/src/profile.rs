@@ -1213,6 +1213,16 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 &[config.spec_draft_threads.to_string()],
             );
         }
+        if config.spec_draft_n_ubatch > 0 {
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_n_ubatch",
+                "--spec-draft-n-ubatch",
+                &[config.spec_draft_n_ubatch.to_string()],
+            );
+        }
         if let Some(p) = config.spec_draft_p_min {
             push_gated(
                 input,
@@ -7638,6 +7648,7 @@ mod tests {
             "--spec-draft-device",
             "--spec-draft-ngl",
             "--spec-draft-threads",
+            "--spec-draft-n-ubatch",
             "--spec-draft-p-min",
             "--spec-draft-p-split",
             "--spec-draft-poll",
@@ -9070,6 +9081,47 @@ mod tests {
                 .any(|w| w.contains("left to the engine live fitter")),
             "unpin warning required: {:?}",
             p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__spec_draft_n_ubatch__pinned_emits_default_silent() {
+        // VRAM-sparing ceiling for the draft context (upstream b11785):
+        // a pinned value rides the placement family only when a draft
+        // model resolved; the default (0) emits nothing anywhere.
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let cfg = Config {
+            spec: "eagle3".into(),
+            spec_draft_n_ubatch: 128,
+            slots: 1, // purpose-scoped: spec flags, not slot sizing
+            ..Config::default()
+        };
+        let mut inp =
+            input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &EAGLE3_SPEC_TYPES);
+        let draft = draft_file("eagle3");
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-draft-n-ubatch" && w[1] == "128"),
+            "pinned ceiling emitted: {:?}",
+            p.argv
+        );
+        let cfg0 = Config {
+            spec: "eagle3".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let mut inp0 =
+            input_named_with_spec("qwen3-8b", &g, &hw, &cfg0, &ALL_FLAGS, &EAGLE3_SPEC_TYPES);
+        inp0.draft_path = Some(&draft);
+        let p0 = compile(&inp0, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p0.argv.contains(&"--spec-draft-n-ubatch".to_string()),
+            "engine default stays silent: {:?}",
+            p0.argv
         );
     }
 

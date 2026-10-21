@@ -81,7 +81,7 @@ unaffected by the Muse items; SMM mask may touch speculative-mamba models). ADOP
 | Feature | Engine | Feasible? | ROI | Note |
 |---|---|---|---|---|
 | `--spec-draft-n-ubatch` | llama.cpp | YES — one spawn flag + config passthrough | LOW-MED | microarch tuning for spec prefill batching |
-| ngram dynamic cache persistence | llama.cpp | YES — flag when spec-type=ngram | MED | warm-start ngram hints across restarts (pairs with our sleep/wake) |
+| ngram dynamic cache persistence | llama.cpp | already wired — config `spec_cache` emits `--lookup-cache-dynamic` ({data_dir}/speccache/{instance}.lcache) | MED | warm-start ngram hints across restarts; CORRECTED 2026-10-21: §2/§3 overcounted this — ngram tuning keys (ngram_size_m/n/min_hits) and lookup_cache_static were already first-class |
 | `--connect` p2p | llama.cpp | YES | NONE | exposure anti-posture — rejected |
 | sgl-router Anthropic dialect | sglang | NO (separate component) | NONE | gateway already owns dialect translation |
 | PD disagg / rust-server | sglang | NO (topology) | NONE | single-box product boundary |
@@ -104,3 +104,21 @@ metrics, cache typing, RPC fleet) is already wired through our spawn + proxy sur
    (only after update lands; tune with benchmarks per the benchmarking contract).
 
 Rollback path exists for every lane (`blazar engine rollback` / `use <old-tag>`).
+
+## 5. Post-update verification (2026-10-21, `blazar engine update all` landed)
+
+All lanes updated by the user in one pass: b11785-cuda, mistral.rs v0.9.5,
+sglang 0.5.22, mlx-lm 0.32.2, sdcpp master-982-0518b34 (whisper b5454 and piper
+unchanged upstream). Per-engine outcome:
+
+| Engine | Utilization verdict | Evidence |
+|---|---|---|
+| llama.cpp b11785 | AUTO-UTILIZED + one knob added | live /api/chat mistral-7b " Ok" (routed_to=b11785-cuda, build 11785 confirmed); new spec flags present in --help; ONLY real gap was `--spec-draft-n-ubatch` → now exposed as config `spec_draft_n_ubatch` (0 = engine default; gated to the spec-draft spawn family) |
+| mistral.rs v0.9.5 | AUTO-UTILIZED | routed v0.9.5 with our profile knobs visibly applied (boot log max_num_seqs/max_num_batched_tokens from profile); `--tok-model-id` escape hatch accepted via model_overrides extra_args; honest engine errors (MLX-quant shape mismatch, un-derivable GGUF SWA) pass through as designed. End-to-end completion blocked by environment (production children hold ~99% VRAM → CPU-split load died in warmup + circuit breaker); spawn/argv/error-passthrough all verified |
+| sglang 0.5.22 | AUTO-UTILIZED, zero changes | routing verified (routed_to=sglang-0.5.22); honest 400 MODEL_UNSUPPORTED_ENGINE on GGUF (no safetensors model fits the squeezed GPU); static check: launch_server --help (2683 lines) confirms our pinned flags + profile argv already use current grammar (--context-length, --max-running-requests, --mem-fraction-static — 0.5.22's renames predate our wiring) |
+| mlx-lm 0.32.2 | AUTO-UTILIZED | live /v1/chat/completions qwen2.5-0.5b pinned recipe lane → " Ok" pt20, gateway-stamped id (routed_to=mlx-0.32.2); bugfix-only release, no API drift |
+| sdcpp master-982 | AUTO-UTILIZED, zero changes | binary route table registers every endpoint our images/videos lanes call: /sdcpp/v1/capabilities, img_gen, vid_gen, jobs/{id}, jobs/{id}/cancel, upscale |
+
+Net code change from the whole update: one knob (`spec_draft_n_ubatch`) — the audit's
+§2/§3 "ngram persistence + tuning" rows were overcounts (already first-class config),
+corrected above.

@@ -877,6 +877,11 @@ pub struct Config {
     /// Draft-model thread count (0 = engine default).
     #[serde(default)]
     pub spec_draft_threads: u32,
+    /// Draft-context physical ubatch ceiling (`--spec-draft-n-ubatch`,
+    /// upstream b11785+): a smaller draft batch spares VRAM instead of
+    /// mirroring the target's full n-ubatch. 0 = engine default.
+    #[serde(default)]
+    pub spec_draft_n_ubatch: u32,
     /// Minimum draft probability below which speculation is not verified
     /// (greedy accept). None = engine default (0.0).
     #[serde(default)]
@@ -3035,6 +3040,7 @@ impl Default for Config {
             spec_draft_device: String::new(),
             spec_draft_ngl: String::new(),
             spec_draft_threads: 0,
+            spec_draft_n_ubatch: 0,
             spec_draft_p_min: None,
             spec_draft_p_split: None,
             spec_draft_poll: None,
@@ -3325,6 +3331,7 @@ const SECTION_FIELDS: &[(&str, &[&str])] = &[
             "spec_draft_cpu_strict_batch",
             "spec_draft_device",
             "spec_draft_ngl",
+            "spec_draft_n_ubatch",
             "spec_draft_threads",
             "spec_draft_threads_batch",
             "spec_draft_p_min",

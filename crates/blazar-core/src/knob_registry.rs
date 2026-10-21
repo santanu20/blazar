@@ -178,6 +178,7 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--spec-draft-model",
     "--spec-draft-n-cpu-moe",
     "--spec-draft-n-max",
+    "--spec-draft-n-ubatch",
     "--spec-draft-ngl",
     "--spec-draft-override-tensor",
     "--spec-draft-p-min",
@@ -676,6 +677,7 @@ fn llamacpp_knob_cfg() -> Config {
         spec_draft_p_split: Some(0.28),
         spec_draft_poll: Some(16),
         spec_draft_poll_batch: Some(true),
+        spec_draft_n_ubatch: 256,
         reasoning_preserve: Some(false),
         ..Config::default()
     }

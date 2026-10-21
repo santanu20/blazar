@@ -54,6 +54,7 @@
       "--seed",
       "--sleep-idle-seconds",
       "--slot-save-path",
+      "--spec-draft-n-ubatch",
       "--spec-draft-p-min",
       "--spec-draft-p-split",
       "--spec-draft-poll",
