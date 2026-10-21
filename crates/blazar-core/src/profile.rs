@@ -2611,6 +2611,22 @@ fn hf_kv_bytes(kv: &crate::hfmeta::KvGeom, ctx: u64, elem: u64) -> Option<u64> {
 /// override wins over the global table. Both `--pa-memory-fraction`
 /// emission sites yield to it (upstream refuses the pair on one
 /// command line).
+/// mistral.rs renamed `--pa-memory-fraction` to
+/// `--gpu-memory-utilization` in v0.9.5 (same semantics: fraction of
+/// VRAM claimable by weights + workspace + KV). Emit whichever the
+/// active engine's manifest advertises; None when it has neither
+/// (pre-paged-attn builds) — callers skip silently in the derived
+/// ladder and warn on explicit user pins.
+fn pa_fraction_flag(input: &ProfileInput<'_>) -> Option<&'static str> {
+    if input.supported_flags.contains("--gpu-memory-utilization") {
+        Some("--gpu-memory-utilization")
+    } else if input.supported_flags.contains("--pa-memory-fraction") {
+        Some("--pa-memory-fraction")
+    } else {
+        None
+    }
+}
+
 fn mistralrs_pa_mb_pin(input: &ProfileInput<'_>) -> Option<u64> {
     input
         .overlay
@@ -2660,15 +2676,15 @@ fn derive_pa_fraction(
     // conflict — see the pa-memory-fraction emission site above).
     if mistralrs_pa_mb_pin(input).is_some() {
         warnings.push(
-            "mistralrs.pa_memory_mb set: skipping derived --pa-memory-fraction (upstream \
+            "mistralrs.pa_memory_mb set: skipping derived memory-fraction (upstream \
              refuses both on one command line)"
                 .into(),
         );
         return;
     }
-    if !input.supported_flags.contains("--pa-memory-fraction") {
+    let Some(pa_flag) = pa_fraction_flag(input) else {
         return;
-    }
+    };
     let total = input.hardware.total_vram_mib();
     if total == 0 {
         return;
@@ -2702,7 +2718,7 @@ fn derive_pa_fraction(
 
     let mut emit = |frac: f64, warn: String| {
         let frac = frac.clamp(0.05, 0.90);
-        argv.push("--pa-memory-fraction".into());
+        argv.push(pa_flag.into());
         argv.push(format!("{frac:.2}"));
         warnings.push(warn);
     };
@@ -2820,17 +2836,18 @@ fn compile_mistralrs(
     if let Some(frac) = input.config.mistralrs_pa_memory_fraction {
         if pa_mb_pin.is_some() {
             warnings.push(
-                "mistralrs.pa_memory_mb set: skipping --pa-memory-fraction (upstream refuses \
+                "mistralrs.pa_memory_mb set: skipping the memory-fraction flag (upstream refuses \
                  both on one command line)"
                     .into(),
             );
-        } else if input.supported_flags.contains("--pa-memory-fraction") {
-            argv.push("--pa-memory-fraction".into());
+        } else if let Some(flag) = pa_fraction_flag(input) {
+            argv.push(flag.into());
             argv.push(format!("{frac}"));
         } else {
             warnings.push(
-                "config mistralrs_pa_memory_fraction set but this engine lacks \
-                 --pa-memory-fraction; flag skipped (blazar engine install updates it)"
+                "config mistralrs_pa_memory_fraction set but this engine lacks both \
+                 --gpu-memory-utilization and --pa-memory-fraction; flag skipped (blazar \
+                 engine install updates it)"
                     .into(),
             );
         }
@@ -3298,6 +3315,8 @@ fn compile_mistralrs(
             "--max-num-batched-tokens",
             "--paged-attn",
             "--pa-memory-fraction",
+            "--gpu-memory-utilization",
+            "--kv-cache",
             "--no-ui",
         ];
         for tok in extra {
@@ -11670,6 +11689,60 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect()
+    }
+
+    /// mistral.rs v0.9.5 renamed `--pa-memory-fraction` to
+    /// `--gpu-memory-utilization`. An explicit pin must ride whichever
+    /// name the active engine advertises — and warn (not silently
+    /// drop) when the engine has neither.
+    #[test]
+    fn unit__mistralrs_pa_fraction__flag_rename_follows_manifest() {
+        let g = meta();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let cfg = Config {
+            mistralrs_pa_memory_fraction: Some(0.5),
+            ..Config::default()
+        };
+        let new_only: BTreeSet<String> = ["--gpu-memory-utilization"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut inp = input(&g, &hw, &cfg, &new_only);
+        inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--gpu-memory-utilization", "0.5"]),
+            "v0.9.5 name emitted when advertised: {:?}",
+            p.argv
+        );
+        let old_flags = mistralrs_pa_flags();
+        let mut inp_old = input(&g, &hw, &cfg, &old_flags);
+        inp_old.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p_old = compile(&inp_old, &TuningOverrides::default()).unwrap();
+        assert!(
+            p_old
+                .argv
+                .windows(2)
+                .any(|w| w == ["--pa-memory-fraction", "0.5"]),
+            "pre-rename name emitted on older engines: {:?}",
+            p_old.argv
+        );
+        let neither: BTreeSet<String> = ["--paged-attn"].into_iter().map(String::from).collect();
+        let mut inp_none = input(&g, &hw, &cfg, &neither);
+        inp_none.engine_kind = crate::engine_kind::EngineKind::MistralRs;
+        let p_none = compile(&inp_none, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p_none.argv.iter().any(|a| a.contains("memory"))
+                && p_none
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("mistralrs_pa_memory_fraction")),
+            "no silent drop: explicit pin warns when the engine has neither name: {:?} / {:?}",
+            p_none.argv,
+            p_none.warnings
+        );
     }
 
     /// mistral.rs enables paged attention BY DEFAULT and its stock

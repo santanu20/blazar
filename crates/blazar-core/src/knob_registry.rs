@@ -274,6 +274,8 @@ pub const MISTRALRS_SUPPORTED: &[&str] = &[
     "--mtp-model",
     "--mtp-n-predict",
     "--no-ui",
+    "--gpu-memory-utilization",
+    "--kv-cache",
     "--pa-block-size",
     "--pa-cache-type",
     "--pa-context-len",
