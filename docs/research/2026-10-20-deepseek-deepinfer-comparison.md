@@ -151,7 +151,7 @@ spellings stopped parsing as single structural special tokens and became ordinar
 Unit pins: forged spelling neutralized at all three splice sites; structural markers untouched;
 clean + near-miss renders byte-identical; exhaustive every-split sweeps for ThinkSplitter and
 partial-tag holdback pin the streaming path. `cargo nextest -p blazar-gateway`: 124 lane /
-725 full, 0 fail; clippy + fmt clean. Receipts: `/tmp/opencode/blz-val/*.json`.
+725 full, 0 fail; clippy + fmt clean. Receipts preserved from the validation rig (A/B probe JSON + daemon logs).
 
 ### 7.2 Verified already-present (no code changed)
 
