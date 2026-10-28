@@ -63,6 +63,7 @@ mmproj_auto
 mmproj_device
 mmproj_offload
 model_overrides
+moe_cache_mib
 mtmd_batch_max_tokens
 ngram_min_hits
 ngram_mod_n_match
@@ -73,6 +74,7 @@ ngram_size_n
 no_host
 no_kv_offload
 numa
+offline
 otlp_endpoint
 otlp_service
 override_kv
@@ -129,6 +131,7 @@ spec_draft_cpu_strict
 spec_draft_cpu_strict_batch
 spec_draft_device
 spec_draft_n_cpu_moe
+spec_draft_n_ubatch
 spec_draft_ngl
 spec_draft_override_tensor
 spec_draft_prio

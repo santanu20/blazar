@@ -13,9 +13,14 @@ gpu vram
 hardware
 inventory mlx
 keys
+kv budget llamacpp
+kv budget mistralrs
+kv budget mlx
 model types
 models
 port
+prompt-recipe
+prompt-recipe mlx
 routing
 rpc fleet
 sentinel

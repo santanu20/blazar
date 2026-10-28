@@ -2003,7 +2003,7 @@ _K = [
         False,
         "behavior",
         None,
-        "per-model spec governor gate; frontier wave 2",
+        "spec governor gate, default ON since 0.28 (ngram fallback ships on, safety net ships armed); frontier wave 2",
     ),
     (
         "ubatch_auto",
@@ -2038,6 +2038,32 @@ _K = [
         "roundtrip",
         None,
         "pull rate cap in MB/s (0 = off); echo + boot",
+    ),
+    # Engine-currency wave (2026-10-21) knobs the fresh list ships that the
+    # tier ledger lacked — same class as the 2026-10-03 fill above.
+    (
+        "offline",
+        False,
+        False,
+        "behavior",
+        None,
+        "default-on child network isolation (--offline on llamacpp children, per-model opt-out); engine-currency wave",
+    ),
+    (
+        "moe_cache_mib",
+        False,
+        False,
+        "argv",
+        None,
+        "MoE expert-cache budget MiB, 0 = off (--moe-cache-mib); engine-currency wave",
+    ),
+    (
+        "spec_draft_n_ubatch",
+        False,
+        False,
+        "argv",
+        None,
+        "spec-draft micro-batch floor, 0 = engine default (llama.cpp --spec-draft-n-ubatch, spec-draft family only); engine-currency wave",
     ),
     (
         "remote_fallback",
@@ -2281,7 +2307,7 @@ CONTAINER_KNOBS = [k["name"] for k in TOPLEVEL_KNOBS if k["container"]]
 FRESH_VISIBLE_KNOBS = [k["name"] for k in TOPLEVEL_KNOBS if not k["option"]]
 
 # ---------------------------------------------------------------------------
-# MODEL_OVERRIDE manifest: all 37 ModelOverride fields + 18 SamplerDefaults
+# MODEL_OVERRIDE manifest: all 38 ModelOverride fields + 18 SamplerDefaults
 # leaves. Evidence = overlay round-trip (gate d) + argv/wave lanes noted.
 # ---------------------------------------------------------------------------
 
@@ -2317,6 +2343,10 @@ MODEL_OVERRIDE_FIELDS = [
     ),
     ("chat_template", "argv: --chat-template"),
     ("chat_template_file", "argv: --chat-template-file"),
+    (
+        "chat_template_kwargs",
+        "argv: --chat-template-kwargs (JSON-object string; overlay beats global — tool-mode enable_thinking lever)",
+    ),
     ("sampler_defaults", "argv: --temp..--seed set"),
     ("spm_infill", "roundtrip echo"),
     # F146: both exist in config.rs ModelOverride but were absent here —
@@ -3836,6 +3866,23 @@ def cli(
     )
     if check_exit and p.returncode != 0:
         print(f"    cli stderr: {p.stderr.strip()[:400]}")
+    return p
+
+
+def cli_retry(
+    *args: str, expect: str, attempts: int = 3
+) -> subprocess.CompletedProcess:
+    """cli() with shape-aware retry: daemon-lifecycle churn inside the
+    sandbox (adjacent-phase stop/start traffic, respawn windows) can
+    hand a capture an empty or dying-daemon answer once; a capture that
+    never matches `expect` (regex, re.search on stdout) is never a
+    legitimate result, so re-run instead of recording junk."""
+    p = cli(*args)
+    for _ in range(attempts - 1):
+        if re.search(expect, p.stdout, re.M):
+            return p
+        time.sleep(2)
+        p = cli(*args)
     return p
 
 
@@ -5541,7 +5588,7 @@ def phase_sentinel() -> None:
         (result.get("collected", "") or "").replace("\n", " ")[:160],
     )
     # doctor row.
-    p = cli("doctor")
+    p = cli_retry("doctor", expect=r"^\s*sentinel\s+\S+", attempts=3)
     check(
         "sentinel",
         "doctor prints the sentinel row",
@@ -5686,11 +5733,23 @@ def llama_fixture() -> dict | None:
     return _LLAMA_FIXTURE_ROW
 
 
-def _eng_pick_safetensors_dir(rows: list[dict]) -> dict | None:
+def _eng_pick_safetensors_dir(
+    rows: list[dict], tools_pass: set[str] | None = None
+) -> dict | None:
     """Plain HF safetensors dir (sglang/mlx-class loaders): a directory
     of *.safetensors without the mlx marker, a component set, or a
     quantized-checkpoint token (AWQ/GPTQ/FP8 dirs only serve the
-    vLLM-style loader)."""
+    vLLM-style loader).
+
+    Smallest CERTIFIED tool-capable row first (same philosophy as
+    _eng_pick_mlx): a tools=PASS certificate in model_caps is the
+    canonical known-good fixture, and an uncertified sub-1B dir turns
+    the lane's free-choice tool cells into draw lottery (measured
+    2026-10-08, qwen2.5-0.5b class). Falls back to the smallest plain
+    dir when nothing is certified — the battery then honestly measures
+    whatever the store holds.
+    """
+    tools_pass = tools_pass or set()
 
     def is_plain_dir(r: dict) -> bool:
         p = Path(r["path"])
@@ -5707,7 +5766,11 @@ def _eng_pick_safetensors_dir(rows: list[dict]) -> dict | None:
         except OSError:
             return False
 
-    return _eng_smallest([r for r in rows if is_plain_dir(r)])
+    cands = [r for r in rows if is_plain_dir(r)]
+    certified = [r for r in cands if r["name"] in tools_pass]
+    if certified:
+        return _eng_smallest(certified)
+    return _eng_smallest(cands)
 
 
 def _eng_tools_pass_models() -> set[str]:
@@ -5722,9 +5785,22 @@ def _eng_tools_pass_models() -> set[str]:
     names: set[str] = set()
     try:
         db = sqlite3.connect(os.path.join(SANDBOX.data_dir, "blazar.db"))
-        for model, caps_json in db.execute("SELECT model, caps_json FROM model_caps"):
+        # Latest-wins per model, mirroring the product's get_model_caps
+        # semantics: a re-measured FAIL must supersede an older PASS,
+        # otherwise a stale certificate keeps resurrecting a fixture the
+        # hardened probe already rejected (observed 2026-10-28: the mlx
+        # lane picked qwen2.5-1.5b-4bit off its mlx-0.32.0-era PASS while
+        # its mlx-0.32.2 two-shape FAIL was the honest verdict).
+        latest: dict[str, tuple[int, str]] = {}
+        for model, tested_at, caps_json in db.execute(
+            "SELECT model, tested_at, caps_json FROM model_caps"
+        ):
+            prior = latest.get(model)
+            if prior is None or (tested_at or 0) > prior[0]:
+                latest[model] = ((tested_at or 0), caps_json or "{}")
+        for model, (_, caps_json) in latest.items():
             try:
-                caps = json.loads(caps_json or "{}").get("caps", {})
+                caps = json.loads(caps_json).get("caps", {})
             except ValueError:
                 continue
             if caps.get("tools", {}).get("status") == "PASS":
@@ -5791,7 +5867,12 @@ def _eng_pick_diffusion(rows: list[dict]) -> dict | None:
 
 
 def _eng_call_args(tc: dict) -> dict:
-    raw = (tc.get("function", {}).get("arguments") or "").strip()
+    raw = tc.get("function", {}).get("arguments") or ""
+    # dialect tolerance: OpenAI ships arguments as a JSON string; mlx-lm
+    # emits a already-parsed object — accept both, crash on neither
+    if isinstance(raw, dict):
+        return raw
+    raw = raw.strip()
     if not raw:
         return {}
     try:
@@ -6746,8 +6827,13 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
             "note": "",
         }
     if kind == "mistralrs":
-        # The GGUF loader maps override ctx -> --max-model-len and
-        # --max-num-batched-tokens = max(4096, ctx) (engine_impl tests).
+        # The GGUF loader maps override ctx -> --max-model-len (exact pair)
+        # and --max-num-batched-tokens = paged_step_ceiling(max(ctx, 4096))
+        # (engine_impl tests + the v0.9.5 activation-envelope mitigation:
+        # cards under ~12 GiB VRAM cap the paged step to 4096 so the
+        # executor does not reserve a full ctx-step envelope up front —
+        # upstream #2502). Asserting an exact step value would pin the
+        # ceiling AWAY from the mitigation, so the step is presence-only.
         #
         # No user-extra_args argv cell on this lane, deliberately: the
         # only owned-but-unemitted manifest flag is --tok-model-id,
@@ -6764,12 +6850,11 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
             "override": {"ctx": 8192},
             "pairs": [
                 ("--max-model-len", "8192"),
-                ("--max-num-batched-tokens", "8192"),
             ],
-            "presence": [],
+            "presence": ["--max-num-batched-tokens"],
             "soft_pairs": [],
             "soft_skip": [],
-            "note": "user extra_args ride pinned at unit tier (fixture tokenizer consistency is not blazar's contract)",
+            "note": "step presence-only (paged_step_ceiling caps it per card; upstream #2502 mitigation); user extra_args ride pinned at unit tier (fixture tokenizer consistency is not blazar's contract)",
         }
     if kind == "mlx":
         # mlx_argv is a fixed spine; extra_args tokens are flag-validated
@@ -6943,8 +7028,14 @@ def phase_engines() -> None:
     text_lanes = [
         # (kind, pin value written into model_overrides, model row, load budget s)
         ("llamacpp", None, gguf, 300),
-        ("mistralrs", "mistralrs", gguf, 300),
-        ("sglang", "sglang", _eng_pick_safetensors_dir(rows), 420),
+        # mistralrs pin is an EXACT TAG (serving_lane resolves exact tags
+        # before kind names): v0.9.5's executor reserves the full paged
+        # step x seqs activation envelope up front (upstream #2502, fix
+        # #2503 merged but unreleased as of 2026-10-28) so every inference
+        # on it 503s; v0.9.3 predates that executor and serves cleanly.
+        # Revisit on the next mistral.rs release.
+        ("mistralrs", "v0.9.3", gguf, 300),
+        ("sglang", "sglang", _eng_pick_safetensors_dir(rows, tools_pass), 420),
         ("mlx", "mlx", _eng_pick_mlx(rows, tools_pass), 300),
     ]
     try:
@@ -7074,7 +7165,7 @@ def phase_engines() -> None:
                 # lane it is serving (ps row + engine list) while the
                 # pinned daemon is up. The broad command matrix lives in
                 # phase commands; this proves per-engine visibility.
-                p = cli("ps")
+                p = cli_retry("ps", expect=r"^NAME", attempts=3)
                 p2 = cli("engine", "list")
                 ok = p.returncode == 0 and model in p.stdout and p2.returncode == 0
                 check(
@@ -7617,7 +7708,7 @@ def phase_cli() -> None:
     d = DAEMON
     d.start({"port": PORT})
     chat("Say ok")  # ensure a model row exists for ps/show
-    p = cli("ps")
+    p = cli_retry("ps", expect=r"^NAME|no models loaded", attempts=3)
     ok = p.returncode == 0 and MODEL in p.stdout
     check(
         "cli",
@@ -7638,7 +7729,7 @@ def phase_cli() -> None:
     ok = p.returncode == 0
     check("cli", "blazar why runs", ok, p.stdout.strip().splitlines()[:1])
     reg("why.default", ok, "rc0")
-    p = cli("doctor")
+    p = cli_retry("doctor", expect=r"ok|warn|FAIL", attempts=3)
     # Row-level FAIL only: WARN details may contain the word "failed"
     # (e.g. "check failed (GitHub API rate limited ...)").
     fail_rows = [
@@ -9777,7 +9868,7 @@ def phase_commands() -> None:
     p = cli("why")
     reg("why", p.returncode == 0, "rc0")
 
-    p = cli("doctor")
+    p = cli_retry("doctor", expect=r"ok|warn|FAIL", attempts=3)
     reg(
         "doctor",
         p.returncode == 0
@@ -11863,11 +11954,12 @@ def _full_toplevel() -> dict:
         "child_transport": "tcp",
         # frontier-wave knobs: config.rs defaults, valid by construction
         # (differential KV pair composes with the cache_type line above;
-        # governor defaults off; preload empty keeps the boot inert).
+        # governor ships armed since 0.28 — ngram fallback default-on
+        # needs its collapse net; preload empty keeps the boot inert).
         "cache_type_k": "q8_0",
         "cache_type_v": "q4_0",
         "spec_auto_ngram": True,
-        "spec_auto_manage": False,
+        "spec_auto_manage": True,
         "ubatch_auto": False,
         "preload": [],
         "idle_ram_warm": True,
@@ -12059,11 +12151,17 @@ def _full_toplevel() -> dict:
         "remote_fallback": False,
         "warm_on_pull": False,
         "whisper_stream_chunk_ms": 5000,
+        # 2026-10-27 engine-currency fill: the three non-Option knobs added
+        # to TOPLEVEL_KNOBS this wave also need benign manifest values so
+        # the (c0) membership gate and the full-manifest boot cover them.
+        "offline": False,
+        "moe_cache_mib": 512,
+        "spec_draft_n_ubatch": 256,
     }
 
 
 def _overlay_a() -> dict:
-    """All 28 ModelOverride fields + 18 sampler leaves (chat_template side of XOR)."""
+    """All 29 ModelOverride fields + 18 sampler leaves (chat_template side of XOR)."""
     return {
         "ctx": 3072,
         "slots": 1,
@@ -12083,6 +12181,7 @@ def _overlay_a() -> dict:
         "replicas": 1,
         "pin": True,
         "chat_template": "chatml",
+        "chat_template_kwargs": '{"enable_thinking": false}',
         "spm_infill": True,
         "decode_policy": "free",
         "prompt_recipe": "child",
@@ -12887,7 +12986,13 @@ def _gold_items() -> dict:
             keys.append(m.group(1).strip())
     items["header.show"] = "\n".join(keys)
 
-    p = cli("doctor")
+    # The doctor capture races adjacent-phase daemon churn in FULL runs
+    # (lifecycle stops/respawns share the sandbox run dir); an empty
+    # capture is never legitimate — doctor always prints its table — so
+    # retry once instead of golden-comparing a torn window.
+    p = cli_retry("doctor", expect=r"ok|warn|FAIL", attempts=3)
+    if not re.search(r"^\s*[a-z][a-z0-9 _-]+\s{2,}(?:ok|warn|FAIL)\s", p.stdout, re.M):
+        p = cli_retry("doctor", expect=r"ok|warn|FAIL", attempts=3)
     names = sorted(
         {
             m.group(1)
@@ -12926,6 +13031,11 @@ def _gold_items() -> dict:
             "nvidia driver",
             "vulkan driver",
             "daemon uptime",
+            # daemon-health-conditional: the row appears only while a
+            # daemon answers the probe, so a golds capture taken while a
+            # phase daemon is up and a compare after teardown can never
+            # agree — same class as "service"/"daemon uptime" above.
+            "daemon binary",
             "gpu fit",
             "gpu arch match",
             # engine-state rows: presence depends on which engines are
@@ -12957,11 +13067,20 @@ def _gold_items() -> dict:
         items["api.version"] = ",".join(sorted(v.keys()))
         rows = http_json("GET", "/api/ps")[2].get("models", [])
         items["api.ps.row"] = ",".join(sorted(rows[0].keys())) if rows else ""
-        p = cli("ps")
+        p = cli_retry("ps", expect=r"^NAME|no models loaded", attempts=3)
         hdr = next(
             (ln for ln in p.stdout.splitlines() if ln.startswith("NAME")),
             "",
         )
+        if not hdr:
+            # Same daemon-churn race as the doctor capture above: the
+            # header is state-invariant in the CLI (always printed), so
+            # an absent NAME row means a torn window — retry once.
+            p = cli_retry("ps", expect=r"^NAME|no models loaded", attempts=3)
+            hdr = next(
+                (ln for ln in p.stdout.splitlines() if ln.startswith("NAME")),
+                "",
+            )
         items["header.ps"] = " ".join(hdr.split())
         ok_sse, collected = sse_collect(
             "/v1/chat/completions",
