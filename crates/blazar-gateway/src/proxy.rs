@@ -2469,6 +2469,14 @@ pub fn strip_json_fence(content: &str) -> &str {
 /// request that demanded JSON via `response_format` (see
 /// [`structured_output_kind`]). Returns whether anything changed so
 /// callers skip a pointless re-serialization.
+///
+/// Models on grammar-less lanes decorate beyond the whole-content fence
+/// the fast path handles: a fence followed by commentary ("Note: the
+/// value above is…"), or prose introducing a fenced/raw object. For a
+/// request that DEMANDED JSON the contract is "content parses as JSON",
+/// so the fallback extracts the first balanced object/array span and
+/// keeps it only when it parses — decorated garbage without any valid
+/// JSON span ships verbatim (no silent invention).
 pub fn normalize_json_fences(v: &mut serde_json::Value) -> bool {
     let Some(choices) = v
         .get_mut("choices")
@@ -2487,14 +2495,63 @@ pub fn normalize_json_fences(v: &mut serde_json::Value) -> bool {
         let Some(text) = content.as_str() else {
             continue;
         };
-        let stripped = strip_json_fence(text);
-        if stripped != text {
-            let owned = stripped.to_string();
+        let whole = strip_json_fence(text);
+        let extracted = if whole == text {
+            extract_json_span(text)
+        } else {
+            Some(whole)
+        };
+        let Some(candidate) = extracted else {
+            continue;
+        };
+        // Accept only spans that parse to an object or array — a demand
+        // for JSON is satisfied by a JSON document, not a bare scalar.
+        let valid = serde_json::from_str::<serde_json::Value>(candidate)
+            .is_ok_and(|parsed| parsed.is_object() || parsed.is_array());
+        if valid && candidate != text {
+            let owned = candidate.to_string();
             *content = serde_json::Value::String(owned);
             touched = true;
         }
     }
     touched
+}
+
+/// First balanced `{ … }` / `[ … ]` span in `content`, string- and
+/// escape-aware, or `None` when no complete span exists. Slicing only —
+/// validation belongs to the caller.
+fn extract_json_span(content: &str) -> Option<&str> {
+    let bytes = content.as_bytes();
+    let start = bytes.iter().position(|b| *b == b'{' || *b == b'[')?;
+    let open = bytes[start];
+    let close = if open == b'{' { b'}' } else { b']' };
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            _ if b == open => depth += 1,
+            _ if b == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return content.get(start..=i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Final buffered-body bytes for the guarded non-stream lanes (think
@@ -3674,6 +3731,64 @@ mod cache_obs_tests {
         assert_eq!(strip_json_fence("{\"a\": 1}"), "{\"a\": 1}");
         assert_eq!(strip_json_fence(""), "");
         assert_eq!(strip_json_fence("plain text"), "plain text");
+    }
+
+    #[test]
+    fn unit__normalize_json_fences__trailing_commentary_extracts_span() {
+        use serde_json::json;
+        // The mlx-lane incident shape: fenced JSON followed by a note the
+        // whole-content fast path refuses to touch — the demand licensed
+        // extracting the first balanced object instead.
+        let mut v = json!({"choices": [
+            {"index": 0, "message": {"role": "assistant", "content":
+                "```json\n{\n  \"city\": \"Oslo\",\n  \"temp_c\": 5\n}\n```\n\nNote: The temperature value of `5` is an example and not based on any real data."}}
+        ]});
+        assert!(normalize_json_fences(&mut v));
+        let out = v["choices"][0]["message"]["content"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(out).expect("bare JSON");
+        assert_eq!(parsed["city"], "Oslo");
+        assert_eq!(parsed["temp_c"], 5);
+        assert!(!out.contains("```"));
+        assert!(!out.contains("Note:"));
+    }
+
+    #[test]
+    fn unit__normalize_json_fences__prose_intro_and_array_span() {
+        use serde_json::json;
+        // prose introducing a fenced object, then a fenced array with a
+        // trailing remark — both extract their first balanced span
+        let mut v = json!({"choices": [
+            {"index": 0, "message": {"role": "assistant", "content":
+                "Here is the summary you asked for:\n```json\n{\"city\": \"Oslo\"}\n```\nEnjoy!"}},
+            {"index": 1, "message": {"role": "assistant", "content":
+                "```\n[1, 2, 3]\n``` — sorted"}}
+        ]});
+        assert!(normalize_json_fences(&mut v));
+        assert_eq!(
+            v["choices"][0]["message"]["content"],
+            json!("{\"city\": \"Oslo\"}")
+        );
+        assert_eq!(v["choices"][1]["message"]["content"], json!("[1, 2, 3]"));
+    }
+
+    #[test]
+    fn unit__normalize_json_fences__no_valid_span_ships_verbatim() {
+        use serde_json::json;
+        // decorated text without any complete balanced span must NOT be
+        // silently rewritten — the client sees the raw truth
+        let decorated = "```json\n{\"unterminated\": ";
+        let mut v = json!({"choices": [
+            {"index": 0, "message": {"role": "assistant", "content": decorated}}
+        ]});
+        assert!(!normalize_json_fences(&mut v));
+        assert_eq!(v["choices"][0]["message"]["content"], json!(decorated));
+        // a demand met with plain prose (no braces at all) also rides through
+        let prose = "I cannot produce JSON for that request.";
+        let mut v2 = json!({"choices": [
+            {"index": 0, "message": {"role": "assistant", "content": prose}}
+        ]});
+        assert!(!normalize_json_fences(&mut v2));
+        assert_eq!(v2["choices"][0]["message"]["content"], json!(prose));
     }
 
     #[test]

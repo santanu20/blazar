@@ -217,6 +217,42 @@ fn judge_tools(code: u16, body: &[u8]) -> Verdict {
     ))
 }
 
+/// Choice-of-3 selection judge: with distractor tools offered and no
+/// `tool_choice` pin, the model must pick the tool the prompt actually
+/// needs. A calculator problem that calls `get_weather` (or answers in
+/// prose) is a selection failure — exactly the over-claim the two-shape
+/// tools certificate exists to catch.
+fn judge_tools_selection(code: u16, body: &[u8], want: &str) -> Verdict {
+    if code != 200 {
+        return fail(format!("HTTP {code}: {}", excerpt(body, 160)));
+    }
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return fail(format!("200 but body is not JSON: {e}")),
+    };
+    let calls = parsed["message"]["tool_calls"].as_array();
+    if calls.is_some_and(|c| {
+        c.iter()
+            .any(|t| t["function"]["name"].as_str() == Some(want))
+    }) {
+        let names: Vec<String> = calls.map_or(Vec::new(), |c| {
+            c.iter()
+                .map(|t| {
+                    t["function"]["name"]
+                        .as_str()
+                        .unwrap_or("(unnamed)")
+                        .to_string()
+                })
+                .collect()
+        });
+        return pass(format!("200, picked {want} (calls: {})", names.join(", ")));
+    }
+    fail(format!(
+        "200 but never called {want} — wrong selection or prose: {}",
+        excerpt(body, 160)
+    ))
+}
+
 /// embeddings probe: 200 with vectors; a lane refusal that names
 /// embeddings is an honest N/A; anything else is a FAIL.
 fn judge_embed(code: u16, body: &[u8]) -> Verdict {
@@ -576,12 +612,17 @@ async fn run_probes(
     );
     caps.insert("json".into(), verdict_json(&v_json));
 
-    // tool elicitation — the probe agents actually care about.
+    // tool elicitation — the probe agents actually care about. Two shapes:
+    // a forced single-tool call (can it emit a call at all) and a free
+    // choice among three tools with distractors (can it pick the one the
+    // prompt needs). A certificate claiming tools while the model fumbles
+    // multi-tool selection over-claims the trust routing builds on, so
+    // PASS requires both.
     let v_tools = {
         if row_cancelled(&state) {
             return;
         }
-        elicit_with_retry(|| async {
+        let v_single = elicit_with_retry(|| async {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return fail("overall time budget exhausted".to_string());
@@ -609,7 +650,77 @@ async fn run_probes(
                 Err(_) => fail(format!("no completion within {}s", PROBE_TIMEOUT.as_secs())),
             }
         })
-        .await
+        .await;
+        // Only a settled single-tool PASS earns the second child spawn —
+        // a model that never emits calls cannot be rescued by selection.
+        if v_single.status.eq("PASS") {
+            let v_choice = elicit_with_retry(|| async {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return fail("overall time budget exhausted".to_string());
+                }
+                let body = json!({
+                    "model": model,
+                    "stream": false,
+                    "messages": [{
+                        "role": "user",
+                        "content": "Calculate 47 * 93"
+                    }],
+                    "tools": [
+                        {"type": "function", "function": {
+                            "name": "get_weather",
+                            "description": "current weather for a city",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"]
+                            }
+                        }},
+                        {"type": "function", "function": {
+                            "name": "calculator",
+                            "description": "evaluate an arithmetic expression",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"expression": {"type": "string"}},
+                                "required": ["expression"]
+                            }
+                        }},
+                        {"type": "function", "function": {
+                            "name": "stock_price",
+                            "description": "latest share price of a ticker",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"ticker": {"type": "string"}},
+                                "required": ["ticker"]
+                            }
+                        }}
+                    ],
+                    "options": {"num_predict": 64},
+                });
+                match tokio::time::timeout(PROBE_TIMEOUT.min(remaining), call_chat(&state, body))
+                    .await
+                {
+                    Ok((code, _, bytes)) => judge_tools_selection(code, &bytes, "calculator"),
+                    Err(_) => fail(format!("no completion within {}s", PROBE_TIMEOUT.as_secs())),
+                }
+            })
+            .await;
+            if v_choice.status == "PASS" {
+                pass(format!(
+                    "{}; choice-of-3: {}",
+                    v_single.receipt, v_choice.receipt
+                ))
+            } else {
+                fail(format!(
+                    "forced single ok ({}); free choice among 3 tools failed — {}",
+                    v_single.receipt, v_choice.receipt
+                ))
+            }
+        } else {
+            // never emits calls at all — the selection probe cannot
+            // rescue this and would only burn another child spawn.
+            v_single
+        }
     };
     state.jobs.record_event(
         &state,
@@ -953,6 +1064,25 @@ mod tests {
         let v = judge_tools(200, prose);
         assert_eq!(v.status, "FAIL");
         assert!(v.receipt.contains("no tool_calls"));
+    }
+
+    #[test]
+    fn unit__judge_tools_selection__distractor_pick_fails_wanted_pick_passes() {
+        // Free choice among three tools: only a `calculator` call passes a
+        // calculator prompt — the distractor call and the prose answer are
+        // both selection failures.
+        let ok = br#"{"message":{"tool_calls":[{"function":{"name":"calculator"}}]}}"#;
+        let v = judge_tools_selection(200, ok, "calculator");
+        assert_eq!(v.status, "PASS");
+        assert!(v.receipt.contains("picked calculator"));
+        let distractor = br#"{"message":{"tool_calls":[{"function":{"name":"get_weather"}}]}}"#;
+        let v = judge_tools_selection(200, distractor, "calculator");
+        assert_eq!(v.status, "FAIL");
+        assert!(v.receipt.contains("never called calculator"));
+        let prose = br#"{"message":{"content":"47 * 93 = 4371"}}"#;
+        let v = judge_tools_selection(200, prose, "calculator");
+        assert_eq!(v.status, "FAIL");
+        assert!(v.receipt.contains("never called calculator"));
     }
 
     #[tokio::test]
