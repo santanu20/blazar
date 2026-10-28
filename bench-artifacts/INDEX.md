@@ -2,6 +2,8 @@
 
 | Campaign | Date | Lanes | Cells | blazar |
 |---|---|---|---:|---|
+| 20261027-uzu-wave | 20261027 | f1-speed-column,f2-cloud-catalog | 2 | 0.28.0 |
+| 20261027-e2e-perf-rebaseline | 20261027 | blazar,cold,conc,direct,greedy,greedy_gw,ollama | 24 | 0.28.0 |
 | 2026-10-07-overhead | 2026 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 34 | mixed |
 | 20260923-media | 20260923 | media | 4 | blazar 0.10.0 |
 | 20260923-media-v2 | 20260923 | media | 5 | blazar 0.10.0 |
@@ -36,3 +38,4 @@
 | 20261012-e2e-perf-audit | 20261012 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 23 | 0.26.0 |
 | 20261012-e2e-perf-audit-postfix | 20261012 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 23 | 0.26.0 |
 | 20261013-e2e-perf-audit-r2 | 20261013 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 23 | 0.26.0 |
+| 20261027-e2e-perf-rebaseline | 20261027 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 23 | 0.28.0 |
