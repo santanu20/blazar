@@ -45,6 +45,9 @@ wiremock = "0.6"
 tempfile = "3"
 libc = { workspace = true }
 proptest = "1.11.0"
+# WebSocket client for the /v1/realtime session tests (dev-only; the
+# server side rides axum's ws feature).
+tokio-tungstenite = "0.30"
 
 [lints]
 workspace = true

@@ -466,15 +466,46 @@ async fn response_parts(resp: Response) -> (StatusCode, axum::body::Bytes) {
     (status, body)
 }
 
-/// Decode one append payload into the session buffer; `Err` is a fatal
-/// misbehavior (bad base64 or over-capacity) and the message says which.
-fn append_audio(buffer: &mut Vec<u8>, b64: &str) -> Result<(), String> {
-    let decoded = base64_decode(b64).map_err(|e| format!("audio is not base64: {e}"))?;
+/// Decode one append payload into the session buffer. `Err(Cap)` is the
+/// fatal case (the 20 MiB memory bound was blown — the session resets);
+/// `Err(Decode)` is a one-frame client encoding bug that must NOT cost
+/// the conversation context: the caller teaches and keeps the session.
+#[derive(Debug)]
+enum AppendErr {
+    Decode(String),
+    Cap,
+}
+
+fn append_audio(buffer: &mut Vec<u8>, b64: &str) -> Result<(), AppendErr> {
+    let decoded =
+        base64_decode(b64).map_err(|e| AppendErr::Decode(format!("audio is not base64: {e}")))?;
     if buffer.len() + decoded.len() > AUDIO_BUFFER_CAP_BYTES {
-        return Err("audio buffer exceeded 20 MiB — this lane is for utterances, not files".into());
+        return Err(AppendErr::Cap);
     }
     buffer.extend_from_slice(&decoded);
     Ok(())
+}
+
+/// Teach one append failure: decode bugs stay recoverable (`invalid_request`),
+/// over-capacity is fatal (`buffer_overflow`) — the caller closes after a Cap.
+async fn append_failed(socket: &WsSink, err: &AppendErr) -> bool {
+    match err {
+        AppendErr::Decode(msg) => {
+            send_json(socket, &error_event("invalid_request", msg)).await;
+            false
+        }
+        AppendErr::Cap => {
+            send_json(
+                socket,
+                &error_event(
+                    "buffer_overflow",
+                    "audio buffer exceeded 20 MiB — this lane is for utterances, not files",
+                ),
+            )
+            .await;
+            true
+        }
+    }
 }
 
 /// Echo a created conversation item back with a server-assigned id.
@@ -523,8 +554,11 @@ async fn dispatch_mid_turn(
         }
         "input_audio_buffer.append" => match ev["audio"].as_str() {
             Some(b64) => {
-                if let Err(msg) = append_audio(buffer, b64) {
-                    send_json(socket, &error_event("buffer_overflow", &msg)).await;
+                let fatal = match append_audio(buffer, b64) {
+                    Err(err) => append_failed(socket, &err).await,
+                    Ok(()) => false,
+                };
+                if fatal {
                     return true;
                 }
             }
@@ -646,8 +680,11 @@ async fn run_session(
                             .await;
                             continue;
                         };
-                        if let Err(msg) = append_audio(&mut buffer, b64) {
-                            send_json(&sink, &error_event("buffer_overflow", &msg)).await;
+                        let fatal = match append_audio(&mut buffer, b64) {
+                            Err(err) => append_failed(&sink, &err).await,
+                            Ok(()) => false,
+                        };
+                        if fatal {
                             sink_close(&sink).await;
                             return;
                         }
@@ -903,6 +940,28 @@ mod tests {
         assert!(base64_decode("A===").is_err(), "interior padding");
         assert!(base64_decode("////").is_ok(), "valid alphabet");
         assert!(base64_decode("?!??").is_err(), "invalid byte");
+    }
+
+    #[test]
+    fn unit__append_audio__decode_taught_cap_fatal() {
+        let mut buffer = Vec::new();
+        // A decode bug is recoverable: the buffer must stay untouched so
+        // the session (and its context) survives the frame.
+        match append_audio(&mut buffer, "??") {
+            Err(AppendErr::Decode(msg)) => assert!(msg.contains("not base64"), "{msg}"),
+            other => panic!("expected Decode, got {other:?}"),
+        }
+        assert!(buffer.is_empty(), "failed append must not grow the buffer");
+        // Valid appends accumulate.
+        append_audio(&mut buffer, &base64_encode(b"abc")).unwrap();
+        assert_eq!(buffer, b"abc");
+        // Blowing the 20 MiB bound is the one fatal append.
+        let huge = vec![0u8; AUDIO_BUFFER_CAP_BYTES];
+        match append_audio(&mut buffer, &base64_encode(&huge)) {
+            Err(AppendErr::Cap) => {}
+            other => panic!("expected Cap, got {other:?}"),
+        }
+        assert_eq!(buffer, b"abc", "capped append must not grow the buffer");
     }
 
     #[test]
