@@ -3204,6 +3204,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_recipe_lanes(&d));
     checks.extend(doctor_model_types(&d));
     checks.extend(doctor_sglang_fit(&d));
+    checks.extend(doctor_kv_budget(&d));
     checks.extend(doctor_sentinel(&d));
     checks.extend(doctor_runtime(&d));
     checks.extend(doctor_exposure(&d));
@@ -3511,6 +3512,10 @@ fn doctor_group(name: &str) -> &'static str {
         | "versions sdcpp"
         | "versions mlx"
         | "engine retention"
+        | "sglang fit"
+        | "kv budget llamacpp"
+        | "kv budget mistralrs"
+        | "kv budget mlx"
         | "whisper lane"
         | "whisper currency"
         | "whisper models"
@@ -4335,6 +4340,159 @@ fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
     out
 }
 
+/// ENGINES section addition — the GGUF/MLX counterpart of `sglang fit`.
+/// For every model the llama.cpp / mistral.rs / mlx lanes could serve,
+/// compile the real spawn profile and charge the f16 KV pool against the
+/// 85% VRAM share — the same math the admission fit uses — so the
+/// quant-ladder and ctx-shrink decisions show up in `blazar doctor`
+/// BEFORE a doomed spawn 502s its way through retries. Rows where the
+/// fit already engaged a remedy (warnings present) surface as warn with
+/// the remedy text, not ok-with-footnote.
+#[allow(clippy::too_many_lines)] // one row per lane×model pair, cohesive table builder
+fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
+    let mut out = Vec::new();
+    let Ok(store) = Store::open(d) else {
+        return out;
+    };
+    let engines = store.list_engines().unwrap_or_default();
+    let Ok(cfg) = config() else {
+        return out; // config failure is reported by the config check
+    };
+    let hw = blazar_runtime::probe_hardware(None);
+    let vram_mib = hw.total_vram_mib();
+    if vram_mib == 0 {
+        return out; // no GPU census: capacity math would be fiction
+    }
+    let data_dir = d.data_dir.to_string_lossy().into_owned();
+    let lanes: [(EngineKind, bool); 3] = [
+        (EngineKind::LlamaCpp, true),  // GGUF files
+        (EngineKind::MistralRs, true), // GGUF files
+        (EngineKind::Mlx, false),      // HF safetensors dirs
+    ];
+    for m in store.list_models().unwrap_or_default() {
+        if m.has_component_set() {
+            continue; // split rows ride their GGUF set; the set's GGUF row previews
+        }
+        let path = std::path::Path::new(&m.path);
+        let is_gguf = path.is_file();
+        for (kind, wants_gguf) in lanes {
+            if is_gguf != wants_gguf {
+                continue;
+            }
+            let Some(engine) = engines
+                .iter()
+                .filter(|e| e.kind == kind)
+                .max_by_key(|e| e.active)
+            else {
+                continue; // lane not installed: nothing to preview against
+            };
+            let flags = manifest_flag_set(&engine.manifest);
+            // Metadata must outlive `meta` (match-arm temporaries would
+            // dangle) — deferred init in the lane-loop scope keeps the
+            // borrowed shape alive through build_input/compile.
+            let gguf_meta;
+            let hf_meta;
+            let meta = if wants_gguf {
+                let Ok(g) = blazar_core::read_metadata_file(path) else {
+                    continue; // unreadable GGUF: doctor_models flags it
+                };
+                gguf_meta = g;
+                blazar_core::ModelMeta::Gguf(&gguf_meta)
+            } else {
+                let Ok(h) = blazar_core::read_hf_config(path) else {
+                    continue;
+                };
+                hf_meta = h;
+                blazar_core::ModelMeta::Hf(&hf_meta)
+            };
+            let overlay = cfg.overlay_for(&m.name);
+            let spec_mode = overlay.spec.clone().unwrap_or_else(|| cfg.spec.clone());
+            let draft = blazar_runtime::resolve_draft_path(&store, &m.name, &spec_mode);
+            let input = blazar_runtime::bench::build_input(
+                &m.name,
+                &m.path,
+                u64::try_from(m.bytes.max(0)).unwrap_or(u64::MAX),
+                meta,
+                &hw,
+                &cfg,
+                &overlay,
+                &[],
+                draft.as_deref(),
+                &engine.tag,
+                &flags,
+                &[],
+                blazar_core::Endpoint::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: 0,
+                },
+                &data_dir,
+                kind,
+            );
+            let label = match kind {
+                EngineKind::LlamaCpp => "kv budget llamacpp",
+                EngineKind::MistralRs => "kv budget mistralrs",
+                EngineKind::Mlx => "kv budget mlx",
+                _ => "kv budget",
+            };
+            match blazar_core::profile::compile(&input, &blazar_core::TuningOverrides::default()) {
+                Ok(p) => {
+                    let kv_mib = blazar_core::profile::estimate_kv_vram_charge(&input, Some(p.ctx))
+                        .map_or(0, |b| b / (1024 * 1024));
+                    let budget_mib = vram_mib / 100 * 85;
+                    let weights_mib = input.model_bytes / (1024 * 1024);
+                    let demand_mib = weights_mib.saturating_add(kv_mib);
+                    // Only FIT remedies make the row a warn: profile
+                    // warnings also carry informational clamps (ctx
+                    // clamp to metadata, derived pa-fraction) that are
+                    // normal tuning, not a budget problem — warning on
+                    // those buried the real tight rows in noise.
+                    let remedy: Vec<String> = p
+                        .warnings
+                        .iter()
+                        .filter(|w| {
+                            let l = w.to_lowercase();
+                            [
+                                "unified kv pool",
+                                "cache_type",
+                                "cannot fit",
+                                "cpu-offload",
+                                "relocat",
+                            ]
+                            .iter()
+                            .any(|m| l.contains(m))
+                        })
+                        .cloned()
+                        .collect();
+                    let remedy_note = if remedy.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", remedy.join("; "))
+                    };
+                    let check = if demand_mib > budget_mib || !remedy.is_empty() {
+                        Check::warn
+                    } else {
+                        Check::ok
+                    };
+                    out.push(check(
+                        label,
+                        format!(
+                            "{}: ctx {}, weights {} MiB + KV {} MiB vs {} MiB budget ({}%){remedy_note}",
+                            m.name,
+                            p.ctx,
+                            weights_mib,
+                            kv_mib,
+                            budget_mib,
+                            demand_mib * 100 / budget_mib.max(1),
+                        ),
+                    ));
+                }
+                Err(e) => out.push(Check::warn(label, format!("{}: {e}", m.name))),
+            }
+        }
+    }
+    out
+}
+
 /// MODELS section addition: on-disk type mix via the same label helper
 /// the list table uses.
 fn doctor_model_types(d: &BlazarDirs) -> Vec<Check> {
@@ -4383,6 +4541,38 @@ mod doctor_tests {
         assert!(set.contains("--a") && set.contains("--b"));
         assert_eq!(manifest_flag_set("not json at all").len(), 0);
         assert_eq!(manifest_flag_set(r#"{"tag":"x","no_flags":true}"#).len(), 0);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor__kv_budget_row_shape() {
+        // Detail-format pin: the row must carry the numbers the remedy
+        // levers need (ctx, weights, KV charge, budget share) and the
+        // engaged-remedy suffix when the fit spoke.
+        let p = blazar_core::profile::Profile {
+            argv: vec![],
+            ctx: 8192,
+            gpu: "full",
+            warnings: vec!["unified KV pool fit: ctx 16384 -> 8192".to_string()],
+            ..Default::default()
+        };
+        let kv_mib = 512u64;
+        let weights_mib = 4_800u64;
+        let budget_mib = 6_960u64;
+        let demand_mib = weights_mib + kv_mib;
+        let detail = format!(
+            "qwen3-4b: ctx {}, weights {} MiB + KV {} MiB vs {} MiB budget ({}%) — {}",
+            p.ctx,
+            weights_mib,
+            kv_mib,
+            budget_mib,
+            demand_mib * 100 / budget_mib,
+            p.warnings.join("; ")
+        );
+        assert!(detail.contains("ctx 8192"));
+        assert!(detail.contains("weights 4800 MiB + KV 512 MiB"));
+        assert!(detail.contains("vs 6960 MiB budget (76%)"));
+        assert!(detail.contains("— unified KV pool fit"));
     }
 
     #[test]
@@ -7669,66 +7859,58 @@ fn trunc_ellipsis(s: &str, cap: usize) -> String {
 /// included) so a value can never bleed into the next column — a fixed
 /// ARCH width once let `Qwen2ForCausalLM` overlap CTX. NAME is never
 /// truncated; ARCH caps with an ellipsis; SIZE and CTX right-align; the
-/// last column (ENGINE) is uncapped. The storage path is deliberately
+/// last column is uncapped. The storage path is deliberately
 /// not shown — `blazar show <model>` carries it.
-fn render_list_table(header: [&str; 9], rows: &[[String; 9]]) -> String {
+fn render_list_table(header: &[&str], rows: &[Vec<String>]) -> String {
     const ARCH_CAP: usize = 18;
-    let mut table: Vec<[String; 9]> = vec![header.map(str::to_string)];
+    // Positional rules that survive column-count changes: the ARCH
+    // column is the only capped one, SIZE/CTX are the only right-aligned
+    // ones. Everything else pads left-aligned to its computed width.
+    let cap_column = 4;
+    let right_align = [2, 5];
+    let ncols = header.len();
+    let mut table: Vec<Vec<String>> = vec![header.iter().map(ToString::to_string).collect()];
     for r in rows {
-        table.push([
-            r[0].clone(),
-            r[1].clone(),
-            r[2].clone(),
-            r[3].clone(),
-            trunc_ellipsis(&r[4], ARCH_CAP),
-            r[5].clone(),
-            r[6].clone(),
-            r[7].clone(),
-            r[8].clone(),
-        ]);
+        table.push(
+            r.iter()
+                .enumerate()
+                .map(|(col, cell)| {
+                    if col == cap_column {
+                        trunc_ellipsis(cell, ARCH_CAP)
+                    } else {
+                        cell.clone()
+                    }
+                })
+                .collect(),
+        );
     }
     let width = |col: usize| {
         table
             .iter()
-            .map(|row| row[col].chars().count())
+            .map(|row| row.get(col).map_or(0, |s| s.chars().count()))
             .max()
             .unwrap_or(0)
     };
-    let (name_w, quant_w, size_w, vision_w, arch_w, ctx_w, type_w, cat_w) = (
-        width(0),
-        width(1),
-        width(2),
-        width(3),
-        width(4),
-        width(5),
-        width(6),
-        width(7),
-    );
+    let widths: Vec<usize> = (0..ncols).map(width).collect();
 
     let mut out = String::new();
     for (i, cells) in table.iter().enumerate() {
         // Trimmed line end: the last column is uncapped, so padding
         // would only leave trailing blanks on copied output.
-        let mut line = format!(
-            "{:<name_w$}  {:<quant_w$}  {:>size_w$}  {:<vision_w$}  {:<arch_w$}  {:>ctx_w$}  {:<type_w$}  {:<cat_w$}  {}",
-            cells[0],
-            cells[1],
-            cells[2],
-            cells[3],
-            cells[4],
-            cells[5],
-            cells[6],
-            cells[7],
-            cells[8],
-            name_w = name_w,
-            quant_w = quant_w,
-            size_w = size_w,
-            vision_w = vision_w,
-            arch_w = arch_w,
-            ctx_w = ctx_w,
-            type_w = type_w,
-            cat_w = cat_w
-        );
+        let mut line = cells
+            .iter()
+            .enumerate()
+            .map(|(col, cell)| {
+                if col + 1 == ncols {
+                    cell.clone()
+                } else if right_align.contains(&col) {
+                    format!("{cell:>w$}", w = widths[col])
+                } else {
+                    format!("{cell:<w$}", w = widths[col])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
         line.truncate(line.trim_end().len());
         // Header row carries the same terminal-only bold the search and
         // engine tables use; widths were computed from the plain text, so
@@ -7838,11 +8020,28 @@ fn render_table(header: &[&str], rows: &[Vec<String>], right: &[usize]) -> Strin
 /// missing on disk, `engine` null = nothing installed serves the model),
 /// plus the additive `engine_arch_gap` key when the routed llamacpp
 /// lane provably lacks this GGUF's arch (see [`engine_arch_gap`]).
+/// Best measured decode throughput for the catalog's SPEED column: the
+/// fastest `tg` bench test on record (tuned-profile benchmark or plain
+/// bench receipt, whichever `resolve_measured` ranks first). `None` =
+/// never measured — the cell prints an honest dash rather than a guess,
+/// matching the never-guess pattern of the ENGINE column.
+fn measured_decode_tps(store: &Store, model: &str) -> Option<f64> {
+    match resolve_measured(store, model).ok()? {
+        Measured::Absent => None,
+        Measured::Tuned { tests, .. } | Measured::Benched { tests, .. } => tests
+            .iter()
+            .filter(|(name, _, _)| name.starts_with("tg"))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(_, t_per_s, _)| *t_per_s),
+    }
+}
+
 fn list_json_row(
     cfg: &blazar_core::Config,
     global: Option<&(String, blazar_core::engine_kind::EngineKind)>,
     engine_rows: &[blazar_core::EngineRow],
     m: &blazar_core::store::ModelRow,
+    speed_tps: Option<f64>,
 ) -> serde_json::Value {
     let mmproj_bytes = m
         .mmproj_path
@@ -7889,6 +8088,9 @@ fn list_json_row(
         "category": model_category(m),
         "engine": engine,
         "engine_kind": engine_kind,
+        // Measured decode tok/s on record (best `tg` test); null = never
+        // benched — the JSON mirror of the table's SPEED dash.
+        "speed_tps": speed_tps,
         "path": m.path,
     });
     if let Some(arch) = engine.as_deref().and_then(|tag| {
@@ -7927,7 +8129,11 @@ fn list(json: bool) -> Result<()> {
         // projector configured (0 = configured but missing on disk),
         // `engine` null = nothing installed serves the model.
         for m in &models {
-            println!("{}", list_json_row(&cfg, global.as_ref(), &engine_rows, m));
+            let speed_tps = measured_decode_tps(&store, &m.name);
+            println!(
+                "{}",
+                list_json_row(&cfg, global.as_ref(), &engine_rows, m, speed_tps)
+            );
         }
         return Ok(());
     }
@@ -7940,7 +8146,7 @@ fn list(json: bool) -> Result<()> {
     // Paradigm-refused models keep the "-" cell; their teaching shows
     // once under the table (same shape as the arch-gap footer).
     let mut paradigm_notes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let rows: Vec<[String; 9]> = models
+    let rows: Vec<Vec<String>> = models
         .iter()
         .map(|m| {
             // Multimodal visibility: the projector is a real on-disk cost
@@ -7986,7 +8192,11 @@ fn list(json: bool) -> Result<()> {
             // beats the name-derived column for safetensors dirs (the
             // column reads BF16 for torchao/awq int4 weights).
             let quant = hf_quant_method(&m.path).unwrap_or_else(|| m.quant.clone());
-            [
+            // SPEED cell: measured decode tok/s (best `tg` on record) or
+            // the honest dash — never a bandwidth-model guess.
+            let speed = measured_decode_tps(&store, &m.name)
+                .map_or_else(|| "-".to_string(), |v| format!("{v:.0} t/s"));
+            vec![
                 m.name.clone(),
                 quant,
                 humansize(m.bytes),
@@ -7996,14 +8206,16 @@ fn list(json: bool) -> Result<()> {
                 model_type_label(&m.path),
                 model_category(m).to_string(),
                 engine_cell,
+                speed,
             ]
         })
         .collect();
     println!(
         "{}",
         render_list_table(
-            [
-                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE"
+            &[
+                "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
+                "SPEED"
             ],
             &rows
         )
@@ -9628,14 +9840,17 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
     ) {
         println!("daemon pid {} ({})", pid.trim(), path.trim());
     }
-    if models.is_empty() {
-        println!("no models loaded");
-        return Ok(());
-    }
+    // Table contract: the header row is state-invariant — even a fresh
+    // daemon with nothing loaded prints it (clients and the golden
+    // suite key on NAME existing before any model row).
     println!(
         "{:<24} {:<9} {:>7} {:>5} {:>6} {:<20} {:>4} {:>10}  ENDPOINT",
         "NAME", "STATE", "CTX", "SLOTS", "GPU", "SPEC", "HIT", "IN_FLIGHT"
     );
+    if models.is_empty() {
+        println!("no models loaded");
+        return Ok(());
+    }
     for m in models {
         let display = match m["blazar_replica"].as_i64() {
             Some(r) => format!("{}#{}", m["name"].as_str().unwrap_or("?"), r),
@@ -21597,6 +21812,32 @@ mod tests {
     }
 
     #[test]
+    fn unit__measured_decode_tps__best_tg_wins_and_absent_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = passport_dirs(&tmp);
+        let store = Store::open(&dirs).unwrap();
+        // Never-benched model: honest None (the SPEED dash), never a guess.
+        assert_eq!(measured_decode_tps(&store, "ghost-model"), None);
+        // Receipt on record: decode cell must surface the BEST tg test,
+        // ignoring prefill rows (pp t/s is a different axis). Plain bench
+        // payloads persist as a bare row array (tuned profiles carry the
+        // wrapped benchmark_json shape instead).
+        let payload = r#"[
+            {"t/s":900.0,"test":"pp512","n_ctx":8192},
+            {"t/s":42.0,"test":"tg128","n_ctx":8192},
+            {"t/s":77.0,"test":"tg512","n_ctx":8192}
+        ]"#;
+        store
+            .put_bench_result("benched-model", "b11785-cuda", payload)
+            .unwrap();
+        let got = measured_decode_tps(&store, "benched-model").unwrap();
+        assert!(
+            (got - 77.0).abs() < 1e-9,
+            "best tg wins over pp and slower tg: {got}"
+        );
+    }
+
+    #[test]
     fn unit__scorecard_bench_summary__groups_repeats_into_sorted_means() {
         let payload = r#"{"score":12.5,"rows":[
             {"t/s":100.0,"test":"pp512","n_ctx":8192},
@@ -23106,10 +23347,10 @@ mod tests {
             ],
         ];
         let out = render_list_table(
-            [
+            &[
                 "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
             ],
-            &rows,
+            &rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
         );
         let lines: Vec<&str> = out.lines().collect();
         // One line per model plus the header — no band rows, no blanks.
@@ -23152,10 +23393,10 @@ mod tests {
             ],
         ];
         let out = render_list_table(
-            [
+            &[
                 "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
             ],
-            &rows,
+            &rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
         );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3, "got: {out}");
@@ -23189,10 +23430,10 @@ mod tests {
             "sg-test".to_string(),
         ]];
         let out2 = render_list_table(
-            [
+            &[
                 "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
             ],
-            &long,
+            &long.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
         );
         let row = out2.lines().nth(1).unwrap();
         assert!(row.contains("имя-модели-очень-длинное"));
@@ -25014,10 +25255,10 @@ mod tests {
         );
         assert_eq!(
             render_list_table(
-                [
+                &[
                     "NAME", "QUANT", "SIZE", "VISION", "ARCH", "CTX", "TYPE", "CATEGORY", "ENGINE",
                 ],
-                &rows,
+                &rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
             ),
             golden
         );
