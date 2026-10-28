@@ -12024,7 +12024,8 @@ mod routing_tests {
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__spec_governor__knob_off_is_inert() {
-        let sup = routing_sup(1); // spec_auto_manage defaults false
+        let mut sup = routing_sup(1);
+        sup.config.spec_auto_manage = false; // explicit off: default is on
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
         sup.instances.insert("m".into(), inst);
         for _ in 0..5 {
@@ -12032,6 +12033,23 @@ mod routing_tests {
         }
         assert!(sup.spec_override.get("m").is_none());
         assert_eq!(sup.spec_governor_snapshot().len(), 0);
+        kill_all(&[ph]);
+    }
+
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__spec_governor__default_on_healthy_never_parks() {
+        // Defaults ship speculation (spec=auto, ngram fallback) WITH the
+        // governor armed. Healthy windows — high acceptance, no queue
+        // pressure — must leave both override and streak state empty.
+        let sup = routing_sup(1); // defaults: spec_auto_manage = true
+        let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
+        sup.instances.insert("m".into(), inst);
+        for _ in 0..5 {
+            sup.spec_governor_window("m", Some(0.97));
+        }
+        assert!(sup.spec_override.get("m").is_none());
+        assert!(sup.spec_gov.get("m").is_none());
         kill_all(&[ph]);
     }
 

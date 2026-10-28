@@ -1397,6 +1397,13 @@ pub struct ModelOverride {
     /// exclusive with `chat_template`. Must exist at config load.
     #[serde(default)]
     pub chat_template_file: Option<String>,
+    /// Per-model `--chat-template-kwargs` override (None = inherit the
+    /// global `chat_template_kwargs`). Same JSON-object-string contract,
+    /// validated at load: the tool-mode lever for thinking models, e.g.
+    /// `"{\"enable_thinking\": false}"` pins one model without
+    /// fleet-wide effect.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<String>,
     /// Per-model sampling defaults, emitted as argv so they apply to
     /// every request that does not override the param in its body.
     #[serde(default)]
@@ -2964,7 +2971,7 @@ impl Default for Config {
             spec: "auto".to_string(),
             spec_autopull: false,
             spec_auto_ngram: true,
-            spec_auto_manage: false,
+            spec_auto_manage: true,
             ubatch_auto: false,
             lazy_mode: "auto".to_string(),
             server_tools: None,
@@ -3790,6 +3797,16 @@ impl Config {
             .unwrap_or(self.moe_cache_mib)
     }
 
+    /// Effective `--chat-template-kwargs` payload: explicit overlay beats
+    /// explicit global; `None` emits nothing (upstream template default).
+    #[must_use]
+    pub fn effective_chat_template_kwargs(&self, model: &str) -> Option<&str> {
+        self.model_overrides
+            .get(model)
+            .and_then(|o| o.chat_template_kwargs.as_deref())
+            .or(self.chat_template_kwargs.as_deref())
+    }
+
     /// Effective KV cache type: "" = auto ladder; explicit overlay beats
     /// explicit global beats auto.
     #[must_use]
@@ -4337,6 +4354,14 @@ impl Config {
                 return Err(CoreError::Config(format!(
                     "model_overrides.{name}.lazy_mode must be \"auto\", \"on\" or \"off\", got {lm:?}"
                 )));
+            }
+            if let Some(kwargs) = &o.chat_template_kwargs {
+                let trimmed = kwargs.trim();
+                if trimmed.is_empty() || !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.chat_template_kwargs must be a JSON object string (e.g. \"{{\\\"enable_thinking\\\": false}}\"), got {kwargs:?}"
+                    )));
+                }
             }
             if let Some(ctx) = o.ctx
                 && ctx == 0
@@ -6623,10 +6648,31 @@ default_ctx = 16384
                 "chat_template_kwargs",
                 "chat_template_kwargs = \"not json\"\n",
             ),
+            (
+                "model_overrides.m.chat_template_kwargs",
+                "[model_overrides.m]\nchat_template_kwargs = \"[]\"\n",
+            ),
+            (
+                "model_overrides.m.chat_template_kwargs",
+                "[model_overrides.m]\nchat_template_kwargs = \"\"\n",
+            ),
         ] {
             let err = Config::from_toml(raw).unwrap_err().to_string();
             assert!(err.contains(field), "{field}: {err}");
         }
+        // Overlay kwargs parse and resolve: explicit overlay beats global,
+        // unpinned models keep the global (see effective_chat_template_kwargs).
+        let cfg = Config::from_toml(
+            "chat_template_kwargs = \"{\\\"a\\\": 1}\"\n\
+             [model_overrides.m]\nchat_template_kwargs = \"{\\\"b\\\": 2}\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_chat_template_kwargs("m"), Some(r#"{"b": 2}"#));
+        assert_eq!(
+            cfg.effective_chat_template_kwargs("other"),
+            Some(r#"{"a": 1}"#)
+        );
+        assert_eq!(Config::default().effective_chat_template_kwargs("m"), None);
     }
 
     #[test]

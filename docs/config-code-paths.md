@@ -44,7 +44,7 @@ token quality are surfaced as drift.
 | spec | "auto".to_string() | other + runtime/gateway + engine-argv + gateway-http + cli | `blazar-core/examples/slots_probe.rs:77` in `main`; `blazar-runtime/src/hf_parallel.rs:931` in `range_server`; `blazar-runtime/src/hf_parallel.rs:932` in `range_server`; `blazar-core/src/profile.rs:772` in `the`; `blazar-core/src/profile.rs:775` in `the`; `blazar-gateway/src/ollama.rs:1039` in `chat`; `blazar-gateway/src/ollama.rs:1046` in `chat`; `blazar-cli/src/main.rs:217` in `?`; `blazar-cli/src/main.rs:1507` in `run` |
 | spec_autopull | false | runtime/gateway | `blazar-runtime/src/supervisor.rs:3088` in `spawn_instance_forced`; `blazar-runtime/src/supervisor.rs:5293` in `autopull_draft` |
 | spec_auto_ngram | true | engine-argv | `blazar-core/src/profile.rs:824` in `the`; `blazar-core/src/profile.rs:4980` in `ngram_fallback_applies` |
-| spec_auto_manage | false | runtime/gateway | `blazar-runtime/src/supervisor.rs:876` in `spec_governor_window`; `blazar-runtime/src/supervisor.rs:8381` in `unit__spec_governor__saturation_streak_parks_and_queues` |
+| spec_auto_manage | true | runtime/gateway | `blazar-runtime/src/supervisor.rs:876` in `spec_governor_window`; `blazar-runtime/src/supervisor.rs:8381` in `unit__spec_governor__saturation_streak_parks_and_queues` |
 | lazy_mode | "auto".to_string() | engine-argv | `blazar-core/src/profile.rs:1206` in `the`; `blazar-core/src/profile.rs:1207` in `the` |
 | server_tools | None | engine-argv | `blazar-core/src/profile.rs:1231` in `the`; `blazar-core/src/profile.rs:10104` in `unit__server_tools__emits_quartet_when_set` |
 | server_tools_runtime | None | engine-argv | `blazar-core/src/profile.rs:1232` in `the`; `blazar-core/src/profile.rs:10105` in `unit__server_tools__emits_quartet_when_set` |
@@ -366,7 +366,7 @@ token quality are surfaced as drift.
 | enable_tf32_matmul | — | engine-argv | `crates/blazar-core/src/profile.rs:4903` (TF32 matmul toggle) |
 | enable_priority_scheduling | Some(true) | engine-argv | `crates/blazar-core/src/profile.rs:4916` (request priority scheduling) |
 
-## ModelOverride ([models."name"]) — 41 fields, 0 dead
+## ModelOverride ([models."name"]) — 42 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -397,6 +397,7 @@ token quality are surfaced as drift.
 | pin | — | other + engine-argv + gateway-http + runtime/gateway + cli | `blazar-core/src/dirs.rs:9` in `warn_fallback`; `blazar-core/src/engine_kind.rs:139` in `format_preference_order`; `blazar-core/src/profile.rs:2335` in `derive_pa_fraction`; `blazar-core/src/profile.rs:2347` in `derive_pa_fraction`; `blazar-gateway/src/proxy.rs:319` in `ensure_with_admission`; `blazar-gateway/src/proxy.rs:323` in `ensure_with_admission`; `blazar-runtime/src/piper.rs:45` in `pin_path`; `blazar-runtime/src/piper.rs:86` in `sorted_tag_dirs`; `blazar-cli/src/main.rs:287` in `?`; `blazar-cli/src/main.rs:297` in `?` |
 | chat_template | — | engine-argv + other + runtime/gateway + gateway-http | `blazar-core/src/profile.rs:1961` in `the`; `blazar-core/src/profile.rs:1966` in `the`; `blazar-core/src/gguf.rs:75` in `?`; `blazar-core/src/gguf.rs:696` in `parse_metadata`; `blazar-runtime/tests/tuner.rs:62` in `gpu_hw`; `blazar-runtime/src/hf.rs:5210` in `unit__select_safetensors_files__shards_aux_skip_nested_and_foreign`; `blazar-gateway/tests/support/mod.rs:56` in `write_gguf`; `blazar-gateway/tests/sentinel.rs:61` in `write_gguf` |
 | chat_template_file | — | engine-argv | `blazar-core/src/profile.rs:1970` in `the`; `blazar-core/src/profile.rs:1978` in `the` |
+| chat_template_kwargs | — | engine-argv | `blazar-core/src/config.rs` `effective_chat_template_kwargs`; `blazar-core/src/profile.rs` compile llama-server knob lane |
 | sampler_defaults | — | engine-argv | `blazar-core/src/profile.rs:1991` in `the`; `blazar-core/src/profile.rs:2031` in `the` |
 | spm_infill | — | engine-argv | `blazar-core/src/profile.rs:1984` in `the`; `blazar-core/src/profile.rs:1988` in `the` |
 | late_chunking | — | engine-argv + gateway-http | `blazar-core/src/profile.rs:712` in `the`; `blazar-core/src/profile.rs:736` in `the`; `blazar-gateway/src/ollama.rs:2253` in `embeddings`; `blazar-gateway/src/ollama.rs:2382` in `embed` |

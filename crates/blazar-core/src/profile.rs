@@ -1822,14 +1822,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             &[secs.to_string()],
         );
     }
-    if let Some(kwargs) = &config.chat_template_kwargs {
+    if let Some(kwargs) = config.effective_chat_template_kwargs(input.model_name) {
         push_gated(
             input,
             &mut argv,
             &mut warnings,
             "chat_template_kwargs",
             "--chat-template-kwargs",
-            std::slice::from_ref(kwargs),
+            std::slice::from_ref(&kwargs.to_string()),
         );
     }
     match config.cont_batching {
@@ -7912,6 +7912,7 @@ mod tests {
         decode_policy: None,
         raw_lane_max_tokens: None,
         cpu_ffn_n: None,
+        chat_template_kwargs: None,
         ctx: None,
         slots: None,
         spec: None,
@@ -12143,6 +12144,46 @@ mod tests {
                 p.warnings
             );
         }
+    }
+
+    #[test]
+    fn unit__chat_template_kwargs__overlay_beats_global_and_inherits() {
+        let g = meta();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let mut flags = full_flags();
+        flags.extend(llama_server_knobs_flags());
+        let overlay = ModelOverride {
+            chat_template_kwargs: Some(r#"{"enable_thinking": false, "tool": 1}"#.into()),
+            ..ModelOverride::default()
+        };
+        // Overlay wins over a set global for THIS model.
+        let cfg = llama_server_cfg();
+        let mut cfg = cfg;
+        cfg.model_overrides
+            .insert("qwen3-8b".into(), overlay.clone());
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        assert!(p.argv.windows(2).any(|w| {
+            w == [
+                "--chat-template-kwargs",
+                r#"{"enable_thinking": false, "tool": 1}"#,
+            ]
+        }));
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w == ["--chat-template-kwargs", r#"{"enable_thinking": false}"#]),
+            "global value must lose to the overlay"
+        );
+        // No overlay for this model → the global still applies.
+        let mut cfg = Config::default();
+        cfg.model_overrides.insert("other-model".into(), overlay);
+        cfg.chat_template_kwargs = Some(r#"{"enable_thinking": false}"#.into());
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--chat-template-kwargs", r#"{"enable_thinking": false}"#])
+        );
     }
 
     fn mistralrs_knobs_flags() -> BTreeSet<String> {
