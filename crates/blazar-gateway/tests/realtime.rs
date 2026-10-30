@@ -271,3 +271,254 @@ async fn realtime__junk_audio_turn__transcription_failed_and_socket_survives() {
 fn base_port(base: &str) -> String {
     base.trim_start_matches("http://").to_string()
 }
+
+/// Read events until `response.audio_transcript.done` (deltas pass
+/// through); returns the final transcript text.
+async fn wait_transcript_done(ws: &mut Ws, what: &str) -> String {
+    loop {
+        let ev = next_ev(ws, what).await;
+        if ev["type"] == "response.audio_transcript.done" {
+            return ev["transcript"].as_str().unwrap_or_default().to_string();
+        }
+        assert_eq!(
+            ev["type"], "response.audio_transcript.delta",
+            "unexpected event while waiting for the transcript: {ev}"
+        );
+    }
+}
+
+/// After the transcript: audio deltas to `response.audio.done`, or the
+/// taught tts failure (piper is absent in this harness — the transcript
+/// was already delivered, so both tails are a pass).
+async fn expect_audio_or_tts_error(ws: &mut Ws) {
+    loop {
+        let ev = next_ev(ws, "audio tail").await;
+        match ev["type"].as_str().unwrap_or_default() {
+            "response.audio.delta" => {}
+            "response.audio.done" => return,
+            "error" if ev["error"]["type"] == "tts_failed" => return,
+            other => panic!("unexpected tail event '{other}': {ev}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn realtime__tool_loop__call_outstanding_output_then_text_answer() {
+    let server = support::start_env(support::config_with_keys(), &[("STUB_TOOL_CALL", "1")]).await;
+    let mut ws = connect_realtime(&base_port(&server.base), "?model=m1").await;
+    let _ = next_ev(&mut ws, "session.created").await;
+
+    // Arm tools + tool_choice; the echo carries the converted chat shape.
+    send_ev(
+        &mut ws,
+        json!({
+            "type": "session.update",
+            "session": {
+                "tools": [{
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "lookup weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                }],
+                "tool_choice": "auto"
+            }
+        }),
+    )
+    .await;
+    let updated = next_ev(&mut ws, "session.updated").await;
+    assert_eq!(
+        updated["session"]["tools"][0]["function"]["name"],
+        "get_weather"
+    );
+    assert_eq!(updated["session"]["tool_choice"], "auto");
+
+    // Typed context + response.create (no audio) drives a continuation
+    // turn; the stub answers with a function call.
+    send_ev(
+        &mut ws,
+        json!({
+            "type": "conversation.item.create",
+            "item": {"type": "message", "role": "user",
+                     "content": [{"type": "text", "text": "weather in paris?"}]}
+        }),
+    )
+    .await;
+    let item = next_ev(&mut ws, "item.created").await;
+    assert_eq!(item["item"]["id"], "item_1");
+
+    send_ev(&mut ws, json!({"type": "response.create"})).await;
+    let added = next_ev(&mut ws, "output_item.added").await;
+    assert_eq!(added["type"], "response.output_item.added", "{added}");
+    assert_eq!(added["item"]["type"], "function_call");
+    assert_eq!(added["item"]["name"], "get_weather");
+    assert!(
+        added["item"]["arguments"]
+            .as_str()
+            .is_some_and(|a| a.contains("paris")),
+        "stub echo should carry its fixed arguments: {added}"
+    );
+    let call_id = added["item"]["call_id"].as_str().unwrap().to_string();
+    assert!(!call_id.is_empty());
+
+    let args_done = next_ev(&mut ws, "function_call_arguments.done").await;
+    assert_eq!(args_done["type"], "response.function_call_arguments.done");
+    assert_eq!(args_done["call_id"].as_str().unwrap(), call_id);
+    assert_eq!(args_done["name"], "get_weather");
+
+    let done = next_ev(&mut ws, "response.done").await;
+    assert_eq!(done["type"], "response.done");
+    let output = done["response"]["output"].as_array().unwrap();
+    assert_eq!(output.len(), 1, "one function_call item: {done}");
+    assert_eq!(output[0]["type"], "function_call");
+    assert_eq!(output[0]["call_id"].as_str().unwrap(), call_id);
+
+    // Continuing before answering is a taught error naming the call.
+    send_ev(&mut ws, json!({"type": "response.create"})).await;
+    let outstanding = next_ev(&mut ws, "outstanding error").await;
+    assert_eq!(outstanding["error"]["type"], "invalid_request");
+    assert!(
+        outstanding["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&call_id)),
+        "error should name the outstanding call: {outstanding}"
+    );
+
+    // Return the output (JSON value, not a string) and continue: the
+    // model now answers in text.
+    send_ev(
+        &mut ws,
+        json!({
+            "type": "conversation.item.create",
+            "item": {"type": "function_call_output", "call_id": call_id,
+                     "output": {"temp_c": 18}}
+        }),
+    )
+    .await;
+    let output_item = next_ev(&mut ws, "output item.created").await;
+    assert_eq!(output_item["item"]["type"], "function_call_output");
+
+    send_ev(&mut ws, json!({"type": "response.create"})).await;
+    let transcript = wait_transcript_done(&mut ws, "continuation transcript").await;
+    assert!(
+        transcript.contains("stub:"),
+        "stub text reply: {transcript}"
+    );
+    expect_audio_or_tts_error(&mut ws).await;
+
+    ws.close(None).await.ok();
+}
+
+#[tokio::test]
+async fn realtime__session_update_tools__validated_and_echoed() {
+    let server = support::start(support::config_with_keys()).await;
+    let mut ws = connect_realtime(&base_port(&server.base), "?model=m1").await;
+    let created = next_ev(&mut ws, "session.created").await;
+    assert_eq!(
+        created["session"]["tools"],
+        json!([]),
+        "birth echo arms no tools"
+    );
+
+    // Non-function tools are taught, not dropped.
+    send_ev(
+        &mut ws,
+        json!({"type": "session.update",
+               "session": {"tools": [{"type": "custom", "name": "x"}]}}),
+    )
+    .await;
+    let custom = next_ev(&mut ws, "custom tool error").await;
+    assert_eq!(custom["error"]["type"], "invalid_request");
+    assert!(
+        custom["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("function")
+    );
+
+    // Count ceiling.
+    let too_many: Vec<Value> = (0..17)
+        .map(|i| json!({"type": "function", "name": format!("t{i}")}))
+        .collect();
+    send_ev(
+        &mut ws,
+        json!({"type": "session.update", "session": {"tools": too_many}}),
+    )
+    .await;
+    let ceiling = next_ev(&mut ws, "tool count error").await;
+    assert_eq!(ceiling["error"]["type"], "invalid_request");
+    assert!(
+        ceiling["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ceiling")
+    );
+
+    // Serialized-size ceiling.
+    send_ev(
+        &mut ws,
+        json!({"type": "session.update",
+               "session": {"tools": [{"type": "function", "name": "t",
+                                       "description": "x".repeat(64 * 1024)}]}}),
+    )
+    .await;
+    let huge = next_ev(&mut ws, "tool size error").await;
+    assert_eq!(huge["error"]["type"], "invalid_request");
+    assert!(huge["error"]["message"].as_str().unwrap().contains("bytes"));
+
+    // tool_choice modes are validated too.
+    send_ev(
+        &mut ws,
+        json!({"type": "session.update", "session": {"tool_choice": "banana"}}),
+    )
+    .await;
+    let choice = next_ev(&mut ws, "tool_choice error").await;
+    assert_eq!(choice["error"]["type"], "invalid_request");
+    assert!(
+        choice["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tool_choice")
+    );
+
+    // A valid arm still lands after all the teaching.
+    send_ev(
+        &mut ws,
+        json!({"type": "session.update",
+               "session": {"tools": [{"type": "function", "name": "ok"}]}}),
+    )
+    .await;
+    let ok = next_ev(&mut ws, "valid session.updated").await;
+    assert_eq!(ok["session"]["tools"][0]["function"]["name"], "ok");
+
+    ws.close(None).await.ok();
+}
+
+#[tokio::test]
+async fn realtime__text_continuation__response_create_without_audio() {
+    // No tools, no STUB_TOOL_CALL: remembered text context alone drives a
+    // continuation turn (the response.create empty-buffer relaxation).
+    let server = support::start(support::config_with_keys()).await;
+    let mut ws = connect_realtime(&base_port(&server.base), "?model=m1").await;
+    let _ = next_ev(&mut ws, "session.created").await;
+
+    send_ev(
+        &mut ws,
+        json!({
+            "type": "conversation.item.create",
+            "item": {"type": "message", "role": "user",
+                     "content": [{"type": "text", "text": "hello there"}]}
+        }),
+    )
+    .await;
+    let _ = next_ev(&mut ws, "item.created").await;
+
+    send_ev(&mut ws, json!({"type": "response.create"})).await;
+    let transcript = wait_transcript_done(&mut ws, "continuation transcript").await;
+    assert!(
+        transcript.contains("stub:"),
+        "stub text reply: {transcript}"
+    );
+    expect_audio_or_tts_error(&mut ws).await;
+
+    ws.close(None).await.ok();
+}
