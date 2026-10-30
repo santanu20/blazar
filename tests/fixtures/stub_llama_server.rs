@@ -308,7 +308,10 @@ fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
         .route("/completion", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/embeddings", post(embeddings))
-        .route("/lora-adapters", get(lora_adapters))
+        .route(
+            "/lora-adapters",
+            get(lora_adapters_get).post(lora_adapters_post),
+        )
         .route("/v1/systemone", post(systemone))
         .route("/metrics", get(metrics))
         .route("/slots", get(slots))
@@ -411,6 +414,10 @@ struct ChatRequest {
     pub stream_options: Option<serde_json::Value>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Function tools as sent by the gateway (`STUB_TOOL_CALL` reflects on
+    /// them; every other mode ignores the field).
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
     /// Think-control passthrough fields: the stub never interprets them,
     /// but `STUB_THINK_WRAP=reflect` echoes them so tests can assert what
     /// the gateway's dialect normalization actually forwarded.
@@ -420,6 +427,11 @@ struct ChatRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Per-request `LoRA` selection (llamacpp completion schema
+    /// `lora: [{id, scale}]`), as stamped by the gateway's variant ride;
+    /// reflected into the reply so e2e tests prove it reached the child.
+    #[serde(default)]
+    pub lora: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -625,6 +637,60 @@ fn think_reflect(req: &ChatRequest) -> String {
     format!("[think-reflect et={et} kwargs={kwargs} effort={effort}]")
 }
 
+/// The per-request `LoRA` list the child RECEIVED (llamacpp completion
+/// schema `lora: [{id, scale}]`), reflected as a compact tag appended to
+/// the reply so e2e tests prove the gateway's variant ride stamp reached
+/// the child. `None` when the request carried no (or an empty) list.
+fn lora_reflect(req: &ChatRequest) -> Option<String> {
+    let arr = req.lora.as_ref()?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = arr
+        .iter()
+        .map(|e| {
+            let id = e
+                .get("id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1);
+            let scale = e
+                .get("scale")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            format!("{id}@{scale}")
+        })
+        .collect();
+    Some(format!("[lora-reflect {}]", parts.join(",")))
+}
+
+/// `STUB_TOOL_CALL=1`: when the request carries a non-empty `tools` array
+/// AND no tool output has come back yet (no `role:"tool"` message), answer
+/// with one well-formed function call on the first tool — the "model calls
+/// the tool, then answers with text" shape realtime tool-loop round-trips
+/// need. Once outputs are in context the normal text reply resumes.
+fn stub_tool_calls(req: &ChatRequest) -> Option<serde_json::Value> {
+    if !env_flag("STUB_TOOL_CALL") {
+        return None;
+    }
+    let tools = req.tools.as_ref()?.as_array()?;
+    if tools.is_empty() {
+        return None;
+    }
+    if req.messages.iter().any(|m| m.role == "tool") {
+        return None;
+    }
+    let first = &tools[0];
+    let name = first
+        .pointer("/function/name")
+        .or_else(|| first.get("name"))
+        .and_then(serde_json::Value::as_str)?;
+    Some(serde_json::json!([{
+        "id": "call_stub_1",
+        "type": "function",
+        "function": {"name": name, "arguments": "{\"city\":\"paris\"}"},
+    }]))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn chat_completions(
     State(state): State<AppState>,
@@ -665,6 +731,12 @@ async fn chat_completions(
     }
     // Sentinel test knobs: shape the response semantics, never the route.
     let text = stub_think_shape(stub_knob_text(&state, &req.messages), &req);
+    // Variant-ride reflection rides AFTER think shaping so the tag stays
+    // outside any <think> wrap.
+    let text = match lora_reflect(&req) {
+        Some(tag) => format!("{text} {tag}"),
+        None => text,
+    };
     let finish = std::env::var("STUB_FINISH").unwrap_or_else(|_| "stop".into());
     let prompt_tokens = count_tokens(
         &req.messages
@@ -691,6 +763,7 @@ async fn chat_completions(
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1)
             .clamp(1, 8);
+        let tool_calls = stub_tool_calls(&req);
         let choices: Vec<serde_json::Value> = (0..choice_count)
             .map(|i| {
                 let content = if choice_count == 1 {
@@ -700,14 +773,16 @@ async fn chat_completions(
                 };
                 serde_json::json!({
                     "index": i,
-                    "message": if env_flag("STUB_BAD_TOOL_ARGS") {
+                    "message": if let Some(tc) = &tool_calls {
+                        serde_json::json!({"role": "assistant", "content": "", "tool_calls": tc})
+                    } else if env_flag("STUB_BAD_TOOL_ARGS") {
                         serde_json::json!({"role": "assistant", "content": "", "tool_calls": [
                             {"id": "t1", "type": "function", "function": {"name": "echo", "arguments": "{\"broken"}}
                         ]})
                     } else {
                         serde_json::json!({"role": "assistant", "content": content})
                     },
-                    "finish_reason": finish,
+                    "finish_reason": if tool_calls.is_some() { "tool_calls" } else { &finish },
                 })
             })
             .collect();
@@ -1000,8 +1075,92 @@ async fn embeddings(
     }))
 }
 
-async fn lora_adapters() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({"adapters": []}))
+/// Child-side spawn-loaded adapter set, argv-order indexed (llamacpp
+/// semantics — see `seed_lora_adapters` for the derivation).
+static LORA_ADAPTERS: std::sync::OnceLock<std::sync::Mutex<Vec<serde_json::Value>>> =
+    std::sync::OnceLock::new();
+
+/// The spawn-loaded adapter set, exactly as server.cpp derives it: the
+/// child's own argv (`--lora PATH` = scale 1.0, `--lora-scaled PATH:SCALE`,
+/// id in argv order). `STUB_LORA_ADAPTERS` (a JSON array of {id,name,scale})
+/// seeds a bare spawn with no --lora argv instead.
+fn seed_lora_adapters() -> Vec<serde_json::Value> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut seeded: Vec<serde_json::Value> = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if a == "--lora" && i + 1 < argv.len() {
+            seeded.push(serde_json::json!({
+                "id": seeded.len(), "path": argv[i + 1], "scale": 1.0,
+                "task_name": "", "prompt_prefix": ""
+            }));
+            i += 2;
+        } else if a == "--lora-scaled" && i + 1 < argv.len() {
+            let tok = &argv[i + 1];
+            let (path, scale) = tok
+                .rsplit_once(':')
+                .and_then(|(p, s)| s.parse::<f64>().ok().map(|s| (p.to_string(), s)))
+                .unwrap_or_else(|| (tok.clone(), 1.0));
+            seeded.push(serde_json::json!({
+                "id": seeded.len(), "path": path, "scale": scale,
+                "task_name": "", "prompt_prefix": ""
+            }));
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    if seeded.is_empty()
+        && let Ok(v) = std::env::var("STUB_LORA_ADAPTERS")
+        && let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&v)
+    {
+        return arr;
+    }
+    seeded
+}
+
+fn lora_adapters_state() -> &'static std::sync::Mutex<Vec<serde_json::Value>> {
+    LORA_ADAPTERS.get_or_init(|| std::sync::Mutex::new(seed_lora_adapters()))
+}
+
+/// GET /lora-adapters — upstream fidelity (b11982 server.cpp): a BARE
+/// array of {id, path, scale, `task_name`, `prompt_prefix`}, id in
+/// argv-load order.
+async fn lora_adapters_get() -> axum::Json<serde_json::Value> {
+    let list = lora_adapters_state().lock().unwrap().clone();
+    axum::Json(serde_json::Value::Array(list))
+}
+
+/// POST /lora-adapters — `construct_lora_list` semantics: reconcile
+/// scales by id over the spawn-loaded set; every loaded id ABSENT from
+/// the body deactivates at scale 0.0; unknown ids are ignored (map
+/// merge); new files can never load.
+async fn lora_adapters_post(
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    let Some(rows) = body.as_array() else {
+        return (axum::http::StatusCode::BAD_REQUEST, "expected an array").into_response();
+    };
+    let asked: Vec<(i64, f64)> = rows
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.get("id").and_then(serde_json::Value::as_i64)?,
+                r.get("scale").and_then(serde_json::Value::as_f64)?,
+            ))
+        })
+        .collect();
+    let mut list = lora_adapters_state().lock().unwrap();
+    for e in list.iter_mut() {
+        let id = e.get("id").and_then(serde_json::Value::as_i64);
+        let mut scale = 0.0;
+        if let Some((_, asked_scale)) = asked.iter().find(|(aid, _)| Some(*aid) == id) {
+            scale = *asked_scale;
+        }
+        e["scale"] = serde_json::Value::from(scale);
+    }
+    (axum::http::StatusCode::OK, "ok").into_response()
 }
 
 /// /v1/systemone (`TypeSafe System One` dialect): mirrors the live child

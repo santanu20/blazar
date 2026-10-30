@@ -774,3 +774,231 @@ fn unit__bytes_admission__heterogeneous_pair_coresides() {
         "second heavyweight must not fit"
     );
 }
+
+#[tokio::test]
+#[allow(non_snake_case)]
+#[allow(clippy::too_many_lines)] // one live-lifecycle story: spawn → GET → attach → detach → name-only detach
+async fn integration__lora_hot_attach__llamacpp_reconciles_scales_over_spawn_set() {
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    // Adapter on disk + store row: the spawn attaches it (--lora argv),
+    // and the stub seeds its /lora-adapters state from that argv.
+    let adapter = dirs.data_dir.join("anonymizer.gguf");
+    std::fs::write(&adapter, b"gguf").unwrap();
+    let store = Store::open(&dirs).unwrap();
+    let row_id = store
+        .add_lora("m1", &adapter.display().to_string(), 1.0)
+        .unwrap();
+    let sup = supervisor(&dirs, base_config(), true);
+    let ep = sup.ensure("m1").await.expect("ensure");
+    let url = match &ep.endpoint {
+        blazar_core::Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
+        blazar_core::Endpoint::Unix { .. } => unreachable!(),
+    };
+    // Spawn argv carried the adapter.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(dirs.run_dir().join("argv.json")).unwrap())
+            .unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--lora" && w[1] == adapter.display().to_string()),
+        "--lora missing from spawn argv: {argv:?}"
+    );
+    blazar_core::tls::ensure_tls_provider();
+    let client = reqwest::Client::new();
+    // Children are bearer-gated: pull the per-child secret the gateway
+    // itself uses (EngineRef.auth) for the direct probes below.
+    let auth = sup
+        .live_http_endpoints()
+        .into_iter()
+        .find(|e| e.name == "m1")
+        .and_then(|e| e.auth);
+    let lora_get = |client: &reqwest::Client| {
+        let mut r = client.get(format!("{url}/lora-adapters"));
+        if let Some(sec) = &auth {
+            r = r.bearer_auth(sec);
+        }
+        r
+    };
+    // GET answers the upstream bare-array shape with the loaded row.
+    let get: serde_json::Value = lora_get(&client)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = get.as_array().expect("bare array (upstream shape)");
+    assert_eq!(arr.len(), 1, "{arr:?}");
+    assert_eq!(
+        arr[0]["path"],
+        serde_json::json!(adapter.display().to_string())
+    );
+    assert_eq!(arr[0]["id"], serde_json::json!(0));
+    assert_eq!(arr[0]["scale"], serde_json::json!(1.0));
+
+    // Hot attach of an already-loaded adapter: reconcile keeps it live.
+    let verdict = sup
+        .lora_hot_attach("m1", true, "anonymizer", &adapter.display().to_string())
+        .await
+        .unwrap();
+    assert!(
+        verdict.starts_with("hot: adapter anonymizer live on"),
+        "{verdict}"
+    );
+
+    // Hot attach of an adapter NOT loaded: teaching deferral (files only
+    // load at spawn), never a silent fall-back.
+    let absent = dirs.data_dir.join("absent.gguf");
+    std::fs::write(&absent, b"gguf").unwrap();
+    let verdict = sup
+        .lora_hot_attach("m1", true, "absent", &absent.display().to_string())
+        .await
+        .unwrap();
+    assert!(verdict.contains("cannot hot-load"), "{verdict}");
+
+    // Hot detach after a store rm: the reconcile POST drops the row's id
+    // from the body, deactivating it at 0.0 on the resident.
+    store.delete_lora(row_id).unwrap();
+    let verdict = sup
+        .lora_hot_attach("m1", false, "anonymizer", &adapter.display().to_string())
+        .await
+        .unwrap();
+    assert!(verdict.contains("detached from"), "{verdict}");
+    let get: serde_json::Value = lora_get(&client)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        get[0]["scale"],
+        serde_json::json!(0.0),
+        "deactivated, not unloaded: {get}"
+    );
+
+    // Re-activate, then detach by NAME ONLY (empty path) — callers that
+    // omit the path (older CLIs) must still match the loaded adapter by
+    // its file stem. The row leaves the store first, mirroring the CLI.
+    let row_id = store
+        .add_lora("m1", &adapter.display().to_string(), 1.0)
+        .unwrap();
+    let verdict = sup
+        .lora_hot_attach("m1", true, "anonymizer", &adapter.display().to_string())
+        .await
+        .unwrap();
+    assert!(verdict.starts_with("hot:"), "{verdict}");
+    store.delete_lora(row_id).unwrap();
+    let verdict = sup
+        .lora_hot_attach("m1", false, "anonymizer", "")
+        .await
+        .unwrap();
+    assert!(verdict.contains("detached from"), "{verdict}");
+    let get: serde_json::Value = lora_get(&client)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(get[0]["scale"], serde_json::json!(0.0), "{get}");
+
+    sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__prewarm_reshape__cutover_same_key_new_argv() {
+    // End-to-end prewarm against the real stub child: a queued reshape
+    // spawns the replacement under `m1#warm` (old child keeps serving,
+    // zero admission gap), then swaps it under `m1`. The stub's
+    // STUB_ARGV_FILE is overwritten per spawn, so after the cutover it
+    // holds the replacement's argv — pinning that the adopted slot
+    // count (-np 4) reached a REAL child, not just the maps.
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    let mut cfg = base_config();
+    cfg.adaptive_slots = true;
+    // Pin + override — the exact production shape that live-exposed the
+    // LC4 precedence bug: without `adaptive_override`, the pin would
+    // exclude m1 from adaptation entirely; with it, the pin seeds the
+    // shape and the adopted value must supersede it at the prewarm
+    // spawn (the spawn-side guard keys on exactly this delegation).
+    cfg.model_overrides.insert(
+        "m1".to_string(),
+        blazar_core::ModelOverride {
+            slots: Some(1),
+            adaptive_override: Some(true),
+            ..Default::default()
+        },
+    );
+    let sup = supervisor(&dirs, cfg, true);
+    let ep1 = sup.ensure("m1").await.expect("ensure");
+    let old_port = match &ep1.endpoint {
+        blazar_core::Endpoint::Tcp { port, .. } => *port,
+        blazar_core::Endpoint::Unix { .. } => panic!("expected tcp endpoint"),
+    };
+
+    // Sustained demand (3 parks deep over a 1-slot shape → peak 3 ≥
+    // 2×1) drives the fast-path adoption inside the production cycle;
+    // the same reap call runs the drain that pre-warms and cuts over.
+    // No decode hints exist yet, so the D5 decode-bound gate stands
+    // down (None) — the adoption proceeds, as it must on a cold model.
+    sup.note_slot_pressure("m1");
+    sup.note_slot_pressure("m1");
+    sup.note_slot_pressure("m1");
+    let mut rx = sup.bus.subscribe();
+    sup.adaptive_slots_reap().await; // tick 1: streak builds
+    sup.adaptive_slots_reap().await; // tick 2: fast-path adopt + drain + cutover
+
+    // Cutover landed: exactly one resident, still named `m1`, at the
+    // adopted shape on a replacement child (new port).
+    let rows = sup.ps();
+    assert_eq!(rows.len(), 1, "single resident: {rows:?}");
+    assert_eq!(rows[0].name, "m1");
+    assert_eq!(rows[0].slots, Some(4), "adopted shape visible: {rows:?}");
+    let rows_port: u16 = rows[0]
+        .endpoint
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .expect("row endpoint port");
+    assert_ne!(rows_port, old_port, "replacement child, not the original");
+
+    // The last spawn's argv carries the adopted shape.
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(dirs.run_dir().join("argv.json")).unwrap())
+            .unwrap();
+    let pos = argv
+        .iter()
+        .position(|a| a == "-np")
+        .expect("-np in spawn argv");
+    assert_eq!(
+        argv[pos + 1],
+        "4",
+        "adopted slots on the real child: {argv:?}"
+    );
+
+    // Both the path-specific and the completion-contract events fired.
+    let mut prewarm = false;
+    let mut reshaped = false;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            blazar_runtime::BlazarEvent::SlotsPrewarmCutover { model, slots } => {
+                assert_eq!(model, "m1");
+                assert_eq!(slots, 4);
+                prewarm = true;
+            }
+            blazar_runtime::BlazarEvent::SlotsReshaped { model, slots } => {
+                assert_eq!(model, "m1");
+                assert_eq!(slots, 4);
+                reshaped = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(prewarm, "SlotsPrewarmCutover received");
+    assert!(reshaped, "SlotsReshaped received (path-agnostic contract)");
+
+    sup.shutdown_all().await.unwrap();
+}
