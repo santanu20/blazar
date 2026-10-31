@@ -10710,6 +10710,12 @@ async fn why(
         println!("sentinel is disabled (config: sentinel = false) — no observations recorded");
         return Ok(());
     }
+    // Live engine degrades come first: they explain WHY everything below
+    // is slow, and they must surface even when the record ring is empty.
+    let out = render_engine_degrades(&v, model);
+    if !out.is_empty() {
+        println!("{out}");
+    }
     let records = v["records"].as_array().cloned().unwrap_or_default();
     if records.is_empty() {
         println!("no observations recorded yet (sentinel records chat-family requests)");
@@ -10719,6 +10725,52 @@ async fn why(
         print_record(r);
     }
     Ok(())
+}
+
+/// Render /api/why's `engine_degrades` for the CLI: live children whose
+/// engine logged a performance degrade (e.g. flash-attention KV-type
+/// conversion). Empty string when none — nothing is printed rather than
+/// a noisy all-clear line. `model_filter` (substring, same semantics as
+/// the records filter) narrows to one lane.
+fn render_engine_degrades(why: &serde_json::Value, model_filter: Option<&str>) -> String {
+    use std::fmt::Write as _;
+    let degrades = why["engine_degrades"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let matched: Vec<&serde_json::Value> = degrades
+        .iter()
+        .filter(|d| model_filter.is_none_or(|f| d["model"].as_str().is_some_and(|m| m.contains(f))))
+        .collect();
+    if matched.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "engine degrades (live children running slow; every request they serve is\nstamped engine_slow_attn):\n",
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for d in matched {
+        let model = d["model"].as_str().unwrap_or("unknown");
+        let child = d["child"].as_str().unwrap_or("unknown");
+        let age = now.saturating_sub(d["since"].as_u64().unwrap_or(now));
+        let ago = if age >= 3600 {
+            format!("{}h ago", age / 3600)
+        } else if age >= 60 {
+            format!("{}m ago", age / 60)
+        } else {
+            format!("{age}s ago")
+        };
+        let _ = writeln!(out, "  {model}  child {child}  since {ago}");
+        if let Some(line) = d["line"].as_str() {
+            let _ = writeln!(out, "    line: {line}");
+        }
+        if let Some(note) = d["note"].as_str() {
+            let _ = writeln!(out, "    fix:  {note}");
+        }
+    }
+    out
 }
 
 /// `blazar explain <model>` — the effective-config card from the live
@@ -20883,6 +20935,39 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__render_engine_degrades__shapes_filter_and_empty_silence() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let why = serde_json::json!({
+            "sentinel": true,
+            "engine_degrades": [
+                {"model": "m1", "child": "tcp://127.0.0.1:41000",
+                 "line": "fattn: no FlashAttention vector kernel compiled for K/V types q5_1-q5_1",
+                 "note": "prefer f16/q8_0/q4_0 pairs", "since": now - 125},
+                {"model": "other", "child": "tcp://127.0.0.1:41001",
+                 "line": "x", "note": "y", "since": now},
+            ]
+        });
+        let out = render_engine_degrades(&why, Some("m1"));
+        assert!(
+            out.contains("m1") && out.contains("tcp://127.0.0.1:41000"),
+            "{out}"
+        );
+        assert!(out.contains("2m ago"), "{out}");
+        assert!(out.contains("fattn: no FlashAttention"), "{out}");
+        assert!(
+            !out.contains("other"),
+            "filter must exclude other lanes: {out}"
+        );
+        // No degrades (or field absent) renders silence, not noise.
+        assert_eq!(render_engine_degrades(&serde_json::json!({}), None), "");
+        let none = serde_json::json!({"engine_degrades": []});
+        assert_eq!(render_engine_degrades(&none, None), "");
+    }
 
     #[test]
     fn unit__hf_quant_method__read_from_checkpoint_config_json() {
