@@ -265,6 +265,10 @@ pub struct AppState {
     /// CONNECTION, not data: WAL + per-call queries keep CLI-side
     /// writes immediately visible cross-process.
     pub store: std::sync::Mutex<Option<blazar_core::Store>>,
+    /// Warn-once latch for `with_store` open failures: the first
+    /// failure of an incident logs (store errors otherwise read as
+    /// "absent" at every call site); a successful re-open re-arms it.
+    pub store_open_warned: std::sync::atomic::AtomicBool,
     /// Ordered failover chains (`[[failover]]`): alias resolution,
     /// anti-flap benching, pin/unpin, bounded switch history. Empty
     /// registry = zero request-path cost (one map miss on the alias).
@@ -457,6 +461,7 @@ impl AppState {
             audit_tx,
             audit_dropped,
             store: std::sync::Mutex::new(store),
+            store_open_warned: std::sync::atomic::AtomicBool::new(false),
             failover,
             mcp,
             usage,
@@ -474,7 +479,31 @@ impl AppState {
     pub fn with_store<T>(&self, f: impl FnOnce(&blazar_core::Store) -> T) -> Option<T> {
         let mut guard = self.store.lock().expect("store handle poisoned");
         if guard.is_none() {
-            *guard = blazar_core::Store::open(&self.dirs).ok();
+            match blazar_core::Store::open(&self.dirs) {
+                Ok(store) => {
+                    *guard = Some(store);
+                    // Re-arm the warn-once latch: a failure after this
+                    // recovery is a new incident, not a repeat.
+                    self.store_open_warned
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // Store-open failures retry per call (below), but a
+                    // broken store makes every persisted read look like
+                    // "absent" — that conflation must be visible at
+                    // least once per incident, not silently per request.
+                    if !self
+                        .store_open_warned
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            target: "blazar::store",
+                            "store open failed ({}) — persisted state reads as absent until it recovers: {e}",
+                            self.dirs.data_dir.display()
+                        );
+                    }
+                }
+            }
         }
         guard.as_ref().map(f)
     }

@@ -2915,11 +2915,25 @@ enum LaneState {
 
 fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneState {
     use blazar_core::engine_kind::{EngineKind, LaneError};
+    // Lane truth needs three live inputs (store, engine index, config).
+    // None of them failing means "served": a wrong Served verdict skips
+    // the install offer and defers the breakage to request time, so a
+    // failure surfaces as teaching text instead (empty kinds = no
+    // install can fix it — the user fixes the source first).
     let Ok(store) = Store::open(d) else {
-        return LaneState::Served;
+        return LaneState::Missing(
+            Vec::new(),
+            format!(
+                "model store unreadable — cannot check this model's lane: {}",
+                d.data_dir.display()
+            ),
+        );
     };
     let Ok(engine_rows) = store.list_engines() else {
-        return LaneState::Served;
+        return LaneState::Missing(
+            Vec::new(),
+            "engine index unreadable — cannot check this model's lane".to_string(),
+        );
     };
     let installed: Vec<(
         String,
@@ -2929,7 +2943,19 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
         .iter()
         .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
         .collect();
-    let cfg = blazar_core::Config::load(d).unwrap_or_default();
+    let cfg = match blazar_core::Config::load(d) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return LaneState::Missing(
+                Vec::new(),
+                format!(
+                    "config unreadable ({e}) — fix or delete {} to regenerate defaults; \
+                     lane advice computed against defaults would be wrong",
+                    d.config_file().display()
+                ),
+            );
+        }
+    };
     // No engine at all: the product's default lane is llamacpp and
     // `engine update` is its installer — same offer, one candidate.
     match engine_rows.iter().find(|r| r.active) {
@@ -3459,16 +3485,42 @@ async fn doctor_network() -> Vec<Check> {
 /// models surface the install command instead of failing at request
 /// time with the same text.
 fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
+    // Same law as the doctor config row: a routing input that cannot be
+    // read is a FAIL, not an empty section — advice computed against a
+    // default config or a dead store would silently mislead.
+    let cfg = match blazar_core::Config::load(d) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return vec![Check::fail(
+                "routing",
+                format!("config unreadable — lane advice unavailable: {e}"),
+            )];
+        }
+    };
     let Ok(store) = blazar_core::store::Store::open(d) else {
-        return Vec::new();
+        return vec![Check::fail(
+            "routing",
+            "store open failed — lane advice unavailable",
+        )];
     };
     let models = match store.list_models() {
         Ok(m) if !m.is_empty() => m,
-        _ => return Vec::new(),
+        Ok(_) => return Vec::new(),
+        Err(e) => {
+            return vec![Check::fail(
+                "routing",
+                format!("model list failed — lane advice unavailable: {e}"),
+            )];
+        }
     };
-    let cfg = blazar_core::Config::load(d).unwrap_or_default();
-    let Ok(engine_rows) = store.list_engines() else {
-        return Vec::new();
+    let engine_rows = match store.list_engines() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return vec![Check::fail(
+                "routing",
+                format!("engine list failed — lane advice unavailable: {e}"),
+            )];
+        }
     };
     let global = engine_rows
         .iter()

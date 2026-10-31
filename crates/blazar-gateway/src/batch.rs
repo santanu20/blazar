@@ -205,17 +205,55 @@ fn store_quota_refusal(
 }
 
 /// Batches still running for `owner`, across both dialects.
-fn active_batch_count(dirs: &BlazarDirs, owner: &str) -> u64 {
-    let Ok(entries) = std::fs::read_dir(batches_dir(dirs)) else {
-        return 0;
+///
+/// Quota accounting fails CLOSED: a meta row that cannot be read or
+/// parsed is an unknown state, and unknown counts as active — an
+/// undercount would silently admit batches past the per-key bound. A
+/// row that vanished mid-scan (a `NotFound` race with the retention sweep)
+/// is genuinely gone and does not count. A missing batches dir means no
+/// batch has ever been created; any other dir-level read failure is
+/// surfaced to the caller instead of collapsing to zero.
+fn active_batch_count(dirs: &BlazarDirs, owner: &str) -> Result<u64, String> {
+    let dir = batches_dir(dirs);
+    let entries = match std::fs::read_dir(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("batch index unreadable ({}): {e}", dir.display())),
+        Ok(entries) => entries,
     };
-    entries
-        .flatten()
-        .filter_map(|e| read_json(&e.path()))
-        .filter(|m| m["_owner"].as_str() == Some(owner) && !batch_terminal(m))
-        .count()
-        .try_into()
-        .unwrap_or(u64::MAX)
+    let mut count: u64 = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            // Dir-stream failure mid-scan: the not-yet-listed rows are
+            // unknown, and unknown counts (fail-closed quota).
+            count = count.saturating_add(1);
+            continue;
+        };
+        let path = entry.path();
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            // Vanished between listing and read: that row is gone and
+            // is not holding a slot.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                count = count.saturating_add(1);
+                continue;
+            }
+        };
+        match serde_json::from_slice::<Value>(&raw) {
+            Ok(m) => {
+                if m["_owner"].as_str() == Some(owner) && !batch_terminal(&m) {
+                    count = count.saturating_add(1);
+                }
+            }
+            // Torn/partial write: owner and terminal state unknowable —
+            // count it so corruption cannot undercut the quota. The
+            // retention sweep removes such garbage once it ages out.
+            Err(_) => {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// Retention sweep — BLZ-6. Runs inline at upload/batch-create time (no
@@ -243,6 +281,39 @@ fn sweep_expired(dirs: &BlazarDirs, retention_secs: u64, now: u64) {
     };
     for e in entries.flatten() {
         let Some(m) = read_json(&e.path()) else {
+            // Unparseable meta: garbage past the retention window (by
+            // file mtime — the row itself carries no readable stamp).
+            // Removing it keeps a torn write from wedging the
+            // fail-closed quota counter forever; a fresh one stays and
+            // counts as unknown until it ages out.
+            // Keep garbage younger than the retention window (mtime is
+            // the only stamp an unparseable row has): it still counts
+            // as unknown against the fail-closed quota until it ages
+            // out. An unknowable mtime errs toward removal; the warn
+            // log below makes every removal visible.
+            let keep = e
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|mtime| mtime.as_secs() >= cutoff);
+            if keep {
+                continue;
+            }
+            if let Err(err) = std::fs::remove_file(e.path()) {
+                tracing::warn!(
+                    target: "blazar::batch",
+                    path = %e.path().display(),
+                    error = %err,
+                    "retention sweep: unparseable batch meta removal failed"
+                );
+            } else {
+                tracing::warn!(
+                    target: "blazar::batch",
+                    path = %e.path().display(),
+                    "retention sweep removed unparseable batch meta past the retention window"
+                );
+            }
             continue;
         };
         let terminal = batch_terminal(&m);
@@ -518,16 +589,22 @@ pub async fn create_batch(
     sweep_expired(&state.dirs, state.config.batch.retention_secs, now_secs());
     if let Some(owner) = owner_name(key_ext.as_ref())
         && state.config.batch.max_active_batches_per_key > 0
-        && active_batch_count(&state.dirs, &owner)
-            >= u64::from(state.config.batch.max_active_batches_per_key)
     {
-        return err(
-            StatusCode::BAD_REQUEST,
-            &format!(
-                "key '{owner}' is already running the configured maximum of {} concurrent batches",
-                state.config.batch.max_active_batches_per_key
-            ),
-        );
+        // Unreadable index: admitting another batch would bypass the
+        // configured bound — refuse with the cause instead.
+        match active_batch_count(&state.dirs, &owner) {
+            Ok(active) if active >= u64::from(state.config.batch.max_active_batches_per_key) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "key '{owner}' is already running the configured maximum of {} concurrent batches",
+                        state.config.batch.max_active_batches_per_key
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(why) => return err(StatusCode::INTERNAL_SERVER_ERROR, &why),
+        }
     }
 
     let id = short_id("batch");
@@ -1365,16 +1442,22 @@ pub async fn anthropic_batches_create(
     let owner = owner_name(key_ext.as_ref());
     if let Some(owner) = &owner
         && state.config.batch.max_active_batches_per_key > 0
-        && active_batch_count(&state.dirs, owner)
-            >= u64::from(state.config.batch.max_active_batches_per_key)
     {
-        return err(
-            StatusCode::BAD_REQUEST,
-            &format!(
-                "key '{owner}' is already running the configured maximum of {} concurrent batches",
-                state.config.batch.max_active_batches_per_key
-            ),
-        );
+        // Same fail-closed law as the OpenAI dialect's create path: an
+        // unreadable index refuses instead of bypassing the bound.
+        match active_batch_count(&state.dirs, owner) {
+            Ok(active) if active >= u64::from(state.config.batch.max_active_batches_per_key) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "key '{owner}' is already running the configured maximum of {} concurrent batches",
+                        state.config.batch.max_active_batches_per_key
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(why) => return err(StatusCode::INTERNAL_SERVER_ERROR, &why),
+        }
     }
     let lines: Vec<String> = requests
         .iter()
@@ -2064,10 +2147,50 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(active_batch_count(&dirs, "alpha"), 2);
-        assert_eq!(active_batch_count(&dirs, "beta"), 1);
-        assert_eq!(active_batch_count(&dirs, "nobody"), 0);
+        assert_eq!(active_batch_count(&dirs, "alpha").unwrap(), 2);
+        assert_eq!(active_batch_count(&dirs, "beta").unwrap(), 1);
+        assert_eq!(active_batch_count(&dirs, "nobody").unwrap(), 0);
 
+        let _ = std::fs::remove_dir_all(files_dir(&dirs).parent().unwrap());
+    }
+
+    /// No batches dir at all = a legitimate zero, not a degradation —
+    /// the very first batch must not be refused.
+    #[test]
+    fn unit__active_batch_count__missing_dir_is_zero() {
+        let dirs = scratch_dirs("active-none");
+        assert_eq!(active_batch_count(&dirs, "anyone").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(files_dir(&dirs).parent().unwrap());
+    }
+
+    /// An unreadable batches dir surfaces as an error instead of a
+    /// zero count (fail-open quota). A file parked on the dir path
+    /// makes `read_dir` fail deterministically on every platform.
+    #[test]
+    fn unit__active_batch_count__unreadable_dir_is_error() {
+        let dirs = scratch_dirs("active-broken");
+        // scratch_dirs pre-creates the dir; park a file on its path.
+        std::fs::remove_dir(batches_dir(&dirs)).unwrap();
+        std::fs::write(batches_dir(&dirs), b"not a directory").unwrap();
+        let verdict = active_batch_count(&dirs, "anyone");
+        assert!(verdict.is_err(), "{verdict:?}");
+        assert!(
+            verdict.unwrap_err().contains("batch index unreadable"),
+            "must name the cause"
+        );
+        let _ = std::fs::remove_dir_all(files_dir(&dirs).parent().unwrap());
+    }
+
+    /// A torn/partial meta write is an unknown state: it counts as
+    /// active so corruption cannot undercut the per-key quota. The
+    /// retention sweep garbage-collects it once past the window.
+    #[test]
+    fn unit__active_batch_count__corrupt_meta_counts_as_active() {
+        let dirs = scratch_dirs("active-corrupt");
+        std::fs::create_dir_all(batches_dir(&dirs)).unwrap();
+        std::fs::write(batch_meta(&dirs, "b-torn"), b"{\"id\": \"b-tor").unwrap();
+        write_openai_batch(&dirs, "b-run", "in_progress", "f", None, "alpha", 1, None);
+        assert_eq!(active_batch_count(&dirs, "alpha").unwrap(), 2);
         let _ = std::fs::remove_dir_all(files_dir(&dirs).parent().unwrap());
     }
 }

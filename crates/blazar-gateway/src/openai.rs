@@ -835,7 +835,21 @@ pub async fn openai_proxy(
                     let status = axum::http::StatusCode::from_u16(child.status().as_u16())
                         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
                     let headers = child.headers().clone();
-                    let bytes = child.bytes().await.unwrap_or_default();
+                    // A body-read failure must not collapse to empty
+                    // bytes: that would hand the client the child's
+                    // success status over an empty body.
+                    let bytes = match child.bytes().await {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            return openai_error(
+                                502,
+                                &format!(
+                                    "mcp response body read failed (child status {}): {e}",
+                                    status.as_u16()
+                                ),
+                            );
+                        }
+                    };
                     let mut builder = axum::response::Response::builder().status(status);
                     for (name, value) in &headers {
                         if name != axum::http::header::CONTENT_LENGTH {

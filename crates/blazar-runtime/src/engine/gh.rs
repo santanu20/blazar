@@ -690,17 +690,32 @@ impl GhClient {
                     match tokio::time::timeout(net_probe::PROBE_ATTEMPT_CAP, http.get(&url).send())
                         .await
                     {
-                        Ok(Ok(resp)) if resp.status().is_success() => {
-                            let body = resp.text().await.unwrap_or_default();
-                            Some(parse_asset_hrefs(&body, &tag, &base))
-                        }
+                        Ok(Ok(resp)) if resp.status().is_success() => match resp.text().await {
+                            // Body-decode failure means "assets unknown for
+                            // this tag" (None), never "release ships zero
+                            // assets" — find-by-name consumers would
+                            // misdiagnose an empty table as a missing build.
+                            Ok(body) => Some(parse_asset_hrefs(&body, &tag, &base)),
+                            Err(_) => None,
+                        },
                         _ => None,
                     }
                 }
             })
             .collect();
-        Ok(futures::future::join_all(futs)
-            .await
+        let tables = futures::future::join_all(futs).await;
+        // The atom feed fetched fine moments ago; every asset table
+        // failing after that is a transport/systemic fault, not N
+        // releases that all ship zero assets. Surface it so callers
+        // fall back or report the fault instead of matching against
+        // empty asset lists.
+        if tables.iter().all(Option::is_none) {
+            bail!(
+                "asset tables for {repo} unreadable across all {} feed tags",
+                tags.len()
+            );
+        }
+        Ok(tables
             .into_iter()
             .zip(tags)
             .map(|(assets, (tag, updated))| GhRelease {

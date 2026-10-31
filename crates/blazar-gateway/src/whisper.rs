@@ -598,7 +598,13 @@ async fn inference_post(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    let bytes = resp.bytes().await.unwrap_or_default();
+    // Body-read failure is a transport fault, not an empty transcript:
+    // propagating it keeps every caller of this triple (sync, async job,
+    // streaming) from handing the client a success status over no body.
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| (502, format!("whisper inference body read: {e}")))?;
     Ok((status, ct, bytes))
 }
 
