@@ -1641,6 +1641,12 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                 let line = String::from_utf8_lossy(&raw);
                 let line = line.trim_end_matches(['\n', '\r']);
                 tracing::debug!(target: "blazar::engine", stream, "{line}");
+                if let Some(note) = classify_child_degrade(line) {
+                    // Upstream prints these once per process at plain
+                    // log level; at blazar they are user-visible degrades
+                    // with a remedy — warn, not debug.
+                    tracing::warn!(target: "blazar::engine", stream, "{line} — {note}");
+                }
                 if let Ok(mut t) = tail.lock() {
                     if t.len() >= TAIL_CAP {
                         t.pop_front();
@@ -1652,10 +1658,50 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     }
 }
 
+/// Known upstream child-log lines that describe a silent performance
+/// degrade (work still succeeds, just slower — often dramatically).
+/// Matched lines are re-emitted at warn with a teaching note so the
+/// degrade is visible without log-level archaeology.
+fn classify_child_degrade(line: &str) -> Option<&'static str> {
+    // llama.cpp/ggml CUDA fattn (verified in b12015 fattn.cu): when the
+    // KV cache type pair has no compiled GPU flash-attention kernel, the
+    // engine converts K/V to f16 per step and carries on — on older
+    // default builds (issue #28455, build 10791) the whole attention op
+    // silently moved to the CPU (~35x slower prefill). Official ggml
+    // CUDA release binaries Blazar installs measure full-speed on all
+    // cache quant pairs (receipt: bench-artifacts/20261031-kv-fa-quant-audit),
+    // so this firing means a custom/older engine build — the remedy is a
+    // supported pair or a rebuild, not a config change on our side.
+    if line.contains("no FlashAttention vector kernel compiled for K/V types") {
+        return Some(
+            "quantized KV pair has no GPU flash-attention kernel in this engine \
+                build; every attention step converts K/V through f16 (slow). Prefer \
+                f16/q8_0/q4_0 cache pairs, rebuild the engine with the missing \
+                GGML_CUDA_FA_QUANTS pair, or run `blazar tune` to measure pairs",
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)] // repo convention: unit__scenario__expected
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__classify_child_degrade__matches_fattn_conversion_warning_verbatim() {
+        // Exact upstream wording from b12015 fattn.cu (GGML_LOG_WARN),
+        // including the K/V types interpolation of a vulnerable pair.
+        let line = "ggml_cuda_fattn_forward: no FlashAttention vector kernel compiled \
+                    for K/V types q5_1-q5_1, converting K and V to f16 instead (slow). \
+                    Add \"q5_1-q5_1\" to GGML_CUDA_FA_QUANTS to compile it.";
+        let note = classify_child_degrade(line).expect("must match the upstream warning");
+        assert!(note.contains("GGML_CUDA_FA_QUANTS"), "{note}");
+        assert!(note.contains("tune"), "{note}");
+        // Ordinary log lines never escalate.
+        assert!(classify_child_degrade("main: server is listening on port 8080").is_none());
+        assert!(classify_child_degrade("").is_none());
+    }
 
     #[test]
     fn unit__child_cwd__anchors_to_engine_dir_and_skips_bare_names() {
