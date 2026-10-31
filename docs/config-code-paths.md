@@ -195,6 +195,7 @@ token quality are surfaced as drift.
 | lookup_cache_dynamic | None | engine-argv | `blazar-core/src/profile.rs:1882` in `the`; `blazar-core/src/profile.rs:9608` in `unit__lookup_cache__emits_both_paths` |
 | predictive_preload | false | runtime/gateway | `blazar-runtime/src/supervisor.rs:4762` in `maybe_preload` |
 | adaptive_slots | true | runtime/gateway | `blazar-runtime/src/supervisor.rs:4879` in `adaptive_slots_tick`; `blazar-runtime/src/supervisor.rs:7524` in `unit__adaptive_slots__adopts_after_streak_and_respects_manual` |
+| adaptive_decode_gate | true | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs` D5 gate in `adaptive_slots_tick` (decode_scaling_ratio < DECODE_SCALE_ADOPT_MIN suppresses adoption + `SlotsDecodeBound` teach); class EWMAs via `note_model_throughput` routing |
 | no_host | false | engine-argv | `blazar-core/src/profile.rs:1886` in `the` |
 | op_offload | None | engine-argv | `blazar-core/src/profile.rs:1889` in `the` |
 | keep_tokens | 0 | engine-argv | `blazar-core/src/profile.rs:1896` in `the`; `blazar-core/src/profile.rs:1898` in `the` |
@@ -408,6 +409,7 @@ token quality are surfaced as drift.
 | engine | — | runtime/gateway + other + engine-argv + gateway-http + cli | `blazar-runtime/src/piper.rs:14` in `?`; `blazar-runtime/src/piper.rs:200` in `install`; `blazar-core/src/session_identity.rs:52` in `build`; `blazar-core/src/session_identity.rs:56` in `build`; `blazar-core/src/profile.rs:233` in `compile`; `blazar-core/src/profile.rs:234` in `compile`; `blazar-gateway/src/preflight.rs:123` in `enforce_prompt_fits`; `blazar-gateway/src/preflight.rs:126` in `enforce_prompt_fits`; `blazar-cli/src/main.rs:17` in `?`; `blazar-cli/src/main.rs:21` in `?` |
 
 | deterministic_isolate | — | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:6467` in `deterministic_isolate` (per-model wins over global) |
+| adaptive_override | — | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:7391` `pin_only` gate in `adaptive_slots_tick` (lifts the slots-pin adaptation exclusion); `crates/blazar-runtime/src/supervisor.rs:7575` in `pinned_pressure_teach` (SlotsPinnedPressure teach + config-set remedy) |
 | cache_type_k | — | engine-argv | `crates/blazar-core/src/config.rs:2887` in `effective_cache_type_kv` (per-model per-phase K type; None inherits global) |
 | cache_type_v | — | engine-argv | `crates/blazar-core/src/config.rs:2887` in `effective_cache_type_kv` (V side) |
 | warm_on_pull | — | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:6036` in effective `warm_on_pull` (per-model wins) |
