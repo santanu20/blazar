@@ -18,6 +18,8 @@ kv budget mistralrs
 kv budget mlx
 model types
 models
+network
+network portal
 port
 prompt-recipe
 prompt-recipe mlx

@@ -652,6 +652,27 @@ fn paged_seqs_ceiling(seqs: u32, profile: &Profile) -> u32 {
     }
 }
 
+/// A repo id the Hub would resolve: exactly one `org/name` slash pair,
+/// plain identifier characters, no scheme/path/colon junk. Pull records
+/// local imports and sidecar-adopted rows with filesystem paths or
+/// placeholder repos — those must NOT become `--tok-model-id` values
+/// (the child would 404 the Hub on boot).
+#[must_use]
+fn plausible_hf_repo_id(repo: &str) -> Option<String> {
+    let mut parts = repo.split('/');
+    let org = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if parts.next().is_some() || org.is_empty() || name.is_empty() {
+        return None;
+    }
+    let plain = |s: &str| {
+        !s.starts_with('.')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (plain(org) && plain(name)).then(|| repo.to_string())
+}
+
 /// Translate a compiled llama.cpp-style profile into `mistralrs serve`
 /// argv. Only the knobs with a clean semantic mapping carry over
 /// (model file, port, ctx, parallelism, mmproj); llama.cpp-only tuning
@@ -735,22 +756,37 @@ pub fn mistralrs_argv(
         argv.push("--mmproj".into());
         argv.push(mm.to_string());
     }
-    // Repackaged multimodal GGUFs (lmstudio-community style) carry no
-    // base-model identity mistral.rs can read: the child aborts with
-    // "multimodal GGUF requires its original config.json ... pass
-    // --tok-model-id". Derive the HF id from the GGUF's own `general.*`
-    // metadata so the forced-mistral.rs lane boots (live-proven on
-    // v0.9.4 with Qwen3.5-9B-Q4_K_M: config refusal gone, server
-    // healthy). Un-derivable files emit nothing and keep the engine's
-    // teaching error.
-    if !is_hf_dir
-        && model.mmproj_path.is_some()
-        && flags.contains("--tok-model-id")
-        && let Ok(meta) = blazar_core::gguf::read_metadata_file(std::path::Path::new(&model.path))
-        && let Some(id) = meta.hf_base_model_id()
-    {
-        argv.push("--tok-model-id".into());
-        argv.push(id);
+    // `--tok-model-id` precedence, strongest provenance first:
+    // 1. the GGUF's own `general.*` metadata (the file's embedded
+    //    identity — authoritative for repackaged multimodal GGUFs,
+    //    live-proven on v0.9.4; overrides a stale user pin, matching
+    //    the pinned contract in tests/mistralrs.rs);
+    // 2. an explicit user extra_args pin (deliberate intent — wins
+    //    over every guess);
+    // 3. `row.repo` for text GGUFs (pull-time record; plausible-HF-id
+    //    gate below refuses registry/local-path junk). Auto-fills the
+    //    SWA/tokenizer refusal class without forcing the escape hatch.
+    // Un-derivable files emit nothing and keep the engine's teaching
+    // error.
+    if !is_hf_dir && flags.contains("--tok-model-id") {
+        let from_metadata = model
+            .mmproj_path
+            .is_some()
+            .then(|| {
+                blazar_core::gguf::read_metadata_file(std::path::Path::new(&model.path))
+                    .ok()
+                    .and_then(|meta| meta.hf_base_model_id())
+            })
+            .flatten();
+        let derived = from_metadata.or_else(|| {
+            (!profile.argv.contains(&"--tok-model-id".to_string()))
+                .then(|| plausible_hf_repo_id(&model.repo))
+                .flatten()
+        });
+        if let Some(id) = derived {
+            argv.push("--tok-model-id".into());
+            argv.push(id);
+        }
     }
     // Engine-tuning passthrough: the mistral.rs profile dialect emits
     // tuning flags (pa-memory-fraction, paged-attn, scheduler/MTP/
@@ -2225,6 +2261,85 @@ mod tests {
             .position(|a| a == "--max-num-batched-tokens")
             .expect("GGUF rows raise the scheduler batch step");
         assert_eq!(argv[b + 1], "32768");
+    }
+
+    #[test]
+    fn unit__mistralrs_tok_model_id__text_gguf_derives_from_row_repo() {
+        // The SWA refusal class: a text GGUF (no mmproj) whose loader
+        // needs the original tokenizer config. The pull-time repo IS
+        // the HF id — auto-derive instead of forcing the extra_args
+        // escape hatch.
+        let mut row = mistralrs_row("/store/qwen2.5-7b-q4.gguf");
+        row.repo = "Qwen/Qwen2.5-7B-Instruct-GGUF".into();
+        let flags = ["--tok-model-id".to_string()].into_iter().collect();
+        let argv = mistralrs_argv(
+            &row,
+            &mistralrs_profile(),
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let i = argv
+            .iter()
+            .position(|a| a == "--tok-model-id")
+            .expect("text GGUF derives --tok-model-id from row.repo");
+        assert_eq!(argv[i + 1], "Qwen/Qwen2.5-7B-Instruct-GGUF");
+    }
+
+    #[test]
+    fn unit__mistralrs_tok_model_id__user_pin_wins_and_junk_repos_refused() {
+        let flags = ["--tok-model-id".to_string()].into_iter().collect();
+        // An explicit extra_args pin is never overridden — auto-derive
+        // fills absences only.
+        let mut row = mistralrs_row("/store/qwen2.5-7b-q4.gguf");
+        row.repo = "Qwen/Qwen2.5-7B-Instruct-GGUF".into();
+        let mut pinned = mistralrs_profile();
+        pinned.argv = vec!["--tok-model-id".into(), "custom/repo".into()];
+        let argv = mistralrs_argv(
+            &row,
+            &pinned,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+            &flags,
+        );
+        let mut hits = argv
+            .windows(2)
+            .filter(|w| w[0] == "--tok-model-id")
+            .map(|w| w[1].clone())
+            .collect::<Vec<_>>();
+        hits.dedup();
+        assert_eq!(hits, vec!["custom/repo".to_string()]);
+
+        // Registry-sourced rows (ollama-style three-part repos) and
+        // filesystem placeholders never become Hub ids — the child
+        // would 404 the Hub on boot. No derivation, teaching error
+        // stays the engine's own.
+        for junk in [
+            "registry.ollama.ai/library/qwen2.5",
+            "/home/user/models",
+            "local-file.gguf",
+            "",
+        ] {
+            let mut row = mistralrs_row("/store/m.gguf");
+            row.repo = junk.into();
+            let argv = mistralrs_argv(
+                &row,
+                &mistralrs_profile(),
+                &Endpoint::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: 8123,
+                },
+                &flags,
+            );
+            assert!(
+                !argv.contains(&"--tok-model-id".to_string()),
+                "repo {junk:?} must not derive"
+            );
+        }
     }
 
     #[test]

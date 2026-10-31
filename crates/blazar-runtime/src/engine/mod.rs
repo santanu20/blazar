@@ -250,6 +250,20 @@ fn restore_retired_engine(data_dir: &Path, aside: Option<&Path>, dir: &Path) {
     }
     let Some(aside) = aside else { return };
     if let Err(e) = std::fs::rename(aside, dir) {
+        if !aside.exists() {
+            // A concurrent install of the same tag swept the aside
+            // (the retire sweep reaps crashed-run asides by prefix and
+            // cannot tell a live one apart). Saying "preserved at"
+            // here would point at a dir that no longer exists.
+            tracing::warn!(
+                "retired aside {} vanished before restore ({e}) — a concurrent \
+                 install of this tag likely swept it; {} was not restored, \
+                 rerun the install to rebuild it",
+                aside.display(),
+                dir.display()
+            );
+            return;
+        }
         tracing::error!(
             "cannot restore retired engine {} -> {}: {e} — the previous engine \
              is preserved at {} until the next install of this tag",
@@ -1702,6 +1716,24 @@ impl EngineManager {
         ))
     }
 
+    /// The backend label (`cuda` / `vulkan` / `cpu` / `metal`) the
+    /// asset picker WOULD choose for `tag` on this machine — the same
+    /// release fetch + pattern order as [`Self::update_sdcpp`], minus
+    /// the install. Powers the same-tag backend-switch check in
+    /// `blazar engine update --kind sdcpp`: sd.cpp re-uploads assets
+    /// to a live master release, so a NVIDIA box must notice a
+    /// newly-appeared CUDA prebuilt even when the tag counter did not
+    /// move.
+    pub async fn sdcpp_backend_label(&self, tag: &str) -> Result<&'static str> {
+        let release = self.gh.release_by_tag_repo(gh::SDCPP_REPO, tag).await?;
+        let nvidia = build::nvidia_gpu_facts().await.0.is_some();
+        let patterns =
+            gh::sdcpp_asset_patterns(std::env::consts::OS, std::env::consts::ARCH, nvidia)?;
+        gh::resolve_sdcpp_asset(&release, &patterns)
+            .map(|(_, pattern)| pattern.label)
+            .ok_or_else(|| anyhow!("no usable sd.cpp asset in release {tag}"))
+    }
+
     /// Install/refresh the whisper lane (prebuilt `whisper-server`).
     /// Mirrors [`Self::update_sdcpp`]: tag pins, latest resolves the
     /// newest b-tag, the platform pick is CPU-shaped (whisper serving
@@ -2128,6 +2160,14 @@ impl EngineManager {
         F: std::future::Future<Output = Result<()>>,
     {
         let dir = self.dirs.engines_dir().join(tag);
+        // Cross-process same-tag serialization: the retire sweep and
+        // the final-dir handoff below are single-writer designs — two
+        // terminals installing the same tag sweep each other's rollback
+        // asides (observed 2026-10-29: concurrent `engine update all`
+        // left a restore-ENOENT). Queue here; the second process then
+        // replaces the first's registered dir cleanly. Best-effort:
+        // downloads cache off → the documented pre-lock race applies.
+        let _install_lock = self.gh.cache_lock(&format!("install-{tag}")).await;
         let aside = retire_engine_dir(&self.dirs.data_dir, &dir)?;
         // Armed across the await: a dropped build future (abort, runtime
         // shutdown, unwind) rolls back exactly like a returned Err.

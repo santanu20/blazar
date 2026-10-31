@@ -272,6 +272,10 @@ pub struct AppState {
     /// MCP stdio server registry: lazily spawned sessions behind the
     /// `mcp` request opt-in. Empty config = zero request-path cost.
     pub mcp: crate::mcp::Registry,
+    /// F4 usage metering: per-(day, model) token/latency rollups.
+    /// Recording is an O(1) hash bump on the response path; a periodic
+    /// task flushes buckets into `usage_daily`.
+    pub usage: std::sync::Arc<crate::usage::UsageMeter>,
 }
 
 /// Client for dialing ONE child endpoint: the shared TCP pool, or the
@@ -419,6 +423,8 @@ impl AppState {
         // before the struct literal because `dirs` moves into it.
         let jobs = std::sync::Arc::new(crate::jobs::JobRuntime::new(&dirs.data_dir));
         let requests = std::sync::Arc::new(crate::requests::RequestRuntime::new());
+        // Usage meter opens its own WAL connection before `dirs` moves.
+        let usage = std::sync::Arc::new(crate::usage::UsageMeter::new(&dirs));
         Self {
             dirs,
             config,
@@ -453,6 +459,7 @@ impl AppState {
             store: std::sync::Mutex::new(store),
             failover,
             mcp,
+            usage,
             singleflight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),

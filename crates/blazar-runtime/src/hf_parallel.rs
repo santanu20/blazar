@@ -158,7 +158,17 @@ fn store_sidecar(part: &Path, sidecar: &ProgressSidecar) -> io::Result<()> {
     let path = sidecar_path(part);
     let tmp = path.with_extension("progress.tmp");
 
-    match OpenOptions::new().write(true).open(part) {
+    // .create(true): the first seed call can run before preallocation
+    // has created the .part — syncing a just-created empty file is
+    // harmless and keeps this warn for real fs refusals only.
+    // .truncate(false) is explicit: an in-progress .part must never be
+    // wiped by the fsync helper.
+    match OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(part)
+    {
         Ok(data) => {
             if let Err(e) = data.sync_all() {
                 tracing::warn!("part fsync before ledger persist failed (continuing): {e}");

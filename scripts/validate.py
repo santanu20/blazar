@@ -1024,6 +1024,7 @@ _COMMAND_ATTRS = {
     "ps.reset": (True, False, False, False, True),
     "ps.device": (True, False, False, False, True),
     "ps.warnings": (True, False, False, False, True),
+    "usage": (True, False, False, False, True),
     "run.colon": (True, True, False, False, True),
     "run.single": (True, True, False, False, True),
     "run.repl-exit": (True, True, False, False, True),
@@ -1735,6 +1736,15 @@ _K = [
     ("predictive_preload", False, False, "existing", None, "phase_wave preload lane"),
     ("adaptive_slots", False, False, "roundtrip", None, "echo + boot"),
     (
+        "adaptive_decode_gate",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "echo + boot; D5 decode-bound gate (SlotsDecodeBound teach when "
+        "aggregate decode fails to scale with concurrency)",
+    ),
+    (
         "lazy_mode",
         False,
         False,
@@ -2307,13 +2317,18 @@ CONTAINER_KNOBS = [k["name"] for k in TOPLEVEL_KNOBS if k["container"]]
 FRESH_VISIBLE_KNOBS = [k["name"] for k in TOPLEVEL_KNOBS if not k["option"]]
 
 # ---------------------------------------------------------------------------
-# MODEL_OVERRIDE manifest: all 38 ModelOverride fields + 18 SamplerDefaults
+# MODEL_OVERRIDE manifest: all ModelOverride fields + 18 SamplerDefaults
 # leaves. Evidence = overlay round-trip (gate d) + argv/wave lanes noted.
 # ---------------------------------------------------------------------------
 
 MODEL_OVERRIDE_FIELDS = [
     ("ctx", "argv: --ctx-size (phase_config C override-wins)"),
     ("slots", "argv: -np"),
+    (
+        "adaptive_override",
+        "D2: lifts the slots-pin adaptation exclusion; sustained queueing "
+        "teaches SlotsPinnedPressure + config-set remedy",
+    ),
     (
         "deterministic",
         "resolve_slots pin: forces -np 1 (greedy reproducibility)",
@@ -4352,6 +4367,25 @@ def phase_config() -> None:
                     "background currency marker",
                     "boundary: GH rate limit",
                 )
+            elif gh_budget is None:
+                # The rate-limit probe itself could not reach
+                # api.github.com (offline / captive-portal / IPv6-only
+                # network — GitHub's API is IPv4-only). The marker needs
+                # GitHub to answer, so this is an environment boundary,
+                # not a regression: the survey task is Rust-unit-tested
+                # and writes when egress returns.
+                boundary(
+                    "config",
+                    "engine_check_secs 5 -> run/engine-check.json marker",
+                    "api.github.com unreachable from this environment "
+                    "(offline/portal/IPv6-only) — marker machinery covered by "
+                    "Rust unit tests + writes when egress returns",
+                )
+                cov(
+                    "engine_check_secs",
+                    "background currency marker",
+                    "boundary: GH unreachable",
+                )
             else:
                 check(
                     "config",
@@ -4619,6 +4653,106 @@ def phase_api() -> None:
         st == 200 and isinstance(v, dict) and v.get("choices"),
         f"status={st}",
     )
+
+    # Reference-media gating on the video lane (sd-server ref_videos /
+    # ref_audios / ref_video_audios): all three taught 400s fire before
+    # model resolution or any engine spawn, so a probe model name keeps
+    # them deterministic on every lane and every fixture.
+    def _err_txt(val) -> str:
+        if isinstance(val, dict):
+            return str(val.get("error", {}).get("message", ""))
+        return str(val)
+
+    st, _, v = http_json(
+        "POST",
+        "/v1/videos",
+        {
+            "model": "ref-media-probe",
+            "prompt": "p",
+            "video_frames": 5,
+            "ref_videos": ["flat-not-nested"],
+        },
+    )
+    txt = _err_txt(v)
+    check(
+        "api",
+        "ref_videos shape violation teaches the field contract",
+        st == 400 and "ref_videos" in txt and "array" in txt,
+        f"status={st} body={txt[:120]}",
+    )
+    st, _, v = http_json(
+        "POST",
+        "/v1/videos",
+        {
+            "model": "ref-media-probe",
+            "prompt": "p",
+            "video_frames": 5,
+            "ref_videos": [["AAAA"]],
+            "ref_video_audios": ["BBB", "CCC"],
+        },
+    )
+    txt = _err_txt(v)
+    check(
+        "api",
+        "ref_video_audios outnumbering ref_videos is a taught 400",
+        st == 400 and "paired soundtrack" in txt,
+        f"status={st} body={txt[:120]}",
+    )
+    st, _, v = http_json(
+        "POST",
+        "/v1/images/generations",
+        {
+            "model": "ref-media-probe",
+            "prompt": "p",
+            "ref_audios": ["AAAA"],
+        },
+    )
+    txt = _err_txt(v)
+    check(
+        "api",
+        "ref media on the image route points at /v1/videos",
+        st == 400 and "/v1/videos" in txt,
+        f"status={st} body={txt[:120]}",
+    )
+    # The positive ref-media render (frames accepted, scratch-priced,
+    # relayed, rendered) is a real diffusion job — opt-in via an explicit
+    # video-model pin, mirroring BLAZAR_VALIDATE_MODEL, so the default
+    # battery stays fast and GPU-light.
+    video_model = os.environ.get("BLAZAR_VALIDATE_VIDEO_MODEL", "")
+    if video_model:
+        frame_png = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4"
+            "nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg=="
+        )
+        st, _, v = http_json(
+            "POST",
+            "/v1/videos",
+            {
+                "model": video_model,
+                "prompt": "a red square, abstract",
+                "video_frames": 5,
+                "width": 320,
+                "height": 320,
+                "ref_videos": [[frame_png, frame_png]],
+            },
+            timeout=600,
+        )
+        b64 = ""
+        if isinstance(v, dict):
+            data = v.get("data") or []
+            b64 = str(data[0].get("b64_json", "")) if data else ""
+        check(
+            "api",
+            "ref_videos positive render returns a container payload",
+            st == 200 and len(b64) > 1024 and b64.startswith("GkX"),
+            f"status={st} bytes={len(b64)}",
+        )
+    else:
+        boundary(
+            "api",
+            "ref_videos positive render",
+            "set BLAZAR_VALIDATE_VIDEO_MODEL to a video family row to exercise it",
+        )
     st, _, v = http_json(
         "POST",
         "/v1/responses",
@@ -5596,6 +5730,16 @@ def phase_sentinel() -> None:
         next(
             (ln.strip() for ln in p.stdout.splitlines() if "sentinel" in ln), "missing"
         ),
+    )
+    # NETWORK diagnostics section: egress truth + portal verdict rows
+    # exist regardless of the environment's health (a dead network is
+    # itself a diagnosable answer — the rows must still render).
+    net_rows = [ln.strip() for ln in p.stdout.splitlines() if "network" in ln.lower()]
+    check(
+        "sentinel",
+        "doctor NETWORK section renders egress + portal rows",
+        any("egress" in r for r in net_rows) and any("portal" in r for r in net_rows),
+        (net_rows[0][:140] if net_rows else "no network rows"),
     )
 
 
@@ -7717,6 +7861,15 @@ def phase_cli() -> None:
         p.stdout.strip().splitlines()[-1][:120] if p.stdout else "",
     )
     reg("ps", ok, "rc0 + model row")
+    # usage: metered lanes above (chat warm-ups) produced rollup rows;
+    # rc0 + a rendered row (or the honest empty teaching line) proves
+    # the CLI reads /api/usage through the daemon.
+    p = cli("usage")
+    ok = p.returncode == 0 and (
+        MODEL in p.stdout or "DAY" in p.stdout or "no metered" in p.stdout
+    )
+    check("cli", "blazar usage", ok, p.stdout.strip().splitlines()[-1][:120])
+    reg("usage", ok, "rc0 + rollup table / teaching line")
     p = cli("list")
     ok = p.returncode == 0 and MODEL in p.stdout
     check("cli", "blazar list", ok, "")
@@ -10612,7 +10765,10 @@ def phase_commands() -> None:
                     "this window; rerun when budget resets",
                 )
             return
-        reg("whisper.install", p.returncode == 0, p.stdout.strip()[:80])
+        # stderr first: install failures print there, and a stdout-only
+        # evidence row hid the failure class entirely (run 2).
+        evidence = (p.stderr.strip() or p.stdout.strip())[:160]
+        reg("whisper.install", p.returncode == 0, evidence)
         # Retry-once on the model pull: HF LFS links throttle/cut mid-stream
         # (live-observed: 28M/142M then dead socket); download_file resumes
         # from the .part, so the second attempt usually lands.

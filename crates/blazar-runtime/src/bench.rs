@@ -290,7 +290,8 @@ impl Tuner<'_> {
                 "-np".to_string(),
                 np.to_string(),
             ]);
-            let mut child = spawn_search_server(&server_bin, &argv)?;
+            let err_log = search_stderr_log(port);
+            let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
             let ok = wait_ready(&mut child, port, 120.0);
             let tps = if ok {
                 drive_concurrent(port, clients).ok()
@@ -352,7 +353,8 @@ impl Tuner<'_> {
                 "--spec-ngram-simple-min-hits".to_string(),
                 h.to_string(),
             ]);
-            let mut child = spawn_search_server(&server_bin, &argv)?;
+            let err_log = search_stderr_log(port);
+            let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
             let ok = wait_ready(&mut child, port, 120.0);
             let tps = if ok {
                 drive_concurrent(port, 1).ok()
@@ -382,17 +384,22 @@ impl Tuner<'_> {
     /// Spec-mode race (`tune --spec-race`): spawn the real llama-server
     /// once per candidate mode — dense (no speculation), ngram
     /// (`--spec-type ngram-simple` at engine defaults), dflash
-    /// (`--spec-type draft-dflash`, draft-free block speculation) — and
-    /// measure single-stream wall tokens/s. Phase one of the two-phase
-    /// spec search: the winning mode (if ngram) goes to [`Self::ngram_search`]
-    /// for (`size_m`, `min_hits`) refinement; dflash and dense carry no
+    /// (`--spec-type draft-dflash`, draft-free block speculation),
+    /// draft (`--spec-type draft-simple` with the catalog's draft
+    /// model and the profile's n-max) — and measure single-stream
+    /// wall tokens/s. Phase one of the two-phase spec search: the
+    /// winning mode (if ngram) goes to [`Self::ngram_search`] for
+    /// (`size_m`, `min_hits`) refinement; dflash and dense carry no
     /// refinable knobs on this axis. Only modes the engine's manifest
     /// advertises may race — the caller filters before invoking.
+    /// `draft` additionally requires the caller to pass the draft
+    /// pair (`path`, `n_max`) resolved from the catalog.
     pub fn spec_mode_race(
         &self,
         base_argv: &[String],
         modes: &[String],
         idle_secs: u64,
+        draft: Option<(&str, u32)>,
     ) -> Result<Vec<(String, f64)>> {
         let server_bin = self
             .bench_bin
@@ -418,9 +425,23 @@ impl Tuner<'_> {
                 "dflash" => {
                     argv.extend(["--spec-type".to_string(), "draft-dflash".to_string()]);
                 }
+                "draft" => {
+                    let (path, n_max) = draft.ok_or_else(|| {
+                        anyhow!("spec race: draft mode requested but no draft pair resolved")
+                    })?;
+                    argv.extend([
+                        "--spec-type".to_string(),
+                        "draft-simple".to_string(),
+                        "--spec-draft-model".to_string(),
+                        path.to_string(),
+                        "--spec-draft-n-max".to_string(),
+                        n_max.to_string(),
+                    ]);
+                }
                 other => anyhow::bail!("spec race: unknown mode {other:?}"),
             }
-            let mut child = spawn_search_server(&server_bin, &argv)?;
+            let err_log = search_stderr_log(port);
+            let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
             let ok = wait_ready(&mut child, port, 120.0);
             let tps = if ok {
                 drive_concurrent(port, 1).ok()
@@ -431,7 +452,25 @@ impl Tuner<'_> {
             let _ = child.kill();
             let _ = child.wait();
             let Some(t) = tps else {
-                anyhow::bail!("spec race: server in mode {mode} never became ready or served");
+                // Quote the child's own stderr (captured per-port): an
+                // early death is usually OOM or a rejected flag, and the
+                // child's words beat a generic readiness timeout.
+                let tail: String = std::fs::read_to_string(&err_log)
+                    .map(|s| {
+                        s.lines()
+                            .rev()
+                            .take(8)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "spec race: server in mode {mode} never became ready or served; \
+                     child stderr tail:\n{tail}"
+                );
             };
             println!("  spec mode {mode}: {t:.1} tok/s");
             out.push((mode.clone(), t));
@@ -492,7 +531,8 @@ impl Tuner<'_> {
             if n > 0 {
                 argv.extend(["--cache-reuse".to_string(), n.to_string()]);
             }
-            let mut child = spawn_search_server(&server_bin, &argv)?;
+            let err_log = search_stderr_log(port);
+            let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
             let warm_secs = if wait_ready(&mut child, port, 180.0) {
                 // Prime, then measure the warm pass (the cache-hit lane).
                 chat_secs(port, &long_prompt)
@@ -551,7 +591,8 @@ impl Tuner<'_> {
                 argv.push("--no-warmup".to_string());
             }
             let t0 = std::time::Instant::now();
-            let mut child = spawn_search_server(&server_bin, &argv)?;
+            let err_log = search_stderr_log(port);
+            let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
             let total = if let (true, Ok(first)) =
                 (wait_ready(&mut child, port, 180.0), first_chat_secs(port))
             {
@@ -593,7 +634,7 @@ impl Tuner<'_> {
                 "--port".to_string(),
                 port.to_string(),
             ]);
-            spawn_search_server(&server_bin, &argv)
+            spawn_search_server(&server_bin, &argv, &search_stderr_log(port))
         };
 
         // Run A: single child.
@@ -658,7 +699,7 @@ impl Tuner<'_> {
 
     /// Grid axis names (`ctx`/`nthreads`/`threads`) mirror each other on
     /// purpose: one is the loop variable, the other the winning knob.
-    #[allow(clippy::similar_names)]
+    #[allow(clippy::similar_names, clippy::too_many_lines)]
     /// `blazar tune <model> --search`: grid {ctx, kv-quant, threads} and
     /// adopt the argmax by mean generation (tg) throughput. Returns the
     /// winning profile plus all rows for display.
@@ -673,66 +714,115 @@ impl Tuner<'_> {
         // Grid axes llama-bench actually supports (verified b10816):
         // threads x KV-quant x flash-attn x batch. (No -c axis: ctx is a
         // server-launch knob.)
-        let mut grid = vec![
-            "-t".into(),
-            format!("{},{}", threads, threads.saturating_sub(2).max(1)),
-            "-ctk".into(),
-            "f16,q8_0".into(),
-            "-ctv".into(),
-            "f16,q8_0".into(),
-            "-fa".into(),
-            "on,off".into(),
-            "-b".into(),
-            "2048,1024".into(),
-        ];
-        grid.extend(default_bench_args());
-        // Some engine/device combos reject specific configurations (e.g.
-        // q8_0 KV-cache on some Vulkan drivers fails context creation and
-        // llama-bench aborts the WHOLE run). Degrade the grid instead of
-        // dying: drop KV-quant, then fa, then batch axes until it runs.
-        let mut grid_rows = None;
-        for reduction in 0..=3 {
-            let mut g = grid.clone();
-            match reduction {
-                1 => {
-                    // KV-quant axis off — value-based (F107): collapse
-                    // every pair-axis value to its first leg; no
-                    // positional assumption about where the axis sits.
-                    for v in &mut g {
-                        if v == "f16,q8_0" {
-                            *v = "f16".into();
+        //
+        // Hardware-shaped grid, budget-neutral: a GPU lane spends its
+        // cells on the 4-grade KV ladder (decode is bandwidth-bound, so
+        // the deeper grades are real candidates) and drops the
+        // threads/batch axes, which barely move tg there; a CPU lane
+        // keeps the legacy axes — threads move tg on CPU and exotic KV
+        // grades are spottier there.
+        //
+        // The engine refuses a quantized V cache unless flash-attn is on
+        // (hard context-creation error that aborts the WHOLE llama-bench
+        // run — receipt: b11946 CUDA, qwen3-0.6b), so the legal search
+        // space is conditional per fa leg instead of a cartesian product:
+        //   fa=on  -> full KV ladder on both sides
+        //   fa=off -> f16 V (mandatory) x the K-side ladder (K quantizes
+        //             fine without fa — the same differential the
+        //             profile's fa-off rule keeps)
+        // One llama-bench run per leg, rows merged before the argmax; the
+        // KV axis is never silently dropped for a legal combo again.
+        let kv_ladder = if input.hardware.has_gpu() {
+            "f16,q8_0,q5_0,q4_0"
+        } else {
+            "f16,q8_0"
+        };
+        let cpu_axes = |kv_k: &str, kv_v: &str, fa: &str| {
+            vec![
+                "-t".into(),
+                format!("{},{}", threads, threads.saturating_sub(2).max(1)),
+                "-ctk".into(),
+                kv_k.into(),
+                "-ctv".into(),
+                kv_v.into(),
+                "-fa".into(),
+                fa.into(),
+                "-b".into(),
+                "2048,1024".into(),
+            ]
+        };
+        let gpu_axes = |kv_k: &str, kv_v: &str, fa: &str| {
+            vec![
+                "-t".into(),
+                threads.to_string(),
+                "-ctk".into(),
+                kv_k.into(),
+                "-ctv".into(),
+                kv_v.into(),
+                "-fa".into(),
+                fa.into(),
+                "-b".into(),
+                "2048".into(),
+            ]
+        };
+        let mut legs: Vec<Vec<String>> = if input.hardware.has_gpu() {
+            vec![
+                gpu_axes(kv_ladder, kv_ladder, "on"),
+                gpu_axes(kv_ladder, "f16", "off"),
+            ]
+        } else {
+            vec![
+                cpu_axes(kv_ladder, kv_ladder, "on"),
+                cpu_axes(kv_ladder, "f16", "off"),
+            ]
+        };
+        for leg in &mut legs {
+            leg.extend(default_bench_args());
+        }
+        // Some engine/device combos still reject specific configurations
+        // (e.g. q8_0 KV on some Vulkan drivers). Degrade a failed leg
+        // instead of dying: collapse its KV axes to the first grade
+        // (f16), then the batch axis. A leg that fails even then
+        // contributes no rows; the argmax proceeds on what measured.
+        let mut grid_rows: Vec<BenchRow> = Vec::new();
+        for leg in &legs {
+            for reduction in 0..=2 {
+                let mut g = leg.clone();
+                if reduction == 1 {
+                    // KV-quant axis off — collapse every KV-axis value
+                    // (the arg right after -ctk/-ctv) to its first leg;
+                    // the flag name is the axis identity, so ladder
+                    // width does not matter here.
+                    for i in 0..g.len() {
+                        if let Some(v) = (g[i] == "-ctk" || g[i] == "-ctv")
+                            .then(|| g.get_mut(i + 1))
+                            .flatten()
+                        {
+                            *v = v.split(',').next().unwrap_or(v).to_string();
                         }
                     }
-                    tracing::warn!("tune: retrying grid without KV-quant axis");
+                    tracing::warn!("tune: retrying fa leg without KV-quant axis");
                 }
-                2 => {
-                    let pos = g.iter().position(|v| v == "on,off");
-                    if let Some(p) = pos {
-                        g[p] = "on".into();
+                if reduction == 2
+                    && let Some(p) = g.iter().position(|v| v == "2048,1024")
+                {
+                    g[p] = "2048".into();
+                    tracing::warn!("tune: retrying fa leg with default batch only");
+                }
+                match self.run(Path::new(input.model_path), &g) {
+                    Ok(rows) => {
+                        grid_rows.extend(rows);
+                        break;
                     }
-                    tracing::warn!("tune: retrying grid with fa=on only");
-                }
-                3 => {
-                    let pos = g.iter().position(|v| v == "2048,1024");
-                    if let Some(p) = pos {
-                        g[p] = "2048".into();
+                    Err(e) => {
+                        tracing::warn!("tune: fa-leg run failed: {e:#}");
                     }
-                    tracing::warn!("tune: retrying grid with default batch only");
-                }
-                _ => {}
-            }
-            match self.run(Path::new(input.model_path), &g) {
-                Ok(rows) => {
-                    grid_rows = Some(rows);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!("tune: grid run failed: {e:#}");
                 }
             }
         }
-        let grid_rows =
-            grid_rows.ok_or_else(|| anyhow!("llama-bench rejected every grid reduction"))?;
+        if grid_rows.is_empty() {
+            return Err(anyhow!("llama-bench rejected every fa leg"));
+        }
 
         // Argmax by mean tg t/s across (threads, quant, fa, batch) combos.
         let mut best: Option<(f64, Combo)> = None;
@@ -748,7 +838,10 @@ impl Tuner<'_> {
         let winning = TuningOverrides {
             ctx: None,
             threads: Some(u32::try_from(win.threads).context("thread count overflow")?),
-            kv_quant: Some(win.kv_q8),
+            kv_pair: Some(win.kv.clone()),
+            // Legacy mirror for callers reading the bool; `kv_pair` above
+            // is the authoritative grade pair at compile time.
+            kv_quant: Some(win.kv.0 == "q8_0" && win.kv.1 == "q8_0"),
             fa: Some(win.fa_on),
             batch: Some(u32::try_from(win.batch).context("batch overflow")?),
             ubatch: None,
@@ -759,13 +852,22 @@ impl Tuner<'_> {
     }
 }
 
-/// One measured combo: (threads, kv-q8?, fa-on?, batch).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// One measured combo: (threads, kv grade pair, fa-on?, batch).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Combo {
     pub threads: u64,
-    pub kv_q8: bool,
+    /// (`type_k`, `type_v`) grades — "f16" when the row omits them.
+    pub kv: (String, String),
     pub fa_on: bool,
     pub batch: u64,
+}
+
+/// Grade pair of a bench row (`f16` for absent `type_k`/`type_v`).
+fn row_kv(r: &BenchRow) -> (String, String) {
+    (
+        r.type_k.clone().unwrap_or_else(|| "f16".into()),
+        r.type_v.clone().unwrap_or_else(|| "f16".into()),
+    )
 }
 
 fn combos(rows: &[BenchRow]) -> Vec<Combo> {
@@ -776,7 +878,7 @@ fn combos(rows: &[BenchRow]) -> Vec<Combo> {
         }
         seen.insert(Combo {
             threads: r.n_threads.unwrap_or(0),
-            kv_q8: r.type_k.as_deref() == Some("q8_0") && r.type_v.as_deref() == Some("q8_0"),
+            kv: row_kv(r),
             fa_on: r.flash_attn.unwrap_or(-1) == 1,
             batch: r.n_batch.unwrap_or(0),
         });
@@ -790,7 +892,7 @@ fn mean_tg(rows: &[BenchRow], want: &Combo) -> f64 {
         .filter(|r| {
             let cur = Combo {
                 threads: r.n_threads.unwrap_or(0),
-                kv_q8: r.type_k.as_deref() == Some("q8_0") && r.type_v.as_deref() == Some("q8_0"),
+                kv: row_kv(r),
                 fa_on: r.flash_attn.unwrap_or(-1) == 1,
                 batch: r.n_batch.unwrap_or(0),
             };
@@ -1055,7 +1157,7 @@ pub fn sglang_spec_mode_race(
     for mode in modes {
         let port = ephemeral_port()?;
         let argv = sglang_race_argv(base_argv, mode, port, flags)?;
-        let mut child = spawn_search_server(server_bin, &argv)?;
+        let mut child = spawn_search_server(server_bin, &argv, &search_stderr_log(port))?;
         let ok = wait_ready(&mut child, port, 240.0);
         let tps = if ok {
             drive_concurrent(port, 1).ok()
@@ -1084,12 +1186,27 @@ pub fn sglang_spec_mode_race(
 /// mid-search (terminal close, kill) must not leak a VRAM-holding
 /// server (live-verified failure mode: an orphaned llama-server held
 /// 5.3 GiB after its owner died).
+/// Per-port child stderr capture path for the search lanes: the file
+/// is overwritten on every spawn attempt at that port and read back
+/// only when a child fails, so it never grows unbounded.
+#[must_use]
+fn search_stderr_log(port: u16) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("blazar-search-{port}.log"))
+}
+
 fn spawn_search_server(
     server_bin: &std::path::Path,
     argv: &[String],
+    stderr_log: &std::path::Path,
 ) -> Result<std::process::Child> {
     let mut cmd = std::process::Command::new(server_bin);
-    cmd.args(argv).stdout(Stdio::null()).stderr(Stdio::null());
+    // Child stderr lands in a per-port file instead of /dev/null: a
+    // child that dies before readiness (OOM, rejected flag) leaves the
+    // reason on disk for the failure path to quote — a nulled stderr
+    // turned every early death into an opaque readiness timeout.
+    let f = std::fs::File::create(stderr_log)
+        .with_context(|| format!("create {}", stderr_log.display()))?;
+    cmd.args(argv).stdout(Stdio::null()).stderr(Stdio::from(f));
     crate::probe::parent_death_tie(&mut cmd);
     cmd.spawn()
         .with_context(|| format!("spawn {}", server_bin.display()))
@@ -1591,21 +1708,21 @@ mod tests {
             row("tg128", 110.0, 4096, 6, "q8_0", "q8_0"),
             row("pp512", 900.0, 8192, 8, "f16", "f16"),
         ];
-        let find = |t, q| {
+        let find = |t: u64, q: &str| {
             combos(&rows)
                 .into_iter()
-                .find(|c| c.threads == t && c.kv_q8 == q)
+                .find(|c| c.threads == t && c.kv == (q.to_string(), q.to_string()))
                 .unwrap()
         };
-        assert!((mean_tg(&rows, &find(8, true)) - 140.0).abs() < 1e-9);
-        assert!((mean_tg(&rows, &find(8, false)) - 100.0).abs() < 1e-9);
-        assert!((mean_tg(&rows, &find(6, true)) - 110.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, &find(8, "q8_0")) - 140.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, &find(8, "f16")) - 100.0).abs() < 1e-9);
+        assert!((mean_tg(&rows, &find(6, "q8_0")) - 110.0).abs() < 1e-9);
         assert!(
             (mean_tg(
                 &rows,
                 &Combo {
                     threads: 1,
-                    kv_q8: false,
+                    kv: ("f16".into(), "f16".into()),
                     fa_on: false,
                     batch: 0
                 }

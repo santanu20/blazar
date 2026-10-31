@@ -327,6 +327,7 @@ pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<Select
     let ggufs: Vec<&HfSibling> = siblings
         .iter()
         .filter(|s| s.rfilename.to_lowercase().ends_with(".gguf")) // pre-lowercased above
+        .filter(|s| !is_sidecar_gguf(&s.rfilename))
         .collect();
     if ggufs.is_empty() {
         return Err(anyhow!("repo has no .gguf files"));
@@ -443,6 +444,26 @@ fn exact_filename_selection(siblings: &[HfSibling], wanted: &str) -> Result<Sele
 /// Accepts only the gguf-split 5-digit `-of-` tail with idx in 1..=count.
 fn parse_shard_marker(fname: &str) -> Option<(u32, u32, String)> {
     parse_shard_marker_pub(fname)
+}
+
+/// Drafter/projector sidecar, not a runnable main model: eagle3 speculator
+/// heads (`eagle3-gpt-oss-120b-BF16.gguf`), dflash/dspark draft artifacts
+/// (the exact spellings spec-pair pulls reference), and multimodal
+/// projector files. These share quant tokens with the main model, so
+/// quant matching and size fallbacks must skip them — only an explicit
+/// exact-filename request (`owner/repo:dflash-Model-Q8_0.gguf`) may pull
+/// one. Basename is matched so sharded subdirs (`BF16/...`) stay main.
+#[must_use]
+pub fn is_sidecar_gguf(rfilename: &str) -> bool {
+    let base = rfilename
+        .rsplit('/')
+        .next()
+        .unwrap_or(rfilename)
+        .to_lowercase();
+    base.starts_with("mmproj")
+        || base.starts_with("dflash-")
+        || base.starts_with("dspark-")
+        || base.contains("eagle3")
 }
 
 /// Public wrapper (shard-set file enumeration is shared with model removal).
@@ -1117,6 +1138,11 @@ fn quant_prefix_match(seg: &str) -> Option<String> {
     if seg == "fp16" {
         return Some(seg.to_string());
     }
+    // gpt-oss native format: not prefix+digit shaped, but llama.cpp
+    // ships and quant-matches it like any other token.
+    if seg == "mxfp4" {
+        return Some(seg.to_string());
+    }
     for prefix in ["iq", "tq", "bf", "q", "f"] {
         if let Some(rest) = seg.strip_prefix(prefix) {
             let mut chars = rest.chars();
@@ -1511,13 +1537,34 @@ fn kv_ladder(bytes: u64, vram_bytes: u64, default_ctx: u32) -> (bool, u32, u32) 
 #[must_use]
 pub fn fit_rows(siblings: &[HfSibling], vram_bytes: u64, default_ctx: u32) -> Vec<FitRow> {
     let mut rows = Vec::new();
+    // GGUF shard sets aggregate to ONE row per complete set: a split
+    // model pulls as a unit, so fit must charge the summed bytes, and
+    // each shard alone would understate the footprint. Keyed by the
+    // shard marker's parsed base; value is (bytes_sum, parts_seen,
+    // first_file).
+    let mut shard_sets: std::collections::BTreeMap<(String, u32), (u64, u32, String)> =
+        std::collections::BTreeMap::new();
     for s in siblings {
         let lower = s.rfilename.to_lowercase();
         let Some(stem) = lower.strip_suffix(".gguf") else {
             continue;
         };
         if stem.contains("-of-") {
-            continue; // shard parts: fit uses the set total via sibling sums
+            // Shard part: accumulate toward the set total.
+            if let Some((_, count, base)) = parse_shard_marker_pub(&s.rfilename)
+                && let Some(bytes) = s.lfs.as_ref().and_then(|l| l.size).or(s.size)
+            {
+                let entry = shard_sets
+                    .entry((base, count))
+                    .or_insert_with(|| (0, 0, s.rfilename.clone()));
+                entry.0 = entry.0.saturating_add(bytes);
+                entry.1 += 1;
+            }
+            continue;
+        }
+        // Drafter/projector sidecars are not runnable variants.
+        if is_sidecar_gguf(&s.rfilename) {
+            continue;
         }
         let bytes = s.lfs.as_ref().and_then(|l| l.size).or(s.size).unwrap_or(0);
         if bytes == 0 {
@@ -1528,6 +1575,24 @@ pub fn fit_rows(siblings: &[HfSibling], vram_bytes: u64, default_ctx: u32) -> Ve
         rows.push(FitRow {
             quant,
             file: s.rfilename.clone(),
+            bytes,
+            fits_vram: fits,
+            kv_bytes_at_default_ctx: kv_estimate_f16(default_ctx),
+            recommended_ctx: recommended,
+            recommended_ctx_q8: ctx_q8,
+        });
+    }
+    // Complete shard sets only: a partial set cannot be pulled whole.
+    // Quant comes from the set's base name (marker already stripped).
+    for ((base, count), (bytes, parts, first_file)) in shard_sets {
+        if parts != count {
+            continue;
+        }
+        let quant = base.rsplit('-').next().unwrap_or("unknown").to_uppercase();
+        let (fits, recommended, ctx_q8) = kv_ladder(bytes, vram_bytes, default_ctx);
+        rows.push(FitRow {
+            quant,
+            file: first_file,
             bytes,
             fits_vram: fits,
             kv_bytes_at_default_ctx: kv_estimate_f16(default_ctx),
@@ -3659,6 +3724,66 @@ mod tests {
     }
 
     #[test]
+    fn unit__fit_rows__gguf_shards_aggregate_and_sidecars_drop() {
+        let sib = |name: &str, size: u64| HfSibling {
+            rfilename: name.to_string(),
+            size: None,
+            lfs: Some(HfLfs {
+                sha256: "x".to_string(),
+                size: Some(size),
+            }),
+        };
+        // unsloth/gemma-3-27b shape: BF16 split in a subdir + quants as
+        // singles. The split set must appear ONCE with summed bytes and
+        // its base quant (BF16), never as per-part rows.
+        let rows = fit_rows(
+            &[
+                sib(
+                    "BF16/gemma-3-27b-it-BF16-00001-of-00002.gguf",
+                    27_000_000_000,
+                ),
+                sib(
+                    "BF16/gemma-3-27b-it-BF16-00002-of-00002.gguf",
+                    27_000_000_000,
+                ),
+                sib("gemma-3-27b-it-Q4_K_M.gguf", 16_000_000_000),
+                // Sidecar heads must not show up as tiny "variants".
+                sib("eagle3-gpt-oss-20b-BF16.gguf", 1_600_000_000),
+                sib("mmproj-F16.gguf", 800_000_000),
+            ],
+            60_000_000_000,
+            32_768,
+        );
+        let bf16 = rows.iter().find(|r| r.quant == "BF16");
+        assert!(bf16.is_some(), "split set aggregates: {rows:?}");
+        let bf16 = bf16.expect("checked above");
+        assert_eq!(bf16.bytes, 54_000_000_000);
+        assert!(bf16.file.ends_with("-00001-of-00002.gguf"));
+        assert!(bf16.fits_vram);
+        let q4 = rows
+            .iter()
+            .find(|r| r.quant == "Q4_K_M")
+            .expect("single quant row");
+        assert_eq!(q4.bytes, 16_000_000_000);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.bytes == 1_600_000_000 || r.bytes == 800_000_000),
+            "sidecars dropped: {rows:?}"
+        );
+        // Incomplete set (one of two parts listed) is not pullable — no row.
+        let rows = fit_rows(
+            &[sib("model-Q5_K_M-00001-of-00002.gguf", 5_000_000_000)],
+            60_000_000_000,
+            32_768,
+        );
+        assert!(
+            rows.iter().all(|r| r.bytes != 5_000_000_000),
+            "incomplete shard set dropped: {rows:?}"
+        );
+    }
+
+    #[test]
     fn unit__fit_rows__gguf_present_beats_safetensors_lane() {
         let sib = |name: &str, size: u64| HfSibling {
             rfilename: name.to_string(),
@@ -3791,6 +3916,48 @@ mod tests {
         assert_eq!(picked.shards[0].filename, "qwen_image_2.1_Q5_K_M.gguf");
         assert_eq!(picked.quant, "q5_k_m");
         assert!(!picked.quant_fallback);
+    }
+
+    #[test]
+    fn unit__select_files__sidecar_heads_never_selected_as_main() {
+        // gpt-oss repo shape (verified against ggml-org/gpt-oss-20b-GGUF):
+        // eagle3 speculator heads share the BF16/Q8_0 quant tokens with
+        // nothing — the ONLY main model is MXFP4. A quant request that
+        // only a sidecar carries must fall through, and the smallest-file
+        // fallback must also skip sidecars instead of shipping a 1.5 GiB
+        // draft head as "the model".
+        let sib = |name: &str, bytes: u64| HfSibling {
+            rfilename: name.to_string(),
+            size: Some(bytes),
+            lfs: None,
+        };
+        let siblings = [
+            sib("eagle3-gpt-oss-20b-BF16.gguf", 1_600_000_000),
+            sib("eagle3-gpt-oss-20b-Q8_0.gguf", 900_000_000),
+            sib("gpt-oss-20b-MXFP4.gguf", 12_000_000_000),
+        ];
+        // Sidecar-only quant: falls back to the main file, flagged.
+        let picked = select_files(&siblings, "bf16").unwrap();
+        assert_eq!(picked.shards[0].filename, "gpt-oss-20b-MXFP4.gguf");
+        assert!(picked.quant_fallback);
+        assert_eq!(picked.quant.to_lowercase(), "mxfp4");
+        // No-quant-here fallback: smallest NON-sidecar still wins over
+        // the (smaller) Q8_0 eagle3 head.
+        let picked = select_files(&siblings, "q4_k_m").unwrap();
+        assert_eq!(picked.shards[0].filename, "gpt-oss-20b-MXFP4.gguf");
+        // Exact-filename requests are the sanctioned sidecar path (spec
+        // pairs pull drafter artifacts this way) — untouched by the filter.
+        let picked = select_files(&siblings, "eagle3-gpt-oss-20b-Q8_0.gguf").unwrap();
+        assert_eq!(picked.shards[0].filename, "eagle3-gpt-oss-20b-Q8_0.gguf");
+        // dflash/dspark draft artifacts + mmproj are sidecars too.
+        assert!(is_sidecar_gguf("dflash-Qwen3-8B-Q8_0.gguf"));
+        assert!(is_sidecar_gguf("dspark-Qwen3-8B-Q8_0.gguf"));
+        assert!(is_sidecar_gguf("mmproj-F16.gguf"));
+        assert!(is_sidecar_gguf("sub/dir/eagle3-model-Q8_0.gguf"));
+        assert!(!is_sidecar_gguf("gpt-oss-20b-MXFP4.gguf"));
+        assert!(!is_sidecar_gguf(
+            "BF16/gemma-3-27b-it-BF16-00001-of-00002.gguf"
+        ));
     }
 
     #[test]

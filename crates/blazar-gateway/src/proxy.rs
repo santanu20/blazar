@@ -133,6 +133,26 @@ pub(crate) async fn ensure_detached(
         })
 }
 
+/// Generation-surface variant of [`ensure_detached`]: routes through
+/// `Supervisor::ensure_generation` so a `model+adapter` request on the
+/// llama.cpp lane rides the dense base child (per-request `lora`
+/// selection) instead of spawning a dedicated variant child.
+pub(crate) async fn ensure_generation_detached(
+    sup: &std::sync::Arc<blazar_runtime::Supervisor>,
+    name: &str,
+    prefix: Option<PrefixKey>,
+) -> Result<EngineRef, SupervisionError> {
+    let sup = std::sync::Arc::clone(sup);
+    let name = name.to_string();
+    tokio::spawn(async move { sup.ensure_generation(&name, prefix).await })
+        .await
+        .unwrap_or_else(|e| {
+            Err(SupervisionError::Internal(anyhow::anyhow!(
+                "load task panicked: {e}"
+            )))
+        })
+}
+
 /// Vision-aware variant of [`ensure_detached`]: routes through
 /// `Supervisor::ensure_vision` so a `mmproj = "lazy"` spawn respawns
 /// WITH the projector when the request carries images. Text requests
@@ -273,8 +293,15 @@ pub(crate) async fn ensure_router_detached(
 /// the images handlers pass `true` (component sets are their cargo);
 /// every text/embedding surface passes `false` and gets a teaching 400
 /// instead of an sd-server child that 404s every chat-shaped route.
+/// `generation` marks surfaces whose requests flow through the llama.cpp
+/// completion schema (chat/completions/responses/anthropic/ollama
+/// chat+generate): there a `model+adapter` variant rides the dense base
+/// child with per-request adapter selection. Embeddings/rerank/images
+/// lanes pass `false` — those tasks never see the per-request `lora`
+/// field, so their variants keep the dedicated child.
 #[allow(clippy::duration_suboptimal_units)] // 120s admission bound per plan
 #[allow(clippy::too_many_arguments)] // mirrors proxy_request: flat call params, one seam
+#[allow(clippy::fn_params_excessive_bools)] // the four bools are independent surface axes
 pub async fn ensure_with_admission(
     state: &Arc<AppState>,
     model: &str,
@@ -284,6 +311,7 @@ pub async fn ensure_with_admission(
     needs_vision: bool,
     allow_diffusion: bool,
     no_evict: bool,
+    generation: bool,
 ) -> Result<(EngineRef, u128), Box<Response>> {
     let started = Instant::now();
     // Model resolution is the only store need; it completes inside the
@@ -340,6 +368,8 @@ pub async fn ensure_with_admission(
             Box::pin(ensure_vision_detached(&state.sup, lane, prefix))
         } else if no_evict {
             Box::pin(ensure_detached_captive(&state.sup, lane))
+        } else if generation {
+            Box::pin(ensure_generation_detached(&state.sup, lane, prefix))
         } else {
             Box::pin(ensure_detached(&state.sup, lane, prefix))
         }
@@ -911,6 +941,31 @@ pub async fn proxy_request(
             .or(Some(model)),
     );
 
+    // llama.cpp LoRA-variant ride (`base+adapter` on a resident llama.cpp
+    // child): resolve the per-request adapter list from the child's own
+    // GET /lora-adapters answer. `Some(Err)` = the ride cannot be
+    // honored — surface the teaching BEFORE any child traffic; falling
+    // back to base weights silently is the wrong-answer failure mode
+    // this stamp exists to prevent. Recomputed on the respawn retry
+    // below so the fresh child sees the identical body.
+    let variant_lora = match llamacpp_variant_lora(
+        state,
+        engine,
+        parsed
+            .as_ref()
+            .and_then(|v| v.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .or(Some(model)),
+    )
+    .await
+    {
+        Some(Ok(pairs)) => Some(pairs),
+        Some(Err(teach)) => {
+            return openai_error(StatusCode::BAD_GATEWAY.as_u16(), &teach);
+        }
+        None => None,
+    };
+
     // Child-boundary body mutations, composed on the hot lane's single
     // parse: R6 include_usage forcing (stream warm/cold classification
     // data; ollama lane does the same in its translator), the per-engine
@@ -935,6 +990,7 @@ pub async fn proxy_request(
             parsed.as_ref()
         },
         variant_stamp.as_deref(),
+        variant_lora.as_deref(),
     );
 
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
@@ -1056,6 +1112,27 @@ pub async fn proxy_request(
                             .and_then(serde_json::Value::as_str)
                             .or(Some(model)),
                     );
+                    // The respawn rebuilds argv from the CURRENT store
+                    // rows, so re-resolve the adapter id instead of
+                    // reusing the pre-crash answer.
+                    let retry_lora = match llamacpp_variant_lora(
+                        state,
+                        &fresh,
+                        parsed
+                            .as_ref()
+                            .and_then(|v| v.get("model"))
+                            .and_then(serde_json::Value::as_str)
+                            .or(Some(model)),
+                    )
+                    .await
+                    {
+                        Some(Ok(pairs)) => Some(pairs),
+                        Some(Err(teach)) => {
+                            drop(sf); // F31: Drop removes the singleflight entry
+                            return openai_error(StatusCode::BAD_GATEWAY.as_u16(), &teach);
+                        }
+                        None => None,
+                    };
                     let retry_body = apply_child_request_mutations_stamped(
                         &fresh,
                         fwd_path,
@@ -1066,6 +1143,7 @@ pub async fn proxy_request(
                             parsed.as_ref()
                         },
                         retry_stamp.as_deref(),
+                        retry_lora.as_deref(),
                     );
                     body_snapshot = retry_body.clone();
                     match forward_once(state, &fresh, method, &fresh_url, headers, retry_body).await
@@ -2022,6 +2100,26 @@ pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) -> bool {
     }
 }
 
+/// llama.cpp variant ride stamp: the per-request `lora: [{id, scale}]`
+/// completion-schema field that selects the adapter for THIS request
+/// (every spawn-loaded adapter absent from the list deactivates for it).
+/// Unlike the model stamp this INSERTS the field when missing — the
+/// adapter only rides when the list rides the body — and is idempotent:
+/// an identical list leaves the body byte-identical.
+pub(crate) fn set_child_lora(v: &mut serde_json::Value, pairs: &[(i64, f64)]) -> bool {
+    let list = serde_json::Value::Array(
+        pairs
+            .iter()
+            .map(|(id, scale)| serde_json::json!({"id": id, "scale": scale}))
+            .collect(),
+    );
+    if v.get("lora") == Some(&list) {
+        return false;
+    }
+    v["lora"] = list;
+    true
+}
+
 /// Think-dialect bridge for mistral.rs children (chat lane only).
 /// mistral.rs reads TOP-LEVEL body fields — `enable_thinking` (bool) and
 /// `reasoning_effort` (`off|low|medium|high|xhigh`) — and enables
@@ -2164,6 +2262,126 @@ pub(crate) fn sglang_variant_stamp(
     Some(format!("{}:{registered}", engine.name))
 }
 
+/// llama.cpp LoRA-variant stamp: a `base+adapter` request resolved to a
+/// resident llama.cpp child rides that child (see
+/// `Supervisor::ensure_generation`), selecting the adapter per request
+/// through the body field `lora: [{id, scale}]` — the engine addresses
+/// adapters by argv index, and every adapter absent from the list
+/// deactivates for that one request (completion-schema semantics).
+/// The id is resolved from the child's own GET /lora-adapters answer —
+/// the only authoritative mapping — and the scale is the store row's
+/// (user intent), so the request sees exactly the dedicated variant
+/// child's posture without a second weights load.
+/// `None` = not a llama.cpp variant request (caller keeps the plain
+/// stamp). `Some(Err)` = the ride cannot be honored — surface the
+/// teaching; NEVER fall back silently to base weights (the
+/// wrong-answer failure mode this stamp exists to prevent).
+pub(crate) async fn llamacpp_variant_lora(
+    state: &Arc<AppState>,
+    engine: &EngineRef,
+    requested_model: Option<&str>,
+) -> Option<Result<Vec<(i64, f64)>, String>> {
+    use blazar_core::engine_kind::EngineKind;
+    if engine.kind != EngineKind::LlamaCpp {
+        return None;
+    }
+    let requested = requested_model?;
+    let (base, stem) = blazar_core::catalog::split_lora_suffix(requested);
+    let stem = stem?;
+    // The base half may arrive in any spelling the resolver accepts;
+    // canonicalize before comparing to the child's registered name so
+    // `m1:q4+ad` rides the `m1` child.
+    let canonical = state
+        .with_store(|s| resolve_model(s, base))
+        .and_then(std::result::Result::ok);
+    if canonical
+        .as_ref()
+        .is_some_and(|row| row.name != engine.name)
+    {
+        return None;
+    }
+    let rows = state
+        .with_store(|s| s.list_loras(Some(&engine.name)))
+        .and_then(std::result::Result::ok)?;
+    let registered = blazar_core::catalog::lora_registered_name(&rows, stem)?;
+    let row = rows.iter().find(|l| {
+        let p = std::path::Path::new(&l.path);
+        let registered = std::ffi::OsStr::new(registered.as_str());
+        p.file_name().is_some_and(|s| s == registered)
+            || p.file_stem().is_some_and(|s| s == registered)
+    })?;
+    let url = format!("{}/lora-adapters", child_base(&engine.endpoint));
+    let client = crate::state::child_client(state, &engine.endpoint);
+    let resp = match child_auth(
+        client.get(&url).timeout(std::time::Duration::from_secs(10)),
+        engine,
+    )
+    .send()
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Some(Err(format!(
+                "variant ride check failed: child {url} unreachable: {e}"
+            )));
+        }
+    };
+    if !resp.status().is_success() {
+        return Some(Err(format!(
+            "variant ride check failed: child answered {} from GET /lora-adapters",
+            resp.status()
+        )));
+    }
+    let adapters = resp.json::<serde_json::Value>().await.ok()?;
+    let hit = adapters.as_array()?.iter().find_map(|e| {
+        // b11982+ GET /lora-adapters entries key the file as "path"
+        // (older builds said "name"); accept both.
+        let loaded = e
+            .get("path")
+            .or_else(|| e.get("name"))
+            .and_then(serde_json::Value::as_str)?;
+        let id = e.get("id")?.as_i64()?;
+        (loaded == row.path).then_some(id)
+    });
+    if let Some(id) = hit {
+        return Some(Ok(vec![(id, row.scale)]));
+    }
+    // Name the observed set so a drifted spawn reads as a mis-loaded
+    // child, not a phantom adapter (first three entries, basenames
+    // only — never a wall of paths).
+    let observed = adapters.as_array().map_or_else(
+        || "<unparseable>".to_string(),
+        |entries| {
+            let parts: Vec<String> = entries
+                .iter()
+                .take(3)
+                .filter_map(|e| {
+                    let p = e.get("path").or_else(|| e.get("name"))?.as_str()?;
+                    let id = e.get("id")?.as_i64()?;
+                    Some(format!(
+                        "{id}:{}",
+                        std::path::Path::new(p)
+                            .file_name()
+                            .map_or_else(|| p.to_string(), |n| n.to_string_lossy().into_owned())
+                    ))
+                })
+                .collect();
+            let suffix = entries.len().saturating_sub(3);
+            let more = if suffix > 0 {
+                format!(" +{suffix} more")
+            } else {
+                String::new()
+            };
+            format!("[{}{more}]", parts.join(", "))
+        },
+    );
+    Some(Err(format!(
+        "adapter {registered} is not loaded on the resident child (spawn loaded a \
+         different set: {observed}) — `blazar stop {base}` then re-request respawns \
+         with the current store rows"
+    )))
+}
+
 /// Per-engine child stamp with the sglang LoRA-variant override folded
 /// in — the single derivation every direct-stamp callsite should use:
 /// a `base+adapter` request on the sglang lane stamps the engine's
@@ -2196,19 +2414,21 @@ pub(crate) fn apply_child_request_mutations(
     body: axum::body::Bytes,
     parsed: Option<&serde_json::Value>,
 ) -> axum::body::Bytes {
-    apply_child_request_mutations_stamped(engine, path_query, body, parsed, None)
+    apply_child_request_mutations_stamped(engine, path_query, body, parsed, None, None)
 }
 
-/// [`apply_child_request_mutations`] with an explicit model-stamp
-/// override: the hot proxy lanes pass the sglang LoRA-variant colon
-/// stamp (see [`sglang_variant_stamp`]) here; `None` keeps the plain
-/// per-engine stamp.
+/// [`apply_child_request_mutations`] with explicit stamp overrides: the
+/// hot proxy lanes pass the sglang LoRA-variant colon stamp (see
+/// [`sglang_variant_stamp`]) and the llama.cpp per-request adapter list
+/// (see [`llamacpp_variant_lora`]) here; `None` keeps the plain
+/// per-engine stamp / no adapter field.
 pub(crate) fn apply_child_request_mutations_stamped(
     engine: &EngineRef,
     path_query: &str,
     body: axum::body::Bytes,
     parsed: Option<&serde_json::Value>,
     variant_stamp: Option<&str>,
+    lora_stamp: Option<&[(i64, f64)]>,
 ) -> axum::body::Bytes {
     let path = path_query.split('?').next().unwrap_or(path_query);
     let usage_lane = path.ends_with("/chat/completions");
@@ -2216,7 +2436,7 @@ pub(crate) fn apply_child_request_mutations_stamped(
     let stamp = variant_stamp
         .map(str::to_string)
         .or_else(|| child_model_stamp(engine));
-    if body.is_empty() || !(usage_lane || think_lane || stamp.is_some()) {
+    if body.is_empty() || !(usage_lane || think_lane || stamp.is_some() || lora_stamp.is_some()) {
         return body;
     }
     // Decide before cloning: the deep `Value` clone is only worth its
@@ -2235,6 +2455,7 @@ pub(crate) fn apply_child_request_mutations_stamped(
     let needed = (usage_lane
         && (include_usage_needed(v_ref) || normalize_system_first_needed(v_ref)))
         || stamp.as_deref().is_some_and(|s| stamp_needed(v_ref, s))
+        || lora_stamp.is_some_and(|p| lora_stamp_needed(v_ref, p))
         || (think_lane && normalize_think_needed(v_ref));
     if !needed {
         return body;
@@ -2250,6 +2471,9 @@ pub(crate) fn apply_child_request_mutations_stamped(
     }
     if let Some(stamp) = stamp.as_deref() {
         changed |= set_child_model(&mut v, stamp);
+    }
+    if let Some(pairs) = lora_stamp {
+        changed |= set_child_lora(&mut v, pairs);
     }
     if think_lane {
         changed |= normalize_think_in_value(engine.kind, &mut v);
@@ -2302,6 +2526,21 @@ fn stamp_needed(v: &serde_json::Value, stamp: &str) -> bool {
     match v.get("model").and_then(serde_json::Value::as_str) {
         Some(current) => current != stamp,
         None => false,
+    }
+}
+
+/// Read-only mirror of [`set_child_lora`]'s change decision: the stamp
+/// fires on ANY mismatch — wrong ids/scales, wrong length, wrong shape,
+/// or the field missing entirely (it must be inserted).
+fn lora_stamp_needed(v: &serde_json::Value, pairs: &[(i64, f64)]) -> bool {
+    match v.get("lora") {
+        Some(serde_json::Value::Array(arr)) if arr.len() == pairs.len() => {
+            arr.iter().zip(pairs).any(|(e, (id, scale))| {
+                e.get("id").and_then(serde_json::Value::as_i64) != Some(*id)
+                    || e.get("scale").and_then(serde_json::Value::as_f64) != Some(*scale)
+            })
+        }
+        _ => true,
     }
 }
 
@@ -2982,6 +3221,21 @@ pub fn begin_accounting(state: &Arc<AppState>, model: &str) -> InFlightGuard {
     }
 }
 
+/// D5 note-side concurrency: the peak number of OTHER streams that
+/// overlapped one request. The buffered note sites hold their in-flight
+/// guard at BOTH anchors, so each live count includes the noting request
+/// itself — subtract one at each anchor and take the max. The max is what
+/// kills the tail-of-burst misroute: the last request of an N-deep burst
+/// notes alone (note anchor sees 0 others) but entered at depth N (entry
+/// anchor sees N-1), so it still lands in the loaded class instead of
+/// dragging the solo rate down.
+#[must_use]
+pub fn others_peak(entry_live: i64, note_live: i64) -> i64 {
+    // `.max(0)` guards the impossible-but-total anchor of 0 (i64
+    // subtraction saturates at the type bounds, not at zero).
+    (entry_live - 1).max(note_live - 1).max(0)
+}
+
 /// Begin accounting as a deterministic-isolation holder: exclusivity was
 /// acquired by the gate (quiescent child verified there); the guard's
 /// `Drop` returns it. Same in-flight accounting as [`begin_accounting`]
@@ -3054,6 +3308,24 @@ mod affinity_tests {
         }
         messages.push(serde_json::json!({"role": "user", "content": user}));
         serde_json::json!({"messages": messages})
+    }
+
+    /// D5 anchor math: both live counts include the noting request, so
+    /// the other-stream peak subtracts 1 per anchor. The tail-of-burst
+    /// case is the reason the max exists — entering at depth 3 but
+    /// noting alone still classifies as loaded (2 others), never solo.
+    #[test]
+    fn unit__others_peak__anchors_and_tail_of_burst() {
+        // Ran truly alone at both anchors: live 1 = self only.
+        assert_eq!(others_peak(1, 1), 0);
+        // Tail of a 3-deep burst: entered with 2 others, noted alone.
+        assert_eq!(others_peak(3, 1), 2);
+        // Joined mid-flight: entered alone, noted with 3 others.
+        assert_eq!(others_peak(1, 4), 3);
+        // Anchor agreement.
+        assert_eq!(others_peak(2, 2), 1);
+        // Degenerate anchors never go negative.
+        assert_eq!(others_peak(0, 0), 0);
     }
 
     #[test]
@@ -3674,6 +3946,7 @@ mod cache_obs_tests {
             json_body(&body),
             Some(&pre),
             Some("qwen3-1.7b:eternis-anonymizer-qwen3-1"),
+            None,
         );
         let v = parse(&out);
         assert_eq!(

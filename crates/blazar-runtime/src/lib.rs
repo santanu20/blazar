@@ -23,6 +23,7 @@ pub mod hf;
 pub mod hf_parallel;
 pub mod knob_registry;
 pub mod models;
+pub mod net_health;
 pub mod piper;
 pub mod probe;
 pub mod quantize;

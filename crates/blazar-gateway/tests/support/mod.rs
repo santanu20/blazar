@@ -96,6 +96,13 @@ pub fn config_with_keys() -> Config {
 }
 
 pub async fn start(config: Config) -> TestServer {
+    start_env(config, &[]).await
+}
+
+/// `start` with extra env stamped onto every spawned stub child — the
+/// sentinel suite's `engine.child_env` pattern, factored for tests that
+/// need marker modes (`STUB_TOOL_CALL`, `STUB_EMPTY`, ...).
+pub async fn start_env(config: Config, stub_env: &[(&str, &str)]) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let dirs = BlazarDirs {
         config_dir: tmp.path().join("c"),
@@ -138,7 +145,11 @@ pub async fn start(config: Config) -> TestServer {
         .unwrap();
     store.set_active_engine("stub-1").unwrap();
     let manifest = blazar_runtime::probe_manifest(&find_stub(), "stub").unwrap();
-    let engine = LlamaCppEngine::new(manifest);
+    let mut engine = LlamaCppEngine::new(manifest);
+    engine.child_env = stub_env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     let mut s = Supervisor::new(
         dirs.clone(),
         config.clone(),

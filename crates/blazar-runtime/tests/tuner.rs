@@ -176,7 +176,9 @@ fn integration__tune_search__adopts_argmax_and_persists() {
     let inp = test_input(&model_str, &hw, &cfg, &flags, &overlay);
 
     // Grid axes: threads x kv-quant (llama-bench b10816 has no -c axis).
-    // Stub scoring: +threads, +50 for q8_0 -> winner (threads 8, q8_0).
+    // GPU grid: 4-grade KV ladder, single threads/batch. Stub scoring:
+    // +threads, grade(k)+grade(v) with q4_0 = +30 per side -> winner
+    // (threads 8, q4_0 pair, fa on, batch 2048).
     let tuner = Tuner {
         dirs: &dirs,
         bench_bin: bench_bin(),
@@ -185,20 +187,42 @@ fn integration__tune_search__adopts_argmax_and_persists() {
     let (profile, winning, rows) = tuner.tune_search(&store, &inp).unwrap();
 
     assert_ne!(rows, [] as [blazar_runtime::BenchRow; 0]);
-    assert!(winning.kv_quant.unwrap(), "stub rewards q8_0 by +50 t/s");
+    assert!(
+        rows.iter()
+            .any(|r| r.type_k.as_deref() == Some("q5_0") && r.type_v.as_deref() == Some("q5_0")),
+        "GPU grid must measure the widened KV ladder (got grades: {:?})",
+        rows.iter()
+            .map(|r| r.type_k.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(
+        winning
+            .kv_pair
+            .as_ref()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+        Some(("q4_0", "q4_0")),
+        "stub rewards deeper KV grades (q4_0 = +30/side)"
+    );
+    assert!(!winning.kv_quant.unwrap(), "legacy bool mirrors the pair");
     assert_eq!(winning.threads.unwrap(), 8);
     assert_eq!(winning.fa, Some(true), "stub rewards fa-on by +15 t/s");
     assert_eq!(
         winning.batch,
-        Some(1024),
-        "stub rewards batch 1024 by +8 t/s"
+        Some(2048),
+        "GPU grid pins the single batch leg"
     );
     assert!(winning.ctx.is_none(), "ctx is not a bench axis");
     assert!(
         profile
             .argv
             .windows(2)
-            .any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0")
+            .any(|w| w[0] == "--cache-type-k" && w[1] == "q4_0")
+    );
+    assert!(
+        profile
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--cache-type-v" && w[1] == "q4_0")
     );
     assert!(
         profile
@@ -216,14 +240,75 @@ fn integration__tune_search__adopts_argmax_and_persists() {
         profile
             .argv
             .windows(2)
-            .any(|w| w[0] == "-b" && w[1] == "1024")
+            .any(|w| w[0] == "-b" && w[1] == "2048")
     );
 
     let stored = store.get_profile("qwen3-8b", "b-stub").unwrap().unwrap();
     let argv: Vec<String> = serde_json::from_str(&stored.args_json).unwrap();
     assert_eq!(argv, profile.argv);
-    let payload: serde_json::Value =
+    let payload: blazar_runtime::bench::BenchmarkPayload =
         serde_json::from_str(stored.benchmark_json.as_deref().unwrap()).unwrap();
-    assert!(payload["score"].as_f64().unwrap() > 0.0);
+    assert!(payload.score > 0.0);
     assert_ne!(stored.args_hash, "");
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn integration__tune_search_cpu__keeps_legacy_grid_and_q8_winner() {
+    let (tmp, dirs) = dirs_setup();
+    let model_path = tmp.path().join("m.gguf");
+    std::fs::write(&model_path, b"x").unwrap();
+    let model_str = model_path.to_str().unwrap().to_string();
+
+    let cfg = Config::default();
+    // No GPU: the CPU lane keeps the legacy grid (threads 2-leg, kv
+    // f16/q8_0, fa 2-leg, batch 2-leg) and its winner contract.
+    let hw = Hardware {
+        physical_cores: 8,
+        total_ram_mib: 32_000,
+        gpus: vec![],
+    };
+    let flags = all_flags();
+    let overlay = ModelOverride::default();
+    let inp = test_input(&model_str, &hw, &cfg, &flags, &overlay);
+
+    let tuner = Tuner {
+        dirs: &dirs,
+        bench_bin: bench_bin(),
+    };
+    let store = Store::open(&dirs).unwrap();
+    let (profile, winning, rows) = tuner.tune_search(&store, &inp).unwrap();
+
+    assert!(
+        rows.iter()
+            .all(|r| r.type_k.as_deref() != Some("q5_0") && r.type_k.as_deref() != Some("q4_0")),
+        "CPU grid must not measure the GPU-only deeper grades"
+    );
+    assert!(winning.kv_quant.unwrap(), "stub rewards q8_0 by +50 t/s");
+    assert_eq!(
+        winning
+            .kv_pair
+            .as_ref()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+        Some(("q8_0", "q8_0"))
+    );
+    assert_eq!(winning.threads.unwrap(), 8);
+    assert_eq!(winning.fa, Some(true), "stub rewards fa-on by +15 t/s");
+    assert_eq!(
+        winning.batch,
+        Some(1024),
+        "stub rewards batch 1024 by +8 t/s"
+    );
+    assert!(
+        profile
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--cache-type-k" && w[1] == "q8_0")
+    );
+    assert!(
+        profile
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--threads" && w[1] == "8")
+    );
 }

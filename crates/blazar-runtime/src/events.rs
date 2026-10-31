@@ -53,6 +53,52 @@ pub enum BlazarEvent {
         model: String,
         slots: u32,
     },
+    /// D2 pinned teach: sustained admission pressure on a model excluded
+    /// from adaptation ONLY by a manual `slots` pin. The pin stays
+    /// authoritative (no adoption happens) — the event makes the
+    /// silent queueing floor visible; the remedy is
+    /// `model_overrides.<model>.adaptive_override on`.
+    SlotsPinnedPressure {
+        model: String,
+        /// The pinned slot count (argv-resolved).
+        slots: u32,
+        /// Parked-waiter gauge level at the teach tick.
+        pressure: u32,
+    },
+    /// D3 starvation bound: the reshape drain had parked admissions past
+    /// the drain budget (90s) and switched to complete-and-cutover —
+    /// admissions reopened into the old shape and the reshape now waits
+    /// for a natural quiesce instead of starving waiters.
+    SlotsDrainCutover {
+        model: String,
+        waited_secs: u64,
+    },
+    /// D5 decode-scaling awareness: fresh solo + loaded throughput
+    /// evidence showed the model's aggregate decode barely scales with
+    /// concurrency (GPU-bound), so a slot adoption was suppressed — the
+    /// reshape would pay its transition for queue relief at best. The
+    /// lane is taught instead (`blazar tune --slots` for an explicit
+    /// shape, or `adaptive_decode_gate = false` to restore always-adopt).
+    SlotsDecodeBound {
+        model: String,
+        /// Solo-class decode EWMA (tok/s).
+        solo_tps: f64,
+        /// Loaded-class per-stream decode EWMA (tok/s).
+        loaded_tps: f64,
+        /// Loaded-class average concurrency (streams).
+        loaded_conc: f64,
+        /// `loaded_tps * loaded_conc / solo_tps` — the aggregate multiple.
+        ratio: f64,
+    },
+    /// Replica pre-warm cutover: the reshape landed through a warm
+    /// standby — the new-shape child reached Ready under a `#warm` key,
+    /// routing swapped to it atomically, and the old child retired (its
+    /// in-flight streams finish undisturbed). Zero admission gap vs the
+    /// evict-then-respawn path.
+    SlotsPrewarmCutover {
+        model: String,
+        slots: u32,
+    },
     /// B2 spec governor: sustained speculation overhead (queue
     /// saturation or a collapsed draft-acceptance rate) parked
     /// speculation for `model` — the child reshapes dense; a long quiet

@@ -265,6 +265,7 @@ fn video_scratch_gate(
     parsed: &serde_json::Value,
     model: &str,
     state: &AppState,
+    ref_frames: u64,
 ) -> Result<(), String> {
     if parsed
         .get("vram_overcommit")
@@ -285,7 +286,12 @@ fn video_scratch_gate(
         return Ok(());
     };
     let (w, h) = gate_size(parsed);
-    let frames = gate_frames(parsed);
+    // Reference frames are VAE-encoded into latents once (cheaper than
+    // a sampler step's scratch), but the calibrated per-frame rate is
+    // the only measured number this gate owns — pricing refs at the
+    // full rate errs conservative, and the refusal already teaches the
+    // vram_overcommit lever for the over-refused edge.
+    let frames = gate_frames(parsed).saturating_add(ref_frames);
     let cold = live_sdcpp_children(state, Some(model)).is_empty();
     let est = estimate_video_scratch(frames, w, h, cold);
     let budget = (free as f64 * VIDEO_VRAM_HEADROOM_FRACTION) as u64;
@@ -548,11 +554,12 @@ fn openai_surface_teaching(
     None
 }
 
-/// Per-model defaults from the child's capabilities, memoized per
-/// engine for [`CHILD_DEFAULTS_TTL`]. One model rides one child, so the
-/// key is the engine name; the TTL covers a re-pull swapping quants
-/// under the same name. A failed fetch is NOT cached — the next request
-/// retries.
+/// Per-model capabilities from the child, memoized per engine for
+/// [`CHILD_DEFAULTS_TTL`]. One model rides one child, so the key is the
+/// engine name; the TTL covers a re-pull swapping quants under the same
+/// name. A failed fetch is NOT cached — the next request retries. The
+/// WHOLE capabilities document is cached (`defaults_by_mode` AND
+/// `generation_features`) so every consumer reads one coherent snapshot.
 const CHILD_DEFAULTS_TTL: Duration = Duration::from_secs(600);
 type ChildDefaultsMap = std::collections::HashMap<String, (Instant, Arc<serde_json::Value>)>;
 static CHILD_DEFAULTS: std::sync::LazyLock<tokio::sync::RwLock<ChildDefaultsMap>> =
@@ -562,6 +569,25 @@ async fn child_mode_defaults(
     state: &AppState,
     engine: &blazar_runtime::EngineRef,
     mode: &str,
+) -> Result<Arc<serde_json::Value>, String> {
+    let caps = child_capabilities(state, engine).await?;
+    // Missing mode block stays an error for the defaults consumers
+    // (quality/style resolution cannot guess); the capabilities fetch
+    // itself is shared with the feature gates below.
+    if caps.pointer(&format!("/defaults_by_mode/{mode}")).is_none() {
+        return Err(format!("engine capabilities lack defaults_by_mode.{mode}"));
+    }
+    Ok(caps)
+}
+
+/// The child's whole `/sdcpp/v1/capabilities` document, memoized per
+/// engine (see [`CHILD_DEFAULTS_TTL`]). Callers reach for
+/// `/defaults_by_mode/{mode}` (dialect defaults) or
+/// `/generation_features` (runtime capability flags — e.g. whether the
+/// loaded model carries an Audio VAE for reference-audio inputs).
+async fn child_capabilities(
+    state: &AppState,
+    engine: &blazar_runtime::EngineRef,
 ) -> Result<Arc<serde_json::Value>, String> {
     if let Some(hit) = CHILD_DEFAULTS
         .read()
@@ -590,16 +616,150 @@ async fn child_mode_defaults(
         .json()
         .await
         .map_err(|e| format!("engine capabilities body unreadable: {e}"))?;
-    let defaults = caps
-        .pointer(&format!("/defaults_by_mode/{mode}"))
-        .cloned()
-        .ok_or_else(|| format!("engine capabilities lack defaults_by_mode.{mode}"))?;
-    let wrapped = Arc::new(defaults);
+    let wrapped = Arc::new(caps);
     CHILD_DEFAULTS
         .write()
         .await
         .insert(engine.name.clone(), (Instant::now(), Arc::clone(&wrapped)));
     Ok(wrapped)
+}
+
+/// Reference-media inventory parsed once per request: `ref_videos`
+/// (each an array of base64 frame strings), `ref_audios` and
+/// `ref_video_audios` (base64 WAV strings, optionally data-URL
+/// prefixed). Structural validation ONLY — it mirrors sd-server's own
+/// contract (examples/common/common.cpp: non-empty frame arrays,
+/// string elements, soundtracks ≤ videos) so the child stays the sole
+/// authority on content decoding; a request that passes here can still
+/// fail there on a corrupt image or non-WAV payload, and that error
+/// rides back verbatim.
+// The `ref_` prefix is the upstream request vocabulary (sd-server's
+// own field names) — renaming for lint symmetry would break the
+// one-to-one trace between validator and child contract.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug)]
+struct RefMedia {
+    /// Frame count of each reference video, in request order.
+    ref_video_frames: Vec<usize>,
+    ref_audios: usize,
+    ref_video_audios: usize,
+}
+
+impl RefMedia {
+    fn total_ref_frames(&self) -> u64 {
+        self.ref_video_frames.iter().map(|&n| n as u64).sum()
+    }
+}
+
+/// Validate reference-media fields against sd-server's structural
+/// contract. `Ok(None)` = no ref-media on the request. On the IMAGE
+/// surface any ref-video/audio key is a taught error: sd-server rejects
+/// them outside `vid_gen` ("reference video and audio inputs require
+/// `vid_gen` mode") and the client's fix is the other route, not payload
+/// surgery — so the gateway names the route instead of forwarding.
+fn parse_ref_media(v: &serde_json::Value, video: bool) -> Result<Option<RefMedia>, String> {
+    const REF_KEYS: [&str; 3] = ["ref_videos", "ref_audios", "ref_video_audios"];
+    if !REF_KEYS.iter().any(|k| v.get(k).is_some()) {
+        return Ok(None);
+    }
+    if !video {
+        return Err(
+            "reference video/audio inputs (ref_videos/ref_audios/ref_video_audios) are \
+             video-lane fields — send them to POST /v1/videos, not the image route"
+                .to_string(),
+        );
+    }
+    let mut ref_video_frames = Vec::new();
+    if let Some(videos) = v.get("ref_videos").filter(|val| !val.is_null()) {
+        let Some(arr) = videos.as_array() else {
+            return Err(
+                "\"ref_videos\" must be an array of videos, each an array of base64 frame strings"
+                    .to_string(),
+            );
+        };
+        for video in arr {
+            let Some(frames) = video.as_array() else {
+                return Err("\"ref_videos\" must be an array of videos, each an array of base64 frame strings".to_string());
+            };
+            if frames.is_empty() {
+                return Err(
+                    "each \"ref_videos\" entry must be a non-empty array of base64 frame strings"
+                        .to_string(),
+                );
+            }
+            if !frames.iter().all(serde_json::Value::is_string) {
+                return Err("each \"ref_videos\" frame must be a base64 image string".to_string());
+            }
+            ref_video_frames.push(frames.len());
+        }
+    }
+    let audio_count = |key: &str| -> Result<usize, String> {
+        match v.get(key).filter(|val| !val.is_null()) {
+            None => Ok(0),
+            Some(val) => {
+                let Some(arr) = val.as_array() else {
+                    return Err(format!("\"{key}\" must be an array of base64 WAV strings"));
+                };
+                if !arr.iter().all(serde_json::Value::is_string) {
+                    return Err(format!("\"{key}\" must be an array of base64 WAV strings"));
+                }
+                Ok(arr.len())
+            }
+        }
+    };
+    let ref_audios = audio_count("ref_audios")?;
+    let ref_video_audios = audio_count("ref_video_audios")?;
+    // sd-server: "each --ref-video-audio needs a corresponding
+    // --ref-video" — paired soundtracks can never outnumber videos.
+    if ref_video_audios > ref_video_frames.len() {
+        return Err(format!(
+            "\"ref_video_audios\" has {ref_video_audios} entries but \"ref_videos\" has {} — \
+             each paired soundtrack needs a reference video",
+            ref_video_frames.len()
+        ));
+    }
+    Ok(Some(RefMedia {
+        ref_video_frames,
+        ref_audios,
+        ref_video_audios,
+    }))
+}
+
+/// Capability gate for reference audio: the child's
+/// `/generation_features` map flips `ref_audios`/`ref_video_audios`
+/// false when the loaded model carries no Audio VAE/Encoder. A MISSING
+/// key means an engine build from before the feature existed — the
+/// request rides and the child's own answer (which may be a perfectly
+/// good generation or its verbatim error) is the truth; the gateway
+/// only pre-empts flags the engine explicitly advertises as absent.
+async fn ref_media_capability_gate(
+    state: &AppState,
+    engine: &blazar_runtime::EngineRef,
+    refs: &RefMedia,
+) -> Result<(), String> {
+    if refs.ref_audios == 0 && refs.ref_video_audios == 0 {
+        return Ok(());
+    }
+    let caps = child_capabilities(state, engine).await?;
+    let feature = |key: &str| -> Option<bool> {
+        caps.pointer(&format!("/generation_features/{key}"))
+            .and_then(serde_json::Value::as_bool)
+    };
+    if refs.ref_audios > 0 && feature("ref_audios") == Some(false) {
+        return Err(
+            "ref_audios requested but the loaded model has no Audio VAE/Encoder — pick a \
+             model that advertises reference-audio (e.g. an S2V family) or drop \"ref_audios\""
+                .to_string(),
+        );
+    }
+    if refs.ref_video_audios > 0 && feature("ref_video_audios") == Some(false) {
+        return Err(
+            "ref_video_audios requested but the loaded model has no Audio VAE — pick a \
+             model that advertises paired reference audio or drop \"ref_video_audios\""
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Resolve the gateway-consumed `OpenAI` knobs (`quality`, `style`)
@@ -963,6 +1123,12 @@ pub async fn generations(
     {
         return openai_error(400, "\"prompt\" must be a non-empty string");
     }
+    // Image-surface teaching for video-lane reference fields: the child
+    // rejects them outside vid_gen, and the client's fix is the other
+    // route — say so here instead of relaying an opaque child error.
+    if let Err(msg) = parse_ref_media(&parsed, false) {
+        return openai_error(400, &msg);
+    }
     let row = state
         .with_store(|s| resolve_model(s, &model).ok())
         .flatten();
@@ -1009,6 +1175,7 @@ pub async fn generations(
         false, // images: no mmproj lane — the vision encoder rides argv
         true,  // images lane: component sets are its cargo
         false,
+        false, // diffusion lane: not a generation surface
     )
     .await
     {
@@ -1197,6 +1364,7 @@ async fn apply_video_timing(
 /// the gate demands a curated video family, and there is no compat
 /// forward — sd-server's OpenAI-compat route serves images only, so
 /// every request rides the native `vid_gen` dialect.
+#[allow(clippy::too_many_lines)]
 pub async fn video_generations(
     State(state): State<Arc<AppState>>,
     key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
@@ -1227,6 +1395,15 @@ pub async fn video_generations(
              compose a continuation manually: an image edit, then a new video",
         );
     }
+    // Reference media rides the native vid_gen dialect verbatim; the
+    // gateway's job is structural teaching (shape errors name the
+    // field), scratch pricing (below), and the audio capability gate
+    // (once the engine is known).
+    let refs = match parse_ref_media(&parsed, true) {
+        Ok(refs) => refs,
+        Err(msg) => return openai_error(400, &msg),
+    };
+    let ref_frames = refs.as_ref().map_or(0, RefMedia::total_ref_frames);
     // Capture the seconds dial BEFORE canonicalization consumes it: the
     // pure converter must assume the 16 fps default, but the honest
     // frame count derives from the model's own default — corrected once
@@ -1261,7 +1438,7 @@ pub async fn video_generations(
     {
         return openai_error(400, &msg);
     }
-    if let Err(msg) = video_scratch_gate(&parsed, &model, &state) {
+    if let Err(msg) = video_scratch_gate(&parsed, &model, &state, ref_frames) {
         return openai_error(400, &msg);
     }
     // The lever is gateway-only vocabulary; it never rides to the child.
@@ -1277,6 +1454,7 @@ pub async fn video_generations(
         false,
         true, // videos lane: component sets are its cargo
         false,
+        false, // diffusion lane: not a generation surface
     )
     .await
     {
@@ -1285,6 +1463,11 @@ pub async fn video_generations(
     };
     if let Err(resp) = apply_generation_semantics(&state, &engine, &mut parsed, true).await {
         return resp;
+    }
+    if let Some(refs) = refs.as_ref()
+        && let Err(msg) = ref_media_capability_gate(&state, &engine, refs).await
+    {
+        return openai_error(400, &msg);
     }
     apply_video_timing(
         &state,
@@ -1353,6 +1536,7 @@ pub async fn edits(
         false,
         true, // images lane: component sets are its cargo
         false,
+        false, // diffusion lane: not a generation surface
     )
     .await
     {
@@ -1532,6 +1716,7 @@ pub async fn variations(
         false, // img2img needs no vision-encoder sidecar (that is edits cargo)
         true,  // images lane: component sets are its cargo
         false,
+        false, // diffusion lane: not a generation surface
     )
     .await
     {
@@ -2678,6 +2863,7 @@ pub async fn upscale(
             false, // no mmproj lane
             true,  // component sets are the diffusion lane's cargo
             false,
+            false, // diffusion lane: not a generation surface
         )
         .await
         {
@@ -3083,6 +3269,88 @@ mod tests {
             gate_size(&serde_json::json!({"size": "320x320", "width": 1024, "height": 1024})),
             (320, 320)
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__parse_ref_media__accepts_upstream_shapes_and_nulls() {
+        // Absent → nothing to gate.
+        assert!(
+            parse_ref_media(&serde_json::json!({}), true)
+                .unwrap()
+                .is_none()
+        );
+        // Full upstream shape: two videos (2 and 4 frames), one audio,
+        // one paired soundtrack, plus data-URL prefixed audio spelling.
+        let refs = parse_ref_media(
+            &serde_json::json!({
+                "ref_videos": [["AAA", "BBB"], ["CCC", "DDD", "EEE", "FFF"]],
+                "ref_audios": ["data:audio/wav;base64,AAAA"],
+                "ref_video_audios": ["AAAA"]
+            }),
+            true,
+        )
+        .unwrap()
+        .expect("present");
+        assert_eq!(refs.total_ref_frames(), 6);
+        assert_eq!(refs.ref_audios, 1);
+        assert_eq!(refs.ref_video_audios, 1);
+        // Null clears per sd-server's parser contract — treated as
+        // absent for gating, never an error.
+        assert!(
+            parse_ref_media(
+                &serde_json::json!({"ref_videos": null, "ref_audios": null}),
+                true
+            )
+            .unwrap()
+            .is_none()
+                || parse_ref_media(&serde_json::json!({"ref_videos": null}), true)
+                    .unwrap()
+                    .is_some_and(|r| r.total_ref_frames() == 0 && r.ref_audios == 0)
+        );
+        // Audio-only request is legal: ref_audios rides without videos.
+        let audio_only = parse_ref_media(&serde_json::json!({"ref_audios": ["AAAA"]}), true)
+            .unwrap()
+            .expect("present");
+        assert_eq!(audio_only.total_ref_frames(), 0);
+        assert_eq!(audio_only.ref_audios, 1);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__parse_ref_media__rejects_each_structural_violation() {
+        // Every rejection mirrors sd-server's parser: non-array
+        // containers, empty frame arrays, non-string frames/audios,
+        // and soundtracks outnumbering videos.
+        let non_array = serde_json::json!({"ref_videos": "not-an-array"});
+        assert!(parse_ref_media(&non_array, true).is_err());
+        let frame_not_array = serde_json::json!({"ref_videos": ["AAA"]});
+        assert!(parse_ref_media(&frame_not_array, true).is_err());
+        let empty_video = serde_json::json!({"ref_videos": [[]]});
+        assert!(parse_ref_media(&empty_video, true).is_err());
+        let non_string_frame = serde_json::json!({"ref_videos": [[42]]});
+        assert!(parse_ref_media(&non_string_frame, true).is_err());
+        let non_string_audio = serde_json::json!({"ref_audios": [7]});
+        assert!(parse_ref_media(&non_string_audio, true).is_err());
+        let audio_not_array = serde_json::json!({"ref_video_audios": {"k": "v"}});
+        assert!(parse_ref_media(&audio_not_array, true).is_err());
+        let pairing_overflow =
+            serde_json::json!({"ref_videos": [["A"]], "ref_video_audios": ["AA", "BB"]});
+        let err = parse_ref_media(&pairing_overflow, true).unwrap_err();
+        assert!(err.contains("ref_video_audios"), "{err}");
+        assert!(err.contains("reference video"), "{err}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__parse_ref_media__image_surface_names_the_video_route() {
+        // On the image surface any ref key teaches the route fix —
+        // sd-server rejects these outside vid_gen, so relaying would
+        // only obscure the actionable answer.
+        let err = parse_ref_media(&serde_json::json!({"ref_videos": [["A"]]}), false).unwrap_err();
+        assert!(err.contains("/v1/videos"), "{err}");
+        // Same teaching for the audio spellings.
+        assert!(parse_ref_media(&serde_json::json!({"ref_audios": ["A"]}), false).is_err());
     }
 
     #[test]

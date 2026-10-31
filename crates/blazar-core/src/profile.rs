@@ -232,6 +232,13 @@ impl CapacityStatus {
 pub struct TuningOverrides {
     pub ctx: Option<u32>,
     pub kv_quant: Option<bool>,
+    /// Explicit KV-cache grade pair (`type_k`, `type_v`) — symmetric
+    /// (`("q5_0", "q5_0")`) or mixed (`("q8_0", "q4_0")`). Takes
+    /// precedence over `kv_quant` and the capacity ladder; an f16-class
+    /// symmetric pair means force-off (no cache-type flags), mirroring
+    /// the config `cache_type` semantics. `tune --search` fills this
+    /// from the measured argmax across the KV ladder.
+    pub kv_pair: Option<(String, String)>,
     pub threads: Option<u32>,
     /// Flash attention on/off (default heuristic: auto).
     pub fa: Option<bool>,
@@ -458,7 +465,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // refuse teaching names this exact lever — it must not be a
         // dead end.
         let mut scratch: Vec<String> = Vec::new();
-        let pinned_pair: Option<(String, String)> = if tuning.kv_quant == Some(true) {
+        let pinned_pair: Option<(String, String)> = if let Some((k, v)) = &tuning.kv_pair {
+            // Literal grades (f16-class included): this pair only feeds
+            // size math, and a forced-f16 pin means full-size KV.
+            Some((k.clone(), v.clone()))
+        } else if tuning.kv_quant == Some(true) {
             Some(("q8_0".to_string(), "q8_0".to_string()))
         } else {
             let (k, v) = config.effective_cache_type_kv(input.model_name);
@@ -639,7 +650,20 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // (3KV/8) -> q4_0 (KV/4). Per-phase `cache_type_k`/`cache_type_v`
     // beat the legacy symmetric `cache_type` for their side; a lone set
     // side mirrors (resolver contract, config.rs).
-    let (kv_k, kv_v): (Option<String>, Option<String>) = if let Some(on) = tuning.kv_quant {
+    let (kv_k, kv_v): (Option<String>, Option<String>) = if let Some((k, v)) = &tuning.kv_pair {
+        // Same symmetric/mixed contract as the config branch below: a
+        // symmetric f16-class pair = force off (no flags); anything else
+        // emits the literal grades so an explicit split stays a split.
+        if k == v {
+            let g = match k.as_str() {
+                "f32" | "f16" | "bf16" => None,
+                _ => Some(k.clone()),
+            };
+            (g.clone(), g)
+        } else {
+            (Some(k.clone()), Some(v.clone()))
+        }
+    } else if let Some(on) = tuning.kv_quant {
         let grade = on.then(|| "q8_0".to_string());
         (grade.clone(), grade)
     } else {
@@ -3430,10 +3454,11 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
     if tuning.fa == Some(true) {
         push_gated(input, &mut argv, &mut warnings, "fa", "--diffusion-fa", &[]);
     }
-    for knob in ["ctx", "kv_quant", "batch", "ubatch"] {
+    for knob in ["ctx", "kv_quant", "kv_pair", "batch", "ubatch"] {
         let set = match knob {
             "ctx" => tuning.ctx.is_some(),
             "kv_quant" => tuning.kv_quant.is_some(),
+            "kv_pair" => tuning.kv_pair.is_some(),
             "batch" => tuning.batch.is_some(),
             _ => tuning.ubatch.is_some(),
         };
@@ -7915,6 +7940,7 @@ mod tests {
         chat_template_kwargs: None,
         ctx: None,
         slots: None,
+        adaptive_override: None,
         spec: None,
         lazy_mode: None,
         loras: None,
@@ -10346,6 +10372,60 @@ mod tests {
     }
 
     #[test]
+    fn unit__kv_pair__beats_kv_quant_and_ladder() {
+        // `tune --search` fills kv_pair from the measured argmax; that
+        // pin must win over both the legacy bool and a tight card's
+        // ladder demotion (the measurement is the receipt).
+        let cfg = Config::default();
+        let hw = gpu_hw(5_500, 32_000, 8); // ladder alone would pick q4_0
+        let g = meta();
+        let t = TuningOverrides {
+            kv_pair: Some(("q5_0".into(), "q5_0".into())),
+            kv_quant: Some(false), // legacy bool must NOT mask the pair
+            ..Default::default()
+        };
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-k", "q5_0"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-v", "q5_0"]));
+    }
+
+    #[test]
+    fn unit__kv_pair__symmetric_f16_forces_off() {
+        let cfg = Config::default();
+        let hw = gpu_hw(5_500, 32_000, 8); // ladder would engage q4_0
+        let g = meta();
+        let t = TuningOverrides {
+            kv_pair: Some(("f16".into(), "f16".into())),
+            ..Default::default()
+        };
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
+        assert!(
+            !p.argv.contains(&"--cache-type-k".to_string()),
+            "{:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv.contains(&"--cache-type-v".to_string()),
+            "{:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__kv_pair__mixed_grades_stay_split() {
+        let cfg = Config::default();
+        let hw = gpu_hw(24_000, 32_000, 8); // no ladder interference
+        let g = meta();
+        let t = TuningOverrides {
+            kv_pair: Some(("q8_0".into(), "q4_0".into())),
+            ..Default::default()
+        };
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-k", "q8_0"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-v", "q4_0"]));
+    }
+
+    #[test]
     fn unit__kv_differential__explicit_pair_emits_split_flags() {
         // Differential pin: K keeps retrieval precision (q8_0) while V
         // drops to q4_0 — the capacity win that motivated the knobs.
@@ -12743,6 +12823,7 @@ mod tests {
         assert_eq!(p.kv_est_bytes, g.kv_f16_bytes(total));
         let t = TuningOverrides {
             kv_quant: Some(true),
+            kv_pair: None,
             ..Default::default()
         };
         let p2 = compile(&inp, &t).unwrap();
@@ -13262,6 +13343,7 @@ mod tests {
             ctx: Some(8192),
             threads: Some(6),
             kv_quant: Some(true),
+            kv_pair: None,
             ..Default::default()
         };
         let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
@@ -14029,6 +14111,7 @@ mod tests {
         // Forced q8_0 halves it.
         let t = TuningOverrides {
             kv_quant: Some(true),
+            kv_pair: None,
             ..Default::default()
         };
         let p2 = compile(&inp, &t).unwrap();
@@ -14090,6 +14173,7 @@ mod tests {
         // q8_0 grade halves the quarter estimate, not a full-layer one.
         let t = TuningOverrides {
             kv_quant: Some(true),
+            kv_pair: None,
             ..Default::default()
         };
         let p2 = compile(&inp, &t).unwrap();

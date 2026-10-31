@@ -15,6 +15,18 @@ categories = ["command-line-utilities", "science"]
 name = "blazar"
 path = "src/main.rs"
 
+# Native rpm layout for cargo-generate-rpm (release workflow's
+# packages-rpm job). The completion sources are produced by that job
+# AFTER `cargo build --release` — a local `cargo generate-rpm` without
+# them fails; generate them first the same way the job does.
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/blazar", dest = "/usr/bin/blazar", mode = "755" },
+  { source = "target/rpm-completions/bash/blazar", dest = "/usr/share/bash-completion/completions/blazar" },
+  { source = "target/rpm-completions/zsh/_blazar", dest = "/usr/share/zsh/site-functions/_blazar" },
+  { source = "target/rpm-completions/fish/blazar.fish", dest = "/usr/share/fish/vendor_completions.d/blazar.fish" },
+]
+
 [features]
 default = []
 test-util = []

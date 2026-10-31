@@ -1,0 +1,31 @@
+# Maintainer: Santanu <santanu20@users.noreply.github.com>
+# Arch package for the Blazar CLI. This file is version-rolling: bump
+# pkgver per release. Per-release sha256 digests are published on the
+# GitHub release page; fill them with `updpkgsums` (or `makepkg -g`)
+# before building — the SKIP placeholders exist so a fresh pkgver bump
+# still builds for quick local testing.
+pkgname=blazar
+pkgver=0.28.0
+pkgrel=1
+pkgdesc="Local model server and inference gateway: OpenAI, Ollama, and Anthropic dialects over llama.cpp, mistral.rs, SGLang, and MLX engines"
+arch=(x86_64 aarch64)
+url="https://github.com/santanu20/blazar"
+license=(MIT Apache-2.0)
+depends=(glibc gcc-libs)
+source_x86_64=("$url/releases/download/v$pkgver/blazar-v$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$url/releases/download/v$pkgver/blazar-v$pkgver-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  cd "$srcdir"
+  install -Dm0755 blazar "$pkgdir/usr/bin/blazar"
+  install -Dm0644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm0644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+  "$pkgdir/usr/bin/blazar" completions bash > blazar.bash
+  "$pkgdir/usr/bin/blazar" completions zsh   > _blazar
+  "$pkgdir/usr/bin/blazar" completions fish > blazar.fish
+  install -Dm0644 blazar.bash "$pkgdir/usr/share/bash-completion/completions/blazar"
+  install -Dm0644 _blazar "$pkgdir/usr/share/zsh/site-functions/_blazar"
+  install -Dm0644 blazar.fish "$pkgdir/usr/share/fish/vendor_completions.d/blazar.fish"
+}

@@ -263,8 +263,13 @@ fn unit__mistralrs_argv__multimodal_gguf_rides_derived_tok_model_id() {
         .expect("derived id rides the multimodal GGUF argv");
     assert_eq!(argv[i + 1], "Qwen/Qwen3.5-9B");
 
-    // Underivable metadata (no org separator) emits nothing: the engine's
-    // own teaching refusal stays the user-facing surface.
+    // Underivable metadata (no org separator) falls back to the row's
+    // pull-time repo when it names a plausible Hub id — the flagged
+    // pull-era gap (text-GGUF SWA refusals forced the extra_args
+    // escape hatch even though the row RECORDS its source repo).
+    // Contract chain: file metadata > explicit user pin > row.repo >
+    // teaching refusal. A junk repo (registry paths, filesystem
+    // placeholders) still derives nothing.
     std::fs::write(
         &gguf,
         gguf_bytes(&[
@@ -283,7 +288,27 @@ fn unit__mistralrs_argv__multimodal_gguf_rides_derived_tok_model_id() {
         },
         &f,
     );
-    assert!(!argv.contains(&"--tok-model-id".to_string()));
+    let i = argv
+        .iter()
+        .position(|a| a == "--tok-model-id")
+        .expect("plausible row.repo derives --tok-model-id");
+    assert_eq!(argv[i + 1], "o/r");
+
+    let mut junk_repo = m.clone();
+    junk_repo.repo = "registry.ollama.ai/library/qwen3.5".into();
+    let argv = mistralrs_argv(
+        &junk_repo,
+        &profile(0, &[]),
+        &Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 8123,
+        },
+        &f,
+    );
+    assert!(
+        !argv.contains(&"--tok-model-id".to_string()),
+        "junk repo must keep the engine's teaching refusal"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

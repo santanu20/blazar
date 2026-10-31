@@ -691,6 +691,7 @@ fn tuned_overrides() -> TuningOverrides {
     TuningOverrides {
         ctx: Some(8192),
         kv_quant: Some(true),
+        kv_pair: None,
         threads: Some(8),
         fa: Some(true),
         batch: Some(1024),

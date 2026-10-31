@@ -1161,6 +1161,16 @@ pub struct Config {
     /// `tune --slots` remains the permanent path). On by default.
     #[serde(default)]
     pub adaptive_slots: bool,
+    /// D5 decode-scaling gate on adaptive slots: suppress the slot
+    /// adoption when fresh solo + loaded throughput evidence says the
+    /// model's aggregate decode barely scales with concurrency
+    /// (GPU-bound) — the reshape would pay a transition for queue
+    /// relief only, so the lane is taught instead (see
+    /// `SlotsDecodeBound`). The gate stands down while either regime
+    /// is unsampled, so a fresh model still adapts as before. On by
+    /// default; `false` restores pre-D5 always-adopt behavior.
+    #[serde(default)]
+    pub adaptive_decode_gate: bool,
     /// Bypass host buffer for extra VRAM (upstream default false).
     #[serde(default)]
     pub no_host: bool,
@@ -1309,6 +1319,14 @@ pub struct ModelOverride {
     /// Per-model parallel slots (`-np`); overrides the global `slots`
     /// for this model only. 0 keeps upstream auto.
     pub slots: Option<u32>,
+    /// Lift the manual-`slots`-pin exclusion from adaptive-slot
+    /// adoption for this model only (D2): the pin becomes the base
+    /// shape adaptation steps from, not a ceiling. Replicas and
+    /// deterministic exclusions stay either way. Default `None`/false —
+    /// a pin is policy; sustained pressure behind it surfaces as a
+    /// `SlotsPinnedPressure` event with this knob as the remedy.
+    #[serde(default)]
+    pub adaptive_override: Option<bool>,
     /// Per-model determinism pin (None = inherit the global
     /// `deterministic`). `true` forces slots = 1 for this model.
     #[serde(default)]
@@ -3132,6 +3150,7 @@ impl Default for Config {
             warm_on_pull: false,
             idle_ram_warm: true,
             adaptive_slots: true,
+            adaptive_decode_gate: true,
             no_host: false,
             op_offload: None,
             keep_tokens: 0,

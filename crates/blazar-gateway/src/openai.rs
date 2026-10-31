@@ -250,6 +250,7 @@ pub async fn embeddings(
         false, // embeddings: text-only
         false, // text surface: diffusion rows teach the images lane
         false,
+        false, // embeddings: dedicated child, not a generation lane
     )
     .await
     {
@@ -727,6 +728,7 @@ pub async fn openai_proxy(
             .is_some_and(|b| crate::proxy::body_needs_vision(b, false)),
         false, // text surface: diffusion rows teach the images lane
         false,
+        true, // chat: generation surface (llama.cpp variant ride)
     )
     .await
     {
@@ -1473,13 +1475,14 @@ pub async fn scoped_proxy(
             .and_then(|v| v.to_str().ok()),
     );
     let class = crate::queue::classify_work(body_has_tools(&body), false);
-    let (engine, load_ms) =
-        match ensure_with_admission(&state, &model, priority, class, None, false, false, false)
-            .await
-        {
-            Ok(ok) => ok,
-            Err(resp) => return *resp,
-        };
+    let (engine, load_ms) = match ensure_with_admission(
+        &state, &model, priority, class, None, false, false, false, true,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
     let model_name = engine.name.clone();
     let deadline_ms = headers
         .get("x-blazar-deadline-ms")
@@ -1687,6 +1690,7 @@ pub async fn responses_api(
             .is_ok_and(|b| crate::proxy::body_needs_vision(&b, false)),
         false, // text surface: diffusion rows teach the images lane
         false,
+        true, // responses: generation surface (llama.cpp variant ride)
     )
     .await
     {
@@ -1897,6 +1901,9 @@ async fn buffered_response_roundtrip(
         Err(openai_error(status, msg))
     }
     let t0 = std::time::Instant::now();
+    // D5 class-routing anchor: guard is held from here through the note,
+    // so both live counts include this request (see `others_peak`).
+    let entry_live = state.sup.model_live_streams(model_name);
     let url = format!(
         "{}/v1/responses",
         crate::proxy::child_base(&engine.endpoint)
@@ -2021,9 +2028,12 @@ async fn buffered_response_roundtrip(
     // A2: blend the completion's decode rate into the model's EWMA
     // (t0 predates the fan/single send on this branch).
     if let Some(n) = out_tok {
-        state
-            .sup
-            .note_model_throughput(model_name, n, t0.elapsed().as_secs_f64());
+        state.sup.note_model_throughput(
+            model_name,
+            n,
+            t0.elapsed().as_secs_f64(),
+            crate::proxy::others_peak(entry_live, state.sup.model_live_streams(model_name)),
+        );
     }
     // FIX6: this buffered branch bypasses proxy_request's sniffer —
     // charge token budgets directly from the parsed usage.
@@ -2157,6 +2167,7 @@ pub async fn lora_adapters(
         false,
         false, // text surface: diffusion rows teach the images lane
         false,
+        false, // adapter control plane: dedicated child
     )
     .await
     {

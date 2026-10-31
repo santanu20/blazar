@@ -1,4 +1,5 @@
 adaptive_decay
+adaptive_decode_gate
 adaptive_slots
 adaptive_target
 agent

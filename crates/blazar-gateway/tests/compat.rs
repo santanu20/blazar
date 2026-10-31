@@ -396,6 +396,9 @@ async fn client__ollama_native__env_dialect_untouched() {
 }
 
 #[tokio::test]
+// Capability discovery asserts one thing per surface; splitting it
+// would scatter the census contract this test pins in one place.
+#[allow(clippy::too_many_lines)]
 async fn client__well_known__capability_discovery() {
     let cfg = support::config_with_keys();
     let ts = start(cfg).await;
@@ -484,6 +487,35 @@ async fn client__well_known__capability_discovery() {
         .await
         .unwrap();
     assert_eq!(anon.status(), 401);
+    // F4 census rule: /api/usage is advertised in the ollama lane AND
+    // is a mounted route serving the rollup shape (empty is honest —
+    // no traffic has flown through this test server).
+    let ollama_eps: Vec<&str> = v["endpoints"]["ollama"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+    assert!(
+        ollama_eps.contains(&"/api/usage"),
+        "census missing /api/usage"
+    );
+    blazar_core::tls::ensure_tls_provider();
+    let usage: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/usage", ts.base))
+        .bearer_auth("plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(usage["object"], "blazar.usage.daily");
+    assert_eq!(usage["days_window"], 7);
+    assert!(
+        usage["days"].as_array().is_some(),
+        "days must be an array even when empty"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

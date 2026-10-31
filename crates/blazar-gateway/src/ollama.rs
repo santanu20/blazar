@@ -470,6 +470,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "blazar_ctx": p.ctx,
                 "blazar_slots": p.slots,
                 "blazar_slots_configured": p.slots_configured,
+                "blazar_slots_source": p.slots_source,
                 "blazar_gpu": p.gpu,
                 "blazar_device": p.device,
                 "blazar_device_id": p.device_id,
@@ -819,7 +820,8 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
         BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated, FailoverSwitched,
         InstanceStateChanged, ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress,
-        QueueDepth, SlotsAutoAdopted, SlotsCtxAutoFit, SlotsReshaped, SpecGovernorOff,
+        QueueDepth, SlotsAutoAdopted, SlotsCtxAutoFit, SlotsDecodeBound, SlotsDrainCutover,
+        SlotsPinnedPressure, SlotsPrewarmCutover, SlotsReshaped, SpecGovernorOff,
         SpecGovernorRecovered,
     };
     match e {
@@ -830,6 +832,10 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
         SlotsAutoAdopted { .. } => "slots_auto_adopted",
         SlotsCtxAutoFit { .. } => "slots_ctx_auto_fit",
         SlotsReshaped { .. } => "slots_reshaped",
+        SlotsPinnedPressure { .. } => "slots_pinned_pressure",
+        SlotsDrainCutover { .. } => "slots_drain_cutover",
+        SlotsDecodeBound { .. } => "slots_decode_bound",
+        SlotsPrewarmCutover { .. } => "slots_prewarm_cutover",
         SpecGovernorOff { .. } => "spec_governor_off",
         SpecGovernorRecovered { .. } => "spec_governor_recovered",
         ModelPulled { .. } => "model_pulled",
@@ -1353,12 +1359,29 @@ pub async fn chat(
         crate::proxy::body_needs_vision(&req, true),
         false, // text surface: diffusion rows teach the images lane
         false,
+        true, // chat: generation surface (llama.cpp variant ride)
     )
     .await
     {
         Ok(ok) => ok,
         Err(resp) => return *resp,
     };
+    // llama.cpp LoRA-variant ride (generation surface): a `base+adapter`
+    // spelling resolved to the resident base child selects the adapter
+    // per request through the completion-schema `lora` field. The
+    // pre-spawn stamp keeps the caller's spelling for llamacpp; re-stamp
+    // the engine's own name so the body names the base model, and
+    // surface the ride teaching instead of silently serving base
+    // weights (the wrong-answer failure mode the ride exists to
+    // prevent).
+    match crate::proxy::llamacpp_variant_lora(&state, &engine, Some(&model_field)).await {
+        Some(Ok(pairs)) => {
+            crate::proxy::set_child_lora(&mut openai_req, &pairs);
+            crate::proxy::set_child_model(&mut openai_req, &engine.name);
+        }
+        Some(Err(teach)) => return api_error(502, &teach),
+        None => {}
+    }
     // F12: full keep_alive contract — >0 pins the instance for N s,
     // -1 pins "forever", 0 clears any prior pin (the evict-after-response
     // path below then owns teardown). Applied at admission so the pin
@@ -1973,6 +1996,9 @@ async fn proxy_core_chat(
     if !stream {
         // We translate the non-stream response into ollama shape.
         let t0 = std::time::Instant::now();
+        // D5 class-routing anchor: the guard is held from here through
+        // the note, so both live counts include this request.
+        let entry_live = state.sup.model_live_streams(model);
         let ttft_secs;
         // Gateway-mediated MCP tools: the loop owns every child round,
         // so it takes precedence over the best-of fan on requests that
@@ -2166,9 +2192,12 @@ async fn proxy_core_chat(
             .pointer("/usage/completion_tokens")
             .and_then(Value::as_u64)
         {
-            state
-                .sup
-                .note_model_throughput(model, n, t0.elapsed().as_secs_f64());
+            state.sup.note_model_throughput(
+                model,
+                n,
+                t0.elapsed().as_secs_f64(),
+                crate::proxy::others_peak(entry_live, state.sup.model_live_streams(model)),
+            );
         }
         // Non-stream + enforce: judge before translation (streaming stays
         // warn-only — bytes are already on the wire).
@@ -2735,6 +2764,7 @@ pub async fn embeddings(
         false,
         false, // text surface: diffusion rows teach the images lane
         false,
+        false, // embeddings: dedicated child
     )
     .await
     {
@@ -2887,6 +2917,7 @@ pub async fn embed(
         false,
         false, // text surface: diffusion rows teach the images lane
         false,
+        false, // embed: dedicated child
     )
     .await
     {
@@ -3071,6 +3102,7 @@ pub async fn rerank(
         false,
         false, // text surface: diffusion rows teach the images lane
         false,
+        false, // rerank: dedicated child (per-request lora skips rerank)
     )
     .await
     {
@@ -3295,6 +3327,7 @@ pub async fn generate(
         crate::proxy::body_needs_vision(&req, true),
         false, // text surface: diffusion rows teach the images lane
         false,
+        true, // generate: generation surface (llama.cpp variant ride)
     )
     .await
     {
@@ -3308,6 +3341,17 @@ pub async fn generate(
     }
     state.sup.note_prefix_hit(&engine.name);
     let model_name = row.name.clone();
+    // llama.cpp LoRA-variant ride (see /api/chat): `base+adapter` on the
+    // resident base child carries the per-request `lora` field and the
+    // engine's own model name.
+    match crate::proxy::llamacpp_variant_lora(&state, &engine, Some(&model)).await {
+        Some(Ok(pairs)) => {
+            crate::proxy::set_child_lora(&mut openai_req, &pairs);
+            crate::proxy::set_child_model(&mut openai_req, &engine.name);
+        }
+        Some(Err(teach)) => return api_error(502, &teach),
+        None => {}
+    }
     // Per-engine child stamp with the sglang `base:adapter` variant
     // override (see proxy.rs::child_model_stamp_for).
     if let Some(stamp) = crate::proxy::child_model_stamp_for(
@@ -3623,6 +3667,10 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         false,
         false, // text surface: diffusion rows teach the images lane
         false,
+        false, // session checkpoints ride /slots, not the completion
+               // schema — the per-request `lora` field cannot follow, so
+               // variant checkpoints keep their dedicated child (spawn
+               // posture at save time == posture at restore)
     )
     .await
     {
@@ -4132,6 +4180,40 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                     "blazar_model_decode_tokens_per_second{{model=\"{model}\"}} {rate:.3}"
                 );
             }
+        }
+    }
+    // D4 adaptive-slots telemetry: the queueing floor behind a pinned
+    // or under-provisioned lane, visible without offline log scraping.
+    let slots_rows = state.sup.slots_gauge_snapshot();
+    if !slots_rows.is_empty() {
+        merged.push_str(
+            "# HELP blazar_slot_pressure_per_model Requests currently parked on admission per model (the adaptive-slots queueing floor)\n# TYPE blazar_slot_pressure_per_model gauge\n",
+        );
+        for (model, pressure, ..) in &slots_rows {
+            let _ = writeln!(
+                merged,
+                "blazar_slot_pressure_per_model{{model=\"{model}\"}} {pressure}"
+            );
+        }
+        merged.push_str(
+            "# HELP blazar_slots_adopted_per_model Adaptive slot target adopted for this model (absent = natural shape)\n# TYPE blazar_slots_adopted_per_model gauge\n",
+        );
+        for (model, _, adopted, _) in &slots_rows {
+            if let Some(slots) = adopted {
+                let _ = writeln!(
+                    merged,
+                    "blazar_slots_adopted_per_model{{model=\"{model}\"}} {slots}"
+                );
+            }
+        }
+        merged.push_str(
+            "# HELP blazar_slots_effective_per_model Effective live slot cap per model (adopted, else child argv -np, else config)\n# TYPE blazar_slots_effective_per_model gauge\n",
+        );
+        for (model, .., effective) in &slots_rows {
+            let _ = writeln!(
+                merged,
+                "blazar_slots_effective_per_model{{model=\"{model}\"}} {effective}"
+            );
         }
     }
     // B2 governor state: which models the spec governor is watching

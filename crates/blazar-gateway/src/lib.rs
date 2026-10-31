@@ -23,6 +23,7 @@ pub mod jobs;
 pub mod model_doctor;
 pub mod quantiles;
 pub mod requests;
+pub mod usage;
 
 pub mod failover;
 pub mod keys;
@@ -69,6 +70,17 @@ use state::AppState;
 /// response header clients see.
 #[derive(Clone)]
 pub struct TraceId(pub String);
+
+/// Per-response usage accumulator the metered body stream folds into:
+/// the trailing byte window (last `usage::TAIL_LIMIT` bytes hold the
+/// final usage chunk across dialects) plus first/last chunk stamps for
+/// TTFT and generation-duration accounting.
+#[derive(Default, Clone)]
+struct UsageTap {
+    tail: Vec<u8>,
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+}
 
 /// Bearer auth: active iff any `[[keys]]` exist (children stay loopback
 /// and unauthenticated). Resolves the presented secret to its key entry
@@ -164,22 +176,26 @@ async fn request_log(
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    // E4 audit: buffer the body ONLY when audit is on AND this is an
-    // audited generation lane — extract `model`, hand the bytes back
-    // untouched. Audit off = zero request-path changes.
+    // E4 audit + F4 usage: buffer the body ONLY when audit is on or
+    // this is a metered generation lane — extract `model`, hand the
+    // bytes back untouched. Neither on = zero request-path changes.
     let audit_on = state.audit_tx.is_some();
+    let usage_lane = crate::usage::USAGE_PATHS.contains(&path.as_str());
     let key = req
         .extensions()
         .get::<keys::KeyCtx>()
         .map(|k| k.name.clone());
     let mut model = None;
-    if audit_on {
+    if audit_on || usage_lane {
         let content_len = req
             .headers()
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
-        if crate::audit::should_sniff(&method, &path, content_len) {
+        let sniff = method == axum::http::Method::POST
+            && content_len.is_none_or(|n| n <= crate::audit::AUDIT_BODY_SNIFF_LIMIT as u64)
+            && (usage_lane || crate::audit::AUDITED_PATHS.contains(&path.as_str()));
+        if sniff {
             let (parts, body) = req.into_parts();
             match axum::body::to_bytes(body, crate::audit::AUDIT_BODY_SNIFF_LIMIT).await {
                 Ok(bytes) => {
@@ -218,6 +234,9 @@ async fn request_log(
     // E4 audit line: identity + outcome, never content. try_send — a
     // saturated writer drops (and counts) rather than stalling the
     // response.
+    // The audit line takes ownership of `model`; the usage tap needs
+    // the name past that point, so lift it out first.
+    let usage_model = model.clone();
     if let Some(tx) = &state.audit_tx
         && crate::audit::AUDITED_PATHS.contains(&path.as_str())
     {
@@ -269,6 +288,64 @@ async fn request_log(
         queue_depth = state.queue.depth(),
         "request"
     );
+    // F4 usage: re-stream successful generation-lane responses through
+    // a tap that keeps the last 8 KiB (usage JSON rides the final
+    // chunk in every dialect) plus first/last chunk timings. The meter
+    // records at stream end — one hash bump, no store I/O on this path
+    // (flushing is the periodic task's job). No model or non-2xx =
+    // nothing metered.
+    if usage_lane
+        && (200..300).contains(&status)
+        && let Some(model_name) = usage_model
+    {
+        let (parts, body) = resp.into_parts();
+        let tap = std::sync::Arc::new(std::sync::Mutex::new(UsageTap::default()));
+        let tap_map = std::sync::Arc::clone(&tap);
+        let metered = futures::StreamExt::map(body.into_data_stream(), move |chunk| {
+            if let Ok(bytes) = chunk.as_ref() {
+                let mut t = tap_map.lock().expect("usage tap poisoned");
+                let now = std::time::Instant::now();
+                t.first.get_or_insert(now);
+                t.last = Some(now);
+                // Keep the trailing window; the usage object is in the
+                // final SSE/NDJSON line, never the head.
+                t.tail.extend_from_slice(bytes);
+                let overflow = t.tail.len().saturating_sub(crate::usage::TAIL_LIMIT);
+                if overflow > 0 {
+                    t.tail.drain(..overflow);
+                }
+            }
+            chunk
+        });
+        let tap_end = std::sync::Arc::clone(&tap);
+        let meter = std::sync::Arc::clone(&state.usage);
+        let finalized = futures::StreamExt::chain(
+            metered,
+            futures::stream::once(async move {
+                let tap = tap_end.lock().expect("usage tap poisoned").clone();
+                let (in_tok, out_tok, cached_tok) = crate::usage::sniff_usage_full(&tap.tail);
+                let gen_secs = match (tap.first, tap.last) {
+                    (Some(f), Some(l)) => l.saturating_duration_since(f).as_secs_f64(),
+                    _ => 0.0,
+                };
+                // TTFT is measured from request entry (before the
+                // handler chain), the user-felt first-token latency.
+                let ttft_ms = tap
+                    .first
+                    .map(|f| f.duration_since(started).as_secs_f64() * 1000.0);
+                meter.record(
+                    &model_name,
+                    in_tok.unwrap_or(0),
+                    out_tok.unwrap_or(0),
+                    cached_tok.unwrap_or(0),
+                    gen_secs,
+                    ttft_ms,
+                );
+                Ok::<axum::body::Bytes, axum::Error>(axum::body::Bytes::new())
+            }),
+        );
+        resp = Response::from_parts(parts, Body::from_stream(finalized));
+    }
     resp
 }
 
@@ -447,6 +524,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Per-GPU capacity: device census + per-resident VRAM
         // attribution joined from the supervisor's live rows.
         .route("/api/capacity", get(capacity::capacity))
+        .route("/api/usage", get(crate::usage::usage_api))
         .route("/api/failover", get(failover::list))
         .route("/api/failover/{chain}", get(failover::detail))
         .route("/api/failover/{chain}/pin", post(failover::pin))
@@ -998,6 +1076,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                         "/v1/requests/{id}/cancel", "/v1/requests/{id}/interrupt",
                         "/audio/transcriptions", "/audio/translations"],
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/capacity", "/api/explain/{model}", "/api/show",
+                       "/api/usage",
                        "/api/replicate", "/api/route/{model}",
                        "/api/model-doctor", "/api/model-doctor/{model}",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
@@ -1262,6 +1341,23 @@ pub async fn serve(
             }
         })
     };
+    // F4 usage rollup flusher: the request tap records into the meter's
+    // in-memory buckets (zero store I/O on the hot path); this task
+    // drains them into `usage_daily` every minute — a crash loses at
+    // most one window, and `/api/usage` + `blazar usage` stay current.
+    let usage_flush_task = {
+        let meter = std::sync::Arc::clone(&state.usage);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_mins(1));
+            interval.tick().await; // immediate first tick: skip (empty)
+            loop {
+                interval.tick().await;
+                if let Err(e) = meter.flush() {
+                    tracing::warn!("usage rollup flush failed: {e}");
+                }
+            }
+        })
+    };
     // OTLP flusher (no-op task when the endpoint is unset).
     let otlp_task = {
         let otlp = Arc::clone(&state.otlp);
@@ -1383,6 +1479,12 @@ pub async fn serve(
     otlp_task.abort();
     hint_task.abort();
     reshape_wake_task.abort();
+    usage_flush_task.abort();
+    // Final usage drain after the flusher stops: everything recorded
+    // since the last tick lands in the store before exit.
+    if let Err(e) = state.usage.flush() {
+        tracing::warn!("usage rollup final flush failed: {e}");
+    }
     // H8: the lazy whisper-server child (if any request spawned one).
     state.whisper.shutdown().await;
     // MCP stdio children die before the engines (fast, independent).

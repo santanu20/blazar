@@ -38,7 +38,14 @@ pub struct Store {
 /// v14 stores re-enter the migration block and take the two ALTERs;
 /// without it they sat at the latest version and every owner INSERT
 /// failed (the model-doctor poll 404 on upgraded stores).
-const SCHEMA_VERSION: i32 = 16;
+/// v17 adds `spec_receipts` (measured spec-mode race verdicts per
+/// model+engine+mode, written by `blazar tune <model> --spec-race`).
+/// Purely additive — CREATE TABLE IF NOT EXISTS inside the migration
+/// batch covers both fresh and old stores.
+/// v18 adds `usage_daily` (per-model daily token/latency rollups,
+/// flushed by the gateway's in-memory usage meter). Additive the same
+/// way.
+const SCHEMA_VERSION: i32 = 18;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -109,6 +116,28 @@ CREATE TABLE IF NOT EXISTS bench_history (
     detail TEXT,                     -- HTTP lane: probe params JSON
     quant TEXT,                      -- v13 evidence axis: model quantization
     hw_fingerprint TEXT              -- v13 evidence axis: canonical hw string
+);
+CREATE TABLE IF NOT EXISTS spec_receipts (
+    model       TEXT NOT NULL,       -- models.name the race measured
+    engine_tag  TEXT NOT NULL,       -- engine lane that hosted the race
+    mode        TEXT NOT NULL,       -- dense | ngram | dflash | draft
+    tok_per_s   REAL NOT NULL,       -- single-stream wall tok/s, greedy
+    dense_tps   REAL NOT NULL,       -- the race's dense baseline
+    ratio       REAL NOT NULL,       -- tok_per_s / dense_tps
+    measured_at INTEGER NOT NULL,    -- unix secs
+    PRIMARY KEY (model, engine_tag, mode)
+);
+CREATE TABLE IF NOT EXISTS usage_daily (
+    day           INTEGER NOT NULL,  -- yyyymmdd local day
+    model         TEXT NOT NULL,
+    in_tokens     INTEGER NOT NULL DEFAULT 0,
+    out_tokens    INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    requests      INTEGER NOT NULL DEFAULT 0,
+    gen_secs      REAL NOT NULL DEFAULT 0,    -- streaming window seconds
+    ttft_count    INTEGER NOT NULL DEFAULT 0, -- TTFT samples
+    ttft_ms_total REAL NOT NULL DEFAULT 0,    -- sum, for mean
+    PRIMARY KEY (day, model)
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id            TEXT PRIMARY KEY,
@@ -332,15 +361,54 @@ pub fn quantized_safetensors_signal(name: &str, repo: &str, path: &str) -> bool 
 }
 
 /// MLX-format signal: the pull convention carries the marker in the
-/// repo (`mlx-community/...`) or name/path token. Callers gate on the
-/// row being a directory (the safetensors class) exactly as they do
-/// for `safetensors` — a GGUF file from an mlx repo is a GGUF row.
+/// repo (`mlx-community/...`) or name/path token, with the on-disk
+/// layout probe as fallback — community dirs renamed away from the
+/// `mlx` token still route correctly. Callers gate on the row being a
+/// directory (the safetensors class) exactly as they do for
+/// `safetensors` — a GGUF file from an mlx repo is a GGUF row.
 #[must_use]
 pub fn mlx_signal(name: &str, repo: &str, path: &str) -> bool {
-    [name, repo, path].iter().any(|s| {
+    let token = [name, repo, path].iter().any(|s| {
         s.to_ascii_lowercase()
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|tok| tok == "mlx")
+    });
+    token || mlx_layout_config(path)
+}
+
+/// On-disk MLX-layout fallback for [`mlx_signal`]: MLX quantized dirs
+/// carry a `quantization` (often mirrored as `quantization_config`)
+/// block with NUMERIC `bits` + `group_size` and NO `quant_method`
+/// string — the layout every local MLX pull stamps (mlx-lm
+/// `save_shards`). Quantized-safetensors dirs (AWQ/GPTQ/torchao)
+/// always carry `quant_method`, which cleanly excludes them; plain
+/// bf16 dirs carry no quantization block at all. Files, missing or
+/// undecodable `config.json`, and non-MLX layouts return false — the
+/// token signal stays primary, this only closes the renamed-dir gap.
+fn mlx_layout_config(path: &str) -> bool {
+    let cfg = std::path::Path::new(path).join("config.json");
+    let Ok(raw) = std::fs::read_to_string(&cfg) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    // A quant_method stamp in EITHER key marks an AWQ/GPTQ/torchao
+    // dir — MLX layouts never carry it anywhere.
+    let stamped = ["quantization", "quantization_config"].iter().any(|k| {
+        v.get(k)
+            .is_some_and(|b| b.get("quant_method").is_some_and(|m| !m.is_null()))
+    });
+    if stamped {
+        return false;
+    }
+    ["quantization", "quantization_config"].iter().any(|key| {
+        v.get(key).is_some_and(|block| {
+            block.get("bits").is_some_and(serde_json::Value::is_number)
+                && block
+                    .get("group_size")
+                    .is_some_and(serde_json::Value::is_number)
+        })
     })
 }
 
@@ -361,7 +429,9 @@ impl ModelRow {
     /// `mlx-community/...`, or an `mlx` name/path token) plus the
     /// caller's dir gate is the discriminator — MLX dirs are
     /// quantized-safetensors-shaped, so routing consults this BEFORE
-    /// [`Self::is_quantized_safetensors`].
+    /// [`Self::is_quantized_safetensors`]. Dirs whose tokens lost the
+    /// `mlx` marker fall back to the on-disk layout probe (see
+    /// [`mlx_signal`]).
     #[must_use]
     pub fn is_mlx(&self) -> bool {
         mlx_signal(&self.name, &self.repo, &self.path)
@@ -473,6 +543,50 @@ pub struct ProfileRow {
     #[serde(default)]
     pub benchmark_json: Option<String>,
     pub updated_at: i64,
+}
+
+/// One spec-race verdict from `blazar tune <model> --spec-race`: the
+/// measured single-stream tok/s of a speculation mode against the same
+/// race's dense baseline. Receipts are the evidence base the supervisor
+/// consults when resolving `spec = "auto"` — a measured mode beats the
+/// heuristic chain only because a user ran the race on this hardware.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SpecReceiptRow {
+    pub model: String,
+    pub engine_tag: String,
+    /// dense | ngram | dflash | draft
+    pub mode: String,
+    pub tok_per_s: f64,
+    pub dense_tps: f64,
+    pub ratio: f64,
+    pub measured_at: i64,
+}
+
+/// One in-memory usage delta the gateway accumulates per (day, model)
+/// bucket and hands to [`Store::add_usage_delta`] on flush.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct UsageDelta {
+    pub in_tokens: i64,
+    pub out_tokens: i64,
+    pub cached_tokens: i64,
+    pub requests: i64,
+    pub gen_secs: f64,
+    pub ttft_count: i64,
+    pub ttft_ms_total: f64,
+}
+
+/// One per-model daily usage rollup row (gateway usage meter target).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UsageDayRow {
+    pub day: i64,
+    pub model: String,
+    pub in_tokens: i64,
+    pub out_tokens: i64,
+    pub cached_tokens: i64,
+    pub requests: i64,
+    pub gen_secs: f64,
+    pub ttft_count: i64,
+    pub ttft_ms_total: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -757,6 +871,9 @@ impl Store {
         // native decision models) is CREATE-TABLE-IF-NOT-EXISTS in
         // SCHEMA_SQL — nothing more to do here; the version bump
         // replays the batch on existing stores.
+        // v16→v17: `spec_receipts` (spec-race verdicts) is likewise
+        // CREATE-TABLE-IF-NOT-EXISTS in SCHEMA_SQL — replay covers it.
+        // v17→v18: `usage_daily` (usage rollups) same replay story.
         Ok(())
     }
 
@@ -2094,6 +2211,121 @@ impl Store {
         Ok(None)
     }
 
+    /// Upsert one spec-race receipt. Keyed (model, `engine_tag`, mode):
+    /// the latest measurement of a mode replaces the previous one — a
+    /// receipt is "current truth for this hardware", not an audit log.
+    pub fn put_spec_receipt(
+        &self,
+        model: &str,
+        engine_tag: &str,
+        mode: &str,
+        tok_per_s: f64,
+        dense_tps: f64,
+    ) -> CoreResult<()> {
+        let ratio = if dense_tps > 0.0 {
+            tok_per_s / dense_tps
+        } else {
+            0.0
+        };
+        self.conn.execute(
+            "INSERT INTO spec_receipts (model, engine_tag, mode, tok_per_s, dense_tps, ratio, measured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(model, engine_tag, mode) DO UPDATE SET
+                 tok_per_s = excluded.tok_per_s,
+                 dense_tps = excluded.dense_tps,
+                 ratio     = excluded.ratio,
+                 measured_at = excluded.measured_at",
+            params![model, engine_tag, mode, tok_per_s, dense_tps, ratio, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    /// All spec-race receipts for one model on one engine lane.
+    pub fn list_spec_receipts(
+        &self,
+        model: &str,
+        engine_tag: &str,
+    ) -> CoreResult<Vec<SpecReceiptRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, engine_tag, mode, tok_per_s, dense_tps, ratio, measured_at
+             FROM spec_receipts WHERE model = ?1 AND engine_tag = ?2
+             ORDER BY ratio DESC",
+        )?;
+        let rows = stmt.query_map(params![model, engine_tag], |r| {
+            Ok(SpecReceiptRow {
+                model: r.get(0)?,
+                engine_tag: r.get(1)?,
+                mode: r.get(2)?,
+                tok_per_s: r.get(3)?,
+                dense_tps: r.get(4)?,
+                ratio: r.get(5)?,
+                measured_at: r.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
+    }
+
+    /// Add one per-model usage delta into the daily rollup (upsert
+    /// accumulates: the gateway flushes in-memory buckets here).
+    pub fn add_usage_delta(&self, day: i64, model: &str, delta: &UsageDelta) -> CoreResult<()> {
+        let UsageDelta {
+            in_tokens,
+            out_tokens,
+            cached_tokens,
+            requests,
+            gen_secs,
+            ttft_count,
+            ttft_ms_total,
+        } = *delta;
+        self.conn.execute(
+            "INSERT INTO usage_daily (day, model, in_tokens, out_tokens, cached_tokens, requests, gen_secs, ttft_count, ttft_ms_total)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(day, model) DO UPDATE SET
+                 in_tokens     = in_tokens + excluded.in_tokens,
+                 out_tokens    = out_tokens + excluded.out_tokens,
+                 cached_tokens = cached_tokens + excluded.cached_tokens,
+                 requests      = requests + excluded.requests,
+                 gen_secs      = gen_secs + excluded.gen_secs,
+                 ttft_count    = ttft_count + excluded.ttft_count,
+                 ttft_ms_total = ttft_ms_total + excluded.ttft_ms_total",
+            params![
+                day,
+                model,
+                in_tokens,
+                out_tokens,
+                cached_tokens,
+                requests,
+                gen_secs,
+                ttft_count,
+                ttft_ms_total
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Usage rollups for the last `days` days, oldest first.
+    pub fn list_usage_days(&self, days: i64) -> CoreResult<Vec<UsageDayRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT day, model, in_tokens, out_tokens, cached_tokens, requests, gen_secs, ttft_count, ttft_ms_total
+             FROM usage_daily WHERE day >= strftime('%Y%m%d', 'now', ?1)
+             ORDER BY day, model",
+        )?;
+        let rows = stmt.query_map(params![format!("-{days} days")], |r| {
+            Ok(UsageDayRow {
+                day: r.get(0)?,
+                model: r.get(1)?,
+                in_tokens: r.get(2)?,
+                out_tokens: r.get(3)?,
+                cached_tokens: r.get(4)?,
+                requests: r.get(5)?,
+                gen_secs: r.get(6)?,
+                ttft_count: r.get(7)?,
+                ttft_ms_total: r.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
+    }
+
     pub fn add_lora(&self, model_name: &str, path: &str, scale: f64) -> CoreResult<i64> {
         self.conn.execute(
             "INSERT INTO loras (model_name, path, scale) VALUES (?1, ?2, ?3)",
@@ -3048,6 +3280,187 @@ mod tests {
     }
 
     #[test]
+    fn unit__spec_receipts__upsert_latest_wins_and_orders_by_ratio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let s = Store::open(&dirs).unwrap();
+        assert!(s.list_spec_receipts("m", "e").unwrap().is_empty());
+        s.put_spec_receipt("m", "e", "dense", 40.0, 40.0).unwrap();
+        s.put_spec_receipt("m", "e", "draft", 80.0, 40.0).unwrap();
+        s.put_spec_receipt("m", "e", "ngram", 50.0, 40.0).unwrap();
+        // Same mode re-measured: the upsert replaces, never appends.
+        s.put_spec_receipt("m", "e", "ngram", 60.0, 40.0).unwrap();
+        let rows = s.list_spec_receipts("m", "e").unwrap();
+        assert_eq!(rows.len(), 3, "upsert must keep one row per mode");
+        assert_eq!(rows[0].mode, "draft", "ratio DESC puts the winner first");
+        #[allow(clippy::cast_precision_loss)] // literal test values
+        let expected = 80.0_f64 / 40.0;
+        assert!(
+            (rows[0].ratio - expected).abs() < 1e-9,
+            "ratio = tok_per_s / dense_tps, got {}",
+            rows[0].ratio
+        );
+        assert_eq!(rows[1].mode, "ngram");
+        assert_eq!(rows[2].mode, "dense");
+        // Receipts are scoped per model+engine: another lane sees none.
+        assert!(s.list_spec_receipts("m", "other").unwrap().is_empty());
+        assert!(s.list_spec_receipts("other", "e").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v16_to_v17_spec_receipts() {
+        // Simulate a v16 database: no spec_receipts table,
+        // user_version 16 — the shape every pre-F2 store has. Reopen
+        // replays SCHEMA_SQL (IF NOT EXISTS) and stamps 17; a receipt
+        // write round-trips on the upgraded store, and the second
+        // reopen proves the presence-gated no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE spec_receipts; PRAGMA user_version = 16;")
+                .unwrap();
+        }
+        for pass in 0..2 {
+            let s = Store::open(&dirs).unwrap();
+            let v: i64 = s
+                .conn()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, i64::from(SCHEMA_VERSION));
+            if pass == 0 {
+                s.put_spec_receipt("m", "e", "draft", 42.0, 21.0).unwrap();
+            }
+            let rows = s.list_spec_receipts("m", "e").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].mode, "draft");
+            #[allow(clippy::cast_precision_loss)] // literal test values
+            let expected = 42.0 / 21.0;
+            assert!((rows[0].ratio - expected).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn unit__usage_daily__delta_accumulates_and_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let s = Store::open(&dirs).unwrap();
+        // Two flushes for the same (day, model) accumulate; a second
+        // model keeps its own bucket.
+        s.add_usage_delta(
+            20_261_028,
+            "m1",
+            &UsageDelta {
+                in_tokens: 100,
+                out_tokens: 40,
+                cached_tokens: 80,
+                requests: 2,
+                gen_secs: 12.5,
+                ttft_count: 2,
+                ttft_ms_total: 900.0,
+            },
+        )
+        .unwrap();
+        s.add_usage_delta(
+            20_261_028,
+            "m1",
+            &UsageDelta {
+                in_tokens: 50,
+                out_tokens: 10,
+                cached_tokens: 0,
+                requests: 1,
+                gen_secs: 4.5,
+                ttft_count: 1,
+                ttft_ms_total: 250.0,
+            },
+        )
+        .unwrap();
+        s.add_usage_delta(
+            20_261_028,
+            "m2",
+            &UsageDelta {
+                in_tokens: 7,
+                out_tokens: 3,
+                cached_tokens: 0,
+                requests: 1,
+                gen_secs: 1.0,
+                ttft_count: 1,
+                ttft_ms_total: 100.0,
+            },
+        )
+        .unwrap();
+        let rows = s.list_usage_days(365).unwrap();
+        assert_eq!(rows.len(), 2, "one row per (day, model)");
+        let m1 = rows.iter().find(|r| r.model == "m1").unwrap();
+        assert_eq!(
+            (m1.in_tokens, m1.out_tokens, m1.cached_tokens, m1.requests),
+            (150, 50, 80, 3)
+        );
+        assert!((m1.gen_secs - 17.0).abs() < 1e-9);
+        assert_eq!(m1.ttft_count, 3);
+        assert!((m1.ttft_ms_total - 1150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unit__store_schema_upgrades__v17_to_v18_usage_daily() {
+        // Simulate a v17 database: no usage_daily table, user_version
+        // 17 — every pre-F4 store's shape. Reopen replays SCHEMA_SQL
+        // and stamps 18; a usage delta round-trips on the upgraded
+        // store, and the second reopen proves the no-op path.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE usage_daily; PRAGMA user_version = 17;")
+                .unwrap();
+        }
+        for pass in 0..2 {
+            let s = Store::open(&dirs).unwrap();
+            let v: i64 = s
+                .conn()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, i64::from(SCHEMA_VERSION));
+            if pass == 0 {
+                s.add_usage_delta(
+                    20_261_028,
+                    "m",
+                    &UsageDelta {
+                        in_tokens: 1,
+                        out_tokens: 2,
+                        cached_tokens: 3,
+                        requests: 4,
+                        gen_secs: 5.0,
+                        ttft_count: 6,
+                        ttft_ms_total: 7.0,
+                    },
+                )
+                .unwrap();
+            }
+            let rows = s.list_usage_days(365).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                (rows[0].in_tokens, rows[0].out_tokens, rows[0].requests),
+                (1, 2, 4)
+            );
+        }
+    }
+
+    #[test]
     fn unit__store_schema_upgrades__v14_to_v15() {
         // Simulate a v14 database: jobs and responses without the BLZ-1
         // `owner` columns, user_version 14 — the exact shape every store
@@ -3949,6 +4362,69 @@ mod tests {
             "qwen/qwen2.5-0.5b-instruct-awq",
             "/models/renamed.d"
         ));
+    }
+
+    /// The MLX routing signal: token marker first, then the on-disk
+    /// layout probe for dirs renamed away from every `mlx` token (the
+    /// mlx-community misroute class). Fixture fingerprints mirror the
+    /// real layouts pulled on this box: MLX quant dirs carry
+    /// numeric `bits`+`group_size` with no `quant_method`; AWQ/GPTQ
+    /// dirs stamp `quant_method`; plain bf16 dirs carry no block.
+    #[test]
+    fn unit__mlx_signal__token_and_layout_probe_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write_cfg = |dir: &str, json: &str| {
+            let d = tmp.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("config.json"), json).unwrap();
+            d.to_string_lossy().into_owned()
+        };
+
+        // Token signal (no disk access needed).
+        assert!(mlx_signal(
+            "qwen3-4b-4bit",
+            "mlx-community/qwen3-4b-4bit",
+            "/x"
+        ));
+        assert!(mlx_signal("m-mlx", "r", "/models/m-mlx.d"));
+        // 'hawkmxl' splits into hawk + mxl — not the mlx token.
+        assert!(!mlx_signal("hawkmxl", "r", "/models/hawkmxl.d"));
+
+        // MLX quant layout, no token anywhere: the probe routes it.
+        let mlx = write_cfg(
+            "renamed-4bit",
+            r#"{"quantization":{"bits":4,"group_size":64},"quantization_config":{"bits":4,"group_size":64}}"#,
+        );
+        assert!(mlx_signal("renamed-4bit", "someorg/renamed-4bit", &mlx));
+
+        // quant_method present (torchao/AWQ/GPTQ stamps) — NOT mlx.
+        let awq = write_cfg(
+            "m-awq",
+            r#"{"quantization_config":{"bits":4,"group_size":128,"quant_method":"torchao"}}"#,
+        );
+        assert!(!mlx_signal("m", "someorg/m", &awq));
+
+        // bits/group_size under quantization but quant_method under the
+        // mirrored key: still a quant-method-stamped dir.
+        let gptq = write_cfg(
+            "m-gptq",
+            r#"{"quantization":{"bits":4,"group_size":128},"quantization_config":{"quant_method":"gptq"}}"#,
+        );
+        assert!(!mlx_signal("m", "someorg/m", &gptq));
+
+        // Plain bf16 dir: no quantization block at all.
+        let plain = write_cfg("m-bf16", r#"{"model_type":"qwen3"}}"#);
+        assert!(!mlx_signal("m", "someorg/m", &plain));
+
+        // Missing numeric fields do not probe true.
+        let half = write_cfg("m-half", r#"{"quantization":{"bits":4}}"#);
+        assert!(!mlx_signal("m", "someorg/m", &half));
+
+        // No config.json / not a dir: token-only behavior preserved.
+        assert!(!mlx_signal("m", "someorg/m", "/nonexistent/m"));
+        let gguf = tmp.path().join("m.gguf");
+        std::fs::write(&gguf, b"gguf").unwrap();
+        assert!(!mlx_signal("m", "someorg/m", gguf.to_str().unwrap()));
     }
 
     #[test]

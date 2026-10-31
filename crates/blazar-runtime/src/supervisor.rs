@@ -125,6 +125,55 @@ pub fn resolve_spec_mode(queued: Option<String>, overlay: Option<String>, config
     queued.or(overlay).unwrap_or_else(|| config.to_string())
 }
 
+/// Evidence consult for `spec = "auto"`: the best MEASURED spec mode
+/// from `blazar tune <model> --spec-race` receipts, gated on what this
+/// engine advertises and whether the catalog's draft pair is actually
+/// available. Returns the override spelling — a winning `draft` receipt
+/// maps to `"auto"` (the profile planner owns pair engagement) — plus
+/// the measured ratio over dense. `None` keeps the heuristic auto
+/// chain (planner decides per spawn). Receipts never override explicit
+/// pins: callers consult only when the tier chain resolved to "auto".
+/// Pure so the gating is pinnable without a live supervisor/store.
+#[must_use]
+pub fn best_measured_spec_mode(
+    receipts: &[blazar_core::store::SpecReceiptRow],
+    advertised: &[String],
+    draft_available: bool,
+) -> Option<(&'static str, f64)> {
+    let mut best: Option<(&'static str, f64, i64)> = None;
+    for r in receipts {
+        // Dense is the baseline, not a candidate; below 1.05 the race
+        // itself would not have adopted the mode.
+        if r.mode == "dense" || r.ratio < 1.05 {
+            continue;
+        }
+        let eligible = match r.mode.as_str() {
+            "ngram" => advertised.iter().any(|s| s == "ngram-simple"),
+            "dflash" => advertised.iter().any(|s| s == "draft-dflash"),
+            "draft" => draft_available && advertised.iter().any(|s| s == "draft-simple"),
+            _ => false,
+        };
+        if !eligible {
+            continue;
+        }
+        let mode: &'static str = match r.mode.as_str() {
+            "ngram" => "ngram",
+            "dflash" => "dflash",
+            _ => "auto", // draft: engage via the profile planner
+        };
+        // Argmax with a recency tie-break on identical stored ratios
+        // (abs-diff, not ==, so clippy's float_cmp stays honest).
+        let better = best.is_none_or(|(_, br, bt)| {
+            let ratio_gain = r.ratio - br;
+            ratio_gain > f64::EPSILON || (ratio_gain.abs() <= f64::EPSILON && r.measured_at > bt)
+        });
+        if better {
+            best = Some((mode, r.ratio, r.measured_at));
+        }
+    }
+    best.map(|(mode, ratio, _)| (mode, ratio))
+}
+
 /// Neutral decode rate (tok/s) assumed by [`route_cost`] when a model
 /// has no measured throughput yet: a small-model-ish floor that keeps
 /// cost ORDERING sane instead of making unmeasured models look
@@ -219,6 +268,52 @@ const KEEP_ALIVE_FOREVER: Duration = Duration::from_hours(876_600);
 /// LC4: reaper ticks (10s each) of sustained concurrent load before a
 /// slots bump is adopted.
 const SLOTS_STREAK_TICKS: u32 = 6;
+/// D1 burst fast-path: saturated ticks needed when the latched window
+/// peak attests `>= 2x` the effective slots. A 2x overcommitment peak is
+/// demand-attested (every queued arrival climbed through each level), so
+/// 2 ticks (20 s) prove what the 6-tick path re-proves for 60 s — bursts
+/// shorter than the standard window still earn their reshape instead of
+/// queueing to death first (spike doc §D1, 2026-10-29).
+const SLOTS_FAST_STREAK_TICKS: u32 = 2;
+/// D1 anti-flap: minimum dwell between two fast-path adoptions on the
+/// same model (burst-quiet-burst sawtooth loads). The standard 6-tick
+/// path stays available inside the cooldown, so eligibility is never
+/// lost — only the shortcut is rate-limited.
+const SLOTS_FAST_COOLDOWN: Duration = Duration::from_secs(300);
+/// D3 starvation bound for the reshape drain: parking new admissions
+/// longer than this costs more tail latency than the reshape can
+/// recover, so the gate reopens (complete-and-cutover) and the reshape
+/// lands at the next natural quiesce instead (spike doc §D3, 2026-10-29).
+const SLOTS_DRAIN_BOUND: Duration = Duration::from_secs(90);
+/// D2 pinned-teach episode dedup: while a manual-`slots` pin keeps a
+/// lane out of adaptation, sustained pressure re-teaches at most this
+/// often (the streak threshold already filters blips; this stops a
+/// 24/7-saturated pin from logging every 60 s).
+const SLOTS_PINNED_TEACH_DEDUP: Duration = Duration::from_secs(600);
+/// D5 decode-scaling awareness: adoption is suppressed when the
+/// measured aggregate decode of the loaded class fails to reach this
+/// multiple of the solo rate. `S = loaded_rate x loaded_conc /
+/// solo_rate`; `S < 1.25` on a GPU-bound model means extra slots buy
+/// queue relief at best while paying a reshape transition — the lane
+/// is taught instead of reshaped (spike doc §4 finding 1 + §D5,
+/// 2026-10-30).
+const DECODE_SCALE_ADOPT_MIN: f64 = 1.25;
+/// D5 evidence freshness: the scaling ratio is only consulted when
+/// BOTH class EWMAs (solo + loaded) were sampled within this window.
+/// Stale evidence stands the gate down — a model that has not been
+/// observed in both regimes recently adapts as before.
+const DECODE_FRESH_WINDOW: Duration = Duration::from_secs(600);
+/// D5 teach episode dedup (same rationale as
+/// [`SLOTS_PINNED_TEACH_DEDUP`]): a decode-bound lane under sustained
+/// load re-teaches at most this often.
+const DECODE_BOUND_TEACH_DEDUP: Duration = Duration::from_secs(600);
+/// Prewarm cutover: attempts to take sole ownership of the warm child's
+/// Arc before the re-key. Transient holders (a gauge snapshot
+/// mid-iteration) clear in microseconds; each attempt is spaced by
+/// [`PREWARM_UNWRAP_BACKOFF`] so a microsecond holder never costs a
+/// whole reaper tick.
+const PREWARM_UNWRAP_ATTEMPTS: usize = 3;
+const PREWARM_UNWRAP_BACKOFF: Duration = Duration::from_millis(100);
 /// LC4: max in-memory slots bump (`tune --slots` for higher). Raised
 /// 4 → 8 on 2026-09-12: the np8 shape measured +19% system t/s and a
 /// 5.4x concurrency TTFT-p99 win over np4 under 8-stream load
@@ -846,7 +941,11 @@ pub struct Instance {
     /// 7302 MiB against 5417 weights, and a weights-only admission let a
     /// 0.5B sibling (~977 MiB actual) join it into an `NVRM NO_MEMORY`
     /// storm. Relaxed ordering: telemetry-grade hint, not a lock.
-    pub settled_mib: std::sync::atomic::AtomicU64,
+    /// Arc-wrapped so the detached settle task can outlive the map entry
+    /// without pinning the whole Instance — the prewarm cutover re-keys
+    /// the Arc out of the map, and any long-lived holder would starve
+    /// that re-key.
+    pub settled_mib: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Per-child bearer secret (child `--api-key` hardening). Lifecycle
     /// = child lifecycle; `None` on UDS children (filesystem perms
     /// already gate the socket) and on engines lacking `--api-key`.
@@ -898,6 +997,47 @@ pub struct ModelHints {
     pub cache: CacheHint,
     pub accept: CacheHint,
     pub decode: ThroughputHint,
+    pub scaling: DecodeScalingHint,
+}
+
+/// One traffic class of the D5 decode-scaling sampler: per-stream
+/// decode rate EWMA plus the concurrency each sample was measured at.
+/// `samples == 0` = never measured (`None` semantics), matching the
+/// atomic hints above.
+#[derive(Debug, Default)]
+struct DecodeClassState {
+    samples: u64,
+    rate: f64,
+    conc: f64,
+    last_seen: Option<std::time::Instant>,
+}
+
+impl DecodeClassState {
+    /// Blend one observation (0.7 history / 0.3 sample — the house EWMA
+    /// shape). Concurrency blends alongside rate so the scaling ratio
+    /// reflects the TYPICAL measured depth, not the latest burst.
+    fn blend(&mut self, rate: f64, conc: f64) {
+        if self.samples == 0 {
+            self.rate = rate;
+            self.conc = conc;
+        } else {
+            self.rate = self.rate * 0.7 + rate * 0.3;
+            self.conc = self.conc * 0.7 + conc * 0.3;
+        }
+        self.samples += 1;
+        self.last_seen = Some(std::time::Instant::now());
+    }
+}
+
+/// D5 decode-scaling sampler: solo (`in_flight == 0` at note time —
+/// the finishing request was the only live stream) vs loaded traffic.
+/// Feeds the adoption gate's scaling ratio; mutex-guarded because the
+/// state is multi-field and the write path (one note per completion)
+/// is far from hot.
+#[derive(Debug, Default)]
+pub struct DecodeScalingHint {
+    solo: std::sync::Mutex<DecodeClassState>,
+    loaded: std::sync::Mutex<DecodeClassState>,
 }
 
 /// One row of [`Supervisor::model_hint_snapshot`]: the model plus its
@@ -1357,7 +1497,22 @@ impl Supervisor {
     /// as the poller hints). Wall time is measured from child-send
     /// start so admission-queue wait never pollutes the rate; zero-token
     /// and non-finite observations are dropped, not recorded as zeroes.
-    pub fn note_model_throughput(&self, model: &str, eval_count: u64, wall_s: f64) {
+    ///
+    /// D5: `concurrent_others` is the PEAK number of OTHER streams that
+    /// overlapped this request (see `proxy::others_peak` — the gateway
+    /// brackets hold the in-flight guard at both anchors, so it computes
+    /// `max(entry, note) - 1` per request). `0` = the request ran truly
+    /// alone at both anchors → solo class (conc 1.0); `n > 0` → loaded
+    /// class at depth `n + 1` (the noter itself). This kills the
+    /// tail-of-burst misroute where the last request of an N-deep burst
+    /// noted alone and dragged the solo rate down.
+    pub fn note_model_throughput(
+        &self,
+        model: &str,
+        eval_count: u64,
+        wall_s: f64,
+        concurrent_others: i64,
+    ) {
         if eval_count == 0 || !(wall_s.is_finite() && wall_s > 0.0) {
             return;
         }
@@ -1368,11 +1523,75 @@ impl Supervisor {
             .get(model)
             .and_then(|h| h.decode.get())
             .map_or(sample, |prev| prev * 0.7 + sample * 0.3);
-        self.model_hints
-            .entry(model.to_string())
-            .or_default()
-            .decode
-            .set(prev);
+        let hints = self.model_hints.entry(model.to_string()).or_default();
+        hints.decode.set(prev);
+        // Stream counts fit f64 exactly (single-digit concurrency); the
+        // i32 hop keeps the cast precision-clean per clippy.
+        let (class, conc) = if concurrent_others <= 0 {
+            (&hints.scaling.solo, 1.0)
+        } else {
+            (
+                &hints.scaling.loaded,
+                f64::from(i32::try_from(concurrent_others).unwrap_or(i32::MAX)) + 1.0,
+            )
+        };
+        if let Ok(mut state) = class.lock() {
+            state.blend(sample, conc);
+        }
+    }
+
+    /// Live-stream count for a model across ALL its instance keys
+    /// (replica/warm grammars included) — the D5 note-side input. At
+    /// the buffered note sites the in-flight guard is still held, so
+    /// the count INCLUDES the noting request; callers derive the
+    /// other-stream count via `proxy::others_peak` before routing.
+    #[must_use]
+    pub fn model_live_streams(&self, model: &str) -> i64 {
+        self.instances
+            .iter()
+            .filter(|e| model_of_key(e.key()) == model)
+            .map(|e| e.value().in_flight.load(Ordering::SeqCst))
+            .sum()
+    }
+
+    /// D5 read side: the model's decode scaling ratio — estimated
+    /// aggregate multiple `loaded_rate x loaded_conc / solo_rate`.
+    /// `Some` only when BOTH classes have fresh samples (inside
+    /// `DECODE_FRESH_WINDOW`); stale or half-empty samplers yield
+    /// `None` and the gate stands down (no suppression without
+    /// evidence, mirroring the hint `None` discipline).
+    #[must_use]
+    pub fn decode_scaling_ratio(&self, model: &str) -> Option<f64> {
+        let hints = self.model_hints.get(model)?;
+        let solo = hints.scaling.solo.lock().ok()?;
+        let loaded = hints.scaling.loaded.lock().ok()?;
+        let fresh = |s: &DecodeClassState| {
+            s.last_seen
+                .is_some_and(|t| t.elapsed() < DECODE_FRESH_WINDOW)
+        };
+        if solo.samples == 0 || loaded.samples == 0 || !fresh(&solo) || !fresh(&loaded) {
+            return None;
+        }
+        (solo.rate > 0.0).then(|| loaded.rate * loaded.conc / solo.rate)
+    }
+
+    /// D5 log/event detail: `(solo_tps, loaded_tps, loaded_conc)` for a
+    /// model that already passed [`Self::decode_scaling_ratio`]. Returns
+    /// zeros on lock poisoning — the values are telemetry, never control
+    /// flow (the ratio call above already gated the decision).
+    #[must_use]
+    pub fn decode_scaling_detail(&self, model: &str) -> (f64, f64, f64) {
+        let Some(hints) = self.model_hints.get(model) else {
+            return (0.0, 0.0, 0.0);
+        };
+        let (solo, loaded) = (
+            hints.scaling.solo.lock().ok(),
+            hints.scaling.loaded.lock().ok(),
+        );
+        match (solo, loaded) {
+            (Some(s), Some(l)) => (s.rate, l.rate, l.conc),
+            _ => (0.0, 0.0, 0.0),
+        }
     }
 
     /// A2 read side: the model's measured decode rate. Deliberately no
@@ -1772,6 +1991,15 @@ pub struct PsRow {
     /// configured ceiling here. `None` for the router front, which no
     /// per-model gate caps.
     pub slots_configured: Option<u32>,
+    /// Which authority owns the shape on this row — the provenance a
+    /// `slots` vs `slots_configured` divergence begs for:
+    /// `"adapted"` (D1 adoption recorded — includes the delegated
+    /// pin+`adaptive_override` lane), `"pinned"` (manual `slots`
+    /// override), `"auto"` (profile-resolved at spawn, recorded in the
+    /// child argv), `"engine"` (slot-less engine owns admission).
+    /// `None` for the router front. Mirrors `slot_cap` precedence so
+    /// the label never disagrees with the number it explains.
+    pub slots_source: Option<&'static str>,
     /// Offload label ("full" | "cpu" | "partial" | "auto") — surfaces
     /// silent CPU fallback, ollama's most-common complaint.
     pub gpu: String,
@@ -1809,6 +2037,17 @@ struct MeasuredTick {
     last_probe: Option<Instant>,
     /// card name → last pressure-teach instant (10-minute dedup).
     warned_cards: std::collections::HashMap<String, Instant>,
+}
+
+/// Drain phase of a queued reshape (D3). `Parking` holds new admissions
+/// so in-flight can only fall; `Cutover` — tripped once parking exceeds
+/// [`SLOTS_DRAIN_BOUND`] — reopens them, and the reshape then waits for a
+/// natural quiesce instead of starving waiters under sustained load.
+/// A NEW adoption (a larger target) re-arms the parking budget.
+#[derive(Debug, Clone, Copy)]
+enum ReshapeDrain {
+    Parking(std::time::Instant),
+    Cutover,
 }
 
 pub struct Supervisor {
@@ -1922,12 +2161,25 @@ pub struct Supervisor {
     /// Consecutive reaper ticks with concurrent in-flight load on a
     /// single-slot model (LC4 adaptive slots).
     busy_streak: DashMap<String, u32>,
-    /// Models whose adopted reshape is being drained right now (mark set
-    /// the moment the drain decides to hold admissions). The admission
-    /// gate parks new requests while a model key is present, so in-flight
-    /// can only fall — a sustained-load stream set reaches zero in one
-    /// max-stream duration instead of never.
-    reshape_draining: DashMap<String, std::time::Instant>,
+    /// Models whose queued reshape is in its drain phase right now.
+    /// The admission gate parks new requests while the model holds the
+    /// [`ReshapeDrain::Parking`] mark, so in-flight can only fall — a
+    /// sustained-load stream set reaches zero in one max-stream duration
+    /// instead of never. [`ReshapeDrain::Cutover`] is the D3 starvation
+    /// bound: after [`SLOTS_DRAIN_BOUND`] of parking the gate reopens
+    /// and the reshape waits for the next natural quiesce.
+    reshape_draining: DashMap<String, ReshapeDrain>,
+    /// D2 pinned teach: consecutive saturated ticks on a model excluded
+    /// from adaptation ONLY by a manual `slots` pin (the pin is policy —
+    /// the teach makes the silent queueing floor visible instead of
+    /// adapting around it).
+    pinned_streak: DashMap<String, u32>,
+    /// D2 teach episode dedup: last [`BlazarEvent::SlotsPinnedPressure`]
+    /// emit per model (see [`SLOTS_PINNED_TEACH_DEDUP`]).
+    pinned_warned_at: DashMap<String, std::time::Instant>,
+    /// D5 teach episode dedup: last [`BlazarEvent::SlotsDecodeBound`]
+    /// emit per model (see [`DECODE_BOUND_TEACH_DEDUP`]).
+    decode_bound_warned_at: DashMap<String, std::time::Instant>,
     /// Consecutive fully-quiet ticks per instance key (no admission
     /// pressure, zero in-flight) feeding the adoption decay rule.
     idle_streak: DashMap<String, u32>,
@@ -1955,6 +2207,13 @@ pub struct Supervisor {
     /// whatever level the 10s tick happened to sample (see the
     /// saturation predicate in [`Self::adaptive_slots_tick`]).
     slot_pressure_seen: DashMap<String, (std::time::Instant, u32)>,
+    /// D1 burst fast-path cooldown: when the fast path last adopted per
+    /// model. Presence inside [`SLOTS_FAST_COOLDOWN`] demotes the model
+    /// back to the standard [`SLOTS_STREAK_TICKS`] streak — a fresh burst
+    /// right after an adoption usually means the reshape has not landed
+    /// yet, not that the new shape is already insufficient. Cleared when
+    /// the adoption decays away (full quiet reset).
+    fast_adopted_at: DashMap<String, std::time::Instant>,
     /// In-flight requests admitted while the instance did not exist yet
     /// (the cold-spawn window). `begin_request` counts here when the
     /// map lookup misses; the spawn registration folds the total onto
@@ -2124,11 +2383,15 @@ impl Supervisor {
             ram_warming: Arc::new(DashMap::new()),
             busy_streak: DashMap::new(),
             reshape_draining: DashMap::new(),
+            pinned_streak: DashMap::new(),
+            pinned_warned_at: DashMap::new(),
+            decode_bound_warned_at: DashMap::new(),
             idle_streak: DashMap::new(),
             adopted_slots: DashMap::new(),
             reshape_queue: DashMap::new(),
             slot_pressure: DashMap::new(),
             slot_pressure_seen: DashMap::new(),
+            fast_adopted_at: DashMap::new(),
             exclusive_holders: DashMap::new(),
             prenatal_load: DashMap::new(),
             device_reservations: std::sync::Arc::new(std::sync::Mutex::new(
@@ -2566,7 +2829,7 @@ impl Supervisor {
         name: &str,
         prefix: Option<PrefixKey>,
     ) -> Result<EngineRef, SupervisionError> {
-        self.ensure_routed_opts(name, prefix, false).await
+        self.ensure_routed_opts(name, prefix, false, false).await
     }
 
     /// Captive variant for side loads (semantic-cache embed model):
@@ -2574,7 +2837,25 @@ impl Supervisor {
     /// spawn refuses under admission pressure instead of evicting
     /// residents.
     pub async fn ensure_routed_captive(&self, name: &str) -> Result<EngineRef, SupervisionError> {
-        self.ensure_routed_opts(name, None, true).await
+        self.ensure_routed_opts(name, None, true, false).await
+    }
+
+    /// `ensure` for GENERATION surfaces (chat, completions, responses,
+    /// anthropic, ollama chat/generate): identical to
+    /// [`Self::ensure_routed`] except a `model+adapter` request on the
+    /// llama.cpp lane ALSO rides the base child — the engine selects
+    /// adapters per request through its `lora` body field, so one dense
+    /// child (all store rows spawn-attached) serves base and every
+    /// variant without a second weights load. Embeddings/rerank surfaces
+    /// must NOT use this entry: llama.cpp tokenization-side tasks bypass
+    /// the completion schema, so those lanes keep the dedicated variant
+    /// child (`ensure_routed`).
+    pub async fn ensure_generation(
+        &self,
+        name: &str,
+        prefix: Option<PrefixKey>,
+    ) -> Result<EngineRef, SupervisionError> {
+        self.ensure_routed_opts(name, prefix, false, true).await
     }
 
     async fn ensure_routed_opts(
@@ -2582,6 +2863,7 @@ impl Supervisor {
         name: &str,
         prefix: Option<PrefixKey>,
         captive: bool,
+        generation: bool,
     ) -> Result<EngineRef, SupervisionError> {
         // ollama API clients send `model:tag`; blazar rows are flat.
         // Same rule as the CLI boundary (`Store::resolve_model_name`),
@@ -2625,15 +2907,23 @@ impl Supervisor {
         // syntax, so a dedicated variant child would re-load the full
         // base weights into VRAM a second time — and the legacy `+stem`
         // body stamp selected NO adapter there (the child answered with
-        // base weights). llamacpp/mistralrs keep the dedicated variant
-        // child (`--lora-file` is baked into spawn argv). Aliasing
-        // BEFORE replica-key derivation shares one instance, one warm
-        // KV cache, and one loading-coalescing slot across base and
-        // variant traffic.
+        // base weights). llamacpp rides too, but ONLY from generation
+        // surfaces (per-request `lora` selection lives in the completion
+        // schema; embeddings/rerank tasks never see it) — those lanes
+        // keep the dedicated variant child via plain `ensure_routed`
+        // (`--lora-file` is baked into spawn argv). mistralrs keeps the
+        // dedicated variant child on every surface. Aliasing BEFORE
+        // replica-key derivation shares one instance, one warm KV cache,
+        // and one loading-coalescing slot across base and variant
+        // traffic.
         let aliased_base;
         let name = match blazar_core::catalog::split_lora_suffix(name) {
             (base, Some(stem)) => {
-                aliased_base = if self.sglang_variant_rides_base(base, stem).await? {
+                // `||` short-circuits: the llamacpp probe (store + roster
+                // reads) only runs for generation surfaces.
+                aliased_base = if self.sglang_variant_rides_base(base, stem).await?
+                    || (generation && self.llamacpp_variant_rides_base(base, stem).await?)
+                {
                     base.to_string()
                 } else {
                     name.to_string()
@@ -2808,13 +3098,253 @@ impl Supervisor {
         Ok(true)
     }
 
-    /// Hot-attach (or detach) a `LoRA` adapter on a *resident* sglang base
-    /// child without a respawn — the engine exposes admin endpoints
+    /// Adapter paths baked into a llama.cpp spawn argv, in flag order
+    /// (`--lora PATH`, `--lora-scaled PATH:SCALE` — single colon-joined
+    /// token per blazar's own profile compiler). This order IS the
+    /// engine's adapter-id namespace: `POST /lora-adapters` and the
+    /// per-request `lora` body field address adapters by argv index.
+    fn llamacpp_argv_lora_paths(argv: &[String]) -> Vec<String> {
+        let mut paths = Vec::new();
+        let mut i = 0;
+        while i + 1 < argv.len() {
+            match argv[i].as_str() {
+                "--lora" => {
+                    paths.push(argv[i + 1].clone());
+                    i += 2;
+                }
+                "--lora-scaled" => {
+                    let raw = argv[i + 1].as_str();
+                    // `PATH:SCALE` — split on the LAST colon so Windows
+                    // drive-letter paths never lose their prefix.
+                    let path = match raw.rsplit_once(':') {
+                        Some((p, scale)) if scale.parse::<f64>().is_ok() => p,
+                        _ => raw,
+                    };
+                    paths.push(path.to_string());
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        paths
+    }
+
+    /// Compact one-line summary of a child's spawn-loaded adapter set for
+    /// teaching messages: `"[0:anonymizer.gguf, 1:style.gguf +1 more]"`
+    /// (path basenames, first three, never a wall of absolute paths).
+    fn llamacpp_loaded_set_brief(loaded: &[(String, i64)]) -> String {
+        let mut parts: Vec<String> = loaded
+            .iter()
+            .take(3)
+            .map(|(p, id)| {
+                let base = std::path::Path::new(p)
+                    .file_name()
+                    .map_or_else(|| p.clone(), |n| n.to_string_lossy().into_owned());
+                format!("{id}:{base}")
+            })
+            .collect();
+        if loaded.len() > 3 {
+            parts.push(format!("+{} more", loaded.len() - 3));
+        }
+        format!("[{}]", parts.join(", "))
+    }
+
+    /// Post-spawn wire-contract probe for adapter-bearing llama.cpp
+    /// children: GET /lora-adapters and verify the entries carry the
+    /// fields the `LoRA` lanes of `blazar` read (`id`, `scale`, and a file
+    /// key — `path` on b11982+, `name` on older builds) and that the child
+    /// lists one adapter per spawn-loaded `--lora` path. Upstream field
+    /// renames would otherwise surface far from the cause as a permanent
+    /// "not loaded on the resident" teaching (live-caught 2026-10-29:
+    /// b11982 renamed `name` → `path`); this warn names the drift on the
+    /// spawn that produced it. Best-effort observability only — a child
+    /// that answers oddly is REPORTED, never failed or blocked.
+    async fn llamacpp_lora_contract_probe(
+        endpoint: &Endpoint,
+        auth: Option<&str>,
+        argv: &[String],
+    ) {
+        let expected = Self::llamacpp_argv_lora_paths(argv);
+        let (client, base) = child_dial(endpoint);
+        let mut get = client
+            .get(format!("{base}/lora-adapters"))
+            .timeout(std::time::Duration::from_secs(10));
+        if let Some(secret) = auth {
+            get = get.bearer_auth(secret);
+        }
+        let resp = match get.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    target: "blazar::lora",
+                    "lora contract probe: GET /lora-adapters failed on the fresh child: {e}"
+                );
+                return;
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::warn!(
+                target: "blazar::lora",
+                "lora contract probe: GET /lora-adapters answered {} on the fresh child",
+                resp.status()
+            );
+            return;
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "blazar::lora",
+                    "lora contract probe: /lora-adapters body unreadable: {e}"
+                );
+                return;
+            }
+        };
+        let Some(entries) = body.as_array() else {
+            tracing::warn!(
+                target: "blazar::lora",
+                "lora contract probe: /lora-adapters returned a non-array body — contract drift? keys: {:?}",
+                body.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            );
+            return;
+        };
+        for e in entries {
+            let file_ok = e
+                .get("path")
+                .or_else(|| e.get("name"))
+                .is_some_and(serde_json::Value::is_string);
+            let shape_ok = e.get("id").is_some_and(serde_json::Value::is_i64)
+                && e.get("scale").is_some_and(|v| v.is_f64() || v.is_i64())
+                && file_ok;
+            if !shape_ok {
+                tracing::warn!(
+                    target: "blazar::lora",
+                    "lora contract probe: /lora-adapters entry lacks the expected fields \
+                     (id: int, scale: number, path|name: string) — contract drift? entry: {e}"
+                );
+                return;
+            }
+        }
+        if entries.len() != expected.len() {
+            tracing::warn!(
+                target: "blazar::lora",
+                "lora contract probe: child lists {} adapter(s) for {} spawn-loaded --lora \
+                 path(s) — possible attach shortfall; GET entries: {}",
+                entries.len(),
+                expected.len(),
+                Self::llamacpp_loaded_set_brief(
+                    &entries
+                        .iter()
+                        .filter_map(|e| {
+                            Some((
+                                e.get("path")
+                                    .or_else(|| e.get("name"))?
+                                    .as_str()?
+                                    .to_string(),
+                                e.get("id")?.as_i64()?,
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                )
+            );
+        }
+    }
+
+    /// llama.cpp mirror of [`Self::sglang_variant_rides_base`] for
+    /// generation surfaces: the engine applies `LoRA` adapters PER REQUEST
+    /// (body field `lora: [{id, scale}]`, cache-aware per slot), so a
+    /// dense child with every store row spawn-attached serves both base
+    /// and `base+stem` traffic — the dedicated variant child would
+    /// re-load the full base weights a second time. Residents whose
+    /// argv adapter set drifted from the store rows (adapter-less dense
+    /// child, a legacy dedicated variant child, rows added/removed
+    /// after spawn) are evicted so the respawn re-attaches the current
+    /// set. `Ok(false)` = non-llamacpp lane or unresolvable routing:
+    /// keep the legacy dedicated variant child.
+    async fn llamacpp_variant_rides_base(
+        &self,
+        base: &str,
+        stem: &str,
+    ) -> Result<bool, SupervisionError> {
+        use blazar_core::engine_kind::EngineKind;
+        let store =
+            Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+        let Ok(Some(row)) = store.get_model(base) else {
+            // Unknown base: the spawn path delivers the resolver's own
+            // teaching (candidates list) — do not shadow it here.
+            return Ok(false);
+        };
+        let overlay = self.config.overlay_for(base);
+        // `Ok(None)` folds three cases — empty roster, manual mode, and
+        // auto picking the already-active lane (for a GGUF model on the
+        // default llamacpp daemon that is llamacpp itself, the single
+        // most common production shape). Only a routed llamacpp pick,
+        // or an active llamacpp engine with its lane row installed,
+        // rides; everything else keeps the legacy variant child.
+        let routed_llamacpp = match self.resolve_routed_engine(&store, &overlay, &row) {
+            Ok(Some((engine, _))) => engine.kind() == EngineKind::LlamaCpp,
+            Ok(None) => {
+                self.engine.kind() == EngineKind::LlamaCpp
+                    && store
+                        .list_engines()
+                        .is_ok_and(|rows| rows.iter().any(|e| e.kind == EngineKind::LlamaCpp))
+            }
+            // A bad pin or an unserved format: the spawn will teach
+            // about it — legacy variant-child behavior.
+            Err(_) => false,
+        };
+        if !routed_llamacpp {
+            return Ok(false);
+        }
+        let rows = store
+            .list_loras(Some(base))
+            .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+        Self::resolve_lora_lane(&rows, base, Some(stem))?;
+        // Consolidate: every llama.cpp resident of this base whose argv
+        // adapter set does not match the CURRENT store rows gets evicted
+        // (collect first — the dashmap shard read-ref must never live
+        // across `evict`'s await points). The respawn attaches all rows,
+        // and the gateway's per-request stamp selects the stem on it.
+        let want: std::collections::BTreeSet<String> =
+            rows.iter().map(|l| l.path.clone()).collect();
+        let stale: Vec<String> = self
+            .instances
+            .iter()
+            .filter(|entry| {
+                let inst = entry.value();
+                model_of_key(entry.key()) == base
+                    && inst.kind == EngineKind::LlamaCpp
+                    && Self::llamacpp_argv_lora_paths(&inst.argv)
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<String>>()
+                        != want
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in &stale {
+            tracing::info!(
+                model = base,
+                "lora variant +{stem} requested — respawning drifted-adapter instance \
+                 {key} to attach the current store rows (one child serves base and \
+                 variants)"
+            );
+            self.evict(key).await.map_err(|e| {
+                SupervisionError::Internal(anyhow!("pre-lora evict failed for {key}: {e}"))
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// Hot-attach (or detach) a `LoRA` adapter on a *resident* base child
+    /// without a respawn. sglang exposes admin endpoints
     /// `/load_lora_adapter` / `/unload_lora_adapter` (probe-verified in
-    /// 0.5.21). The verdict string is user-facing (CLI prints it).
-    /// Non-sglang lanes, missing residents, and adapter-less spawns
-    /// defer to the next spawn; store rows are the source of truth and
-    /// every spawn already attaches all of them.
+    /// 0.5.21); llama.cpp reconciles scales over the spawn-loaded set via
+    /// GET + POST `/lora-adapters` (adapter FILES themselves load only at
+    /// spawn). The verdict string is user-facing (CLI prints it).
+    /// Other lanes, missing residents, and adapter-less spawns defer to
+    /// the next spawn; store rows are the source of truth and every
+    /// spawn already attaches all of them.
+    #[allow(clippy::too_many_lines)]
     pub async fn lora_hot_attach(
         &self,
         model: &str,
@@ -2824,6 +3354,11 @@ impl Supervisor {
     ) -> Result<String, String> {
         use blazar_core::engine_kind::EngineKind;
         let mut target: Option<(blazar_core::Endpoint, Option<String>, String)> = None;
+        // llama.cpp lane capture: (endpoint, auth, key, argv) — the
+        // reconcile below needs the spawn argv to know which adapter
+        // files the child actually loaded.
+        let mut llama_target: Option<(blazar_core::Endpoint, Option<String>, String, Vec<String>)> =
+            None;
         let mut deferred = String::from(
             "model not resident — the next spawn attaches the store row automatically",
         );
@@ -2832,6 +3367,17 @@ impl Supervisor {
                 continue;
             }
             let inst = entry.value();
+            if inst.kind == EngineKind::LlamaCpp {
+                if llama_target.is_none() {
+                    llama_target = Some((
+                        inst.endpoint.clone(),
+                        inst.auth.clone(),
+                        entry.key().clone(),
+                        inst.argv.clone(),
+                    ));
+                }
+                continue;
+            }
             if inst.kind != EngineKind::Sglang {
                 deferred = format!(
                     "resident {} child bakes adapters into its spawn argv — the next \
@@ -2854,6 +3400,130 @@ impl Supervisor {
                 entry.key().clone(),
             ));
             break;
+        }
+        // llama.cpp lane: adapter FILES load only at spawn, but POST
+        // /lora-adapters reconciles scales over the loaded set by argv
+        // index (ids absent from the body deactivate to 0.0). GET first
+        // to map each loaded path to its engine id, then POST every
+        // store row that is loaded, at its row scale — the dense-spawn
+        // posture, without a respawn.
+        if target.is_none()
+            && let Some((endpoint, auth, key, argv)) = llama_target
+        {
+            let loaded = Self::llamacpp_argv_lora_paths(&argv);
+            if loaded.is_empty() {
+                return Ok(format!(
+                    "resident llamacpp child {key} was spawned without adapters — \
+                     `blazar stop {model}` then re-request attaches the store rows now"
+                ));
+            }
+            let (client, base) = child_dial(&endpoint);
+            let mut get = client
+                .get(format!("{base}/lora-adapters"))
+                .timeout(std::time::Duration::from_secs(30));
+            if let Some(secret) = &auth {
+                get = get.bearer_auth(secret);
+            }
+            let resp = get
+                .send()
+                .await
+                .map_err(|e| format!("child GET /lora-adapters failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "child GET /lora-adapters answered {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+            let ids: Vec<(String, i64)> = resp
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| format!("child /lora-adapters body unreadable: {e}"))?
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|e| {
+                            // b11982+ keys the file as "path" (older
+                            // builds said "name"); accept both.
+                            let loaded = e
+                                .get("path")
+                                .or_else(|| e.get("name"))
+                                .and_then(serde_json::Value::as_str)?;
+                            Some((loaded.to_string(), e.get("id")?.as_i64()?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let rows = Store::open(&self.dirs)
+                .map_err(|e| format!("store unavailable: {e}"))?
+                .list_loras(Some(model))
+                .map_err(|e| format!("store lora rows unreadable: {e}"))?;
+            let request_path = std::path::Path::new(lora_path);
+            let requested_loaded = loaded.iter().any(|p| {
+                p == lora_path
+                    || std::path::Path::new(p)
+                        .file_name()
+                        .is_some_and(|n| n == request_path.file_name().unwrap_or_default())
+                    // callers that omit the path still match by stem
+                    || (lora_path.is_empty()
+                        && std::path::Path::new(p)
+                            .file_stem()
+                            .is_some_and(|s| s == lora_name))
+            });
+            if attach && !requested_loaded {
+                return Ok(format!(
+                    "resident llamacpp child {key} cannot hot-load new adapter files — \
+                     llama.cpp bakes them into the spawn; `blazar stop {model}` then \
+                     re-request attaches the row now (resident loaded set: {})",
+                    Self::llamacpp_loaded_set_brief(&ids)
+                ));
+            }
+            if !attach && !requested_loaded {
+                return Ok(format!(
+                    "adapter {lora_name} not loaded on resident {key} — nothing to detach \
+                     (resident loaded set: {})",
+                    Self::llamacpp_loaded_set_brief(&ids)
+                ));
+            }
+            let reconcile: Vec<serde_json::Value> = rows
+                .iter()
+                .filter_map(|row| {
+                    let id = ids
+                        .iter()
+                        .find(|(p, _)| p == &row.path)
+                        .map(|(_, id)| *id)?;
+                    Some(serde_json::json!({"id": id, "scale": row.scale}))
+                })
+                .collect();
+            let mut post = client
+                .post(format!("{base}/lora-adapters"))
+                .json(&reconcile)
+                .timeout(std::time::Duration::from_secs(120));
+            if let Some(secret) = &auth {
+                post = post.bearer_auth(secret);
+            }
+            let resp = post
+                .send()
+                .await
+                .map_err(|e| format!("child POST /lora-adapters failed: {e}"))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            if !status.is_success() {
+                let detail = body
+                    .get("message")
+                    .or_else(|| body.get("error"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no detail");
+                return Err(format!(
+                    "child POST /lora-adapters answered {status}: {detail}"
+                ));
+            }
+            return Ok(format!(
+                "hot: adapter {lora_name} {} resident {key} (scale reconcile over the \
+                 spawn-loaded set)",
+                if attach { "live on" } else { "detached from" }
+            ));
         }
         let Some((endpoint, auth, key)) = target else {
             return Ok(deferred);
@@ -3433,7 +4103,26 @@ impl Supervisor {
             // "not pulled" error. Router mode has no per-request spec
             // (the gateway rejects options.spec there), so resolution
             // is overlay → config only.
-            let spec_mode = resolve_spec_mode(None, overlay.spec.clone(), &self.config.spec);
+            let mut spec_mode = resolve_spec_mode(None, overlay.spec.clone(), &self.config.spec);
+            // F2 evidence consult: a `tune --spec-race` measurement on
+            // this exact hardware beats the heuristic chain, but only
+            // at the auto tier — explicit pins above stay immune.
+            if spec_mode == "auto"
+                && let Ok(receipts) = store.list_spec_receipts(&m.name, &manifest.tag)
+            {
+                let draft_available = resolve_draft_path(&store, &m.name, "auto").is_some();
+                if let Some((mode, ratio)) =
+                    best_measured_spec_mode(&receipts, &manifest.spec_types, draft_available)
+                {
+                    tracing::info!(
+                        model = %m.name,
+                        mode,
+                        ratio,
+                        "spec=auto resolved from tune --spec-race receipts"
+                    );
+                    spec_mode = mode.to_string();
+                }
+            }
             let draft_path = resolve_draft_path(&store, &m.name, &spec_mode);
             let input = ProfileInput {
                 spec_mode: &spec_mode,
@@ -3665,7 +4354,7 @@ impl Supervisor {
                         // router: no single spec mode (per-section drafts)
                         spec_mode: String::new(),
                         draft: None,
-                        settled_mib: std::sync::atomic::AtomicU64::new(0),
+                        settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
                         pid,
@@ -4152,10 +4841,13 @@ impl Supervisor {
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
             .ok_or_else(|| SupervisionError::ModelNotFound(not_found_name(name)))?;
         let mut overlay = self.config.overlay_for(name);
-        // LC4: in-memory adaptive slots fill in ONLY where the user left
+        // LC4: in-memory adaptive slots fill in where the user left
         // slots unset (manual overlay always wins; `tune --slots` writes
-        // the overlay, which then shadows any adoption).
-        if overlay.slots.is_none()
+        // the overlay, which then shadows any adoption). A pin with
+        // `adaptive_override` on is the one exception: the user delegated
+        // shape authority to adaptation, so the pin serves as the seed
+        // shape only and the adopted value supersedes it at spawn.
+        if (overlay.slots.is_none() || overlay.adaptive_override.unwrap_or(false))
             && let Some(adopted) = self.adopted_slots.get(name)
         {
             overlay.slots = Some(*adopted);
@@ -4264,11 +4956,32 @@ impl Supervisor {
         // left it unset — per-request > overlay > governor > config.
         // A pin anywhere permanently exempts the model (the governor
         // itself refuses to act on pinned models).
-        let spec_mode = resolve_spec_mode(
+        let mut spec_mode = resolve_spec_mode(
             self.pending_spec.remove(name).map(|(_, m)| m),
             overlay.spec.clone(),
             &self.governed_spec_default(name),
         );
+        // F2 evidence consult: a `tune --spec-race` measurement on
+        // this exact hardware beats the heuristic chain, but only at
+        // the auto tier — queued/overlay/governor pins above stay
+        // immune, and without receipts the planner chain is unchanged.
+        if spec_mode == "auto" {
+            let caps = engine.capabilities();
+            if let Ok(receipts) = store.list_spec_receipts(name, &caps.tag) {
+                let draft_available = resolve_draft_path(&store, name, "auto").is_some();
+                if let Some((mode, ratio)) =
+                    best_measured_spec_mode(&receipts, &caps.spec_types, draft_available)
+                {
+                    tracing::info!(
+                        model = name,
+                        mode,
+                        ratio,
+                        "spec=auto resolved from tune --spec-race receipts"
+                    );
+                    spec_mode = mode.to_string();
+                }
+            }
+        }
         let mut draft_path = resolve_draft_path(&store, name, &spec_mode);
         if draft_path.is_none() && self.config.spec_autopull {
             // opt-in: pull the missing catalog draft, then re-resolve.
@@ -5174,6 +5887,28 @@ impl Supervisor {
                         }
                     }
 
+                    // LoRA contract probe (llamacpp with spawn-attached
+                    // adapters): detached, best-effort — verifies the
+                    // child's /lora-adapters wire shape right where a
+                    // field rename or attach shortfall originates, so
+                    // drift is named at spawn instead of masquerading as
+                    // "not loaded" teachings on later hot-attach calls.
+                    if kind == blazar_core::engine_kind::EngineKind::LlamaCpp
+                        && !Self::llamacpp_argv_lora_paths(&argv).is_empty()
+                    {
+                        let endpoint = endpoint.clone();
+                        let argv_snapshot = argv.clone();
+                        let secret = auth.as_ref().map(|a| a.secret.clone());
+                        tokio::spawn(async move {
+                            Self::llamacpp_lora_contract_probe(
+                                &endpoint,
+                                secret.as_deref(),
+                                &argv_snapshot,
+                            )
+                            .await;
+                        });
+                    }
+
                     // NEVER default the pid: a 0 here would later target
                     // process group 0 (the whole session) on teardown.
                     let pid = child.id().ok_or_else(|| {
@@ -5190,6 +5925,7 @@ impl Supervisor {
                         )));
                     }
                     let autofit_model_name = model.name.clone();
+                    let np_at_spawn = argv_np(&argv);
                     let inst = Arc::new(Instance {
                         name: key.to_string(),
                         // routed adapter or daemon global — whichever
@@ -5226,7 +5962,7 @@ impl Supervisor {
                                 .file_name()
                                 .map_or_else(|| p.to_string(), |f| f.to_string_lossy().into_owned())
                         }),
-                        settled_mib: std::sync::atomic::AtomicU64::new(0),
+                        settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
                         pid,
@@ -5246,6 +5982,13 @@ impl Supervisor {
                     let _ = std::fs::write(
                         self.dirs.run_dir().join(format!("{key}.pid")),
                         pid.to_string(),
+                    );
+                    tracing::info!(
+                        model = name,
+                        key,
+                        np = np_at_spawn,
+                        overlay_slots = overlay.slots,
+                        "engine child up: resident serving"
                     );
                     self.instances.insert(key.to_string(), inst);
                     // Registration fold: requests the admission gate
@@ -5288,7 +6031,11 @@ impl Supervisor {
                         // settle report must probe the lane that actually
                         // serves, not the daemon's global one.
                         let engine = Arc::clone(&engine);
-                        let settled_inst = Arc::clone(inst.value());
+                        // Hold ONLY the settle counter, never the
+                        // Instance Arc: this task outlives the spawn
+                        // return, and any Instance pin here starves the
+                        // prewarm cutover's re-key (try_unwrap).
+                        let settled_mib = Arc::clone(&inst.value().settled_mib);
                         let picked = picked_device.clone();
                         let model_name = name.to_string();
                         let predicted_mib = model_bytes / (1024 * 1024)
@@ -5298,9 +6045,7 @@ impl Supervisor {
                             if let Some((card, taken_mib, used_pct)) =
                                 settle_report(&pre, &post, picked.as_deref())
                             {
-                                settled_inst
-                                    .settled_mib
-                                    .store(taken_mib, std::sync::atomic::Ordering::Relaxed);
+                                settled_mib.store(taken_mib, std::sync::atomic::Ordering::Relaxed);
                                 tracing::info!(
                                     model = %model_name,
                                     card = %card,
@@ -5693,6 +6438,9 @@ drop them from rpc_servers in config.toml",
         // to the last-known-good shape instead of crash-looping on it.
         if self.adopted_slots.remove(model).is_some() {
             self.reshape_queue.remove(model);
+            // The D1 cooldown belongs to the rolled-back adoption — a
+            // failed reshape must not rate-limit the retry burst.
+            self.fast_adopted_at.remove(model);
             tracing::warn!(
                 model = model,
                 "adaptive slots rolled back after spawn failure — the adopted shape did not fit"
@@ -6786,6 +7534,11 @@ drop them from rpc_servers in config.toml",
     /// Explicit overlay slots, replicas, and `deterministic` exclude
     /// the model (a pin is a policy statement); opt-in via config.
     /// Adoption queues a respawn (see [`Self::drain_reshape_queue`]).
+    /// D1 burst fast-path: a window peak of >= 2x the effective slots
+    /// shortens the streak to [`SLOTS_FAST_STREAK_TICKS`] (rate-limited
+    /// by [`SLOTS_FAST_COOLDOWN`]) — sub-minute bursts used to queue out
+    /// the whole 60 s standard window before the first adoption.
+    #[allow(clippy::too_many_lines)] // one saturation story per instance; splitting hides the branch pairs
     fn adaptive_slots_tick(&self) {
         if !self.config.adaptive_slots {
             return;
@@ -6800,16 +7553,39 @@ drop them from rpc_servers in config.toml",
                 self.idle_streak.remove(&key);
                 continue;
             }
+            // A `#warm` instance is a transitional prewarm child waiting
+            // for its cutover — invisible to routing by key grammar, so
+            // it must be invisible to adaptation too. Adopting against
+            // it would queue a reshape keyed `#warm`, whose cutover
+            // "old-gone" guard then evicts the resident warm child
+            // itself (live-repro'd as a 10 s spawn/evict churn loop).
+            if key.ends_with("#warm") {
+                continue;
+            }
             let overlay = self.config.overlay_for(&model);
             // Manual slots, replicas, or deterministic mode exclude the
-            // model entirely (deterministic spawns pin slots = 1 by
-            // design — adoption would fight the pin every tick).
-            if overlay.slots.is_some()
-                || overlay.replicas.unwrap_or(1) > 1
-                || overlay.deterministic.unwrap_or(self.config.deterministic)
-            {
+            // model (deterministic spawns pin slots = 1 by design —
+            // adoption would fight the pin every tick). D2: the pin
+            // arm is liftABLE per model — `adaptive_override on` treats
+            // the pin as the base shape instead of a ceiling; the
+            // replicas/deterministic exclusions stay either way.
+            let deterministic = overlay.deterministic.unwrap_or(self.config.deterministic);
+            let replicated = overlay.replicas.unwrap_or(1) > 1;
+            let pin_only = overlay.slots.is_some() && !overlay.adaptive_override.unwrap_or(false);
+            if pin_only || replicated || deterministic {
                 self.busy_streak.remove(&key);
                 self.idle_streak.remove(&key);
+                // Shape authority returns to the exclusion: adaptation no
+                // longer owns this model's slot count, so any adopted
+                // value (e.g. recorded before the pin landed) must not
+                // keep shadowing spawns and `slot_cap` displays.
+                self.adopted_slots.remove(&model);
+                self.fast_adopted_at.remove(&model);
+                // D2: a pin is policy, but a sustained queueing floor
+                // behind it must not stay silent.
+                if pin_only && !replicated && !deterministic {
+                    self.pinned_pressure_teach(&model, &key, i, &overlay);
+                }
                 continue;
             }
             // Live shape from the child's own argv (source of truth);
@@ -6864,12 +7640,73 @@ drop them from rpc_servers in config.toml",
             if saturated {
                 // Saturation cancels any pending decay count.
                 self.idle_streak.remove(&key);
+                // D5 decode-scaling awareness: when fresh solo + loaded
+                // throughput evidence says the model's aggregate decode
+                // barely scales with concurrency (GPU-bound decode), a
+                // reshape buys queue relief at best while paying the
+                // transition — teach instead of adopt. The gate stands
+                // down (None) until both regimes were sampled inside
+                // DECODE_FRESH_WINDOW, and `adaptive_decode_gate` is the
+                // one-knob kill-switch.
+                if self.config.adaptive_decode_gate
+                    && let Some(ratio) = self.decode_scaling_ratio(&model)
+                    && ratio < DECODE_SCALE_ADOPT_MIN
+                {
+                    self.busy_streak.remove(&key);
+                    if self
+                        .decode_bound_warned_at
+                        .get(&model)
+                        .is_none_or(|t| t.elapsed() >= DECODE_BOUND_TEACH_DEDUP)
+                    {
+                        self.decode_bound_warned_at
+                            .insert(model.clone(), Instant::now());
+                        let (solo_tps, loaded_tps, loaded_conc) =
+                            self.decode_scaling_detail(&model);
+                        tracing::warn!(
+                            model = %model,
+                            ratio,
+                            solo_tps,
+                            loaded_tps,
+                            loaded_conc,
+                            "sustained queueing but decode is the bottleneck — measured aggregate decode barely scales with concurrency, so more slots would pay a reshape for queue relief only — keep the shape (or raise it explicitly with `blazar tune --slots`) or disable this gate per daemon with `adaptive_decode_gate = false`"
+                        );
+                        self.bus.publish(BlazarEvent::SlotsDecodeBound {
+                            model: model.clone(),
+                            solo_tps,
+                            loaded_tps,
+                            loaded_conc,
+                            ratio,
+                        });
+                    }
+                    continue;
+                }
+                self.decode_bound_warned_at.remove(&model);
+                // D1 burst fast-path: a window peak of >= 2x the
+                // effective slots is demand-attested (every queued
+                // arrival climbed through each gauge level), so 2 ticks
+                // prove what the standard window re-proves for 6.
+                // Rate-limited per model: right after an adoption the
+                // reshape has not landed yet, so a fresh burst reads as
+                // "cooldown" and takes the standard path instead of
+                // stacking a second bump before the first is testable.
+                let peak = latched_max.max(pressure);
+                let fast_eligible = effective > 0
+                    && i64::from(peak) >= 2 * i64::from(effective)
+                    && self
+                        .fast_adopted_at
+                        .get(&model)
+                        .is_none_or(|t| t.elapsed() >= SLOTS_FAST_COOLDOWN);
+                let threshold = if fast_eligible {
+                    SLOTS_FAST_STREAK_TICKS
+                } else {
+                    SLOTS_STREAK_TICKS
+                };
                 // Scope the entry guard: it must drop BEFORE the remove
                 // below, or the DashMap shard self-deadlocks.
                 let hit_threshold = {
                     let mut streak = self.busy_streak.entry(key.clone()).or_insert(0);
                     *streak += 1;
-                    *streak >= SLOTS_STREAK_TICKS
+                    *streak >= threshold
                 };
                 if hit_threshold {
                     let from = effective;
@@ -6882,19 +7719,33 @@ drop them from rpc_servers in config.toml",
                     // streak off dip samples. Fit-safe: the spawn
                     // re-spends the same total-ctx budget across slots
                     // and the profile walk caps what the card hosts.
-                    let step = latched_max.max(pressure).max(1);
+                    let step = peak.max(1);
                     let to = (from + step).min(SLOTS_ADOPT_CAP);
                     self.busy_streak.remove(&key);
                     if to > from {
+                        if fast_eligible {
+                            self.fast_adopted_at.insert(model.clone(), Instant::now());
+                        }
                         self.adopted_slots.insert(model.clone(), to);
                         // Queue the respawn: the drain below performs it
                         // once live streams finish (in-flight = 0), so
                         // the reshape never kills an active stream.
                         self.reshape_queue.insert(model.clone(), key.clone());
+                        // A new (larger) adoption re-arms the drain
+                        // budget: the episode that cutover out of
+                        // starvation earns a fresh parking window for
+                        // its bigger shape.
+                        self.reshape_draining.remove(&model);
                         // Consume the latch: the next window must attest
                         // its own peak, not inherit this one's.
                         self.slot_pressure_seen.remove(&model);
-                        tracing::info!(model = %model, from, to, "adaptive slots adopted");
+                        tracing::info!(
+                            model = %model,
+                            from,
+                            to,
+                            fast_path = fast_eligible,
+                            "adaptive slots adopted"
+                        );
                         self.bus
                             .publish(BlazarEvent::SlotsAutoAdopted { model, from, to });
                     }
@@ -6922,6 +7773,13 @@ drop them from rpc_servers in config.toml",
                     self.idle_streak.remove(&key);
                     self.busy_streak.remove(&key);
                     self.adopted_slots.remove(&model);
+                    // Full quiet reset clears the D1 cooldown too: the
+                    // burst that earned the (now decayed) adoption is
+                    // ancient history at this point. The D5 teach dedup
+                    // resets with it — the next queueing episode earns a
+                    // fresh verdict.
+                    self.fast_adopted_at.remove(&model);
+                    self.decode_bound_warned_at.remove(&model);
                     self.reshape_queue.insert(model.clone(), key.clone());
                     tracing::info!(
                         model = %model,
@@ -6939,19 +7797,90 @@ drop them from rpc_servers in config.toml",
         }
     }
 
+    /// D2: sustained admission pressure on a lane excluded from
+    /// adaptation ONLY by a manual `slots` pin. The pin stays
+    /// authoritative — no adoption happens — this only makes the
+    /// queueing floor visible: after [`SLOTS_STREAK_TICKS`] saturated
+    /// ticks, ONE throttled [`BlazarEvent::SlotsPinnedPressure`] event +
+    /// log per [`SLOTS_PINNED_TEACH_DEDUP`] window, carrying the
+    /// one-command remedy that lifts the pin exclusion per model.
+    fn pinned_pressure_teach(
+        &self,
+        model: &str,
+        key: &str,
+        i: &Instance,
+        overlay: &blazar_core::config::ModelOverride,
+    ) {
+        // Same saturation rule as the adoption path: the pinned cap is
+        // argv-resolved (the pin's own `-np`), with the overlay value as
+        // the fallback for fabricated/test instances without argv.
+        let effective = argv_np(&i.argv).unwrap_or(overlay.slots.unwrap_or(self.config.slots));
+        let in_flight = i.in_flight.load(Ordering::SeqCst);
+        let pressure = self.slot_pressure.get(model).map_or(0, |v| *v);
+        let demand_recent = self
+            .slot_pressure_seen
+            .get(model)
+            .is_some_and(|e| e.value().0.elapsed() < self.reaper_interval.saturating_mul(2));
+        let saturated = pressure > 0
+            || (effective > 0 && in_flight > i64::from(effective))
+            || (effective > 0 && in_flight >= i64::from(effective) && demand_recent);
+        if !saturated {
+            self.pinned_streak.remove(key);
+            return;
+        }
+        // Scope the entry guard: it must drop before the removes below
+        // or the DashMap shard self-deadlocks (same shape as the
+        // adoption streak).
+        let hit = {
+            let mut streak = self.pinned_streak.entry(key.to_string()).or_insert(0);
+            *streak += 1;
+            *streak >= SLOTS_STREAK_TICKS
+        };
+        if !hit {
+            return;
+        }
+        self.pinned_streak.remove(key);
+        if self
+            .pinned_warned_at
+            .get(model)
+            .is_some_and(|t| t.elapsed() < SLOTS_PINNED_TEACH_DEDUP)
+        {
+            return;
+        }
+        self.pinned_warned_at
+            .insert(model.to_string(), std::time::Instant::now());
+        tracing::warn!(
+            model = %model,
+            pinned_slots = effective,
+            pressure,
+            "sustained queueing behind a manual slots pin (no adaptation while pinned) — lift it per model with: blazar config set model_overrides.\"{model}\".adaptive_override on"
+        );
+        self.bus.publish(BlazarEvent::SlotsPinnedPressure {
+            model: model.to_string(),
+            slots: effective,
+            pressure,
+        });
+    }
+
     /// LC4 reaper half: observe saturation, then reshape. Runs on the
     /// 10s tick; see [`Self::adaptive_slots_tick`] for the adoption
     /// rule and [`Self::drain_reshape_queue`] for the respawn.
-    async fn adaptive_slots_reap(&self) {
+    /// Public so integration tests can drive the exact production
+    /// cycle (tick + drain) without waiting on the 10s timer.
+    pub async fn adaptive_slots_reap(&self) {
         self.adaptive_slots_tick();
         self.drain_reshape_queue().await;
     }
 
-    /// True while the model's queued reshape is draining: new admissions
-    /// park so the live-stream count can only fall. The admission gate
-    /// consults this on every pass through its re-check loop.
+    /// True while the model's queued reshape is parking admissions: the
+    /// admission gate consults this on every pass through its re-check
+    /// loop. The D3 `Cutover` phase deliberately reports false — the
+    /// parking budget was exceeded and the gate reopened into the old
+    /// shape (the reshape waits for a natural quiesce instead).
     pub fn is_reshaping(&self, model: &str) -> bool {
-        self.reshape_draining.contains_key(model)
+        self.reshape_draining
+            .get(model)
+            .is_some_and(|m| matches!(*m.value(), ReshapeDrain::Parking(_)))
     }
 
     /// Respawn adopted models once their streams drain. A busy instance
@@ -6965,6 +7894,7 @@ drop them from rpc_servers in config.toml",
     /// Residual race (a request admitted in the instant between the
     /// mark and the gate noticing) self-heals via the existing
     /// child-send retry path, which respawns and retries once.
+    #[allow(clippy::too_many_lines)]
     async fn drain_reshape_queue(&self) {
         let entries: Vec<(String, String)> = self
             .reshape_queue
@@ -6977,15 +7907,48 @@ drop them from rpc_servers in config.toml",
                 .get(&key)
                 .is_some_and(|i| i.in_flight.load(Ordering::SeqCst) > 0);
             if busy {
-                if self
-                    .reshape_draining
-                    .insert(model.clone(), std::time::Instant::now())
-                    .is_none()
-                {
-                    tracing::info!(
-                        model = %model,
-                        "adaptive slots: holding admissions to drain live streams for the reshape"
-                    );
+                // Capture the PREVIOUS phase before the insert overwrites
+                // it — reading the age after the write would always see a
+                // fresh timestamp and the bound could never trip.
+                let prev = self.reshape_draining.insert(
+                    model.clone(),
+                    ReshapeDrain::Parking(std::time::Instant::now()),
+                );
+                match prev {
+                    None => {
+                        tracing::info!(
+                            model = %model,
+                            "adaptive slots: holding admissions to drain live streams for the reshape"
+                        );
+                    }
+                    // Cutover phase: admissions are open by decision —
+                    // never re-park this episode; the reshape lands at
+                    // the next natural quiesce the not-busy arm below
+                    // catches.
+                    Some(ReshapeDrain::Cutover) => {}
+                    Some(ReshapeDrain::Parking(since)) => {
+                        let age = since.elapsed();
+                        if age >= SLOTS_DRAIN_BOUND {
+                            // D3 starvation bound: the reshape is a
+                            // latency optimization — a parking floor
+                            // longer than the budget costs more tail
+                            // latency than the reshape recovers.
+                            // Reopen admissions into the old shape;
+                            // the reshape waits for the next natural
+                            // quiesce instead of holding waiters.
+                            self.reshape_draining
+                                .insert(model.clone(), ReshapeDrain::Cutover);
+                            tracing::warn!(
+                                model = %model,
+                                waited_secs = age.as_secs(),
+                                "adaptive slots: drain exceeded the parking bound — admissions reopen, reshape lands at the next natural quiesce"
+                            );
+                            self.bus.publish(BlazarEvent::SlotsDrainCutover {
+                                model: model.clone(),
+                                waited_secs: age.as_secs(),
+                            });
+                        }
+                    }
                 }
                 continue;
             }
@@ -6993,33 +7956,209 @@ drop them from rpc_servers in config.toml",
             // respawn: the admission gate must keep parking requests while
             // the lane is child-less (evict -> spawn -> healthy takes a
             // model-load of wall time), not just while streams drain.
+            // Re-arming to `Parking` here also covers the cutover phase:
+            // a quiesce observed during cutover still gets its reshape,
+            // and the gate parks through the child-less window.
+            self.reshape_draining.insert(
+                model.clone(),
+                ReshapeDrain::Parking(std::time::Instant::now()),
+            );
             let slots = self
                 .adopted_slots
                 .get(&model)
                 .map_or(self.config.slots, |v| *v.value());
-            tracing::warn!(
-                model = %model,
-                slots,
-                "adaptive slots: respawning with the new slot count \
-                 (the KV bank carries conversations across the reshape)"
-            );
-            if let Err(e) = self.evict(&key).await {
-                // keep the queue entry + mark: retry the reshape next tick
-                tracing::warn!(model = %model, "adaptive reshape evict: {e:#}");
-                continue;
-            }
-            match self.ensure(&model).await {
-                Ok(_) => {
-                    self.reshape_draining.remove(&model);
-                    self.reshape_queue.remove(&model);
-                    self.bus
-                        .publish(BlazarEvent::SlotsReshaped { model, slots });
+            // Replica pre-warm cutover (spike doc §D3 alternative): the
+            // replacement-shape child loads UNDER a `#warm` key while the
+            // old child keeps serving, so the reshape lands with zero
+            // admission gap instead of a drain + model-load of parking.
+            // Captive spawn: the warm load must never evict the old child
+            // as its VRAM victim — a refusal (common on 8 GB cards: two
+            // residents of one model) falls back to the drain-reshape
+            // verbatim below. Trade-off vs the fallback: the warm child
+            // starts before the old one banks its KV, so past-conversation
+            // cache warmth re-prefills (~100 ms class) instead of
+            // restoring — in-flight streams are unaffected (this arm only
+            // runs at quiesce).
+            let warm_key = format!("{model}#warm");
+            // A warm child already resident (a prior cutover deferred by
+            // Arc contention) must never be re-spawned: the spawn would
+            // overwrite the map entry and orphan a live child. Go
+            // straight to the cutover instead. Only a Ready warm may
+            // skip the spawn — a crashed one must be replaced (the
+            // overwrite drops the dead child's Arc; kill_on_drop reaps).
+            let warm_waiting = self.instances.get(&warm_key).is_some_and(|w| {
+                matches!(*w.state.read().expect("state lock"), InstanceState::Ready)
+            });
+            let spawn_result = if warm_waiting {
+                Ok(())
+            } else {
+                self.spawn_instance_captive(&warm_key).await.map(|_| ())
+            };
+            match spawn_result {
+                Ok(()) => {
+                    // Cutover at quiesce: the old child is idle by this
+                    // arm's own busy-check. The parked gate (draining
+                    // held above) stays closed through the swap, so no
+                    // admission can spawn a competing child mid-rekey.
+                    //
+                    // Ordering contract (live-repro'd churn): take and
+                    // unwrap the warm Arc BEFORE evicting the old child.
+                    // try_unwrap can fail while a transient gauge or
+                    // iterator holds a clone; retry briefly in-line so a
+                    // microsecond holder does not cost a whole reaper
+                    // tick — and on final failure the ONLY safe retry
+                    // leaves both children exactly where they are (old
+                    // still serving under the plain key, warm still
+                    // waiting). Evicting first would strand the lane
+                    // child-less and hand it to a competing ensure-spawn.
+                    let mut taken: Option<Instance> = None;
+                    let mut vanished = false;
+                    for attempt in 0..PREWARM_UNWRAP_ATTEMPTS {
+                        if let Some(warm_arc) = self.instances.remove(&warm_key).map(|(_, a)| a) {
+                            match Arc::try_unwrap(warm_arc) {
+                                Ok(warm) => {
+                                    taken = Some(warm);
+                                    break;
+                                }
+                                Err(shared) => {
+                                    if attempt + 1 < PREWARM_UNWRAP_ATTEMPTS {
+                                        tokio::time::sleep(PREWARM_UNWRAP_BACKOFF).await;
+                                    }
+                                    // Reinsert between attempts so the map
+                                    // is never child-less while we wait the
+                                    // holder out; the tick skips `#warm`
+                                    // keys, so nothing else consumes it.
+                                    self.instances.insert(warm_key.clone(), shared);
+                                }
+                            }
+                        } else {
+                            vanished = true;
+                            break;
+                        }
+                    }
+                    match taken {
+                        Some(mut warm) => {
+                            let old_gone = self.instances.get(&key).is_none();
+                            if !old_gone && let Err(e) = self.evict(&key).await {
+                                // Old-child teardown failed: retire the
+                                // unwrapped warm child we are holding
+                                // and hold the queue for a clean retry
+                                // next tick (re-spawn, no orphan).
+                                tracing::warn!(model = %model, "adaptive reshape evict: {e:#}");
+                                let _ = self.terminate_warm(&mut warm).await;
+                                continue;
+                            }
+                            // Runtime files follow the instance key
+                            // (pid/apikey are per-key): rebase the
+                            // warm child's onto the plain model key
+                            // so a later evict cleans the right
+                            // names. Best-effort renames — a missing
+                            // file is inert (`let _` cleanup parity
+                            // with evict).
+                            let run = self.dirs.run_dir();
+                            let _ = std::fs::rename(
+                                run.join(format!("{warm_key}.pid")),
+                                run.join(format!("{model}.pid")),
+                            );
+                            let _ = std::fs::rename(
+                                run.join(format!("{warm_key}.apikey")),
+                                run.join(format!("{model}.apikey")),
+                            );
+                            let key = model.clone();
+                            warm.name.clone_from(&key);
+                            self.instances.insert(key, Arc::new(warm));
+                            self.reshape_draining.remove(&model);
+                            self.reshape_queue.remove(&model);
+                            tracing::info!(
+                                model = %model,
+                                slots,
+                                "adaptive slots: pre-warm cutover — replacement shape served Ready under #warm, routing swapped with zero admission gap"
+                            );
+                            self.bus.publish(BlazarEvent::SlotsPrewarmCutover {
+                                model: model.clone(),
+                                slots,
+                            });
+                            // Completion contract: listeners waiting
+                            // for "the reshape landed" must not care
+                            // which path landed it.
+                            self.bus
+                                .publish(BlazarEvent::SlotsReshaped { model, slots });
+                        }
+                        None if vanished => {
+                            // Warm vanished mid-cutover (crash race):
+                            // fall through to the drain-reshape.
+                            tracing::warn!(
+                                model = %model,
+                                "adaptive pre-warm child vanished before cutover — falling back to drain-reshape"
+                            );
+                            self.fallback_reshape(&model, &key, slots).await;
+                        }
+                        None => {
+                            // Every unwrap attempt lost the race to a
+                            // longer-lived holder. Both children are
+                            // exactly where they belong (old serving
+                            // under the plain key, warm reinserted and
+                            // waiting); hold the queue and retry the
+                            // re-key on the next drain.
+                            tracing::warn!(
+                                model = %model,
+                                "adaptive pre-warm cutover deferred: the warm child's Arc is still held — retrying next tick"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
-                    // Respawn failed: hold admissions one more tick and
-                    // retry — never publish completion for a dead lane.
-                    tracing::warn!(model = %model, "adaptive reshape respawn: {e:#}");
+                    // Fit-refusal (typical) or spawn failure: the old
+                    // drain-reshape path, verbatim semantics.
+                    tracing::info!(
+                        model = %model,
+                        "adaptive pre-warm refused ({e:#}) — falling back to drain-reshape (two residents of one model will not fit)"
+                    );
+                    self.fallback_reshape(&model, &key, slots).await;
                 }
+            }
+        }
+    }
+
+    /// Drain-reshape fallback for the pre-warm path: the pre-D3 shape —
+    /// evict the idle child, respawn at the adopted shape, hold the
+    /// parking gate through the child-less window. Kept as its own method
+    /// so both call sites (pre-warm refusal, warm-vanished race) share
+    /// identical semantics with the pre-warm wave's code.
+    /// Retire a warm child the cutover could not install (old-child
+    /// teardown failed and the lane must retry clean). The instance is
+    /// already off the map at every call site — this owns only process
+    /// teardown, mirroring `evict`'s `terminate_group` contract.
+    async fn terminate_warm(&self, warm: &mut Instance) -> Result<()> {
+        let mut child = warm.child.lock().await;
+        terminate_group(warm.pid, self.shutdown_grace, &mut child).await
+    }
+
+    async fn fallback_reshape(&self, model: &str, key: &str, slots: u32) {
+        tracing::warn!(
+            model = %model,
+            slots,
+            "adaptive slots: respawning with the new slot count \
+             (the KV bank carries conversations across the reshape)"
+        );
+        if let Err(e) = self.evict(key).await {
+            // keep the queue entry + mark: retry the reshape next tick
+            tracing::warn!(model = %model, "adaptive reshape evict: {e:#}");
+            return;
+        }
+        match self.ensure(model).await {
+            Ok(_) => {
+                self.reshape_draining.remove(model);
+                self.reshape_queue.remove(model);
+                self.bus.publish(BlazarEvent::SlotsReshaped {
+                    model: model.to_string(),
+                    slots,
+                });
+            }
+            Err(e) => {
+                // Respawn failed: hold admissions one more tick and
+                // retry — never publish completion for a dead lane.
+                tracing::warn!(model = %model, "adaptive reshape respawn: {e:#}");
             }
         }
     }
@@ -7070,6 +8209,32 @@ drop them from rpc_servers in config.toml",
                 self.slot_pressure.remove(model);
             }
         }
+    }
+
+    /// D4 `/metrics` snapshot: per RESIDENT model (canonicalized,
+    /// replica keys deduped) the current admission-pressure level, the
+    /// adopted slot target when one is active, and the effective live
+    /// cap (adopted → child argv `-np` → config). Sorted by model for a
+    /// stable exposition — the queueing floor used to need offline log
+    /// parsing to see.
+    #[must_use]
+    pub fn slots_gauge_snapshot(&self) -> Vec<(String, u32, Option<u32>, u32)> {
+        let mut rows: Vec<(String, u32, Option<u32>, u32)> = self
+            .instances
+            .iter()
+            .map(|e| {
+                let model = model_of_key(e.key()).to_string();
+                let i = e.value();
+                let pressure = self.slot_pressure.get(&model).map_or(0, |v| *v);
+                let adopted = self.adopted_slots.get(&model).map(|v| *v.value());
+                let effective =
+                    adopted.unwrap_or_else(|| argv_np(&i.argv).unwrap_or(self.config.slots));
+                (model, pressure, adopted, effective)
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.dedup_by(|a, b| a.0 == b.0);
+        rows
     }
 
     /// Live slot ceiling for the gateway admission gate. The static
@@ -7279,6 +8444,23 @@ drop them from rpc_servers in config.toml",
                         None
                     } else {
                         Some(u32::try_from(self.slot_cap(&i.name)).unwrap_or(u32::MAX))
+                    },
+                    slots_source: if i.name == ROUTER_KEY {
+                        None
+                    } else {
+                        // Canonicalize: replica/variant keys record their
+                        // override against the base model (same as the
+                        // adopted lookup directly above).
+                        let base = model_of_key(&i.name);
+                        Some(if self.adopted_slots.get(base).is_some() {
+                            "adapted"
+                        } else if self.config.overlay_for(base).slots.is_some() {
+                            "pinned"
+                        } else if argv_np(&i.argv).is_some() {
+                            "auto"
+                        } else {
+                            "engine"
+                        })
                     },
                     gpu: i.gpu.clone(),
                     device: i.device.clone(),
@@ -8598,7 +9780,7 @@ mod routing_tests {
             warnings: Vec::new(),
             spec_mode: "off".into(),
             draft: None,
-            settled_mib: std::sync::atomic::AtomicU64::new(settled_mib),
+            settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(settled_mib)),
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
             pid,
@@ -9066,6 +10248,151 @@ mod routing_tests {
         );
         assert!(sup.instances.contains_key("m"), "capable resident stays");
         kill_all(&[stale_pid, capable_pid]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one resident shape per arm, mirrors the sglang pin
+    async fn unit__llamacpp_variant_rides_base__validates_stems_and_evicts_drifted() {
+        use blazar_core::engine_kind::EngineKind;
+        let (sup, root) = gpu_sup();
+        // Model: a GGUF file (the format fact that routes auto-mode
+        // serving to llamacpp when that lane is installed).
+        let model_gguf = root.path().join("m.gguf");
+        std::fs::write(&model_gguf, b"gguf").unwrap();
+        // Adapter present on disk as a file (llamacpp --lora cargo).
+        let adapter = root.path().join("adapters").join("anonymizer.gguf");
+        std::fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+        std::fs::write(&adapter, b"gguf").unwrap();
+        let store = Store::open(&sup.dirs).unwrap();
+        store
+            .upsert_model(&blazar_core::ModelRow {
+                name: "m".into(),
+                repo: "m".into(),
+                quant: "Q4_K_M".into(),
+                path: model_gguf.to_string_lossy().into_owned(),
+                bytes: 1,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+                last_used_at: 0,
+            })
+            .unwrap();
+        // No engines installed: routing stays global/indeterminate —
+        // the legacy dedicated variant child must be kept.
+        assert!(
+            !sup.llamacpp_variant_rides_base("m", "anonymizer")
+                .await
+                .unwrap(),
+            "empty roster keeps the variant child"
+        );
+        // Install the llamacpp lane (valid manifest, kind override).
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                kind: EngineKind::LlamaCpp,
+                manifest: serde_json::to_string(&crate::engine::manifest::Manifest {
+                    tag: "llamacpp-t".into(),
+                    ..Default::default()
+                })
+                .unwrap(),
+                ..lane_row("llamacpp-t", &[], 1000)
+            })
+            .unwrap();
+        // Missing adapter stem: the variant-child teaching fires
+        // IDENTICALLY (attach remedy names the `+stem` request form).
+        let err = sup
+            .llamacpp_variant_rides_base("m", "absent")
+            .await
+            .unwrap_err();
+        match &err {
+            SupervisionError::ModelNotFound(msg) => assert!(
+                msg.contains("blazar lora add") && msg.contains("m+absent"),
+                "teaching lost the remedy: {msg}"
+            ),
+            other => panic!("expected ModelNotFound teaching, got {other:?}"),
+        }
+        // Attached + on disk: alias fires.
+        store
+            .add_lora("m", &adapter.to_string_lossy(), 1.0)
+            .unwrap();
+        assert!(
+            sup.llamacpp_variant_rides_base("m", "anonymizer")
+                .await
+                .unwrap(),
+            "llamacpp lane + valid stem aliases to the base child"
+        );
+        // A resident base child spawned WITHOUT --lora cannot serve
+        // variants (the per-request field only addresses loaded
+        // adapters): evict so the ensure that follows respawns with
+        // every row adapter in argv.
+        let (mut dense, dense_pid) = fake_instance("m", InstanceState::Ready, 0);
+        {
+            let inst = Arc::get_mut(&mut dense).unwrap();
+            inst.kind = EngineKind::LlamaCpp;
+            inst.argv = vec!["llama-server".into(), "-m".into(), "m.gguf".into()];
+        }
+        sup.instances.insert("m".to_string(), dense);
+        assert!(
+            sup.llamacpp_variant_rides_base("m", "anonymizer")
+                .await
+                .unwrap(),
+            "dense resident still aliases (after eviction)"
+        );
+        assert!(
+            !sup.instances.contains_key("m"),
+            "adapter-less resident must be evicted for the respawn"
+        );
+        // An adapter-LOADED resident stays: it serves every attached
+        // adapter through the per-request `lora` field.
+        let (mut loaded, loaded_pid) = fake_instance("m", InstanceState::Ready, 0);
+        {
+            let inst = Arc::get_mut(&mut loaded).unwrap();
+            inst.kind = EngineKind::LlamaCpp;
+            inst.argv = vec![
+                "llama-server".into(),
+                "-m".into(),
+                "m.gguf".into(),
+                "--lora".into(),
+                adapter.to_string_lossy().into_owned(),
+            ];
+        }
+        sup.instances.insert("m".to_string(), loaded);
+        assert!(
+            sup.llamacpp_variant_rides_base("m", "anonymizer")
+                .await
+                .unwrap()
+        );
+        assert!(sup.instances.contains_key("m"), "loaded resident stays");
+        // A DRIFTED resident (adapter set ≠ current store rows) is
+        // evicted for consolidation onto the current spawn set.
+        let (mut drifted, drifted_pid) = fake_instance("m", InstanceState::Ready, 0);
+        {
+            let inst = Arc::get_mut(&mut drifted).unwrap();
+            inst.kind = EngineKind::LlamaCpp;
+            inst.argv = vec![
+                "llama-server".into(),
+                "-m".into(),
+                "m.gguf".into(),
+                "--lora-scaled".into(),
+                format!("{}:0.5", root.path().join("stale.gguf").to_string_lossy()),
+            ];
+        }
+        sup.instances.insert("m".to_string(), drifted);
+        assert!(
+            sup.llamacpp_variant_rides_base("m", "anonymizer")
+                .await
+                .unwrap(),
+            "drifted resident still aliases (after eviction)"
+        );
+        assert!(
+            !sup.instances.contains_key("m"),
+            "drifted adapter set must be evicted for the respawn"
+        );
+        kill_all(&[dense_pid, loaded_pid, drifted_pid]);
     }
 
     #[test]
@@ -9986,7 +11313,7 @@ mod routing_tests {
             warnings: Vec::new(),
             spec_mode: "off".into(),
             draft: None,
-            settled_mib: std::sync::atomic::AtomicU64::new(0),
+            settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
             pid,
@@ -10393,6 +11720,60 @@ mod routing_tests {
         assert_eq!(r(None, Some("eagle3".into()), "auto"), "eagle3");
         // Neither: the global config default.
         assert_eq!(r(None, None, "auto"), "auto");
+    }
+
+    #[test]
+    fn unit__best_measured_spec_mode__gating_argmax_and_mapping() {
+        use super::best_measured_spec_mode as best;
+        let receipt = |mode: &str, ratio: f64| blazar_core::store::SpecReceiptRow {
+            model: "m".into(),
+            engine_tag: "e".into(),
+            mode: mode.into(),
+            tok_per_s: ratio * 40.0,
+            dense_tps: 40.0,
+            ratio,
+            measured_at: 100,
+        };
+        let advertised = ["ngram-simple".to_string(), "draft-simple".to_string()].to_vec();
+        // Draft wins on ratio but the pair is not pulled: receipt is
+        // gated out, ngram (1.10) takes over — hardware truth, not hope.
+        let rows = vec![receipt("ngram", 1.10), receipt("draft", 1.30)];
+        assert_eq!(
+            best(&rows, &advertised, false),
+            Some(("ngram", 1.10)),
+            "draft receipt without an available pair must not win"
+        );
+        // With the pair available the draft receipt wins and maps to
+        // the "auto" override spelling (planner owns engagement).
+        assert_eq!(best(&rows, &advertised, true), Some(("auto", 1.30)));
+        // Engine that advertises neither spec type: nothing is usable.
+        assert_eq!(best(&rows, &[], true), None);
+        // dflash needs draft-dflash advertised.
+        let dflash_rows = vec![receipt("dflash", 1.50)];
+        assert_eq!(best(&dflash_rows, &advertised, true), None);
+        assert_eq!(
+            best(&dflash_rows, &["draft-dflash".to_string()], false),
+            Some(("dflash", 1.50)),
+            "dflash is draft-free: pair availability is irrelevant"
+        );
+        // Dense is the baseline, sub-threshold receipts are noise.
+        let noise = vec![receipt("dense", 1.0), receipt("ngram", 1.02)];
+        assert_eq!(best(&noise, &advertised, true), None);
+        // Equal ratios: the LATER measurement breaks the tie.
+        let tie = vec![
+            blazar_core::store::SpecReceiptRow {
+                measured_at: 100,
+                ..receipt("ngram", 1.20)
+            },
+            blazar_core::store::SpecReceiptRow {
+                measured_at: 200,
+                ..receipt("ngram", 1.20)
+            },
+        ];
+        assert_eq!(best(&tie, &advertised, true), Some(("ngram", 1.20)));
+        // Unknown receipt spellings never select.
+        let unknown = vec![receipt("eagle3", 2.0)];
+        assert_eq!(best(&unknown, &advertised, true), None);
     }
 
     #[test]
@@ -11237,8 +12618,10 @@ mod routing_tests {
         );
         // draining mark alone (queue already consumed) blocks too
         sup.reshape_queue.remove("m");
-        sup.reshape_draining
-            .insert("m".to_string(), std::time::Instant::now());
+        sup.reshape_draining.insert(
+            "m".to_string(),
+            ReshapeDrain::Parking(std::time::Instant::now()),
+        );
         for _ in 0..(SLOTS_DECAY_TICKS + 5) {
             sup.adaptive_slots_tick();
         }
@@ -11363,6 +12746,781 @@ mod routing_tests {
             "streak must survive gauge dips; step sizes off the window PEAK (4 + 4, cap 8)"
         );
         kill_all(&[ph]);
+    }
+
+    /// D1 burst fast-path: a window peak of >= 2x the effective slots is
+    /// demand-attested, so 2 saturated ticks adopt (the 6-tick window
+    /// used to outlast sub-minute bursts — C4 0.56x/C8 0.61x queueing,
+    /// spike doc 2026-10-29). The cooldown map records the fast adoption.
+    #[tokio::test]
+    async fn unit__adaptive_slots__burst_fast_path_adopts_at_two_ticks() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        // Two waiters park on a 1-slot child: peak 2 >= 2x1.
+        sup.note_slot_pressure("m");
+        sup.note_slot_pressure("m");
+        sup.adaptive_slots_tick();
+        assert!(
+            sup.adopted_slots.get("m").is_none(),
+            "one tick short of the fast threshold"
+        );
+        sup.adaptive_slots_tick();
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(3),
+            "burst peak 2x effective must adopt at tick 2 with a demand-sized step (1 + 2)"
+        );
+        assert!(
+            sup.fast_adopted_at.get("m").is_some(),
+            "fast adoption starts the cooldown window"
+        );
+        kill_all(&[ph]);
+    }
+
+    /// D1 anti-flap: inside the cooldown a fresh burst is demoted to the
+    /// standard 6-tick streak (the reshape has not landed yet — stacking
+    /// a second bump before the first is testable would overshoot).
+    #[tokio::test]
+    async fn unit__adaptive_slots__fast_path_cooldown_demotes_to_standard_window() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        // First burst: fast adoption to 3, cooldown armed.
+        sup.note_slot_pressure("m");
+        sup.note_slot_pressure("m");
+        sup.adaptive_slots_tick();
+        sup.adaptive_slots_tick();
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(3));
+        // The reshape landed; the same burst keeps queueing. The gauge
+        // already sits at 2 — four more parks push the window peak to 6
+        // >= 2x3, so ONLY the cooldown can demote this to the standard
+        // window (a broken cooldown would adopt 3 + 6 = 9 at tick 2).
+        for _ in 0..4 {
+            sup.note_slot_pressure("m");
+        }
+        for _ in 0..SLOTS_FAST_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert!(
+            sup.adopted_slots.get("m").map(|v| *v) == Some(3),
+            "cooldown demotes the streak to the standard window — no fast re-adopt"
+        );
+        assert!(
+            sup.busy_streak.get(&"m".to_string()).map(|v| *v.value())
+                == Some(SLOTS_FAST_STREAK_TICKS),
+            "the standard streak is counting from the demoted threshold"
+        );
+        kill_all(&[ph]);
+    }
+
+    /// D1 boundary: a peak below 2x effective keeps the standard 6-tick
+    /// window (the fast path is a burst shortcut, not a lower bar).
+    #[tokio::test]
+    async fn unit__adaptive_slots__sub_double_peak_keeps_standard_window() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        sup.instances.insert("m".into(), inst);
+        // Peak 3 < 2x2: standard path.
+        for _ in 0..3 {
+            sup.note_slot_pressure("m");
+        }
+        for _ in 0..SLOTS_FAST_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert!(
+            sup.adopted_slots.get("m").is_none(),
+            "peak below 2x effective must NOT take the fast path"
+        );
+        for _ in 0..(SLOTS_STREAK_TICKS - SLOTS_FAST_STREAK_TICKS) {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(5),
+            "standard window adopts with the demand-sized step (2 + 3)"
+        );
+        assert!(
+            sup.fast_adopted_at.get("m").is_none(),
+            "standard adoptions do not arm the fast cooldown"
+        );
+        kill_all(&[ph]);
+    }
+
+    /// D3 starvation bound: a busy instance parks admissions while the
+    /// reshape waits for streams to drain — but a parking floor longer
+    /// than the bound costs more tail latency than the reshape
+    /// recovers. A backdated mark trips the cutover (admissions reopen,
+    /// `is_reshaping` goes false), and a LATER larger adoption re-arms a
+    /// fresh parking budget for the bigger shape.
+    #[tokio::test]
+    async fn unit__adaptive_slots__drain_bound_trips_cutover_opens_gate() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        let mut rx = sup.bus.subscribe();
+        // Burst-adopt to 3 (fast path) and queue the reshape.
+        sup.note_slot_pressure("m");
+        sup.note_slot_pressure("m");
+        sup.adaptive_slots_tick();
+        sup.adaptive_slots_tick();
+        assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(3));
+        // Busy child: the drain parks admissions instead of reshaping.
+        sup.drain_reshape_queue().await;
+        assert!(sup.is_reshaping("m"), "first busy drain marks Parking");
+        // Backdate the mark past the bound: the next drain must cut over.
+        sup.reshape_draining.insert(
+            "m".to_string(),
+            ReshapeDrain::Parking(
+                std::time::Instant::now()
+                    .checked_sub(SLOTS_DRAIN_BOUND + Duration::from_secs(1))
+                    .expect("backdated mark stays within Instant range"),
+            ),
+        );
+        sup.drain_reshape_queue().await;
+        assert!(!sup.is_reshaping("m"), "cutover reopens the admission gate");
+        assert!(matches!(
+            sup.reshape_draining.get("m").map(|m| *m.value()),
+            Some(ReshapeDrain::Cutover)
+        ));
+        let mut cut_over = None;
+        for _ in 0..4 {
+            match rx.try_recv() {
+                Ok(BlazarEvent::SlotsDrainCutover { model, waited_secs }) => {
+                    cut_over = Some((model, waited_secs));
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        match cut_over {
+            Some((model, waited_secs)) => {
+                assert_eq!(model, "m");
+                assert!(waited_secs >= SLOTS_DRAIN_BOUND.as_secs());
+            }
+            None => panic!("expected SlotsDrainCutover after the bound trips"),
+        }
+        // A later larger adoption re-arms the budget: the cutover
+        // episode earns a fresh parking window for its bigger shape.
+        for _ in 0..4 {
+            sup.note_slot_pressure("m");
+        }
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(9),
+            "the post-cutover adoption sizes off the window peak (3 + 6)"
+        );
+        assert!(
+            sup.reshape_draining.get("m").is_none(),
+            "adoption re-arms the drain budget"
+        );
+        // The re-armed episode parks fresh on its next busy drain.
+        sup.drain_reshape_queue().await;
+        assert!(matches!(
+            sup.reshape_draining.get("m").map(|m| *m.value()),
+            Some(ReshapeDrain::Parking(_))
+        ));
+        assert!(sup.is_reshaping("m"));
+        kill_all(&[ph]);
+    }
+
+    /// D5 sampler: notes route by residual concurrency (0 = solo class,
+    /// n > 0 = loaded at depth n+1) and the ratio needs BOTH classes
+    /// fresh — a half-empty or stale sampler stands the gate down.
+    #[test]
+    fn unit__decode_scaling__class_routing_and_freshness() {
+        let sup = routing_sup(1);
+        // Solo sample: 100 t/s with 0 other streams; loaded: 60 t/s with
+        // 1 other (depth 2 — the noter itself is the +1; see the router
+        // doc and `proxy::others_peak`).
+        sup.note_model_throughput("zeta", 100, 1.0, 0);
+        sup.note_model_throughput("zeta", 60, 1.0, 1);
+        let ratio = sup
+            .decode_scaling_ratio("zeta")
+            .expect("both classes sampled");
+        assert!((ratio - 1.2).abs() < 1e-9, "60*2/100 = 1.2, got {ratio}");
+        let (solo, loaded, conc) = sup.decode_scaling_detail("zeta");
+        assert!((solo - 100.0).abs() < 1e-9);
+        assert!((loaded - 60.0).abs() < 1e-9);
+        assert!((conc - 2.0).abs() < 1e-9);
+        // Half-empty sampler: solo-only never saw the loaded class.
+        sup.note_model_throughput("solo-only", 100, 1.0, 0);
+        assert!(sup.decode_scaling_ratio("solo-only").is_none());
+        // Stale solo sample: the fresh window expires the evidence.
+        sup.note_model_throughput("stale", 100, 1.0, 0);
+        sup.note_model_throughput("stale", 60, 1.0, 1);
+        let hints = sup.model_hints.get("stale").expect("hints entry");
+        if let Ok(mut solo) = hints.scaling.solo.lock() {
+            solo.last_seen = Some(
+                std::time::Instant::now()
+                    .checked_sub(DECODE_FRESH_WINDOW + Duration::from_secs(1))
+                    .expect("backdated stamp stays within Instant range"),
+            );
+        }
+        assert!(sup.decode_scaling_ratio("stale").is_none());
+    }
+
+    /// D5 gate: when measured aggregate decode barely scales with
+    /// concurrency (ratio < `DECODE_SCALE_ADOPT_MIN`), a saturated lane
+    /// must NOT pay a reshape for queue relief — it teaches once per
+    /// dedup window instead. The kill-switch and a healthy ratio both
+    /// restore adoption.
+    #[tokio::test]
+    async fn unit__adaptive_slots__decode_bound_suppresses_adoption() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        let mut rx = sup.bus.subscribe();
+        // GPU-bound shape: solo 100 t/s, loaded 30 t/s at depth 2
+        // (1 other stream) → ratio 0.6 << 1.25.
+        sup.note_model_throughput("m", 100, 1.0, 0);
+        sup.note_model_throughput("m", 30, 1.0, 1);
+        sup.note_slot_pressure("m");
+        sup.note_slot_pressure("m");
+        for _ in 0..8 {
+            sup.adaptive_slots_tick();
+        }
+        assert!(
+            sup.adopted_slots.get("m").is_none(),
+            "decode-bound lane must not adopt"
+        );
+        assert!(sup.busy_streak.get("m").is_none(), "streak cleared");
+        let mut bounds = 0;
+        for _ in 0..8 {
+            match rx.try_recv() {
+                Ok(BlazarEvent::SlotsDecodeBound { .. }) => bounds += 1,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert_eq!(bounds, 1, "teach fires once per dedup window");
+        // Kill-switch off: the explicit override restores adoption.
+        sup.config.adaptive_decode_gate = false;
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(3),
+            "kill-switch off adopts off the window peak"
+        );
+        kill_all(&[ph]);
+
+        // Healthy scaling (ratio 1.6 ≥ 1.25): adoption proceeds.
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.slots = 0;
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        sup.note_model_throughput("m", 100, 1.0, 0);
+        sup.note_model_throughput("m", 80, 1.0, 1);
+        sup.note_slot_pressure("m");
+        sup.note_slot_pressure("m");
+        sup.adaptive_slots_tick();
+        sup.adaptive_slots_tick();
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(3),
+            "scaling lane adopts via the fast path"
+        );
+        kill_all(&[ph]);
+    }
+
+    /// Prewarm cutover: an idle reshape spawns the replacement under
+    /// `m#warm` first (the old child serves until the swap), then re-keys
+    /// the warm instance to `m` — one resident, adopted argv, no warm
+    /// residue, `SlotsPrewarmCutover` published.
+    #[tokio::test]
+    async fn unit__prewarm__cutover_rekeys_and_retires_old() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        // A prewarm-capable box: the transient double-residency (old +
+        // warm) needs room for two concurrent instances — the default
+        // no-GPU harness caps at one, and a one-slot box correctly
+        // takes the fallback instead.
+        sup.config.max_loaded_models = 2;
+        let model_path = sup.dirs.data_dir.join("models").join("m-q4_0.gguf");
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        write_minimal_qwen3_gguf(&model_path);
+        blazar_core::Store::open(&sup.dirs)
+            .unwrap()
+            .upsert_model(&blazar_core::ModelRow {
+                name: "m".into(),
+                repo: "m".into(),
+                quant: "Q4_0".into(),
+                path: model_path.to_string_lossy().into_owned(),
+                bytes: 1,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+                last_used_at: 0,
+            })
+            .unwrap();
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        sup.adopted_slots.insert("m".to_string(), 4);
+        sup.reshape_queue.insert("m".to_string(), "m".to_string());
+        let mut rx = sup.bus.subscribe();
+        sup.drain_reshape_queue().await;
+        let warm = sup.instances.get("m#warm");
+        assert!(warm.is_none(), "warm must be re-keyed, not left behind");
+        let respawned = sup.instances.get("m").expect("re-keyed instance under m");
+        assert_eq!(respawned.name, "m");
+        // (The adopted shape is asserted via the cutover event below —
+        // FakeEngine's build_argv is empty, so the spawned argv carries
+        // no `-np` pair to check here; the integration test pins the
+        // real child argv.)
+        assert!(
+            sup.reshape_draining.get("m").is_none() && sup.reshape_queue.get("m").is_none(),
+            "cutover completes the reshape"
+        );
+        let mut cut = None;
+        let mut reshaped = false;
+        for _ in 0..6 {
+            match rx.try_recv() {
+                Ok(BlazarEvent::SlotsPrewarmCutover { model, slots }) => {
+                    cut = Some((model, slots));
+                }
+                Ok(BlazarEvent::SlotsReshaped { .. }) => reshaped = true,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        match cut {
+            Some((model, slots)) => {
+                assert_eq!(model, "m");
+                assert_eq!(slots, 4);
+            }
+            None => panic!("expected SlotsPrewarmCutover at the swap"),
+        }
+        assert!(reshaped, "cutover still completes the reshape contract");
+        respawned
+            .child
+            .lock()
+            .await
+            .kill()
+            .await
+            .expect("kill the replacement child");
+        kill_all(&[ph]);
+    }
+
+    /// Prewarm refusal: when the warm spawn cannot start (unreadable
+    /// model metadata here), the drain falls back to the verbatim
+    /// evict-then-ensure shape — which also fails on the same metadata,
+    /// so the reshape holds (parked) instead of half-installing.
+    #[tokio::test]
+    async fn unit__prewarm__refused_falls_back_and_holds() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        let model_path = sup.dirs.data_dir.join("models").join("broken.gguf");
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"not a gguf").unwrap();
+        blazar_core::Store::open(&sup.dirs)
+            .unwrap()
+            .upsert_model(&blazar_core::ModelRow {
+                name: "m".into(),
+                repo: "m".into(),
+                quant: "Q4_0".into(),
+                path: model_path.to_string_lossy().into_owned(),
+                bytes: 1,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+                last_used_at: 0,
+            })
+            .unwrap();
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), inst);
+        sup.adopted_slots.insert("m".to_string(), 4);
+        sup.reshape_queue.insert("m".to_string(), "m".to_string());
+        sup.drain_reshape_queue().await;
+        assert!(
+            sup.instances.get("m").is_none() && sup.instances.get("m#warm").is_none(),
+            "old evicted by the fallback, nothing half-installed"
+        );
+        assert!(
+            matches!(
+                sup.reshape_draining.get("m").map(|m| *m.value()),
+                Some(ReshapeDrain::Parking(_))
+            ) && sup.reshape_queue.get("m").is_some(),
+            "failed reshape holds for the next tick"
+        );
+        kill_all(&[ph]);
+    }
+
+    /// Shape authority handback (live-caught on the rig): a stale
+    /// adopted value must stop shadowing a model the moment the model
+    /// becomes excluded — a pin (or replicas/deterministic) reclaims
+    /// authority, so spawns and `slot_cap` fall back to the pin/argv
+    /// instead of a value adaptation no longer owns.
+    #[tokio::test]
+    async fn unit__adaptive_slots__exclusion_returns_shape_authority() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        // routing_sup seeds a replicas override; replace it with a pin.
+        sup.config.model_overrides.insert(
+            "m".to_string(),
+            blazar_core::ModelOverride {
+                slots: Some(2),
+                ..Default::default()
+            },
+        );
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        sup.instances.insert("m".into(), inst);
+        // Adoption recorded before the pin landed — now stale.
+        sup.adopted_slots.insert("m".to_string(), 6);
+        sup.fast_adopted_at
+            .insert("m".to_string(), std::time::Instant::now());
+        sup.adaptive_slots_tick();
+        assert!(
+            sup.adopted_slots.get("m").is_none(),
+            "excluded model must not keep an adopted shape"
+        );
+        assert!(sup.fast_adopted_at.get("m").is_none());
+        assert_eq!(sup.slot_cap("m"), 2, "slot_cap falls back to the argv pin");
+        kill_all(&[ph]);
+    }
+
+    /// `ps()` must say WHERE each resident's slot count comes from,
+    /// mirroring `slot_cap` precedence: adapted (adaptation owns the
+    /// shape — including a delegated pin+override) > pinned (manual
+    /// overlay pin) > auto (argv `-np`) > engine (child default). A
+    /// replica key records its override against the base model — the
+    /// canonicalization `ps()` owes `overlay_for`'s raw lookup.
+    #[tokio::test]
+    async fn unit__ps__slots_source_reports_precedence() {
+        let mut sup = routing_sup(1);
+        // Delegated pin: adaptation owns the shape once it adopted.
+        sup.config.model_overrides.insert(
+            "m".to_string(),
+            blazar_core::ModelOverride {
+                slots: Some(2),
+                adaptive_override: Some(true),
+                ..Default::default()
+            },
+        );
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        sup.instances.insert("m".into(), inst);
+        sup.adopted_slots.insert("m".to_string(), 6);
+        // Pin-only lane (no adoption recorded).
+        sup.config.model_overrides.insert(
+            "p".to_string(),
+            blazar_core::ModelOverride {
+                slots: Some(3),
+                ..Default::default()
+            },
+        );
+        let (mut pinned, ph2) = fake_instance("p", InstanceState::Ready, 0);
+        Arc::get_mut(&mut pinned).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "3".into()];
+        sup.instances.insert("p".into(), pinned);
+        // Plain lane: argv carries the shape.
+        let (mut plain, ph3) = fake_instance("a", InstanceState::Ready, 0);
+        Arc::get_mut(&mut plain).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "4".into()];
+        sup.instances.insert("a".into(), plain);
+        // Engine-default lane: argv without -np (mistralrs-style shape).
+        let (mut no_np, ph4) = fake_instance("e", InstanceState::Ready, 0);
+        Arc::get_mut(&mut no_np).expect("sole owner").argv =
+            vec!["mistralrs-server".into(), "--port".into(), "1234".into()];
+        sup.instances.insert("e".into(), no_np);
+        // Replica of the pinned lane: override applies via base model.
+        let (mut rep, ph5) = fake_instance("p#1", InstanceState::Ready, 0);
+        Arc::get_mut(&mut rep).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "3".into()];
+        sup.instances.insert("p#1".into(), rep);
+
+        let rows = sup.ps();
+        let src = |name: &str| {
+            rows.iter()
+                .find(|r| r.name == name && r.replica.is_none())
+                .unwrap_or_else(|| panic!("no ps row for {name}"))
+                .slots_source
+        };
+        // Replica rows display under the base name; key by replica index.
+        let rep_src = rows
+            .iter()
+            .find(|r| r.name == "p" && r.replica == Some(1))
+            .expect("replica row p#1")
+            .slots_source;
+        assert_eq!(
+            src("m"),
+            Some("adapted"),
+            "adopted shadows the delegated pin"
+        );
+        assert_eq!(src("p"), Some("pinned"), "pin-only lane reports pinned");
+        assert_eq!(rep_src, Some("pinned"), "replica resolves via base model");
+        assert_eq!(src("a"), Some("auto"), "argv -np without pin reports auto");
+        assert_eq!(src("e"), Some("engine"), "no pin, no -np: engine default");
+        kill_all(&[ph, ph2, ph3, ph4, ph5]);
+    }
+
+    /// Churn regression (live-repro'd on the rig): a `#warm` child is
+    /// invisible to routing, so the adaptive tick must not adopt or
+    /// queue a reshape against it — that loop evicted the very warm
+    /// child the drain had installed, once per 10s tick.
+    #[tokio::test]
+    async fn unit__adaptive_slots__warm_transitional_child_ignored() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        let (mut inst, ph) = fake_instance("m#warm", InstanceState::Ready, 4);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m#warm".into(), inst);
+        sup.note_slot_pressure("m");
+        sup.note_slot_pressure("m");
+        for _ in 0..6 {
+            sup.adaptive_slots_tick();
+        }
+        assert!(
+            sup.adopted_slots.get("m").is_none(),
+            "no adoption against a warm-only instance map"
+        );
+        assert!(sup.busy_streak.get("m").is_none());
+        assert!(
+            sup.reshape_queue.iter().count() == 0,
+            "no reshape may be queued from the transitional child"
+        );
+        kill_all(&[ph]);
+    }
+
+    /// Churn regression: when a Ready warm child is already waiting, the
+    /// drain must consume it (cutover) instead of spawning another —
+    /// the old code overwrote `m#warm` every tick, orphaning a live
+    /// child each time. Identity of the survivor proves no respawn: the
+    /// post-cutover instance under `m` carries the marker planted on
+    /// the pre-inserted warm child.
+    #[tokio::test]
+    async fn unit__prewarm__warm_waiting_skips_respawn() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        let (mut old, old_ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut old).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "1".into()];
+        sup.instances.insert("m".into(), old);
+        let (mut warm, warm_ph) = fake_instance("m#warm", InstanceState::Ready, 0);
+        {
+            let w = Arc::get_mut(&mut warm).expect("sole owner");
+            w.argv = vec!["llama-server".into(), "-np".into(), "4".into()];
+            w.warnings = vec!["warm-marker".into()];
+        }
+        // The drain must end up sole owner of the warm Arc (try_unwrap):
+        // our handle is dropped by the insert above, after planting the
+        // marker.
+        sup.instances.insert("m#warm".into(), warm);
+        sup.adopted_slots.insert("m".to_string(), 4);
+        sup.reshape_queue.insert("m".to_string(), "m".to_string());
+        let mut rx = sup.bus.subscribe();
+        sup.drain_reshape_queue().await;
+        assert!(
+            sup.instances.get("m#warm").is_none(),
+            "warm consumed by the cutover"
+        );
+        let survivor = sup
+            .instances
+            .get("m")
+            .expect("cutover installed the warm child under m");
+        assert_eq!(survivor.name, "m");
+        assert_eq!(
+            survivor.warnings,
+            vec!["warm-marker".to_string()],
+            "the survivor IS the pre-inserted warm child — no respawn happened"
+        );
+        assert!(
+            sup.reshape_draining.get("m").is_none() && sup.reshape_queue.get("m").is_none(),
+            "cutover completes the reshape"
+        );
+        let mut cut = false;
+        for _ in 0..6 {
+            match rx.try_recv() {
+                Ok(BlazarEvent::SlotsPrewarmCutover { model, slots }) => {
+                    assert_eq!((model.as_str(), slots), ("m", 4));
+                    cut = true;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(cut, "cutover — not the fallback — ran");
+        kill_all(&[old_ph, warm_ph]);
+    }
+
+    /// D2: a manual `slots` pin stays authoritative — sustained pressure
+    /// behind it teaches (ONE event per dedup window, never adopts),
+    /// and the streak resets as soon as the lane reads unsaturated.
+    #[tokio::test]
+    async fn unit__pinned_lane__sustained_pressure_teaches_once() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                slots: Some(2),
+                ..Default::default()
+            },
+        );
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        sup.instances.insert("m".into(), inst);
+        let mut rx = sup.bus.subscribe();
+        sup.note_slot_pressure("m");
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        assert!(
+            sup.pinned_warned_at.get("m").is_some(),
+            "six saturated ticks teach once"
+        );
+        assert!(
+            sup.adopted_slots.get("m").is_none(),
+            "the pin stays authoritative — no adoption"
+        );
+        let mut taught = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, BlazarEvent::SlotsPinnedPressure { .. }) {
+                taught += 1;
+            }
+        }
+        assert_eq!(taught, 1, "exactly one SlotsPinnedPressure event");
+        // The dedup window swallows the next streak's teach.
+        for _ in 0..SLOTS_STREAK_TICKS {
+            sup.adaptive_slots_tick();
+        }
+        let mut taught_again = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, BlazarEvent::SlotsPinnedPressure { .. }) {
+                taught_again += 1;
+            }
+        }
+        assert_eq!(taught_again, 0, "dedup window throttles the repeat teach");
+        // Unsaturated: the streak entry clears instead of climbing.
+        sup.note_slot_pressure_release("m");
+        sup.instances
+            .get("m")
+            .expect("instance")
+            .in_flight
+            .store(0, Ordering::SeqCst);
+        sup.pinned_streak.insert("m".to_string(), 3);
+        sup.adaptive_slots_tick();
+        assert!(
+            sup.pinned_streak.get("m").is_none(),
+            "unsaturated tick clears the pinned streak"
+        );
+        kill_all(&[ph]);
+    }
+
+    /// D2 escape hatch: `adaptive_override on` lifts the pin exclusion —
+    /// the pinned value becomes the base shape and D1 applies (fast
+    /// path at 2 ticks, demand-sized step).
+    #[tokio::test]
+    async fn unit__pinned_lane__adaptive_override_lifts_exclusion() {
+        let mut sup = routing_sup(1);
+        sup.config.adaptive_slots = true;
+        sup.config.model_overrides.insert(
+            "m".into(),
+            ModelOverride {
+                slots: Some(2),
+                adaptive_override: Some(true),
+                ..Default::default()
+            },
+        );
+        let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
+        Arc::get_mut(&mut inst).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        sup.instances.insert("m".into(), inst);
+        // Window peak 4 >= 2x the pinned 2: the fast path applies.
+        for _ in 0..4 {
+            sup.note_slot_pressure("m");
+        }
+        sup.adaptive_slots_tick();
+        assert!(sup.adopted_slots.get("m").is_none());
+        sup.adaptive_slots_tick();
+        assert_eq!(
+            sup.adopted_slots.get("m").map(|v| *v),
+            Some(6),
+            "override lifts the pin: fast adoption 2 + 4 at tick 2"
+        );
+        assert!(sup.fast_adopted_at.get("m").is_some());
+        kill_all(&[ph]);
+    }
+
+    /// D4 gauge snapshot: per canonical model (replica keys deduped),
+    /// sorted, with adopted → argv → config resolution for the
+    /// effective cap.
+    #[tokio::test]
+    async fn unit__slots_gauge_snapshot__dedupes_replica_keys() {
+        let sup = routing_sup(1);
+        let (mut a, ph) = fake_instance("m", InstanceState::Ready, 0);
+        Arc::get_mut(&mut a).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        let (mut b, ph2) = fake_instance("m#1", InstanceState::Ready, 0);
+        Arc::get_mut(&mut b).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        let (mut x, ph3) = fake_instance("x", InstanceState::Ready, 0);
+        Arc::get_mut(&mut x).expect("sole owner").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        sup.instances.insert("m".into(), a);
+        sup.instances.insert("m#1".into(), b);
+        sup.instances.insert("x".into(), x);
+        sup.adopted_slots.insert("m".to_string(), 4);
+        for _ in 0..3 {
+            sup.note_slot_pressure("m");
+        }
+        let rows = sup.slots_gauge_snapshot();
+        assert_eq!(
+            rows,
+            vec![
+                ("m".to_string(), 3, Some(4), 4),
+                ("x".to_string(), 0, None, 2),
+            ],
+            "replica keys collapse to one row; adopted wins the effective cap"
+        );
+        kill_all(&[ph, ph2, ph3]);
     }
 
     /// The latch is CONSUMED at adoption: the window after an adoption
@@ -11893,7 +14051,7 @@ mod routing_tests {
         let sup = routing_sup(1);
         sup.set_model_hints("zeta", Some(0.2), Some(0.8));
         sup.set_model_hints("alpha", Some(0.7), None);
-        sup.note_model_throughput("zeta", 120, 0.5);
+        sup.note_model_throughput("zeta", 120, 0.5, 0);
         let rows = sup.model_hint_snapshot();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, "alpha", "sorted by model name");
@@ -11919,9 +14077,9 @@ mod routing_tests {
     fn unit__note_model_throughput__ewma_blends_and_guards() {
         let sup = routing_sup(1);
         // Degenerate observations are dropped, never recorded as zeroes.
-        sup.note_model_throughput("m", 0, 1.0);
-        sup.note_model_throughput("m", 10, 0.0);
-        sup.note_model_throughput("m", 10, f64::NAN);
+        sup.note_model_throughput("m", 0, 1.0, 0);
+        sup.note_model_throughput("m", 10, 0.0, 1);
+        sup.note_model_throughput("m", 10, f64::NAN, 2);
         assert_eq!(sup.decode_rate_for("m"), None, "no valid observation yet");
         assert_eq!(
             sup.decode_rate_for("unseen"),
@@ -11929,10 +14087,10 @@ mod routing_tests {
             "decode never falls back across models"
         );
         // Seed: 100 tokens over 1s.
-        sup.note_model_throughput("m", 100, 1.0);
+        sup.note_model_throughput("m", 100, 1.0, 0);
         assert_eq!(sup.decode_rate_for("m"), Some(100.0));
         // Blend: 200 tok/s sample -> 0.7*100 + 0.3*200 = 130.
-        sup.note_model_throughput("m", 200, 1.0);
+        sup.note_model_throughput("m", 200, 1.0, 1);
         assert_eq!(sup.decode_rate_for("m"), Some(130.0));
     }
 

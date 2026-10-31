@@ -185,6 +185,16 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Daily per-model usage rollups (tokens, cache hits, TTFT) from
+    /// the daemon's metered traffic
+    Usage {
+        /// How many days back to report (1..=365, default 7)
+        #[arg(long)]
+        days: Option<i64>,
+        /// Raw JSON document (same shape as GET /api/usage)
+        #[arg(long)]
+        json: bool,
+    },
     /// One-shot classification through a decision model (Laya-class
     /// system-one classifiers): the input plus candidate labels in, a
     /// calibrated label distribution out — no prose generation
@@ -254,10 +264,11 @@ enum Cmd {
         /// as the global ngram_* config (requires/sets spec = "ngram")
         #[arg(long)]
         ngram: bool,
-        /// Live speculation-mode race: dense vs ngram vs dflash real
-        /// children, single-stream wall tok/s; adopts the winning mode
-        /// (vs dense by >5%) as the model's spec override — ngram wins
-        /// then refine via --ngram
+        /// Live speculation-mode race: dense vs ngram vs dflash vs draft
+        /// (catalog pair) real children, single-stream wall tok/s; every
+        /// arm is saved as a receipt the supervisor later consults when
+        /// spec = "auto", and the winner (vs dense by >5%) becomes the
+        /// model's spec override — ngram wins then refine via --ngram
         #[arg(long = "spec-race")]
         race: bool,
         /// Live warmup A/B: spawn the model twice (with/without
@@ -289,7 +300,16 @@ enum Cmd {
     /// measured profile, capability certificate, and next actions —
     /// read-only; an unpulled target shows the upstream fit preview
     Plan {
-        model: String,
+        model: Option<String>,
+        /// Ranked pull menu across the whole catalog: census-filtered
+        /// (VRAM + disk) upstream variants, scored by predicted decode
+        /// speed and model capacity, best first — read-only
+        #[arg(long, conflicts_with = "model")]
+        install: bool,
+        /// Preference axis for --install ranking: speed (default)
+        /// weights predicted tok/s higher; smart weights capacity
+        #[arg(long, requires = "install")]
+        prefer: Option<Prefer>,
         /// Machine-readable object (unpulled targets emit fit rows)
         #[arg(long)]
         json: bool,
@@ -505,6 +525,13 @@ enum Cmd {
         /// rolls back if the test request fails
         #[arg(long)]
         write: bool,
+        /// Also install a Blazar skill/rules file into the client's
+        /// conventional location (opencode/claude: skills dir; continue:
+        /// rules; cline: .clinerules) teaching the agent this daemon's
+        /// dialects, endpoints, and helper commands; clients without a
+        /// skill mechanism print the snippet instead
+        #[arg(long)]
+        install_skill: bool,
         /// One JSON object instead of the human report
         #[arg(long)]
         json: bool,
@@ -1062,7 +1089,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Observability",
-        &["why", "explain", "model-doctor", "route", "watch"],
+        &["why", "explain", "model-doctor", "route", "watch", "usage"],
     ),
     (
         "Refused by design (no cloud services)",
@@ -1136,23 +1163,14 @@ fn render_grouped_help() -> String {
     out
 }
 
-/// One audited libc call (mirrors the statvfs precedent): reset SIGPIPE
-/// to its default disposition so `search --json | head`/`| jq` closing
-/// early ends the process quietly instead of panicking on a broken pipe.
-/// Runs first in `main`, before any thread exists.
-#[cfg(unix)]
-#[allow(unsafe_code)] // one-time signal reset; no pointers escape
-fn reset_sigpipe_default() {
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-}
-
-#[cfg(not(unix))]
-fn reset_sigpipe_default() {}
+// NOTE: do NOT reset SIGPIPE to SIG_DFL for quiet `| head` exits. Rust
+// installs SIG_IGN at startup and reqwest/rustls socket writes depend on
+// it: with DFL, a CDN closing a keep-alive connection mid-download
+// (engine install, pull, search) kills the whole process (writev EPIPE
+// -> SIGPIPE, validate.py 2026-10-29 RC=141 repro). Piping into `head`
+// now costs a broken-pipe panic instead — the lesser evil.
 
 fn main() {
-    reset_sigpipe_default();
     // First statement with a side effect by design: every reqwest client
     // in the process (engine lanes, HF, upgrade, federation) needs the
     // rustls ring provider installed before construction.
@@ -1942,6 +1960,7 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::List { json } => list(json),
         Cmd::Show { model, json } => show(&resolve_model_cli(&model), json),
         Cmd::Ps { reset, json } => ps(reset, json).await,
+        Cmd::Usage { days, json } => usage_cmd(days, json).await,
         Cmd::Classify {
             model,
             text,
@@ -2039,7 +2058,28 @@ blazar mmproj <model> <mmproj.gguf path>"
             .await
         }
         Cmd::Scorecard { model, json } => scorecard(&resolve_model_cli(&model), json),
-        Cmd::Plan { model, json } => plan_cmd(&model, json).await,
+        Cmd::Plan {
+            model,
+            install,
+            prefer,
+            json,
+        } => match model {
+            Some(model) => plan_cmd(&model, json).await,
+            None => {
+                if install {
+                    plan_install_cmd(prefer, json).await
+                } else {
+                    // Bare `blazar plan` with no target: point at both
+                    // modes instead of a bare parse error.
+                    println!("plan needs a model (pre-run card) or --install (ranked pull menu)");
+                    println!(
+                        "  blazar plan <model>          routing decision, profile, certificate"
+                    );
+                    println!("  blazar plan --install        rank the catalog for this hardware");
+                    Ok(())
+                }
+            }
+        },
         Cmd::Autopilot { apply } => autopilot(apply).await,
         Cmd::Certify {
             model,
@@ -2062,8 +2102,9 @@ blazar mmproj <model> <mmproj.gguf path>"
             model,
             all_models,
             write,
+            install_skill,
             json,
-        } => connect_cmd(&client, model, all_models, write, json).await,
+        } => connect_cmd(&client, model, all_models, write, install_skill, json).await,
         Cmd::Prune {
             orphans,
             unused,
@@ -3190,6 +3231,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_engines(&d));
     checks.extend(doctor_routing(&d));
     checks.extend(doctor_channels());
+    checks.extend(doctor_network().await);
     checks.extend(doctor_whisper_currency(&d).await);
     checks.extend(doctor_whisper_models(&d));
     checks.extend(doctor_binary_shadow());
@@ -3370,7 +3412,47 @@ fn doctor_footer(checks: &[Check]) -> String {
 /// Section order for the grouped doctor render. SYSTEM also catches
 /// every unmapped name (remotes, config pins, future rows) so no check
 /// ever disappears in grouped mode.
-const GROUPS: [&str; 6] = ["SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "RUNTIME"];
+const GROUPS: [&str; 7] = [
+    "SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "NETWORK", "RUNTIME",
+];
+
+/// Egress diagnostics (see `blazar_runtime::net_health`): one row for
+/// the reachability facts, one for the portal verdict. The detail text
+/// carries the same teaching the engine-update errors append, so a
+/// support session reads the same story from either surface.
+async fn doctor_network() -> Vec<Check> {
+    let snap = blazar_runtime::net_health::snapshot().await;
+    let family = |f: Option<blazar_runtime::net_health::IpFamily>| match f {
+        Some(blazar_runtime::net_health::IpFamily::V4) => "IPv4",
+        Some(blazar_runtime::net_health::IpFamily::V6) => "IPv6",
+        None => "-",
+    };
+    let any = if snap.any.reachable() {
+        format!(
+            "egress ok (pypi.org over {}, github api {})",
+            family(snap.any.family),
+            if snap.github.reachable() {
+                "reachable"
+            } else {
+                "UNREACHABLE"
+            }
+        )
+    } else {
+        "no egress: pypi.org unreachable".to_string()
+    };
+    let verdict = blazar_runtime::net_health::diagnosis(&snap);
+    let mut checks = vec![Check::ok("network", any)];
+    match verdict {
+        Some(text) => {
+            checks.push(Check::warn("network portal", text));
+        }
+        None => checks.push(Check::ok(
+            "network portal",
+            "no captive portal intercept detected (204 check clean)",
+        )),
+    }
+    checks
+}
 
 /// Routing rows: every pulled model must have a lane that can serve it
 /// (global active in manual mode, format+policy in auto). Unservable
@@ -3493,6 +3575,7 @@ async fn doctor_rpc_fleet(cfg: &Config) -> Vec<Check> {
 
 fn doctor_group(name: &str) -> &'static str {
     match name {
+        "network" | "network portal" => "NETWORK",
         "hardware" | "gpu driver" | "gpu vram" | "gpu fit" | "gpu arch match" => "GPU",
         "engine"
         | "engine binary"
@@ -4635,13 +4718,17 @@ mod doctor_tests {
         assert_eq!(doctor_group("hardware"), "GPU");
         assert_eq!(doctor_group("model types"), "MODELS");
         assert_eq!(doctor_group("ccache"), "CHANNELS");
+        assert_eq!(doctor_group("network"), "NETWORK");
+        assert_eq!(doctor_group("network portal"), "NETWORK");
         assert_eq!(doctor_group("sentinel"), "RUNTIME");
         assert_eq!(doctor_group("bench baseline"), "RUNTIME");
         assert_eq!(doctor_group("config"), "SYSTEM");
         assert_eq!(doctor_group("totally unknown future row"), "SYSTEM");
         assert_eq!(
             GROUPS,
-            ["SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "RUNTIME"]
+            [
+                "SYSTEM", "GPU", "ENGINES", "MODELS", "CHANNELS", "NETWORK", "RUNTIME"
+            ]
         );
     }
 
@@ -5475,6 +5562,20 @@ fn overlay_lag_note(active_tag: &str, asset: &str) -> &'static str {
     }
 }
 
+/// GitHub-unreachable hint with a live diagnosis appended: the static
+/// `offline? set GH_TOKEN` guess is wrong on captive portals and
+/// `IPv6`-only networks (where a token fixes nothing). The probe is
+/// memoized for 30s so the `update --all` walk probes once, and costs
+/// nothing on a healthy box.
+async fn gh_offline_hint() -> String {
+    let extra = blazar_runtime::net_health::diagnosis_suffix().await;
+    if extra.is_empty() {
+        "offline? set GH_TOKEN if rate limited".to_string()
+    } else {
+        format!("offline? set GH_TOKEN if rate limited; {extra}")
+    }
+}
+
 /// Live engine-currency probe (marker missing or >48h stale): 4s cap,
 /// warn-only — the update itself stays a human action.
 async fn live_engine_currency(active: &str, asset: &str) -> Check {
@@ -5518,7 +5619,7 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
         }
         Err(e) => Check::warn(
             "engine currency",
-            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
         ),
     }
 }
@@ -5619,7 +5720,7 @@ async fn live_mistralrs_currency(active: &str) -> Check {
         }
         Err(e) => Check::warn(
             "engine currency",
-            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
         ),
     }
 }
@@ -5649,7 +5750,7 @@ async fn live_sdcpp_currency(active: &str) -> Check {
         ),
         Err(e) => Check::warn(
             "engine currency",
-            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
         ),
     }
 }
@@ -5998,7 +6099,7 @@ async fn doctor_app_currency() -> Vec<Check> {
         )],
         Err(e) => vec![Check::warn(
             "app currency",
-            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
         )],
     }
 }
@@ -6047,7 +6148,7 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
         Ok(latest) => vec![whisper_pin_verdict(d, &installed, &latest, action)],
         Err(e) => vec![Check::warn(
             "whisper currency",
-            format!("check failed ({e:#}) — offline? set GH_TOKEN if rate limited"),
+            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
         )],
     }
 }
@@ -8393,14 +8494,15 @@ fn group_bench_rows(rows: &[blazar_runtime::bench::BenchRow]) -> Vec<BenchTestRo
         .collect()
 }
 
-/// Prediction for a model with no measurement on record: calibrates the
-/// active lane's effective bandwidth from its bench history and divides
-/// by the target's size. `None` when there is nothing to calibrate from
-/// (the honest "no basis" case, not a guess).
-fn predict_for_plan(
+/// Calibration samples for bandwidth predictions: the active lane's
+/// bench history (falling back to every recorded lane), each row
+/// joined with its model's on-disk size. `None` when nothing was ever
+/// measured — the honest "no basis" case, not a guess. Shared by
+/// `plan` (single-model prediction) and `plan --install` (catalog
+/// ranking), so both name the SAME basis in their output.
+fn bench_calibration_samples(
     store: &Store,
-    row: &blazar_core::store::ModelRow,
-) -> Option<(String, blazar_core::predict::Prediction)> {
+) -> Option<(String, Vec<blazar_core::predict::CalibSample>)> {
     let engine = store.active_engine().ok().flatten()?;
     // Exact-lane history first; engine updates prune old engine rows, so a
     // long-lived store keeps its bench_history under retired tags — fall
@@ -8430,6 +8532,18 @@ fn predict_for_plan(
             })
         })
         .collect::<Vec<_>>();
+    Some((basis_lane, samples))
+}
+
+/// Prediction for a model with no measurement on record: calibrates the
+/// active lane's effective bandwidth from its bench history and divides
+/// by the target's size. `None` when there is nothing to calibrate from
+/// (the honest "no basis" case, not a guess).
+fn predict_for_plan(
+    store: &Store,
+    row: &blazar_core::store::ModelRow,
+) -> Option<(String, blazar_core::predict::Prediction)> {
+    let (basis_lane, samples) = bench_calibration_samples(store)?;
     let target_bytes = u64::try_from(row.bytes.max(0)).ok()?;
     let prediction = blazar_core::predict::predict_decode_tps(&samples, target_bytes, &row.name)?;
     Some((basis_lane, prediction))
@@ -9031,6 +9145,275 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
     ) {
         println!("  {hint}");
     }
+    Ok(())
+}
+
+/// Parse a parameter count out of a model artifact name (`Qwen3-8B`,
+/// `Llama-3.2-3B`, `30B-A3B` `MoE` total). `None` when the name carries
+/// no size token (e.g. `phi-4`) — the honest gap, rendered as such.
+fn parse_params_billions(name: &str) -> Option<f64> {
+    let lower = name.to_ascii_lowercase();
+    let mut best: Option<f64> = None;
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            let number = &lower[start..i];
+            // A size token: immediately followed by 'b' (which must end
+            // the token or precede a separator) and not part of a quant
+            // word (q4, q8) — those never precede 'b'.
+            if i < bytes.len()
+                && bytes[i] == b'b'
+                && bytes
+                    .get(i + 1)
+                    .copied()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric())
+                && let Ok(v) = number.parse::<f64>()
+            {
+                // MoE "30b-a3b": the FIRST token is total params
+                // (capacity); keep the largest seen — plain names
+                // carry exactly one token anyway.
+                if best.is_none_or(|b| v > b) {
+                    best = Some(v);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+/// One `plan --install` candidate: a catalog entry's best census-fitting
+/// variant with the axes the ranking needs.
+struct InstallCandidate {
+    short_name: String,
+    quant: String,
+    file: String,
+    bytes: u64,
+    recommended_ctx: u32,
+    params_b: Option<f64>,
+    predicted_tps: Option<f64>,
+}
+
+/// `blazar plan --install`: rank every unpulled catalog entry for THIS
+/// hardware. Census hard-filters first (VRAM fit + disk verdict from
+/// the same analytic estimators `fit` uses), then scores the survivors
+/// on two honest axes — predicted decode speed (bandwidth calibration
+/// over the machine's bench history) and model capacity (params parsed
+/// from the artifact name) — normalized across the candidate set so the
+/// preference knob is a weighting, not a unit change. Read-only: the
+/// menu prints the `blazar pull` line, it never pulls.
+#[allow(clippy::too_many_lines, reason = "one ranked-menu render fn")]
+async fn plan_install_cmd(prefer: Option<Prefer>, json: bool) -> Result<()> {
+    use blazar_runtime::storage;
+    let d = dirs();
+    let store = Store::open(&d)?;
+    let cfg = config()?;
+    let prefer = prefer.unwrap_or(Prefer::Speed);
+
+    let vram = store
+        .active_engine()
+        .ok()
+        .flatten()
+        .and_then(|e| serde_json::from_str::<blazar_runtime::Manifest>(&e.manifest).ok())
+        .map_or(0, |m| {
+            blazar_runtime::probe_hardware(Some(&m)).total_vram_mib()
+        });
+    let vram_bytes = blazar_core::Hardware::bytes(vram);
+    let models_path = d.models_dir();
+    let disk_free = storage::disk_free_bytes(&models_path);
+
+    let pulled: std::collections::HashSet<String> = store
+        .list_models()?
+        .into_iter()
+        .map(|r| r.repo.to_ascii_lowercase())
+        .collect();
+
+    let token = std::env::var("HF_TOKEN").ok();
+    let client = blazar_runtime::hf::HfClient::new(token)?;
+    let calibration = bench_calibration_samples(&store);
+
+    let mut candidates: Vec<InstallCandidate> = Vec::new();
+    let mut skipped_pulled = 0usize;
+    let mut skipped_unfit = 0usize;
+    for entry in &blazar_core::catalog::catalog().entries {
+        if pulled.contains(&entry.repo.to_ascii_lowercase()) {
+            skipped_pulled += 1;
+            continue;
+        }
+        let parsed = blazar_runtime::parse_pull_target(&entry.short_name)?;
+        let info = match client.model_info(&parsed.repo).await {
+            Ok(i) => i,
+            // Upstream hiccup on ONE entry must not sink the menu.
+            Err(e) => {
+                println!(
+                    "{}",
+                    warn_line(&format!(
+                        "{}: upstream lookup failed ({e})",
+                        entry.short_name
+                    ))
+                );
+                continue;
+            }
+        };
+        let rows = blazar_runtime::hf::fit_rows(&info.siblings, vram_bytes, cfg.default_ctx);
+        // Census hard filter: keep variants that fit VRAM AND disk.
+        // TIGHT still fits (the pull gate re-checks with numbers);
+        // UNKNOWN cannot honestly claim a fit, so it drops out.
+        let fitting: Vec<_> = rows
+            .into_iter()
+            .filter(|r| {
+                r.fits_vram
+                    && matches!(
+                        storage::disk_verdict(r.bytes + storage::REQUIRED_SLACK_BYTES, disk_free),
+                        "FIT" | "TIGHT"
+                    )
+            })
+            .collect();
+        if fitting.is_empty() {
+            skipped_unfit += 1;
+            continue;
+        }
+        // Best variant = the LARGEST that fits (a pull defaults to the
+        // richest quality the hardware admits); speed ranking then uses
+        // that variant's size, so the axes trade off honestly.
+        let best = fitting
+            .into_iter()
+            .max_by_key(|r| r.bytes)
+            .expect("non-empty filtered set has a max");
+        let predicted_tps = calibration.as_ref().and_then(|(_, samples)| {
+            blazar_core::predict::predict_decode_tps(samples, best.bytes, &entry.short_name)
+                .map(|p| p.decode_tps)
+        });
+        let params_b =
+            parse_params_billions(&best.file).or_else(|| parse_params_billions(&entry.repo));
+        candidates.push(InstallCandidate {
+            short_name: entry.short_name.clone(),
+            quant: best.quant,
+            file: best.file,
+            bytes: best.bytes,
+            recommended_ctx: best.recommended_ctx,
+            params_b,
+            predicted_tps,
+        });
+    }
+
+    // Normalize both axes to [0,1] across the candidate set; entries
+    // missing an axis contribute 0 there (and render the gap honestly).
+    let tps_vals: Vec<f64> = candidates.iter().filter_map(|c| c.predicted_tps).collect();
+    let (tps_min, tps_max) = (
+        tps_vals.iter().copied().fold(f64::INFINITY, f64::min),
+        tps_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    );
+    let par_vals: Vec<f64> = candidates.iter().filter_map(|c| c.params_b).collect();
+    let (par_min, par_max) = (
+        par_vals.iter().copied().fold(f64::INFINITY, f64::min),
+        par_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    );
+    #[allow(clippy::cast_possible_truncation)] // index arithmetic, not data
+    let norm = |v: f64, lo: f64, hi: f64| -> f64 {
+        if hi <= lo {
+            return 0.5; // single candidate / flat axis: neutral
+        }
+        ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
+    };
+    let (w_speed, w_smart) = match prefer {
+        Prefer::Speed => (0.75, 0.25),
+        Prefer::Smart => (0.25, 0.75),
+    };
+    let mut ranked: Vec<(f64, &InstallCandidate)> = candidates
+        .iter()
+        .map(|c| {
+            let speed = c.predicted_tps.map_or(0.0, |t| norm(t, tps_min, tps_max));
+            let smart = c.params_b.map_or(0.0, |p| norm(p, par_min, par_max));
+            (w_speed * speed + w_smart * smart, c)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if json {
+        for (_, c) in &ranked {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "object": "blazar.plan.install",
+                    "name": c.short_name,
+                    "quant": c.quant,
+                    "file": c.file,
+                    "size_bytes": c.bytes,
+                    "params_b": c.params_b,
+                    "predicted_decode_tps": c.predicted_tps,
+                    "prediction_basis": calibration.as_ref().map(|(lane, _)| lane),
+                    "recommended_ctx": c.recommended_ctx,
+                    "vram_bytes": vram_bytes,
+                    "prefer": match prefer { Prefer::Speed => "speed", Prefer::Smart => "smart" },
+                })
+            );
+        }
+        return Ok(());
+    }
+
+    println!(
+        "PLAN INSTALL — ranked pull menu (census-filtered, {} MiB VRAM, prefer {})",
+        vram,
+        match prefer {
+            Prefer::Speed => "speed",
+            Prefer::Smart => "smart",
+        }
+    );
+    println!(
+        "  {} pulled (skipped) · {} unfit for this hardware · {} candidates",
+        skipped_pulled,
+        skipped_unfit,
+        ranked.len()
+    );
+    if let Some((lane, samples)) = &calibration {
+        println!(
+            "  speed axis: bandwidth calibration from {} sample(s) on lane {lane} — predicted, not measured",
+            samples.len()
+        );
+    } else {
+        println!(
+            "  speed axis: NO bench history on record — ranking is capacity-only; run `blazar bench` on any model to calibrate"
+        );
+    }
+    println!();
+    if ranked.is_empty() {
+        println!("nothing to recommend — every catalog entry is pulled or unfit");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<8} {:>10} {:>7} {:>12} {:>8}  PARAMS",
+        "MODEL", "QUANT", "SIZE", "TOK/S", "REC_CTX", "SCORE"
+    );
+    for (score, c) in &ranked {
+        println!(
+            "{:<24} {:<8} {:>10} {:>7} {:>12} {:>8.2}  {}",
+            c.short_name,
+            c.quant,
+            humansize(i64::try_from(c.bytes).unwrap_or(i64::MAX)),
+            c.predicted_tps
+                .map_or_else(|| "~".to_string(), |t| format!("{t:.0}")),
+            c.recommended_ctx,
+            score,
+            c.params_b
+                .map_or_else(|| "(unknown)".to_string(), |p| format!("{p}B")),
+        );
+    }
+    println!();
+    println!("NEXT");
+    if let Some((_, best)) = ranked.first() {
+        println!(
+            "  blazar pull {}   top pick for this hardware ({} {})",
+            best.short_name, best.quant, best.file
+        );
+    }
+    println!("  blazar plan <model>        pre-run card after a pull");
     Ok(())
 }
 
@@ -9783,15 +10166,145 @@ async fn classify_cmd(model: &str, text: &[String], labels: &[String], json: boo
     Ok(())
 }
 
+/// `blazar usage [--days N] [--json]`: daily per-model rollups from the
+/// daemon's metered generation traffic (tokens in/out/cached, requests,
+/// generation seconds, mean TTFT). The endpoint flushes the meter
+/// first, so the table reflects everything through the last request.
+async fn usage_cmd(days: Option<i64>, json: bool) -> Result<()> {
+    let days_n = days.unwrap_or(7).clamp(1, 365);
+    let base = ensure_daemon().await?;
+    let v: serde_json::Value = cli_http()
+        .get(format!("{base}/api/usage?days={days_n}"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    let rows = v["days"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!(
+            "no metered traffic in the last {days_n} day(s) — generation lanes \
+             (/v1/chat/completions, /api/chat, ...) are counted once they serve"
+        );
+        return Ok(());
+    }
+    println!("usage — last {days_n} day(s):");
+    println!(
+        "{:<9} {:<28} {:>10} {:>9} {:>9} {:>7} {:>9} {:>9}",
+        "DAY", "MODEL", "IN_TOK", "OUT_TOK", "CACHED", "REQ", "GEN_S", "TTFT_MS"
+    );
+    for r in &rows {
+        let ttft = if r["ttft_count"].as_i64().unwrap_or(0) > 0 {
+            format!(
+                "{:.0}",
+                r["ttft_ms_total"].as_f64().unwrap_or(0.0)
+                    / r["ttft_count"].as_f64().unwrap_or(1.0).max(1.0)
+            )
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "{:<9} {:<28} {:>10} {:>9} {:>9} {:>7} {:>9.1} {:>9}",
+            r["day"].as_i64().unwrap_or(0),
+            r["model"].as_str().unwrap_or("-"),
+            r["in_tokens"].as_i64().unwrap_or(0),
+            r["out_tokens"].as_i64().unwrap_or(0),
+            r["cached_tokens"].as_i64().unwrap_or(0),
+            r["requests"].as_i64().unwrap_or(0),
+            r["gen_secs"].as_f64().unwrap_or(0.0),
+            ttft,
+        );
+    }
+    Ok(())
+}
+
+/// `blazar ps` response contract: a 2xx body whose `models` is an array.
+/// Anything else — an error payload (401/503 mid-lifecycle), a shape
+/// drift — is an ERROR, never an empty list. The pre-2026-10-30 form
+/// collapsed every non-conforming body to `[]` and printed "no models
+/// loaded", masking daemon trouble as idleness (live-caught:
+/// intermittent false empties while `/api/ps` answered errors and the
+/// HTTP surface showed the resident ready).
+fn ps_models_of(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, String> {
+    if !status.is_success() {
+        let detail = body
+            .get("error")
+            .or_else(|| body.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("no detail");
+        return Err(format!("daemon answered {status}: {detail}"));
+    }
+    if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
+        return Ok(models.clone());
+    }
+    let keys = body.as_object().map_or_else(
+        || "non-object body".to_string(),
+        |o| o.keys().cloned().collect::<Vec<_>>().join(", "),
+    );
+    Err(format!(
+        "daemon answered {status} but the body has no models array (keys: {keys})"
+    ))
+}
+
+/// Fetch `/api/ps` under the contract above. Bounded retry (one pass,
+/// 2 s apart) on the transient classes only — transport errors and 5xx
+/// (the daemon restarting mid-request); a 4xx or a malformed 2xx body
+/// fails immediately (retrying an auth or shape problem just doubles
+/// the wait for the same error).
+async fn ps_fetch(base: &str) -> Result<Vec<serde_json::Value>> {
+    let mut attempt = 0;
+    loop {
+        let outcome: Result<Vec<serde_json::Value>, String> =
+            match cli_http().get(format!("{base}/api/ps")).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(body) => ps_models_of(status, &body),
+                        Err(e) => Err(format!("body unreadable: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("request failed: {e}")),
+            };
+        match outcome {
+            Ok(models) => return Ok(models),
+            Err(msg) if attempt == 0 && ps_retryable(&msg) => {
+                eprintln!("ps: {msg} — retrying once in 2s");
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(msg) => return Err(anyhow!("{msg}")),
+        }
+    }
+}
+
+/// Retry classifier for [`ps_fetch`]: transient shapes only — transport
+/// failures, a truncated/garbled body (the socket dying mid-restart),
+/// and the gateway-family 5xx (502/503/504). A 500 is a real daemon
+/// bug and fails immediately; 4xx never retries.
+fn ps_retryable(msg: &str) -> bool {
+    msg.starts_with("request failed")
+        || msg.starts_with("body unreadable")
+        || [
+            "daemon answered 502",
+            "daemon answered 503",
+            "daemon answered 504",
+        ]
+        .iter()
+        .any(|prefix| msg.starts_with(prefix))
+}
+
 async fn ps(reset: bool, json: bool) -> Result<()> {
     if reset {
         let base = ensure_daemon().await?;
-        let _: serde_json::Value = cli_http()
-            .get(format!("{base}/api/ps"))
-            .send()
-            .await?
-            .json()
-            .await?;
+        // Same contract as the listing lane: a failed reset must say so,
+        // not print "circuits reset" over an error body.
+        ps_fetch(&base).await?;
         println!("{}", ok_line("circuits reset"));
         return Ok(());
     }
@@ -9799,13 +10312,7 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
         upstream_update_hint(&dirs()).await;
     }
     let base = ensure_daemon().await?;
-    let v: serde_json::Value = cli_http()
-        .get(format!("{base}/api/ps"))
-        .send()
-        .await?
-        .json()
-        .await?;
-    let models = v["models"].as_array().cloned().unwrap_or_default();
+    let models = ps_fetch(&base).await?;
     if json {
         // Machine-typed mirror of the table; the daemon banner, the
         // "no models loaded" line and warn decorations stay human-only.
@@ -9820,6 +10327,7 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
                     "ctx": m["blazar_ctx"].as_i64().unwrap_or(0),
                     "slots": m["blazar_slots"].as_i64(),
                     "slots_configured": m["blazar_slots_configured"].as_i64(),
+                    "slots_source": m["blazar_slots_source"].as_str(),
                     "gpu": m["blazar_gpu"].as_str().unwrap_or("-"),
                     "device": m["blazar_device"].as_str(),
                     "cache_hit": m["blazar_cache_hit"].as_f64(),
@@ -9906,6 +10414,13 @@ enum Intent {
     Coding,
     Reasoning,
     Vision,
+}
+
+/// Ranking axis for `plan --install`: predicted speed vs model capacity.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+enum Prefer {
+    Speed,
+    Smart,
 }
 
 /// What one intent actually changes. `priority` rides the gateway's
@@ -13963,11 +14478,11 @@ aborts on this family. Profile pins for it would measure nothing",
         }
     }
     if race {
-        // Live speculation-mode race: dense vs ngram vs dflash, one real
-        // child each at engine defaults, single-stream wall tok/s (spec
-        // decoding is a c=1 win; concurrency would mask it). Only modes
-        // the engine's parsed manifest advertises may race — spec flags
-        // are never invented for an engine that lacks them.
+        // Live speculation-mode race: dense vs ngram vs dflash vs draft,
+        // one real child each at engine defaults, single-stream wall
+        // tok/s (spec decoding is a c=1 win; concurrency would mask it).
+        // Only modes the engine's parsed manifest advertises may race —
+        // spec flags are never invented for an engine that lacks them.
         let mut race_modes = vec!["dense".to_string()];
         if manifest.spec_types.iter().any(|s| s == "ngram-simple") {
             race_modes.push("ngram".to_string());
@@ -13996,11 +14511,85 @@ aborts on this family. Profile pins for it would measure nothing",
             &data_dir,
             blazar_core::engine_kind::EngineKind::LlamaCpp,
         );
+        // Draft arm: resolve the catalog pair for this model (auto =
+        // generic pair) and read the profile planner's n-max decision
+        // by compiling the draft-engaged variant once. The race then
+        // runs at engine defaults, mirroring the other arms.
+        let mut draft_pair: Option<(String, u32)> = None;
+        let draft_path = blazar_runtime::resolve_draft_path(&store, model, "auto");
+        if let Some(dp) = draft_path.as_deref()
+            && manifest.spec_types.iter().any(|s| s == "draft-simple")
+        {
+            let input_d = blazar_runtime::bench::build_input(
+                model,
+                &row.path,
+                u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
+                blazar_core::ModelMeta::Gguf(&gguf),
+                &hw,
+                &cfg,
+                &overlay_race,
+                &loras,
+                Some(dp),
+                &engine_row.tag,
+                &manifest.flags,
+                &manifest.spec_types,
+                blazar_core::Endpoint::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: 0,
+                },
+                &data_dir,
+                blazar_core::engine_kind::EngineKind::LlamaCpp,
+            );
+            match blazar_core::profile::compile(&input_d, &blazar_core::TuningOverrides::default())
+            {
+                Ok(prof_d) => {
+                    // Only race the draft arm when the planner actually
+                    // ENGAGED the pair: compile degrades self-pairs (the
+                    // model is its own catalog draft) and capacity-misfit
+                    // pairs to dense with a warning — racing a degraded
+                    // pair would hand llama-server an argv the planner
+                    // already rejected (live repro: self-pair double KV
+                    // allocation boot-OOMs an 8 GiB card).
+                    let engaged = prof_d
+                        .argv
+                        .windows(2)
+                        .any(|w| w == ["--spec-type", "draft-simple"]);
+                    if engaged {
+                        let n_max = prof_d
+                            .argv
+                            .iter()
+                            .position(|a| a == "--spec-draft-n-max")
+                            .and_then(|i| prof_d.argv.get(i + 1))
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .unwrap_or(3);
+                        draft_pair = Some((dp.to_string(), n_max));
+                        race_modes.push("draft".to_string());
+                    } else if let Some(why) = prof_d
+                        .warnings
+                        .iter()
+                        .find(|w| w.starts_with("spec=auto:") || w.starts_with("spec auto:"))
+                    {
+                        println!("draft arm skipped — {why}");
+                    }
+                }
+                Err(e) => {
+                    // Fail loud, not silent: a draft profile that cannot
+                    // even compile is a real condition the user must see
+                    // (the race still runs the other arms).
+                    println!("draft arm skipped — draft profile compile failed: {e}");
+                }
+            }
+        }
         let base_race =
             blazar_core::profile::compile(&input_race, &blazar_core::TuningOverrides::default())
                 .map_err(|e| anyhow!("profile: {e}"))?;
         println!("spec race: live servers across {race_modes:?} (~1 min each) ...");
-        let rows = tuner.spec_mode_race(&base_race.argv, &race_modes, 1)?;
+        let rows = tuner.spec_mode_race(
+            &base_race.argv,
+            &race_modes,
+            1,
+            draft_pair.as_ref().map(|(p, n)| (p.as_str(), *n)),
+        )?;
         println!("{:<8} {:>14}", "mode", "tok/s");
         for (mode, tps) in &rows {
             println!("{mode:<8} {tps:>14.1}");
@@ -14009,17 +14598,35 @@ aborts on this family. Profile pins for it would measure nothing",
             if r.1 > acc.1 { (r.0.clone(), r.1) } else { acc }
         });
         let dense_tps = rows.iter().find(|r| r.0 == "dense").map_or(0.0, |r| r.1);
+        // Persist every arm as a receipt — the supervisor's spec=auto
+        // resolution consults these measurements on later starts.
+        for (mode, tps) in &rows {
+            store.put_spec_receipt(model, &engine_row.tag, mode, *tps, dense_tps)?;
+        }
+        println!(
+            "receipts saved ({} rows) — later `spec = \"auto\"` resolves from these measurements",
+            rows.len()
+        );
         // Adopt against the DENSE baseline — the honest question is
         // "does speculation beat no speculation at all", not "which
-        // speculation is least bad".
+        // speculation is least bad". Bidirectional: a decisive dense
+        // win pins spec off instead of silently leaving a slower
+        // speculation configured.
         if best_mode != "dense" && best_tps > dense_tps * 1.05 {
-            set_model_override(model, "spec", &format!("\"{best_mode}\""))?;
+            // draft engages via the profile planner (auto + pair), so
+            // the persisted override is "auto", not the arm name.
+            let adopted = if best_mode == "draft" {
+                "auto"
+            } else {
+                best_mode.as_str()
+            };
+            set_model_override(model, "spec", &format!("\"{adopted}\""))?;
             cfg = config()?;
             adopted_any = true;
             println!(
                 "{}",
                 ok_line(&format!(
-                    "adopted model_overrides.{model}.spec = {best_mode} \
+                    "adopted model_overrides.{model}.spec = {adopted} \
                      ({best_tps:.1} tok/s, +{:.0}% over dense)",
                     (best_tps / dense_tps - 1.0) * 100.0
                 ))
@@ -14028,10 +14635,28 @@ aborts on this family. Profile pins for it would measure nothing",
                 println!("next: `blazar tune {model} --ngram` refines (size_m, min_hits)");
             }
         } else {
-            println!(
-                "no spec mode beat dense by >5% (best {best_tps:.1} vs dense {dense_tps:.1}) — \
-                 spec stays as configured"
-            );
+            let best_spec = rows
+                .iter()
+                .filter(|r| r.0 != "dense")
+                .map(|r| r.1)
+                .fold(0.0_f64, f64::max);
+            if best_spec > 0.0 && dense_tps > best_spec * 1.05 {
+                set_model_override(model, "spec", "\"off\"")?;
+                cfg = config()?;
+                adopted_any = true;
+                println!(
+                    "{}",
+                    ok_line(&format!(
+                        "dense beat every spec mode by >5% ({dense_tps:.1} vs {best_spec:.1}) — \
+                         adopted model_overrides.{model}.spec = off"
+                    ))
+                );
+            } else {
+                println!(
+                    "no spec mode beat dense by >5% (best {best_tps:.1} vs dense {dense_tps:.1}) — \
+                     spec stays as configured"
+                );
+            }
         }
     }
     if load || replicas || cache_reuse {
@@ -15530,7 +16155,8 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
         match fetched {
             Ok(rel) => rel.tag_name,
             Err(e) => anyhow::bail!(
-                "cannot check mistral.rs releases: {e:#} — offline? set GH_TOKEN if rate limited"
+                "cannot check mistral.rs releases: {e:#} — {}",
+                gh_offline_hint().await
             ),
         }
     };
@@ -15628,7 +16254,8 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
         match fetched {
             Ok(rel) => rel.tag_name,
             Err(e) => anyhow::bail!(
-                "cannot check sd.cpp releases: {e:#} — offline? set GH_TOKEN if rate limited"
+                "cannot check sd.cpp releases: {e:#} — {}",
+                gh_offline_hint().await
             ),
         }
     };
@@ -15639,6 +16266,32 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
         ),
         (Some(a), Some(b)) if b > a
     );
+    // sd.cpp re-uploads assets to the same live master release several
+    // times a day — the tag counter cannot see a backend appearing. A
+    // NVIDIA box that installed vulkan must still pick up a CUDA
+    // prebuilt the day it ships, so the "stays" branches re-ask the
+    // picker what it WOULD choose for the same tag.
+    let installed_label = store
+        .list_engines()?
+        .into_iter()
+        .find(|e| e.kind == EngineKind::SdCpp && e.tag == installed)
+        .map(|e| e.asset);
+    let mgr = local_engine_manager(d)?;
+    let would_label = match mgr.sdcpp_backend_label(&target).await {
+        Ok(label) => Some(label),
+        Err(e) => {
+            // Offline / rate-limited probe: never block currency on it,
+            // but say so instead of silently skipping the check.
+            println!(
+                "{}",
+                warn_line(&format!(
+                    "backend check failed: {e:#} — staying on {installed}"
+                ))
+            );
+            None
+        }
+    };
+    let switches = sdcpp_same_tag_switches(installed_label.as_deref(), would_label);
     if check {
         println!(
             "{}",
@@ -15647,12 +16300,29 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
         if newer {
             println!("would update sd.cpp {installed} -> {target}");
             println!("  blazar engine update --kind sdcpp {target}");
+        } else if switches {
+            println!(
+                "would switch backend: {} -> {} — same tag {installed}",
+                installed_label.as_deref().unwrap_or("?"),
+                would_label.unwrap_or("?")
+            );
         } else {
             println!("sd.cpp {installed} stays (target: {target})");
         }
         return Ok(());
     }
     if !pinned && !newer {
+        if switches {
+            println!(
+                "{}",
+                ok_line(&format!(
+                    "backend changed: {} -> {} — updating sd.cpp {installed} (same tag)",
+                    installed_label.as_deref().unwrap_or("?"),
+                    would_label.unwrap_or("?")
+                ))
+            );
+            return engine_install_sdcpp(d, Some(target)).await;
+        }
         println!("sd.cpp {installed} is current (upstream latest: {target}).");
         return Ok(());
     }
@@ -15722,7 +16392,8 @@ async fn engine_update_whisper(d: &BlazarDirs, tag: Option<String>, check: bool)
         match fetched {
             Ok(rel) => rel.tag_name,
             Err(e) => anyhow::bail!(
-                "cannot check whisper.cpp releases: {e:#} — offline? set GH_TOKEN if rate limited"
+                "cannot check whisper.cpp releases: {e:#} — {}",
+                gh_offline_hint().await
             ),
         }
     };
@@ -15817,7 +16488,8 @@ async fn engine_update_piper(d: &BlazarDirs, tag: Option<String>, check: bool) -
         match fetched {
             Ok(rel) => rel.tag_name,
             Err(e) => anyhow::bail!(
-                "cannot check rhasspy/piper releases: {e:#} — offline? set GH_TOKEN if rate limited"
+                "cannot check rhasspy/piper releases: {e:#} — {}",
+                gh_offline_hint().await
             ),
         }
     };
@@ -15869,6 +16541,19 @@ fn newest_sdcpp_tag(store: &Store) -> Result<Option<String>> {
         .filter(|e| e.kind == EngineKind::SdCpp)
         .max_by_key(|e| blazar_runtime::engine::gh::sdtag_counter(&e.tag).unwrap_or(0))
         .map(|e| e.tag.clone()))
+}
+
+/// Same-tag sd.cpp backend switch decision: `true` only when we know
+/// BOTH the installed backend label and the label the picker would
+/// choose right now, and they differ (e.g. `vulkan` installed, upstream
+/// just added a CUDA prebuilt to the same live master release). An
+/// unknown label on either side keeps the current build — no switch on
+/// guesswork.
+fn sdcpp_same_tag_switches(installed: Option<&str>, would: Option<&str>) -> bool {
+    match (installed, would) {
+        (Some(cur), Some(next)) => cur != next,
+        _ => false,
+    }
 }
 
 /// Newest installed whisper tag (`bNNNN`) by build counter — mirrors
@@ -16324,7 +17009,22 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
             EngineKind::Piper => engine_update_piper(d, None, check).await,
         };
         if let Err(e) = result {
-            eprintln!("lane {} failed: {e:#}", kind.as_str());
+            // The per-lane error may already carry a live network
+            // diagnosis (the "cannot check X releases" wrappers append
+            // one); llamacpp's raw propagation does not — append it
+            // exactly once, and only when a diagnosis exists.
+            let text = format!("{e:#}");
+            let suffix = if text.contains("egress") || text.contains("captive portal") {
+                String::new()
+            } else {
+                let hint = blazar_runtime::net_health::diagnosis_suffix().await;
+                if hint.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {hint}")
+                }
+            };
+            eprintln!("lane {} failed: {text}{suffix}", kind.as_str());
             failed.push(kind.as_str());
         }
     }
@@ -17431,9 +18131,11 @@ fn validate_lora_attach(
 /// hot-attach (or detach) the adapter on a resident sglang base child
 /// without a respawn. Best-effort — a down daemon, a non-resident
 /// model, or a lane that bakes adapters at spawn defers to the next
-/// spawn (the store row drives it). Prints ONLY the actionable
-/// outcomes: a hot attach/detach line, or a child-side refusal (e.g.
-/// adapter rank above the spawn-time `--max-lora-rank`).
+/// spawn (the store row drives it). Prints the actionable outcomes: a
+/// hot attach/detach line, a child-side refusal (e.g. adapter rank
+/// above the spawn-time `--max-lora-rank`), or the deferred teaching
+/// (which names the resident's observed adapter set and the remedy —
+/// staying silent there would hide why the attach did not go live).
 async fn notify_lora_sync(model: &str, action: &str, lora_name: &str, lora_path: &str) {
     let Some(base) = daemon_base_if_up().await else {
         return;
@@ -17469,6 +18171,13 @@ async fn notify_lora_sync(model: &str, action: &str, lora_name: &str, lora_path:
                 dim_line(&format!("daemon: adapter not live — {detail}"))
             );
         }
+        // Deferred (lane bakes adapters at spawn / nothing to detach /
+        // no resident): print the teaching — it names the observed
+        // resident adapter set and the remedy, which is exactly what
+        // the user needs the moment their attach did not go live.
+        Some("ok") => {
+            eprintln!("{}", dim_line(&format!("daemon: {detail}")));
+        }
         _ => {}
     }
 }
@@ -17496,14 +18205,15 @@ async fn lora_cmd(cmd: LoraCmd) -> Result<()> {
         }
         LoraCmd::Rm { id } => {
             // Capture the row before the delete — the daemon sync names
-            // the adapter by its path's file stem.
+            // the adapter by its path's file stem, and the llamacpp arm
+            // matches the path against the resident's loaded set.
             let removed = store.list_loras(None)?.into_iter().find(|l| l.id == id);
             if store.delete_lora(id)? {
                 if let Some(l) = removed {
                     let lora_name = std::path::Path::new(&l.path)
                         .file_stem()
                         .map_or_else(|| l.path.clone(), |s| s.to_string_lossy().into_owned());
-                    notify_lora_sync(&l.model_name, "rm", &lora_name, "").await;
+                    notify_lora_sync(&l.model_name, "rm", &lora_name, &l.path).await;
                 }
                 println!("{}", ok_line(&format!("lora #{id} removed")));
             } else {
@@ -18564,6 +19274,95 @@ fn connect_model_meta(model: &str) -> ConnectModelMeta {
     }
 }
 
+/// Where `--install-skill` drops the Blazar skill file for a client,
+/// following each client's OWN convention directory. `None` = the
+/// client has no skill-file mechanism (the snippet prints instead).
+/// opencode honors `XDG_CONFIG_HOME` like every other XDG tool.
+fn skill_file_for_client(client: &str, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    match client {
+        "opencode" => {
+            let config_root = std::env::var_os("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| home.join(".config"));
+            Some(config_root.join("opencode/skills/blazar/SKILL.md"))
+        }
+        "claude" => Some(home.join(".claude/skills/blazar/SKILL.md")),
+        "continue" => Some(home.join(".continue/rules/blazar.md")),
+        "cline" => Some(std::path::PathBuf::from(".clinerules/blazar.md")),
+        _ => None,
+    }
+}
+
+/// The skill/rules body installed by `--install-skill`. One template:
+/// what this daemon serves, in which dialects, with the connected
+/// model's verified capabilities and the helper commands an agent
+/// should reach for. Frontmatter only where the convention reads it
+/// (opencode/claude skills); continue/cline rules take plain markdown.
+fn skill_markdown(client: &str, base: &str, model: &str, meta: &ConnectModelMeta) -> String {
+    let ctx = meta
+        .context
+        .map_or_else(|| "unknown".to_string(), |c| format!("{c}"));
+    let caps = {
+        let mut c = Vec::new();
+        if meta.tools {
+            c.push("tool/function calling");
+        }
+        if meta.reasoning {
+            c.push("reasoning/think control");
+        }
+        if meta.vision {
+            c.push("vision (image input)");
+        }
+        if c.is_empty() {
+            "text chat (uncertified for tools/vision)".to_string()
+        } else {
+            c.join(", ")
+        }
+    };
+    let frontmatter = if matches!(client, "opencode" | "claude") {
+        "---\nname: blazar\ndescription: Serve chat completions through the local Blazar daemon (OpenAI, Ollama, and Anthropic dialects) with model management and usage commands\n---\n\n".to_string()
+    } else {
+        String::new()
+    };
+    format!(
+        "{frontmatter}\
+# Blazar — local model server\n\n\
+This machine runs a [Blazar](https://github.com/santanu20/blazar) daemon at `{base}` serving\n\
+local models in THREE wire dialects — pick the one the surrounding tool expects:\n\n\
+| Dialect | Endpoint | Notes |\n\
+|---|---|---|---\n\
+| OpenAI | `{base}/v1/chat/completions` | also `/v1/models`, `/v1/completions`, `/v1/embeddings`, `/v1/responses` |\n\
+| Ollama | `{base}/api/chat`, `{base}/api/generate` | also `/api/tags`, `/api/embed` |\n\
+| Anthropic | `{base}/v1/messages` | system prompts + tool use |\n\n\
+When no API key is configured the daemon ignores auth headers; send any token when a\n\
+client demands one (e.g. `Authorization: Bearer blazar-local`).\n\n\
+## Default model\n\n\
+`{model}` — training context `{ctx}` tokens, verified: {caps}.\n\
+List everything with `GET {base}/v1/models` or `blazar models`.\n\n\
+## Quick examples\n\n\
+```bash\n\
+curl {base}/v1/chat/completions -H 'content-type: application/json' -d '{{\n\
+  \"model\": \"{model}\", \"messages\": [{{\"role\": \"user\", \"content\": \"hello\"}}]\n\
+}}'\n\
+```\n\n\
+```python\n\
+from openai import OpenAI\n\
+client = OpenAI(base_url=\"{base}/v1\", api_key=\"blazar-local\")\n\
+print(client.chat.completions.create(\n\
+    model=\"{model}\",\n\
+    messages=[{{\"role\": \"user\", \"content\": \"hello\"}}],\n\
+).choices[0].message.content)\n\
+```\n\n\
+## Helper commands\n\n\
+- `blazar models` / `blazar ps` — what is installed / what is running\n\
+- `blazar usage` — daily token usage per model (in/out/cached, TTFT)\n\
+- `blazar pull <model>` — fetch another model; `blazar plan --install` ranks what fits the hardware\n\
+- `blazar doctor` / `blazar model-doctor <model>` — health + capability checks\n\n\
+Prefer these over guessing daemon state; they read the same store the daemon serves from.\n"
+    )
+}
+
 /// opencode provider block (schema verified against the published
 /// config schema at <https://opencode.ai/config.json>): an
 /// OpenAI-compatible provider the agent loads via
@@ -19052,11 +19851,16 @@ fn connect_backup_path(path: &std::path::Path, ts: u64) -> std::path::PathBuf {
 }
 
 #[allow(clippy::too_many_lines)]
+// Four booleans mirror the clap surface 1:1 (all_models/write/
+// install_skill/json); grouping them into a struct would decouple the
+// handler from its own argument parser for no reuse gain.
+#[allow(clippy::fn_params_excessive_bools)]
 async fn connect_cmd(
     client: &str,
     model: Option<String>,
     all_models: bool,
     write: bool,
+    install_skill: bool,
     json: bool,
 ) -> Result<()> {
     if client.is_empty() {
@@ -19234,6 +20038,47 @@ async fn connect_cmd(
         }
     }
 
+    // `--install-skill`: drop a Blazar skill/rules file into the
+    // client's own convention directory. Existing different files are
+    // only replaced under `--write` (same discipline as the config
+    // writes); a missing file installs immediately — it touches nothing
+    // the user already has.
+    let mut skill_written: Option<std::path::PathBuf> = None;
+    let mut skill_note = String::new();
+    if install_skill {
+        match skill_file_for_client(client, &home) {
+            Some(path) => {
+                let content = skill_markdown(client, &base, &model, &meta);
+                if path.exists() {
+                    let same =
+                        std::fs::read_to_string(&path).is_ok_and(|existing| existing == content);
+                    if same {
+                        skill_note = "already installed, unchanged".to_string();
+                        skill_written = Some(path);
+                    } else if write {
+                        std::fs::write(&path, &content)?;
+                        skill_written = Some(path);
+                        skill_note = "replaced (was present, differed)".to_string();
+                    } else {
+                        skill_note = "exists and differs — pass --write to replace".to_string();
+                    }
+                } else {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, &content)?;
+                    skill_written = Some(path);
+                }
+            }
+            None => {
+                skill_note = format!(
+                    "{client} has no skill-file convention — paste the snippet below into its \
+                     instructions/knowledge area"
+                );
+            }
+        }
+    }
+
     if json {
         let v = serde_json::json!({
             "object": "blazar.connect",
@@ -19246,6 +20091,10 @@ async fn connect_cmd(
             "wrote": wrote_path.is_some(),
             "backup": backup,
             "rolled_back": rolled_back,
+            "skill": skill_written.as_ref().map(|p| serde_json::json!({
+                "path": p,
+                "note": skill_note,
+            })),
             "test": if daemon_up { serde_json::json!({"ok": test_ok, "model": model}) } else { serde_json::json!({"ok": false, "skipped": true}) },
             "detail": plan.detail,
         });
@@ -19284,6 +20133,18 @@ async fn connect_cmd(
             bak.display(),
             plan.config_path.display()
         );
+    }
+    if install_skill {
+        if let Some(p) = &skill_written {
+            println!(
+                "{}",
+                ok_line(&format!("skill:       {} ({skill_note})", p.display()))
+            );
+        } else {
+            println!("{}", warn_line(&format!("skill:       {skill_note}")));
+            println!();
+            println!("{}", skill_markdown(client, &base, &model, &meta));
+        }
     }
     if matches!(
         plan.action,
@@ -21128,6 +21989,99 @@ mod tests {
     }
 
     #[test]
+    fn unit__skill_file_for_client__conventions_and_none() {
+        use super::skill_file_for_client as s;
+        let home = std::path::Path::new("/home tester");
+        // opencode honors XDG_CONFIG_HOME when absolute, else ~/.config.
+        // Env-read only: this crate forbids unsafe code, so the test
+        // derives the expectation from whatever env it runs under.
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute());
+        let expected_opencode = xdg.unwrap_or_else(|| home.join(".config"));
+        assert_eq!(
+            s("opencode", home).unwrap(),
+            expected_opencode.join("opencode/skills/blazar/SKILL.md")
+        );
+        assert_eq!(
+            s("claude", home).unwrap(),
+            std::path::PathBuf::from("/home tester/.claude/skills/blazar/SKILL.md")
+        );
+        assert_eq!(
+            s("continue", home).unwrap(),
+            std::path::PathBuf::from("/home tester/.continue/rules/blazar.md")
+        );
+        // cline is workspace-scoped: relative to the project root.
+        assert_eq!(
+            s("cline", home).unwrap(),
+            std::path::PathBuf::from(".clinerules/blazar.md")
+        );
+        // No skill-file convention: honest None (snippet prints).
+        assert!(s("codex", home).is_none());
+        assert!(s("openwebui", home).is_none());
+        assert!(s("pi", home).is_none());
+    }
+
+    #[test]
+    fn unit__skill_markdown__frontmatter_dialects_and_model() {
+        use super::{ConnectModelMeta, skill_markdown as md};
+        let meta = ConnectModelMeta {
+            id: "qwen3-8b".into(),
+            context: Some(32_768),
+            tools: true,
+            reasoning: true,
+            vision: false,
+        };
+        // Frontmatter only where the skill convention reads it.
+        let opencode = md("opencode", "http://127.0.0.1:11434", "qwen3-8b", &meta);
+        assert!(opencode.starts_with("---\nname: blazar\n"));
+        let rules = md("continue", "http://127.0.0.1:11434", "qwen3-8b", &meta);
+        assert!(!rules.starts_with("---"));
+        // All three dialects, the base, the model, and the curl example
+        // with properly-escaped JSON braces all present.
+        for body in [&opencode, &rules] {
+            assert!(body.contains("http://127.0.0.1:11434/v1/chat/completions"));
+            assert!(body.contains("http://127.0.0.1:11434/api/chat"));
+            assert!(body.contains("http://127.0.0.1:11434/v1/messages"));
+            assert!(body.contains("\"model\": \"qwen3-8b\""));
+            assert!(body.contains("blazar usage"));
+        }
+    }
+
+    #[test]
+    fn unit__sdcpp_same_tag_switches__needs_both_labels_and_diff() {
+        use super::sdcpp_same_tag_switches as s;
+        // Known flip: vulkan installed, CUDA prebuilt appeared — switch.
+        assert!(s(Some("vulkan"), Some("cuda")));
+        assert!(s(Some("cpu"), Some("vulkan")));
+        // Same backend on both sides: stay (no churn on a live tag).
+        assert!(!s(Some("vulkan"), Some("vulkan")));
+        // Either label unknown: stay — never switch on guesswork
+        // (offline probe, pre-label engine row).
+        assert!(!s(None, Some("cuda")));
+        assert!(!s(Some("vulkan"), None));
+        assert!(!s(None, None));
+    }
+
+    #[test]
+    fn unit__parse_params_billions__catalog_names_and_moe() {
+        use super::parse_params_billions as p;
+        // Plain families.        assert_eq!(p("Qwen3-8B-Q4_K_M.gguf"), Some(8.0));
+        assert_eq!(p("Llama-3.2-3B-Instruct-Q4_0.gguf"), Some(3.0));
+        assert_eq!(p("qwen2.5-0.5b-q8_0.gguf"), Some(0.5));
+        assert_eq!(p("gemma-3-4b-qat-q4_0.gguf"), Some(4.0));
+        // MoE: first (total) token wins — capacity axis.
+        assert_eq!(p("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"), Some(30.0));
+        // Quant tokens are not parameter counts.
+        assert_eq!(p("model-q4_k_m.gguf"), None);
+        assert_eq!(p("model-q8_0-v2.gguf"), None);
+        // No size token at all: the honest gap.
+        assert_eq!(p("phi-4/phi-4-q4.gguf"), None);
+        // '3b' inside a word is not a token (separator rule).
+        assert_eq!(p("some3brandy.gguf"), None);
+    }
+
+    #[test]
     fn unit__intent_plan__maps_all_six_postures() {
         // Agent + coding share the high lane; batch yields; reasoning
         // forces think; vision demands the projector preflight; the
@@ -22060,6 +23014,56 @@ mod tests {
             cold.trim_start_matches("m:8b").contains("4.6 GiB") || cold.contains("GiB"),
             "disk bytes render human-sized: {cold}"
         );
+    }
+
+    /// The ps contract: only a 2xx body with a models array lists. Error
+    /// payloads and shape drift must ERROR — the old form collapsed them
+    /// to an empty list and masked daemon trouble as "no models loaded".
+    #[test]
+    fn unit__ps_models_of__contract_enforced() {
+        use serde_json::json;
+        // Happy path.
+        let models = ps_models_of(
+            reqwest::StatusCode::OK,
+            &json!({"models": [{"name": "m1"}]}),
+        )
+        .expect("200 + models array lists");
+        assert_eq!(models.len(), 1);
+        // Error payload (the live-caught masking shape): 503 + error JSON
+        // is a loud failure, never an empty success.
+        let err = ps_models_of(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "supervisor restarting"}),
+        )
+        .expect_err("non-2xx must error");
+        assert!(
+            err.contains("503") && err.contains("supervisor restarting"),
+            "{err}"
+        );
+        // Shape drift: 2xx without a models array names the actual keys.
+        let err = ps_models_of(reqwest::StatusCode::OK, &json!({"instances": []}))
+            .expect_err("missing models array must error");
+        assert!(err.contains("instances"), "{err}");
+        // models present but not an array is equally a contract break.
+        let err = ps_models_of(reqwest::StatusCode::OK, &json!({"models": "all"}))
+            .expect_err("non-array models must error");
+        assert!(err.contains("no models array"), "{err}");
+    }
+
+    /// Only the transient classes retry: transport, truncated body, and
+    /// 502/503/504. A 500 or a 4xx fails on the first pass.
+    #[test]
+    fn unit__ps_retryable__transient_classes_only() {
+        assert!(ps_retryable("request failed: connection reset"));
+        assert!(ps_retryable("body unreadable: eof"));
+        assert!(ps_retryable("daemon answered 503: restarting"));
+        assert!(ps_retryable("daemon answered 502: bad gateway"));
+        assert!(ps_retryable("daemon answered 504: gateway timeout"));
+        assert!(!ps_retryable("daemon answered 500: internal"));
+        assert!(!ps_retryable("daemon answered 401: unauthorized"));
+        assert!(!ps_retryable(
+            "daemon answered 200 but the body has no models array"
+        ));
     }
 
     #[test]

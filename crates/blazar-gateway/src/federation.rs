@@ -283,6 +283,7 @@ pub async fn warm(
         false,
         false,
         false,
+        true, // warm: generation surface (llama.cpp variant ride)
     )
     .await
     {

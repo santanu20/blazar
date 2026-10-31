@@ -197,12 +197,26 @@ pub async fn messages(
         crate::proxy::body_needs_vision(&openai_body, false),
         false, // text surface: diffusion rows teach the images lane
         false,
+        true, // messages: generation surface (llama.cpp variant ride)
     )
     .await
     {
         Ok(ok) => ok,
         Err(resp) => return *resp,
     };
+    // llama.cpp LoRA-variant ride (see proxy.rs::llamacpp_variant_lora):
+    // `base+adapter` on the resident base child carries the per-request
+    // `lora` field and the engine's own model name in the translated
+    // OpenAI body. Teaching surfaces as 502 upstream_error — never a
+    // silent fall back to base weights.
+    match crate::proxy::llamacpp_variant_lora(&state, &engine, Some(&model)).await {
+        Some(Ok(pairs)) => {
+            crate::proxy::set_child_lora(&mut openai_body, &pairs);
+            crate::proxy::set_child_model(&mut openai_body, &engine.name);
+        }
+        Some(Err(teach)) => return anthropic_error(502, "api_error", &teach),
+        None => {}
+    }
     let key_name = engine.name.clone();
     state.sup.note_prefix_hit(&key_name);
     // Think-dialect bridge for mistral.rs children (see proxy.rs): the
@@ -300,8 +314,11 @@ pub async fn messages(
     // `mcp::stamp`).
     let mut mcp_hdr: Option<String> = None;
     // A2: wall anchor for the decode-throughput observation below —
-    // predates both the fan and the single send.
+    // predates both the fan and the single send. Also the D5
+    // class-routing anchor: the guard is held from here through the
+    // note, so both live counts include this request (`others_peak`).
     let t0 = std::time::Instant::now();
+    let entry_live = state.sup.model_live_streams(&model);
     let fan = if let Some(want) = best_of.filter(|n| *n >= 2) {
         crate::bestof::fan_out(
             &state,
@@ -379,9 +396,12 @@ pub async fn messages(
         .pointer("/usage/completion_tokens")
         .and_then(Value::as_u64)
     {
-        state
-            .sup
-            .note_model_throughput(&model, n, t0.elapsed().as_secs_f64());
+        state.sup.note_model_throughput(
+            &model,
+            n,
+            t0.elapsed().as_secs_f64(),
+            crate::proxy::others_peak(entry_live, state.sup.model_live_streams(&model)),
+        );
     }
     let mut resp = (StatusCode::OK, axum::Json(translated)).into_response();
     crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
@@ -445,6 +465,7 @@ pub async fn count_tokens(
         false,
         false, // text surface: diffusion rows teach the images lane
         false,
+        true, // count_tokens: chat-parity generation surface
     )
     .await
     {

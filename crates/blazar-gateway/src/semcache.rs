@@ -386,7 +386,8 @@ pub async fn embed_prompt(
         false,
         false, // text surface: diffusion rows teach the images lane
         true,  // captive: the cache probe must never evict generation
-               // residents; under pressure this lookup bypasses instead
+        // residents; under pressure this lookup bypasses instead
+        false, // embeddings probe: dedicated child, not a generation lane
     )
     .await
     .map_err(|e| format!("embed model admission failed: {e:?}"))?;

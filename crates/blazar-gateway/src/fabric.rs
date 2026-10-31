@@ -312,6 +312,7 @@ mod tests {
             capacity: None,
             slots: Some(2),
             slots_configured: Some(2),
+            slots_source: Some("auto"),
             gpu: "full".to_string(),
             device: Some("RTX 4070".to_string()),
             device_id: device_id.map(str::to_string),

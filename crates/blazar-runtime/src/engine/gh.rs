@@ -127,6 +127,17 @@ fn parse_asset_hrefs(body: &str, tag: &str, base: &str) -> Vec<GhAsset> {
 /// same lane and default the model-pull client uses (see `hf_parallel`).
 const ASSET_DOWNLOAD_CONNECTIONS: u32 = 8;
 
+/// Stall-window for [`GhClient::progress_guard`]: one full window under
+/// [`PROGRESS_MIN_BYTES`] of on-disk growth aborts the attempt. 1 MiB in
+/// 60 s (~17 KiB/s) sits above deliberate slow-but-real links and below
+/// every observed CDN-abuse trickle (~11 KiB/s) — an engine asset at
+/// that rate is a multi-hour install either way.
+const PROGRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
+/// Zero-byte grace before the window clock starts counting (TLS,
+/// redirect chain, parallel-chunk setup).
+const PROGRESS_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GhAsset {
     pub name: String,
@@ -192,6 +203,11 @@ pub struct GhClient {
     /// `download_speed_limit_mb`, so one config caps every byte the
     /// daemon fetches.
     download_speed_limit_mb: f64,
+    /// On-disk download cache root (see `default_downloads_cache`).
+    /// `None` disables reuse — `with_base` (the test/mirror
+    /// constructor) always builds cache-off so tests stay hermetic and
+    /// never touch the user's cache directory.
+    downloads_cache: Option<std::path::PathBuf>,
 }
 
 #[must_use]
@@ -250,6 +266,158 @@ fn authed(
     }
 }
 
+/// Resolve the default engine-download cache root. Precedence:
+/// `BLAZAR_DOWNLOADS_CACHE` (absolute override; `"0"` or empty =
+/// explicitly off), then `$XDG_CACHE_HOME/blazar/downloads`, then the
+/// platform cache dir. `None` when no home/cache dir exists — the
+/// cache is always best-effort. Purge is `rm -rf` on the directory;
+/// there is deliberately no eviction or TTL.
+#[must_use]
+pub fn default_downloads_cache() -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("BLAZAR_DOWNLOADS_CACHE") {
+        return if v.is_empty() || v == "0" {
+            None
+        } else {
+            Some(std::path::PathBuf::from(v))
+        };
+    }
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::cache_dir)?;
+    Some(root.join("blazar").join("downloads"))
+}
+
+/// Sanitize an asset name for a cache filename: keep the common
+/// release-asset characters, replace everything else with `_`, and cap
+/// the total length (the url-hash prefix already guarantees
+/// uniqueness).
+fn cache_safe_name(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    s.truncate(64);
+    s
+}
+
+/// Advisory per-blob mutex built on an exclusive directory create —
+/// `mkdir` is atomic on every platform we ship (advisory `flock` is
+/// unix-only), needs no extra dependency, and its mere existence is
+/// the held lock. Holders release by removing the directory on drop.
+///
+/// A holder that crashed hard leaves the directory behind; a lock
+/// older than [`BlobLock::STALE`] is considered abandoned and stolen
+/// (remove + retry). The window intentionally matches the slowest
+/// engine lane (30 min) so a live download is never stolen from.
+pub(crate) struct BlobLock(std::path::PathBuf);
+
+impl BlobLock {
+    /// Locks live for the blob's lifetime; a stale threshold equal to
+    /// the slowest engine lane tolerates a crashed holder without
+    /// punishing a slow-but-alive one. (30 minutes — stable Rust has
+    /// no minutes constructor for the lint to rewrite into.)
+    #[allow(
+        clippy::duration_suboptimal_units,
+        reason = "30 * 60 secs is clearer than 1800"
+    )]
+    const STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    /// Poll cadence while another process holds the lock.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+    pub(crate) async fn acquire(
+        cache_root: &std::path::Path,
+        blob: &std::path::Path,
+    ) -> Option<Self> {
+        let lock_dir = cache_root.join(format!("{}.lock", blob.file_name()?.to_string_lossy()));
+        loop {
+            match std::fs::create_dir(&lock_dir) {
+                Ok(()) => return Some(Self(lock_dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&lock_dir)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|held| held.elapsed().ok())
+                        .is_some_and(|age| age > Self::STALE);
+                    if stale {
+                        // remove_dir only succeeds when empty: a live
+                        // holder that re-created its marker keeps the
+                        // lock; a crashed one leaves nothing behind.
+                        let _ = std::fs::remove_dir(&lock_dir);
+                        continue;
+                    }
+                    tokio::time::sleep(Self::POLL).await;
+                }
+                Err(_) => {
+                    // Cache fs refuses lock dirs entirely: fall back to
+                    // the pre-lock behavior (documented race) rather
+                    // than failing the download.
+                    tracing::debug!(lock = %lock_dir.display(), "blob lock dir unusable");
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for BlobLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+/// Link `src` to `dst`, replacing any existing `dst`. Prefers a
+/// hardlink (zero copy; the cache blob and the install's archive are
+/// the same bytes) and falls back to a copy when the link cannot cross
+/// filesystems. Returns the linked byte count.
+fn hardlink_or_copy(src: &std::path::Path, dst: &std::path::Path) -> Result<u64> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let _ = std::fs::remove_file(dst);
+    if std::fs::hard_link(src, dst).is_err() {
+        tracing::debug!(from = %src.display(), to = %dst.display(), "hardlink failed — copying");
+        return std::fs::copy(src, dst).with_context(|| format!("copy {}", src.display()));
+    }
+    let len = std::fs::metadata(src)
+        .map(|m| m.len())
+        .with_context(|| format!("stat {}", src.display()))?;
+    Ok(len)
+}
+
+/// A blob is a hit when its length matches the manifest-declared
+/// size (the digest was verified when it was first written by the
+/// stream verifier). A mismatch evicts the blob and any in-flight
+/// `.part` state so the next attempt starts clean. `None` = miss.
+fn cache_hit(asset: &GhAsset, blob: &std::path::Path) -> Option<u64> {
+    let len = std::fs::metadata(blob).ok().map(|m| m.len())?;
+    let hit = match asset.size {
+        Some(expected) => len == expected,
+        // No declared size in the manifest: trust the verified
+        // digest from the original write.
+        None => true,
+    };
+    if hit {
+        Some(len)
+    } else {
+        tracing::warn!(
+            blob = %blob.display(),
+            have = len,
+            want = ?asset.size,
+            "engine asset cache size mismatch — evicting"
+        );
+        let _ = std::fs::remove_file(blob);
+        let _ = std::fs::remove_file(format!("{}.part", blob.display()));
+        let _ = std::fs::remove_file(format!("{}.part.progress", blob.display()));
+        None
+    }
+}
+
 impl GhClient {
     pub fn new(token: Option<String>) -> Result<Self> {
         // BLAZAR_GH_BASE: mirrors/tests override the GitHub API base for
@@ -257,7 +425,7 @@ impl GhClient {
         // BLAZAR_INSTALL_BASE_URL). Unset = the real API.
         let base =
             std::env::var("BLAZAR_GH_BASE").unwrap_or_else(|_| "https://api.github.com".into());
-        Self::with_base(&base, token)
+        Ok(Self::with_base(&base, token)?.with_downloads_cache(default_downloads_cache()))
     }
 
     pub fn with_base(base: &str, token: Option<String>) -> Result<Self> {
@@ -284,6 +452,7 @@ impl GhClient {
             base: reqwest::Url::parse(base)?,
             token,
             download_speed_limit_mb: 0.0,
+            downloads_cache: None,
         })
     }
 
@@ -294,6 +463,27 @@ impl GhClient {
     pub fn with_download_speed_limit(mut self, limit_mb: f64) -> Self {
         self.download_speed_limit_mb = limit_mb;
         self
+    }
+
+    /// Builder: point the on-disk download cache at `root`. Accepts a
+    /// path (tests inject a tempdir) or `None` to disable; production
+    /// passes `default_downloads_cache()`.
+    #[must_use]
+    pub fn with_downloads_cache(mut self, root: impl Into<Option<std::path::PathBuf>>) -> Self {
+        self.downloads_cache = root.into();
+        self
+    }
+
+    /// Advisory cross-process lock over a NAMED shared resource in the
+    /// downloads cache root — used for blob downloads (inside
+    /// [`Self::download_asset_file`]) and per-tag engine installs
+    /// (`install_with_rollback`). `None` when the cache is off or its
+    /// fs refuses lock dirs: callers proceed unlocked and the
+    /// documented best-effort race applies.
+    pub(crate) async fn cache_lock(&self, name: &str) -> Option<BlobLock> {
+        let root = self.downloads_cache.as_ref()?;
+        let safe = cache_safe_name(name);
+        BlobLock::acquire(root, std::path::Path::new(&safe)).await
     }
 
     /// Progress-bar suffix naming the active cap, empty when uncapped.
@@ -985,12 +1175,209 @@ impl GhClient {
         Ok(bytes.to_vec())
     }
 
+    /// Download an asset to `dest`, reusing the on-disk cache when the
+    /// client has one (see `default_downloads_cache`). A cache hit
+    /// costs zero network; a miss downloads into the cache blob and
+    /// hardlinks (or copies, cross-device) to `dest`, so the blob
+    /// survives the caller's post-extract archive cleanup and later
+    /// installs — and a stalled parallel download's `.part` state —
+    /// resume across runs. Cache disabled or unusable → plain
+    /// download straight to `dest`.
+    pub async fn download_asset_file(
+        &self,
+        asset: &GhAsset,
+        dest: &std::path::Path,
+    ) -> Result<u64> {
+        let Some(cache_root) = self.downloads_cache.clone() else {
+            return self.download_asset_file_uncached(asset, dest).await;
+        };
+        let blob = cache_root.join(Self::asset_cache_key(asset));
+        if let Some(len) = cache_hit(asset, &blob) {
+            tracing::info!(
+                bytes = len,
+                url = %asset.browser_download_url,
+                "engine asset cache hit"
+            );
+            hardlink_or_copy(&blob, dest)?;
+            return Ok(len);
+        }
+        // Best-effort: a cache dir we cannot create (read-only fs,
+        // permissions) degrades to a direct download, never an error.
+        if std::fs::create_dir_all(&cache_root).is_ok() {
+            // Serialize concurrent downloads of the same blob: the
+            // second installer waits for the first to finish, then
+            // takes the cache hit instead of racing the same .part.
+            // Without this, two `engine update` terminals duplicate
+            // every byte and the loser dies at the final rename.
+            let _lock = BlobLock::acquire(&cache_root, &blob).await;
+            // The winner may have finalized while we waited.
+            if let Some(len) = cache_hit(asset, &blob) {
+                tracing::info!(
+                    bytes = len,
+                    url = %asset.browser_download_url,
+                    "engine asset cache hit (after wait)"
+                );
+                hardlink_or_copy(&blob, dest)?;
+                return Ok(len);
+            }
+            let len = Self::progress_guard(
+                self.download_asset_file_uncached(asset, &blob),
+                &blob,
+                self.download_speed_limit_mb > 0.0,
+                PROGRESS_WINDOW,
+                PROGRESS_MIN_BYTES,
+                PROGRESS_GRACE,
+            )
+            .await?;
+            tracing::info!(
+                bytes = len,
+                blob = %blob.display(),
+                "engine asset cached for reuse"
+            );
+            hardlink_or_copy(&blob, dest)?;
+            return Ok(len);
+        }
+        tracing::debug!(root = %cache_root.display(), "engine asset cache dir unusable");
+        Self::progress_guard(
+            self.download_asset_file_uncached(asset, dest),
+            dest,
+            self.download_speed_limit_mb > 0.0,
+            PROGRESS_WINDOW,
+            PROGRESS_MIN_BYTES,
+            PROGRESS_GRACE,
+        )
+        .await
+    }
+
+    /// A stalled asset download must fail loud, not grind forever: the
+    /// HTTP client's read-timeout only caps IDLE gaps, so a live CDN
+    /// trickle (edge rate-limiting, path policing) keeps an install
+    /// "progressing" for hours at kilobytes per second. This watchdog
+    /// samples the destination's on-disk growth — orthogonal to the
+    /// serial/parallel lane internals — and cancels the attempt when a
+    /// full window passes under the floor. The parallel lane's chunk
+    /// ledger makes the next attempt resume where this one died, so an
+    /// operator retry after the underlying condition clears pays only
+    /// for the un-downloaded remainder. A deliberate speed cap
+    /// (`speed_limit_mb` configured) disables the guard: the user owns
+    /// that slowness.
+    ///
+    /// Constants are parameters so the unit test can shrink the window.
+    async fn progress_guard<F>(
+        fut: F,
+        dest: &std::path::Path,
+        disabled: bool,
+        window: std::time::Duration,
+        min_bytes: u64,
+        grace: std::time::Duration,
+    ) -> Result<u64>
+    where
+        F: std::future::Future<Output = Result<u64>>,
+    {
+        if disabled {
+            return fut.await;
+        }
+        let (trip_tx, mut trip_rx) = tokio::sync::watch::channel(false);
+        let watch_path = dest.to_path_buf();
+        let sampler = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            // Composite progress: the serial lane grows `dest`
+            // monotonically, but the parallel lane PREALLOCATES its
+            // `.part` at full (sparse) size before writing a byte —
+            // size there is a constant. Real parallel progress lands in
+            // the chunk ledger `<dest>.part.progress`, which the
+            // parallel machinery rewrites on every chunk completion, so
+            // an mtime advance inside the window counts as one floor's
+            // worth of growth (a completed chunk is always larger than
+            // the floor).
+            let ledger = {
+                let mut p = watch_path.clone().into_os_string();
+                p.push(".part.progress");
+                std::path::PathBuf::from(p)
+            };
+            let mark = || -> (u64, u64) {
+                let dest_size = std::fs::metadata(&watch_path).map_or(0, |m| m.len());
+                let ledger_ns = std::fs::metadata(&ledger).map_or(0_u64, |m| {
+                    m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+                });
+                (dest_size, ledger_ns)
+            };
+            // Window growth = dest bytes grown + one floor's credit per
+            // ledger rewrite (a completed chunk is always larger than
+            // the floor, so any mtime advance inside the window is
+            // healthy progress).
+            let grew = |a: (u64, u64), b: (u64, u64)| {
+                b.0.saturating_sub(a.0) + u64::from(b.1 > a.1) * min_bytes
+            };
+            let mut last_mark = mark();
+            let mut last_mark_at = start;
+            // Sample at window/4 so the verdict lands within one window
+            // of the stall beginning; the grace window protects setup
+            // (TLS, redirect chains, chunk prealloc) from tripping the
+            // very first check.
+            let sleep = std::time::Duration::max(window / 4, std::time::Duration::from_millis(50));
+            loop {
+                tokio::time::sleep(sleep).await;
+                let now = std::time::Instant::now();
+                if start.elapsed() < grace {
+                    continue;
+                }
+                if now.duration_since(last_mark_at) >= window {
+                    let now_mark = mark();
+                    if grew(last_mark, now_mark) < min_bytes {
+                        tracing::warn!(
+                            window_secs = now.duration_since(last_mark_at).as_secs(),
+                            "asset download stalled below progress floor"
+                        );
+                        let _ = trip_tx.send(true);
+                        return;
+                    }
+                    last_mark = now_mark;
+                    last_mark_at = now;
+                }
+            }
+        });
+        let out = tokio::select! {
+            r = fut => r,
+            _ = trip_rx.changed() => Err(anyhow!(
+                "asset download stalled: {} grew under {} bytes in {:?} — \
+                 the CDN or path is throttling this transfer (rate-limit or \
+                 policing). Retry resumes from the chunk ledger; if it keeps \
+                 stalling, wait out the remote rate-limit window or check \
+                 BLAZAR_* speed caps",
+                dest.display(),
+                min_bytes,
+                window
+            )),
+        };
+        sampler.abort();
+        out
+    }
+
+    /// Cache filename for an asset: a 16-hex-char sha256 of the
+    /// download URL (release assets are immutable per tag URL) plus the
+    /// sanitized asset name for human legibility.
+    fn asset_cache_key(asset: &GhAsset) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(asset.browser_download_url.as_bytes());
+        let hex: String = h.finalize().iter().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        format!("{}-{}", &hex[..16], cache_safe_name(&asset.name))
+    }
+
     /// Stream an asset to `dest` with incremental sha256 — for GiB-class
     /// assets (mistral.rs CUDA prebuilts are 0.8-1.1 GiB) that must not
     /// be buffered whole in memory. The client's read-timeout is an
     /// idle-gap cap, not a total deadline, so slow links survive.
     /// Returns bytes written.
-    pub async fn download_asset_file(
+    async fn download_asset_file_uncached(
         &self,
         asset: &GhAsset,
         dest: &std::path::Path,
@@ -1940,6 +2327,155 @@ mod tests {
         assert!(!same_build("b10816", "b10817"));
         assert!(same_build("local", "local"));
         assert!(!same_build("local", "b10816"));
+    }
+
+    #[tokio::test]
+    async fn unit__progress_guard__trips_on_stalled_growth() {
+        let dir = std::env::temp_dir().join(format!("blazar-stall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("asset.part");
+        // A file that exists and never grows — the CDN-abuse trickle
+        // shape. Tiny window so the test runs in milliseconds.
+        std::fs::write(&dest, vec![0u8; 4096]).unwrap();
+        let never = std::future::pending::<()>();
+        let r = GhClient::progress_guard(
+            async {
+                never.await;
+                unreachable!("guard must cancel before the future resolves")
+            },
+            &dest,
+            false,
+            std::time::Duration::from_millis(300),
+            1024 * 1024,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let err = match r {
+            Err(e) => e,
+            Ok(n) => panic!("stalled download must abort, got Ok({n})"),
+        };
+        assert!(err.to_string().contains("stalled"), "{err:#}");
+        assert!(err.to_string().contains("throttling"), "{err:#}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unit__progress_guard__passes_on_healthy_growth() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("blazar-grow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("asset.part");
+        std::fs::write(&dest, vec![0u8; 4096]).unwrap();
+        // A writer growing the file well past the floor every window.
+        let writer_dest = dest.clone();
+        let writer = tokio::spawn(async move {
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&writer_dest)
+                    .unwrap();
+                f.write_all(&vec![0u8; 2 * 1024 * 1024]).unwrap();
+            }
+        });
+        let r = GhClient::progress_guard(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                Ok(64_u64)
+            },
+            &dest,
+            false,
+            std::time::Duration::from_millis(300),
+            1024 * 1024,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(r.unwrap(), 64, "healthy growth must complete");
+        writer.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unit__progress_guard__parallel_prealloc_shape_passes_via_ledger() {
+        // The parallel lane's footprint: `.part` PREALLOCATED at full
+        // (sparse) size — constant for the whole download — plus a
+        // `.part.progress` ledger rewritten per completed chunk. Size-
+        // only watching false-trips this shape; the ledger credit must
+        // carry it.
+        let dir = std::env::temp_dir().join(format!("blazar-par-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("asset.part");
+        std::fs::write(&dest, vec![0u8; 16 * 1024 * 1024]).unwrap(); // sparse prealloc stand-in
+        let ledger = {
+            let mut p = dest.clone().into_os_string();
+            p.push(".part.progress");
+            std::path::PathBuf::from(p)
+        };
+        let toucher = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                std::fs::write(&ledger, b"{\"done\":[0]}").unwrap();
+            }
+        });
+        let r = GhClient::progress_guard(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                Ok(16 * 1024 * 1024_u64)
+            },
+            &dest,
+            false,
+            std::time::Duration::from_millis(300),
+            1024 * 1024,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            r.unwrap(),
+            16 * 1024 * 1024,
+            "ledger rewrites count as growth"
+        );
+        toucher.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unit__progress_guard__disabled_passthrough_and_grace_holds() {
+        // Deliberate speed caps own their slowness: the guard must not
+        // fire at all.
+        let dir = std::env::temp_dir().join(format!("blazar-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("asset.part");
+        std::fs::write(&dest, vec![0u8; 4096]).unwrap();
+        let r = GhClient::progress_guard(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                Ok(7_u64)
+            },
+            &dest,
+            true,
+            std::time::Duration::from_millis(200),
+            u64::MAX,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(r.unwrap(), 7, "disabled guard never trips");
+
+        // Grace: a download that produced nothing yet within the grace
+        // window keeps waiting instead of aborting.
+        let r2 = GhClient::progress_guard(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                Ok(9_u64)
+            },
+            &dest,
+            false,
+            std::time::Duration::from_millis(200),
+            1024,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(r2.unwrap(), 9, "grace holds the window open pre-first-byte");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -2946,6 +3482,211 @@ mod tests {
             size: None,
             browser_download_url: url.to_string(),
         }
+    }
+
+    #[test]
+    fn unit__asset_cache_key__stable_sanitized_and_capped() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _ = tmp; // key tests are pure: no client, no cache dir needed
+        let a = GhAsset {
+            name: "blazar-cuda-b11981-x64.zip".into(),
+            digest: None,
+            size: None,
+            browser_download_url: "https://example.com/rel/b11981/blazar-cuda.zip".into(),
+        };
+        let k1 = GhClient::asset_cache_key(&a);
+        let k2 = GhClient::asset_cache_key(&a);
+        assert_eq!(k1, k2, "same asset → same key");
+        assert_eq!(
+            k1.split('-').next().map(str::len),
+            Some(16),
+            "16-hex url-hash prefix: {k1}"
+        );
+        assert!(
+            k1.ends_with("blazar-cuda-b11981-x64.zip"),
+            "legible name: {k1}"
+        );
+        // Hostile name: unsafe chars sanitized, absurd length capped.
+        let b = GhAsset {
+            name: "we!!ird/na..me  \u{2603}".into(),
+            ..a.clone()
+        };
+        let kb = GhClient::asset_cache_key(&b);
+        assert!(
+            kb.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+            "sanitized: {kb}"
+        );
+        assert!(kb.len() <= 16 + 1 + 64, "capped: {kb}");
+        // Different URL → different hash prefix (immutability keying).
+        let key_a = GhClient::asset_cache_key(&a);
+        let c = GhAsset {
+            browser_download_url: "https://example.com/rel/b11982/x.zip".into(),
+            ..a
+        };
+        assert_ne!(key_a, GhClient::asset_cache_key(&c));
+    }
+
+    #[test]
+    fn unit__cache_hit__size_match_evicts_mismatch_and_trusts_verified() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let blob = tmp.path().join("deadbeefdeadbeef-asset.bin");
+        std::fs::write(&blob, vec![1u8; 1024]).expect("blob");
+        // Declared size matches → hit.
+        let a = GhAsset {
+            name: "asset.bin".into(),
+            digest: None,
+            size: Some(1024),
+            browser_download_url: "https://example.com/a.bin".into(),
+        };
+        assert_eq!(cache_hit(&a, &blob), Some(1024));
+        // Mismatch → None, and the blob plus any in-flight part state
+        // is evicted so the redownload starts clean.
+        let stale = GhAsset {
+            size: Some(4096),
+            ..a.clone()
+        };
+        assert_eq!(cache_hit(&stale, &blob), None);
+        assert!(!blob.exists(), "mismatched blob evicted");
+        // Undeclared size: trust the digest-verified original write.
+        std::fs::write(&blob, vec![1u8; 512]).expect("blob again");
+        let undeclared = GhAsset { size: None, ..a };
+        assert_eq!(cache_hit(&undeclared, &blob), Some(512));
+        // Eviction also clears .part sidecars when present.
+        std::fs::write(tmp.path().join("deadbeefdeadbeef-asset.bin.part"), b"x").expect("part");
+        std::fs::write(
+            tmp.path().join("deadbeefdeadbeef-asset.bin.part.progress"),
+            b"{}",
+        )
+        .expect("progress");
+        std::fs::write(&blob, vec![1u8; 999]).expect("blob third");
+        let stale2 = GhAsset {
+            size: Some(1),
+            ..undeclared.clone()
+        };
+        assert_eq!(cache_hit(&stale2, &blob), None);
+        assert!(
+            !tmp.path().join("deadbeefdeadbeef-asset.bin.part").exists()
+                && !tmp
+                    .path()
+                    .join("deadbeefdeadbeef-asset.bin.part.progress")
+                    .exists(),
+            "part state evicted with the blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__second_download_hits_cache_not_network() {
+        // serve_once drops its listener after one request: if the
+        // second download goes to the network it errors — only a cache
+        // hit can satisfy it.
+        let body: &'static [u8] = Box::leak(vec![7u8; 300_000].into_boxed_slice());
+        let url = serve_once(body);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let client = GhClient::with_base("http://127.0.0.1", None)
+            .expect("client")
+            .with_downloads_cache(cache.path().to_path_buf());
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(body)));
+        let a = asset(&url, Some(&digest));
+        let first = cache.path().join("install-one").join("asset.bin");
+        let wrote = client
+            .download_asset_file(&a, &first)
+            .await
+            .expect("first download");
+        assert_eq!(wrote, body.len() as u64);
+        assert!(
+            std::fs::read(&first)
+                .expect("first")
+                .iter()
+                .all(|&b| b == 7)
+        );
+        // Blob landed in the cache dir under the hashed key.
+        let blobs = std::fs::read_dir(cache.path())
+            .expect("cache dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .collect::<Vec<_>>();
+        assert_eq!(blobs.len(), 1, "exactly one cache blob");
+        // Second install to a different dest: zero network.
+        let second = cache.path().join("install-two").join("asset.bin");
+        let wrote2 = client
+            .download_asset_file(&a, &second)
+            .await
+            .expect("cache hit");
+        assert_eq!(wrote2, body.len() as u64);
+        let back = std::fs::read(&second).expect("second");
+        assert_eq!(back.len(), body.len(), "same length via cache");
+        assert!(back.iter().all(|&b| b == 7), "same content via cache");
+    }
+
+    #[tokio::test]
+    async fn unit__cache_lock__second_acquire_blocks_until_release() {
+        // Primitive behind same-tag install serialization: while one
+        // holder lives, a second acquire on the same name must still
+        // be pending after several poll cycles, then succeed promptly
+        // after release.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let held = BlobLock::acquire(tmp.path(), std::path::Path::new("install-x"))
+            .await
+            .expect("first acquire");
+        let raced = tokio::time::timeout(
+            std::time::Duration::from_millis(1_200),
+            BlobLock::acquire(tmp.path(), std::path::Path::new("install-x")),
+        )
+        .await;
+        assert!(raced.is_err(), "second acquire must block while held");
+        drop(held);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            BlobLock::acquire(tmp.path(), std::path::Path::new("install-x")),
+        )
+        .await
+        .expect("acquire after release")
+        .expect("lock dir");
+        drop(next);
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("cache root readable")
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "locks clean up: {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn unit__download_asset_file__concurrent_calls_serialize_on_blob_lock() {
+        // Two installers racing the same asset must not both hit the
+        // network: serve_once allows exactly ONE request — the loser
+        // either waits for the blob lock and takes the cache hit, or
+        // this test fails outright.
+        let body: &'static [u8] = Box::leak(vec![9u8; 300_000].into_boxed_slice());
+        let url = serve_once(body);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let client = GhClient::with_base("http://127.0.0.1", None)
+            .expect("client")
+            .with_downloads_cache(cache.path().to_path_buf());
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(body)));
+        let a = asset(&url, Some(&digest));
+        let d1 = cache.path().join("a").join("asset.bin");
+        let d2 = cache.path().join("b").join("asset.bin");
+        let (r1, r2) = tokio::join!(
+            client.download_asset_file(&a, &d1),
+            client.download_asset_file(&a, &d2)
+        );
+        let (l1, l2) = (r1.expect("first"), r2.expect("second via cache"));
+        assert_eq!(l1, body.len() as u64);
+        assert_eq!(l2, body.len() as u64);
+        assert_eq!(std::fs::read(&d1).expect("d1").len(), body.len());
+        assert!(std::fs::read(&d2).expect("d2").iter().all(|&b| b == 9));
+        // The lock dir must not outlive its holders (the a/ b/ dirs are
+        // this test's own install destinations, not locks).
+        let leftovers = std::fs::read_dir(cache.path())
+            .expect("cache dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.file_type().is_ok_and(|t| t.is_dir())
+                    && e.file_name().to_string_lossy().ends_with(".lock")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "blob lock dir released after download");
     }
 
     #[tokio::test]
