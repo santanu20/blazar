@@ -76,6 +76,104 @@ pub fn resolve_draft_path(store: &Store, model: &str, spec_mode: &str) -> Option
     store.get_model(&draft_name).ok().flatten().map(|r| r.path)
 }
 
+/// Which on-disk shape an engine lane can actually load as a speculative
+/// draft: llama.cpp/mistral.rs consume GGUF draft files, sglang/mlx
+/// consume HF safetensors dirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftLane {
+    Gguf,
+    Safetensors,
+}
+
+#[must_use]
+pub fn lane_for(kind: blazar_core::engine_kind::EngineKind) -> DraftLane {
+    match kind {
+        blazar_core::engine_kind::EngineKind::Sglang
+        | blazar_core::engine_kind::EngineKind::Mlx => DraftLane::Safetensors,
+        // Everything else — llama.cpp/mistral.rs LLM lanes plus the
+        // non-LLM lanes (diffusion, audio, tts) that never speculate
+        // and only need the match to be exhaustive — drafts as GGUF.
+        _ => DraftLane::Gguf,
+    }
+}
+
+/// Lane-aware draft resolution: the catalog pair resolved through the
+/// store, classified against the spawning lane and the main model's own
+/// path. `Paired` is the only shape a spawn may arm; the other variants
+/// carry the teaching reason so callers degrade dense loudly instead of
+/// handing the engine a draft it cannot load (or itself).
+pub enum DraftPick {
+    Paired(String),
+    /// Draft row absent from the store (autopull may still fix this one).
+    Unavailable,
+    /// Draft exists but is the wrong on-disk shape for this lane.
+    IncompatibleLane(String),
+    /// Draft resolved to the main model's own file — a model cannot
+    /// draft itself.
+    SelfPaired(String),
+}
+
+pub fn pick_draft(
+    store: &Store,
+    model: &str,
+    spec_mode: &str,
+    lane: DraftLane,
+    main_path: Option<&str>,
+) -> DraftPick {
+    let Some(path) = resolve_draft_path(store, model, spec_mode) else {
+        return DraftPick::Unavailable;
+    };
+    if main_path.is_some_and(|mp| mp == path) {
+        return DraftPick::SelfPaired(path);
+    }
+    let is_gguf = |p: &str| {
+        p.rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("gguf"))
+    };
+    let compatible = match lane {
+        DraftLane::Gguf => is_gguf(&path),
+        DraftLane::Safetensors => !is_gguf(&path),
+    };
+    if compatible {
+        DraftPick::Paired(path)
+    } else {
+        DraftPick::IncompatibleLane(path)
+    }
+}
+
+/// One warn, the teaching text mirroring compile's wording, so a lane
+/// that cannot use its catalog draft degrades dense visibly instead of
+/// arming a doomed pair every spawn.
+fn warn_draft_skip(model: &str, pick: &DraftPick, lane: DraftLane) {
+    match pick {
+        DraftPick::IncompatibleLane(path) => {
+            if lane == DraftLane::Safetensors {
+                tracing::warn!(
+                    target: "blazar::supervisor",
+                    "spec draft {path} is a GGUF file; sglang EAGLE drafts must be HF \
+                     safetensors dirs — spawning dense (pull the draft as a safetensors \
+                     row to enable the pair)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "blazar::supervisor",
+                    "spec draft {path} is not a GGUF file; {lane:?} drafts load as GGUF \
+                     files — spawning dense (pull the draft as a GGUF row to enable the pair)"
+                );
+            }
+        }
+        DraftPick::SelfPaired(_) => {
+            tracing::warn!(
+                target: "blazar::supervisor",
+                "catalog draft for {model} resolved to the main model file itself — a \
+                 model cannot draft itself; spawning dense (pull the paired draft to \
+                 enable speculation)"
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Spec engagement for sglang admission: which draft dir (if any) the
 /// spawn will charge and whether speculative decoding engages at all.
 /// Mirrors `push_sglang_speculative` precedence — the knob lane
@@ -4110,7 +4208,16 @@ impl Supervisor {
             if spec_mode == "auto"
                 && let Ok(receipts) = store.list_spec_receipts(&m.name, &manifest.tag)
             {
-                let draft_available = resolve_draft_path(&store, &m.name, "auto").is_some();
+                let draft_available = matches!(
+                    pick_draft(
+                        &store,
+                        &m.name,
+                        "auto",
+                        lane_for(self.engine.kind()),
+                        Some(&m.path),
+                    ),
+                    DraftPick::Paired(_)
+                );
                 if let Some((mode, ratio)) =
                     best_measured_spec_mode(&receipts, &manifest.spec_types, draft_available)
                 {
@@ -4123,7 +4230,18 @@ impl Supervisor {
                     spec_mode = mode.to_string();
                 }
             }
-            let draft_path = resolve_draft_path(&store, &m.name, &spec_mode);
+            let draft_pick = pick_draft(
+                &store,
+                &m.name,
+                &spec_mode,
+                lane_for(self.engine.kind()),
+                Some(&m.path),
+            );
+            warn_draft_skip(&m.name, &draft_pick, lane_for(self.engine.kind()));
+            let draft_path = match draft_pick {
+                DraftPick::Paired(p) => Some(p),
+                _ => None,
+            };
             let input = ProfileInput {
                 spec_mode: &spec_mode,
                 engine_kind: self.engine.kind(),
@@ -4965,10 +5083,22 @@ impl Supervisor {
         // this exact hardware beats the heuristic chain, but only at
         // the auto tier — queued/overlay/governor pins above stay
         // immune, and without receipts the planner chain is unchanged.
+        // Lane-aware draft classification needs the main model's own
+        // path (self-pair detection) — one cheap store read.
+        let main_path: Option<String> = store.get_model(name).ok().flatten().map(|r| r.path);
         if spec_mode == "auto" {
             let caps = engine.capabilities();
             if let Ok(receipts) = store.list_spec_receipts(name, &caps.tag) {
-                let draft_available = resolve_draft_path(&store, name, "auto").is_some();
+                let draft_available = matches!(
+                    pick_draft(
+                        &store,
+                        name,
+                        "auto",
+                        lane_for(engine.kind()),
+                        main_path.as_deref(),
+                    ),
+                    DraftPick::Paired(_)
+                );
                 if let Some((mode, ratio)) =
                     best_measured_spec_mode(&receipts, &caps.spec_types, draft_available)
                 {
@@ -4982,7 +5112,13 @@ impl Supervisor {
                 }
             }
         }
-        let mut draft_path = resolve_draft_path(&store, name, &spec_mode);
+        let lane = lane_for(engine.kind());
+        let draft_pick = pick_draft(&store, name, &spec_mode, lane, main_path.as_deref());
+        warn_draft_skip(name, &draft_pick, lane);
+        let mut draft_path = match draft_pick {
+            DraftPick::Paired(p) => Some(p),
+            _ => None,
+        };
         if draft_path.is_none() && self.config.spec_autopull {
             // opt-in: pull the missing catalog draft, then re-resolve.
             // Any failure falls back to exactly the without-autopull
@@ -8819,6 +8955,108 @@ mod routing_tests {
     use super::*;
     use crate::engine::manifest::Manifest;
     use blazar_core::{GpuInfo, ModelOverride, Profile};
+
+    #[test]
+    fn unit__pick_draft__lane_aware_and_self_paired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = blazar_core::BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.data_dir).unwrap();
+        let store = Store::open(&dirs).unwrap();
+        // Real catalog pair for qwen3-0.6b (its generic draft resolves
+        // back to the model itself — the live self-pair case).
+        let pair = blazar_core::catalog::pair_for_spec_mode("qwen3-0.6b", "auto")
+            .expect("catalog pair for qwen3-0.6b");
+        let (repo, file) = pair
+            .draft_repo
+            .split_once(':')
+            .unwrap_or((&pair.draft_repo, ""));
+        let draft_name = crate::hf::draft_aware_name(repo, file);
+        let row = |name: &str, path: &str| {
+            serde_json::from_value::<blazar_core::ModelRow>(serde_json::json!({
+                "name": name, "repo": "r", "quant": "q",
+                "path": path, "bytes": 1, "pulled_at": 0,
+            }))
+            .unwrap()
+        };
+        let main_path = tmp.path().join("main.gguf");
+        std::fs::write(&main_path, "x").unwrap();
+        store
+            .upsert_model(&row("qwen3-0.6b", main_path.to_str().unwrap()))
+            .unwrap();
+
+        // Draft row parked on the main file: self-pair, any lane.
+        store
+            .upsert_model(&row(&draft_name, main_path.to_str().unwrap()))
+            .unwrap();
+        assert!(matches!(
+            pick_draft(
+                &store,
+                "qwen3-0.6b",
+                "auto",
+                DraftLane::Gguf,
+                Some(main_path.to_str().unwrap())
+            ),
+            DraftPick::SelfPaired(_)
+        ));
+
+        // GGUF draft on a GGUF lane pairs; on a safetensors lane it is
+        // the exact shape sglang rejects.
+        let gguf_draft = tmp.path().join("draft.gguf");
+        std::fs::write(&gguf_draft, "x").unwrap();
+        store
+            .upsert_model(&row(&draft_name, gguf_draft.to_str().unwrap()))
+            .unwrap();
+        assert!(matches!(
+            pick_draft(
+                &store,
+                "qwen3-0.6b",
+                "auto",
+                DraftLane::Gguf,
+                Some(main_path.to_str().unwrap())
+            ),
+            DraftPick::Paired(_)
+        ));
+        assert!(matches!(
+            pick_draft(
+                &store,
+                "qwen3-0.6b",
+                "auto",
+                DraftLane::Safetensors,
+                Some(main_path.to_str().unwrap())
+            ),
+            DraftPick::IncompatibleLane(_)
+        ));
+
+        // Dir-shaped draft flips the verdict per lane.
+        let dir_draft = tmp.path().join("draft-hf-dir");
+        std::fs::create_dir_all(&dir_draft).unwrap();
+        store
+            .upsert_model(&row(&draft_name, dir_draft.to_str().unwrap()))
+            .unwrap();
+        assert!(matches!(
+            pick_draft(
+                &store,
+                "qwen3-0.6b",
+                "auto",
+                DraftLane::Gguf,
+                Some(main_path.to_str().unwrap())
+            ),
+            DraftPick::IncompatibleLane(_)
+        ));
+        assert!(matches!(
+            pick_draft(
+                &store,
+                "qwen3-0.6b",
+                "auto",
+                DraftLane::Safetensors,
+                Some(main_path.to_str().unwrap())
+            ),
+            DraftPick::Paired(_)
+        ));
+    }
 
     #[test]
     fn unit__slot_reported_tokens__distinguishes_zero_from_missing() {

@@ -3272,6 +3272,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_recipe_lanes(&d));
     checks.extend(doctor_model_types(&d));
     checks.extend(doctor_sglang_fit(&d));
+    checks.extend(doctor_bench_receipts(&d));
     checks.extend(doctor_kv_budget(&d));
     checks.extend(doctor_sentinel(&d));
     checks.extend(doctor_runtime(&d));
@@ -4416,6 +4417,62 @@ fn sglang_fit_detail(name: &str, p: &blazar_core::profile::Profile) -> String {
 }
 
 /// SGLANG FIT section: preview the fit ladder for every safetensors
+/// Bench-receipt freshness: a receipt measured on an older engine build
+/// quietly misleads every later tune/spec decision (the numbers look
+/// current but describe a binary that no longer serves). Warn per model
+/// whose latest receipt predates the active engine; models without any
+/// receipt stay silent (benching is opt-in).
+fn doctor_bench_receipts(d: &BlazarDirs) -> Vec<Check> {
+    let Ok(store) = Store::open(d) else {
+        return vec![Check::fail(
+            "bench receipts",
+            format!(
+                "store open failed — receipt freshness unavailable: {}",
+                d.data_dir.display()
+            ),
+        )];
+    };
+    let engines = match store.list_engines() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return vec![Check::fail(
+                "bench receipts",
+                format!("engine list failed — receipt freshness unavailable: {e}"),
+            )];
+        }
+    };
+    let Some(active) = engines.iter().find(|e| e.active).map(|e| e.tag.clone()) else {
+        return Vec::new(); // no active engine: engine check owns that row
+    };
+    let models = match store.list_models() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return vec![Check::fail(
+                "bench receipts",
+                format!("model list failed — receipt freshness unavailable: {e}"),
+            )];
+        }
+    };
+    let mut out = Vec::new();
+    for m in models {
+        match store.latest_bench_result(&m.name, None) {
+            Ok(Some((tag, _, _))) if tag != active => out.push(Check::warn(
+                "bench receipts",
+                format!(
+                    "bench receipt for {} predates the active engine (receipt {}, \
+                     active {}) — re-run `blazar bench {}` / `blazar tune {} --search` \
+                     after engine updates so decisions track the serving binary",
+                    m.name, tag, active, m.name, m.name
+                ),
+            )),
+            // No receipt, current-lane receipt, or a store read error
+            // surfaced by the store check itself: nothing to add here.
+            _ => {}
+        }
+    }
+    out
+}
+
 /// model against the installed sglang engine by running the REAL
 /// profile compile (single source of truth — the numbers here are the
 /// numbers a spawn would use, never a re-derivation).
@@ -14105,7 +14162,18 @@ a long CUDA init. Embedding/rerank speed is measured live per request (/metrics,
         dirs: &d,
         bench_bin,
     };
-    let rows = tuner.bench_default(std::path::Path::new(&row.path))?;
+    // Threads alignment: measure with the serving profile's pinned
+    // thread count when one exists (adopted argv carries --threads N);
+    // unpinned profiles bench at llama-bench's default, same as serve.
+    let pinned_threads = bench_lane_engine(&store)
+        .and_then(|engine| store.get_profile(&row.name, &engine.tag).ok().flatten())
+        .and_then(|p| serde_json::from_str::<Vec<String>>(&p.args_json).ok())
+        .and_then(|argv| {
+            argv.windows(2)
+                .find_map(|w| (w[0] == "--threads").then(|| w[1].parse::<u32>().ok().unwrap_or(0)))
+        })
+        .filter(|t| *t > 0);
+    let rows = tuner.bench_default_threads(std::path::Path::new(&row.path), pinned_threads)?;
     println!(
         "{:<10} {:>8} {:>8} {:>6} {:<6} {:<6}",
         "TEST", "T/S", "CTX", "THREADS", "CTK", "CTV"
@@ -14666,7 +14734,36 @@ aborts on this family. Profile pins for it would measure nothing",
         // by compiling the draft-engaged variant once. The race then
         // runs at engine defaults, mirroring the other arms.
         let mut draft_pair: Option<(String, u32)> = None;
-        let draft_path = blazar_runtime::resolve_draft_path(&store, model, "auto");
+        // Lane-aware pick: a GGUF/safetensors mismatch or a self-pair is
+        // skipped BEFORE compiling the draft arm — the reason prints
+        // instead of surfacing as a compile-degrade warning later.
+        let draft_pick = blazar_runtime::pick_draft(
+            &store,
+            model,
+            "auto",
+            blazar_runtime::lane_for(blazar_core::engine_kind::EngineKind::LlamaCpp),
+            Some(&row.path),
+        );
+        let draft_path = match &draft_pick {
+            blazar_runtime::DraftPick::Paired(p) => Some(p.clone()),
+            blazar_runtime::DraftPick::Unavailable => None,
+            blazar_runtime::DraftPick::IncompatibleLane(p) => {
+                println!(
+                    "draft arm skipped — catalog draft {p} is not a GGUF file; \
+                     llama.cpp drafts load as GGUF files (pull the draft as a GGUF \
+                     row to enable the pair)"
+                );
+                None
+            }
+            blazar_runtime::DraftPick::SelfPaired(_) => {
+                println!(
+                    "draft arm skipped — catalog draft for {model} resolved to the \
+                     main model file itself; a model cannot draft itself (pull the \
+                     paired draft to enable speculation)"
+                );
+                None
+            }
+        };
         if let Some(dp) = draft_path.as_deref()
             && manifest.spec_types.iter().any(|s| s == "draft-simple")
         {
@@ -14734,11 +14831,22 @@ aborts on this family. Profile pins for it would measure nothing",
             blazar_core::profile::compile(&input_race, &blazar_core::TuningOverrides::default())
                 .map_err(|e| anyhow!("profile: {e}"))?;
         println!("spec race: live servers across {race_modes:?} (~1 min each) ...");
+        // Tuned n-gram shape feeds the ngram arm; untuned (all-zero
+        // ngram_* config) says so instead of silently racing a
+        // dead-tie engine-default shape into the receipts.
+        let ngram_knobs = (cfg.ngram_size_m, cfg.ngram_size_n, cfg.ngram_min_hits);
+        if race_modes.iter().any(|m| m == "ngram") && ngram_knobs.0 == 0 {
+            println!(
+                "ngram arm racing engine defaults (ngram_* untuned — \
+                 `blazar tune {model} --ngram` refines the shape first)"
+            );
+        }
         let rows = tuner.spec_mode_race(
             &base_race.argv,
             &race_modes,
             1,
             draft_pair.as_ref().map(|(p, n)| (p.as_str(), *n)),
+            Some(ngram_knobs),
         )?;
         println!("{:<8} {:>14}", "mode", "tok/s");
         for (mode, tps) in &rows {

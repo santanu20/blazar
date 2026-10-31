@@ -400,6 +400,7 @@ impl Tuner<'_> {
         modes: &[String],
         idle_secs: u64,
         draft: Option<(&str, u32)>,
+        ngram_knobs: Option<(u32, u32, u32)>,
     ) -> Result<Vec<(String, f64)>> {
         let server_bin = self
             .bench_bin
@@ -421,6 +422,21 @@ impl Tuner<'_> {
                 "dense" => {}
                 "ngram" => {
                     argv.extend(["--spec-type".to_string(), "ngram-simple".to_string()]);
+                    // Tuned n-gram shape (from `tune --ngram` /
+                    // ngram_* config): without it the arm races engine
+                    // defaults, which measured as a dead tie against
+                    // dense and biased every later spec=auto resolution.
+                    if let Some((size_m, size_n, min_hits)) = ngram_knobs.filter(|(m, _, _)| *m > 0)
+                    {
+                        argv.extend([
+                            "--spec-ngram-simple-size-m".to_string(),
+                            size_m.to_string(),
+                            "--spec-ngram-simple-size-n".to_string(),
+                            size_n.to_string(),
+                            "--spec-ngram-simple-min-hits".to_string(),
+                            min_hits.to_string(),
+                        ]);
+                    }
                 }
                 "dflash" => {
                     argv.extend(["--spec-type".to_string(), "draft-dflash".to_string()]);
@@ -681,7 +697,24 @@ impl Tuner<'_> {
 
     /// Plain `blazar bench <model>`: one deterministic profile, no grid.
     pub fn bench_default(&self, model: &Path) -> Result<Vec<BenchRow>> {
-        self.run(model, &default_bench_args())
+        self.bench_default_threads(model, None)
+    }
+
+    /// `bench_default` with the serving profile's thread pin: receipts
+    /// must measure the same thread shape the daemon serves with — an
+    /// unpinned llama-bench run reports its own default (8) while the
+    /// adopted profile may serve on all cores, and the stored numbers
+    /// then mislead every later tune decision.
+    pub fn bench_default_threads(
+        &self,
+        model: &Path,
+        threads: Option<u32>,
+    ) -> Result<Vec<BenchRow>> {
+        let mut args = default_bench_args();
+        if let Some(t) = threads {
+            args.extend(["--threads".to_string(), t.to_string()]);
+        }
+        self.run(model, &args)
     }
 
     /// Compile + persist a profile with explicit overrides (tune --ctx).

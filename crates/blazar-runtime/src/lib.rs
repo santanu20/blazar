@@ -60,7 +60,7 @@ pub use models::{instance_running, remove_model};
 pub use probe::parent_death_tie;
 pub use probe::probe_hardware;
 pub use supervisor::{
-    EngineRef, PrefixKey, PsRow, ROUTER_KEY, SupervisionError, Supervisor, resolve_draft_path,
-    resolve_spec_mode,
+    DraftLane, DraftPick, EngineRef, PrefixKey, PsRow, ROUTER_KEY, SupervisionError, Supervisor,
+    lane_for, pick_draft, resolve_draft_path, resolve_spec_mode,
 };
 pub use verify::{VerifyReport, verify_model};
