@@ -5,9 +5,13 @@
 //! per combination, like the real tool. Throughput values are a
 //! deterministic function of the config so `tune --search` tests can
 //! predict the winner:
-//!   `tg` `t/s` = `100 + threads + 2*ctx_bonus + 50*(k/v quantized)`
+//!   `tg` `t/s` = `100 + threads + 2*ctx_bonus + grade(k) + grade(v) + fa + batch`
 //!   `pp` `t/s` = `10 * tg`
 //! `ctx_bonus`: any non-base ctx scores +3 `t/s` (predictable winner).
+//! `grade`: per-side KV-cache bonus — `f16` 0, `q8_0` 25, `q5_0` 27.5,
+//! `q4_0` 30 — modelling bandwidth-bound decode (deeper quant = faster).
+//! Same-grade pairs preserve the historical totals (`q8_0/q8_0` = +50),
+//! so grids that only offer `f16/q8_0` keep their old winners.
 
 use std::io::Write as _;
 
@@ -20,7 +24,7 @@ fn or_default(v: Vec<String>, d: &[&str]) -> Vec<String> {
     }
 }
 
-#[allow(clippy::similar_names)] // cs/ts/ctks/ctvs mirror llama-bench flag names
+#[allow(clippy::similar_names, clippy::too_many_lines)] // cs/ts/ctks/ctvs mirror llama-bench flag names; one linear scan
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Ok(path) = std::env::var("STUB_ARGV_FILE") {
@@ -63,7 +67,14 @@ fn main() {
             let threads: u64 = t.parse().unwrap_or(1);
             for ctk in &ctks {
                 for ctv in &ctvs {
-                    let quant = ctk == "q8_0" && ctv == "q8_0";
+                    // Per-side KV grade bonus (see module docs): deeper
+                    // quant = less decode bandwidth = higher t/s.
+                    let grade = |g: &str| match g {
+                        "q8_0" => 25.0,
+                        "q5_0" => 27.5,
+                        "q4_0" => 30.0,
+                        _ => 0.0,
+                    };
                     for fa in &fas {
                         for b in &bs {
                             let batch: u64 = b.parse().unwrap_or(2048);
@@ -73,15 +84,17 @@ fn main() {
                                     Some(_) => 3,
                                     None => 0,
                                 };
-                                // Deterministic scoring: quant +50, fa-on
-                                // +15, batch 1024 +8, +threads.
+                                // Deterministic scoring: grade(k)+grade(v)
+                                // (q8_0 pair = +50, q5_0 = +55, q4_0 = +60),
+                                // fa-on +15, batch 1024 +8, +threads.
                                 let fa_bonus = if fa == "on" { 15.0 } else { 0.0 };
                                 let b_bonus = if batch == 1024 { 8.0 } else { 0.0 };
                                 #[allow(clippy::cast_precision_loss)]
                                 let tg = 100.0
                                     + threads as f64
                                     + f64::from(ctx_bonus)
-                                    + f64::from(u8::from(quant)) * 50.0
+                                    + grade(ctk)
+                                    + grade(ctv)
                                     + fa_bonus
                                     + b_bonus;
                                 let fa_code: i64 = i64::from(fa == "on");

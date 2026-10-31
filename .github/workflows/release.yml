@@ -162,8 +162,110 @@ jobs:
           path: crates/blazar-cli/blazar-sbom.json
           if-no-files-found: error
 
-  release:
+  # Native installers: the tarball/zip archives above stay (curl-based
+  # installers depend on them); these jobs add the package-manager
+  # formats users on Debian/Ubuntu, RHEL-family, and macOS expect. All
+  # artifacts flow into the same dist/ upload (the release job
+  # downloads every artifact with merge-multiple), so they attach to
+  # the GitHub release AND get build-provenance attestations for free.
+  packages-deb:
+    name: package deb (amd64 + arm64)
     needs: [build, checks]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: blazar-x86_64-unknown-linux-gnu
+          path: dist-amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: blazar-aarch64-unknown-linux-gnu
+          path: dist-arm64
+      - name: Build debs
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p out
+          # Flat-root tarballs: blazar + LICENSE-* at archive root.
+          tar -xzf dist-amd64/blazar-*.tar.gz -C dist-amd64
+          tar -xzf dist-arm64/blazar-*.tar.gz -C dist-arm64
+          scripts/package-deb.sh dist-amd64/blazar "$ver" amd64 "out/blazar-${ver}-amd64.deb"
+          scripts/package-deb.sh dist-arm64/blazar "$ver" arm64 "out/blazar-${ver}-arm64.deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-deb
+          path: out/*.deb
+          if-no-files-found: error
+
+  packages-rpm:
+    name: package rpm (x86_64)
+    needs: [build, checks]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Full in-job build: generate-rpm packages target/release/blazar
+      # plus the completion files its metadata block declares.
+      - name: Build release binary
+        run: cargo build --release --locked -p blazar
+      - name: Generate shell completions
+        run: |
+          mkdir -p target/rpm-completions/{bash,zsh,fish}
+          target/release/blazar completions bash > target/rpm-completions/bash/blazar
+          target/release/blazar completions zsh   > target/rpm-completions/zsh/_blazar
+          target/release/blazar completions fish > target/rpm-completions/fish/blazar.fish
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+      - name: Build rpm
+        run: |
+          cargo generate-rpm -p blazar --target x86_64-unknown-linux-gnu \
+            --sha256 --output "blazar-${GITHUB_REF_NAME#v}-x86_64.rpm"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-rpm
+          path: blazar-*.rpm
+          if-no-files-found: error
+
+  packages-dmg:
+    name: package dmg (x64 + arm64)
+    needs: [build, checks]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: blazar-x86_64-apple-darwin
+          path: dist-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: blazar-aarch64-apple-darwin
+          path: dist-arm64
+      - name: Build dmgs
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p out
+          for pair in "dist-x64:x64" "dist-arm64:arm64"; do
+            dir="${pair%%:*}"; arch="${pair##*:}"
+            tar -xzf "$dir"/blazar-*.tar.gz -C "$dir"
+            # A folder holding the binary + licenses; a bare file on a
+            # dmg loses the license pointers users get in the tarball.
+            stage="$(mktemp -d)/blazar"
+            mkdir -p "$stage"
+            cp "$dir"/blazar "$dir"/LICENSE-* "$stage/"
+            hdiutil create -volname "Blazar $ver" \
+              -srcfolder "$stage" -format UDZO -ov \
+              "out/blazar-${ver}-macos-${arch}.dmg"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-dmg
+          path: out/*.dmg
+          if-no-files-found: error
+
+  release:
+    needs: [build, checks, packages-deb, packages-rpm, packages-dmg]
     runs-on: ubuntu-latest
     permissions:
       # A job-level permissions block REPLACES the workflow-level one
