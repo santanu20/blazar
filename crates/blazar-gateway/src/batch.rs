@@ -80,9 +80,17 @@ fn write_json(path: &PathBuf, v: &Value) -> std::io::Result<()> {
 }
 
 fn err(status: StatusCode, message: &str) -> Response {
+    // OpenAI compat: client faults stay invalid_request_error; server
+    // faults (unreadable batch index, store failures) must not pose as
+    // the caller's mistake.
+    let typ = if status.is_server_error() {
+        "server_error"
+    } else {
+        "invalid_request_error"
+    };
     (
         status,
-        axum::Json(json!({"error": {"message": message, "type": "invalid_request_error"}})),
+        axum::Json(json!({"error": {"message": message, "type": typ}})),
     )
         .into_response()
 }
@@ -1718,6 +1726,22 @@ pub async fn anthropic_batches_results(
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__err__server_faults_type_as_server_error_client_as_invalid_request() {
+        // OpenAI-compat wire shape: a 500 (e.g. unreadable batch index)
+        // must not pose as the caller's mistake.
+        let resp = err(StatusCode::INTERNAL_SERVER_ERROR, "batch index unreadable");
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "server_error");
+        let resp = err(StatusCode::BAD_REQUEST, "too many batches");
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
 
     #[test]
     fn unit__short_id__prefix_and_uniqueness() {
