@@ -73,7 +73,7 @@ token quality are surfaced as drift.
 | load_mode | String::new() | engine-argv | `blazar-core/src/profile.rs:1328` in `the`; `blazar-core/src/profile.rs:1331` in `the` |
 | spawn_mem_guard | true | runtime/gateway | `blazar-runtime/src/supervisor.rs:3166` in `spawn_instance_forced`; `blazar-runtime/src/supervisor.rs:3174` in `spawn_instance_forced` |
 | session_bank | true | runtime/gateway + gateway-http | `blazar-runtime/src/supervisor.rs:4386` in `bank_restore_sync`; `blazar-runtime/src/supervisor.rs:4482` in `bank_save`; `blazar-gateway/src/lib.rs:839` in `well_known` |
-| singleflight | true | gateway-http | `blazar-gateway/src/lib.rs:838` in `well_known`; `blazar-gateway/src/state.rs:214` in `miss` |
+| singleflight | false | gateway-http | `blazar-gateway/src/lib.rs:838` in `well_known`; `blazar-gateway/src/state.rs:214` in `miss` |
 | prompt_preflight | true | gateway-http | `blazar-gateway/src/lib.rs:840` in `well_known`; `blazar-gateway/src/preflight.rs:107` in `enforce_prompt_fits` |
 | spec_cache | true | engine-argv | `blazar-core/src/profile.rs:823` in `the`; `blazar-core/src/profile.rs:1754` in `the` |
 | warm_peg | WarmPeg::default() | runtime/gateway | `blazar-runtime/src/supervisor.rs:3648` in `spawn_instance_forced` |
