@@ -183,6 +183,88 @@ fn codes(rec: &blazar_gateway::sentinel::SentinelRecord) -> Vec<&'static str> {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn integration__sentinel__engine_child_degrade_stamps_requests_and_why() {
+    // A live child that logged a flash-attention KV-type degrade must
+    // stamp EVERY request it serves: x-blazar-warnings header, an
+    // engine_slow_attn detection on the record, and an entry in
+    // /api/why's engine_degrades — the degrade is per-child, the
+    // visibility is per-request.
+    let ts = start(Config::default(), &[], false).await;
+    let c = client();
+    // Boot the model so a live child exists.
+    let ok = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let live = ts.state.sup.live_http_endpoints();
+    let child = live
+        .iter()
+        .find(|e| e.name == "m1")
+        .map(|e| blazar_runtime::degrades::endpoint_id(&e.endpoint))
+        .expect("live child for m1");
+    let warn_line = "fattn: no FlashAttention vector kernel compiled for K/V types \
+                     q5_1-q5_1, converting K and V to f16 instead (slow)";
+    blazar_runtime::degrades::record(child.clone(), warn_line.to_string(), "note".into());
+    // The stamped request: header + record detection.
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "again"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let header = resp
+        .headers()
+        .get("x-blazar-warnings")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(header.contains("engine_slow_attn"), "header: {header}");
+    let rec = await_record(&ts, "openai-chat").await;
+    assert!(
+        codes(&rec).contains(&"engine_slow_attn"),
+        "{:?}",
+        codes(&rec)
+    );
+    // /api/why exposes the live degrade, model-resolved.
+    let why = c
+        .get(format!("{}/api/why", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let degrades = why["engine_degrades"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        degrades
+            .iter()
+            .any(|d| d["model"] == "m1" && d["line"].as_str() == Some(warn_line)),
+        "engine_degrades: {degrades:?}"
+    );
+    // Registry hygiene: this test must not leak the degrade into other
+    // tests sharing the process.
+    blazar_runtime::degrades::clear(&child);
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn integration__sentinel__truncation_and_near_limit() {
     // Contract 1 (default): prompt_preflight refuses the over-ctx prompt
     // pre-hoc with a teaching 400 — the engine never truncates silently.

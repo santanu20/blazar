@@ -66,6 +66,7 @@ pub enum Code {
     StalledStream,
     TemplateNoTools,
     CacheBustSystem,
+    EngineSlowAttn,
 }
 
 impl Code {
@@ -82,6 +83,7 @@ impl Code {
             Self::StalledStream => "stalled_stream",
             Self::TemplateNoTools => "template_no_tools",
             Self::CacheBustSystem => "cache_bust_system",
+            Self::EngineSlowAttn => "engine_slow_attn",
         }
     }
 
@@ -113,6 +115,9 @@ impl Code {
             }
             Self::CacheBustSystem => {
                 "system prompt or tools mutate between turns on a stable conversation — every turn re-prefills from scratch (KV cache busted). If unintended, keep the system prompt byte-stable (move counters/timestamps to the last user message)"
+            }
+            Self::EngineSlowAttn => {
+                "this model's engine child logged a flash-attention KV-type degrade: attention runs through an f16-conversion (or CPU) path — much slower prefill/decode for every request until the child respawns"
             }
         }
     }
@@ -151,6 +156,9 @@ impl Code {
             }
             Self::CacheBustSystem => {
                 "no retry needed — advisory: stabilize the client system prompt to restore full prefix-cache reuse"
+            }
+            Self::EngineSlowAttn => {
+                "no retry needed — advisory: prefer f16/q8_0/q4_0 cache pairs for this model, rebuild the engine with the missing GGML_CUDA_FA_QUANTS pair, or run `blazar tune` to measure pairs; the flag clears when the child respawns"
             }
         }
     }
@@ -264,6 +272,12 @@ pub struct RequestCtx {
     /// Serving ctx from the live instance row (unknown = skip ctx checks).
     pub ctx: Option<u32>,
     pub template: Option<TemplateSupport>,
+    /// Active engine-child degrade for THIS model (flash-attention
+    /// KV-type conversion line from the child's stderr; see
+    /// `blazar_runtime::degrades`). `Some(line)` stamps the record and the
+    /// `x-blazar-warnings` header — the degrade outlives any single
+    /// request, so every affected request carries it.
+    pub child_degrade: Option<String>,
 }
 
 /// Parse tool names/schemas + `response_format` + stream flag from an
@@ -584,6 +598,13 @@ pub fn request_ctx(
     ) {
         warnings.push(Code::TemplateNoTools.as_str());
     }
+    // Per-child degrade (flash-attention KV conversion etc.): correlate
+    // the model's live children against the runtime registry. Advisory —
+    // the request still serves, but the header + record say why it is slow.
+    let child_degrade = model_child_degrade(state, model);
+    if child_degrade.is_some() {
+        warnings.push(Code::EngineSlowAttn.as_str());
+    }
     let ctx = RequestCtx {
         trace: trace.unwrap_or_default(),
         route: route.to_string(),
@@ -602,8 +623,25 @@ pub fn request_ctx(
             // never a zero-token ceiling.
             .and_then(|p| (p.ctx > 0).then_some(p.ctx)),
         template,
+        child_degrade,
     };
     (ctx, warnings)
+}
+
+/// Is any LIVE child serving `model` currently carrying a recorded
+/// degrade? Returns the evidence line when yes.
+fn model_child_degrade(state: &crate::state::AppState, model: &str) -> Option<String> {
+    let children: Vec<String> = state
+        .sup
+        .live_http_endpoints()
+        .into_iter()
+        .filter(|e| e.name == model)
+        .map(|e| blazar_runtime::degrades::endpoint_id(&e.endpoint))
+        .collect();
+    blazar_runtime::degrades::snapshot()
+        .into_iter()
+        .find(|d| children.contains(&d.child))
+        .map(|d| d.line)
 }
 
 /// Shared entry for both API paths: build the context and begin
@@ -1120,6 +1158,13 @@ impl Sentinel {
     /// Detection predicates over the accumulated response.
     fn finalize(&self, ctx: &RequestCtx, acc: &Accum, status: u16) -> Vec<Detection> {
         let mut out = Vec::new();
+
+        if let Some(line) = &ctx.child_degrade {
+            out.push(Detection {
+                code: Code::EngineSlowAttn,
+                detail: format!("serving child logged: {line}"),
+            });
+        }
 
         if !ctx.tool_names.is_empty() {
             match ctx.template {

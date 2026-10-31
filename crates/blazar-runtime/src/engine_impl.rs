@@ -412,13 +412,15 @@ fn spawn_child(
     // Pipe child logs into tracing; the shared tail keeps the last lines
     // around for death diagnostics.
     let tail = new_tail();
+    let child_id = crate::degrades::endpoint_id(endpoint);
     if let Some(stdout) = child.stdout.take() {
         let t = tail.clone();
-        tokio::spawn(pipe_logs(stdout, "stdout", t));
+        let id = child_id.clone();
+        tokio::spawn(pipe_logs(stdout, "stdout", t, id));
     }
     if let Some(stderr) = child.stderr.take() {
         let t = tail.clone();
-        tokio::spawn(pipe_logs(stderr, "stderr", t));
+        tokio::spawn(pipe_logs(stderr, "stderr", t, child_id));
     }
     Ok(ChildHandle::with_tail(endpoint.clone(), child, tail))
 }
@@ -1627,6 +1629,7 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     r: R,
     stream: &str,
     tail: LogTail,
+    child: String,
 ) {
     use tokio::io::AsyncBufReadExt;
     // Raw-byte reads + lossy decode (F102): `lines()` aborts the whole
@@ -1644,8 +1647,11 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                 if let Some(note) = classify_child_degrade(line) {
                     // Upstream prints these once per process at plain
                     // log level; at blazar they are user-visible degrades
-                    // with a remedy — warn, not debug.
+                    // with a remedy — warn, not debug — and they land in
+                    // the degrade registry so the sentinel can stamp
+                    // requests served by this child (see degrades.rs).
                     tracing::warn!(target: "blazar::engine", stream, "{line} — {note}");
+                    crate::degrades::record(child.clone(), line.to_string(), note.to_string());
                 }
                 if let Ok(mut t) = tail.lock() {
                     if t.len() >= TAIL_CAP {

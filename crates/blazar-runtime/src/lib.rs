@@ -15,6 +15,7 @@ pub fn tool_file_name(base: &str) -> String {
 
 pub mod bench;
 pub mod daemon;
+pub mod degrades;
 pub mod diffusion;
 pub mod engine;
 pub mod engine_impl;

@@ -167,9 +167,36 @@ pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     } else {
         records_json
     };
+    // Active engine-child degrades (flash-attention KV conversion etc.),
+    // model-resolved against live children — the per-request view is the
+    // `engine_slow_attn` detection on each record above; this array is
+    // the "what is degraded RIGHT NOW" console view.
+    let live: Vec<(String, String)> = state
+        .sup
+        .live_http_endpoints()
+        .into_iter()
+        .map(|e| (e.name, blazar_runtime::degrades::endpoint_id(&e.endpoint)))
+        .collect();
+    let engine_degrades: Vec<_> = blazar_runtime::degrades::snapshot()
+        .into_iter()
+        .filter_map(|d| {
+            live.iter()
+                .find(|(_, id)| *id == d.child)
+                .map(|(model, _)| {
+                    serde_json::json!({
+                        "model": model,
+                        "child": d.child,
+                        "line": d.line,
+                        "note": d.note,
+                        "since": d.since,
+                    })
+                })
+        })
+        .collect();
     axum::Json(json!({
         "sentinel": state.config.sentinel,
         "records": records_json,
+        "engine_degrades": engine_degrades,
     }))
     .into_response()
 }
