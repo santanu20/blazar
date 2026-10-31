@@ -324,7 +324,15 @@ pub struct Config {
     /// child-call boundary (the twin awaits the leader, then rides the
     /// warm prefix). 5s bound — long generations never serialize their
     /// duplicates indefinitely.
-    #[serde(default = "default_true")]
+    ///
+    /// OFF by default: measured to serialize parallel duplicates behind
+    /// the leader's FULL generation on multi-slot children — a C=8
+    /// identical-body ladder lost 23-45% aggregate throughput vs the
+    /// direct engine (the follower gains no warmth it would not also
+    /// get from the child's own persistent prompt cache when served in
+    /// parallel). Enable only for prefill-dominated stampede loads
+    /// (many identical short prompts, single-slot children).
+    #[serde(default)]
     pub singleflight: bool,
     /// Refuse chat requests whose prompt cannot fit the effective
     /// context (pre-hoc; the alternative is the engine's silent
@@ -3064,7 +3072,7 @@ impl Default for Config {
             load_mode: String::new(),
             spawn_mem_guard: true,
             session_bank: true,
-            singleflight: true,
+            singleflight: false,
             prompt_preflight: true,
             spec_cache: true,
             warm_peg: WarmPeg::default(),

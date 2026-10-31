@@ -414,7 +414,9 @@ async fn client__well_known__capability_discovery() {
         .unwrap();
     assert_eq!(v["name"], "blazar");
     assert_eq!(v["features"]["keys"], true);
-    assert_eq!(v["features"]["singleflight"], true);
+    // Reports the runtime switch, not feature presence: single-flight
+    // is opt-in since the C>=2 serialization finding (default false).
+    assert_eq!(v["features"]["singleflight"], false);
     assert!(
         v["endpoints"]["openai"]
             .as_array()
