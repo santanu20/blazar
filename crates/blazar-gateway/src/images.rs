@@ -2828,7 +2828,12 @@ pub async fn upscale(
     }
     // Route gate: the standalone endpoint shipped in master-929; on an
     // older engine the child would answer a confusing 404 — teach
-    // instead. Unparseable/missing manifests forward (the child speaks).
+    // instead. Deliberately fails OPEN on an unreadable store or
+    // unparseable manifest (audited F1, posture kept): the upscale
+    // child's own response is self-describing, store-open failures
+    // already warn once via with_store, and doctor surfaces store
+    // errors loudly — so blocking this lane on a meta-read failure
+    // would trade availability for nothing.
     let too_old = state
         .with_store(|s| {
             s.list_engines()

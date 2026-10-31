@@ -4422,9 +4422,23 @@ fn sglang_fit_detail(name: &str, p: &blazar_core::profile::Profile) -> String {
 fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
-        return out;
+        return vec![Check::fail(
+            "sglang fit",
+            format!(
+                "store open failed — fit preview unavailable: {}",
+                d.data_dir.display()
+            ),
+        )];
     };
-    let engines = store.list_engines().unwrap_or_default();
+    let engines = match store.list_engines() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return vec![Check::fail(
+                "sglang fit",
+                format!("engine index unreadable — fit preview unavailable: {e}"),
+            )];
+        }
+    };
     let Some(engine) = engines
         .iter()
         .filter(|e| e.kind == EngineKind::Sglang)
@@ -4438,7 +4452,16 @@ fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
     let hw = blazar_runtime::probe_hardware(None);
     let flags = manifest_flag_set(&engine.manifest);
     let data_dir = d.data_dir.to_string_lossy();
-    for m in store.list_models().unwrap_or_default() {
+    let models = match store.list_models() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return vec![Check::fail(
+                "sglang fit",
+                format!("model list failed — fit preview unavailable: {e}"),
+            )];
+        }
+    };
+    for m in models {
         let path = std::path::Path::new(&m.path);
         if !path.is_dir() || m.has_component_set() {
             continue; // sglang serves HF safetensors dirs; split rows ride their GGUF set
@@ -4487,9 +4510,23 @@ fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
 fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
-        return out;
+        return vec![Check::fail(
+            "kv budget",
+            format!(
+                "store open failed — KV preview unavailable: {}",
+                d.data_dir.display()
+            ),
+        )];
     };
-    let engines = store.list_engines().unwrap_or_default();
+    let engines = match store.list_engines() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return vec![Check::fail(
+                "kv budget",
+                format!("engine index unreadable — KV preview unavailable: {e}"),
+            )];
+        }
+    };
     let Ok(cfg) = config() else {
         return out; // config failure is reported by the config check
     };
@@ -4504,7 +4541,16 @@ fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
         (EngineKind::MistralRs, true), // GGUF files
         (EngineKind::Mlx, false),      // HF safetensors dirs
     ];
-    for m in store.list_models().unwrap_or_default() {
+    let models = match store.list_models() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return vec![Check::fail(
+                "kv budget",
+                format!("model list failed — KV preview unavailable: {e}"),
+            )];
+        }
+    };
+    for m in models {
         if m.has_component_set() {
             continue; // split rows ride their GGUF set; the set's GGUF row previews
         }

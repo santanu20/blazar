@@ -44,10 +44,30 @@ impl DaemonLock {
                 Ok(Self { path, pid })
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing: u32 = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|s| s.trim().parse().ok())
-                    .unwrap_or(0);
+                // An unreadable or unparseable pidfile is UNKNOWN state, not
+                // evidence of a stale lock: guessing "stale" could fork a
+                // second daemon under a live peer. Refuse and name the file.
+                let existing = match std::fs::read_to_string(&path) {
+                    Ok(s) => match s.trim().parse::<u32>() {
+                        Ok(pid) => pid,
+                        Err(why) => {
+                            return Err(anyhow::anyhow!(
+                                "pidfile {} is unparseable ({why}): no blazar can be \
+                                 verified running — remove the file if you are certain \
+                                 none is, then retry",
+                                path.display()
+                            ));
+                        }
+                    },
+                    Err(why) => {
+                        return Err(anyhow::anyhow!(
+                            "pidfile {} is unreadable ({why}): no blazar can be verified \
+                             running — fix permissions or remove the file if you are \
+                             certain none is, then retry",
+                            path.display()
+                        ));
+                    }
+                };
                 if existing > 1 && process_alive(existing) {
                     // Remedy lives at the CLI boundary (one place, user-
                     // facing); the chain stays fact-only so composed
@@ -429,6 +449,28 @@ mod tests {
         assert_ne!(lock.pid(), 4_190_403);
         drop(lock);
         assert!(!d.run_dir().join("blazar.pid").exists());
+    }
+
+    #[test]
+    fn unit__daemon_lock__garbage_pidfile_refuses_with_remedy() {
+        let (_t, d) = dirs();
+        std::fs::write(d.run_dir().join("blazar.pid"), "not-a-pid\n").unwrap();
+        let err = DaemonLock::acquire(&d).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unparseable"), "{msg}");
+        // The remedy names the exact file so the operator can act on it.
+        assert!(
+            msg.contains(
+                d.run_dir()
+                    .join("blazar.pid")
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "{msg}"
+        );
+        // Refused, not taken over: the garbage file stays for inspection.
+        assert!(d.run_dir().join("blazar.pid").exists());
     }
 
     // V3 (escalation): a child that ignores SIGTERM must die to the KILL

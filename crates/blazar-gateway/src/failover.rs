@@ -115,7 +115,10 @@ impl Registry {
     /// unknown aliases return `None` (the lane serves normally).
     pub fn plan(&self, alias: &str) -> Option<Attempt> {
         let chain = self.chains.get(alias)?;
-        let guard = self.state.lock().ok()?;
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = guard.get(alias)?;
         Some(Self::plan_locked(chain, st))
     }
@@ -139,7 +142,10 @@ impl Registry {
     #[must_use]
     pub fn record_failure(&self, alias: &str, index: usize) -> Option<Switch> {
         let chain = self.chains.get(alias)?;
-        let mut states = self.state.lock().ok()?;
+        let mut states = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = states.get_mut(alias)?;
         let bench = Duration::from_secs(chain.min_residence_secs);
         if st.benched_until.len() > index {
@@ -168,7 +174,10 @@ impl Registry {
     /// Returns the switch record when one happened.
     #[must_use]
     pub fn record_success(&self, alias: &str, index: usize) -> Option<(usize, usize)> {
-        let mut guard = self.state.lock().ok()?;
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = guard.get_mut(alias)?;
         let from = st.sticky;
         if from == index {
@@ -234,7 +243,10 @@ impl Registry {
             .map(|c| c.alias.clone())
             .or_else(|| self.chains.contains_key(key).then(|| key.to_string()))?;
         let chain = &self.chains[&alias];
-        let st = self.state.lock().ok()?;
+        let st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = st.get(&alias)?;
         let now = Instant::now();
         let targets: Vec<serde_json::Value> = chain
@@ -475,6 +487,25 @@ mod tests {
         let reg = Registry::from_config(&[chain()]);
         assert!(reg.record_failure("assistant", 0).is_some());
         assert!(reg.record_failure("assistant", 1).is_none());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__registry__poisoned_lock_recovers_instead_of_serving_base() {
+        let reg = Registry::from_config(&[chain()]);
+        // Poison the registry the only way std allows: panic while the
+        // guard is held (unwind drops it mid-flight).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = reg.state.lock().unwrap();
+            panic!("poison the registry");
+        }));
+        assert!(reg.state.is_poisoned());
+        // plan() must still resolve the alias — NOT fall back to the
+        // caller's serve-base lane as the old `.ok()?` did.
+        let a = reg.plan("assistant").unwrap();
+        assert_eq!(a.index, 0);
+        // Mutations through the recovered guard keep working.
+        assert!(reg.record_failure("assistant", 0).is_some());
     }
 
     #[test]

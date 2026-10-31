@@ -1618,12 +1618,20 @@ pub(crate) fn template_supports_thinking_cached(row: &blazar_core::ModelRow) -> 
         }
     }
     let template = if is_dir {
-        hf_chat_template(&probe)
+        // Read/parse failure is UNKNOWN, not "no template": return
+        // uncached so a later successful read can flip the answer.
+        match hf_chat_template(&probe) {
+            Some(t) => t,
+            None => return false,
+        }
     } else {
-        blazar_core::read_metadata_file(std::path::Path::new(&row.path))
-            .ok()
-            .and_then(|gguf| gguf.chat_template)
-            .unwrap_or_default()
+        match blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
+            // A readable GGUF with no chat_template field is a REAL
+            // "does not support" answer — safe to cache. A read failure
+            // is unknown and must not poison the entry with false.
+            Ok(gguf) => gguf.chat_template.unwrap_or_default(),
+            Err(_) => return false,
+        }
     };
     let supports = template_supports_thinking(&template);
     cache.insert(key, (meta.len(), mtime, supports));
@@ -1633,22 +1641,21 @@ pub(crate) fn template_supports_thinking_cached(row: &blazar_core::ModelRow) -> 
 /// Chat template text out of an HF `tokenizer_config.json`: the field is
 /// either a single Jinja string or a list of named variants — both are
 /// marker-scanned so think gating sees the same evidence class the
-/// engine's renderer uses.
-fn hf_chat_template(path: &std::path::Path) -> String {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return String::new();
-    };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return String::new();
-    };
+/// engine's renderer uses. `None` = the file could not be read/parsed
+/// (unknown); `Some("")` = read fine, no template field (real answer).
+fn hf_chat_template(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let val = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
     match val.get("chat_template") {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|it| it.get("template").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Array(items)) => Some(
+            items
+                .iter()
+                .filter_map(|it| it.get("template").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => Some(String::new()),
     }
 }
 
@@ -4361,6 +4368,30 @@ mod tests {
             v["think"] = serde_json::Value::Bool(t);
         }
         v
+    }
+
+    #[test]
+    fn unit__template_supports_thinking_cached__read_failure_leaves_cache_unpoisoned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        // `tokenizer_config.json` exists (stat guard passes) but is a
+        // DIRECTORY: the read fails with EISDIR — an unknown answer.
+        let probe = model_dir.join("tokenizer_config.json");
+        std::fs::create_dir_all(&probe).unwrap();
+        let row = row_with_path(model_dir.to_str().unwrap());
+        assert!(!template_supports_thinking_cached(&row));
+        let key = probe.to_string_lossy().to_string();
+        let cache = TEMPLATE_SUPPORT_CACHE.get_or_init(dashmap::DashMap::new);
+        assert!(
+            cache.get(&key).is_none(),
+            "read failure must not cache supports=false (stat key: {key})"
+        );
+        // Positive control: a readable thinking template caches true.
+        std::fs::remove_dir(&probe).unwrap();
+        std::fs::write(&probe, r#"{"chat_template": "yes <think> here"}"#).unwrap();
+        assert!(template_supports_thinking_cached(&row));
+        assert!(cache.get(&key).is_some_and(|e| e.value().2));
     }
 
     #[test]

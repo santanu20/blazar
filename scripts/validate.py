@@ -2730,8 +2730,10 @@ def total_mem_mib() -> int:
     return 0
 
 
-def _gpu_free_mib() -> int:
-    """Free VRAM across GPUs (MiB); 0 when NVIDIA tooling is absent."""
+def _gpu_free_mib() -> int | None:
+    """Free VRAM across GPUs (MiB); None when the probe fails (tooling
+    present but unreadable/timed out) — unknown, NOT zero. 0 is returned
+    only when the driver itself reports a genuinely full GPU."""
     try:
         out = subprocess.run(
             [
@@ -2745,14 +2747,22 @@ def _gpu_free_mib() -> int:
             check=False,
         )
         if out.returncode == 0:
-            return max(int(x) for x in out.stdout.split())
-    except Exception:
-        pass
-    return 0
+            values = [int(x) for x in out.stdout.split()]
+            if values:
+                return max(values)
+    except Exception as exc:  # noqa: BLE001 - probe must never kill the battery
+        print(f"  [WARN] GPU free-memory probe failed ({exc}) — reporting unknown")
+        return None
+    if out.returncode != 0:
+        print(
+            f"  [WARN] GPU free-memory probe failed (rc={out.returncode}) — reporting unknown"
+        )
+    return None
 
 
 def _gpu_headroom_mib() -> int | None:
-    """Free VRAM (MiB); None on CPU-only boxes (no nvidia tooling)."""
+    """Free VRAM (MiB); None on CPU-only boxes (no nvidia tooling) or when
+    the probe itself fails (unknown — never misreported as 0 free)."""
     if shutil.which("nvidia-smi") is None:
         return None
     return _gpu_free_mib()
@@ -5313,9 +5323,11 @@ def phase_api() -> None:
             # R2-28: clear OUR OWN residue first — earlier phases leave
             # live children (idle-sleep not yet fired) or crash-battery
             # orphans; only boundary on what an external holder keeps.
-            def _vision_env_ok() -> tuple[bool, int]:
+            def _vision_env_ok() -> tuple[bool, int | None]:
                 free = _gpu_free_mib()
-                ok = (free == 0 or free >= big_bytes_mib) and (
+                # None = probe failed (unknown): treat like absent tooling
+                # rather than guessing a VRAM number.
+                ok = (free is None or free == 0 or free >= big_bytes_mib) and (
                     mem_available_mib() >= big_bytes_mib
                 )
                 return ok, free
@@ -6877,6 +6889,13 @@ def _eng_sdcpp_images(lane: str, row: dict | None) -> None:
         )
         return
     free = _gpu_free_mib()
+    if free is None:
+        boundary(
+            ph,
+            "image generation returns a PNG",
+            "GPU free-memory probe failed — diffusion lane unmeasured (unknown VRAM)",
+        )
+        return
     if free < 2048:
         boundary(
             ph,
