@@ -199,3 +199,21 @@ masks (fn-level arms fixed in E4; section-level `unwrap_or_default()` rows remai
 ollama.rs metadata double-policy, F6 validate.py GPU probe. Residual P1: 44+
 `with_store(...ok().flatten())` sites still read store-error ≡ absent (fail-closed direction)
 beyond the new warn-once; err() helper types 500s as `invalid_request_error` (pre-existing shape).
+
+## §11 — Flagged-site disposition (2026-10-31, follow-up wave; commits f119861 + c246095)
+
+| # | Disposition | Change |
+|---|-------------|--------|
+| F1 | Kept open, documented | sdcpp upscale gate comment now states the audited fail-open posture and why (self-describing child response; store errors already warn/fail elsewhere) |
+| F2 | Fixed | Unparseable/unreadable pidfile → serve refuses with a remedy naming the exact file (was: guess stale, take over). Live-proven: garbage pidfile → exit 1 + remedy text |
+| F3 | Fixed | 4 × `state.lock().ok()?` → `unwrap_or_else(PoisonError::into_inner)` (matches the file's own pin/unpin posture). Poison-recovery pin added |
+| F4 | Fixed | `doctor_sglang_fit` / `doctor_kv_budget` emit fail rows on store-open / list_engines / list_models errors (were: silently empty sections). Live-proven with a corrupt store |
+| F5 | Fixed | `hf_chat_template` → `Option<String>`; read failures return uncached (unknown), readable-but-templateless still caches false. Cache-unpoisoned pin added |
+| F6 | Fixed | `validate.py` GPU probe failure → `None` + WARN (unknown), no longer misread as 0-free/absent; both call sites distinguish unknown from a genuinely full GPU. Live-proven with a failing fake `nvidia-smi` |
+
+Wire-shape follow-up: batch-lane `err()` now types ≥500 bodies as
+`server_error` (commit c246095); 4xx stays `invalid_request_error`.
+
+Gates: fmt ✓, clippy -D 0 (workspace), nextest **2312/2312** (4 new pins:
+daemon garbage-pidfile, failover poison recovery, think-cache unpoisoned,
+err typing).
