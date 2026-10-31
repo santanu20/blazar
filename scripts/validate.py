@@ -1737,12 +1737,13 @@ _K = [
     ("adaptive_slots", False, False, "roundtrip", None, "echo + boot"),
     (
         "adaptive_decode_gate",
-        True,
+        False,
         False,
         "roundtrip",
         None,
         "echo + boot; D5 decode-bound gate (SlotsDecodeBound teach when "
-        "aggregate decode fails to scale with concurrency)",
+        "aggregate decode fails to scale with concurrency); plain bool "
+        "with default true (config.rs), NOT an Option knob",
     ),
     (
         "lazy_mode",
@@ -7188,16 +7189,25 @@ def phase_engines() -> None:
 
     gguf = _eng_pick_gguf_chat(rows)
     tools_pass = _eng_tools_pass_models()
+    # mistralrs pin is an EXACT TAG (serving_lane resolves exact tags
+    # before kind names): v0.9.5's executor reserves the full paged
+    # step x seqs activation envelope up front (upstream #2502, fix
+    # #2503 merged but unreleased as of 2026-10-28) so every inference
+    # on it 503s; v0.9.3 predates that executor and serves cleanly.
+    # The pin must RESOLVE dynamically against the installed inventory:
+    # a hard-coded tag goes stale the moment keep-tags rotation drops
+    # that engine (live 2026-10-31: pin "v0.9.3" refused with
+    # MODEL_UNSUPPORTED_ENGINE naming only v0.9.5 installed) — pick the
+    # newest mistralrs tag that is not the #2502-affected v0.9.5, and
+    # boundary the lane honestly when nothing else is installed.
+    mrs_tags = sorted(
+        t for t, k in kinds_by_tag.items() if k == "mistralrs" and t != "v0.9.5"
+    )
+    mrs_pin = mrs_tags[-1] if mrs_tags else "v0.9.5"
     text_lanes = [
         # (kind, pin value written into model_overrides, model row, load budget s)
         ("llamacpp", None, gguf, 300),
-        # mistralrs pin is an EXACT TAG (serving_lane resolves exact tags
-        # before kind names): v0.9.5's executor reserves the full paged
-        # step x seqs activation envelope up front (upstream #2502, fix
-        # #2503 merged but unreleased as of 2026-10-28) so every inference
-        # on it 503s; v0.9.3 predates that executor and serves cleanly.
-        # Revisit on the next mistral.rs release.
-        ("mistralrs", "v0.9.3", gguf, 300),
+        ("mistralrs", mrs_pin, gguf, 300),
         ("sglang", "sglang", _eng_pick_safetensors_dir(rows, tools_pass), 420),
         ("mlx", "mlx", _eng_pick_mlx(rows, tools_pass), 300),
     ]
@@ -7230,6 +7240,16 @@ def phase_engines() -> None:
                 cfg: dict = {"port": PORT, **knobs["cfg"]}
                 override: dict = {}
                 if pin:
+                    if kind == "mistralrs" and pin == "v0.9.5":
+                        boundary(
+                            ph,
+                            "lane",
+                            "only mistralrs tag installed is v0.9.5 — every "
+                            "inference 503s (upstream #2502, fix #2503 "
+                            "unreleased as of 2026-10-28); install a "
+                            "pre-2502 tag to run this lane",
+                        )
+                        continue
                     # ModelOverride.engine pin forces the serving lane;
                     # the kind string parses like the engines.kind column.
                     override["engine"] = pin
@@ -12248,6 +12268,7 @@ def _full_toplevel() -> dict:
         "spec_draft_backend_sampling": True,
         "adaptive_decay": 0,
         "adaptive_target": 0.0,
+        "adaptive_decode_gate": True,
         "ngram_size_m": 0,
         "ngram_size_n": 0,
         "ngram_min_hits": 0,
