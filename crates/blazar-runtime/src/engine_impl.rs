@@ -2372,7 +2372,7 @@ mod tests {
         // stays the engine's own.
         for junk in [
             "registry.ollama.ai/library/qwen2.5",
-            "/home/user/models",
+            "../user/models",
             "local-file.gguf",
             "",
         ] {

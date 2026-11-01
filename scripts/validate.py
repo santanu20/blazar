@@ -2751,7 +2751,8 @@ def _gpu_free_mib() -> int | None:
             values = [int(x) for x in out.stdout.split()]
             if values:
                 return max(values)
-    except Exception as exc:  # noqa: BLE001 - probe must never kill the battery
+    except Exception as exc:
+        # A probe failure must read as unknown, never kill the battery.
         print(f"  [WARN] GPU free-memory probe failed ({exc}) — reporting unknown")
         return None
     if out.returncode != 0:
@@ -3905,7 +3906,7 @@ def cli_retry(
     legitimate result, so re-run instead of recording junk."""
     p = cli(*args)
     for _ in range(attempts - 1):
-        if re.search(expect, p.stdout, re.M):
+        if re.search(expect, p.stdout, re.MULTILINE):
             return p
         time.sleep(2)
         p = cli(*args)
@@ -13187,7 +13188,9 @@ def _gold_items() -> dict:
     # capture is never legitimate — doctor always prints its table — so
     # retry once instead of golden-comparing a torn window.
     p = cli_retry("doctor", expect=r"ok|warn|FAIL", attempts=3)
-    if not re.search(r"^\s*[a-z][a-z0-9 _-]+\s{2,}(?:ok|warn|FAIL)\s", p.stdout, re.M):
+    if not re.search(
+        r"^\s*[a-z][a-z0-9 _-]+\s{2,}(?:ok|warn|FAIL)\s", p.stdout, re.MULTILINE
+    ):
         p = cli_retry("doctor", expect=r"ok|warn|FAIL", attempts=3)
     names = sorted(
         {

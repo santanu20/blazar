@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) — 234 fields, 0 dead
+## Config (top-level keys) — 235 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -367,7 +367,7 @@ token quality are surfaced as drift.
 | enable_tf32_matmul | — | engine-argv | `crates/blazar-core/src/profile.rs:4903` (TF32 matmul toggle) |
 | enable_priority_scheduling | Some(true) | engine-argv | `crates/blazar-core/src/profile.rs:4916` (request priority scheduling) |
 
-## ModelOverride ([models."name"]) — 42 fields, 0 dead
+## ModelOverride ([models."name"]) — 43 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|

@@ -6,8 +6,8 @@ prior session with the current code), TEST-ONLY (unit/e2e suite via the
 stub fixture, no live engine receipt), or STALE (no current receipt);
 (b) SOTA position vs the reference set an operator actually compares
 against: ollama, vLLM, and bare llama.cpp-server. Gap items carry an
-ROI rank. Sources: this session's live receipts ( rigs at
-/tmp/opencode/blz-val), the 2 223-test workspace suite, and the prior
+ROI rank. Sources: this session's live receipts (XDG-sandboxed local
+rigs), the 2 223-test workspace suite, and the prior
 research docs (DeepInfer comparison, engine-currency audit, surface
 re-diff).
 

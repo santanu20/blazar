@@ -1,6 +1,6 @@
 # Spec-governor default-flip — live validation campaign
 
-**Date:** 2026-10-27 · **Binary:** 0.28.0+governor-flip (release build, uncommitted tree @ `git rev-parse --short HEAD`) · **Engine:** llamacpp b11785-cuda · **Model:** qwen2.5-0.5b-instruct Q4_K_M (469 MiB) · **Rig:** port 11437, XDG-sandboxed `/tmp/opencode/rt-rig`, zero mocks.
+**Date:** 2026-10-27 · **Binary:** 0.28.0+governor-flip (release build, uncommitted tree at the session HEAD) · **Engine:** llamacpp b11785-cuda · **Model:** qwen2.5-0.5b-instruct Q4_K_M (469 MiB) · **Rig:** port 11437, XDG-sandboxed temp rig, zero mocks.
 
 ## The change
 
