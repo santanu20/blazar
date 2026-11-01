@@ -45,15 +45,7 @@ pub struct Store {
 /// v18 adds `usage_daily` (per-model daily token/latency rollups,
 /// flushed by the gateway's in-memory usage meter). Additive the same
 /// way.
-/// v19 grows `spec_receipts` with provenance axes (hardware
-/// fingerprint, exact spec parameters, tuned-vs-default flag,
-/// repetitions) and adds the optimization ledger
-/// (`optimization_experiments` + `optimization_measurements` +
-/// `optimization_events` + `active_profiles`) — the append-only
-/// evidence base tuning adoption will be judged against. Existing
-/// `spec_receipts` rows keep tuned=0: every pre-v19 ngram race ran
-/// engine defaults, and an honest unknown beats a guessed provenance.
-const SCHEMA_VERSION: i32 = 19;
+const SCHEMA_VERSION: i32 = 18;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -133,10 +125,6 @@ CREATE TABLE IF NOT EXISTS spec_receipts (
     dense_tps   REAL NOT NULL,       -- the race's dense baseline
     ratio       REAL NOT NULL,       -- tok_per_s / dense_tps
     measured_at INTEGER NOT NULL,    -- unix secs
-    hw_fingerprint TEXT,             -- v19 provenance: canonical hw string
-    spec_params   TEXT,              -- v19 provenance: exact knobs raced (JSON)
-    tuned         INTEGER NOT NULL DEFAULT 0, -- knobs deliberately configured vs engine defaults
-    reps          INTEGER NOT NULL DEFAULT 1, -- race repetitions behind the number
     PRIMARY KEY (model, engine_tag, mode)
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
@@ -150,38 +138,6 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     ttft_count    INTEGER NOT NULL DEFAULT 0, -- TTFT samples
     ttft_ms_total REAL NOT NULL DEFAULT 0,    -- sum, for mean
     PRIMARY KEY (day, model)
-);
-CREATE TABLE IF NOT EXISTS optimization_experiments (
-    id             INTEGER PRIMARY KEY,
-    created_at     INTEGER NOT NULL,   -- unix secs
-    model          TEXT NOT NULL,      -- models.name under optimization
-    engine_tag     TEXT NOT NULL,      -- engine lane measured on
-    hw_fingerprint TEXT,               -- canonical hw string (null = unknown, never guessed)
-    quant          TEXT,               -- model quantization artifact identity
-    config_json    TEXT NOT NULL,      -- the candidate's effective launch config
-    profile_hash   TEXT NOT NULL,      -- compiled-profile identity for rollback joins
-    objective      TEXT NOT NULL       -- Interactive | Throughput | Memory
-);
-CREATE TABLE IF NOT EXISTS optimization_measurements (
-    id            INTEGER PRIMARY KEY,
-    experiment_id INTEGER NOT NULL REFERENCES optimization_experiments(id),
-    ts            INTEGER NOT NULL,    -- unix secs
-    kind          TEXT NOT NULL,       -- llama-bench-grid | gateway-drive | ppl-quality | ...
-    metrics_json  TEXT NOT NULL        -- raw measurements, append-only
-);
-CREATE TABLE IF NOT EXISTS optimization_events (
-    id            INTEGER PRIMARY KEY,
-    experiment_id INTEGER NOT NULL REFERENCES optimization_experiments(id),
-    ts            INTEGER NOT NULL,    -- unix secs
-    kind          TEXT NOT NULL,       -- measured | adopted | rolled-back | rejected | ...
-    reason        TEXT NOT NULL        -- human-readable decision justification
-);
-CREATE TABLE IF NOT EXISTS active_profiles (
-    model          TEXT NOT NULL,
-    engine_tag     TEXT NOT NULL,
-    experiment_id  INTEGER NOT NULL REFERENCES optimization_experiments(id),
-    updated_at     INTEGER NOT NULL,   -- unix secs
-    PRIMARY KEY (model, engine_tag)
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id            TEXT PRIMARY KEY,
@@ -388,11 +344,11 @@ impl ComponentFile {
 /// v0.9.3: dtype-mismatch empty 200s, garbage tokens under f16).
 const QUANTIZED_SAFETENSORS_TOKENS: [&str; 3] = ["awq", "gptq", "fp8"];
 
-/// GGUF quant tokens ollama tags carry after the size class
-/// (`qwen3.5:9b-q4_K_M`). Matched case-insensitively against the last
-/// `-`/`:`-separated segment of an (already colon-swapped) name so the
-/// name-resolution ladder can fold a migrant tag back onto the stored
-/// row. Conservative by design: unknown tails do NOT strip.
+/// GGUF quantization tokens ollama appends to model tags
+/// (`qwen3.5:9b-q4_K_M`). Recognized for name folding ONLY — an unknown
+/// tail never strips, and ollama size/recency tags (`latest`, `7b`)
+/// are deliberately absent: folding those would silently rewrite user
+/// intent onto whatever stem happens to exist.
 const GGUF_QUANT_TOKENS: &[&str] = &[
     "f32", "f16", "bf16", "q2_k", "q3_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_1", "q4_k_s",
     "q4_k_m", "q5_0", "q5_1", "q5_k_s", "q5_k_m", "q6_k", "q8_0", "q8_1", "tq1_0", "tq2_0",
@@ -400,18 +356,15 @@ const GGUF_QUANT_TOKENS: &[&str] = &[
     "iq1_s", "iq1_m",
 ];
 
-/// Strip one trailing quant token from a colon-swapped name
-/// (`qwen3.5-9b-q4_K_M` -> `qwen3.5-9b`). `None` when the tail is not a
-/// known quant token (or there is no separator) — callers treat that as
-/// "nothing to fold" and keep the name verbatim.
+/// Drop a trailing GGUF quant tag from a colon-swapped migrant name:
+/// `qwen3.5-9b-q4_K_M` → `qwen3.5-9b`. `None` when the tail is not a
+/// known quant token (case-insensitive) — callers must not fold then.
 fn strip_quant_tag(swapped: &str) -> Option<String> {
-    let cut = swapped.rsplit_once(['-', ':'])?;
-    let (stem, tail) = (cut.0, cut.1);
-    if GGUF_QUANT_TOKENS.contains(&tail.to_ascii_lowercase().as_str()) {
-        Some(stem.to_string())
-    } else {
-        None
-    }
+    let (stem, tail) = swapped.rsplit_once(['-', ':'])?;
+    let tail = tail.to_ascii_lowercase();
+    GGUF_QUANT_TOKENS
+        .contains(&tail.as_str())
+        .then(|| stem.to_string())
 }
 
 /// The quantized-safetensors routing signal, shared by every caller
@@ -630,40 +583,6 @@ pub struct SpecReceiptRow {
     pub dense_tps: f64,
     pub ratio: f64,
     pub measured_at: i64,
-    /// Canonical hardware string of the machine that raced (None on
-    /// pre-v19 rows — honest unknown).
-    #[serde(default)]
-    pub hw_fingerprint: Option<String>,
-    /// Exact speculation knobs raced, as JSON (None = engine defaults).
-    #[serde(default)]
-    pub spec_params: Option<String>,
-    /// True only when the racing knobs were deliberately configured
-    /// (tuned ngram sizes, a chosen draft pair) — an engine-default
-    /// arm racing alongside tuned ones is not adoption-grade evidence.
-    #[serde(default)]
-    pub tuned: bool,
-    /// Repetitions behind the measured number.
-    #[serde(default = "default_spec_reps")]
-    pub reps: i64,
-}
-
-fn default_spec_reps() -> i64 {
-    1
-}
-
-/// Provenance a spec race must declare when persisting a receipt, so
-/// `spec = "auto"` never mistakes an engine-default fluke for a tuned
-/// verdict. Passed to [`Store::put_spec_receipt`].
-#[derive(Debug, Clone, Default)]
-pub struct SpecProvenance<'a> {
-    /// Canonical hardware fingerprint of the racing machine.
-    pub hw_fingerprint: Option<&'a str>,
-    /// Exact knobs raced (already JSON-serialized by the caller).
-    pub spec_params: Option<&'a str>,
-    /// Whether the knobs were deliberately configured.
-    pub tuned: bool,
-    /// Race repetitions.
-    pub reps: i64,
 }
 
 /// One in-memory usage delta the gateway accumulates per (day, model)
@@ -969,12 +888,6 @@ impl Store {
             // transaction: a mid-failure rolls back and the next
             // open retries the whole step.
             self.migrate_v14_one_active_engine()?;
-            // v18→v19: `spec_receipts` provenance columns are ALTERs on
-            // an existing table (fresh stores get them from SCHEMA_SQL
-            // and the guards below no-op); the optimization-ledger
-            // tables are CREATE-IF-NOT-EXISTS in SCHEMA_SQL — replay
-            // covers them.
-            self.migrate_v19_spec_provenance()?;
         }
         // v15→v16: `model_modalities` (engine-advertised output
         // modalities, e.g. llama-server's architecture object marking
@@ -984,8 +897,6 @@ impl Store {
         // v16→v17: `spec_receipts` (spec-race verdicts) is likewise
         // CREATE-TABLE-IF-NOT-EXISTS in SCHEMA_SQL — replay covers it.
         // v17→v18: `usage_daily` (usage rollups) same replay story.
-        // v18→v19: see `migrate_v19_spec_provenance` — replay covers
-        // the new ledger tables; the receipt ALTERs live there.
         Ok(())
     }
 
@@ -1090,33 +1001,6 @@ impl Store {
         v14.commit()?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        Ok(())
-    }
-
-    /// v19: `spec_receipts` grows the provenance axes the supervisor
-    /// needs before trusting a receipt — which hardware produced it,
-    /// which exact knobs the race ran, whether those knobs were
-    /// deliberately tuned or engine defaults, and how many repetitions
-    /// back the number. Additive ALTERs for pre-v19 stores; fresh ones
-    /// carry the columns from SCHEMA_SQL. No backfill: tuned defaults
-    /// to 0 because every pre-v19 ngram arm raced engine defaults —
-    /// an honest unknown, never a guessed provenance.
-    fn migrate_v19_spec_provenance(&self) -> CoreResult<()> {
-        let cols = self.table_columns("spec_receipts")?;
-        for col in [
-            "hw_fingerprint TEXT",
-            "spec_params TEXT",
-            "tuned INTEGER NOT NULL DEFAULT 0",
-            "reps INTEGER NOT NULL DEFAULT 1",
-        ] {
-            let (name, ty) = col.split_once(' ').unwrap_or((col, "TEXT"));
-            if !cols.contains(&name.to_string()) {
-                self.conn.execute(
-                    &format!("ALTER TABLE spec_receipts ADD COLUMN {name} {ty}"),
-                    [],
-                )?;
-            }
-        }
         Ok(())
     }
 
@@ -2292,20 +2176,12 @@ impl Store {
 
     /// Map a user-supplied model name onto a store row for ollama
     /// migrants: exact match first, then a `model:tag` → `model-tag`
-    /// `:`→`-` swap. Returns the input unchanged when nothing matches,
+    /// `:`→`-` swap, then a quant-tag fold (`model:tag-q4_K_M` →
+    /// `model-tag`). Returns the input unchanged when nothing matches,
     /// so callers keep their own not-found error text (fail loud, no
     /// hidden rewrite). Shared rule for the CLI boundary and the
     /// gateway's `ensure` path; `pull` never uses it (its colon is the
     /// `owner/repo:QUANT` separator).
-    ///
-    /// Ollama-migrant names carry a quant tag (`qwen3.5:9b-q4_K_M`).
-    /// The plain colon-swap misses (no row ends in the tag), so as a
-    /// LAST resort the ladder strips a trailing quant token from the
-    /// swapped form and retries the exact row. The strip only fires
-    /// after every exact form missed — a row that genuinely ends in a
-    /// quant token is found before the strip can rewrite it, and an
-    /// ambiguity beyond the strip stays the caller's error (this fn
-    /// resolves, it never guesses between rows).
     pub fn resolve_model_name(&self, name: &str) -> String {
         if !name.contains(':') {
             return name.to_string();
@@ -2318,6 +2194,13 @@ impl Store {
         if hit(&swapped) {
             return swapped;
         }
+        // Ollama migrant names carry the quant as a suffix tag
+        // (`qwen3.5:9b-q4_K_M`); when no row keeps that suffix, fold the
+        // tag away and try the bare stem. The strip only fires after
+        // every exact form missed — a row genuinely ending in a quant
+        // token is found by the arms above before this can rewrite it,
+        // and unknown tails (e.g. `latest`) never strip, so ambiguity
+        // beyond the fold stays the caller's error to raise.
         if let Some(stem) = strip_quant_tag(&swapped) {
             if hit(&stem) {
                 return stem;
@@ -2367,8 +2250,6 @@ impl Store {
     /// Upsert one spec-race receipt. Keyed (model, `engine_tag`, mode):
     /// the latest measurement of a mode replaces the previous one — a
     /// receipt is "current truth for this hardware", not an audit log.
-    /// `prov` carries the provenance axes (hw fingerprint, exact knobs,
-    /// tuned flag, repetitions) that make the receipt trustworthy.
     pub fn put_spec_receipt(
         &self,
         model: &str,
@@ -2376,7 +2257,6 @@ impl Store {
         mode: &str,
         tok_per_s: f64,
         dense_tps: f64,
-        prov: &SpecProvenance<'_>,
     ) -> CoreResult<()> {
         let ratio = if dense_tps > 0.0 {
             tok_per_s / dense_tps
@@ -2384,32 +2264,14 @@ impl Store {
             0.0
         };
         self.conn.execute(
-            "INSERT INTO spec_receipts
-                 (model, engine_tag, mode, tok_per_s, dense_tps, ratio, measured_at,
-                  hw_fingerprint, spec_params, tuned, reps)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "INSERT INTO spec_receipts (model, engine_tag, mode, tok_per_s, dense_tps, ratio, measured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(model, engine_tag, mode) DO UPDATE SET
-                  tok_per_s      = excluded.tok_per_s,
-                  dense_tps      = excluded.dense_tps,
-                  ratio          = excluded.ratio,
-                  measured_at    = excluded.measured_at,
-                  hw_fingerprint = excluded.hw_fingerprint,
-                  spec_params    = excluded.spec_params,
-                  tuned          = excluded.tuned,
-                  reps           = excluded.reps",
-            params![
-                model,
-                engine_tag,
-                mode,
-                tok_per_s,
-                dense_tps,
-                ratio,
-                unix_now(),
-                prov.hw_fingerprint,
-                prov.spec_params,
-                i64::from(prov.tuned),
-                prov.reps
-            ],
+                 tok_per_s = excluded.tok_per_s,
+                 dense_tps = excluded.dense_tps,
+                 ratio     = excluded.ratio,
+                 measured_at = excluded.measured_at",
+            params![model, engine_tag, mode, tok_per_s, dense_tps, ratio, unix_now()],
         )?;
         Ok(())
     }
@@ -2421,8 +2283,7 @@ impl Store {
         engine_tag: &str,
     ) -> CoreResult<Vec<SpecReceiptRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT model, engine_tag, mode, tok_per_s, dense_tps, ratio, measured_at,
-                    hw_fingerprint, spec_params, tuned, reps
+            "SELECT model, engine_tag, mode, tok_per_s, dense_tps, ratio, measured_at
              FROM spec_receipts WHERE model = ?1 AND engine_tag = ?2
              ORDER BY ratio DESC",
         )?;
@@ -2435,10 +2296,6 @@ impl Store {
                 dense_tps: r.get(4)?,
                 ratio: r.get(5)?,
                 measured_at: r.get(6)?,
-                hw_fingerprint: r.get(7)?,
-                spec_params: r.get(8)?,
-                tuned: r.get::<_, i64>(9)? != 0,
-                reps: r.get(10)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
@@ -2666,135 +2523,6 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(())
-    }
-
-    /// Add a whole flush-batch of per-model usage deltas in ONE
-    /// transaction — the gateway's meter hands every drained bucket
-    /// here per tick. All-or-nothing on purpose: a mid-batch failure
-    /// must leave the day-rows untouched so the caller can requeue the
-    /// entire batch and retry next tick without double-counting.
-    pub fn add_usage_deltas(&self, batch: &[(i64, String, UsageDelta)]) -> CoreResult<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for (day, model, delta) in batch {
-            let UsageDelta {
-                in_tokens,
-                out_tokens,
-                cached_tokens,
-                requests,
-                gen_secs,
-                ttft_count,
-                ttft_ms_total,
-            } = *delta;
-            tx.execute(
-                "INSERT INTO usage_daily (day, model, in_tokens, out_tokens, cached_tokens, requests, gen_secs, ttft_count, ttft_ms_total)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(day, model) DO UPDATE SET
-                     in_tokens     = in_tokens + excluded.in_tokens,
-                     out_tokens    = out_tokens + excluded.out_tokens,
-                     cached_tokens = cached_tokens + excluded.cached_tokens,
-                     requests      = requests + excluded.requests,
-                     gen_secs      = gen_secs + excluded.gen_secs,
-                     ttft_count    = ttft_count + excluded.ttft_count,
-                     ttft_ms_total = ttft_ms_total + excluded.ttft_ms_total",
-                params![
-                    day,
-                    model,
-                    in_tokens,
-                    out_tokens,
-                    cached_tokens,
-                    requests,
-                    gen_secs,
-                    ttft_count,
-                    ttft_ms_total
-                ],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Register one optimization experiment (immutable identity row)
-    /// and return its id. Lifecycle NEVER mutates this row —
-    /// measurements and transitions land in the append-only
-    /// [`Store::append_measurement`] / [`Store::append_event`] tables,
-    /// so the audit trail reads as history, not as final state.
-    pub fn insert_experiment(
-        &self,
-        model: &str,
-        engine_tag: &str,
-        hw_fingerprint: Option<&str>,
-        quant: Option<&str>,
-        config_json: &str,
-        profile_hash: &str,
-        objective: &str,
-    ) -> CoreResult<i64> {
-        self.conn.execute(
-            "INSERT INTO optimization_experiments
-                 (created_at, model, engine_tag, hw_fingerprint, quant, config_json, profile_hash, objective)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                unix_now(),
-                model,
-                engine_tag,
-                hw_fingerprint,
-                quant,
-                config_json,
-                profile_hash,
-                objective
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Append one raw measurement to an experiment (bench grid, gateway
-    /// drive, quality probe — `kind` says which; `metrics_json` is the
-    /// verbatim numbers).
-    pub fn append_measurement(
-        &self,
-        experiment_id: i64,
-        kind: &str,
-        metrics_json: &str,
-    ) -> CoreResult<()> {
-        self.conn.execute(
-            "INSERT INTO optimization_measurements (experiment_id, ts, kind, metrics_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![experiment_id, unix_now(), kind, metrics_json],
-        )?;
-        Ok(())
-    }
-
-    /// Append one lifecycle transition (`measured` | `adopted` |
-    /// `rolled-back` | `rejected` | ...) with its human-readable
-    /// justification. The current lifecycle state of an experiment is
-    /// derived from these events — never stored as mutable status.
-    pub fn append_event(&self, experiment_id: i64, kind: &str, reason: &str) -> CoreResult<()> {
-        self.conn.execute(
-            "INSERT INTO optimization_events (experiment_id, ts, kind, reason)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![experiment_id, unix_now(), kind, reason],
-        )?;
-        Ok(())
-    }
-
-    /// Point `active_profiles` at the experiment whose verified
-    /// candidate the (model, engine) lane is now serving. This pointer
-    /// IS the adoption act — rolling back means re-pointing at the
-    /// previous experiment, whose row and measurements never left.
-    pub fn set_active_profile(
-        &self,
-        model: &str,
-        engine_tag: &str,
-        experiment_id: i64,
-    ) -> CoreResult<()> {
-        self.conn.execute(
-            "INSERT INTO active_profiles (model, engine_tag, experiment_id, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(model, engine_tag) DO UPDATE SET
-                 experiment_id = excluded.experiment_id,
-                 updated_at    = excluded.updated_at",
-            params![model, engine_tag, experiment_id, unix_now()],
-        )?;
         Ok(())
     }
 }
@@ -3596,16 +3324,11 @@ mod tests {
         };
         let s = Store::open(&dirs).unwrap();
         assert!(s.list_spec_receipts("m", "e").unwrap().is_empty());
-        let dense_prov = SpecProvenance::default();
-        s.put_spec_receipt("m", "e", "dense", 40.0, 40.0, &dense_prov)
-            .unwrap();
-        s.put_spec_receipt("m", "e", "draft", 80.0, 40.0, &dense_prov)
-            .unwrap();
-        s.put_spec_receipt("m", "e", "ngram", 50.0, 40.0, &dense_prov)
-            .unwrap();
+        s.put_spec_receipt("m", "e", "dense", 40.0, 40.0).unwrap();
+        s.put_spec_receipt("m", "e", "draft", 80.0, 40.0).unwrap();
+        s.put_spec_receipt("m", "e", "ngram", 50.0, 40.0).unwrap();
         // Same mode re-measured: the upsert replaces, never appends.
-        s.put_spec_receipt("m", "e", "ngram", 60.0, 40.0, &dense_prov)
-            .unwrap();
+        s.put_spec_receipt("m", "e", "ngram", 60.0, 40.0).unwrap();
         let rows = s.list_spec_receipts("m", "e").unwrap();
         assert_eq!(rows.len(), 3, "upsert must keep one row per mode");
         assert_eq!(rows[0].mode, "draft", "ratio DESC puts the winner first");
@@ -3649,14 +3372,7 @@ mod tests {
                 .unwrap();
             assert_eq!(v, i64::from(SCHEMA_VERSION));
             if pass == 0 {
-                let prov = SpecProvenance {
-                    hw_fingerprint: Some("gpu:ada|vram:8192|arch:x86_64"),
-                    spec_params: Some(r#"{"draft":"qwen3-0.6b.gguf","draft_len":16}"#),
-                    tuned: true,
-                    reps: 2,
-                };
-                s.put_spec_receipt("m", "e", "draft", 42.0, 21.0, &prov)
-                    .unwrap();
+                s.put_spec_receipt("m", "e", "draft", 42.0, 21.0).unwrap();
             }
             let rows = s.list_spec_receipts("m", "e").unwrap();
             assert_eq!(rows.len(), 1);
@@ -3664,165 +3380,7 @@ mod tests {
             #[allow(clippy::cast_precision_loss)] // literal test values
             let expected = 42.0 / 21.0;
             assert!((rows[0].ratio - expected).abs() < 1e-9);
-            if pass == 0 {
-                // Provenance round-trips with the receipt.
-                assert_eq!(
-                    rows[0].hw_fingerprint.as_deref(),
-                    Some("gpu:ada|vram:8192|arch:x86_64")
-                );
-                assert!(
-                    rows[0]
-                        .spec_params
-                        .as_deref()
-                        .is_some_and(|p| p.contains("draft_len"))
-                );
-                assert!(rows[0].tuned);
-                assert_eq!(rows[0].reps, 2);
-            }
         }
-    }
-
-    #[test]
-    fn unit__store_schema_upgrades__v18_to_v19_spec_provenance_and_ledger() {
-        // Simulate a v18 database: spec_receipts WITHOUT the provenance
-        // columns, no ledger tables, user_version 18. Reopen replays
-        // SCHEMA_SQL (creates the ledger tables), the guarded ALTERs
-        // add the receipt columns, and the stamp lands at 19. A
-        // pre-existing receipt must read back tuned=false / reps=1 —
-        // every pre-v19 ngram arm raced engine defaults, and the
-        // default says so honestly.
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = BlazarDirs {
-            config_dir: tmp.path().join("cfg"),
-            data_dir: tmp.path().join("data"),
-        };
-        {
-            let s = Store::open(&dirs).unwrap();
-            s.conn()
-                .execute_batch(
-                    "DROP TABLE optimization_measurements;
-                 DROP TABLE optimization_events;
-                 DROP TABLE active_profiles;
-                 DROP TABLE optimization_experiments;
-                 DROP TABLE spec_receipts;
-                 CREATE TABLE spec_receipts (
-                     model       TEXT NOT NULL,
-                     engine_tag  TEXT NOT NULL,
-                     mode        TEXT NOT NULL,
-                     tok_per_s   REAL NOT NULL,
-                     dense_tps   REAL NOT NULL,
-                     ratio       REAL NOT NULL,
-                     measured_at INTEGER NOT NULL,
-                     PRIMARY KEY (model, engine_tag, mode)
-                 );
-                 INSERT INTO spec_receipts
-                     (model, engine_tag, mode, tok_per_s, dense_tps, ratio, measured_at)
-                 VALUES ('m', 'e', 'ngram', 40.02, 40.0, 1.0005, 100);
-                 PRAGMA user_version = 18;",
-                )
-                .unwrap();
-        }
-        for pass in 0..2 {
-            let s = Store::open(&dirs).unwrap();
-            let v: i64 = s
-                .conn()
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(v, i64::from(SCHEMA_VERSION));
-            // Legacy row: provenance defaults, never guesses.
-            let rows = s.list_spec_receipts("m", "e").unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].mode, "ngram");
-            assert!(!rows[0].tuned, "pre-v19 ngram races ran engine defaults");
-            assert_eq!(rows[0].reps, 1);
-            assert_eq!(rows[0].hw_fingerprint, None);
-            assert_eq!(rows[0].spec_params, None);
-            if pass == 0 {
-                // Ledger round-trips on the upgraded store: identity,
-                // append-only measurements/events, and the pointer.
-                let exp = s
-                    .insert_experiment(
-                        "m",
-                        "e",
-                        Some("gpu:ada|vram:8192|arch:x86_64"),
-                        Some("Q4_K_M"),
-                        r#"{"--cache-type-k":"q8_0"}"#,
-                        "hash-1",
-                        "Throughput",
-                    )
-                    .unwrap();
-                let exp2 = s
-                    .insert_experiment("m", "e", None, None, "{}", "hash-2", "Throughput")
-                    .unwrap();
-                assert!(exp2 > exp, "experiment ids are monotonic");
-                s.append_measurement(exp, "llama-bench-grid", r#"{"score":42.0}"#)
-                    .unwrap();
-                s.append_event(exp, "measured", "grid of 6 rows").unwrap();
-                s.append_event(exp, "adopted", "tune-search winner")
-                    .unwrap();
-                s.set_active_profile("m", "e", exp).unwrap();
-                // Pointer is an upsert: re-pointing tracks the newest.
-                s.set_active_profile("m", "e", exp2).unwrap();
-                let pointer: i64 = s
-                    .conn()
-                    .query_row(
-                        "SELECT experiment_id FROM active_profiles WHERE model='m' AND engine_tag='e'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(pointer, exp2);
-                let events: i64 = s
-                    .conn()
-                    .query_row(
-                        "SELECT COUNT(*) FROM optimization_events WHERE experiment_id = ?1",
-                        rusqlite::params![exp],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(events, 2, "events append, never overwrite");
-            }
-        }
-    }
-
-    #[test]
-    fn unit__usage_deltas__single_transaction_batch_accumulates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = BlazarDirs {
-            config_dir: tmp.path().join("cfg"),
-            data_dir: tmp.path().join("data"),
-        };
-        let s = Store::open(&dirs).unwrap();
-        let d = |out: i64, req: i64| UsageDelta {
-            out_tokens: out,
-            requests: req,
-            ..UsageDelta::default()
-        };
-        // Two buckets in one batch, one of them twice — the batch tx
-        // must accumulate exactly like N sequential single deltas.
-        let batch = vec![
-            (20261101, "a".to_string(), d(10, 1)),
-            (20261101, "b".to_string(), d(5, 1)),
-            (20261101, "a".to_string(), d(7, 2)),
-        ];
-        s.add_usage_deltas(&batch).unwrap();
-        let rows = s.list_usage_days(30).unwrap();
-        assert_eq!(rows.len(), 2);
-        let a = rows.iter().find(|r| r.model == "a").unwrap();
-        assert_eq!(a.out_tokens, 17);
-        assert_eq!(a.requests, 3);
-        let b = rows.iter().find(|r| r.model == "b").unwrap();
-        assert_eq!(b.out_tokens, 5);
-        assert_eq!(b.requests, 1);
-        // A failing batch is all-or-nothing: dropping the table makes
-        // every row fail together, nothing partial lands.
-        s.conn().execute_batch("DROP TABLE usage_daily;").unwrap();
-        let failing = vec![(20261101, "a".to_string(), d(1, 1))];
-        assert!(s.add_usage_deltas(&failing).is_err());
-        assert!(
-            s.list_usage_days(30).is_err(),
-            "failed batch must persist nothing (table still absent => no partial rows)"
-        );
     }
 
     #[test]
@@ -4511,21 +4069,24 @@ mod tests {
     fn unit__resolve_model_name__quant_tag_folds_onto_stem_row() {
         let (_t, s) = tmp_store();
         s.upsert_model(&base_model("qwen3.5-9b")).unwrap();
-        // The live geokit-harness shape: migrant name with quant tag.
+        // Ollama migrant name carrying the quant tag folds onto the
+        // bare stem row (the tag names the file's quant, not the row).
         assert_eq!(s.resolve_model_name("qwen3.5:9b-q4_K_M"), "qwen3.5-9b");
-        // Case-insensitive token match.
+        // Quant token matching is case-insensitive (tag casing varies
+        // across registries).
         assert_eq!(s.resolve_model_name("qwen3.5:9b-Q8_0"), "qwen3.5-9b");
-        // Quant-tag fold is NOT a guess between rows: with only the
-        // tagged row present, exact colon-swap finds it (no strip).
+        // A row that genuinely keeps the quant suffix wins via the
+        // plain colon swap BEFORE the fold can rewrite it.
         s.upsert_model(&base_model("model-a-q4_K_M")).unwrap();
         assert_eq!(s.resolve_model_name("model-a:q4_K_M"), "model-a-q4_K_M");
-        // Unknown tail token never strips (ambiguity stays caller's).
+        // Unknown tails (ollama size/recency tags) never fold: the
+        // input returns verbatim for the caller to error on.
         assert_eq!(
             s.resolve_model_name("qwen3.5:9b-latest"),
             "qwen3.5:9b-latest"
         );
-        // Stem missing -> verbatim miss (caller 404s with the request).
-        assert_eq!(s.resolve_model_name("nope:9b-q4_K_M"), "nope:9b-q4_K_M");
+        // A quant tail whose stem has no row stays verbatim too.
+        assert_eq!(s.resolve_model_name("ghost:9b-q4_K_M"), "ghost:9b-q4_K_M");
     }
 
     #[test]
@@ -4534,10 +4095,11 @@ mod tests {
             strip_quant_tag("qwen3.5-9b-q4_K_M").as_deref(),
             Some("qwen3.5-9b")
         );
-        assert_eq!(strip_quant_tag("model-f16").as_deref(), Some("model"));
-        // Unknown tail, or no separator at all: nothing folds.
-        assert_eq!(strip_quant_tag("qwen3.5-9b-instruct"), None);
-        assert_eq!(strip_quant_tag("plainname"), None);
+        assert_eq!(strip_quant_tag("m-f16").as_deref(), Some("m"));
+        assert_eq!(strip_quant_tag("m-iq2_xxs").as_deref(), Some("m"));
+        assert_eq!(strip_quant_tag("m-latest"), None);
+        assert_eq!(strip_quant_tag("m-7b"), None);
+        assert_eq!(strip_quant_tag("flatname"), None);
     }
 
     #[test]
