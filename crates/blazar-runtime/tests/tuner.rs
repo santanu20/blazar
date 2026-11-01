@@ -65,6 +65,7 @@ static META: std::sync::LazyLock<GgufMeta> = std::sync::LazyLock::new(|| GgufMet
 });
 
 fn test_input<'a>(
+    model_name: &'a str,
     model_path: &'a str,
     hw: &'a Hardware,
     cfg: &'a Config,
@@ -78,8 +79,8 @@ fn test_input<'a>(
         auto_tp_size: None,
         mmproj_path: None,
         components: &[],
-        model_name: "qwen3-8b",
-        instance_key: "qwen3-8b",
+        model_name,
+        instance_key: model_name,
         model_path,
         model_bytes: 5_000 * 1024 * 1024,
         meta: blazar_core::ModelMeta::Gguf(&META),
@@ -173,7 +174,12 @@ fn integration__tune_search__adopts_argmax_and_persists() {
     let hw = gpu_hw(8, 12_000, 32_000);
     let flags = all_flags();
     let overlay = ModelOverride::default();
-    let inp = test_input(&model_str, &hw, &cfg, &flags, &overlay);
+    // "qwen3.5-9b" carries measured KV-quality receipts (q8_0 and q4_0
+    // at ctx 32768) in the compiled-in registry, so the quality gate
+    // lets the stub's q4_0 winner through — this test pins the winner
+    // contract for an evidenced model. The gate-blocking case has its
+    // own test below with an unevidenced name.
+    let inp = test_input("qwen3.5-9b", &model_str, &hw, &cfg, &flags, &overlay);
 
     // Grid axes: threads x kv-quant (llama-bench b10816 has no -c axis).
     // GPU grid: 4-grade KV ladder, single threads/batch. Stub scoring:
@@ -243,13 +249,49 @@ fn integration__tune_search__adopts_argmax_and_persists() {
             .any(|w| w[0] == "-b" && w[1] == "2048")
     );
 
-    let stored = store.get_profile("qwen3-8b", "b-stub").unwrap().unwrap();
+    let stored = store.get_profile("qwen3.5-9b", "b-stub").unwrap().unwrap();
     let argv: Vec<String> = serde_json::from_str(&stored.args_json).unwrap();
     assert_eq!(argv, profile.argv);
     let payload: blazar_runtime::bench::BenchmarkPayload =
         serde_json::from_str(stored.benchmark_json.as_deref().unwrap()).unwrap();
     assert!(payload.score > 0.0);
     assert_ne!(stored.args_hash, "");
+
+    // Optimization-ledger wiring: the adoption must leave an immutable
+    // experiment, a measurement row, an adoption event, and the
+    // active-profile pointer — the trust base later --plan/--run
+    // decisions will be judged against.
+    let ledger: (i64, i64, i64) = store
+        .conn()
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM optimization_experiments
+                  WHERE model = 'qwen3.5-9b' AND engine_tag = 'b-stub'),
+                (SELECT COUNT(*) FROM optimization_measurements m
+                  JOIN optimization_experiments e ON e.id = m.experiment_id
+                  WHERE e.model = 'qwen3.5-9b' AND m.kind = 'llama-bench-grid'),
+                (SELECT COUNT(*) FROM optimization_events v
+                  JOIN optimization_experiments e ON e.id = v.experiment_id
+                  WHERE e.model = 'qwen3.5-9b' AND v.kind = 'adopted')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        ledger,
+        (1, 1, 1),
+        "experiment + measurement + adopted event"
+    );
+    let pointer: i64 = store
+        .conn()
+        .query_row(
+            "SELECT experiment_id FROM active_profiles
+             WHERE model = 'qwen3.5-9b' AND engine_tag = 'b-stub'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(pointer > 0, "active_profiles points at the adoption");
 }
 
 #[test]
@@ -270,7 +312,9 @@ fn integration__tune_search_cpu__keeps_legacy_grid_and_q8_winner() {
     };
     let flags = all_flags();
     let overlay = ModelOverride::default();
-    let inp = test_input(&model_str, &hw, &cfg, &flags, &overlay);
+    // Evidenced model: q8_0 has a measured receipt at ctx 32768, so the
+    // legacy q8 winner stays eligible under the quality gate.
+    let inp = test_input("qwen3.5-9b", &model_str, &hw, &cfg, &flags, &overlay);
 
     let tuner = Tuner {
         dirs: &dirs,
@@ -310,5 +354,59 @@ fn integration__tune_search_cpu__keeps_legacy_grid_and_q8_winner() {
             .argv
             .windows(2)
             .any(|w| w[0] == "--threads" && w[1] == "8")
+    );
+}
+
+/// The quality gate's blocking side: an unevidenced model must never
+/// adopt a quantized KV grade on throughput alone, no matter how fast
+/// the stub says it is. The grid still MEASURES the deeper grades (the
+/// search is not shrunk — evidence, not exploration, is gated); only
+/// the adoption argmax is restricted to f16.
+#[test]
+#[allow(non_snake_case)]
+fn integration__tune_search_gpu__kv_quality_gate_blocks_unevidenced_grades() {
+    let (tmp, dirs) = dirs_setup();
+    let model_path = tmp.path().join("m.gguf");
+    std::fs::write(&model_path, b"x").unwrap();
+    let model_str = model_path.to_str().unwrap().to_string();
+
+    let cfg = Config::default(); // default_ctx 16384
+    let hw = gpu_hw(8, 12_000, 32_000);
+    let flags = all_flags();
+    let overlay = ModelOverride::default();
+    // "qwen3-8b" has NO entry in the kv-quality registry — every
+    // quantized grade is ineligible at any ctx, so the stub's q4_0
+    // +30/side bait must lose to the f16 baseline.
+    let inp = test_input("qwen3-8b", &model_str, &hw, &cfg, &flags, &overlay);
+
+    let tuner = Tuner {
+        dirs: &dirs,
+        bench_bin: bench_bin(),
+    };
+    let store = Store::open(&dirs).unwrap();
+    let (profile, winning, rows) = tuner.tune_search(&store, &inp).unwrap();
+
+    // Grid unchanged: the deeper grades are still measured.
+    assert!(
+        rows.iter().any(|r| r.type_k.as_deref() == Some("q4_0")),
+        "the gate filters adoption, not exploration — q4_0 rows must exist"
+    );
+    // Adoption restricted: f16/f16 is the only eligible pair for an
+    // unevidenced model.
+    assert_eq!(
+        winning
+            .kv_pair
+            .as_ref()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+        Some(("f16", "f16")),
+        "unevidenced quantized grades must not win the argmax"
+    );
+    assert!(!winning.kv_quant.unwrap());
+    assert!(
+        !profile
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--cache-type-k" && w[1] != "f16"),
+        "compiled argv must not carry a quantized K cache"
     );
 }

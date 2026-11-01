@@ -83,28 +83,48 @@ impl UsageMeter {
         }
     }
 
-    /// Drain in-memory buckets into `usage_daily`. Returns rows
-    /// written; errors propagate (fail loud, retry next tick).
+    /// Drain in-memory buckets into `usage_daily` in ONE store
+    /// transaction. Returns rows written. Failure-safe by construction:
+    /// the store is ensured BEFORE anything is drained (an unopenable
+    /// database defers the flush with the batch untouched), and a
+    /// failed batch write requeues the whole drained batch additively —
+    /// `add_usage_deltas` is all-or-nothing, so a mid-batch failure
+    /// persists nothing and the retry next tick re-offers exactly what
+    /// was measured, plus whatever `record` accumulated meanwhile.
+    /// Errors propagate (fail loud; the caller's periodic task logs
+    /// them and tries again next tick).
     pub fn flush(&self) -> anyhow::Result<usize> {
+        {
+            let mut guard = self.store.lock().expect("usage store poisoned");
+            if guard.is_none() {
+                *guard = Store::open(&self.dirs).ok();
+                if guard.is_none() {
+                    tracing::warn!(
+                        db = %self.dirs.db_file().display(),
+                        "usage flush deferred: store open failed (batch kept for next tick)"
+                    );
+                    return Ok(0);
+                }
+            }
+        }
         let drained: Vec<((i64, String), UsageAcc)> = {
             let mut map = self.buckets.lock().expect("usage buckets poisoned");
             map.drain().collect()
         };
-        let mut guard = self.store.lock().expect("usage store poisoned");
-        if guard.is_none() {
-            *guard = Store::open(&self.dirs).ok();
-            if guard.is_none() {
-                tracing::warn!(
-                    db = %self.dirs.db_file().display(),
-                    "usage flush skipped: store open failed (will retry next tick)"
-                );
-                return Ok(0);
-            }
+        if drained.is_empty() {
+            return Ok(0);
         }
-        let store = guard.as_ref().expect("store just ensured");
         let n = drained.len();
-        for ((day, model), a) in drained {
-            store.add_usage_delta(day, &model, &a)?;
+        let batch: Vec<(i64, String, UsageDelta)> = drained
+            .into_iter()
+            .map(|((day, model), a)| (day, model, a))
+            .collect();
+        let guard = self.store.lock().expect("usage store poisoned");
+        let store = guard.as_ref().expect("store ensured above");
+        if let Err(e) = store.add_usage_deltas(&batch) {
+            drop(guard);
+            requeue_additively(&self.buckets, &batch);
+            return Err(e.into());
         }
         Ok(n)
     }
@@ -117,6 +137,28 @@ impl UsageMeter {
             return Ok(Vec::new());
         };
         Ok(store.list_usage_days(days)?)
+    }
+}
+
+/// Fold a failed flush-batch back into the live buckets, ADDITIVELY:
+/// `record` calls that landed while the batch was being written must
+/// survive — assignment would silently erase them. Field-by-field
+/// because the accumulator type is core's [`UsageDelta`] and orphan
+/// rules forbid an `AddAssign` impl here.
+fn requeue_additively(
+    buckets: &Mutex<HashMap<(i64, String), UsageAcc>>,
+    batch: &[(i64, String, UsageDelta)],
+) {
+    let mut map = buckets.lock().expect("usage buckets poisoned");
+    for (day, model, d) in batch {
+        let acc = map.entry((*day, model.clone())).or_default();
+        acc.in_tokens += d.in_tokens;
+        acc.out_tokens += d.out_tokens;
+        acc.cached_tokens += d.cached_tokens;
+        acc.requests += d.requests;
+        acc.gen_secs += d.gen_secs;
+        acc.ttft_count += d.ttft_count;
+        acc.ttft_ms_total += d.ttft_ms_total;
     }
 }
 
@@ -298,5 +340,104 @@ mod tests {
         // TTFT: only the measured sample counts.
         assert_eq!(m1.ttft_count, 1);
         assert!((m1.ttft_ms_total - 120.0).abs() < 1e-9);
+    }
+
+    /// Pin for the flush-ordering bug: the old flush drained buckets
+    /// BEFORE ensuring the store, so an unopenable database silently
+    /// discarded the whole in-memory batch (the "will retry next tick"
+    /// warning lied — nothing remained to retry). Deferred-open must
+    /// keep the batch, and the later successful flush must land it.
+    #[test]
+    #[allow(non_snake_case)] // repo test-name convention: integration__unit__scenario
+    fn integration__usage_flush__open_failure_keeps_batch_and_lands_later() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        // Block the data dir with a regular file: no db can be created
+        // inside a file path, so every Store::open fails.
+        std::fs::create_dir_all(tmp.path().join("cfg")).unwrap();
+        std::fs::write(tmp.path().join("data"), b"not a directory").unwrap();
+        let m = UsageMeter::new(&dirs); // eager open fails -> None
+        m.record("m1", 100, 40, 80, 2.5, Some(120.0));
+        assert_eq!(
+            m.flush().unwrap(),
+            0,
+            "open failure defers the flush — the batch must survive"
+        );
+        // Unblock: the very same meter must land exactly what was
+        // recorded, proving nothing was drained into the void.
+        std::fs::remove_file(tmp.path().join("data")).unwrap();
+        assert_eq!(m.flush().unwrap(), 1, "the deferred batch lands on retry");
+        let rows = m.snapshot(365).unwrap();
+        let m1 = rows
+            .iter()
+            .find(|r| r.model == "m1")
+            .expect("deferred record must exist after recovery");
+        assert_eq!((m1.in_tokens, m1.out_tokens, m1.requests), (100, 40, 1));
+        assert_eq!(m.flush().unwrap(), 0, "exactly-once: nothing left to flush");
+    }
+
+    /// Pin for the mid-batch loss: the old per-row loop aborted on the
+    /// first failing row, leaving a partially-written day and no
+    /// requeue. The transactional batch must fail all-or-nothing and
+    /// requeue the whole drained set; records arriving during the
+    /// failure window must merge in additively (never be overwritten).
+    #[test]
+    #[allow(non_snake_case)] // repo test-name convention: integration__unit__scenario
+    fn integration__usage_flush__midbatch_failure_requeues_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let m = UsageMeter::new(&dirs);
+        m.record("m1", 100, 40, 80, 2.5, Some(120.0));
+        m.record("m2", 7, 3, 0, 1.0, None);
+        // Sabotage the rollup table from a second connection.
+        {
+            let s2 = Store::open(&dirs).unwrap();
+            s2.conn().execute_batch("DROP TABLE usage_daily;").unwrap();
+        }
+        assert!(
+            m.flush().is_err(),
+            "batch write must fail loudly with the table gone"
+        );
+        // A record landing during the failure window must survive the
+        // requeue merge (additive, not overwrite).
+        m.record("m1", 10, 5, 0, 0.5, None);
+        // Repair the table (reopen alone does not replay the schema at
+        // a current user_version, by design).
+        {
+            let s3 = Store::open(&dirs).unwrap();
+            s3.conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS usage_daily (
+                         day           INTEGER NOT NULL,
+                         model         TEXT NOT NULL,
+                         in_tokens     INTEGER NOT NULL DEFAULT 0,
+                         out_tokens    INTEGER NOT NULL DEFAULT 0,
+                         cached_tokens INTEGER NOT NULL DEFAULT 0,
+                         requests      INTEGER NOT NULL DEFAULT 0,
+                         gen_secs      REAL NOT NULL DEFAULT 0,
+                         ttft_count    INTEGER NOT NULL DEFAULT 0,
+                         ttft_ms_total REAL NOT NULL DEFAULT 0,
+                         PRIMARY KEY (day, model)
+                     );",
+                )
+                .unwrap();
+        }
+        assert_eq!(m.flush().unwrap(), 2, "requeued batch lands whole");
+        let rows = m.snapshot(365).unwrap();
+        let m1 = rows.iter().find(|r| r.model == "m1").unwrap();
+        assert_eq!(
+            (m1.in_tokens, m1.out_tokens, m1.requests),
+            (110, 45, 2),
+            "original + failure-window record, merged additively"
+        );
+        let m2 = rows.iter().find(|r| r.model == "m2").unwrap();
+        assert_eq!((m2.in_tokens, m2.out_tokens), (7, 3));
+        assert_eq!(m.flush().unwrap(), 0, "exactly-once: nothing left");
     }
 }

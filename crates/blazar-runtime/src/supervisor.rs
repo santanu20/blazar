@@ -245,6 +245,16 @@ pub fn best_measured_spec_mode(
         if r.mode == "dense" || r.ratio < 1.05 {
             continue;
         }
+        // An untuned ngram receipt raced engine-default knobs — a
+        // noisy default arm clearing 1.05 is not adoption-grade
+        // evidence (the tuned ngram sizes are the whole point of the
+        // mode). draft/dflash arms always carry their deliberate
+        // configuration (a chosen pair / engine's flash decoder), so
+        // the gate reads ngram only. Pre-v19 rows default tuned=false
+        // — every historical ngram race ran defaults.
+        if r.mode == "ngram" && !r.tuned {
+            continue;
+        }
         let eligible = match r.mode.as_str() {
             "ngram" => advertised.iter().any(|s| s == "ngram-simple"),
             "dflash" => advertised.iter().any(|s| s == "draft-dflash"),
@@ -11971,6 +11981,10 @@ mod routing_tests {
             dense_tps: 40.0,
             ratio,
             measured_at: 100,
+            hw_fingerprint: None,
+            spec_params: None,
+            tuned: true,
+            reps: 1,
         };
         let advertised = ["ngram-simple".to_string(), "draft-simple".to_string()].to_vec();
         // Draft wins on ratio but the pair is not pulled: receipt is
@@ -12012,6 +12026,57 @@ mod routing_tests {
         // Unknown receipt spellings never select.
         let unknown = vec![receipt("eagle3", 2.0)];
         assert_eq!(best(&unknown, &advertised, true), None);
+    }
+
+    #[test]
+    fn unit__best_measured_spec_mode__untuned_ngram_receipt_is_not_selectable() {
+        use super::best_measured_spec_mode as best;
+        let receipt = |mode: &str, ratio: f64, tuned: bool| blazar_core::store::SpecReceiptRow {
+            model: "m".into(),
+            engine_tag: "e".into(),
+            mode: mode.into(),
+            tok_per_s: ratio * 40.0,
+            dense_tps: 40.0,
+            ratio,
+            measured_at: 100,
+            hw_fingerprint: None,
+            spec_params: None,
+            tuned,
+            reps: 1,
+        };
+        let advertised = ["ngram-simple".to_string()].to_vec();
+        // An untuned ngram receipt — even a LOUD winner above every
+        // tuned arm — raced engine-default knobs: a default-shape fluke
+        // is not adoption-grade evidence, so it must not select. The
+        // tuned arm wins on its honest (smaller) ratio.
+        let rows = vec![receipt("ngram", 1.50, false), receipt("ngram", 1.12, true)];
+        assert_eq!(
+            best(&rows, &advertised, false),
+            Some(("ngram", 1.12)),
+            "untuned ngram must lose to the tuned arm despite the higher ratio"
+        );
+        // Untuned-only evidence: no selection at all — the heuristic
+        // auto chain keeps deciding (this is exactly the pre-v19
+        // receipt population's shape: default-shape races).
+        let untuned_only = vec![receipt("ngram", 1.50, false)];
+        assert_eq!(
+            best(&untuned_only, &advertised, false),
+            None,
+            "an untuned-only ngram history must not pin the mode"
+        );
+        // The gate reads ngram only: a "tuned=false" spelling on other
+        // modes (never written today, defensive tomorrow) still selects
+        // when their real eligibility holds — dflash arms carry the
+        // engine's flash decoder by construction.
+        let dflash = vec![blazar_core::store::SpecReceiptRow {
+            mode: "dflash".into(),
+            ratio: 1.40,
+            ..receipt("dflash", 1.40, false)
+        }];
+        assert_eq!(
+            best(&dflash, &["draft-dflash".to_string()], false),
+            Some(("dflash", 1.40))
+        );
     }
 
     #[test]

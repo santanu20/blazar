@@ -14860,9 +14860,52 @@ aborts on this family. Profile pins for it would measure nothing",
         });
         let dense_tps = rows.iter().find(|r| r.0 == "dense").map_or(0.0, |r| r.1);
         // Persist every arm as a receipt — the supervisor's spec=auto
-        // resolution consults these measurements on later starts.
+        // resolution consults these measurements on later starts. Each
+        // receipt carries its provenance: the hardware that raced, the
+        // exact knobs engaged, and whether those knobs were deliberately
+        // tuned (a tuned ngram shape) or engine defaults — an untuned
+        // ngram arm must never be mistaken for optimized evidence later.
+        let race_hw =
+            blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&engine_row.manifest);
         for (mode, tps) in &rows {
-            store.put_spec_receipt(model, &engine_row.tag, mode, *tps, dense_tps)?;
+            let (spec_params, tuned) = match mode.as_str() {
+                "ngram" => {
+                    let (m, n, min_hits) = ngram_knobs;
+                    if m > 0 {
+                        (
+                            Some(format!(
+                                "{{\"size_m\":{m},\"size_n\":{n},\"min_hits\":{min_hits}}}"
+                            )),
+                            true,
+                        )
+                    } else {
+                        (None, false)
+                    }
+                }
+                "draft" => draft_pair.as_ref().map_or((None, false), |(path, n)| {
+                    (
+                        Some(format!("{{\"draft\":\"{path}\",\"draft_len\":{n}}}")),
+                        true,
+                    )
+                }),
+                // dense is the deliberate baseline; dflash runs the
+                // engine's flash decoder as shipped — no tunable knobs
+                // on either arm, so nothing to record beyond the race.
+                _ => (None, true),
+            };
+            store.put_spec_receipt(
+                model,
+                &engine_row.tag,
+                mode,
+                *tps,
+                dense_tps,
+                &blazar_core::store::SpecProvenance {
+                    hw_fingerprint: race_hw.as_deref(),
+                    spec_params: spec_params.as_deref(),
+                    tuned,
+                    reps: 1,
+                },
+            )?;
         }
         println!(
             "receipts saved ({} rows) — later `spec = \"auto\"` resolves from these measurements",

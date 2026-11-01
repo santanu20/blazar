@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use blazar_core::config::Config;
 use blazar_core::hardware::Hardware;
+use blazar_core::kv_quality;
 use blazar_core::profile::{self, Endpoint, Profile, ProfileInput, TuningOverrides};
 use blazar_core::store::{ProfileRow, Store};
 use blazar_core::{BlazarDirs, ModelOverride};
@@ -742,7 +743,11 @@ impl Tuner<'_> {
         input: &ProfileInput<'_>,
     ) -> Result<(Profile, TuningOverrides, Vec<BenchRow>)> {
         // Validation gate: profile must compile before we spawn anything.
-        profile::compile(input, &TuningOverrides::default()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // The compiled default also fixes the TARGET context every KV
+        // candidate must be quality-evidenced at (the grid never varies
+        // ctx, so one compile answers for all combos below).
+        let base_profile = profile::compile(input, &TuningOverrides::default())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let threads = input.hardware.physical_cores.max(1);
         // Grid axes llama-bench actually supports (verified b10816):
         // threads x KV-quant x flash-attn x batch. (No -c axis: ctx is a
@@ -857,13 +862,52 @@ impl Tuner<'_> {
             return Err(anyhow!("llama-bench rejected every fa leg"));
         }
 
-        // Argmax by mean tg t/s across (threads, quant, fa, batch) combos.
+        // Argmax by mean tg t/s across (threads, quant, fa, batch)
+        // combos — restricted to combos whose KV grades carry measured
+        // quality evidence at the profile's serving context. Throughput
+        // alone must never adopt a degrading grade: the ppl registry is
+        // the eligibility evidence, a grade without a measured rung for
+        // THIS model at >= the compiled ctx stays out of the running,
+        // and f16 is the always-eligible baseline. A model with no
+        // receipts at all tunes over f16 only — the conservative
+        // stance until a campaign measures more grades. The gate
+        // decides only what the tuner adopts on its own; an explicit
+        // `cache_type` model override remains the human override.
+        let kv_eligible = |kv: &(String, String)| {
+            (kv.0 == "f16"
+                || kv_quality::grade_evidenced_at_ctx(input.model_name, &kv.0, base_profile.ctx))
+                && (kv.1 == "f16"
+                    || kv_quality::grade_evidenced_at_ctx(
+                        input.model_name,
+                        &kv.1,
+                        base_profile.ctx,
+                    ))
+        };
+        let mut skipped_grades: BTreeSet<String> = BTreeSet::new();
         let mut best: Option<(f64, Combo)> = None;
         for combo in combos(&grid_rows) {
+            if !kv_eligible(&combo.kv) {
+                for grade in [&combo.kv.0, &combo.kv.1] {
+                    if grade != "f16" {
+                        skipped_grades.insert(grade.clone());
+                    }
+                }
+                continue;
+            }
             let score = mean_tg(&grid_rows, &combo);
             if best.as_ref().is_none_or(|(b, ..)| score > *b) {
                 best = Some((score, combo));
             }
+        }
+        if !skipped_grades.is_empty() {
+            tracing::warn!(
+                model = input.model_name,
+                ctx = base_profile.ctx,
+                grades = skipped_grades.iter().cloned().collect::<Vec<_>>().join(","),
+                "tune: excluded faster KV grades lacking quality evidence at this context \
+                 (measure them via the kv-quality campaign to widen eligibility; \
+                 an explicit cache_type override is unaffected by this gate)"
+            );
         }
         let Some((score, win)) = best else {
             return Err(anyhow!("llama-bench produced no tg rows"));
@@ -966,9 +1010,9 @@ fn persist_profile(
     score: f64,
 ) -> Result<()> {
     let hash = args_hash(input, profile);
-    // Tuning knobs are recorded via the winning argv (they ARE the argv);
-    // `_tuning` is intentionally not serialized separately.
-    let _ = tuning;
+    // Tuning knobs are recorded via the winning argv (they ARE the
+    // argv); `tuning` is not serialized separately — it is only quoted
+    // in the ledger's adoption event below.
     let row = ProfileRow {
         model_name: input.model_name.to_string(),
         engine_tag: input.engine_tag.to_string(),
@@ -991,17 +1035,65 @@ fn persist_profile(
         .ok()
         .flatten()
         .map(|m| m.quant);
+    // Hardware provenance: a tune receipt without its hw fingerprint
+    // cannot be told apart from another machine's numbers later, which
+    // is exactly what the evidence-axes audit flagged. Derived from the
+    // engine manifest (the binary that actually ran the grid).
+    let hw =
+        store.active_engine().ok().flatten().and_then(|e| {
+            blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&e.manifest)
+        });
     store.put_bench_result_with_axes(
         input.model_name,
         input.engine_tag,
         &serde_json::to_string(bench_rows)?,
         &blazar_core::store::EvidenceAxes {
-            quant,
-            hw_fingerprint: None,
+            quant: quant.clone(),
+            hw_fingerprint: hw.clone(),
             workload: Some("tune-search".to_string()),
-            profile_hash: Some(hash),
+            profile_hash: Some(hash.clone()),
         },
     )?;
+    // Optimization ledger: this persist IS an adoption. Record the
+    // experiment identity (immutable), the raw grid measurements
+    // (append-only), the adoption event with its justification, and
+    // repoint active_profiles at the winning experiment. Errors
+    // propagate on purpose — a profile without its evidence trail is
+    // not silently adoptable; the ledger is the trust base every
+    // future auto-optimization decision will be judged against.
+    let experiment_id = store.insert_experiment(
+        input.model_name,
+        input.engine_tag,
+        hw.as_deref(),
+        quant.as_deref(),
+        &row.args_json,
+        &hash,
+        "Throughput",
+    )?;
+    if !bench_rows.is_empty() {
+        store.append_measurement(
+            experiment_id,
+            "llama-bench-grid",
+            row.benchmark_json.as_deref().unwrap_or("[]"),
+        )?;
+    }
+    let reason = if bench_rows.is_empty() {
+        "manual overrides adopted (no grid measured on this path)".to_string()
+    } else {
+        let (k, v) = tuning
+            .kv_pair
+            .clone()
+            .unwrap_or_else(|| ("f16".into(), "f16".into()));
+        format!(
+            "tune-search winner adopted: kv={k}/{v}, fa={}, threads={}, batch={}, \
+             mean_tg={score:.1} tok/s (non-f16 grades quality-evidenced at the serving ctx)",
+            tuning.fa.unwrap_or(false),
+            tuning.threads.unwrap_or(0),
+            tuning.batch.unwrap_or(0),
+        )
+    };
+    store.append_event(experiment_id, "adopted", &reason)?;
+    store.set_active_profile(input.model_name, input.engine_tag, experiment_id)?;
     Ok(())
 }
 
