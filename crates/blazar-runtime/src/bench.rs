@@ -972,7 +972,7 @@ fn persist_profile(
     let row = ProfileRow {
         model_name: input.model_name.to_string(),
         engine_tag: input.engine_tag.to_string(),
-        args_hash: hash,
+        args_hash: hash.clone(),
         args_json: serde_json::to_string(&profile.argv)?,
         benchmark_json: Some(serde_json::to_string(&BenchmarkPayload {
             score,
@@ -981,6 +981,27 @@ fn persist_profile(
         updated_at: now_secs(),
     };
     store.upsert_profile(&row)?;
+    // The winning config's llama-bench rows are also a valid engine-tagged
+    // bench receipt: without this, `tune --search` adoptions leave the
+    // bench_results table at the previous engine tag and doctor's
+    // staleness row fires for a model that was JUST tuned. `workload`
+    // distinguishes tune receipts from plain `blazar bench` ones.
+    let quant = store
+        .get_model(input.model_name)
+        .ok()
+        .flatten()
+        .map(|m| m.quant);
+    store.put_bench_result_with_axes(
+        input.model_name,
+        input.engine_tag,
+        &serde_json::to_string(bench_rows)?,
+        &blazar_core::store::EvidenceAxes {
+            quant,
+            hw_fingerprint: None,
+            workload: Some("tune-search".to_string()),
+            profile_hash: Some(hash),
+        },
+    )?;
     Ok(())
 }
 
