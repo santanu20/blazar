@@ -217,13 +217,16 @@ jobs:
           target/release/blazar completions zsh   > target/rpm-completions/zsh/_blazar
           target/release/blazar completions fish > target/rpm-completions/fish/blazar.fish
       - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm --locked
+        # Pinned: the 0.21 CLI changed --package to take a package PATH
+        # and dropped --sha256; an unpinned install broke two releases.
+        run: cargo install cargo-generate-rpm --version 0.21.1 --locked
       - name: Build rpm
         run: |
-          # No --sha256: current cargo-generate-rpm dropped the flag, and
-          # its digest sidecar was never uploaded or verified — installers
-          # read digests from the GitHub release metadata API instead.
-          cargo generate-rpm -p blazar --target x86_64-unknown-linux-gnu \
+          # Verified against 0.21.1: --package takes the package directory
+          # (the `blazar` bin lives in crates/blazar-cli), assets resolve
+          # from the workspace root per the generate-rpm metadata block,
+          # and installers verify digests via the GitHub release API.
+          cargo generate-rpm --package crates/blazar-cli \
             --output "blazar-${GITHUB_REF_NAME#v}-x86_64.rpm"
       - uses: actions/upload-artifact@v4
         with:
