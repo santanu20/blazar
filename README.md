@@ -360,6 +360,7 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | One-page perf + quality card | `blazar scorecard <model>` |
 | Evidence-gap advice for a model | `blazar optimize <model> --plan` (read-only: names stale benchmarks, untuned speculation, KV grades without quality evidence, missing certificates - and the commands that close each gap) |
 | Measured optimization run | `blazar optimize <model> --run` (screens the tune grid WITHOUT adopting, A/B-measures baseline vs candidate through the live gateway, verdict is noise-gated; the serving profile is restored untouched) |
+| Adopt a verified candidate | `blazar optimize <model> --apply <experiment-id>` (refuses unverified/wrong-lane/wrong-hardware experiments; rollback = apply the prior verified id) |
 | One-word config posture | `blazar config preset balanced` |
 | Observe → recommend per model | `blazar autopilot`, `blazar autopilot --apply` |
 | Pull / import models | `blazar pull <target>`, `blazar import <file> --name <name>` |

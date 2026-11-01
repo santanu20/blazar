@@ -845,11 +845,11 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
 
 fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
-        BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated, FailoverSwitched,
-        InstanceStateChanged, ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress,
-        QueueDepth, SlotsAutoAdopted, SlotsCtxAutoFit, SlotsDecodeBound, SlotsDrainCutover,
-        SlotsPinnedPressure, SlotsPrewarmCutover, SlotsReshaped, SpecGovernorOff,
-        SpecGovernorRecovered,
+        AutotuneAdvice, BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated,
+        FailoverSwitched, InstanceStateChanged, ModelPreloaded, ModelPulled, ModelRemoved,
+        PullFailed, PullProgress, QueueDepth, SlotsAutoAdopted, SlotsCtxAutoFit, SlotsDecodeBound,
+        SlotsDrainCutover, SlotsPinnedPressure, SlotsPrewarmCutover, SlotsReshaped,
+        SpecGovernorOff, SpecGovernorRecovered,
     };
     match e {
         EngineUpdated { .. } => "engine_updated",
@@ -865,6 +865,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
         SlotsPrewarmCutover { .. } => "slots_prewarm_cutover",
         SpecGovernorOff { .. } => "spec_governor_off",
         SpecGovernorRecovered { .. } => "spec_governor_recovered",
+        AutotuneAdvice { .. } => "autotune_advice",
         ModelPulled { .. } => "model_pulled",
         ModelRemoved { .. } => "model_removed",
         PullProgress { .. } => "pull_progress",

@@ -817,6 +817,86 @@ fn experiment_provenance(
     (hw, quant)
 }
 
+// ------------------------------------------------------------- adoption
+
+/// Outcome of a successful `--apply`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdoptOutcome {
+    pub experiment_id: i64,
+    pub model: String,
+    pub engine_tag: String,
+}
+
+/// Wave-3 adoption: promote a VERIFIED experiment to the active
+/// profile. Refuses (with teaching) when the id is unknown, unverified,
+/// or measured on a different lane/hardware. Write order is
+/// profile-row -> adopted event -> pointer LAST, so a pointer's presence
+/// implies the full trail (crash between steps leaves at most a
+/// re-runnable adoption, never a pointer into nothing).
+pub fn adopt_experiment(store: &Store, experiment_id: i64) -> Result<AdoptOutcome> {
+    let exp = store
+        .get_experiment(experiment_id)?
+        .ok_or_else(|| anyhow::anyhow!("no optimization experiment #{experiment_id}"))?;
+    let events = store.list_experiment_events(experiment_id)?;
+    let verified = events
+        .iter()
+        .any(|(_, kind, _)| kind == "verified" || kind == "adopted");
+    if !verified {
+        anyhow::bail!(
+            "experiment #{experiment_id} for {} has no verified event - refusing \
+             to adopt; re-run `blazar optimize {} --run`",
+            exp.model,
+            exp.model
+        );
+    }
+    let active = store
+        .active_engine()?
+        .ok_or_else(|| anyhow::anyhow!("no active engine; adoption needs a lane"))?;
+    if active.tag != exp.engine_tag {
+        anyhow::bail!(
+            "experiment #{experiment_id} was measured on engine '{}', but '{}' is \
+             active - switching engines invalidates its evidence; re-run --run on \
+             the active lane",
+            exp.engine_tag,
+            active.tag
+        );
+    }
+    if let (Some(exp_hw), Some(now_hw)) = (
+        exp.hw_fingerprint.as_deref(),
+        blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&active.manifest).as_deref(),
+    ) {
+        if exp_hw != now_hw {
+            anyhow::bail!(
+                "experiment #{experiment_id} was measured on different hardware \
+                 ({exp_hw}) than the active lane ({now_hw}) - receipts do not \
+                 transfer between machines",
+            );
+        }
+    }
+    let row = ProfileRow {
+        model_name: exp.model.clone(),
+        engine_tag: exp.engine_tag.clone(),
+        args_hash: exp.profile_hash.clone(),
+        args_json: exp.config_json.clone(),
+        benchmark_json: None,
+        updated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    };
+    store.upsert_profile(&row)?;
+    store.append_event(
+        experiment_id,
+        "adopted",
+        "--apply: verified experiment promoted to the active profile",
+    )?;
+    store.set_active_profile(&exp.model, &exp.engine_tag, experiment_id)?;
+    Ok(AdoptOutcome {
+        experiment_id,
+        model: exp.model,
+        engine_tag: exp.engine_tag,
+    })
+}
 
 // ------------------------------------------------------------------ tests
 
@@ -835,6 +915,135 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // adoption gate (Wave 3)
+    // ------------------------------------------------------------------
+
+    fn adopt_store(manifest: &str) -> (blazar_core::store::Store, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = blazar_core::BlazarDirs {
+            config_dir: std::path::PathBuf::from(tmp.path().join("cfg")),
+            data_dir: std::path::PathBuf::from(tmp.path().join("data")),
+        };
+        let store = blazar_core::store::Store::open(&dirs).unwrap();
+        store
+            .upsert_engine(&blazar_core::store::EngineRow {
+                tag: "b1".into(),
+                asset: "a".into(),
+                sha256: String::new(),
+                installed_at: 1_000_000,
+                active: true,
+                manifest: manifest.into(),
+                kind: blazar_core::engine_kind::EngineKind::default(),
+            })
+            .unwrap();
+        (store, tmp)
+    }
+
+    fn hw_manifest() -> String {
+        r#"{"devices":[{"name":"TestGpu","total_mib":8188}]}"#.into()
+    }
+
+    fn manifest_fp() -> String {
+        blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&hw_manifest())
+            .expect("manifest carries a device")
+    }
+
+    fn seed_experiment(
+        store: &blazar_core::store::Store,
+        engine_tag: &str,
+        hw: Option<&str>,
+    ) -> i64 {
+        store
+            .insert_experiment(
+                "m",
+                engine_tag,
+                hw,
+                Some("Q4_K_M".into()),
+                "[]".into(),
+                "hash-1".into(),
+                "Throughput".into(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn unit__adopt_experiment__unknown_id_teaches() {
+        let (store, _tmp) = adopt_store(&hw_manifest());
+        let err = adopt_experiment(&store, 999).unwrap_err().to_string();
+        assert!(err.contains("no optimization experiment #999"), "{err}");
+    }
+
+    #[test]
+    fn unit__adopt_experiment__refuses_unverified_then_adopts_verified() {
+        let (store, _tmp) = adopt_store(&hw_manifest());
+        let id = seed_experiment(&store, "b1", Some(&manifest_fp()));
+
+        let err = adopt_experiment(&store, id).unwrap_err().to_string();
+        assert!(
+            err.contains("no verified event") && err.contains("--run"),
+            "teaching refusal, got: {err}"
+        );
+
+        store
+            .append_event(id, "verified", "gain beyond noise")
+            .unwrap();
+        let out = adopt_experiment(&store, id).unwrap();
+        assert_eq!(
+            (
+                out.experiment_id,
+                out.model.as_str(),
+                out.engine_tag.as_str()
+            ),
+            (id, "m", "b1")
+        );
+
+        // Pointer-last invariant: the row exists AND the pointer is set.
+        let row = store.get_profile("m", "b1").unwrap().expect("adopted row");
+        assert_eq!(row.args_json, "[]");
+        assert_eq!(
+            row.benchmark_json, None,
+            "adoption carries no bench payload - the ledger holds the evidence"
+        );
+        assert!(
+            store.active_profile_of("m", "b1").unwrap().is_some(),
+            "pointer written last"
+        );
+        let kinds: Vec<String> = store
+            .list_experiment_events(id)
+            .unwrap()
+            .into_iter()
+            .map(|(_, k, _)| k)
+            .collect();
+        assert!(kinds.iter().any(|k| k == "adopted"));
+
+        // Re-adopting is safe: an adopted experiment is trivially verified.
+        adopt_experiment(&store, id).unwrap();
+    }
+
+    #[test]
+    fn unit__adopt_experiment__refuses_lane_and_hw_mismatch() {
+        let (store, _tmp) = adopt_store(&hw_manifest());
+
+        // Same hardware, different engine lane: evidence does not cross.
+        let lane_id = seed_experiment(&store, "other-lane", Some(&manifest_fp()));
+        store.append_event(lane_id, "verified", "x").unwrap();
+        let err = adopt_experiment(&store, lane_id).unwrap_err().to_string();
+        assert!(
+            err.contains("measured on engine 'other-lane'"),
+            "lane refusal, got: {err}"
+        );
+
+        // Same lane, different hardware: receipts do not transfer.
+        let hw_id = seed_experiment(&store, "b1", Some("gpu=Elsewhere|vram_mib=1"));
+        store.append_event(hw_id, "verified", "x").unwrap();
+        let err = adopt_experiment(&store, hw_id).unwrap_err().to_string();
+        assert!(err.contains("different hardware"), "hw refusal, got: {err}");
+
+        // Nothing was written by the refusals.
+        assert!(store.get_profile("m", "b1").unwrap().is_none());
+        assert!(store.active_profile_of("m", "b1").unwrap().is_none());
+    }
 
     fn stats(tps_series: &[f64], agg: f64) -> ArmStats {
         ArmStats {

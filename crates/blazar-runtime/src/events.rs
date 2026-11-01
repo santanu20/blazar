@@ -114,6 +114,17 @@ pub enum BlazarEvent {
     SpecGovernorRecovered {
         model: String,
     },
+    /// `autotune = "advise"` periodic scan found optimization
+    /// opportunities for `model` (read-only by construction: the
+    /// operator closes the gaps by hand). `next` is the
+    /// highest-priority recommended command, `warnings`/`recommendations`
+    /// count the plan's warn findings and recs.
+    AutotuneAdvice {
+        model: String,
+        warnings: u32,
+        recommendations: u32,
+        next: Option<String>,
+    },
     ModelPulled {
         name: String,
         /// Post-download GGUF health check: set when the header did not

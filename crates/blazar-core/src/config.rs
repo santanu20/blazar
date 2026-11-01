@@ -106,6 +106,16 @@ pub struct Config {
     /// verification) and MTP measured +50% decode on Qwen3.5-9B; ollama
     /// auto-enables MTP the same way.
     pub spec: String,
+    /// Autotune steward posture. `"off"` (default) = no background
+    /// optimization work at all; `"advise"` = the daemon periodically
+    /// scans stored evidence per model (`optimize --plan` logic) and
+    /// logs the findings — still zero mutations. `"scheduled"`
+    /// (unattended adoption) is REFUSED at parse with a teaching error:
+    /// scheduled autonomy is unlocked only after repeated successful
+    /// manual `optimize --run` / `--apply` cycles prove the lease,
+    /// verification and rollback paths.
+    #[serde(default)]
+    pub autotune: Option<String>,
     /// Pull a missing draft model on first spawn instead of degrading to
     /// dense (spec = "auto") or failing (explicit modes). Applies to the
     /// per-model ensure lane only — router presets keep their
@@ -2958,6 +2968,7 @@ impl Default for Config {
             max_loaded_models: 0,
             child_transport: "tcp".to_string(),
             child_auth: None,
+            autotune: None,
             log_level: None,
             update_channel: UpdateChannel::default(),
             engine_asset: "auto".to_string(),
@@ -3590,6 +3601,13 @@ fn flatten_hierarchy(table: &mut toml::Table) -> CoreResult<()> {
 }
 
 impl Config {
+    /// Whether the daemon's background autotune scan (`advise` posture)
+    /// is on. `off`/unset = no background optimization work at all.
+    #[must_use]
+    pub fn autotune_advise(&self) -> bool {
+        self.autotune.as_deref() == Some("advise")
+    }
+
     /// Load config from `<config_dir>/config.toml`, creating it with defaults
     /// if absent. Then apply `BLAZAR_*` env overrides.
     pub fn load(dirs: &BlazarDirs) -> CoreResult<Self> {
@@ -4304,6 +4322,26 @@ impl Config {
                 "lazy_mode must be \"auto\", \"on\" or \"off\", got {:?}",
                 self.lazy_mode
             )));
+        }
+        // Staged autonomy (docs/research §7.6): advise-only today. The
+        // scheduled posture stays a parse error with teaching until
+        // repeated manual `optimize --run` + `--apply` cycles earn it.
+        match self.autotune.as_deref() {
+            None | Some("off") | Some("advise") => {}
+            Some("scheduled") => {
+                return Err(CoreError::Config(
+                    "autotune = \"scheduled\" is not available yet - run `blazar optimize <model> --run` \
+                     and adopt verified candidates with `blazar optimize <model> --apply <experiment-id>` \
+                     manually first; scheduled autonomy unlocks only after those cycles prove reliable"
+                        .to_string(),
+                ));
+            }
+            Some(other) => {
+                return Err(CoreError::Config(format!(
+                    "autotune must be one of \"off\" or \"advise\" (\"scheduled\" arrives with a proven \
+                     manual track record), got {other:?}"
+                )));
+            }
         }
         // Experimental upstream agent-tooling surface. Global-only by
         // design: a security posture must not vary silently per model.
@@ -6157,6 +6195,44 @@ mod tests {
 
     #[test]
     fn unit__wire_validation__enum_and_range_rejects() {
+        // autotune: scheduled is a planned posture refused with a
+        // TEACHING error (staged autonomy); typos get the plain
+        // vocabulary error; off/advise/default all validate.
+        let scheduled = Config {
+            autotune: Some("scheduled".into()),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(scheduled.contains("not available yet"), "{scheduled}");
+        assert!(scheduled.contains("--apply"), "{scheduled}");
+        for bad in ["auto", "always"] {
+            let err = Config {
+                autotune: Some(bad.into()),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("autotune must be one of"), "{bad}: {err}");
+        }
+        for good in [None, Some("off"), Some("advise")] {
+            Config {
+                autotune: good.map(str::to_string),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap();
+        }
+        assert!(!Config::default().autotune_advise());
+        assert!(
+            Config {
+                autotune: Some("advise".into()),
+                ..Default::default()
+            }
+            .autotune_advise()
+        );
         for bad in ["turbo", "ultra"] {
             let cfg = Config {
                 reasoning_effort: bad.into(),

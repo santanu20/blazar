@@ -2358,6 +2358,10 @@ pub struct Supervisor {
     /// failure so the pre-spawn guard never trusts a census that
     /// predates a failed boot.
     census_cache: std::sync::Mutex<Option<(Instant, Hardware)>>,
+    /// Autotune advise cadence: when the last `autotune = "advise"` scan
+    /// ran (the reaper tick re-scans at most once per
+    /// [`AUTOTUNE_ADVISE_INTERVAL`]). `None` = never.
+    autotune_advise_at: std::sync::Mutex<Option<Instant>>,
     // Test knobs (prod defaults from config).
     /// User-set health-gate budget (`model_load_timeout_secs`), `None` =
     /// unset. Resolved PER KIND at the health gate — see
@@ -2463,6 +2467,7 @@ impl Supervisor {
             capability_pins: std::sync::Mutex::new(std::collections::HashMap::new()),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
             census_cache: std::sync::Mutex::new(None),
+            autotune_advise_at: std::sync::Mutex::new(None),
             load_timeout_secs: config.model_load_timeout_secs,
             shutdown_grace: Duration::from_secs(10),
             reaper_interval: Duration::from_secs(10),
@@ -7267,6 +7272,100 @@ drop them from rpc_servers in config.toml",
         self.maybe_preload().await;
         self.adaptive_slots_reap().await;
         self.measured_pressure_tick();
+        self.autotune_advise_tick();
+    }
+
+    /// How often the `autotune = "advise"` scan re-runs the evidence
+    /// adviser across the store. Advice is cheap (local SQLite reads)
+    /// but the log/event channel should not repeat every 10s reaper
+    /// tick — once per 10 minutes matches the other teach dedups.
+    const AUTOTUNE_ADVISE_INTERVAL: Duration = Duration::from_secs(600);
+
+    /// `autotune = "advise"` posture: periodically run the read-only
+    /// evidence adviser over every model and surface the opportunities
+    /// it finds — one info log line plus a
+    /// [`BlazarEvent::AutotuneAdvice`] per model with recommendations.
+    /// Read-only by construction (`build_plan` mutates nothing); the
+    /// operator closes each gap by hand (`optimize --plan` to inspect,
+    /// `--run`/`--apply` to act). Skipped entirely — zero store opens —
+    /// unless the config enables the posture and the interval elapsed.
+    /// Public so integration tests drive the exact production scan
+    /// without waiting on the reaper timer.
+    pub fn autotune_advise_tick(&self) {
+        if !self.config.autotune_advise() {
+            return;
+        }
+        {
+            let mut last = self
+                .autotune_advise_at
+                .lock()
+                .expect("autotune advise lock");
+            match *last {
+                Some(at) if at.elapsed() < Self::AUTOTUNE_ADVISE_INTERVAL => return,
+                _ => *last = Some(Instant::now()),
+            }
+        }
+        // Unreadable evidence degrades loudly, never silently.
+        let store = match Store::open(&self.dirs) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("autotune advise: store unavailable, skipping scan: {e}");
+                return;
+            }
+        };
+        let engine = match store.active_engine() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("autotune advise: engine row unreadable: {e}");
+                return;
+            }
+        };
+        let models = match store.list_models() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("autotune advise: model list unreadable: {e}");
+                return;
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for row in &models {
+            let inputs = blazar_core::optimize::OptimizeInputs {
+                row,
+                engine: engine.as_ref(),
+                config_ctx: self.config.default_ctx,
+                now,
+                workload_min_requests: blazar_core::optimize::WORKLOAD_MIN_REQUESTS,
+            };
+            match blazar_core::optimize::build_plan(&store, &inputs) {
+                Ok(plan) if !plan.recs.is_empty() => {
+                    let next = plan.recs.first().map(|r| r.cmd.clone());
+                    tracing::info!(
+                        model = %plan.model,
+                        recs = plan.recs.len(),
+                        "autotune advise: run `blazar optimize {} --plan` (next: {})",
+                        plan.model,
+                        next.as_deref().unwrap_or("n/a")
+                    );
+                    self.bus.publish(BlazarEvent::AutotuneAdvice {
+                        model: plan.model.clone(),
+                        warnings: plan
+                            .findings
+                            .iter()
+                            .filter(|f| matches!(f.severity, blazar_core::optimize::Severity::Warn))
+                            .count() as u32,
+                        recommendations: plan.recs.len() as u32,
+                        next,
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(model = %row.name, "autotune advise: plan build failed: {e}");
+                }
+            }
+        }
     }
 
     /// Measured-pressure feedback loop (#28b): re-probe the GPU census
@@ -9932,6 +10031,97 @@ mod routing_tests {
             .unwrap()
             .unwrap();
         assert_eq!(active.tag, "b_good");
+    }
+
+    fn autotune_sup(autotune: Option<&str>) -> (Supervisor, tempfile::TempDir, EventBus) {
+        let bus = EventBus::default();
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        let store = Store::open(&dirs).unwrap();
+        store
+            .upsert_engine(&blazar_core::store::EngineRow {
+                tag: "b1".into(),
+                asset: "a".into(),
+                sha256: String::new(),
+                installed_at: 1_000_000,
+                active: true,
+                manifest: String::new(),
+                kind: blazar_core::engine_kind::EngineKind::default(),
+            })
+            .unwrap();
+        // A fresh model: no bench, no profile, no receipts — the adviser
+        // must recommend the full evidence ladder.
+        store
+            .upsert_model(&blazar_core::store::ModelRow {
+                name: "fresh-model".into(),
+                repo: "r".into(),
+                quant: "Q4_K_M".into(),
+                path: "/tmp/nonexistent.gguf".into(),
+                bytes: 1,
+                sha256: None,
+                mmproj_path: None,
+                components: Vec::new(),
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+                last_used_at: 0,
+            })
+            .unwrap();
+        let mut cfg = Config::default();
+        cfg.autotune = autotune.map(str::to_string);
+        let sup = Supervisor::new(
+            dirs,
+            cfg,
+            bus.clone(),
+            Hardware {
+                physical_cores: 1,
+                total_ram_mib: 1024,
+                gpus: vec![],
+            },
+            Arc::new(FakeEngine(Manifest {
+                tag: "fake".into(),
+                ..Default::default()
+            })),
+        );
+        (sup, root, bus)
+    }
+
+    #[test]
+    fn unit__autotune_advise__scan_publishes_event_then_gates_on_interval() {
+        let (sup, _root, bus) = autotune_sup(Some("advise"));
+        let mut events = bus.subscribe();
+        sup.autotune_advise_tick();
+        match events.try_recv().unwrap() {
+            BlazarEvent::AutotuneAdvice {
+                model,
+                warnings,
+                recommendations,
+                next,
+            } => {
+                assert_eq!(model, "fresh-model");
+                assert!(warnings >= 1, "fresh model must carry warn findings");
+                assert!(recommendations >= 1);
+                assert!(next.is_some_and(|cmd| cmd.contains("bench")));
+            }
+            other => panic!("expected AutotuneAdvice, got {other:?}"),
+        }
+        // Interval gate: an immediate second scan is a no-op.
+        sup.autotune_advise_tick();
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn unit__autotune_advise__default_posture_never_scans() {
+        let (sup, _root, bus) = autotune_sup(None);
+        let mut events = bus.subscribe();
+        sup.autotune_advise_tick();
+        assert!(events.try_recv().is_err());
     }
 
     /// GPU supervisor with one 8188 MiB card — the 2026-09-11 crash box

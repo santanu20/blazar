@@ -2836,8 +2836,75 @@ impl Store {
         }
     }
 
+    /// Fetch one experiment's immutable identity row. `--apply` reads
+    /// this to validate that the id names a real candidate before any
+    /// adoption write happens.
+    pub fn get_experiment(&self, experiment_id: i64) -> CoreResult<Option<ExperimentRow>> {
+        let row = self.conn.query_row(
+            "SELECT id, created_at, model, engine_tag, hw_fingerprint, quant,
+                    config_json, profile_hash, objective
+             FROM optimization_experiments WHERE id = ?1",
+            params![experiment_id],
+            |r| {
+                Ok(ExperimentRow {
+                    id: r.get(0)?,
+                    created_at: r.get(1)?,
+                    model: r.get(2)?,
+                    engine_tag: r.get(3)?,
+                    hw_fingerprint: r.get(4)?,
+                    quant: r.get(5)?,
+                    config_json: r.get(6)?,
+                    profile_hash: r.get(7)?,
+                    objective: r.get(8)?,
+                })
+            },
+        );
+        match row {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every lifecycle event for one experiment, oldest first — the
+    /// audit trail `--apply` checks for a `verified` transition (and
+    /// the one a future `--why` lane will replay for operators).
+    pub fn list_experiment_events(
+        &self,
+        experiment_id: i64,
+    ) -> CoreResult<Vec<(i64, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, kind, reason FROM optimization_events
+             WHERE experiment_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![experiment_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
+/// One immutable `optimization_experiments` row: the candidate's
+/// identity — what was tried, on which lane and hardware, with which
+/// exact argv. Lifecycle lives in `optimization_events`, never here.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExperimentRow {
+    pub id: i64,
+    pub created_at: i64,
+    pub model: String,
+    pub engine_tag: String,
+    pub hw_fingerprint: Option<String>,
+    pub quant: Option<String>,
+    pub config_json: String,
+    pub profile_hash: String,
+    pub objective: String,
+}
 
 /// Daily usage counters for one key.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -3897,6 +3964,48 @@ mod tests {
         s.delete_profile("m", "e").unwrap();
     }
 
+    #[test]
+    fn unit__experiment_getters__row_and_ordered_events_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let s = Store::open(&dirs).unwrap();
+        let id = s
+            .insert_experiment(
+                "qwen3.5-9b",
+                "b1",
+                Some("gpu=T|vram_mib=8188|cpu=x86_64"),
+                Some("Q4_K_M"),
+                r#"["--threads","8"]"#,
+                "abc123",
+                "Throughput",
+            )
+            .unwrap();
+        assert!(
+            s.get_experiment(id + 1).unwrap().is_none(),
+            "unknown id reads as absent, not error"
+        );
+        let row = s.get_experiment(id).unwrap().expect("just inserted");
+        assert_eq!(row.model, "qwen3.5-9b");
+        assert_eq!(row.engine_tag, "b1");
+        assert_eq!(row.quant.as_deref(), Some("Q4_K_M"));
+        assert_eq!(row.config_json, r#"["--threads","8"]"#);
+        assert_eq!(row.profile_hash, "abc123");
+        assert_eq!(row.objective, "Throughput");
+        for (kind, reason) in [
+            ("attempted", "screen winner"),
+            ("measured", "grid"),
+            ("verified", "gain"),
+        ] {
+            s.append_event(id, kind, reason).unwrap();
+        }
+        let events = s.list_experiment_events(id).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|(_, k, _)| k.as_str()).collect();
+        assert_eq!(kinds, ["attempted", "measured", "verified"]);
+        assert!(events.iter().all(|(_, _, r)| !r.is_empty()));
+    }
 
     #[test]
     fn unit__usage_daily__delta_accumulates_and_windows() {

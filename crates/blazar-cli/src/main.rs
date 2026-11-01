@@ -313,6 +313,10 @@ enum Cmd {
         /// the result is a ledger experiment, never a profile change
         #[arg(long, group = "mode")]
         run: bool,
+        /// Adopt a previously verified experiment (`--apply <id>`);
+        /// rollback = apply the prior verified experiment id
+        #[arg(long, group = "mode", value_name = "ID")]
+        apply: Option<i64>,
         /// Verification objective for --run: throughput (default) |
         /// interactive | memory
         #[arg(long)]
@@ -2100,6 +2104,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             model,
             plan,
             run,
+            apply,
             objective,
             concurrency,
             reps,
@@ -2110,6 +2115,7 @@ blazar mmproj <model> <mmproj.gguf path>"
                 &resolve_model_cli(&model),
                 plan,
                 run,
+                apply,
                 objective.as_deref(),
                 concurrency,
                 reps,
@@ -10173,6 +10179,28 @@ fn scorecard_json(
 
 /// `blazar optimize <model> --plan` - render the advise-only evidence
 /// plan. Every line is derived from stored receipts, never guessed.
+/// Best-effort evict ping after an adoption (or any store-level
+/// profile change): a warm child keeps serving the argv it spawned
+/// with until it idles out - the evict makes the next request spawn
+/// fresh. Absent daemon = nothing to evict, skip without noise.
+async fn notify_daemon_evict(model: &str) {
+    let Ok(cfg) = config() else {
+        return;
+    };
+    let base = daemon_base(&cfg);
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return;
+    };
+    let _ = http
+        .post(format!("{base}/api/evict"))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await;
+}
+
 /// `blazar optimize <model>` - three receipt-driven modes: `--plan`
 /// (read-only evidence advice), `--run` (screen a candidate through
 /// the tune grid, verify it against the live gateway via alternating
@@ -10183,12 +10211,49 @@ async fn optimize_cmd(
     model: &str,
     plan: bool,
     run: bool,
+    apply: Option<i64>,
     objective: Option<&str>,
     concurrency: u32,
     reps: u32,
     min_gain_pct: f64,
     json: bool,
 ) -> Result<()> {
+    if let Some(id) = apply {
+        let d = dirs();
+        let store = Store::open(&d)?;
+        let out = blazar_runtime::optimize_run::adopt_experiment(&store, id)?;
+        // A warm child would keep serving the OLD argv until it idles
+        // out - evicting (best-effort) makes the next request spawn
+        // with the adopted profile.
+        notify_daemon_evict(&out.model).await;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "object": "blazar.optimize.apply",
+                    "experiment_id": out.experiment_id,
+                    "model": out.model,
+                    "engine_tag": out.engine_tag,
+                    "status": "adopted",
+                })
+            );
+            return Ok(());
+        }
+        println!(
+            "{}",
+            ok_line(&format!(
+                "adopted experiment #{} for {} on lane {}",
+                out.experiment_id, out.model, out.engine_tag
+            ))
+        );
+        println!("  profile row + ledger pointer updated; warm child evicted if any");
+        println!(
+            "  next request spawns the adopted argv; rollback: blazar optimize {} --apply <prior-verified-id>",
+            out.model
+        );
+        return Ok(());
+    }
+
     if run {
         let d = dirs();
         let store = Store::open(&d)?;
@@ -10307,6 +10372,12 @@ async fn optimize_cmd(
             report.experiment_id
         );
         println!("profiles     baseline row restored - the active profile is unchanged");
+        if v.recommended {
+            println!(
+                "next         blazar optimize {} --apply {}",
+                report.model, report.experiment_id
+            );
+        }
         return Ok(());
     }
 

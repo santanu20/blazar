@@ -1095,6 +1095,7 @@ _COMMAND_ATTRS = {
     "scorecard": (False, False, False, False, True),
     "optimize.plan": (False, False, False, False, True),
     "optimize.run": (False, False, True, False, False),
+    "optimize.apply": (False, False, True, False, False),
     "autopilot": (False, False, False, False, True),
     "certify": (True, True, False, False, True),
     "classify": (False, False, False, False, True),
@@ -13836,11 +13837,11 @@ def phase_wave13() -> None:
         f"rc={pi.returncode} note={'intent:' in out_i}",
     )
 
-    # optimize --run: the full measured-optimizer control path
-    # against the live gateway - tune screen WITHOUT adoption,
-    # gateway A/B at probe cost (C=2, reps=2), noise-gated verdict,
-    # ledger chain, serving profile restored.
-    pr = cli(
+    # optimize --run / --apply: the full measured-optimizer control path
+    # against the live gateway — tune screen WITHOUT adoption, gateway
+    # A/B at probe cost (C=2, reps=2), noise-gated verdict, ledger
+    # chain, serving profile restored. --apply then either adopts the
+    # verified winner or honestly refuses when --run rejected.
     pr = cli(
         "optimize",
         MODEL,
@@ -13873,6 +13874,26 @@ def phase_wave13() -> None:
             "" if ok_run else " tail=" + out_r.strip()[-900:],
         ),
     )
+    m_exp = re.search(r"experiment #(\d+)", out_r)
+    if m_exp is None:
+        reg("optimize.apply", False, "no experiment id surfaced by --run")
+    else:
+        pa = cli("optimize", MODEL, "--apply", m_exp.group(1), timeout=300)
+        out_a = pa.stdout + pa.stderr
+        if "VERIFIED" in out_r:
+            reg(
+                "optimize.apply",
+                pa.returncode == 0 and "adopted" in out_a,
+                f"adopted #{m_exp.group(1)} rc={pa.returncode}",
+            )
+        else:
+            # An honest REJECTED run leaves nothing adoptable — the
+            # refusal IS the correct behavior, not a failure.
+            reg(
+                "optimize.apply",
+                pa.returncode != 0 and "no verified event" in out_a,
+                f"refused unverified #{m_exp.group(1)} rc={pa.returncode}",
+            )
     check(
         "wave13",
         "run --intent agent prints the mapping and generates",
