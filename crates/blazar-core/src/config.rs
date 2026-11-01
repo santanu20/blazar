@@ -3235,7 +3235,27 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
         // millisecond would otherwise copy into the SAME backup path and
         // the loser dies with a Windows sharing violation on the open.
         let bak = path.with_file_name(format!("config.toml.bak-{ms}.{}.{seq}", std::process::id()));
-        retry_on_sharing_violation(|| std::fs::copy(path, &bak))?;
+        if let Err(e) = retry_on_sharing_violation(|| std::fs::copy(path, &bak)) {
+            // Concurrent rotation can retire the source or the fresh
+            // backup mid-copy on some filesystems (observed as ENOENT on
+            // APFS CI under 8 writers). The body write below is the
+            // authoritative operation and recreates the target, so a
+            // vanished-source backup is vacuous — same philosophy as the
+            // armor guard below. Anything else is a real failure.
+            if e.kind() == std::io::ErrorKind::NotFound && !path.exists() {
+                // vacuous: source rotated away; skip the backup
+            } else {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "config backup copy {} -> {}: {e}",
+                        path.display(),
+                        bak.display()
+                    ),
+                )
+                .into());
+            }
+        }
         // fs::copy duplicates the permission bits, so a backup of a
         // previously-loose config would keep the loose mode (BLZ-4):
         // re-armor every backup explicitly. A concurrent writer's prune
@@ -3260,12 +3280,19 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
         .file_name()
         .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned());
     let tmp = path.with_file_name(format!("{name}.tmp-write.{}.{seq}", std::process::id()));
-    std::fs::write(&tmp, body)?;
+    std::fs::write(&tmp, body).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("config write {}: {e}", tmp.display()))
+    })?;
     // The persisted TOML carries `[[keys]]` bearer secrets: the temp is
     // armed owner-only BEFORE the rename so the final inode (rename
     // preserves the temp's mode) never depends on umask (BLZ-4).
     restrict_to_owner(&tmp)?;
-    retry_on_sharing_violation(|| std::fs::rename(&tmp, path))?;
+    retry_on_sharing_violation(|| std::fs::rename(&tmp, path)).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("config rename {} -> {}: {e}", tmp.display(), path.display()),
+        )
+    })?;
     Ok(())
 }
 

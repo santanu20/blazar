@@ -2087,7 +2087,10 @@ blazar mmproj <model> <mmproj.gguf path>"
             export,
             refresh,
         } => certify(&resolve_model_cli(&model), json, export, refresh).await,
-        Cmd::Engine { cmd } => engine_cmd(cmd).await,
+        // Boxed: the engine subtree's future measures ~16 KiB on Windows
+        // ABI layouts, tripping clippy::large_futures there; pinning the
+        // tail dispatch keeps every OS under the stack-growth budget.
+        Cmd::Engine { cmd } => Box::pin(engine_cmd(cmd)).await,
         Cmd::Lora { cmd } => lora_cmd(cmd).await,
         Cmd::Search {
             query,
