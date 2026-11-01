@@ -6,7 +6,7 @@
 //! locally yields the same probe/serve surface as a release asset,
 //! tagged `bNNNN-cuda`.
 //!
-//! Authority rules: cmake and nvcc decide architecture compatibility —
+//! Authority rules: cmake and nvcc decide architecture compatibility -
 //! Blazar only passes the GPU's compute capability (from `nvidia-smi`)
 //! through and surfaces the compiler's own errors verbatim (tail).
 
@@ -30,7 +30,7 @@ use super::{
 
 /// Where `engine build` compiles from. Upstream = a `bNNNN` tag of
 /// `ggml-org/llama.cpp`; Fork = an immutable `owner/repo@sha` pin of a
-/// llama.cpp fork (a temporary capability lane — see the README's
+/// llama.cpp fork (a temporary capability lane - see the README's
 /// capability-lanes section).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildSource {
@@ -62,7 +62,7 @@ pub fn validate_repo_slug(repo: &str) -> Result<()> {
                 // constructed URL would silently normalize to a
                 // different repo than the user named.
                 && *p != "."
-                && *p != ".."                // `repo.git` is a clone-URL spelling, not a slug — the
+                && *p != ".."                // `repo.git` is a clone-URL spelling, not a slug - the
                 // constructed github.com URL would double the suffix.
                 && !p.rsplit_once('.')
                     .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("git"))
@@ -73,7 +73,7 @@ pub fn validate_repo_slug(repo: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!(
-            "invalid repo {repo:?} — pass an owner/name slug like ggml-org/llama.cpp \
+            "invalid repo {repo:?} - pass an owner/name slug like ggml-org/llama.cpp \
              (letters, digits, _ . - only; no URL, no .git)"
         ))
     }
@@ -87,7 +87,7 @@ pub fn validate_commit_sha(sha: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!(
-            "invalid commit {sha:?} — pass the fork's commit SHA (4-40 hex \
+            "invalid commit {sha:?} - pass the fork's commit SHA (4-40 hex \
              digits, e.g. 7c81a9f0), never a branch or tag name: fork lanes \
              are immutable"
         ))
@@ -98,7 +98,7 @@ pub fn validate_commit_sha(sha: &str) -> Result<()> {
 pub fn parse_fork_spec(spec: &str) -> Result<(String, String)> {
     let Some((repo, sha)) = spec.rsplit_once('@') else {
         return Err(anyhow!(
-            "invalid --fork {spec:?} — expected owner/repo@commit-sha"
+            "invalid --fork {spec:?} - expected owner/repo@commit-sha"
         ));
     };
     validate_repo_slug(repo)?;
@@ -109,7 +109,7 @@ pub fn parse_fork_spec(spec: &str) -> Result<(String, String)> {
 /// Engine tag for a fork lane: `fork-<owner>_<repo>-<sha8>-<backend>`.
 /// Deterministic per (repo, commit, backend) so a rebuild replaces the
 /// same row; the `fork-` prefix keeps it outside the `bNNNN` namespace
-/// (`btag_number` yields None — safe from upstream currency checks).
+/// (`btag_number` yields None - safe from upstream currency checks).
 #[must_use]
 pub fn derive_fork_engine_tag(repo: &str, full_sha: &str, backend: BuildBackend) -> String {
     let slug = repo.replace('/', "_");
@@ -119,7 +119,7 @@ pub fn derive_fork_engine_tag(repo: &str, full_sha: &str, backend: BuildBackend)
 
 /// Backends Blazar can build from source. Intentionally only the two
 /// that upstream does not ship as Linux prebuilts worth building
-/// (Vulkan/ROCm/SYCL prebuilts exist — use `engine update` for those).
+/// (Vulkan/ROCm/SYCL prebuilts exist - use `engine update` for those).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildBackend {
     Cuda,
@@ -136,7 +136,7 @@ impl BuildBackend {
     }
 }
 
-/// Binaries copied into the engine dir — exactly the sibling set the
+/// Binaries copied into the engine dir - exactly the sibling set the
 /// release tarballs ship and the quantize/bench/perplexity/rpc lanes
 /// discover. ggml-rpc-server is the one prebuilt assets ship that a
 /// server-only build silently omits (F164/F167: the rpc override leg
@@ -164,8 +164,8 @@ pub const ERROR_TAIL_LINES: usize = 25;
 pub struct BuildOpts {
     pub backend: BuildBackend,
     /// Concrete upstream `bNNNN` tag to compile (the Fork source
-    /// ignores it for naming — the engine tag derives from the pinned
-    /// SHA — but it still labels the build log).
+    /// ignores it for naming - the engine tag derives from the pinned
+    /// SHA - but it still labels the build log).
     pub tag: String,
     /// Where the source comes from: an upstream `bNNNN` tag (default)
     /// or an immutable `owner/repo@sha` fork pin.
@@ -307,7 +307,7 @@ pub fn require_toolchain(tc: &Toolchain, backend: BuildBackend) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!(
-            "missing build toolchain: {} — install, then re-run blazar engine build",
+            "missing build toolchain: {} - install, then re-run blazar engine build",
             missing.join("; ")
         ))
     }
@@ -394,7 +394,7 @@ pub fn cmake_configure_args(
         // Parity with upstream prebuilt engines: they ship the
         // ggml-rpc-server tool (verified live b10896/b10902), and
         // upstream tools/CMakeLists.txt gates add_subdirectory(rpc)
-        // behind GGML_RPC — without this flag the target does not
+        // behind GGML_RPC - without this flag the target does not
         // exist and BUILD_TARGETS' "ggml-rpc-server" entry fails the
         // whole build with "No rule to make target" (caught live
         // 2026-09-11, b10903). The rpc backend is inert unless an
@@ -404,7 +404,7 @@ pub fn cmake_configure_args(
         // default; copying them into the engine store leaves a dead path
         // and the loader fails with a misleading "cannot open shared
         // object file" for a library sitting right next to the binary
-        // (caught live 2026-09-09: RUNPATH=/tmp/blazar-build-…/build/bin
+        // (caught live 2026-09-09: RUNPATH=/tmp/blazar-build-.../build/bin
         // vs upstream release binaries' $ORIGIN). BUILD_RPATH_USE_ORIGIN
         // makes build-tree RPATHs $ORIGIN-relative, matching the layout
         // we install (binary + shared libs in one directory).
@@ -470,7 +470,7 @@ async fn run_cmake_build(
             |n| n.to_string_lossy().into_owned(),
         );
         (on_line)(&format!(
-            "compiler cache: {name} — repeat builds skip recompiling"
+            "compiler cache: {name} - repeat builds skip recompiling"
         ));
     }
     let args = cmake_configure_args(
@@ -517,7 +517,7 @@ async fn run_step(
         .kill_on_drop(true);
     #[cfg(unix)]
     {
-        // tokio::process::Command has an inherent unix process_group —
+        // tokio::process::Command has an inherent unix process_group -
         // new pgid so a killed build cannot take the daemon with it.
         cmd.process_group(0);
     }
@@ -584,14 +584,14 @@ async fn run_step(
         Err(_) => {
             let _ = child.start_kill();
             return Err(anyhow!(
-                "{what} timed out after {}s (pid {pid:?}) — killed",
+                "{what} timed out after {}s (pid {pid:?}) - killed",
                 timeout.as_secs()
             ));
         }
     };
     // The relay task owns the stdout pipe: only once it joins is the
     // channel guaranteed complete. child.wait() alone races lines still
-    // buffered in the pipe — a fast child (stub builds, `cmake --build`
+    // buffered in the pipe - a fast child (stub builds, `cmake --build`
     // with a script backend) can exit before its final echo is read, and
     // an eager drain then loses it forever. Forward the remainder only
     // after the join, until the channel closes (sender dropped).
@@ -609,7 +609,7 @@ async fn run_step(
             .cloned()
             .collect();
         return Err(anyhow!(
-            "{what} exited {status} — last output:\n{}",
+            "{what} exited {status} - last output:\n{}",
             last.join("\n")
         ));
     }
@@ -670,7 +670,7 @@ impl EngineManager {
     /// Effective build source, resolved before any fetch:
     ///
     /// - GitHub's smart-HTTP fetch only accepts full 40-char object
-    ///   names as want-refs — an abbreviated pin (>= 4 hex, validated
+    ///   names as want-refs - an abbreviated pin (>= 4 hex, validated
     ///   at the CLI) is resolved to the full commit first.
     /// - Provenance honesty for caller-provided trees: a `source_dir`
     ///   whose git origin is NOT upstream llama.cpp is a fork
@@ -699,7 +699,7 @@ impl EngineManager {
                 && slug != *LLAMA_CPP_REPO
             {
                 (on_line)(&format!(
-                    "source tree origin is {slug} (not upstream llama.cpp) — \
+                    "source tree origin is {slug} (not upstream llama.cpp) - \
                          stamping this build as a fork lane"
                 ));
                 return Ok(BuildOpts {
@@ -716,7 +716,7 @@ impl EngineManager {
     }
 
     /// Clone (or take) the source tree, configure, build, install, probe,
-    /// activate. The build tree is a tempfile — torn down on every exit
+    /// activate. The build tree is a tempfile - torn down on every exit
     /// path (Drop), success or failure.
     pub async fn build_and_install(
         &self,
@@ -758,7 +758,7 @@ impl EngineManager {
         // installed copy is probed. An absolute build-dir RPATH (the CMake
         // default this lane guards against via BUILD_RPATH_USE_ORIGIN)
         // would otherwise resolve through the still-alive build tree and
-        // let a broken install pass its probe — exactly the live failure
+        // let a broken install pass its probe - exactly the live failure
         // of 2026-09-09. Probe-after-teardown keeps the install check
         // honest: the stored engine must stand on its own.
         // Scoped-tempdir compile + rollback-safe swap (see compile_source_lane).
@@ -821,9 +821,9 @@ impl EngineManager {
             tempfile::TempDir::with_prefix("blazar-build-").context("create build tempdir")?;
         let (src, full_sha) = fetch_source(build_root.path(), tc, opts, tag, on_line).await?;
 
-        // Mine the architecture set the source advertises — the
+        // Mine the architecture set the source advertises - the
         // capability currency the supervisor's unknown-arch re-route
-        // consumes — and pin the lane's identity from it.
+        // consumes - and pin the lane's identity from it.
         let architectures = super::arch_miner::mine_architectures(&src);
         let (engine_tag, mut provenance) = lane_identity(
             &opts.source,
@@ -835,7 +835,7 @@ impl EngineManager {
         // Stamp the supersede floor for forks: the newest upstream
         // release known RIGHT NOW predates the pin, so no mainstream
         // lane at or below it may later graduate this fork. Best
-        // effort — an offline build leaves it unstamped and the
+        // effort - an offline build leaves it unstamped and the
         // legacy arch-coverage rule applies.
         if provenance.source == EngineSource::Fork {
             provenance.floor_release = self.gh.list_releases().await.ok().and_then(|releases| {
@@ -855,14 +855,14 @@ impl EngineManager {
 
         // Rollback-safe swap (same contract as the release lanes'
         // install_with_rollback): the old build is displaced only
-        // AFTER the new one compiled — restored on any later
+        // AFTER the new one compiled - restored on any later
         // failure, discarded once the new row lands. Retire must
         // precede the extraction: install_built_binaries refuses to
         // merge into a live dir.
         let engine_dir = self.dirs.engines_dir().join(&engine_tag);
         let aside = retire_engine_dir(&self.dirs.data_dir, &engine_dir)?;
         // Panic safety for the extract below (future cancellation
-        // cannot strike here — the region from retire to register is
+        // cannot strike here - the region from retire to register is
         // await-free; the guard is what keeps that invariant honest
         // if an await ever sneaks in).
         let mut guard = CancelledInstallGuard {
@@ -944,12 +944,12 @@ async fn resolve_fork_pin(
 
 /// nvidia-smi compute-cap query -> cmake architectures token.
 /// Extract `major.minor` from a version fragment even when padded with
-/// table decoration (`nvidia-smi` banner: `CUDA Version: 13.0     |` —
+/// table decoration (`nvidia-smi` banner: `CUDA Version: 13.0     |` -
 /// the trailing pipe is what a plain trim-and-parse chokes on).
 #[must_use]
 pub(crate) fn parse_version_pair(s: &str) -> Option<(u32, u32)> {
     let digits = |part: &str| -> Option<u32> {
-        // Banner fragments arrive space-padded (" 13.0     |") — skip
+        // Banner fragments arrive space-padded (" 13.0     |") - skip
         // leading whitespace, then take the digit run; junk beyond it
         // (table border, "-rc") is ignored.
         let run: String = part
@@ -964,17 +964,17 @@ pub(crate) fn parse_version_pair(s: &str) -> Option<(u32, u32)> {
 }
 
 /// Live NVIDIA facts for asset selection (mistralrs CUDA lane):
-/// `(driver_cuda, first_gpu_compute_cap)` — `(None, None)` on any
+/// `(driver_cuda, first_gpu_compute_cap)` - `(None, None)` on any
 /// probe failure (caller then falls back to CPU assets). Driver CUDA
 /// comes from the `nvidia-smi` banner (`CUDA Version: 13.0`), which
-/// reflects the driver's runtime capability — exactly the ceiling a
+/// reflects the driver's runtime capability - exactly the ceiling a
 /// prebuilt CUDA binary must not exceed.
 ///
 /// Latency contract: with driver persistence mode OFF (laptop default)
 /// the GPU drops to P3 after ~45 s idle and the FIRST nvidia-smi of a
 /// burst pays ~1.9 s re-waking it (measured 3/3 after idle vs 33-46 ms
 /// back-to-back; CPU load does not reproduce it). Callers that time
-/// this probe must budget seconds, not milliseconds — `sudo
+/// this probe must budget seconds, not milliseconds - `sudo
 /// nvidia-smi -pm 1` pins persistence for servers that want it.
 pub async fn nvidia_gpu_facts() -> (Option<(u32, u32)>, Option<(u32, u32)>) {
     let Some(smi) = detect_toolchain(&path_dirs()).nvidia_smi else {
@@ -1017,7 +1017,7 @@ const CUDA_RUNTIME_LIBS: [&str; 3] = ["libcudart", "libcublas", "libcublasLt"];
 
 /// Decide from `ldconfig -p` output whether the system already exposes
 /// the full CUDA runtime for `major`, so a 410-594 MiB companion
-/// download can be skipped. Pure parser — unit-testable on any box.
+/// download can be skipped. Pure parser - unit-testable on any box.
 #[must_use]
 pub fn cuda_runtime_complete_from_ldconfig(text: &str, major: u32) -> bool {
     let suffix = format!(".so.{major} ");
@@ -1029,7 +1029,7 @@ pub fn cuda_runtime_complete_from_ldconfig(text: &str, major: u32) -> bool {
 
 /// Live probe: does this system expose the full CUDA runtime for
 /// `major`? Linux parses `ldconfig -p` (cudart + cublas + cublasLt for
-/// the major); non-Linux always answers false — Windows resolves DLLs
+/// the major); non-Linux always answers false - Windows resolves DLLs
 /// from the exe dir, so the companion belongs beside the binary and the
 /// probe would only risk a wrong skip.
 pub async fn system_cuda_runtime_complete(major: u32) -> bool {
@@ -1045,7 +1045,7 @@ pub async fn system_cuda_runtime_complete(major: u32) -> bool {
     .and_then(std::result::Result::ok);
     match out {
         Some(o) => cuda_runtime_complete_from_ldconfig(&String::from_utf8_lossy(&o.stdout), major),
-        // ldconfig missing (exotic distro): treat as incomplete — the
+        // ldconfig missing (exotic distro): treat as incomplete - the
         // companion download is the fail-safe answer, never a skip.
         None => false,
     }
@@ -1055,7 +1055,7 @@ async fn query_compute_caps(tc: &Toolchain) -> Result<String> {
     let smi = tc.nvidia_smi.as_ref().ok_or_else(|| {
         anyhow!(
             "no nvidia-smi on PATH and no --arch given: cannot determine the \
-         target CUDA architecture — pass --arch (e.g. 89 for RTX 40xx) or \
+         target CUDA architecture - pass --arch (e.g. 89 for RTX 40xx) or \
          install the NVIDIA driver tools"
         )
     })?;
@@ -1089,7 +1089,7 @@ async fn query_compute_caps(tc: &Toolchain) -> Result<String> {
     cuda_architectures(&caps)
 }
 
-/// Caller-provided source tree, or a fresh clone — plus the resolved
+/// Caller-provided source tree, or a fresh clone - plus the resolved
 /// full commit SHA of the checked-out tree (`None` where no git history
 /// exists, e.g. a test fixture tree). The SHA is recorded as lane
 /// provenance so an engine row always names the exact code it runs.
@@ -1101,7 +1101,7 @@ async fn query_compute_caps(tc: &Toolchain) -> Result<String> {
 /// Fork: clone without checkout, fetch the pinned SHA straight from
 /// origin (no local ref exists for an arbitrary commit), detach onto
 /// `FETCH_HEAD`, verify the checkout matches the pin, then init
-/// submodules — a no-op when the fork carries none.
+/// submodules - a no-op when the fork carries none.
 async fn fetch_source(
     build_root: &Path,
     tc: &Toolchain,
@@ -1156,7 +1156,7 @@ async fn fetch_source(
             let full = git_rev_parse(tc, &src).await?;
             anyhow::ensure!(
                 full.to_lowercase().starts_with(&ref_sha.to_lowercase()),
-                "checked out {full} but the pin asked for {ref_sha} — refusing an \
+                "checked out {full} but the pin asked for {ref_sha} - refusing an \
                  unverified fork lane (forks must build exactly the pinned commit)"
             );
             let mut subs = tokio::process::Command::new(&git);
@@ -1193,7 +1193,7 @@ async fn fetch_source(
     }
 }
 
-/// `git -C <dir> rev-parse HEAD` — full commit SHA of a checked-out
+/// `git -C <dir> rev-parse HEAD` - full commit SHA of a checked-out
 /// tree, for lane provenance.
 async fn git_rev_parse(tc: &Toolchain, dir: &Path) -> Result<String> {
     let git = tc.git.as_ref().context("git gone")?;
@@ -1220,7 +1220,7 @@ async fn git_rev_parse(tc: &Toolchain, dir: &Path) -> Result<String> {
 
 /// `git remote get-url origin` of a tree, normalized to an `owner/repo`
 /// slug. `None` when the tree has no git history or no origin remote
-/// (plain fixture trees) or the URL does not name a GitHub-style slug —
+/// (plain fixture trees) or the URL does not name a GitHub-style slug -
 /// callers treat that as "origin unknown, keep the declared source".
 async fn git_remote_slug(tc: &Toolchain, dir: &Path) -> Option<String> {
     let git = tc.git.as_ref()?;
@@ -1267,7 +1267,7 @@ fn install_built_binaries(
     // merging into a live dir would leave stale files behind.
     anyhow::ensure!(
         !dir.exists(),
-        "engine dir {} already exists — the caller must retire it first",
+        "engine dir {} already exists - the caller must retire it first",
         dir.display()
     );
     let inner = dir.join(format!("llama-{engine_tag}"));
@@ -1288,7 +1288,7 @@ fn install_built_binaries(
         };
         if !bin.join(&name).exists() {
             return Err(anyhow!(
-                "build produced no {name} in {} — upstream layout change?",
+                "build produced no {name} in {} - upstream layout change?",
                 bin.display()
             ));
         }
@@ -1433,7 +1433,7 @@ mod tests {
     #[test]
     fn unit__parse_version_pair__nvidia_smi_banner_shapes() {
         // Real banner row from an RTX 4070 laptop box: table borders pad
-        // the version — the trailing pipe broke trim-and-parse (the live
+        // the version - the trailing pipe broke trim-and-parse (the live
         // CPU-fallback-on-CUDA-box bug).
         let banner =
             "| NVIDIA-SMI: 580.173.02    Driver Version: 580.173.02    CUDA Version: 13.0     |";
@@ -1456,7 +1456,7 @@ mod tests {
         \tlibcublasLt.so.12 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcublasLt.so.12\n\
         \tlibcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1\n";
         assert!(cuda_runtime_complete_from_ldconfig(full_12, 12));
-        // Missing libcublasLt: incomplete — the companion is the
+        // Missing libcublasLt: incomplete - the companion is the
         // fail-safe answer, never a half-skip.
         let no_lt = &full_12.replace("libcublasLt.so.12", "libother.so.12");
         assert!(!cuda_runtime_complete_from_ldconfig(no_lt, 12));
@@ -1636,7 +1636,7 @@ mod tests {
     /// Remote-origin provenance: both GitHub URL forms normalize to a
     /// validated slug; foreign hosts and remote-less trees yield None
     /// (caller keeps the declared source). Skips silently where no git
-    /// binary exists — the probe is about URL parsing, not the tool.
+    /// binary exists - the probe is about URL parsing, not the tool.
     #[tokio::test]
     async fn unit__git_remote_slug__parses_forms_and_ignores_foreign() {
         let Some(git) = std::env::var_os("PATH").and_then(|paths| {

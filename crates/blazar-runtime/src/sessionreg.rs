@@ -49,7 +49,7 @@ impl SessionRegistry {
         let mut map = self.inner.lock().expect("session registry lock");
         if map.len() >= MAX_SESSIONS && !map.contains_key(session) {
             // Full: drop the stalest entry to make room (bounded table,
-            // oldest-activity-first — the same discipline as the heat map).
+            // oldest-activity-first - the same discipline as the heat map).
             if let Some((oldest, _)) = map.iter().min_by_key(|(_, e)| e.last_seen) {
                 let oldest = oldest.clone();
                 map.remove(&oldest);

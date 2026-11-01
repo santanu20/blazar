@@ -36,7 +36,7 @@ use crate::state::AppState;
 
 /// Normalize a census device id for joins: the supervisor writes
 /// backend-namespace keys (`CUDA0`), the capacity census writes
-/// lowercase path ids (`cuda:0`) — to this fn they are the same card.
+/// lowercase path ids (`cuda:0`) - to this fn they are the same card.
 fn join_key(id: &str) -> String {
     id.chars()
         .filter(char::is_ascii_alphanumeric)
@@ -48,7 +48,7 @@ fn join_key(id: &str) -> String {
 /// `nvidia-smi --query-gpu` plus per-pid VRAM from compute-apps.
 pub(crate) type Census<'a> = Option<(&'a [DeviceRow], &'a [(u32, u64)])>;
 
-/// Pure assembly of the fabric snapshot — every input injected, so the
+/// Pure assembly of the fabric snapshot - every input injected, so the
 /// whole read-model is unit-pinnable without a live daemon.
 #[allow(clippy::too_many_lines)] // one JSON block per source, cohesive
 #[must_use]
@@ -90,14 +90,14 @@ pub(crate) fn fabric_snapshot(
                 .collect();
             if gpus.is_empty() {
                 notes.push(
-                    "no GPU census available — non-NVIDIA boxes without an engine manifest \
+                    "no GPU census available - non-NVIDIA boxes without an engine manifest \
                      census report an empty device list; residents below still come from \
                      the supervisor",
                 );
                 (Vec::new(), "none".to_string())
             } else {
                 notes.push(
-                    "nvidia-smi unavailable — device list comes from the active engine \
+                    "nvidia-smi unavailable - device list comes from the active engine \
                      manifest census (no utilization, no per-process VRAM)",
                 );
                 (gpus, "engine manifest census".to_string())
@@ -213,7 +213,7 @@ pub(crate) fn fabric_snapshot(
         })
         .collect();
 
-    notes.push("read-model inventory — placement decisions stay with the spawn planner");
+    notes.push("read-model inventory - placement decisions stay with the spawn planner");
     serde_json::json!({
         "object": "blazar.fabric",
         "backend": backend,
@@ -226,7 +226,7 @@ pub(crate) fn fabric_snapshot(
     })
 }
 
-/// `GET /api/fabric` — the `ComputeFabric` read-model.
+/// `GET /api/fabric` - the `ComputeFabric` read-model.
 pub async fn fabric(State(state): State<Arc<AppState>>) -> Response {
     // Same two bounded nvidia-smi spawns as /api/capacity (~30-60 ms):
     // blocking work, off the async runtime threads.

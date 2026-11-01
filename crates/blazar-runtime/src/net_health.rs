@@ -4,7 +4,7 @@
 //!
 //! - `PyPI` (`pypi.org`, dual-stack): is there any egress, and which
 //!   address family carried it?
-//! - GitHub API (`api.github.com`, IPv4-only — no AAAA, verified
+//! - GitHub API (`api.github.com`, IPv4-only - no AAAA, verified
 //!   2026-10-31): can this box reach the host every engine lane's
 //!   update check needs?
 //! - Captive-portal check (`connectivitycheck.gstatic.com/generate_204`
@@ -13,7 +13,7 @@
 //!
 //! The probes ride the standard proxy environment (`HTTPS_PROXY`/
 //! `ALL_PROXY`) through reqwest's defaults, so a proxied box reports
-//! the proxy's egress — which is the truth that matters for updates.
+//! the proxy's egress - which is the truth that matters for updates.
 
 use std::net::IpAddr;
 
@@ -72,7 +72,7 @@ pub struct NetSnapshot {
     pub portal: ProbeResult,
 }
 
-/// One bounded GET. Errors are compressed to their display string —
+/// One bounded GET. Errors are compressed to their display string -
 /// the diagnosis names conditions, not transport trivia.
 async fn probe(client: &reqwest::Client, url: &str) -> ProbeResult {
     match client.get(url).send().await {
@@ -90,7 +90,7 @@ async fn probe(client: &reqwest::Client, url: &str) -> ProbeResult {
 
 /// Run the three probes concurrently. Each is independently bounded by
 /// [`PROBE_TIMEOUT`]; the snapshot returns even when every probe fails
-/// — a dead network is itself the diagnosis.
+/// - a dead network is itself the diagnosis.
 pub async fn snapshot() -> NetSnapshot {
     blazar_core::tls::ensure_tls_provider();
     let Ok(client) = reqwest::Client::builder()
@@ -113,7 +113,7 @@ pub async fn snapshot() -> NetSnapshot {
 }
 
 /// Human teaching for a snapshot. `None` = everything healthy, nothing
-/// to say. Pure — the unit pins cover every branch.
+/// to say. Pure - the unit pins cover every branch.
 #[must_use]
 pub fn diagnosis(snap: &NetSnapshot) -> Option<String> {
     let github_ok = snap.github.reachable();
@@ -128,14 +128,14 @@ pub fn diagnosis(snap: &NetSnapshot) -> Option<String> {
     }
     if !any_ok && !github_ok {
         return Some(
-            "no egress: pypi.org and api.github.com both unreachable — check the \
+            "no egress: pypi.org and api.github.com both unreachable - check the \
              network/Wi-Fi, or set HTTPS_PROXY to a reachable proxy"
                 .to_string(),
         );
     }
     if portal_active {
         return Some(
-            "captive portal active (connectivity check answered without a 204) — \
+            "captive portal active (connectivity check answered without a 204) - \
              complete the portal login in a browser, then retry"
                 .to_string(),
         );
@@ -143,7 +143,7 @@ pub fn diagnosis(snap: &NetSnapshot) -> Option<String> {
     if !github_ok && snap.any.family == Some(IpFamily::V6) {
         return Some(
             "IPv6-only egress: pypi.org answers over IPv6 but GitHub's API and \
-             release CDNs are IPv4-only (no AAAA) — engine updates are blocked \
+             release CDNs are IPv4-only (no AAAA) - engine updates are blocked \
              until the network provides IPv4 (portal auth / different network) or \
              HTTPS_PROXY points at a reachable proxy; model pulls keep working \
              (huggingface.co is dual-stack)"
@@ -152,22 +152,22 @@ pub fn diagnosis(snap: &NetSnapshot) -> Option<String> {
     }
     if !github_ok {
         return Some(
-            "GitHub API unreachable while the general internet answers — GitHub-side \
+            "GitHub API unreachable while the general internet answers - GitHub-side \
              block or throttle (rate limit/abuse flag): wait it out or set GH_TOKEN"
                 .to_string(),
         );
     }
     // GitHub answers but the dual-stack probe does not: an odd partial
-    // network — say so without over-explaining.
+    // network - say so without over-explaining.
     Some(
-        "partial egress: api.github.com answers but pypi.org does not — pip lanes \
+        "partial egress: api.github.com answers but pypi.org does not - pip lanes \
          (sglang/mlx) will report stale; check HTTPS_PROXY or the network path"
             .to_string(),
     )
 }
 
 /// Memoized [`diagnosis`] for error paths: `engine update --all` walks
-/// four lanes and each failure wants the same suffix — probe once,
+/// four lanes and each failure wants the same suffix - probe once,
 /// cache for half a minute, never add probe latency on a healthy box
 /// (healthy snapshots memoize `None` too).
 pub async fn diagnosis_suffix() -> String {

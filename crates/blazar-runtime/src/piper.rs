@@ -48,7 +48,7 @@ fn pin_path(dirs: &BlazarDirs) -> PathBuf {
     bin_root(dirs).join("pin")
 }
 
-/// Pin-file location from the bare data dir — engine-removal
+/// Pin-file location from the bare data dir - engine-removal
 /// reconciliation (`engine rm` of a pinned tag) runs from the removal
 /// site, which owns the data dir but not a full `BlazarDirs`.
 #[must_use]
@@ -66,7 +66,7 @@ fn valid_tag(tag: &str) -> bool {
 
 /// Sort key for a piper tag: the date shape `YYYY.MM.DD-N` (upstream
 /// has never shipped another form). Non-conforming tags order after
-/// date tags, alphabetically — newest installed still wins sanely.
+/// date tags, alphabetically - newest installed still wins sanely.
 /// `pub` mirrors `gh::btag_number`: the CLI currency lane ranks tags
 /// with it.
 pub type TagKey = (u64, u64, u64, u64);
@@ -90,7 +90,7 @@ pub fn tag_key(tag: &str) -> Option<TagKey> {
 
 type TagDirEntry = (Option<TagKey>, String, PathBuf);
 
-/// Installed tag dirs, newest first — the LEGACY `data/piper` tree
+/// Installed tag dirs, newest first - the LEGACY `data/piper` tree
 /// only. `pub(crate)`: the engines lane's legacy-tree adoption walks
 /// these same dirs, newest first (mirror of the whisper lane).
 pub(crate) fn sorted_tag_dirs(dirs: &BlazarDirs) -> Vec<PathBuf> {
@@ -136,7 +136,7 @@ fn piper_bin_in(dir: &Path) -> Option<PathBuf> {
 
 /// Pin management, mirroring the whisper lane: pin an installed tag or
 /// `None` to clear; prune re-runs so a formerly-protected old tag drops.
-/// The tag may live in either lane — engines rows or the legacy tree —
+/// The tag may live in either lane - engines rows or the legacy tree -
 /// because the user has ONE `--pin` flag and cannot be expected to know
 /// which channel holds the tag.
 pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
@@ -152,12 +152,12 @@ pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
             known.dedup();
             if !known.iter().any(|installed| installed == t) {
                 anyhow::bail!(
-                    "tag {t} is not installed (installed: {}) — run: blazar tts --install --tag {t}",
+                    "tag {t} is not installed (installed: {}) - run: blazar tts --install --tag {t}",
                     known.join(", ")
                 );
             }
-            // The engines lane never creates the legacy pin dir — a
-            // fresh install has no `data/piper` tree at all — so the
+            // The engines lane never creates the legacy pin dir - a
+            // fresh install has no `data/piper` tree at all - so the
             // pin site mkdirs its own home before the write.
             std::fs::create_dir_all(bin_root(dirs))
                 .with_context(|| format!("mkdir {}", bin_root(dirs).display()))?;
@@ -205,7 +205,7 @@ fn prune(dirs: &BlazarDirs) -> Result<()> {
                 | blazar_core::fs_safety::GuardedRemoval::Absent,
             ) => {}
             Ok(blazar_core::fs_safety::GuardedRemoval::Escaped) => {
-                // Not this store's dir — skip, keep the pass moving.
+                // Not this store's dir - skip, keep the pass moving.
                 continue;
             }
             Err(e) => return Err(anyhow!("prune piper dir {}: {e}", dir.display())),
@@ -222,7 +222,7 @@ fn prune(dirs: &BlazarDirs) -> Result<()> {
 ///
 /// Resolution mirrors the whisper lane: a pin is lane-agnostic (honored
 /// against the engines table first, then the legacy tree), then the
-/// engines lane's row, then the legacy `data/piper` tree newest-first —
+/// engines lane's row, then the legacy `data/piper` tree newest-first -
 /// both stay working installs (the engines lane adopts legacy trees at
 /// serve preflight, doctor, and `engine prune`).
 #[must_use]
@@ -263,7 +263,7 @@ fn bin_and_lib_in(dir: &Path) -> Option<(PathBuf, PathBuf)> {
 }
 
 /// The engines-table lane's piper row: a row matching the pin (see
-/// [`server_bin`] — pins are lane-agnostic) first, else the active row
+/// [`server_bin`] - pins are lane-agnostic) first, else the active row
 /// when one is flagged, else the newest installed. `None` when no piper
 /// row exists (the legacy tree decides) or the store cannot be read
 /// (warn, never mask).
@@ -291,7 +291,7 @@ fn engines_lane_row(dirs: &BlazarDirs) -> Option<blazar_core::store::EngineRow> 
     }
     // `list_engines` orders newest-installed first; the active row (if
     // any) still wins so a flagged lane is honored. `installed_at`
-    // breaks ties explicitly — max_by_key on the active flag alone
+    // breaks ties explicitly - max_by_key on the active flag alone
     // returns the LAST row among equal keys, i.e. the OLDEST.
     rows.into_iter()
         .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::Piper)
@@ -310,7 +310,7 @@ fn engines_lane_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
 
 /// Row's binary: the install-time probed path when it still exists,
 /// otherwise re-derived from the tag dir (a relocated data dir must not
-/// brick the lane — same recovery register performs).
+/// brick the lane - same recovery register performs).
 fn engines_lane_server_bin(
     dirs: &BlazarDirs,
     row: &blazar_core::store::EngineRow,
@@ -327,7 +327,7 @@ fn engines_lane_server_bin(
 }
 
 /// The tag currency verdicts must compare against upstream: a mirror of
-/// [`server_bin`]'s pick (pin first — either lane — then the engines
+/// [`server_bin`]'s pick (pin first - either lane - then the engines
 /// row, then the legacy tree). Update hints keyed on a bare lane listing
 /// would warn about a version the serving lane can never pick.
 #[must_use]
@@ -354,7 +354,7 @@ pub fn installed_tag(dirs: &BlazarDirs) -> Option<String> {
 }
 
 /// HF path stem for a piper voice id (`<locale>-<name>-<quality>`, e.g.
-/// `en_US-amy-medium` → `en/en_US/amy/medium/en_US-amy-medium`).
+/// `en_US-amy-medium` -> `en/en_US/amy/medium/en_US-amy-medium`).
 /// `None` on names that don't carry the three-part shape.
 #[must_use]
 pub fn voice_repo_path(voice: &str) -> Option<String> {
@@ -363,7 +363,7 @@ pub fn voice_repo_path(voice: &str) -> Option<String> {
     Some(format!("{lang}/{locale}/{name}/{quality}/{voice}"))
 }
 
-/// Voice id → (locale, name, quality). Piper names use `_`, never `-`
+/// Voice id -> (locale, name, quality). Piper names use `_`, never `-`
 /// (en_GB-northern_english_male-medium), so an rsplitn(3, '-') is
 /// unambiguous. Public so the gateway voices listing can split the same
 /// way the runtime does.
@@ -413,7 +413,7 @@ fn valid_voice(voice: &str) -> bool {
 }
 
 /// One voice in the upstream index (`rhasspy/piper-voices`), with its
-/// on-disk byte size — the searchable remote catalog behind
+/// on-disk byte size - the searchable remote catalog behind
 /// `tts --search`.
 #[derive(Debug, Clone)]
 pub struct RemoteVoice {
@@ -425,7 +425,7 @@ pub struct RemoteVoice {
 /// Voice id + quality from a tree path like
 /// `en/en_US/amy/medium/en_US-amy-medium.onnx`. `None` for the `.json`
 /// config halves and any stem that lacks the pullable
-/// `<locale>-<name>-<quality>` shape — every listed voice must resolve
+/// `<locale>-<name>-<quality>` shape - every listed voice must resolve
 /// through [`voice_repo_path`] later or the row is a dead end.
 #[must_use]
 pub fn voice_from_tree_path(path: &str) -> Option<(String, String)> {
@@ -462,7 +462,7 @@ fn voice_lang_scope(root: &[crate::hf::HfTreeEntry], query: &str) -> Vec<String>
 pub async fn search_voices(hf: &crate::hf::HfClient, query: &str) -> Result<Vec<RemoteVoice>> {
     let root = hf.list_tree(VOICES_REPO, "", false).await?;
     let needle = query.to_lowercase();
-    // One language subtree per request, all in flight at once — each is
+    // One language subtree per request, all in flight at once - each is
     // an independent paginated walk (futures is already a workspace dep).
     // The async block owns its `lang` because `list_tree` borrows the
     // path for the whole paginated future.
@@ -543,7 +543,7 @@ pub async fn pull_voice(
         let _ = blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir);
         return Err(anyhow!(
             "{VOICES_REPO}/{voice}: payload is not a piper voice ({onnx_len} bytes, expected a \
-             multi-MB onnx) — removed"
+             multi-MB onnx) - removed"
         ));
     }
     let json_raw = std::fs::read_to_string(dir.join(format!("{voice}.onnx.json")))
@@ -551,7 +551,7 @@ pub async fn pull_voice(
     if serde_json::from_str::<serde_json::Value>(&json_raw).is_err() {
         let _ = blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir);
         return Err(anyhow!(
-            "{VOICES_REPO}/{voice}: config half is not JSON — removed"
+            "{VOICES_REPO}/{voice}: config half is not JSON - removed"
         ));
     }
     Ok(dest)
@@ -626,7 +626,7 @@ fn validate_speech_input(text: &str, opts: &SpeakOptions) -> Result<(), anyhow::
     }
     if text.chars().count() > MAX_INPUT_CHARS {
         return Err(anyhow!(
-            "input is {} chars (max {MAX_INPUT_CHARS}) — split long documents",
+            "input is {} chars (max {MAX_INPUT_CHARS}) - split long documents",
             text.chars().count()
         ));
     }
@@ -690,7 +690,7 @@ pub async fn synthesize_raw(
 
 /// `sample_rate` from a voice's `.onnx.json` (`audio.sample_rate`), the
 /// one field the streaming transcode lane needs from the voice config.
-/// `None` on any missing/unreadable/malformed piece — the caller teaches
+/// `None` on any missing/unreadable/malformed piece - the caller teaches
 /// rather than guessing a rate.
 #[must_use]
 pub fn voice_sample_rate(dirs: &BlazarDirs, voice: &str) -> Option<u32> {
@@ -730,7 +730,7 @@ fn synthesis_argv(
 /// Emission truth for the piper lane: every flag token a synthesis
 /// spawn can carry, across both output dialects (WAV and raw) with the
 /// full [`SpeakOptions`] surface engaged. Feeds the knob registry
-/// (`crate::knob_registry::lane_flags`); paths are fixtures — only the
+/// (`crate::knob_registry::lane_flags`); paths are fixtures - only the
 /// flag tokens matter.
 #[must_use]
 pub fn knob_surface() -> Vec<String> {
@@ -761,13 +761,13 @@ async fn synthesize_inner(
 ) -> Result<Vec<u8>> {
     let Some((bin, lib_dir)) = server_bin(dirs) else {
         return Err(anyhow!(
-            "piper is not installed — run: blazar tts --install"
+            "piper is not installed - run: blazar tts --install"
         ));
     };
     let Some((onnx, _json)) = voice_file(dirs, voice) else {
         let installed = list_voices(dirs);
         return Err(anyhow!(
-            "voice {voice} is not pulled{} — run: blazar tts --pull {voice}",
+            "voice {voice} is not pulled{} - run: blazar tts --pull {voice}",
             if installed.is_empty() {
                 String::new()
             } else {
@@ -881,7 +881,7 @@ mod tests {
             option_argv(&opts),
             vec![
                 "--length_scale",
-                "0.5000", // speed 2.0 → inverse length scale
+                "0.5000", // speed 2.0 -> inverse length scale
                 "--speaker",
                 "3",
                 "--noise_scale",
@@ -961,10 +961,10 @@ mod tests {
             data_dir: tmp.clone(),
         };
         assert_eq!(voice_sample_rate(&dirs, voice), Some(22_050));
-        // Junk config → None: the caller teaches instead of guessing a rate.
+        // Junk config -> None: the caller teaches instead of guessing a rate.
         std::fs::write(voice_dir.join(format!("{voice}.onnx.json")), b"not json").unwrap();
         assert_eq!(voice_sample_rate(&dirs, voice), None);
-        // Missing voice → None.
+        // Missing voice -> None.
         assert_eq!(voice_sample_rate(&dirs, "en_US-nobody-x"), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1028,7 +1028,7 @@ mod tests {
         // Config halves never surface as voices.
         assert!(voice_from_tree_path("en/en_US/amy/medium/en_US-amy-medium.onnx.json").is_none());
         // A stem without the <locale>-<name>-<quality> shape cannot round-trip
-        // through voice_repo_path later — a listed dead end.
+        // through voice_repo_path later - a listed dead end.
         assert!(voice_from_tree_path("en/stray/voice.onnx").is_none());
     }
 

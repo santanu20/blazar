@@ -2,7 +2,7 @@
 
 Zero-dependency TypeScript client for the
 [blazar](https://github.com/santanu20/blazar) inference control plane.
-Node's built-in `fetch` does the transport — nothing to install beyond
+Node's built-in `fetch` does the transport - nothing to install beyond
 this package. Node >= 18.
 
 ## Install
@@ -41,7 +41,7 @@ const whyThisEngine = await blazar.explain("qwen3-0-6b");
 
 Non-2xx responses throw `BlazarError` with `status` (HTTP code) and
 `blazarCode` (the stable `blazar_code` string from the gateway error
-catalog — see `GET /api/errors`), when present.
+catalog - see `GET /api/errors`), when present.
 
 ## Environment
 

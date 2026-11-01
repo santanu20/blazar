@@ -2,36 +2,36 @@
 //! whisper.cpp lane (H8).
 //!
 //! Decision order:
-//! (1) explicit remote intent (`name:model`) always forwards — the user
+//! (1) explicit remote intent (`name:model`) always forwards - the user
 //!     named a remote;
 //! (2) local lane when whisper-server + at least one ggml model are
 //!     installed (lazy child, hot model swap);
 //! (3) otherwise a teaching error (llama.cpp children do not transcribe).
 //!
 //! Multipart is parsed binary-safe: parts split ONLY on the exact random
-//! boundary — audio bytes cannot forge one.
+//! boundary - audio bytes cannot forge one.
 //!
 //! The local lane REBUILDS the multipart from a verified field
-//! whitelist (upstream has no OpenAI-compatible audio route — `/inference`
+//! whitelist (upstream has no OpenAI-compatible audio route - `/inference`
 //! is the whole surface), so transcription/translation ride the same
 //! lazy child. `/v1/audio/translations` forces `translate=true` on the
 //! rebuilt request; upstream reports `"task": "translate"` back.
 //! `timestamp_granularities` is consumed gateway-side: it forces the
 //! `verbose_json` shape, turns on the engine's token timing, and the
 //! gateway folds token timings into `segments[].words` (engine-derived
-//! only — never interpolated).
+//! only - never interpolated).
 //!
 //! Async: upstream `/inference` is sync-only (no job surface to relay,
 //! unlike the sd-server image lane), so `"async": "true"` as a form
 //! field runs the same forward inside a spawned task and hands back a
-//! gateway-owned job handle — `/v1/audio/jobs/{id}` polls it,
+//! gateway-owned job handle - `/v1/audio/jobs/{id}` polls it,
 //! `/v1/audio/jobs/{id}/cancel` aborts the wait. Jobs die with the
 //! gateway process, the same lifetime truth the image lane attaches to
 //! its children.
 //!
 //! Streaming (F6): upstream has no partial-transcription surface (the
 //! server is mutex-serialized batch), so `"stream": "true"` implements
-//! progressive decode gateway-side — WAV PCM inputs split into
+//! progressive decode gateway-side - WAV PCM inputs split into
 //! frame-aligned windows decoded sequentially on the same lazy child,
 //! one SSE `chunk.completed` per window and a final
 //! `transcript.completed`. Zero throughput cost: the child serializes
@@ -99,7 +99,7 @@ pub(crate) fn parse_multipart(body: &[u8], content_type: &str) -> Option<Vec<Par
         let headers_raw = &body[seg_start..seg_start + hdr_end_rel];
         let data_start = seg_start + hdr_end_rel + sep_len;
         // Data runs to the NEXT delimiter that starts a line (preceded
-        // by CRLF/LF) — binary audio containing the boundary bytes
+        // by CRLF/LF) - binary audio containing the boundary bytes
         // mid-line is data, not a separator.
         let Some(next) = find_line_delim(body, data_start, delim.as_bytes()) else {
             break;
@@ -176,7 +176,7 @@ fn field(parts: &[Part], key: &str) -> Option<String> {
 
 /// whisper-server `/inference` fields we forward, live-verified on
 /// master b5130 (probe + binary strings). Everything else a client
-/// sends is dropped rather than relayed into an upstream 400 — except
+/// sends is dropped rather than relayed into an upstream 400 - except
 /// `timestamp_granularities`, which is CONSUMED gateway-side (see
 /// `granularity_plan`): it forces the `verbose_json` shape and turns on
 /// token-level timing, whose output the gateway folds into
@@ -203,7 +203,7 @@ const FORWARDED_FIELDS: &[&str] = &[
     "carry_initial_prompt",
     "detect_language",
     "audio_ctx",
-    // Token-level timing and non-speech suppression — form-field names
+    // Token-level timing and non-speech suppression - form-field names
     // verified in the b5130 binary strings.
     "token_timestamps",
     "suppress_non_speech",
@@ -217,7 +217,7 @@ const FORWARDED_FIELDS: &[&str] = &[
     "vad_max_speech_duration_s",
     "vad_speech_pad_ms",
     "vad_samples_overlap",
-    // Diarization and verbose-json shaping — live-probed on the b5130
+    // Diarization and verbose-json shaping - live-probed on the b5130
     // child: `diarize=true` labels each segment with its channel's
     // speaker index, `no_language_probabilities=true` drops the
     // language_probabilities/detected_language keys from verbose_json.
@@ -229,7 +229,7 @@ const FORWARDED_FIELDS: &[&str] = &[
 
 /// Rebuilt `/inference` form fields (pure): whitelisted client fields
 /// verbatim, `translate` per the route (`force_translate` overrides any
-/// client value — a translations request always translates), and the
+/// client value - a translations request always translates), and the
 /// `response_format=json` default that keeps non-verbose clients on the
 /// machine-readable shape (observed live: no default upstream).
 fn forwarded_fields(parts: &[Part], force_translate: bool) -> Vec<(String, String)> {
@@ -255,7 +255,7 @@ fn forwarded_fields(parts: &[Part], force_translate: bool) -> Vec<(String, Strin
 /// that would crop or shift a WINDOW instead of the file (a client's
 /// `duration`/`offset_t`/`no_timestamps` mean the whole recording, and
 /// timestamps are the payload of every streaming event), with
-/// `response_format=verbose_json` forced — segments and per-chunk
+/// `response_format=verbose_json` forced - segments and per-chunk
 /// durations are what the SSE events are built from.
 fn forwarded_fields_stream(parts: &[Part], force_translate: bool) -> Vec<(String, String)> {
     const WINDOW_SHAPING: &[&str] = &["response_format", "no_timestamps", "duration", "offset_t"];
@@ -268,7 +268,7 @@ fn forwarded_fields_stream(parts: &[Part], force_translate: bool) -> Vec<(String
 
 /// What the client asked of `timestamp_granularities`. `OpenAI`'s contract
 /// only defines `word` and `segment`, and both only ride on
-/// `verbose_json` — the gateway enforces exactly that (and derives the
+/// `verbose_json` - the gateway enforces exactly that (and derives the
 /// `words` arrays itself; see `enrich_verbose_json_with_words`).
 #[derive(Debug, Clone, Copy, Default)]
 struct Granularity {
@@ -306,7 +306,7 @@ fn granularity_plan(parts: &[Part]) -> Result<Option<Granularity>, String> {
             "segment" => gran.segment = true,
             other => {
                 return Err(format!(
-                    "timestamp_granularities accepts 'word' or 'segment' — got {other:?}. \
+                    "timestamp_granularities accepts 'word' or 'segment' - got {other:?}. \
                      Word timings come back as segments[].words on verbose_json (derived \
                      from the engine's token timestamps, never interpolated); segment \
                      timings are always present on verbose_json"
@@ -315,13 +315,13 @@ fn granularity_plan(parts: &[Part]) -> Result<Option<Granularity>, String> {
         }
     }
     // OpenAI's contract: granularities only exist on verbose_json. A
-    // client naming another format says two contradictory things —
+    // client naming another format says two contradictory things -
     // teach instead of silently picking one.
     if let Some(fmt) = field(parts, "response_format")
         && fmt.trim() != "verbose_json"
     {
         return Err(format!(
-            "timestamp_granularities requires response_format=verbose_json — request \
+            "timestamp_granularities requires response_format=verbose_json - request \
              also named {fmt:?}: drop the explicit format (verbose_json is forced) or \
              set it to verbose_json"
         ));
@@ -339,7 +339,7 @@ fn apply_granularity(fields: &mut Vec<(String, String)>, gran: Granularity) {
     }
 }
 
-/// Replace an existing field's value or append it — the rebuilt form
+/// Replace an existing field's value or append it - the rebuilt form
 /// must never carry duplicates (upstream reads the first occurrence).
 fn set_field(fields: &mut Vec<(String, String)>, key: &str, value: &str) {
     if let Some(slot) = fields.iter_mut().find(|(n, _)| n == key) {
@@ -349,7 +349,7 @@ fn set_field(fields: &mut Vec<(String, String)>, key: &str, value: &str) {
     }
 }
 
-/// `response_format=diarized_json` — a gateway-built format, not an
+/// `response_format=diarized_json` - a gateway-built format, not an
 /// engine one: the child gets `verbose_json` + `diarize=true` and the
 /// reply is mapped to the documented diarized shape. Stereo input is
 /// what makes the labels meaningful (channel 0 = speaker 0, channel 1 =
@@ -358,7 +358,7 @@ fn diarize_requested(parts: &[Part]) -> bool {
     field(parts, "response_format").is_some_and(|f| f.trim() == "diarized_json")
 }
 
-/// Engine diarization prefixes segment text with "(speaker N)" — the
+/// Engine diarization prefixes segment text with "(speaker N)" - the
 /// mapped format carries the label as a field, so the prefix goes.
 fn strip_speaker_prefix(text: &str) -> &str {
     let t = text.trim_start();
@@ -380,7 +380,7 @@ fn strip_speaker_prefix(text: &str) -> &str {
 /// `{duration, text, segments[{id, start, end, text, speaker}]}`. The
 /// speaker value rides verbatim (the engine's channel index); a segment
 /// the engine left unlabeled omits the field instead of guessing.
-/// `None` when the body carries no segments array — the caller fails
+/// `None` when the body carries no segments array - the caller fails
 /// loud rather than relaying a wrong shape under a `diarized_json` name.
 fn to_diarized_json(body: &serde_json::Value) -> Option<serde_json::Value> {
     let segments = body.get("segments")?.as_array()?;
@@ -411,14 +411,14 @@ fn to_diarized_json(body: &serde_json::Value) -> Option<serde_json::Value> {
     }))
 }
 
-/// `OpenAI` audio params the local whisper lane cannot honor — each gets
+/// `OpenAI` audio params the local whisper lane cannot honor - each gets
 /// a teaching 400 that names the nearest supported thing, never a
 /// silent drop.
 fn unsupported_field_error(parts: &[Part]) -> Option<String> {
     if let Some(v) = field(parts, "include") {
         return Some(format!(
             "include={v:?} is an OpenAI cloud extra (logprobs) the local whisper lane \
-             cannot produce — drop it"
+             cannot produce - drop it"
         ));
     }
     if let Some(v) = field(parts, "keywords") {
@@ -445,7 +445,7 @@ fn token_times(token: &serde_json::Value) -> Option<(f64, f64)> {
 
 /// Group one segment's timed tokens into `OpenAI` `words` entries, using
 /// the engine's own word-boundary convention (a token whose text begins
-/// with a space or `▁` starts the next word — the `SentencePiece` marker).
+/// with a space or `▁` starts the next word - the `SentencePiece` marker).
 /// Times come only from engine tokens: a word missing any token timing
 /// is omitted rather than interpolated. Returns the words (empty when
 /// nothing derivable).
@@ -492,7 +492,7 @@ fn words_from_tokens(tokens: &[serde_json::Value], seg_end: Option<f64>) -> Vec<
     // Upstream quirk: token `timestamps` are milliseconds while segment
     // bounds are seconds. A word end beyond the segment's own end (plus
     // slack) but sane once divided by 1000 was milliseconds. Segments
-    // past ~9 minutes are ambiguous under this rule — verified against
+    // past ~9 minutes are ambiguous under this rule - verified against
     // the running child in live validation.
     if let Some(seg_end) = seg_end {
         for w in &mut words {
@@ -509,7 +509,7 @@ fn words_from_tokens(tokens: &[serde_json::Value], seg_end: Option<f64>) -> Vec<
 }
 
 /// Fold token-level timing into `segments[].words` on a `verbose_json`
-/// body (in place, only what the engine actually timed — never
+/// body (in place, only what the engine actually timed - never
 /// interpolated). Engine-served `words` arrays pass through untouched.
 /// Returns whether any words surfaced.
 fn enrich_verbose_json_with_words(body: &mut serde_json::Value) -> bool {
@@ -548,8 +548,8 @@ fn sse_frame(event: &str, data: &serde_json::Value) -> Vec<u8> {
 /// Shift a decoded chunk's segment timestamps onto the source
 /// recording's timeline (`start`/`end` are chunk-relative seconds in
 /// upstream's `verbose_json`). Non-numeric or missing fields pass through
-/// untouched — the event carries what the decoder reported.
-#[allow(clippy::cast_precision_loss)] // ms → s float for JSON segment times
+/// untouched - the event carries what the decoder reported.
+#[allow(clippy::cast_precision_loss)] // ms -> s float for JSON segment times
 fn rebase_segments(segments: &mut serde_json::Value, offset_ms: u64) {
     let Some(list) = segments.as_array_mut() else {
         return;
@@ -612,7 +612,7 @@ async fn inference_post(
 /// a bare name is looked up beside the whisper-server binary (the
 /// engine dir ships `silero-vad ggml` files there), anything else is
 /// taken as a user-owned path. A configured model that cannot be
-/// resolved is a teaching error — VAD is an explicit user intent, and
+/// resolved is a teaching error - VAD is an explicit user intent, and
 /// silently booting without it would hide the miss.
 fn resolve_vad_model(
     state: &AppState,
@@ -635,7 +635,7 @@ fn resolve_vad_model(
         Ok(Some(candidate))
     } else {
         Err(format!(
-            "whisper_vad_model '{name}' not found (looked at {}) — place the \
+            "whisper_vad_model '{name}' not found (looked at {}) - place the \
              Silero VAD ggml in the whisper engine dir or give an absolute path; \
              unset the knob to boot without VAD",
             candidate.display()
@@ -646,7 +646,7 @@ fn resolve_vad_model(
 /// Local lane transport: ensure the lazy child (hot model swap on size
 /// change), forward the multipart fields whisper-server understands,
 /// and return the raw upstream triple. Shared by the sync path and the
-/// async job task — the Err codes/messages are the sync route's exact
+/// async job task - the Err codes/messages are the sync route's exact
 /// error surface, so both lanes fail identically.
 #[allow(clippy::too_many_arguments)] // natural lane surface: state, parts, file, model, translate, stream, gran
 async fn forward_local_raw(
@@ -711,14 +711,14 @@ async fn forward_local_raw(
         (status, _ct, bytes) if diarize && status.is_success() => {
             // diarized_json: map the engine's diarized verbose_json to
             // the documented shape. A success body without a segments
-            // array is not mappable — fail loud, never hand back
+            // array is not mappable - fail loud, never hand back
             // verbose_json under a diarized_json name.
             let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 Err(_) => {
                     return Err((
                         502,
-                        "whisper-server returned a non-JSON body with diarization on — \
+                        "whisper-server returned a non-JSON body with diarization on - \
                          cannot build diarized_json"
                             .to_string(),
                     ));
@@ -737,7 +737,7 @@ async fn forward_local_raw(
                 None => {
                     return Err((
                         502,
-                        "whisper-server returned no segments with diarization on — cannot \
+                        "whisper-server returned no segments with diarization on - cannot \
                          build diarized_json"
                             .to_string(),
                     ));
@@ -747,7 +747,7 @@ async fn forward_local_raw(
         (status, ct, bytes) if gran.is_some_and(|g| g.word) && status.is_success() => {
             // Word granularity: fold the engine's token timings into
             // segments[].words before the body leaves the gateway. Parse
-            // failures leave the body verbatim — the client still gets
+            // failures leave the body verbatim - the client still gets
             // the engine's own verbose_json.
             let mut v: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
@@ -764,7 +764,7 @@ async fn forward_local_raw(
     Ok(((status, ct, bytes), words_derived))
 }
 
-/// Sync local lane: same contract as before the async split — the raw
+/// Sync local lane: same contract as before the async split - the raw
 /// triple rendered as a verbatim passthrough, errors as `openai_error`
 /// with the historical codes and messages.
 #[allow(clippy::too_many_arguments)] // same surface as forward_local_raw
@@ -796,7 +796,7 @@ async fn forward_local(
             let mut builder = Response::builder()
                 .status(status)
                 .header(axum::http::header::CONTENT_TYPE, ct);
-            // Word granularity reports its own outcome — an unavailable
+            // Word granularity reports its own outcome - an unavailable
             // verdict is a capability statement, not a failure.
             if gran.is_some_and(|g| g.word) {
                 builder = builder.header(
@@ -818,7 +818,7 @@ async fn forward_local(
 
 /// Registry ceiling: abandoned handles must not grow the map forever.
 /// At the cap the oldest terminal job is evicted first (nobody polls
-/// those anymore); if all are live, the oldest overall goes — its task
+/// those anymore); if all are live, the oldest overall goes - its task
 /// is aborted, the same as an explicit cancel.
 const MAX_AUDIO_JOBS: usize = 256;
 
@@ -868,7 +868,7 @@ struct AudioJobEntry {
 }
 
 /// Gateway-owned async audio jobs. Every method takes the inner lock
-/// briefly and never across an await — job tasks re-enter the registry
+/// briefly and never across an await - job tasks re-enter the registry
 /// to update their own state, so a held lock would deadlock the lane.
 #[derive(Default)]
 pub struct AudioJobs {
@@ -883,7 +883,7 @@ struct AudioJobStore {
 }
 
 impl AudioJobs {
-    /// Jobs not yet terminal (queued or running) — the `/metrics`
+    /// Jobs not yet terminal (queued or running) - the `/metrics`
     /// activity gauge (audit MM9).
     #[must_use]
     pub fn active_count(&self) -> usize {
@@ -946,7 +946,7 @@ impl AudioJobs {
         let mut store = self.inner.lock().expect("audio jobs lock");
         if let Some(entry) = store.jobs.get_mut(id) {
             // A cancel that fired before the handle landed already
-            // marked the job terminal — keep the handle anyway so a
+            // marked the job terminal - keep the handle anyway so a
             // later drop can still abort the straggler.
             entry.handle = Some(handle);
         }
@@ -1006,7 +1006,7 @@ impl AudioJobs {
 
     /// Poll payload for `/v1/audio/jobs/{id}`: status plus the upstream
     /// triple on completion (body parsed as JSON when possible, raw
-    /// text otherwise — transcription bodies are JSON in practice).
+    /// text otherwise - transcription bodies are JSON in practice).
     pub(crate) fn payload(&self, id: &str) -> Option<serde_json::Value> {
         let store = self.inner.lock().expect("audio jobs lock");
         let entry = store.jobs.get(id)?;
@@ -1039,7 +1039,7 @@ impl AudioJobs {
 }
 
 /// Registry eviction: oldest terminal job first; if everything is live,
-/// the oldest overall (aborted — an implicit cancel).
+/// the oldest overall (aborted - an implicit cancel).
 fn evict_one(store: &mut AudioJobStore) {
     let victim = store
         .jobs
@@ -1056,7 +1056,7 @@ fn evict_one(store: &mut AudioJobStore) {
 
 /// The gateway-only `async` knob: a plain form field (the audio routes
 /// are multipart; images uses the same knob as a JSON field). Honored
-/// on the local lane only — a remote forward streams the client's body
+/// on the local lane only - a remote forward streams the client's body
 /// untouched, remotes keep their own sync contracts.
 fn wants_async(parts: &[Part]) -> bool {
     field(parts, "async").is_some_and(|v| {
@@ -1066,7 +1066,7 @@ fn wants_async(parts: &[Part]) -> bool {
 }
 
 /// The `stream` knob (F6): same multipart-field convention as `async`.
-/// Progressive SSE transcription on the local lane only — remotes keep
+/// Progressive SSE transcription on the local lane only - remotes keep
 /// whatever contract they have upstream.
 fn wants_stream(parts: &[Part]) -> bool {
     field(parts, "stream").is_some_and(|v| {
@@ -1077,14 +1077,14 @@ fn wants_stream(parts: &[Part]) -> bool {
 
 /// `stream=true` (F6): progressive transcription over SSE. WAV PCM
 /// inputs split into `whisper_stream_chunk_ms` windows (frame-aligned,
-/// lossless — see `whisper::split_wav`) decoded sequentially on the
+/// lossless - see `whisper::split_wav`) decoded sequentially on the
 /// same lazy child, so text surfaces every window instead of only when
 /// the whole file finishes. Upstream is mutex-serialized batch (no
 /// streaming surface exists to relay), so sequential windows cost zero
 /// throughput versus one monolithic decode. Events: `chunk.completed`
 /// per window (source-relative timestamps), one final
 /// `transcript.completed`, `error` for mid-stream failures (once the
-/// event stream is open, failures stop being HTTP status codes — every
+/// event stream is open, failures stop being HTTP status codes - every
 /// major SSE API behaves the same), and `: keep-alive` comments during
 /// long window decodes so proxies do not reap an idle connection.
 /// Non-WAV inputs decode once and stream as a single final event: the
@@ -1093,7 +1093,7 @@ fn wants_stream(parts: &[Part]) -> bool {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // one streaming transcription relay: parse, rebased SSE, usage
 #[allow(clippy::unused_async)] // axum handler shape; body streams via the response
-#[allow(clippy::cast_possible_truncation)] // duration seconds → ms for segment math
+#[allow(clippy::cast_possible_truncation)] // duration seconds -> ms for segment math
 #[allow(clippy::cast_sign_loss)] // negative durations are invalid input; clamp-by-cast is acceptable
 async fn forward_local_stream(
     state: &Arc<AppState>,
@@ -1131,7 +1131,7 @@ async fn forward_local_stream(
     let lib_dir = lib_dir.to_path_buf();
     let size = size.to_string();
     tokio::spawn(async move {
-        // Cold child boot can take its whole ready timeout — that failure
+        // Cold child boot can take its whole ready timeout - that failure
         // and every later one surface as `error` events, never silence.
         let vad_model = match resolve_vad_model(&task_state, &bin) {
             Ok(v) => v,
@@ -1282,7 +1282,7 @@ async fn forward_local_stream(
 
 /// Submit an async job: reserve the handle, spawn the forward task,
 /// answer with the gateway-owned job envelope (same shape vocabulary as
-/// the images lane's `async` handles). No awaits — the spawned task owns
+/// the images lane's `async` handles). No awaits - the spawned task owns
 /// all the waiting.
 #[allow(clippy::too_many_arguments)] // mirrors forward_local_raw plus owned parts
 fn submit_async(
@@ -1300,7 +1300,7 @@ fn submit_async(
     let id = state.audio_jobs.reserve(owner);
     // Durable ledger write-through: the row outlives the gateway, the
     // input artifact makes a resubmit after an abandon possible without
-    // re-uploading (bounded — oversized uploads skip the copy, the row
+    // re-uploading (bounded - oversized uploads skip the copy, the row
     // still lands).
     let mut request = serde_json::json!({
         "size": size,
@@ -1349,7 +1349,7 @@ fn submit_async(
         {
             Ok(((status, ct, bytes), _words_derived)) => {
                 // Word-derived bodies are already enriched inside
-                // forward_local_raw — pollers see the same words the
+                // forward_local_raw - pollers see the same words the
                 // sync lane returns.
                 task_state
                     .audio_jobs
@@ -1385,9 +1385,9 @@ fn submit_async(
         .unwrap_or_else(|_| openai_error(500, "response build").into_response())
 }
 
-/// GET /v1/audio/jobs/{id} — poll a gateway-owned async audio job. The
+/// GET /v1/audio/jobs/{id} - poll a gateway-owned async audio job. The
 /// live registry answers while this gateway lives; the durable ledger
-/// answers after a restart (completed results and honest failures —
+/// answers after a restart (completed results and honest failures -
 /// in-flight work cannot resume and is swept to `abandoned` at boot).
 #[allow(clippy::unused_async)] // axum's Handler trait requires async fns
 pub async fn audio_jobs_get(
@@ -1401,7 +1401,7 @@ pub async fn audio_jobs_get(
     {
         return openai_error(400, "invalid job id");
     }
-    // Live registry first, then the durable row — either way the owner
+    // Live registry first, then the durable row - either way the owner
     // gate answers 404 for a foreign key before any payload leaks (BLZ-1).
     if let Some(owner) = state.audio_jobs.owner_of(&job_id) {
         if !crate::keys::owner_allows(owner.as_deref(), key_ext.as_deref()) {
@@ -1433,14 +1433,14 @@ pub async fn audio_jobs_get(
     }
     openai_error(
         404,
-        "job not found — live audio handles are capped and gateway-owned; durable records \
+        "job not found - live audio handles are capped and gateway-owned; durable records \
          live at /v1/jobs/{id} (completed results survive restarts)",
     )
 }
 
-/// POST /v1/audio/jobs/{id}/cancel — abort a queued/running job. The
+/// POST /v1/audio/jobs/{id}/cancel - abort a queued/running job. The
 /// wait stops immediately; an in-flight upstream inference runs to
-/// completion inside the child (whisper-server has no cancel surface —
+/// completion inside the child (whisper-server has no cancel surface -
 /// the result is simply discarded). Terminal jobs answer with their
 /// final state (idempotent).
 #[allow(clippy::unused_async)] // axum's Handler trait requires async fns
@@ -1455,7 +1455,7 @@ pub async fn audio_jobs_cancel(
     {
         return openai_error(400, "invalid job id");
     }
-    // Owner gate before the abort side effect — a foreign key must not
+    // Owner gate before the abort side effect - a foreign key must not
     // cancel (BLZ-1); registry first, durable row as after-restart truth.
     let entry_owner: Option<String> = match state.audio_jobs.owner_of(&job_id) {
         Some(owner) => owner,
@@ -1467,7 +1467,7 @@ pub async fn audio_jobs_cancel(
     if !crate::keys::owner_allows(entry_owner.as_deref(), key_ext.as_deref()) {
         return openai_error(404, "job not found");
     } // cancel() performs the abort side effect (a terminal/unknown job is
-    // a no-op); either way the answer is the job's current state — 200
+    // a no-op); either way the answer is the job's current state - 200
     // with the payload, 404 when no such job exists.
     if state.audio_jobs.cancel(&job_id) == Some(true) {
         state.jobs.record_cancelled(&state, &job_id);
@@ -1485,8 +1485,8 @@ pub async fn audio_jobs_cancel(
         .flatten()
     {
         // Registry miss but a ledger row exists (restarted gateway or an
-        // evicted cap slot): close an in-flight row — its task died with
-        // the old process — and answer from the row.
+        // evicted cap slot): close an in-flight row - its task died with
+        // the old process - and answer from the row.
         if matches!(row.state.as_str(), "queued" | "running") {
             state.jobs.record_cancelled(&state, &job_id);
         }
@@ -1495,18 +1495,18 @@ pub async fn audio_jobs_cancel(
             .flatten();
         match fresh {
             Some(fresh) => axum::Json(crate::jobs::row_payload(&fresh)).into_response(),
-            None => openai_error(404, "job not found — durable records live at /v1/jobs/{id}"),
+            None => openai_error(404, "job not found - durable records live at /v1/jobs/{id}"),
         }
     } else {
         openai_error(
             404,
-            "job not found — live audio handles are capped and gateway-owned; durable records \
+            "job not found - live audio handles are capped and gateway-owned; durable records \
              live at /v1/jobs/{id}",
         )
     }
 }
 
-/// GET /v1/audio/capabilities — the audio lane's gateway-derived menu.
+/// GET /v1/audio/capabilities - the audio lane's gateway-derived menu.
 /// Unlike `/v1/images/capabilities` (a relay of the child's sampler
 /// menu), whisper-server has no capabilities route, so this reads local
 /// truth only: engine presence, pulled models, live child state, and
@@ -1552,16 +1552,16 @@ pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response 
         "diarized_json": {
             "input": "stereo (channel 0 = speaker 0, channel 1 = speaker 1); mono collapses \
                       to a single speaker",
-            "shape": "{duration, text, segments[{id, start, end, text, speaker}]} — speaker \
+            "shape": "{duration, text, segments[{id, start, end, text, speaker}]} - speaker \
                       is the engine's channel index, segments the engine left unlabeled \
                       omit the field",
         },
         "timestamp_granularities": {
             "values": ["word", "segment"],
-            "requires": "response_format=verbose_json — forced automatically when absent, \
+            "requires": "response_format=verbose_json - forced automatically when absent, \
                          400 when the request names another format",
             "words": "segments[].words derived from the engine's token timestamps, never \
-                      interpolated — the sync lane reports derived|unavailable via the \
+                      interpolated - the sync lane reports derived|unavailable via the \
                       x-blazar-word-timestamps header",
         },
         "engine_fields": {
@@ -1617,7 +1617,7 @@ pub async fn audio_transcriptions(
 
     // (1) Explicit remote intent wins: `name:model` never goes local.
     // F11: remote audio lanes pay key admission too (scope + rate +
-    // request count) — every other remote lane has since the audit; the
+    // request count) - every other remote lane has since the audit; the
     // token sniffer has nothing to read in whisper JSON (no usage
     // field), so request counts are the charge unit here.
     if let Some(model) = model.as_deref()
@@ -1644,7 +1644,7 @@ pub async fn audio_transcriptions(
     }
 
     // (2) Local lane: installed binary + pulled ggml model. Name the exact
-    // missing half — "lane not installed" when the server binary is the
+    // missing half - "lane not installed" when the server binary is the
     // gap, "no model pulled" when the server is fine but transcription
     // has nothing to load (both halves observed live in validation).
     // The lane pays the same admission the remote branch just paid
@@ -1667,7 +1667,7 @@ pub async fn audio_transcriptions(
         return openai_error(
             400,
             "stream and async are mutually exclusive: stream returns progressive SSE \
-             events, async returns a pollable job handle — pick one",
+             events, async returns a pollable job handle - pick one",
         );
     }
     if let Some(msg) = unsupported_field_error(&parts) {
@@ -1680,7 +1680,7 @@ pub async fn audio_transcriptions(
     if gran.is_some() && wants_stream(&parts) {
         return openai_error(
             400,
-            "timestamp_granularities applies to the buffered lanes — the SSE stream emits \
+            "timestamp_granularities applies to the buffered lanes - the SSE stream emits \
              its own segment events and has no words surface: drop stream or the \
              granularities field",
         );
@@ -1689,7 +1689,7 @@ pub async fn audio_transcriptions(
     if diarize && wants_stream(&parts) {
         return openai_error(
             400,
-            "response_format=diarized_json applies to the buffered lanes — the SSE stream \
+            "response_format=diarized_json applies to the buffered lanes - the SSE stream \
              emits its own segment events and carries no speaker labels: drop stream or \
              pick verbose_json",
         );
@@ -1732,7 +1732,7 @@ pub async fn audio_transcriptions(
 }
 
 /// `/v1/audio/translations`: same decision order as transcriptions,
-/// same lazy child — the only difference is `translate=true` forced on
+/// same lazy child - the only difference is `translate=true` forced on
 /// the rebuilt `/inference` request (upstream has no separate route).
 #[allow(clippy::too_many_lines)] // mirrors audio_transcriptions plus the translate flag
 pub async fn audio_translations(
@@ -1759,7 +1759,7 @@ pub async fn audio_translations(
     let model = field(&parts, "model");
 
     // (1) Explicit remote intent wins (F11 admission, same as
-    // transcriptions — request counts are the charge unit here).
+    // transcriptions - request counts are the charge unit here).
     if let Some(model) = model.as_deref()
         && split_remote(model, &state.config).is_some()
     {
@@ -1802,7 +1802,7 @@ pub async fn audio_translations(
         return openai_error(
             400,
             "stream and async are mutually exclusive: stream returns progressive SSE \
-             events, async returns a pollable job handle — pick one",
+             events, async returns a pollable job handle - pick one",
         );
     }
     if let Some(msg) = unsupported_field_error(&parts) {
@@ -1815,7 +1815,7 @@ pub async fn audio_translations(
     if gran.is_some() && wants_stream(&parts) {
         return openai_error(
             400,
-            "timestamp_granularities applies to the buffered lanes — the SSE stream emits \
+            "timestamp_granularities applies to the buffered lanes - the SSE stream emits \
              its own segment events and has no words surface: drop stream or the \
              granularities field",
         );
@@ -1824,7 +1824,7 @@ pub async fn audio_translations(
     if diarize && wants_stream(&parts) {
         return openai_error(
             400,
-            "response_format=diarized_json applies to the buffered lanes — the SSE stream \
+            "response_format=diarized_json applies to the buffered lanes - the SSE stream \
              emits its own segment events and carries no speaker labels: drop stream or \
              pick verbose_json",
         );
@@ -1878,7 +1878,7 @@ fn teaching_detail(has_server: bool, requested: &str, available: &[String]) -> S
     if has_server {
         format!(
             "whisper server installed but no usable model for {requested:?} \
-             — pull one: `blazar whisper --pull base`. \
+             - pull one: `blazar whisper --pull base`. \
              Available local models: {avail}."
         )
     } else {
@@ -1898,7 +1898,7 @@ mod tests {
     use super::*;
 
     fn body(boundary: &str, parts: &[(&str, &str, &[u8])]) -> (Vec<u8>, String) {
-        // (name, filename, data) — data is embedded verbatim between the
+        // (name, filename, data) - data is embedded verbatim between the
         // delimiters, exactly like a real audio part would be.
         let mut b = Vec::new();
         for (name, filename, data) in parts {
@@ -1999,7 +1999,7 @@ mod tests {
         assert!(d.contains("base, small"), "got: {d}");
     }
 
-    /// Form body where `fields` are plain value parts (no filename —
+    /// Form body where `fields` are plain value parts (no filename -
     /// what `field()` matches) plus one file part.
     fn mixed_body(
         boundary: &str,
@@ -2064,7 +2064,7 @@ mod tests {
 
     #[test]
     fn unit__forwarded_fields__force_translate_overrides_client_value() {
-        // The translations route OWNS translate — even an explicit
+        // The translations route OWNS translate - even an explicit
         // client "false" must not disable it, and a client "true" must
         // not duplicate the part.
         let (b, ct) = mixed_body("XbOuNdArY", &[("translate", b"false")], ("a.wav", b"RIFF"));
@@ -2117,7 +2117,7 @@ mod tests {
         assert!(!wants_async(&parts));
     }
 
-    /// Registry lifecycle: reserve → running → completed carries the
+    /// Registry lifecycle: reserve -> running -> completed carries the
     /// upstream triple into the poll payload; fail and cancel are
     /// terminal and idempotent; unknown ids 404 (payload None).
     #[test]
@@ -2192,7 +2192,7 @@ mod tests {
     fn unit__audio_jobs__eviction_oldest_terminal_first() {
         let jobs = AudioJobs::new();
         // One live job reserved early, then a wave of terminal jobs past
-        // the cap — the early live one must survive every eviction.
+        // the cap - the early live one must survive every eviction.
         let live = jobs.reserve(None);
         jobs.mark_running(&live);
         let mut first_terminal = String::new();
@@ -2214,7 +2214,7 @@ mod tests {
     }
 
     /// Audit MM9: `active_count` is the /metrics footprint of the local
-    /// audio lane — queued+running only; every terminal state (or
+    /// audio lane - queued+running only; every terminal state (or
     /// eviction) stops counting.
     #[test]
     fn unit__audio_jobs__active_count_tracks_live_only() {
@@ -2333,7 +2333,7 @@ mod tests {
     #[test]
     fn unit__forwarded_fields__vad_and_token_fields_ride() {
         // The b5130-verified engine knobs must reach the rebuilt form
-        // verbatim — VAD tuning and token timing are request-side
+        // verbatim - VAD tuning and token timing are request-side
         // whisper.cpp fields, not gateway concepts.
         let (b, ct) = mixed_body(
             "XbOuNdArY",
@@ -2397,7 +2397,7 @@ mod tests {
         assert!(err.contains("'word' or 'segment'"), "got: {err}");
         assert!(err.contains("syllable"), "got: {err}");
 
-        // Granularities only exist on verbose_json — an explicit other
+        // Granularities only exist on verbose_json - an explicit other
         // format is a contradiction, taught, not silently resolved.
         let (b, ct) = mixed_body(
             "XbOuNdArY",
@@ -2447,7 +2447,7 @@ mod tests {
         );
         assert_eq!(get("response_format", &fields), Some("verbose_json"));
         assert_eq!(get("token_timestamps", &fields), Some("true"));
-        // Exactly one of each key — duplicates would shift meaning
+        // Exactly one of each key - duplicates would shift meaning
         // upstream (first occurrence wins).
         for key in ["response_format", "token_timestamps"] {
             let n = fields.iter().filter(|(n, _)| n == key).count();
@@ -2484,7 +2484,7 @@ mod tests {
             "got: {err}"
         );
 
-        // The supported vocabulary stays silent — diarized_json included
+        // The supported vocabulary stays silent - diarized_json included
         // since W9 (gateway-built on the engine's live-probed diarize
         // field; mono input collapses to one speaker).
         for fmt in [
@@ -2549,7 +2549,7 @@ mod tests {
         // No prefix at all.
         assert_eq!(strip_speaker_prefix("  plain"), "plain");
 
-        // No segments array → None (caller fails loud, 502).
+        // No segments array -> None (caller fails loud, 502).
         assert!(to_diarized_json(&serde_json::json!({"text": "x"})).is_none());
     }
 
@@ -2576,10 +2576,10 @@ mod tests {
     #[test]
     fn unit__enrich_verbose_json_with_words__groups_tokens_by_leading_marker() {
         // whisper.cpp token timings arrive in MILLISECONDS while segment
-        // bounds are seconds — the normalization against the segment
+        // bounds are seconds - the normalization against the segment
         // end converts (0,320)/(320,640) into 0.0/0.32/0.64. The
         // SentencePiece marker (▁) starts a new word; unmarked tokens
-        // append to the current word ("▁cat" + "s" → "cats").
+        // append to the current word ("▁cat" + "s" -> "cats").
         let mut body = serde_json::json!({
             "text": "The cats",
             "segments": [{
@@ -2635,7 +2635,7 @@ mod tests {
         assert_eq!(words.len(), 1);
         assert_eq!(words[0]["word"], "kept");
 
-        // No timing anywhere: nothing derived (false), body unchanged —
+        // No timing anywhere: nothing derived (false), body unchanged -
         // never interpolated.
         let mut body = serde_json::json!({
             "segments": [{

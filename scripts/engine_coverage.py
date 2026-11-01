@@ -10,7 +10,7 @@ Disposition pipeline (first match wins):
                             model on this hardware). Emission alone proves
                             the argv; the receipt proves the behavior.
   first-class               Blazar pins the flag from config knobs or
-                            derivations — it appears in
+                            derivations - it appears in
                             scripts/first_class_flags.json, which is
                             generated from LIVE emission (profile-compiler
                             fixtures + spawn-time argv builders; see
@@ -28,7 +28,7 @@ Disposition pipeline (first match wins):
                             manifest-gated strict on mistralrs / sglang /
                             sdcpp / mlx; reserved-checked on whisper).
                             Grouped into keyword families for readability
-                            only — the disposition is uniform.
+                            only - the disposition is uniform.
   not-applicable            the flag is not a capability Blazar could
                             integrate: CLI ergonomics, alternative input
                             surfaces, or an alias of a flag the lane
@@ -42,7 +42,7 @@ Disposition pipeline (first match wins):
                             guessed.
 
 Policy: promotion from passthrough to a first-class knob requires
-workload evidence — a receipt in scripts/certification_receipts.json
+workload evidence - a receipt in scripts/certification_receipts.json
 linking the flag to a live-engine run. Emission tests gate the "how",
 receipts gate the "why".
 
@@ -55,7 +55,7 @@ Non-flag scope dispositions (documented, not flag-level):
     launch path; router/disagg flags that the installed server advertises
     are passthrough-reachable where the manifest gates allow. A dedicated
     router tier is a scope decision, not a wiring gap.
-  - sdcpp component settings: certification-pending — knob emission is
+  - sdcpp component settings: certification-pending - knob emission is
     pinned by the registry, per-component behavior against real models is
     tracked by the benchmark harness, not this audit.
 
@@ -63,7 +63,7 @@ Modes:
   (default)   human-readable matrix to stdout
   --json      machine-readable dump (disposition per flag)
   --markdown  regenerate docs/engine-coverage.md (byte-stable, no
-              timestamps — the --check gate compares bytes)
+              timestamps - the --check gate compares bytes)
   --refresh   snapshot the live store's engine manifests into
               scripts/manifest_flag_fixtures.json, then regenerate the
               doc from the new fixtures (commit both together)
@@ -146,12 +146,12 @@ RESERVED: dict[str, list[str]] = {
     "mlx": ["--model", "--host", "--port"],
     # whisper.rs, RESERVED_WHISPER_FLAGS (loopback/model/VAD pins)
     "whisper": ["--host", "--port", "--model", "--vad", "--vad-model"],
-    # llamacpp: no reserved set — extra_args ride verbatim.
+    # llamacpp: no reserved set - extra_args ride verbatim.
 }
 
 # Lanes the emission-truth registry does not cover yet. knob_registry.rs
 # owns llamacpp/mistralrs/sglang/sdcpp/mlx; whisper and piper ride
-# knob_surface(). Empty today — kept so a future lane that composes its
+# knob_surface(). Empty today - kept so a future lane that composes its
 # argv outside the registry is forced to say so here, out loud.
 LANES_WITHOUT_REGISTRY: set[str] = set()
 
@@ -160,12 +160,12 @@ LANES_WITHOUT_REGISTRY: set[str] = set()
 # one-shot synthesizer spawn (no config knob, no user argv tail).
 LANES_WITHOUT_EXTRA_ARGS: set[str] = {"piper"}
 
-# Flags that are not capabilities Blazar could integrate — CLI ergonomics,
+# Flags that are not capabilities Blazar could integrate - CLI ergonomics,
 # alternative input surfaces, or long-form aliases of flags the lane
 # already emits. The reason is rendered per flag in the doc. Tashkeel is
 # the one deliberate hold-out: a real capability, but it needs a separate
 # model asset and an Arabic voice, and this lane has no extra_args
-# surface — revisit when tashkeel models enter the store.
+# surface - revisit when tashkeel models enter the store.
 NOT_APPLICABLE: dict[str, dict[str, str]] = {
     "piper": {
         "--config": ("config-file input competes with Blazar's composed argv"),
@@ -376,7 +376,7 @@ def disposition(
         return "intentionally-unsupported"
     if lane in LANES_WITHOUT_EXTRA_ARGS:
         # No extra_args surface exists on this lane, so the flag is not
-        # reachable through Blazar by any means — an honest "unverified",
+        # reachable through Blazar by any means - an honest "unverified",
         # not a phantom "passthrough".
         return "unverified"
     return "passthrough"
@@ -436,7 +436,7 @@ def render_markdown(
         "- receipts: `scripts/certification_receipts.json` (live-engine runs",
         "  that upgrade first-class flags to certified)",
         "- gate: `python3 scripts/engine_coverage.py --check` fails CI when",
-        "  the doc drifts from any input. No timestamps — the bytes are",
+        "  the doc drifts from any input. No timestamps - the bytes are",
         "  the contract.",
         "",
         "| Disposition | Meaning |",
@@ -449,7 +449,7 @@ def render_markdown(
         "| unverified | no verified reach through Blazar on this lane |",
         "",
         "Policy: promotion from passthrough to a first-class knob requires",
-        "workload evidence — a receipt linking the flag to a live-engine",
+        "workload evidence - a receipt linking the flag to a live-engine",
         "run. Emission tests gate the *how*; receipts gate the *why*.",
         "",
     ]
@@ -458,9 +458,9 @@ def render_markdown(
         tag = engine.tag
         counts = engine.counts
         flags = engine.flags
-        lines.append(f"## {tag} ({lane}) — {engine.total} flags probed")
+        lines.append(f"## {tag} ({lane}) - {engine.total} flags probed")
         lines.append("")
-        summary = " · ".join(
+        summary = " | ".join(
             f"{d}: {counts.get(d, 0)}"
             for d in (
                 "certified",
@@ -487,7 +487,7 @@ def render_markdown(
             lines.append("### Certified against a live engine")
             lines.append("")
             for flag, meta in certified_hit.items():
-                note = f" — {meta['note']}" if meta["note"] else ""
+                note = f" - {meta['note']}" if meta["note"] else ""
                 lines.append(
                     f"- `{flag}` [`{meta['receipt']}`]({meta['receipt']}){note}"
                 )
@@ -524,7 +524,7 @@ def render_markdown(
         if lane in LANES_WITHOUT_REGISTRY:
             lines.append(
                 "Unverified: this lane has no emission-truth registry "
-                "entry yet — every flag above is listed as unverified "
+                "entry yet - every flag above is listed as unverified "
                 "until it grows one (see knob_registry.rs)."
             )
             lines.append("")
@@ -671,7 +671,7 @@ def main() -> int:
         return 0
     for engine in audited:
         counts = engine.counts
-        print(f"\n== {engine.tag} ({engine.kind}) — {engine.total} flags probed")
+        print(f"\n== {engine.tag} ({engine.kind}) - {engine.total} flags probed")
         for d in (
             "certified",
             "first-class",

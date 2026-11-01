@@ -23,7 +23,7 @@ pub enum BlazarEvent {
         reason: String,
     },
     /// LC1 predictive pre-loading: the supervisor pre-spawned `model`
-    /// because it historically follows `from` — the switch will be warm.
+    /// because it historically follows `from` - the switch will be warm.
     ModelPreloaded {
         model: String,
         from: String,
@@ -45,7 +45,7 @@ pub enum BlazarEvent {
         slots: u32,
         total_ctx: u32,
     },
-    /// LC4 adaptive capacity: a queued reshape (adoption or decay) landed —
+    /// LC4 adaptive capacity: a queued reshape (adoption or decay) landed -
     /// the child respawned with the new slot count and parked admission
     /// waiters were woken. Emitted when the drain completes, not when the
     /// adoption fires (adoption only queues; the drain performs it).
@@ -55,7 +55,7 @@ pub enum BlazarEvent {
     },
     /// D2 pinned teach: sustained admission pressure on a model excluded
     /// from adaptation ONLY by a manual `slots` pin. The pin stays
-    /// authoritative (no adoption happens) — the event makes the
+    /// authoritative (no adoption happens) - the event makes the
     /// silent queueing floor visible; the remedy is
     /// `model_overrides.<model>.adaptive_override on`.
     SlotsPinnedPressure {
@@ -66,7 +66,7 @@ pub enum BlazarEvent {
         pressure: u32,
     },
     /// D3 starvation bound: the reshape drain had parked admissions past
-    /// the drain budget (90s) and switched to complete-and-cutover —
+    /// the drain budget (90s) and switched to complete-and-cutover -
     /// admissions reopened into the old shape and the reshape now waits
     /// for a natural quiesce instead of starving waiters.
     SlotsDrainCutover {
@@ -75,7 +75,7 @@ pub enum BlazarEvent {
     },
     /// D5 decode-scaling awareness: fresh solo + loaded throughput
     /// evidence showed the model's aggregate decode barely scales with
-    /// concurrency (GPU-bound), so a slot adoption was suppressed — the
+    /// concurrency (GPU-bound), so a slot adoption was suppressed - the
     /// reshape would pay its transition for queue relief at best. The
     /// lane is taught instead (`blazar tune --slots` for an explicit
     /// shape, or `adaptive_decode_gate = false` to restore always-adopt).
@@ -87,11 +87,11 @@ pub enum BlazarEvent {
         loaded_tps: f64,
         /// Loaded-class average concurrency (streams).
         loaded_conc: f64,
-        /// `loaded_tps * loaded_conc / solo_tps` — the aggregate multiple.
+        /// `loaded_tps * loaded_conc / solo_tps` - the aggregate multiple.
         ratio: f64,
     },
     /// Replica pre-warm cutover: the reshape landed through a warm
-    /// standby — the new-shape child reached Ready under a `#warm` key,
+    /// standby - the new-shape child reached Ready under a `#warm` key,
     /// routing swapped to it atomically, and the old child retired (its
     /// in-flight streams finish undisturbed). Zero admission gap vs the
     /// evict-then-respawn path.
@@ -101,14 +101,14 @@ pub enum BlazarEvent {
     },
     /// B2 spec governor: sustained speculation overhead (queue
     /// saturation or a collapsed draft-acceptance rate) parked
-    /// speculation for `model` — the child reshapes dense; a long quiet
+    /// speculation for `model` - the child reshapes dense; a long quiet
     /// streak restores it (`SpecGovernorRecovered`). The `reason` is
     /// "saturation" or "acceptance".
     SpecGovernorOff {
         model: String,
         reason: String,
     },
-    /// B2 spec governor: the quiet streak was satisfied — speculation
+    /// B2 spec governor: the quiet streak was satisfied - speculation
     /// is restored for `model` and the override cleared (the natural
     /// overlay/config resolution resumes).
     SpecGovernorRecovered {

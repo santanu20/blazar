@@ -2,10 +2,10 @@
 //!
 //! Pins two real bugs found 2026-09-05 (smoke-tested live against a config
 //! file ending in `[engine_env]`):
-//! 1. String values were written unquoted → invalid TOML → every later
+//! 1. String values were written unquoted -> invalid TOML -> every later
 //!    `config` command failed ("TOML parse error").
-//! 2. NEW keys were appended at EOF → landed INSIDE the last table
-//!    (`[engine_env]`) → type errors / silently wrong section.
+//! 2. NEW keys were appended at EOF -> landed INSIDE the last table
+//!    (`[engine_env]`) -> type errors / silently wrong section.
 //!
 //! Isolation: `XDG_CONFIG_HOME` -> tempdir (`BlazarDirs::from_env` honors XDG).
 
@@ -37,7 +37,7 @@ fn e2e__config_set_string_value_quoted_and_placed_above_tables() {
     let cfg_root = tmp.path();
     seed(cfg_root);
 
-    // Before the fix: "cpu_range = 0-15" → TOML parse error on next load.
+    // Before the fix: "cpu_range = 0-15" -> TOML parse error on next load.
     blazar(cfg_root)
         .args(["config", "set", "cpu_range", "0-15"])
         .assert()

@@ -20,7 +20,7 @@
 //!                       `is_processing: true` on `/slots` while no response
 //!                       byte is emitted (headers arrive only at completion).
 //!                       The header-timeout guard must probe, see a busy
-//!                       child, and keep it alive — unlike `STUB_HANG_ON`,
+//!                       child, and keep it alive - unlike `STUB_HANG_ON`,
 //!                       which models a wedged child (parked, slot idle).
 //!   `STUB_HANG_ONCE_FILE` when set, only the FIRST child to claim this path hangs;
 //!                       respawned children serve the retry (evict-and-retry pins)
@@ -33,7 +33,7 @@ use axum::response::IntoResponse;
 static SERVING_CTX: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 
 /// A REAL ctx-ceiling hit reports prompt+completion at the window edge;
-/// tiny counts would mean a client `max_tokens` cap instead — the exact
+/// tiny counts would mean a client `max_tokens` cap instead - the exact
 /// distinction the sentinel's truncation gate checks. Counted usage that
 /// already sits at the edge is kept as-is (it IS the real story).
 fn trunc_usage(prompt_tokens: i64, completion_tokens: i64) -> (i64, i64) {
@@ -174,7 +174,7 @@ fn main() {
     };
     let alias = flag("--alias").unwrap_or_else(|| "stub-model".into());
     // Child-auth hardening: --api-key wins, else --api-key-file content
-    // (trimmed) — mirrors upstream's two intake paths.
+    // (trimmed) - mirrors upstream's two intake paths.
     let api_key = flag("--api-key").or_else(|| {
         flag("--api-key-file")
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -242,7 +242,7 @@ fn is_sock_path(host: &str) -> bool {
 
 /// Bind the identical axum app over a unix socket: unlink a stale
 /// file from a previous run first (same contract as the supervisor's
-/// boot sweep). Unix-only by nature — `tokio::net::UnixListener` does
+/// boot sweep). Unix-only by nature - `tokio::net::UnixListener` does
 /// not exist on Windows.
 #[cfg(unix)]
 async fn serve_unix(host: &str, app: axum::routing::Router) {
@@ -253,7 +253,7 @@ async fn serve_unix(host: &str, app: axum::routing::Router) {
     axum::serve(listener, app).await.expect("stub server error");
 }
 
-/// Windows refusal for a `.sock` argv — same contract as the
+/// Windows refusal for a `.sock` argv - same contract as the
 /// supervisor's transport validation: loud, never a silent TCP
 /// fallback. A separate diverging function (not a panic! inline in
 /// the if-branch) because clippy's `if_then_panic` lint fires on the
@@ -263,7 +263,7 @@ fn refuse_unix_transport() -> ! {
     panic!("stub-llama-server: unix sockets require a unix platform");
 }
 
-/// One router with every stub route — shared by the TCP and
+/// One router with every stub route - shared by the TCP and
 /// unix-socket transports so both serve byte-identical API surface.
 fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
     use axum::routing::{get, post};
@@ -512,7 +512,7 @@ static SLOT_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// `STUB_HANG_ONCE_FILE` narrows the hang to the FIRST child process
 /// that claims the marker (atomic `O_EXCL` create): respawned children
 /// see the claim and serve the request. This is what lets the
-/// evict-and-retry pins discriminate — a 200 proves the retry landed on
+/// evict-and-retry pins discriminate - a 200 proves the retry landed on
 /// a fresh child, a 504 proves it hit the same wedged endpoint.
 fn should_hang(text: &str) -> bool {
     let Ok(marker) = std::env::var("STUB_HANG_ON") else {
@@ -521,8 +521,8 @@ fn should_hang(text: &str) -> bool {
     marker_claimed(&marker, text)
 }
 
-/// `STUB_HANG_BUSY_ON`: same park, but the child is healthy — the slot is
-/// mid-generation (`SLOT_BUSY` → `/slots` shows `is_processing: true`) and the
+/// `STUB_HANG_BUSY_ON`: same park, but the child is healthy - the slot is
+/// mid-generation (`SLOT_BUSY` -> `/slots` shows `is_processing: true`) and the
 /// buffered response simply has not completed yet. The header-timeout guard
 /// must distinguish this from [`should_hang`]'s wedged child (parked, slot
 /// idle) and refuse to evict.
@@ -564,7 +564,7 @@ fn marker_mode(req_text: &str) -> Option<MarkerMode> {
 }
 
 /// The zero-progress wedge: ONE empty-delta event flushes the child's
-/// response headers while carrying no progress, then nothing — ever
+/// response headers while carrying no progress, then nothing - ever
 /// (the live shape: headers + keepalive-class frame, 600 s of silence).
 fn stall_body_response() -> axum::response::Response {
     use futures::StreamExt as _;
@@ -596,11 +596,11 @@ fn stub_knob_text(state: &AppState, messages: &[ChatMessage]) -> String {
 
 /// `STUB_THINK_WRAP` shapes the reply as a thinking-capable model would:
 ///
-///   always  — prefix `<think>…</think>` to the normal reply (engines
+///   always  - prefix `<think>...</think>` to the normal reply (engines
 ///             that burn reasoning tokens by default; the gateway
 ///             suppressor must strip it unless the caller asked for
 ///             thinking)
-///   reflect — replace the reply with the think controls the child
+///   reflect - replace the reply with the think controls the child
 ///             RECEIVED (top-level `enable_thinking`, the kwargs pair,
 ///             `reasoning_effort`) so a test asserts exactly what the
 ///             gateway's engine-dialect normalization forwarded.
@@ -665,7 +665,7 @@ fn lora_reflect(req: &ChatRequest) -> Option<String> {
 
 /// `STUB_TOOL_CALL=1`: when the request carries a non-empty `tools` array
 /// AND no tool output has come back yet (no `role:"tool"` message), answer
-/// with one well-formed function call on the first tool — the "model calls
+/// with one well-formed function call on the first tool - the "model calls
 /// the tool, then answers with text" shape realtime tool-loop round-trips
 /// need. Once outputs are in context the normal text reply resumes.
 fn stub_tool_calls(req: &ChatRequest) -> Option<serde_json::Value> {
@@ -703,7 +703,7 @@ async fn chat_completions(
     // regressions to chunked forwarding fail here, not in the field.
     // Framing contract assert, opt-in: the local child lane must send exact
     // Content-Length (mlx_lm.server's python http.server rejects chunked), but
-    // the remote lane legitimately streams client bodies chunked — tests that
+    // the remote lane legitimately streams client bodies chunked - tests that
     // exercise the stub as a remote leave STUB_REJECT_CHUNKED unset.
     if std::env::var("STUB_REJECT_CHUNKED").is_ok()
         && headers
@@ -808,7 +808,7 @@ async fn chat_completions(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     // Body-stall knob: accept the request, open the SSE body, never
-    // deliver a byte — the zero-byte wedge shape (live evidence: two
+    // deliver a byte - the zero-byte wedge shape (live evidence: two
     // 600 s zero-chunk hangs, no tokens, no usage, no detection). The
     // sentinel stall detector must catch it, evict, and close the
     // client stream cleanly.
@@ -970,7 +970,7 @@ async fn completions(
     // error-passthrough contracts: `garbage` = 200 with a non-JSON
     // body (dialect-swap must 502, never fail open); `error` = 400
     // with a JSON error body (child teaching must pass through
-    // verbatim — status AND body — never be adapted into a chat
+    // verbatim - status AND body - never be adapted into a chat
     // shape that masks the message).
     match std::env::var("STUB_RAW_COMPLETION_MODE").as_deref() {
         Ok("garbage") => {
@@ -995,7 +995,7 @@ async fn completions(
     if req.stream {
         // Raw-completion SSE dialect: text deltas in choices[0].text,
         // usage as a bare final frame (when stream_options asked for
-        // it), [DONE] terminator — the shape llama-server and mlx-lm
+        // it), [DONE] terminator - the shape llama-server and mlx-lm
         // speak on /v1/completions.
         let include_usage = req
             .stream_options
@@ -1076,7 +1076,7 @@ async fn embeddings(
 }
 
 /// Child-side spawn-loaded adapter set, argv-order indexed (llamacpp
-/// semantics — see `seed_lora_adapters` for the derivation).
+/// semantics - see `seed_lora_adapters` for the derivation).
 static LORA_ADAPTERS: std::sync::OnceLock<std::sync::Mutex<Vec<serde_json::Value>>> =
     std::sync::OnceLock::new();
 
@@ -1124,7 +1124,7 @@ fn lora_adapters_state() -> &'static std::sync::Mutex<Vec<serde_json::Value>> {
     LORA_ADAPTERS.get_or_init(|| std::sync::Mutex::new(seed_lora_adapters()))
 }
 
-/// GET /lora-adapters — upstream fidelity (b11982 server.cpp): a BARE
+/// GET /lora-adapters - upstream fidelity (b11982 server.cpp): a BARE
 /// array of {id, path, scale, `task_name`, `prompt_prefix`}, id in
 /// argv-load order.
 async fn lora_adapters_get() -> axum::Json<serde_json::Value> {
@@ -1132,7 +1132,7 @@ async fn lora_adapters_get() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::Value::Array(list))
 }
 
-/// POST /lora-adapters — `construct_lora_list` semantics: reconcile
+/// POST /lora-adapters - `construct_lora_list` semantics: reconcile
 /// scales by id over the spawn-loaded set; every loaded id ABSENT from
 /// the body deactivates at scale 0.0; unknown ids are ignored (map
 /// merge); new files can never load.
@@ -1391,7 +1391,7 @@ async fn tokenize(body: axum::body::Bytes) -> axum::Json<serde_json::Value> {
 /// Legacy single-doc embedding route (upstream shape): accepts
 /// `{"content": [token ids]}` or a plain string, returns a per-token
 /// matrix `[{index, embedding: [[f64]]}]`. Deterministic 16-dim
-/// multiplicative-hash vectors per id — identical prompts embed
+/// multiplicative-hash vectors per id - identical prompts embed
 /// identically, different id sets land in quasi-random directions.
 async fn embedding_legacy(body: axum::body::Bytes) -> axum::Json<serde_json::Value> {
     let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
@@ -1561,7 +1561,7 @@ async fn slots() -> axum::Json<serde_json::Value> {
     ]))
 }
 
-/// GET/POST /props — echoes the alias so the e2e can prove per-child
+/// GET/POST /props - echoes the alias so the e2e can prove per-child
 /// routing, and merges any settings from a `POST` back into the response.
 async fn props(
     State(state): State<AppState>,
@@ -1580,7 +1580,7 @@ async fn props(
     axum::Json(props)
 }
 
-/// GET /v1/stream — slot-save stream listing; `DELETE /v1/stream?stream_id=`
+/// GET /v1/stream - slot-save stream listing; `DELETE /v1/stream?stream_id=`
 /// removes it (upstream novel streaming surface).
 async fn stream_list(
     axum::extract::RawQuery(q): axum::extract::RawQuery,
@@ -1606,7 +1606,7 @@ async fn stream_delete(
     }
 }
 
-/// POST /v1/streams/lookup — chat-shaped body; finds a stream by prompt
+/// POST /v1/streams/lookup - chat-shaped body; finds a stream by prompt
 /// prefix. Stub answers deterministically so the e2e can pin the shape.
 async fn streams_lookup(
     State(state): State<AppState>,
@@ -1629,7 +1629,7 @@ async fn streams_lookup(
     .into_response()
 }
 
-/// POST /v1/reranking — Jina-style alias; ranks by naive doc length so
+/// POST /v1/reranking - Jina-style alias; ranks by naive doc length so
 /// the e2e can verify pass-through ordering.
 #[allow(clippy::cast_precision_loss)] // doc length -> score is a stub heuristic
 async fn reranking(body: axum::body::Bytes) -> axum::response::Response {

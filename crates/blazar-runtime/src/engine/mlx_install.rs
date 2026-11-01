@@ -10,18 +10,18 @@
 //! └── mlx-server            # shim: exec venv/bin/python -m mlx_lm.server "$@"
 //! ```
 //!
-//! Why venv-per-tag (not one shared venv): Blazar's engine lifecycle —
-//! install/use/rollback/prune — requires each tag to be independently
+//! Why venv-per-tag (not one shared venv): Blazar's engine lifecycle -
+//! install/use/rollback/prune - requires each tag to be independently
 //! deletable (`prune` does `remove_dir_all`), and a version pin must be
 //! exact. A shared venv would make rollback a mutation, not a switch.
 //!
 //! Backend matrix (mirrors how mlx-lm 0.32 itself distributes, `PyPI`
-//! `requires_dist`): Linux/NVIDIA installs `mlx[cuda12]` — the CUDA
+//! `requires_dist`): Linux/NVIDIA installs `mlx[cuda12]` - the CUDA
 //! backend rides the standard package as an extra (the separate
 //! `mlx-cuda` wheel was the pre-0.32 distribution and is no longer the
 //! path mlx-lm resolves); macOS installs plain `mlx-lm` whose Darwin
 //! marker pulls Metal `mlx` natively; CPU-only Linux refuses with
-//! teaching — a CPU mlx lane would silently serve at toy speed next to
+//! teaching - a CPU mlx lane would silently serve at toy speed next to
 //! the CUDA lanes.
 
 use anyhow::{Context, Result, anyhow};
@@ -37,17 +37,17 @@ use super::sglang_install::{disk_avail_bytes, make_executable, run_streaming, uv
 /// re-verifying the server flags in the new release.
 pub const MLX_LM_DEFAULT_VERSION: &str = "0.32.0";
 
-/// The CUDA backend rides `mlx` as a pip extra with its own version —
+/// The CUDA backend rides `mlx` as a pip extra with its own version -
 /// pinned independently of mlx-lm so a backend float can never move
 /// under a verified mlx-lm pin (dual-pin discipline).
 /// cuda12, not cuda13: the bundled CUDA 12 userspace rides every driver
 /// since the 525 series (broadest install base), while cuda13 requires
-/// the newest drivers only — one tested surface.
+/// the newest drivers only - one tested surface.
 pub const MLX_CUDA_PIN: &str = "mlx[cuda12]==0.32.2";
 
 /// Kernel-compile surface for the CUDA backend: mlx JIT-compiles its
 /// kernels at generation time through NVRTC and needs a `CUDA_HOME` with
-/// modern headers — the fp8 types mlx 0.32's bundled CCCL requires postdate
+/// modern headers - the fp8 types mlx 0.32's bundled CCCL requires postdate
 /// CUDA 12.0, and system toolkits are routinely that old. These two wheels
 /// carry the headers (runtime + crt) and libs the engine-local cuda-home
 /// farm links; live-proven 2026-10-02 on a CUDA 12.0 apt box.
@@ -65,7 +65,7 @@ const MLX_MIN_DISK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MLX_INSTALL_TIMEOUT_SECS: u64 = 1200;
 
 /// First import of the mlx backend chain initializes CUDA context and
-/// loads extension modules — the cap catches a wedged import, not a
+/// loads extension modules - the cap catches a wedged import, not a
 /// slow one.
 const MLX_BOOT_SMOKE_TIMEOUT_SECS: u64 = 300;
 
@@ -74,7 +74,7 @@ const MLX_BOOT_SMOKE_TIMEOUT_SECS: u64 = 300;
 /// `dir` (F88 discipline lives with the `EngineManager` entry point).
 pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     if cfg!(target_os = "macos") {
-        // macOS: mlx-lm's own platform marker pulls Metal mlx — nothing
+        // macOS: mlx-lm's own platform marker pulls Metal mlx - nothing
         // extra to pin.
         install_platform(dir, version, &[]).await
     } else if cfg!(target_os = "linux") {
@@ -101,7 +101,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
         // The farm must exist before the row can ever serve: JIT kernel
         // compiles happen at generation time, so a missing farm is an
         // instant broken lane, not a degraded one. The helper itself is
-        // Linux-only (CUDA farm), so the reference is gated to match —
+        // Linux-only (CUDA farm), so the reference is gated to match -
         // this branch is selected at runtime, not compile time.
         #[cfg(target_os = "linux")]
         link_cuda_home(dir)?;
@@ -116,7 +116,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
 }
 
 /// Shared venv build for both supported platforms: `extra_pins` carries
-/// the backend pin(s) — empty on macOS (platform marker resolves), the
+/// the backend pin(s) - empty on macOS (platform marker resolves), the
 /// CUDA extra on Linux.
 async fn install_platform(dir: &Path, version: &str, extra_pins: &[String]) -> Result<PathBuf> {
     let avail = disk_avail_bytes(dir).context("disk preflight")?;
@@ -202,7 +202,7 @@ async fn install_platform(dir: &Path, version: &str, extra_pins: &[String]) -> R
     // whose boot-critical import chain dies (CUDA driver mismatch,
     // broken extension) still installed and activated cleanly. Import
     // the real server module here with the venv python; failure bubbles
-    // out of install_into and F88 rolls the dir back — an unbootable
+    // out of install_into and F88 rolls the dir back - an unbootable
     // venv must never become an activatable row.
     let mut smoke = tokio::process::Command::new(&venv_python);
     smoke.arg("-c").arg("import mlx_lm.server");
@@ -212,7 +212,7 @@ async fn install_platform(dir: &Path, version: &str, extra_pins: &[String]) -> R
         MLX_BOOT_SMOKE_TIMEOUT_SECS,
     )
     .await
-    .context("boot-smoke failed: the venv cannot import the mlx-lm server — rerun manually to inspect: <engine>/venv/bin/python -c 'import mlx_lm.server'")?;
+    .context("boot-smoke failed: the venv cannot import the mlx-lm server - rerun manually to inspect: <engine>/venv/bin/python -c 'import mlx_lm.server'")?;
     Ok(shim)
 }
 
@@ -252,7 +252,7 @@ pub async fn pypi_latest_mlx_lm() -> Result<String> {
             }
             match resp.json::<PypiResp>().await {
                 Ok(resp) => Attempt::Done(Ok(resp.info.version)),
-                // A connection reset mid-body truncates the 200 —
+                // A connection reset mid-body truncates the 200 -
                 // decode failures are transport-class, worth one more
                 // attempt.
                 Err(e) => Attempt::Retry(anyhow!("pypi mlx-lm json: {e}")),
@@ -274,7 +274,7 @@ pub fn version_tuple(v: &str) -> Option<(u64, u64, u64)> {
 /// against: `include/` merges the `cuda_runtime` and `cuda_nvcc` (crt)
 /// headers, `lib64/` merges the `cuda_runtime` and `cuda_nvrtc` libs, and
 /// `bin`/`nvvm` symlink the nvcc wheel's ptxas + nvvm tree. No nvcc
-/// binary ships in these wheels — mlx JIT-compiles through NVRTC, which
+/// binary ships in these wheels - mlx JIT-compiles through NVRTC, which
 /// the farm's lib64 satisfies. Keeps the lane self-contained on hosts
 /// whose system CUDA toolkit is older than the headers mlx requires.
 /// Idempotent: an existing farm is removed and rebuilt.

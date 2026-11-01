@@ -2,7 +2,7 @@
 //!
 //! llama-server (b11147+, #28690) accepts `.sock` paths via `--host`;
 //! the gateway dials children over the socket with reqwest's
-//! `unix_socket` connector (one client per socket path — the connector
+//! `unix_socket` connector (one client per socket path - the connector
 //! pins a single path per client). TCP remains the default and
 //! byte-identical; unix is opt-in per daemon.
 //!
@@ -25,7 +25,7 @@ pub const MAX_SOCKET_PATH_BYTES: usize = 100;
 
 /// Bound on cached per-socket clients. One entry per live unix child;
 /// the cap only guards a leak (reaped children must not accumulate
-/// entries). On overflow the cache clears — connections rebuild lazily.
+/// entries). On overflow the cache clears - connections rebuild lazily.
 const MAX_CACHED_CLIENTS: usize = 32;
 
 /// Reject socket paths that cannot fit `sun_path` at spawn time.
@@ -36,7 +36,7 @@ pub fn validate_socket_path(socket: &str) -> Result<(), String> {
         if bytes > MAX_SOCKET_PATH_BYTES {
             return Err(format!(
                 "unix socket path is {bytes} bytes, over the {MAX_SOCKET_PATH_BYTES}-byte \
-                 sockaddr_un.sun_path budget — move the blazar data dir shallower or use \
+                 sockaddr_un.sun_path budget - move the blazar data dir shallower or use \
                  child_transport = \"tcp\""
             ));
         }
@@ -51,7 +51,7 @@ pub fn validate_socket_path(socket: &str) -> Result<(), String> {
 
 /// Build one client pinned to `socket`. All requests through it dial
 /// the socket regardless of URL host; the URL scheme still decides
-/// plain-vs-TLS, so bases stay `http://…`.
+/// plain-vs-TLS, so bases stay `http://...`.
 #[must_use]
 pub fn client(socket: &str) -> reqwest::Client {
     #[cfg(unix)]
@@ -77,7 +77,7 @@ pub fn client(socket: &str) -> reqwest::Client {
 /// Bounded cache of per-socket clients for hot lanes (the proxy dials
 /// the same child repeatedly; a fresh client per request would pay
 /// pool setup each time). Cold lanes (bank save/restore, warm peg,
-/// health probes) use [`client`] directly — they run once per spawn.
+/// health probes) use [`client`] directly - they run once per spawn.
 #[derive(Default)]
 pub struct UdsClients {
     inner: std::sync::Mutex<HashMap<String, reqwest::Client>>,
@@ -95,7 +95,7 @@ impl UdsClients {
         if guard.len() >= MAX_CACHED_CLIENTS && !guard.contains_key(socket) {
             tracing::warn!(
                 cached = guard.len(),
-                "unix client cache over budget — clearing (leaked child sockets?)"
+                "unix client cache over budget - clearing (leaked child sockets?)"
             );
             guard.clear();
         }
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(guard.len(), 2, "one entry per distinct socket path");
     }
 
-    // Binds a real AF_UNIX socket — the platform feature under test.
+    // Binds a real AF_UNIX socket - the platform feature under test.
     #[cfg(unix)]
     #[test]
     fn unit__sweep_stale__removes_dead_socket_keeps_live() {

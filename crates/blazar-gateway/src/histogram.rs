@@ -1,10 +1,10 @@
 //! Lock-free latency histograms for the gateway evidence loop.
 //!
 //! vLLM/SGLang ship TTFT/TPOT histograms as their most-used observability;
-//! blazar measures the same things at the proxy — it is the only component
+//! blazar measures the same things at the proxy - it is the only component
 //! that sees every byte of every stream. Hand-rolled on `AtomicU64`
 //! (nanoseconds internally): no metrics crate, no locks on the streaming
-//! hot path, no label cardinality (global histograms — per-model split when
+//! hot path, no label cardinality (global histograms - per-model split when
 //! someone asks with a reason).
 
 use std::fmt::Write as _;
@@ -56,12 +56,12 @@ impl Histogram {
             self.buckets[i].fetch_add(1, Ordering::Relaxed);
         }
         // Above every bound: counted in _sum/_count (and therefore +Inf)
-        // only — finite buckets must stay true upper bounds.
+        // only - finite buckets must stay true upper bounds.
         self.sum_ns.fetch_add(ns, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Append `# HELP/# TYPE`, cumulative `_bucket{le=…}` lines, `_sum`,
+    /// Append `# HELP/# TYPE`, cumulative `_bucket{le=...}` lines, `_sum`,
     /// `_count` in Prometheus exposition format.
     #[allow(
         clippy::cast_precision_loss,
@@ -95,7 +95,7 @@ impl Histogram {
         let _ = writeln!(out, "{}_count {}", self.name, count);
         // Quantile gauges (p50/p99/p999) so `doctor` and dashboards read
         // directly without a PromQL histogram_quantile. Linear
-        // interpolation inside the containing bucket — approximate by
+        // interpolation inside the containing bucket - approximate by
         // construction (documented in the HELP line above).
         for (label, q) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
             let _ = writeln!(
@@ -153,7 +153,7 @@ impl Histogram {
             prev_bound = *b;
         }
         // Above every finite bound: report the top bound (a floor, not an
-        // extrapolation — never invent latency beyond what was measured).
+        // extrapolation - never invent latency beyond what was measured).
         *self.bounds.last().unwrap_or(&0.0)
     }
 }
@@ -186,7 +186,7 @@ pub fn ttft() -> Histogram {
 }
 
 /// Inter-chunk cadence of streamed generations. NOTE: SSE chunks may carry
-/// more than one token per flush — this is chunk cadence, an approximation
+/// more than one token per flush - this is chunk cadence, an approximation
 /// of time-per-output-token, not an exact TPOT.
 #[must_use]
 pub fn tpot() -> Histogram {

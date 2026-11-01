@@ -1,5 +1,5 @@
 // Crash/teardown pins send real signals (SIGKILL, signal-0 liveness) to
-// exact child pids — a unix contract; the gateway crash-retry suite
+// exact child pids - a unix contract; the gateway crash-retry suite
 // carries the portable taskkill variant.
 #![cfg(unix)]
 //! Supervisor integration tests against the REAL stub-llama-server:
@@ -186,12 +186,12 @@ async fn integration__ensure_ready__health_and_argv_flags() {
     // cache-reuse defaults OFF (native slot cache covers identical and
     // extended prefixes; the engine force-disables it at load on
     // hybrid-linear archs, so it only engages on full-attention models
-    // — the retired "~0.6s cold" claim was sweep noise, unreproducible).
+    // - the retired "~0.6s cold" claim was sweep noise, unreproducible).
     assert!(
         !argv.contains(&"--cache-reuse".to_string()),
         "cache-reuse must not ride the default argv: {argv:?}"
     );
-    // sessions dir is per-model under the data dir (path_safe suffix — derive)
+    // sessions dir is per-model under the data dir (path_safe suffix - derive)
     let sess_subdir = format!("sessions/{}/", blazar_core::profile::path_safe("m1"));
     assert!(
         argv.windows(2)
@@ -229,7 +229,7 @@ async fn integration__ensure_unknown_model__named_error() {
 #[allow(non_snake_case)]
 async fn regression__dropped_loader_future_does_not_wedge_next_ensure() {
     // Live-repro'd wedge: a request future dropped mid-spawn (client
-    // timeout during cold load) used to strand `loading[key]` — every
+    // timeout during cold load) used to strand `loading[key]` - every
     // later ensure parked forever on a Notify that never fired. The
     // LoadAbort guard must clear the slot so the NEXT loader runs.
     let (_t, dirs) = setup(&[("m1", 500)]);
@@ -239,7 +239,7 @@ async fn regression__dropped_loader_future_does_not_wedge_next_ensure() {
         let mut fut = Box::pin(sup.ensure("m1"));
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(5)) => {},
-            _ = &mut fut => { /* load finished instantly — pin vacuous */ }
+            _ = &mut fut => { /* load finished instantly - pin vacuous */ }
         }
     } // fut dropped HERE = the client-disconnect cancellation
     let budget = Duration::from_secs(
@@ -271,7 +271,7 @@ async fn regression__dropped_loader_future_does_not_wedge_next_ensure() {
 #[allow(non_snake_case)]
 async fn integration__capacity_two__hot_cache_survives_cold_eviction() {
     // Prefix heat biases capacity eviction: with m1 hot (agent traffic)
-    // and m2 cold, admitting m3 must evict m2 — NOT the hot m1 — even
+    // and m2 cold, admitting m3 must evict m2 - NOT the hot m1 - even
     // though both are idle. Recency weighting: heat = hits/2 + 1.
     let (_t, dirs) = setup(&[("m1", 500), ("m2", 500), ("m3", 500)]);
     let mut cfg = base_config();
@@ -279,7 +279,7 @@ async fn integration__capacity_two__hot_cache_survives_cold_eviction() {
     let sup = supervisor(&dirs, cfg, false);
     sup.ensure("m1").await.unwrap();
     sup.ensure("m2").await.unwrap();
-    // m1 gets the traffic (three hits — decisively above cold 0).
+    // m1 gets the traffic (three hits - decisively above cold 0).
     sup.note_prefix_hit("m1");
     sup.note_prefix_hit("m1");
     sup.note_prefix_hit("m1");
@@ -436,7 +436,7 @@ async fn integration__crash__spawn_phase_death_counts_toward_circuit() {
     // num_ctx-storm shape (live 2026-09-13): a child that dies during
     // LOAD never becomes a tracked instance, so record_restart never
     // fired and the breaker stayed closed through 21 consecutive
-    // spawn-retry 502s — each request re-pinned a doomed ctx and the
+    // spawn-retry 502s - each request re-pinned a doomed ctx and the
     // child died at context creation on every attempt. A death during
     // load is a crash-class restart; clean churn and pure load
     // timeouts stay uncounted (the wave-7 contract).
@@ -453,7 +453,7 @@ async fn integration__crash__spawn_phase_death_counts_toward_circuit() {
         ),
         // Health can never win the race (503 forever) and the child
         // dies (exit 3) mid-load on EVERY attempt: the 2-attempt spawn
-        // loop exhausts with child_died set — the storm's exact shape.
+        // loop exhausts with child_died set - the storm's exact shape.
         ("STUB_HEALTH_NEVER".into(), "1".into()),
         ("STUB_DIE_MS".into(), "300".into()),
     ];
@@ -474,7 +474,7 @@ async fn integration__crash__spawn_phase_death_counts_toward_circuit() {
     s.circuit_window = Duration::from_secs(30);
     s.max_restarts = 2;
     let sup = Arc::new(s);
-    // Three doomed spawn rounds → three counted restarts; the fourth
+    // Three doomed spawn rounds -> three counted restarts; the fourth
     // ensure must hit CircuitOpen (recent 3 > max 2) instead of another
     // full spawn-retry cycle.
     for round in 0..3 {
@@ -498,7 +498,7 @@ async fn integration__crash__spawn_phase_death_counts_toward_circuit() {
 async fn integration__evict__concurrent_marks_clear_without_starving() {
     // The evicting mark is a tokio Mutex with an explicit clear (no
     // Drop): two concurrent evicts of one name must both complete and
-    // leave the set empty — a leaked mark would defer every future
+    // leave the set empty - a leaked mark would defer every future
     // spawn of that name (starvation), the wedge class observed once
     // live as a /api/evict timeout.
     let (_t, dirs) = setup(&[("m1", 500)]);
@@ -520,9 +520,9 @@ async fn integration__evict__concurrent_marks_clear_without_starving() {
 #[allow(non_snake_case)]
 async fn integration__churn__clean_stop_run_never_trips_circuit() {
     // Live-repro'd bug: record_restart fired on EVERY successful spawn,
-    // so a user stop→run churn ×4 inside the breaker window opened the
+    // so a user stop->run churn x4 inside the breaker window opened the
     // circuit on the 5th and 503'd until `ps --reset`. A clean teardown
-    // is a cold start, not a crash restart — churn must never trip.
+    // is a cold start, not a crash restart - churn must never trip.
     let (_t, dirs) = setup(&[("m1", 500)]);
     let sup = supervisor(&dirs, base_config(), false);
     for round in 0..6 {
@@ -601,7 +601,7 @@ async fn integration__load_timeout__never_healthy_stub() {
 }
 
 /// Fail-fast contract: a child that DIES mid-load must surface as
-/// `EngineCrashed` in seconds — never wait out the full `model_load_timeout`
+/// `EngineCrashed` in seconds - never wait out the full `model_load_timeout`
 /// polling a corpse (live bug: 0.5B model "timing out" for 180s while the
 /// child had rejected `--device` and exited at 2s).
 #[tokio::test]
@@ -688,7 +688,7 @@ fn unit__capacity_auto__cpu_one_gpu_bytes_admission() {
     assert!(s2.bytes_admission_active());
     assert_eq!(s2.vram_budget_bytes(), 24_576 * 1024 * 1024);
     // Heterogeneous co-residency the old floor(VRAM/largest) formula
-    // rejected: 23.4 GiB VRAM, a 4 GiB + a 3 GiB model = 7 GiB sum —
+    // rejected: 23.4 GiB VRAM, a 4 GiB + a 3 GiB model = 7 GiB sum -
     // admitted (the old formula said capacity 5 by count but capacity 1
     // whenever the LARGEST model alone crossed VRAM/model).
     let hw_234 = Hardware {
@@ -777,7 +777,7 @@ fn unit__bytes_admission__heterogeneous_pair_coresides() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
-#[allow(clippy::too_many_lines)] // one live-lifecycle story: spawn → GET → attach → detach → name-only detach
+#[allow(clippy::too_many_lines)] // one live-lifecycle story: spawn -> GET -> attach -> detach -> name-only detach
 async fn integration__lora_hot_attach__llamacpp_reconciles_scales_over_spawn_set() {
     let (_t, dirs) = setup(&[("m1", 500)]);
     // Adapter on disk + store row: the spawn attaches it (--lora argv),
@@ -878,7 +878,7 @@ async fn integration__lora_hot_attach__llamacpp_reconciles_scales_over_spawn_set
         "deactivated, not unloaded: {get}"
     );
 
-    // Re-activate, then detach by NAME ONLY (empty path) — callers that
+    // Re-activate, then detach by NAME ONLY (empty path) - callers that
     // omit the path (older CLIs) must still match the loaded adapter by
     // its file stem. The row leaves the store first, mirroring the CLI.
     let row_id = store
@@ -914,12 +914,12 @@ async fn integration__prewarm_reshape__cutover_same_key_new_argv() {
     // spawns the replacement under `m1#warm` (old child keeps serving,
     // zero admission gap), then swaps it under `m1`. The stub's
     // STUB_ARGV_FILE is overwritten per spawn, so after the cutover it
-    // holds the replacement's argv — pinning that the adopted slot
+    // holds the replacement's argv - pinning that the adopted slot
     // count (-np 4) reached a REAL child, not just the maps.
     let (_t, dirs) = setup(&[("m1", 500)]);
     let mut cfg = base_config();
     cfg.adaptive_slots = true;
-    // Pin + override — the exact production shape that live-exposed the
+    // Pin + override - the exact production shape that live-exposed the
     // LC4 precedence bug: without `adaptive_override`, the pin would
     // exclude m1 from adaptation entirely; with it, the pin seeds the
     // shape and the adopted value must supersede it at the prewarm
@@ -939,11 +939,11 @@ async fn integration__prewarm_reshape__cutover_same_key_new_argv() {
         blazar_core::Endpoint::Unix { .. } => panic!("expected tcp endpoint"),
     };
 
-    // Sustained demand (3 parks deep over a 1-slot shape → peak 3 ≥
-    // 2×1) drives the fast-path adoption inside the production cycle;
+    // Sustained demand (3 parks deep over a 1-slot shape -> peak 3 >=
+    // 2x1) drives the fast-path adoption inside the production cycle;
     // the same reap call runs the drain that pre-warms and cuts over.
     // No decode hints exist yet, so the D5 decode-bound gate stands
-    // down (None) — the adoption proceeds, as it must on a cold model.
+    // down (None) - the adoption proceeds, as it must on a cold model.
     sup.note_slot_pressure("m1");
     sup.note_slot_pressure("m1");
     sup.note_slot_pressure("m1");

@@ -1,7 +1,7 @@
 //! Opt-in download speed cap (token bucket, shared across a pull's
 //! connections). Ollama #2006 complaint class: a model pull saturating
 //! a shared link. `0` (the default) constructs no bucket at all, so the
-//! uncapped path stays byte-identical — pacing only exists when asked
+//! uncapped path stays byte-identical - pacing only exists when asked
 //! for via `download_speed_limit_mb`.
 
 use std::time::Duration;
@@ -27,7 +27,7 @@ struct BucketState {
 /// negative debt, and each waiter's elapsed-time refill pays down that
 /// debt (capped at one burst) before its own bytes are charged. Sleeping
 /// outside the lock instead let every concurrent worker refill to a
-/// fresh burst and run the pull at roughly `cap × active workers` — the
+/// fresh burst and run the pull at roughly `cap x active workers` - the
 /// aggregate cap is the whole point, so the lock has to own the wait.
 pub struct Throttle {
     rate_bytes_per_sec: f64,
@@ -40,7 +40,7 @@ pub struct Throttle {
 /// * refill `tokens` for the elapsed time (capped at one full burst),
 /// * spend `bytes` from the bucket,
 /// * a deficit carries over as negative tokens and divides by the rate
-///   into a wait — the debt is shared, so concurrent waiters cannot
+///   into a wait - the debt is shared, so concurrent waiters cannot
 ///   ride each other's wait windows.
 #[must_use]
 pub fn bucket_delay(
@@ -61,7 +61,7 @@ pub fn bucket_delay(
         // wait out its share of the same debt. Clamping to 0 instead let
         // a sleeping worker's wait window regenerate a fresh allowance
         // for the next worker while the sleeper's own bytes still flowed
-        // at wake-up — every window carried two reads and the aggregate
+        // at wake-up - every window carried two reads and the aggregate
         // rate ran at cap x (1 + freeloaders).
         let wait = (-remaining) / rate_bytes_per_sec;
         (remaining, Duration::from_secs_f64(wait))

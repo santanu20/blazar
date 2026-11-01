@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""blazar exhaustive validation harness — REAL engine, REAL model, REAL config.
+"""blazar exhaustive validation harness - REAL engine, REAL model, REAL config.
 
 Dev tooling, not shipped: this script is the project's own e2e validator
 (excluded from release packaging); it exercises the installed/repo blazar
@@ -8,7 +8,7 @@ binary end-to-end so no command, flag, env knob, or route can silently rot.
 The Step-11 "god tier" validator as a permanent script: boots an ISOLATED
 blazar daemon (temp XDG dirs, copied store DB, symlinked real engine +
 model files, own random-free port) and walks every config knob, API route, CLI
-command, sentinel surface, and lifecycle behavior with real inference —
+command, sentinel surface, and lifecycle behavior with real inference -
 printing evidence for every check.
 
 Isolation contract:
@@ -28,7 +28,7 @@ Usage:
 Honest boundaries (printed, not hidden): rpc_servers needs a second box;
 child_transport="unix" is a documented unsupported proxy path; /api/pull runs
 for real (tiny model, heavy-gated) in full runs; 100% LINE coverage is
-llvm-cov territory — this is exhaustive E2E path coverage.
+llvm-cov territory - this is exhaustive E2E path coverage.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def _listed_model_names(list_stdout: str) -> set[str]:
     """`name` field of `blazar list --json` output (one JSONL object per row).
 
     The rendered table adaptively truncates cells once a daemon is loaded
-    (a name can render as `qwen3-0.…`), which silently broke exact-name
+    (a name can render as `qwen3-0....`), which silently broke exact-name
     assertions mid-suite; JSONL is stable. Lines that fail to parse as
     JSON (a stray table, an error banner) are skipped, and store names
     never contain spaces so the first-token fallback stays safe.
@@ -120,11 +120,11 @@ def _resolve_store_row(name: str) -> tuple[str, str, bool]:
     The gateway resolves request names exact -> unique bare prefix
     (proxy.rs ladder) and keys the INSTANCE (pidfile, /api/ps row name)
     by the resolved row. The harness must probe that row name or every
-    instance-keyed check misses while serving still passes — the fixture
+    instance-keyed check misses while serving still passes - the fixture
     inventory drifts (rows get re-pulled under fuller names), so a
     hardcoded default rots. Mirrors the product ladder: exact match
     wins, one prefix match adopts the row name, ambiguity/miss reports
-    ok=False and main() exits at startup — a name the gateway itself
+    ok=False and main() exits at startup - a name the gateway itself
     would 404 must not ride into the phases as a 58-check cascade.
     """
     rows = _store_model_rows()
@@ -186,7 +186,7 @@ USER_CONFIG_SHA = None
 def check(phase: str, name: str, ok: bool, evidence: str = "") -> bool:
     tag = "PASS" if ok else "FAIL"
     CHECKS.append({"phase": phase, "name": name, "ok": bool(ok), "evidence": evidence})
-    print(f"  [{tag}] {name}" + (f" — {evidence}" if evidence else ""))
+    print(f"  [{tag}] {name}" + (f" - {evidence}" if evidence else ""))
     return bool(ok)
 
 
@@ -194,7 +194,7 @@ def boundary(phase: str, name: str, why: str) -> None:
     CHECKS.append(
         {"phase": phase, "name": name, "ok": True, "evidence": why, "boundary": True}
     )
-    print(f"  [BOUNDARY] {name} — {why}")
+    print(f"  [BOUNDARY] {name} - {why}")
 
 
 def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
@@ -206,7 +206,7 @@ def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
 
 
 # ---------------------------------------------------------------------------
-# MANIFEST REGISTRY (merged from the former validate_manifests.py — the
+# MANIFEST REGISTRY (merged from the former validate_manifests.py - the
 # single source of truth for real-integration coverage manifests, kept as
 # one file with its consumer per the one-script-per-concern layout).
 # ---------------------------------------------------------------------------
@@ -342,7 +342,7 @@ def cov(knob: str, expectation: str, evidence: str, ok: bool = True) -> None:
 # # CLI aliases: real paths we exercise, but NOT advertised in `--help`.
 # ALIASES = {"ls": "list", "start": "serve"}
 #
-# # Top-level subcommand names (derived from paths, aliases excluded) + `help` —
+# # Top-level subcommand names (derived from paths, aliases excluded) + `help` -
 # # the set that `blazar --help` must advertise, exactly, in both directions.
 # TOPLEVEL_COMMANDS = sorted(
 #     ({p.split(".")[0] for p in _COMMAND_ATTRS} - set(ALIASES)) | {"help"}
@@ -1135,7 +1135,7 @@ COMMANDS = [
 # CLI aliases: real paths we exercise, but NOT advertised in `--help`.
 ALIASES = {"ls": "list", "start": "serve"}
 
-# Top-level subcommand names (derived from paths, aliases excluded) + `help` —
+# Top-level subcommand names (derived from paths, aliases excluded) + `help` -
 # the set that `blazar --help` must advertise, exactly, in both directions.
 TOPLEVEL_COMMANDS = sorted(
     ({p.split(".")[0] for p in _COMMAND_ATTRS} - set(ALIASES)) | {"help"}
@@ -1768,7 +1768,7 @@ _K = [
     ),
     ("server_tools", True, False, "argv", "G4", "--tools all"),
     # every accepted runtime value (docker:/podman:/ssh:) eagerly spawns
-    # external infrastructure at engine boot — argv e2e impossible here;
+    # external infrastructure at engine boot - argv e2e impossible here;
     # emission proven by unit pin, config echo by roundtrip tier
     (
         "server_tools_runtime",
@@ -1884,7 +1884,7 @@ _K = [
         None,
         "engine/app update channel (stable|latest); fresh-visible + roundtrip boot",
     ),
-    # F146: config.rs knobs that were absent from the registry —
+    # F146: config.rs knobs that were absent from the registry -
     # gate (b) would have gone RED on the first fresh-config-list diff,
     # and the Options were invisible holes in the manifest denominator.
     (
@@ -2064,7 +2064,7 @@ _K = [
         "pull rate cap in MB/s (0 = off); echo + boot",
     ),
     # Engine-currency wave (2026-10-21) knobs the fresh list ships that the
-    # tier ledger lacked — same class as the 2026-10-03 fill above.
+    # tier ledger lacked - same class as the 2026-10-03 fill above.
     (
         "offline",
         False,
@@ -2374,11 +2374,11 @@ MODEL_OVERRIDE_FIELDS = [
     ("chat_template_file", "argv: --chat-template-file"),
     (
         "chat_template_kwargs",
-        "argv: --chat-template-kwargs (JSON-object string; overlay beats global — tool-mode enable_thinking lever)",
+        "argv: --chat-template-kwargs (JSON-object string; overlay beats global - tool-mode enable_thinking lever)",
     ),
     ("sampler_defaults", "argv: --temp..--seed set"),
     ("spm_infill", "roundtrip echo"),
-    # F146: both exist in config.rs ModelOverride but were absent here —
+    # F146: both exist in config.rs ModelOverride but were absent here -
     # coverage denominator undercounted while the lanes ran inline.
     ("late_chunking", "roundtrip echo (late-chunk model knob)"),
     (
@@ -2390,7 +2390,7 @@ MODEL_OVERRIDE_FIELDS = [
         "model_overrides.tensor_split -> child --tensor-split 3,1 alongside --rpc (F2 rpc battery)",
     ),
     ("lazy_mode", "roundtrip echo + argv: --lazy-mode on deviation from auto"),
-    # config-audit wave backfill (2026-10-07): same F146 class — lanes ran
+    # config-audit wave backfill (2026-10-07): same F146 class - lanes ran
     # inline while the manifest denominator undercounted.
     (
         "cache_type_k",
@@ -2589,7 +2589,7 @@ def argv_groups():
         # G6 is mcp_servers_json ALONE: the flag enables the engine's
         # tools subsystem ("MCP config: no servers found"), and a tools
         # runtime configured in the SAME group makes b11147 spawn the
-        # docker container eagerly at boot — fatal on dockerless boxes.
+        # docker container eagerly at boot - fatal on dockerless boxes.
         # Empty servers + no explicit runtime = subsystem on, nothing
         # spawned, flag provably passed.
         "G6": [
@@ -2608,7 +2608,7 @@ COMMAND_COVERAGE: list[dict] = []
 def reg(path: str, ok: bool, evidence: str = "") -> bool:
     COMMAND_COVERAGE.append({"path": path, "ok": bool(ok), "evidence": evidence})
     tag = "PASS" if ok else "FAIL"
-    print(f"  [CMD:{tag}] {path}" + (f" — {evidence}" if evidence else ""))
+    print(f"  [CMD:{tag}] {path}" + (f" - {evidence}" if evidence else ""))
     return bool(ok)
 
 
@@ -2616,7 +2616,7 @@ def regb(path: str, why: str) -> None:
     COMMAND_COVERAGE.append(
         {"path": path, "ok": True, "evidence": why, "boundary": True}
     )
-    print(f"  [CMD:BOUNDARY] {path} — {why}")
+    print(f"  [CMD:BOUNDARY] {path} - {why}")
 
 
 def lane(path: str, fn, *sub: str) -> None:
@@ -2624,7 +2624,7 @@ def lane(path: str, fn, *sub: str) -> None:
 
     A lane that raises (slow-network pull timeouts, unexpected CLI
     crashes) must boundary THAT lane with the failure named, not kill
-    the whole phase — the 2026-09-30 runs lost every remaining check to
+    the whole phase - the 2026-09-30 runs lost every remaining check to
     one 3600s F16-pull TimeoutExpired propagating out of here.
     """
     entry = next(c for c in COMMANDS if c["path"] == path)
@@ -2671,7 +2671,7 @@ def _metric_value(raw: bytes, name: str) -> float | None:
 
 
 def _tiny_png_b64() -> str:
-    """128x128 four-quadrant PNG (red/green/blue/yellow), pure stdlib —
+    """128x128 four-quadrant PNG (red/green/blue/yellow), pure stdlib -
     a solid 8x8 blank produced immediate-EOS empty completions; a
     structured image gives the projector something to describe."""
     import base64
@@ -2746,7 +2746,7 @@ def total_mem_mib() -> int:
 
 def _gpu_free_mib() -> int | None:
     """Free VRAM across GPUs (MiB); None when the probe fails (tooling
-    present but unreadable/timed out) — unknown, NOT zero. 0 is returned
+    present but unreadable/timed out) - unknown, NOT zero. 0 is returned
     only when the driver itself reports a genuinely full GPU."""
     try:
         out = subprocess.run(
@@ -2766,18 +2766,18 @@ def _gpu_free_mib() -> int | None:
                 return max(values)
     except Exception as exc:
         # A probe failure must read as unknown, never kill the battery.
-        print(f"  [WARN] GPU free-memory probe failed ({exc}) — reporting unknown")
+        print(f"  [WARN] GPU free-memory probe failed ({exc}) - reporting unknown")
         return None
     if out.returncode != 0:
         print(
-            f"  [WARN] GPU free-memory probe failed (rc={out.returncode}) — reporting unknown"
+            f"  [WARN] GPU free-memory probe failed (rc={out.returncode}) - reporting unknown"
         )
     return None
 
 
 def _gpu_headroom_mib() -> int | None:
     """Free VRAM (MiB); None on CPU-only boxes (no nvidia tooling) or when
-    the probe itself fails (unknown — never misreported as 0 free)."""
+    the probe itself fails (unknown - never misreported as 0 free)."""
     if shutil.which("nvidia-smi") is None:
         return None
     return _gpu_free_mib()
@@ -2858,7 +2858,7 @@ class Sandbox:
             "engines copy crossed filesystems (hardlinks would become copies)"
         )
         # Lazy-lane assets (piper voices, whisper models) are data-dir
-        # trees, not store rows — hardlink-copy them the same way so the
+        # trees, not store rows - hardlink-copy them the same way so the
         # engines phase can synthesize and transcribe real speech without
         # touching the user's real files. Trees absent on a box are
         # simply skipped (the phase boundary-skips with a named reason).
@@ -2878,12 +2878,12 @@ class Sandbox:
         dst.close()
         src.close()
         os.makedirs(os.path.join(self.data_dir, "run"), exist_ok=True)
-        # The copied rows keep REAL absolute blob paths — a sandboxed
+        # The copied rows keep REAL absolute blob paths - a sandboxed
         # rm/delete/prune would follow them and delete the user's real
         # files (live incident 2026-10-03: the pull battery's cleanup
         # `rm qwen3-0.6b` unlinked the real Q4_0 blob through the copied
         # row). Rebase every referenced artifact onto a sandbox hardlink
-        # so destructive ops can only ever unlink sandbox links — same
+        # so destructive ops can only ever unlink sandbox links - same
         # guarantee the engines copy above buys for `engine update`.
         self._rebase_model_paths()
 
@@ -3060,14 +3060,14 @@ class Daemon:
                 big_ov = mo.setdefault(BIG, {})
                 big_ov.setdefault("devices", [VALIDATE_DEVICES])
         # Dynamic floor: the model + working headroom. A co-resident
-        # engine (the user's own daemon) eats the same budget — fail
+        # engine (the user's own daemon) eats the same budget - fail
         # LOUD instead of thrashing swap for minutes. Late-campaign
         # page-cache drift can shave tens of MiB off MemAvailable
-        # seconds after an identical boot succeeded — one 20 s retry,
+        # seconds after an identical boot succeeded - one 20 s retry,
         # then abort (explicit policy, never silent looping).
         # BLAZAR_VALIDATE_MEM_FLOOR_MIB lowers the floor for an explicit
         # debug window (e.g. a desktop-heavy box proving a MECHANISM,
-        # not recording t/s) — the in-product spawn mem-guard still
+        # not recording t/s) - the in-product spawn mem-guard still
         # aborts if the box truly cannot host the child.
         need = int(model_bytes_mib(floor_model) * 1.25) + 1024
         floor_env = os.environ.get("BLAZAR_VALIDATE_MEM_FLOOR_MIB")
@@ -3088,7 +3088,7 @@ class Daemon:
             if attempt == 0:
                 print(
                     f"validate: MemAvailable {mem_available_mib()} MiB < "
-                    f"~{need} MiB — waiting 20s for teardown/cache settle, "
+                    f"~{need} MiB - waiting 20s for teardown/cache settle, "
                     f"one retry"
                 )
                 time.sleep(20)
@@ -3105,13 +3105,13 @@ class Daemon:
         # cleanup (timeout kill, crash) leaves a `blazar serve` holding
         # PORT with a DESTROYED sandbox behind it (pidfile rmtree'd with
         # the sandbox). Such orphans carry our harness marker in their
-        # environment — TERM them before spawning, or our own child
+        # environment - TERM them before spawning, or our own child
         # loses the bind race and every probe silently targets a daemon
         # whose store no longer exists (live leak 2026-09-09, pid
-        # 1587661). NEVER signal by name/pgid — exact pids only, and
+        # 1587661). NEVER signal by name/pgid - exact pids only, and
         # only ones provably ours (BLAZAR_VALIDATE marker in environ).
         # Random per-campaign ports (BLAZAR_VALIDATE_PORT) mean the
-        # port check below misses most of them — the marker sweep is
+        # port check below misses most of them - the marker sweep is
         # the real net; a live non-us parent = concurrent run, untouched.
         marker_orphans = self._find_marker_orphans()
         if marker_orphans:
@@ -3136,7 +3136,7 @@ class Daemon:
             except ProcessLookupError:
                 pass
 
-        log = open(self.log_path, "ab")  # noqa: SIM115 — daemon append log, lives with the child
+        log = open(self.log_path, "ab")  # noqa: SIM115 - daemon append log, lives with the child
         self.proc = subprocess.Popen(
             [PAL, serve_cmd],
             env=self.sb.env(env_extra),
@@ -3234,7 +3234,7 @@ class Daemon:
     def _sandbox_procs(self, exclude: int | None = None) -> list[int]:
         """Every live process belonging to THIS sandbox: the daemon plus
         its engine children (they inherit the daemon's environ, so both
-        carry BLAZAR_VALIDATE=1 AND this sandbox's XDG_DATA_HOME —
+        carry BLAZAR_VALIDATE=1 AND this sandbox's XDG_DATA_HOME -
         reparented grandchildren included, the user's real daemon never).
         Exact pids only; callers kill individually, never by group."""
         marker = self.sb.data_home.encode()
@@ -3256,7 +3256,7 @@ class Daemon:
 
     def _find_marker_orphans(self) -> list[int]:
         """Harness-marked blazar daemons from DEAD runs (parent exited,
-        process reparented to init) — the random-port leak class the port
+        process reparented to init) - the random-port leak class the port
         orphan check cannot see. Live-parented marker daemons are NEVER
         touched: our own deliberate spawns (Daemon instances, battery-F
         edge daemons) are direct children of this process, and a live
@@ -3290,7 +3290,7 @@ class Daemon:
                 # the next d.start() -> instant-refused 502 trio (live
                 # 2026-09-11: pids 3120088/3120129 TERM-ignored-SIGKILLed).
                 # Only reparented (ppid<=1) or dead-parent processes are
-                # orphans of DEAD runs — the 2026-09-09 leak class.
+                # orphans of DEAD runs - the 2026-09-09 leak class.
                 if ppid <= 1 or not os.path.exists(f"/proc/{ppid}"):
                     out.append(pid)  # reparented orphan of a dead run
             except OSError:
@@ -3313,7 +3313,7 @@ class Daemon:
                 return
             time.sleep(0.5)
         for pid in alive:
-            print(f"validate: {what} pid={pid} ignored TERM — SIGKILL")
+            print(f"validate: {what} pid={pid} ignored TERM - SIGKILL")
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -3353,7 +3353,7 @@ class Daemon:
         # that is mid-load (mistralrs CUDA init is slow), leaving a
         # GPU+RAM squatting orphan behind a destroyed sandbox (live leak
         # 2026-09-10: 6.4 GiB VRAM held for minutes after the cell "ended").
-        # They inherit this sandbox's environ — sweep and reap by exact pid.
+        # They inherit this sandbox's environ - sweep and reap by exact pid.
         strays = self._sandbox_procs()
         if strays:
             print(
@@ -3385,7 +3385,7 @@ def _reap_orphan_validate_engines() -> None:
     """Kill engine children this harness stranded: llama-server cmdline,
     BLAZAR_VALIDATE=1 in their environ, and NOT parented by a live
     blazar daemon (a validate engine's only legitimate parent). Reparent
-    targets include subreapers — init, a dead parent, or a shell wrapper
+    targets include subreapers - init, a dead parent, or a shell wrapper
     all mean the owning daemon is gone; /api/evict owns live-daemon
     children, and a concurrent run's engines stay safe because their
     daemon parent matches."""
@@ -3524,7 +3524,7 @@ def sse_collect(
                     try:
                         size = int(buf[:nl].split(b";")[0].strip(), 16)
                     except ValueError:
-                        break  # partial/garbage — need more bytes
+                        break  # partial/garbage - need more bytes
                     if size == 0:
                         s.close()
                         return _want_hit(), out.decode(errors="replace")
@@ -3549,7 +3549,7 @@ def sse_collect(
         return _want_hit(), out.decode(errors="replace")
     except Exception as e:
         # F137: judge against the payload seen so far (out), not a dead
-        # variable — an error AFTER the want-token still counts as seen.
+        # variable - an error AFTER the want-token still counts as seen.
         return want.encode() in out, out.decode(
             errors="replace"
         ) + f"\n<sse error: {e}>"
@@ -3686,7 +3686,7 @@ def http_multipart(
 
 
 def tiny_wav(seconds: float = 0.5) -> bytes:
-    """Minimal canonical RIFF/WAVE (silence) — enough for multipart routing."""
+    """Minimal canonical RIFF/WAVE (silence) - enough for multipart routing."""
     import struct
 
     rate, n = 8000, int(8000 * seconds)
@@ -3882,7 +3882,7 @@ def _promote_fixture(ref: str) -> None:
         except OSError:
             shutil.copy2(row["path"], dest)
     meta = cache / f"{repo.replace('/', '_')}__{quant}.json"
-    # sqlite3.Row iteration yields VALUES, not keys — row[k] on a value
+    # sqlite3.Row iteration yields VALUES, not keys - row[k] on a value
     # raises IndexError("No item with that key") (quantize-lane crash,
     # 2026-10-03). .keys() is the column-name iterator; the dict-membership
     # advice below does not apply to sqlite3.Row.
@@ -3933,7 +3933,7 @@ def _help_command_names(help_stdout: str) -> list[str]:
     name (aliases live in parens after the name, e.g. `serve (start)`);
     Options lines start with '-'; headings and the footer are not
     indented. Single parser shared by the commands registry check, the
-    gates manifest cross-check and the goldens capture — keep in sync
+    gates manifest cross-check and the goldens capture - keep in sync
     with `render_grouped_help()` in crates/blazar-cli/src/main.rs.
     """
     return [
@@ -4083,7 +4083,7 @@ def phase_manifests() -> None:
 def phase_baseline() -> None:
     print("\n== phase 1: baseline ==")
     d = Daemon(SANDBOX) if DAEMON is None else DAEMON
-    # Boot the FIRST daemon through the `start` alias — the only lane where
+    # Boot the FIRST daemon through the `start` alias - the only lane where
     # the alias is the thing under test; every later boot uses `serve`.
     d.start({"port": PORT}, serve_cmd="start")
     reg("start", True, "alias boot: `blazar start` -> healthz 200 (serve alias)")
@@ -4168,7 +4168,7 @@ def phase_config() -> None:
         boundary(
             "config",
             "config-flow matrix",
-            "no GGUF chat row on this box — the llama-server argv matrix "
+            "no GGUF chat row on this box - the llama-server argv matrix "
             "needs a llamacpp-lane fixture",
         )
         return
@@ -4207,7 +4207,7 @@ def phase_config() -> None:
     ctx_now = row_ctx(row or {}) if row else None
     # ps ctx = PER-SLOT ctx by design (profile.rs: --ctx-size is the total,
     # upstream divides it across -np slots; Profile.ctx/ps report what ONE
-    # slot holds) — slots:2 + default_ctx 8192 => argv total 8192, ps 4096.
+    # slot holds) - slots:2 + default_ctx 8192 => argv total 8192, ps 4096.
     check(
         "config",
         "default_ctx 8192 + slots 2 -> --ctx-size 8192 total, ps per-slot ctx 4096",
@@ -4286,7 +4286,7 @@ def phase_config() -> None:
 
     # Group A2: devices + engine currency + GPU-offload label (2026-09-06).
     # Devices come from the ACTIVE engine's manifest (never bogus names);
-    # tried largest-VRAM first with fallthrough — iGPUs report shared
+    # tried largest-VRAM first with fallthrough - iGPUs report shared
     # memory as VRAM, so the biggest number is not always loadable.
     mrow = (
         sqlite3.connect(os.path.join(SANDBOX.data_dir, "blazar.db"))
@@ -4333,7 +4333,7 @@ def phase_config() -> None:
     # engine_check_secs: background marker lands within a few seconds.
     # The llamacpp channel survey deliberately skips non-llamacpp ACTIVE
     # engines (product design: a cross-kind "update available: bNNNN"
-    # nag is meaningless) — boundary-skip the battery in that env.
+    # nag is meaningless) - boundary-skip the battery in that env.
     _ec_db = _sandbox_db()
     _ec_row = _ec_db.execute("SELECT kind FROM engines WHERE active = 1").fetchone()
     _ec_db.close()
@@ -4395,7 +4395,7 @@ def phase_config() -> None:
             elif gh_budget is None:
                 # The rate-limit probe itself could not reach
                 # api.github.com (offline / captive-portal / IPv6-only
-                # network — GitHub's API is IPv4-only). The marker needs
+                # network - GitHub's API is IPv4-only). The marker needs
                 # GitHub to answer, so this is an environment boundary,
                 # not a regression: the survey task is Rust-unit-tested
                 # and writes when egress returns.
@@ -4403,7 +4403,7 @@ def phase_config() -> None:
                     "config",
                     "engine_check_secs 5 -> run/engine-check.json marker",
                     "api.github.com unreachable from this environment "
-                    "(offline/portal/IPv6-only) — marker machinery covered by "
+                    "(offline/portal/IPv6-only) - marker machinery covered by "
                     "Rust unit tests + writes when egress returns",
                 )
                 cov(
@@ -4416,7 +4416,7 @@ def phase_config() -> None:
                     "config",
                     "engine_check_secs 5 -> run/engine-check.json marker",
                     False,
-                    f"marker=missing (GH budget={gh_budget} — not a rate limit)",
+                    f"marker=missing (GH budget={gh_budget} - not a rate limit)",
                 )
                 cov(
                     "engine_check_secs",
@@ -4594,7 +4594,7 @@ def _gateway_route_paths() -> set[str]:
     """Literal route paths from the gateway's axum table, at runtime.
 
     Source-anchored (crates/blazar-gateway/src/lib.rs) so a route added
-    upstream must gain probe coverage here or gate (e) goes red — routes
+    upstream must gain probe coverage here or gate (e) goes red - routes
     never rot silently. Empty set when the source tree is absent.
     """
     src = os.path.join(
@@ -4626,7 +4626,7 @@ def phase_api() -> None:
     # The request-name ladder (exact -> unique bare prefix, proxy.rs) is a
     # product lane: clients say "qwen2.5-0.5b" for the -instruct row. MODEL
     # now probes the resolved ROW name, so exercise the alias dialect
-    # explicitly — this coverage used to ride the drifting default.
+    # explicitly - this coverage used to ride the drifting default.
     alias = ""
     cand = MODEL.rsplit("-", 1)[0] if "-" in MODEL else ""
     while cand and not alias:
@@ -4740,7 +4740,7 @@ def phase_api() -> None:
         f"status={st} body={txt[:120]}",
     )
     # The positive ref-media render (frames accepted, scratch-priced,
-    # relayed, rendered) is a real diffusion job — opt-in via an explicit
+    # relayed, rendered) is a real diffusion job - opt-in via an explicit
     # video-model pin, mirroring BLAZAR_VALIDATE_MODEL, so the default
     # battery stays fast and GPU-light.
     video_model = os.environ.get("BLAZAR_VALIDATE_VIDEO_MODEL", "")
@@ -4898,10 +4898,10 @@ def phase_api() -> None:
         "api",
         "ollama /api/embeddings (model-capability dependent)",
         st in (200, 400, 501),
-        f"status={st} — generative models may refuse",
+        f"status={st} - generative models may refuse",
     )
 
-    # blazar-native — canonical contract: POST /api/session {"model",
+    # blazar-native - canonical contract: POST /api/session {"model",
     # "action": "save|restore|erase", "filename"} (the /api/session/save
     # sub-path form was retired; this check silently degraded to a boundary
     # for a whole session before the contract was re-verified 2026-09-06).
@@ -4949,7 +4949,7 @@ def phase_api() -> None:
     )
     # Contract: 200 + non-empty content of well-typed blocks. A thinking
     # model may spend its whole token budget reasoning (stop_reason
-    # max_tokens, thinking-only content) — faithful to upstream Anthropic,
+    # max_tokens, thinking-only content) - faithful to upstream Anthropic,
     # so block TYPE is asserted, not the presence of a text block.
     blocks = v.get("content") if isinstance(v, dict) else None
     valid_blocks = bool(isinstance(blocks, list) and blocks) and all(
@@ -5216,7 +5216,7 @@ def phase_api() -> None:
     st, _, v = http_json("POST", "/api/evict", {"model": MODEL})
     check("api", "/api/evict unloads", st in (200, 404), f"status={st}")
 
-    # /api/delete (ollama semantics): cp a scratch copy (post-evict — cp
+    # /api/delete (ollama semantics): cp a scratch copy (post-evict - cp
     # refuses while loaded), delete it over HTTP, confirm store no longer
     # lists it.
     p = cli("cp", MODEL, "validate-del")
@@ -5236,7 +5236,7 @@ def phase_api() -> None:
     )
 
     # /api/pull: REAL gateway pull over the event bus (user directive
-    # 2026-09-08: real traffic, no mocks) — supersedes the 2026-09-05
+    # 2026-09-08: real traffic, no mocks) - supersedes the 2026-09-05
     # no-egress carve-out that left this route to offline suites. Tiny
     # Q4_K_M (~400MB); heavy-gated, skipped under FAST.
     if FAST:
@@ -5247,7 +5247,7 @@ def phase_api() -> None:
         # Pre-pull snapshot: this battery pulls the same repo MODEL
         # normalizes to, so when the store copy already holds the row the
         # pull dedups (no new blob lands) and a cleanup rm would delete
-        # MODEL's own row — starving every later phase — and pre-rebase
+        # MODEL's own row - starving every later phase - and pre-rebase
         # that rm once unlinked the REAL blob through the copied DB's
         # absolute path (2026-10-03). Only rm when the row is genuinely
         # new; a dedup leaves nothing to clean.
@@ -5294,7 +5294,7 @@ def phase_api() -> None:
             cli("rm", "qwen3-0.6b")
 
     # vision chat over the real attached projector (BIG carries mmproj in
-    # the store) — real PNG bytes end-to-end, no mock. Heavy: BIG load.
+    # the store) - real PNG bytes end-to-end, no mock. Heavy: BIG load.
     if FAST:
         print("  (skip vision chat lane: FAST mode)")
     else:
@@ -5335,7 +5335,7 @@ def phase_api() -> None:
             # engine (e.g. ollama) squeezing VRAM/RAM makes blazar's
             # spawn guard refuse pre-spawn (a 500 in ~100ms, by design).
             # Mirror the guard: free VRAM + MemAvailable vs BIG's bytes.
-            # R2-28: clear OUR OWN residue first — earlier phases leave
+            # R2-28: clear OUR OWN residue first - earlier phases leave
             # live children (idle-sleep not yet fired) or crash-battery
             # orphans; only boundary on what an external holder keeps.
             def _vision_env_ok() -> tuple[bool, int | None]:
@@ -5366,7 +5366,7 @@ def phase_api() -> None:
                     f"free VRAM {free_vram_mib} MiB / MemAvailable "
                     f"{mem_available_mib()} MiB vs {vision_model} ~{big_bytes_mib} MiB "
                     "after evicting this harness's engines and reaping "
-                    "orphans — blazar's spawn guard refuses the load by "
+                    "orphans - blazar's spawn guard refuses the load by "
                     "design; GPU holders now: "
                     + ("; ".join(holders) if holders else "none visible"),
                 )
@@ -5405,7 +5405,7 @@ def phase_api() -> None:
                 vfield = ""
                 verr = ""
                 if st != 200:
-                    # P5: the error body IS the evidence on failure —
+                    # P5: the error body IS the evidence on failure -
                     # print it (spawn-guard refusals carry named reasons).
                     verr = v if isinstance(v, str) else json.dumps(v)[:200]
                 try:
@@ -5444,7 +5444,7 @@ def phase_api() -> None:
     # A route that vanished from the build (or was never wired) must fail
     # here instead of rotting. Any answer that is not axum's unrouted 404
     # (empty/plain body) proves routing; handler-level 404s answer JSON
-    # and pass. Stream endpoints legally never close — a read timeout
+    # and pass. Stream endpoints legally never close - a read timeout
     # after the handler accepted the request also proves the route.
     d = DAEMON
     d.start({"port": PORT})
@@ -5620,7 +5620,7 @@ def phase_sentinel() -> None:
         f"fn={named_fn!r}",
     )
     # structured output: response_format json_schema (child-side constrained
-    # decoding — the grammar path; json_object alone never proves it).
+    # decoding - the grammar path; json_object alone never proves it).
     schema = {
         "type": "object",
         "properties": {"ok": {"type": "boolean"}},
@@ -5727,7 +5727,7 @@ def phase_sentinel() -> None:
         "sentinel",
         "enforce header: clean request passes (judge ran)",
         st in (200, 422),
-        f"status={st} — 422 acceptable if the model actually violated; both prove the judge ran",
+        f"status={st} - 422 acceptable if the model actually violated; both prove the judge ran",
     )
     # watch live delivery.
     result: dict = {}
@@ -5760,7 +5760,7 @@ def phase_sentinel() -> None:
     )
     # NETWORK diagnostics section: egress truth + portal verdict rows
     # exist regardless of the environment's health (a dead network is
-    # itself a diagnosable answer — the rows must still render).
+    # itself a diagnosable answer - the rows must still render).
     net_rows = [ln.strip() for ln in p.stdout.splitlines() if "network" in ln.lower()]
     check(
         "sentinel",
@@ -5772,7 +5772,7 @@ def phase_sentinel() -> None:
 
 # ---------------------------------------------------------------------------
 # Phase engines: every installed engine kind gets REAL inference through
-# the surface it serves, with the serving lane PROVEN — the ps row's
+# the surface it serves, with the serving lane PROVEN - the ps row's
 # engine kind must equal the config pin. The tool battery carries the
 # same hard-fail contract as scripts/toolcall_eval.py (exact name, parse-
 # able args, tool_choice forms, multi-turn grounding, streaming deltas),
@@ -5819,7 +5819,7 @@ ENG_TOOL_CALC = {
 }
 
 # Embedder/reranker families never serve chat; "rerank" models are not
-# embedders either — both stay out of the chat-lane and embedding picks.
+# embedders either - both stay out of the chat-lane and embedding picks.
 ENG_EMBEDDER_RE = re.compile(r"bge|embed|minilm|e5", re.IGNORECASE)
 ENG_NON_CHAT_RE = re.compile(
     r"bge|embed|minilm|e5|rerank|whisper|piper|speech|tts", re.IGNORECASE
@@ -5828,7 +5828,7 @@ ENG_QUANTIZED_ST_RE = re.compile(r"\b(?:awq|gptq|fp8)\b", re.IGNORECASE)
 
 
 def _eng_store() -> tuple[list[dict], dict]:
-    """(model rows, tag->kind) from the sandbox store — the box's real
+    """(model rows, tag->kind) from the sandbox store - the box's real
     install state, which every lane pick resolves against."""
     db = sqlite3.connect(os.path.join(SANDBOX.data_dir, "blazar.db"))
     models = [
@@ -5873,7 +5873,7 @@ def _eng_pick_gguf_chat(rows: list[dict]) -> dict | None:
     if exact:
         return exact[0]
     # MODEL may be a unique prefix ("qwen2.5-0.5b" -> qwen2.5-0.5b-instruct);
-    # an ambiguous prefix (several rows) still falls through to smallest —
+    # an ambiguous prefix (several rows) still falls through to smallest -
     # same resolution semantics as model_bytes_mib().
     prefixed = [r for r in cands if r["name"].startswith(MODEL)]
     if len(prefixed) == 1:
@@ -5890,12 +5890,12 @@ def llama_fixture() -> dict | None:
     parity flag battery, spec ngram spawn check). Those phases assert
     llama-server argv, so they must ride the llamacpp lane even when
     BLAZAR_VALIDATE_MODEL pins a safetensors-dir row for the model-driven
-    phases — _eng_pick_gguf_chat honors MODEL whenever MODEL is itself a
+    phases - _eng_pick_gguf_chat honors MODEL whenever MODEL is itself a
     GGUF row, so a GGUF pin still controls the fixture."""
     global _LLAMA_FIXTURE_ROW, _LLAMA_FIXTURE_RESOLVED
     if not _LLAMA_FIXTURE_RESOLVED:
         # Rich rows from the sandbox store copy (_eng_store); resolves
-        # only once the sandbox exists — phases run post-sandbox, and a
+        # only once the sandbox exists - phases run post-sandbox, and a
         # premature call yields None (phases register a boundary row)
         # rather than half-state.
         if SANDBOX is not None:
@@ -5917,7 +5917,7 @@ def _eng_pick_safetensors_dir(
     canonical known-good fixture, and an uncertified sub-1B dir turns
     the lane's free-choice tool cells into draw lottery (measured
     2026-10-08, qwen2.5-0.5b class). Falls back to the smallest plain
-    dir when nothing is certified — the battery then honestly measures
+    dir when nothing is certified - the battery then honestly measures
     whatever the store holds.
     """
     tools_pass = tools_pass or set()
@@ -5948,7 +5948,7 @@ def _eng_tools_pass_models() -> set[str]:
     """Model names with a tools=PASS capability certificate (any engine).
 
     The engines battery's tool cells measure the lane's raw emission and
-    the relay — a fixture that provably cannot emit parseable tool calls
+    the relay - a fixture that provably cannot emit parseable tool calls
     (cert FAIL) turns them into draw lottery, so lane pickers prefer
     certified-tool-capable fixtures when one exists. Certificates come
     from the sandbox DB copy of the user's store (model_caps, written by
@@ -5989,7 +5989,7 @@ def _eng_pick_mlx(rows: list[dict], tools_pass: set[str] | None = None) -> dict 
     The certification preference outranks the MODEL pin: sub-1B quants
     sit below the tool-calling floor (measured live 2026-10-08:
     qwen2.5-0.5b-4bit answers tool requests in prose even through the
-    recipe lane — retry x3, no lift shape), and the lane battery's tool
+    recipe lane - retry x3, no lift shape), and the lane battery's tool
     cells measuring a proven-incapable fixture degrade into draw
     lottery. A certified row IS the canonical known-good fixture for
     this lane; MODEL is the fallback when nothing is certified (the
@@ -6040,7 +6040,7 @@ def _eng_pick_diffusion(rows: list[dict]) -> dict | None:
 def _eng_call_args(tc: dict) -> dict:
     raw = tc.get("function", {}).get("arguments") or ""
     # dialect tolerance: OpenAI ships arguments as a JSON string; mlx-lm
-    # emits a already-parsed object — accept both, crash on neither
+    # emits a already-parsed object - accept both, crash on neither
     if isinstance(raw, dict):
         return raw
     raw = raw.strip()
@@ -6082,7 +6082,7 @@ def _eng_tool_chat(model: str, tools: list, messages: list, **kw) -> tuple[int, 
 
 
 def _eng_probe(probe, attempts: int = 2):
-    """Run a closure up to `attempts` times — tiny models occasionally
+    """Run a closure up to `attempts` times - tiny models occasionally
     sample prose on the first draw; the battery targets transport and
     dialect correctness, not draw luck. A malformed dialect answer is a
     finding, never a harness crash."""
@@ -6101,7 +6101,7 @@ def _eng_probe(probe, attempts: int = 2):
 def _eng_cert_gate_check(lane: str, model: str, weather_tool: dict) -> None:
     """Observe the capability-cert gate's POLICY on this lane with a
     no-probe-header tools request. Both shapes are legitimate: 200 (no
-    matching FAIL certificate for the serving kind — gate inert) or a
+    matching FAIL certificate for the serving kind - gate inert) or a
     teaching 400 naming the failed probe. Any OTHER refusal is a real
     admission failure. Raw capability is measured separately with the
     probe header (see _eng_tool_chat)."""
@@ -6276,12 +6276,12 @@ def _eng_tool_battery(lane: str, model: str) -> None:
         }
         if lane not in ("mlx", "sglang"):
             # mlx: forced choice is gateway-refused by design (mlx-lm
-            # ignores tool_choice entirely) — a forced T8 would never see
+            # ignores tool_choice entirely) - a forced T8 would never see
             # SSE. T8 on mlx exercises the same delta-assembly path with a
             # voluntary call instead.
             # sglang: the upstream 0.5.21 forced path (required or dict
             # pin) emits the call with COMPLETE-EMPTY arguments "{}" in a
-            # single delta — no fragments ever flow, so a forced T8
+            # single delta - no fragments ever flow, so a forced T8
             # measures nothing about assembly. Voluntary calls emit real
             # argument fragments, which is exactly what this check must
             # prove the relay assembles. The forcing contract itself is
@@ -6299,7 +6299,7 @@ def _eng_tool_battery(lane: str, model: str) -> None:
         )
         # Assemble delta.tool_calls by index; name fragments and argument
         # fragments both arrive as concatenated deltas, and a dialect may
-        # also emit one complete call in a single delta — both assemble.
+        # also emit one complete call in a single delta - both assemble.
         names: dict[int, str] = {}
         args: dict[int, str] = {}
         for line in collected.splitlines():
@@ -6342,7 +6342,7 @@ def _eng_tool_battery(lane: str, model: str) -> None:
     if lane == "mlx":
         # mlx-lm has no tool_choice forcing (verified against the installed
         # package). The product contract is a loud teaching refusal from the
-        # gateway — never a silent 200 that quietly drops the forcing.
+        # gateway - never a silent 200 that quietly drops the forcing.
         forced_probes = ()
 
     for label, probe in (
@@ -6402,11 +6402,11 @@ def _eng_tool_battery(lane: str, model: str) -> None:
     if lane == "mistralrs":
         # probe M (2026-10-05): IDENTICAL child-direct bodies flip 0 <-> 389
         # tool calls, and probe L4 caught the child returning an instant
-        # EMPTY 200 stream — emission under tools+required+stream is an
+        # EMPTY 200 stream - emission under tools+required+stream is an
         # upstream mistralrs v0.9.4 lottery, not a gateway property. T8
         # here validates the gateway relay: PASS on any assembled call;
         # every non-winning shape (budget expiry mid-storm, instant-empty
-        # 200) is a lottery sample — relay breakage is not distinguishable
+        # 200) is a lottery sample - relay breakage is not distinguishable
         # from outside and the relay is unit-proven frame-preserving.
         overrun = False
         empty = False
@@ -6437,7 +6437,7 @@ def _eng_tool_battery(lane: str, model: str) -> None:
                 ph,
                 "tool T8 streaming deltas assemble",
                 f"no lottery win in 4 attempts ({variant}) "
-                "— upstream mistralrs v0.9.4 emission lottery (probe M: "
+                "- upstream mistralrs v0.9.4 emission lottery (probe M: "
                 "identical bodies gave 0 then 389 calls; probe L4: the child "
                 "itself returns instant-empty 200s); gateway relay proven "
                 "intact by fully assembled storms on winning samples",
@@ -6456,7 +6456,7 @@ def _eng_classify(lane: str, model: str) -> None:
     """Cover the /v1/classify decision-model surface.
 
     Gateway contract (classify.rs): {model, input, labels[2..16 unique
-    non-empty]} translates to a /v1/systemone child call — a
+    non-empty]} translates to a /v1/systemone child call - a
     llama-server-only surface (LLAMACPP_ONLY_PATHS). Malformed shapes 400
     pre-routing on any lane; non-llamacpp lanes get the llama-server-only
     teaching refusal; the llamacpp lane must answer with the normalized
@@ -6472,7 +6472,7 @@ def _eng_classify(lane: str, model: str) -> None:
     def body_txt(v) -> str:
         return json.dumps(v)[:160] if v is not None else ""
 
-    # shape contract — rejected pre-routing, identical on every lane
+    # shape contract - rejected pre-routing, identical on every lane
     for name, bad in (
         ("one label", {"model": model, "input": "x", "labels": ["a"]}),
         (
@@ -6546,7 +6546,7 @@ def _eng_classify(lane: str, model: str) -> None:
             boundary(
                 ph,
                 "classify returns the normalized card",
-                f"model={m} answered status={status} — build may predate the "
+                f"model={m} answered status={status} - build may predate the "
                 "/v1/systemone surface, spawn hit a mem floor, or the engine "
                 f"refused a non-decision model; body={txt}",
             )
@@ -6562,7 +6562,7 @@ def _eng_classify(lane: str, model: str) -> None:
         # 0.5.21+ serves typed decisions natively (live-probed
         # 2026-10-12): classify rides /v1/decisions and must return the
         # normalized card. Older sglang builds without the endpoint keep
-        # the llama-server-only teaching — both honest, logged as
+        # the llama-server-only teaching - both honest, logged as
         # boundary.
         txt = body_txt(v)
         if st == 400 and "llama-server-only" in txt:
@@ -6584,7 +6584,7 @@ def _eng_classify(lane: str, model: str) -> None:
         # discovery) do not apply on this lane.
         return
 
-    # a CHAT model on the llamacpp lane must get the honest 501 refusal —
+    # a CHAT model on the llamacpp lane must get the honest 501 refusal -
     # the surface discriminates model class instead of serving garbage
     chat_txt = body_txt(v)
     check(
@@ -6596,7 +6596,7 @@ def _eng_classify(lane: str, model: str) -> None:
 
     # the card path needs an actual decision model: arch modern-bert is the
     # classifier class (profile.rs serves it without a language head);
-    # discover one dynamically — no hardcoded names
+    # discover one dynamically - no hardcoded names
     rows, _tags = _eng_store()
     decision = _eng_smallest(
         [
@@ -6611,7 +6611,7 @@ def _eng_classify(lane: str, model: str) -> None:
         boundary(
             ph,
             "classify returns the normalized card",
-            "no decision model (arch modern-bert GGUF) installed — the card "
+            "no decision model (arch modern-bert GGUF) installed - the card "
             "path needs one (e.g. a Laya-class checkpoint); the chat-model "
             "501 discrimination above already proves the surface is live",
         )
@@ -6682,7 +6682,7 @@ def _eng_json_schema(lane: str, model: str) -> None:
 
 
 def _eng_no_tools_clean(lane: str, model: str) -> None:
-    """Without a tools field the lane must answer in plain prose — a
+    """Without a tools field the lane must answer in plain prose - a
     dialect that leaks tool plumbing into bare chats fails here."""
     ph = f"engines/{lane}"
 
@@ -6693,7 +6693,7 @@ def _eng_no_tools_clean(lane: str, model: str) -> None:
         msg = (v.get("choices") or [{}])[0].get("message") or {}
         content = str(msg.get("content") or "")
         # Name where the text went: thinking models park the answer in
-        # reasoning_content — an empty content surface is the finding,
+        # reasoning_content - an empty content surface is the finding,
         # the evidence must say which field carried it.
         reasoning = str(msg.get("reasoning_content") or "")
         return (
@@ -6710,7 +6710,7 @@ def _eng_no_tools_clean(lane: str, model: str) -> None:
 
 def _eng_embeddings(lane: str, embed_row: dict | None) -> None:
     """Identical input through the lane twice must give the same vector
-    (cosine ~1.0, float tolerance) — the /v1/embeddings surface on the
+    (cosine ~1.0, float tolerance) - the /v1/embeddings surface on the
     GGUF-capable lanes."""
     ph = f"engines/{lane}"
     if embed_row is None:
@@ -6746,7 +6746,7 @@ def _eng_embeddings(lane: str, embed_row: dict | None) -> None:
     if st1 != 200 or st2 != 200 or a is None or b is None:
         # A lane that cannot host the embedder upstream (e.g. mistralrs
         # rejecting bert-GGUF: "Unknown normal-model GGUF architecture")
-        # is a documented engine limit, not a gateway defect — the 502
+        # is a documented engine limit, not a gateway defect - the 502
         # with a named cause in the log is the CORRECT failure shape.
         if st1 == 502 and st2 == 502 and DAEMON is not None:
             try:
@@ -6775,7 +6775,7 @@ def _eng_embeddings(lane: str, embed_row: dict | None) -> None:
     na = sum(x * x for x in a) ** 0.5
     nb = sum(x * x for x in b) ** 0.5
     # An exactly-zero norm means the engine returned an all-zero vector
-    # (silently useless embeddings) — name it, do not fold it into cos=0.
+    # (silently useless embeddings) - name it, do not fold it into cos=0.
     zero = na == 0.0 or nb == 0.0
     cos = dot / (na * nb) if not zero else 0.0
     check(
@@ -6785,7 +6785,7 @@ def _eng_embeddings(lane: str, embed_row: dict | None) -> None:
         f"model={name} cos={cos:.6f} dim={len(a)} |a|={na:.4f} |b|={nb:.4f} "
         f"head_a={a[:3]} head_b={b[:3]}" + (" ZERO-NORM VECTOR" if zero else ""),
     )
-    # Distinct sentences must NOT collapse to the same vector — a
+    # Distinct sentences must NOT collapse to the same vector - a
     # constant embedder would sail through the identical-input check.
     st3, _, v3 = http_json(
         "POST",
@@ -6845,7 +6845,7 @@ def _eng_piper_speech(lane: str) -> bytes | None:
 
 
 def _eng_whisper_transcribe(lane: str, wav: bytes | None) -> None:
-    """/v1/audio/transcriptions fed the piper WAV — real speech in,
+    """/v1/audio/transcriptions fed the piper WAV - real speech in,
     real words out (>=2 distinctive words), never a silence stub."""
     ph = f"engines/{lane}"
     bins = sorted((Path(SANDBOX.data_dir) / "whisper").rglob("*.bin"))
@@ -6900,7 +6900,7 @@ def _eng_sdcpp_images(lane: str, row: dict | None) -> None:
         boundary(
             ph,
             "image generation returns a PNG",
-            "no GPU tooling on this box (nvidia-smi absent) — diffusion lane unmeasured",
+            "no GPU tooling on this box (nvidia-smi absent) - diffusion lane unmeasured",
         )
         return
     free = _gpu_free_mib()
@@ -6908,14 +6908,14 @@ def _eng_sdcpp_images(lane: str, row: dict | None) -> None:
         boundary(
             ph,
             "image generation returns a PNG",
-            "GPU free-memory probe failed — diffusion lane unmeasured (unknown VRAM)",
+            "GPU free-memory probe failed - diffusion lane unmeasured (unknown VRAM)",
         )
         return
     if free < 2048:
         boundary(
             ph,
             "image generation returns a PNG",
-            f"only {free} MiB VRAM free — diffusion lane skipped rather than thrash",
+            f"only {free} MiB VRAM free - diffusion lane skipped rather than thrash",
         )
         return
     st, _, v = http_json(
@@ -6968,10 +6968,10 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
     Keys: cfg (global config extras), override (model-override extras),
     pairs (exact (flag, value) argv pairs), presence (presence-only argv
     flags), soft_pairs + soft_skip (install-gated knobs: the pair must
-    appear in argv OR the daemon log must carry the named skip warning —
+    appear in argv OR the daemon log must carry the named skip warning -
     supported_flags probing drops flags the installed build removed),
     note (coverage boundary note). Argv assertions use exact-token pair
-    matching — substring matching false-positives on sibling flags
+    matching - substring matching false-positives on sibling flags
     (--cuda-graph-max-bs vs --cuda-graph-bs).
     """
     if kind == "sglang":
@@ -7009,7 +7009,7 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
         # and --max-num-batched-tokens = paged_step_ceiling(max(ctx, 4096))
         # (engine_impl tests + the v0.9.5 activation-envelope mitigation:
         # cards under ~12 GiB VRAM cap the paged step to 4096 so the
-        # executor does not reserve a full ctx-step envelope up front —
+        # executor does not reserve a full ctx-step envelope up front -
         # upstream #2502). Asserting an exact step value would pin the
         # ceiling AWAY from the mitigation, so the step is presence-only.
         #
@@ -7019,7 +7019,7 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
         # load depend on tokenizer/config consistency between the GGUF
         # packaging and that repo (live-proven failure: qwen2.5-0.5b
         # GGUF carries output.weight while the original config.json
-        # sets tie_word_embeddings=true — mistral.rs aborts). The
+        # sets tie_word_embeddings=true - mistral.rs aborts). The
         # ride/dedup contract for user extra_args is pinned at unit
         # tier instead (tests/mistralrs.rs, text-GGUF + derived-wins
         # cases).
@@ -7047,7 +7047,7 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
             "presence": [],
             "soft_pairs": [],
             "soft_skip": [],
-            "note": "extra_args surface is flag-validated per mlx-lm build — spine asserted only",
+            "note": "extra_args surface is flag-validated per mlx-lm build - spine asserted only",
         }
     # llamacpp: the full knob matrix is phase knobs_argv's lane.
     return {
@@ -7073,7 +7073,7 @@ def _eng_argv_check(
 
     Soft pairs are install-gated knobs: satisfied by the argv pair OR by
     the daemon log naming the skip (the engine install's supported_flags
-    probe dropped the flag — correct behavior, must be loud). A soft
+    probe dropped the flag - correct behavior, must be loud). A soft
     pair's flag may be a tuple of surface-spelling alternatives: the
     knob maps to whichever flag the installed build's manifest carries
     (e.g. cuda_graph_max_bs -> --cuda-graph-max-bs on legacy sglang,
@@ -7149,7 +7149,7 @@ def phase_engines() -> None:
         tags = sorted(t for t, k in kinds_by_tag.items() if k == kind)
         return (
             f"registry drift: rows {tags} present but engine files missing "
-            "on disk — reinstall via blazar engine install"
+            "on disk - reinstall via blazar engine install"
         )
 
     # BLAZAR_VALIDATE_ENGINES=sglang,mlx narrows the battery to those
@@ -7159,7 +7159,7 @@ def phase_engines() -> None:
 
     d = DAEMON
     # Unknown tuning keys must fail FAST at config parse, naming the
-    # offending field (deny_unknown_fields) — never a silent spawn with
+    # offending field (deny_unknown_fields) - never a silent spawn with
     # the knob dropped. Parse failures exit before any engine spawn.
     neg_floor = _eng_pick_gguf_chat(rows)
     for scope, bad_field, bad_val in (
@@ -7178,7 +7178,7 @@ def phase_engines() -> None:
             err = str(e)
             if "MemAvailable" in err:
                 # Environmental mem gate (co-resident daemon), not a
-                # config-parse verdict — re-run when the box frees up.
+                # config-parse verdict - re-run when the box frees up.
                 boundary(
                     f"engines/{scope}",
                     f"unknown [{scope}] key fails fast naming the field",
@@ -7211,7 +7211,7 @@ def phase_engines() -> None:
     # The pin must RESOLVE dynamically against the installed inventory:
     # a hard-coded tag goes stale the moment keep-tags rotation drops
     # that engine (live 2026-10-31: pin "v0.9.3" refused with
-    # MODEL_UNSUPPORTED_ENGINE naming only v0.9.5 installed) — pick the
+    # MODEL_UNSUPPORTED_ENGINE naming only v0.9.5 installed) - pick the
     # newest mistralrs tag that is not the #2502-affected v0.9.5, and
     # boundary the lane honestly when nothing else is installed.
     mrs_tags = sorted(
@@ -7258,7 +7258,7 @@ def phase_engines() -> None:
                         boundary(
                             ph,
                             "lane",
-                            "only mistralrs tag installed is v0.9.5 — every "
+                            "only mistralrs tag installed is v0.9.5 - every "
                             "inference 503s (upstream #2502, fix #2503 "
                             "unreleased as of 2026-10-28); install a "
                             "pre-2502 tag to run this lane",
@@ -7281,7 +7281,7 @@ def phase_engines() -> None:
                         }
                 d.start(cfg, floor_model=model)
                 # Fire one request to trigger the spawn; its own outcome
-                # is irrelevant (a slow load may eat the timeout) —
+                # is irrelevant (a slow load may eat the timeout) -
                 # wait_loaded is the authority on lane readiness.
                 try:
                     chat("Say ok", model=model, timeout=int(load_budget) + 120)
@@ -7293,7 +7293,7 @@ def phase_engines() -> None:
                         ph,
                         "model loads on the lane",
                         False,
-                        f"no ps row for {model} after {load_budget}s — daemon log: {d.log_path}",
+                        f"no ps row for {model} after {load_budget}s - daemon log: {d.log_path}",
                     )
                     continue
                 tag = str(row.get("blazar_engine") or "")
@@ -7356,7 +7356,7 @@ def phase_engines() -> None:
                     boundary(
                         ph,
                         "embeddings identical-input cosine",
-                        "safetensors-weight lanes serve chat only — embeddings ride the GGUF lanes",
+                        "safetensors-weight lanes serve chat only - embeddings ride the GGUF lanes",
                     )
                 # Per-lane CLI surface: the sandboxed CLI must see the
                 # lane it is serving (ps row + engine list) while the
@@ -7378,7 +7378,7 @@ def phase_engines() -> None:
             except Exception as exc:
                 if isinstance(exc, RuntimeError) and "MemAvailable" in str(exc):
                     # Environmental mem gate (co-resident daemon), not an
-                    # engine verdict — the lane re-runs when the box frees.
+                    # engine verdict - the lane re-runs when the box frees.
                     boundary(
                         ph,
                         "lane",
@@ -7392,7 +7392,7 @@ def phase_engines() -> None:
                     # The daemon process itself died under us (observed:
                     # concurrent sessions kill-sweeping blazar processes
                     # mid-lane). Requests fail with connection refused, but
-                    # the engine was never exercised — not a lane verdict.
+                    # the engine was never exercised - not a lane verdict.
                     boundary(
                         ph,
                         "lane",
@@ -7440,7 +7440,7 @@ def phase_engines() -> None:
                 d.start({"port": PORT}, floor_model=audio_floor)
             except RuntimeError as exc:
                 # Mem gate is environmental (co-resident daemon), not an
-                # engine verdict — every runnable lane re-runs later.
+                # engine verdict - every runnable lane re-runs later.
                 for k, what in lazy_spec:
                     boundary(
                         f"engines/{k}",
@@ -7674,7 +7674,7 @@ def phase_behavior() -> None:
         t.join(timeout=10)
     # in_flight brackets gateway-accepted requests (supervisor.rs
     # begin_request/end_request), so a queued second request is EXPECTED
-    # to read in_flight > 1 — queueing at the child is proven by both
+    # to read in_flight > 1 - queueing at the child is proven by both
     # requests completing 200, not by the gauge staying at 1.
     check(
         "behavior",
@@ -7696,7 +7696,7 @@ def phase_behavior() -> None:
 
     def _hold_slot(ev: threading.Event | None = None) -> None:
         # Streaming holder on a raw socket. Two flake classes died here:
-        # (1) max_tokens is a CAP, not a floor — a 0.5B base model can EOS
+        # (1) max_tokens is a CAP, not a floor - a 0.5B base model can EOS
         # at 13 tokens (65ms stream), and the old 0.2s ps poller could
         # never catch that window (seal2/sweep-9/sweep-11 flakes), and
         # (2) a thread-per-request holder can starve on the GIL behind the
@@ -7715,7 +7715,7 @@ def phase_behavior() -> None:
                 # and kill the generation window the choreography depends
                 # on; min_tokens pins the holder to the FULL 1500 tokens.
                 # (If the engine rejected the param the holder never
-                # reports 200 and the lane degrades to its boundary row —
+                # reports 200 and the lane degrades to its boundary row -
                 # loud, never silently wrong.)
                 "min_tokens": 1500,
                 "max_tokens": 1500,
@@ -7781,7 +7781,7 @@ def phase_behavior() -> None:
         # running, and a running request can never be reordered. A fixed
         # sleep cannot guarantee that: observed live (2026-09-26 run 7,
         # daemon log plm-1a0dd31d215/8) the low thread reached the
-        # gateway ~1s AFTER the holder's stream had already ended —
+        # gateway ~1s AFTER the holder's stream had already ended -
         # thread-start latency under load ate the whole generation
         # window and low was admitted to a free slot before high
         # arrived. Gate high's launch on the gateway's own queue gauge
@@ -7822,7 +7822,7 @@ def phase_behavior() -> None:
             )
 
     # deadline accounting: a request admitted past its deadline lands in
-    # blazar_slo_deadline_exceeded_total (or is 503-rejected — both honor SLO).
+    # blazar_slo_deadline_exceeded_total (or is 503-rejected - both honor SLO).
     def _slo_counter() -> int:
         _, _, raw = http("GET", "/metrics")
         m = re.search(rb"^blazar_slo_deadline_exceeded_total (\d+)", raw, re.MULTILINE)
@@ -7838,7 +7838,7 @@ def phase_behavior() -> None:
             "Say the word late.",
             extra={"max_tokens": 5},
             # 1ms: any queue wait behind the holder deterministically breaches
-            # the deadline (3000ms relied on the holder outlasting 3s — a
+            # the deadline (3000ms relied on the holder outlasting 3s - a
             # race; fast admission left the counter correctly static).
             headers={"x-blazar-deadline-ms": "1"},
             timeout=300,
@@ -7858,7 +7858,7 @@ def phase_behavior() -> None:
             "x-blazar-deadline-ms: late admission accounted or rejected",
             # 429 = predictive early-reject (frontier #28): when TTFT history
             # proves the deadline is unreachable, admission refuses BEFORE
-            # queueing — the strongest form of honoring the SLO.
+            # queueing - the strongest form of honoring the SLO.
             tight.get("st") in (200, 503, 429)
             and (slo_after > slo_before or tight.get("st") in (503, 429)),
             f"status={tight.get('st')} counter {slo_before}->{slo_after}",
@@ -7870,7 +7870,7 @@ def phase_behavior() -> None:
         boundary(
             "behavior",
             "spec=ngram: child spawned with --spec-type ngram",
-            "no GGUF chat row on this box — ngram spawn argv is llama-lane",
+            "no GGUF chat row on this box - ngram spawn argv is llama-lane",
         )
     else:
         chat(
@@ -8072,7 +8072,7 @@ def phase_auth() -> None:
     check("auth", "correct bearer -> 200", st == 200, f"status={st}")
     st, _, _ = http_json("GET", "/healthz")
     check("auth", "/healthz stays open", st == 200, f"status={st}")
-    # /api/keys/rotate: admin-scoped — new secret shown once, old dies.
+    # /api/keys/rotate: admin-scoped - new secret shown once, old dies.
     st, _, v = http_json(
         "POST",
         "/api/keys/rotate?name=validate",
@@ -8164,7 +8164,7 @@ def phase_wave() -> None:
         boundary(
             "wave",
             "wave battery",
-            "no GGUF chat row on this box — the llama-server flag battery "
+            "no GGUF chat row on this box - the llama-server flag battery "
             "needs a llamacpp-lane fixture",
         )
         return
@@ -8291,7 +8291,7 @@ def phase_wave() -> None:
     # Capacity pre-check mirroring the supervisor's bytes admission: the
     # reaper's maybe_preload skips when the MEASURED resident footprint
     # plus the incoming model's admission floor (weights + projector +
-    # 512 MiB KV floor + 700 MiB spawn overhead — the same charges the
+    # 512 MiB KV floor + 700 MiB spawn overhead - the same charges the
     # unified gpu-layers pin trusts) would cross the VRAM budget.
     # Weights-only math oversubscribed an 8 GiB card on 2026-09-11: the
     # 9B VL model settled at 7302 MiB MEASURED (5417 weights) and the
@@ -8310,7 +8310,7 @@ def phase_wave() -> None:
     )
     if FAST:
         print(
-            f"  (FAST: skipping predictive-preload battery — needs {small}+{big} loads)"
+            f"  (FAST: skipping predictive-preload battery - needs {small}+{big} loads)"
         )
         boundary(
             "wave",
@@ -8392,7 +8392,7 @@ def phase_wave() -> None:
         boundary(
             "wave",
             "whisper lane -> 501 teaching (install/pull hints)",
-            "whisper engine + model live on this box — the lane transcribes "
+            "whisper engine + model live on this box - the lane transcribes "
             "(200), so the missing-piece teaching is not observable here",
         )
     else:
@@ -8409,7 +8409,7 @@ def phase_wave() -> None:
             # F166 + teaching_detail (gateway whisper.rs) has TWO halves:
             # server missing -> `blazar whisper --install`; server present
             # but no model -> `blazar whisper --pull`. The sandbox engines
-            # copy tracks the real box, so state decides which hint fires —
+            # copy tracks the real box, so state decides which hint fires -
             # either one proves the 501 teaching contract.
             st == 501 and (b"whisper --install" in raw or b"whisper --pull" in raw),
             f"status={st}",
@@ -8575,7 +8575,7 @@ def phase_wave() -> None:
 
     # F1: audit + WFQ + predictive deadline on one keyed daemon. (rpc
     # override moved to F2: upstream ABORTS at argv-parse when --rpc
-    # points at a dead endpoint — F2 spawns a real ggml-rpc-server.)
+    # points at a dead endpoint - F2 spawns a real ggml-rpc-server.)
     d.start(
         {
             "port": PORT,
@@ -8638,7 +8638,7 @@ def phase_wave() -> None:
         if got_401 is None:
             time.sleep(0.25)
     # F64: request_log is now OUTSIDE auth, so a rejected secret still
-    # gets an access/audit line (key=null, status=401) — brute-force
+    # gets an access/audit line (key=null, status=401) - brute-force
     # probing is visible. Old contract ("401 leaves no audit line")
     # was the bug being pinned away.
     check(
@@ -8757,7 +8757,7 @@ def phase_wave() -> None:
     # F2: keyless daemon for rpc override + session identity. Upstream
     # llama-server connects --rpc endpoints EAGERLY at argv-parse and
     # SIGABRTs on a dead one (ggml-rpc.cpp:547), so spawn a REAL
-    # ggml-rpc-server first — anything less crash-loops the child.
+    # ggml-rpc-server first - anything less crash-loops the child.
     d.stop()
     # ggml-rpc-server is a llama.cpp binary: resolve the dir from a
     # llamacpp engine row (the ACTIVE row may be a JIT-installed
@@ -8775,7 +8775,7 @@ def phase_wave() -> None:
             SANDBOX.data_dir, "engines", rpc_tag, f"llama-{rpc_tag}", "ggml-rpc-server"
         ),
     )
-    # F164: existence precheck — a missing binary used to raise
+    # F164: existence precheck - a missing binary used to raise
     # FileNotFoundError here and truncate every phase after the battery.
     # Skip the rpc leg with a recorded failure and keep the harness alive
     # (the CUDA asset ships without ggml-rpc-server; see F167).
@@ -8786,7 +8786,7 @@ def phase_wave() -> None:
             "wave",
             "rpc override leg (ggml-rpc-server present in asset)",
             False,
-            f"{rpc_srv_path} missing — rpc override leg skipped (F164 guard)",
+            f"{rpc_srv_path} missing - rpc override leg skipped (F164 guard)",
         )
         d.start({"port": PORT}, floor_model=f_small)
         st = 0
@@ -8796,7 +8796,7 @@ def phase_wave() -> None:
             if st != 200:
                 time.sleep(2)
     else:
-        # Kernel-assigned free port — the fixed 54321 made two concurrent
+        # Kernel-assigned free port - the fixed 54321 made two concurrent
         # validate runs fight over one ggml-rpc-server (same class as the
         # edge-port collision, 2026-09-10).
         rpc_port = _free_port()
@@ -8879,7 +8879,7 @@ def phase_wave() -> None:
     # F2b: dead rpc endpoint -> spawn REFUSED with a teaching error (the
     # LlamaCppEngine::spawn preflight): gateway 500 naming the endpoint,
     # zero child processes (no SIGABRT crash-loop), no engine rollback.
-    # Needs no ggml-rpc-server binary — runs in both branches above.
+    # Needs no ggml-rpc-server binary - runs in both branches above.
     d.stop()
     st_dead, elapsed, taught, no_child = 0, 0.0, False, False
     for _attempt in range(2):  # retry-once: _free_port bind-release race
@@ -8909,7 +8909,7 @@ def phase_wave() -> None:
     )
 
     # F-identity and every lane after it expect a LIVE keyless daemon; F2b
-    # leaves it stopped. Restart clean — without the dead rpc pin, so the
+    # leaves it stopped. Restart clean - without the dead rpc pin, so the
     # session lanes spawn f_small normally (same idiom as the F164 skip arm).
     d.start({"port": PORT}, floor_model=f_small)
     st = 0
@@ -9008,7 +9008,7 @@ def phase_wave() -> None:
     # F-remotes: two REAL secondary daemons as one "far" pool; prefix
     # stickiness binds a conversation to one backend and says so in the
     # x-blazar-remote response header. Edge ports are kernel-assigned
-    # free ports — the fixed 115xx defaults made two concurrent validate
+    # free ports - the fixed 115xx defaults made two concurrent validate
     # runs bind each other's backends and 502 mid-battery (2026-09-10).
     edge_ports = (_free_port(), _free_port())
     edge_sbs: list[Sandbox] = []
@@ -9023,7 +9023,7 @@ def phase_wave() -> None:
                     "keys": [{"name": "edge", "key": "edge-secret-1"}],
                 }
             )
-            elog = open(  # noqa: SIM115 — daemon append log, lives with the child
+            elog = open(  # noqa: SIM115 - daemon append log, lives with the child
                 os.path.join(esb.data_dir, "run", "daemon.log"), "ab"
             )
             eproc = subprocess.Popen(
@@ -9105,7 +9105,7 @@ def phase_wave() -> None:
     finally:
         d.stop()
         # Autopsy aid: on failure the edge daemon logs are the ONLY
-        # evidence of a 2nd-level crash — surface their tails before the
+        # evidence of a 2nd-level crash - surface their tails before the
         # sandboxes (and logs) are destroyed.
         if not remote_ok:
             for esb in edge_sbs:
@@ -9142,7 +9142,7 @@ def phase_parity() -> None:
         boundary(
             "parity",
             "parity battery",
-            "no GGUF chat row on this box — the llama-server flag battery "
+            "no GGUF chat row on this box - the llama-server flag battery "
             "needs a llamacpp-lane fixture",
         )
         return
@@ -9515,15 +9515,15 @@ def phase_parity() -> None:
 
 
 # ------------------------------------------------- 100%-coverage phases
-# phase commands / knobs_argv / knobs_behavior / gates — driven by the
+# phase commands / knobs_argv / knobs_behavior / gates - driven by the
 # manifests in the MANIFEST REGISTRY section above (single source of truth).
 
 PHASE_FILTER: set | None = None  # set by main() when --phase= is used
 CRASHED: bool = False  # a phase raised; sandbox must be kept for post-mortem
 
 # --smoke preset: the fast pre-commit signal (~2-4 min, one 0.5B load).
-# Picks the phases that catch the common breakage classes — binary boots,
-# daemon spawns + serves chat, config surface, CLI surface, golden drift —
+# Picks the phases that catch the common breakage classes - binary boots,
+# daemon spawns + serves chat, config surface, CLI surface, golden drift -
 # and deliberately excludes coverage-ledger phases (gates/coverage redden
 # when the rows they audit never ran) and the slow media/engine lanes.
 # An explicit --phase= always wins over the preset.
@@ -9577,7 +9577,7 @@ def _sandbox_engine_tags() -> list[str]:
 def _rollback_expectation(anchor: str) -> str | None:
     """The tag `engine rollback` must step to: the next-older row of the
     anchor's kind in the sandbox store (product `list_engines` order:
-    newest first). `None` when no same-kind row sits below the anchor —
+    newest first). `None` when no same-kind row sits below the anchor -
     rollback is kind-scoped (a text-lane step once crossed onto the
     whisper voice lane, 2026-09-26) and must refuse by design."""
     db = _sandbox_db()
@@ -9616,12 +9616,12 @@ def _full_engine_tags() -> list[str]:
     """Real b-numbered engine tags carrying both llama-server and llama-quantize.
 
     Covers plain upstream tags (bNNNN) AND CUDA overlay/source tags
-    (bNNNN-cuda) — `engine use`/`rollback` switch between them the same
+    (bNNNN-cuda) - `engine use`/`rollback` switch between them the same
     way, so the gate must count both. The real store is user-mutable
     (updates prune old tags, `engine local` registers non-b tags), so
     tests must never hardcode engine tags. Disk dirs WITHOUT a store row
-    are orphaned install debris — `engine use` refuses them ("Query
-    returned no rows") — so intersect with the table.
+    are orphaned install debris - `engine use` refuses them ("Query
+    returned no rows") - so intersect with the table.
     """
     try:
         db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
@@ -9638,7 +9638,7 @@ def _full_engine_tags() -> list[str]:
                 and (rows is None or name in rows)
                 # derive real layout: CUDA overlay assets unpack into
                 # vendor-suffixed dirs (llama-<tag>-bin-ubuntu-cuda-...),
-                # not llama-<tag> — rglob instead of assuming
+                # not llama-<tag> - rglob instead of assuming
                 and all(
                     any(Path(eng_root, name).rglob(tool))
                     for tool in ("llama-server", "llama-quantize")
@@ -9650,7 +9650,7 @@ def _full_engine_tags() -> list[str]:
 
 def _server_engine_tags() -> list[str]:
     """Any llamacpp engine tag carrying llama-server (slim CUDA overlay
-    assets ship server-only — no llama-quantize). Fallback pin when no
+    assets ship server-only - no llama-quantize). Fallback pin when no
     full bundle exists on the box."""
     try:
         db = sqlite3.connect(os.path.join(REAL_DATA, "blazar.db"))
@@ -9683,12 +9683,12 @@ def _store_engine_tags() -> list[str]:
     real row is a valid dance partner for the use lanes; `engine
     rollback` is kind-scoped (2026-09-26 fix) and derives its own
     expectation from the sandbox store. The `local` pseudo-tag is
-    excluded — it is a path registration, not a store lane. Audio-lane
+    excluded - it is a path registration, not a store lane. Audio-lane
     rows (kind whisper/piper) are excluded by DESIGN (2026-10-03
     lazy-lane parity): `engine use` on a lazy lane refuses with a
     per-kind pin hint (audio lanes serve via /v1/audio, never through
     the serving-active flag), and `engine rm` now reconciles the lane
-    pin files — both live-observed behaviors before the fix; the
+    pin files - both live-observed behaviors before the fix; the
     exclusion keeps the dance on lanes that can legally hold the
     active flag.
     """
@@ -9890,7 +9890,7 @@ def phase_evidence() -> None:
     d.start(
         {
             # Root `port` is injected by Daemon.start (setdefault); the
-            # [gateway] section must not repeat it — the collision rule
+            # [gateway] section must not repeat it - the collision rule
             # refuses both spellings, so prove hierarchy with section-only
             # keys (host here, default_ctx under [resources]).
             "gateway": {"host": "127.0.0.1"},
@@ -9917,7 +9917,7 @@ def phase_commands() -> None:
     if pin_tags:
         cli("engine", "use", pin_tags[0], "--kind", "llamacpp")
     else:
-        print("note: no llamacpp engine tag on disk — pinning skipped")
+        print("note: no llamacpp engine tag on disk - pinning skipped")
 
     d = DAEMON
     d.start({"port": PORT})
@@ -9954,7 +9954,7 @@ def phase_commands() -> None:
         f"colon input rc0 + canonical row printed; out={p.stdout.strip()[:60]!r}",
     )
 
-    # -- A1b: gate-(a) fill commands (2026-10-03) — the eight top-level
+    # -- A1b: gate-(a) fill commands (2026-10-03) - the eight top-level
     # commands the help advertises that had no evidence lane. Daemon is
     # warm from the chat above; every probe is a real invocation. ------
     p = cli("storage")
@@ -10060,7 +10060,7 @@ def phase_commands() -> None:
 
     # Gateway-side colon resolution: ollama-style model:tag must route
     # onto the flat row through the same ensure() choke point (rides the
-    # instance loaded above — warm, cheap).
+    # instance loaded above - warm, cheap).
     st_c, _, _ = chat(
         "Say ok",
         extra={"model": MODEL.replace("-", ":", 1), "max_tokens": 8},
@@ -10128,7 +10128,7 @@ def phase_commands() -> None:
         # lifted out of the text query (stderr carries the filter notice,
         # stdout stays clean). Hub text-search result pages churn between
         # runs (ranking/content refresh), so a zero-row page is retried
-        # once and then boundary'd — the filter notice + the --json lane
+        # once and then boundary'd - the filter notice + the --json lane
         # below still pin the filter machinery either way.
         p4 = cli("search", "qwen", "0.5b", "q4", timeout=120)
         if p4.returncode != 0:
@@ -10184,7 +10184,7 @@ def phase_commands() -> None:
         d.proc is not None and d.proc.poll() is None,
         "daemon alive via `blazar serve` (healthz 200 + chat 200 above)",
     )
-    # watch: live SSE tail — timeout-kill after 6s, banner must appear
+    # watch: live SSE tail - timeout-kill after 6s, banner must appear
     w = subprocess.run(
         ["timeout", "6", PAL, "watch"],
         env=SANDBOX.env(),
@@ -10328,13 +10328,13 @@ def phase_commands() -> None:
     else:
         regb(
             "import.scan.json",
-            "no other-runtime models on disk — JSONL shape unexercisable "
+            "no other-runtime models on disk - JSONL shape unexercisable "
             "(table lane above still proves the scan path)",
         )
 
     # -- E: mmproj (refusal always; happy via real HF projector) --------
     # Target BIG: attaching a projector is model-agnostic but the happy lane
-    # was proven on the 9B — keep it pinned there even when MODEL is small.
+    # was proven on the 9B - keep it pinned there even when MODEL is small.
     if src:
         target = BIG or MODEL
         # mmproj refuses while the model is loaded; release it first and
@@ -10439,7 +10439,7 @@ def phase_commands() -> None:
             "named key resolved to plm_ secret",
         )
     # (--warm <model> probe lives after rm.running-guard, where MODEL is
-    # pulled and loaded — probe order matters for the sandbox store.)
+    # pulled and loaded - probe order matters for the sandbox store.)
     p = cli("keys", "rm", "vk2")  # bootstrap gatekey still present
     check(
         "commands",
@@ -10536,7 +10536,7 @@ def phase_commands() -> None:
         f"rc={p.returncode} keys={n_keys} backups={baks[:1]} idempotent_rc={p2.returncode}",
     )
     # migrate leaves [[keys]] in config.toml; drop them so the daemonless
-    # heavy lanes below (bench auto-start etc.) boot without key gating —
+    # heavy lanes below (bench auto-start etc.) boot without key gating -
     # bearerless /v1 clients (whisper transcribe) would 401 otherwise.
     SANDBOX.write_config({"port": PORT})
 
@@ -10580,14 +10580,14 @@ def phase_commands() -> None:
     heavy_ok = disk_free_gb() > 8.0 and not vram_starved
 
     def _bench_unavailable(p) -> str | None:
-        # Slim per-arch engine assets ship llama-server only — bench/tune
+        # Slim per-arch engine assets ship llama-server only - bench/tune
         # fail fast with a teaching that names the real remedy. That is an
         # environment boundary (build/register a bench-bearing engine to
         # run these lanes), not a blazar regression.
         err = p.stderr + p.stdout
         if "no llama-bench found in any installed engine" in err:
             return (
-                "slim engine assets ship llama-server only — no llama-bench "
+                "slim engine assets ship llama-server only - no llama-bench "
                 "on this box; `blazar engine build cuda` or `engine local` "
                 "a full bundle to run this lane"
             )
@@ -10598,7 +10598,7 @@ def phase_commands() -> None:
             regb(
                 "bench",
                 f"free VRAM {gpu_mib} MiB < 1200 MiB after reaping this "
-                f"harness's orphaned engines — GPU holders: "
+                f"harness's orphaned engines - GPU holders: "
                 f"{'; '.join(_gpu_compute_holders()) or 'none visible'}",
             )
             return
@@ -10675,7 +10675,7 @@ def phase_commands() -> None:
     def _pull_retry(*args, timeout=2400):
         # Single explicit retry for transient HF API failures (observed
         # intermittent 429/5xx on /api/models). Policy: max 1 retry, 10s
-        # backoff, evidence carries both attempts — never silent. A
+        # backoff, evidence carries both attempts - never silent. A
         # cached or main-store fixture seeds the sandbox first so the
         # pull resolves locally instead of re-downloading.
         if (
@@ -10783,7 +10783,7 @@ def phase_commands() -> None:
         cli("rm", "qwen3-0.6b")
         # Restore MODEL for the phases still to come (golds boots a
         # daemon and runs a real chat on it): the F16 source pull
-        # REPLACED the store-copy's Q4_0 row — same normalized name —
+        # REPLACED the store-copy's Q4_0 row - same normalized name -
         # and the cleanup rm above removed it outright. Seed from the
         # main store (instant hardlink) with a network fallback.
         if not seed_main_store_model("qwen3-0.6b:Q4_0"):
@@ -10871,7 +10871,7 @@ def phase_commands() -> None:
             # product bug. Boundary the lane; rerun when network allows.
             regb(
                 "whisper.transcribe",
-                "model pull failed — lane cannot run; server+model logic "
+                "model pull failed - lane cannot run; server+model logic "
                 "proven by unit tests and the pinned checks below are "
                 "skipped (they would misfire on the pull failure)",
             )
@@ -10894,7 +10894,7 @@ def phase_commands() -> None:
             )
         # Regression pin: whisper_cmd must resolve an admin bearer (BLAZAR_KEYS
         # else first unscoped [[keys]]) so transcription keeps working once the
-        # gateway is key-gated — same class as the keys_cmd bearer fix.
+        # gateway is key-gated - same class as the keys_cmd bearer fix.
         if server_ok:
             d.stop()
             d.start(
@@ -10935,7 +10935,7 @@ def phase_commands() -> None:
             regb(wp, f"disk free {disk_free_gb():.1f}G <= 8G")
 
     # whisper --pin refusals: standalone flag path, no install/net needed
-    # (FAST-visible — manifest tier fast=True).
+    # (FAST-visible - manifest tier fast=True).
     p = cli("whisper", "--pin", "v0.0.0-validate")
     r1 = p.returncode != 0 and "is not installed" in (p.stdout + p.stderr)
     p = cli("whisper", "--pin", "../evil")
@@ -10953,7 +10953,7 @@ def phase_commands() -> None:
         # slim-asset box (CUDA overlay ships server-only) or a mixed store
         # (one full + one slim): fall back to any server-bearing llamacpp
         # tag so local/use lanes still exercise a real engine. With >=2 of
-        # them, dance too — the switch lanes' whole purpose is a REAL
+        # them, dance too - the switch lanes' whole purpose is a REAL
         # engine dance, and slim pairs prove switching just as well as full
         # bundles (quantize presence is irrelevant to use/rollback).
         server_tags = _server_engine_tags()
@@ -10963,19 +10963,19 @@ def phase_commands() -> None:
     if dance is None and anchor is not None:
         # One-per-lane prune contract (dedaceb, 2026-09-16): every install
         # path prune_siblings its lane, so a healthy store holds EXACTLY
-        # ONE llamacpp build — the >=2-llamacpp dance is only reachable on
+        # ONE llamacpp build - the >=2-llamacpp dance is only reachable on
         # pre-dedaceb legacy stores. The designed switch dance on a modern
         # store pairs the llamacpp anchor with a real cross-kind engine
         # row (sglang/mistralrs) for the `engine use` lanes. `engine
         # rollback` itself is KIND-SCOPED (2026-09-26 fix: a text-lane
-        # step once crossed onto the whisper voice lane) — its expected
+        # step once crossed onto the whisper voice lane) - its expected
         # target is derived independently from the sandbox store in
         # _engine_full below, not from this dance partner.
         dance = next((t for t in _store_engine_tags() if t != anchor), None)
     # Prefer a plain upstream tag for the pin-update dance so the lane
     # exercises the standard asset path whenever the store has one; a
     # -cuda pick goes through the CUDA overlay repo (needs bNNNN-cuda
-    # releases published there — boundary row when the channel is not
+    # releases published there - boundary row when the channel is not
     # live yet).
     update_pick = next(
         (t for t in tags if t != anchor and not t.endswith("-cuda")), dance
@@ -10983,7 +10983,7 @@ def phase_commands() -> None:
     if update_pick is not None and update_pick not in tags:
         # Cross-kind dance partner (or a non-b store row): the llamacpp
         # updater only accepts llamacpp tags, so pin the update lane to
-        # the anchor itself — a plain anchor re-exercises the standard
+        # the anchor itself - a plain anchor re-exercises the standard
         # asset path, a -cuda anchor hits the documented overlay-miss
         # boundary (bNNNN-cuda release not published in the overlay repo).
         update_pick = anchor
@@ -10994,7 +10994,7 @@ def phase_commands() -> None:
         # the newest-first install list (kind-scoped since the
         # 2026-09-26 whisper-lane incident fix), so it must run while
         # the anchor is active and its expected target is derived from
-        # the sandbox store — not from the cross-kind dance partner.
+        # the sandbox store - not from the cross-kind dance partner.
         p = cli("engine", "use", dance)
         ok_use = p.returncode == 0 and _active_engine_tag() == dance
         reg("engine.use", ok_use, f"active={_active_engine_tag()}")
@@ -11016,7 +11016,7 @@ def phase_commands() -> None:
             )
         elif expected_rollback is None:
             # Designed refusal: no older same-kind engine below the
-            # anchor — the product must say so, never cross kinds.
+            # anchor - the product must say so, never cross kinds.
             regb(
                 "engine.rollback",
                 f"no older same-kind engine below {anchor}: {rout.strip()[:80]}",
@@ -11039,7 +11039,7 @@ def phase_commands() -> None:
         eout = p.stdout + p.stderr
         # Designed teaching refusal: an overlay-shaped tag (-cuda,
         # self-hosted builds) without BLAZAR_ENGINE_REPO configured
-        # must refuse — the error names the env var and the overlay
+        # must refuse - the error names the env var and the overlay
         # repo. Any such refusal is the documented boundary, whatever
         # the exact phrasing ("overlay repo is not configured", "no
         # overlay release ...").
@@ -11150,7 +11150,7 @@ def phase_commands() -> None:
 
     def _config_edit():
         # EDITOR=cat turns the $EDITOR spawn into a harmless print: rc0,
-        # config bytes untouched — proves the spawn path without a UI.
+        # config bytes untouched - proves the spawn path without a UI.
         cfgp2 = os.path.join(SANDBOX.config_dir, "config.toml")
         before = Path(cfgp2).read_bytes() if os.path.exists(cfgp2) else b""
         p = cli("config", "edit", extra_env={"EDITOR": "cat"})
@@ -11205,7 +11205,7 @@ def phase_commands() -> None:
                 f"--json rows={len(rows)}",
             )
             # --arch filter with a REAL registry value (first row's first
-            # architecture) — proves the filter narrows, not just parses.
+            # architecture) - proves the filter narrows, not just parses.
             arch = None
             for r in rows:
                 if r.get("architectures"):
@@ -11246,7 +11246,7 @@ def phase_commands() -> None:
             f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
         )
         # Real removal when a spare (dance) engine exists in the sandbox
-        # store — never the active anchor later lanes spawn from.
+        # store - never the active anchor later lanes spawn from.
         if dance and dance != anchor:
             listed = cli("engine", "list").stdout
             if dance in listed:
@@ -11292,7 +11292,7 @@ def phase_commands() -> None:
         # job is proving the build path, not the fastest artifacts.
         # One-build-per-lane contract: build ACTIVATES its tag and
         # prune_siblings deletes the previous llamacpp builds (the old
-        # anchor included) — "engine update should clean the old
+        # anchor included) - "engine update should clean the old
         # builds". The anchor therefore rolls FORWARD to the built tag,
         # not back to a tag the prune just deleted.
         p = cli("engine", "build", "cpu", timeout=3600)
@@ -11303,7 +11303,7 @@ def phase_commands() -> None:
         if p.returncode != 0 and ("rate limited" in out.lower() or "403" in out):
             # engine.build clones from GitHub; the anonymous API quota
             # (60 req/hr) shared with every other lane's release lookups
-            # exhausts on heavy windows — same environment class the
+            # exhausts on heavy windows - same environment class the
             # install/download lanes already boundary-classify.
             regb("engine.build", f"blocked this window: {out.strip()[:120]}")
             return
@@ -11327,11 +11327,11 @@ def phase_commands() -> None:
         # Prebuilt mistral.rs lane. TAG + --kind only: clap forbids TAG
         # together with --lane (curated-lane installs are lane-id driven).
         # v0.9.3 is a real published release (v0.9.4 may already be in
-        # the sandbox store — a re-install of the same tag would skip the
+        # the sandbox store - a re-install of the same tag would skip the
         # download path this lane exists to exercise). Install ACTIVATES
         # its tag and prunes same-kind siblings; the anchor here is the
         # SURVIVING llamacpp build (the built tag after the build lane's
-        # one-per-lane prune) — restoring it keeps later phases spawning
+        # one-per-lane prune) - restoring it keeps later phases spawning
         # llama-server children, not mistral.rs ones.
         p = cli(
             "engine",
@@ -11372,7 +11372,7 @@ def phase_commands() -> None:
 
     lane("engine.install", _engine_install)
 
-    # -- A1c: gate-fill commands (2026-10-09) — rpc.* shipped in 0.23.0
+    # -- A1c: gate-fill commands (2026-10-09) - rpc.* shipped in 0.23.0
     # ahead of the registry (gates a/a2 + CONFIG COVERAGE fallback rows
     # poisoned by manifest_ok=False), and certify/classify/tune.ctx sat
     # in the manifest without battery evidence rows. Every probe below
@@ -11386,7 +11386,7 @@ def phase_commands() -> None:
     )
 
     # Real foreground worker on a free port: bind, answer a TCP probe,
-    # then SIGTERM — the documented shutdown contract maps TERM to 143
+    # then SIGTERM - the documented shutdown contract maps TERM to 143
     # (128+15), the same mapping the unix rpc worker pins in tests.
     rpc_port = _free_port()
     worker = subprocess.Popen(
@@ -11443,7 +11443,7 @@ def phase_commands() -> None:
     p = cli("tune", MODEL, "--ctx", "4096", timeout=600)
     out = p.stdout + p.stderr
     # Full CUDA bundles adopt the measured ctx (rc0); slim server-only
-    # assets refuse with the llama-bench teaching — both are the real
+    # assets refuse with the llama-bench teaching - both are the real
     # behavior of this box's engine set, and the row reports which.
     reg(
         "tune.ctx",
@@ -11483,7 +11483,7 @@ def phase_commands() -> None:
             f"rc={p.returncode} err={(p.stderr or p.stdout).strip()[:90]}",
         )
         # --no-play was removed from the product surface (clap rejects it);
-        # the registry entry went with it — see _FLAG_EVIDENCE['tts'].
+        # the registry entry went with it - see _FLAG_EVIDENCE['tts'].
         # Catalog searches are read-only upstream queries: cheap, no
         # downloads; boundary (not fail) when the network refuses.
         p = cli("tts", "--search", "en", timeout=120)
@@ -11558,7 +11558,7 @@ def phase_commands() -> None:
     def _pull():
         # The store normally already holds the canonical row this repo
         # normalizes to (`qwen3-0.6b`); pulling the repo ref again is the
-        # DEDUP path by design — rc=0, "already present", zero new bytes,
+        # DEDUP path by design - rc=0, "already present", zero new bytes,
         # no destructive re-pull. Only a store WITHOUT the row exercises
         # a real fetch; require a fresh row only then.
         before = _listed_model_names(cli("list", "--json").stdout)
@@ -11569,7 +11569,7 @@ def phase_commands() -> None:
         out = (p.stdout or "") + (p.stderr or "")
         err = (p.stderr or "").lower()
         # A double HF-side failure (429/5xx on both attempts) is a transient
-        # upstream window, not a regression — boundary it (run.miss-pulls
+        # upstream window, not a regression - boundary it (run.miss-pulls
         # re-proves the pull path later in the same sweep).
         transient = p.returncode != 0 and (
             "429" in err
@@ -11590,7 +11590,7 @@ def phase_commands() -> None:
         elif row_existed:
             # Row present, blob may or may not be (earlier rm windows in
             # this sweep): a dedup OR a re-fetch of the same name are
-            # both non-destructive successes — a re-fetch never adds a
+            # both non-destructive successes - a re-fetch never adds a
             # new NAME, so the set-diff stays empty. Only rc!=0 or a
             # vanished row is a failure.
             reg(
@@ -11607,7 +11607,7 @@ def phase_commands() -> None:
                 p.returncode == 0 and bool(new),
                 f"rc={p.returncode} new={sorted(new)[:3]}",
             )
-        # --verify: re-hash the just-pulled model against its store row —
+        # --verify: re-hash the just-pulled model against its store row -
         # must pass while the model is still in the store (pre-rm). The
         # dedup path keeps the existing row, so --verify stays valid there.
         if (new or row_existed) and not transient:
@@ -11633,14 +11633,14 @@ def phase_commands() -> None:
 
     def _run_miss_pulls():
         # `blazar run` on a missing model must auto-pull (same flow as
-        # `blazar pull`: progress, locks) and then run it — one-shot
+        # `blazar pull`: progress, locks) and then run it - one-shot
         # prompt mode proves the whole chain parse -> pull -> serve.
         # The store normally already holds the canonical row this repo
-        # normalizes to (`qwen3-0.6b`) — in that case the CLI REFUSES to
+        # normalizes to (`qwen3-0.6b`) - in that case the CLI REFUSES to
         # re-pull over it (data-hazard guard) and dedups silently, which
         # is equally correct: assert the non-destructive path instead of
         # the miss teaching. Only a store WITHOUT the row exercises the
-        # "not in the store — pulling …" arm.
+        # "not in the store - pulling ..." arm.
         before = _listed_model_names(cli("list", "--json").stdout)
         row_existed = "qwen3-0.6b" in before
         ensure_phase_daemon()
@@ -11653,7 +11653,7 @@ def phase_commands() -> None:
         miss = "not in the store" in (p.stdout or "")
         pulled = "qwen3-0.6b" in after and "qwen3-0.6b" not in before
         # A killed child (negative rc) or an upstream network window is
-        # a stall, not a deterministic miss-pull failure — boundary it
+        # a stall, not a deterministic miss-pull failure - boundary it
         # like the pull lane does instead of failing the sweep.
         transient = p.returncode < 0 or any(
             tok in miss_out
@@ -11773,7 +11773,7 @@ def phase_knobs_argv() -> None:
         "knobs_argv",
         "server_tools_runtime: argv e2e not bootable",
         "every accepted value (docker:/podman:/ssh:) eagerly spawns external "
-        "infrastructure at engine boot — unavailable in this sandbox; argv "
+        "infrastructure at engine boot - unavailable in this sandbox; argv "
         "emission proven by unit__server_tools__emits_quartet_when_set, "
         "config echo by roundtrip tier",
     )
@@ -11792,7 +11792,7 @@ def phase_knobs_argv() -> None:
             d.start(cfg, floor_model=MODEL)
         except RuntimeError:
             # tensor_split ratios can be rejected on a single visible
-            # device — retry honestly without it and record the boundary.
+            # device - retry honestly without it and record the boundary.
             if "tensor_split" not in cfg:
                 raise
             cov(
@@ -12137,7 +12137,7 @@ def _full_toplevel() -> dict:
         "deterministic_isolate": False,
         "audit_log": False,
         "cpu_ffn_n": 1,
-        # container knob: benign explicit boot (enabled=false — true would
+        # container knob: benign explicit boot (enabled=false - true would
         # require a model; config.rs validation rule)
         "semantic_cache": {"enabled": False},
         "default_ctx": 2048,
@@ -12152,7 +12152,7 @@ def _full_toplevel() -> dict:
         "sdcpp_sage_attn": False,
         "sdcpp_vae_tiling": False,
         "max_loaded_models": 2,
-        # six real knobs surfaced by gate (b) — values are the config.rs
+        # six real knobs surfaced by gate (b) - values are the config.rs
         # defaults, valid by construction
         "child_header_timeout_secs": 120,
         "decode_policy": "free",
@@ -12163,7 +12163,7 @@ def _full_toplevel() -> dict:
         "child_transport": "tcp",
         # frontier-wave knobs: config.rs defaults, valid by construction
         # (differential KV pair composes with the cache_type line above;
-        # governor ships armed since 0.28 — ngram fallback default-on
+        # governor ships armed since 0.28 - ngram fallback default-on
         # needs its collapse net; preload empty keeps the boot inert).
         "cache_type_k": "q8_0",
         "cache_type_v": "q4_0",
@@ -12192,7 +12192,7 @@ def _full_toplevel() -> dict:
         "cache_ram_mb": 1024,
         # config-audit wave backfill: always-serialized containers
         # (gate-b RED) + Option knobs counting for the (c0) denominator.
-        # keep_tags is a usize retention count (floor 1), not a list —
+        # keep_tags is a usize retention count (floor 1), not a list -
         # 2 = fresh build plus one rollback anchor.
         "failover": [],
         "keep_tags": 2,
@@ -12440,7 +12440,7 @@ def _env_override_surface() -> tuple[set[str], dict[str, str]]:
 
     Source-anchored so a newly added BLAZAR_* knob that validate.py never
     exercises shows up as an unregistered row instead of silently passing.
-    Returns empty set when the source file is absent (packaged runs) —
+    Returns empty set when the source file is absent (packaged runs) -
     callers must handle that honestly.
     """
     src = os.path.join(
@@ -12455,7 +12455,7 @@ def _env_override_surface() -> tuple[set[str], dict[str, str]]:
     with open(src, encoding="utf-8") as f:
         text = f.read()
     vars_ = set(re.findall(r'env\("BLAZAR_([A-Z0-9_]+)"\)', text))
-    # parse_u16("BLAZAR_PORT", &v) → BLAZAR_PORT: u16
+    # parse_u16("BLAZAR_PORT", &v) -> BLAZAR_PORT: u16
     types = {
         var: f"{fn}_"
         for fn, var in re.findall(r'parse_(\w+)\("BLAZAR_([A-Z0-9_]+)"', text)
@@ -12480,7 +12480,7 @@ _ENV_TYPE_VALUES = {
 def _env_valid_value(var: str, rust_type: str | None) -> str:
     """A value the parser must accept: the sandbox TOML value when set
     (round-trip through the real config), else a typed default."""
-    # Format-constrained string knobs each need their real syntax —
+    # Format-constrained string knobs each need their real syntax -
     # the generic placeholder is (correctly) rejected by config.validate().
     specials = {
         "CACHE_TYPE": "f16",
@@ -12488,7 +12488,7 @@ def _env_valid_value(var: str, rust_type: str | None) -> str:
         "CPU_RANGE": "0-1",
         # 0 (off) or (1.0..=32.0] per config.validate()
         "CTX_EXTEND": "1.5",
-        # must be >= idle_sleep_secs (default 300) — eviction after sleep
+        # must be >= idle_sleep_secs (default 300) - eviction after sleep
         "IDLE_TIMEOUT_SECS": "900",
         "KEYS": "envk:plm_test",
         "LAZY_MODE": "auto",
@@ -12498,7 +12498,7 @@ def _env_valid_value(var: str, rust_type: str | None) -> str:
         "SERVER_TOOLS_RUNTIME": "docker:alpine",
         "SPEC": "auto",
         # passthrough-argv knobs: config.validate() requires the first
-        # token to be a flag (bare tokens are positionals — rejected with
+        # token to be a flag (bare tokens are positionals - rejected with
         # "must start with a flag token"); the generic placeholder trips it.
         "SDCPP_EXTRA_ARGS": "--validate-probe 1",
         "WHISPER_EXTRA_ARGS": "--validate-probe 1",
@@ -12531,19 +12531,19 @@ def phase_env_overrides() -> None:
         "env",
         "config.rs env surface parsed",
         bool(vars_),
-        f"{len(vars_)} BLAZAR_* vars" + ("" if vars_ else " — source file not found"),
+        f"{len(vars_)} BLAZAR_* vars" + ("" if vars_ else " - source file not found"),
     )
     for var in sorted(vars_):
         rust_type = types.get(var)
         field = var.lower()
         value = _env_valid_value(var, rust_type)
         # Cross-field rule: a tools runtime is meaningless without tools
-        # enabled — the companion var must ride along (config.rs validate()).
+        # enabled - the companion var must ride along (config.rs validate()).
         extra = {f"BLAZAR_{var}": value}
         if var == "SERVER_TOOLS_RUNTIME":
             extra["BLAZAR_SERVER_TOOLS"] = "validate"
         if var == "KEYS":
-            # [[keys]] is a container: `get keys` cannot address it — the
+            # [[keys]] is a container: `get keys` cannot address it - the
             # machine-composition form is proven via `config list`.
             p = cli("config", "list", extra_env={f"BLAZAR_{var}": value})
             reg(
@@ -12559,7 +12559,7 @@ def phase_env_overrides() -> None:
             reg(f"env.BLAZAR_{var}", True, f"get {field} == {value!r}")
         elif applied:
             # Accepted but `get` shows a different repr (tables like
-            # [[keys]] render as multi-line TOML) — apply-proof only.
+            # [[keys]] render as multi-line TOML) - apply-proof only.
             reg(
                 f"env.BLAZAR_{var}",
                 True,
@@ -12617,7 +12617,7 @@ def phase_frontier_knobs() -> None:
     )
     cli("config", "unset", "preload")
 
-    # keep_tags: retention knob with a floor — round-trip plus the 0
+    # keep_tags: retention knob with a floor - round-trip plus the 0
     # rejection contract (set validates before persisting, file unchanged).
     cli("config", "set", "keep_tags", "1")
     p = cli("config", "get", "keep_tags")
@@ -12659,7 +12659,7 @@ def phase_gates() -> None:
 
     # (a2) nested subcommand leaves x manifest, bidirectional -------------
     # Parents are DISCOVERED live: any advertised toplevel whose own
-    # --help carries a Commands: section (never hardcoded — a brand-new
+    # --help carries a Commands: section (never hardcoded - a brand-new
     # parent must surface here, not rot silently). clap injects `help`
     # into every parent and this probe exercises it, so it joins the
     # expected set without manifest rows. Manifest paths deeper than one
@@ -12693,7 +12693,7 @@ def phase_gates() -> None:
     cfgp = os.path.join(SANDBOX.config_dir, "config.toml")
     stash = cfgp + ".stash"
     # Phase-filtered runs (e.g. --phase=gates) may reach here before any
-    # daemon boot created the sandbox config — stash only if present.
+    # daemon boot created the sandbox config - stash only if present.
     had_cfg = os.path.exists(cfgp)
     if had_cfg:
         os.replace(cfgp, stash)
@@ -12832,7 +12832,7 @@ def phase_gates() -> None:
             "mlx",
             "table serializes in fresh list + full-manifest boot (gates b/c); "
             "per-knob flags validated against the installed mlx-lm manifest "
-            "at spawn — engines/mlx battery rides defaults",
+            "at spawn - engines/mlx battery rides defaults",
         ),
     ):
         cov(b_knob, f"boundary: {why}", "documented boundary", ok=True)
@@ -12857,7 +12857,7 @@ def phase_gates() -> None:
         )
         # COMMAND completeness is enforced at the END (phase_coverage):
         # later phases (commands battery, wave13, ...) keep adding
-        # evidence rows after this gate — an early check would count
+        # evidence rows after this gate - an early check would count
         # every not-yet-run lane as missing.
 
         # (e) gateway routes: probed set == source .route() table --------
@@ -12884,7 +12884,7 @@ def report() -> int:
         tag = "ok " if c["ok"] else "MISS"
         print(f"  [{tag}] {c['knob']:<28} {c['expectation']}")
     print(
-        f"  — {sum(1 for c in COVERAGE if c['ok'])}/{len(COVERAGE)} knob flows verified with evidence"
+        f"  - {sum(1 for c in COVERAGE if c['ok'])}/{len(COVERAGE)} knob flows verified with evidence"
     )
     # Command coverage from the registry (reg/regb rows only count once per path).
     regd = {r["path"] for r in COMMAND_COVERAGE if r["ok"]}
@@ -12933,12 +12933,12 @@ def report() -> int:
     if USER_CONFIG_SHA and os.path.exists(REAL_CONFIG):
         with open(REAL_CONFIG, "rb") as f:
             now = hashlib.sha256(f.read()).hexdigest()
-        print(f"user config.toml untouched: {now == USER_CONFIG_SHA} ({now[:16]}…)")
+        print(f"user config.toml untouched: {now == USER_CONFIG_SHA} ({now[:16]}...)")
     return 1 if (failed or cmd_failed) else 0
 
 
 # ---------------------------------------------------------------------------
-# phase: realuser — drive the CLI on a REAL pty terminal (interactive truth)
+# phase: realuser - drive the CLI on a REAL pty terminal (interactive truth)
 # ---------------------------------------------------------------------------
 def _pty_session(argv, steps, timeout=300, env=None):
     """Run argv under a real pty terminal and drive it through `steps`.
@@ -12967,7 +12967,7 @@ def _pty_session(argv, steps, timeout=300, env=None):
     firsts: list = []
     err = ""
     # Search cursor for expect markers: starts at 0 and advances to just
-    # past each found marker — NOT to end-of-buffer — so a marker that
+    # past each found marker - NOT to end-of-buffer - so a marker that
     # arrived batched with the previous step's output still matches.
     cursor = 0
     try:
@@ -13144,7 +13144,7 @@ def phase_realuser():
 
 
 # ---------------------------------------------------------------------------
-# phase: golds — golden-file validation of stable output surfaces
+# phase: golds - golden-file validation of stable output surfaces
 # ---------------------------------------------------------------------------
 GOLDEN_DIR = os.path.join(dirname(abspath(__file__)), "goldens")
 UPDATE_GOLDENS = False  # set by main() from --update-goldens
@@ -13156,7 +13156,7 @@ def _gold_items() -> dict:
 
     p = cli("--help")
     # Grouped help: same name set as the old single Commands: block
-    # (shared parser — see _help_command_names).
+    # (shared parser - see _help_command_names).
     cmds = _help_command_names(p.stdout)
     items["help.commands"] = "\n".join(sorted(cmds))
     cfg_path = os.path.join(SANDBOX.root, "config", "blazar", "config.toml")
@@ -13198,7 +13198,7 @@ def _gold_items() -> dict:
 
     # The doctor capture races adjacent-phase daemon churn in FULL runs
     # (lifecycle stops/respawns share the sandbox run dir); an empty
-    # capture is never legitimate — doctor always prints its table — so
+    # capture is never legitimate - doctor always prints its table - so
     # retry once instead of golden-comparing a torn window.
     p = cli_retry("doctor", expect=r"ok|warn|FAIL", attempts=3)
     if not re.search(
@@ -13209,7 +13209,7 @@ def _gold_items() -> dict:
         {
             m.group(1)
             # doctor renders statuses ok/warn lowercase, FAIL uppercase
-            # (matches the coverage-phase --flat token parse) — a warn
+            # (matches the coverage-phase --flat token parse) - a warn
             # row must NOT silently vanish from this capture.
             for m in (
                 re.match(r"^\s*([a-z][a-z0-9 _-]+?)\s{2,}(?:ok|warn|FAIL)\s", ln)
@@ -13246,13 +13246,13 @@ def _gold_items() -> dict:
             # daemon-health-conditional: the row appears only while a
             # daemon answers the probe, so a golds capture taken while a
             # phase daemon is up and a compare after teardown can never
-            # agree — same class as "service"/"daemon uptime" above.
+            # agree - same class as "service"/"daemon uptime" above.
             "daemon binary",
             "gpu fit",
             "gpu arch match",
             # engine-state rows: presence depends on which engines are
             # installed (per-kind inventory) and on update/retention/
-            # bench state at capture time — none is environment-stable
+            # bench state at capture time - none is environment-stable
             "inventory llamacpp",
             "inventory mistralrs",
             "inventory sdcpp",
@@ -13262,7 +13262,7 @@ def _gold_items() -> dict:
             "engine retention",
             "bench baseline",
             # bench-state-conditional: the row appears only when some
-            # model's bench receipt predates the active engine tag —
+            # model's bench receipt predates the active engine tag -
             # fresh receipts hide it, engine updates surface it (same
             # class as "bench baseline" above)
             "bench receipts",
@@ -13292,7 +13292,7 @@ def _gold_items() -> dict:
         if not hdr:
             # Same daemon-churn race as the doctor capture above: the
             # header is state-invariant in the CLI (always printed), so
-            # an absent NAME row means a torn window — retry once.
+            # an absent NAME row means a torn window - retry once.
             p = cli_retry("ps", expect=r"^NAME|no models loaded", attempts=3)
             hdr = next(
                 (ln for ln in p.stdout.splitlines() if ln.startswith("NAME")),
@@ -13381,7 +13381,7 @@ def phase_golds():
             "golds",
             "golden files present",
             False,
-            f"{meta_path} missing — run `python3 scripts/validate.py "
+            f"{meta_path} missing - run `python3 scripts/validate.py "
             f"--update-goldens` once on a verified binary",
         )
         return
@@ -13428,16 +13428,16 @@ def _pyspy_reexec_if_requested(args: list[str]) -> None:
     common Linux default) only lets a tracer follow processes it spawned,
     so a recorder child cannot attach to this parent without root. Making
     py-spy the PARENT (``py-spy record -- python3 validate.py ...``)
-    traces its own child — no sudo, works everywhere py-spy does.
+    traces its own child - no sudo, works everywhere py-spy does.
     """
     if os.environ.get("BLAZAR_VALIDATE_PYSPY", "") != "1":
         return
     if os.environ.get("BLAZAR_VALIDATE_PYSPY_CHILD") == "1":
-        return  # already under the recorder — never recurse
+        return  # already under the recorder - never recurse
     bin_path = shutil.which("py-spy")
     if not bin_path:
         print(
-            "py-spy: BLAZAR_VALIDATE_PYSPY=1 but py-spy is not on PATH — "
+            "py-spy: BLAZAR_VALIDATE_PYSPY=1 but py-spy is not on PATH - "
             "install it first:  pip install py-spy",
             file=sys.stderr,
         )
@@ -13446,7 +13446,7 @@ def _pyspy_reexec_if_requested(args: list[str]) -> None:
         # macOS requires root for py-spy even in spawn mode; run it
         # externally with sudo there. Loud skip, never silent.
         print(
-            "py-spy: macOS needs a root tracer — run "
+            "py-spy: macOS needs a root tracer - run "
             "`sudo py-spy record -- python3 scripts/validate.py` instead; "
             "continuing unprofiled",
             file=sys.stderr,
@@ -13798,7 +13798,7 @@ def phase_wave13() -> None:
         else f"status={st}",
     )
 
-    # TTFT is observed on the first streamed chunk — fire a real
+    # TTFT is observed on the first streamed chunk - fire a real
     # streaming generation (non-stream requests never cross that seam).
     ok_sse, collected = sse_collect(
         "/v1/chat/completions",
@@ -13838,7 +13838,7 @@ def phase_wave13() -> None:
     )
 
     # optimize --run / --apply: the full measured-optimizer control path
-    # against the live gateway — tune screen WITHOUT adoption, gateway
+    # against the live gateway - tune screen WITHOUT adoption, gateway
     # A/B at probe cost (C=2, reps=2), noise-gated verdict, ledger
     # chain, serving profile restored. --apply then either adopts the
     # verified winner or honestly refuses when --run rejected.
@@ -13887,7 +13887,7 @@ def phase_wave13() -> None:
                 f"adopted #{m_exp.group(1)} rc={pa.returncode}",
             )
         else:
-            # An honest REJECTED run leaves nothing adoptable — the
+            # An honest REJECTED run leaves nothing adoptable - the
             # refusal IS the correct behavior, not a failure.
             reg(
                 "optimize.apply",
@@ -13994,7 +13994,7 @@ def phase_wave13() -> None:
         f"status={st}",
     )
 
-    # Evict through the tags-form name (name:quant) — the ladder must
+    # Evict through the tags-form name (name:quant) - the ladder must
     # resolve it to the bare store key (raw passthrough no-op'd 200).
     st, _, tags = http_json("GET", "/api/tags")
     models = tags.get("models", []) if isinstance(tags, dict) else []
@@ -14087,7 +14087,7 @@ def phase_coverage() -> None:
     p = cli("ps", "--json")
     rows = _jsonl(p.stdout)
     # Idle daemon legally prints zero rows; only rc0 + parseable (or empty)
-    # output passes — unparseable non-empty stdout fails.
+    # output passes - unparseable non-empty stdout fails.
     reg(
         "flag.ps.--json",
         p.returncode == 0 and (bool(rows) or not p.stdout.strip()),
@@ -14370,7 +14370,7 @@ def main() -> int:
         print(f"smoke preset: {', '.join(SMOKE_PHASES)}")
     PHASE_FILTER = wanted
     print(
-        f"blazar validation harness — engine+model REAL, isolation via temp XDG, port {PORT}"
+        f"blazar validation harness - engine+model REAL, isolation via temp XDG, port {PORT}"
     )
     print(f"binary={PAL} model={MODEL} fast={FAST}")
     if _MODEL_NOTE:
@@ -14406,7 +14406,7 @@ def main() -> int:
             del os.environ["GH_TOKEN"]
             boundary(
                 "baseline",
-                "GH_TOKEN invalid — removed from env",
+                "GH_TOKEN invalid - removed from env",
                 f"authed probe rejected ({type(e).__name__}); "
                 "falling back to unauth 60/hr budget",
             )
@@ -14422,7 +14422,7 @@ def main() -> int:
         _lf = llama_fixture()
         if _lf:
             print(
-                f"note: {MODEL} rides a non-llamacpp lane — llama-server argv "
+                f"note: {MODEL} rides a non-llamacpp lane - llama-server argv "
                 f"phases pin GGUF fixture {_lf['name']}; model-driven phases "
                 f"continue on {MODEL}"
             )
@@ -14431,7 +14431,7 @@ def main() -> int:
 
     def _cleanup() -> None:
         # F138: registered with atexit AND called explicitly before the
-        # exit — guard so the pair runs the body exactly once.
+        # exit - guard so the pair runs the body exactly once.
         nonlocal cleaned
         if cleaned:
             return
@@ -14454,7 +14454,7 @@ def main() -> int:
     atexit.register(_cleanup)
 
     # SIGTERM (timeout(1), CI runners) kills python WITHOUT running
-    # atexit handlers — the exact hole that leaked daemon pid 1134882
+    # atexit handlers - the exact hole that leaked daemon pid 1134882
     # for 8h on 2026-09-13. Route external termination through the same
     # cleanup; the daemon-side PDEATHSIG guard covers harness SIGKILL.
     def _on_signal(signum: int, frame: object) -> None:

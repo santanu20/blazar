@@ -1,7 +1,7 @@
 //! Cross-dialect conformance: one semantic request, four spellings, one
 //! semantic answer. Every case in `CASES` is sent through the `OpenAI` chat,
 //! Anthropic messages, Ollama chat, and Ollama generate surfaces and must
-//! come back with the SAME completion text and the SAME token accounting —
+//! come back with the SAME completion text and the SAME token accounting -
 //! the dialect-specific spellings (`usage.prompt_tokens` vs
 //! `usage.input_tokens` vs `prompt_eval_count`) are translation, never
 //! divergence. The streaming spellings must carry the same text in deltas

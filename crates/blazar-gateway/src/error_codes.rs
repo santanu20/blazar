@@ -118,7 +118,7 @@ impl BlazarCode {
     }
 
     /// One-line plain statement of what happened (no model-specific
-    /// detail — that lives in `message`).
+    /// detail - that lives in `message`).
     #[must_use]
     pub fn description(self) -> &'static str {
         match self {
@@ -293,7 +293,7 @@ pub fn error_response(code: BlazarCode, message: &str) -> axum::response::Respon
         .into_response()
 }
 
-/// `GET /api/errors` — the machine-readable catalog. Static by
+/// `GET /api/errors` - the machine-readable catalog. Static by
 /// construction (no state), same auth posture as every other /api route.
 pub async fn errors_catalog() -> axum::response::Response {
     let codes: Vec<serde_json::Value> = ALL
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(
             rows.len(),
             ALL.len(),
-            "docs/error-codes.md row count {} != {} enum variants — regenerate the table",
+            "docs/error-codes.md row count {} != {} enum variants - regenerate the table",
             rows.len(),
             ALL.len()
         );

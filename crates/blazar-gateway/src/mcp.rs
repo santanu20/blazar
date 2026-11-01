@@ -1,7 +1,7 @@
 //! Gateway-side MCP (Model Context Protocol) tool catalog: registered
 //! stdio or streamable-HTTP servers contribute tools that any dialect
 //! lane can inject on request; the gateway executes the tool calls the
-//! model makes and feeds results back — every engine gets tool use with
+//! model makes and feeds results back - every engine gets tool use with
 //! zero child-side MCP support.
 //!
 //! Opt-in per request: body field `"mcp": "all" | "<server>"` or header
@@ -137,7 +137,7 @@ impl Registry {
     /// Layer the config default under a request-level selector result:
     /// header/body win (with `"none"` as the explicit opt-out), then the
     /// config default, then no MCP. Errors from the request selector
-    /// pass straight through — invalid input must teach, not fall back.
+    /// pass straight through - invalid input must teach, not fall back.
     pub(crate) fn resolve(
         &self,
         request: Result<Option<String>, String>,
@@ -352,7 +352,7 @@ fn check_cwd(cfg: &McpServer) -> Result<(), String> {
     let Some(dir) = &cfg.cwd else { return Ok(()) };
     let meta = std::fs::metadata(dir).map_err(|e| {
         format!(
-            "mcp server '{}' cwd '{dir}' unusable: {e} — fix the path or remove cwd",
+            "mcp server '{}' cwd '{dir}' unusable: {e} - fix the path or remove cwd",
             cfg.name
         )
     })?;
@@ -371,7 +371,7 @@ fn spawn_error(cfg: &McpServer, e: &std::io::Error) -> String {
     let mut m = format!("spawn {}: {e}", cfg.command[0]);
     if cfg.env_clear {
         m.push_str(
-            " — env_clear scrubbed the inherited environment; if the binary \
+            " - env_clear scrubbed the inherited environment; if the binary \
              lives on PATH, add \"PATH\" to allowed_env (Windows also needs \
              \"SYSTEMROOT\")",
         );
@@ -484,7 +484,7 @@ async fn spawn_session(cfg: &McpServer) -> Result<Session, String> {
 }
 
 /// Log a bounded slice of a child's stderr (first 32 KiB per server) and
-/// count the rest — diagnostics without a memory or log-flood hazard.
+/// count the rest - diagnostics without a memory or log-flood hazard.
 fn spawn_stderr_drain(stderr: tokio::process::ChildStderr, server: &str) {
     let server = server.to_string();
     tokio::spawn(async move {
@@ -626,7 +626,7 @@ async fn rpc_call(
 /// transport: `Accept: application/json, text/event-stream`, response
 /// either a single JSON object or SSE `data:` frames (first frame
 /// carrying the matching id wins; interleaved notifications are
-/// skipped). Returns `(result, Mcp-Session-Id)` — the session id only
+/// skipped). Returns `(result, Mcp-Session-Id)` - the session id only
 /// appears on the initialize response.
 async fn http_rpc(
     hs: &HttpSession,
@@ -731,7 +731,7 @@ async fn http_init(cfg: &McpServer, hs: &HttpSession) -> Result<HttpState, Strin
             "capabilities": {},
             "clientInfo": {"name": "blazar", "version": env!("CARGO_PKG_VERSION")},
         }),
-        None, // fresh session — never a stale header
+        None, // fresh session - never a stale header
         None,
         timeout,
     )
@@ -821,7 +821,7 @@ fn render_content(result: &Value) -> String {
 
 fn unknown_server(name: &str, known: &[String]) -> String {
     format!(
-        "unknown mcp server '{name}' — configured: [{}] (see [[mcp]] in docs/7.SETUP.md)",
+        "unknown mcp server '{name}' - configured: [{}] (see [[mcp]] in docs/7.SETUP.md)",
         known.join(", ")
     )
 }
@@ -891,7 +891,7 @@ pub(crate) fn selector_read(headers: &HeaderMap, body: &Value) -> Result<Option<
 }
 
 /// Split `mcp__<server>__<tool>` into its parts (exact, no
-/// reassembly surprises — the pieces feed `execute` directly).
+/// reassembly surprises - the pieces feed `execute` directly).
 pub(crate) fn split_tool_name(name: &str) -> Option<(String, String)> {
     let rest = name.strip_prefix(MCP_TOOL_PREFIX)?;
     let (server, tool) = rest.split_once("__")?;
@@ -946,7 +946,7 @@ pub(crate) fn tool_result_messages(
 
 /// Tool results for caller-owned tool calls that landed in a mixed
 /// turn (caller tools alongside gateway tools): the gateway cannot
-/// execute them — the client owns them — so they get an honest
+/// execute them - the client owns them - so they get an honest
 /// placeholder result instead of being silently dropped, which would
 /// leave a dangling `tool_call` and violate the chat protocol on the
 /// next turn.
@@ -963,7 +963,7 @@ pub(crate) fn caller_tool_results(all_calls: &[Value], mcp_calls: &[Value]) -> V
                 "role": "tool",
                 "tool_call_id": call["id"].clone(),
                 "content": format!(
-                    "(gateway mcp note: caller tool '{name}' runs on the client, not in this mediated turn — answer from the mcp results, or re-issue it on a follow-up request)"
+                    "(gateway mcp note: caller tool '{name}' runs on the client, not in this mediated turn - answer from the mcp results, or re-issue it on a follow-up request)"
                 ),
             })
         })
@@ -1089,7 +1089,7 @@ pub(crate) async fn chat_via_mcp(
             return Err(teaching_error(
                 StatusCode::BAD_GATEWAY,
                 &format!(
-                    "mcp loop exceeded {MCP_MAX_ROUNDS} tool rounds — tighten the prompt or raise the bound"
+                    "mcp loop exceeded {MCP_MAX_ROUNDS} tool rounds - tighten the prompt or raise the bound"
                 ),
             ));
         }
@@ -1465,7 +1465,7 @@ mod tests {
     #[allow(non_snake_case)]
     #[tokio::test]
     async fn unit__http_rpc__attaches_jsonrpc_body_and_reads_json_reply() {
-        // One-shot TCP server: pins the wire contract — the POST must
+        // One-shot TCP server: pins the wire contract - the POST must
         // carry the JSON-RPC envelope as its body (a regression once
         // sent headers only, which lenient servers masked as 202s).
         use std::io::{Read, Write};

@@ -1,9 +1,9 @@
 //! Profile compiler: deterministic llama-server argv from (model GGUF meta,
-//! hardware, config+overlay, engine flag set). Rules 1–12 from the plan,
+//! hardware, config+overlay, engine flag set). Rules 1-12 from the plan,
 //! applied in order. Every emitted flag is validated against the installed
 //! engine's manifest; a needed-but-missing flag is a hard error naming it.
 //!
-//! Near-pure: no time, no randomness — table-testable. The one I/O
+//! Near-pure: no time, no randomness - table-testable. The one I/O
 //! touch is read-only `fs::metadata` on the optional mmproj projector
 //! (sizing must see the real file). The supervisor
 //! picks the endpoint (free port / socket) and passes it in.
@@ -59,7 +59,7 @@ pub struct ProfileInput<'a> {
     pub hardware: &'a Hardware,
     pub config: &'a Config,
     pub overlay: &'a ModelOverride,
-    /// Spec-decoding mode the SUPERVISOR resolved for this spawn — the
+    /// Spec-decoding mode the SUPERVISOR resolved for this spawn - the
     /// full tier order (per-request `options.spec` > model overlay >
     /// governor override > config default) lives in one place upstream;
     /// compile treats this as THE decision and never re-derives it from
@@ -70,7 +70,7 @@ pub struct ProfileInput<'a> {
     pub loras: &'a [(String, f64)],
     /// Local path of the pulled draft model when spec=auto resolved one.
     pub draft_path: Option<&'a str>,
-    /// Parsed GGUF header of that draft model, when available — lets the
+    /// Parsed GGUF header of that draft model, when available - lets the
     /// planner charge the draft's device-side KV alongside the dense
     /// model's. `None` = header unreadable (spawn still proceeds; the
     /// charge degrades to dense-only with a daemon-side warn).
@@ -97,11 +97,11 @@ pub struct ProfileInput<'a> {
     pub supported_flags: &'a BTreeSet<String>,
     /// `--spec-type` values the ACTIVE engine advertises (manifest help
     /// parsing). Gates `spec = "mtp"` (draft-mtp) with a fail-fast error
-    /// naming the engine update path — an unadvertised value would die in
+    /// naming the engine update path - an unadvertised value would die in
     /// the child with an opaque argv error.
     pub spec_types: &'a [String],
     /// Dialect selector: the engines.kind column owns this truth (the
-    /// manifest carries no kind). `MistralRs` compiles a minimal profile —
+    /// manifest carries no kind). `MistralRs` compiles a minimal profile -
     /// the child CLI grammar is foreign and `MistralRsEngine` argv
     /// translator owns it.
     pub engine_kind: crate::engine_kind::EngineKind,
@@ -117,11 +117,11 @@ pub struct ProfileInput<'a> {
     /// mlock auto-policy charges it: a dying engine's pinned pages are
     /// not released until its teardown completes, so overlapping
     /// replacements must not re-pin the same RAM share (churn live-
-    /// repro'd: 2 × 5.4 GiB mlock on 13.6 GiB RAM → spawn failures).
+    /// repro'd: 2 x 5.4 GiB mlock on 13.6 GiB RAM -> spawn failures).
     pub resident_ram_mib: u64,
     /// Auto-picked GPU id (e.g. "Vulkan1") from `--list-devices` free
     /// memory at spawn time. Only consulted when neither overlay nor
-    /// config set `devices` — manual selection always wins. The same
+    /// config set `devices` - manual selection always wins. The same
     /// pick scopes `hardware` to that single GPU so every downstream
     /// VRAM estimate (ngl ladder, KV, cache-ram) sizes against the card
     /// the child will actually land on.
@@ -129,14 +129,14 @@ pub struct ProfileInput<'a> {
     /// FULL engine device census BEFORE single-card scoping: the build
     /// class of the engine binary (e.g. a vulkan build enumerates the
     /// integrated GPU alongside discrete cards) is a property of the
-    /// CENSUS, not of the card the spawn lands on — `hardware.gpus` may
+    /// CENSUS, not of the card the spawn lands on - `hardware.gpus` may
     /// be scoped to just the picked card, so build-class detection
     /// (vulkan-class slot capping in `auto_slots_capacity`) reads THIS.
     /// Capacity math never does: it stays on `hardware`.
     pub engine_census: Vec<GpuInfo>,
     /// Discrete GPUs NOT taken by the auto-pick (or by manual `devices`),
     /// best-free-first. Drives placement RECOMMENDATIONS only (spec-draft
-    /// and mmproj offload hints) — never a silent placement decision.
+    /// and mmproj offload hints) - never a silent placement decision.
     /// Empty on single-GPU boxes and when every sibling is integrated.
     pub sibling_devices: Vec<String>,
     /// Supervisor-planned `--tensor-split` ratio string (e.g. "2,1"),
@@ -170,7 +170,7 @@ pub struct Profile {
     /// Counting VRAM (iGPU-excluded) of the compile host; 0 when a lane
     /// compiles without hardware in hand. Cross-engine consumers scale
     /// memory-shaped scheduling decisions by it instead of running
-    /// VRAM-blind — the mistral.rs paged-execution ladder is the first.
+    /// VRAM-blind - the mistral.rs paged-execution ladder is the first.
     pub vram_mib: u64,
     /// Estimated f16-equivalent KV-cache bytes at the compiled ctx, after
     /// w KV quantization the profile chose (`q8_0` halves, `q4_0`
@@ -185,13 +185,13 @@ pub struct Profile {
     /// telemetry can distinguish "ctx 4096 because user pinned" from
     /// "ctx 4096 because auto-fit traded depth for concurrency".
     pub ctx_autofit: Option<(u32, u32)>,
-    /// How `ctx` / `kv_est_bytes` must be read on this lane — see
+    /// How `ctx` / `kv_est_bytes` must be read on this lane - see
     /// [`CapacityStatus`]. Keeps "engine owns memory" lanes from being
     /// read as "capacity unknown" (they are neither zero nor unlimited).
     pub capacity: CapacityStatus,
 }
 
-/// How a lane's context/KV capacity is governed — the difference between
+/// How a lane's context/KV capacity is governed - the difference between
 /// "Blazar compiled a window" and "the engine runtime owns memory".
 ///
 /// This is the observability contract for lanes like MLX: reporting
@@ -199,7 +199,7 @@ pub struct Profile {
 /// conclusions (unlimited? broken probe?). The runtime-managed variant
 /// states the actual design: the engine sizes its own caches, and the
 /// profile's `ctx` is the model's trained-window ceiling used as a fit
-/// bound for request admission — never an allocation Blazar makes.
+/// bound for request admission - never an allocation Blazar makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CapacityStatus {
     /// Blazar-compiled lane: `ctx` is the allocated context window and
@@ -210,7 +210,7 @@ pub enum CapacityStatus {
     /// Runtime-managed lane: the engine owns memory admission internally.
     /// `ctx` carries the model's trained-window ceiling (fit bound for
     /// request preflight); `kv_est_bytes` stays `None` because the
-    /// runtime sizes its caches itself — unknown is NOT unlimited, and
+    /// runtime sizes its caches itself - unknown is NOT unlimited, and
     /// residency accounting uses the measured settle footprint instead.
     RuntimeManaged,
 }
@@ -232,7 +232,7 @@ impl CapacityStatus {
 pub struct TuningOverrides {
     pub ctx: Option<u32>,
     pub kv_quant: Option<bool>,
-    /// Explicit KV-cache grade pair (`type_k`, `type_v`) — symmetric
+    /// Explicit KV-cache grade pair (`type_k`, `type_v`) - symmetric
     /// (`("q5_0", "q5_0")`) or mixed (`("q8_0", "q4_0")`). Takes
     /// precedence over `kv_quant` and the capacity ladder; an f16-class
     /// symmetric pair means force-off (no cache-type flags), mirroring
@@ -249,9 +249,9 @@ pub struct TuningOverrides {
     pub ubatch: Option<u32>,
 }
 
-/// Compile the launch argv (plan rules D.1–12).
+/// Compile the launch argv (plan rules D.1-12).
 ///
-/// One function per the plan's ordered rule list: rules 1–12 append in
+/// One function per the plan's ordered rule list: rules 1-12 append in
 /// sequence and each needs the same locals; splitting further would
 /// shuffle state through six one-use helpers.
 #[allow(clippy::too_many_lines)]
@@ -259,21 +259,21 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // Dialect fork: mistral.rs has no llama-server grammar (no --jinja,
     // --ctx-size, -np slots...). Its argv is assembled by
     // MistralRsEngine::build_argv; the profile only resolves what that
-    // translator consumes — ctx and slot count (mined back out of argv
+    // translator consumes - ctx and slot count (mined back out of argv
     // as `-np N`). Skipping here avoids the manifest flag gate, which
     // would hard-error on every llama-server-only flag.
     if input.engine_kind == crate::engine_kind::EngineKind::MistralRs {
         return compile_mistralrs(input, tuning);
     }
     // Dialect fork: sglang speaks `launch_server` grammar, sizes KV from a
-    // VRAM fraction (not ctx math), and reads safetensors dirs — none of
+    // VRAM fraction (not ctx math), and reads safetensors dirs - none of
     // the llama-server rules below apply. SglangEngine::build_argv owns
     // the connection quintet (model-path/host/port/api-key/served-name);
     // this profile owns the numbers (ctx ladder, VRAM tiers, concurrency).
     if input.engine_kind == crate::engine_kind::EngineKind::Sglang {
         return compile_sglang(input, tuning);
     }
-    // Dialect fork: sd-server has no llama grammar either — no ctx/KV
+    // Dialect fork: sd-server has no llama grammar either - no ctx/KV
     // ladder, no slots; the argv IS the component set (DiT+VAE+TE) plus
     // the listen pair and a threads/offload heuristic. All request-side
     // tuning (steps/cfg/seed/size) rides the HTTP parameters of
@@ -282,7 +282,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         return compile_sdcpp(input, tuning);
     }
     // Dialect fork: mlx_lm.server owns its whole launch grammar
-    // (--model/--host/--port) the same way the sglang fork does — no ctx
+    // (--model/--host/--port) the same way the sglang fork does - no ctx
     // ladder and no KV math (mlx manages context and memory inside its
     // own runtime), so none of the llama-server rules below apply.
     if input.engine_kind == crate::engine_kind::EngineKind::Mlx {
@@ -290,12 +290,12 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
     // The llama-server grammar below is GGUF-only: every rule reads GGUF
     // tensor metadata. A safetensors row on a GGUF engine is a routing
-    // mistake — teach instead of crashing deep in a rule.
+    // mistake - teach instead of crashing deep in a rule.
     let gguf = match input.meta {
         ModelMeta::Gguf(g) => g,
         ModelMeta::Hf(h) => {
             return Err(format!(
-                "model {} is a safetensors directory (arch {}) — llamacpp/mistralrs engines \
+                "model {} is a safetensors directory (arch {}) - llamacpp/mistralrs engines \
                  consume GGUF files; serve it on the sglang engine: `blazar engine install \
                  --kind sglang`, `blazar engine use <sglang-tag>` (see `blazar engine list`), \
                  then restart the daemon",
@@ -309,14 +309,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     let config = input.config;
 
     // Draft-row freshness (mirrors the 11y mcp-config existence check):
-    // a stale store row — file deleted or moved after the pull — fails
+    // a stale store row - file deleted or moved after the pull - fails
     // HERE with a re-pull instruction instead of five seconds into a
     // child boot with an opaque engine error.
     if let Some(draft) = input.draft_path
         && !std::path::Path::new(draft).is_file()
     {
         return Err(format!(
-            "draft model file for {} is missing at {draft} — the store row is \
+            "draft model file for {} is missing at {draft} - the store row is \
                  stale; pull the draft model again to refresh it",
             input.model_name
         ));
@@ -347,26 +347,26 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 2a. slots BEFORE the ctx push: auto slots scale the TOTAL ctx
     // (upstream divides --ctx-size across -np slots), so the emitted ctx
     // and every downstream capacity rule (offload resolver, KV ladder, KV
-    // estimate) must see the scaled total. Each slot keeps `base_ctx` —
+    // estimate) must see the scaled total. Each slot keeps `base_ctx` -
     // Profile.ctx reports the per-slot value so prompt preflight bounds a
     // single request correctly.
     let vram_bytes = capacity_bytes(input.hardware);
     // default_ctx is a CEILING auto-fit may divide; tuning (bench) and
-    // overlay ctx are hard pins — never divided.
+    // overlay ctx are hard pins - never divided.
     let ctx_pinned = tuning.ctx.is_some() || overlay.ctx.is_some();
     // --- 2a-bis. effective --cache-ram budget, computed ONCE and BEFORE
     // the slot resolver: the pinned-ctx slot walk-down inside
     // resolve_slots must judge pool shapes against the EXACT budget the
-    // 2b fit below sees — a second, drifting copy would walk to a
+    // 2b fit below sees - a second, drifting copy would walk to a
     // different np than 2b then hosts. Otherwise: the adaptive clamp
     // (A16) may pull the budget below the model's own weights, which
-    // `--cache-ram` caps the model WEIGHTS mmap plus the prompt cache —
+    // `--cache-ram` caps the model WEIGHTS mmap plus the prompt cache -
     // it does NOT move the KV pool off the GPU (live-verified b10948:
     // `llama_kv_cache: CUDA0 KV buffer` with `--kv-unified` on; the
     // upstream flag only shares ONE buffer across sequences, and
     // `--cache-ram` is the mmap cache cap per PR #16391). A sub-weights
-    // budget is still nonsense — the upstream live fitter then
-    // CPU-splits layers to honor it — live-measured on a 9B/8
+    // budget is still nonsense - the upstream live fitter then
+    // CPU-splits layers to honor it - live-measured on a 9B/8
     // GiB-VRAM/13.6 GiB box: --cache-ram 4102 < weights 5417 decoded at
     // 15.6 t/s while a budget covering the weights decoded at 39.9 t/s,
     // same argv otherwise. Floor the budget at weights + headroom when
@@ -377,7 +377,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     {
         // Explicit `extra_args --cache-ram` wins over the config
         // knob (same doctrine as `-mm`): deliberate argv owns the
-        // budget — no clamp, no floor, rule 12 emits nothing (the
+        // budget - no clamp, no floor, rule 12 emits nothing (the
         // flag lands exactly once, via extra_args itself).
         Some(v)
     } else if config.cache_ram_mb > 0 {
@@ -385,7 +385,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         let clamped = effective_cache_ram_mib(input).map_or(requested, |cap| requested.min(cap));
         if clamped < requested {
             // The shipped default meeting the adaptive cap is auto-tuning
-            // doing its designed job — journal only. A user-pinned budget
+            // doing its designed job - journal only. A user-pinned budget
             // being lowered is a real divergence and stays a warning.
             let user_pinned = config.cache_ram_mb != DEFAULT_CACHE_RAM_MB;
             let line = format!(
@@ -407,14 +407,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         if kv_unified_emitted(input) && input.model_bytes > 0 {
             let weights_mib = input.model_bytes / (1024 * 1024);
             // Floor FROM the budget's true job: it must host the weights
-            // mmap (x20/17 integer ÷0.85 headroom). The KV pool is
+            // mmap (x20/17 integer /0.85 headroom). The KV pool is
             // device-side and deliberately NOT part of this budget.
             let floor_mib = (weights_mib + 64) * 20 / 17;
             let ram_guard = input.hardware.total_ram_mib * 60 / 100;
             if clamped < floor_mib && floor_mib <= ram_guard {
                 warnings.push(format!(
                     "cache-ram budget {clamped} MiB < weights {weights_mib} MiB (the budget \
-                     caps the weights mmap) — floored to {floor_mib} MiB; a sub-weights budget \
+                     caps the weights mmap) - floored to {floor_mib} MiB; a sub-weights budget \
                      makes the engine fitter CPU-split layers (measured 15.6 vs 39.9 t/s on \
                      a 9B)"
                 ));
@@ -423,7 +423,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 warnings.push(format!(
                     "cache-ram budget {clamped} MiB cannot cover weights {weights_mib} MiB \
                      and the {floor_mib} MiB floor exceeds the 60% RAM guard ({ram_guard} MiB) \
-                     — set kv_unified = false, quant down (blazar fit), or raise the budget; \
+                     - set kv_unified = false, quant down (blazar fit), or raise the budget; \
                      the fitter may CPU-split layers"
                 ));
                 Some(clamped)
@@ -446,15 +446,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     );
     // --- 2b. KV pool must fit the GPU. Live-verified child physics
     // (b10948, manual exec): the KV cache allocates DEVICE-side on
-    // BOTH lanes — `--kv-unified` shares ONE buffer across sequences
+    // BOTH lanes - `--kv-unified` shares ONE buffer across sequences
     // (its real saving: no per-slot duplication) and `--cache-ram` is
     // the weights-mmap cap, not a KV relocation. Judge the unified
     // pool against VRAM exactly like the classic path; the only
     // unified-specific part is the shared-buffer geometry (KV scales
     // with TOTAL ctx across slots either way). Shrink ctx (never
-    // below AUTOFIT_CTX_FLOOR) to fit; pinned ctx is never touched —
+    // below AUTOFIT_CTX_FLOOR) to fit; pinned ctx is never touched -
     // verdict/refuse instead. f16 bytes are an upper bound (quantized
-    // KV only shrinks it) — conservative by design.
+    // KV only shrinks it) - conservative by design.
     if kv_unified_emitted(input)
         && let Some(f16) = kv_f16_bytes(input, rs.total_ctx).filter(|kv| *kv > 0)
     {
@@ -462,7 +462,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // the quant the spawn will actually run: an explicit
         // cache_type override (per-phase pair or legacy), or the
         // ladder demotion the same tight card triggers anyway. The
-        // refuse teaching names this exact lever — it must not be a
+        // refuse teaching names this exact lever - it must not be a
         // dead end.
         let mut scratch: Vec<String> = Vec::new();
         let pinned_pair: Option<(String, String)> = if let Some((k, v)) = &tuning.kv_pair {
@@ -500,7 +500,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         let demand = input.model_bytes.saturating_add(kv);
         let vram85 = vram_bytes / 100 * 85;
         if ctx_pinned {
-            // Pinned ctx is sovereign — never shrunk. The SHARED
+            // Pinned ctx is sovereign - never shrunk. The SHARED
             // verdict (same fn the gateway preflights with) refuses
             // a pin the device cannot host; warn-yet-proceed here is
             // how a doomed pin 502-looped through spawn retries
@@ -512,12 +512,12 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             }
             if demand > vram85 {
                 // Middle zone (85%..100%): physically hostable, so
-                // serve it — but gpu-layers stays on the engine's
+                // serve it - but gpu-layers stays on the engine's
                 // live fitter, which may CPU-split the last layers.
                 // Honest degraded serve, not a refuse.
                 warnings.push(format!(
                     "pinned ctx {} fits the {} MiB VRAM only above the 85% share \
-                         (demand {} MiB) — gpu-layers left to the engine fitter; it may \
+                         (demand {} MiB) - gpu-layers left to the engine fitter; it may \
                          CPU-split layers for the last stretch",
                     rs.total_ctx,
                     mib(vram_bytes),
@@ -548,18 +548,18 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             } else {
                 warnings.push(format!(
                     "unified KV pool cannot fit the {} MiB VRAM even at the ctx floor \
-                             {AUTOFIT_CTX_FLOOR}: spawn will likely fail — pull a smaller quant \
+                             {AUTOFIT_CTX_FLOOR}: spawn will likely fail - pull a smaller quant \
                              (blazar fit) or set cache_type = \"q8_0\"",
                     mib(vram_bytes)
                 ));
             }
         } else if demand > vram_bytes {
             // Relocatable posture: the engine moves the over-subscribed
-            // pool slice to host instead of dying at context creation —
+            // pool slice to host instead of dying at context creation -
             // keep the auto-fit ctx (host relocation, not an OOM bet).
             tracing::info!(
                 model = input.model_name,
-                "profile: unified KV pool {} MiB exceeds the {} MiB VRAM — engine \
+                "profile: unified KV pool {} MiB exceeds the {} MiB VRAM - engine \
                      relocates the overflow to host (--no-kv-offload available, not disabled)",
                 mib(demand),
                 mib(vram_bytes)
@@ -614,7 +614,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // unambiguous so `ps` can show the split and warn on CPU fallback
     // (ollama's #1 complaint: GPU present, model silently on CPU). A
     // comfortable full fit pins 999; no GPU pins 0 (labeled); the tight
-    // middle keeps `auto` — the engine's fine-grained layer juggling beats
+    // middle keeps `auto` - the engine's fine-grained layer juggling beats
     // our estimate there, and guessing wrong OOMs loads.
     argv.push("--gpu-layers".into());
     let (gpu_layers, gpu_label) = resolve_gpu_offload(input, ctx, vram_bytes, &mut warnings);
@@ -622,11 +622,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // --- 5. prefix-cache chunk reuse. Upstream disables cache_reuse
     // whenever a multimodal projector is attached ("cache_reuse is not
-    // supported by multimodal") — emitting it on VL spawns is dead argv
+    // supported by multimodal") - emitting it on VL spawns is dead argv
     // that misleads profile readers, so skip and say why. Same for
     // hybrid-linear archs: their interleaved-rope KV cannot shift
     // (llama_memory_can_shift is false), so the engine zeroes the knob
-    // at load with its own warning — dead argv there too.
+    // at load with its own warning - dead argv there too.
     if config.cache_reuse > 0 {
         if input.mmproj_path.is_some() {
             warnings.push(
@@ -636,7 +636,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             if g.attention_class() == crate::gguf::AttentionClass::HybridLinear)
         {
             warnings.push(
-                "cache_reuse skipped: upstream disables it at load on hybrid-linear archs (interleaved-rope KV cannot shift) — it only engages on full-attention models; the native slot prompt-cache still covers identical and extended prefixes".into(),
+                "cache_reuse skipped: upstream disables it at load on hybrid-linear archs (interleaved-rope KV cannot shift) - it only engages on full-attention models; the native slot prompt-cache still covers identical and extended prefixes".into(),
             );
         } else {
             argv.push("--cache-reuse".into());
@@ -690,13 +690,13 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
     };
     // FA-off reconciliation: upstream refuses a quantized V cache without
-    // flash-attn ("quantized V cache requires flash_attn to be enabled" —
+    // flash-attn ("quantized V cache requires flash_attn to be enabled" -
     // the engine exits during load otherwise; receipt: 20260929-flagship-gguf
     // fa_off cold cell). K quants are FA-independent, so the K side survives.
     let kv_v = match kv_v {
         Some(v) if fa == "off" => {
             warnings.push(format!(
-                "flash-attn off: quantized V cache ({v}) requires FA upstream — \
+                "flash-attn off: quantized V cache ({v}) requires FA upstream - \
                  V cache falls back to f16, K quantization kept"
             ));
             None
@@ -729,7 +729,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // --- 9. slots (resolved at rule 2a: `slots = 0` blazar-auto sizes
     // concurrency from capacity and scales the total ctx; explicit pins
-    // pass through). The emitted value is always >= 1 — the auto path
+    // pass through). The emitted value is always >= 1 - the auto path
     // subsumes the old upstream `-1` passthrough.
     argv.push("-np".into());
     argv.push(slots.to_string());
@@ -823,7 +823,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             argv.push(ratios.clone());
             warnings.push(format!(
                 "auto tensor-split {ratios}: weights+KV exceed the best single card's free \
-                 VRAM but fit the discrete cards combined — layer split buys capacity, \
+                 VRAM but fit the discrete cards combined - layer split buys capacity, \
                  not speed (inter-card bandwidth taxes every token); a smaller quant \
                  (blazar fit) or kv quantization may serve faster. Pin `tensor_split` \
                  to silence"
@@ -852,8 +852,8 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             // Embedding tasks cannot split across micro-batches (upstream
             // `!slot.can_split()` rejects input > n_ubatch), so a late-
             // chunking doc must fit ONE ubatch. Default to the upstream
-            // embedding-preset scale (embeddinggemma etc. use 2048) — a
-            // full-ctx ubatch OOMs the compute buffer on tight GPUs —
+            // embedding-preset scale (embeddinggemma etc. use 2048) - a
+            // full-ctx ubatch OOMs the compute buffer on tight GPUs -
             // while never shrinking an explicit config/tuning value. The
             // gateway token guard enforces the same number.
             let late_ubatch = if config.ubatch_size > 0 {
@@ -879,7 +879,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     {
         // Reranker-class checkpoint: either an explicit rank pooling type
         // (LLAMA_POOLING_TYPE_RANK, e.g. GGUFs carrying the KV) or a
-        // `bert` architecture with NO pooling KV — the bge-reranker GGUFs
+        // `bert` architecture with NO pooling KV - the bge-reranker GGUFs
         // ship without the KV and upstream serves them under the same
         // shape, so arch is the only reliable signal for those. A bert
         // WITH an embed pooling KV (MEAN/CLS/LAST, e.g. bge-small-en
@@ -889,7 +889,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // all-zero vectors (live-proven: norm 0.000000 under
         // `--embeddings --reranking`, norm 1.000000 under plain
         // `--embeddings`), so those fall through to the native pooling
-        // arm below. `modern-bert` is excluded on purpose — upstream
+        // arm below. `modern-bert` is excluded on purpose - upstream
         // crashes a rank head against its classifier (GGML_ASSERT in
         // build_pooling). Serving shape: `--embeddings --reranking` with
         // NO `--pooling` (any explicit pooling would neutralize
@@ -913,11 +913,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // reality (live-verified): the reranker arm crashes a rank head
         // against the modern-bert classifier (GGML_ASSERT in
         // build_pooling), and even an explicit `--pooling cls` serves
-        // LLAMA_POOLING_TYPE_NONE — llama.cpp's modern-bert has no
+        // LLAMA_POOLING_TYPE_NONE - llama.cpp's modern-bert has no
         // pooling support, so /v1/embeddings 400s ("Pooling type
         // 'none' is not OAI compatible") and generation 500s ("context
         // does not support logits computation"). A re-converted GGUF
-        // (b11273+ writes the pooling KV) must NOT land here — the
+        // (b11273+ writes the pooling KV) must NOT land here - the
         // `pooling_type.is_none()` guard sends it down the normal
         // pooling arm below, so the upstream fix is honored the day a
         // new artifact arrives, no blazar change needed. Flags ride
@@ -930,9 +930,9 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             argv.push("cls".into());
         }
         warnings.push(
-            "modern-bert classifier checkpoint (no pooling metadata — pre-b11273 \
+            "modern-bert classifier checkpoint (no pooling metadata - pre-b11273 \
              conversion): llama.cpp serves it without pooling and without a language \
-             head — chat and embeddings are unavailable upstream; re-convert the GGUF \
+             head - chat and embeddings are unavailable upstream; re-convert the GGUF \
              with a current llama.cpp to gain the pooling arm, sequence-classification \
              endpoints are this class's other surface"
                 .to_string(),
@@ -958,8 +958,8 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     } else if input.supported_flags.contains("--embeddings") {
         // Embed-any-model parity (2026-09-30 receipt): llama-server
         // b11202+ serves /v1/embeddings AND generation on the SAME
-        // child with `--embeddings` — the --help "restrict to
-        // embedding" wording overstates the limit — so generative
+        // child with `--embeddings` - the --help "restrict to
+        // embedding" wording overstates the limit - so generative
         // checkpoints get the endpoint too (ollama embeds any model;
         // /api/embed previously relayed the upstream 501 "does not
         // support embeddings"). Causal instruct models carry no
@@ -976,12 +976,12 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // --- 11. speculative decoding
     // The mode is the supervisor's resolved decision (see ProfileInput::
-    // spec_mode) — the tier order (per-request > overlay > governor >
+    // spec_mode) - the tier order (per-request > overlay > governor >
     // config) was applied upstream. The `mut` is the ngram rebind below.
     let mut spec_mode = input.spec_mode;
     if spec_mode == "auto" {
         // Embedded MTP head wins over a catalog draft pair: it drafts from
-        // the target's own trained weights (no separate model to pull) —
+        // the target's own trained weights (no separate model to pull) -
         // the exact lane ollama auto-enables for MTP-bearing GGUFs. Still
         // opt-in: fires only because the user set spec = "auto"
         // (spec = "off" never reaches this branch).
@@ -991,7 +991,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             {
                 argv.push("--spec-type".into());
                 argv.push("draft-mtp".into());
-                // Draft steps are bounded by the trained head count — more
+                // Draft steps are bounded by the trained head count - more
                 // is pure verification overhead. Cap at 2 until benched.
                 let n_max = n_layers.min(2);
                 if input.supported_flags.contains("--spec-draft-n-max") {
@@ -1005,7 +1005,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                     argv.push("--spec-draft-backend-sampling".into());
                 }
                 warnings.push(format!(
-                    "spec auto: MTP head ({n_layers} layer(s)) baked into the GGUF — \
+                    "spec auto: MTP head ({n_layers} layer(s)) baked into the GGUF - \
                      draft-mtp enabled (n-max {n_max}); set spec = \"off\" to disable, \
                      bench before adopting at scale"
                 ));
@@ -1013,7 +1013,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             } else {
                 warnings.push(format!(
                     "spec auto: GGUF carries an MTP head but engine {} lacks \
-                     draft-mtp — falling back to the catalog draft-pair path (if \
+                     draft-mtp - falling back to the catalog draft-pair path (if \
                      one exists); run: blazar engine update",
                     input.engine_tag
                 ));
@@ -1028,14 +1028,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
         // Last resort inside auto: self-drafting n-gram lookup. Every
         // drafter above needs weights the user must pull (or a card big
-        // enough to hold them); n-gram drafts from the context itself —
+        // enough to hold them); n-gram drafts from the context itself -
         // zero extra VRAM, persisted via spec_cache, and manifest-gated
         // so old engines keep the dense behavior. The user asked for
         // speculation by setting spec = "auto"; give them the only lane
         // that always fits.
         if !spec_engaged && ngram_fallback_applies(input, config) {
             warnings.push(format!(
-                "spec=auto: no usable draft pair for {} — n-gram lookup \
+                "spec=auto: no usable draft pair for {} - n-gram lookup \
                      speculation engaged (self-drafting, no extra VRAM; \
                      warm across restarts via spec_cache); set spec = \"off\" \
                      or spec_auto_ngram = false to disable",
@@ -1048,7 +1048,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // Self-drafting n-gram speculation: no draft model to pull; drafts
         // from the context's own n-grams ("ngram" is blazar shorthand for
         // the upstream "ngram-simple"; the typed variants map verbatim).
-        // Bench before adopting at scale — verification overhead can
+        // Bench before adopting at scale - verification overhead can
         // regress non-repetitive workloads.
         argv.push("--spec-type".into());
         argv.push(if spec_mode == "ngram" {
@@ -1058,8 +1058,8 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         });
     } else if spec_mode == "mtp" {
         // Multi-token-prediction head baked into the GGUF itself (no
-        // separate draft model). The head must ship IN the weights — e.g.
-        // the Unsloth Qwen3.5-9B GGUF carries none — so this stays strictly
+        // separate draft model). The head must ship IN the weights - e.g.
+        // the Unsloth Qwen3.5-9B GGUF carries none - so this stays strictly
         // opt-in, like every other spec mode (never default-on: ngram
         // precedent showed unmeasured speculation can net-lose).
         if !input.supported_flags.contains("--spec-type")
@@ -1067,14 +1067,14 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         {
             return Err(format!(
                 "spec = \"mtp\" needs an engine advertising draft-mtp; \
-                 engine {} does not — run: blazar engine update",
+                 engine {} does not - run: blazar engine update",
                 input.engine_tag
             ));
         }
         if gguf.mtp_layers.is_none() {
             warnings.push(
                 "spec = \"mtp\" but this GGUF carries no MTP head (no \
-                 n_predict_layers metadata) — the engine will likely fail to \
+                 n_predict_layers metadata) - the engine will likely fail to \
                  create an MTP context; pull an MTP-bearing build \
                  (e.g. unsloth ...-MTP-GGUF)"
                     .into(),
@@ -1095,7 +1095,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     } else if spec_mode == "mtp-adaptive" {
         // Adaptive MTP (llama.cpp PR27210, OPEN upstream): draft-mtp-
         // adaptive re-scores draft candidates against target logits at
-        // verification time instead of trusting the head blindly — the
+        // verification time instead of trusting the head blindly - the
         // acceptance bar climbs with the head's trained depth, so the
         // recommended n-max is 8 (vs the fixed head's 2). Pre-wired: on
         // engines without the type this is a teaching error, on GGUFs
@@ -1106,7 +1106,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             return Err(format!(
                 "spec = \"mtp-adaptive\" needs an engine advertising \
                  draft-mtp-adaptive (llama.cpp PR27210); engine {} does not \
-                 — run: blazar engine update once shipped upstream",
+                 - run: blazar engine update once shipped upstream",
                 input.engine_tag
             ));
         }
@@ -1114,7 +1114,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             argv.push("--spec-type".into());
             argv.push("draft-mtp-adaptive".into());
             // Upstream recommends n-max 8; the trained head depth is the
-            // hard ceiling — more would be pure verification overhead.
+            // hard ceiling - more would be pure verification overhead.
             let n_max = n_layers.min(8);
             if input.supported_flags.contains("--spec-draft-n-max") {
                 argv.push("--spec-draft-n-max".into());
@@ -1127,7 +1127,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         } else {
             warnings.push(
                 "spec = \"mtp-adaptive\" but this GGUF carries no MTP head \
-                 (no n_predict_layers metadata) — staying dense; pull an \
+                 (no n_predict_layers metadata) - staying dense; pull an \
                  MTP-bearing build (e.g. unsloth ...-MTP-GGUF)"
                     .into(),
             );
@@ -1140,7 +1140,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     } {
         // Trained / block-diffusion draft lanes: a SEPARATE draft model
         // (speculator GGUF or dflash/dspark sibling) paired with the
-        // target — unlike MTP there is a real second file to resolve and
+        // target - unlike MTP there is a real second file to resolve and
         // place (upstream asserts ctx_dft for all three). Force-modes for
         // users who benched them; auto keeps its own precedence.
         if !input.supported_flags.contains("--spec-type")
@@ -1148,7 +1148,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         {
             return Err(format!(
                 "spec = {spec_mode:?} needs an engine advertising {spec_val}; \
-                 engine {} does not — run: blazar engine update",
+                 engine {} does not - run: blazar engine update",
                 input.engine_tag
             ));
         }
@@ -1171,7 +1171,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             None => {
                 return Err(format!(
                     "spec = {spec_mode:?} has no {spec_val} draft pair for {} in the catalog; \
-                     running dense instead means un-training your intent — pick another \
+                     running dense instead means un-training your intent - pick another \
                      spec mode (\"auto\" pairs automatically, \"mtp\" uses a baked-in head)",
                     input.model_name
                 ));
@@ -1195,11 +1195,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             );
         } else if let Some(spare) = input.sibling_devices.first() {
             // Teaching, never silent placement: offloading a draft is a
-            // measurable win only on some models — name the spare card
+            // measurable win only on some models - name the spare card
             // and let the user opt in.
             warnings.push(format!(
                 "spec draft shares the target's GPU; spare discrete card {spare} \
-                 is idle — try spec_draft_device = \"{spare}\" (bench both ways)"
+                 is idle - try spec_draft_device = \"{spare}\" (bench both ways)"
             ));
         }
         if config.spec_draft_cpu_strict {
@@ -1418,7 +1418,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
 
     // --- 11c. n-gram tuning. Upstream b10833 REMOVED the generic
-    // --spec-ngram-* forms — the typed --spec-ngram-<family>-* flags
+    // --spec-ngram-* forms - the typed --spec-ngram-<family>-* flags
     // are the live surface. Warn-skip class: tuning is an enhancement, an
     // older engine still serves with engine defaults. The generic
     // size-m/size-n/min-hits knobs feed the simple, map-k and map-k4v
@@ -1465,7 +1465,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
 
     // --- 11z. on-demand tensor loading (`--lazy-mode`): big-tensor
-    // mmap reads from disk instead of keeping them resident — the
+    // mmap reads from disk instead of keeping them resident - the
     // big-MoE RAM-relief lever. Emitted ONLY on deviation: "auto" is
     // already the engine default (tensors > 4 GiB), so default config
     // stays argv-clean; a non-default mode on an engine without the
@@ -1489,7 +1489,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // --- 11y. experimental upstream agent-tooling passthrough
     // (`--tools` / `--tools-runtime` / `--mcp-servers-config|-json`).
-    // Opt-in only — never defaulted. The engine limits CORS to localhost
+    // Opt-in only - never defaulted. The engine limits CORS to localhost
     // when w of these is set; a flag-less engine degrades to a teaching
     // warning (user intent stays visible). The MCP config PATH is
     // existence-checked here: a typo should fail at profile-compile,
@@ -1503,7 +1503,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         let Some(value) = value else { continue };
         if flag == "--mcp-servers-config" && !std::path::Path::new(value).is_file() {
             return Err(format!(
-                "mcp_servers_config = {value:?} does not exist — fix the path \
+                "mcp_servers_config = {value:?} does not exist - fix the path \
                  (engine would refuse the MCP definitions at boot)"
             ));
         }
@@ -1521,7 +1521,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 12. prompt-cache budget + vision projector
     if config.cache_ram_mb > 0
         // Explicit extra_args --cache-ram owns the flag (parsed in
-        // 2a-bis as the budget model) — emitting here too would land
+        // 2a-bis as the budget model) - emitting here too would land
         // the flag twice with different values.
         && cache_ram_from_extra_args(input.overlay.extra_args.as_deref().unwrap_or_default()).is_none()
     {
@@ -1537,7 +1537,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push(budget.to_string());
     }
 
-    // --- 12b. KV buffer layout (upstream unified cache: the cheap radix —
+    // --- 12b. KV buffer layout (upstream unified cache: the cheap radix -
     // one shared buffer + K-shift lets a sequence reuse another's prefix
     // via --cache-reuse). Manifest-gated; unsupported knobs warn loudly
     // only when the user explicitly set them.
@@ -1638,11 +1638,11 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         if ram_mib > 0 && pinned_mib * 100 <= ram_mib * 40 {
             argv.push("--load-mode".into());
             argv.push("mlock".into());
-            // Auto policy rationale: journal only — the decision note is
+            // Auto policy rationale: journal only - the decision note is
             // not a user-facing warning.
             tracing::info!(
                 model = input.model_name,
-                "profile: load-mode mlock auto — weights {weights_mib} MiB (+ {} MiB resident) \
+                "profile: load-mode mlock auto - weights {weights_mib} MiB (+ {} MiB resident) \
                  <= 40% of {ram_mib} MiB RAM; eager page-in measured ~0.7s faster to first \
                  token; set load_mode = \"mmap\" to opt out",
                 input.resident_ram_mib
@@ -1652,7 +1652,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // --- 13. latency/affinity/reasoning/vision passthrough
     // (config-validated; every flag below is manifest-gated with a
-    // teaching warn-skip — an older engine serves with its defaults
+    // teaching warn-skip - an older engine serves with its defaults
     // instead of failing to boot). Semantics verified against upstream
     // arg.cpp b10816: --cpu-range pins child threads to a "lo-hi" CPU
     // set (P/E hybrid boxes: pin to P-cores); --poll 1..100 busy-polls
@@ -1732,7 +1732,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 &[effort.to_string()],
             );
         }
-        // Server-side reasoning switch — authoritative for templates
+        // Server-side reasoning switch - authoritative for templates
         // that ignore the `thinking`/`enable_thinking` request vars.
         let reasoning = overlay
             .reasoning
@@ -1959,7 +1959,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // dependent.
         warnings.push(format!(
             "mmproj shares the target's GPU; spare discrete card {spare} \
-                 is idle — try mmproj_device = \"{spare}\""
+                 is idle - try mmproj_device = \"{spare}\""
         ));
     }
     if config.embd_normalize > 0 {
@@ -1969,12 +1969,12 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 19. multimodal projector: the pulled mmproj wires vision/
     // audio-in into the engine. Explicit `extra_args` -mm wins; a pulled
     // projector on an engine without the flag warns (model still loads,
-    // vision off) — never silently, never fatally. Policy resolution
+    // vision off) - never silently, never fatally. Policy resolution
     // (`attach` | `skip` | `lazy`, default `lazy`): `skip` spawns
     // TEXT-ONLY with vision failing loudly per request; `lazy` also
     // spawns text-only but the gateway respawns WITH the projector on
-    // the first vision request (KV bank carries the conversation) —
-    // everyone gets the measured cold win (875 MiB projector ≈ +3.9 s
+    // the first vision request (KV bank carries the conversation) -
+    // everyone gets the measured cold win (875 MiB projector ~ +3.9 s
     // cold TTFT + 1126 MiB VRAM on the 9B VL row) without losing
     // vision. The supervisor reads the same policy via
     // `mmproj_policy_effective` to know a spawn is projector-less.
@@ -1997,7 +1997,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push(mmproj);
     } else if input.mmproj_force {
         // caller-mandated attach (@vision respawn, router preset): policy
-        // machinery stays out of the way — the caller already decided
+        // machinery stays out of the way - the caller already decided
         if let Some(mmproj) = input.mmproj_path {
             argv.push("-mm".into());
             argv.push(mmproj.to_string());
@@ -2005,7 +2005,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     } else if mm_policy == crate::config::MmprojPolicy::Skip {
         if let Some(mmproj) = input.mmproj_path {
             warnings.push(format!(
-                "mmproj suppressed: model_overrides.{}.mmproj = skip — \
+                "mmproj suppressed: model_overrides.{}.mmproj = skip - \
                  text-only spawn, projector {} skipped (cold boot saves the \
                  projector read; multimodal requests will fail loudly)",
                 input.model_name, mmproj
@@ -2014,7 +2014,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     } else if mm_policy == crate::config::MmprojPolicy::Lazy {
         if let Some(mmproj) = input.mmproj_path {
             warnings.push(format!(
-                "mmproj lazy: {} spawns text-only (projector {} held back — \
+                "mmproj lazy: {} spawns text-only (projector {} held back - \
                  faster cold start, less VRAM); the first vision request \
                  triggers a projector respawn that carries the conversation \
                  via the KV bank",
@@ -2026,7 +2026,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             argv.push("-mm".into());
             argv.push(mmproj.to_string());
         } else {
-            // F108: warnings is the teaching channel (ps/show/tracing) —
+            // F108: warnings is the teaching channel (ps/show/tracing) -
             // eprintln! bypassed it and vanished under daemons.
             warnings.push(format!(
                 "mmproj skipped: model {} has a multimodal projector but \
@@ -2039,7 +2039,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 14. persistent n-gram speculative cache: the lookup table
     // survives restarts, so speculation is warm from the first request
     // after a respawn (default-on convenience: warn-skip on old engines).
-    // Every n-gram family benefits — ngram-cache literally consumes the
+    // Every n-gram family benefits - ngram-cache literally consumes the
     // lookup-cache paths upstream (common.h ngram_cache struct).
     if is_ngram_spec(spec_mode) && config.spec_cache {
         if input.supported_flags.contains("--lookup-cache-dynamic") {
@@ -2078,7 +2078,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // --- 15b. props endpoint: llama-server gates POST /props behind a
     // spawn flag (model/template capability discovery for clients).
-    // Default-on read-only surface — warn-skip on engines without it.
+    // Default-on read-only surface - warn-skip on engines without it.
     if input.supported_flags.contains("--props") {
         argv.push("--props".into());
     } else {
@@ -2181,7 +2181,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv.push(ot.clone());
     }
 
-    // --- 19. agent mode: built-in tools + MCP CORS proxy. Opt-in only —
+    // --- 19. agent mode: built-in tools + MCP CORS proxy. Opt-in only -
     // tools include exec_shell_command; the warning keeps it visible.
     if config.agent {
         argv.push("--agent".into());
@@ -2266,7 +2266,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     }
     if !config.samplers.is_empty() {
         // Config syntax is comma-separated (validated in config.rs); the
-        // engine splits --samplers on ';' only — a comma chain reaches it
+        // engine splits --samplers on ';' only - a comma chain reaches it
         // as one unmatched name and silently degrades the sampler order.
         let chain = config
             .samplers
@@ -2397,7 +2397,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
 
     // KV estimate for the co-residency planner. Unified layout: the buffer
     // lives in the --cache-ram (system RAM) budget, so VRAM only sees the
-    // measured working-set floor — charging full f16 here made the planner
+    // measured working-set floor - charging full f16 here made the planner
     // read unified spawns as 2-4x their real VRAM demand and downgrade or
     // evict on phantom pressure (KV quantization shrinks the RAM buffer,
     // not this floor). Classic path: f16 bytes scaled by the quantization
@@ -2410,7 +2410,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     {
         warnings.push(format!(
             "arch {} is hybrid-linear but the GGUF lacks recurrent_layers/full_attention_interval \
-             metadata — KV estimate counts all layers (upper bound); a newer GGUF conversion may \
+             metadata - KV estimate counts all layers (upper bound); a newer GGUF conversion may \
              emit the layer map",
             gguf.architecture
         ));
@@ -2426,7 +2426,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         .unwrap_or(0);
     let kv_est_bytes = kv_f16_bytes(input, ctx).map(|f16| {
         // Per-phase pair (rule 6): the estimate mirrors what the spawn
-        // emits — differential grades scale at the pair average.
+        // emits - differential grades scale at the pair average.
         let dense = match (kv_k.as_deref(), kv_v.as_deref()) {
             (Some(k), Some(v)) if k != v => scale_kv_pair(f16, k, v),
             (Some(t), _) | (_, Some(t)) => scale_kv_pair(f16, t, t),
@@ -2439,7 +2439,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         argv,
         warnings,
         // per-slot ctx: with auto slots the argv --ctx-size is the scaled
-        // TOTAL, but a single request lives in ONE slot — preflight must
+        // TOTAL, but a single request lives in ONE slot - preflight must
         // bound prompts by what a slot can hold, not the total
         ctx: rs.per_slot_ctx,
         gpu: gpu_label,
@@ -2467,8 +2467,8 @@ pub const POOLING_TYPE_RANK: u64 = 4;
 
 /// `LLAMA_POOLING_TYPE_MEAN` / `_CLS` / `_LAST` from upstream llama.h,
 /// as carried in the GGUF `{arch}.pooling_type` KV (value space confirmed
-/// against upstream's `llama_pooling_type` enum — NONE=0, MEAN=1, CLS=2,
-/// LAST=3, RANK=4 — and a raw KV parse of bge-small-en: 2 = cls). A
+/// against upstream's `llama_pooling_type` enum - NONE=0, MEAN=1, CLS=2,
+/// LAST=3, RANK=4 - and a raw KV parse of bge-small-en: 2 = cls). A
 /// bert-class GGUF carrying any of these is
 /// an EMBEDDER: the reranker arm must not claim it (see the spawn-time
 /// branch above for the zero-vector receipt).
@@ -2478,7 +2478,7 @@ pub const POOLING_TYPE_LAST: u64 = 3;
 
 /// VRAM the unified KV cache still touches on TOP of its f16 pool when
 /// `--kv-unified` is on: the resident slice + paging working set
-/// (device-backed pool — see `estimate_kv_vram_charge`). Measured as
+/// (device-backed pool - see `estimate_kv_vram_charge`). Measured as
 /// part of the ~548 MiB non-weights overhead of a fully-offloaded 16k
 /// spawn (CUDA context + compute buffers included) on an 8 GiB card.
 /// Public: the supervisor's bytes admission charges it as the standing
@@ -2496,7 +2496,7 @@ const UNIFIED_SPAWN_OVERHEAD_BYTES: u64 = 700 * 1024 * 1024;
 
 /// Measured-floor admission charge for a candidate spawn: weights +
 /// projector + the unified KV working-set floor + the fixed spawn
-/// overhead — the same standing charges the unified gpu-layers pin
+/// overhead - the same standing charges the unified gpu-layers pin
 /// trusts, exposed so the supervisor's bytes admission charges incoming
 /// models identically (one decision source). Weights-only admission
 /// oversubscribed an 8 GiB card on 2026-09-11: a 9B VL model settled at
@@ -2514,7 +2514,7 @@ pub fn admission_floor_bytes(model_bytes: u64, mmproj_bytes: u64) -> u64 {
 /// Effective host offload an sglang spawn will run with, in bytes. A
 /// manual `cpu_offload_gb` pin wins, ceil-quantized exactly like the
 /// flag emission in `sglang_gpu_fit` (the engine takes whole GB); with
-/// no pin the ladder's Tier C posture is assumed — ceil of the standing
+/// no pin the ladder's Tier C posture is assumed - ceil of the standing
 /// floor's deficit against the largest single-card budget. Sharing
 /// this with supervisor admission keeps the gate and the emitted argv
 /// from disagreeing about the spawn posture (2026-10-16: a 7.5 GiB
@@ -2522,7 +2522,7 @@ pub fn admission_floor_bytes(model_bytes: u64, mmproj_bytes: u64) -> u64 {
 /// "impossible floor" while its real VRAM demand was ~6 GiB).
 ///
 /// Unpinned invariant: `floor - ceil(floor - budget) <= budget`, so an
-/// unpinned spawn can never refuse-fast on a single card — only a pin
+/// unpinned spawn can never refuse-fast on a single card - only a pin
 /// can demand more GPU than the ladder would leave behind.
 #[must_use]
 pub fn sglang_effective_offload_bytes(
@@ -2540,11 +2540,11 @@ pub fn sglang_effective_offload_bytes(
 
 /// VRAM that ctx-scaled compute buffers cost per token of TOTAL ctx on
 /// vulkan-class builds (mixed integrated+discrete census) when a
-/// projector is attached — the one combination whose allocation footprint
+/// projector is attached - the one combination whose allocation footprint
 /// blazar cannot see ahead of spawn. Measured on an 8 GiB card
 /// (Qwen3.5-9B `Q4_K_M` + mmproj, `--kv-unified`): total ctx 16384 boots
 /// clean (load 3.5s, 88 t/s system), 32768 boots degraded (load 27s,
-/// 47 t/s), 65536 OOMs or crawls at 96% commitment — while the same
+/// 47 t/s), 65536 OOMs or crawls at 96% commitment - while the same
 /// shapes without the projector, and CUDA builds with it, stay healthy.
 /// Bounds the true per-token cost to (21, 43) KiB; 24 KiB sits just
 /// above the np2 failure edge. See `auto_slots_capacity`.
@@ -2563,7 +2563,7 @@ fn floor_batch_flag(argv: &mut [String], flag: &str, floor: u32) {
 }
 
 /// `floor_batch_flag`, but appends `<flag> <floor>` when the flag is
-/// absent — embedding docs need the knob present at all.
+/// absent - embedding docs need the knob present at all.
 fn ensure_batch_flag(argv: &mut Vec<String>, flag: &str, floor: u32) {
     if argv.iter().any(|a| a == flag) {
         floor_batch_flag(argv, flag, floor);
@@ -2575,7 +2575,7 @@ fn ensure_batch_flag(argv: &mut Vec<String>, flag: &str, floor: u32) {
 
 /// Mistral.rs tuning flags that take a value. Single source of truth:
 /// `compile_mistralrs` emits them and the runtime argv translator
-/// forwards them — the lockstep unit test diffs a full-knob compile
+/// forwards them - the lockstep unit test diffs a full-knob compile
 /// against these lists so neither side can drift alone.
 pub const MISTRALRS_TUNING_VALUE_FLAGS: &[&str] = &[
     "--max-batch-size",
@@ -2622,8 +2622,8 @@ pub const MISTRALRS_TUNING_BOOL_FLAGS: &[&str] = &[
 /// ctx math, so an f16 estimate here would be a lie.
 #[allow(clippy::too_many_lines)] // one flat flag inventory, not logic
 #[allow(clippy::cast_precision_loss)] // MiB-scale integers: 52-bit f64 mantissa is exact here
-/// f16-element KV bytes for a full context: `layers × kv_heads ×
-/// head_dim × 2 (K+V) × ctx × elem`. Shared by the sglang fit ladder
+/// f16-element KV bytes for a full context: `layers x kv_heads x
+/// head_dim x 2 (K+V) x ctx x elem`. Shared by the sglang fit ladder
 /// and the mistral.rs pa-fraction derive so both engines size KV from
 /// ONE formula. `None` = checkpoint lacks complete KV geometry.
 fn hf_kv_bytes(kv: &crate::hfmeta::KvGeom, ctx: u64, elem: u64) -> Option<u64> {
@@ -2645,7 +2645,7 @@ fn hf_kv_bytes(kv: &crate::hfmeta::KvGeom, ctx: u64, elem: u64) -> Option<u64> {
 /// `--gpu-memory-utilization` in v0.9.5 (same semantics: fraction of
 /// VRAM claimable by weights + workspace + KV). Emit whichever the
 /// active engine's manifest advertises; None when it has neither
-/// (pre-paged-attn builds) — callers skip silently in the derived
+/// (pre-paged-attn builds) - callers skip silently in the derived
 /// ladder and warn on explicit user pins.
 fn pa_fraction_flag(input: &ProfileInput<'_>) -> Option<&'static str> {
     if input.supported_flags.contains("--gpu-memory-utilization") {
@@ -2669,23 +2669,23 @@ fn mistralrs_pa_mb_pin(input: &ProfileInput<'_>) -> Option<u64> {
 /// Derive `--pa-memory-fraction` from what the spawn actually NEEDS,
 /// not from what the card happens to have. Two candidates, min wins:
 ///
-/// * geometry — weights + ctx-sized f16 KV + runtime floor, from the
+/// * geometry - weights + ctx-sized f16 KV + runtime floor, from the
 ///   checkpoint's own KV geometry. Upstream's 0.90-of-TOTAL default
 ///   made a 0.5B spawn hold ~7 GiB of an 8 GiB card (live-proven:
 ///   6984 MiB resident for a 942 MiB model) and starve every
-///   co-resident lane blazar routes beside it — sizing KV to serving
-///   intent (ctx × slots geometry) is the fix, mirroring the sglang
+///   co-resident lane blazar routes beside it - sizing KV to serving
+///   intent (ctx x slots geometry) is the fix, mirroring the sglang
 ///   ladder. Absent geometry (incomplete config.json) degrades
 ///   silently to the co-tenant guard below.
-/// * free-VRAM budget — when a GPU co-tenant shrinks the pool
+/// * free-VRAM budget - when a GPU co-tenant shrinks the pool
 ///   upstream's fraction would silently truncate into empty responses
 ///   (live-proven: instant ~60ms empties on long prompts, real replies
-///   on short ones — the worst failure mode, serving while broken).
+///   on short ones - the worst failure mode, serving while broken).
 ///
 /// No-op when the operator pinned `mistralrs_pa_memory_fraction`,
-/// the engine lacks the flag, or (no geometry AND single-tenant —
+/// the engine lacks the flag, or (no geometry AND single-tenant -
 /// nothing to correct). `forced_on`: `mistralrs_paged_attn = true` was
-/// pinned — never emit a conflicting `--paged-attn off`, warn instead.
+/// pinned - never emit a conflicting `--paged-attn off`, warn instead.
 #[allow(clippy::too_many_lines)] // one derivation, two documented candidates; splitting scatters the math
 #[allow(clippy::cast_precision_loss)] // MiB-scale integers: 52-bit f64 mantissa is exact here
 fn derive_pa_fraction(
@@ -2703,7 +2703,7 @@ fn derive_pa_fraction(
         return;
     }
     // Absolute-MiB pin wins over any derived fraction (upstream clap
-    // conflict — see the pa-memory-fraction emission site above).
+    // conflict - see the pa-memory-fraction emission site above).
     if mistralrs_pa_mb_pin(input).is_some() {
         warnings.push(
             "mistralrs.pa_memory_mb set: skipping derived memory-fraction (upstream \
@@ -2724,11 +2724,11 @@ fn derive_pa_fraction(
         .mmproj_path
         .and_then(|p| std::fs::metadata(p).ok())
         .map_or(0, |m| m.len());
-    // Probe values are MiB from real hardware/files — always inside i64.
+    // Probe values are MiB from real hardware/files - always inside i64.
     let resident_mib: i64 =
         i64::try_from(input.model_bytes.saturating_add(mmproj) / MIB).expect("MiB fits i64");
 
-    // Candidate 1: geometry — only for safetensors dirs (HfMeta). The
+    // Candidate 1: geometry - only for safetensors dirs (HfMeta). The
     // GGUF-on-mistralrs lane keeps the co-tenant guard only; GGUF KV
     // sizing lives in the llamacpp arch tables.
     let ctx = u64::from(resolve_ctx(input, input.overlay, &mut Vec::new()));
@@ -2754,19 +2754,19 @@ fn derive_pa_fraction(
     };
 
     match (geometry_frac, budget_mib) {
-        // Both apply: the need must fit the free pool — min wins.
+        // Both apply: the need must fit the free pool - min wins.
         (Some(g), Some(b)) if b >= MIN_KV_MIB => {
             emit(
                 g.min(b as f64 / total as f64),
                 format!(
-                    "pa-memory-fraction {g:.2}→min(geometry, free) applied: a GPU co-tenant holds \
+                    "pa-memory-fraction {g:.2}->min(geometry, free) applied: a GPU co-tenant holds \
                  part of the card (total {total} MiB, free {free} MiB, weights+projector \
                  {resident_mib} MiB); pin mistralrs_pa_memory_fraction to override"
                 ),
             );
         }
-        // Geometry alone (single tenant): the idle-GPU grab fix — KV
-        // sized to ctx×geometry, the rest of the card stays free for
+        // Geometry alone (single tenant): the idle-GPU grab fix - KV
+        // sized to ctxxgeometry, the rest of the card stays free for
         // co-resident lanes.
         (Some(g), None) => {
             emit(
@@ -2774,7 +2774,7 @@ fn derive_pa_fraction(
                 format!(
                     "pa-memory-fraction {g:.2} sized from model geometry (weights+projector \
                  {resident_mib} MiB + f16 KV {} MiB at ctx {ctx} + floor {MISTRALRS_RUNTIME_FLOOR_MIB} MiB, \
-                 of {total} MiB total) — upstream's 0.90-of-total default would grab the \
+                 of {total} MiB total) - upstream's 0.90-of-total default would grab the \
                  whole card and starve co-resident lanes; pin mistralrs_pa_memory_fraction \
                  to override",
                     geometry_mib.unwrap_or(0)
@@ -2789,27 +2789,27 @@ fn derive_pa_fraction(
                 format!(
                     "pa-memory-fraction {frac:.2} derived from free VRAM: a GPU co-tenant holds \
                  most of the card (total {total} MiB, free {free} MiB, weights+projector \
-                 {resident_mib} MiB) — upstream's 0.90-of-total default would silently truncate \
+                 {resident_mib} MiB) - upstream's 0.90-of-total default would silently truncate \
                  the KV pool into empty responses; pin mistralrs_pa_memory_fraction to override"
                 ),
             );
         }
         // No viable paged pool next to the tenant (geometry can't
         // rescue it: the need includes weights, which already exceed
-        // free) — classic ctx-sized KV either serves or fails loudly.
+        // free) - classic ctx-sized KV either serves or fails loudly.
         (_, Some(_)) if !forced_on => {
             argv.push("--paged-attn".into());
             argv.push("off".into());
             warnings.push(format!(
                 "paged-attn off: the GPU co-tenant leaves no paged-KV room (total {total} MiB, \
-                 free {free} MiB, weights+projector {resident_mib} MiB) — classic ctx-sized KV \
+                 free {free} MiB, weights+projector {resident_mib} MiB) - classic ctx-sized KV \
                  either serves or fails loudly at load; free the GPU or reroute the model"
             ));
         }
         (_, Some(_)) => {
             warnings.push(format!(
                 "GPU co-tenant leaves ~{} MiB for paged KV (total {total} MiB, free {free} MiB, \
-                 weights+projector {resident_mib} MiB) — expect a loud load failure; set \
+                 weights+projector {resident_mib} MiB) - expect a loud load failure; set \
                  mistralrs_paged_attn = false for classic KV or free the GPU",
                 budget_mib.map_or(0, |b| b.max(0))
             ));
@@ -2838,13 +2838,13 @@ fn compile_mistralrs(
     {
         if slots > 1 {
             warnings.push(format!(
-                "deterministic = true pins slots = 1 — explicit slots = {slots} ignored: \
+                "deterministic = true pins slots = 1 - explicit slots = {slots} ignored: \
                  multi-slot batches perturb logits in near-tie positions and break \
                  token-for-token greedy reproducibility; drop one of the two knobs"
             ));
         } else if slots == 0 {
             warnings.push(
-                "deterministic = true: slots pinned to 1 — concurrent streams queue \
+                "deterministic = true: slots pinned to 1 - concurrent streams queue \
                  instead of batching; unset the pin to recover multi-slot throughput"
                     .to_string(),
             );
@@ -2857,7 +2857,7 @@ fn compile_mistralrs(
     }
     // Paged-KV budget: upstream's 0.90 default hard-fails at load
     // ("Num GPU blocks is 0", live-proven with a 9B vision model on an
-    // 8 GB card) — an explicit fraction reclaims the balance for KV.
+    // 8 GB card) - an explicit fraction reclaims the balance for KV.
     // An absolute `--pa-memory-mb` pin and any fraction are mutually
     // exclusive upstream (clap conflict, live-proven 2026-10-10:
     // spawn dies with "cannot be used with"); the absolute pin wins
@@ -2883,19 +2883,19 @@ fn compile_mistralrs(
         }
     }
     // Attention backend: classic KV (sized by ctx) instead of paged KV
-    // (sized by VRAM fraction) — the only fit for big vision models on
+    // (sized by VRAM fraction) - the only fit for big vision models on
     // 8 GB cards, live-proven with qwen3.5-9b + projector.
     //
     // Co-tenancy: upstream's --pa-memory-fraction is a fraction of
     // TOTAL VRAM, and its 0.90 default silently truncates the KV pool
     // when another GPU tenant (a desktop ollama, a second model server)
-    // already holds most of the card — the engine then serves
+    // already holds most of the card - the engine then serves
     // instant-empty responses instead of failing (live-proven: 0.5B
     // BF16 on a 8 GiB card with 6.3 GiB resident elsewhere = ~60ms
     // empty replies on long tool prompts, real replies on short ones).
     // When a co-tenant is detected we therefore DERIVE a fraction from
     // what is actually free, mirroring the sglang fit ladder:
-    // derive → classic-KV fallback → refuse with numbers.
+    // derive -> classic-KV fallback -> refuse with numbers.
     match input.config.mistralrs_paged_attn {
         Some(pa) => {
             if input.supported_flags.contains("--paged-attn") {
@@ -2931,14 +2931,14 @@ fn compile_mistralrs(
                     warnings.push(
                         "paged-attn auto-off: weights+projector occupy >75% of VRAM and \
                          upstream's paged-KV block pool computes to zero (load would fail with \
-                         'Num GPU blocks is 0'); classic ctx-sized KV serves instead — set \
+                         'Num GPU blocks is 0'); classic ctx-sized KV serves instead - set \
                          mistralrs_paged_attn = true to override"
                             .into(),
                     );
                 } else {
                     // PA stays on (weights fit): under a co-tenant the
                     // upstream 0.90-of-total fraction still points at
-                    // absent memory — derive from free instead.
+                    // absent memory - derive from free instead.
                     derive_pa_fraction(input, &mut argv, &mut warnings, false);
                 }
             }
@@ -2951,7 +2951,7 @@ fn compile_mistralrs(
 
     // LoRA adapter lane: mistral.rs `--lora ALIAS=SOURCE` accepts
     // repeated pairs (alias --lora-modules), GGUF and safetensors
-    // alike — unlike the sglang lane there is no format split. The
+    // alike - unlike the sglang lane there is no format split. The
     // llamacpp `scale` field has no ALIAS=SOURCE form (the upstream
     // JSON form is undocumented in --help); warn instead of guessing.
     for (path, scale) in input.loras {
@@ -2969,7 +2969,7 @@ fn compile_mistralrs(
         );
         if (*scale - 1.0).abs() > f64::EPSILON {
             warnings.push(format!(
-                "lora scale {scale} ignored on the mistralrs engine — its ALIAS=SOURCE \
+                "lora scale {scale} ignored on the mistralrs engine - its ALIAS=SOURCE \
                  form has no scale; the adapter serves at its trained strength"
             ));
         }
@@ -2985,7 +2985,7 @@ fn compile_mistralrs(
             "--max-batch-size",
             &[n.to_string()],
         );
-        // Multimodal fit advisory (receipt: 20260929 flagship mr_batch_64 —
+        // Multimodal fit advisory (receipt: 20260929 flagship mr_batch_64 -
         // mistral.rs sizes its multimodal device-map activation reservation
         // from the batch and refused to load a 9B vision model at batch 64
         // on an 8 GiB card: "cannot fit ... within 7094 MB of usable
@@ -3084,7 +3084,7 @@ fn compile_mistralrs(
     }
 
     // LoRA family: --enable-lora (dynamic serving switch) leads; the
-    // runtime limits only take effect with it or a preloaded adapter —
+    // runtime limits only take effect with it or a preloaded adapter -
     // upstream rejects bare limits with a hard error at boot.
     let lora_serving = tun.enable_lora == Some(true) || !input.loras.is_empty();
     if !lora_serving
@@ -3095,7 +3095,7 @@ fn compile_mistralrs(
         warnings.push(
             "mistralrs.lora_max_rank/lora_max_adapters/lora_max_bytes set but no LoRA serving \
              (mistralrs.enable_lora absent and no adapters preloaded); upstream rejects bare \
-             LoRA runtime limits — set mistralrs.enable_lora = true or attach adapters"
+             LoRA runtime limits - set mistralrs.enable_lora = true or attach adapters"
                 .to_string(),
         );
     }
@@ -3251,7 +3251,7 @@ fn compile_mistralrs(
     }
     // In-situ quantization family: loading-time weight quantization.
     // ISQ only ever shrinks the resident set below the on-disk bytes
-    // admission charges, so the fit ladder stays conservative — no
+    // admission charges, so the fit ladder stays conservative - no
     // reserve adjustment needed (documented on the config knob).
     if let Some(level) = &tun.isq {
         push_gated(
@@ -3296,7 +3296,7 @@ fn compile_mistralrs(
 
     // Layer mapping pin: emit only with a teaching nudge on single-GPU
     // boxes (mirrors the sglang parallelism pins). A MULTI-ord split on
-    // a single-GPU box is a hard refuse, not a warning — the engine
+    // a single-GPU box is a hard refuse, not a warning - the engine
     // accepts the grammar and then dies at weight load (live-proven on
     // v0.9.4: exit 1 right after DType selection), so failing at profile
     // time beats a 502 crash-and-retry cycle.
@@ -3305,13 +3305,13 @@ fn compile_mistralrs(
             if layers.contains(';') {
                 return Err(format!(
                     "mistralrs.device_layers {layers:?} maps layers onto multiple \
-                     GPU ordinals but this box has a single GPU — the engine dies at \
+                     GPU ordinals but this box has a single GPU - the engine dies at \
                      load; use one \"ORD:NUM\" pair or drop the pin for automatic \
                      mapping"
                 ));
             }
             warnings.push(
-                "mistralrs.device_layers set but this box has a single GPU — a manual \
+                "mistralrs.device_layers set but this box has a single GPU - a manual \
                  layer split only makes sense multi-GPU; drop the pin for automatic \
                  mapping"
                     .to_string(),
@@ -3327,7 +3327,7 @@ fn compile_mistralrs(
         );
     }
 
-    // extra_args: strict manifest-gated passthrough — the same contract
+    // extra_args: strict manifest-gated passthrough - the same contract
     // as the sglang lane. The probed manifest IS the dialect's grammar:
     // unknown flags hard-fail with it (a silent warn-drop once measured
     // nothing for a whole ISQ A/B run), and blazar-owned flags refuse
@@ -3353,7 +3353,7 @@ fn compile_mistralrs(
             }
             if RESERVED.contains(&tok.as_str()) {
                 return Err(format!(
-                    "extra_args {tok} is reserved — blazar owns it on the mistralrs \
+                    "extra_args {tok} is reserved - blazar owns it on the mistralrs \
                      engine (host/port/model/scheduling pins); remove it from the \
                      override"
                 ));
@@ -3361,7 +3361,7 @@ fn compile_mistralrs(
             if !input.supported_flags.contains(tok.as_str()) {
                 return Err(format!(
                     "extra_args {tok} is not in this mistralrs engine's probed manifest \
-                     (blazar engine list) — drop it, or blazar engine update refreshes \
+                     (blazar engine list) - drop it, or blazar engine update refreshes \
                      the probe"
                 ));
             }
@@ -3382,7 +3382,7 @@ fn compile_mistralrs(
 
 /// sglang runtime overhead the server needs beyond weights+KV: CUDA
 /// graphs, activation workspace, NCCL/comm buffers, allocator
-/// fragmentation. Deliberately coarse — the ladder only needs it to stop
+/// fragmentation. Deliberately coarse - the ladder only needs it to stop
 /// mem-fraction from promising the last gibibyte to tensors (live OOM
 /// class upstream warns about in their own memory guide).
 const SGLANG_RUNTIME_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
@@ -3440,7 +3440,7 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
 
     if let Some(n) = tuning.threads {
         // The manifest probe keeps long forms only, so the `-t` spelling
-        // could never clear the gate — threads tuning silently vanished
+        // could never clear the gate - threads tuning silently vanished
         // from the launch line (live-verified on the spawned child).
         push_gated(
             input,
@@ -3464,7 +3464,7 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
         };
         if set {
             warnings.push(format!(
-                "tuning {knob} ignored on the sdcpp engine — it is a text-engine \
+                "tuning {knob} ignored on the sdcpp engine - it is a text-engine \
                  knob; diffusion tuning rides request parameters (steps/cfg/seed/size)"
             ));
         }
@@ -3472,13 +3472,13 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
 
     // Offload heuristic (the 75% precedent from the mistralrs paged-attn
     // arm): weights(DiT)+every component file beyond three quarters of
-    // VRAM means the load would OOM — sd-server's --offload-to-cpu
+    // VRAM means the load would OOM - sd-server's --offload-to-cpu
     // keeps params in system RAM and streams compute, the proven
     // Q4-DiT+8B-TE-on-8GiB posture. A VRAM-less box is CPU-only by
     // construction.
     let vram_bytes = capacity_bytes(input.hardware);
     // The standalone `--model` component self-references the model
-    // file — counting it would double the resident estimate.
+    // file - counting it would double the resident estimate.
     let component_bytes = input
         .components
         .iter()
@@ -3492,7 +3492,7 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
     push_sdcpp_tuning(input, &mut argv, &mut warnings);
 
     // extra_args: strict manifest-gated passthrough, same contract as the
-    // other dialects — blazar-owned launch pins refuse rather than
+    // other dialects - blazar-owned launch pins refuse rather than
     // double-set the component/listen pair. Config tier first, model
     // overlay after (engine last-wins).
     argv.extend(sdcpp_extra_args(input, &mut warnings)?);
@@ -3512,13 +3512,13 @@ fn compile_sdcpp(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<P
 
 /// Generation defaults for the launch line: sd-server's built-ins are
 /// SD1.5-era (seed 42, cfg 7.0, `euler_a`, 512x512) and the OpenAI-compat
-/// image route parses prompt/n/size only — every request without
+/// image route parses prompt/n/size only - every request without
 /// explicit parameters inherits the argv, so this IS the effective
 /// default. `--seed -1` re-rolls every generation (upstream: random
 /// seed for values < 0) instead of returning byte-identical frames. The
 /// qwen-image flow-matching `DiT` family additionally needs its documented
 /// posture (model card `true_cfg` 4.0; upstream `qwen_image.md` demo:
-/// `euler` + flow-shift 3 at the native 1024) — cfg 7.0/`euler_a`/512
+/// `euler` + flow-shift 3 at the native 1024) - cfg 7.0/`euler_a`/512
 /// washes those frames out. Wan video and flux keep their engine
 /// model-type defaults (seed only). Every flag rides the manifest gate;
 /// user `extra_args` extend after these (last-wins override), and
@@ -3546,7 +3546,7 @@ fn push_generation_defaults(
 /// First-class config surface for sd-server's high-value perf knobs
 /// (`sdcpp_cache_mode` & friends in config.rs). Emitted manifest-gated
 /// BEFORE user `extra_args`, so an explicit user flag still wins
-/// last-wins. Every default is off — unset knobs compile byte-identical
+/// last-wins. Every default is off - unset knobs compile byte-identical
 /// argv to before this surface existed.
 #[allow(clippy::too_many_lines)]
 fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings: &mut Vec<String>) {
@@ -3591,7 +3591,7 @@ fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings:
         } else {
             warnings.push(format!(
                 "sage_attn skipped: SageAttention requires a CUDA device (SM80+, CUDA \
-                 build) and the child dies during load otherwise; active device {} — \
+                 build) and the child dies during load otherwise; active device {} - \
                  extra_args --sage-attn overrides for custom postures",
                 input.device_hint.unwrap_or("none (CPU-only)")
             ));
@@ -3599,7 +3599,7 @@ fn push_sdcpp_tuning(input: &ProfileInput<'_>, argv: &mut Vec<String>, warnings:
     }
     // Qwen-Image-2.1 prefix-cache type (PR2045) rides --model-args, not
     // a first-class flag: compose it into the user's model-args. An
-    // explicit user entry for the same key wins — blazar never
+    // explicit user entry for the same key wins - blazar never
     // overrides a named lever, it warns instead.
     let merged_model_args = merged_sdcpp_model_args(cfg, warnings);
     for (key, flag, value) in [
@@ -3748,9 +3748,9 @@ fn merged_sdcpp_model_args(cfg: &Config, warnings: &mut Vec<String>) -> Option<S
 }
 
 /// Component-set gates shared by every sdcpp compile: a diffusion `DiT`
-/// is unservable alone. An empty set — or one with neither a `--vae`
+/// is unservable alone. An empty set - or one with neither a `--vae`
 /// (component families) nor a `--model` self-reference (standalone
-/// checkpoints) — means a family-blinded pull (older row); dead paths
+/// checkpoints) - means a family-blinded pull (older row); dead paths
 /// mean deleted files. Both repair the same way: re-pull.
 fn sdcpp_components(input: &ProfileInput<'_>) -> Result<(), String> {
     let serves = input
@@ -3759,7 +3759,7 @@ fn sdcpp_components(input: &ProfileInput<'_>) -> Result<(), String> {
         .any(|c| c.flag == "--vae" || c.flag == "--model");
     if input.components.is_empty() || !serves {
         return Err(format!(
-            "model {} has no diffusion component set (VAE/text encoder) — the DiT \
+            "model {} has no diffusion component set (VAE/text encoder) - the DiT \
              GGUF alone cannot boot; re-pull the model to fetch the set: blazar pull {}",
             input.model_name, input.model_name
         ));
@@ -3767,7 +3767,7 @@ fn sdcpp_components(input: &ProfileInput<'_>) -> Result<(), String> {
     for component in input.components {
         if !std::path::Path::new(component.path).is_file() {
             return Err(format!(
-                "{} file for {} is missing at {} — the store row is stale; \
+                "{} file for {} is missing at {} - the store row is stale; \
                  re-pull the model to repair the component set",
                 component.flag, input.model_name, component.path
             ));
@@ -3798,7 +3798,7 @@ fn sdcpp_offload_decision(vram_bytes: u64, resident: u64) -> SdOffload {
             gpu: "partial",
             flag: Some("--offload-to-cpu"),
             warning: Some(format!(
-                "offload-to-cpu: DiT+VAE ~{} MiB vs {} MiB VRAM — params stay in system \
+                "offload-to-cpu: DiT+VAE ~{} MiB vs {} MiB VRAM - params stay in system \
                  RAM and stream to the GPU (the Q4-DiT + 8B-TE posture); an explicit \
                  extra_args choice would own this flag",
                 resident / MIB,
@@ -3817,17 +3817,17 @@ fn sdcpp_offload_decision(vram_bytes: u64, resident: u64) -> SdOffload {
 /// (everything streams from RAM) and full-GPU sits a third shape the
 /// qwen-image family made common: the DiT+VAE pair fits the card while
 /// the LLM text encoder (8B-class, several GiB) does not. sd-server's
-/// `--backend` assigns modules per name — `te` is the `--llm` module
-/// (live-verified on master-890) — so the planner splits exactly that:
+/// `--backend` assigns modules per name - `te` is the `--llm` module
+/// (live-verified on master-890) - so the planner splits exactly that:
 /// diffusion+VAE resident on the auto-picked card, TE streaming from
 /// system RAM one-shot per prompt (live posture: 49.5s warm vs 60s
 /// blanket on an 8 GiB card). Fences: only the `--llm` family (other
 /// families' module names are unverified), only when the GPU pair fits
 /// 75% of VRAM (the same ladder the blanket arm trips on), never when
-/// `extra_args` (either tier — config or model overlay) already owns
+/// `extra_args` (either tier - config or model overlay) already owns
 /// `--backend` (last-wins would silently clobber the user's posture), and
 /// the flag itself rides the manifest
-/// gate — an engine without `--backend` degrades to the blanket posture
+/// gate - an engine without `--backend` degrades to the blanket posture
 /// instead of dying on an unknown flag.
 fn apply_sdcpp_offload(
     input: &ProfileInput<'_>,
@@ -3840,7 +3840,7 @@ fn apply_sdcpp_offload(
     // `te` is the engine's universal text-encoder module: upstream maps
     // the old `--clip-on-cpu` to `--backend te=cpu` (examples/common/
     // common.cpp), so every external text-encoder stack splits the same
-    // way — the Qwen-image `--llm` family (live-verified) and the
+    // way - the Qwen-image `--llm` family (live-verified) and the
     // flux/SD3 `--t5xxl`/`--clip_l`/`--clip_g` family.
     const TE_FLAGS: &[&str] = &["--llm", "--llm_vision", "--t5xxl", "--clip_l", "--clip_g"];
     let component_bytes = |flag: &str| {
@@ -3865,7 +3865,7 @@ fn apply_sdcpp_offload(
             .sdcpp_extra_args
             .as_deref()
             .is_some_and(tier_owns_backend);
-    // A user-set --backend owns the posture outright — neither the split
+    // A user-set --backend owns the posture outright - neither the split
     // nor the blanket flag stacks underneath it (last-wins confusion).
     if user_owns_backend {
         return;
@@ -3891,7 +3891,7 @@ fn apply_sdcpp_offload(
         if argv.len() > before {
             warnings.push(format!(
                 "backend split: DiT+VAE ~{} MiB on {dev}, text encoder ~{} MiB streams \
-                 from system RAM (one-shot per prompt) — the pair fits the card while \
+                 from system RAM (one-shot per prompt) - the pair fits the card while \
                  the full set does not; extra_args --backend owns this flag for a \
                  custom posture",
                 dit_vae / MIB,
@@ -3915,7 +3915,7 @@ fn apply_sdcpp_offload(
 /// per-model `model_overrides.<m>.extra_args` overlay. Reserved launch
 /// pins refuse rather than double-set the component/listen pair; anything
 /// else must appear in the engine's probed flags. The config tier rides
-/// first, the overlay after — the engine parses last-wins, so a flag set
+/// first, the overlay after - the engine parses last-wins, so a flag set
 /// in both resolves to the overlay's posture and a warning names the
 /// shadowing.
 fn sdcpp_extra_args(
@@ -3953,14 +3953,14 @@ fn sdcpp_extra_args(
             }
             if RESERVED.contains(&tok.as_str()) {
                 return Err(format!(
-                    "{tok} in {tier} is reserved — blazar owns it on the sdcpp \
+                    "{tok} in {tier} is reserved - blazar owns it on the sdcpp \
                      engine (component set + listen pins); remove the entry"
                 ));
             }
             if !input.supported_flags.contains(tok.as_str()) {
                 return Err(format!(
                     "{tok} in {tier} is not in this sdcpp engine's probed \
-                     manifest (blazar engine list) — drop it, or blazar engine \
+                     manifest (blazar engine list) - drop it, or blazar engine \
                      update refreshes the probe"
                 ));
             }
@@ -3972,7 +3972,7 @@ fn sdcpp_extra_args(
         if tok.starts_with('-') && config_tier.contains(tok) {
             warnings.push(format!(
                 "sdcpp_extra_args {tok} is also set by the model override's \
-                 extra_args — the model override wins (engine last-wins)"
+                 extra_args - the model override wins (engine last-wins)"
             ));
         }
         merged.push(tok.clone());
@@ -3984,7 +3984,7 @@ fn sdcpp_extra_args(
 /// weights+KV (torch reserves the rest for activations/workspace).
 const SGLANG_VRAM_USABLE_PCT: u64 = 92;
 
-/// Hard clamp band for emitted `--mem-fraction-static` — below 0.20 the
+/// Hard clamp band for emitted `--mem-fraction-static` - below 0.20 the
 /// server starves weights; above 0.90 it OOMs at graph capture (upstream
 /// default 0.88 lives at the top of the band for a reason).
 const SGLANG_MEM_FRACTION_MIN: f32 = 0.20;
@@ -3995,19 +3995,19 @@ const SGLANG_MEM_FRACTION_MAX: f32 = 0.90;
 /// itself. Receipts: `mem_fraction_static = 0.90` on an 8 GiB card
 /// (RTX 4070 Laptop, `Qwen3-1.7B` bf16) left 0.8 GiB and `PyTorch` hit
 /// `num_active_captures_ > 0 INTERNAL ASSERT` (`CUDACachingAllocator`)
-/// during prefill-graph capture — sglang then `kill_process_tree`s
+/// during prefill-graph capture - sglang then `kill_process_tree`s
 /// itself and the gateway surfaces an opaque 502; the ladder-derived
-/// 0.68 (≈2.7 GiB left) served green, and the bench-calibrated tight-fit
+/// 0.68 (~2.7 GiB left) served green, and the bench-calibrated tight-fit
 /// fixture boots green at 2.0 GiB left on a 12 GiB card. The pool share
 /// scales with VRAM, this reserve does not, so it is expressed in MiB
-/// and only bites small cards (8 GiB → ceiling 0.75; 24 GiB → 0.90, the
+/// and only bites small cards (8 GiB -> ceiling 0.75; 24 GiB -> 0.90, the
 /// band max).
 const SGLANG_ACTIVATION_RESERVE_MIB: u64 = 2_000;
 
 /// Host RAM sglang itself refuses to touch for the hierarchical KV tier
 /// (`HICACHE_HOST_MEMORY_RESERVE_BYTES = 10 GiB`,
 /// `srt/mem_cache/pool_host/base.py` in 0.5.19): the host tier must fit
-/// in `MemAvailable − 10 GiB` at pool-init time.
+/// in `MemAvailable - 10 GiB` at pool-init time.
 const SGLANG_HICACHE_HOST_RESERVE_MIB: u64 = 10_240;
 
 /// Host RAM the sglang child itself occupies before the hierarchical KV
@@ -4018,7 +4018,7 @@ const SGLANG_HOST_ENGINE_FOOTPRINT_MIB: u64 = 4_096;
 
 /// Flags `SglangEngine::build_argv` owns. An `extra_args` entry naming
 /// one of these is a hand-written attempt to fight the connection
-/// quintet, the VRAM ladder, or the loras lane — hard error with the
+/// quintet, the VRAM ladder, or the loras lane - hard error with the
 /// reason, never a silent duplicate flag (last-one-wins argv semantics
 /// would let a user accidentally unpublish the API key or move the
 /// child off loopback).
@@ -4062,7 +4062,7 @@ fn push_tuned(
 }
 
 /// List-shaped sibling of `push_tuned` for nargs flags (`--cuda-graph-bs
-/// 1 2 4`): the flag once, then every value as its own argv token —
+/// 1 2 4`): the flag once, then every value as its own argv token -
 /// argparse consumes tokens until the next `--` flag.
 fn push_tuned_list(
     argv: &mut Vec<String>,
@@ -4087,7 +4087,7 @@ fn push_tuned_list(
 /// a fit ladder the mistralrs path never needed because that engine
 /// juggles layers itself. The connection quintet (model-path/host/port/
 /// api-key/served-model-name) is prepended by `SglangEngine::build_argv`
-/// — this argv is pure tuning + fit output.
+/// - this argv is pure tuning + fit output.
 ///
 /// Fit ladder (user-facing low-VRAM contract, "Tier A..D"):
 /// - A: weights + f16 KV inside usable VRAM -> full GPU.
@@ -4099,13 +4099,13 @@ fn push_tuned_list(
 ///   refusal with the numbers, BEFORE w child spawns. An OOM
 ///   crash-loop at spawn is a planner bug, not an operational state.
 ///
-/// No GPU at all → `--device cpu` lane with a loud warning.
+/// No GPU at all -> `--device cpu` lane with a loud warning.
 #[allow(clippy::too_many_lines)]
 /// mlx-lm launch profile: the connection quintet (--model/--host/--port)
 /// is owned by `MlxEngine::build_argv` (same split as the sglang fork).
 /// Context and memory stay runtime-managed inside mlx-lm: the profile
 /// reports the model's trained context ceiling as `ctx` (0 when metadata
-/// is absent) and marks capacity `RuntimeManaged` — `kv_est_bytes` and
+/// is absent) and marks capacity `RuntimeManaged` - `kv_est_bytes` and
 /// `ctx_autofit` stay unset because admission is settle-based bytes
 /// accounting, not pre-computed KV geometry. First-class tuning knobs
 /// ([`MlxTuning`]) are pinned by `push_mlx_pins`; the strict
@@ -4116,7 +4116,7 @@ fn compile_mlx(input: &ProfileInput<'_>) -> Result<Profile, String> {
         ModelMeta::Hf(_) => {}
         ModelMeta::Gguf(g) => {
             return Err(format!(
-                "model {} is a GGUF file (arch {}) — the mlx engine consumes MLX                  safetensors directories (mlx-community repos); run it on the                  llamacpp engine (default) or pull an MLX quant repo",
+                "model {} is a GGUF file (arch {}) - the mlx engine consumes MLX                  safetensors directories (mlx-community repos); run it on the                  llamacpp engine (default) or pull an MLX quant repo",
                 input.model_name, g.architecture
             ));
         }
@@ -4241,7 +4241,7 @@ fn mlx_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
         }
         if RESERVED.contains(&tok.as_str()) {
             return Err(format!(
-                "extra_args {tok} is reserved — blazar owns it on the mlx engine                  (model + loopback listen pins); remove it from the override"
+                "extra_args {tok} is reserved - blazar owns it on the mlx engine                  (model + loopback listen pins); remove it from the override"
             ));
         }
         if !input.supported_flags.contains(tok.as_str()) {
@@ -4262,7 +4262,7 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
         ModelMeta::Hf(h) => h,
         ModelMeta::Gguf(g) => {
             return Err(format!(
-                "model {} is a GGUF file (arch {}) — the sglang engine consumes HF \
+                "model {} is a GGUF file (arch {}) - the sglang engine consumes HF \
                  safetensors directories; run it on the llamacpp engine (default) or \
                  pull a safetensors checkpoint (e.g. Qwen/Qwen2.5-0.5B-Instruct)",
                 input.model_name, g.architecture
@@ -4417,7 +4417,7 @@ fn push_sglang_parallel_sizes(
     }
     if multi_pin && input.hardware.gpus.len() < 2 {
         warnings.push(format!(
-            "sglang parallel sizes > 1 on a {} GPU machine — sglang shards the \
+            "sglang parallel sizes > 1 on a {} GPU machine - sglang shards the \
              model across ranks and will fail or CPU-shard at spawn; this pin \
              only makes sense multi-GPU",
             input.hardware.gpus.len()
@@ -4437,7 +4437,7 @@ fn push_sglang_parallel_sizes(
         warnings.push(format!(
             "auto tensor-parallelism: weights+KV exceed the best single card but \
                  fit {tp} discrete cards per-rank (manual parallel pins unset); ranks \
-                 bind over every visible GPU via NCCL — inter-card bandwidth is the \
+                 bind over every visible GPU via NCCL - inter-card bandwidth is the \
                  price of capacity. Pin models.<name>.sglang.tp_size to override"
         ));
     }
@@ -4473,7 +4473,7 @@ fn push_sglang_lora_capacity(
 }
 
 /// `extra_args` passthrough, strict: reserved flags (connection quintet +
-/// ladder outputs) are a hard error — a duplicate would silently shadow
+/// ladder outputs) are a hard error - a duplicate would silently shadow
 /// the supervisor-owned values (loopback bind, API key, VRAM budget).
 fn extend_sglang_extra_args(
     input: &ProfileInput<'_>,
@@ -4643,7 +4643,7 @@ fn push_sglang_lifecycle_hygiene(
         // Explicit opt-out: the busy-poll posture is the user's call.
         Some(false) => {}
         // Explicit request keeps the tuned-knob contract (warn + skip on
-        // engines without the flag — the user asked for it by name).
+        // engines without the flag - the user asked for it by name).
         Some(true) => push_tuned(
             argv,
             input.supported_flags,
@@ -4732,7 +4732,7 @@ fn push_sglang_scheduler_observability(
     }
 }
 
-/// `HiCache` (KV tiering to host RAM) — opt-in, with structural viability
+/// `HiCache` (KV tiering to host RAM) - opt-in, with structural viability
 /// gates that convert sglang's guaranteed-boot-crash RAM math into a
 /// teaching refusal before any flag leaves the profile.
 fn push_sglang_hicache(
@@ -4743,7 +4743,7 @@ fn push_sglang_hicache(
 ) -> Result<(), String> {
     if tun.is_embedding == Some(true) {
         // Dedicated embedding posture: upstream runs the CausalLM as an
-        // embedder — decoder pooling, normalized vectors, `/v1/embeddings`
+        // embedder - decoder pooling, normalized vectors, `/v1/embeddings`
         // served while generation is refused on this child (without the
         // flag the mirror image holds: embeddings raise "Please add
         // `--is-embedding`"). That exclusivity is why this knob belongs
@@ -4762,10 +4762,10 @@ fn push_sglang_hicache(
         // sglang 0.5.19 sizes its host tier against
         // `MemAvailable - 10 GiB` (HICACHE_HOST_MEMORY_RESERVE_BYTES,
         // srt/mem_cache/pool_host/base.py) and aborts boot mid-init when
-        // the tier does not fit — on a 16 GiB-RAM box (≈5.8 GiB available
+        // the tier does not fit - on a 16 GiB-RAM box (~5.8 GiB available
         // after torch+weights staging) that budget is NEGATIVE and every
         // tier size fails (receipt: "Requesting 4.59 GB but only have
-        // -4.22 GB free", then kill_process_tree SIGKILL → opaque 502).
+        // -4.22 GB free", then kill_process_tree SIGKILL -> opaque 502).
         // Convert the guaranteed crash into a teaching refusal here; on
         // RAM classes where the tier CAN fit, the flag passes through
         // untouched.
@@ -4793,7 +4793,7 @@ fn push_sglang_hicache(
              hierarchical tier against MemAvailable minus a fixed {} GiB \
              reserve plus the engine's own ~{} GiB host footprint, leaving \
              only {budget_mib} MiB of headroom on this box's {total_ram_mib} \
-             MiB RAM — every tier size fails at boot (upstream aborts \
+             MiB RAM - every tier size fails at boot (upstream aborts \
              scheduler init). HiCache needs a RAM class with at least ~{} \
              GiB of headroom; disable sglang.hicache_enable",
                 SGLANG_HICACHE_HOST_RESERVE_MIB / 1024,
@@ -4857,7 +4857,7 @@ fn push_sglang_portability_defaults(
         );
         // Static portability rationale, not a per-instance health fact:
         // debug-level everywhere (visible when diagnosing with
-        // RUST_LOG=debug) — at info it fired three times before the
+        // RUST_LOG=debug) - at info it fired three times before the
         // `doctor` table during the config-parse compile pass, and per
         // spawn in the journal, without anything to act on whenever the
         // local toolchain cannot host flashinfer anyway.
@@ -4909,7 +4909,7 @@ fn push_sglang_string_pins(
     // inside `content` and the thinking/answer split the gateway promises
     // never happens (live receipt 2026-09-30: qwen3-1.7b, think=true,
     // reasoning rode inline). An explicit pin wins; engines without the
-    // flag are warned about only when the USER pinned a parser — the
+    // flag are warned about only when the USER pinned a parser - the
     // default itself stays silent on legacy surfaces.
     let reasoning_parser = tun.reasoning_parser.clone().or_else(|| {
         input
@@ -4925,9 +4925,9 @@ fn push_sglang_string_pins(
     tun_str("--schedule-policy", &tun.schedule_policy, warnings);
     // Multimodal attention runs its own backend selection; the list is
     // long and hardware-specific (sdpa/fa3/fa4/triton_attn/...), so the
-    // engine's argparse owns rejection — no blazar-side vocabulary.
+    // engine's argparse owns rejection - no blazar-side vocabulary.
     // (grammar-backend stays in push_sglang_cache_policy with the other
-    // structured-output knobs — exactly one emission site per flag.)
+    // structured-output knobs - exactly one emission site per flag.)
     tun_str(
         "--mm-attention-backend",
         &tun.mm_attention_backend,
@@ -5143,7 +5143,7 @@ fn sglang_resolve_ctx(
 /// single-stream exactly like the mistralrs profile, and additionally
 /// engages sglang's native deterministic-inference flag when the
 /// installed engine advertises it (batch-invariant kernels on top of
-/// the serialization pin — additive, never a replacement: the slots=1
+/// the serialization pin - additive, never a replacement: the slots=1
 /// pin is what actually guarantees token-for-token greedy
 /// reproducibility). Returns the resolved slots for the fit ladder.
 fn sglang_resolve_slots(
@@ -5159,7 +5159,7 @@ fn sglang_resolve_slots(
     {
         if slots > 1 {
             warnings.push(format!(
-                "deterministic = true pins max-running-requests = 1 — explicit \
+                "deterministic = true pins max-running-requests = 1 - explicit \
                  slots = {slots} ignored: continuous batching perturbs logits in \
                  near-tie positions and breaks token-for-token greedy \
                  reproducibility; drop one of the two knobs"
@@ -5190,7 +5190,7 @@ fn sglang_resolve_slots(
 
 /// `LoRA` adapters: sglang serves PEFT/safetensors via --enable-lora +
 /// --lora-paths name=path. llama.cpp-class .gguf/.bin adapters are a
-/// different format entirely — hard error with the lane teaching
+/// different format entirely - hard error with the lane teaching
 /// instead of a child crash mid-boot. The llama.cpp `scale` dial has no
 /// sglang equivalent (upstream applies the adapter at its trained
 /// strength): warn, never silently drop the pair.
@@ -5212,7 +5212,7 @@ fn push_sglang_loras(
             .is_some_and(|e| e.eq_ignore_ascii_case("gguf") || e.eq_ignore_ascii_case("bin"));
         if is_llamacpp_adapter {
             return Err(format!(
-                "lora {path} is a .gguf/.bin adapter — the sglang engine loads \
+                "lora {path} is a .gguf/.bin adapter - the sglang engine loads \
                  PEFT/safetensors adapters only (adapter_model.safetensors \
                  dirs); run it on the llamacpp engine or pull a PEFT variant"
             ));
@@ -5221,7 +5221,7 @@ fn push_sglang_loras(
         lora_tokens.push(format!("{name}={path}"));
         if (*scale - 1.0).abs() > f64::EPSILON && !scale_warned {
             warnings.push(
-                "lora scale is llama.cpp vocabulary and is ignored on sglang — \
+                "lora scale is llama.cpp vocabulary and is ignored on sglang - \
                  adapters apply at their trained strength"
                     .into(),
             );
@@ -5254,19 +5254,19 @@ fn push_sglang_loras(
 ///     knob-reachable: sglang 0.5.21 hard-requires a draft model path
 ///     for it (2026-10-09 live receipt: `ValueError` at spawn), so it
 ///     belongs to the draft-pair lane when that grows DFLASH pairs;
-/// (2) the EAGLE3 draft pair via the resolved `draft_path` — sglang rows
+/// (2) the EAGLE3 draft pair via the resolved `draft_path` - sglang rows
 ///     resolve `spec = "eagle3"`-class drafts as safetensors dirs; the
 ///     manifest carries no `spec_types` for sglang (no --spec-type flag
 ///     upstream), so both lanes gate on flags. A GGUF file is never a
 ///     valid EAGLE draft here: sglang's loader treats unknown-path
-///     drafts as HF repo ids and dies in `download_weights_from_hf` —
+///     drafts as HF repo ids and dies in `download_weights_from_hf` -
 ///     the shared spec catalog pairs a text model with a small GGUF
 ///     (fine for llama.cpp's EAGLE lane), so the format gate must live
 ///     at the engine boundary (2026-09-30 receipt: qwen3-1.7b + pulled
 ///     Qwen3-0.6B-f16.gguf -> EAGLE3 draft -> 502).
 /// An explicit algorithm pin owns the spawn: a resolved draft pair
 /// stands down with a warning (user pin > catalog pair). Returns true
-/// when speculation engaged — the fit ladder holds back a verify-KV and
+/// when speculation engaged - the fit ladder holds back a verify-KV and
 /// Spec-depth knobs shared by every engaging speculation arm (the
 /// explicit `spec_algorithm` pin and the resolved EAGLE3 draft pair).
 /// Emitted ONLY when speculation engaged: dense spawns stay
@@ -5342,7 +5342,7 @@ fn sglang_spec_draft_dir<'a>(
 ) -> Option<&'a str> {
     let Some(draft) = tun.spec_draft_path.as_deref().filter(|p| !p.is_empty()) else {
         warnings.push(
-            "sglang.spec_algorithm \"dflash\" needs sglang.spec_draft_path — \
+            "sglang.spec_algorithm \"dflash\" needs sglang.spec_draft_path - \
              a safetensors draft dir; spawning dense (config validation \
              normally catches this at load)"
                 .to_string(),
@@ -5355,7 +5355,7 @@ fn sglang_spec_draft_dir<'a>(
     {
         warnings.push(format!(
             "spec draft {draft} is a GGUF file; sglang drafts must be HF \
-             safetensors dirs (the loader treats unknown paths as repo ids) — \
+             safetensors dirs (the loader treats unknown paths as repo ids) - \
              spawning dense"
         ));
         return None;
@@ -5378,7 +5378,7 @@ fn sglang_spec_draft_dir<'a>(
 /// What the speculative stage decided: whether speculation engages and
 /// the draft-model dir it will load (None = dense, or draft-free
 /// self-drafting like ngram). The ladder charges the draft as
-/// static-side VRAM, so the resolution lives with the emitter — one
+/// static-side VRAM, so the resolution lives with the emitter - one
 /// truth for both.
 struct SpecEngagement<'a> {
     engaged: bool,
@@ -5415,7 +5415,7 @@ fn push_sglang_speculative<'a>(
                 warnings.push(format!(
                     "sglang.spec_algorithm {other:?} is not a knob-lane algorithm \
                      (supported: ngram draft-free, dflash via spec_draft_path); spawning \
-                     dense — the EAGLE family rides the draft-pair lane (spec = \"eagle3\")"
+                     dense - the EAGLE family rides the draft-pair lane (spec = \"eagle3\")"
                 ));
                 return SpecEngagement::dense();
             }
@@ -5439,7 +5439,7 @@ fn push_sglang_speculative<'a>(
         if input.draft_path.is_some() {
             warnings.push(
                 "sglang.spec_algorithm pin overrides the resolved EAGLE3 draft \
-                 pair — the explicit knob owns the spawn"
+                 pair - the explicit knob owns the spawn"
                     .into(),
             );
         }
@@ -5472,7 +5472,7 @@ fn push_sglang_speculative<'a>(
         {
             warnings.push(format!(
                 "spec draft {draft} is a GGUF file; sglang EAGLE drafts must be \
-                 HF safetensors dirs — spawning dense (pull the draft as a \
+                 HF safetensors dirs - spawning dense (pull the draft as a \
                  safetensors row to enable the pair)"
             ));
         } else if input.supported_flags.contains("--speculative-algorithm")
@@ -5510,7 +5510,7 @@ fn push_sglang_vocab_teaching(input: &ProfileInput<'_>, warnings: &mut Vec<Strin
         .is_some_and(|c| !c.is_empty())
     {
         warnings.push(
-            "cache_type is llama-server vocabulary and is ignored on sglang — set \
+            "cache_type is llama-server vocabulary and is ignored on sglang - set \
              models.<name>.sglang.kv_cache_dtype (auto, bf16, fp8_e5m2, fp8_e4m3) \
              instead"
                 .into(),
@@ -5577,7 +5577,7 @@ fn push_nonllama_vocab_teaching(config: &Config, lane: &str, warnings: &mut Vec<
         return;
     }
     warnings.push(format!(
-        "llama-server-only knobs {} are ignored on the {lane} engine — they apply to the \
+        "llama-server-only knobs {} are ignored on the {lane} engine - they apply to the \
          GGUF (llama-server) lane; see the {lane} tuning tables for the lane-native \
          equivalents",
         set.join(", ")
@@ -5606,7 +5606,7 @@ fn sglang_run_fit_ladder(
         .unwrap_or_else(|| "auto".to_string());
     let kv_bytes_at = |elem: u64| -> Option<u64> {
         // layers * kv_heads * head_dim * 2 (K and V) * ctx * elem bytes
-        // — shared with the mistral.rs pa-fraction derive (one formula).
+        // - shared with the mistral.rs pa-fraction derive (one formula).
         hf_kv_bytes(&hf.kv, u64::from(ctx), elem)
     };
     let gpu_label: &'static str;
@@ -5621,7 +5621,7 @@ fn sglang_run_fit_ladder(
                 warnings.push(
                     "fit ladder skipped: config.json lacks KV geometry \
                  (num_hidden_layers / num_key_value_heads / head_dim); \
-                 sglang defaults apply and may OOM on tight cards — a \
+                 sglang defaults apply and may OOM on tight cards - a \
                  rebuilt/complete checkpoint dir fixes this"
                         .into(),
                 );
@@ -5634,7 +5634,7 @@ fn sglang_run_fit_ladder(
                 // Draft weights are STATIC-side: sglang loads them
                 // before sizing the KV pool and counts them in
                 // pre_model_load ("If using speculative decoding, draft
-                // weights are now counted" — kv_cache_configurator).
+                // weights are now counted" - kv_cache_configurator).
                 // Leaving them out of the derive lands the fraction
                 // under the engine's own minimum-viable floor and the
                 // spawn dies at alloc_memory_pool (2026-10-16 receipt:
@@ -5645,7 +5645,7 @@ fn sglang_run_fit_ladder(
                     crate::hfmeta::root_safetensors_bytes(std::path::Path::new(draft))
                         .unwrap_or_else(|| {
                             warnings.push(format!(
-                                "sglang draft dir {draft} unreadable at compile — \
+                                "sglang draft dir {draft} unreadable at compile - \
                                  mem-fraction derived draft-free; sizing may run tight"
                             ));
                             0
@@ -5710,7 +5710,7 @@ struct SglangFitGeometry {
     vram: u64,
     budget: u64,
     weights: u64,
-    /// Draft-model weights the spec lane loads before pool sizing —
+    /// Draft-model weights the spec lane loads before pool sizing -
     /// static-side demand the derive must charge (0 when not engaged).
     draft_weights: u64,
     kv16_v: u64,
@@ -5719,7 +5719,7 @@ struct SglangFitGeometry {
 
 /// What the chosen fit tier decided: the serving-tier label, the KV
 /// bytes it budgeted, and the total host-offload it emitted (manual pin
-/// or ladder-derived) — the mem-fraction derive consumes all three.
+/// or ladder-derived) - the mem-fraction derive consumes all three.
 struct SglangFitOutcome {
     gpu_label: &'static str,
     kv_est_bytes: Option<u64>,
@@ -5730,7 +5730,7 @@ struct SglangFitOutcome {
 /// pin wins over the supervisor's auto plan) and the (vram, usable
 /// budget) pair the tiers must fit inside. Under a shard pin > 1 the
 /// anchor is the SMALLEST discrete card (the bottleneck rank), never
-/// the summed pool — planning 2x8 GiB as 16 GiB is how NCCL dies at
+/// the summed pool - planning 2x8 GiB as 16 GiB is how NCCL dies at
 /// spawn. Zero discrete cards under a shard pin falls back to
 /// single-rank math (the census warning already flags the impossible
 /// pin).
@@ -5786,7 +5786,7 @@ fn sglang_shard_budget(input: &ProfileInput<'_>, tun: &SglangTuning) -> (u32, u6
 }
 
 /// The GPU fit tiers, tried cheapest-first: A full-GPU f16 KV, B fp8
-/// KV, C host-offload; D (inside the Tier C helper) refuses — spawning
+/// KV, C host-offload; D (inside the Tier C helper) refuses - spawning
 /// would only OOM-loop. The manual `cpu_offload_gb` pin is honored in
 /// EVERY tier (the user asked for offload; the ladder only derives it
 /// when unpinned) and rides into the outcome for the mem-fraction
@@ -5805,16 +5805,16 @@ fn sglang_gpu_fit(
     let mut offload_total_gb = 0.0f32;
     if let Some(pin) = tun.cpu_offload_gb {
         // The engine flag is integer-GB (0.5.21 argparse rejects "5.5":
-        // invalid int value) — a fractional pin rounds UP, never down:
+        // invalid int value) - a fractional pin rounds UP, never down:
         // under-offloading would OOM the spawn the pin exists to save.
         let whole = pin.ceil();
         // Equality is exact here by construction: ceil() is whole, so the
-        // comparison only answers "was the pin already whole" — no
+        // comparison only answers "was the pin already whole" - no
         // tolerance semantics involved.
         #[allow(clippy::float_cmp)]
         if whole != pin {
             warnings.push(format!(
-                "sglang.cpu_offload_gb {pin} rounded up to {whole} — the \
+                "sglang.cpu_offload_gb {pin} rounded up to {whole} - the \
                  engine's --cpu-offload-gb accepts whole GB only"
             ));
         }
@@ -5836,7 +5836,7 @@ fn sglang_gpu_fit(
         }
         // A full fit still owes the spec lane an explicit graph ceiling:
         // upstream's default 256 assumes dense decode graphs, and the
-        // verify graphs cost the draft-token multiple — on a
+        // verify graphs cost the draft-token multiple - on a
         // near-full card that default alone can OOM the capture.
         if spec_engaged {
             let headroom = budget.saturating_sub(weights).saturating_sub(kv16_v);
@@ -5868,7 +5868,7 @@ fn sglang_gpu_fit(
                 warnings,
             );
             warnings.push(
-                "fit ladder Tier B: f16 KV would overflow the card — \
+                "fit ladder Tier B: f16 KV would overflow the card - \
                  KV cache pinned to fp8_e5m2 (halves KV VRAM; slight \
                  precision cost on long-tail logits). Override with \
                  models.<name>.sglang.kv_cache_dtype"
@@ -5923,14 +5923,14 @@ fn sglang_tier_c_host_offload(
         .saturating_div(u64::from(shard));
     // The pin (already quantized to whole GB at its own emission
     // site) overrides the ladder's derive for BOTH the flag and the
-    // headroom math — offload_bytes derived from the same value the
+    // headroom math - offload_bytes derived from the same value the
     // engine receives keeps them from disagreeing.
     let emitted = if let Some(pin) = tun.cpu_offload_gb {
         pin.ceil()
     } else {
         warnings.push(format!(
             "fit ladder Tier C: weights {:.2} GiB + KV {:.2} GiB \
-                 exceed the {:.2} GiB usable VRAM — offloading \
+                 exceed the {:.2} GiB usable VRAM - offloading \
                  {offload_gb} GB of weights to host RAM (decode \
                  speed drops roughly with the offloaded share); \
                  override with models.<name>.sglang.cpu_offload_gb",
@@ -5953,7 +5953,7 @@ fn sglang_tier_c_host_offload(
             );
         }
         // The pin already emitted its flag at the top of `sglang_gpu_fit`
-        // — the pin site owns the flag so the argv never carries it
+        // - the pin site owns the flag so the argv never carries it
         // twice. Only the ladder-derived path pushes here.
         if tun.cpu_offload_gb.is_none() {
             push_tuned(
@@ -5986,7 +5986,7 @@ fn sglang_tier_c_host_offload(
             offload_gb: emitted,
         })
     } else {
-        // Tier D: refusal — spawning would only OOM-loop.
+        // Tier D: refusal - spawning would only OOM-loop.
         Err(format!(
             "model {} does not fit this machine: weights {:.2} GiB + \
              fp8 KV {:.2} GiB vs {:.2} GiB usable VRAM (needs \
@@ -6005,18 +6005,18 @@ fn sglang_tier_c_host_offload(
 
 /// mem-fraction-static: the anti-OOM heart. sglang bounds only the
 /// static pool (weights + draft + KV) by the fraction; every dynamic
-/// allocation — CUDA graphs, the spec verify/prewarm chain,
-/// activations — lives in the `(1-frac)` remainder. So the spec
+/// allocation - CUDA graphs, the spec verify/prewarm chain,
+/// activations - lives in the `(1-frac)` remainder. So the spec
 /// reserve LOWERS THE CEILING: `frac <= (vram - reserves) / vram`
 /// guarantees the dynamic remainder is at least the reserves.
 /// (Charging the reserve into the numerator grows the static pool and
-/// shrinks the dynamic side — that inversion is what OOM'd the
+/// shrinks the dynamic side - that inversion is what OOM'd the
 /// 2026-10-16 DFLASH spawn at `prewarm_sampling`.)
 /// Derived from what actually stays device-side (weights minus the
-/// EMITTED offload — pin or ladder-derived — plus KV). An explicit pin
+/// EMITTED offload - pin or ladder-derived - plus KV). An explicit pin
 /// still passes governance: it may tighten or widen the derived fit,
 /// but never past the activation+graph reserve
-/// (`SGLANG_ACTIVATION_RESERVE_MIB` receipts) or the hard band — an
+/// (`SGLANG_ACTIVATION_RESERVE_MIB` receipts) or the hard band - an
 /// over-budget pin is a mid-boot crash (capture assert ->
 /// `kill_process_tree` -> opaque 502), never a usable configuration.
 #[allow(clippy::too_many_arguments)]
@@ -6038,7 +6038,7 @@ fn sglang_push_mem_fraction(
         .saturating_add(geom.draft_weights);
     // The dynamic side = vram * (1 - frac) must hold activations +
     // graphs + the spec chain. Guaranteeing that means the RESERVE
-    // LOWERS THE CEILING (frac <= 1 - reserves/vram) — never a
+    // LOWERS THE CEILING (frac <= 1 - reserves/vram) - never a
     // numerator add or a shrunken denominator: both RAISE frac, grow
     // the static pool, and starve the dynamic side they claim to
     // protect (that inversion OOM'd the 2026-10-16 DFLASH spawn at
@@ -6097,19 +6097,19 @@ fn sglang_push_mem_fraction(
 }
 
 /// VRAM that must stay OUT of the static pool when speculation engages:
-/// sglang bounds only weights+KV by `mem-fraction-static` — everything
+/// sglang bounds only weights+KV by `mem-fraction-static` - everything
 /// else (verify CUDA graphs, the DFLASH prewarm sampling chain, whose
 /// `(rows, vocab)` fp32 tensors scale with the decode-graph ceiling)
 /// allocates from the `(1-frac)` remainder (sglang 0.5.21
 /// `kv_cache_configurator._profile_available_bytes`: pool = free -
 /// pre*(1-frac)). Sized 256 MiB by two independent receipts:
 /// (a) the 2026-10-16 through-blazar prewarm OOM happened at an
-/// UNBOUNDED ceiling of 201 — after the ladder's x8 graph-ceiling
+/// UNBOUNDED ceiling of 201 - after the ladder's x8 graph-ceiling
 /// division (tight cards derive 4-25) and the draft-weights static
 /// charge, the residual dynamic spec need is the prewarm tail, a few
 /// hundred MiB at these ceilings; (b) the follow-up live runs pushed
 /// the fraction ceiling below sglang's OWN minimum-viable floor
-/// (derive capped at 0.605 vs floor 0.6076) — the engine's live
+/// (derive capped at 0.605 vs floor 0.6076) - the engine's live
 /// budget admitted `2000 MiB activations + ~300` as viable, i.e. it
 /// converges with `ACTIVATION_RESERVE` + 256, not + 1024. Too much
 /// reserve does not merely cost KV headroom: on tight cards it makes
@@ -6120,13 +6120,13 @@ pub const SGLANG_SPEC_DYNAMIC_RESERVE_MIB: u64 = 256;
 /// Verify-step CUDA graphs cost roughly the draft-token multiple of a
 /// dense decode graph: the 2026-10-16 receipt measured ~23 MiB per
 /// captured size beside 3.5 GiB on-GPU weights (23 buckets, 0.52 GiB
-/// verify pool) vs the dense slope's 2.51 MiB/size — a ~9x factor for
+/// verify pool) vs the dense slope's 2.51 MiB/size - a ~9x factor for
 /// the b16 draft class. First-order 8x until the concurrency-ladder
 /// run calibrates per algorithm.
 const SGLANG_SPEC_GRAPH_MULT: f64 = 8.0;
 
 /// Captured-graph memory slope: MiB of CUDA-graph pool per captured batch
-/// size, per GiB of weights. Calibrated from a live receipt — the bs-256
+/// size, per GiB of weights. Calibrated from a live receipt - the bs-256
 /// capture pool measured +334 MiB beside 3.9 GiB weights (sglang 0.5.19,
 /// RTX 4070 8 GiB, bench-artifacts/20260928-sglang-safetensors, `cg_bs_256`
 /// cell). First-order: the pool tracks activations, which track model size.
@@ -6144,7 +6144,7 @@ fn sglang_graph_per_size_mib(weights: u64) -> f64 {
 /// Memory-bound ceiling for the cuda-graph capture list: spend at most
 /// half the post-weights/KV headroom on captured graphs, never below the
 /// historical flat floor of 4, never above the upstream default of 256.
-/// Spec lanes pay the verify multiplier per captured size — the capture
+/// Spec lanes pay the verify multiplier per captured size - the capture
 /// replays draft-token verification, not one dense step (2026-10-16
 /// receipt: ~23 MiB/size observed vs the dense 2.51).
 #[allow(
@@ -6171,11 +6171,11 @@ const SGLANG_DEFAULT_CHUNKED_PREFILL: u32 = 2048;
 
 /// Prefill capture buckets for the split flag surface (sglang 0.5.21+),
 /// derived from the effective chunk size. Prefill `bs` counts aggregate
-/// TOKENS, not requests — the breakable backend composes smaller
-/// captures — so a 3-rung ladder ending at the chunk boundary covers
+/// TOKENS, not requests - the breakable backend composes smaller
+/// captures - so a 3-rung ladder ending at the chunk boundary covers
 /// every shape the scheduler can emit. Receipt (instrumented A/B,
 /// qwen3-1.7b, RTX 4070 8 GiB, 2026-10-09): [256, 1024, 2048] vs the
-/// upstream 42-shape ladder — identical temp-0 output hash, identical
+/// upstream 42-shape ladder - identical temp-0 output hash, identical
 /// 6.4k-token prefill latency and 66 tok/s decode, capture 17.1s -> 5.5s.
 fn sglang_prefill_graph_buckets(chunk: u32) -> Vec<u32> {
     let mut buckets = [chunk / 8, chunk / 2, chunk].map(|b| b.max(1)).to_vec();
@@ -6215,8 +6215,8 @@ const SGLANG_PREFILL_GRAPH_PIN_FLAGS: &[&str] = &[
 /// Derived prefill capture list on the split surface:
 /// `--cuda-graph-bs-prefill <chunk/8> <chunk/2> <chunk>` plus the chunk
 /// pin that makes the top bucket the exact chunk boundary. The legacy
-/// combined-flag surface (0.5.19 and older) keeps its existing posture —
-/// the combined `--cuda-graph-max-bs` cap keeps covering prefill there —
+/// combined-flag surface (0.5.19 and older) keeps its existing posture -
+/// the combined `--cuda-graph-max-bs` cap keeps covering prefill there -
 /// so this emits nothing when the split flag is missing.
 fn push_sglang_prefill_capture(
     input: &ProfileInput<'_>,
@@ -6380,7 +6380,7 @@ fn ceil_gb(bytes: u64) -> f32 {
 }
 
 /// GB (f32 flag grammar) to bytes, 1e9-based like the engine's own GB
-/// units — not GiB — so admission arithmetic matches the emitted flag.
+/// units - not GiB - so admission arithmetic matches the emitted flag.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn gb_to_bytes(gb: f32) -> u64 {
     (f64::from(gb) * 1e9).round() as u64
@@ -6397,7 +6397,7 @@ fn resolve_ctx(
 ) -> u32 {
     let requested = overlay.ctx.unwrap_or(input.config.default_ctx);
     // F109: when YaRN ctx extension is active the usable window is the
-    // TRAINED length stretched by ctx_extend — clamping to the bare
+    // TRAINED length stretched by ctx_extend - clamping to the bare
     // trained length defeated the feature (extend 2.0 on a 64k model
     // could never run past 65536 no matter what ctx asked for).
     let extend = input.config.effective_ctx_extend(input.model_name);
@@ -6406,7 +6406,7 @@ fn resolve_ctx(
         let ceiling = if extend > 1.0 {
             // train <= u32::MAX and extend is clamped > 1.0 by config
             // validation, and the min() keeps the product inside u32
-            // range before the cast — no sign or truncation hazard.
+            // range before the cast - no sign or truncation hazard.
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             let stretched = (f64::from(train) * extend).floor().min(f64::from(u32::MAX)) as u64;
             u32::try_from(stretched).unwrap_or(u32::MAX)
@@ -6439,9 +6439,9 @@ fn resolve_ctx(
 /// bytes; `q8_0` halves it, `q4_0` quarters it. The cheapest grade that keeps
 /// weights+KV within 0.9x VRAM wins, with one differential rung between the
 /// symmetric `q8_0` and `q4_0` grades: K at `q8_0` + V at `q4_0` (3/8 of f16)
-/// — K precision dominates attention retrieval, V tolerates the heavier
+/// - K precision dominates attention retrieval, V tolerates the heavier
 /// quant at better quality than symmetric `q4_0` (SnapKV/PyramidKV lineage).
-/// Missing GGUF fields skip with a named warning — never guessed.
+/// Missing GGUF fields skip with a named warning - never guessed.
 /// True when the spawn's device hint resolves to a CUDA-class GPU
 /// (e.g. "CUDA0"); `None` or other backends (Vulkan/Metal/CPU) are false.
 fn cuda_class_device(input: &ProfileInput<'_>) -> bool {
@@ -6468,7 +6468,7 @@ fn kv_quant_ladder(
     fa_off: bool,
     warnings: &mut Vec<String>,
 ) -> Option<(&'static str, &'static str)> {
-    // The multimodal projector is GPU-resident too — capacity math that
+    // The multimodal projector is GPU-resident too - capacity math that
     // ignores it OOMs at load on vision models (live incident).
     let mmproj_bytes = input
         .mmproj_path
@@ -6492,7 +6492,7 @@ fn kv_quant_ladder(
         // Stock upstream engine builds compile flash-attention kernels
         // only for SYMMETRIC K/V quant pairs (GGML_CUDA_FA_QUANT defaults):
         // a mixed pair rides an f16-conversion path around every attention
-        // op — measured ~4% decode t/s loss on a CUDA device (b11293,
+        // op - measured ~4% decode t/s loss on a CUDA device (b11293,
         // qwen3.5-9b: 38.1 vs 39.8 tok/s) and the engine logs it "slow".
         // FA-off spawns never touch those kernels, and non-CUDA backends
         // dequantize mixed pairs natively, so only the CUDA+FA lane falls
@@ -6501,7 +6501,7 @@ fn kv_quant_ladder(
         if !fa_off && cuda_class_engine(input.engine_tag) {
             warnings.push(
                 "KV differential quant skipped on this CUDA engine build: stock engine builds \
-                 ship flash-attention kernels only for symmetric K/V pairs — q8_0/q4_0 \
+                 ship flash-attention kernels only for symmetric K/V pairs - q8_0/q4_0 \
                  dequantizes to f16 around every attention op (measured ~4% decode loss; \
                  the engine logs it as slow); using q4_0/q4_0 instead (native kernel, \
                  KV/4 bytes). Pin cache_type_k/v to force the mixed grade"
@@ -6510,7 +6510,7 @@ fn kv_quant_ladder(
             Some(("q4_0", "q4_0"))
         } else {
             warnings.push(
-                "KV differential quant engaged: K=q8_0 V=q4_0 (3/8 of f16 KV bytes) — K precision \
+                "KV differential quant engaged: K=q8_0 V=q4_0 (3/8 of f16 KV bytes) - K precision \
                  dominates retrieval quality, V carries the heavier quant; pin cache_type for a \
                  symmetric grade"
                     .into(),
@@ -6520,14 +6520,14 @@ fn kv_quant_ladder(
     } else {
         if resident.saturating_add(kv / 4) > budget {
             warnings.push(
-                "KV q4_0 engaged but weights+KV still exceed 90% VRAM; --fit will shrink ctx or the engine may OOM — consider a smaller quant".into(),
+                "KV q4_0 engaged but weights+KV still exceed 90% VRAM; --fit will shrink ctx or the engine may OOM - consider a smaller quant".into(),
             );
         }
         Some(("q4_0", "q4_0"))
     }
 }
 
-/// Scale factor of one KV grade as a (numerator, denominator) rational —
+/// Scale factor of one KV grade as a (numerator, denominator) rational -
 /// K and V each hold half the f16 KV bytes, so a pair scales f16 by the
 /// average of the two sides. Shared by the compiler verdict, the gateway
 /// ctx preflight, and the fit ladder so all three agree on one math.
@@ -6545,7 +6545,7 @@ pub fn kv_grade_rational(grade: &str) -> (u64, u64) {
     }
 }
 
-/// f16 KV bytes scaled to a (K, V) grade pair — the shared per-phase math.
+/// f16 KV bytes scaled to a (K, V) grade pair - the shared per-phase math.
 #[must_use]
 pub fn scale_kv_pair(f16_bytes: u64, k: &str, v: &str) -> u64 {
     let (nk, dk) = kv_grade_rational(k);
@@ -6557,7 +6557,7 @@ pub fn scale_kv_pair(f16_bytes: u64, k: &str, v: &str) -> u64 {
 /// f16 KV-cache bytes at `ctx` for this model, when the GGUF carries
 /// enough geometry (shared by the KV ladder and the offload resolver).
 /// Formula lives on `GgufMeta::kv_f16_bytes` (MLA/SWA-aware) so every
-/// caller — ladder, offload resolver, gateway preflight — shares one math.
+/// caller - ladder, offload resolver, gateway preflight - shares one math.
 #[must_use]
 fn kv_f16_bytes(input: &ProfileInput<'_>, ctx: u32) -> Option<u64> {
     match input.meta {
@@ -6585,7 +6585,7 @@ pub fn estimate_kv_f16(input: &ProfileInput<'_>, ctx: Option<u32>) -> Option<u64
 /// host relocation available, and an over-subscribed unified pool
 /// relocates to system RAM instead of hogging VRAM (b11202, 20260928
 /// campaign: a `4x16384` spawn held only +208 MiB over `2x8192` while
-/// scoring +64% t/s) — those spawns charge the unified VRAM floor.
+/// scoring +64% t/s) - those spawns charge the unified VRAM floor.
 /// Engines without the flag (b10948-era) allocate device-side on both
 /// lanes and keep the full f16 charge. The floor deliberately does not
 /// scale with ctx: the engine's pinned device slice is roughly
@@ -6615,7 +6615,7 @@ fn cache_ram_pct(hit: Option<f64>) -> u32 {
 
 /// The `--cache-ram` budget rule 12 will actually emit, in MiB: the
 /// configured request clamped to the A16 RAM-share cap. None when the
-/// knob requests unlimited (0) or the box RAM is unknown — callers apply
+/// knob requests unlimited (0) or the box RAM is unknown - callers apply
 /// their own fallback share. Single source of truth so slot sizing and
 /// the emitted flag can never disagree.
 fn effective_cache_ram_mib(input: &ProfileInput<'_>) -> Option<u64> {
@@ -6630,13 +6630,13 @@ fn effective_cache_ram_mib(input: &ProfileInput<'_>) -> Option<u64> {
 /// Verdict for a PINNED unified-KV ctx against the GPU: the 2b fit
 /// constraint as ONE decision shared by profile compilation and the
 /// gateway `num_ctx` preflight. Both sites must refuse the same shapes
-/// — a split brain here is how a doomed pin evicts a healthy instance
+/// - a split brain here is how a doomed pin evicts a healthy instance
 /// and 502-loops the requester (live-repro'd 2026-09-13: 21x
 /// spawn-retry of a child that could never create its context).
 #[must_use]
 pub enum UnifiedCtxVerdict {
     /// Weights + f16 KV fit the device (the 85%..100% band is still
-    /// `Fit` — the offload resolver answers it with `auto`, letting
+    /// `Fit` - the offload resolver answers it with `auto`, letting
     /// the engine fitter split layers; honest degraded serve).
     Fit,
     /// The device cannot host the pin even at 100%: refuse, with
@@ -6644,7 +6644,7 @@ pub enum UnifiedCtxVerdict {
     Refuse(String),
 }
 
-/// The shared 2b decision, judged against DEVICE VRAM — the unified KV
+/// The shared 2b decision, judged against DEVICE VRAM - the unified KV
 /// pool is device-backed (live-verified b10948: `CUDA0 KV buffer` with
 /// `--kv-unified` on; the flag shares one buffer across sequences, it
 /// does not move the pool to system RAM). `model_bytes`/`kv_bytes` are
@@ -6671,7 +6671,7 @@ pub fn unified_ctx_verdict(
     UnifiedCtxVerdict::Refuse(format!(
         "pinned num_ctx {ctx} cannot fit the GPU: weights {weights_mib} MiB + KV {kv_mib} \
          MiB = {demand_mib} MiB demand (+{} MiB spawn overhead) exceeds the {vram_mib} MiB VRAM \
-         — lower num_ctx, cache_type = \"q8_0\" (halves KV), or a smaller quant (blazar fit)",
+         - lower num_ctx, cache_type = \"q8_0\" (halves KV), or a smaller quant (blazar fit)",
         UNIFIED_SPAWN_OVERHEAD_BYTES / (1024 * 1024)
     ))
 }
@@ -6719,23 +6719,23 @@ const AUTOFIT_CTX_FLOOR: u32 = 4096;
 /// Resolve the slot count and the TOTAL ctx to emit. `slots = 0` (blazar
 /// auto, the default) sizes concurrency from capacity: upstream divides
 /// `--ctx-size` across `-np` slots, so N slots cost N x per-slot KV (RAM
-/// under `--kv-unified`, VRAM on the classic path) and no extra weights —
+/// under `--kv-unified`, VRAM on the classic path) and no extra weights -
 /// scaling the total keeps each slot at the resolved per-slot ctx while
 /// concurrent streams batch on the GPU instead of queueing (measured
-/// ~2.5x system throughput at 4 slots for +138 MiB VRAM). Explicit pins —
+/// ~2.5x system throughput at 4 slots for +138 MiB VRAM). Explicit pins -
 /// overlay slots (which the supervisor also uses for LC4-adopted values),
-/// `slots = 1`, manual N — pass through untouched; manual N keeps the
+/// `slots = 1`, manual N - pass through untouched; manual N keeps the
 /// historical slicing semantics (total = resolved ctx, per-slot = ctx/N).
 ///
 /// When capacity caps auto at ONE slot and the ctx came from the default
 /// (not pinned by tuning/overlay), auto-fit re-spends the same total-ctx
 /// budget as shallower parallel slots (4x4096 costs the same capacity as
-/// 1x16384) — ollama's throughput-first default. Pinned ctx (per-request,
+/// 1x16384) - ollama's throughput-first default. Pinned ctx (per-request,
 /// tuning bench, or overlay) is a hard pin: never divided.
 /// Pinned-pool walk (unified lane): the capacity vram-slots axis is
 /// CAP-blind under `--kv-unified`, so it can admit an np whose whole pool
-/// (np × `base_ctx` of device-backed KV on top of the weights) the 2b
-/// verdict refuses — the spawn would die at context creation and retry
+/// (np x `base_ctx` of device-backed KV on top of the weights) the 2b
+/// verdict refuses - the spawn would die at context creation and retry
 /// per request. Walk down to the largest count the verdict actually
 /// hosts and say so. Explicit slot pins never reach here (an unfit pin
 /// must error loudly at 2b, not be silently reshaped); the classic lane's
@@ -6752,7 +6752,7 @@ fn walk_pinned_np(
             unified_ctx_verdict(input.model_bytes, kv, vram_bytes, base_ctx),
             UnifiedCtxVerdict::Refuse(_)
         ),
-        None => false, // unknown KV charge — never guess that it fits
+        None => false, // unknown KV charge - never guess that it fits
     };
     let full = np;
     let mut np = np;
@@ -6762,7 +6762,7 @@ fn walk_pinned_np(
     if np < full {
         warnings.push(format!(
             "pinned ctx {base_ctx}: auto slots np {full} pool ({} ctx) exceeds the GPU \
-             VRAM budget — walked down to np {np} (pool {}); pin slots = {full} to force \
+             VRAM budget - walked down to np {np} (pool {}); pin slots = {full} to force \
              the conflict to error instead",
             full * base_ctx,
             np * base_ctx
@@ -6783,13 +6783,13 @@ fn resolve_slots(
     if overlay.deterministic.unwrap_or(input.config.deterministic) {
         if slots > 1 {
             warnings.push(format!(
-                "deterministic = true pins slots = 1 — explicit slots = {slots} ignored: \
+                "deterministic = true pins slots = 1 - explicit slots = {slots} ignored: \
                  multi-slot batches perturb logits in near-tie positions and break \
                  token-for-token greedy reproducibility; drop one of the two knobs"
             ));
         } else if slots == 0 {
             warnings.push(
-                "deterministic = true: slots pinned to 1 — concurrent streams queue \
+                "deterministic = true: slots pinned to 1 - concurrent streams queue \
                  instead of batching; unset the pin to recover multi-slot throughput"
                     .to_string(),
             );
@@ -6818,11 +6818,11 @@ fn resolve_slots(
         warn_vulkan_slot_cap(input, base_ctx, vram_bytes, warnings);
     }
     if np >= 2 {
-        // Auto-slot decision rationale: journal only — a machine decision
+        // Auto-slot decision rationale: journal only - a machine decision
         // with a tuning tip is not a user-facing warning.
         tracing::info!(
             model = input.model_name,
-            "profile: slots auto -np {np} with total ctx {} (per-slot {base_ctx}) — concurrent \
+            "profile: slots auto -np {np} with total ctx {} (per-slot {base_ctx}) - concurrent \
              streams batch on the GPU instead of queueing; pin slots = 1 for single-client \
              full-speed",
             np * base_ctx
@@ -6836,7 +6836,7 @@ fn resolve_slots(
     }
     // --- auto-fit: single slot at the full resolved ctx. If that ctx is
     // only the config default (not a pin), re-spend its capacity budget
-    // as N shallower slots — the total-ctx charge the capacity guards
+    // as N shallower slots - the total-ctx charge the capacity guards
     // scale on is UNCHANGED (4x4096 == 1x16384 under both the unified
     // per-token compute guard and classic KV math), so this adds zero
     // boot risk while un-serializing concurrent streams.
@@ -6855,13 +6855,13 @@ fn resolve_slots(
             per_slot /= 2;
         }
         if let Some((np, per_slot)) = best {
-            // Auto-fit decision rationale: journal only — same
+            // Auto-fit decision rationale: journal only - same
             // classification as the -np auto note above.
             tracing::info!(
                 model = input.model_name,
-                "profile: slots auto-fit default ctx {base_ctx} fits only 1 concurrent slot — \
+                "profile: slots auto-fit default ctx {base_ctx} fits only 1 concurrent slot - \
                  re-spent the same capacity budget as -np {np} x {per_slot} ctx (total {}, \
-                 within the capacity guards — floor-rounding may grant a little extra \
+                 within the capacity guards - floor-rounding may grant a little extra \
                  headroom; prompts longer than {per_slot} tokens trigger the num_ctx \
                  restart-once path at a wider ctx); pin ctx or slots to disable",
                 np * per_slot
@@ -6922,18 +6922,18 @@ fn warn_vulkan_slot_cap(
     if cap < u64::from(AUTO_SLOTS_CAP) {
         warnings.push(format!(
             "slots auto capped at {cap}: vulkan-class build (mixed integrated+discrete \
-             census) with a projector attached overcommits VRAM as total ctx scales — \
+             census) with a projector attached overcommits VRAM as total ctx scales - \
              measured degraded boot at np2/32k total ctx on an 8 GiB card; use a \
              projector-free model or explicit slots to override"
         ));
     }
 }
 
-/// Capacity-aware slot count for `slots = 0`, pure (no warnings — the
+/// Capacity-aware slot count for `slots = 0`, pure (no warnings - the
 /// auto-fit loop probes it repeatedly). Clamps, in order: the measured
 /// 4-slot sweet spot; the model's trained context (the scaled total
 /// cannot exceed it); the `--cache-ram` mmap soft cap (prompt-cache
-/// working set, NOT the KV pool — the pool is device-backed on both
+/// working set, NOT the KV pool - the pool is device-backed on both
 /// lanes); and the 85% VRAM envelope the offload resolver uses (the KV
 /// charge is VRAM-resident everywhere). Unknown KV geometry means
 /// unknown cost: stay single-slot, never guess.
@@ -6975,7 +6975,7 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
     let vram_slots = if vulkan_mmproj_guard(input) {
         // Mixed integrated+discrete census with a projector attached:
         // each slot costs its f16 KV PLUS the measured per-token compute
-        // charge (see UNIFIED_COMPUTE_PER_TOKEN_BYTES) — the vulkan
+        // charge (see UNIFIED_COMPUTE_PER_TOKEN_BYTES) - the vulkan
         // build allocates fat ctx-scaled compute buffers that the KV
         // term alone never sees (measured degraded boot at np2/32k on
         // an 8 GiB card).
@@ -6985,7 +6985,7 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
     } else if kv_pool_relocatable(input) {
         // Posture truth (b11202 receipt): with engine KV host-relocation
         // available, an over-subscribed pool moves to host RAM instead of
-        // OOMing — VRAM keeps weights + the standing floor slice, and the
+        // OOMing - VRAM keeps weights + the standing floor slice, and the
         // host budget (ram_slots) is the binding cap. Letting the f16
         // VRAM term veto here under-provisions 2x on tight cards (gateway
         // conc measured 67.5 t/s at the VRAM-vetoed shape vs 110.6 at the
@@ -7009,7 +7009,7 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
 ///
 /// - no GPU -> "0" / "cpu" (expected on CPU boxes: label, no warning)
 /// - weights(+mmproj) and f16 KV comfortably fit VRAM (<= 85%) -> "999" /
-///   "full" — same placement the engine's auto picks, now *known*
+///   "full" - same placement the engine's auto picks, now *known*
 /// - weights alone exceed VRAM but a GPU exists -> "auto" / "partial" +
 ///   warning (engine splits layers across CPU+GPU; tok/s drops)
 /// - everything else (tight fits) -> "auto" / "auto": the engine's
@@ -7018,11 +7018,11 @@ fn auto_slots_capacity(input: &ProfileInput<'_>, base_ctx: u32, vram_bytes: u64)
 /// Spawn-time capacity for every VRAM-budgeted profile rule: FREE VRAM
 /// when the probe reports w, else the card total. Sizing against totals
 /// pins `-ngl 999` on boxes whose VRAM a neighbour already consumed at
-/// spawn time — the engine's `--fit` refuses to shrink an EXPLICIT ngl
+/// spawn time - the engine's `--fit` refuses to shrink an EXPLICIT ngl
 /// ("already set by user, abort", live-proven) and the load OOMs instead
 /// of degrading to the `auto` band. Free-based math keeps the offload
 /// pin, KV ladder, and slot capacity honest under contention; idle boxes
-/// report free ≈ total so nothing changes there. Zero/absent probe
+/// report free ~ total so nothing changes there. Zero/absent probe
 /// readings fail open to the total (a stale number beats refusing to
 /// spawn).
 fn capacity_bytes(hw: &Hardware) -> u64 {
@@ -7037,7 +7037,7 @@ fn capacity_bytes(hw: &Hardware) -> u64 {
 /// True when the speculative draft will actually ride this spawn:
 /// path known, file present, and the picked card fits dense + draft +
 /// KV floor + spawn overhead. Rule 4's gpu-layers unpin and rule 7's
-/// capacity gate must AGREE — a declined draft (running dense) must not
+/// capacity gate must AGREE - a declined draft (running dense) must not
 /// needlessly hand gpu-layers to the live fitter (live-repro'd: 9B with
 /// an MTP pair too big for the card ran dense but unpinned).
 fn spec_draft_will_attach(input: &ProfileInput<'_>) -> bool {
@@ -7064,7 +7064,7 @@ fn spec_draft_will_attach(input: &ProfileInput<'_>) -> bool {
 
 /// True when the projector actually rides THIS spawn. Mirrors the argv
 /// mmproj block in `compile` (explicit `-mm` arg, caller force, or attach
-/// policy with engine flag support) — keep the two in lockstep. Skip and
+/// policy with engine flag support) - keep the two in lockstep. Skip and
 /// Lazy policies hold the projector back, and an engine without the flag
 /// cannot load it; charging its bytes then would falsely drop
 /// `--gpu-layers` into the engine `auto` band.
@@ -7116,7 +7116,7 @@ fn resolve_gpu_offload(
     // it back; the engine cannot load what argv never passes). Charging
     // held-back projector bytes pushed real fits past the 85% pin line
     // into the engine `auto` band, whose live fitter under-offloads onto
-    // the CPU — live-repro'd on qwen3.5-9b: lazy mmproj 879 MiB charged
+    // the CPU - live-repro'd on qwen3.5-9b: lazy mmproj 879 MiB charged
     // against a 7807 MiB free card turned a 5878 MiB real demand
     // (weights+KV) into "auto", parking layers on CPU for -18% decode
     // throughput while the card sat at 80%.
@@ -7132,7 +7132,7 @@ fn resolve_gpu_offload(
     let kv = kv_f16_bytes(input, ctx).unwrap_or(0);
     if resident > vram_bytes {
         warnings.push(format!(
-            "weights {} MiB exceed VRAM {} MiB — engine will split layers across CPU+GPU; expect lower tok/s or a smaller quant",
+            "weights {} MiB exceed VRAM {} MiB - engine will split layers across CPU+GPU; expect lower tok/s or a smaller quant",
             resident / (1 << 20),
             vram_bytes / (1 << 20)
         ));
@@ -7141,7 +7141,7 @@ fn resolve_gpu_offload(
     // One placement model for both lanes (device truth): the KV pool is
     // device-backed under `--kv-unified` too (shared buffer, not host
     // memory), so the classic 85% envelope is THE gate. The 85%..100%
-    // band falls through to "auto" — the engine's live fitter places
+    // band falls through to "auto" - the engine's live fitter places
     // the last layers, possibly CPU-splitting them (honest degraded
     // serve), and a hard pin there would abort the fitter ("already
     // set by user to 999") into a cudaMalloc OOM.
@@ -7161,7 +7161,7 @@ fn resolve_gpu_offload(
 
 /// True when the compiled argv will carry the POSITIVE `--kv-unified`
 /// flag: the engine manifest supports it and the user did not opt out
-/// (explicit `kv_unified = false` — including via overlay — means the KV
+/// (explicit `kv_unified = false` - including via overlay - means the KV
 /// buffer IS VRAM-resident, so capacity math must charge it in full).
 /// Single source of truth shared by rule 12b's default-on branch and the
 /// gpu-offload resolver so the two can never disagree.
@@ -7174,9 +7174,9 @@ fn kv_unified_emitted(input: &ProfileInput<'_>) -> bool {
 /// owns offload semantics), the config does not disable offload, and the
 /// spawn rides the unified lane. Measured on b11202 (20260928 bench
 /// campaign): an over-subscribed unified KV pool relocates to host RAM
-/// instead of OOM — a `4x16384` direct spawn held only +208 MiB VRAM
+/// instead of OOM - a `4x16384` direct spawn held only +208 MiB VRAM
 /// over the 2x8192 shape while beating it +64% t/s. Engines that lack
-/// the flag (b10948-era) keep the full device-side VRAM charge — the
+/// the flag (b10948-era) keep the full device-side VRAM charge - the
 /// b10948 live receipt still binds for them.
 fn kv_pool_relocatable(input: &ProfileInput<'_>) -> bool {
     input.supported_flags.contains("--no-kv-offload")
@@ -7188,7 +7188,7 @@ fn kv_pool_relocatable(input: &ProfileInput<'_>) -> bool {
 /// compilation: the per-request `num_ctx` preflight (gateway) and the
 /// `coreside` planner need to know whether the spawn will carry
 /// `--kv-unified` (shared single KV buffer) for argv-shape decisions.
-/// Capacity math itself is lane-independent now — the KV pool is
+/// Capacity math itself is lane-independent now - the KV pool is
 /// device-backed either way. Callers without a compiled `ProfileInput`
 /// supply the active engine's manifest flag set directly.
 #[must_use]
@@ -7213,7 +7213,7 @@ fn is_ngram_spec(mode: &str) -> bool {
 /// Gate for the spec=auto n-gram fallback: the engine must advertise
 /// `ngram-simple` through `--spec-type` (old engines keep the dense
 /// behavior) and the user must not have opted out. Consulted only when
-/// no drafter engaged — embedded MTP, catalog pair, capacity are all
+/// no drafter engaged - embedded MTP, catalog pair, capacity are all
 /// checked first.
 fn ngram_fallback_applies(input: &ProfileInput<'_>, config: &Config) -> bool {
     config.spec_auto_ngram
@@ -7244,11 +7244,11 @@ fn push_gated(
     argv.extend(values.iter().cloned());
 }
 
-/// Rule 11: spec=auto draft pairing, opportunistic by design — an
+/// Rule 11: spec=auto draft pairing, opportunistic by design - an
 /// unpulled or unsupported pair degrades to dense with a teaching
 /// warning; manifest-gated emission when the draft is live. Returns
 /// true when a drafter engaged (argv carries spec flags), false when
-/// the spawn will run dense — the auto branch uses that to decide the
+/// the spawn will run dense - the auto branch uses that to decide the
 /// n-gram fallback.
 fn push_spec_args(
     input: &ProfileInput<'_>,
@@ -7259,7 +7259,7 @@ fn push_spec_args(
         if let Some(draft) = input.draft_path {
             // Self-draft guard: the draft row's registry name can
             // prefix-collide with its own main model (qwen3.5-9b-mtp
-            // matches the qwen3.5-9b pair) — drafting from the main
+            // matches the qwen3.5-9b pair) - drafting from the main
             // weights would loop the same file through both roles.
             if draft == input.model_path {
                 warnings.push(format!(
@@ -7279,14 +7279,14 @@ fn push_spec_args(
                 // teaching warning, never a fatal child boot.
                 warnings.push(format!(
                     "spec=auto: catalog draft pair ({}) for {} is pulled but \
-                         engine {} lacks it; running dense — run: blazar engine update",
+                         engine {} lacks it; running dense - run: blazar engine update",
                     pair.spec_type, input.model_name, input.engine_tag
                 ));
                 return false;
             }
             // Capacity gate: the draft rides the SAME card as the main
             // model, and the pre-spawn census's free MiB predates the
-            // main load — so the draft must fit alongside model + KV
+            // main load - so the draft must fit alongside model + KV
             // floor + spawn overhead. Without this an 8 GiB card
             // (main 5.4 GiB + MTP draft 5.9 GiB) boot-OOMs instead of
             // serving dense (live-measured: draft-on-CPU is 2x slower,
@@ -7304,12 +7304,12 @@ fn push_spec_args(
                 .saturating_add(KV_UNIFIED_VRAM_FLOOR_BYTES)
                 .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES);
             // Same predicate rule 4 consults (spec_draft_will_attach)
-            // — keep the local math only for the warning numbers.
+            // - keep the local math only for the warning numbers.
             if draft_bytes == 0 || needed > card_free_bytes {
                 warnings.push(format!(
                     "spec=auto: draft {} ({} MiB) does not fit the picked card \
                          alongside {} (model {} MiB + KV floor + spawn overhead vs \
-                         {} MiB free); running dense — speculation engages \
+                         {} MiB free); running dense - speculation engages \
                          automatically on a card that fits both",
                     pair.spec_type,
                     draft_bytes / (1024 * 1024),
@@ -7330,15 +7330,15 @@ fn push_spec_args(
             return true;
         }
         // Opportunistic auto: an unpulled catalog draft degrades
-        // to dense with a teaching warning — auto must never
+        // to dense with a teaching warning - auto must never
         // refuse a spawn (hard errors belong to the explicit
         // typed modes, where the user asked for THAT drafter).
         // (`--spec-draft-hf` auto-download exists in b10840+ but
         // resolves to an empty path and the child exits fatally,
-        // verified live 2026-09-07 — revisit if upstream fixes
+        // verified live 2026-09-07 - revisit if upstream fixes
         // draft-side HF resolution.)
         warnings.push(format!(
-            "spec=auto: draft pair {} for {} is not pulled; running dense — run: \
+            "spec=auto: draft pair {} for {} is not pulled; running dense - run: \
                      blazar pull {} to enable speculation",
             pair.spec_type, input.model_name, pair.draft_repo
         ));
@@ -7424,7 +7424,7 @@ const ROUTER_MODEL_KEYS: &[&str] = &[
     "mtmd-batch-max-tokens",
     "mmproj-device",
     // F110: per-context knobs the normal profile emits but the router
-    // INI silently dropped — device placement, chat templating, sampler
+    // INI silently dropped - device placement, chat templating, sampler
     // defaults, sampler chain, warmup and mmproj offload all live with
     // the model context in upstream arg.cpp.
     "device",
@@ -7556,7 +7556,7 @@ pub fn generate_router_preset(models: &[(String, Vec<String>)], global: &[String
 /// a discriminator (FNV-1a of the ORIGINAL name) is appended so `a/b`
 /// and `a_b` cannot collide into one speccache/session file (F112).
 /// FNV-1a is inline because `DefaultHasher` is not stable across
-/// runs/versions — these names must survive restarts.
+/// runs/versions - these names must survive restarts.
 #[must_use]
 pub fn path_safe(name: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -7840,7 +7840,7 @@ mod tests {
     }
 
     /// Materialize a real (empty) draft file so compile's stale-row
-    /// existence check sees a live path — the fixture must not lie
+    /// existence check sees a live path - the fixture must not lie
     /// about freshness w more than the store may.
     fn draft_file(tag: &str) -> String {
         let p =
@@ -7914,7 +7914,7 @@ mod tests {
     static DRAFT_AND_NGRAM_SPEC_TYPES: LazyLock<Vec<String>> =
         LazyLock::new(|| vec!["draft-simple".to_string(), "ngram-simple".to_string()]);
 
-    /// Same as `input_with_spec` but with a controllable model name — the
+    /// Same as `input_with_spec` but with a controllable model name - the
     /// default "qwen3-8b" matches the catalog spec-pair prefix, which is
     /// wrong for tests that need the no-pair path.
     fn input_named_with_spec<'a>(
@@ -8052,7 +8052,7 @@ mod tests {
     fn unit__rerank_pooling__bert_with_cls_pooling_is_an_embedder_not_a_reranker() {
         // bge-small-en shape (live-parsed GGUF KV: arch bert, pooling 2 =
         // cls): forcing the rerank arm made upstream select RANK pooling
-        // against a checkpoint with no rank head — /v1/embeddings answered
+        // against a checkpoint with no rank head - /v1/embeddings answered
         // HTTP 200 with all-zero vectors. It must ride the native pooling
         // arm instead.
         let cfg = Config::default();
@@ -8075,7 +8075,7 @@ mod tests {
 
     #[test]
     fn unit__rerank_pooling__bert_without_pooling_kv_stays_reranker() {
-        // bge-reranker-class GGUF: bert arch carrying NO pooling KV — the
+        // bge-reranker-class GGUF: bert arch carrying NO pooling KV - the
         // arch signal alone must keep serving the rerank shape.
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -8122,7 +8122,7 @@ mod tests {
 
     #[test]
     fn unit__rerank_pooling__bert_arch_without_pooling_kv_serves_rerank_flags() {
-        // bge-reranker GGUFs ship with NO pooling KV — arch is the only
+        // bge-reranker GGUFs ship with NO pooling KV - arch is the only
         // signal (live receipt: gpustack/bge-reranker-v2-m3 Q8_0, upstream
         // /v1/rerank 200 with correct ranking under --embeddings --reranking).
         let cfg = Config::default();
@@ -8146,7 +8146,7 @@ mod tests {
     #[test]
     fn unit__rerank_pooling__modern_bert_arch_is_not_a_reranker() {
         // live receipt: Laya-BF16 (arch modern-bert) core-dumps upstream
-        // when spawned with a rank head — exact-match `bert` keeps it out.
+        // when spawned with a rank head - exact-match `bert` keeps it out.
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let mut g = meta();
@@ -8220,7 +8220,7 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--alias" && w[1] == "qwen3-8b")
         );
-        // Rule 2: jinja + metrics + flash-attn auto + ctx — default slots=0
+        // Rule 2: jinja + metrics + flash-attn auto + ctx - default slots=0
         // auto earns np=2 (train 40960 / base 16384), scaling the total.
         assert!(p.argv.contains(&"--jinja".to_string()));
         assert!(p.argv.contains(&"--metrics".to_string()));
@@ -8251,7 +8251,7 @@ mod tests {
         // Rule 5: cache-reuse defaults OFF (native slot cache covers
         // identical/extended prefixes; engine force-disables it at load
         // on hybrid-linear archs, so it only engages on full-attention
-        // models — the retired "~0.6s cold" claim was sweep noise)
+        // models - the retired "~0.6s cold" claim was sweep noise)
         assert!(!p.argv.contains(&"--cache-reuse".to_string()));
         // Rule 6: KV at the scaled total = 2*28*8*64*32768*2 = 938MB;
         // +5GB < 0.9*12GB -> NO kv quant
@@ -8355,7 +8355,7 @@ mod tests {
         assert!(p.argv.contains(&"--no-kv-unified".to_string()));
 
         // Auto: unified is the DEFAULT whenever the engine supports it
-        // (single- and multi-slot alike — K-shift reuse rides it).
+        // (single- and multi-slot alike - K-shift reuse rides it).
         let cfg = Config::default();
         let p = compile(
             &input(&GgufMeta::default(), &hw, &cfg, &ALL_FLAGS),
@@ -8379,7 +8379,7 @@ mod tests {
     #[test]
     fn unit__gpu_offload__unified_tight_fit_leaves_fitter_band() {
         // Classic-attention meta: kv @16384 = 8*(64+64)*2*28*16384 = 896 MiB.
-        // VRAM 6400 MiB: 5000+896 = 5896 > 85% (5440) — device truth: the
+        // VRAM 6400 MiB: 5000+896 = 5896 > 85% (5440) - device truth: the
         // unified pool is VRAM-resident too, so this tight fit goes to the
         // engine's live fitter band (may CPU-split the last layers)
         // instead of the old floor-accounted 999 pin. That pin was the
@@ -8493,7 +8493,7 @@ mod tests {
             p.warnings
         );
         // Control: a full-attention arch with the same knob DOES get the
-        // flag — the gate is arch-scoped, not a blanket suppression.
+        // flag - the gate is arch-scoped, not a blanket suppression.
         let m_full = meta();
         let i_full = input(&m_full, &hw, &cfg, &ALL_FLAGS);
         let p_full = compile(&i_full, &TuningOverrides::default()).unwrap();
@@ -8555,7 +8555,7 @@ mod tests {
             p2.warnings
         );
 
-        // 3. extra_args -mm beats the lazy default — attach, no lazy warning
+        // 3. extra_args -mm beats the lazy default - attach, no lazy warning
         let explicit = ovr(
             ModelOverride {
                 extra_args: Some(vec!["-mm".into(), mmp.into()]),
@@ -8599,7 +8599,7 @@ mod tests {
     fn unit__gpu_layers_pin_ignores_held_back_mmproj() {
         // Live-repro'd regression (2026-10-06, qwen3.5-9b on an 8 GiB
         // card): the DEFAULT lazy policy spawns text-only, but the pin
-        // envelope still charged the projector — 879 MiB of held-back
+        // envelope still charged the projector - 879 MiB of held-back
         // bytes pushed a 5878 MiB real demand past 85% of the 7807 MiB
         // free card, `--gpu-layers` fell into the engine `auto` band,
         // and the engine's live fitter parked layers on the CPU for
@@ -9057,7 +9057,7 @@ mod tests {
         assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
         // Rule 14: persistent lookup cache rides along with ngram mode.
         // Expected path derives via path_safe (FNV-suffixed since the
-        // collision-proofing change) — never hardcode it.
+        // collision-proofing change) - never hardcode it.
         let lcache = format!(
             "/tmp/blazar-test-data/speccache/{}.lcache",
             path_safe("qwen3-8b")
@@ -9089,7 +9089,7 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp")
         );
-        // The MTP head ships inside the GGUF — no draft model to name.
+        // The MTP head ships inside the GGUF - no draft model to name.
         assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
         // n-gram-only lookup cache must not ride along (rule 14 gate).
         assert!(!p.argv.contains(&"--lookup-cache-dynamic".to_string()));
@@ -9210,7 +9210,7 @@ mod tests {
         // Network isolation (upstream b11785 --offline): the default
         // posture emits it on supporting engines, an explicit opt-out
         // emits nothing, and an engine built before the flag skips
-        // SILENTLY — a default-on knob must never break an older
+        // SILENTLY - a default-on knob must never break an older
         // install or spam its spawns with warnings.
         let hw = gpu_hw(12_000, 32_000, 8);
         let g = meta();
@@ -9411,9 +9411,9 @@ mod tests {
             &TuningOverrides::default(),
         )
         .unwrap_err();
-        // dflash type advertised but dspark asked -> engine gate fires…
+        // dflash type advertised but dspark asked -> engine gate fires...
         assert!(err.contains("draft-dspark"), "{err}");
-        // …and a dspark-advertising engine with no catalog pair for a
+        // ...and a dspark-advertising engine with no catalog pair for a
         // model outside the pair prefix -> pair gate.
         err = compile(
             &input_named_with_spec(
@@ -9459,7 +9459,7 @@ mod tests {
             p.argv
                 .contains(&"--spec-draft-backend-sampling".to_string())
         );
-        // No external draft model — the head ships in the weights.
+        // No external draft model - the head ships in the weights.
         assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
         assert!(
             p.warnings.iter().any(|w| w.contains("MTP head")),
@@ -9573,7 +9573,7 @@ mod tests {
     #[test]
     fn unit__spec_mtp__manual_caps_n_max_at_head_layers() {
         // R2-4: manual spec="mtp" must cap --spec-draft-n-max at the
-        // trained head count (min 2), matching the auto lane — the
+        // trained head count (min 2), matching the auto lane - the
         // upstream default of 3 would make a 1-2 layer head pay pure
         // verification overhead.
         let cfg = Config {
@@ -9847,7 +9847,7 @@ mod tests {
     #[test]
     fn unit__ctx_extend_yarn__stretches_clamp_ceiling() {
         // F109 regression: ctx_extend 2.0 on a 40960-trained model lifts
-        // the clamp ceiling to 81920 — the trained-length clamp must not
+        // the clamp ceiling to 81920 - the trained-length clamp must not
         // defeat YaRN.
         let cfg = Config {
             default_ctx: 131_072,
@@ -9864,7 +9864,7 @@ mod tests {
         // YaRN lifts the CEILING (81920); the capacity re-spend then
         // lands on 8x5120 (train_slots 2 caps the 20480 probe; the
         // 5120 probe earns the full auto ceiling of 8 on this 8 GiB+
-        // card) — f16 KV 2240 MiB + weights 5000 <= the 12000 MiB card,
+        // card) - f16 KV 2240 MiB + weights 5000 <= the 12000 MiB card,
         // no shrink needed.
         assert_eq!(p.ctx, 5_120);
         assert_eq!(p.ctx_autofit, Some((5_120, 8)));
@@ -9885,7 +9885,7 @@ mod tests {
         // Device truth (live b10948): on engines WITHOUT KV host-offload
         // (no --no-kv-offload in the manifest) the KV pool is VRAM-resident
         // on BOTH lanes, so an autofit ctx whose pool overflows the card
-        // must shrink against the 85% VRAM envelope — at the quant the
+        // must shrink against the 85% VRAM envelope - at the quant the
         // spawn will actually run. Geometry head_dim 64 -> 57344
         // B/ctx-token: kv(131072) = 7168 MiB f16; the tight 6000 MiB
         // card drives the ladder to q4_0 (1792 MiB pool, 14336
@@ -9902,7 +9902,7 @@ mod tests {
         };
         // Legacy-engine fixture: strip the offload flag so the pool is
         // device-bound and the shrink path fires (b11202-class engines
-        // relocate the overflow instead — see the relocatable-pins test).
+        // relocate the overflow instead - see the relocatable-pins test).
         let mut legacy = full_flags();
         legacy.remove("--no-kv-offload");
         let mut inp = input(&g, &hw, &cfg, &legacy);
@@ -9927,7 +9927,7 @@ mod tests {
     #[test]
     fn unit__unified_kv_pool_fit__pinned_ctx_refuses_when_guard_blocks() {
         // Pinned ctx is sovereign (never shrunk) but a pin the DEVICE
-        // cannot host — even at the ladder's max q4_0 demotion — is a
+        // cannot host - even at the ladder's max q4_0 demotion - is a
         // REFUSAL, not a warning: warn-yet-proceed here is how the
         // num_ctx storm 502-looped (child died at context creation on
         // every spawn retry). Shape: weights 5000 + KV 7168 f16 / 1792
@@ -9993,7 +9993,7 @@ mod tests {
     fn unit__pinned_pool_walk__all_np_refuse_errors_at_np1() {
         // Nothing hostable at ANY count (weights 2000 + KV 469 + 700 =
         // 3169 > 1600 even at np1): the walk lands at 1 and the 2b
-        // verdict teaches the refusal — never a warn-yet-proceed spawn.
+        // verdict teaches the refusal - never a warn-yet-proceed spawn.
         let cfg = Config {
             default_ctx: 8_192,
             ..Config::default()
@@ -10018,7 +10018,7 @@ mod tests {
     fn unit__pinned_pool_walk__explicit_slots_never_walk() {
         // An explicit slots pin is sovereign: the walk must NOT reshape
         // it. Explicit -np divides --ctx-size across slots upstream (the
-        // pool total STAYS the pin — argv keeps ctx 8192 + -np 2), so a
+        // pool total STAYS the pin - argv keeps ctx 8192 + -np 2), so a
         // hostable pin serves at the requested concurrency with no walk
         // warning; an unhostable pin errors at 2b (covered by the
         // refuses-when-guard-blocks pin).
@@ -10055,7 +10055,7 @@ mod tests {
     #[test]
     fn unit__unified_kv_pool_fit__pinned_middle_zone_serves_degraded() {
         // Middle zone (85%..100% of VRAM): physically hostable, so the
-        // pin is SERVED — verdict Fit — but gpu-layers goes to the
+        // pin is SERVED - verdict Fit - but gpu-layers goes to the
         // engine fitter (may CPU-split the last layers) with an honest
         // warning. Shape: weights 2700 + f16 KV 1792 = 4492 MiB; VRAM
         // 5200 (85% share = 4420): demand fits the card (4492 + 700
@@ -10065,7 +10065,7 @@ mod tests {
             ..Config::default()
         };
         let hw = gpu_hw(5_200, 13_674, 8);
-        let g = meta(); // trained 40960 ≥ the pin; 57344 B/ctx-token
+        let g = meta(); // trained 40960 >= the pin; 57344 B/ctx-token
         let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
         inp.model_bytes = 2_700 * MIB;
         let p = compile(
@@ -10076,10 +10076,10 @@ mod tests {
             },
         )
         .unwrap();
-        // The pin is honored untouched…
+        // The pin is honored untouched...
         assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
         assert_eq!(p.ctx_autofit, None);
-        // …and the degraded serve is surfaced, not hidden.
+        // ...and the degraded serve is surfaced, not hidden.
         assert!(p.warnings.iter().any(|w| {
             w.contains("fits the 5200 MiB VRAM only above the 85% share (demand 4492 MiB)")
         }));
@@ -10101,7 +10101,7 @@ mod tests {
             unified_ctx_verdict(weights, kv, 4_947 * MIB, 32_768),
             UnifiedCtxVerdict::Fit
         ));
-        // One MiB less → physically impossible → refuse with teaching.
+        // One MiB less -> physically impossible -> refuse with teaching.
         let v = unified_ctx_verdict(weights, kv, 4_946 * MIB, 32_768);
         let UnifiedCtxVerdict::Refuse(msg) = v else {
             panic!("must refuse below the demand+overhead line");
@@ -10152,7 +10152,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(emissions.len(), 1, "flag lands exactly once");
         assert_eq!(emissions[0], ["--cache-ram", "12000"]);
-        // The explicit branch wins before the A16 clamp — no clamp
+        // The explicit branch wins before the A16 clamp - no clamp
         // warning for the explicit value.
         assert!(!p.warnings.iter().any(|w| w.contains("clamped")));
     }
@@ -10191,7 +10191,7 @@ mod tests {
         )
         .unwrap();
         // Stretched ceiling 61440; auto-fit divides to 5x7680 (38400
-        // total) — the raised auto ceiling admits the fifth slot on
+        // total) - the raised auto ceiling admits the fifth slot on
         // this 8 GiB+ card.
         assert_eq!(p.ctx, 7_680);
         assert_eq!(p.ctx_autofit, Some((7_680, 5)));
@@ -10428,7 +10428,7 @@ mod tests {
     #[test]
     fn unit__kv_differential__explicit_pair_emits_split_flags() {
         // Differential pin: K keeps retrieval precision (q8_0) while V
-        // drops to q4_0 — the capacity win that motivated the knobs.
+        // drops to q4_0 - the capacity win that motivated the knobs.
         let cfg = Config {
             cache_type_k: "q8_0".into(),
             cache_type_v: "q4_0".into(),
@@ -10470,7 +10470,7 @@ mod tests {
         // 57344 B/ctx-token -> kv(131072) = 7168 MiB f16. On an 8400 MiB
         // card (budget 7560) with a 4800 MiB resident model: q8_0
         // symmetric (3584 MiB) overflows, the differential rung K=q8_0
-        // V=q4_0 (2688 MiB) fits — the ladder stops there, before q4_0
+        // V=q4_0 (2688 MiB) fits - the ladder stops there, before q4_0
         // symmetric. The ladder is tested directly: through compile() the
         // slots auto-sizer scales ctx with VRAM, which would couple the
         // rung under test to slot math instead of capacity math.
@@ -10503,7 +10503,7 @@ mod tests {
         // engine builds have no flash-attention kernel for mixed pairs,
         // so the ladder must fall to symmetric q4_0 (native kernel) and
         // say why.
-        // Same numbers as the fixture above — the ONLY axis that moves
+        // Same numbers as the fixture above - the ONLY axis that moves
         // is the engine build class (tag ends -cuda) and FA.
         let cfg = Config {
             default_ctx: 131_072,
@@ -10640,7 +10640,7 @@ mod tests {
         )
         .unwrap();
         assert!(!p0.argv.contains(&"--n-cpu-ffn".to_string()));
-        // Overlay Some(0) is an explicit off — F114 discipline.
+        // Overlay Some(0) is an explicit off - F114 discipline.
         let cfg_off = Config {
             cpu_ffn_n: 3,
             model_overrides: std::collections::BTreeMap::from([(
@@ -10719,7 +10719,7 @@ mod tests {
         )
         .unwrap();
         // second model with an overlay knob (F111: the overlay is now
-        // actually APPLIED — the fixture used to build it and discard)
+        // actually APPLIED - the fixture used to build it and discard)
         let o = ModelOverride {
             ctx: Some(8192),
             warmup: Some(false),
@@ -10761,7 +10761,7 @@ mod tests {
         assert!(ini.contains("gpu-layers = 999"));
         assert!(ini.contains("parallel = 1"));
         assert!(!ini.contains("cache-reuse"));
-        // F111: m2's overlay actually applied — its ctx + sampler +
+        // F111: m2's overlay actually applied - its ctx + sampler +
         // warmup knobs land in the m2 section.
         let m2 = ini.split("[m2]\n").nth(1).unwrap_or_default();
         assert!(m2.contains("ctx-size = 8192"), "{m2}");
@@ -10828,7 +10828,7 @@ mod tests {
     #[test]
     fn unit__kv_quant__head_count_kv_missing_falls_back_to_head_count() {
         // Upstream llama.cpp defaults head_count_kv = head_count when the
-        // GGUF omits it (no-GQA models like qwen2.5-0.5b) — same rule here.
+        // GGUF omits it (no-GQA models like qwen2.5-0.5b) - same rule here.
         let mut g = meta();
         g.head_count_kv = None; // falls back to head_count 16
         let cfg = Config::default();
@@ -10895,7 +10895,7 @@ mod tests {
         // 900 MiB at spawn time. The unified-KV projection (weights +
         // 512 MiB KV floor + spawn overhead) cannot fit 900 MiB, so the
         // resolver must decline the `-ngl 999` pin and hand the decision
-        // to the engine's dynamic `auto` band — the live-proven OOM
+        // to the engine's dynamic `auto` band - the live-proven OOM
         // shape ("n_gpu_layers already set by user to 999, abort").
         let cfg = Config::default();
         let mut hw = gpu_hw(12_000, 32_000, 8);
@@ -11198,7 +11198,7 @@ mod tests {
     fn unit__spec_mode_input__resolved_off_beats_auto_config() {
         // Live incident shape: the governor (or a per-request
         // options.spec="off") resolved "off" while config.spec stayed
-        // "auto" — before the resolved mode was threaded into compile,
+        // "auto" - before the resolved mode was threaded into compile,
         // the compiler re-derived "auto" from config and engaged the
         // n-gram fallback anyway. The input's decision must win.
         let cfg = Config {
@@ -11231,7 +11231,7 @@ mod tests {
     #[test]
     fn unit__spec_mode_input__resolved_ngram_beats_off_config() {
         // The converse: an explicit per-request "ngram" must engage even
-        // against a dense global config — proving compile honors the
+        // against a dense global config - proving compile honors the
         // resolved decision in BOTH directions (no config re-read).
         let cfg = Config {
             spec: "off".into(),
@@ -11293,7 +11293,7 @@ mod tests {
     #[test]
     fn unit__spec_auto_ngram_fallback__engine_lacking_ngram_stays_dense() {
         // Manifest gate: the engine advertises a draft pair type but not
-        // ngram-simple — the fallback must not push argv the child rejects.
+        // ngram-simple - the fallback must not push argv the child rejects.
         let cfg = Config {
             spec: "auto".into(),
             ..Config::default()
@@ -11320,7 +11320,7 @@ mod tests {
     #[test]
     fn unit__spec_auto_ngram_fallback__capacity_gate_falls_back() {
         // The 8 GiB shape: the pair is pulled but the card cannot hold
-        // model + draft + KV floor — n-gram needs no weights, so the
+        // model + draft + KV floor - n-gram needs no weights, so the
         // fallback engages after the capacity warning.
         let cfg = Config {
             spec: "auto".into(),
@@ -11457,7 +11457,7 @@ mod tests {
         let p = compile(&i, &TuningOverrides::default()).unwrap();
         assert!(p.argv.windows(2).any(|w| w == ["-np", "3"]));
         // No hint, no overlay, default slots=0 (blazar auto): capacity
-        // decides — this fixture (train 40960, base 16384, unified KV,
+        // decides - this fixture (train 40960, base 16384, unified KV,
         // comfortable RAM/VRAM) earns np=2 with the total ctx scaled.
         let p = compile(
             &input(&g, &hw, &Config::default(), &ALL_FLAGS),
@@ -11503,7 +11503,7 @@ mod tests {
         assert!(p.argv.windows(2).any(|w| w == ["--ctx-size", "32768"]));
 
         // RAM clamp: 1 GiB effective cache-ram < 2 x 896 MiB KV -> single
-        // at the FULL ctx, but the default ctx is divisible — auto-fit
+        // at the FULL ctx, but the default ctx is divisible - auto-fit
         // re-spends the same RAM budget as 4 x 4096 (224 MiB KV/slot).
         let p2 = compile(
             &input(&g, &hw, &cfg_tight, &ALL_FLAGS),
@@ -11565,7 +11565,7 @@ mod tests {
     #[test]
     fn unit__auto_slots__eight_cap_on_big_cards_only() {
         // 8 GiB+ card with train/RAM/VRAM budgets that all admit 8: the
-        // ceiling itself binds (np-sweep evidence — true parallelism at
+        // ceiling itself binds (np-sweep evidence - true parallelism at
         // slots 8 on an 8 GiB RTX 4070, 440.7 vs 394 tok/s at cap 4).
         // Classic (non-unified) flags keep this on the direct
         // auto_slots_capacity path; a small model keeps the small
@@ -11604,7 +11604,7 @@ mod tests {
         // b11202 posture receipt (20260928 bench): with the engine's KV
         // host-relocation available (manifest --no-kv-offload, config not
         // disabling it, unified lane), an over-subscribed pool relocates
-        // to host instead of OOMing — the f16 VRAM term must not veto
+        // to host instead of OOMing - the f16 VRAM term must not veto
         // slots the host budget proves safe. Box geometry: 8 GiB card,
         // 5366 MiB weights, kv/slot @8192 = 448 MiB, train 262144.
         let g = GgufMeta {
@@ -11630,7 +11630,7 @@ mod tests {
             "{:?}",
             p.argv
         );
-        // The over-VRAM pool relocated — ctx must NOT shrink and no
+        // The over-VRAM pool relocated - ctx must NOT shrink and no
         // shrink warning may fire.
         assert!(!p.warnings.iter().any(|w| w.contains("unified KV pool fit")));
 
@@ -11664,7 +11664,7 @@ mod tests {
         );
 
         // Classic (non-unified) lane: the shared-pool relocation credit
-        // does not apply — full f16 VRAM charge.
+        // does not apply - full f16 VRAM charge.
         let mut classic = full_flags();
         classic.remove("--kv-unified");
         inp.supported_flags = &classic;
@@ -11782,7 +11782,7 @@ mod tests {
 
     /// mistral.rs v0.9.5 renamed `--pa-memory-fraction` to
     /// `--gpu-memory-utilization`. An explicit pin must ride whichever
-    /// name the active engine advertises — and warn (not silently
+    /// name the active engine advertises - and warn (not silently
     /// drop) when the engine has neither.
     #[test]
     fn unit__mistralrs_pa_fraction__flag_rename_follows_manifest() {
@@ -11839,7 +11839,7 @@ mod tests {
         // --kv-cache sizes KV directly (the v0.9.5 workaround for
         // upstream #2502's auto-sizing starvation on 8 GiB cards); no
         // blazar knob emits it, so the extra_args lane IS its first
-        //-class path — it must clear the RESERVED check and ride the
+        //-class path - it must clear the RESERVED check and ride the
         // manifest gate like any user-facing engine flag. Regresion
         // pin: a reserved-list edit once made this refuse.
         let g = meta();
@@ -11866,7 +11866,7 @@ mod tests {
     }
 
     /// mistral.rs enables paged attention BY DEFAULT and its stock
-    /// `--pa-memory-fraction` is 0.90 of TOTAL VRAM — with a co-tenant
+    /// `--pa-memory-fraction` is 0.90 of TOTAL VRAM - with a co-tenant
     /// on the GPU that pool points at memory the engine cannot have,
     /// silently truncating KV into ~60 ms empty responses (live-proven:
     /// 0.5B BF16 + 6.3 GiB tenant on an 8 GiB card). Under co-tenancy
@@ -11876,8 +11876,8 @@ mod tests {
         let g = meta();
         let flags = mistralrs_pa_flags();
         let cfg = Config::default();
-        // The live incident: total 8192, free 1843, model 942 MiB →
-        // budget 1843-942-512 = 389 MiB → 389/8192 = 0.047 → floor 0.05.
+        // The live incident: total 8192, free 1843, model 942 MiB ->
+        // budget 1843-942-512 = 389 MiB -> 389/8192 = 0.047 -> floor 0.05.
         let hw = cotenant_hw(8_192, 1_843, 16_000);
         let mut inp = input(&g, &hw, &cfg, &flags);
         inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
@@ -11894,7 +11894,7 @@ mod tests {
     }
 
     /// Healthy co-tenant budget derives a proportional fraction (not the
-    /// floor): free 6144 − resident 942 − headroom 512 = 4690/8192 ≈ 0.57.
+    /// floor): free 6144 - resident 942 - headroom 512 = 4690/8192 ~ 0.57.
     #[test]
     fn unit__mistralrs_pa_fraction__healthy_budget_derives_proportionally() {
         let g = meta();
@@ -11914,7 +11914,7 @@ mod tests {
         );
     }
 
-    /// mistralrs pa-fraction input over an HF (safetensors dir) meta —
+    /// mistralrs pa-fraction input over an HF (safetensors dir) meta -
     /// the geometry path these pins exercise.
     fn mistralrs_hf_input<'a>(
         hf: &'a crate::hfmeta::HfMeta,
@@ -11960,11 +11960,11 @@ mod tests {
     }
 
     /// THE live incident (user's JIT run): idle 8 GiB card, 0.5B BF16
-    /// dir (942 MiB) — upstream's 0.90-of-total default made the child
+    /// dir (942 MiB) - upstream's 0.90-of-total default made the child
     /// hold 6984 MiB and starve the next routed lane. With KV geometry
     /// the compiler must size the fraction from need: weights 942 +
     /// f16 KV 896 (28*2*128*2*32768*2 B) + floor 512 = 2350 of 8192 =
-    /// 0.29 — the other 71% of the card stays free for co-residents.
+    /// 0.29 - the other 71% of the card stays free for co-residents.
     #[test]
     fn unit__mistralrs_pa_fraction__geometry_sizes_idle_card() {
         let hf = hf_meta();
@@ -11992,7 +11992,7 @@ mod tests {
     }
 
     /// Geometry caps under a co-tenant too: free 6144 gives a budget
-    /// fraction of 0.57, but geometry only NEEDS 0.29 — min wins, so
+    /// fraction of 0.57, but geometry only NEEDS 0.29 - min wins, so
     /// the tenant keeps its memory and the spawn stops there.
     #[test]
     fn unit__mistralrs_pa_fraction__geometry_and_cotenant_take_the_min() {
@@ -12016,7 +12016,7 @@ mod tests {
     }
 
     /// No geometry (GGUF file on the mistralrs lane) + idle card: the
-    /// historical no-op stands — nothing to correct without geometry.
+    /// historical no-op stands - nothing to correct without geometry.
     #[test]
     fn unit__mistralrs_pa_fraction__gguf_idle_card_stays_noop() {
         let g = meta();
@@ -12042,7 +12042,7 @@ mod tests {
         let flags = mistralrs_pa_flags();
         let cfg = Config::default();
         // resident 800 = 50% of free 1550 (auto-off 75% heuristic does
-        // NOT fire) but budget 1550-800-512 = 238 < 256 → classic KV.
+        // NOT fire) but budget 1550-800-512 = 238 < 256 -> classic KV.
         let hw = cotenant_hw(8_192, 1_550, 16_000);
         let mut inp = input(&g, &hw, &cfg, &flags);
         inp.engine_kind = crate::engine_kind::EngineKind::MistralRs;
@@ -12087,8 +12087,8 @@ mod tests {
         );
     }
 
-    /// Single-tenant GPUs (free ≈ total) are exactly today's argv: the
-    /// engine's own defaults are already correct there — no derivation,
+    /// Single-tenant GPUs (free ~ total) are exactly today's argv: the
+    /// engine's own defaults are already correct there - no derivation,
     /// no warning, no behavior change.
     #[test]
     fn unit__mistralrs_pa_fraction__single_tenant_unchanged() {
@@ -12104,7 +12104,7 @@ mod tests {
         assert!(!p.warnings.iter().any(|w| w.contains("co-tenant")));
     }
 
-    /// An explicit `mistralrs_pa_memory_fraction` pin always wins — the
+    /// An explicit `mistralrs_pa_memory_fraction` pin always wins - the
     /// derivation never second-guesses an operator.
     #[test]
     fn unit__mistralrs_pa_fraction__explicit_pin_wins() {
@@ -12196,7 +12196,7 @@ mod tests {
         let g = meta();
         let cfg = llama_server_cfg();
         // full_flags() deliberately lacks the six new flags (house rule:
-        // shared fixture stays minimal) — exactly the old-engine shape.
+        // shared fixture stays minimal) - exactly the old-engine shape.
         let flags = full_flags();
         let hw = gpu_hw(24_000, 32_000, 8);
         let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
@@ -12254,7 +12254,7 @@ mod tests {
                 .any(|w| w == ["--chat-template-kwargs", r#"{"enable_thinking": false}"#]),
             "global value must lose to the overlay"
         );
-        // No overlay for this model → the global still applies.
+        // No overlay for this model -> the global still applies.
         let mut cfg = Config::default();
         cfg.model_overrides.insert("other-model".into(), overlay);
         cfg.chat_template_kwargs = Some(r#"{"enable_thinking": false}"#.into());
@@ -12407,7 +12407,7 @@ mod tests {
     }
 
     /// `extra_args` on the mistralrs lane: manifest-gated strict
-    /// passthrough (the sglang contract) — known flags ride the argv,
+    /// passthrough (the sglang contract) - known flags ride the argv,
     /// unknown flags fail with the manifest pointer, blazar-owned
     /// flags refuse instead of double-setting.
     #[test]
@@ -12521,25 +12521,25 @@ mod tests {
         for t in &emitted_by_knobs {
             assert!(
                 listed.contains(t),
-                "compile emits {t} but the translator flag lists lack it — the child argv would drop it"
+                "compile emits {t} but the translator flag lists lack it - the child argv would drop it"
             );
         }
         for f in &listed {
             assert!(
                 argv_full.iter().any(|t| t == f),
-                "translator lists {f} but no knob or adapter lane emits it — stale entry"
+                "translator lists {f} but no knob or adapter lane emits it - stale entry"
             );
         }
         assert!(
             !emitted_by_knobs.is_empty(),
-            "diff produced nothing — the fixture stopped exercising the knobs"
+            "diff produced nothing - the fixture stopped exercising the knobs"
         );
     }
 
     #[test]
     fn unit__mistralrs_knobs__lora_caps_require_serving() {
         // Bare LoRA runtime limits (no enable_lora, no preloaded adapters)
-        // are rejected by upstream at boot — warn and suppress them.
+        // are rejected by upstream at boot - warn and suppress them.
         let g = meta();
         let cfg = Config {
             mistralrs: MistralrsTuning {
@@ -12611,7 +12611,7 @@ mod tests {
     fn unit__auto_slots__vulkan_class_with_projector_caps_conservatively() {
         let g = meta();
         let cfg = Config::default();
-        // Mixed census — integrated iGPU alongside the discrete card —
+        // Mixed census - integrated iGPU alongside the discrete card -
         // is the vulkan-class signature (a CUDA census lists CUDA
         // devices only). 5900 MiB vram: headroom 688 MiB admits exactly
         // one 16384-ctx slot at the conservative per-token charge.
@@ -12652,7 +12652,7 @@ mod tests {
         );
 
         // CUDA-class census with the same projector: the classic 85%
-        // axis gates it — 5000 weights + 2x448 KV do not fit 5900 MiB
+        // axis gates it - 5000 weights + 2x448 KV do not fit 5900 MiB
         // at the share, and no shallower re-spend pays either. Legacy
         // flag set: b11202-class engines relocate the overflow pool to
         // host (see relocatable-pins), so the device-bound classic axis
@@ -12666,7 +12666,7 @@ mod tests {
         assert!(p2.argv.windows(2).any(|w| w == ["-np", "1"]));
         assert!(!p2.warnings.iter().any(|w| w.contains("capped")));
 
-        // Vulkan-class census WITHOUT a projector: classic axis only —
+        // Vulkan-class census WITHOUT a projector: classic axis only -
         // same single-slot truth, no conservative-cap warning.
         let p3 = compile(
             &input(&g, &vulkan_hw, &cfg, &legacy),
@@ -12681,7 +12681,7 @@ mod tests {
     fn unit__auto_slots__scoped_hardware_full_census_still_caps() {
         // Product shape (supervisor spawn path): the auto GPU pick
         // scopes `hardware` to the PICKED card only, while the engine
-        // census stays mixed — the vulkan build enumerated the iGPU
+        // census stays mixed - the vulkan build enumerated the iGPU
         // alongside the discrete card. Build-class detection must read
         // the census, or the cap silently dies at spawn time
         // (measured live: scoped census spawned np4/65536 and rode the
@@ -12729,7 +12729,7 @@ mod tests {
         let g = meta(); // kv/slot @16384 = 896 MiB, train 40960
         let hw = gpu_hw(24_000, 64_000, 8);
         // RAM-clamped card (1 GiB effective cache-ram): single slot at
-        // full ctx, but the halved ctx earns capacity — 4x4096 wins.
+        // full ctx, but the halved ctx earns capacity - 4x4096 wins.
         let cfg_tight = Config {
             cache_ram_mb: 1024,
             ..Config::default()
@@ -12805,7 +12805,7 @@ mod tests {
     #[test]
     fn unit__kv_est__unified_lane_charges_full_device_pool() {
         // Device truth: the unified pool is VRAM-resident (live-verified
-        // b10948), so the planner charge is the full f16 estimate —
+        // b10948), so the planner charge is the full f16 estimate -
         // and the quant ladder applies to it like the classic lane
         // (q8_0 halves the buffer the child actually allocates).
         let hw = gpu_hw(24_000, 64_000, 8);
@@ -12837,7 +12837,7 @@ mod tests {
     #[test]
     fn unit__kv_est__draft_kv_charged_unified() {
         // Spec pair on unified KV: BOTH pools are device-backed (the
-        // flag shares buffers, it does not relocate them) — the planner
+        // flag shares buffers, it does not relocate them) - the planner
         // charge is dense f16 + draft f16 at the compiled total ctx.
         let hw = gpu_hw(24_000, 64_000, 8);
         let g = meta();
@@ -12909,7 +12909,7 @@ mod tests {
 
     #[test]
     fn unit__admission_floor_bytes__charges_standing_overheads() {
-        // Same standing charges the unified gpu-layers pin trusts — the
+        // Same standing charges the unified gpu-layers pin trusts - the
         // 2026-09-11 crash: weights-only admission let a 0.5B sibling
         // (floor 1712 MiB) join a 7302 MiB measured 9B VL resident on an
         // 8 GiB card. Saturating: a u64-weights row must not wrap.
@@ -12950,7 +12950,7 @@ mod tests {
     #[test]
     fn unit__sglang_effective_offload_bytes__unpinned_derive_never_refuses() {
         // Unpinned: offload = ceil(floor - largest budget), so the
-        // post-offload demand is always <= that budget — only a pin can
+        // post-offload demand is always <= that budget - only a pin can
         // leave more on the GPU than the ladder would. The 2026-10-16
         // false-refusal class (floor 8.7 GiB vs 8.59 GiB card) dies here.
         let mib = |m: u64| m * 1024 * 1024;
@@ -12978,11 +12978,11 @@ mod tests {
         // Posture-aware truth, two receipts. Geometry: 57344 B/token
         // x 16384 = 896 MiB full-charge. (a) Relocatable posture
         // (engine ships --no-kv-offload, config leaves offload on,
-        // unified lane): b11202 device truth — the pool spills to host
+        // unified lane): b11202 device truth - the pool spills to host
         // RAM, so device occupancy is the 512 MiB unified floor
         // (4x16384 held only +208 MiB over 2x8192 while +64% t/s).
         // (b) Legacy engine without --no-kv-offload: the b10948
-        // device-side receipt still binds — full f16 charge. (c) No
+        // device-side receipt still binds - full f16 charge. (c) No
         // unified lane at all: full f16 charge either way.
         let hw = gpu_hw(24_000, 64_000, 8);
         let g = meta();
@@ -13105,7 +13105,7 @@ mod tests {
     #[test]
     fn unit__spec_auto__draft_missing__opportunistic_dense_with_warning() {
         // Live evidence (b10840): `--spec-draft-hf` resolves the repo to an
-        // empty draft path and the child exits fatally — so auto (now the
+        // empty draft path and the child exits fatally - so auto (now the
         // default) must degrade to dense with a pull hint instead of
         // refusing the spawn; hard errors belong to the explicit modes.
         let cfg = Config {
@@ -13138,7 +13138,7 @@ mod tests {
         inp.model_name = "gemma3-4b"; // no catalog pair
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(!p.argv.contains(&"--spec-type".to_string()));
-        // Auto-mode fallback to dense is the system working as designed —
+        // Auto-mode fallback to dense is the system working as designed -
         // rationale lives in the journal, not the warning vec.
         assert!(!p.warnings.iter().any(|w| w.contains("draft pair")));
     }
@@ -13386,8 +13386,8 @@ mod tests {
     fn unit__mmproj_from_store__emitted_when_engine_supports() {
         // Rule 19: a pulled projector reaches the engine when the policy
         // asks for it. Default is Lazy (text-only spawn + @vision respawn
-        // on first image); Attach — explicit or the @vision/router
-        // mmproj_force — emits -mm from the store row (the gap that
+        // on first image); Attach - explicit or the @vision/router
+        // mmproj_force - emits -mm from the store row (the gap that
         // once left downloaded projectors dead on disk).
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -13710,7 +13710,7 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--reasoning" && w[1] == "on")
         );
-        // Default (empty) never emits the flag — child keeps its own
+        // Default (empty) never emits the flag - child keeps its own
         // auto-detect default, argv byte-identical to pre-knob.
         let p_default = compile(
             &input(&g, &hw, &Config::default(), &WIRE_FLAGS),
@@ -13861,7 +13861,7 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--spec-ngram-mod-n-min" && w[1] == "12")
         );
-        // cache: parameterless — only --spec-type, but the rule-14 lookup
+        // cache: parameterless - only --spec-type, but the rule-14 lookup
         // cache still rides when spec_cache is on.
         let cfg = Config {
             spec: "ngram-cache".into(),
@@ -14051,7 +14051,7 @@ mod tests {
     #[test]
     fn unit__wire__cache_hint_adapts_ram_cap() {
         // 16384 (not the shipped 8192 default): a user-pinned budget, so
-        // the adaptive clamp is a divergence worth a warning — the tier
+        // the adaptive clamp is a divergence worth a warning - the tier
         // numbers below stay visible through that warning.
         let cfg = Config {
             cache_ram_mb: 16384,
@@ -14069,7 +14069,7 @@ mod tests {
                 .any(|w| w[0] == "--cache-ram" && w[1] == "6553")
         );
         // Cold: 20% cap = 3276, but the 2a-bis weights floor (5000 + 64
-        // over 0.85 = 5957) lifts every below-floor cap to 5957 — a
+        // over 0.85 = 5957) lifts every below-floor cap to 5957 - a
         // sub-weights budget CPU-splits layers at the fitter.
         let mut inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         inp.cache_hit_rate = Some(0.01);
@@ -14081,7 +14081,7 @@ mod tests {
         );
         // The tier itself stays visible in the clamp warning.
         assert!(p2.warnings.iter().any(|w| w.contains("clamped to 3276")));
-        // None: static 30% = 4915 — also below the floor.
+        // None: static 30% = 4915 - also below the floor.
         let inp = input(&g, &hw, &cfg, &WIRE_FLAGS);
         let p3 = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
@@ -14186,7 +14186,7 @@ mod tests {
         // the llama-server dialect is foreign and --jinja/--ctx-size
         // style flags would hard-error against a foreign flag set (the
         // live 500 that birthed this fork). The profile is ctx plus
-        // `-np N` for the argv translator to mine — nothing else.
+        // `-np N` for the argv translator to mine - nothing else.
         // Explicit slots=1 pins the emission; slots=0 (the new default)
         // emits nothing and lets the translator's own default apply.
         let cfg = Config {
@@ -14202,7 +14202,7 @@ mod tests {
         assert_eq!(p.argv, vec!["-np".to_string(), "1".to_string()]);
         assert_eq!(p.warnings.len(), 0);
         assert_eq!(p.kv_est_bytes, None);
-        // Default config (slots=0) also emits nothing on this dialect —
+        // Default config (slots=0) also emits nothing on this dialect -
         // blazar's llama-lane auto sizing has no mistral.rs equivalent
         // (upstream sizes its own sequences).
         let cfg_def = Config::default();
@@ -14237,7 +14237,7 @@ mod tests {
         );
         assert_eq!(pn.warnings.len(), 1);
         // paged-attn off: the only fit for big vision models on 8 GB
-        // cards (live-proven) — same gate shape as the fraction knob.
+        // cards (live-proven) - same gate shape as the fraction knob.
         let cfg_pa = Config {
             mistralrs_paged_attn: Some(false),
             ..Default::default()
@@ -14265,7 +14265,7 @@ mod tests {
         // audit GAP-2, post-strict-passthrough contract: extra_args with
         // llama-server dialect on the mistralrs lane hard-fails at
         // compile with manifest teaching (the old warn-and-drop silently
-        // disabled engine-only flags — see the ISQ A/B that measured
+        // disabled engine-only flags - see the ISQ A/B that measured
         // nothing). Unknown-to-the-manifest = Err, never silent.
         let hw = gpu_hw(0, 32_000, 8);
         let g = meta();
@@ -14285,7 +14285,7 @@ mod tests {
             err.contains("not in this mistralrs engine's probed manifest"),
             "{err}"
         );
-        // Empty extra_args stays silent — no warning noise for no action.
+        // Empty extra_args stays silent - no warning noise for no action.
         let ov_empty = ModelOverride {
             extra_args: Some(Vec::new()),
             ..DEFAULT_OVERLAY.clone()
@@ -14346,7 +14346,7 @@ mod tests {
 
         // Tight GPU: resident = model bytes ONCE (deduped self-reference),
         // so the fixture's 5000 MiB model vs 75% of 6000 MiB still trips
-        // the offload ladder — but counting it twice would too; the dedupe
+        // the offload ladder - but counting it twice would too; the dedupe
         // is proven by the roomy case above not double-summing to partial.
         let hw_tight = gpu_hw(6_000, 32_000, 8);
         let mut inp2 = input(&g, &hw_tight, &cfg, &sd_flags);
@@ -14473,7 +14473,7 @@ mod tests {
     #[test]
     fn unit__compile_sdcpp__backend_split_llm_family() {
         // The qwen-image posture: blanket offload would trip (full set
-        // over the 75% ladder) but the DiT+VAE pair fits — the planner
+        // over the 75% ladder) but the DiT+VAE pair fits - the planner
         // splits modules instead: diffusion+VAE on the hinted card, the
         // TE streaming from RAM. Sparse component files carry real
         // metadata sizes without writing gigabytes.
@@ -14513,7 +14513,7 @@ mod tests {
             ComponentArg::new("--llm_vision", llm_vision.to_str().unwrap()),
         ];
         // resident 5000+650+5400+400 > 6144 trips the blanket ladder;
-        // DiT+VAE 5650 <= 6144 fits → split fires.
+        // DiT+VAE 5650 <= 6144 fits -> split fires.
         let mut inp = input(&g, &hw, &cfg, &sd_flags);
         inp.engine_kind = crate::engine_kind::EngineKind::SdCpp;
         inp.components = &components;
@@ -14576,7 +14576,7 @@ mod tests {
         assert!(!p4.argv.iter().any(|a| a == "--backend"));
 
         // Non-llm family (standalone --model checkpoint): module names
-        // unverified — stays blanket even with a hint.
+        // unverified - stays blanket even with a hint.
         let hw_tight = gpu_hw(6_000, 32_000, 8); // 75% = 4500 < 5000 model
         let standalone = [ComponentArg::new("--model", ckpt.to_str().unwrap())];
         let mut inp5 = input(&g, &hw_tight, &cfg, &sd_flags);
@@ -14626,7 +14626,7 @@ mod tests {
         let hw = gpu_hw(8_192, 32_000, 8); // 75% ladder = 6144 MiB
 
         // resident 5000+650+4000+250 > 6144 trips the ladder; the
-        // DiT+VAE pair 5650 <= 6144 fits → split fires for this family
+        // DiT+VAE pair 5650 <= 6144 fits -> split fires for this family
         // too, TE (t5xxl+clip_l ~4250) streaming from RAM.
         let components = [
             ComponentArg::new("--vae", vae.to_str().unwrap()),
@@ -14658,7 +14658,7 @@ mod tests {
     #[test]
     fn unit__compile_sdcpp__missing_or_stale_component_set_teaches_repull() {
         // Gate both ways: no set in the row (older pull) and a set whose
-        // files vanished both repair the same way — re-pull.
+        // files vanished both repair the same way - re-pull.
         let g = meta();
         let hw = gpu_hw(16_384, 32_000, 8);
         let empty: BTreeSet<String> = BTreeSet::new();
@@ -14685,7 +14685,7 @@ mod tests {
     #[test]
     fn unit__compile_sdcpp__flux_family_flags_and_multi_component_ladder() {
         // FLUX dialect: --t5xxl + --clip_l (no --llm), and the offload
-        // ladder charges EVERY component file — a T5 that streams from
+        // ladder charges EVERY component file - a T5 that streams from
         // RAM still counts toward the resident-set decision.
         let g = meta();
         let sd_flags: BTreeSet<String> =
@@ -14695,7 +14695,7 @@ mod tests {
                 .collect();
         let cfg = Config::default();
         // Unique dir name: the sibling te-family flux test stages its own
-        // clip_l at a different sparse size — sharing one dir let the later
+        // clip_l at a different sparse size - sharing one dir let the later
         // truncate win the metadata race and flip the warning arithmetic.
         let dir =
             std::env::temp_dir().join(format!("blazar-sdcpp-flux-roomy-{}", std::process::id()));
@@ -14746,7 +14746,7 @@ mod tests {
         assert_eq!(p.gpu, "full");
 
         // Tight GPU (6 GiB): DiT 5000 MiB + components ~3446 MiB busts
-        // the 75% bar → stream posture. (Sparsely-allocated fixture
+        // the 75% bar -> stream posture. (Sparsely-allocated fixture
         // files keep this test fast; the ladder reads metadata only.)
         let hw_tight = gpu_hw(6_144, 32_000, 8);
         let mut inp2 = input(&g, &hw_tight, &cfg, &sd_flags);
@@ -14940,7 +14940,7 @@ mod tests {
     #[test]
     fn unit__compile_sdcpp__tuning_knobs_defaults_emit_fa_only() {
         // Flash attention ships on by default (measured 25% faster at
-        // identical quality); every other knob stays opt-in — an unset
+        // identical quality); every other knob stays opt-in - an unset
         // cache mode / vae-tiling / rpc keeps the argv free of its flag.
         let (dir, vae, llm) = sdcpp_tuning_fixture("off");
         let g = meta();
@@ -14984,7 +14984,7 @@ mod tests {
     }
 
     #[test]
-    // One assertion row per sdcpp companion knob — the matrix is the
+    // One assertion row per sdcpp companion knob - the matrix is the
     // point; splitting it would hide knob coverage per surface.
     #[allow(clippy::too_many_lines)]
     fn unit__compile_sdcpp__tuning_knobs_emitted_and_gated() {
@@ -15110,7 +15110,7 @@ mod tests {
         // The knob rides --model-args (no first-class upstream flag):
         // alone it becomes the sole entry, beside user args it appends,
         // and an explicit user entry for the same key wins with a
-        // warning — blazar never overrides a named lever.
+        // warning - blazar never overrides a named lever.
         let (dir, vae, llm) = sdcpp_tuning_fixture("prefix-cache");
         let g = meta();
         let hw = gpu_hw(16_384, 32_000, 8);
@@ -15177,7 +15177,7 @@ mod tests {
     #[test]
     fn unit__compile_sdcpp__config_extra_args_rides_under_overlay() {
         // Two tiers: the config-level sdcpp_extra_args fleet lever rides
-        // first, the per-model overlay after — engine last-wins resolves a
+        // first, the per-model overlay after - engine last-wins resolves a
         // flag set in both to the overlay, with a warning naming the
         // shadowing. Gate contract (reserved pins + probed manifest) fires
         // on BOTH tiers with the tier named in the error.
@@ -15270,7 +15270,7 @@ mod tests {
     #[test]
     fn unit__compile_sdcpp__config_backend_owns_posture_over_auto_split() {
         // A --backend in EITHER extra-args tier suppresses the automatic
-        // DiT+VAE/te=cpu split — last-wins must not silently clobber the
+        // DiT+VAE/te=cpu split - last-wins must not silently clobber the
         // user's posture. Fixture trips the split without user flags
         // (small DiT+VAE fits 75%, a 3 GiB TE does not) and asserts it
         // disappears under the config-tier lever.
@@ -15578,7 +15578,7 @@ mod tests {
     #[test]
     fn unit__compile__safetensors_on_llamacpp_teaches_working_remedy() {
         // audit GAP-1: the wrong-lane teaching once pointed at
-        // `blazar run <model> --engine sglang` — a flag the Run command
+        // `blazar run <model> --engine sglang` - a flag the Run command
         // never had (clap would reject it). The remedy must name the
         // engine install/use lane and the daemon restart.
         let hw = gpu_hw(0, 32_000, 8);
@@ -15862,7 +15862,7 @@ mod tests {
     }
 
     /// Qwen2.5-class checkpoint: 28 layers, 2 KV heads, 128 `head_dim`,
-    /// 32768 trained ctx, bf16 — KV geometry is the ladder's fuel.
+    /// 32768 trained ctx, bf16 - KV geometry is the ladder's fuel.
     fn hf_meta() -> crate::hfmeta::HfMeta {
         crate::hfmeta::HfMeta {
             architecture: "Qwen2ForCausalLM".into(),
@@ -15883,7 +15883,7 @@ mod tests {
     static MLX_FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(mlx_flags);
 
     /// The verified sglang 0.5.21 surface (probe receipt: engines.manifest
-    /// in blazar.db, 2026-10-09): the combined cuda-graph flags split —
+    /// in blazar.db, 2026-10-09): the combined cuda-graph flags split -
     /// `--cuda-graph-bs`/`--cuda-graph-max-bs` are gone, decode and
     /// prefill each take their own list/ceiling, and prefill `bs` counts
     /// aggregate tokens, not requests. Otherwise identical to 0.5.19.
@@ -15960,7 +15960,7 @@ mod tests {
 
     /// ctx = 32768 via overlay so KV bytes are deterministic:
     /// kv8 (fp8, 1B/elem) = 28*2*128*2*32768 = 469,762,048; kv16 = 2x;
-    /// vram `12_000` MiB = 12,582,912,000 → budget = 92% − 1 GiB = 10,502,537,216.
+    /// vram `12_000` MiB = 12,582,912,000 -> budget = 92% - 1 GiB = 10,502,537,216.
     fn sglang_ctx_overlay() -> ModelOverride {
         ModelOverride {
             ctx: Some(32_768),
@@ -16149,7 +16149,7 @@ mod tests {
         inp.supported_flags = &flags;
         inp.auto_tp_size = Some(2);
         // 9 GiB per rank vs 6.36 GiB per-card budget: sharding alone
-        // cannot hold it — per-rank overflow (2.85 GB with fp8 KV)
+        // cannot hold it - per-rank overflow (2.85 GB with fp8 KV)
         // lands in Tier C against the PER-RANK host share
         // (16000*4/10/2 = 3200 MiB), so the spawn is honest "partial",
         // never a blind NCCL death.
@@ -16266,7 +16266,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // sglang: split cuda-graph surface (0.5.21) — prefill bucket derive
+    // sglang: split cuda-graph surface (0.5.21) - prefill bucket derive
     // ------------------------------------------------------------------
 
     /// Tier A on the split surface: full-VRAM fits derive no decode
@@ -16305,7 +16305,7 @@ mod tests {
 
     /// Tier B on the split surface: the headroom ceiling lands on the
     /// decode flag, the prefill buckets ride alongside, and the chunk
-    /// pin appears exactly once (tight-fit emitted it first — the
+    /// pin appears exactly once (tight-fit emitted it first - the
     /// prefill derive must not duplicate it).
     #[test]
     fn unit__sglang__split_surface_tier_b_decode_ceiling_and_single_chunk_pin() {
@@ -16569,7 +16569,7 @@ mod tests {
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
             !p.argv.iter().any(|a| *a == "--sleep-on-idle"),
-            "flag absent from manifest — nothing to emit"
+            "flag absent from manifest - nothing to emit"
         );
         assert!(
             !p.warnings.iter().any(|w| w.contains("sleep_on_idle")),
@@ -16811,7 +16811,7 @@ mod tests {
         let hf = hf_meta();
         let overlay = sglang_ctx_overlay();
         // EAGLE drafts for sglang are HF safetensors DIRS (the `.d`
-        // store-row shape), never GGUF files — the GGUF shape is the
+        // store-row shape), never GGUF files - the GGUF shape is the
         // rejected lane covered by the pin below.
         let draft = format!("/tmp/blazar-draft-sglang-eagle3-{}.d", std::process::id());
         let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
@@ -16858,7 +16858,7 @@ mod tests {
     #[test]
     fn unit__sglang_spec__draft_free_ngram_emits_knobs() {
         // The draft-free lane: NGRAM self-speculation from the sglang
-        // tuning knobs — no draft model flag, steps/draft-tokens ride
+        // tuning knobs - no draft model flag, steps/draft-tokens ride
         // their own flags.
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -17071,7 +17071,7 @@ mod tests {
     #[test]
     fn unit__sglang_spec__algorithm_flag_missing_warns_dense() {
         // An engine without --speculative-algorithm must stay dense with
-        // a teaching warning — never a spawn-time argparse death.
+        // a teaching warning - never a spawn-time argparse death.
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
@@ -17192,7 +17192,7 @@ mod tests {
         // 2026-10-16 receipts were pin postures). Pin both runs at the
         // same over-budget fraction; the dense run must clamp to
         // (12000-2000)/12000 = 0.833 and the engaged run to
-        // (12000-2256)/12000 = 0.812 — a delta of exactly the reserve
+        // (12000-2256)/12000 = 0.812 - a delta of exactly the reserve
         // share. (Unpinned derives never reach either ceiling inside
         // Tiers A/B: the tier budget already sits under the ceiling, so
         // only a pin exercises this governance.)
@@ -17239,7 +17239,7 @@ mod tests {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped fixture math
     fn unit__sglang__spec_lane_ceiling_pays_verify_mult_and_reserve() {
         // The ceiling fn's contract is the verify multiplier: same
-        // headroom, same weights — the spec lane's capture ceiling lands
+        // headroom, same weights - the spec lane's capture ceiling lands
         // at ~1/SGLANG_SPEC_GRAPH_MULT of the dense derive (both clamps
         // respected). The spec-chain reserve deduction happens one level
         // up, in `sglang_tight_fit_knobs`, before this fn is called.
@@ -17292,7 +17292,7 @@ mod tests {
     #[test]
     fn unit__sglang__spec_tier_a_still_bounds_graph_ceiling() {
         // Tier A (weights + f16 KV fit with room to spare) historically
-        // emitted no graph ceiling, leaving upstream's default 256 —
+        // emitted no graph ceiling, leaving upstream's default 256 -
         // fine dense, an OOM class on spec lanes where verify graphs
         // cost the draft multiple. Engaged Tier A must emit an explicit
         // bounded ceiling; dense Tier A keeps the historical silence
@@ -17333,7 +17333,7 @@ mod tests {
     fn unit__sglang_depth__string_pins_emitted() {
         // grammar-backend rides the cache-policy stage; mm-attention-backend
         // and retraction-policy join the string-pin table. Depth knobs are
-        // 0.5.21-surface: race on the 0521 fixture (0.5.19 base warn-skips —
+        // 0.5.21-surface: race on the 0521 fixture (0.5.19 base warn-skips -
         // pinned by unit__sglang__new_knobs_warn_skip_on_old_engine).
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -17412,7 +17412,7 @@ mod tests {
     fn unit__sglang_depth__spec_knobs_only_when_engaged() {
         // Depth knobs (eagle-topk, accept thresholds) ride ONLY an
         // engaging speculation arm: a dense spawn with stray depth
-        // pins stays byte-identical dense — no orphan --speculative-*
+        // pins stays byte-identical dense - no orphan --speculative-*
         // flags on a path the user never chose.
         let depth = crate::config::SglangTuning {
             speculative_eagle_topk: Some(4),
@@ -17699,7 +17699,7 @@ mod tests {
     }
 
     /// Honest degradation: a safetensors row without config.json ctx
-    /// metadata must NOT fabricate a ceiling — 0 keeps admission on the
+    /// metadata must NOT fabricate a ceiling - 0 keeps admission on the
     /// configured default (the pre-B behavior), just explicitly labeled.
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[test]
@@ -17735,7 +17735,7 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
         );
-        // mem-fraction nets out the pinned offload: (weights − 2GB + kv16)/vram
+        // mem-fraction nets out the pinned offload: (weights - 2GB + kv16)/vram
         assert!(
             p.argv
                 .windows(2)
@@ -17746,7 +17746,7 @@ mod tests {
     #[test]
     fn unit__sglang__fractional_offload_pin_rounds_up_to_whole_gb() {
         // The engine flag is integer-GB (0.5.21 argparse: "invalid int
-        // value: '5.5'", live 2026-10-16) — a fractional pin must emit
+        // value: '5.5'", live 2026-10-16) - a fractional pin must emit
         // whole GB rounded UP (under-offloading OOMs the spawn) and
         // teach, never silently pass the fraction through.
         let cfg = Config::default();
@@ -17800,7 +17800,7 @@ mod tests {
         assert_eq!(p.gpu, "auto");
         assert_eq!(p.kv_est_bytes, None);
         assert!(p.warnings.iter().any(|w| w.contains("lacks KV geometry")));
-        // no mem-fraction guess without geometry — sglang defaults apply
+        // no mem-fraction guess without geometry - sglang defaults apply
         assert!(!p.argv.iter().any(|a| a == "--mem-fraction-static"));
     }
 
@@ -17876,7 +17876,7 @@ mod tests {
     #[test]
     fn unit__sglang__mem_fraction_pin_governed_by_activation_reserve() {
         // Receipt: 0.90 pinned on an 8 GiB card crashed in CUDA-graph
-        // capture (PyTorch allocator assert → sglang kill_process_tree →
+        // capture (PyTorch allocator assert -> sglang kill_process_tree ->
         // opaque 502). The pin must clamp to the activation-reserve
         // ceiling with a loud warning, while a big card keeps the pin
         // and an under-band pin clamps up.
@@ -17907,7 +17907,7 @@ mod tests {
                 .any(|w| w.contains("clamped to") && w.contains("graph capture"))
         );
 
-        // 24 GiB card: ceiling 0.917 hits the band max first — a 0.90
+        // 24 GiB card: ceiling 0.917 hits the band max first - a 0.90
         // pin is legitimate and must pass through untouched.
         let hw_big = gpu_hw(24_000, 64_000, 8);
         let mut inp_big = sglang_input(&hf, &hw_big, &cfg, 3_300 * MIB);
@@ -17958,7 +17958,7 @@ mod tests {
         let hf = hf_meta();
 
         // 13.5 GiB RAM (the receipt box reports 13.7 GiB usable):
-        // budget = 13500 - 10240 - 4096 < 0 → refuse.
+        // budget = 13500 - 10240 - 4096 < 0 -> refuse.
         let hw_small = gpu_hw(8_000, 13_500, 8);
         let overlay_on = ModelOverride {
             ctx: Some(32_768),
@@ -18015,7 +18015,7 @@ mod tests {
         // Thinking templates must split thoughts out of `content` for the
         // gateway's thinking/answer contract; sglang only does that when
         // a reasoning parser is configured, so unset means `auto`
-        // (upstream detects from the chat template — the same posture as
+        // (upstream detects from the chat template - the same posture as
         // llama-server's `--reasoning-format auto` default). An explicit
         // pin replaces the default; a legacy engine without the flag is
         // left untouched.
@@ -18079,7 +18079,7 @@ mod tests {
         // Dedicated embedding posture (upstream `--is-embedding`: the
         // CausalLM pools decoder states and serves `/v1/embeddings`,
         // refusing generation on that child). Emits when the engine
-        // carries the flag; a legacy engine without it warns and skips —
+        // carries the flag; a legacy engine without it warns and skips -
         // the knob never breaks the spawn.
         let cfg = Config::default();
         let hf = hf_meta();
@@ -18148,7 +18148,7 @@ mod tests {
     #[test]
     fn unit__sglang__cache_report_default_on_and_opt_out() {
         // The report powers the gateway's warm/cold split and per-model
-        // cache-hit surfaces — blazar-managed children carry it by
+        // cache-hit surfaces - blazar-managed children carry it by
         // default, `cache_report = false` is the explicit opt-out.
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -18273,7 +18273,7 @@ mod tests {
     #[test]
     fn unit__sglang__new_knobs_warn_skip_on_old_engine() {
         // Base fixture lacks every new flag: knobs degrade to warn-skips,
-        // argv stays clean — an old engine never receives unknown flags.
+        // argv stays clean - an old engine never receives unknown flags.
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
@@ -18350,7 +18350,7 @@ mod tests {
             p.argv[idx + 1],
             "qwen-lora-r16=/models/adapters/qwen-lora-r16"
         );
-        // llama.cpp scale has no upstream equivalent — teach, never drop
+        // llama.cpp scale has no upstream equivalent - teach, never drop
         assert!(
             p.warnings
                 .iter()

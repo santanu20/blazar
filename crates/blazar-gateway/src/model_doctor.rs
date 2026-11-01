@@ -1,9 +1,9 @@
-//! POST /api/model-doctor — per-model capability certificate.
+//! POST /api/model-doctor - per-model capability certificate.
 //!
 //! Every probe runs through the REAL gateway path (admission queue,
 //! dialect translation, `child_send`, sentinel) by invoking the ollama
 //! handlers directly as functions. Auth is a middleware concern, so an
-//! in-daemon call carries no key — the run is operator-initiated. No
+//! in-daemon call carries no key - the run is operator-initiated. No
 //! self-HTTP loop: that would re-enter the body limit and lifecycle
 //! middleware with a fake client disconnect semantics.
 //!
@@ -31,7 +31,7 @@ const FIRST_PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Warm probes: generation itself is seconds.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Hard ceiling for the whole run. A hung child cannot pin a doctor job
-/// forever — probes left when the budget is gone are marked FAIL(timeout)
+/// forever - probes left when the budget is gone are marked FAIL(timeout)
 /// and the partial certificate is still stored.
 const OVERALL_CAP: Duration = Duration::from_secs(600);
 /// Probe replies are tiny by construction; anything larger means the lane
@@ -40,8 +40,8 @@ const PROBE_BODY_CAP: usize = 4 * 1024 * 1024;
 /// Borderline models draw unlucky: a small quant answers the tool probe
 /// in prose on one sample and emits a perfect call on the identically
 /// shaped retry (measured live 2026-10-08, qwen2.5-1.5b-4bit on mlx).
-/// The certificate's question is existence — CAN this lane elicit the
-/// behavior — not per-draw reliability, so elicitation probes retry and
+/// The certificate's question is existence - CAN this lane elicit the
+/// behavior - not per-draw reliability, so elicitation probes retry and
 /// PASS on any success. Reliability is the scorecard's axis; a
 /// single-draw FAIL here blocks live traffic via `CAPABILITY_VERIFIED_FAILED`
 /// on a configuration that works.
@@ -60,7 +60,7 @@ fn next_job_id() -> String {
     format!("doc_{boot:x}_{}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// One probe verdict. `PASS` / `FAIL` / `N/A` — N/A is reserved for
+/// One probe verdict. `PASS` / `FAIL` / `N/A` - N/A is reserved for
 /// capabilities the lane honestly does not serve (e.g. embeddings on a
 /// generative-only lane), never to soften a failure.
 pub(crate) struct Verdict {
@@ -95,16 +95,19 @@ fn excerpt(body: &[u8], max: usize) -> String {
     if text.len() <= max {
         text.to_owned()
     } else {
-        let mut cut = max;
+        // Budget the ASCII ellipsis inside the cap so the total never
+        // exceeds it; walk back to a char boundary so multi-byte text
+        // is never split.
+        let mut cut = (max.saturating_sub(3)).max(1);
         while !text.is_char_boundary(cut) {
             cut -= 1;
         }
-        format!("{}…", &text[..cut])
+        format!("{}...", &text[..cut])
     }
 }
 
 // ---------------------------------------------------------------------------
-// Judges — pure (status, body) classifiers so the wire vocabulary is
+// Judges - pure (status, body) classifiers so the wire vocabulary is
 // unit-pinned without a live child.
 // ---------------------------------------------------------------------------
 
@@ -185,7 +188,7 @@ fn judge_json(code: u16, body: &[u8]) -> Verdict {
 
 /// tool-call probe: 200 AND the model actually emitted a tool call. A
 /// model that answers in prose when handed a tool is exactly the failure
-/// the certificate exists to surface — that is a FAIL, not an N/A.
+/// the certificate exists to surface - that is a FAIL, not an N/A.
 fn judge_tools(code: u16, body: &[u8]) -> Verdict {
     if code != 200 {
         return fail(format!("HTTP {code}: {}", excerpt(body, 160)));
@@ -212,7 +215,7 @@ fn judge_tools(code: u16, body: &[u8]) -> Verdict {
         ));
     }
     fail(format!(
-        "200 but no tool_calls — model answered in prose: {}",
+        "200 but no tool_calls - model answered in prose: {}",
         excerpt(body, 160)
     ))
 }
@@ -220,7 +223,7 @@ fn judge_tools(code: u16, body: &[u8]) -> Verdict {
 /// Choice-of-3 selection judge: with distractor tools offered and no
 /// `tool_choice` pin, the model must pick the tool the prompt actually
 /// needs. A calculator problem that calls `get_weather` (or answers in
-/// prose) is a selection failure — exactly the over-claim the two-shape
+/// prose) is a selection failure - exactly the over-claim the two-shape
 /// tools certificate exists to catch.
 fn judge_tools_selection(code: u16, body: &[u8], want: &str) -> Verdict {
     if code != 200 {
@@ -248,7 +251,7 @@ fn judge_tools_selection(code: u16, body: &[u8], want: &str) -> Verdict {
         return pass(format!("200, picked {want} (calls: {})", names.join(", ")));
     }
     fail(format!(
-        "200 but never called {want} — wrong selection or prose: {}",
+        "200 but never called {want} - wrong selection or prose: {}",
         excerpt(body, 160)
     ))
 }
@@ -275,7 +278,7 @@ fn judge_embed(code: u16, body: &[u8]) -> Verdict {
     if code == 400 && text.to_lowercase().contains("embed") {
         return na(format!("lane refuses embeddings for this model: {text}"));
     }
-    // 404 = the lane never routed the endpoint — the model was never
+    // 404 = the lane never routed the endpoint - the model was never
     // measured, so the honest verdict is "not applicable here", not a
     // failure the scorecard would attribute to the model.
     if code == 404 {
@@ -285,7 +288,7 @@ fn judge_embed(code: u16, body: &[u8]) -> Verdict {
 }
 
 // ---------------------------------------------------------------------------
-// Probe transport — direct handler invocation through the real path.
+// Probe transport - direct handler invocation through the real path.
 // ---------------------------------------------------------------------------
 
 /// Run an elicitation probe up to [`ELICIT_ATTEMPTS`] times, returning
@@ -355,7 +358,7 @@ async fn call_embed(state: &Arc<AppState>, body: Value) -> (u16, Bytes) {
 // Handlers.
 // ---------------------------------------------------------------------------
 
-/// POST /api/model-doctor {"model": "..."} — queue the probe run as a
+/// POST /api/model-doctor {"model": "..."} - queue the probe run as a
 /// durable job; poll `/v1/jobs/{id}` for the certificate.
 pub async fn run(
     State(state): State<Arc<AppState>>,
@@ -388,7 +391,7 @@ pub async fn run(
             receipt: "mmproj present (capability not exercised by this run)".to_string(),
         }
     } else {
-        na("no mmproj pulled — vision requests would be text-only".to_string())
+        na("no mmproj pulled - vision requests would be text-only".to_string())
     };
     // Decision-class checkpoint: the /v1/classify lane is its surface.
     // Probed live below for modern-bert rows; everything else is an
@@ -439,7 +442,7 @@ pub async fn run(
     .into_response()
 }
 
-/// GET /api/model-doctor/{model} — the latest stored certificate.
+/// GET /api/model-doctor/{model} - the latest stored certificate.
 pub async fn cert(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(model): axum::extract::Path<String>,
@@ -456,7 +459,7 @@ pub async fn cert(
         return crate::error_response(
             404,
             &format!(
-                "no certificate on record — POST /api/model-doctor {{\"model\": \"{model}\"}} runs the probes"
+                "no certificate on record - POST /api/model-doctor {{\"model\": \"{model}\"}} runs the probes"
             ),
         );
     };
@@ -484,7 +487,7 @@ async fn run_probes(
     let deadline = started + OVERALL_CAP;
 
     // Between probes: honor a cancel that landed on the row. The ledger
-    // close is one-way, so this task's later writes would no-op anyway —
+    // close is one-way, so this task's later writes would no-op anyway -
     // this stops the actual work instead of burning child time.
     let row_cancelled = |state: &Arc<AppState>| {
         state
@@ -495,7 +498,7 @@ async fn run_probes(
 
     let mut caps = serde_json::Map::new();
 
-    // chat / load — the first probe carries the cold-load allowance.
+    // chat / load - the first probe carries the cold-load allowance.
     let v_chat = {
         if row_cancelled(&state) {
             return;
@@ -612,7 +615,7 @@ async fn run_probes(
     );
     caps.insert("json".into(), verdict_json(&v_json));
 
-    // tool elicitation — the probe agents actually care about. Two shapes:
+    // tool elicitation - the probe agents actually care about. Two shapes:
     // a forced single-tool call (can it emit a call at all) and a free
     // choice among three tools with distractors (can it pick the one the
     // prompt needs). A certificate claiming tools while the model fumbles
@@ -651,7 +654,7 @@ async fn run_probes(
             }
         })
         .await;
-        // Only a settled single-tool PASS earns the second child spawn —
+        // Only a settled single-tool PASS earns the second child spawn -
         // a model that never emits calls cannot be rescued by selection.
         if v_single.status.eq("PASS") {
             let v_choice = elicit_with_retry(|| async {
@@ -712,12 +715,12 @@ async fn run_probes(
                 ))
             } else {
                 fail(format!(
-                    "forced single ok ({}); free choice among 3 tools failed — {}",
+                    "forced single ok ({}); free choice among 3 tools failed - {}",
                     v_single.receipt, v_choice.receipt
                 ))
             }
         } else {
-            // never emits calls at all — the selection probe cannot
+            // never emits calls at all - the selection probe cannot
             // rescue this and would only burn another child spawn.
             v_single
         }
@@ -730,7 +733,7 @@ async fn run_probes(
     );
     caps.insert("tools".into(), verdict_json(&v_tools));
 
-    // classify — the decision-model lane (modern-bert arch only; static
+    // classify - the decision-model lane (modern-bert arch only; static
     // N/A above for everything else). Rides the in-process handler so
     // the probe crosses the exact public contract, spawn included.
     let v_classify = if let Some(v) = classify {
@@ -786,7 +789,7 @@ async fn run_probes(
     );
     caps.insert("classify".into(), verdict_json(&v_classify));
 
-    // embeddings — separate handler, honest N/A on lane refusal.
+    // embeddings - separate handler, honest N/A on lane refusal.
     let v_embed = {
         if row_cancelled(&state) {
             return;
@@ -881,7 +884,7 @@ async fn run_probes(
         })
         .flatten()
     {
-        tracing::warn!(target: "blazar::model_doctor", job = %id, %err, "certificate store write failed — job result still carries it");
+        tracing::warn!(target: "blazar::model_doctor", job = %id, %err, "certificate store write failed - job result still carries it");
     }
     state
         .jobs
@@ -895,7 +898,7 @@ fn verdict_json(v: &Verdict) -> Value {
 /// Fold a fresh certificate into the prior evidence held for the same
 /// `(model, engine_tag)` pair: stamp an `evidence` block
 /// `{n_runs, first_seen, last_seen}` onto the cert and per-probe `n_runs`
-/// counters onto each verdict. Statuses and receipts stay latest-wins —
+/// counters onto each verdict. Statuses and receipts stay latest-wins -
 /// the counters record how many runs back the evidence goes, nothing
 /// more. A legacy prior without counters still counts as exactly one
 /// earlier run (the row itself is the proof); a probe absent from the
@@ -980,7 +983,7 @@ mod tests {
         merge_evidence(None, &mut first, 1_791_000_000);
         let prior_json = first.to_string();
         let mut second = fresh_cert();
-        // The verdict flipped between runs — statuses stay latest-wins.
+        // The verdict flipped between runs - statuses stay latest-wins.
         second["caps"]["tools"]["status"] = json!("PASS");
         merge_evidence(
             Some((1_791_000_000, prior_json.as_str())),
@@ -1007,7 +1010,7 @@ mod tests {
             "the legacy row itself proves one earlier run"
         );
         assert_eq!(cert["evidence"]["first_seen"], 1_789_000_000);
-        // chat existed in the legacy cert → 2; tools did not → 1.
+        // chat existed in the legacy cert -> 2; tools did not -> 1.
         assert_eq!(cert["caps"]["chat"]["n_runs"], 2);
         assert_eq!(cert["caps"]["tools"]["n_runs"], 1);
     }
@@ -1069,7 +1072,7 @@ mod tests {
     #[test]
     fn unit__judge_tools_selection__distractor_pick_fails_wanted_pick_passes() {
         // Free choice among three tools: only a `calculator` call passes a
-        // calculator prompt — the distractor call and the prose answer are
+        // calculator prompt - the distractor call and the prose answer are
         // both selection failures.
         let ok = br#"{"message":{"tool_calls":[{"function":{"name":"calculator"}}]}}"#;
         let v = judge_tools_selection(200, ok, "calculator");
@@ -1088,7 +1091,7 @@ mod tests {
     #[tokio::test]
     async fn unit__elicit_with_retry__passes_on_any_success() {
         // Borderline fixture: prose on the first draw, a call on the
-        // second — the retry must settle the existence question PASS.
+        // second - the retry must settle the existence question PASS.
         for fail_before_pass in 0..ELICIT_ATTEMPTS {
             let draws = AtomicU64::new(0);
             let v = elicit_with_retry(|| async {
@@ -1155,8 +1158,8 @@ mod tests {
         assert_eq!(excerpt(b"short", 32), "short");
         let long = "é".repeat(64);
         let cut = excerpt(long.as_bytes(), 10);
-        // 5 é chars (10 bytes) + the 3-byte ellipsis: never splits a
-        // char, never exceeds the cap by more than the ellipsis itself.
-        assert!(cut.ends_with('…') && cut.chars().count() == 6);
+        // 3 é chars (6 bytes, walked back from the 7-byte budget) + the
+        // 3-char ASCII ellipsis: total fits the cap, never splits a char.
+        assert!(cut.ends_with("...") && cut.chars().count() == 6);
     }
 }

@@ -8,8 +8,8 @@
 //!   `tg` `t/s` = `100 + threads + 2*ctx_bonus + grade(k) + grade(v) + fa + batch`
 //!   `pp` `t/s` = `10 * tg`
 //! `ctx_bonus`: any non-base ctx scores +3 `t/s` (predictable winner).
-//! `grade`: per-side KV-cache bonus — `f16` 0, `q8_0` 25, `q5_0` 27.5,
-//! `q4_0` 30 — modelling bandwidth-bound decode (deeper quant = faster).
+//! `grade`: per-side KV-cache bonus - `f16` 0, `q8_0` 25, `q5_0` 27.5,
+//! `q4_0` 30 - modelling bandwidth-bound decode (deeper quant = faster).
 //! Same-grade pairs preserve the historical totals (`q8_0/q8_0` = +50),
 //! so grids that only offer `f16/q8_0` keep their old winners.
 

@@ -2,17 +2,17 @@
 # End-to-end test for scripts/install.sh against a local fake GitHub API.
 #
 # Proves, without touching GitHub or the real HOME:
-#   1. happy path  — asset selected per-arch, digest verified, binary installed and runs
-#   2. tamper      — corrupted digest in metadata -> hard failure, nothing installed
-#   3. wrong arch  — release without a matching asset -> clear error naming the asset
-#   4. one-click   — engine bootstrap: install.sh pulls the llama.cpp engine
-#                   from the (faked) engine lane and leaves it ACTIVE — the
+#   1. happy path  - asset selected per-arch, digest verified, binary installed and runs
+#   2. tamper      - corrupted digest in metadata -> hard failure, nothing installed
+#   3. wrong arch  - release without a matching asset -> clear error naming the asset
+#   4. one-click   - engine bootstrap: install.sh pulls the llama.cpp engine
+#                   from the (faked) engine lane and leaves it ACTIVE - the
 #                   box is infer-ready with zero manual steps
-#   5. --build     — a failing toolchain bootstrap is LOUD and FATAL (the
+#   5. --build     - a failing toolchain bootstrap is LOUD and FATAL (the
 #                   bootstrap really ran, with --minimal, nothing installed)
-#   6. unit groups — SupplementaryGroups lists only render/video groups that
+#   6. unit groups - SupplementaryGroups lists only render/video groups that
 #                   exist on the box (systemd rejects units naming ghosts)
-#   7. armv7 host  — fake uname armv7l maps to the static musleabihf asset
+#   7. armv7 host  - fake uname armv7l maps to the static musleabihf asset
 #
 # The fake release JSON puts a decoy asset with a WRONG digest first, so a
 # parser bug that grabs a sibling asset's digest fails this test.
@@ -27,7 +27,7 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 INSTALL_SH="$ROOT/scripts/install.sh"
 BIN="$ROOT/target/release/blazar"
 
-[ -f "$BIN" ] || { echo "FAIL: $BIN not built — run: cargo build --release"; exit 1; }
+[ -f "$BIN" ] || { echo "FAIL: $BIN not built - run: cargo build --release"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 required"; exit 1; }
 
 # Same target derivation as install.sh (oracle duplication is intentional).
@@ -278,7 +278,7 @@ if [ "$(uname -m)" = x86_64 ] && [ -x "$STUB" ]; then
     # --- 4b. rerun with an active engine: bootstrap lane never entered ------
     # The engine tarball is now GONE from the fake server. If the rerun's
     # already-active guard regressed, the bootstrap would run and die on
-    # the 404 (loud WARN) — a clean skip proves the guard matched and no
+    # the 404 (loud WARN) - a clean skip proves the guard matched and no
     # engine bytes were requested.
     rm -f "$SRV/$EASSET"
     OUT2=$(env $ENGINE_ENV sh "$INSTALL_SH" 2>&1) && RC2=0 || RC2=$?
@@ -387,7 +387,7 @@ fi
 # (a) full-flow wiring: BLAZAR_AUTO_DRIVER=0 reaches the preflight and
 #     skips it; (b) function-level: a driverless NVIDIA PCI census drives
 #     the apt driver lane (fake apt-get records its argv) with the REBOOT
-#     + engine-update messaging — no real package is touched.
+#     + engine-update messaging - no real package is touched.
 rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
 mkdir -p "$TMP/home"
 printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
@@ -402,7 +402,7 @@ fi
 # Function-level scenario: extract gpu_preflight verbatim from install.sh
 # and run it against a scratch PATH whose lspci reports a driverless
 # NVIDIA card and whose apt-get is a recorder. nvidia-smi is absent from
-# the scratch PATH — the driverless branch must fire.
+# the scratch PATH - the driverless branch must fire.
 GPDIR="$TMP/gpu"
 mkdir -p "$GPDIR/scratch" "$GPDIR/fake"
 sed -n '/^gpu_preflight() {/,/^}/p' "$INSTALL_SH" > "$GPDIR/fn.sh"
@@ -587,7 +587,7 @@ fi
 # explicit ownership hand-off it lands root-owned and the daemon dies
 # with EACCES on its first write (run/, locks) while systemd
 # restart-loops it. The installer must chown -R the tree to the
-# service user unconditionally — healing both fresh installs and
+# service user unconditionally - healing both fresh installs and
 # legacy trees with root-owned files left by past sudo-run daemons.
 rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
 mkdir -p "$TMP/home"
@@ -673,7 +673,7 @@ fi
 # --- 13. auto mode: successful checkout build names the source origin ----------
 # A minimal WORKING checkout (real cargo compile, seconds, no deps): the
 # auto lane must install the fresh build and label it "source build
-# (checkout)" — not the --from voice ("Bootstrap install from") and not
+# (checkout)" - not the --from voice ("Bootstrap install from") and not
 # the release artifact line.
 GOOD_CK="$TMP/goodck"
 mkdir -p "$GOOD_CK/crates/blazar-cli/src"
@@ -706,7 +706,7 @@ fi
 
 # --- 14. pinned bare semver normalizes to the v-tag -------------------------
 # BLAZAR_VERSION=0.9.9 must resolve the v0.9.9 tag (this project tags
-# "v*") — the pin without the v is the natural user spelling.
+# "v*") - the pin without the v is the natural user spelling.
 PIN_TAG=v0.9.9
 PIN_ASSET="blazar-${PIN_TAG}-${TARGET}.tar.gz"
 tar -czf "$SRV/$PIN_ASSET" -C "$STAGE" .

@@ -26,14 +26,14 @@ use crate::events::{BlazarEvent, EventBus};
 use gh::{GhClient, GhRelease, same_build};
 use manifest::Manifest;
 
-/// Retention for engine dirs: the newest 2 survive auto-prune — the
+/// Retention for engine dirs: the newest 2 survive auto-prune - the
 /// fresh build plus one rollback anchor (~215 MiB each). `local` and the
 /// active tag are always kept on top of this. The `keep_tags` config knob
 /// overrides this default per box (1 = no rollback anchor).
 pub use blazar_core::config::DEFAULT_KEEP_TAGS as KEEP_TAGS;
 
 /// Retention in force on this box: the `keep_tags` config knob when a
-/// config file exists (validated parse — a broken config fails the prune
+/// config file exists (validated parse - a broken config fails the prune
 /// loudly instead of silently keeping stale builds), the built-in default
 /// otherwise. Read at prune time, not install time, so a knob edit
 /// applies to the very next install/prune with no daemon restart.
@@ -51,7 +51,7 @@ pub fn effective_keep_tags(dirs: &BlazarDirs) -> Result<usize> {
 /// refreshes the archive file's mtime, venv builds create files), so a
 /// live install never looks stale; anything untouched this long is
 /// debris from a killed process. Manual `blazar engine prune` bypasses
-/// the gate entirely — an explicit user order needs no grace.
+/// the gate entirely - an explicit user order needs no grace.
 pub const STALLED_INSTALL_GRACE: std::time::Duration = std::time::Duration::from_hours(6);
 
 /// Recursive byte size of an engine dir (for the update-prune summary).
@@ -119,14 +119,14 @@ pub const LOCAL_TAG: &str = "local";
 
 /// Error-context marker for the PROBE phase of engine registration
 /// (binary discovery + version probe). The asset-install lanes match it
-/// to decide an extracted dir is unusable garbage — a SIGILL-class
-/// instruction mismatch or a missing server binary — and remove it
+/// to decide an extracted dir is unusable garbage - a SIGILL-class
+/// instruction mismatch or a missing server binary - and remove it
 /// instead of orphaning hundreds of MB (`engines/b11005-cuda` lesson).
 /// Store-phase failures never carry it: a store row may already
 /// reference the dir, so deleting it would desync dir and row.
 pub const ENGINE_PROBE_FAILED: &str = "engine probe failed";
 /// Does this error chain carry the probe marker? (SIGILL-class binary
-/// mismatch, missing server binary — the asset is fine for other boxes,
+/// mismatch, missing server binary - the asset is fine for other boxes,
 /// just unusable on THIS one.) Lanes convert it to a decline so the next
 /// lane (overlay, then Vulkan) gets a chance; infra errors propagate.
 fn is_probe_failure(e: &anyhow::Error) -> bool {
@@ -136,7 +136,7 @@ fn is_probe_failure(e: &anyhow::Error) -> bool {
 /// Pure lane-1 scan-back selection (test seam, no network): the newest
 /// release STRICTLY behind the lane's channel number whose assets
 /// resolve for this driver/arch, within [`UPSTREAM_SCANBACK_DEPTH`].
-/// The channel release itself is excluded — the caller already tried
+/// The channel release itself is excluded - the caller already tried
 /// its own assets before scanning.
 fn scanback_release<'a>(releases: &'a [GhRelease], lane: &CudaLane) -> Option<&'a GhRelease> {
     let mut behind: Vec<(u64, &GhRelease)> = releases
@@ -175,14 +175,14 @@ fn release_is_fresh(release: &GhRelease) -> bool {
 const RETIRED_ENGINE_PREFIX: &str = ".retired-";
 
 /// Rename the installed `engines/<tag>` aside so a replacement build can
-/// run at the FINAL path — venvs and extracted archives embed absolute
+/// run at the FINAL path - venvs and extracted archives embed absolute
 /// paths, so building under a scratch name and renaming in is not an
 /// option. The aside copy is the rollback: `restore_retired_engine`
 /// puts it back when the replacement fails, `discard_retired_engine`
 /// deletes it once the new engine registers. Asides from CRASHED runs
 /// of the same tag are swept here: nothing else references them and
 /// they would leak GiB. Returns `None` when no installed dir existed
-/// (fresh install — nothing to preserve).
+/// (fresh install - nothing to preserve).
 fn retire_engine_dir(data_dir: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     if !dir.exists() {
         return Ok(None);
@@ -191,11 +191,11 @@ fn retire_engine_dir(data_dir: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     // uses. Renaming an engine dir that resolves outside the data root
     // (symlinked engines dir) would move foreign ground into an aside
     // name, and the guarded cleanup after a successful install would
-    // then refuse to delete it — both copies stranded, neither ours.
+    // then refuse to delete it - both copies stranded, neither ours.
     if !path_is_within(data_dir, dir) {
         return Err(anyhow!(
             "engine dir {} resolves outside the data root (symlinked engines \
-             dir?) — unhook the link or remove the dir manually, then retry",
+             dir?) - unhook the link or remove the dir manually, then retry",
             dir.display()
         ));
     }
@@ -216,14 +216,14 @@ fn retire_engine_dir(data_dir: &Path, dir: &Path) -> Result<Option<PathBuf>> {
         {
             // A crashed run's rollback copy: the replacement about to
             // run supersedes anything it held. (Concurrent installs of
-            // the same tag are already undefined — both write this same
+            // the same tag are already undefined - both write this same
             // final dir.) Containment: an aside resolving outside the
             // data root is skipped, not deleted through the link.
             match remove_dir_within(data_dir, &entry.path()) {
                 Ok(GuardedRemoval::Removed | GuardedRemoval::Absent) => {}
                 Ok(GuardedRemoval::Escaped) => {
                     tracing::warn!(
-                        "left stale aside {} in place — it resolves outside the data root",
+                        "left stale aside {} in place - it resolves outside the data root",
                         entry.path().display()
                     );
                 }
@@ -240,10 +240,10 @@ fn retire_engine_dir(data_dir: &Path, dir: &Path) -> Result<Option<PathBuf>> {
 
 /// Put a retired engine back after a failed replacement. The failed
 /// replacement's remains go first (`register_or_clean` already removed
-/// probe-class dirs; store-class keeps them — neither may block the
+/// probe-class dirs; store-class keeps them - neither may block the
 /// rename). A restore failure means both copies are stranded: logged at
 /// error level with the aside left on disk for the next same-tag
-/// install (or a human) to recover — never silently dropped.
+/// install (or a human) to recover - never silently dropped.
 fn restore_retired_engine(data_dir: &Path, aside: Option<&Path>, dir: &Path) {
     if dir.exists() {
         let _ = remove_dir_within(data_dir, dir);
@@ -256,7 +256,7 @@ fn restore_retired_engine(data_dir: &Path, aside: Option<&Path>, dir: &Path) {
             // cannot tell a live one apart). Saying "preserved at"
             // here would point at a dir that no longer exists.
             tracing::warn!(
-                "retired aside {} vanished before restore ({e}) — a concurrent \
+                "retired aside {} vanished before restore ({e}) - a concurrent \
                  install of this tag likely swept it; {} was not restored, \
                  rerun the install to rebuild it",
                 aside.display(),
@@ -265,7 +265,7 @@ fn restore_retired_engine(data_dir: &Path, aside: Option<&Path>, dir: &Path) {
             return;
         }
         tracing::error!(
-            "cannot restore retired engine {} -> {}: {e} — the previous engine \
+            "cannot restore retired engine {} -> {}: {e} - the previous engine \
              is preserved at {} until the next install of this tag",
             aside.display(),
             dir.display(),
@@ -275,7 +275,7 @@ fn restore_retired_engine(data_dir: &Path, aside: Option<&Path>, dir: &Path) {
 }
 
 /// Delete the superseded engine copy after its replacement registered.
-/// A leak here wastes disk but breaks nothing — warn, never fail the
+/// A leak here wastes disk but breaks nothing - warn, never fail the
 /// install that already succeeded.
 fn discard_retired_engine(data_dir: &Path, aside: Option<&Path>) {
     let Some(aside) = aside else { return };
@@ -300,12 +300,12 @@ fn discard_retired_engine(data_dir: &Path, aside: Option<&Path>) {
 /// Cancellation-safe rollback for in-flight installs. The Err arm of
 /// [`EngineManager::install_with_rollback`] restores state, but a
 /// dropped future (task abort, runtime shutdown, panic unwind) never
-/// reaches any match arm — the guard runs the same recovery from Drop.
+/// reaches any match arm - the guard runs the same recovery from Drop.
 /// Hard kills (SIGKILL, power loss) still run no code; the boot debris
 /// sweep converges those. Disarmed the moment the build future resolves:
 /// registration may then write the store row, and deleting a
 /// row-referenced dir on a late cancel would desync dir and row (a
-/// stranded dir is reclaimed by the sweep instead — never a ghost row).
+/// stranded dir is reclaimed by the sweep instead - never a ghost row).
 struct CancelledInstallGuard {
     data_dir: PathBuf,
     dir: PathBuf,
@@ -326,7 +326,7 @@ impl Drop for CancelledInstallGuard {
         }
         restore_retired_engine(self.data_dir.as_path(), self.aside.as_deref(), &self.dir);
         tracing::warn!(
-            "install into {} was cancelled — rolled back (half-built dir removed, \
+            "install into {} was cancelled - rolled back (half-built dir removed, \
              previous engine restored when one was retired)",
             self.dir.display()
         );
@@ -335,7 +335,7 @@ impl Drop for CancelledInstallGuard {
 
 /// Delete an engine's directory AND its store row as one unit: retire the
 /// dir aside first, delete the row second, discard the aside last. Any
-/// failure restores the previous state — a row never survives over a
+/// failure restores the previous state - a row never survives over a
 /// deleted dir (ghost row), and a dir never disappears while its row
 /// lives. Returns the bytes reclaimed. Both retirement paths (the boot
 /// sweep and manual `engine rm`) go through here so the ordering
@@ -347,12 +347,12 @@ pub fn remove_engine_row_and_tree(
     data_dir: &Path,
 ) -> Result<u64> {
     // An explicit `engine rm` must not delete through a symlinked
-    // engines root either — refuse loudly instead of leaving a ghost
+    // engines root either - refuse loudly instead of leaving a ghost
     // row over a dir that still exists wherever the link points.
     if dir.exists() && !path_is_within(data_dir, dir) {
         return Err(anyhow!(
             "engine dir {} resolves outside the data root (symlinked engines \
-             dir?) — unhook the link or remove the dir manually, then retry",
+             dir?) - unhook the link or remove the dir manually, then retry",
             dir.display()
         ));
     }
@@ -361,12 +361,12 @@ pub fn remove_engine_row_and_tree(
     if let Err(e) = store.delete_engine(tag) {
         restore_retired_engine(data_dir, aside.as_deref(), dir);
         return Err(anyhow!(e).context(format!(
-            "cannot delete engine row {tag} — the engine dir was restored"
+            "cannot delete engine row {tag} - the engine dir was restored"
         )));
     }
     discard_retired_engine(data_dir, aside.as_deref());
     // Lazy-lane pin reconciliation: whisper and piper select their
-    // serving binary by pin file (lane-agnostic — the pin may name the
+    // serving binary by pin file (lane-agnostic - the pin may name the
     // engines row just removed), not by the active flag. A pin naming a
     // removed tag dangles on every resolution (warn + newest
     // fallback); clearing it here makes removal own the whole story.
@@ -406,7 +406,7 @@ pub struct LaneCheck {
     pub upstream_cuda: Option<gh::AssetPick>,
     /// Release tag `upstream_cuda` was picked from. Differs from
     /// `target_tag` exactly when the install lane's scan-back walked to
-    /// an older release that ships a driver-runnable asset — the
+    /// an older release that ships a driver-runnable asset - the
     /// dry-run verdict must name the build the update would really
     /// install, not the channel label.
     pub upstream_cuda_tag: Option<String>,
@@ -424,7 +424,7 @@ pub struct LaneCheck {
 }
 
 /// System-level GPU vendor hint used to pick the first engine asset
-/// (before any engine exists to probe). Filesystem checks — no GPU libs
+/// (before any engine exists to probe). Filesystem checks - no GPU libs
 /// loaded, works on every distro.
 #[must_use]
 pub fn system_vendor_hint() -> manifest::Vendor {
@@ -461,7 +461,7 @@ pub fn is_cuda_engine(tag: &str, asset_label: &str) -> bool {
 /// classification honest for lanes registered by older/other tooling).
 /// Fork lanes are user-installed escape hatches for capabilities
 /// upstream has not merged: they never count against mainstream
-/// retention budgets and are never auto-pruned — removal is explicit
+/// retention budgets and are never auto-pruned - removal is explicit
 /// (`blazar engine rm <tag>`).
 #[must_use]
 pub fn is_fork_lane(row: &EngineRow) -> bool {
@@ -473,7 +473,7 @@ pub fn is_fork_lane(row: &EngineRow) -> bool {
 /// Pre-download mirror of the keep-CUDA activation guard: on a
 /// Linux-x86_64-NVIDIA box whose active engine is a llama.cpp CUDA
 /// build, a standard-lane (Vulkan) asset can only ever register
-/// dormant — the guard in `register_engine_with_vendor` refuses to
+/// dormant - the guard in `register_engine_with_vendor` refuses to
 /// activate it after the fact. Deciding the same thing BEFORE the
 /// download skips the ~28 MiB fetch + probe of an engine that will
 /// Preconditions every CUDA lane probe in `maybe_cuda_overlay` shares:
@@ -493,7 +493,7 @@ struct CudaLane {
 enum LagOutcome {
     /// A published build older than the channel target was installed.
     Installed(EngineRow),
-    /// The newest published runnable build IS the active engine —
+    /// The newest published runnable build IS the active engine -
     /// nothing to do until the overlay drops the next build.
     AlreadyActive(EngineRow),
     /// Nothing runnable published (or the probe failed): the
@@ -557,7 +557,7 @@ impl EngineManager {
             && let Some(row) = self.active_row_if_tag(&release.tag_name)?
         {
             tracing::info!(
-                "channel target {} is already the active engine — skipping the download",
+                "channel target {} is already the active engine - skipping the download",
                 release.tag_name
             );
             return Ok(row);
@@ -566,7 +566,7 @@ impl EngineManager {
             return Ok(row);
         }
         // Channel automation never benefits from the standard (Vulkan)
-        // lane while the keep-CUDA guard holds — explicit tag pins
+        // lane while the keep-CUDA guard holds - explicit tag pins
         // still download so `blazar engine use <tag>` can reach them.
         if tag.is_none()
             && let Some(row) = self.try_keep_cuda_skip(&release.tag_name, system_vendor_hint())?
@@ -584,8 +584,8 @@ impl EngineManager {
     }
 
     /// Read-only dry-run of the update lane for `engine update --check`:
-    /// resolves exactly what an update WOULD target — the derived CUDA
-    /// overlay tag and the prebuilt asset this box would install —
+    /// resolves exactly what an update WOULD target - the derived CUDA
+    /// overlay tag and the prebuilt asset this box would install -
     /// without downloading, installing, or writing anything. The guards
     /// mirror `maybe_cuda_overlay` so the dry-run and the real lane can
     /// never disagree about applicability.
@@ -626,7 +626,7 @@ impl EngineManager {
             return Ok(out);
         }
         // Lane 1 report: the SAME helper the install lane uses (own
-        // asset, else scan-back for the newest release that ships one —
+        // asset, else scan-back for the newest release that ships one -
         // never behind an exact pin).
         let lane = CudaLane {
             driver_cuda: dc,
@@ -659,7 +659,7 @@ impl EngineManager {
     /// `update_resolved` with an injectable vendor hint so the keep-CUDA
     /// skip is deterministically testable on any box (same injection
     /// pattern as `register_engine_with_vendor`). `exact_pin`: the
-    /// release came from a user-pinned tag — the overlay-lag fallback
+    /// release came from a user-pinned tag - the overlay-lag fallback
     /// must not swap an exact pin for an older build.
     pub async fn update_resolved_with_vendor(
         &self,
@@ -669,10 +669,10 @@ impl EngineManager {
     ) -> Result<EngineRow> {
         // Same-tag idempotency: an update that resolved to the
         // already-active engine must not retire + re-download it. Exact
-        // pins stay on the install path — re-install is the point.
+        // pins stay on the install path - re-install is the point.
         if !exact_pin && let Some(row) = self.active_row_if_tag(&release.tag_name)? {
             tracing::info!(
-                "target {} is already the active engine — skipping the download",
+                "target {} is already the active engine - skipping the download",
                 release.tag_name
             );
             return Ok(row);
@@ -708,7 +708,7 @@ impl EngineManager {
             return Ok(None);
         }
         tracing::warn!(
-            "NVIDIA box with active CUDA engine {} — skipped the standard (Vulkan) asset \
+            "NVIDIA box with active CUDA engine {} - skipped the standard (Vulkan) asset \
              download for {release_tag}: the keep-CUDA guard would leave it dormant. Refresh \
              the CUDA lane with `blazar engine build cuda`, or pin engine_asset \
              = \"ubuntu-vulkan-x64\" in config.toml to force the Vulkan lane",
@@ -720,7 +720,7 @@ impl EngineManager {
     /// Same-tag idempotency for the update lanes: when the release an
     /// update resolved to is ALREADY the active engine, return it
     /// instead of retiring and re-downloading the identical build.
-    /// Exact tag pins are exempt — they are the repair lane
+    /// Exact tag pins are exempt - they are the repair lane
     /// (`blazar engine install <tag>` re-installs on purpose).
     fn active_row_if_tag(&self, tag: &str) -> Result<Option<EngineRow>> {
         let Some(active) = Store::open(&self.dirs)?.active_engine()? else {
@@ -738,7 +738,7 @@ impl EngineManager {
         let Some(repo) = gh::engine_overlay_repo() else {
             bail!(
                 "{tag} looks like a self-hosted overlay tag, but no overlay \
-                 repo is configured — set {} to the repo publishing \
+                 repo is configured - set {} to the repo publishing \
                  bNNNN-cuda releases. The default channel serves upstream's \
                  official CUDA assets via: blazar engine update",
                 gh::ENGINE_OVERLAY_REPO_ENV
@@ -770,7 +770,7 @@ impl EngineManager {
             other => {
                 return Err(anyhow!(
                     "no CUDA overlay asset for CPU arch {other} (prebuilt lane \
-                     publishes x64 and arm64 only) — `blazar engine build cuda` \
+                     publishes x64 and arm64 only) - `blazar engine build cuda` \
                      compiles locally"
                 ));
             }
@@ -786,14 +786,14 @@ impl EngineManager {
     /// arm64) with a CUDA-capable driver, prefer a prebuilt CUDA engine
     /// over the Vulkan asset (~4% decode uplift). Chain, first wins:
     /// (1) upstream official ubuntu-cuda asset from the SAME release
-    /// (generic SASS + CPU dispatch — runs on nearly every box, needs
+    /// (generic SASS + CPU dispatch - runs on nearly every box, needs
     /// a system CUDA runtime or the cudart companion; falls back to a
     /// scan-back for the newest release that ships one), (2) a
     /// self-hosted `bNNNN-cuda` overlay for the same tag when
     /// `BLAZAR_ENGINE_REPO` points at one (sm-slim SASS, bundled
     /// cudart), (3) the newest published overlay build (overlay-lag
-    /// fallback), else the Vulkan universal fallback. Any miss — asset
-    /// absent, not runnable, overlay unset — is a quiet return to the
+    /// fallback), else the Vulkan universal fallback. Any miss - asset
+    /// absent, not runnable, overlay unset - is a quiet return to the
     /// next lane; the project publishes no overlay of its own.
     async fn maybe_cuda_overlay(
         &self,
@@ -829,14 +829,14 @@ impl EngineManager {
             tracing::warn!(
                 "NVIDIA GPU present but no CUDA driver capability probed \
                  (driver installed but not rebooted?); staying on the Vulkan \
-                 lane — after a driver install, reboot then run: blazar \
+                 lane - after a driver install, reboot then run: blazar \
                  engine update"
             );
             return Ok(None);
         };
         if driver_cuda.0 < 12 {
             tracing::warn!(
-                "driver CUDA {}.{} predates CUDA 12 — the prebuilt CUDA lane \
+                "driver CUDA {}.{} predates CUDA 12 - the prebuilt CUDA lane \
                  is never eligible for it; staying on the Vulkan lane",
                 driver_cuda.0,
                 driver_cuda.1
@@ -849,7 +849,7 @@ impl EngineManager {
             arch,
             number,
         };
-        // Lane 1 — upstream official CUDA (same tag, driver-capped,
+        // Lane 1 - upstream official CUDA (same tag, driver-capped,
         // generic SASS + CPU dispatch). Falls through to the overlay on
         // a decline or a probe-class failure; infra errors propagate.
         if let Some(row) = self
@@ -859,7 +859,7 @@ impl EngineManager {
             return Ok(Some(row));
         }
         // Overlay lanes are self-hosted-only: with BLAZAR_ENGINE_REPO
-        // unset there is nothing to probe — the Vulkan lane follows
+        // unset there is nothing to probe - the Vulkan lane follows
         // (the caller narrates that drop).
         let Some(repo) = repo else {
             return Ok(None);
@@ -871,10 +871,10 @@ impl EngineManager {
                 // Overlay-lag fallback: a channel update must never shunt
                 // an NVIDIA user into the hour-class source lane just
                 // because the overlay has not published the brand-new tag
-                // yet — install the newest PUBLISHED build instead.
+                // yet - install the newest PUBLISHED build instead.
                 tracing::warn!(
                     "no CUDA overlay release {overlay_tag} in {repo} yet \
-                     ({e:#}) — probing published overlay builds as a fallback"
+                     ({e:#}) - probing published overlay builds as a fallback"
                 );
                 if let Some(row) = self
                     .overlay_lag_or_none(&overlay_tag, exact_pin, &lane, &release.tag_name)
@@ -898,7 +898,7 @@ impl EngineManager {
                 .map_or_else(|| "unknown".into(), |(a, b)| format!("{a}.{b}"));
             tracing::warn!(
                 "CUDA overlay {overlay_tag} needs CUDA {need}; this driver \
-                 runs {}.{} — staying on the Vulkan lane. Options: blazar \
+                 runs {}.{} - staying on the Vulkan lane. Options: blazar \
                  engine build cuda (builds locally for THIS driver), or pin \
                  an older overlay tag: blazar engine install b<N>-cuda",
                 lane.driver_cuda.0,
@@ -908,7 +908,7 @@ impl EngineManager {
         }
     }
 
-    /// Lane 2 — the same-tag overlay asset. A probe-class failure
+    /// Lane 2 - the same-tag overlay asset. A probe-class failure
     /// (SIGILL-class baseline mismatch) means this box cannot run the
     /// overlay build: fall to the Vulkan lane instead of failing the
     /// whole update. Infra errors still propagate.
@@ -928,7 +928,7 @@ impl EngineManager {
             Err(e) if is_probe_failure(&e) => {
                 tracing::warn!(
                     "overlay CUDA asset {overlay_tag}/{} unusable on \
-                     this machine ({e:#}) — using the Vulkan lane this \
+                     this machine ({e:#}) - using the Vulkan lane this \
                      update; `blazar engine build cuda` compiles a \
                      local build for this exact CPU",
                     pick.label
@@ -941,7 +941,7 @@ impl EngineManager {
 
     /// Lane 1 of the prebuilt chain: try the upstream release's own
     /// official ubuntu-cuda asset before any overlay probe. `None`
-    /// means the lane declined or the binary proved unusable here —
+    /// means the lane declined or the binary proved unusable here -
     /// the overlay lanes are the next resort; hard errors propagate.
     async fn upstream_lane_or_none(
         &self,
@@ -955,12 +955,12 @@ impl EngineManager {
         };
         match self.install_upstream_cuda(&asset_release, &pick).await {
             Ok(Some(row)) => Ok(Some(row)),
-            // lane politely declined (no companion) — try overlay
+            // lane politely declined (no companion) - try overlay
             Ok(None) => Ok(None),
             Err(e) if is_probe_failure(&e) => {
                 tracing::warn!(
                     "upstream CUDA asset {} unusable on this machine \
-                     ({e:#}) — trying the overlay lane",
+                     ({e:#}) - trying the overlay lane",
                     pick.label
                 );
                 Ok(None)
@@ -971,7 +971,7 @@ impl EngineManager {
 
     /// The lane-1 asset choice, shared by the install lane and the
     /// `--check` dry-run so they can never disagree: the release's own
-    /// ubuntu-cuda asset, else (auto updates only — never an exact pin)
+    /// ubuntu-cuda asset, else (auto updates only - never an exact pin)
     /// the newest release at or behind the channel target that ships
     /// one. Roughly two thirds of upstream releases carry no ubuntu-cuda
     /// assets; without the scan an asset-less channel target would punt
@@ -993,7 +993,7 @@ impl EngineManager {
             Err(e) => {
                 tracing::warn!(
                     "cannot list {} for the upstream-asset scan-back \
-                     ({e:#}) — continuing on the overlay lanes",
+                     ({e:#}) - continuing on the overlay lanes",
                     gh::LLAMA_CPP_REPO
                 );
                 return None;
@@ -1004,7 +1004,7 @@ impl EngineManager {
                 .expect("scanback only returns releases that resolve");
             tracing::info!(
                 "channel release {} ships no ubuntu-cuda asset for this \
-                 driver/arch — using upstream {} ({}) instead",
+                 driver/arch - using upstream {} ({}) instead",
                 release.tag_name,
                 cand.tag_name,
                 pick.label
@@ -1016,7 +1016,7 @@ impl EngineManager {
 
     /// The overlay-lag arm of [`EngineManager::maybe_cuda_overlay`]:
     /// when the same-tag overlay release is missing, run the lag
-    /// fallback (never for an exact pin — a user-pinned tag must not be
+    /// fallback (never for an exact pin - a user-pinned tag must not be
     /// silently swapped for an older build) and narrate each outcome.
     /// `Some(row)` = a lag lane resolved the update; `None` = fall
     /// through to the Vulkan warn.
@@ -1038,7 +1038,7 @@ impl EngineManager {
             Err(e) if is_probe_failure(&e) => {
                 tracing::warn!(
                     "lagged overlay CUDA asset unusable on this machine \
-                     ({e:#}) — using the Vulkan lane this update; \
+                     ({e:#}) - using the Vulkan lane this update; \
                      `blazar engine build cuda` compiles a local build \
                      for this exact CPU"
                 );
@@ -1051,7 +1051,7 @@ impl EngineManager {
             LagOutcome::AlreadyActive(row) => {
                 tracing::warn!(
                     "overlay hasn't published {overlay_tag} yet; \
-                     newest published CUDA build {} is already active — rerun \
+                     newest published CUDA build {} is already active - rerun \
                      `blazar engine update` after the overlay publishes, or run \
                      `blazar engine build cuda` to compile {target_tag} locally now",
                     row.tag
@@ -1066,7 +1066,7 @@ impl EngineManager {
     /// official ubuntu-cuda asset under a local `bNNNN-cuda` tag
     /// (same lane separation, keep-CUDA guard, and prune semantics).
     /// Skips (returns `Ok(None)`) when the system lacks the CUDA runtime
-    /// for the pick's major AND the release ships no cudart companion —
+    /// for the pick's major AND the release ships no cudart companion -
     /// better a quiet lane decline than a guaranteed-dead 168 MB
     /// download. The cudart companion extracts beside the binaries;
     /// RUNPATH=$ORIGIN resolves it with zero env wiring.
@@ -1075,7 +1075,7 @@ impl EngineManager {
         release: &GhRelease,
         pick: &gh::AssetPick,
     ) -> Result<Option<EngineRow>> {
-        // AssetPick::label is `ubuntu-cuda-{major.minor}-{arch}` — the
+        // AssetPick::label is `ubuntu-cuda-{major.minor}-{arch}` - the
         // major decides which runtime libs must be present.
         let cuda_major = pick
             .label
@@ -1084,7 +1084,7 @@ impl EngineManager {
             .and_then(|m| m.parse::<u32>().ok());
         let Some(cuda_major) = cuda_major else {
             tracing::warn!(
-                "cannot parse CUDA major from asset label {} — skipping the \
+                "cannot parse CUDA major from asset label {} - skipping the \
                  upstream CUDA lane this update",
                 pick.label
             );
@@ -1095,7 +1095,7 @@ impl EngineManager {
         if companion.is_none() && !runtime_present {
             tracing::warn!(
                 "system lacks the CUDA {} runtime and release {} ships no \
-                 cudart companion for {} — skipping the upstream CUDA lane \
+                 cudart companion for {} - skipping the upstream CUDA lane \
                  (overlay bundles its own runtime)",
                 cuda_major,
                 release.tag_name,
@@ -1104,7 +1104,7 @@ impl EngineManager {
             return Ok(None);
         }
         // Register under the overlay tag so the row lands in the CUDA
-        // lane (is_cuda_build, keep-CUDA guard, one-per-lane prune) —
+        // lane (is_cuda_build, keep-CUDA guard, one-per-lane prune) -
         // install_picked finds the asset by pick.name, so the cloned
         // release with a rewritten tag resolves identically.
         let mut cuda_release = release.clone();
@@ -1112,10 +1112,10 @@ impl EngineManager {
             cuda_release.tag_name = format!("{}-cuda", cuda_release.tag_name);
         }
         // Same-tag idempotency: the derived overlay tag is already the
-        // active engine — this update resolved to what is running.
+        // active engine - this update resolved to what is running.
         if let Some(row) = self.active_row_if_tag(&cuda_release.tag_name)? {
             tracing::info!(
-                "upstream CUDA target {} is already the active engine — skipping the download",
+                "upstream CUDA target {} is already the active engine - skipping the download",
                 cuda_release.tag_name
             );
             return Ok(Some(row));
@@ -1139,7 +1139,7 @@ impl EngineManager {
 
     /// Overlay-lag fallback for channel updates: the channel target is
     /// not published in the overlay yet, so install the newest PUBLISHED
-    /// overlay build the driver can run — never newer than the target,
+    /// overlay build the driver can run - never newer than the target,
     /// never the already-active tag (no reinstall churn). A
     /// minutes-class download beats the hour-class source lane while
     /// the overlay catches up.
@@ -1148,7 +1148,7 @@ impl EngineManager {
     /// distinctly: "newest published build is already active" used to
     /// collapse into `None` and read as "found nothing runnable",
     /// printing a Vulkan-lane switch the keep-CUDA guard then
-    /// cancelled — three contradictory decisions in one run.
+    /// cancelled - three contradictory decisions in one run.
     async fn overlay_lag_fallback(&self, lane: &CudaLane) -> Result<LagOutcome> {
         let Some(repo) = gh::engine_overlay_repo() else {
             return Ok(LagOutcome::NothingRunnable);
@@ -1209,7 +1209,7 @@ impl EngineManager {
             match self.pick(&release).await? {
                 Some(pick) => {
                     // A Windows CUDA build dlopens cudart/cublas DLLs that
-                    // Windows never ships system-wide — no companion means
+                    // Windows never ships system-wide - no companion means
                     // a guaranteed probe failure, so name it up front
                     // instead of shipping a 150+ MiB corpse.
                     let companion = if std::env::consts::OS == "windows"
@@ -1219,7 +1219,7 @@ impl EngineManager {
                         if comp.is_none() {
                             return Err(anyhow!(
                                 "release {tag_name} ships {} but no cudart \
-                                 companion — the DLLs are not system-provided on \
+                                 companion - the DLLs are not system-provided on \
                                  Windows and the engine cannot boot; pin an older \
                                  release or use the Vulkan lane (blazar engine \
                                  install <tag> after `blazar config set \
@@ -1228,7 +1228,7 @@ impl EngineManager {
                             ));
                         }
                         tracing::info!(
-                            "queuing cudart companion for {} — Windows never \
+                            "queuing cudart companion for {} - Windows never \
                              ships the CUDA DLLs system-wide",
                             pick.label
                         );
@@ -1255,7 +1255,7 @@ impl EngineManager {
                     if pick.cpu_fallback {
                         tracing::warn!(
                             "no GPU asset for this machine in release {}; installed the \
-                             CPU build ({}) instead — re-run `blazar engine update` \
+                             CPU build ({}) instead - re-run `blazar engine update` \
                              later to pick up the GPU build",
                             tag_name,
                             pick.label
@@ -1303,7 +1303,7 @@ impl EngineManager {
     /// auto matrix against the release's actual assets. On the Windows
     /// NVIDIA lane the driver's CUDA ceiling caps the win-cuda version
     /// choice (a newer prebuilt cannot start); Linux-NVIDIA never lands
-    /// here with a CUDA asset — the upstream/overlay chain in
+    /// here with a CUDA asset - the upstream/overlay chain in
     /// `maybe_cuda_overlay` owns that decision.
     async fn pick(&self, release: &GhRelease) -> Result<Option<gh::AssetPick>> {
         if self.asset_override != "auto" && !self.asset_override.is_empty() {
@@ -1336,7 +1336,7 @@ impl EngineManager {
                 tracing::warn!(
                     "NVIDIA GPU present but the driver's CUDA ceiling could not \
                      be probed (nvidia-smi missing or unparsable); picking the \
-                     newest win-cuda asset uncapped — install the driver's \
+                     newest win-cuda asset uncapped - install the driver's \
                      nvidia-smi or pin an older release if the probe fails"
                 );
             }
@@ -1357,7 +1357,7 @@ impl EngineManager {
     /// activate + prune). `companion` is the optional cudart runtime
     /// archive (upstream splits the CUDA runtime out of the main
     /// tarball): downloaded after the main extract and flattened into
-    /// the server binary's dir — the binaries carry RUNPATH=$ORIGIN
+    /// the server binary's dir - the binaries carry RUNPATH=$ORIGIN
     /// (verified b11011), so libs beside the binary resolve with no env
     /// wiring, and Windows resolves DLLs from the exe dir natively.
     pub async fn install_picked(
@@ -1382,7 +1382,7 @@ impl EngineManager {
             .clone()
             .and_then(|d| d.strip_prefix("sha256:").map(str::to_string))
             .unwrap_or_else(|| "unverified".into());
-        // F87: stream to disk — llama.cpp release assets reach ~400 MB
+        // F87: stream to disk - llama.cpp release assets reach ~400 MB
         // and must not be buffered whole in RAM (the mistralrs lane has
         // streamed since day one). F88 + rollback: a failed download or
         // extract restores the previously installed engine instead of
@@ -1407,7 +1407,7 @@ impl EngineManager {
                         .size
                         .map_or_else(String::new, |b| format!(" ({} MiB)", b / 1_048_576));
                     tracing::info!(
-                        "downloading CUDA runtime companion {}{} — the system lacks \
+                        "downloading CUDA runtime companion {}{} - the system lacks \
                          the runtime for this build and the binary dlopens it at boot",
                         comp.name,
                         comp_size
@@ -1500,7 +1500,7 @@ impl EngineManager {
             extracted?;
             if cpu_fallback {
                 tracing::warn!(
-                    "installed the CPU fallback asset {asset_name} — no GPU-qualified \
+                    "installed the CPU fallback asset {asset_name} - no GPU-qualified \
                      prebuilt matched this machine; expect CPU-only speed",
                 );
             }
@@ -1518,7 +1518,7 @@ impl EngineManager {
         if !cfg!(target_os = "linux") {
             anyhow::bail!(
                 "sglang upstream supports Linux (CUDA/ROCm) only; {} is not \
-                 installable here — llamacpp (default) and mistralrs serve \
+                 installable here - llamacpp (default) and mistralrs serve \
                  Windows/macOS",
                 std::env::consts::OS
             );
@@ -1552,7 +1552,7 @@ impl EngineManager {
     /// Install the mlx lane (mlx-lm venv). Platform/backend gating lives
     /// in `mlx_install::install_into` (macOS Metal / Linux CUDA), this
     /// wrapper only owns the tag, the dual-pin asset label and the
-    /// rollback envelope — same discipline as the sglang lane.
+    /// rollback envelope - same discipline as the sglang lane.
     pub async fn install_mlx(&self, version: Option<&str>) -> Result<EngineRow> {
         let version = version.unwrap_or(mlx_install::MLX_LM_DEFAULT_VERSION);
         // Reject malformed pins early: the tag IS the version string that
@@ -1592,7 +1592,7 @@ impl EngineManager {
             // the repo API with a teaching error naming the release.
             self.gh.release_by_tag_repo(gh::MISTRALRS_REPO, t).await?
         } else {
-            // The list endpoint trims `assets` — resolve the newest v-tag
+            // The list endpoint trims `assets` - resolve the newest v-tag
             // there, then single-fetch the full release (same resolved-
             // release shape as the llamacpp update lane).
             let latest = self.gh.latest_mistralrs_release().await?;
@@ -1648,7 +1648,7 @@ impl EngineManager {
 
     /// Resolve and install an sd.cpp release: explicit `master-NNN-<sha>`
     /// tag or latest by build counter. Assets are matched by pattern
-    /// (names embed the commit sha) with vulkan preferred — one backend
+    /// (names embed the commit sha) with vulkan preferred - one backend
     /// covers NVIDIA/AMD/Intel and no linux-cuda prebuilt exists
     /// upstream. Same fresh-release retry cadence as the other lanes.
     /// A CUDA-from-source build is deliberately not wired here: the
@@ -1717,7 +1717,7 @@ impl EngineManager {
     }
 
     /// The backend label (`cuda` / `vulkan` / `cpu` / `metal`) the
-    /// asset picker WOULD choose for `tag` on this machine — the same
+    /// asset picker WOULD choose for `tag` on this machine - the same
     /// release fetch + pattern order as [`Self::update_sdcpp`], minus
     /// the install. Powers the same-tag backend-switch check in
     /// `blazar engine update --kind sdcpp`: sd.cpp re-uploads assets
@@ -1886,7 +1886,7 @@ impl EngineManager {
 
     /// `register_engine` plus lane provenance: build lanes (upstream
     /// b-tags and fork pins) bake their source repo, commit SHA, and
-    /// mined architecture set into the row's manifest — the capability
+    /// mined architecture set into the row's manifest - the capability
     /// currency the supervisor's unknown-architecture re-route consumes.
     /// `trust` marks registry-installed curated lanes (auto-retirable
     /// once mainline covers them); user builds pass the default.
@@ -1952,21 +1952,21 @@ impl EngineManager {
     ) {
         if keep_cuda {
             tracing::warn!(
-                "NVIDIA GPU present — registered engine {tag} ({asset_label}) but KEPT the \
+                "NVIDIA GPU present - registered engine {tag} ({asset_label}) but KEPT the \
              installed CUDA engine active (Vulkan first-token is measurably slower); run \
              `blazar engine use {tag}` to switch anyway"
             );
         }
         if fork_additive {
             tracing::info!(
-                "fork lane {tag} registered without activating — the active {} engine stays; \
+                "fork lane {tag} registered without activating - the active {} engine stays; \
              `blazar engine use {tag}` switches explicitly",
                 new_kind
             );
         }
         if lazy_lane {
             tracing::info!(
-                "lazy lane {tag} registered without activating — it serves from the gateway \
+                "lazy lane {tag} registered without activating - it serves from the gateway \
              on demand; the active {} engine stays",
                 store
                     .active_engine()
@@ -2032,7 +2032,7 @@ impl EngineManager {
             }
             // mistralrs builds cannot enumerate devices; GPU use follows
             // from the asset label (cuda*/metal), so there is nothing to
-            // cross-check here — an unusable GPU build fails at spawn.
+            // cross-check here - an unusable GPU build fails at spawn.
             EngineKind::MistralRs => {
                 tracing::debug!(target: "blazar::engine", "registered mistralrs {tag} ({asset_label}); device use follows the asset label");
             }
@@ -2040,14 +2040,14 @@ impl EngineManager {
                 tracing::debug!(target: "blazar::engine", "registered sglang {tag} ({asset_label})");
             }
             // venv lane like sglang: devices follow the pip backend
-            // (mlx-cuda on Linux/NVIDIA, mlx on Apple Silicon) — an
+            // (mlx-cuda on Linux/NVIDIA, mlx on Apple Silicon) - an
             // unusable backend fails at spawn, loudly.
             EngineKind::Mlx => {
                 tracing::debug!(target: "blazar::engine", "registered mlx {tag} ({asset_label})");
             }
             // sd.cpp CAN enumerate devices (Vulkan0/CUDA0/CPU rows, no
             // MiB numbers), so the llama GPU-count crosscheck does not
-            // apply — an unusable build fails at spawn, loudly.
+            // apply - an unusable build fails at spawn, loudly.
             EngineKind::SdCpp => {
                 tracing::debug!(target: "blazar::engine", "registered sdcpp {tag} ({asset_label})");
             }
@@ -2058,7 +2058,7 @@ impl EngineManager {
                 tracing::debug!(target: "blazar::engine", "registered whisper {tag} ({asset_label})");
             }
             // piper synthesizes one-shot per request from the gateway
-            // TTS handler (no supervised spawn, no device enumeration —
+            // TTS handler (no supervised spawn, no device enumeration -
             // the CLI phonemizes through its bundled espeak-ng data).
             EngineKind::Piper => {
                 tracing::debug!(target: "blazar::engine", "registered piper {tag} ({asset_label})");
@@ -2138,12 +2138,12 @@ impl EngineManager {
 
     /// Rollback-safe engine install for the release/asset lanes: the
     /// installed `engines/<tag>` dir is renamed aside (instant) before
-    /// `build` runs at the FINAL path — venvs and extracted archives
+    /// `build` runs at the FINAL path - venvs and extracted archives
     /// embed absolute paths, so a scratch-name build cannot be renamed
-    /// in — and restored untouched when anything fails: build error
+    /// in - and restored untouched when anything fails: build error
     /// (disk-full mid-venv), probe rejection, store failure. The aside
     /// copy is deleted only after the replacement registers, so a
-    /// replacement needs headroom for BOTH copies at peak — that disk
+    /// replacement needs headroom for BOTH copies at peak - that disk
     /// cost is the price of never destroying a working engine (live
     /// incident 2026-09-18: a 100%-full disk ate the sglang venv
     /// mid-rebuild under the old rm-first flow).
@@ -2161,12 +2161,12 @@ impl EngineManager {
     {
         let dir = self.dirs.engines_dir().join(tag);
         // Cross-process same-tag serialization: the retire sweep and
-        // the final-dir handoff below are single-writer designs — two
+        // the final-dir handoff below are single-writer designs - two
         // terminals installing the same tag sweep each other's rollback
         // asides (observed 2026-10-29: concurrent `engine update all`
         // left a restore-ENOENT). Queue here; the second process then
         // replaces the first's registered dir cleanly. Best-effort:
-        // downloads cache off → the documented pre-lock race applies.
+        // downloads cache off -> the documented pre-lock race applies.
         let _install_lock = self.gh.cache_lock(&format!("install-{tag}")).await;
         let aside = retire_engine_dir(&self.dirs.data_dir, &dir)?;
         // Armed across the await: a dropped build future (abort, runtime
@@ -2179,7 +2179,7 @@ impl EngineManager {
         };
         let build_outcome = build(dir.clone()).await;
         // Past this point the closure's dir may be handed to registration
-        // (which can write the store row) — a late cancel must not rip a
+        // (which can write the store row) - a late cancel must not rip a
         // row-referenced dir out; stranded state converges via the boot
         // debris sweep instead.
         guard.disarm();
@@ -2199,7 +2199,7 @@ impl EngineManager {
 
     /// Register a dir the caller JUST extracted for this install, removing
     /// the dir when the probe phase rejects the binary (unusable asset:
-    /// SIGILL-class instruction mismatch, missing server binary) — F88's
+    /// SIGILL-class instruction mismatch, missing server binary) - F88's
     /// no-orphan contract extended through the register tail. Store-phase
     /// failures keep the dir: a store row may already reference it.
     fn register_or_clean(
@@ -2225,7 +2225,7 @@ impl EngineManager {
                         Ok(GuardedRemoval::Escaped) => {
                             tracing::warn!(
                                 "probe-rejected engine dir {} resolves outside the \
-                                 data root — left in place",
+                                 data root - left in place",
                                 dir.display()
                             );
                         }
@@ -2246,7 +2246,7 @@ impl EngineManager {
     ///
     /// A miss returns a teaching error naming the installed set and the
     /// nearest tags by edit distance instead of the raw store "no rows"
-    /// failure — dead tags are routine after `engine update --all`
+    /// failure - dead tags are routine after `engine update --all`
     /// prunes a superseded build, and the raw error gives no way back.
     pub fn use_tag(&self, tag: &str) -> Result<EngineRow> {
         let store = Store::open(&self.dirs)?;
@@ -2260,10 +2260,10 @@ impl EngineManager {
         // `use` used to wedge the daemon into exactly that state, then
         // every update dance resolved against the llamacpp channel and
         // failed with "release not found"). Selection on those lanes
-        // rides the lane pin instead — teach the per-kind command.
+        // rides the lane pin instead - teach the per-kind command.
         if row.kind.is_lazy_lane() {
             anyhow::bail!(
-                "{tag} is a {} lane — audio lanes serve lazily through /v1/audio and never \
+                "{tag} is a {} lane - audio lanes serve lazily through /v1/audio and never \
                  take the serving-active flag; pin the lane instead: {}",
                 row.kind,
                 match row.kind {
@@ -2284,7 +2284,7 @@ impl EngineManager {
     }
 
     /// Step back to the previous tag by install time, staying on the
-    /// active engine's kind — see [`rollback_candidate`] for why other
+    /// active engine's kind - see [`rollback_candidate`] for why other
     /// kinds are never targets.
     pub fn rollback(&self) -> Result<EngineRow> {
         let store = Store::open(&self.dirs)?;
@@ -2308,7 +2308,7 @@ impl EngineManager {
 
     /// Keep the newest `keep_tags` engines (config knob, default
     /// `KEEP_TAGS`); `local` and the active tag are
-    /// never pruned. Fork capability lanes are exempt entirely — see
+    /// never pruned. Fork capability lanes are exempt entirely - see
     /// [`is_fork_lane`]. Returns the freed (tag, bytes) pairs for the
     /// summary, mirroring [`Self::prune_siblings`].
     ///
@@ -2317,7 +2317,7 @@ impl EngineManager {
     /// `None` (manual `engine prune`) sweeps every lane as before. The
     /// active flag is a GLOBAL single slot, so the moment lane B
     /// registers and claims it, lane A's newest rows lose their only
-    /// cross-kind protection — a mistralrs install could then retire the
+    /// cross-kind protection - a mistralrs install could then retire the
     /// CUDA llama.cpp anchor purely because it happened to be lane A's
     /// third-newest row (live incident 2026-09-26: `engine install
     /// v0.9.3 --kind mistralrs` pruned the active b11193-cuda). Other
@@ -2367,7 +2367,7 @@ impl EngineManager {
                         // symlinked root points, and `engine list` must
                         // stay truthful about what still exists.
                         tracing::warn!(
-                            "kept engine {} — its dir resolves outside the data root",
+                            "kept engine {} - its dir resolves outside the data root",
                             e.tag
                         );
                         continue;
@@ -2389,7 +2389,7 @@ impl EngineManager {
     /// Phase-3 supersede lifecycle, run at daemon start and after any
     /// roster change:
     ///
-    /// (a) persist re-rooted engine paths — rows installed under a
+    /// (a) persist re-rooted engine paths - rows installed under a
     ///     different data dir carry a stale absolute server path that
     ///     load-time adoption fixes in memory on every access; writing
     ///     the adopted path back once heals the row instead of warning
@@ -2397,12 +2397,12 @@ impl EngineManager {
     /// (b) one-time architecture mining for binary-installed upstream
     ///     lanes (release assets ship no manifest architectures; the
     ///     raw `src/llama-arch.cpp` at the lane's tag is fetched once
-    ///     and the mined set persisted — never refetched);
-    /// (c) supersede marking — a fork lane whose advertised architecture
+    ///     and the mined set persisted - never refetched);
+    /// (c) supersede marking - a fork lane whose advertised architecture
     ///     set is fully covered by mainstream lanes gets
     ///     `superseded_by`/`superseded_at` stamped, so `engine list` can
     ///     show the graduation and the supervisor can drop learned pins;
-    /// (d) retirement sweep — curated fork lanes past
+    /// (d) retirement sweep - curated fork lanes past
     ///     `fork_retire_days` (0 = never) are deleted, EXCEPT rows that
     ///     are active or referenced by `pinned_tags` (user pins and
     ///     in-flight rescue pins override the lifecycle; user-built
@@ -2422,7 +2422,7 @@ impl EngineManager {
         self.sweep_retired_lanes(&store, fork_retire_days, pinned_tags)?;
         // (e) Interrupted-install debris: rollback asides stranded by a
         // kill and row-less half-built dirs, grace-gated. Fail-open like
-        // every step above — hygiene never fails the triggering boot.
+        // every step above - hygiene never fails the triggering boot.
         self.sweep_install_debris(STALLED_INSTALL_GRACE);
         Ok(())
     }
@@ -2432,7 +2432,7 @@ impl EngineManager {
     /// whose recorded data dir is gone would re-warn on every boot;
     /// persisting the adopted path makes the relocation stick. Rows from
     /// before the relative-storage invariant are folded to
-    /// `engines/<tag>/...` in the same pass. No network, no spawn — just
+    /// `engines/<tag>/...` in the same pass. No network, no spawn - just
     /// an `exists` walk and, for stale rows only, one manifest rewrite.
     fn re_root_engine_rows(&self, store: &Store) {
         let rows = store.list_engines().unwrap_or_default();
@@ -2467,7 +2467,7 @@ impl EngineManager {
     /// Supersede step (b): one-time architecture mining for
     /// binary-installed upstream lanes (release assets ship no manifest
     /// architectures; source builds mine at build time). Fetch failures
-    /// warn and move on — supersede coverage catches up on the next
+    /// warn and move on - supersede coverage catches up on the next
     /// restart once the raw host is reachable again.
     async fn mine_missing_architectures(&self, store: &Store) {
         let rows = store.list_engines().unwrap_or_default(); // newest first
@@ -2494,7 +2494,7 @@ impl EngineManager {
                     let archs = arch_miner::parse_arch_table(&text);
                     if archs.is_empty() {
                         tracing::warn!(
-                            "lane {}: mined 0 architectures from upstream {} — leaving manifest untouched",
+                            "lane {}: mined 0 architectures from upstream {} - leaving manifest untouched",
                             row.tag,
                             source_tag
                         );
@@ -2524,7 +2524,7 @@ impl EngineManager {
                     // Fail open: an unreachable raw host must not block
                     // registration or the rest of the supersede pass.
                     tracing::warn!(
-                        "lane {}: one-time arch mining skipped ({e:#}) — supersede coverage may be incomplete until next restart",
+                        "lane {}: one-time arch mining skipped ({e:#}) - supersede coverage may be incomplete until next restart",
                         row.tag
                     );
                 }
@@ -2534,12 +2534,12 @@ impl EngineManager {
 
     /// Supersede step (c): stamp fork lanes whose advertised
     /// architecture set is fully covered by mainstream lanes. Partial
-    /// coverage keeps the fork active — partial mainstream support is
+    /// coverage keeps the fork active - partial mainstream support is
     /// exactly the self-correcting case (unknown-arch rescue re-pins
     /// the fork for the archs mainline still rejects).
     /// Supersede recency rule: a mainstream lane may graduate (supersede)
     /// a fork only when its build number EXCEEDS the fork's stamped
-    /// floor — the newest upstream release that existed when the fork
+    /// floor - the newest upstream release that existed when the fork
     /// was built. `None` floor (offline build, legacy row) keeps the
     /// plain arch-coverage behavior.
     fn supersede_recency_allows(graduator_build: u64, floor: Option<u64>) -> bool {
@@ -2580,7 +2580,7 @@ impl EngineManager {
         // fork-build time. Endpoint-only forks register no new
         // architectures (identical 153-entry sets), so arch coverage
         // alone would let an OLDER mainstream instantly retire a lane
-        // built from a strictly newer commit — the a4cb4c6-vs-b11349
+        // built from a strictly newer commit - the a4cb4c6-vs-b11349
         // false supersede. Unstamped floors (offline builds, legacy
         // rows) keep the plain arch-coverage rule.
         let recency_allows = Self::supersede_recency_allows;
@@ -2622,7 +2622,7 @@ impl EngineManager {
             let encoded = serde_json::to_string(manifest).context("encode superseded manifest")?;
             store.update_engine_manifest(&row.tag, &encoded)?;
             tracing::warn!(
-                "fork lane {} superseded by {} — mainline now covers its architectures; model pins clear on next resolve",
+                "fork lane {} superseded by {} - mainline now covers its architectures; model pins clear on next resolve",
                 row.tag,
                 newest_coverer
             );
@@ -2630,7 +2630,7 @@ impl EngineManager {
         Ok(())
     }
 
-    /// Supersede step (d): retirement sweep — curated fork lanes past
+    /// Supersede step (d): retirement sweep - curated fork lanes past
     /// the grace period are deleted, EXCEPT rows that are active or
     /// referenced by `pinned_tags` (user pins and in-flight rescue pins
     /// override the lifecycle). User-built forks (trust User) outlive
@@ -2664,7 +2664,7 @@ impl EngineManager {
                 continue;
             }
             let dir = self.dirs.engines_dir().join(&row.tag);
-            // Retire-to-aside, then row-delete, then discard — the row
+            // Retire-to-aside, then row-delete, then discard - the row
             // only disappears once the directory is safely out of the
             // way, and any failure restores the previous state (no
             // ghost row over a deleted dir). A lane that cannot be
@@ -2674,7 +2674,7 @@ impl EngineManager {
             match remove_engine_row_and_tree(store, &row.tag, &dir, &self.dirs.data_dir) {
                 Ok(bytes) => {
                     tracing::warn!(
-                        "retired curated fork lane {} ({} bytes) — rebuild any time via the registry",
+                        "retired curated fork lane {} ({} bytes) - rebuild any time via the registry",
                         row.tag,
                         bytes
                     );
@@ -2684,7 +2684,7 @@ impl EngineManager {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "cannot retire curated fork lane {} dir {} ({e:#}) — skipped this pass",
+                        "cannot retire curated fork lane {} dir {} ({e:#}) - skipped this pass",
                         row.tag,
                         dir.display()
                     );
@@ -2723,9 +2723,9 @@ impl EngineManager {
                     Ok(GuardedRemoval::Removed | GuardedRemoval::Absent) => {}
                     Ok(GuardedRemoval::Escaped) => {
                         // Same pairing rule as `prune`: a dir outside the
-                        // data root keeps its row — no ghost either way.
+                        // data root keeps its row - no ghost either way.
                         tracing::warn!(
-                            "kept superseded engine {} — its dir resolves outside \
+                            "kept superseded engine {} - its dir resolves outside \
                              the data root",
                             e.tag
                         );
@@ -2755,7 +2755,7 @@ impl EngineManager {
     /// install or a pre-rollback-era upgrade, invisible to `engine list`
     /// yet still eating disk (a 1 GiB `b11064-cuda` survived this way).
     /// A dir is NEVER an orphan while some row's manifest points into it.
-    /// The manual pass is ungated — the user asked. The automatic pass
+    /// The manual pass is ungated - the user asked. The automatic pass
     /// (see [`Self::sweep_install_debris`]) applies the same rules plus
     /// a quiet-period grace so a concurrently running install is never
     /// reaped mid-build.
@@ -2813,7 +2813,7 @@ impl EngineManager {
             {
                 continue;
             }
-            // Automatic pass only: no row AND recently written to — this
+            // Automatic pass only: no row AND recently written to - this
             // is very likely an install building right now in another
             // process; the next sweep converges once it goes quiet.
             if grace.is_some_and(|g| dir_recent(&dir, g)) {
@@ -2821,7 +2821,7 @@ impl EngineManager {
             }
             let bytes = engine_dir_bytes(&dir);
             // Best-effort: a busy dir (child running from it) is skipped,
-            // not fatal — the next sweep catches it. A dir resolving
+            // not fatal - the next sweep catches it. A dir resolving
             // outside the data root (symlinked engines dir) is skipped
             // entirely: it is not this store's to reclaim.
             match remove_dir_within(&self.dirs.data_dir, &dir) {
@@ -2865,7 +2865,7 @@ impl EngineManager {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            // `.retired-<tag>-<pid>` — tags themselves contain hyphens
+            // `.retired-<tag>-<pid>` - tags themselves contain hyphens
             // (b11139-cuda), so split the trailing pid once from the right
             // and refuse anything that does not decode cleanly.
             let Some(rest) = name.strip_prefix(RETIRED_ENGINE_PREFIX) else {
@@ -2890,7 +2890,7 @@ impl EngineManager {
                 Ok(GuardedRemoval::Removed) => {}
                 Ok(GuardedRemoval::Absent | GuardedRemoval::Escaped) => {
                     tracing::warn!(
-                        "skipped stale retired engine {name} — absent or outside \
+                        "skipped stale retired engine {name} - absent or outside \
                          the data root"
                     );
                     continue;
@@ -2909,7 +2909,7 @@ impl EngineManager {
     /// Interrupted-install debris convergence, run at daemon start and
     /// after installs: stale rollback asides plus row-less dirs, both
     /// grace-gated so a concurrently running install is never reaped.
-    /// Fail-open by construction — every step logs and skips on error;
+    /// Fail-open by construction - every step logs and skips on error;
     /// hygiene must never fail the boot that triggered it. Returns what
     /// was reclaimed (tag, bytes) for callers that surface it.
     pub fn sweep_install_debris(&self, grace: std::time::Duration) -> Vec<(String, u64)> {
@@ -2935,7 +2935,7 @@ impl EngineManager {
             ));
         }
         // Probe under the configured engine env (e.g. GGML_BACKEND_PATH so
-        // a CUDA build actually discovers its GPU) — applied to the probe
+        // a CUDA build actually discovers its GPU) - applied to the probe
         // children directly, never to this process's environment. Keys
         // already present in the parent env keep the parent's value,
         // matching what a serving child would inherit.
@@ -2946,7 +2946,7 @@ impl EngineManager {
             .collect();
         let mut m = manifest::probe_with_env(server, LOCAL_TAG, &probe_env)?;
         // Local lane: BLAZAR_ENGINE_PATH is user-owned and usually
-        // out-of-tree — relativize is a no-op there by design.
+        // out-of-tree - relativize is a no-op there by design.
         m.relativize_server_path(&self.dirs.data_dir);
         let row = EngineRow {
             tag: LOCAL_TAG.to_string(),
@@ -2977,7 +2977,7 @@ impl EngineManager {
     }
 
     /// Rows whose engine binary is gone while the row survives (dir
-    /// deleted underneath the db — manual removal, disk cleanup).
+    /// deleted underneath the db - manual removal, disk cleanup).
     /// Returns `(tag, kind, anchored path)`; the doctor surface renders
     /// these with the heal command so a ghost row is named instead of
     /// failing spawn/verify silently.
@@ -3006,10 +3006,10 @@ impl EngineManager {
     /// Adopt legacy `whisper/bin/<tag>` trees into the engines lane:
     /// move the dir under `engines/` and register it like any engine
     /// install. The legacy lane predates the engines table, so its
-    /// installs carry no rows — resolution masked ghost rows and the
+    /// installs carry no rows - resolution masked ghost rows and the
     /// lane sat outside `engine prune`'s reach. Called at serve
     /// preflight and before `engine prune` (the one place an
-    /// unregistered `engines/<tag>` dir — crash-window debris — is
+    /// unregistered `engines/<tag>` dir - crash-window debris - is
     /// exposed to deletion). Each tag adopts independently; on failure
     /// the tree is restored to its legacy path and the rest still
     /// adopt. After one clean pass this is a no-op. Returns the
@@ -3064,7 +3064,7 @@ impl EngineManager {
     fn adopt_whisper_tree(&self, legacy_dir: &Path, tag: &str, engines_root: &Path) -> Result<()> {
         // Adoption can be the first engines-lane writer in a fresh
         // store (live-validated: `engine prune` on a planted legacy
-        // tree, no engines dir yet) — the rename target must exist.
+        // tree, no engines dir yet) - the rename target must exist.
         std::fs::create_dir_all(engines_root)
             .with_context(|| format!("mkdir {}", engines_root.display()))?;
         let target = engines_root.join(tag);
@@ -3114,9 +3114,9 @@ impl EngineManager {
                 if let Err(back) = std::fs::rename(&target, legacy_dir) {
                     // The tree cannot go home: it already sits at the
                     // final path, so registration is the only way
-                    // forward — retry once before giving up.
+                    // forward - retry once before giving up.
                     tracing::error!(
-                        "cannot restore {} -> {} ({back}) — retrying registration",
+                        "cannot restore {} -> {} ({back}) - retrying registration",
                         target.display(),
                         legacy_dir.display()
                     );
@@ -3195,7 +3195,7 @@ impl EngineManager {
     /// the tree back to its legacy path before restoring the aside.
     fn adopt_piper_tree(&self, legacy_dir: &Path, tag: &str, engines_root: &Path) -> Result<()> {
         // Adoption can be the first engines-lane writer in a fresh
-        // store — the rename target must exist.
+        // store - the rename target must exist.
         std::fs::create_dir_all(engines_root)
             .with_context(|| format!("mkdir {}", engines_root.display()))?;
         let target = engines_root.join(tag);
@@ -3244,9 +3244,9 @@ impl EngineManager {
                 if let Err(back) = std::fs::rename(&target, legacy_dir) {
                     // The tree cannot go home: it already sits at the
                     // final path, so registration is the only way
-                    // forward — retry once before giving up.
+                    // forward - retry once before giving up.
                     tracing::error!(
-                        "cannot restore {} -> {} ({back}) — retrying registration",
+                        "cannot restore {} -> {} ({back}) - retrying registration",
                         target.display(),
                         legacy_dir.display()
                     );
@@ -3271,7 +3271,7 @@ impl EngineManager {
     }
 }
 
-/// Content digest of a legacy tree's server binary — the honest value
+/// Content digest of a legacy tree's server binary - the honest value
 /// an asset download would have carried (upstream ships none for
 /// already-extracted trees).
 fn legacy_tree_digest(bin: &Path) -> Result<String> {
@@ -3339,7 +3339,7 @@ pub(crate) fn find_server(dir: &Path) -> Result<PathBuf> {
 }
 
 /// Move every file of an extracted runtime payload (cudart companion)
-/// into `dst`, flattening whatever root layout the archive used —
+/// into `dst`, flattening whatever root layout the archive used -
 /// upstream wraps it in its own top-level dir, and the layout differs
 /// per platform, so the merge must not depend on it. Same-filesystem
 /// renames; an existing file of the same name wins (the main tarball
@@ -3357,7 +3357,7 @@ fn flatten_payload_into(src: &Path, dst: &Path) -> Result<()> {
             let to = dst.join(entry.file_name());
             if to.exists() {
                 tracing::debug!(
-                    "runtime payload file {} already present — keeping the main tarball's copy",
+                    "runtime payload file {} already present - keeping the main tarball's copy",
                     to.display()
                 );
                 let _ = std::fs::remove_file(&from);
@@ -3379,7 +3379,7 @@ pub(crate) fn find_engine_binary(dir: &Path, names: &[&str]) -> Result<PathBuf> 
         };
         for e in entries.flatten() {
             let p = e.path();
-            // F86: `DirEntry::file_type` does NOT follow symlinks — a
+            // F86: `DirEntry::file_type` does NOT follow symlinks - a
             // symlinked dir cycles forever under `p.is_dir()` (which
             // does). Only REAL dirs recurse; symlinks are treated as
             // leaf files (matchable, never descended).
@@ -3431,14 +3431,14 @@ fn make_executable(path: &Path) {
 /// checks (never GPU/HTTP work), the worker thread reaps the child
 /// whenever it does finish, and sharing the `Child` handle across the
 /// waiter and a killer thread reintroduces the classic wait-vs-kill lock
-/// race. Bounding the DECISION (not the child's life) is the contract —
+/// race. Bounding the DECISION (not the child's life) is the contract -
 /// the previous probe blocked the spawn path indefinitely instead.
 fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) -> bool {
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // Bounded transient retry (EAGAIN-class under parallel load) — a
+    // Bounded transient retry (EAGAIN-class under parallel load) - a
     // permanent failure (missing/garbage binary) still fails attempt one.
     let Ok(child) = crate::probe::with_spawn_retry(|| cmd.spawn()) else {
         return false;
@@ -3454,14 +3454,14 @@ fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) ->
 /// Post-crash liveness check of the ACTIVE engine's own binary, per
 /// kind. This gates the supervisor's engine rollback: a false verdict
 /// silently de-thrones a healthy engine, so the probe must exec what the
-/// lane actually ships — historically this walked for `llama-server` by
+/// lane actually ships - historically this walked for `llama-server` by
 /// name only, which structurally failed for sglang (shim is
 /// `sglang-server`) and mistral.rs, making EVERY spawn failure on those
 /// lanes a guaranteed false rollback.
 ///
 /// Per-kind probes (cheap, no GPU, no torch import):
 /// - llamacpp: `llama-server --version` (native exec, 5 s)
-/// - sglang: the venv's `importlib.metadata` version read — NOT the
+/// - sglang: the venv's `importlib.metadata` version read - NOT the
 ///   shim, which boots python+torch and parses `launch_server` args
 ///   (slow, and `--version` is not a `launch_server` flag) (15 s)
 /// - mistral.rs: `mistralrs --version` (clap, native exec, 15 s)
@@ -3474,7 +3474,7 @@ fn exec_version_probe(bin: &Path, args: &[&str], budget: std::time::Duration) ->
 /// One engine lane's liveness probe: the binary, argv, and budget that
 /// together prove an install executes. Shared by the supervisor's
 /// post-update verify gate and doctor's engine-binary smoke row so the
-/// two can never disagree on what "healthy" means for a lane — native
+/// two can never disagree on what "healthy" means for a lane - native
 /// lanes answer `--version`, venv lanes read package metadata through
 /// their venv python (the shims' own `--version` is an argparse error),
 /// and whisper answers `--help` (it has no `--version` flag).
@@ -3518,15 +3518,15 @@ pub fn smoke_probe(
         EngineKind::MistralRs | EngineKind::SdCpp => native_version_probe(manifest),
         // whisper-server has no --version flag (unknown argument,
         // verified b5130) and piper answers --help with its option
-        // table the same way — the shared lazy-lane liveness shape:
+        // table the same way - the shared lazy-lane liveness shape:
         // usage on stdout/stderr, exit 0.
         EngineKind::Whisper | EngineKind::Piper => native_help_probe(manifest),
     }
 }
 
-/// `server_path` = `<engines>/<tag>/<name>-server` → the venv sits next
+/// `server_path` = `<engines>/<tag>/<name>-server` -> the venv sits next
 /// to the shim (`sglang_install` layout contract);
-/// the venv python is the real liveness check — no torch import, just
+/// the venv python is the real liveness check - no torch import, just
 /// a metadata read.
 fn venv_metadata_probe(
     manifest: Option<crate::engine::manifest::Manifest>,
@@ -3579,7 +3579,7 @@ pub fn verify_engine_binary(
 
 /// The rollback target for a newest-first engine list (the order
 /// [`Store::list_engines`] returns): the next-older row of the ACTIVE
-/// row's kind. Kinds are separate universes — a text-lane rollback once
+/// row's kind. Kinds are separate universes - a text-lane rollback once
 /// stepped onto the whisper voice-lane row and silently deactivated
 /// serving (live incident 2026-09-26: `engine rollback` crossed into
 /// `b5130/whisper` while the user expected a llama.cpp step).
@@ -3601,7 +3601,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// Nearest installed tags by edit distance, same kind as nothing in
-/// particular — closest wins, ties broken by list order (newest first).
+/// particular - closest wins, ties broken by list order (newest first).
 fn nearest_tags(tag: &str, engines: &[EngineRow], limit: usize) -> Vec<String> {
     let mut ranked: Vec<(usize, &str)> = engines
         .iter()
@@ -3734,7 +3734,7 @@ mod rollback_tests {
         );
 
         // Only cross-kind rows below the active one: no same-kind
-        // target exists — the caller must refuse, not cross kinds.
+        // target exists - the caller must refuse, not cross kinds.
         let voice_only_below = vec![
             row("b11193-cuda", 400, true, EngineKind::LlamaCpp),
             row("b5130", 350, false, EngineKind::Whisper),
@@ -3799,7 +3799,7 @@ mod verify_tests {
     }
 
     #[test]
-    // Storage-invariant rows carry a data-dir-relative server_path — the
+    // Storage-invariant rows carry a data-dir-relative server_path - the
     // probe must anchor them before spawning the binary.
     #[cfg(unix)]
     fn unit__verify_engine_binary__relative_row_anchors_to_data_dir() {
@@ -3830,7 +3830,7 @@ mod verify_tests {
     fn unit__verify_engine_binary__sglang_venv_metadata_probe() {
         let tmp = tempfile::tempdir().unwrap();
         // The flashinfer-class regression pin: a sglang dir with NO
-        // llama-server anywhere and a WORKING venv must verify TRUE —
+        // llama-server anywhere and a WORKING venv must verify TRUE -
         // the old name-walk probe returned false unconditionally for
         // this lane and rolled healthy engines back.
         let shim = fake_bin(tmp.path(), "sglang-server", "exec venv/bin/python \"$@\"");
@@ -3868,7 +3868,7 @@ mod verify_tests {
             Some(&manifest_for(&bin))
         ));
         // No manifest (legacy row): the venv lanes cannot fall back to a
-        // name walk — their layout is the install contract.
+        // name walk - their layout is the install contract.
         assert!(!verify_engine_binary(
             &EngineKind::MistralRs,
             tmp.path(),
@@ -3877,7 +3877,7 @@ mod verify_tests {
     }
 
     #[test]
-    // whisper-server has no --version flag — its probe is --help
+    // whisper-server has no --version flag - its probe is --help
     // (verified b5130). Anchored rows verify like every other lane;
     // manifest-less rows and ghost anchors stay unverifiable, which is
     // what the adoption heals.
@@ -3927,7 +3927,7 @@ mod verify_tests {
 
     /// `register_or_clean` pins: an unusable binary (exec-format /
     /// SIGILL-class probe failure) must take its whole engine dir with
-    /// it — the engines/b11005-cuda 927 MiB orphan lesson — while a
+    /// it - the engines/b11005-cuda 927 MiB orphan lesson - while a
     /// healthy dir registers normally. Linux-only: the fixtures are
     /// /bin/sh scripts.
     #[cfg(target_os = "linux")]
@@ -3963,7 +3963,7 @@ mod verify_tests {
             let tmp = tempfile::tempdir().unwrap();
             let mgr = manager_in(&tmp);
             let dir = tmp.path().join("data/engines/b1-cuda");
-            // Garbage bytes with the +x bit: spawn fails at exec — the
+            // Garbage bytes with the +x bit: spawn fails at exec - the
             // same register-tail failure class as a SIGILL'd asset.
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("llama-server"), b"not an elf").unwrap();
@@ -4109,7 +4109,7 @@ mod verify_tests {
                     EngineKind::LlamaCpp,
                     |dir| async move {
                         // Garbage bytes with the +x bit: spawn fails at
-                        // exec — the register-tail failure class a
+                        // exec - the register-tail failure class a
                         // SIGILL'd asset hits.
                         std::fs::create_dir_all(&dir).unwrap();
                         std::fs::write(dir.join("llama-server"), b"not an elf").unwrap();
@@ -4239,7 +4239,7 @@ mod verify_tests {
 
         #[test]
         fn unit__scanback_release__depth_cap_returns_none() {
-            // Assets exist 17 builds behind — beyond UPSTREAM_SCANBACK_DEPTH.
+            // Assets exist 17 builds behind - beyond UPSTREAM_SCANBACK_DEPTH.
             let mut releases = Vec::new();
             for n in (11010..=11027).rev() {
                 let assets: Vec<String> = if n == 11010 {
@@ -4260,8 +4260,8 @@ mod verify_tests {
 
         #[test]
         fn unit__scanback_release__driver_cap_skips_overcap_candidates() {
-            // b11026 ships only 13.3 assets — over this driver's 13.0
-            // ceiling — so the scan continues to b11020's 12.8 asset.
+            // b11026 ships only 13.3 assets - over this driver's 13.0
+            // ceiling - so the scan continues to b11020's 12.8 asset.
             let releases = vec![
                 cuda_release("b11026", &["llama-b11026-bin-ubuntu-cuda-13.3-x64.tar.gz"]),
                 cuda_release("b11020", &["llama-b11020-bin-ubuntu-cuda-12.8-x64.tar.gz"]),
@@ -4369,7 +4369,7 @@ mod supersede_floor_tests {
     fn unit__supersede_recency__older_mainstream_cannot_graduate_a_newer_fork() {
         let allows = EngineManager::supersede_recency_allows;
         // The a4cb4c6 false-supersede shape: fork pinned when the newest
-        // release was b11349 — that same release (and anything older)
+        // release was b11349 - that same release (and anything older)
         // must not graduate it; the first release PAST the floor may.
         assert!(!allows(11_349, Some(11_349)));
         assert!(!allows(11_344, Some(11_349)));
@@ -4390,7 +4390,7 @@ mod retire_containment_tests {
 
     /// BLZ-7: an engine dir reached through a symlinked engines dir
     /// that resolves outside the data root must NOT be renamed into an
-    /// aside — the install aborts loudly instead of stranding foreign
+    /// aside - the install aborts loudly instead of stranding foreign
     /// copies that guarded cleanup would later refuse to touch.
     #[test]
     fn unit__retire_engine_dir__refuses_dir_outside_the_data_root() {

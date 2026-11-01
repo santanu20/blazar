@@ -5,7 +5,7 @@ The site (docs/, served via GitHub Pages from main) and the README
 quickstart carry the release version in exactly seven places: the hero
 eyebrow, the two install command URLs, and the demo banner in
 index.html, the banner's SVG twin, and the two quickstart install URLs
-in README.md. These are "current release" claims — a stale one is the
+in README.md. These are "current release" claims - a stale one is the
 site (or README) lying about what shipping today looks like; v0.28.0
 shipped with README still pointing at v0.27.0 install URLs because the
 sync did not cover them. Verification-date stamps inside the markdown
@@ -30,13 +30,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# (file, pattern with one version group, what it is) — every pattern
+# (file, pattern with one version group, what it is) - every pattern
 # must match exactly once; a drift in the surrounding markup is a
 # rewrite-the-sync problem, never a silent skip.
 VERSION_SPOTS: list[tuple[str, str, str]] = [
     (
         "docs/index.html",
-        r'(hero-eyebrow">v)(\d+\.\d+\.\d+)( ·)',
+        r'(hero-eyebrow">v)(\d+\.\d+\.\d+)( |)',
         "hero eyebrow version",
     ),
     (
@@ -51,12 +51,12 @@ VERSION_SPOTS: list[tuple[str, str, str]] = [
     ),
     (
         "docs/index.html",
-        r"(blazar )(\d+\.\d+\.\d+)( — powered by)",
+        r"(blazar )(\d+\.\d+\.\d+)( - powered by)",
         "index.html demo banner",
     ),
     (
         "docs/assets/blazar-demo.svg",
-        r"(blazar )(\d+\.\d+\.\d+)( — powered by)",
+        r"(blazar )(\d+\.\d+\.\d+)( - powered by)",
         "SVG demo banner",
     ),
     (

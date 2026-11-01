@@ -5,7 +5,7 @@
 //! Zero-tax contract: with no `[[keys]]` configured, nothing here runs.
 //! With keys but no token budgets, only exact request counting applies
 //! (no body bytes are read). Token counting activates a bounded
-//! tail-sniffer on the proxied byte stream — constructed per request
+//! tail-sniffer on the proxied byte stream - constructed per request
 //! ONLY when the requesting key carries `tpm`/`daily_tokens` limits,
 //! never for unauthenticated or unlimited keys.
 
@@ -31,7 +31,7 @@ pub struct KeyCtx {
 /// operations (failover pinning, replication fan-out, live-adapter
 /// surgery, adapter listing) change what serves traffic or touch every
 /// peer, so they demand an unscoped (admin) key whenever keys exist.
-/// On the open gateway (no keys) they stay open — the auth
+/// On the open gateway (no keys) they stay open - the auth
 /// middleware's documented trust boundary applies unchanged.
 pub fn control_plane_authorized(
     keys: &KeysLimiter,
@@ -62,7 +62,7 @@ pub fn control_plane_authorized(
 }
 
 /// BLZ-2: pure model-scope predicate for model-specific control
-/// actions (warm). Authorization only — no quota accounting: warm is
+/// actions (warm). Authorization only - no quota accounting: warm is
 /// an operator nudge, not an inference request.
 pub fn scope_permits(
     keys: &KeysLimiter,
@@ -192,7 +192,7 @@ pub fn utc_day(ts: SystemTime) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Seconds until the next UTC midnight (`1..=86_400`) — the true reset
+/// Seconds until the next UTC midnight (`1..=86_400`) - the true reset
 /// point for daily token budgets (F56: was hardcoded 3600).
 fn secs_until_utc_midnight() -> u64 {
     let now = SystemTime::now()
@@ -223,7 +223,7 @@ struct KeyState {
     day: String,
     requests: u64,
     tokens: u64,
-    /// Live leases (concurrency cap); instantaneous state — never
+    /// Live leases (concurrency cap); instantaneous state - never
     /// rolled by `roll_day` nor persisted.
     in_flight: u32,
     dirty: bool,
@@ -252,7 +252,7 @@ pub struct KeysLimiter {
 }
 
 impl KeysLimiter {
-    /// Build with today's persisted usage pre-loaded (best effort — a
+    /// Build with today's persisted usage pre-loaded (best effort - a
     /// store failure degrades to zero-based counters, never blocks boot).
     #[must_use]
     pub fn loaded(store: Option<&Store>, entries: Vec<blazar_core::ApiKey>) -> Self {
@@ -290,7 +290,7 @@ impl KeysLimiter {
     /// Bearer secret -> key entry (None = unknown / no keys configured).
     /// Secret comparison is constant-time (see [`ct_eq`]). `.find()`
     /// short-circuits, but a later position requires presenting a valid
-    /// secret for some earlier entry — position leaks nothing without
+    /// secret for some earlier entry - position leaks nothing without
     /// the key, and per-compare `ct_eq` hides content differences.
     #[must_use]
     pub fn resolve(&self, presented: &str) -> Option<blazar_core::ApiKey> {
@@ -346,7 +346,7 @@ impl KeysLimiter {
     }
 
     /// Atomic admission (BLZ-3): model scope, then the rpm/tpm/daily
-    /// gates, then the request charge — all under ONE lock acquisition.
+    /// gates, then the request charge - all under ONE lock acquisition.
     /// The old read-then-charge pair let N concurrent requests all pass
     /// the same pre-charge window and overshoot the rpm ceiling; here a
     /// request is only admitted when its own charge lands in the same
@@ -428,7 +428,7 @@ impl KeysLimiter {
 
     /// Add measured tokens for a finished chat-family request (exact
     /// values from the response-usage tail, zero when the sniffer found
-    /// none — e.g. streaming without a usage chunk).
+    /// none - e.g. streaming without a usage chunk).
     pub fn charge_tokens(&self, name: &str, tokens: u64) {
         if tokens == 0 {
             return;
@@ -449,7 +449,7 @@ impl KeysLimiter {
 
     /// Lease an in-flight slot at auth time. `Ok(None)` = no cap
     /// configured (nothing tracked, zero cost). Checked BEFORE model
-    /// scope (cheapest gate first — a capped key cannot even probe
+    /// scope (cheapest gate first - a capped key cannot even probe
     /// scopes). Rejected requests never consume a slot.
     pub fn acquire(
         self: &Arc<Self>,
@@ -476,7 +476,7 @@ impl KeysLimiter {
     }
 
     /// Release a lease (called by `SlotLease::drop`). A key removed
-    /// mid-flight keeps its state entry — `get_mut` only decrements and
+    /// mid-flight keeps its state entry - `get_mut` only decrements and
     /// never inserts, so nothing is re-created here.
     fn release(&self, name: &str) {
         let mut states = self.states.lock().expect("keys state poisoned");
@@ -505,7 +505,7 @@ impl KeysLimiter {
     /// Persist dirty counters (write-behind; called by the flusher task
     /// and at daemon shutdown). Absolute day-state per key, one tx per
     /// day stamp. F55: entries dirty under a PRIOR day stamp flush under
-    /// that day — `roll_day` resets counters on first charge of the new
+    /// that day - `roll_day` resets counters on first charge of the new
     /// day, so filtering on `today` here silently dropped the last
     /// <flush-interval of pre-midnight usage every night.
     pub fn flush(&self, dirs: &blazar_core::BlazarDirs) {
@@ -574,7 +574,7 @@ fn clone_state(st: &KeyState) -> KeyState {
 /// RAII in-flight lease: increments on acquire, releases when dropped.
 /// The guard lives inside the response body, so the slot is held for
 /// exactly as long as the response streams (dropped on completion OR
-/// client disconnect — hyper drops bodies either way).
+/// client disconnect - hyper drops bodies either way).
 pub struct SlotLease {
     limiter: std::sync::Arc<KeysLimiter>,
     name: String,
@@ -655,7 +655,7 @@ pub fn scope_matches(pattern: &str, model: &str) -> bool {
 /// dialects blazar serves (`OpenAI` `prompt_tokens`/`completion_tokens`,
 /// Responses `input_tokens`/`output_tokens`, ollama NDJSON
 /// `prompt_eval_count`/`eval_count`). Constructed only for keys with
-/// token budgets — everyone else pays nothing.
+/// token budgets - everyone else pays nothing.
 pub struct UsageSniffer {
     tail: Vec<u8>,
     key: String,
@@ -679,7 +679,7 @@ impl UsageSniffer {
         }
     }
 
-    /// Charge the completion side `mult`× (see field note). Default 1.
+    /// Charge the completion side `mult`x (see field note). Default 1.
     #[must_use]
     pub fn with_completion_multiplier(mut self, mult: u64) -> Self {
         self.completion_multiplier = mult.max(1);
@@ -715,7 +715,7 @@ pub fn sniff_usage(tail: &[u8]) -> u64 {
     prompt.unwrap_or(0).saturating_add(completion.unwrap_or(0))
 }
 
-/// (prompt, completion) split of the usage tail — each side uses the
+/// (prompt, completion) split of the usage tail - each side uses the
 /// first dialect that appears (`OpenAI`, Responses, ollama NDJSON).
 /// Pure; unit-pinned alongside `scaled_total`.
 #[must_use]
@@ -729,7 +729,7 @@ pub fn sniff_usage_parts(tail: &[u8]) -> (Option<u64>, Option<u64>) {
     (prompt, completion)
 }
 
-/// Multi-choice-aware total: prompt once + completion × mult, clamped
+/// Multi-choice-aware total: prompt once + completion x mult, clamped
 /// at u64 so an oversized lie cannot wrap around into a small charge.
 #[must_use]
 pub fn scaled_total(prompt: Option<u64>, completion: Option<u64>, mult: u64) -> u64 {
@@ -747,7 +747,7 @@ pub(crate) fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Value of the LAST `<key> <int>` occurrence in a streamed tail — the
+/// Value of the LAST `<key> <int>` occurrence in a streamed tail - the
 /// usage payload is always the final event, so a literal appearing in
 /// generated prose earlier must not win. If the last occurrence fails
 /// to parse (prose), the previous parse wins.
@@ -765,7 +765,7 @@ pub(crate) fn last_int_after(tail: &[u8], key: &str) -> Option<u64> {
 /// Wrap a finished handler `Response` so its body charges the key's
 /// token counters as it streams out (usage lives in the final NDJSON
 /// line / final JSON object of ollama-API responses). Abort-safe via
-/// `Drop` — a client disconnect still charges what was generated.
+/// `Drop` - a client disconnect still charges what was generated.
 #[must_use]
 pub fn charge_outgoing(
     resp: axum::response::Response,
@@ -847,7 +847,7 @@ mod tests {
     }
 
     /// BLZ-2 truth table: warm-style model-specific actions pass on a
-    /// pure scope check — allowlist match or admin, never quota.
+    /// pure scope check - allowlist match or admin, never quota.
     #[test]
     fn unit__scope_permits__model_specific_control_actions() {
         let ctx = |name: &str| KeyCtx {
@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn unit__prune_window__drops_expired_prefix_keeps_live_tail() {
-        // F54: charge-time front-drain keeps the rpm/tpm vecs bounded —
+        // F54: charge-time front-drain keeps the rpm/tpm vecs bounded -
         // without it every rate check scanned the full request history.
         let now = Instant::now();
         let old = now
@@ -1049,7 +1049,7 @@ mod tests {
     fn unit__rpm__admission_is_atomic_under_a_concurrent_burst() {
         // BLZ-3 pin: gates and the charge land in one lock step, so a
         // burst of threads racing the same rpm-limited key admits
-        // EXACTLY rpm requests — never more. The old check/charge pair
+        // EXACTLY rpm requests - never more. The old check/charge pair
         // let every racer pass the same pre-charge window.
         let rpm: u32 = 5;
         let racers = 4 * rpm as usize;

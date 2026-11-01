@@ -5,7 +5,7 @@
 //! response flows back through each dialect's unchanged response path.
 //!
 //! Contract:
-//! - non-streaming only (`stream: true` + best-of is rejected 400 — a
+//! - non-streaming only (`stream: true` + best-of is rejected 400 - a
 //!   winner cannot be picked before completion, and streaming N
 //!   candidates to the client is a different feature);
 //! - the winner is chosen by a deterministic ladder: schema-valid (when
@@ -41,7 +41,7 @@ fn parse_u64(v: &str) -> Option<u64> {
 /// Merge the header and body spellings of the knob into one validated
 /// value. `Ok(None)` = fan-out not requested (the default path).
 /// Header wins on conflict (it is the explicit, dialect-universal
-/// spelling); out-of-range values are errors, not clamps — a client
+/// spelling); out-of-range values are errors, not clamps - a client
 /// asking for 9 candidates should learn the ceiling, not silently
 /// get 4.
 pub fn resolve_best_of(
@@ -68,7 +68,7 @@ pub fn resolve_best_of(
         && h != b
     {
         return Err(format!(
-            "{HEADER} header ({h}) and best_of body field ({b}) disagree — send one"
+            "{HEADER} header ({h}) and best_of body field ({b}) disagree - send one"
         ));
     }
     Ok(header_val
@@ -79,9 +79,9 @@ pub fn resolve_best_of(
 
 /// Pure decision core of the saturation guard: the fan-out size plus the
 /// degrade reason when it shrank. Reasons are stable header vocabulary:
-/// `queue` (real traffic is waiting — candidates must never push it
+/// `queue` (real traffic is waiting - candidates must never push it
 /// back), `headroom` (the child has no free decode slot to judge on).
-/// A partial shrink that still runs (headroom >= 2) needs no reason —
+/// A partial shrink that still runs (headroom >= 2) needs no reason -
 /// the ran header already reports `asked`/`used` truthfully.
 pub(crate) fn decide_n(queue_depth: u64, headroom: u64, want: u64) -> (u64, Option<&'static str>) {
     if queue_depth > 0 {
@@ -201,7 +201,7 @@ pub(crate) enum FanOut {
     /// Fan-out ran; the judged winner rides inside.
     Ran(FanOutOutcome),
     /// Take the normal single-send path; nothing to surface (knob off,
-    /// non-JSON body, or first-copy transport failure — the normal
+    /// non-JSON body, or first-copy transport failure - the normal
     /// path's respawn-retry contract owns crash recovery).
     Skip,
     /// The saturation guard or the body cap collapsed the fan-out to a
@@ -211,7 +211,7 @@ pub(crate) enum FanOut {
     Degraded(String),
 }
 
-/// Run the fan-out and judge it. See `FanOut` for the outcomes — every
+/// Run the fan-out and judge it. See `FanOut` for the outcomes - every
 /// non-`Ran` variant falls back to the caller's single-send path, whose
 /// respawn-retry contract then owns crash recovery (re-running the
 /// request once through that path beats failing a live lane because one
@@ -234,7 +234,7 @@ pub(crate) async fn fan_out(
         tracing::warn!(
             target: "blazar::bestof",
             model = %engine.name,
-            "body {} bytes exceeds the fan-out cap — single-send path",
+            "body {} bytes exceeds the fan-out cap - single-send path",
             child_body.len()
         );
         FANOUT_DEGRADED.fetch_add(1, Ordering::Relaxed);
@@ -262,7 +262,7 @@ pub(crate) async fn fan_out(
         tracing::warn!(
             target: "blazar::bestof",
             model = %engine.name,
-            "candidate 0 failed transport ({}) — falling back to the single-send path",
+            "candidate 0 failed transport ({}) - falling back to the single-send path",
             results[0].as_ref().unwrap_err()
         );
         return FanOut::Skip;
@@ -295,7 +295,7 @@ pub(crate) async fn fan_out(
     let hdr = patch_winner(winner_val, &others, n, used);
     let status = *status;
     let raw = raw.clone();
-    // A non-JSON winner body (degenerate case — the ladder ranks those
+    // A non-JSON winner body (degenerate case - the ladder ranks those
     // last) keeps its raw bytes so error text survives reconstruction.
     let body = if winner_val.is_null() {
         raw.clone()
@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(decide_n(0, 0, 2), (1, Some("headroom")));
         assert_eq!(decide_n(0, 1, 2), (1, Some("headroom")));
         // Partial shrink that still runs: header's asked/used already
-        // tells the truth — no extra reason.
+        // tells the truth - no extra reason.
         assert_eq!(decide_n(0, 3, 4), (3, None));
         // Full headroom: run the ask as-is.
         assert_eq!(decide_n(0, 8, 2), (2, None));

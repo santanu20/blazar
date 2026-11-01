@@ -12,7 +12,7 @@
 //!
 //! Scope note (F78): the middleware sees the header on ANY lane, but
 //! only the JSON-body lanes (chat/generate/embeddings) carry the model
-//! name inside the parsed body the pin reads — multipart lanes (whisper
+//! name inside the parsed body the pin reads - multipart lanes (whisper
 //! audio, file uploads) never pin because they carry no model field to
 //! pin against.
 
@@ -29,7 +29,7 @@ use crate::state::AppState;
 /// Header name (lowercase, HTTP/1.1 canonical form as received).
 pub const SESSION_HEADER: &str = "x-blazar-session";
 
-/// Session-name ceiling — same policy as checkpoint filenames.
+/// Session-name ceiling - same policy as checkpoint filenames.
 const MAX_SESSION_NAME: usize = 128;
 
 /// Buffer cap for the header-carrying path. Matches the gateway's global
@@ -40,7 +40,7 @@ const PIN_BODY_CAP: usize = 50 * 1024 * 1024;
 
 /// Pure decision core of [`pin_mw`]: given the feature switch, the raw
 /// header value, the buffered body and the model store, return the
-/// `(session, canonical model)` to pin — or `None` (pass through
+/// `(session, canonical model)` to pin - or `None` (pass through
 /// untouched). Every gate (feature off, invalid/oversized name,
 /// unparseable body, missing model, unresolvable model) is `None`.
 fn pin_target(
@@ -66,7 +66,7 @@ fn pin_target(
 }
 
 /// Session-pin touch point (see module docs). Feature off
-/// (`session_keep_secs = 0`) or header absent/invalid → untouched
+/// (`session_keep_secs = 0`) or header absent/invalid -> untouched
 /// pass-through, zero work; otherwise the body is buffered once, the
 /// target model resolved to its canonical name, and the registry
 /// touched before the request continues downstream.
@@ -75,7 +75,7 @@ pub async fn pin_mw(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Cheap gates first: feature off or no usable header → the request
+    // Cheap gates first: feature off or no usable header -> the request
     // flows on untouched, no buffering, no locks (H4).
     if state.config.session_keep_secs == 0 {
         return next.run(req).await;
@@ -97,7 +97,7 @@ pub async fn pin_mw(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 axum::Json(serde_json::json!({
                     "error": {"type": "blazar_error", "code": 413, "blazar_code": "PAYLOAD_TOO_LARGE", "message": format!(
-                        "x-blazar-session pinning buffers the request body (cap {PIN_BODY_CAP} bytes): {e} — resend without the header or shrink the body"
+                        "x-blazar-session pinning buffers the request body (cap {PIN_BODY_CAP} bytes): {e} - resend without the header or shrink the body"
                     )}
                 })),
             )
@@ -105,7 +105,7 @@ pub async fn pin_mw(
         }
     };
     // Best-effort model resolution: unresolvable models (remote routes,
-    // typos) never pin — the request passes through untouched. The
+    // typos) never pin - the request passes through untouched. The
     // cached-connection visit is fully synchronous (guard never crosses
     // the `next.run` await below).
     if let Some((session, model)) = state
@@ -125,7 +125,7 @@ pub async fn pin_mw(
         .await
 }
 
-/// GET /api/sessions — live pins (observability: `blazar` tooling, live
+/// GET /api/sessions - live pins (observability: `blazar` tooling, live
 /// validation, agent dashboards). Oldest idle first.
 pub async fn list(State(state): State<Arc<AppState>>) -> Response {
     let ttl = std::time::Duration::from_secs(state.config.session_keep_secs);

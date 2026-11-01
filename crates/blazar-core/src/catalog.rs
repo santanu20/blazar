@@ -8,7 +8,7 @@ use crate::error::{CoreError, CoreResult};
 /// verified to exist and be publicly pullable via the HF API
 /// (GET /api/models/{repo} -> 200, gated=false) at catalog-freeze time.
 /// The registry name shown to users is ALWAYS the real repo name
-/// (lowercased, `-gguf` suffix stripped) — never a marketing alias.
+/// (lowercased, `-gguf` suffix stripped) - never a marketing alias.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CatalogEntry {
     /// Short name users type, e.g. "qwen3-coder-30b".
@@ -166,7 +166,7 @@ pub fn split_lora_suffix(requested: &str) -> (&str, Option<&str>) {
 /// the adapter per request by that exact name (its native
 /// `base:adapter` model syntax). This mirrors the supervisor's lane
 /// resolution (file-name OR file-stem match, exactly one) so every
-/// spelling it accepts maps to the name the child actually registered —
+/// spelling it accepts maps to the name the child actually registered -
 /// including the dotted-directory edge (`.../my.adapter.v2` matches a
 /// `+my.adapter.v2` request but registers as `my.adapter`).
 /// `None` = no unambiguous match (the caller's own teaching covers it).
@@ -204,13 +204,13 @@ mod tests {
             row(1, "/models/adapters/anonymizer"),
             row(2, "/models/adapters/my.adapter.v2"),
         ];
-        // Plain stem → the registered (file-stem) name.
+        // Plain stem -> the registered (file-stem) name.
         assert_eq!(
             lora_registered_name(&rows, "anonymizer").as_deref(),
             Some("anonymizer")
         );
         // Dotted directory: a file-name spelling registers under the
-        // file STEM — the colon stamp must use that name.
+        // file STEM - the colon stamp must use that name.
         assert_eq!(
             lora_registered_name(&rows, "my.adapter.v2").as_deref(),
             Some("my.adapter")
@@ -243,7 +243,7 @@ mod tests {
         // catalog (mirrors the resolve_draft_path pins).
         assert!(pair_for_spec_mode("qwen3-8b", "auto").is_some());
         assert!(pair_for_spec_mode("qwen3-8b", "eagle3").is_some());
-        // File-less modes never consume an external draft — at any
+        // File-less modes never consume an external draft - at any
         // model, regardless of catalog content.
         for mode in ["off", "mtp", "ngram", "ngram-map-k", "ngram-mod"] {
             assert!(
@@ -321,12 +321,12 @@ mod tests {
 
     #[test]
     fn unit__spec_pair_typed__eagle3_pair_order_preserved() {
-        // Typed lookup finds the eagle3 head for the exact family…
+        // Typed lookup finds the eagle3 head for the exact family...
         let pair =
             spec_pair_for_typed("qwen3-8b", "draft-eagle3").expect("qwen3-8b has an eagle3 pair");
         assert_eq!(pair.spec_type, "draft-eagle3");
         assert!(pair.draft_repo.starts_with("williamliao/Qwen3-8B-EAGLE3"));
-        // …while untyped auto lookup on the SAME name keeps the generic
+        // ...while untyped auto lookup on the SAME name keeps the generic
         // draft-simple sibling (order in catalog.json is precedence).
         assert_eq!(
             spec_pair_for("qwen3-8b").expect("auto pair").spec_type,

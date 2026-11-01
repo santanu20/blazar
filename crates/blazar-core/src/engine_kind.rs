@@ -1,7 +1,7 @@
 //! Engine kind: which upstream project an installed engine row belongs
 //! to. Drives repo/asset resolution, manifest probing, profile argv
 //! compilation, and gateway feature gating. Stored in the `engines.kind`
-//! column (string-backed, default `llamacpp`) — the single source of
+//! column (string-backed, default `llamacpp`) - the single source of
 //! truth; the manifest JSON never duplicates it.
 
 use std::fmt;
@@ -24,21 +24,21 @@ pub enum EngineKind {
     /// HF safetensors models, Linux CUDA/ROCm upstream).
     Sglang,
     /// leejet/stable-diffusion.cpp `sd-server` (prebuilt assets +
-    /// source build; diffusion/image component sets — never text).
+    /// source build; diffusion/image component sets - never text).
     SdCpp,
     /// ggml-org/whisper.cpp `whisper-server` (prebuilt assets; lazy
-    /// audio lane for transcription/translation — serves no model rows,
+    /// audio lane for transcription/translation - serves no model rows,
     /// so it never appears in format routing in either direction).
     Whisper,
     /// rhasspy/piper neural TTS (prebuilt assets; lazy audio lane for
-    /// speech synthesis — the gateway synthesizes per request through
+    /// speech synthesis - the gateway synthesizes per request through
     /// the one-shot `piper` CLI, so like Whisper it serves no model
     /// rows and never appears in format routing in either direction).
     Piper,
     /// ml-explore/mlx-lm `mlx_lm.server` (pip venv; MLX-format
-    /// community dirs — safetensors + a `quantization` block in
+    /// community dirs - safetensors + a `quantization` block in
     /// config.json. Backend matrix: `mlx-cuda` on Linux/NVIDIA,
-    /// `mlx` on Apple Silicon; MLX quants are lane-exclusive — no
+    /// `mlx` on Apple Silicon; MLX quants are lane-exclusive - no
     /// other kind decodes them).
     Mlx,
 }
@@ -72,7 +72,7 @@ impl EngineKind {
     /// bank speaks. Only `llama-server` (and router fronts built on
     /// it) implements it; every other lane's children would just 404,
     /// so the supervisor skips banking there instead of issuing dead
-    /// requests. Extend the match when a lane grows the API — the
+    /// requests. Extend the match when a lane grows the API - the
     /// predicate is the single gate both bank paths read.
     #[must_use]
     pub fn supports_slot_banks(self) -> bool {
@@ -83,7 +83,7 @@ impl EngineKind {
     /// pick the serving engine for one model from the installed kinds.
     ///
     /// GGUF runs everywhere but llamacpp's quant kernels are the
-    /// reference (mistral.rs is the overlap fallback) — for every
+    /// reference (mistral.rs is the overlap fallback) - for every
     /// policy, until a quant-matched mistral.rs GGUF row lands in the
     /// engine matrix (that experiment is pending).
     ///
@@ -91,7 +91,7 @@ impl EngineKind {
     /// throughput prefer sglang (0.612-vs-0.575 quality and
     /// 752-vs-509 tok/s conc4, engine matrix 2026-09-17); latency
     /// prefers mistral.rs (26-ms-vs-73-ms warm TTFT and 8-s-vs-92-s
-    /// cold boot — the F16 matrix run). Fallbacks keep the format
+    /// cold boot - the F16 matrix run). Fallbacks keep the format
     /// served when the preferred lane is not installed. `None` =
     /// nothing installed can serve the format (caller teaches; e.g.
     /// safetensors with only llamacpp installed).
@@ -100,11 +100,11 @@ impl EngineKind {
     /// candidate list to sglang: mistral.rs prebuilt builds dequant
     /// these checkpoints broken (live-proven v0.9.3: dtype-mismatch
     /// empty 200s on default dtype; f16 workaround emits garbage
-    /// tokens) while the same lanes serve BF16 dirs perfectly — so a
+    /// tokens) while the same lanes serve BF16 dirs perfectly - so a
     /// quantized dir routes sglang-only, and an absent sglang teaches
     /// instead of routing into a known-broken lane.
     ///
-    /// `mlx` (MLX-format community dirs — safetensors with an MLX
+    /// `mlx` (MLX-format community dirs - safetensors with an MLX
     /// `quantization` block) routes Mlx-only and is checked BEFORE the
     /// quantized arm: MLX quants share the safetensors+quantized shape
     /// but only mlx-lm decodes the layout, so a present sglang must not
@@ -141,7 +141,7 @@ impl EngineKind {
             return installed.iter().copied().find(|k| *k == EngineKind::SdCpp);
         }
         match shape.shards {
-            // MLX gate: same one-kind domain rule — an MLX-format dir
+            // MLX gate: same one-kind domain rule - an MLX-format dir
             // has exactly one decoder, and no preference order names
             // Mlx so other rows can never land on it. Matched before
             // the quantized arm: MLX dirs are quantized-safetensors-
@@ -159,7 +159,7 @@ impl EngineKind {
         prefer(primary, fallback)
     }
 
-    /// The policy-ordered candidate kinds for a format, best first —
+    /// The policy-ordered candidate kinds for a format, best first -
     /// the order [`route_format`](Self::route_format) tries and the
     /// order the CLI's just-in-time install offer recommends them in.
     #[must_use]
@@ -184,7 +184,7 @@ impl EngineKind {
 /// Typed [`serving_lane`] failure for callers that act on the reason
 /// (the CLI's just-in-time engine install offer) instead of only
 /// teaching. The rendered text is byte-identical to the historical
-/// string errors — it flows into API bodies and validate expectations.
+/// string errors - it flows into API bodies and validate expectations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneError {
     /// The model's engine pin names a kind with no installed row.
@@ -196,10 +196,10 @@ pub enum LaneError {
     /// sglang, the only lane that serves those.
     FormatUnserved { shape: FormatShape, roster: String },
     /// A diffusion component set (DiT+VAE+TE) with no sdcpp engine
-    /// installed — text lanes cannot serve it, so the teaching narrows
+    /// installed - text lanes cannot serve it, so the teaching narrows
     /// to the one lane that can.
     DiffusionUnserved { roster: String },
-    /// An MLX-format community dir with no mlx engine installed — the
+    /// An MLX-format community dir with no mlx engine installed - the
     /// MLX quant layout is lane-exclusive, so the teaching narrows to
     /// the one lane that can decode it.
     MlxUnserved { roster: String },
@@ -207,7 +207,7 @@ pub enum LaneError {
 
 impl LaneError {
     /// Kinds whose installation would unblock this model, best first.
-    /// Empty = installing nothing helps (unknown pin) — caller teaches.
+    /// Empty = installing nothing helps (unknown pin) - caller teaches.
     #[must_use]
     pub fn missing_kinds(&self, policy: crate::config::RoutingPolicy) -> Vec<EngineKind> {
         match self {
@@ -231,23 +231,23 @@ impl fmt::Display for LaneError {
         match self {
             Self::PinKindMissing { kind, roster } => write!(
                 f,
-                "no {kind} engine installed — blazar engine install --kind {kind} (installed: {roster})"
+                "no {kind} engine installed - blazar engine install --kind {kind} (installed: {roster})"
             ),
             Self::PinUnknown { pin, roster } => write!(
                 f,
-                "model engine pin \"{pin}\" matches no installed tag or kind — installed: {roster}"
+                "model engine pin \"{pin}\" matches no installed tag or kind - installed: {roster}"
             ),
             Self::FormatUnserved { shape, roster }
                 if shape.shards == ShardFormat::QuantizedSafetensors =>
             {
                 write!(
                     f,
-                    "no installed engine serves quantized safetensors (AWQ/GPTQ/FP8) — sglang is the lane for those; blazar engine install --kind sglang (installed: {roster})"
+                    "no installed engine serves quantized safetensors (AWQ/GPTQ/FP8) - sglang is the lane for those; blazar engine install --kind sglang (installed: {roster})"
                 )
             }
             Self::FormatUnserved { shape, roster } => write!(
                 f,
-                "no installed engine serves the {} format — install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: {roster}",
+                "no installed engine serves the {} format - install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: {roster}",
                 if shape.shards.is_dir() {
                     "safetensors"
                 } else {
@@ -257,13 +257,13 @@ impl fmt::Display for LaneError {
             Self::DiffusionUnserved { roster } => write!(
                 f,
                 "no installed engine serves diffusion component sets (DiT+VAE+text-encoder) \
-                 — sdcpp is the lane for those; blazar engine install --kind sdcpp \
+                 - sdcpp is the lane for those; blazar engine install --kind sdcpp \
                  (installed: {roster})"
             ),
             Self::MlxUnserved { roster } => write!(
                 f,
                 "no installed engine serves MLX-format models (mlx-community dirs) \
-                 — mlx is the lane for those; blazar engine install --kind mlx \
+                 - mlx is the lane for those; blazar engine install --kind mlx \
                  (installed: {roster})"
             ),
         }
@@ -272,9 +272,9 @@ impl fmt::Display for LaneError {
 
 /// The single routing decision both the supervisor (adapter pick at
 /// spawn) and the gateway (per-child protocol quirks, e.g. mistral.rs's
-/// `default` model id) consult — one source so they can never disagree.
+/// `default` model id) consult - one source so they can never disagree.
 ///
-/// `pin` = the per-model `engine = "…"` override (exact tag first, then
+/// `pin` = the per-model `engine = "..."` override (exact tag first, then
 /// kind), `global` = the daemon's active engine kind, `installed` =
 /// (tag, kind) rows newest-first. `Ok(None)` = serve on the global lane,
 /// Provenance class of an installed lane, used as the tiebreak when
@@ -289,7 +289,7 @@ pub enum LaneClass {
     Fork,
 }
 
-/// The model's shard shape on disk — what the router discriminates on,
+/// The model's shard shape on disk - what the router discriminates on,
 /// independent of how it is served. The variants are mutually exclusive
 /// by construction: a model is exactly one of these shapes, and each
 /// carries a different decoder contract.
@@ -301,9 +301,9 @@ pub enum ShardFormat {
     /// A directory of plain HF safetensors shards.
     SafetensorsDir,
     /// Safetensors shards carrying a quantization block (AWQ/GPTQ/FP8)
-    /// — only sglang decodes those.
+    /// - only sglang decodes those.
     QuantizedSafetensors,
-    /// MLX `quantization` layout — only mlx-lm decodes it. Quant-
+    /// MLX `quantization` layout - only mlx-lm decodes it. Quant-
     /// safetensors-shaped, but a different decoder contract, so it
     /// outranks the quantized arm in every cascade.
     MlxLayout,
@@ -341,7 +341,7 @@ impl ShardFormat {
 /// read identically once shuffled, and the shuffle is the bug).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FormatShape {
-    /// Diffusion component set (DiT+VAE+TE) — the image domain gate,
+    /// Diffusion component set (DiT+VAE+TE) - the image domain gate,
     /// orthogonal to the shard format: diffusion models ship as
     /// safetensors dirs, and the domain, not the container, routes
     /// them.
@@ -364,7 +364,7 @@ pub fn serving_lane(
     serving_lane_typed(mode, policy, pin, shape, global, installed).map_err(|e| e.to_string())
 }
 
-/// [`serving_lane`] with the failure reason typed — callers that act on
+/// [`serving_lane`] with the failure reason typed - callers that act on
 /// the reason (CLI just-in-time install offer) read the variant; every
 /// other caller keeps the string form.
 pub fn serving_lane_typed(
@@ -409,7 +409,7 @@ pub fn serving_lane_typed(
         Some(kind) if kind == global => Ok(None),
         // `kinds` is built from `installed`, so a matching lane always
         // exists; the None arm is pure type-shape. Among same-kind
-        // lanes a Mainstream build wins over a Fork shim — a fork
+        // lanes a Mainstream build wins over a Fork shim - a fork
         // exists to serve architectures mainline lacks, so overlaps
         // (same arch in both) belong on the maintained build. Stable
         // min_by_key keeps the caller's order (newest first) inside
@@ -444,14 +444,14 @@ pub fn sglang_child_model_name(row_name: &str) -> String {
 }
 
 /// Borrowed lane view for [`advertising_lanes`]: (tag, routing class,
-/// mined GGUF arch set — `None` = nothing mined, advertises nothing).
+/// mined GGUF arch set - `None` = nothing mined, advertises nothing).
 pub type LaneArchView<'a> = (
     &'a str,
     LaneClass,
     Option<&'a std::collections::BTreeSet<String>>,
 );
 
-/// Lanes the spawn-time capability rescue considers for `arch` — the
+/// Lanes the spawn-time capability rescue considers for `arch` - the
 /// ONE preference rule shared by the supervisor's rescue and every
 /// listing preview (list ENGINE cell, /api/tags, /v1/models): among
 /// installed llama.cpp lanes whose mined arch set advertises the
@@ -472,7 +472,7 @@ pub fn advertising_lanes<'a>(
         .map(|(t, class, _)| (*t, *class))
         .collect();
     // Stable sort: mainstream first, caller order preserved inside each
-    // class — byte-for-byte the supervisor's rescue pick.
+    // class - byte-for-byte the supervisor's rescue pick.
     hits.sort_by_key(|(_, class)| u8::from(*class == LaneClass::Fork));
     hits.into_iter().map(|(tag, _)| tag).collect()
 }
@@ -649,7 +649,7 @@ mod tests {
         );
 
         // Quantized safetensors (AWQ/GPTQ/FP8): sglang-only, every
-        // policy — mistral.rs dequant is broken on these checkpoints
+        // policy - mistral.rs dequant is broken on these checkpoints
         // (live-proven v0.9.3), so it must never be the fallback, and
         // a latency policy must not flip a quantized dir onto it.
         assert_eq!(
@@ -669,14 +669,14 @@ mod tests {
             None,
             "quantized dir with no sglang = unservable (teach), never mistral.rs"
         );
-        // GGUF ignores the quantized flag — GGUF quants are their own
+        // GGUF ignores the quantized flag - GGUF quants are their own
         // well-served lane. Under the enum that contract lives in
         // detect(): a quant signal outside a shard directory maps to
         // the GGUF shape, so the router never sees a "quantized GGUF".
         assert_eq!(ShardFormat::detect(false, true, false), GgufFile);
 
         // Overlap fallbacks: GGUF without llamacpp, safetensors without
-        // sglang — both land on mistral.rs.
+        // sglang - both land on mistral.rs.
         assert_eq!(
             EngineKind::route_format(shape(false, GgufFile), &[MistralRs, Sglang], Quality),
             Some(MistralRs)
@@ -706,7 +706,7 @@ mod tests {
         );
 
         // Domain gate (sd.cpp lane): text formats never route onto the
-        // image engine — an sdcpp-only box teaches FormatUnserved, and
+        // image engine - an sdcpp-only box teaches FormatUnserved, and
         // an installed sdcpp lane is invisible beside text kinds.
         assert_eq!(
             EngineKind::route_format(shape(false, GgufFile), &[EngineKind::SdCpp], Quality),
@@ -742,7 +742,7 @@ mod tests {
         use crate::config::RoutingPolicy::Quality;
         use EngineKind::{LlamaCpp, SdCpp, Sglang};
 
-        // A diffusion component set routes to sdcpp and ONLY sdcpp —
+        // A diffusion component set routes to sdcpp and ONLY sdcpp -
         // every text lane is unroutable for the row, whatever else is
         // installed (GGUF-format DiT would otherwise prefer llamacpp).
         let mixed = [SdCpp, LlamaCpp, Sglang];
@@ -754,9 +754,9 @@ mod tests {
             EngineKind::route_format(shape(true, SafetensorsDir), &mixed, Quality),
             Some(SdCpp)
         );
-        // Reverse gate: text rows can never land on the image engine —
+        // Reverse gate: text rows can never land on the image engine -
         // the preference orders do not name it (pinned in the sibling
-        // test via [SdCpp, LlamaCpp] GGUF→LlamaCpp and safetensors→None).
+        // test via [SdCpp, LlamaCpp] GGUF->LlamaCpp and safetensors->None).
         assert_eq!(
             EngineKind::route_format(shape(false, GgufFile), &[SdCpp], Quality),
             None
@@ -791,7 +791,7 @@ mod tests {
             .missing_kinds(Quality),
             Vec::<EngineKind>::new()
         );
-        // A diffusion set has exactly one unblocking kind — and its
+        // A diffusion set has exactly one unblocking kind - and its
         // teaching names the install command for it.
         let diff = LaneError::DiffusionUnserved {
             roster: roster.clone(),
@@ -829,7 +829,7 @@ mod tests {
             .missing_kinds(Quality),
             vec![LlamaCpp, MistralRs]
         );
-        // Quantized safetensors offer narrows to sglang alone — the
+        // Quantized safetensors offer narrows to sglang alone - the
         // JIT install menu must not recommend a known-broken lane.
         assert_eq!(
             LaneError::FormatUnserved {
@@ -845,12 +845,12 @@ mod tests {
                 roster: "b1 (llamacpp)".to_string()
             }
             .to_string(),
-            "no installed engine serves quantized safetensors (AWQ/GPTQ/FP8) — sglang is the lane for those; blazar engine install --kind sglang (installed: b1 (llamacpp))"
+            "no installed engine serves quantized safetensors (AWQ/GPTQ/FP8) - sglang is the lane for those; blazar engine install --kind sglang (installed: b1 (llamacpp))"
         );
     }
 
     /// The typed errors must render BYTE-IDENTICAL to the historical
-    /// string errors — the text flows into API bodies and validate
+    /// string errors - the text flows into API bodies and validate
     /// expectations; parity is the contract.
     #[test]
     fn unit__serving_lane_error_text__byte_identical_to_historical() {
@@ -899,7 +899,7 @@ mod tests {
         .to_string();
         assert_eq!(
             fmt_typed,
-            "no installed engine serves the safetensors format — install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: b1 (llamacpp)"
+            "no installed engine serves the safetensors format - install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: b1 (llamacpp)"
         );
     }
 

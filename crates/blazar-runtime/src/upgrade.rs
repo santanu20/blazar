@@ -1,8 +1,8 @@
-//! `blazar upgrade` — self-update from GitHub Releases.
+//! `blazar upgrade` - self-update from GitHub Releases.
 //!
 //! Mirrors `scripts/install.sh` exactly: same asset naming
 //! (`blazar-{tag}-{triple}.tar.gz|.zip`, flat root), same digest source
-//! (the release API's `digest: sha256:…` field, verified by
+//! (the release API's `digest: sha256:...` field, verified by
 //! `GhClient::download_asset_bytes` before anything touches disk), same
 //! gnu-before-musl platform preference. `BLAZAR_INSTALL_BASE_URL` and
 //! `BLAZAR_VERSION` behave as in the installer, which is what the tests
@@ -33,7 +33,7 @@ fn downgrade_note(tag: &str, current: &str) -> String {
         .zip(semver_triple(current))
         .is_some_and(|(target, running)| target < running);
     if older {
-        format!(" — downgrade from {current} (rollback path)")
+        format!(" - downgrade from {current} (rollback path)")
     } else {
         String::new()
     }
@@ -42,7 +42,7 @@ fn downgrade_note(tag: &str, current: &str) -> String {
 /// Resolve + verify + replace in one call. Returns the human summary.
 ///
 /// `dry_run` resolves and downloads (verifying the digest) but replaces
-/// nothing — it proves the whole chain except the final rename.
+/// nothing - it proves the whole chain except the final rename.
 pub async fn run(
     client: &GhClient,
     repo: &str,
@@ -175,7 +175,7 @@ pub fn extract_binary(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
 /// Atomic self-replace. Unix: sibling temp + rename over the running exe
 /// (the old inode stays alive for the current process; a running daemon
 /// picks the new binary up on next start). Windows cannot rename over a
-/// running exe — the new binary is parked next to it with instructions.
+/// running exe - the new binary is parked next to it with instructions.
 pub fn replace_current_exe(binary: &[u8]) -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("resolve current exe path")?;
     // Append instead of with_extension: a versioned binary name
@@ -198,7 +198,7 @@ pub fn replace_current_exe(binary: &[u8]) -> Result<std::path::PathBuf> {
     {
         let _ = &exe;
         bail!(
-            "Windows cannot replace a running exe; staged binary at {} — stop blazar, then move it over {}",
+            "Windows cannot replace a running exe; staged binary at {} - stop blazar, then move it over {}",
             staged.display(),
             exe.display()
         );
@@ -227,7 +227,7 @@ mod tests {
     fn unit__downgrade_note__older_target_flags_rollback_only() {
         assert_eq!(
             downgrade_note("v0.13.0", "0.14.0"),
-            " — downgrade from 0.14.0 (rollback path)"
+            " - downgrade from 0.14.0 (rollback path)"
         );
         // Newer, equal, and unparseable targets stay silent.
         assert_eq!(downgrade_note("v0.15.0", "0.14.0"), "");

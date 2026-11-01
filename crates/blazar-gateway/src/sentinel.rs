@@ -1,7 +1,7 @@
 //! Sentinel: warn-only response-semantics observation (the semantic
 //! reliability layer). The gateway proves the pipe works; the sentinel
-//! checks whether the *semantic operation* succeeded — truncation,
-//! tool-call validity, schema violations, empty replies, stalls — and
+//! checks whether the *semantic operation* succeeded - truncation,
+//! tool-call validity, schema violations, empty replies, stalls - and
 //! surfaces each with a fix hint. It never alters bytes: request and
 //! response bodies pass through untouched, observation happens on a
 //! side-channel (bounded, drop-with-degraded-flag), so it can neither
@@ -30,7 +30,7 @@ const MAX_CARRY_BYTES: usize = 1 << 20;
 /// only; re-compiling a hot schema is off the request path).
 const SCHEMA_CACHE_CAP: usize = 32;
 /// Enforce path: non-stream bodies larger than this pass through
-/// unenforced (loudly) — buffering unbounded bodies is never worth it.
+/// unenforced (loudly) - buffering unbounded bodies is never worth it.
 pub const ENFORCE_BODY_CAP: usize = 4 << 20;
 /// Violations `sentinel_enforce` may hard-fail (422). Deliberately
 /// excludes the empty-response class: a weird-but-valid completion is
@@ -50,7 +50,7 @@ const NEAR_LIMIT_TENTHS: u64 = 9;
 /// Detection vocabulary. `as_str` is the machine code (response headers,
 /// `/api/why` consumers); `hint` is the human fix. `rename_all` keeps the
 /// derive path (persisted `run/sentinel.jsonl`, doctor's offline scan) on
-/// the same `snake_case` spelling as `as_str` — the two spellings diverged
+/// the same `snake_case` spelling as `as_str` - the two spellings diverged
 /// once (derive = `PascalCase`, display = `snake`) and doctor's
 /// `blazar why --code` hint dead-ended against the filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -111,18 +111,18 @@ impl Code {
                 "stream alive but no chunks for the stall threshold (swap thrash / CPU fallback?)"
             }
             Self::TemplateNoTools => {
-                "request carries tools but the model's chat template has no tool support — expect plain text instead of tool calls"
+                "request carries tools but the model's chat template has no tool support - expect plain text instead of tool calls"
             }
             Self::CacheBustSystem => {
-                "system prompt or tools mutate between turns on a stable conversation — every turn re-prefills from scratch (KV cache busted). If unintended, keep the system prompt byte-stable (move counters/timestamps to the last user message)"
+                "system prompt or tools mutate between turns on a stable conversation - every turn re-prefills from scratch (KV cache busted). If unintended, keep the system prompt byte-stable (move counters/timestamps to the last user message)"
             }
             Self::EngineSlowAttn => {
-                "this model's engine child logged a flash-attention KV-type degrade: attention runs through an f16-conversion (or CPU) path — much slower prefill/decode for every request until the child respawns"
+                "this model's engine child logged a flash-attention KV-type degrade: attention runs through an f16-conversion (or CPU) path - much slower prefill/decode for every request until the child respawns"
             }
         }
     }
 
-    /// The exact retry policy per code — what an agent loop should DO
+    /// The exact retry policy per code - what an agent loop should DO
     /// next, not just what went wrong.
     #[must_use]
     pub fn retry_hint(self) -> &'static str {
@@ -134,16 +134,16 @@ impl Code {
                 "retry: trim history or raise ctx before sending the next request"
             }
             Self::ToolArgsInvalidJson => {
-                "retry: one repair round-trip — resend with the parse error quoted back to the model"
+                "retry: one repair round-trip - resend with the parse error quoted back to the model"
             }
             Self::ToolNameUnknown => {
-                "retry: one repair round-trip — name the valid tools in the repair prompt"
+                "retry: one repair round-trip - name the valid tools in the repair prompt"
             }
             Self::SchemaViolation => {
-                "retry: one repair round-trip — include the schema error and the schema in the prompt"
+                "retry: one repair round-trip - include the schema error and the schema in the prompt"
             }
             Self::EmptyResponse => {
-                "retry: resend once; persistent empties point at ctx/template config — `blazar doctor`"
+                "retry: resend once; persistent empties point at ctx/template config - `blazar doctor`"
             }
             Self::ReasoningNoAnswer => {
                 "retry: resend (reasoning consumed the budget); persistent -> raise max tokens or switch reasoning_format"
@@ -155,10 +155,10 @@ impl Code {
                 "no retry will help: pull a tool-capable model (template with tool markers) for tool work"
             }
             Self::CacheBustSystem => {
-                "no retry needed — advisory: stabilize the client system prompt to restore full prefix-cache reuse"
+                "no retry needed - advisory: stabilize the client system prompt to restore full prefix-cache reuse"
             }
             Self::EngineSlowAttn => {
-                "no retry needed — advisory: prefer f16/q8_0/q4_0 cache pairs for this model, rebuild the engine with the missing GGML_CUDA_FA_QUANTS pair, or run `blazar tune` to measure pairs; the flag clears when the child respawns"
+                "no retry needed - advisory: prefer f16/q8_0/q4_0 cache pairs for this model, rebuild the engine with the missing GGML_CUDA_FA_QUANTS pair, or run `blazar tune` to measure pairs; the flag clears when the child respawns"
             }
         }
     }
@@ -171,7 +171,7 @@ pub struct Detection {
 }
 
 /// Does one parsed stream frame carry generation progress (content,
-/// text, or usage)? Keepalive-class frames — comments, empty deltas —
+/// text, or usage)? Keepalive-class frames - comments, empty deltas -
 /// do not: they keep the wire alive while the child produces nothing.
 fn event_shows_progress(v: &Value) -> bool {
     if v.get("usage").is_some_and(|u| !u.is_null()) {
@@ -196,7 +196,7 @@ fn event_shows_progress(v: &Value) -> bool {
 
 /// One observed request: what the model returned and what was wrong with
 /// it. Bounded in-memory ring + bounded JSONL under `run/` (persistence:
-/// `blazar why` survives daemon restarts). Metadata only — never content.
+/// `blazar why` survives daemon restarts). Metadata only - never content.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SentinelRecord {
     pub trace: String,
@@ -205,8 +205,8 @@ pub struct SentinelRecord {
     pub model: String,
     pub status: u16,
     pub stream: bool,
-    /// Engine `finish_reason` (stop / length / `tool_calls` …). `length` on a
-    /// small completion = client budget cap; near ctx = real truncation —
+    /// Engine `finish_reason` (stop / length / `tool_calls` ...). `length` on a
+    /// small completion = client budget cap; near ctx = real truncation -
     /// one glance separates the two in `why`.
     pub finish: Option<String>,
     pub detections: Vec<Detection>,
@@ -275,7 +275,7 @@ pub struct RequestCtx {
     /// Active engine-child degrade for THIS model (flash-attention
     /// KV-type conversion line from the child's stderr; see
     /// `blazar_runtime::degrades`). `Some(line)` stamps the record and the
-    /// `x-blazar-warnings` header — the degrade outlives any single
+    /// `x-blazar-warnings` header - the degrade outlives any single
     /// request, so every affected request carries it.
     pub child_degrade: Option<String>,
 }
@@ -308,7 +308,7 @@ pub fn parse_request_ctx(
 
 /// Strict tool-definition lint (`OpenAI` strict subset): a `strict: true`
 /// function def must be an object schema with `additionalProperties:
-/// false` and EVERY property listed in `required` — and every declared
+/// false` and EVERY property listed in `required` - and every declared
 /// schema (strict or not) must compile. Returns the first teaching
 /// error; None = clean or no tools. This is request-side: catch a broken
 /// def BEFORE the model wastes a turn producing calls nothing accepts.
@@ -361,20 +361,20 @@ pub fn strict_tool_def_error(body: &Value) -> Option<String> {
     None
 }
 
-/// Raw GBNF grammar size cap the gateway will forward (256 KiB — far
+/// Raw GBNF grammar size cap the gateway will forward (256 KiB - far
 /// beyond any sane grammar, small enough to bound request memory).
 pub const MAX_GRAMMAR_BYTES: usize = 256 * 1024;
 
 /// Structured-output request lint (R9): top-level sanity for ollama
 /// `format`, raw `grammar`, and a client-sent `response_format` BEFORE
-/// admission — a malformed schema or an over-sized grammar fails fast
+/// admission - a malformed schema or an over-sized grammar fails fast
 /// with a teaching error instead of loading a model to die at the child
 /// (or being silently ignored). Deliberately TOP-LEVEL ONLY: no
-/// recursion, no `$ref` resolution — anything the child's converter
+/// recursion, no `$ref` resolution - anything the child's converter
 /// accepts deeper in the schema passes untouched.
 #[must_use]
 pub fn structured_output_error(body: &Value) -> Option<String> {
-    // Raw GBNF grammar: forwarded verbatim downstream — type and cap.
+    // Raw GBNF grammar: forwarded verbatim downstream - type and cap.
     let mut grammar_set = false;
     if let Some(g) = body.get("grammar").filter(|v| !v.is_null()) {
         match g.as_str() {
@@ -393,7 +393,7 @@ pub fn structured_output_error(body: &Value) -> Option<String> {
     }
     // ollama `format`: absent/null = unconstrained, "json" = JSON mode,
     // object = structured schema. Anything else was silently ignored
-    // before — now it fails fast.
+    // before - now it fails fast.
     if let Some(fmt) = body.get("format").filter(|v| !v.is_null()) {
         match fmt {
             Value::String(s) if s == "json" => {}
@@ -406,7 +406,7 @@ pub fn structured_output_error(body: &Value) -> Option<String> {
                 // Mirrors the child's json_schema+grammar mutual exclusion.
                 if grammar_set {
                     return Some(
-                        "cannot use both format (schema) and grammar — the engine rejects the pair"
+                        "cannot use both format (schema) and grammar - the engine rejects the pair"
                             .into(),
                     );
                 }
@@ -418,7 +418,7 @@ pub fn structured_output_error(body: &Value) -> Option<String> {
         }
     }
     // Client-sent `response_format` (OpenAI shape) is NOT consumed on the
-    // ollama lane — but if present and malformed, say so instead of
+    // ollama lane - but if present and malformed, say so instead of
     // silently dropping it. Mirrors the child's accepted type set
     // (server-common.cpp:1168-1180: json_object / json_schema / empty).
     if let Some(rf) = body.get("response_format").filter(|v| !v.is_null()) {
@@ -504,7 +504,7 @@ pub fn template_has_tools(template: &str) -> bool {
 
 enum FeedEvent {
     /// Raw response bytes (SSE or JSON body; grammar fixed at `begin`).
-    /// Refcounted handle to the proxied chunk — no per-chunk copy on the
+    /// Refcounted handle to the proxied chunk - no per-chunk copy on the
     /// token hot path.
     Bytes(axum::body::Bytes),
     /// Pre-parsed OpenAI-shaped chunk/response (ollama-compat path).
@@ -577,7 +577,7 @@ pub fn request_ctx(
     sse: bool,
 ) -> (RequestCtx, Vec<&'static str>) {
     let (tool_names, tool_schemas, response_format, stream) = parse_request_ctx(body);
-    // Precheck: tools on a template without tool support — the
+    // Precheck: tools on a template without tool support - the
     // plain-text-instead-of-tool-calls root cause, known before inference.
     let template = if tool_names.is_empty() {
         None
@@ -599,7 +599,7 @@ pub fn request_ctx(
         warnings.push(Code::TemplateNoTools.as_str());
     }
     // Per-child degrade (flash-attention KV conversion etc.): correlate
-    // the model's live children against the runtime registry. Advisory —
+    // the model's live children against the runtime registry. Advisory -
     // the request still serves, but the header + record say why it is slow.
     let child_degrade = model_child_degrade(state, model);
     if child_degrade.is_some() {
@@ -619,7 +619,7 @@ pub fn request_ctx(
             .into_iter()
             .find(|p| p.name == model)
             // ctx == 0 marks lanes that manage their own window (mlx:
-            // compile_mlx reports 0 by design) — that is "unknown",
+            // compile_mlx reports 0 by design) - that is "unknown",
             // never a zero-token ceiling.
             .and_then(|p| (p.ctx > 0).then_some(p.ctx)),
         template,
@@ -669,7 +669,7 @@ struct PersistState {
     written: u64,
 }
 
-/// D6: bounded LRU caching verdicts of the pure request-side lints —
+/// D6: bounded LRU caching verdicts of the pure request-side lints -
 /// the same schema/grammar bytes always produce the same verdict, and
 /// `jsonschema::validator_for` (the expensive part) should run once per
 /// distinct schema, not once per request. No TTL: the inputs are pure.
@@ -723,7 +723,7 @@ impl VerdictCache {
 }
 
 /// FNV-1a over the compact serialization of exactly the fields a lint
-/// reads — two bodies identical in those fields share a verdict.
+/// reads - two bodies identical in those fields share a verdict.
 fn verdict_key(tag: u64, fields: &[&str], body: &Value) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ tag;
     for f in fields {
@@ -755,7 +755,7 @@ pub struct Sentinel {
     /// D6: lint verdicts (see [`VerdictCache`]).
     verdicts: Mutex<VerdictCache>,
     /// Bounded JSONL at `<run_dir>/sentinel.jsonl`; `None` = memory-only
-    /// (no run dir, or open failed — IO problems never take the daemon).
+    /// (no run dir, or open failed - IO problems never take the daemon).
     persist: Option<Mutex<PersistState>>,
     persist_path: Option<std::path::PathBuf>,
     /// Live tail for `blazar watch` / `GET /api/watch`: every committed
@@ -785,7 +785,7 @@ impl Sentinel {
         if let Some(dir) = run_dir {
             let path = dir.join("sentinel.jsonl");
             // Load history (best effort): corrupt lines are skipped, never
-            // fatal — one bad line must not erase the rest.
+            // fatal - one bad line must not erase the rest.
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 for line in raw.lines().filter(|l| !l.trim().is_empty()) {
                     if let Ok(r) = serde_json::from_str::<SentinelRecord>(line) {
@@ -831,7 +831,7 @@ impl Sentinel {
         self.enabled
     }
 
-    /// D6: cached structured-output lint — identical
+    /// D6: cached structured-output lint - identical
     /// (`grammar`, `format`, `response_format`) triples hit the verdict LRU.
     #[must_use]
     pub fn structured_output_error_cached(&self, body: &Value) -> Option<String> {
@@ -844,7 +844,7 @@ impl Sentinel {
         verdict
     }
 
-    /// D6: cached strict-tool-def lint — identical `tools` arrays hit
+    /// D6: cached strict-tool-def lint - identical `tools` arrays hit
     /// the verdict LRU (the `jsonschema::validator_for` compile runs
     /// once per distinct schema).
     #[must_use]
@@ -866,7 +866,7 @@ impl Sentinel {
     }
 
     /// Begin observing a request: spawns the analyzer and returns the
-    /// hot-path feed. Error statuses are recorded nowhere — the gateway
+    /// hot-path feed. Error statuses are recorded nowhere - the gateway
     /// already surfaces transport failures loudly.
     #[must_use]
     pub fn begin(self: &Arc<Self>, ctx: RequestCtx, status: u16, sse: bool) -> SentinelFeed {
@@ -889,7 +889,7 @@ impl Sentinel {
 
     /// Capability precheck: does this model's embedded template render
     /// tools? Cached per model; reads the GGUF header once.
-    /// `None` = no verdict (unreadable GGUF — doctor flags those).
+    /// `None` = no verdict (unreadable GGUF - doctor flags those).
     #[must_use]
     pub fn template_support(&self, model: &str, gguf_path: &Path) -> Option<TemplateSupport> {
         {
@@ -910,7 +910,7 @@ impl Sentinel {
 
     /// One silent stall window elapsed. J5 fires AT DETECTION for
     /// progress-less streams: the commit-time eviction runs only after
-    /// the stream ends — for a wedged stream that is whenever the
+    /// the stream ends - for a wedged stream that is whenever the
     /// CLIENT gives up. One grace window first: a slow first prefill
     /// is indistinguishable from a wedge until the SECOND consecutive
     /// silent window. Evicting there terminates the upstream body,
@@ -927,7 +927,7 @@ impl Sentinel {
             tracing::info!(
                 target: "blazar::sentinel",
                 model = %ctx.model,
-                "progress-less stalled child — eviction requested"
+                "progress-less stalled child - eviction requested"
             );
         }
     }
@@ -966,7 +966,7 @@ impl Sentinel {
         // "Ever produced a byte" separates a WEDGED child from a slow
         // one: a stream that has delivered anything may legitimately gap
         // past the stall window (slow prefill, chunked cadence) and must
-        // NEVER be evicted for it — only a zero-byte-since-open stream
+        // NEVER be evicted for it - only a zero-byte-since-open stream
         // (live evidence: two 600 s hangs, prompt_tokens null, no chunks
         // ever) is a wedge worth killing.
         let mut saw_any = false;
@@ -1002,7 +1002,7 @@ impl Sentinel {
                         }
                         let (events, _done, consumed) = tr::parse_sse(&carry);
                         carry.drain(..consumed);
-                        // Wedge axis: PROGRESS events seen — frames
+                        // Wedge axis: PROGRESS events seen - frames
                         // carrying content, text, or usage. A
                         // keepalive-class frame (comment, empty delta)
                         // flushes headers without progress: exactly the
@@ -1084,14 +1084,14 @@ impl Sentinel {
                 "{}", d.code.hint()
             );
             // J5: a stalled stream means the child is wedged (swap
-            // thrash / driver hang) — ask the supervisor to reap it so
+            // thrash / driver hang) - ask the supervisor to reap it so
             // the next request respawns clean instead of queueing
             // behind a zombie. Best-effort: the evict itself is async.
             if d.code == Code::StalledStream
                 && let Some(hook) = self.evict_hook.lock().clone()
             {
                 let _ = hook.0.send(record.model.clone());
-                tracing::info!(target: "blazar::sentinel", model = %record.model, "stalled child — eviction requested");
+                tracing::info!(target: "blazar::sentinel", model = %record.model, "stalled child - eviction requested");
             }
         }
         {
@@ -1113,7 +1113,7 @@ impl Sentinel {
     }
 
     /// Append one JSON line; rotate (rewrite with the newest rows) when
-    /// the file crosses its cap. IO failures log and continue — the ring
+    /// the file crosses its cap. IO failures log and continue - the ring
     /// in memory is always the source of truth for the current session.
     fn persist_record(&self, record: &SentinelRecord) {
         use std::io::Write as _;
@@ -1190,7 +1190,7 @@ impl Sentinel {
             // capping generation is the client's own request, not a fault
             // (ReasoningNoAnswer still catches the pathological pairing).
             // A 0 window is never real (mlx-style lanes report 0 for
-            // "managed inside the engine") — normalize it away, and with
+            // "managed inside the engine") - normalize it away, and with
             // no window at all there is nothing blazar can raise, so the
             // flag stays silent instead of guessing.
             let window = ctx.ctx.filter(|c| *c > 0);
@@ -1199,9 +1199,9 @@ impl Sentinel {
                     (p + c) * 10 >= u64::from(window) * NEAR_LIMIT_TENTHS
                 }
                 // usage unknown keeps the legacy flag (a real ceiling hit
-                // with broken usage reporting must not go silent)…
+                // with broken usage reporting must not go silent)...
                 (None, _, _) | (_, None, _) => true,
-                // …but an absent window never flags: mlx-style lanes
+                // ...but an absent window never flags: mlx-style lanes
                 // manage context inside the engine, so "raise default_ctx"
                 // is not a remediation blazar can offer.
                 (_, _, None) => false,
@@ -1238,14 +1238,14 @@ impl Sentinel {
                 if has_reasoning {
                     // Detail must name the budget when usage proves it:
                     // finish=length at N completion tokens is the client's
-                    // own max_tokens budget eaten by thinking — an
+                    // own max_tokens budget eaten by thinking - an
                     // answerable hint, not a mystery. Client-abort shape
                     // (finish/usage unknown) keeps the base sentence.
                     let budget = match (acc.finish.as_deref(), acc.usage_completion) {
                         (Some(f), Some(c)) => format!(
-                            " — finish={f} at {c} completion tokens (reasoning consumed the budget)"
+                            " - finish={f} at {c} completion tokens (reasoning consumed the budget)"
                         ),
-                        (Some(f), None) => format!(" — finish={f}"),
+                        (Some(f), None) => format!(" - finish={f}"),
                         _ => String::new(),
                     };
                     out.push(Detection {
@@ -1401,7 +1401,7 @@ impl Sentinel {
         Some(msg)
     }
 
-    /// Pure schema validity probe (no detection recording, no commit) —
+    /// Pure schema validity probe (no detection recording, no commit) -
     /// the best-of-N judge scores candidates with the same predicate the
     /// enforce path uses, without double-counting sentinel events.
     pub(crate) fn schema_check(&self, schema: &Value, instance: &Value) -> Option<String> {
@@ -1410,10 +1410,10 @@ impl Sentinel {
 }
 
 /// Assemble the finalized record (shared by the async analyzer and the
-/// synchronous enforce judge — one shape, no drift).
+/// synchronous enforce judge - one shape, no drift).
 /// True request latency: trace ids are minted at request start
 /// (`plm-<millis-hex>-seq`, from `request_log`), so the request's wall
-/// time decodes straight out of the id — no plumbing through handlers.
+/// time decodes straight out of the id - no plumbing through handlers.
 /// Fallback: the analyzer's own span (tests, extension-less calls).
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -1489,7 +1489,7 @@ fn preview(s: &str, n: usize) -> String {
     if t.chars().count() <= n {
         t.to_string()
     } else {
-        format!("{}…", t.chars().take(n).collect::<String>())
+        format!("{}...", t.chars().take(n).collect::<String>())
     }
 }
 
@@ -1533,7 +1533,7 @@ struct Accum {
     has_reasoning: bool,
     /// Logprob confidence (R2): per-token logprobs from
     /// choices[].logprobs.content[] when the client asked for them.
-    /// Display-only — no detection fires on these.
+    /// Display-only - no detection fires on these.
     lp_sum: f64,
     lp_min: Option<f64>,
     lp_tokens: u64,
@@ -1568,7 +1568,7 @@ impl Accum {
                 self.finish = Some(fr.to_string());
             }
             // Logprob confidence (R2): same shape on stream chunks and
-            // complete bodies — content[].logprob per token.
+            // complete bodies - content[].logprob per token.
             if let Some(lps) = choice
                 .pointer("/logprobs/content")
                 .and_then(Value::as_array)
@@ -1628,7 +1628,7 @@ impl Accum {
     }
 
     /// Responses-API grammar: streamed events carry `type`; the final
-    /// non-stream response object does not — both land here. Unknown
+    /// non-stream response object does not - both land here. Unknown
     /// event types are ignored by design (the surface evolves upstream).
     fn apply_responses(&mut self, ev: &Value) {
         if let Some(ty) = ev.get("type").and_then(Value::as_str) {
@@ -1729,7 +1729,7 @@ impl Accum {
                         if let Some(n) = item.get("name").and_then(Value::as_str) {
                             entry.name = n.to_string();
                         }
-                        // F61: bound like every sibling accumulator — a
+                        // F61: bound like every sibling accumulator - a
                         // body-limit-sized `arguments` string must not
                         // mirror into memory unbounded.
                         if let Some(a) = item.get("arguments").and_then(Value::as_str)
@@ -2011,7 +2011,7 @@ mod tests {
     #[test]
     fn unit__structured_output__happy_paths_pass() {
         // Absent / null / "json" / clean schema / empty grammar / clean
-        // response_format — all pass untouched.
+        // response_format - all pass untouched.
         for body in [
             serde_json::json!({"model": "m"}),
             serde_json::json!({"model": "m", "format": null, "grammar": null}),
@@ -2032,7 +2032,7 @@ mod tests {
     #[test]
     fn unit__structured_output__garbage_format_fails_fast() {
         // Unknown string / number / bool / array formats were silently
-        // ignored before R9 — now they 400.
+        // ignored before R9 - now they 400.
         for fmt in [
             serde_json::json!("nonsense"),
             serde_json::json!(5),
@@ -2104,7 +2104,7 @@ mod tests {
 
     #[test]
     fn unit__structured_output__exotic_valid_schemas_never_rejected() {
-        // Deep/compound keywords are the child converter's business —
+        // Deep/compound keywords are the child converter's business -
         // the gateway lint never recurses into them.
         let exotic = serde_json::json!({
             "model": "m",
@@ -2123,7 +2123,7 @@ mod tests {
 
     #[test]
     fn unit__structured_output__response_format_mirrors_child_type_set() {
-        // Unknown non-empty type → 400 (child: server-common.cpp:1180).
+        // Unknown non-empty type -> 400 (child: server-common.cpp:1180).
         let body = serde_json::json!({"model": "m", "response_format": {"type": "yaml"}});
         assert!(
             structured_output_error(&body)
@@ -2222,7 +2222,7 @@ mod tests {
     #[test]
     fn unit__finalize__zero_ctx_window_is_unknown_not_a_ceiling() {
         // BUG-9 pin (mlx lane): compile_mlx reports ctx 0 for "the
-        // engine manages its own window" — a zero/absent window must
+        // engine manages its own window" - a zero/absent window must
         // never fire near-limit or truncation detections.
         let s = Sentinel::new(true, 0, None);
         let acc = Accum {
@@ -2267,7 +2267,7 @@ mod tests {
     #[test]
     fn unit__accum__responses_object_args_bounded() {
         // F61: a body-limit-sized `arguments` string must not mirror into
-        // memory unbounded — the accumulator caps like every sibling.
+        // memory unbounded - the accumulator caps like every sibling.
         let mut acc = Accum::default();
         let huge = "x".repeat(MAX_ACCUM_BYTES + 1024);
         let ev = serde_json::json!({
@@ -2454,7 +2454,7 @@ mod tests {
     #[test]
     fn unit__filter_why_records__flagged_code_model_limit_reach() {
         // Ring of 20: the 12 NEWEST records clean, the 8 OLDEST flagged
-        // (the doctor dead-end shape — flagged history behind clean
+        // (the doctor dead-end shape - flagged history behind clean
         // traffic). Ring order here is oldest-first (append order); the
         // caller passes newest-first, so build the input reversed.
         let rec = |i: usize, flagged: bool, model: &str| SentinelRecord {
@@ -2489,7 +2489,7 @@ mod tests {
             .collect();
 
         // Default window (limit 10, no filters) misses every flagged
-        // record — the exact bug this helper exists to fix.
+        // record - the exact bug this helper exists to fix.
         let plain = filter_why_records(ring.clone(), None, None, false, 10);
         assert_eq!(plain.len(), 10);
         assert!(plain.iter().all(|r| r.detections.is_empty()));
@@ -2563,7 +2563,7 @@ mod tests {
     #[test]
     fn unit__accum__captures_every_upstream_grammar() {
         // Coverage pin: every response grammar any lane can feed the
-        // analyzer must land in the accumulator — a grammar the parser
+        // analyzer must land in the accumulator - a grammar the parser
         // silently drops becomes a 100% false-flag route (the
         // EmptyResponse incident on ollama-generate/openai-completions).
         // Chat non-stream (message carrier).
@@ -2816,7 +2816,7 @@ mod tests {
     #[tokio::test]
     async fn integration__analyze_sse_stream__budget_cap_not_ctx_truncated() {
         // Live incident shape (2026-09-06): finish_reason=length from a
-        // client max_tokens=64 cap, 83 tokens against a 16384 ctx — the
+        // client max_tokens=64 cap, 83 tokens against a 16384 ctx - the
         // budget is the client's own request, not a ctx-ceiling hit.
         let s = Sentinel::new(true, 0, None);
         let ctx = RequestCtx {
@@ -2847,7 +2847,7 @@ mod tests {
 
     #[tokio::test]
     async fn integration__analyze_sse_stream__usageless_length_still_flagged() {
-        // Streaming without a usage chunk cannot prove either way — the
+        // Streaming without a usage chunk cannot prove either way - the
         // legacy conservative flag stands.
         let s = Sentinel::new(true, 0, None);
         let ctx = RequestCtx {

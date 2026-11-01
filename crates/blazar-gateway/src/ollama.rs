@@ -2,7 +2,7 @@
 //! mirrored from ollama's upstream `api/types.go`; divergences are
 //! deliberate and documented:
 //! - `options.num_ctx` restarts the instance at the requested size (never
-//!   silently truncates — complaint #13)
+//!   silently truncates - complaint #13)
 //! - `keep_alive` honored: number>0 pins N s, 0 evicts after this request,
 //!   -1 pins forever (complaint #12)
 //! - unknown options -> 400 listing them (no silent drops)
@@ -46,7 +46,7 @@ pub async fn version() -> Response {
     .into_response()
 }
 
-/// GET /api/watch — live SSE tail of sentinel records (`blazar watch`).
+/// GET /api/watch - live SSE tail of sentinel records (`blazar watch`).
 /// Each committed record arrives as `data: {record json}`; a lagged
 /// consumer gets a resync note and keeps streaming. History is `why`'s
 /// job; this is strictly live.
@@ -82,13 +82,13 @@ pub async fn watch(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or_else(|e| api_error(500, &format!("watch body: {e}")))
 }
 
-/// GET /api/why — the sentinel ring: what the model returned,
+/// GET /api/why - the sentinel ring: what the model returned,
 /// what was wrong with it, which knob fixes it. Powers `blazar why`.
 /// `sentinel: false` reports the kill-switch state instead of an error:
 /// silent-empty is the exact failure mode this exists to expose.
 /// Params: `trace=<id>` (exact match), `model=<substr>`,
 /// `code=<substr>` (detection code), `flagged=1` (detection-carrying
-/// records only), `limit=<n>` (default 10, capped at the ring size) —
+/// records only), `limit=<n>` (default 10, capped at the ring size) -
 /// filters apply before the newest-first cut so flagged records older
 /// than the latest clean batch stay reachable.
 /// Minimal percent-decoding for hand-parsed query values (F19: model
@@ -150,7 +150,7 @@ pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     }
     // Scan the full ring (not a fixed 100) so filtered views reach older
     // records; the cap + take live in filter_why_records. `limit` above
-    // RING_CAP would just return the whole ring — clamp for honesty.
+    // RING_CAP would just return the whole ring - clamp for honesty.
     let records = sentinel::filter_why_records(
         state.sentinel.why(trace.as_deref(), sentinel::RING_CAP),
         model.as_deref(),
@@ -168,7 +168,7 @@ pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
         records_json
     };
     // Active engine-child degrades (flash-attention KV conversion etc.),
-    // model-resolved against live children — the per-request view is the
+    // model-resolved against live children - the per-request view is the
     // `engine_slow_attn` detection on each record above; this array is
     // the "what is degraded RIGHT NOW" console view.
     let live: Vec<(String, String)> = state
@@ -226,7 +226,7 @@ pub async fn tags(State(state): State<Arc<AppState>>) -> Response {
             });
             // Which engine row WOULD serve this model right now (routed
             // lane, or the global active row in manual mode). null =
-            // nothing can serve it — the spawn path teaches on use.
+            // nothing can serve it - the spawn path teaches on use.
             let engine =
                 crate::proxy::resolve_serving(&state, &m.name, &m.path).and_then(|lane| lane.tag);
             json!({
@@ -267,7 +267,7 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 /// RFC3339 UTC stamp from epoch seconds (ollama emits full date-time
-/// strings, not bare epoch ints — F16).
+/// strings, not bare epoch ints - F16).
 pub(crate) fn iso(secs: i64) -> String {
     let secs = secs.max(0);
     let days = secs.div_euclid(86_400);
@@ -289,7 +289,7 @@ fn format_params(p: Option<f64>) -> String {
     }
 }
 
-/// POST /api/show — GGUF metadata + active profile + last benchmark.
+/// POST /api/show - GGUF metadata + active profile + last benchmark.
 pub async fn show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -328,13 +328,13 @@ pub async fn show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         details["expert_count"] = json!(g.expert_count.unwrap_or(0));
     }
     // ollama-parity capability discovery (vision clients read this):
-    // vision iff an mmproj projector is attached to the model —
+    // vision iff an mmproj projector is attached to the model -
     // evidence from the store, never a filename guess.
     let mut capabilities = vec!["completion"];
     if row.mmproj_path.is_some() {
         capabilities.push("vision");
     }
-    // Thinking capability is template-evidenced — the same marker sniff
+    // Thinking capability is template-evidenced - the same marker sniff
     // the think:true request gate uses. Downstream tooling reads this
     // to decide whether the `think` request key is legal; an
     // unreadable row never claims the capability (fail-closed).
@@ -369,7 +369,7 @@ pub async fn show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     axum::Json(resp).into_response()
 }
 
-/// POST /api/delete — refuses while running (409).
+/// POST /api/delete - refuses while running (409).
 pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -379,9 +379,9 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
         .as_str()
         .or(req["name"].as_str())
         .unwrap_or_default();
-    // Resolve through the shared ladder (exact → colon-swap → bare stem
-    // → unique prefix → suggestion) so a client can delete by the very
-    // `name:quant` string GET /api/tags rendered — a raw store-key probe
+    // Resolve through the shared ladder (exact -> colon-swap -> bare stem
+    // -> unique prefix -> suggestion) so a client can delete by the very
+    // `name:quant` string GET /api/tags rendered - a raw store-key probe
     // here 404'd on the tags-displayed name. Same rule the CLI's
     // `blazar rm` applies before removing.
     let row = match state.with_store(|s| crate::proxy::resolve_model(s, name)) {
@@ -390,7 +390,7 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
         None => return api_error(500, "store unavailable"),
     };
     let key = row.name;
-    // F22: classify from typed state, not error-string substrings — an
+    // F22: classify from typed state, not error-string substrings - an
     // unrelated io error whose text contains "running" must not 409.
     if blazar_runtime::instance_running(&state.dirs, &key) {
         return api_error(
@@ -402,7 +402,7 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
     }
     match blazar_runtime::remove_model(&state.dirs, &key) {
         Ok(()) => StatusCode::OK.into_response(),
-        // State may shift between pre-checks and removal (race) —
+        // State may shift between pre-checks and removal (race) -
         // classify from live state again, never from the message text.
         Err(e) => {
             if blazar_runtime::instance_running(&state.dirs, &key) {
@@ -419,7 +419,7 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
     }
 }
 
-/// GET /api/ps — live slots: name, state, ctx, idle countdown, endpoint.
+/// GET /api/ps - live slots: name, state, ctx, idle countdown, endpoint.
 /// Router mode: translate the child's GET /models (per-model load state
 /// from the engine's own supervisor) instead of blazar instance rows.
 #[allow(clippy::too_many_lines)] // row assembly + sleep probes + remote capacity fold
@@ -429,12 +429,12 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
     }
     let entries = state.sup.ps();
     // Sleep surfacing (llama.cpp children): `/props` carries `is_sleeping`
-    // once the child enters its `--sleep-idle-seconds` rest — VRAM
+    // once the child enters its `--sleep-idle-seconds` rest - VRAM
     // released, next request pays the wake. Probes ride the engine-level
     // fetch list (`live_http_endpoints`, the same seam the metrics
     // merger uses) with the per-child auth stamped, concurrently under a
     // tight cap so `ps` stays fast. The field is ABSENT when the child
-    // does not report sleeping state (non-llama engine, probe failure) —
+    // does not report sleeping state (non-llama engine, probe failure) -
     // absence means unknown, never guessed.
     let engines = state.sup.live_http_endpoints();
     let probe_futs: Vec<_> = engines
@@ -516,7 +516,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
             // Runtime-managed lanes only: states HOW ctx/kv must be read
             // there (engine owns memory; ctx is the trained-window fit
             // ceiling, not a compiled allocation). Compiled lanes stay
-            // byte-identical — their reading is already the default.
+            // byte-identical - their reading is already the default.
             if let Some(cap) = p.capacity {
                 row["blazar_capacity"] = json!(cap);
             }
@@ -525,7 +525,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
         .collect();
     // Remotes: probed concurrently (3s cap each) so `ps` stays fast
     // even with a dead remote on the list (F15: collected futures are
-    // NOT concurrent under a sequential await loop — join them).
+    // NOT concurrent under a sequential await loop - join them).
     let remotes: Vec<Value> = if state.config.remotes.is_empty() {
         Vec::new()
     } else {
@@ -554,7 +554,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
             let mut entry = json!({"name": r.name, "ok": ok, "note": note});
             // v0.16: cached capacity summary per remote. The field is
             // ABSENT when there is no snapshot (non-Blazar peer, or not
-            // yet fetched) — absence is the degrade signal, matching
+            // yet fetched) - absence is the degrade signal, matching
             // the parse_capacity contract.
             if let Some(c) = crate::remotes::cached_capacity(&state, r) {
                 let free: u64 = c.devices.iter().map(|d| d.free_vram_bytes).sum();
@@ -655,7 +655,7 @@ fn pull_stream_names(target: &str) -> Vec<String> {
     names
 }
 
-/// POST /api/pull — NDJSON progress straight from the event bus; a
+/// POST /api/pull - NDJSON progress straight from the event bus; a
 /// duplicate pull errors and closes the stream (ollama semantics).
 #[allow(clippy::similar_names)] // pull_request vs target distinguish intent
 /// The /api/pull NDJSON body as a stream: emit-then-STOP semantics.
@@ -663,7 +663,7 @@ fn pull_stream_names(target: &str) -> Vec<String> {
 /// stream must end right after it. `take_while` drops the item that
 /// trips the predicate (silencing bogus-repo failures into empty
 /// 200s); a bare `filter_map` never ends the body. The unfold state
-/// machine gives both guarantees — including the bus-closed arm: when
+/// machine gives both guarantees - including the bus-closed arm: when
 /// every sender drops (a daemon shutdown mid-pull), the body ends with
 /// a terminal error frame instead of a silent EOF (live receipt:
 /// 2026-09-30 /api/pull ended cleanly at 31% during a restart window).
@@ -681,7 +681,7 @@ fn pull_ndjson_stream(
                 match events.next().await {
                     Some(Ok(e)) => {
                         let (line, terminal) = pull_event_line(&names, &e);
-                        // F17: non-matching bus events produce no frame —
+                        // F17: non-matching bus events produce no frame -
                         // skip them instead of yielding empty DATA chunks.
                         if line.is_empty() && !terminal {
                             continue;
@@ -696,7 +696,7 @@ fn pull_ndjson_stream(
                     None => {
                         let line = format!(
                             "{}\n",
-                            json!({"error": "event bus closed before terminal status — the daemon shut down mid-pull; retry the pull (resume keeps completed chunks)"})
+                            json!({"error": "event bus closed before terminal status - the daemon shut down mid-pull; retry the pull (resume keeps completed chunks)"})
                         );
                         return Some((
                             Ok::<_, std::io::Error>(Bytes::from(line)),
@@ -814,10 +814,10 @@ fn pull_event_line(names: &[String], e: &blazar_runtime::BlazarEvent) -> (String
     }
 }
 
-/// GET /api/events — SSE of every `BlazarEvent` (dashboards).
+/// GET /api/events - SSE of every `BlazarEvent` (dashboards).
 pub async fn events(State(state): State<Arc<AppState>>) -> Response {
     let rx2 = state.bus.subscribe();
-    // F18: scrub parity with /api/watch — event payloads today carry
+    // F18: scrub parity with /api/watch - event payloads today carry
     // names/counts only, but error strings can surface remote URLs.
     let scrub = state.config.pii_scrub;
     let events = tokio_stream::wrappers::BroadcastStream::new(rx2);
@@ -878,7 +878,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
 }
 
 /// ollama unload idiom: `{model, keep_alive: 0}` with no inference
-/// payload is a load-state ping, not a request — real ollama answers
+/// payload is a load-state ping, not a request - real ollama answers
 /// 200 (harnesses release models with exactly this shape; a 400 here
 /// broke `_unload_all`-style sweeps). Evict-if-running, session pins
 /// still win (R3, same contract as the serve-then-evict path), then a
@@ -923,7 +923,7 @@ async fn unload_ping(state: &Arc<AppState>, model: &str, chat_shape: bool) -> Re
         .into_response()
 }
 
-/// POST /api/chat — full translation incl. `num_ctx` + `keep_alive`.
+/// POST /api/chat - full translation incl. `num_ctx` + `keep_alive`.
 #[allow(clippy::too_many_lines)] // one cohesive translation + admission path
 pub async fn chat(
     State(state): State<Arc<AppState>>,
@@ -953,7 +953,7 @@ pub async fn chat(
         return resp;
     }
     // Failover chains (ollama dialect): a virtual alias resolves to a
-    // concrete target — local model or `remote:<name>:<model>` (the
+    // concrete target - local model or `remote:<name>:<model>` (the
     // pool-aware remote branch above serves the latter). A failing
     // target is benched (anti-flap) and the request escalates.
     if !state.failover.is_empty()
@@ -985,7 +985,7 @@ pub async fn chat(
                             from: sw.benched_index,
                             to: sw.attempt.index,
                             reason: format!(
-                                "target {} failed with HTTP {} — benched, escalating",
+                                "target {} failed with HTTP {} - benched, escalating",
                                 attempt.label,
                                 resp.status().as_u16()
                             ),
@@ -1010,13 +1010,13 @@ pub async fn chat(
         }
     }
     // Key admission resolved ONCE, before any lane decision (F11): the
-    // remote branch below needs it too — previously `remote:<model>`
+    // remote branch below needs it too - previously `remote:<model>`
     // requests bypassed scope/rate/request-count entirely.
     let key_entry = key_ext
         .as_ref()
         .map(|Extension(k)| k.name.clone())
         .and_then(|name| state.keys.entry(&name).map(|e| (name, e)));
-    // Remote routing: `<remote>:<model>` on the ollama API too —
+    // Remote routing: `<remote>:<model>` on the ollama API too -
     // POOL-aware (C4): select among same-named remotes with prefix
     // stickiness + circuit health, not just the first configured entry.
     if crate::remotes::split_remote(&model_field, &state.config).is_some() {
@@ -1061,7 +1061,7 @@ pub async fn chat(
             // Federation fallback on the ollama lane too: a bare name
             // no local row owns routes to a live peer that lists it
             // (ollama shape preserved by the remote chat translator).
-            // Pure not-found only — the ambiguous/local-teaching 404
+            // Pure not-found only - the ambiguous/local-teaching 404
             // below is untouched when no peer claims it.
             if let Some(mut out) = crate::remotes::try_fallback_forward(
                 &state,
@@ -1091,7 +1091,7 @@ pub async fn chat(
         None => return api_error(500, "store unavailable"),
     };
 
-    // Key admission already ran above (F11 hoist) — scope check against
+    // Key admission already ran above (F11 hoist) - scope check against
     // the RESOLVED row name + request-count charge for the local lane.
     if let Some((_name, entry)) = &key_entry
         && let Err(rej) = state.keys.admit(entry, &row.name)
@@ -1100,7 +1100,7 @@ pub async fn chat(
     }
     // Agent-client cache teaching (advisory, never mutates `req`): flag
     // a conversation whose system-prompt/tools fingerprint churns turn
-    // over turn — that client silently re-prefills from scratch every
+    // over turn - that client silently re-prefills from scratch every
     // request. Runs on the local lane only (remote hops manage their
     // own cache).
     crate::cache_bust::note_request(
@@ -1116,7 +1116,7 @@ pub async fn chat(
     );
     // Think-capability gate (ollama parity): refuse `think: true` on a
     // provably non-thinking template instead of silently ignoring it.
-    // Both think gates run BEFORE translation — the translator maps
+    // Both think gates run BEFORE translation - the translator maps
     // `think` to engine kwargs, so a post-translate mutation would never
     // reach the child (live-caught: injected `think:false` was a no-op
     // while explicit `think:false` worked).
@@ -1124,7 +1124,7 @@ pub async fn chat(
         return resp;
     }
     // Ollama parity for the absent toggle: thinking-capable templates
-    // default OFF when the caller did not say `think` (local lane only —
+    // default OFF when the caller did not say `think` (local lane only -
     // remote forwards carry the caller's own bytes to the remote's policy).
     default_think_off(&row, &mut req);
     let (mut openai_req, num_ctx) = match tr::chat_to_openai(&req) {
@@ -1141,7 +1141,7 @@ pub async fn chat(
         crate::proxy::set_child_model(&mut openai_req, &stamp);
     }
     // Think-dialect bridge for mistral.rs children: the translated body
-    // carries the kwargs dialect, which mistral.rs ignores — mirror it
+    // carries the kwargs dialect, which mistral.rs ignores - mirror it
     // into the top-level fields it actually reads (chat lane only).
     if let Some(lane) = crate::proxy::resolve_serving(&state, &row.name, &row.path) {
         crate::proxy::normalize_think_in_value(lane.kind, &mut openai_req);
@@ -1156,7 +1156,7 @@ pub async fn chat(
         return api_error(400, &format!("invalid structured output: {err}"));
     }
     // Capability-certificate gate: refuse what the model's own VERIFIED
-    // probe says it cannot do — a fresh matching FAIL only; absent or
+    // probe says it cannot do - a fresh matching FAIL only; absent or
     // stale certificates fail open (the sentinel still watches every
     // response live).
     let cap_needs = crate::preflight::capability_needs(&req, true);
@@ -1189,8 +1189,8 @@ pub async fn chat(
         }
     }
 
-    // F27: validate num_ctx BEFORE the semantic cache — a hit must not
-    // skip the validation a miss enforces (miss→400, hit→200 asymmetry).
+    // F27: validate num_ctx BEFORE the semantic cache - a hit must not
+    // skip the validation a miss enforces (miss->400, hit->200 asymmetry).
     // The restart itself stays on the miss path (a hit needs no model).
     if let Some(want) = num_ctx
         && want <= 0
@@ -1201,11 +1201,11 @@ pub async fn chat(
     // admission entirely; embed failures bypass (never fail the request);
     // malformed override headers fail fast (400). Key-scoped keys whose
     // scope excludes the embed model bypass silently (the embed admission
-    // would be rejected anyway — no point failing the chat for it).
+    // would be rejected anyway - no point failing the chat for it).
     // Structured-output requests (grammar or any non-null format) bypass
     // in BOTH directions: a constraint narrows the valid response space,
-    // so serving a cached unconstrained answer — or storing a constrained
-    // one for later unconstrained reuse — violates the constraint
+    // so serving a cached unconstrained answer - or storing a constrained
+    // one for later unconstrained reuse - violates the constraint
     // (live-pinned 11499: a malformed-grammar request was served a
     // semantic-cache 200 instead of the child's 400).
     let constrained = req
@@ -1215,7 +1215,7 @@ pub async fn chat(
         || req.get("format").is_some_and(|v| !v.is_null());
     let mut sem_ctx: Option<semcache::SemCtx> = None;
     // Tool-result gate: requests carrying role=tool messages bypass the
-    // cache in both directions (lookup above, store below) — tool outputs
+    // cache in both directions (lookup above, store below) - tool outputs
     // are not in the serving fingerprint, so a prompt-similarity hit could
     // serve an answer computed against different tool results.
     let tool_gate = semcache::has_tool_result_messages(&req);
@@ -1297,16 +1297,16 @@ pub async fn chat(
     );
     let keep_alive = parse_keep_alive(req.get("keep_alive"));
 
-    // Complaint #13: honor num_ctx — restart instance once at requested
+    // Complaint #13: honor num_ctx - restart instance once at requested
     // size when idle (no in-flight requests). Router mode has one shared
-    // child: per-request restarts are impossible — fail fast with the
+    // child: per-request restarts are impossible - fail fast with the
     // overlay fix instead of silently ignoring (H1).
     if let Some(want) = num_ctx {
         if state.config.router {
             return api_error(
                 400,
                 &format!(
-                    "router mode serves all models from one child; per-request num_ctx is not available — set [model_overrides.{}] ctx = {} in config.toml and restart the daemon",
+                    "router mode serves all models from one child; per-request num_ctx is not available - set [model_overrides.{}] ctx = {} in config.toml and restart the daemon",
                     row.name, want
                 ),
             );
@@ -1316,7 +1316,7 @@ pub async fn chat(
         }
     }
     // Per-request spec mode (`options.spec`): same restart-once shape
-    // as num_ctx, and router mode refuses it for the same reason — one
+    // as num_ctx, and router mode refuses it for the same reason - one
     // shared child has no per-model spawn shape to override.
     if let Some(mode) = req
         .pointer("/options/spec")
@@ -1326,7 +1326,7 @@ pub async fn chat(
             return api_error(
                 400,
                 &format!(
-                    "router mode serves all models from one child; per-request spec is not available — set [model_overrides.{}] spec = \"{mode}\" in config.toml and restart the daemon",
+                    "router mode serves all models from one child; per-request spec is not available - set [model_overrides.{}] spec = \"{mode}\" in config.toml and restart the daemon",
                     row.name
                 ),
             );
@@ -1337,7 +1337,7 @@ pub async fn chat(
     }
 
     // Best-of-N fan-out knob (blazar extension): validate before
-    // admission — garbage must never occupy queue slots. Non-streaming
+    // admission - garbage must never occupy queue slots. Non-streaming
     // only: a winner cannot be judged before completion.
     let best_of = match crate::bestof::resolve_best_of(&headers, req.get("best_of")) {
         Ok(n) => n,
@@ -1346,12 +1346,12 @@ pub async fn chat(
     if best_of.is_some() && req["stream"].as_bool().unwrap_or(true) {
         return api_error(
             400,
-            "best_of requires stream=false — a winner cannot be judged before completion",
+            "best_of requires stream=false - a winner cannot be judged before completion",
         );
     }
 
     // WorkClass: raw-lane classification follows the LANE the request
-    // will actually take — image requests fall back to the child lane
+    // will actually take - image requests fall back to the child lane
     // even under ollama_compat, so they keep their interactive class
     // (and are exactly the mixed traffic that makes reserved capacity
     // reachable on a compat model).
@@ -1410,7 +1410,7 @@ pub async fn chat(
         Some(Err(teach)) => return api_error(502, &teach),
         None => {}
     }
-    // F12: full keep_alive contract — >0 pins the instance for N s,
+    // F12: full keep_alive contract - >0 pins the instance for N s,
     // -1 pins "forever", 0 clears any prior pin (the evict-after-response
     // path below then owns teardown). Applied at admission so the pin
     // covers the generation itself.
@@ -1423,7 +1423,7 @@ pub async fn chat(
 
     let stream = req["stream"].as_bool().unwrap_or(true);
     // MCP tool catalog (opt-in): resolve the selector while the ollama
-    // body is still in hand — the core chat path takes it from here.
+    // body is still in hand - the core chat path takes it from here.
     let mcp_sel = match state.mcp.resolve(crate::mcp::selector_read(&headers, &req)) {
         Ok(sel) => sel,
         Err(msg) => return api_error(400, &msg),
@@ -1431,7 +1431,7 @@ pub async fn chat(
     if stream && mcp_sel.is_some() {
         return api_error(
             400,
-            "mcp tool loop requires stream:false in this release — the gateway mediates buffered tool rounds",
+            "mcp tool loop requires stream:false in this release - the gateway mediates buffered tool rounds",
         );
     }
     let model_name = row.name.clone();
@@ -1440,7 +1440,7 @@ pub async fn chat(
     let engine2 = engine.clone();
 
     // F29: accounting rides the response BODY (begin at admission,
-    // release when the body drains or the client aborts) — not the
+    // release when the body drains or the client aborts) - not the
     // handler future, which resolves at headers-ready for streams and
     // can be dropped mid-flight on client disconnects. The guard began
     // at the admission gate above.
@@ -1466,7 +1466,7 @@ pub async fn chat(
             .await;
             // keep_alive=0: evict right after this response (complaint #12),
             // banking the KV checkpoint first. A live session pin wins (R3):
-            // the client asked to keep the model for its session — the pin's
+            // the client asked to keep the model for its session - the pin's
             // TTL (or an explicit close / force stop) ends the protection.
             if keep_alive == Some(0)
                 && !state2
@@ -1500,8 +1500,8 @@ fn parse_keep_alive(v: Option<&Value>) -> Option<i64> {
 }
 
 /// Ollama duration strings: Go format (`"5m"`, `"1h30m"`, `"45s"`,
-/// bare `"300"`). Malformed → `None` (request then follows the daemon's
-/// default idle policy — same silent fallback as before, now reachable
+/// bare `"300"`). Malformed -> `None` (request then follows the daemon's
+/// default idle policy - same silent fallback as before, now reachable
 /// only for genuinely unparseable input).
 fn parse_keep_alive_str(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -1559,7 +1559,7 @@ fn emb_prompt_text(req: &Value) -> String {
 
 /// Serve a semantic-cache hit: translate the stored `OpenAI` shape back to
 /// ollama (same code path as a live response), attach `cache_debug` and
-/// F36: `remote:` routing exists only on /api/chat — on every other
+/// F36: `remote:` routing exists only on /api/chat - on every other
 /// ollama lane the prefix would fall through to model resolution and
 /// return a confusing 404. Teaching 400 instead.
 fn refuse_remote_prefix(state: &AppState, model: &str) -> Option<Response> {
@@ -1587,7 +1587,7 @@ fn template_supports_thinking(template: &str) -> bool {
 
 /// Think-capability gate (ollama parity): `think: true` on a model whose
 /// chat template provably lacks thinking markers is a teaching 400, not
-/// a silent no-op. Fail-open on unreadable/absent templates — safetensors
+/// a silent no-op. Fail-open on unreadable/absent templates - safetensors
 /// lanes and legacy GGUFs without `tokenizer.chat_template` keep today's
 /// behavior; refuse only on evidence.
 /// Ollama thinking parity for the *absent* `think` key: qwen3-dialect
@@ -1595,10 +1595,10 @@ fn template_supports_thinking(template: &str) -> bool {
 /// reasoning trace eats the whole `num_predict` budget and the answer never
 /// arrives (70k-char `reasoning_no_answer` spirals observed live). Ollama's
 /// documented default for thinking-capable models is OFF unless `think` is
-/// set — inject the explicit off-toggle when the template carries a thinking
+/// set - inject the explicit off-toggle when the template carries a thinking
 /// switch. Evidence rule matches the refuse gate: no readable template =
 /// no injection (fail-open). Explicit user `chat_template_kwargs` still win
-/// — the translate layer fills only missing keys.
+/// - the translate layer fills only missing keys.
 fn default_think_off(row: &blazar_core::ModelRow, req: &mut Value) {
     if !req.get("think").is_none_or(Value::is_null) {
         return;
@@ -1611,7 +1611,7 @@ fn default_think_off(row: &blazar_core::ModelRow, req: &mut Value) {
 /// Per-path cache for `template_supports_thinking`, validated by file
 /// length + mtime. The think gates run on every request that omits
 /// `think`, and a full GGUF metadata parse walks the whole tokenizer
-/// vocabulary — live-measured ~60ms on a 5.7 GiB model, the single
+/// vocabulary - live-measured ~60ms on a 5.7 GiB model, the single
 /// largest first-token latency component on the ollama lane (parity
 /// probes: explicit `think:false` 74-80ms vs absent key 133-141ms).
 /// Model files are immutable once pulled; the stat guard keeps the
@@ -1655,7 +1655,7 @@ pub(crate) fn template_supports_thinking_cached(row: &blazar_core::ModelRow) -> 
     } else {
         match blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
             // A readable GGUF with no chat_template field is a REAL
-            // "does not support" answer — safe to cache. A read failure
+            // "does not support" answer - safe to cache. A read failure
             // is unknown and must not poison the entry with false.
             Ok(gguf) => gguf.chat_template.unwrap_or_default(),
             Err(_) => return false,
@@ -1667,7 +1667,7 @@ pub(crate) fn template_supports_thinking_cached(row: &blazar_core::ModelRow) -> 
 }
 
 /// Chat template text out of an HF `tokenizer_config.json`: the field is
-/// either a single Jinja string or a list of named variants — both are
+/// either a single Jinja string or a list of named variants - both are
 /// marker-scanned so think gating sees the same evidence class the
 /// engine's renderer uses. `None` = the file could not be read/parsed
 /// (unknown); `Some("")` = read fine, no template field (real answer).
@@ -1755,7 +1755,7 @@ fn semcache_hit_response(model: &str, cached: &Value, id: u64, sim: f32) -> Resp
 
 /// Scale the f16 KV estimate by the effective `cache_type` quant the
 /// spawn will actually use (mirrors the compiler's kv ladder), so the
-/// preflight judges the buffer the child allocates — the 400's own
+/// preflight judges the buffer the child allocates - the 400's own
 /// teaching (`cache_type = "q8_0" halves KV`) must not be a dead end
 /// when the user applies it. Per-phase pairs scale via
 /// `profile::scale_kv_pair` (K and V each hold half the f16 bytes).
@@ -1772,7 +1772,7 @@ pub(crate) async fn apply_num_ctx(
     // the same recycle + ctx queue as the exact name, instead of
     // silently skipping the preflight and queueing a phantom ctx under
     // the display alias. Unknown names fail fast with the ladder's
-    // teaching message — the serving path would 404 identically.
+    // teaching message - the serving path would 404 identically.
     let model = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
         Some(Ok(row)) => row.name,
         Some(Err(msg)) => return Err(Box::new(api_error(404, &msg))),
@@ -1801,7 +1801,7 @@ pub(crate) async fn apply_num_ctx(
                 // doctrine); an unpinned one LADDERS
                 // f16 -> q8_0 -> q8_0/q4_0 -> q4_0 like the spawn
                 // compiler's kv_quant_ladder (which additionally
-                // skips the mixed rung on CUDA+FA spawns — no
+                // skips the mixed rung on CUDA+FA spawns - no
                 // symmetric-pair flash-attention kernel in stock
                 // builds; the mixed rung here stays feasibility-
                 // equivalent: anything it fits, the smaller q4_0
@@ -1877,7 +1877,7 @@ pub(crate) async fn apply_num_ctx(
 /// first when idle (same restart-once shape as `apply_num_ctx`). Same
 /// shape = no-op, so a REPL re-sending `spec: "off"` every turn never
 /// churns a matching instance. Draft availability/manifest gates stay
-/// in `profile::compile` — queueing `eagle3` without the draft pulled
+/// in `profile::compile` - queueing `eagle3` without the draft pulled
 /// fails at spawn exactly like config-pinned eagle3 does.
 pub(crate) async fn apply_spec(
     state: &Arc<AppState>,
@@ -1960,12 +1960,12 @@ async fn proxy_core_chat(
         // mlx-lm 0.32.0 reports `finish_reason: "tool_calls"` but drops
         // `message.tool_calls` at serialization (live receipt: 23
         // completion tokens, finish tool_calls, message absent + content
-        // null) — native tool calls die inside the child. The
+        // null) - native tool calls die inside the child. The
         // gateway-rendered tool grammar on the raw completion lane never
         // enters that code path, so tool requests on the mlx lane route
         // here even under the default `child` recipe. (sglang's
-        // equivalent marker-as-prose bug is fixed at the spawn instead —
-        // `--tool-call-parser auto` — because the recipe's GBNF grammar
+        // equivalent marker-as-prose bug is fixed at the spawn instead -
+        // `--tool-call-parser auto` - because the recipe's GBNF grammar
         // is llama.cpp-only and native parsing is the stronger lane.)
         let mlx_tools = engine.kind == blazar_core::engine_kind::EngineKind::Mlx
             && parsed
@@ -1979,7 +1979,7 @@ async fn proxy_core_chat(
                 .is_some_and(|v| !crate::prompt_recipe::has_images(v))
     };
     // Tool names the recipe adapters may lift a marker-less JSON call
-    // for — read from the PRE-render chat body: `to_completion_request`
+    // for - read from the PRE-render chat body: `to_completion_request`
     // bakes the descriptors into the prompt text, so the re-rendered
     // bytes no longer carry a machine-readable `tools` array.
     let recipe_tool_names = if ollama_compat {
@@ -2038,13 +2038,13 @@ async fn proxy_core_chat(
         // Gateway-mediated MCP tools: the loop owns every child round,
         // so it takes precedence over the best-of fan on requests that
         // opt in. The recipe-rendered completion lane speaks a
-        // different wire shape — teach instead of guessing.
+        // different wire shape - teach instead of guessing.
         let mcp_child = if let Some(sel) = &mcp_sel {
             if ollama_compat {
                 return api_error(
                     400,
                     "mcp is not available on the recipe-rendered completion lane \
-                     (pinned recipe or mlx tool grammar) — clear the pin or use the chat lane",
+                     (pinned recipe or mlx tool grammar) - clear the pin or use the chat lane",
                 );
             }
             let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&openai_body) else {
@@ -2113,7 +2113,7 @@ async fn proxy_core_chat(
                             // and still generating (buffered responses emit
                             // headers only at completion). Retrying on a
                             // respawned lane re-runs the same oversized
-                            // generation into the same ceiling — surface the
+                            // generation into the same ceiling - surface the
                             // teaching 504 for the caller instead.
                             if matches!(
                                 &e,
@@ -2123,7 +2123,7 @@ async fn proxy_core_chat(
                             }
                             tracing::warn!(
                                 model,
-                                "nonstream upstream failed: {e} — respawning lane, retrying once in-band"
+                                "nonstream upstream failed: {e} - respawning lane, retrying once in-band"
                             );
                             // Same crash-recovery contract as the proxy path:
                             // `child_send` already evicted a wedged child; the
@@ -2195,7 +2195,7 @@ async fn proxy_core_chat(
         };
         // Raw-completion lane: adapt the text completion into the chat
         // shape before every downstream concern (cache observability,
-        // enforce, translation) — they see a native chat response.
+        // enforce, translation) - they see a native chat response.
         let mut openai = if ollama_compat {
             crate::prompt_recipe::raw_json_to_chat(&openai, &recipe_tool_names)
         } else {
@@ -2203,7 +2203,7 @@ async fn proxy_core_chat(
         };
         // JSON-fence normalization: lanes without decoder-level grammar
         // (recipe raw lane, mlx/mistralrs native) decorate JSON with a
-        // markdown fence even under a strict `response_format` demand —
+        // markdown fence even under a strict `response_format` demand -
         // strip it so the content contract (parses as JSON) holds on
         // every lane. Only under the demand; plain chat fences stay.
         if structured_json {
@@ -2221,7 +2221,7 @@ async fn proxy_core_chat(
             None => state.obs.miss(),
         }
         // A2: blend this completion's decode rate into the model's EWMA
-        // (completion tokens over child-send wall time — t0 predates the
+        // (completion tokens over child-send wall time - t0 predates the
         // fan/single send, so queue wait upstream of it stays excluded).
         if let Some(n) = openai
             .pointer("/usage/completion_tokens")
@@ -2235,7 +2235,7 @@ async fn proxy_core_chat(
             );
         }
         // Non-stream + enforce: judge before translation (streaming stays
-        // warn-only — bytes are already on the wire).
+        // warn-only - bytes are already on the wire).
         if enforce {
             let (ctx, _) =
                 sentinel::request_ctx(state, shape.lane(), model, &openai_body, trace, false);
@@ -2277,7 +2277,7 @@ async fn proxy_core_chat(
         };
         // Templates that ignore the thinking-off kwargs still emit raw
         // <think> blocks; hide them when the request did not ask for
-        // thinking (already-split content is unaffected — idempotent).
+        // thinking (already-split content is unaffected - idempotent).
         if !tr::request_think_on(&openai_body) {
             tr::suppress_raw_think_response(&mut ollama);
         }
@@ -2346,7 +2346,7 @@ async fn proxy_core_chat(
             // been sent yet (headers are built only after this match).
             // Busy-child header timeout (a giant prefill still computing):
             // the child is healthy, a respawn+retry would re-run the same
-            // prefill into the same ceiling — teaching error wins.
+            // prefill into the same ceiling - teaching error wins.
             if matches!(
                 &e,
                 crate::proxy::ChildSendError::HeaderTimeout { evicted: false, .. }
@@ -2355,7 +2355,7 @@ async fn proxy_core_chat(
             }
             tracing::warn!(
                 model,
-                "stream upstream failed: {e} — respawning lane, retrying once in-band"
+                "stream upstream failed: {e} - respawning lane, retrying once in-band"
             );
             match crate::proxy::respawn_lane(state, &engine.key).await {
                 Ok(fresh) => {
@@ -2419,7 +2419,7 @@ async fn proxy_core_chat(
     };
     let model_c = model.to_string();
     let load_hdr = load_ms > 100;
-    // Sentinel: same side-channel tap as the OpenAI path — bytes cloned
+    // Sentinel: same side-channel tap as the OpenAI path - bytes cloned
     // in the observation closure, analyzer parses off the hot path.
     let (sentinel_feed, _) = sentinel::begin_chat_observation(
         state,
@@ -2437,7 +2437,7 @@ async fn proxy_core_chat(
     let hist_state = std::sync::Arc::clone(state);
     // Shared clock: the map closure stamps first/last-byte offsets, the
     // unfold closure reads them for the final NDJSON line (streaming
-    // children report no timings — durations are gateway-measured).
+    // children report no timings - durations are gateway-measured).
     let clock = std::sync::Arc::new(std::sync::Mutex::new((None::<u64>, 0u64)));
     let clock_map = std::sync::Arc::clone(&clock);
     let stream = futures::StreamExt::map(upstream, move |chunk| {
@@ -2463,7 +2463,7 @@ async fn proxy_core_chat(
         chunk.map_err(|e| std::io::Error::other(e.to_string()))
     });
     // Translate SSE -> NDJSON incrementally. F70: bytes accumulate in a
-    // boundary-safe LineBuffer — a multi-byte UTF-8 char split across
+    // boundary-safe LineBuffer - a multi-byte UTF-8 char split across
     // chunks never decodes to twin U+FFFD.
     let buf = String::new();
     let lines = tr::LineBuffer::new();
@@ -2510,7 +2510,7 @@ async fn proxy_core_chat(
                         }
                     };
                     // Cache observability (R6): classify exactly once at
-                    // completion — first-byte time is the TTFT evidence.
+                    // completion - first-byte time is the TTFT evidence.
                     let ttft_secs = {
                         let c = clock.lock().unwrap();
                         c.0.map(|ns| std::time::Duration::from_nanos(ns).as_secs_f64())
@@ -2671,7 +2671,7 @@ async fn proxy_core_chat(
                         // race): once headers are committed the only
                         // legal close is a clean one. Surface the
                         // truncation as a semantic terminal error line,
-                        // then let the done lane finish the stream —
+                        // then let the done lane finish the stream -
                         // an Err item here aborts the HTTP body and the
                         // client eats a RemoteProtocolError instead.
                         let line = serde_json::json!({
@@ -2728,7 +2728,7 @@ async fn proxy_core_chat(
 
 /// Structured-output receipt (E2-δ), ollama lane: the translated
 /// request's constraint stamped on completed responses (success paths
-/// only — this helper runs at response assembly, after the child
+/// only - this helper runs at response assembly, after the child
 /// answered). Same header/kind vocabulary as the `OpenAI` lane.
 fn stamp_so_receipt(resp: &mut Response, openai_body: &[u8]) {
     let parsed = serde_json::from_slice::<Value>(openai_body).ok();
@@ -2755,7 +2755,7 @@ pub async fn embeddings(
         Err(e) => return api_error(400, &e),
     };
     let model = openai_req["model"].as_str().unwrap_or_default().to_string();
-    // F14: resolve first, scope-check the RESOLVED name — alias/quant-tag
+    // F14: resolve first, scope-check the RESOLVED name - alias/quant-tag
     // parity with /api/chat.
     if let Some(resp) = refuse_remote_prefix(&state, &model) {
         return resp;
@@ -2775,7 +2775,7 @@ pub async fn embeddings(
         return rej.to_response();
     }
     // Request-level admission (chat parity): embeddings are cheap but
-    // still occupy child slots — park at the ceiling instead of piling
+    // still occupy child slots - park at the ceiling instead of piling
     // onto the engine's internal queue.
     let guard = match crate::proxy::admission_gate_ollama(
         &state,
@@ -2862,7 +2862,7 @@ pub async fn embeddings(
                 // knob that produces a dedicated embedding spawn.
                 let text = if text.contains("is-embedding") {
                     format!(
-                        "{text} — blazar: the sglang lane serves embeddings via a \
+                        "{text} - blazar: the sglang lane serves embeddings via a \
                          dedicated spawn; set model_overrides.<model>.sglang.is_embedding \
                          = true on an embedding-specific entry (that child no longer \
                          generates). The llamacpp lane co-serves chat and embeddings \
@@ -2883,7 +2883,7 @@ pub async fn embeddings(
     )
 }
 
-/// POST /api/embed — ollama new-style embeddings (input: str | [str]);
+/// POST /api/embed - ollama new-style embeddings (input: str | [str]);
 /// same engine lane as /api/embeddings, array-friendly shape.
 // ollama-embed batch fan-out: one request shape, one handler. Splitting the
 // batch loop out is queued with the parallel gateway wave.
@@ -2928,7 +2928,7 @@ pub async fn embed(
         return rej.to_response();
     }
     // Request-level admission (chat parity): embeddings are cheap but
-    // still occupy child slots — park at the ceiling instead of piling
+    // still occupy child slots - park at the ceiling instead of piling
     // onto the engine's internal queue.
     let guard = match crate::proxy::admission_gate_ollama(
         &state,
@@ -3024,7 +3024,7 @@ pub async fn embed(
                 // Same sglang embedding-posture teaching as /api/embeddings.
                 let text = if text.contains("is-embedding") {
                     format!(
-                        "{text} — blazar: the sglang lane serves embeddings via a \
+                        "{text} - blazar: the sglang lane serves embeddings via a \
                          dedicated spawn; set model_overrides.<model>.sglang.is_embedding \
                          = true on an embedding-specific entry (that child no longer \
                          generates). The llamacpp lane co-serves chat and embeddings \
@@ -3050,7 +3050,7 @@ pub async fn embed(
     )
 }
 
-/// POST /api/rerank — ollama-lane rerank: forwards to the child's
+/// POST /api/rerank - ollama-lane rerank: forwards to the child's
 /// /v1/rerank. Accepts `documents` as strings or {text} objects
 /// (normalizes to the `OpenAI` string shape); response passes through
 /// verbatim (results + usage).
@@ -3113,7 +3113,7 @@ pub async fn rerank(
         return rej.to_response();
     }
     // Request-level admission (chat parity): embeddings are cheap but
-    // still occupy child slots — park at the ceiling instead of piling
+    // still occupy child slots - park at the ceiling instead of piling
     // onto the engine's internal queue.
     let guard = match crate::proxy::admission_gate_ollama(
         &state,
@@ -3151,7 +3151,7 @@ pub async fn rerank(
             let url = format!("{}/v1/rerank", child_base(&engine.endpoint));
             // Per-engine child stamp with the sglang `base:adapter`
             // variant override (see proxy.rs::child_model_stamp_for)
-            // — F28: rerank lane rewrites like every other.
+            // - F28: rerank lane rewrites like every other.
             if let Some(stamp) = crate::proxy::child_model_stamp_for(
                 &state,
                 &engine,
@@ -3177,7 +3177,7 @@ pub async fn rerank(
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
             // Engine error text (e.g. non-rerank model) passes through with
-            // its status — teaching, not masking.
+            // its status - teaching, not masking.
             if status == 200 {
                 match serde_json::from_str::<Value>(&text) {
                     Ok(v) => return axum::Json(v).into_response(),
@@ -3190,7 +3190,7 @@ pub async fn rerank(
     )
 }
 
-/// POST /api/generate — chat-bus translation (system/prompt/images/think
+/// POST /api/generate - chat-bus translation (system/prompt/images/think
 /// map onto /v1/chat/completions exactly like ollama's templated
 /// generate); template/suffix stay rejected (400 + pointer).
 #[allow(clippy::too_many_lines)] // one cohesive translation path
@@ -3206,7 +3206,7 @@ pub async fn generate(
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
     // ollama unload idiom: no/empty prompt + keep_alive 0 = release
-    // ping — must short-circuit before the translator's required-field
+    // ping - must short-circuit before the translator's required-field
     // 400 (real ollama is an idempotent 200).
     if parse_keep_alive(req.get("keep_alive")) == Some(0)
         && req
@@ -3222,7 +3222,7 @@ pub async fn generate(
         .as_ref()
         .map(|Extension(k)| k.name.clone())
         .and_then(|name| state.keys.entry(&name).map(|e| (name, e)));
-    // F14: resolve FIRST, scope-check the RESOLVED name — alias and
+    // F14: resolve FIRST, scope-check the RESOLVED name - alias and
     // quant-tag requests behave identically to /api/chat.
     if let Some(resp) = refuse_remote_prefix(&state, &model) {
         return resp;
@@ -3238,7 +3238,7 @@ pub async fn generate(
         return rej.to_response();
     }
     // Think-capability gate (ollama parity), same as /api/chat. Both
-    // think gates run BEFORE translation — the translator maps `think`
+    // think gates run BEFORE translation - the translator maps `think`
     // to engine kwargs, so a post-translate mutation would never reach
     // the child (live-caught on /api/chat; same ordering here).
     if let Some(resp) = refuse_unsupported_think(&row, &req) {
@@ -3262,7 +3262,7 @@ pub async fn generate(
             .and_then(|v| v.to_str().ok()),
     );
     let keep_alive = parse_keep_alive(req.get("keep_alive"));
-    // F13: prompt-fit preflight (num_ctx request override counts) — the
+    // F13: prompt-fit preflight (num_ctx request override counts) - the
     // same pre-hoc contract /api/chat enforces.
     {
         let eff = req
@@ -3280,7 +3280,7 @@ pub async fn generate(
             return *resp;
         }
     }
-    // F13: honor options.num_ctx — restart once at the requested size;
+    // F13: honor options.num_ctx - restart once at the requested size;
     // router mode cannot (one shared child), fail fast with the overlay
     // fix instead of silently ignoring (complaint #13, chat parity).
     if let Some(want) = req
@@ -3292,7 +3292,7 @@ pub async fn generate(
             return api_error(
                 400,
                 &format!(
-                    "router mode serves all models from one child; per-request num_ctx is not available — set [model_overrides.{}] ctx = {} in config.toml and restart the daemon",
+                    "router mode serves all models from one child; per-request num_ctx is not available - set [model_overrides.{}] ctx = {} in config.toml and restart the daemon",
                     row.name, want
                 ),
             );
@@ -3311,7 +3311,7 @@ pub async fn generate(
             return api_error(
                 400,
                 &format!(
-                    "router mode serves all models from one child; per-request spec is not available — set [model_overrides.{}] spec = \"{mode}\" in config.toml and restart the daemon",
+                    "router mode serves all models from one child; per-request spec is not available - set [model_overrides.{}] spec = \"{mode}\" in config.toml and restart the daemon",
                     row.name
                 ),
             );
@@ -3321,7 +3321,7 @@ pub async fn generate(
         }
     }
     // Best-of-N fan-out knob (blazar extension): validate before
-    // admission — garbage must never occupy queue slots. Non-streaming
+    // admission - garbage must never occupy queue slots. Non-streaming
     // only: a winner cannot be judged before completion.
     let best_of = match crate::bestof::resolve_best_of(&headers, req.get("best_of")) {
         Ok(n) => n,
@@ -3330,7 +3330,7 @@ pub async fn generate(
     if best_of.is_some() && req["stream"].as_bool().unwrap_or(true) {
         return api_error(
             400,
-            "best_of requires stream=false — a winner cannot be judged before completion",
+            "best_of requires stream=false - a winner cannot be judged before completion",
         );
     }
     let class = crate::queue::classify_work(
@@ -3369,7 +3369,7 @@ pub async fn generate(
         Ok(ok) => ok,
         Err(resp) => return *resp,
     };
-    // F12: keep_alive parity with /api/chat — pin window at admission,
+    // F12: keep_alive parity with /api/chat - pin window at admission,
     // explicit evict after the response on 0 (session pins still win).
     if let Some(secs) = keep_alive {
         state.sup.set_keep_alive(&engine.name, secs);
@@ -3410,7 +3410,7 @@ pub async fn generate(
     if stream && mcp_sel.is_some() {
         return api_error(
             400,
-            "mcp tool loop requires stream:false in this release — the gateway mediates buffered tool rounds",
+            "mcp tool loop requires stream:false in this release - the gateway mediates buffered tool rounds",
         );
     }
     let state_ej = state.clone();
@@ -3436,7 +3436,7 @@ pub async fn generate(
             .await;
             // keep_alive=0: evict right after this response (complaint
             // #12), banking the KV checkpoint first. A live session pin
-            // wins (R3) — identical to the /api/chat lane.
+            // wins (R3) - identical to the /api/chat lane.
             if keep_alive == Some(0)
                 && !state_ej
                     .sup
@@ -3459,7 +3459,7 @@ pub async fn generate(
     out
 }
 
-/// POST /api/evict {"model": name} — blazar-internal (ollama has no REST
+/// POST /api/evict {"model": name} - blazar-internal (ollama has no REST
 /// equivalent): unload a model now. Powers `blazar stop <model>`.
 pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let v: Value = match serde_json::from_slice(&body) {
@@ -3469,9 +3469,9 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
     let Some(model) = v["model"].as_str() else {
         return api_error(400, "missing 'model'");
     };
-    // Resolve through the shared ladder (exact → colon-swap → bare stem
-    // → unique prefix → suggestion) so a client can evict by the very
-    // `name:quant` string GET /api/tags renders — instance keys hold
+    // Resolve through the shared ladder (exact -> colon-swap -> bare stem
+    // -> unique prefix -> suggestion) so a client can evict by the very
+    // `name:quant` string GET /api/tags renders - instance keys hold
     // bare store names, and a raw passthrough here no-op'd 200 on the
     // tags form while the model kept serving (live-repro'd against
     // bge-reranker-v2-m3:q8_0). Same rule /api/delete applies.
@@ -3480,7 +3480,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
         Some(Err(msg)) => return evict_unresolved(&state, model, &msg).await,
         None => return api_error(500, "store unavailable"),
     };
-    // Router mode: the engine owns per-model lifecycle — forward the
+    // Router mode: the engine owns per-model lifecycle - forward the
     // unload to the router child (models stay preset-listed, just unloaded).
     // The child's preset list is built from store rows, so the resolved
     // bare name is what it keys on too.
@@ -3514,17 +3514,17 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
 }
 
 /// Store-miss resolution for /api/evict: two name spaces the store
-/// ladder cannot see — the lazy whisper lane (its child keys by the
+/// ladder cannot see - the lazy whisper lane (its child keys by the
 /// whisper size name, e.g. "base", never a store row) and supervised
 /// instances outliving their store row. A lane hit tears that lane
 /// down; otherwise the 404 teaches with BOTH the store suggestion and
 /// the live candidates. (Live-repro'd before this ladder: evicting
 /// "base" while the whisper child was loaded returned a store-shaped
-/// 404 suggesting "laya" — a levenshtein artifact — and the audio
+/// 404 suggesting "laya" - a levenshtein artifact - and the audio
 /// child stayed resident.)
 async fn evict_unresolved(state: &Arc<AppState>, model: &str, store_msg: &str) -> Response {
     // Whisper lane first: its names never exist in the store, so this
-    // is their ONLY resolution path. Case-insensitive — the size name
+    // is their ONLY resolution path. Case-insensitive - the size name
     // is a CLI convention, not a store key.
     if let Some((_, loaded)) = state.whisper.status().await
         && loaded.eq_ignore_ascii_case(model)
@@ -3571,13 +3571,13 @@ async fn evict_unresolved(state: &Arc<AppState>, model: &str, store_msg: &str) -
     let msg = if live_names.is_empty() {
         store_msg.to_string()
     } else {
-        format!("{store_msg} — live now: {}", live_names.join(", "))
+        format!("{store_msg} - live now: {}", live_names.join(", "))
     };
     api_error(404, &msg)
 }
 
 /// A session checkpoint filename: alphanumerics, dot, underscore, dash.
-/// Mirrors upstream `fs_validate_filename` — no path separators, ever.
+/// Mirrors upstream `fs_validate_filename` - no path separators, ever.
 fn valid_session_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
@@ -3588,7 +3588,7 @@ fn valid_session_name(name: &str) -> bool {
 }
 
 /// POST /api/session {"model", "action": "save|restore|erase",
-/// "filename", "slot": 0} — blazar-internal: slot KV-cache
+/// "filename", "slot": 0} - blazar-internal: slot KV-cache
 /// checkpoints via upstream `--slot-save-path` + `POST /slots/{id}`.
 /// Ensures the model is loaded first (save needs live slot state).
 #[allow(clippy::too_many_lines)] // save/restore/erase/list + identity pre-flight; precedent: chat()
@@ -3606,8 +3606,8 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
     // Slot KV checkpoints ride llama-server's --slot-save-path + POST
     // /slots/{id}; non-llamacpp children (mistralrs, sglang) have no slot
     // surface. Keyed on the ROUTED lane for this model, not the global
-    // active row — auto-routing serves GGUF models on a llamacpp child
-    // regardless of which engine is globally active. `close` stays open —
+    // active row - auto-routing serves GGUF models on a llamacpp child
+    // regardless of which engine is globally active. `close` stays open -
     // it only releases a gateway-side session pin.
     let engine_kind = v["model"]
         .as_str()
@@ -3626,12 +3626,12 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
             400,
             &format!(
                 "slot KV checkpoints are llama-server-only; the {kind} lane that \
-                     serves this request does not implement /slots — switch with \
+                     serves this request does not implement /slots - switch with \
                      `blazar engine use <tag>` or a model_overrides engine pin",
             ),
         );
     }
-    // Close releases a session PIN (R3) — no model, slot or checkpoint
+    // Close releases a session PIN (R3) - no model, slot or checkpoint
     // involved; safe to run while children are asleep or absent.
     if action == "close" {
         let Some(session) = v["session"].as_str() else {
@@ -3666,7 +3666,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
     }
     let slot = v["slot"].as_u64().unwrap_or(0);
     // F21: a slot beyond u32 range is a client bug (often a typo'd
-    // 4_294_967_296) — silently clamping to slot 0 would clobber the
+    // 4_294_967_296) - silently clamping to slot 0 would clobber the
     // wrong slot's checkpoint.
     let Ok(slot) = u32::try_from(slot) else {
         return api_error(400, "slot out of range (max u32)");
@@ -3674,7 +3674,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
 
     // Erase is a FILE deletion, owned by the daemon (it owns the sessions
     // dir). Upstream's slot-erase action clears live KV state, not the
-    // checkpoint file — forwarding would report success and delete nothing.
+    // checkpoint file - forwarding would report success and delete nothing.
     if action == "erase" {
         let path = state
             .dirs
@@ -3703,7 +3703,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         false, // text surface: diffusion rows teach the images lane
         false,
         false, // session checkpoints ride /slots, not the completion
-               // schema — the per-request `lora` field cannot follow, so
+               // schema - the per-request `lora` field cannot follow, so
                // variant checkpoints keep their dedicated child (spawn
                // posture at save time == posture at restore)
     )
@@ -3713,7 +3713,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         Err(resp) => return *resp,
     };
     // #20 identity: the LIVE instance ctx wins over config (tuned or
-    // overridden instances — same precedence as the prompt-fit gate).
+    // overridden instances - same precedence as the prompt-fit gate).
     let live_ctx = state
         .sup
         .ps()
@@ -3756,7 +3756,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
                 tracing::warn!(
                     target: "blazar::session",
                     model = %engine.name,
-                    "restoring checkpoint {filename} with no identity manifest (pre-#20?) — unverified"
+                    "restoring checkpoint {filename} with no identity manifest (pre-#20?) - unverified"
                 );
             }
         }
@@ -3812,7 +3812,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
                         None => {
                             tracing::warn!(
                                 target: "blazar::session",
-                                "could not determine runtime shape — checkpoint saved WITHOUT identity manifest"
+                                "could not determine runtime shape - checkpoint saved WITHOUT identity manifest"
                             );
                         }
                     }
@@ -3825,7 +3825,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
     )
 }
 
-/// GET /api/session?model=NAME — list checkpoint files for a model from
+/// GET /api/session?model=NAME - list checkpoint files for a model from
 /// the sessions dir the daemon owns (no child required).
 pub async fn session_list(
     State(state): State<Arc<AppState>>,
@@ -3848,7 +3848,7 @@ pub async fn session_list(
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             // F26: `.identity.json` sidecars (session-identity manifests)
-            // are bookkeeping, not checkpoints — don't list them.
+            // are bookkeeping, not checkpoints - don't list them.
             if name.ends_with(".identity.json") {
                 continue;
             }
@@ -3861,14 +3861,14 @@ pub async fn session_list(
 }
 
 /// Prometheus text-format label escaping (F25): key names are admin
-/// free-text — backslash, quote and newline must not break the scrape.
+/// free-text - backslash, quote and newline must not break the scrape.
 fn escape_label(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
 }
 
-/// GET /metrics — merged children prometheus text + blazar_* gauges.
+/// GET /metrics - merged children prometheus text + blazar_* gauges.
 /// Emit a poller-fed gauge iff it has been measured at least once.
 fn hint_gauge(out: &mut String, rate: Option<f64>, name: &str, help: &str) {
     if let Some(rate) = rate {
@@ -3907,7 +3907,7 @@ fn cache_metrics(state: &AppState, merged: &mut String) {
     let cached_total = sum_child_counter(merged, "prompt_tokens_cached_total");
     // Upstream `prompt_tokens_total` counts tokens PROCESSED, excluding cached
     // ones (server-task.cpp metric help), so the hit ratio denominator is the
-    // sum — cached/processed alone can exceed 1.
+    // sum - cached/processed alone can exceed 1.
     let prompt_processed = sum_child_counter(merged, "prompt_tokens_total");
     if let Some(ratio) = cache_hit_ratio(cached_total, prompt_processed) {
         let _ = write!(
@@ -3997,7 +3997,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // counters summed across live engines (scrape time = truth), plus
     // the gateway-observed warm/cold split.
     cache_metrics(&state, &mut merged);
-    // F25: router mode serves N models through ONE blazar instance —
+    // F25: router mode serves N models through ONE blazar instance -
     // count the router child's loaded models, not supervisor rows.
     let models_loaded = if state.config.router {
         match crate::proxy::ensure_router_detached(&state.sup).await {
@@ -4044,7 +4044,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         state.queue.depth()
     );
     // Audit MM9: the local audio lane (transcriptions/translations async
-    // jobs) has no queue of its own — this gauge is its only footprint
+    // jobs) has no queue of its own - this gauge is its only footprint
     // in /metrics.
     let _ = write!(
         merged,
@@ -4052,7 +4052,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         state.audio_jobs.active_count()
     );
     // Durable ledger view: non-terminal rows across ALL lanes (audio,
-    // image, video) — after a restart this drops to zero via the boot
+    // image, video) - after a restart this drops to zero via the boot
     // sweep, which is exactly the signal an operator wants.
     let durable_jobs_active = state
         .with_store(|s| {
@@ -4090,7 +4090,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             .audit_dropped
             .load(std::sync::atomic::Ordering::Relaxed)
     );
-    // F81: spans never exported (channel saturated or POST failed) —
+    // F81: spans never exported (channel saturated or POST failed) -
     // same honesty contract as the audit drop counter.
     let _ = write!(
         merged,
@@ -4135,7 +4135,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         );
     }
     // Prefix heat per loaded model (why a capacity eviction chose its
-    // victim — hot caches survive).
+    // victim - hot caches survive).
     let _ = write!(
         merged,
         "# HELP blazar_model_prefix_heat Recency-weighted prefix heat (capacity-eviction bias)\n# TYPE blazar_model_prefix_heat gauge\n"
@@ -4349,7 +4349,7 @@ mod tests {
     }
 
     /// Minimal GGUF with `general.architecture` + optional
-    /// `tokenizer.chat_template` — just enough header for
+    /// `tokenizer.chat_template` - just enough header for
     /// `read_metadata_file` to reach the template field.
     fn write_gguf_with_template(path: &std::path::Path, template: Option<&str>) {
         let mut b: Vec<u8> = Vec::new();
@@ -4404,7 +4404,7 @@ mod tests {
         let model_dir = tmp.path().join("model");
         std::fs::create_dir_all(&model_dir).unwrap();
         // `tokenizer_config.json` exists (stat guard passes) but is a
-        // DIRECTORY: the read fails with EISDIR — an unknown answer.
+        // DIRECTORY: the read fails with EISDIR - an unknown answer.
         let probe = model_dir.join("tokenizer_config.json");
         std::fs::create_dir_all(&probe).unwrap();
         let row = row_with_path(model_dir.to_str().unwrap());

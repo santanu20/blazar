@@ -60,7 +60,7 @@ async fn gateway__llamacpp_lora_variant__rides_dense_child_with_request_stamp() 
         "the per-request lora stamp must reach the child: {content}"
     );
 
-    // Exactly one resident served both requests — no dedicated variant
+    // Exactly one resident served both requests - no dedicated variant
     // child, no second weights load.
     let ps = ts.state.sup.ps();
     assert_eq!(ps.len(), 1, "variant must ride the dense child: {ps:?}");

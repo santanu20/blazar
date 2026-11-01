@@ -65,7 +65,7 @@ pub struct Config {
     /// "tcp" (curl-debuggable children) | "unix" (socket files).
     pub child_transport: String,
     /// Per-child bearer auth (`--api-key-file` on every spawned engine
-    /// child): None = auto (TCP children authenticated — any local
+    /// child): None = auto (TCP children authenticated - any local
     /// process could otherwise bypass the gateway's keys by hitting the
     /// child port directly; UDS children already get filesystem
     /// permissions), Some(true) = always, Some(false) = never.
@@ -91,17 +91,17 @@ pub struct Config {
     /// reject Range get the single-stream lane regardless.
     pub download_connections: u32,
     /// Total download speed cap in MB/s (decimal megabytes), shared
-    /// across every connection of a pull — a ceiling on the WHOLE
+    /// across every connection of a pull - a ceiling on the WHOLE
     /// download, not per connection. 0 = unlimited (default). Low caps
     /// keep a model pull from saturating a shared link (the ollama
     /// "no way to rate-limit downloads" complaint); read timeouts are
     /// idle-gap based, so slow-but-flowing capped pulls never abort.
     pub download_speed_limit_mb: f64,
-    /// "auto" (default: opportunistic — embedded MTP head used when the
+    /// "auto" (default: opportunistic - embedded MTP head used when the
     /// GGUF carries one, catalog draft pair used when pulled, dense with a
     /// teaching warning otherwise) | "off" | "mtp" | "eagle3" | "dflash" |
     /// "dspark" (explicit modes fail fast when their inputs are missing).
-    /// n-gram variants: see ngram-* keys. Default flipped off→auto
+    /// n-gram variants: see ngram-* keys. Default flipped off->auto
     /// 2026-09-11: speculation is verified-lossless (target-side
     /// verification) and MTP measured +50% decode on Qwen3.5-9B; ollama
     /// auto-enables MTP the same way.
@@ -109,7 +109,7 @@ pub struct Config {
     /// Autotune steward posture. `"off"` (default) = no background
     /// optimization work at all; `"advise"` = the daemon periodically
     /// scans stored evidence per model (`optimize --plan` logic) and
-    /// logs the findings — still zero mutations. `"scheduled"`
+    /// logs the findings - still zero mutations. `"scheduled"`
     /// (unattended adoption) is REFUSED at parse with a teaching error:
     /// scheduled autonomy is unlocked only after repeated successful
     /// manual `optimize --run` / `--apply` cycles prove the lease,
@@ -118,7 +118,7 @@ pub struct Config {
     pub autotune: Option<String>,
     /// Pull a missing draft model on first spawn instead of degrading to
     /// dense (spec = "auto") or failing (explicit modes). Applies to the
-    /// per-model ensure lane only — router presets keep their
+    /// per-model ensure lane only - router presets keep their
     /// skip-with-warning semantics. A failed autopull never blocks the
     /// spawn: it falls back to exactly what would have happened with
     /// autopull off. Default false.
@@ -128,7 +128,7 @@ pub struct Config {
     /// not pulled, or the draft does not fit the card), fall back to
     /// n-gram lookup speculation instead of running dense. Self-drafting:
     /// no draft weights, no extra VRAM, and the persisted lookup cache
-    /// (`spec_cache`) makes it warm across restarts. Manifest-gated —
+    /// (`spec_cache`) makes it warm across restarts. Manifest-gated -
     /// engines that do not advertise ngram-simple keep the dense
     /// behavior. Set false (or spec = "off") to stay dense.
     #[serde(default = "default_true")]
@@ -143,7 +143,7 @@ pub struct Config {
     pub spec_auto_manage: bool,
     /// Adaptive prefill shaping: when a model stays saturated for two
     /// consecutive 60 s windows, raise its micro-batch ceiling one tier
-    /// (1024 → 2048) at the next reshape so prefill chunks drain the
+    /// (1024 -> 2048) at the next reshape so prefill chunks drain the
     /// queue faster; a sustained quiet streak (10 windows) steps back
     /// down. Only fills where `ubatch_size` is unset (a config pin
     /// always wins). Default false; llamacpp lanes only (mistral.rs
@@ -152,17 +152,17 @@ pub struct Config {
     pub ubatch_auto: bool,
     /// On-demand tensor loading (`--lazy-mode`): "auto" (engine default:
     /// on-demand only for tensors > 4 GiB), "on" (all such tensors from
-    /// disk via mmap — big-MoE RAM relief), "off" (fully resident).
+    /// disk via mmap - big-MoE RAM relief), "off" (fully resident).
     pub lazy_mode: String,
     /// EXPERIMENTAL upstream server-side agent tools (`--tools` CSV or
-    /// "all"): the engine gains read/grep/exec/write capabilities —
+    /// "all"): the engine gains read/grep/exec/write capabilities -
     /// opt-in, never defaulted, engine also limits CORS to localhost
     /// when set. Do not enable in untrusted environments.
     #[serde(default)]
     pub server_tools: Option<String>,
     /// Runtime sandbox for `server_tools` (`--tools-runtime`), one of
     /// docker:<image> | podman:<image> | docker-container:<id> |
-    /// podman-container:<id> | ssh:<target>. Passthrough only — blazar
+    /// podman-container:<id> | ssh:<target>. Passthrough only - blazar
     /// itself never requires docker.
     #[serde(default)]
     pub server_tools_runtime: Option<String>,
@@ -179,7 +179,7 @@ pub struct Config {
     /// and extended prefixes (99.5% of tokens skipped on re-ask,
     /// measured) at zero cost, and the engine force-disables
     /// `--cache-reuse` at load on hybrid-linear archs (qwen35/
-    /// qwen3next/qwen4exp: interleaved-rope KV cannot shift — upstream
+    /// qwen3next/qwen4exp: interleaved-rope KV cannot shift - upstream
     /// warns `cache_reuse is not supported by this context`), so the
     /// flag only ever engages on full-attention archs. An earlier
     /// "~0.6s slower cold loads" note (elim sweep 2026-09-12, n=3
@@ -187,7 +187,7 @@ pub struct Config {
     /// (measured delta ~0 where the flag engages at all). Opt in for
     /// within-child mid-prompt prefix reuse on full-attention models:
     /// `--cache-reuse N` reuses KV chunks from that child's own slot
-    /// cache (per-process; never cross-replica — each replica is a
+    /// cache (per-process; never cross-replica - each replica is a
     /// separate llama-server with its own cache).
     pub cache_reuse: u32,
     /// API keys (virtual keys): empty = no auth (loopback default).
@@ -199,7 +199,7 @@ pub struct Config {
     pub rpc_servers: String,
     /// Child prompt-cache budget in MiB; 0 = unlimited. The default is a
     /// starting point the profile's adaptive RAM cap (30% of total) may
-    /// silently lower on small boxes — a user-set value that gets clamped
+    /// silently lower on small boxes - a user-set value that gets clamped
     /// is the only case worth a warning.
     pub cache_ram_mb: i64,
     /// CPU affinity range for child threads, "lo-hi" (e.g. "0-15" for the
@@ -213,7 +213,7 @@ pub struct Config {
     /// Empty = upstream auto (detect from template).
     pub reasoning_format: String,
     /// Server slots (`-np`). 0 = blazar auto (default): capacity-aware
-    /// concurrency — the total ctx scales so each slot keeps the resolved
+    /// concurrency - the total ctx scales so each slot keeps the resolved
     /// per-slot ctx, and the slot count is clamped by the KV budget and the
     /// model's trained context (up to 4). Concurrent streams then batch on
     /// the GPU instead of queueing (measured ~2.5x system throughput).
@@ -232,7 +232,7 @@ pub struct Config {
     pub deterministic: bool,
     /// Per-request deterministic isolation (complements `deterministic`):
     /// when `true`, a greedy request (temperature <= 0) that carries an
-    /// explicit `seed` is admitted EXCLUSIVELY — the gateway parks every
+    /// explicit `seed` is admitted EXCLUSIVELY - the gateway parks every
     /// other request for that model until it finishes, so the child
     /// serves it with a single-shape batch. Keeps multi-slot throughput
     /// for ordinary traffic while giving reproducibility-critical calls
@@ -249,19 +249,19 @@ pub struct Config {
     pub cache_type: String,
     /// Per-phase KV cache quantization, K side ("" = none set). When either
     /// side is set it wins over [`Config::cache_type`] for that side; a set
-    /// side with the other (and `cache_type`) unset mirrors into both — same
+    /// side with the other (and `cache_type`) unset mirrors into both - same
     /// vocabulary as `cache_type`. K precision dominates attention retrieval,
     /// so a split like `q8_0` K + `q4_0` V recovers capacity at better
     /// quality than symmetric `q4_0` (SnapKV/PyramidKV lineage).
     #[serde(default)]
     pub cache_type_k: String,
-    /// Per-phase KV cache quantization, V side — see `cache_type_k`.
+    /// Per-phase KV cache quantization, V side - see `cache_type_k`.
     #[serde(default)]
     pub cache_type_v: String,
-    /// Chat prompt recipe: `child` (default — the engine child renders
+    /// Chat prompt recipe: `child` (default - the engine child renders
     /// its own chat template) or `ollama_compat` (the gateway renders the
-    /// full prompt — chatml wrapping plus a JSON tool-call grammar
-    /// system block — and drives the child through the raw-completion
+    /// full prompt - chatml wrapping plus a JSON tool-call grammar
+    /// system block - and drives the child through the raw-completion
     /// lane; the gateway then parses tool calls back out of the text).
     /// `ollama_compat` measurably improves tool-calling on error-path and
     /// multi-turn flows for chatml-family models (A/B pinned live);
@@ -272,7 +272,7 @@ pub struct Config {
     /// `ollama_compat` raw lane. `free` (default) lets the model choose
     /// prose or a tool call; `strict` attaches a GBNF grammar that
     /// confines the completion to one-or-more `<tool_call>` envelopes
-    /// whose `name` must be one of the request's tools — structurally
+    /// whose `name` must be one of the request's tools - structurally
     /// valid calls, impossible to hallucinate names or malformed JSON.
     #[serde(default = "default_decode_policy")]
     pub decode_policy: String,
@@ -285,7 +285,7 @@ pub struct Config {
     pub raw_lane_max_tokens: u64,
     /// KV buffer layout: None = engine default (unified when slots are
     /// auto); Some(true) = `--kv-unified` (one shared buffer; K-shift
-    /// prefix reuse across sequences — the cheap radix); Some(false) =
+    /// prefix reuse across sequences - the cheap radix); Some(false) =
     /// `--no-kv-unified` (isolated per-slot buffers). Manifest-gated.
     #[serde(default)]
     pub kv_unified: Option<bool>,
@@ -312,7 +312,7 @@ pub struct Config {
     /// Manifest-gated.
     #[serde(default)]
     pub moe_cache_mib: u64,
-    /// `--no-kv-offload`: keep all KV on GPU — fail the load when it
+    /// `--no-kv-offload`: keep all KV on GPU - fail the load when it
     /// does not fit instead of spilling to CPU (latency determinism).
     #[serde(default)]
     pub no_kv_offload: bool,
@@ -325,18 +325,18 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub spawn_mem_guard: bool,
     /// Session bank: checkpoint slot KV to `_auto` on evict and restore
-    /// it on the next spawn — agent conversations resume warm after a
+    /// it on the next spawn - agent conversations resume warm after a
     /// capacity cycle instead of re-prefilling from scratch. Banks over
     /// 512 MiB are dropped (not a bank, a hoard).
     #[serde(default = "default_true")]
     pub session_bank: bool,
     /// Single-flight: identical NON-STREAM chat requests coalesce at the
     /// child-call boundary (the twin awaits the leader, then rides the
-    /// warm prefix). 5s bound — long generations never serialize their
+    /// warm prefix). 5s bound - long generations never serialize their
     /// duplicates indefinitely.
     ///
     /// OFF by default: measured to serialize parallel duplicates behind
-    /// the leader's FULL generation on multi-slot children — a C=8
+    /// the leader's FULL generation on multi-slot children - a C=8
     /// identical-body ladder lost 23-45% aggregate throughput vs the
     /// direct engine (the follower gains no warmth it would not also
     /// get from the child's own persistent prompt cache when served in
@@ -357,7 +357,7 @@ pub struct Config {
     /// every engine that benefits; `sglang`/`llamacpp` override it per
     /// engine. Pegged engines fire one tiny single completion (drains
     /// sglang's residual warmup queue) plus a small concurrent burst
-    /// (pegs the bs=N batch shapes) right after /health turns 200 — the
+    /// (pegs the bs=N batch shapes) right after /health turns 200 - the
     /// JIT cost lands in spawn instead of on a random first request.
     /// sglang pegs blocking (its first request paid ~30 s anyway),
     /// llamacpp pegs detached (near-zero cost). Engines that ship
@@ -375,8 +375,8 @@ pub struct Config {
     /// Per-request engine routing (the `[engine_routing]` table). `manual`
     /// (default) is byte-identical to today: the daemon's active engine
     /// serves everything and format mismatches teach. `auto` routes each
-    /// spawn by model format — GGUF to llamacpp (else mistral.rs),
-    /// safetensors to sglang (else mistral.rs) — building the routed
+    /// spawn by model format - GGUF to llamacpp (else mistral.rs),
+    /// safetensors to sglang (else mistral.rs) - building the routed
     /// engine's adapter for that spawn only; the global active engine is
     /// untouched. Per-model `model_overrides.<name>.engine` pins win over
     /// both modes.
@@ -400,7 +400,7 @@ pub struct Config {
     #[serde(default)]
     pub override_tensor: Vec<String>,
     /// Enable the child's agent mode (`--agent`): built-in tools + MCP CORS
-    /// proxy. WARNING: tools include `exec_shell_command` — only enable on
+    /// proxy. WARNING: tools include `exec_shell_command` - only enable on
     /// machines where that is acceptable.
     #[serde(default)]
     pub agent: bool,
@@ -452,7 +452,7 @@ pub struct Config {
     /// Audio lane (PR4083 era): Silero VAD model for the whisper-server
     /// child (`--vad --vad-model`), a ggml file the user provides (e.g.
     /// `silero-vad-v5.ggml`). VAD skips silence/noise segments before
-    /// decode — faster long-audio runs and fewer hallucinated spans.
+    /// decode - faster long-audio runs and fewer hallucinated spans.
     /// Blazar never auto-pulls the VAD model: an unset file that exists
     /// in the whisper engine dir is referenced by name; a missing file
     /// is a teaching error at child spawn, not a silent no-op. Unset =
@@ -505,7 +505,7 @@ pub struct Config {
     pub whisper_tinydiarize: bool,
     /// VAD speech probability threshold (`--vad-threshold`, upstream
     /// default 0.50): higher = fewer, longer segments; lower = more,
-    /// shorter segments. Only read when `whisper_vad_model` is set —
+    /// shorter segments. Only read when `whisper_vad_model` is set -
     /// a threshold without VAD is a config error, not a silent no-op.
     /// Unset = engine default.
     #[serde(default)]
@@ -544,14 +544,14 @@ pub struct Config {
     #[serde(default = "default_keep_tags")]
     pub keep_tags: usize,
     /// R4: opt-in semantic cache for non-stream chat responses.
-    /// Disabled by default — semantic similarity can serve a near-miss
+    /// Disabled by default - semantic similarity can serve a near-miss
     /// where an exact match was required; correctness-sensitive lanes
     /// must stay off (per-request `x-blazar-cache: off` escape hatch).
     #[serde(default)]
     pub semantic_cache: SemanticCacheConfig,
     /// BLZ-6 bounds for the filesystem-backed batch/file store. All
     /// quotas default to 0 = unlimited (the long-standing behavior);
-    /// the retention sweep is always-on and conservative — terminal
+    /// the retention sweep is always-on and conservative - terminal
     /// batches and orphaned uploads only, never in-flight work.
     #[serde(default)]
     pub batch: BatchLimits,
@@ -562,20 +562,20 @@ pub struct Config {
     pub devices: Vec<String>,
     /// How often the daemon checks GitHub for a newer llama.cpp b-release
     /// (0 = off). Never auto-installs: the result surfaces in `doctor`,
-    /// `ps`, and the log — `blazar engine update` stays a human action.
+    /// `ps`, and the log - `blazar engine update` stays a human action.
     #[serde(default = "default_engine_check_secs")]
     pub engine_check_secs: u64,
     /// mistral.rs paged-attention KV budget as a fraction of GPU memory
     /// (`--pa-memory-fraction`): the upstream default (0.90) claims ~90%
     /// of VRAM for KV and hard-fails at load ("Num GPU blocks is 0")
-    /// when weights + projector crowd an 8 GB card — lower it for big
+    /// when weights + projector crowd an 8 GB card - lower it for big
     /// vision models. None (default) = upstream default; 0.05..=0.95.
     #[serde(default)]
     pub mistralrs_pa_memory_fraction: Option<f32>,
     /// mistral.rs attention backend override (`--paged-attn on|off`):
     /// None (default) = upstream auto (paged on CUDA). `Some(false)`
     /// sizes the classic KV cache from the context instead of a
-    /// VRAM fraction — the only configuration that fits big vision
+    /// VRAM fraction - the only configuration that fits big vision
     /// models (9B + projector) on 8 GB cards, live-proven.
     #[serde(default)]
     pub mistralrs_paged_attn: Option<bool>,
@@ -583,7 +583,7 @@ pub struct Config {
     /// `model_overrides.<name>.mistralrs` replaces this whole struct
     /// when present). Every field maps 1:1 to a `mistralrs serve` flag
     /// and is emitted only when the active engine's capability manifest
-    /// advertises it — unknown-on-this-version flags skip with a
+    /// advertises it - unknown-on-this-version flags skip with a
     /// warning instead of erroring. The two legacy globals
     /// (`mistralrs_pa_memory_fraction`, `mistralrs_paged_attn`) predate
     /// the struct and keep their names.
@@ -593,7 +593,7 @@ pub struct Config {
     /// `model_overrides.<name>.sglang` replaces this whole struct when
     /// present). Every field maps 1:1 to a `python -m sglang.launch_server`
     /// flag and is emitted only when the active engine's capability
-    /// manifest advertises it — unknown-on-this-version flags skip with a
+    /// manifest advertises it - unknown-on-this-version flags skip with a
     /// warning instead of erroring. The VRAM ladder flags
     /// (`--mem-fraction-static`, `--cpu-offload-gb`, `--kv-cache-dtype`,
     /// `--context-length`) are owned by the profile compiler; the tuning
@@ -605,7 +605,7 @@ pub struct Config {
     /// `model_overrides.<name>.mlx` replaces this whole struct when
     /// present). Every field maps 1:1 to a `mlx_lm.server` flag and is
     /// emitted only when the active engine's capability manifest
-    /// advertises it — unknown-on-this-version flags skip with a
+    /// advertises it - unknown-on-this-version flags skip with a
     /// warning instead of erroring.
     #[serde(default)]
     pub mlx: MlxTuning,
@@ -628,7 +628,7 @@ pub struct Config {
     /// (pre-first-byte). A child that accepts a request but never answers
     /// is a live wedge (observed live: a banked-session slot restore
     /// raced traffic and parked one request 300s+ while the child served
-    /// every later request) — it gets evicted, the request retries once
+    /// every later request) - it gets evicted, the request retries once
     /// in-band on the respawned lane, and a second stall fails 504
     /// instead of parking until the blanket transport ceiling. Sized
     /// above worst legitimate prefill (JIT-class first request ~30s;
@@ -638,7 +638,7 @@ pub struct Config {
     pub child_header_timeout_secs: u64,
     /// Same ceiling, scoped to the sdcpp (diffusion) lane. A diffusion
     /// child sends its first response byte only after the ENTIRE frame
-    /// is computed — time-to-headers IS generation time, minutes at
+    /// is computed - time-to-headers IS generation time, minutes at
     /// native resolutions on offloaded hardware (a 1024px qwen-image
     /// tour on a streaming-from-RAM posture blew the text-lane 120s
     /// ceiling live and got evicted mid-generation). Video runs longer
@@ -648,13 +648,13 @@ pub struct Config {
     pub sdcpp_child_header_timeout_secs: u64,
     /// Step-caching strategy for sd-server children (`--cache-mode`):
     /// one of easycache | ucache | dbcache | taylorseer | cache-dit |
-    /// spectrum. Adaptive feature reuse across denoising steps — a
+    /// spectrum. Adaptive feature reuse across denoising steps - a
     /// large speed lever on `DiT` renders with threshold-controlled
     /// quality drift. None = exact per-step compute (unchanged output).
     #[serde(default)]
     pub sdcpp_cache_mode: Option<String>,
     /// Flash-attention kernels for sd-server children (`--fa`): faster
-    /// attention, less VRAM. On by default — measured 25% faster renders
+    /// attention, less VRAM. On by default - measured 25% faster renders
     /// at statistically identical output (seeded A/B, pixel delta 0.46%
     /// of range); the manifest gate degrades to a warning on engines
     /// that lack the flag.
@@ -665,12 +665,12 @@ pub struct Config {
     #[serde(default)]
     pub sdcpp_vae_tiling: bool,
     /// RPC worker endpoints for sd-server children (`--rpc-servers`,
-    /// comma-joined) — the diffusion-lane twin of llamacpp
+    /// comma-joined) - the diffusion-lane twin of llamacpp
     /// `rpc_servers`. Empty = local devices only.
     #[serde(default)]
     pub sdcpp_rpc_servers: Vec<String>,
     /// `SageAttention` kernels for sd-server children (`--sage-attn`):
-    /// native 8-bit attention, roughly 2x over legacy kernels — but it
+    /// native 8-bit attention, roughly 2x over legacy kernels - but it
     /// hard-requires a patched GGML CUDA backend (CUDA 12+, SM80+) and
     /// the child DIES AT LOAD on other builds (verified live: the Vulkan
     /// backend refuses and the engine exits). Off by default; only
@@ -712,8 +712,8 @@ pub struct Config {
     #[serde(default)]
     pub sdcpp_conditioning_cache_size: Option<u64>,
     /// Qwen-Image-2.1 prefix KV cache strategy for sd-server children:
-    /// sets the `qwen_image_2_1_prefix_cache_type` model-arg — `auto`
-    /// or a concrete type — enabling early prefix-cache scheduling
+    /// sets the `qwen_image_2_1_prefix_cache_type` model-arg - `auto`
+    /// or a concrete type - enabling early prefix-cache scheduling
     /// (upstream PR2045, master-929+). A large VRAM win on repeated
     /// compositions; older engines ignore the key. Composes into
     /// `sdcpp_model_args`; an explicit user entry for the same key wins
@@ -726,7 +726,7 @@ pub struct Config {
     /// engine defaults.
     #[serde(default)]
     pub sdcpp_model_args: Option<String>,
-    /// Engine-boot flag passthrough for sd-server children — the levers
+    /// Engine-boot flag passthrough for sd-server children - the levers
     /// with no first-class knob. Blazar's launch pins and the
     /// first-class component knobs are refused here; flags are
     /// validated against the installed sdcpp engine's probed manifest
@@ -748,7 +748,7 @@ pub struct Config {
     pub sdcpp_control_net: Option<String>,
     /// IP-Adapter model path (`--ip-adapter`): image-prompt conditioning
     /// (style/identity transfer from a reference image, per-request
-    /// `--ip-adapter-image`). Requires `sdcpp_clip_vision` — config
+    /// `--ip-adapter-image`). Requires `sdcpp_clip_vision` - config
     /// validation rejects the pair otherwise (upstream hard-requires
     /// it). Unset = no IP-Adapter.
     #[serde(default)]
@@ -817,12 +817,12 @@ pub struct Config {
     /// many seconds the gateway answers 504 while the engine child may
     /// still be rendering. Long video tours should raise this. 0 means
     /// no gateway cap (the client disconnect or job completion is the
-    /// bound). Async handles are never capped — only their holders poll.
+    /// bound). Async handles are never capped - only their holders poll.
     #[serde(default = "default_media_job_wait_secs")]
     pub media_job_wait_secs: u64,
     /// Sentinel enforce: hard violations (invalid tool args, unknown tool
     /// names, schema violations) become 422s on NON-STREAMING chat
-    /// requests (streaming bytes are already on the wire — warn-only
+    /// requests (streaming bytes are already on the wire - warn-only
     /// there). Per-request `X-Blazar-Enforce: 1|0` overrides.
     #[serde(default)]
     pub sentinel_enforce: bool,
@@ -833,7 +833,7 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub audit_log: bool,
     /// TLS: PEM certificate chain path. Empty = plain HTTP. Must be set
-    /// together with `tls_key` (both or neither — validated).
+    /// together with `tls_key` (both or neither - validated).
     #[serde(default)]
     pub tls_cert: String,
     /// TLS: PEM private key path matching `tls_cert`.
@@ -849,7 +849,7 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     /// OTLP trace export: collector base URL (e.g.
     /// "<http://127.0.0.1:4318>"). Empty = off (default). One span per
-    /// gateway request, batched, bounded — observability never becomes
+    /// gateway request, batched, bounded - observability never becomes
     /// backpressure.
     #[serde(default)]
     pub otlp_endpoint: String,
@@ -1099,7 +1099,7 @@ pub struct Config {
     #[serde(default)]
     pub chat_template_kwargs: Option<String>,
     /// Continuous (dynamic) batching (upstream default true). Disabling
-    /// serializes slots — useful only for debugging near-tie logits.
+    /// serializes slots - useful only for debugging near-tie logits.
     #[serde(default)]
     pub cont_batching: Option<bool>,
     /// Flash attention override for the GGML (llama-server) lane.
@@ -1126,7 +1126,7 @@ pub struct Config {
 
     /// Global projector policy default (None = `lazy`: text-only spawn,
     /// projector attaches on the first vision request via a KV-bank
-    /// respawn — measured 2026-09-11: 875 MiB projector costs +3.9 s
+    /// respawn - measured 2026-09-11: 875 MiB projector costs +3.9 s
     /// cold TTFT + 1126 MiB VRAM on a 9B VL row). Per-model
     /// `model_overrides.<name>.mmproj` wins.
     #[serde(default, deserialize_with = "de_mmproj")]
@@ -1151,7 +1151,7 @@ pub struct Config {
     /// Predictive pre-loading (LC1): track which model tends to follow
     /// which and pre-spawn the likely next model while the current one
     /// idles, so the switch is warm instead of a cold start. Off by
-    /// default — it deliberately spends RAM/VRAM ahead of demand.
+    /// default - it deliberately spends RAM/VRAM ahead of demand.
     #[serde(default)]
     pub predictive_preload: bool,
     /// Startup preload list (F1): models to spawn right after the
@@ -1162,14 +1162,14 @@ pub struct Config {
     pub preload: Vec<String>,
     /// Warm-on-pull (Wave L): when a model finishes pulling, spawn it in
     /// the background right away so the first request rides a warm child
-    /// instead of a cold start. Off by default — it spends RAM/VRAM at
+    /// instead of a cold start. Off by default - it spends RAM/VRAM at
     /// intent time rather than request time. Gated on AC power where
     /// detectable and on the standard spawn admission belts.
     #[serde(default)]
     pub warm_on_pull: bool,
     /// Idle-to-RAM warm (F1): after the idle ladder evicts a model, a
     /// background sequential re-read of its weights refreshes the OS
-    /// page cache — the RAM tier between VRAM and disk — so a re-spawn
+    /// page cache - the RAM tier between VRAM and disk - so a re-spawn
     /// mmaps warm pages instead of faulting from storage. Holds no
     /// VRAM. Skipped under `load_mode = "direct-io"`. On by default.
     #[serde(default = "default_true")]
@@ -1182,7 +1182,7 @@ pub struct Config {
     /// D5 decode-scaling gate on adaptive slots: suppress the slot
     /// adoption when fresh solo + loaded throughput evidence says the
     /// model's aggregate decode barely scales with concurrency
-    /// (GPU-bound) — the reshape would pay a transition for queue
+    /// (GPU-bound) - the reshape would pay a transition for queue
     /// relief only, so the lane is taught instead (see
     /// `SlotsDecodeBound`). The gate stands down while either regime
     /// is unsampled, so a fresh model still adapts as before. On by
@@ -1218,7 +1218,7 @@ pub struct Config {
     #[serde(default)]
     pub tensor_preset: String,
     /// Redact obvious PII (emails, bearer secrets, IPv4 addresses) from
-    /// `why`/`watch` output. On by default — redaction costs nothing
+    /// `why`/`watch` output. On by default - redaction costs nothing
     /// and access logs never carry bodies anyway; set `false` for
     /// verbatim values.
     #[serde(default = "default_true")]
@@ -1240,7 +1240,7 @@ pub struct Config {
     #[serde(default)]
     pub check_tensors: bool,
     /// Enable context shift on infinite generation (upstream b10833
-    /// default: DISABLED — emits `--context-shift` only when true).
+    /// default: DISABLED - emits `--context-shift` only when true).
     #[serde(default)]
     pub context_shift: bool,
     /// Default sampler chain, comma-separated (`""` = engine default; e.g.
@@ -1283,7 +1283,7 @@ pub struct Config {
 
 /// The spec-mode vocabulary shared by config validation (global
 /// `spec`, `model_overrides.<name>.spec`) and the per-request
-/// `options.spec` / `X-Blazar-Spec` override — one list, one teaching
+/// `options.spec` / `X-Blazar-Spec` override - one list, one teaching
 /// error, no drift between the lanes that accept a mode.
 #[must_use]
 pub fn is_valid_spec_mode(mode: &str) -> bool {
@@ -1328,7 +1328,7 @@ fn tensor_preset_entries(name: &str) -> Option<&'static [String]> {
 
 const REASONING_EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// Per-model config overlay. Unknown keys are a hard error at parse time —
+/// Per-model config overlay. Unknown keys are a hard error at parse time -
 /// a typo'd knob must never be silently ignored.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1340,7 +1340,7 @@ pub struct ModelOverride {
     /// Lift the manual-`slots`-pin exclusion from adaptive-slot
     /// adoption for this model only (D2): the pin becomes the base
     /// shape adaptation steps from, not a ceiling. Replicas and
-    /// deterministic exclusions stay either way. Default `None`/false —
+    /// deterministic exclusions stay either way. Default `None`/false -
     /// a pin is policy; sustained pressure behind it surfaces as a
     /// `SlotsPinnedPressure` event with this knob as the remedy.
     #[serde(default)]
@@ -1414,7 +1414,7 @@ pub struct ModelOverride {
     /// Per-model server-side reasoning switch (None = inherit global).
     #[serde(default)]
     pub reasoning: Option<String>,
-    /// Per-model replica count (1 = single instance — the default and
+    /// Per-model replica count (1 = single instance - the default and
     /// the exact pre-replica behavior). >1 enables prefix-affinity
     /// routing across identical children of the same model.
     #[serde(default)]
@@ -1459,7 +1459,7 @@ pub struct ModelOverride {
     pub late_chunking: Option<bool>,
     /// Per-model RPC server list (`--rpc`): comma-separated `host:port`
     /// entries pointing at `llama-server -r` workers. Replaces (not
-    /// merges) the global `rpc_servers` list for this model — C6:
+    /// merges) the global `rpc_servers` list for this model - C6:
     /// different models can lean on different GPU boxes without a
     /// fleet-wide config change. Empty/None = inherit the global.
     #[serde(default)]
@@ -1467,7 +1467,7 @@ pub struct ModelOverride {
     /// Per-model `--tensor-split` ratios: comma-separated positive
     /// numbers apportioning weights+KV across devices (local GPUs +
     /// RPC workers, in device order). Replaces (not merges) the
-    /// global `tensor_split` for this model — C6: a fleet box with a
+    /// global `tensor_split` for this model - C6: a fleet box with a
     /// idle second card can host one fat model split while the rest
     /// keep whole-device placement. Empty/None = inherit the global.
     #[serde(default)]
@@ -1476,9 +1476,9 @@ pub struct ModelOverride {
     /// `true`/`"attach"` spawns with the row's mmproj as before;
     /// `false`/`"skip"` spawns text-only and vision fails loudly;
     /// `"lazy"` spawns text-only for the measured cold-start/VRAM win
-    /// (2026-09-11: 875 MiB projector ≈ +3.9 s cold TTFT + 1126 MiB VRAM
+    /// (2026-09-11: 875 MiB projector ~ +3.9 s cold TTFT + 1126 MiB VRAM
     /// on a 9B VL row) and RESPAWNS with the projector on the first
-    /// vision request — conversation state rides the KV bank across the
+    /// vision request - conversation state rides the KV bank across the
     /// respawn, so nothing is lost beyond one warm-cache reload. An
     /// explicit `-mm` in `extra_args` still wins.
     #[serde(default, deserialize_with = "de_mmproj")]
@@ -1498,7 +1498,7 @@ pub struct ModelOverride {
     /// engine.
     #[serde(default)]
     pub mlx: Option<MlxTuning>,
-    /// Pin this model to one engine — an exact engine tag (`b10980-cuda`)
+    /// Pin this model to one engine - an exact engine tag (`b10980-cuda`)
     /// or a kind (`llamacpp` / `sglang` / `mistralrs`). Wins over both
     /// `[engine_routing]` modes; a tag that is not installed fails loudly
     /// at spawn with the roster.
@@ -1551,7 +1551,7 @@ pub struct SglangTuning {
     pub tokenizer_path: Option<String>,
     /// `--dtype` (auto, half, bfloat16, float...).
     pub dtype: Option<String>,
-    /// `--quantization` (awq, gptq, fp8, marlin...) — overrides the
+    /// `--quantization` (awq, gptq, fp8, marlin...) - overrides the
     /// checkpoint's own quantization config.
     pub quantization: Option<String>,
     /// `--kv-cache-dtype` (auto, bf16, `fp8_e5m2`, `fp8_e4m3`...). Explicit
@@ -1561,12 +1561,12 @@ pub struct SglangTuning {
     /// ladder's derived fraction, but passes reserve governance: it is
     /// clamped to a ceiling that keeps activations, CUDA-graph capture,
     /// and (on spec lanes) the verify/prewarm chain inside the
-    /// `(1-frac)` dynamic remainder — the engine bounds only
+    /// `(1-frac)` dynamic remainder - the engine bounds only
     /// weights+draft+KV by the fraction.
     pub mem_fraction_static: Option<f32>,
     /// `--cpu-offload-gb`: weights GBs pinned to host RAM (low-VRAM
     /// ladder engages this automatically; an explicit pin wins). The
-    /// engine flag is integer-GB — fractional pins round UP at emission
+    /// engine flag is integer-GB - fractional pins round UP at emission
     /// with a teaching warning.
     pub cpu_offload_gb: Option<f32>,
     /// `--page-size` (tokens per KV page).
@@ -1584,7 +1584,7 @@ pub struct SglangTuning {
     pub stream_interval: Option<u32>,
     /// `--random-seed`.
     pub random_seed: Option<i64>,
-    /// `--cuda-graph-max-bs` (0.5.19 default 256 — expensive on small
+    /// `--cuda-graph-max-bs` (0.5.19 default 256 - expensive on small
     /// cards; the ladder lowers it on tight fits).
     pub cuda_graph_max_bs: Option<u32>,
     /// `--enable-hierarchical-cache`: KV hierarchical caching to host
@@ -1596,8 +1596,8 @@ pub struct SglangTuning {
     pub hicache_size: Option<f64>,
     /// `--is-embedding`: run this `CausalLM` as an embedding model
     /// (decoder pooling, normalized). sglang treats this as a dedicated
-    /// posture — that child serves `/v1/embeddings` and refuses
-    /// generation — so it belongs on an embedding-specific model entry,
+    /// posture - that child serves `/v1/embeddings` and refuses
+    /// generation - so it belongs on an embedding-specific model entry,
     /// not the main chat lane.
     pub is_embedding: Option<bool>,
     /// `--enable-metrics` (Prometheus /metrics).
@@ -1655,7 +1655,7 @@ pub struct SglangTuning {
     /// (e.g. `[1, 2, 4]`). Overrides the ladder's derived
     /// cuda-graph-max-bs on tight fits.
     pub cuda_graph_bs: Option<Vec<u32>>,
-    /// `--cuda-graph-backend-prefill`: prefill-graph capture strategy —
+    /// `--cuda-graph-backend-prefill`: prefill-graph capture strategy -
     /// `full`, `breakable` (upstream default), `tc_piecewise`, or
     /// `disabled`. On some hybrid-GPU laptops the 42-shape breakable
     /// prefill capture deadlocks at 0% (live-proven with an AWQ model);
@@ -1676,40 +1676,40 @@ pub struct SglangTuning {
     /// `--lora-backend` (pytorch, flashinfer).
     pub lora_backend: Option<String>,
     /// `--speculative-algorithm` ("ngram" -> NGRAM): prompt-based
-    /// draft-free self-speculation — the drafter is the context itself
+    /// draft-free self-speculation - the drafter is the context itself
     /// (n-gram lookup), so there are no draft weights to pull and no
     /// admission charge beyond verify-KV. DFLASH is deliberately not
     /// offered: sglang 0.5.21 hard-requires --speculative-draft-model-path
     /// for it (2026-10-09 live receipt: `ValueError` at spawn), which puts
     /// it in the draft-pair lane, not the knob lane.
     /// Verified output stays distribution-identical to dense decode
-    /// (rejection sampling); bench before adopting at scale —
+    /// (rejection sampling); bench before adopting at scale -
     /// verification overhead can regress non-repetitive workloads and
     /// C >= 2 aggregate throughput. 2026-10-09 live receipts
     /// (qwen3-1.7b, RTX 4070): ngram lost to dense at every concurrency
-    /// (-16% C1, -44% C8, +12s cold), so the default stays off — this
+    /// (-16% C1, -44% C8, +12s cold), so the default stays off - this
     /// knob is opt-in. Sampling is unconstrained: the 2026-10-09
     /// greedy-only caveat (non-greedy verify sampling drove a
     /// flashinfer JIT whose floating CUDA compiler trio mismatched
-    /// the torch wheels — "Ninja build failed") was root-caused and
+    /// the torch wheels - "Ninja build failed") was root-caused and
     /// fixed by pinning the venv's compiler trio to torch's line at
     /// install; 2026-10-17 live receipts (qwen3-1.7b, NGRAM engaged,
     /// fixed toolchain): temperature 0.7-1.0 requests complete on
     /// both sampling backends (`pytorch` default and a
     /// `sampling_backend = "flashinfer"` pin), coherent output, zero
     /// JIT failures. The `attention_backend = "triton"` pairing note
-    /// retires with it — flashinfer backends work when pinned; the
+    /// retires with it - flashinfer backends work when pinned; the
     /// global portability default still emits triton for toolchain-
     /// less boxes. The EAGLE family rides the
     /// draft-pair lane (`spec = "eagle3"` + a pulled safetensors
     /// draft), not this knob. `"dflash"` (0.5.21+) additionally
-    /// requires `spec_draft_path` — a safetensors draft dir the
+    /// requires `spec_draft_path` - a safetensors draft dir the
     /// engine loads via `--speculative-draft-model-path`.
     pub spec_algorithm: Option<String>,
     /// `--speculative-draft-model-path`: a safetensors draft dir for
     /// draft-model algorithms on the knob lane (`spec_algorithm =
     /// "dflash"`). The engine hard-requires it for DFLASH (2026-10-09
-    /// live receipt: `ValueError` at spawn without it) — DFLASH rides
+    /// live receipt: `ValueError` at spawn without it) - DFLASH rides
     /// the EAGLE-family draft machinery, so an EAGLE3-class head dir
     /// is the artifact. GGUF drafts are llama.cpp-lane-only: sglang's
     /// loader treats unknown paths as HF repo ids and dies in
@@ -1722,7 +1722,7 @@ pub struct SglangTuning {
     /// round; upstream relates it to `num_steps` per algorithm and
     /// enforces its own grammar at spawn.
     pub spec_num_draft_tokens: Option<u32>,
-    /// `--speculative-eagle-topk`: EAGLE-family draft-tree fanout —
+    /// `--speculative-eagle-topk`: EAGLE-family draft-tree fanout -
     /// how many candidate heads the draft step expands per level.
     /// Depth knob for the EAGLE3 draft-pair lane (and any future
     /// draft-model algorithm); meaningless without speculation
@@ -1736,7 +1736,7 @@ pub struct SglangTuning {
     /// sampling keeps it lossless only at the upstream defaults).
     pub speculative_accept_threshold_single: Option<f64>,
     /// `--speculative-accept-threshold-acc` (0.0..=1.0): raises a
-    /// draft token's accept probability from p to min(1, p / t) —
+    /// draft token's accept probability from p to min(1, p / t) -
     /// the cumulative counterpart of the single-token threshold.
     pub speculative_accept_threshold_acc: Option<f64>,
     /// `--speculative-dflash-block-size`: DFLASH block size in tokens.
@@ -1744,7 +1744,7 @@ pub struct SglangTuning {
     /// `spec_algorithm = "dflash"` + `spec_draft_path`.
     pub speculative_dflash_block_size: Option<u64>,
     /// `--mm-attention-backend`: multimodal attention backend. No
-    /// blazar-side choice list — the upstream enum is long,
+    /// blazar-side choice list - the upstream enum is long,
     /// hardware-specific, and still growing; the engine's own
     /// argparse rejects typos at spawn (fail fast, no silent pass).
     pub mm_attention_backend: Option<String>,
@@ -1760,12 +1760,12 @@ pub struct SglangTuning {
     /// on a single 8 GB card it mostly adds capture-time memory.
     pub enable_two_batch_overlap: Option<bool>,
     /// `--enable-tf32-matmul`: allow TF32 (19-bit mantissa math) for
-    /// float32 matmuls on Ampere+ — faster fp32 paths, bitwise
+    /// float32 matmuls on Ampere+ - faster fp32 paths, bitwise
     /// different from strict fp32. Off keeps strict fp32.
     pub enable_tf32_matmul: Option<bool>,
     /// `--enable-priority-scheduling`: schedule by request priority
     /// instead of arrival order. Required companion of
-    /// `retraction_policy = "priority"` — sglang 0.5.21 refuses the
+    /// `retraction_policy = "priority"` - sglang 0.5.21 refuses the
     /// pair at spawn otherwise (2026-10-10 live receipt: engine dies
     /// during load with "retraction-policy priority requires
     /// enable-priority-scheduling"); `validate` enforces it here so
@@ -1781,7 +1781,7 @@ impl SglangTuning {
         override_.cloned().unwrap_or_else(|| global.clone())
     }
 
-    /// True when ANY parallel size (tp/dp/pp/ep) is pinned above 1 —
+    /// True when ANY parallel size (tp/dp/pp/ep) is pinned above 1 -
     /// the user is orchestrating sharding themselves, so the
     /// supervisor's auto tensor-parallel plan must stand down.
     #[must_use]
@@ -1861,7 +1861,7 @@ impl SglangTuning {
     }
 
     /// Choice lists mirror the installed sglang 0.5.19 `--help`
-    /// grammar — rejecting at config-write time beats an opaque
+    /// grammar - rejecting at config-write time beats an opaque
     /// argparse death at spawn.
     fn validate_choice_fields(&self, where_: &str) -> Result<(), CoreError> {
         let choice = |field: &str, v: &Option<String>, allowed: &[&str]| -> Option<CoreError> {
@@ -1912,7 +1912,7 @@ impl SglangTuning {
             && self.spec_draft_path.as_deref().is_none_or(str::is_empty)
         {
             return Err(CoreError::Config(
-                "sglang.spec_algorithm \"dflash\" needs sglang.spec_draft_path — a \
+                "sglang.spec_algorithm \"dflash\" needs sglang.spec_draft_path - a \
                  safetensors draft dir (sglang hard-requires the draft model; \
                  2026-10-09 live receipt)"
                     .into(),
@@ -2001,7 +2001,7 @@ pub struct MlxTuning {
     /// `--num-draft-tokens`: how many tokens the draft proposes per
     /// verify round. Only meaningful with `draft_model`.
     pub num_draft_tokens: Option<u32>,
-    /// `--kv-bits`: KV cache quantization width (e.g. 4 or 8) —
+    /// `--kv-bits`: KV cache quantization width (e.g. 4 or 8) -
     /// shrinks memory so longer contexts fit in unified memory.
     /// Trade-off straight from upstream help: this DISABLES BATCHING
     /// (the server serves one request at a time).
@@ -2115,7 +2115,7 @@ pub struct MistralrsTuning {
     /// instead of a VRAM fraction.
     pub pa_context_len: Option<u64>,
     /// `--pa-memory-mb` (v0.9.4): absolute paged-KV pool in MiB instead
-    /// of the VRAM-fraction derive — the pin to reach for when the GPU
+    /// of the VRAM-fraction derive - the pin to reach for when the GPU
     /// is shared with non-inference residents and a fraction would
     /// overcommit.
     pub pa_memory_mb: Option<u64>,
@@ -2162,7 +2162,7 @@ pub struct MistralrsTuning {
     /// (numeric level `2..8` or a quant name like `q4k`, `q8_0`).
     /// Shrinks the resident model below its on-disk size, so blazar's
     /// admission (which charges the checkpoint bytes) stays
-    /// conservative — the fit ladder over-reserves rather than
+    /// conservative - the fit ladder over-reserves rather than
     /// under-reserving. Engine-owned vocabulary: an unknown level fails
     /// loudly at spawn with upstream's own error.
     pub isq: Option<String>,
@@ -2172,7 +2172,7 @@ pub struct MistralrsTuning {
     /// `--calibration-file`: calibration data for imatrix generation.
     /// Unset = none.
     pub calibration_file: Option<String>,
-    /// `--isq-organization`: ISQ layout strategy — `default` or `moqe`.
+    /// `--isq-organization`: ISQ layout strategy - `default` or `moqe`.
     pub isq_organization: Option<String>,
     /// `--device-layers`: layer mapping `ORD:NUM;...` (e.g.
     /// `0:10;1:20`). Single-GPU boxes get a teaching warning.
@@ -2222,7 +2222,7 @@ impl MistralrsTuning {
                 return Err(e);
             }
         }
-        // prefix_cache_n: 0 is a valid "disable" — only negative is
+        // prefix_cache_n: 0 is a valid "disable" - only negative is
         // impossible in u64, so no floor check.
         if let Some(s) = &self.mtp_draft_sampling
             && !["auto", "greedy", "probabilistic"].contains(&s.as_str())
@@ -2231,7 +2231,7 @@ impl MistralrsTuning {
                 "{where_}.mtp_draft_sampling must be one of [\"auto\", \"greedy\", \"probabilistic\"], got {s:?}"
             )));
         }
-        // Mirrors the installed mistral.rs `--pa-cache-type` grammar —
+        // Mirrors the installed mistral.rs `--pa-cache-type` grammar -
         // rejecting at config-write time beats an opaque engine death at
         // spawn (the 502 still teaches the accepted values if a future
         // engine build widens the set before this list catches up).
@@ -2271,10 +2271,10 @@ impl MistralrsTuning {
             }
         }
         if self.mtp_model.is_some() && self.mtp != Some(true) {
-            // Not an error: the model pin is inert without --mtp —
+            // Not an error: the model pin is inert without --mtp -
             // surface as a config-time footgun catch.
             return Err(CoreError::Config(format!(
-                "{where_}.mtp_model set but mtp is not true — the MTP head stays inactive; set mtp = true or drop mtp_model"
+                "{where_}.mtp_model set but mtp is not true - the MTP head stays inactive; set mtp = true or drop mtp_model"
             )));
         }
         Ok(())
@@ -2456,7 +2456,7 @@ impl SamplerDefaults {
 }
 
 /// One external OpenAI-compatible server (another blazar, vLLM, MLX
-/// server, llamactl — anything speaking `/v1/*`).
+/// server, llamactl - anything speaking `/v1/*`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Remote {
@@ -2469,7 +2469,7 @@ pub struct Remote {
     pub key: String,
     /// Escape hatch for the scheme ladder: a cleartext-HTTP remote that
     /// is not loopback is refused at boot by default. Setting this makes
-    /// it a loud warning instead — for labs that genuinely must talk to
+    /// it a loud warning instead - for labs that genuinely must talk to
     /// a public HTTP endpoint. Prefer https:// or an IP literal.
     #[serde(default)]
     pub allow_insecure_http: bool,
@@ -2480,14 +2480,14 @@ pub struct Remote {
 /// and instant): any hostname other than `localhost` counts as public.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteSchemePolicy {
-    /// `https://` — encrypted on any network.
+    /// `https://` - encrypted on any network.
     HttpsOk,
-    /// `http://` to a loopback address — never leaves the machine.
+    /// `http://` to a loopback address - never leaves the machine.
     LoopbackHttpOk,
-    /// `http://` to a private/link-local address — the bearer key
+    /// `http://` to a private/link-local address - the bearer key
     /// travels in cleartext on the LAN.
     LanHttpWarn,
-    /// `http://` to anything else (or a non-http(s) URL) — refused.
+    /// `http://` to anything else (or a non-http(s) URL) - refused.
     InsecureHttpRefused,
 }
 
@@ -2597,7 +2597,7 @@ fn default_failover_min_residence_secs() -> u64 {
 /// A local MCP (Model Context Protocol) server the gateway can pull
 /// tools from. Tools are injected into chat requests that opt in via
 /// the `mcp` body field or `x-blazar-mcp` header; the gateway executes
-/// the calls the model makes and feeds results back — every engine
+/// the calls the model makes and feeds results back - every engine
 /// lane gets tool use, no child-side MCP support required.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2621,7 +2621,7 @@ pub struct McpServer {
     /// Security boundary (stdio only): start the child from an EMPTY
     /// environment instead of inheriting the daemon's. With it, the child
     /// sees only what `env` sets below, what `allowed_env` re-inherits,
-    /// and nothing else. Off by default — existing servers keep today's
+    /// and nothing else. Off by default - existing servers keep today's
     /// inherit-everything behavior.
     #[serde(default)]
     pub env_clear: bool,
@@ -2655,7 +2655,7 @@ fn default_remote_fallback() -> bool {
 
 /// One virtual API key: bearer identity + optional model scope and
 /// rate/token budgets. 0-valued budgets are unlimited; an empty `models`
-/// list means every model (admin semantics — such keys also manage the
+/// list means every model (admin semantics - such keys also manage the
 /// key list itself via `/api/keys`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2679,7 +2679,7 @@ pub struct ApiKey {
     pub daily_tokens: u64,
     /// Simultaneous in-flight requests cap; 0 = unlimited. The slot is
     /// leased at auth time and held until the response body finishes
-    /// streaming (or the connection drops) — a held SSE stream IS the
+    /// streaming (or the connection drops) - a held SSE stream IS the
     /// resource being bounded.
     #[serde(default)]
     pub max_concurrent: u32,
@@ -2722,7 +2722,7 @@ fn default_fork_retire_days() -> u64 {
 }
 
 /// Built-in engine retention (per kind) when the config knob is absent.
-/// blazar-runtime re-exports this as `engine::KEEP_TAGS` — one source of
+/// blazar-runtime re-exports this as `engine::KEEP_TAGS` - one source of
 /// truth for the default across both crates.
 pub const DEFAULT_KEEP_TAGS: usize = 2;
 
@@ -2742,12 +2742,12 @@ fn default_semantic_max_entries() -> usize {
     256
 }
 
-/// `[semantic_cache]` — opt-in semantic response cache (R4). The `model`
+/// `[semantic_cache]` - opt-in semantic response cache (R4). The `model`
 /// is a registered embedding-capable model used to embed prompts; the
 /// cache stores L2-normalized prompt vectors and serves stored responses
 /// when cosine similarity meets `threshold` for the same chat model and
 /// API key on the same lane.
-/// Spawn warm-peg policy — the `[warm_peg]` table. `default` gates every
+/// Spawn warm-peg policy - the `[warm_peg]` table. `default` gates every
 /// engine that benefits; `sglang`/`llamacpp` override it per engine
 /// (`blazar config set warm_peg.sglang false`). Engines outside the
 /// pegged set are never pegged regardless of `default`.
@@ -2758,14 +2758,14 @@ pub struct WarmPeg {
     /// is pinned.
     #[serde(default = "default_true")]
     pub default: bool,
-    /// sglang override (its peg blocks spawn by design — set false to
+    /// sglang override (its peg blocks spawn by design - set false to
     /// publish Ready as soon as /health flips and let the first request
     /// pay the residual warmup).
     pub sglang: Option<bool>,
     /// llamacpp override (its peg is detached and near-free).
     pub llamacpp: Option<bool>,
     /// mlx override (same JIT class as sglang: the warm peg absorbs
-    /// the python cold-boot — set false to publish Ready on /health).
+    /// the python cold-boot - set false to publish Ready on /health).
     pub mlx: Option<bool>,
 }
 
@@ -2792,9 +2792,9 @@ impl WarmPeg {
             EngineKind::Mlx => self.mlx.unwrap_or(self.default),
             // No peg lane exists for these servers: readiness publishes
             // when the health probe flips (mistralrs), /v1/models first
-            // answers (sdcpp), or the lazy child first boots (whisper —
+            // answers (sdcpp), or the lazy child first boots (whisper -
             // never supervised at all). Piper synthesizes one-shot per
-            // request through the CLI — nothing stays up to peg.
+            // request through the CLI - nothing stays up to peg.
             EngineKind::MistralRs | EngineKind::SdCpp | EngineKind::Whisper | EngineKind::Piper => {
                 false
             }
@@ -2802,19 +2802,19 @@ impl WarmPeg {
     }
 }
 
-/// Per-request engine routing — the `[engine_routing]` table. `manual`
+/// Per-request engine routing - the `[engine_routing]` table. `manual`
 /// (default) keeps today's single-active-engine behavior byte-identical;
 /// `auto` picks the serving engine per model at spawn time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineRouting {
-    /// `auto` (default): each model's spawn routes by format (GGUF →
-    /// llamacpp, safetensors → sglang/mistral.rs per `policy`) so a
+    /// `auto` (default): each model's spawn routes by format (GGUF ->
+    /// llamacpp, safetensors -> sglang/mistral.rs per `policy`) so a
     /// freshly pulled model never hits the wrong-lane 400 out of the
     /// box; `manual`: the daemon's active engine serves everything;
     /// format mismatches keep their teaching error. `auto`: route each
-    /// spawn by model format (GGUF → llamacpp-else-mistral.rs,
-    /// safetensors → sglang-else-mistral.rs).
+    /// spawn by model format (GGUF -> llamacpp-else-mistral.rs,
+    /// safetensors -> sglang-else-mistral.rs).
     #[serde(default)]
     pub mode: RoutingMode,
     /// Route ordering when engines overlap. `quality`/`throughput`
@@ -2822,7 +2822,7 @@ pub struct EngineRouting {
     /// tok/s conc4); `latency` prefers mistral.rs there (26-vs-73 ms warm
     /// TTFT, 8-vs-92 s cold boot). GGUF stays on llamacpp quant kernels
     /// under every policy until a quant-matched mistral.rs GGUF matrix
-    /// row exists. Default `quality` — the same routing the format table
+    /// row exists. Default `quality` - the same routing the format table
     /// shipped with.
     #[serde(default)]
     pub policy: RoutingPolicy,
@@ -2842,16 +2842,16 @@ impl Default for EngineRouting {
 #[serde(rename_all = "lowercase")]
 pub enum RoutingMode {
     /// Active engine serves everything (byte-identical to pre-router
-    /// Blazar) — opt back in with `mode = "manual"`.
+    /// Blazar) - opt back in with `mode = "manual"`.
     Manual,
-    /// Route each spawn by model format — the default: the wrong-lane
+    /// Route each spawn by model format - the default: the wrong-lane
     /// 400 on a freshly pulled safetensors model should never happen
     /// out of the box.
     #[default]
     Auto,
 }
 
-/// `[batch]` — BLZ-6 disk bounds for the batch/file store. Quotas are
+/// `[batch]` - BLZ-6 disk bounds for the batch/file store. Quotas are
 /// opt-in (0 = unlimited, the historical behavior); the retention sweep
 /// defaults to the advertised 24h window and only removes terminal
 /// batches and orphaned uploads.
@@ -2871,7 +2871,7 @@ pub struct BatchLimits {
     pub max_active_batches_per_key: u32,
     /// Cumulative output-bytes cap per batch (0 = unlimited). The worker
     /// aborts the batch as `failed` once its results file crosses the
-    /// cap — a runaway response body can otherwise balloon a modest
+    /// cap - a runaway response body can otherwise balloon a modest
     /// input into unbounded disk use.
     #[serde(default)]
     pub max_output_bytes_per_batch: u64,
@@ -2898,7 +2898,7 @@ fn default_batch_retention_secs() -> u64 {
     24 * 60 * 60
 }
 
-/// `[engine_routing]` `policy` — which engine wins when the format
+/// `[engine_routing]` `policy` - which engine wins when the format
 /// overlaps (safetensors is the only weighted fork in v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -3210,7 +3210,7 @@ impl fmt::Display for Config {
 /// Persist a `config.toml` body safely. Every config write path routes
 /// through here so nothing can lose user settings silently:
 /// - previous file backed up to `config.toml.bak-<unix-ms>` (5 newest
-///   kept, older pruned) — an uninstall/reinstall cycle or operator
+///   kept, older pruned) - an uninstall/reinstall cycle or operator
 ///   mistake is recoverable;
 /// - write is temp-file + atomic rename (a crash mid-write never leaves
 ///   a truncated config behind);
@@ -3248,16 +3248,16 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
         let bak = path.with_file_name(format!("config.toml.bak-{ms}.{}.{seq}", std::process::id()));
         if let Err(e) = retry_on_transient_fs(|| std::fs::copy(path, &bak)) {
             // Two distinct benign outcomes, both observed on loaded CI:
-            //  (1) APFS lookup race — copyfile re-resolves the source path
+            //  (1) APFS lookup race - copyfile re-resolves the source path
             //      internally; a concurrent atomic rename(tmp -> path)
             //      inside that window fails with ENOENT while the path
             //      exists both before and after. Retrying above resolves
             //      it; only a NotFound that SURVIVES the bounded retries
             //      can be a real vanish.
-            //  (2) genuine vanish — concurrent rotation retired the source
+            //  (2) genuine vanish - concurrent rotation retired the source
             //      for good. The body write below is the authoritative
             //      operation and recreates the target, so a vanished-source
-            //      backup is vacuous — same philosophy as the armor guard
+            //      backup is vacuous - same philosophy as the armor guard
             //      below. Anything else is a real failure.
             if e.kind() == std::io::ErrorKind::NotFound && !path.exists() {
                 // vacuous: source rotated away; skip the backup
@@ -3276,8 +3276,8 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
         // fs::copy duplicates the permission bits, so a backup of a
         // previously-loose config would keep the loose mode (BLZ-4):
         // re-armor every backup explicitly. A concurrent writer's prune
-        // may remove THIS backup first — a stalled writer's timestamp
-        // makes it sort oldest — and a pruned backup has nothing left
+        // may remove THIS backup first - a stalled writer's timestamp
+        // makes it sort oldest - and a pruned backup has nothing left
         // to armor: NotFound there is vacuous completion, not failure.
         if let Err(e) = restrict_to_owner(&bak)
             && bak.exists()
@@ -3286,7 +3286,7 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
         }
     }
     // Unique-per-writer temp name. A FIXED name makes two concurrent
-    // writers race on write+rename — the loser's rename finds the temp
+    // writers race on write+rename - the loser's rename finds the temp
     // already consumed and dies with a spurious io ENOENT (live case:
     // three parallel `blazar upgrade` CLIs creating the config on a
     // fresh HOME, e.g. CI; also CLI-vs-daemon key rotation). The pid
@@ -3357,7 +3357,7 @@ fn is_sharing_violation(err: &std::io::Error) -> bool {
 /// lookup races on copy-style syscalls under concurrent atomic replaces
 /// (observed on APFS CI). At most 8 attempts with linear backoff (10ms
 /// step, ~360ms total worst case), then the last error surfaces
-/// unchanged — loud, never a silent give-up.
+/// unchanged - loud, never a silent give-up.
 fn retry_on_transient_fs<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     const MAX_ATTEMPTS: u32 = 8;
     let mut attempt = 0;
@@ -3380,7 +3380,7 @@ fn retry_on_transient_fs<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::
 
 /// Bounded retry for transient Windows sharing locks: at most 8 attempts
 /// with linear backoff (10ms step, ~360ms total worst case), then the
-/// last error surfaces unchanged — loud, never a silent give-up.
+/// last error surfaces unchanged - loud, never a silent give-up.
 fn retry_on_sharing_violation<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     const MAX_ATTEMPTS: u32 = 8;
     let mut attempt = 0;
@@ -3397,10 +3397,10 @@ fn retry_on_sharing_violation<T>(mut op: impl FnMut() -> std::io::Result<T>) -> 
 }
 
 /// Optional hierarchy: config sections that alias flat root keys. A config
-/// may group keys under these tables (`[gateway]` …) instead of the flat
+/// may group keys under these tables (`[gateway]` ...) instead of the flat
 /// root; the loader hoists them back to root before deserializing, so the
 /// flat spelling stays the canonical form (`to_toml` always writes flat).
-/// Membership is an exact allowlist — a key under a section that is not
+/// Membership is an exact allowlist - a key under a section that is not
 /// listed here fails loud with the section's members, instead of silently
 /// ignoring the typo.
 const SECTION_FIELDS: &[(&str, &[&str])] = &[
@@ -3586,12 +3586,12 @@ fn flatten_hierarchy(table: &mut toml::Table) -> CoreResult<()> {
                     .unwrap_or_default();
                 let listed = members.join(", ");
                 return Err(CoreError::Config(format!(
-                    "[{section}] does not accept {key:?}{home} — members: {listed}"
+                    "[{section}] does not accept {key:?}{home} - members: {listed}"
                 )));
             }
             if table.contains_key(&key) {
                 return Err(CoreError::Config(format!(
-                    "{key} is set both at the root and inside [{section}] — keep one spelling"
+                    "{key} is set both at the root and inside [{section}] - keep one spelling"
                 )));
             }
             table.insert(key, value);
@@ -3626,7 +3626,7 @@ impl Config {
 
     pub fn from_toml(raw: &str) -> CoreResult<Self> {
         // One-click upgrade: the removed flat `api_keys` list migrates
-        // IN MEMORY (no file write — side-effect-free load), loudly.
+        // IN MEMORY (no file write - side-effect-free load), loudly.
         // `blazar migrate` persists the canonical form; installers and
         // self-upgrade call it. Every entry keeps its secret as an
         // unscoped admin key: same bearer power, nothing silently lost.
@@ -3656,7 +3656,7 @@ impl Config {
                 .collect();
             tracing::warn!(
                 target: "blazar::config",
-                "legacy api_keys migrated to [[keys]] ({} key(s), in memory) — persist with `blazar migrate`",
+                "legacy api_keys migrated to [[keys]] ({} key(s), in memory) - persist with `blazar migrate`",
                 cfg.keys.len()
             );
             return cfg.validate().map(|()| cfg);
@@ -3664,7 +3664,7 @@ impl Config {
             // Removed knobs strip IN MEMORY (same contract as the
             // api_keys migration above): an old config line must never
             // lock the whole daemon out with an unknown-field error
-            // after an upgrade — while genuinely-unknown keys (typos)
+            // after an upgrade - while genuinely-unknown keys (typos)
             // still fail loud.
             let stripped = Self::strip_removed_knobs(raw)?;
             let mut user_table =
@@ -3678,11 +3678,11 @@ impl Config {
     }
 
     /// Deserialize a user table onto the documented defaults: keys the
-    /// user wrote win; keys they omitted inherit `Config::default()` —
+    /// user wrote win; keys they omitted inherit `Config::default()` -
     /// never a serde zero-value. The struct carries field-level plain
     /// `#[serde(default)]` (needed so `deny_unknown_fields` tolerates
     /// partial files), but a plain field default silently overrides the
-    /// container-level `#[serde(default)]` with `false`/`0`/`None` —
+    /// container-level `#[serde(default)]` with `false`/`0`/`None` -
     /// live receipt 2026-09-29: a minimal `port = N` sandbox config ran
     /// the whole daemon with `adaptive_slots` silently OFF (reshape
     /// campaign, zero adoptions under 8-stream load). Merging over the
@@ -3703,14 +3703,14 @@ impl Config {
 
     /// Config knobs deleted by policy (§ backwards-compat: NONE). Each entry
     /// is stripped at load with a warning instead of hard-failing the whole
-    /// config — an upgraded binary must never lock the daemon out over a
+    /// config - an upgraded binary must never lock the daemon out over a
     /// line the user never touched. Unknown keys NOT in this list stay hard
     /// errors (typo catching).
     const REMOVED_KNOBS: &[&str] = &["auto_restart_engine_switch"];
 
     /// Strip [`REMOVED_KNOBS`] from a raw config document, warning once per
     /// stripped key PER PROCESS (a REPL turn loads the config more than
-    /// once — daemon base + profile — and the user must not see the same
+    /// once - daemon base + profile - and the user must not see the same
     /// hygiene line twice at the prompt). Parse errors still surface (the
     /// document must be valid TOML before stripping).
     fn strip_removed_knobs(raw: &str) -> CoreResult<String> {
@@ -3737,7 +3737,7 @@ impl Config {
         if !fresh.is_empty() {
             tracing::warn!(
                 target: "blazar::config",
-                "removed knob(s) ignored: {} — deleted in this version; persist the canonical form with `blazar migrate`",
+                "removed knob(s) ignored: {} - deleted in this version; persist the canonical form with `blazar migrate`",
                 fresh.join(", ")
             );
             warned.extend(fresh.iter().map(|k| (*k).to_string()));
@@ -3773,7 +3773,7 @@ impl Config {
     /// overlay replaces the global list; empty/absent inherits it.
     #[must_use]
     pub fn effective_rpc_servers(&self, model: &str) -> &str {
-        // Borrow the stored overlay (overlay_for returns an owned clone —
+        // Borrow the stored overlay (overlay_for returns an owned clone -
         // borrowing that temporary would dangle).
         let overlay = self
             .model_overrides
@@ -3810,7 +3810,7 @@ impl Config {
     /// written when the old value was the default, the default has
     /// since changed, and the pin now silently keeps the old behavior.
     /// Returns one human-readable line per offending pin (empty = none)
-    /// for `blazar doctor` to surface as a WARN — a deliberate pin is
+    /// for `blazar doctor` to surface as a WARN - a deliberate pin is
     /// legitimate, the point is visibility.
     ///
     /// MAINTENANCE CONTRACT: whenever a default value changes, add a
@@ -3856,7 +3856,7 @@ impl Config {
         names.dedup();
         if names.len() != n {
             return Err(CoreError::Config(
-                "keys: duplicate name — each key needs a unique name".to_string(),
+                "keys: duplicate name - each key needs a unique name".to_string(),
             ));
         }
         let mut secrets: Vec<&str> = self.keys.iter().map(|k| k.key.as_str()).collect();
@@ -3865,7 +3865,7 @@ impl Config {
         secrets.dedup();
         if secrets.len() != s {
             return Err(CoreError::Config(
-                "keys: duplicate key secret — regenerate one of them".to_string(),
+                "keys: duplicate key secret - regenerate one of them".to_string(),
             ));
         }
         Ok(())
@@ -3882,7 +3882,7 @@ impl Config {
 
     /// Effective `offline`: overlay beats global. The gateway pins
     /// local-model children network-isolated unless explicitly opted
-    /// out — a child that never needs the network cannot leak through
+    /// out - a child that never needs the network cannot leak through
     /// one that does.
     #[must_use]
     pub fn effective_offline(&self, model: &str) -> bool {
@@ -3999,7 +3999,7 @@ impl Config {
     pub fn effective_ctx_extend(&self, model: &str) -> f64 {
         let o = self.overlay_for(model);
         // F114: Some(0.0) is a VALID explicit off (validate teaches
-        // "0 (off)") — it must override the global, not fall through it.
+        // "0 (off)") - it must override the global, not fall through it.
         o.ctx_extend.unwrap_or(self.ctx_extend)
     }
 
@@ -4007,7 +4007,7 @@ impl Config {
     #[must_use]
     pub fn effective_cpu_moe_n(&self, model: &str) -> i32 {
         let o = self.overlay_for(model);
-        // F114: Some(0) is a VALID explicit off — override, not inherit.
+        // F114: Some(0) is a VALID explicit off - override, not inherit.
         o.cpu_moe_n.unwrap_or(self.cpu_moe_n)
     }
 
@@ -4016,7 +4016,7 @@ impl Config {
     #[must_use]
     pub fn effective_cpu_ffn_n(&self, model: &str) -> i32 {
         let o = self.overlay_for(model);
-        // F114: Some(0) is a VALID explicit off — override, not inherit.
+        // F114: Some(0) is a VALID explicit off - override, not inherit.
         o.cpu_ffn_n.unwrap_or(self.cpu_ffn_n)
     }
 
@@ -4175,7 +4175,7 @@ impl Config {
         {
             let known: Vec<&str> = self.mcp.iter().map(|srv| srv.name.as_str()).collect();
             return Err(CoreError::Config(format!(
-                "mcp_default '{}' matches no configured mcp server (known: [{}] — or use \"all\"/\"none\")",
+                "mcp_default '{}' matches no configured mcp server (known: [{}] - or use \"all\"/\"none\")",
                 d,
                 known.join(", ")
             )));
@@ -4190,7 +4190,7 @@ impl Config {
                 RemoteSchemePolicy::LanHttpWarn => {
                     tracing::warn!(
                         target: "blazar::config",
-                        "remote '{}' uses cleartext HTTP on a private address ({}): its bearer key travels unencrypted on the LAN — prefer https://",
+                        "remote '{}' uses cleartext HTTP on a private address ({}): its bearer key travels unencrypted on the LAN - prefer https://",
                         remote.name,
                         remote.url
                     );
@@ -4199,13 +4199,13 @@ impl Config {
                     if remote.allow_insecure_http {
                         tracing::warn!(
                             target: "blazar::config",
-                            "remote '{}' allows insecure cleartext HTTP to a non-private address ({}): its bearer key is visible on the network path — remove allow_insecure_http and use https://",
+                            "remote '{}' allows insecure cleartext HTTP to a non-private address ({}): its bearer key is visible on the network path - remove allow_insecure_http and use https://",
                             remote.name,
                             remote.url
                         );
                     } else {
                         return Err(CoreError::Config(format!(
-                            "remote '{}' url ({}) sends its bearer key in cleartext to a non-private address — use https://, target a loopback/private IP literal, or set that remote's allow_insecure_http = true to accept the risk",
+                            "remote '{}' url ({}) sends its bearer key in cleartext to a non-private address - use https://, target a loopback/private IP literal, or set that remote's allow_insecure_http = true to accept the risk",
                             remote.name, remote.url
                         )));
                     }
@@ -4228,7 +4228,7 @@ impl Config {
                     .into(),
             ));
         }
-        // F115: 0.0 must be rejected — the header path enforces
+        // F115: 0.0 must be rejected - the header path enforces
         // 0.01..=1.0 and 0.0 would make nearly everything a "hit".
         if sc.enabled && !(sc.threshold > 0.0 && sc.threshold <= 1.0) {
             return Err(CoreError::Config(format!(
@@ -4250,20 +4250,20 @@ impl Config {
         match (self.tls_cert.is_empty(), self.tls_key.is_empty()) {
             (false, true) => {
                 return Err(CoreError::Config(
-                    "tls_cert set without tls_key — provide the matching PEM key or clear both"
+                    "tls_cert set without tls_key - provide the matching PEM key or clear both"
                         .into(),
                 ));
             }
             (true, false) => {
                 return Err(CoreError::Config(
-                    "tls_key set without tls_cert — provide the PEM chain or clear both".into(),
+                    "tls_key set without tls_cert - provide the PEM chain or clear both".into(),
                 ));
             }
             _ => {}
         }
         if self.idle_timeout_secs < self.idle_sleep_secs {
             return Err(CoreError::Config(format!(
-                "idle_timeout_secs ({}) must be >= idle_sleep_secs ({}) — eviction must not fire before sleep",
+                "idle_timeout_secs ({}) must be >= idle_sleep_secs ({}) - eviction must not fire before sleep",
                 self.idle_timeout_secs, self.idle_sleep_secs
             )));
         }
@@ -4296,7 +4296,7 @@ impl Config {
                 #[cfg(not(unix))]
                 {
                     return Err(CoreError::Config(
-                        "child_transport = \"unix\" requires a unix platform — use \"tcp\""
+                        "child_transport = \"unix\" requires a unix platform - use \"tcp\""
                             .to_string(),
                     ));
                 }
@@ -4363,7 +4363,7 @@ impl Config {
             }
             if self.server_tools.is_none() {
                 return Err(CoreError::Config(
-                    "server_tools_runtime is set but server_tools is not — a runtime \
+                    "server_tools_runtime is set but server_tools is not - a runtime \
                      without tools is meaningless; set server_tools (or drop the runtime)"
                         .into(),
                 ));
@@ -4380,7 +4380,7 @@ impl Config {
         }
         if self.mcp_servers_config.is_some() && self.mcp_servers_json.is_some() {
             return Err(CoreError::Config(
-                "mcp_servers_config and mcp_servers_json are mutually exclusive — \
+                "mcp_servers_config and mcp_servers_json are mutually exclusive - \
                  pick the file path or the inline JSON"
                     .into(),
             ));
@@ -4552,8 +4552,8 @@ impl Config {
         Ok(())
     }
 
-    /// Time-bound knobs share one shape of rule — 0 disables, else a
-    /// documented band — and one home, extracted from
+    /// Time-bound knobs share one shape of rule - 0 disables, else a
+    /// documented band - and one home, extracted from
     /// `validate_new_knobs` to stay under its line budget. The diffusion
     /// header ceiling gets a taller band than text lanes: its
     /// time-to-headers IS full generation time.
@@ -4597,7 +4597,7 @@ impl Config {
     /// Whisper decode/VAD knobs: floors mirror the upstream defaults'
     /// own valid ranges (-1 beam = greedy sentinel, so a SET beam must
     /// be a real beam >= 1); VAD thresholds are probabilities; the VAD
-    /// tuning knobs are hard errors without a VAD model — a silent
+    /// tuning knobs are hard errors without a VAD model - a silent
     /// no-op would hide that half the configuration is inert.
     fn validate_whisper_tuning(&self) -> CoreResult<()> {
         if self.whisper_beam_size == Some(0) {
@@ -4645,7 +4645,7 @@ impl Config {
         if vad_knob_set && !vad_on {
             return Err(CoreError::Config(
                 "whisper_vad_threshold / whisper_vad_min_speech_duration_ms / \
-                 whisper_vad_min_silence_duration_ms require whisper_vad_model — \
+                 whisper_vad_min_silence_duration_ms require whisper_vad_model - \
                  set the Silero VAD model or drop the VAD tuning knobs"
                     .into(),
             ));
@@ -4659,12 +4659,12 @@ impl Config {
     /// vocabularies, and the conditioning-cache bound.
     fn validate_sdcpp_tuning(&self) -> CoreResult<()> {
         // IP-Adapter conditioning is meaningless without its CLIP-vision
-        // encoder — upstream refuses the pair at boot; refusing at
+        // encoder - upstream refuses the pair at boot; refusing at
         // config-write time teaches the fix in the error itself.
         if self.sdcpp_ip_adapter.is_some() && self.sdcpp_clip_vision.is_none() {
             return Err(CoreError::Config(
                 "sdcpp_ip_adapter requires sdcpp_clip_vision (the IP-Adapter \
-                 conditions on CLIP-vision image embeddings) — set both or drop \
+                 conditions on CLIP-vision image embeddings) - set both or drop \
                  sdcpp_ip_adapter"
                     .into(),
             ));
@@ -4793,7 +4793,7 @@ impl Config {
     /// (`sdcpp_extra_args`, `whisper_extra_args`): trimmed tokens must be
     /// non-empty and the first token must be a flag (a bare leading value
     /// has no flag to ride). Engine-pin refusal and per-build manifest
-    /// gating live at child compile (profile dialects) — one authority
+    /// gating live at child compile (profile dialects) - one authority
     /// per concern, no duplicated reserved lists.
     fn validate_boot_extra_args(&self) -> CoreResult<()> {
         for (key, list) in [
@@ -4810,7 +4810,7 @@ impl Config {
                 && !first.starts_with('-')
             {
                 return Err(CoreError::Config(format!(
-                    "{key} must start with a flag token, got {first:?} — values ride their preceding flag"
+                    "{key} must start with a flag token, got {first:?} - values ride their preceding flag"
                 )));
             }
         }
@@ -4865,7 +4865,7 @@ impl Config {
     fn validate_new_knobs(&self) -> CoreResult<()> {
         self.validate_time_bounds()?;
         // 0 would starve the active lane's rollback target while the
-        // active tag itself stays protected — a confusing no-win setting.
+        // active tag itself stays protected - a confusing no-win setting.
         if self.keep_tags == 0 {
             return Err(CoreError::Config(
                 "keep_tags must be >= 1 (1 = no rollback anchor, 2 = fresh build + one anchor), got 0"
@@ -5296,7 +5296,7 @@ impl Config {
             cfg.cache_reuse = parse_u32("BLAZAR_CACHE_REUSE", &v)?;
         }
         if let Some(v) = env("BLAZAR_KEYS") {
-            // `name:key[,name:key...]` — machine-composition-friendly form
+            // `name:key[,name:key...]` - machine-composition-friendly form
             // of the [[keys]] tables; budgets/scopes stay file-only.
             cfg.keys = v
                 .split(',')
@@ -5475,7 +5475,7 @@ fn split_extra_args_env(key: &str, raw: &str) -> CoreResult<Vec<String>> {
     }
     if !tokens[0].starts_with('-') {
         return Err(CoreError::Config(format!(
-            "invalid {key} {raw:?}: must start with a flag token — values ride their preceding flag"
+            "invalid {key} {raw:?}: must start with a flag token - values ride their preceding flag"
         )));
     }
     Ok(tokens)
@@ -5614,7 +5614,7 @@ mod tests {
     /// Live receipt 2026-09-29: a minimal config.toml (the validate
     /// sandbox writes exactly `port = N` + a model override) ran the
     /// daemon with the adaptive reshaper dead for the whole reshape
-    /// campaign — no adoption under 8-stream load for 300s. This pin is
+    /// campaign - no adoption under 8-stream load for 300s. This pin is
     /// the contract: omitting a key must inherit the DOCUMENTED default
     /// (`Config::default()`), never a serde zero-value.
     #[test]
@@ -5703,7 +5703,7 @@ mod tests {
         for (section, members) in SECTION_FIELDS {
             for member in *members {
                 match Config::from_toml(&format!("{member} = 0\n")) {
-                    // The field exists and even accepted the zero — fine.
+                    // The field exists and even accepted the zero - fine.
                     Ok(_) => {}
                     Err(err) => {
                         let err = err.to_string();
@@ -5719,7 +5719,7 @@ mod tests {
 
     #[test]
     fn unit__child_transport__unix_validates_and_garbage_rejects() {
-        // F35 lift pin: the unix lane is a first-class transport now —
+        // F35 lift pin: the unix lane is a first-class transport now -
         // on unix it validates; on every other platform the validator
         // teaches the boundary instead of silently accepting.
         let unix_cfg = Config {
@@ -6162,7 +6162,7 @@ mod tests {
         }
         .validate("mlx")
         .unwrap();
-        // Unknown keys fail loudly at parse (deny_unknown_fields) —
+        // Unknown keys fail loudly at parse (deny_unknown_fields) -
         // typos must not silently no-op.
         let bad = toml::from_str::<MlxTuning>(r"typo_field = 1");
         assert!(bad.is_err(), "unknown mlx knob must be rejected");
@@ -6680,7 +6680,7 @@ default_ctx = 16384
 
     #[test]
     fn unit__engine_routing__parsed_and_guarded() {
-        // Default: auto — a freshly pulled model never hits the
+        // Default: auto - a freshly pulled model never hits the
         // wrong-lane 400 out of the box. Manual stays reachable.
         let d = Config::default().engine_routing;
         assert_eq!(d.mode, RoutingMode::Auto);
@@ -6880,7 +6880,7 @@ default_ctx = 16384
             ("device_layers", "[mistralrs]\ndevice_layers = \"0-12\"\n"),
             ("device_layers", "[mistralrs]\ndevice_layers = \"all\"\n"),
             // pa_cache_type is an engine enum (auto | f8e4m3), not a free
-            // KV-cache dtype string — anything else dies at child boot.
+            // KV-cache dtype string - anything else dies at child boot.
             ("pa_cache_type", "[mistralrs]\npa_cache_type = \"q4k\"\n"),
         ] {
             let err = Config::from_toml(raw).unwrap_err().to_string();
@@ -7058,7 +7058,7 @@ default_ctx = 16384
         assert!(cfg.audit_log, "audit log default flipped off?");
         assert!(
             !cfg.sdcpp_sage_attn,
-            "sage is fatal off-CUDA — must stay off"
+            "sage is fatal off-CUDA - must stay off"
         );
         assert_eq!(cfg.sdcpp_cache_mode, None, "cache mode must stay opt-in");
     }
@@ -7389,7 +7389,7 @@ default_ctx = 16384
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("stdio-only"), "{err}");
 
-        // allowed_env without env_clear does nothing — refuse loudly.
+        // allowed_env without env_clear does nothing - refuse loudly.
         cfg.mcp[0] = {
             let mut s = hardened();
             s.env_clear = false;
@@ -7625,7 +7625,7 @@ default_ctx = 16384
     }
 
     /// Test-only resolver (F118: the live auth path is gateway keys.rs
-    /// `ct_eq`, constant-time — this plain `==` must never be reachable
+    /// `ct_eq`, constant-time - this plain `==` must never be reachable
     /// from request handling).
     impl Config {
         fn key_for(&self, presented: &str) -> Option<&ApiKey> {
@@ -8104,7 +8104,7 @@ key = "plm_admin"
     // that no other thread read or write the environment concurrently.
     // Every caller of these helpers holds `env_lock()`, and the env-reading
     // production code under test runs on the calling thread between lock
-    // acquire and release — the one safety condition std demands.
+    // acquire and release - the one safety condition std demands.
     /// # Safety-free wrapper around `std::env::set_var` (see note above).
     fn set_env(key: &str, value: &str) {
         #[expect(unsafe_code)]
@@ -8129,11 +8129,11 @@ mod persist_tests {
 
     #[test]
     fn unit__persist_config__concurrent_writers_all_succeed() {
-        // Pin: a FIXED temp name made concurrent writers race write→rename;
+        // Pin: a FIXED temp name made concurrent writers race write->rename;
         // the loser died with a spurious io ENOENT (live case: three
         // parallel `blazar upgrade` CLIs on a fresh HOME crashed one CLI
         // before it could print its result). Every writer must succeed and
-        // the final file must be one complete body — never torn, never
+        // the final file must be one complete body - never torn, never
         // missing.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -8180,8 +8180,8 @@ mod persist_tests {
             })
             .count();
         assert_eq!(tmp_residue, 0, "temp files must be renamed away");
-        // Backups exist, keep-5 enforced, and — since every writer's
-        // backup name is unique (pid + per-writer counter) — no two
+        // Backups exist, keep-5 enforced, and - since every writer's
+        // backup name is unique (pid + per-writer counter) - no two
         // writes ever collapse onto one backup name.
         let baks = std::fs::read_dir(dir.path())
             .unwrap()

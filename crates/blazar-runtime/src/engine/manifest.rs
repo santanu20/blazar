@@ -1,7 +1,7 @@
 //! Capability manifest: probe an installed llama-server binary once and
 //! store what it actually supports. The profile compiler emits ONLY flags
 //! present in `flags`; a needed-but-missing flag is a hard error naming
-//! the flag and suggesting `blazar engine use <tag>` — never a guess.
+//! the flag and suggesting `blazar engine use <tag>` - never a guess.
 //! `--list-devices` output is PLAIN TEXT (verified against upstream
 //! common/arg.cpp): `  NAME: DESC (TOTAL MiB, FREE MiB free)`.
 
@@ -116,7 +116,7 @@ pub struct LaneProvenance {
     /// immutable: never a branch or tag name).
     pub ref_pin: Option<String>,
     /// Upstream anchor recorded when the lane was created (`bNNNN`
-    /// base or `master`); provenance only — consumed by the Phase 3
+    /// base or `master`); provenance only - consumed by the Phase 3
     /// retire lifecycle, never by routing.
     pub base_ref: Option<String>,
     /// Architecture names mined from the built source's
@@ -125,7 +125,7 @@ pub struct LaneProvenance {
     pub architectures: BTreeSet<String>,
     /// Newest upstream llama.cpp release build number known at fork-build
     /// time. A mainstream lane can only graduate (supersede) this fork
-    /// when its own build is NEWER than this floor — a lane at or below
+    /// when its own build is NEWER than this floor - a lane at or below
     /// it predates the pin and cannot contain the fork's changes.
     /// `None` = unknown (offline build): legacy supersede behavior.
     pub floor_release: Option<u64>,
@@ -169,11 +169,11 @@ pub struct Manifest {
     pub base_ref: Option<String>,
     /// Newest upstream llama.cpp release build number at fork-build
     /// time (v2.2): mainstream lanes with `build_number <= floor` can
-    /// never supersede this fork — they predate its commit pin. `None`
+    /// never supersede this fork - they predate its commit pin. `None`
     /// = unstamped/legacy lane: arch coverage alone decides.
     #[serde(default)]
     pub floor_release: Option<u64>,
-    /// Architecture names this build advertises (v2) — mined from the
+    /// Architecture names this build advertises (v2) - mined from the
     /// source tree at build time. Empty = unknown/unverified: such a
     /// lane is never picked by architecture-based re-routing.
     #[serde(default)]
@@ -187,7 +187,7 @@ pub struct Manifest {
     /// every architecture this fork lane was built for (v2.1). `None`
     /// = live lane. Set once by the supersede check; routing keeps the
     /// lane eligible as a rescue fallback (the runtime load is the
-    /// truth — if upstream support turns out partial, the rescue path
+    /// truth - if upstream support turns out partial, the rescue path
     /// re-pins this lane).
     #[serde(default)]
     pub superseded_by: Option<String>,
@@ -199,14 +199,14 @@ pub struct Manifest {
 
 /// Preview of the spawn-time capability rescue (the re-route in
 /// `spawn_instance` after a lane dies rejecting an architecture): when
-/// the lane the router picked provably cannot load this GGUF's arch —
-/// its mined arch set is known and lacks it — the spawn path crashes
+/// the lane the router picked provably cannot load this GGUF's arch -
+/// its mined arch set is known and lacks it - the spawn path crashes
 /// once, then re-routes to the installed lane that advertises the
 /// architecture. Previews (list ENGINE cell, /api/tags, /v1/models)
 /// call this so they show the lane that will ULTIMATELY serve. No
 /// prediction under a user pin (the spawn rescue has the same gate),
 /// for non-llama.cpp picked kinds, or when the picked lane's arch set
-/// is unknown (honest unknown — the crash-time rescue still fires at
+/// is unknown (honest unknown - the crash-time rescue still fires at
 /// spawn, it just cannot be predicted here).
 #[must_use]
 pub fn predicted_rescue_lane(
@@ -261,7 +261,7 @@ impl Manifest {
     }
 
     /// The mined arch set, `None` when nothing was mined (pre-v2 rows,
-    /// non-llama.cpp kinds) — callers treat `None` as "advertises
+    /// non-llama.cpp kinds) - callers treat `None` as "advertises
     /// nothing" and "cannot be proven to lack" (honest unknown).
     #[must_use]
     pub fn advertised_archs(&self) -> Option<&std::collections::BTreeSet<String>> {
@@ -361,11 +361,11 @@ impl Manifest {
     }
 
     /// Anchor a stored (possibly relative) `server_path` to an absolute
-    /// live path — call at EVERY row decode before the manifest reaches
+    /// live path - call at EVERY row decode before the manifest reaches
     /// consumers (spawns expect an executable path). Relative rows
     /// (`engines/<tag>/...`, the storage invariant) resolve against the
     /// live data dir; absolute rows are legacy installs or the
-    /// out-of-tree `local` lane — legacy ones heal via
+    /// out-of-tree `local` lane - legacy ones heal via
     /// [`Manifest::re_root_server_path`] when their recorded root moved,
     /// user-given local paths stay untouched. An empty path stays empty
     /// (guards the orphan sweep against a match-everything reference).
@@ -423,7 +423,7 @@ pub fn probe(server_path: &Path, tag: &str) -> Result<Manifest> {
 /// `probe` with extra environment applied to every probe child, exactly
 /// the way `engine_env` applies to a serving child (e.g. `GGML_BACKEND_PATH`
 /// so a CUDA build discovers its GPU during probing). The process
-/// environment itself is never mutated — edition 2024 makes that unsafe,
+/// environment itself is never mutated - edition 2024 makes that unsafe,
 /// and a set-around-call dance would also leak the probe env into any
 /// concurrently spawned child.
 pub fn probe_with_env(
@@ -495,9 +495,9 @@ pub fn probe_with_env(
     })
 }
 
-/// Kind-aware probe entry: dispatches to the llamacpp parser (strict —
+/// Kind-aware probe entry: dispatches to the llamacpp parser (strict -
 /// the banner shape is a verified upstream contract) or the mistralrs
-/// parser (tolerant — its CLI surface is undocumented enough to only
+/// parser (tolerant - its CLI surface is undocumented enough to only
 /// trust what parses).
 pub fn probe_kind(
     server_path: &Path,
@@ -518,7 +518,7 @@ pub fn probe_kind(
 /// Probe an mlx-lm venv lane. Same shape as sglang (the lane it
 /// mirrors): importlib.metadata version read through the venv python,
 /// display serial from the install tag, argparse `--help` flags via
-/// the shim — the mlx import chain is torch-class cold, hence the
+/// the shim - the mlx import chain is torch-class cold, hence the
 /// 120s budget. Zero parsed flags = upstream format change = probe
 /// failure, not a silently degraded manifest.
 fn probe_mlx(server_path: &Path, tag: &str) -> Result<Manifest> {
@@ -605,7 +605,7 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
 
-    // Best-effort banner; never fatal — the tag is authoritative.
+    // Best-effort banner; never fatal - the tag is authoritative.
     // F85: a hung `--version` counts as "no banner", not a wedge.
     let version_raw = match crate::probe::probe_output(Command::new(server).arg("--version"), 30) {
         Some(out) => {
@@ -630,7 +630,7 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
         .map_or(0, |(maj, min, patch)| maj * 1_000_000 + min * 1_000 + patch);
 
     // Flags: global `--help` + `serve --help`, both best-effort. An empty
-    // set downgrades argv gating to "emit the fixed dialect" — a stale
+    // set downgrades argv gating to "emit the fixed dialect" - a stale
     // flag then fails at spawn, loudly.
     let mut flags = BTreeSet::new();
     // NEVER probe with zero args: a bare `mistralrs` drops into serving
@@ -668,10 +668,10 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
 ///
 /// Divergences from the other engines (verified against sglang v0.5.19):
 /// - no `--version` flag on `launch_server`; the version comes from
-///   `importlib.metadata` against the venv python (a metadata read — no
+///   `importlib.metadata` against the venv python (a metadata read - no
 ///   torch import, seconds even cold).
 /// - flags come from `launch_server --help` (standard argparse renderer,
-///   `server_args.py:345 add_cli_args`) — but the import chain behind it
+///   `server_args.py:345 add_cli_args`) - but the import chain behind it
 ///   pulls torch, so the FIRST cold run can take a minute: 120s budget.
 /// - NEVER probe with zero args: a bare `launch_server` starts serving
 ///   and never exits (same wedge class as mistralrs).
@@ -686,7 +686,7 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
         .join("bin")
         .join("python");
 
-    // Version: importlib metadata read. Strict — a broken venv must fail
+    // Version: importlib metadata read. Strict - a broken venv must fail
     // the probe here with the venv path named, not at spawn.
     let version_out = crate::probe::probe_output(
         Command::new(&venv_python)
@@ -729,7 +729,7 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
 
     // Flags: launch_server --help via the shim. Argparse renderer, so
     // parse_help applies. Torch import behind it: 120s cold budget. A
-    // zero-token parse is a FORMAT change upstream — treat as probe
+    // zero-token parse is a FORMAT change upstream - treat as probe
     // failure (fail fast) rather than degrading every gated emission.
     let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 120)
         .with_context(|| {
@@ -760,12 +760,12 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
 /// (verified against stable-diffusion.cpp master-890-74988b2):
 /// - `--version` prints `stable-diffusion.cpp version unknown, commit
 ///   74988b2` and exits 0, but the version word is literally "unknown"
-///   on rolling master builds — the banner is display-only; the commit
+///   on rolling master builds - the banner is display-only; the commit
 ///   hash in the INSTALL TAG (`master-890-74988b2`) is the identity.
 /// - `-h` prints the full usage to stdout and exits 0 (llama parity, so
 ///   `parse_help` applies). NEVER probe with zero args: a bare
 ///   `sd-server` demands `model_path/diffusion_model` and exits 1.
-/// - `--list-devices` prints `NAME<TAB>description` per line — a
+/// - `--list-devices` prints `NAME<TAB>description` per line - a
 ///   different shape from llama's `NAME: DESC (TOTAL MiB, FREE MiB
 ///   free)`, so it gets its own parser and no MiB numbers (sd.cpp does
 ///   not report VRAM there).
@@ -774,7 +774,7 @@ fn probe_sdcpp(server_path: &Path, tag: &str) -> Result<Manifest> {
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
 
-    // Best-effort banner; never fatal — the tag is authoritative.
+    // Best-effort banner; never fatal - the tag is authoritative.
     let version_raw = match crate::probe::probe_output(Command::new(server).arg("--version"), 30) {
         Some(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -802,7 +802,7 @@ fn probe_sdcpp(server_path: &Path, tag: &str) -> Result<Manifest> {
         .unwrap_or(0);
 
     // Flags: `-h`/`--help` both exit 0 with usage on stdout (verified
-    // master-890). A zero-flag parse is an upstream format change —
+    // master-890). A zero-flag parse is an upstream format change -
     // fail the probe loudly rather than degrading argv gating.
     let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
         .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
@@ -869,7 +869,7 @@ pub(crate) fn parse_sd_devices(text: &str) -> Vec<DeviceDesc> {
 }
 /// Probe a whisper-server binary. Divergences from llama-server
 /// (verified against ggml-org/whisper.cpp b5130): no `--version` flag
-/// at all (`error: unknown argument: --version`) — the b-tag is the
+/// at all (`error: unknown argument: --version`) - the b-tag is the
 /// identity; `-h`/`--help` exit 0 with usage on stdout in the same
 /// shape llama parses; no `--list-devices` (CPU-only serving contract).
 fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
@@ -877,15 +877,15 @@ fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
 
-    // Tags are b-tags (`b5130`) — the upstream build counter is the
+    // Tags are b-tags (`b5130`) - the upstream build counter is the
     // sortable identity, exactly like the llama lane.
     let build_number = super::gh::btag_number(tag).unwrap_or(0);
     let version_raw = format!("whisper.cpp {tag}");
 
-    // Flags: `--help` exits 0 — but whisper.cpp prints its usage to
+    // Flags: `--help` exits 0 - but whisper.cpp prints its usage to
     // STDERR (live-verified b5130: 0 bytes stdout, ~4.8 KiB stderr),
     // unlike the llama lanes. Parse stderr first, stdout as fallback.
-    // A zero-flag parse is an upstream format change — fail the probe
+    // A zero-flag parse is an upstream format change - fail the probe
     // loudly rather than degrading argv gating.
     let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
         .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
@@ -923,7 +923,7 @@ fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
 
 /// Probe a piper binary. Lazy audio lane like whisper, with two tag
 /// divergences: releases are version tags (`v1.2.0`) or date tags
-/// (`2023.11.14-2`), never b-tags — the numeric identity is the
+/// (`2023.11.14-2`), never b-tags - the numeric identity is the
 /// concatenation of the tag's digit runs (`202311142`), monotonic
 /// within a scheme and used only for listings (rollback orders by
 /// installed rows, not build numbers). And the usage table's stream
@@ -1008,14 +1008,14 @@ fn parse_version(text: &str) -> Result<(u64, String)> {
 
 /// Live device census: run `<server> --list-devices` and parse the
 /// per-card TOTAL/FREE MiB straight from the engine binary. This is the
-/// ONLY source of live VRAM numbers — the manifest's stored `devices`
+/// ONLY source of live VRAM numbers - the manifest's stored `devices`
 /// are an install-day snapshot and go stale the moment any other
 /// process (ollama, a desktop session) touches the card.
 ///
 /// Failure-tolerant by design: a missing binary or a hung census
 /// returns an empty list and callers fall back to the manifest
 /// snapshot. Census runs take a few hundred milliseconds (backend
-/// init), so callers throttle to spawn-time and ≥60s periodic.
+/// init), so callers throttle to spawn-time and >=60s periodic.
 #[must_use]
 pub fn run_list_devices(server: &Path) -> Vec<DeviceDesc> {
     run_list_devices_with_env(server, &[])
@@ -1027,7 +1027,7 @@ pub fn run_list_devices(server: &Path) -> Vec<DeviceDesc> {
 #[must_use]
 pub fn run_list_devices_with_env(server: &Path, extra_env: &[(String, String)]) -> Vec<DeviceDesc> {
     // F85: the doc's "a hung census returns an empty list" is now
-    // literally true — a deadline-bounded probe replaces the blocking
+    // literally true - a deadline-bounded probe replaces the blocking
     // `.output()` that would wedge forever.
     let Some(out) = crate::probe::probe_output(
         Command::new(server)
@@ -1103,7 +1103,7 @@ fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>) {
                 // only. Underscores included: sd-server documents
                 // `--llm_vision`/`--clip_vision` style flags and the
                 // strict probed-flags gate later refuses any argv flag
-                // the manifest lacks — dropping them here disabled
+                // the manifest lacks - dropping them here disabled
                 // image edits at spawn (verified live).
                 if clean
                     .chars()
@@ -1290,7 +1290,7 @@ mod tests {
     #[test]
     fn unit__relativize_server_path__out_of_tree_stays_absolute() {
         // The `local` lane's BLAZAR_ENGINE_PATH binary never lives under
-        // the data dir — relativizing it would corrupt a user-owned path.
+        // the data dir - relativizing it would corrupt a user-owned path.
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data/blazar");
         let mut m = bare_manifest("/opt/llama.cpp/llama-server");
@@ -1332,7 +1332,7 @@ mod tests {
         m.anchor_server_path(&data);
         // Compare component-wise: the healer rebuilds the tail with the
         // platform separator while the staged literal keeps its forward
-        // slashes — same file, different spelling on windows.
+        // slashes - same file, different spelling on windows.
         assert_eq!(Path::new(&m.server_path), live_bin.as_path());
     }
 
@@ -1561,7 +1561,7 @@ options:
     fn unit__manifest__v1_json_decodes_as_upstream_with_no_archs() {
         // Rows written by pre-v2 Blazar carry only the seven v1 fields;
         // they must decode losslessly (serde defaults) as upstream lanes
-        // that advertise nothing — never a fork, never a blocked lane.
+        // that advertise nothing - never a fork, never a blocked lane.
         let v1 = r#"{
             "tag": "b10980-cuda",
             "build_number": 10980,
@@ -1696,7 +1696,7 @@ mod live_census_tests {
     #[test]
     fn unit__run_list_devices__parses_live_census_output() {
         // tempfile guard: an earlier revision hand-rolled the fixture dir
-        // and removed only the script file — every `cargo test` leaked an
+        // and removed only the script file - every `cargo test` leaked an
         // empty /tmp/blazar-census-<pid> dir (200+ accumulated on the
         // dev box before this was noticed).
         let dir = tempfile::tempdir().expect("tempdir");

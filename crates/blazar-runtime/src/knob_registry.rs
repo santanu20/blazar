@@ -1,7 +1,7 @@
 //! Runtime half of the emission-truth knob registry: folds the
 //! spawn-time argv builders into the compile-time lane unions from
 //! [`blazar_core::knob_registry`], and adds the whisper and piper lanes
-//! (neither has a profile compiler — whisper composes its argv at spawn,
+//! (neither has a profile compiler - whisper composes its argv at spawn,
 //! piper per synthesis call).
 //!
 //! llama.cpp and stable-diffusion.cpp children run `profile.argv`
@@ -38,7 +38,7 @@ pub fn lane_flags() -> BTreeMap<&'static str, Vec<String>> {
 
     // mistral.rs: the builder swaps loader flags by row shape (GGUF file
     // vs HF/safetensors dir), so both rows ride every fixture profile.
-    // The manifest is the lane's supported superset — fixture posture,
+    // The manifest is the lane's supported superset - fixture posture,
     // same rule as the compile half.
     let gguf_row = model_row(
         "/models/qwen3.5-9b/qwen3.5-9b-q4_k_m.gguf",

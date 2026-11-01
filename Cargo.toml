@@ -27,7 +27,7 @@ axum = { version = "0.8", features = ["json", "ws"] }
 # Provider-less TLS: the workspace pins ONE rustls crypto provider (ring,
 # via the rustls entry below). axum-server's tls-rustls feature would force
 # rustls/aws-lc-rs into the graph (ambiguous dual providers at runtime, plus
-# aws-lc-sys cmake/nasm build deps on release targets) — so the no-provider
+# aws-lc-sys cmake/nasm build deps on release targets) - so the no-provider
 # flavor is used and ring is installed process-wide via
 # blazar_core::tls::ensure_tls_provider().
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }

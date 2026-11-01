@@ -1,13 +1,13 @@
 //! Disk-space intelligence: the same planning discipline the VRAM planner
 //! applies to memory, applied to storage. Three consumers:
 //!
-//! * `gate_disk` — pull-time admission for the filesystem: refuse a download
+//! * `gate_disk` - pull-time admission for the filesystem: refuse a download
 //!   that cannot finish instead of dying at 95% (the classic multi-GiB
 //!   heartbreak). The parallel lane preallocates the full-size `.part`, so
 //!   peak need == final size plus a small slack, never 2x.
-//! * `disk_verdict` / `disk_free_bytes` — the `blazar fit` DISK column and
+//! * `disk_verdict` / `disk_free_bytes` - the `blazar fit` DISK column and
 //!   the `blazar storage` report.
-//! * `orphan_scan` / `unused_rows` — `blazar prune` candidates: files the
+//! * `orphan_scan` / `unused_rows` - `blazar prune` candidates: files the
 //!   store owns no row for (aborted pulls, replaced quants), stale `.part`
 //!   debris, and models nobody has loaded in a chosen window.
 
@@ -20,7 +20,7 @@ use blazar_core::store::ModelRow;
 
 /// Headroom added to a download's byte total when admitting it: the
 /// `.part.progress` sidecar ledger, store growth, and filesystem
-/// bookkeeping. Deliberately small — the `.part` is preallocated at exactly
+/// bookkeeping. Deliberately small - the `.part` is preallocated at exactly
 /// the final size and renamed in place, so there is no copy phase.
 pub const REQUIRED_SLACK_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -30,7 +30,7 @@ pub const PART_MIN_AGE_SECS: u64 = 24 * 60 * 60;
 
 /// Available space on the filesystem holding `path` (sysinfo mount table,
 /// longest mount-point prefix of the canonicalized path). `None` when no
-/// mount matches (odd container layouts) — callers treat that as "unknown",
+/// mount matches (odd container layouts) - callers treat that as "unknown",
 /// never as zero.
 #[must_use]
 pub fn disk_free_bytes(path: &Path) -> Option<u64> {
@@ -67,7 +67,7 @@ pub fn disk_total_bytes(path: &Path) -> Option<u64> {
 }
 
 /// Recursive size of `path` (files only; symlinks are never followed and
-/// contribute 0). Hardlink twins inside one walk are counted per path —
+/// contribute 0). Hardlink twins inside one walk are counted per path -
 /// `blazar storage` labels twin reclaim honestly instead (deleting a twin
 /// frees nothing while the other link lives).
 #[must_use]
@@ -91,7 +91,7 @@ pub fn du(path: &Path) -> u64 {
 }
 
 /// FIT verdict for `required` bytes against `available` (None = unknown).
-/// TIGHT fires when the download would leave under 10% of the disk free —
+/// TIGHT fires when the download would leave under 10% of the disk free -
 /// the point where SQLite WAL checkpoints and engine extraction start
 /// hurting even though the raw bytes technically fit.
 #[must_use]
@@ -124,7 +124,7 @@ pub fn gate_disk(dirs: &BlazarDirs, total_bytes: u64, what: &str) -> Result<()> 
     if required > avail {
         Err(anyhow!(
             "not enough disk for {what}: needs {} (model + 64 MiB slack), {} available on {} \
-             — free space first: `blazar storage` shows the breakdown, `blazar prune` reclaims \
+             - free space first: `blazar storage` shows the breakdown, `blazar prune` reclaims \
              orphaned files and unused models",
             humansize(required),
             humansize(avail),
@@ -166,14 +166,14 @@ pub struct OrphanReport {
     /// [`PART_MIN_AGE_SECS`] (younger ones may belong to a live pull).
     pub stale_partials: Vec<(PathBuf, u64)>,
     /// Hardlink twins of owned files (unix): separate paths, same bytes on
-    /// disk. Deleting frees nothing while the owned link lives — reported,
+    /// disk. Deleting frees nothing while the owned link lives - reported,
     /// never auto-pruned.
     pub twins: Vec<(PathBuf, u64)>,
 }
 
 /// Scan `models_dir` against the owned-set derived from `rows`:
 /// row paths (file or safetensors directory), mmproj sidecars, and shard
-/// siblings (`stem-0000N-of-0000M.gguf` — the row stores only the first
+/// siblings (`stem-0000N-of-0000M.gguf` - the row stores only the first
 /// shard, the set is derivable, same rule `prune_replaced` applies).
 #[must_use]
 pub fn orphan_scan(models_dir: &Path, rows: &[ModelRow]) -> OrphanReport {
@@ -197,7 +197,7 @@ pub fn orphan_scan(models_dir: &Path, rows: &[ModelRow]) -> OrphanReport {
         }
         // GGUF shard sets: the row names shard 1; own the siblings.
         // `shard_first_suffix` carries the leading dash, so the stripped
-        // prefix needs it re-added — the convention is
+        // prefix needs it re-added - the convention is
         // `stem-0000N-of-0000M.gguf`, and a missing dash would orphan
         // every shard past the first (prune bait).
         if let Some(name) = row_path.file_name().and_then(|n| n.to_str())
@@ -369,7 +369,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dd = dirs(&tmp);
         std::fs::create_dir_all(dd.models_dir()).unwrap();
-        // Unknown fs (tmpdir may still resolve on real mounts) — treat both
+        // Unknown fs (tmpdir may still resolve on real mounts) - treat both
         // branches honestly: gate on a path that cannot resolve to a mount.
         let gated = gate_disk(&dd, u64::MAX, "probe-model");
         // On Linux tmpfs IS a mount with finite space, so this must refuse.

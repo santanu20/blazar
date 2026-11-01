@@ -1,7 +1,7 @@
 //! Engine build-lane integration tests: a stub toolchain (cmake script
-//! that "builds" the compiled stub-llama-server) drives the REAL lane —
+//! that "builds" the compiled stub-llama-server) drives the REAL lane -
 //! source resolution, configure args, binary copyout, layout, probe,
-//! store, activate — with zero network and zero compiler.
+//! store, activate - with zero network and zero compiler.
 
 #![cfg(unix)]
 
@@ -24,7 +24,7 @@ fn stub_server_bin() -> PathBuf {
 
 // Edition 2024 makes env mutation unsafe (std demands no concurrent
 // reader/writer thread). These tests run one-per-process under nextest and
-// only the spawning test thread touches STUB_SERVER — the condition std
+// only the spawning test thread touches STUB_SERVER - the condition std
 // requires.
 fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
     #[expect(unsafe_code)]
@@ -163,7 +163,7 @@ async fn integration__build_cpu__installs_probes_activates() {
         Path::new("libggml.so.0")
     );
     // Real probe of the stub: the banner reports build 9999, but the
-    // install tag (b4242) is the authoritative build identity — the
+    // install tag (b4242) is the authoritative build identity - the
     // shallow-clone "build 1" artifact is overridden by exactly this rule.
     let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest).unwrap();
     assert_eq!(m.build_number, 4242);
@@ -361,7 +361,7 @@ fn unit__parse_fork_spec__rejects_branches_urls_and_git_suffixes() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("commit"), "{err}");
-    // Full URLs must be rejected — we construct the clone URL ourselves.
+    // Full URLs must be rejected - we construct the clone URL ourselves.
     assert!(parse_fork_spec("https://github.com/acme/llama.cpp@7c81a9f0").is_err());
     // `.git` is a clone-URL spelling, not an owner/name slug.
     assert!(parse_fork_spec("acme/llama.cpp.git@7c81a9f0").is_err());

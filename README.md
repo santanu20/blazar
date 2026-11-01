@@ -2,7 +2,7 @@
 
 **The control plane for local AI inference.**
 
-Unified OpenAI · Ollama · Anthropic gateway &nbsp;·&nbsp; Multi-engine serving &nbsp;·&nbsp; Resource-aware orchestration &nbsp;·&nbsp; Multimodal
+Unified OpenAI | Ollama | Anthropic gateway &nbsp;|&nbsp; Multi-engine serving &nbsp;|&nbsp; Resource-aware orchestration &nbsp;|&nbsp; Multimodal
 
 [![CI](https://github.com/santanu20/blazar/actions/workflows/ci.yml/badge.svg)](https://github.com/santanu20/blazar/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/blazar.svg)](https://crates.io/crates/blazar)
@@ -18,7 +18,7 @@ Unified OpenAI · Ollama · Anthropic gateway &nbsp;·&nbsp; Multi-engine servin
 
 *Live CLI session: single-shot generation, the engine panel with speculation state, the installed-lane inventory, and the routing decision for a model - all from one daemon.*
 
-**[Get started in 60 seconds](#60-second-quickstart)** &nbsp;·&nbsp; **[Why use Blazar](#why-use-blazar)** &nbsp;·&nbsp; **[Benchmark evidence](#benchmark-snapshot)** &nbsp;·&nbsp; **[API reference](docs/4.API_SPEC.md)**
+**[Get started in 60 seconds](#60-second-quickstart)** &nbsp;|&nbsp; **[Why use Blazar](#why-use-blazar)** &nbsp;|&nbsp; **[Benchmark evidence](#benchmark-snapshot)** &nbsp;|&nbsp; **[API reference](docs/4.API_SPEC.md)**
 
 </div>
 
@@ -191,7 +191,7 @@ curl http://127.0.0.1:11435/v1/chat/completions -d '{
 }'
 ```
 
-The same `"mcp"` field (or `x-blazar-mcp` header) works on `/api/chat` and `/v1/messages`; the response carries `x-blazar-mcp: rounds=N` proving real tool executions. `stream: false` is required on mediated calls, `"none"` opts a request out when a default is set, and `GET /api/mcp` lists servers without spawning them. The Python SDK takes `Client(...).chat(model, messages, mcp="all")`. Config owners declare servers; keyed clients can only select among them - never add their own. → [`7.SETUP.md`](docs/7.SETUP.md)
+The same `"mcp"` field (or `x-blazar-mcp` header) works on `/api/chat` and `/v1/messages`; the response carries `x-blazar-mcp: rounds=N` proving real tool executions. `stream: false` is required on mediated calls, `"none"` opts a request out when a default is set, and `GET /api/mcp` lists servers without spawning them. The Python SDK takes `Client(...).chat(model, messages, mcp="all")`. Config owners declare servers; keyed clients can only select among them - never add their own. -> [`7.SETUP.md`](docs/7.SETUP.md)
 
 ---
 
@@ -234,55 +234,55 @@ Full lane inventory and channel policy: [`docs/engines.md`](docs/engines.md). Ro
 
 ### Dialects and request-path features
 
-Three native dialects with per-engine **thinking management** (effort mapping, `<think>` leak suppression), **structured-output receipts** (`x-blazar-structured-output` on every constrained response), Anthropic **cache accounting** (`cache_read_input_tokens`) and **Batch API** (`/v1/messages/batches`), completion **metadata cards** (update at `POST /v1/chat/completions/{id}`), Responses-API **conversations** (`previous_response_id` chains, background jobs), and engine **passthrough utilities** (`/tokenize`, `/detokenize`, `/apply-template`, `/infill`). → [`4.API_SPEC.md`](docs/4.API_SPEC.md)
+Three native dialects with per-engine **thinking management** (effort mapping, `<think>` leak suppression), **structured-output receipts** (`x-blazar-structured-output` on every constrained response), Anthropic **cache accounting** (`cache_read_input_tokens`) and **Batch API** (`/v1/messages/batches`), completion **metadata cards** (update at `POST /v1/chat/completions/{id}`), Responses-API **conversations** (`previous_response_id` chains, background jobs), and engine **passthrough utilities** (`/tokenize`, `/detokenize`, `/apply-template`, `/infill`). -> [`4.API_SPEC.md`](docs/4.API_SPEC.md)
 
 ### Voice, tools, resilience add-ons
 
-`/v1/realtime` WebSocket voice (whisper STT → chat → piper TTS); `[[mcp]]` tool catalog over stdio or Streamable HTTP - the gateway runs the tool loop for engines with no MCP support of their own, per-request opt-in or config-wide `mcp_default` (`/api/mcp` status); `[[failover]]` alias chains over ordered local/remote targets (anti-flap benching, pin/unpin at `/api/failover`); idle-sleep visibility (`blazar_sleeping` in `/api/ps`). → [`7.SETUP.md`](docs/7.SETUP.md)
+`/v1/realtime` WebSocket voice (whisper STT -> chat -> piper TTS); `[[mcp]]` tool catalog over stdio or Streamable HTTP - the gateway runs the tool loop for engines with no MCP support of their own, per-request opt-in or config-wide `mcp_default` (`/api/mcp` status); `[[failover]]` alias chains over ordered local/remote targets (anti-flap benching, pin/unpin at `/api/failover`); idle-sleep visibility (`blazar_sleeping` in `/api/ps`). -> [`7.SETUP.md`](docs/7.SETUP.md)
 
 ### One-word UX
 
-`plan` previews the run decision, `run` prints the daemon's real ready-card (`--intent agent|batch|coding|reasoning|vision` maps a workload class), `config preset` flips a posture, `scorecard` assembles the stored bench + certificate (never re-runs), `autopilot` recommends only real work (`--apply` runs it), `optimize --plan` audits stored evidence per model and advises the next tuning move (every verdict cites its receipt), `optimize --run/--apply` measure candidates through the live gateway and adopt only verified winners (every experiment lands in an append-only ledger; `autotune = advise` logs periodic evidence-gap scans, `scheduled` refuses until a manual track record exists). Capability certificates gate admission on verified FAILs, with probe and refresh command. → [`9.USAGE.md`](docs/9.USAGE.md)
+`plan` previews the run decision, `run` prints the daemon's real ready-card (`--intent agent|batch|coding|reasoning|vision` maps a workload class), `config preset` flips a posture, `scorecard` assembles the stored bench + certificate (never re-runs), `autopilot` recommends only real work (`--apply` runs it), `optimize --plan` audits stored evidence per model and advises the next tuning move (every verdict cites its receipt), `optimize --run/--apply` measure candidates through the live gateway and adopt only verified winners (every experiment lands in an append-only ledger; `autotune = advise` logs periodic evidence-gap scans, `scheduled` refuses until a manual track record exists). Capability certificates gate admission on verified FAILs, with probe and refresh command. -> [`9.USAGE.md`](docs/9.USAGE.md)
 
 ### Resource-aware scheduling and speculation
 
-`fit` previews VRAM/KV/slots/co-residency before download; bounded admission under saturation; adaptive slot reshape from live telemetry. Speculative decoding (MTP/EAGLE/draft pairs) with n-gram auto-fallback and closed-loop governors (`spec_auto_manage`, `ubatch_auto`) that park speculation when acceptance collapses; draft pairing is lane-aware (GGUF drafts to llama.cpp/mistral.rs, safetensors drafts to SGLang/MLX - never a mismatched or self-pair). → [`6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) · [`10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md)
+`fit` previews VRAM/KV/slots/co-residency before download; bounded admission under saturation; adaptive slot reshape from live telemetry. Speculative decoding (MTP/EAGLE/draft pairs) with n-gram auto-fallback and closed-loop governors (`spec_auto_manage`, `ubatch_auto`) that park speculation when acceptance collapses; draft pairing is lane-aware (GGUF drafts to llama.cpp/mistral.rs, safetensors drafts to SGLang/MLX - never a mismatched or self-pair). -> [`6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) | [`10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md)
 
 ### Reliability: jobs, requests, durability
 
-A SQLite ledger survives restarts: durable jobs (events/cancel/artifacts, `abandoned` marking on crash), live request cards (`GET /v1/requests`, cancel/interrupt from another connection), restart-safe `previous_response_id` chains, and disk intelligence (`storage`, `prune --orphans/--unused`). → [`4.API_SPEC.md`](docs/4.API_SPEC.md)
+A SQLite ledger survives restarts: durable jobs (events/cancel/artifacts, `abandoned` marking on crash), live request cards (`GET /v1/requests`, cancel/interrupt from another connection), restart-safe `previous_response_id` chains, and disk intelligence (`storage`, `prune --orphans/--unused`). -> [`4.API_SPEC.md`](docs/4.API_SPEC.md)
 
 ### Federation
 
-Strictly opt-in: without `[[remotes]]`, nothing leaves the machine. Peers publish `/api/capacity`; picks prefer warm models, then queue wait, then free VRAM. `warm`, `replicate`, `route` manage placement; non-Blazar remotes degrade to pass-through peers. → [`7.SETUP.md`](docs/7.SETUP.md)
+Strictly opt-in: without `[[remotes]]`, nothing leaves the machine. Peers publish `/api/capacity`; picks prefer warm models, then queue wait, then free VRAM. `warm`, `replicate`, `route` manage placement; non-Blazar remotes degrade to pass-through peers. -> [`7.SETUP.md`](docs/7.SETUP.md)
 
 ### Advanced orchestration
 
-Per-request `best_of` fan-out, validated parallel choices (`n` 1–8), cascade routing (cheap-first, escalates on decision-ladder failure), typed decision models (`/v1/systemone`). → [`4.API_SPEC.md`](docs/4.API_SPEC.md)
+Per-request `best_of` fan-out, validated parallel choices (`n` 1-8), cascade routing (cheap-first, escalates on decision-ladder failure), typed decision models (`/v1/systemone`). -> [`4.API_SPEC.md`](docs/4.API_SPEC.md)
 
 ### Multimodal
 
-Images (generations/edits/ESRGAN upscale), video generation, streaming transcription with Silero VAD, piper TTS, embeddings with late-chunking opt-in, rerankers served live from GGUF. CLI: `blazar whisper`, `blazar tts`. → [`4.API_SPEC.md`](docs/4.API_SPEC.md)
+Images (generations/edits/ESRGAN upscale), video generation, streaming transcription with Silero VAD, piper TTS, embeddings with late-chunking opt-in, rerankers served live from GGUF. CLI: `blazar whisper`, `blazar tts`. -> [`4.API_SPEC.md`](docs/4.API_SPEC.md)
 
 ### Sessions, cache, warm starts
 
-`session save/restore` plus automatic KV session banking on graceful stop - the first request after a restart resumes with the prompt cache warm. Prefix-cache visibility, opt-in semantic cache, warm-on-pull. → [`7.SETUP.md`](docs/7.SETUP.md)
+`session save/restore` plus automatic KV session banking on graceful stop - the first request after a restart resumes with the prompt cache warm. Prefix-cache visibility, opt-in semantic cache, warm-on-pull. -> [`7.SETUP.md`](docs/7.SETUP.md)
 
 ### Safe engine lifecycle
 
-Versioned side-by-side installs, SHA-256 verification, capability probing, regression gates with auto-rollback, `engine use`/`rollback`, per-kind upstream checks in `doctor`. → [`7.SETUP.md`](docs/7.SETUP.md)
+Versioned side-by-side installs, SHA-256 verification, capability probing, regression gates with auto-rollback, `engine use`/`rollback`, per-kind upstream checks in `doctor`. -> [`7.SETUP.md`](docs/7.SETUP.md)
 
 ### Diagnostics and observability
 
-`doctor` (system/GPU/engines/models/channels, `--fix`), `why` trace explanations, `explain` effective-config card, `model-doctor` capability certificates, `/api/capacity` GPU census, `/metrics`, OTLP, audit JSONL, PII scrubbing. Engine silent degrades (e.g. a flash-attention KV-type fallback in the serving child) are detected and surfaced per-request - `x-blazar-warnings` headers, `engine_slow_attn` detections in `why`, and a live `engine_degrades` panel on `/api/why`. → [`9.USAGE.md`](docs/9.USAGE.md)
+`doctor` (system/GPU/engines/models/channels, `--fix`), `why` trace explanations, `explain` effective-config card, `model-doctor` capability certificates, `/api/capacity` GPU census, `/metrics`, OTLP, audit JSONL, PII scrubbing. Engine silent degrades (e.g. a flash-attention KV-type fallback in the serving child) are detected and surfaced per-request - `x-blazar-warnings` headers, `engine_slow_attn` detections in `why`, and a live `engine_degrades` panel on `/api/why`. -> [`9.USAGE.md`](docs/9.USAGE.md)
 
 ### Web console
 
-`/ui` - zero-dependency console served by the daemon (TTFT/TPOT dashboard, models, engines, compute census, benches, jobs, sessions); read-only by construction. `/api/fabric` and `/api/quantiles` expose the same read models as JSON. → [`4.API_SPEC.md`](docs/4.API_SPEC.md)
+`/ui` - zero-dependency console served by the daemon (TTFT/TPOT dashboard, models, engines, compute census, benches, jobs, sessions); read-only by construction. `/api/fabric` and `/api/quantiles` expose the same read models as JSON. -> [`4.API_SPEC.md`](docs/4.API_SPEC.md)
 
 ### Security and network
 
-Loopback by default; optional scoped API keys (`keys add/rotate`), TLS, explicit CORS, DNS-rebinding hardening on loopback binds, audit logging, PII scrubbing, opt-in OTLP. → [`7.SETUP.md`](docs/7.SETUP.md)
+Loopback by default; optional scoped API keys (`keys add/rotate`), TLS, explicit CORS, DNS-rebinding hardening on loopback binds, audit logging, PII scrubbing, opt-in OTLP. -> [`7.SETUP.md`](docs/7.SETUP.md)
 
 ---
 
@@ -293,31 +293,31 @@ Two committed campaigns, full receipts in [`BENCHMARK.md`](BENCHMARK.md): the pe
 | Workload | Blazar | Reference | Interpretation |
 |---|---:|---:|---|
 | Single-stream decode | **41.07 t/s** | 41.64 t/s direct engine | **~1.4%** gateway overhead |
-| Single-stream TTFT p50 / ITL p99 | **120 ms / 25.8 ms** | 121 / 25.2 ms direct; 122 / **75.0 ms** Ollama | parity with direct; **~3×** lower tail than Ollama |
-| Cached prefill | **7,494 t/s** | 7,359 t/s direct | parity–better |
-| Long-context hold (2k → 16k) | 41.1 → 40.6 t/s | 6,145 MiB peak vs Ollama 6,829 | −1.2% across the ladder, leaner memory |
+| Single-stream TTFT p50 / ITL p99 | **120 ms / 25.8 ms** | 121 / 25.2 ms direct; 122 / **75.0 ms** Ollama | parity with direct; **~3x** lower tail than Ollama |
+| Cached prefill | **7,494 t/s** | 7,359 t/s direct | parity-better |
+| Long-context hold (2k -> 16k) | 41.1 -> 40.6 t/s | 6,145 MiB peak vs Ollama 6,829 | -1.2% across the ladder, leaner memory |
 | Cold start (page cache dropped) | **4.8 s** | 4.6 s Ollama (warm daemon) | parity incl. full spawn |
-| Idle wake | **2.4–3.5 s** | 6.2 s Ollama | **~2×** faster wake |
-| Tool-call TTFT p50 | **117 ms** | 285 ms Ollama | **~2.4×** lower |
-| Concurrent, matched slots, C=1 | **423.7 t/s** | 373.3 t/s direct engine | **1.14×** - parity-to-better (singleflight default-off) |
-| Concurrent, matched slots, C=4 | **604.9 t/s** | 594.7 t/s direct engine | **1.02×** aggregate at load |
-| Concurrent, matched slots, C=8 | **597.2 t/s** | 605.8 t/s direct engine | **0.99×** at saturation (was **0.72×** before the serialization fix) |
-| Concurrent throughput, C=4 | **104.8 t/s** | 33.6 t/s Ollama lane | **~3.1×** system throughput |
+| Idle wake | **2.4-3.5 s** | 6.2 s Ollama | **~2x** faster wake |
+| Tool-call TTFT p50 | **117 ms** | 285 ms Ollama | **~2.4x** lower |
+| Concurrent, matched slots, C=1 | **423.7 t/s** | 373.3 t/s direct engine | **1.14x** - parity-to-better (singleflight default-off) |
+| Concurrent, matched slots, C=4 | **604.9 t/s** | 594.7 t/s direct engine | **1.02x** aggregate at load |
+| Concurrent, matched slots, C=8 | **597.2 t/s** | 605.8 t/s direct engine | **0.99x** at saturation (was **0.72x** before the serialization fix) |
+| Concurrent throughput, C=4 | **104.8 t/s** | 33.6 t/s Ollama lane | **~3.1x** system throughput |
 | Concurrent TTFT p99, C=4 | **554 ms** | 15.9 s Ollama lane | Lower tail latency |
-| Adaptive serving | **49 → 63 t/s** | - | **~28%** gain, 0 failed requests |
+| Adaptive serving | **49 -> 63 t/s** | - | **~28%** gain, 0 failed requests |
 
-Concurrency rows above the Ollama block are the current-release ladder (8 × 64-token bodies, temp 0, identical child argv both sides; receipt `bench-artifacts/20261031-benchmark-audit/gateway-overhead-ladder-after-fix.json`).
+Concurrency rows above the Ollama block are the current-release ladder (8 x 64-token bodies, temp 0, identical child argv both sides; receipt `bench-artifacts/20261031-benchmark-audit/gateway-overhead-ladder-after-fix.json`).
 
 Where the gateway can matter - scheduling, residency, cache, tail control, tools - Blazar leads Ollama by receipt:
 
 | Surface | Blazar | Ollama | Margin |
 |---|---:|---:|---|
-| ITL p99 (tail smoothness) | **25.8 ms** | 75.0 ms | **~3×** |
-| Idle wake | **2.4–3.5 s** | 6.2 s | **~2×** |
-| Tool-call TTFT p50 | **117 ms** | 285 ms | **~2.4×** |
-| TTFT p99 under load, C=4 | **554 ms** | 15.9 s | **~28×** |
-| Cached-path TTFT | **~0.4 s** | 6.1–6.5 s | **~15×** |
-| Throughput under load, C=4 | **104.8 t/s** | 33.6 t/s | **~3.1×** |
+| ITL p99 (tail smoothness) | **25.8 ms** | 75.0 ms | **~3x** |
+| Idle wake | **2.4-3.5 s** | 6.2 s | **~2x** |
+| Tool-call TTFT p50 | **117 ms** | 285 ms | **~2.4x** |
+| TTFT p99 under load, C=4 | **554 ms** | 15.9 s | **~28x** |
+| Cached-path TTFT | **~0.4 s** | 6.1-6.5 s | **~15x** |
+| Throughput under load, C=4 | **104.8 t/s** | 33.6 t/s | **~3.1x** |
 
 The two parity rows in the table above are physics, not lost ground: single-stream TTFT is the same engine doing prefill in every lane (the relay adds ~0 ms), and cold start is disk-bandwidth-bound model loading - where Ollama's 4.6 s reference even ran on a warm daemon while Blazar's 4.8 s included the full gateway boot.
 
@@ -362,7 +362,7 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | Measured optimization run | `blazar optimize <model> --run` (screens the tune grid WITHOUT adopting, A/B-measures baseline vs candidate through the live gateway, verdict is noise-gated; the serving profile is restored untouched) |
 | Adopt a verified candidate | `blazar optimize <model> --apply <experiment-id>` (refuses unverified/wrong-lane/wrong-hardware experiments; rollback = apply the prior verified id) |
 | One-word config posture | `blazar config preset balanced` |
-| Observe → recommend per model | `blazar autopilot`, `blazar autopilot --apply` |
+| Observe -> recommend per model | `blazar autopilot`, `blazar autopilot --apply` |
 | Pull / import models | `blazar pull <target>`, `blazar import <file> --name <name>` |
 | Reuse models from other runtimes | `blazar import --scan` (lists ollama / HF cache / LM Studio models; `blazar pull` links them byte-verified, no re-download) |
 | Inspect models | `blazar list`, `blazar show <model>`, `blazar ps` |
@@ -470,8 +470,8 @@ This README is the product entry point; depth lives in dedicated documents. The 
 
 Blazar is an orchestration layer built on upstream open-source projects:
 
-- Inference runtimes: [llama.cpp](https://github.com/ggml-org/llama.cpp) · [mistral.rs](https://github.com/EricLBuehler/mistral.rs) · [SGLang](https://github.com/sgl-project/sglang) · [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) · [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) · [whisper.cpp](https://github.com/ggml-org/whisper.cpp) · [piper](https://github.com/rhasspy/piper)
-- Models and architectures: [Silero VAD](https://github.com/snakers4/silero-vad) (speech detection for streaming audio) · [ModernBERT](https://github.com/AnswerDotAI/modernbert) (the System One decision-model family rides ModernBERT-architecture GGUFs)
+- Inference runtimes: [llama.cpp](https://github.com/ggml-org/llama.cpp) | [mistral.rs](https://github.com/EricLBuehler/mistral.rs) | [SGLang](https://github.com/sgl-project/sglang) | [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | [piper](https://github.com/rhasspy/piper)
+- Models and architectures: [Silero VAD](https://github.com/snakers4/silero-vad) (speech detection for streaming audio) | [ModernBERT](https://github.com/AnswerDotAI/modernbert) (the System One decision-model family rides ModernBERT-architecture GGUFs)
 
 Those projects provide the inference runtimes. Model weights remain subject to their publishers' licenses and distribution terms.
 

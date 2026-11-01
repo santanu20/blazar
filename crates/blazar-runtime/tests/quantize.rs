@@ -6,13 +6,13 @@
 use blazar_runtime::quantize::{plausible_quant_type, quantize};
 
 // The stub reads BLAZAR_STUB_QUANTIZE_FAIL from the process environment,
-// which is global across test threads — serialize the tests that touch it
+// which is global across test threads - serialize the tests that touch it
 // (default parallel test execution otherwise races success-vs-failure).
 static QUANT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // Edition 2024 makes env mutation unsafe (std demands no concurrent
 // reader/writer thread). Callers hold QUANT_ENV_LOCK and the stub child
-// reads the variable only after spawn — the condition std requires.
+// reads the variable only after spawn - the condition std requires.
 fn set_env(key: &str, value: &str) {
     #[expect(unsafe_code)]
     unsafe {

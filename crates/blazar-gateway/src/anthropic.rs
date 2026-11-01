@@ -1,12 +1,12 @@
-//! D7 — Anthropic `/v1/messages` native translate lane.
+//! D7 - Anthropic `/v1/messages` native translate lane.
 //!
 //! Claude-dialect clients (Claude Code, anthropic SDKs) speak
 //! `/v1/messages`: top-level `system`, content-block arrays,
 //! `tool_use`/`tool_result` blocks, `stop_reason` semantics and the
-//! `message_start` → `content_block_*` → `message_delta` `SSE` event
+//! `message_start` -> `content_block_*` -> `message_delta` `SSE` event
 //! family. The engine speaks `OpenAI` chat. This module translates BOTH
-//! directions locally: request → `OpenAI` chat body, child response →
-//! Anthropic shape (`JSON` + `SSE`). Local engine only — a remote-prefixed
+//! directions locally: request -> `OpenAI` chat body, child response ->
+//! Anthropic shape (`JSON` + `SSE`). Local engine only - a remote-prefixed
 //! model gets a teaching error (remote fleet speaks its own dialect).
 
 use axum::body::{Body, Bytes};
@@ -21,7 +21,7 @@ use crate::proxy::{admission_gate_slo, child_base, ensure_with_admission};
 use crate::queue::Priority;
 use crate::translate::image_data_url;
 
-/// POST /v1/messages — full Anthropic Messages API translate.
+/// POST /v1/messages - full Anthropic Messages API translate.
 #[allow(clippy::too_many_lines)]
 pub async fn messages(
     State(state): State<Arc<crate::state::AppState>>,
@@ -56,7 +56,7 @@ pub async fn messages(
         );
     }
     // Failover chains (Anthropic dialect): the translate lane serves
-    // LOCAL targets only — a remote hop would need dialect re-translation
+    // LOCAL targets only - a remote hop would need dialect re-translation
     // both ways, which this lane refuses by design (see above). Mixed
     // chains stay fully usable on the OpenAI and ollama lanes.
     if !state.failover.is_empty()
@@ -70,7 +70,7 @@ pub async fn messages(
                     "invalid_request_error",
                     &format!(
                         "failover chain {:?} includes remote targets; the /v1/messages \
-                         translate lane serves local targets only — use the chain on the \
+                         translate lane serves local targets only - use the chain on the \
                          OpenAI or ollama lane, or keep its targets local",
                         attempt.chain
                     ),
@@ -99,7 +99,7 @@ pub async fn messages(
                             from: sw.benched_index,
                             to: sw.attempt.index,
                             reason: format!(
-                                "target {} failed with HTTP {} — benched, escalating",
+                                "target {} failed with HTTP {} - benched, escalating",
                                 attempt.label,
                                 resp.status().as_u16()
                             ),
@@ -121,7 +121,7 @@ pub async fn messages(
             return resp;
         }
     }
-    // F46: the Anthropic schema makes `max_tokens` REQUIRED — accepting
+    // F46: the Anthropic schema makes `max_tokens` REQUIRED - accepting
     // requests without an output cap lets a reasoning model burn the
     // whole context before the client learns anything.
     if parsed.get("max_tokens").and_then(Value::as_u64).is_none() {
@@ -150,7 +150,7 @@ pub async fn messages(
         return anthropic_error(
             400,
             "invalid_request_error",
-            "best_of requires stream=false — a winner cannot be judged before completion",
+            "best_of requires stream=false - a winner cannot be judged before completion",
         );
     }
     // F53 + BLZ-3: atomic admission AFTER validation so 400s consume
@@ -207,7 +207,7 @@ pub async fn messages(
     // llama.cpp LoRA-variant ride (see proxy.rs::llamacpp_variant_lora):
     // `base+adapter` on the resident base child carries the per-request
     // `lora` field and the engine's own model name in the translated
-    // OpenAI body. Teaching surfaces as 502 upstream_error — never a
+    // OpenAI body. Teaching surfaces as 502 upstream_error - never a
     // silent fall back to base weights.
     match crate::proxy::llamacpp_variant_lora(&state, &engine, Some(&model)).await {
         Some(Ok(pairs)) => {
@@ -221,7 +221,7 @@ pub async fn messages(
     state.sup.note_prefix_hit(&key_name);
     // Think-dialect bridge for mistral.rs children (see proxy.rs): the
     // translated body speaks the kwargs dialect, which mistral.rs ignores
-    // — mirror the think state into the top-level fields it reads.
+    // - mirror the think state into the top-level fields it reads.
     crate::proxy::normalize_think_in_value(engine.kind, &mut openai_body);
     let deadline_ms = headers
         .get("x-blazar-deadline-ms")
@@ -237,7 +237,7 @@ pub async fn messages(
         key_ext
             .as_ref()
             .map(|axum::extract::Extension(k)| (k.name.as_str(), k.weight)),
-        // Anthropic bodies carry temperature but no seed — nothing to
+        // Anthropic bodies carry temperature but no seed - nothing to
         // reproduce, exclusivity never applies on this surface.
         false,
     )
@@ -262,12 +262,12 @@ pub async fn messages(
         return anthropic_error(
             400,
             "invalid_request_error",
-            "mcp tool loop requires stream:false in this release — the gateway mediates \
+            "mcp tool loop requires stream:false in this release - the gateway mediates \
              buffered tool rounds",
         );
     }
     // F44: pooled client (10-min total timeout) instead of a per-request
-    // build — same transport every other child lane uses (socket-pinned
+    // build - same transport every other child lane uses (socket-pinned
     // for unix children).
     let client = crate::state::child_client(&state, &engine.endpoint);
     let send = crate::proxy::child_auth(
@@ -282,7 +282,7 @@ pub async fn messages(
             Ok(r) => r,
             Err(e) => return anthropic_error(502, "api_error", &format!("engine: {e}")),
         };
-        // F45: a non-2xx child body is a JSON error, not an SSE stream —
+        // F45: a non-2xx child body is a JSON error, not an SSE stream -
         // surfacing it as 200+empty-events hangs clients. Translate the
         // status instead of framing the error bytes as events.
         if !resp.status().is_success() {
@@ -313,7 +313,7 @@ pub async fn messages(
     // MCP receipt survives the dialect rebuild via this capture (see
     // `mcp::stamp`).
     let mut mcp_hdr: Option<String> = None;
-    // A2: wall anchor for the decode-throughput observation below —
+    // A2: wall anchor for the decode-throughput observation below -
     // predates both the fan and the single send. Also the D5
     // class-routing anchor: the guard is held from here through the
     // note, so both live counts include this request (`others_peak`).
@@ -409,7 +409,7 @@ pub async fn messages(
     resp
 }
 
-/// POST `/v1/messages/count_tokens` — Anthropic counting over `/tokenize`.
+/// POST `/v1/messages/count_tokens` - Anthropic counting over `/tokenize`.
 pub async fn count_tokens(
     State(state): State<Arc<crate::state::AppState>>,
     axum::extract::Extension(trace): axum::extract::Extension<crate::TraceId>,
@@ -433,7 +433,7 @@ pub async fn count_tokens(
     if model.is_empty() {
         return anthropic_error(400, "invalid_request_error", "missing `model` field");
     }
-    // F48: tokenizing a model SP loads it — scoped keys must not spawn
+    // F48: tokenizing a model SP loads it - scoped keys must not spawn
     // outside their scope through this lane.
     if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
         && let Some(entry) = state.keys.entry(&key.name)
@@ -473,7 +473,7 @@ pub async fn count_tokens(
         Err(resp) => return *resp,
     };
     let url = format!("{}/tokenize", child_base(&engine.endpoint));
-    // F44: pooled client — the old bare `Client::new()` had NO timeout,
+    // F44: pooled client - the old bare `Client::new()` had NO timeout,
     // so a dead child hung the count_tokens lane forever (socket-pinned
     // for unix children).
     let client = crate::state::child_client(&state, &engine.endpoint);
@@ -498,7 +498,7 @@ pub async fn count_tokens(
 
 // ---------- request direction ----------
 
-/// Anthropic Messages body → `OpenAI` chat body. `stream` is forced onto
+/// Anthropic Messages body -> `OpenAI` chat body. `stream` is forced onto
 /// the translated body; callers add `stream_options` themselves.
 pub fn translate_request(v: &Value, stream: bool) -> Result<Value, String> {
     let mut out = json!({"model": v.get("model").and_then(Value::as_str).unwrap_or_default()});
@@ -557,9 +557,9 @@ pub fn translate_request(v: &Value, stream: bool) -> Result<Value, String> {
             }
         }
     }
-    // Thinking budget (Anthropic `thinking` block → engine template
+    // Thinking budget (Anthropic `thinking` block -> engine template
     // kwargs): `max_tokens` is REQUIRED on this API and must exceed the
-    // thinking budget — the spec's own constraint, enforced here so the
+    // thinking budget - the spec's own constraint, enforced here so the
     // child never sees an impossible split. `enabled` without a budget is
     // tolerated (flags only): the template decides how much to think.
     if let Some(thinking) = obj.get("thinking") {
@@ -627,7 +627,7 @@ fn system_to_text(sys: &Value) -> Option<String> {
     }
 }
 
-/// One Anthropic message (string or block array) → one or more `OpenAI`
+/// One Anthropic message (string or block array) -> one or more `OpenAI`
 /// messages. `tool_result` blocks become standalone `OpenAI` `tool`
 /// messages; assistant `tool_use` blocks fold into `tool_calls`.
 fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Result<(), String> {
@@ -653,9 +653,9 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
             "image" => {
                 // Real multimodal ingress: base64 sources become data
                 // URLs (mime sniffed from the bytes, whitespace-wrapped
-                // base64 tolerated — same lane the ollama images field
+                // base64 tolerated - same lane the ollama images field
                 // uses); url sources pass through verbatim. Anything
-                // else is a malformed source — reject the request
+                // else is a malformed source - reject the request
                 // instead of silently degrading to a text marker.
                 let src = b
                     .get("source")
@@ -680,14 +680,14 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
                 // them as image parts on the tool message (verified on
                 // b11147: server-chat builds exactly that shape from its
                 // own anthropic ingress). Text-only results keep the
-                // joined-string form — byte-identical to prior traffic.
+                // joined-string form - byte-identical to prior traffic.
                 let inner = match b.get("content") {
                     Some(c) => tool_result_content(c)?,
                     None => Value::String(String::new()),
                 };
                 tool_results.push(json!({"role": "tool", "tool_call_id": id, "content": inner}));
             }
-            // F47: preserve prior-turn reasoning — `thinking` text rides
+            // F47: preserve prior-turn reasoning - `thinking` text rides
             // the assistant message as `reasoning_content` (engines that
             // model reasoning read it; others ignore unknown fields).
             // `redacted_thinking` is an opaque encrypted payload with no
@@ -707,7 +707,7 @@ fn translate_message(role: &str, content: &Value, out: &mut Vec<Value>) -> Resul
         || (tool_calls.is_empty() && tool_results.is_empty())
     {
         // Images present: content must be a parts array (text part
-        // first when present). Text-only keeps the plain string —
+        // first when present). Text-only keeps the plain string -
         // byte-identical to pre-multimodal traffic.
         let content = if image_parts.is_empty() {
             json!(text_parts.join(""))
@@ -764,7 +764,7 @@ fn content_to_text(content: &Value) -> String {
     }
 }
 
-/// One Anthropic image `source` → one `OpenAI` `image_url` content part.
+/// One Anthropic image `source` -> one `OpenAI` `image_url` content part.
 /// Base64 rides the shared data-URL lane (mime sniffed from the bytes);
 /// `url` sources pass through verbatim. Malformed sources are errors,
 /// not silent text markers.
@@ -821,7 +821,7 @@ fn tool_result_content(content: &Value) -> Result<Value, String> {
                         parts.push(image_part(src)?);
                     }
                     // Non-text, non-image blocks in tool results have no
-                    // OpenAI part form — omit them (same treatment the
+                    // OpenAI part form - omit them (same treatment the
                     // top-level message lane gives `document` blocks).
                     _ => {}
                 }
@@ -841,7 +841,7 @@ fn tool_result_content(content: &Value) -> Result<Value, String> {
 
 // ---------- response direction ----------
 
-/// `OpenAI` chat response → Anthropic message shape.
+/// `OpenAI` chat response -> Anthropic message shape.
 pub fn translate_response(openai: &Value, model: &str) -> Value {
     let id = format!(
         "msg_{}",
@@ -906,7 +906,7 @@ pub fn translate_response(openai: &Value, model: &str) -> Value {
     })
 }
 
-/// `OpenAI` usage object → Anthropic usage shape. Anthropic clients
+/// `OpenAI` usage object -> Anthropic usage shape. Anthropic clients
 /// expect the prompt-caching accounting fields to be present (0 when
 /// nothing was cached); `cache_read_input_tokens` maps 1:1 from the
 /// child's `prompt_tokens_details.cached_tokens`. llama-server reports
@@ -924,7 +924,7 @@ pub fn anthropic_usage(openai_usage: Option<&Value>) -> Value {
     })
 }
 
-/// One `OpenAI` `SSE` chunk → zero or more Anthropic `SSE` events. The state
+/// One `OpenAI` `SSE` chunk -> zero or more Anthropic `SSE` events. The state
 /// machine (which block indexes are open) lives in the stream wrapper.
 // Chunk-to-SSE translation is one state machine over event kinds; splitting
 // it scatters the per-state transitions. TODO(split-chunk-events): extract
@@ -984,7 +984,7 @@ pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Valu
     if let Some(text) = choice.pointer("/delta/content").and_then(Value::as_str)
         && !text.is_empty()
     {
-        // F50: track the ACTUAL text block index — with tool-first
+        // F50: track the ACTUAL text block index - with tool-first
         // streams the text slot is not 0 and hardcoding it corrupted
         // the Anthropic indices.
         match state.text_idx {
@@ -1047,7 +1047,7 @@ pub fn chunk_events(chunk: &Value, state: &mut StreamState) -> Vec<(String, Valu
             .pointer("/usage/completion_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        // F49: engines report usage on the FINAL chunk only — the
+        // F49: engines report usage on the FINAL chunk only - the
         // message_start snapshot stays 0, so correct input_tokens here
         // where Anthropic clients merge cumulative usage.
         let input = chunk
@@ -1134,7 +1134,7 @@ impl StreamState {
     }
 }
 
-/// Child `OpenAI` `SSE` → Anthropic event `SSE`. The in-flight guard rides in
+/// Child `OpenAI` `SSE` -> Anthropic event `SSE`. The in-flight guard rides in
 /// the stream state so accounting holds until the last frame ships.
 fn anthropic_sse_stream<S>(
     child: S,
@@ -1189,7 +1189,7 @@ where
                         queue.push_back(frame);
                     }
                     None => {
-                        // F51: child ended without a finish chunk — emit a
+                        // F51: child ended without a finish chunk - emit a
                         // terminal error event so clients see the truncation
                         // instead of a silent bare EOF.
                         if !st.done {
@@ -1219,7 +1219,7 @@ fn anthropic_error(status: u16, err_type: &str, message: &str) -> Response {
 }
 
 fn unique_suffix() -> String {
-    // cheap uniqueness: no uuid dep in gateway — timestamp + counter
+    // cheap uniqueness: no uuid dep in gateway - timestamp + counter
     use std::sync::atomic::{AtomicU64, Ordering};
     static CTR: AtomicU64 = AtomicU64::new(0);
     let n = CTR.fetch_add(1, Ordering::Relaxed);
@@ -1240,7 +1240,7 @@ mod tests {
     #[test]
     fn unit__translate_message__image_base64_becomes_image_url_part() {
         // Pin (2026-09-25 multimodal ingress): image blocks previously
-        // collapsed to a "[image: …]" text marker — images never reached
+        // collapsed to a "[image: ...]" text marker - images never reached
         // the engine. They must now ride real image_url parts.
         let content = json!([
             {"type": "text", "text": "what is this"},
@@ -1324,7 +1324,7 @@ mod tests {
     fn unit__translate_message__tool_result_image_becomes_parts_array() {
         // b11147 child-verified: role:tool content accepts image parts
         // (server-chat.cpp builds this exact shape from its own
-        // anthropic ingress) — tool-returned images must survive.
+        // anthropic ingress) - tool-returned images must survive.
         let content = json!([
             {"type": "tool_result", "tool_use_id": "t1",
              "content": [
@@ -1494,7 +1494,7 @@ mod tests {
         assert_eq!(out["chat_template_kwargs"]["enable_thinking"], false);
         assert!(out["chat_template_kwargs"].get("thinking_budget").is_none());
 
-        // enabled without budget_tokens: flags-only pair (documented leniency —
+        // enabled without budget_tokens: flags-only pair (documented leniency -
         // the Anthropic spec requires budget_tokens but we tolerate its absence)
         let mut budgetless = anthropic_req();
         budgetless["thinking"] = json!({"type": "enabled"});
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn unit__chunk_events__final_chunk_input_tokens_corrected() {
-        // F49: usage arrives only on the final chunk — message_start saw
+        // F49: usage arrives only on the final chunk - message_start saw
         // 0; the closing message_delta must carry the real prompt_tokens.
         let mut st = StreamState::new("msg_t", "m1");
         let c1: Value = serde_json::from_str(
@@ -1677,7 +1677,7 @@ mod tests {
 
     #[test]
     fn unit__chunk_events__tool_first_text_uses_real_index() {
-        // F50: with tool calls opening first, text arrives at block 1 —
+        // F50: with tool calls opening first, text arrives at block 1 -
         // deltas must reference index 1, not the old hardcoded 0.
         let mut st = StreamState::new("msg_t", "m1");
         let c1 = json!({

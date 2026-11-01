@@ -2,8 +2,8 @@
 //!
 //! `nvidia-smi` costs a process spawn (~30-60 ms); a burst of video
 //! submits would pay it per request. A short TTL cache keeps the number
-//! fresh enough for admission math — foreign tenants move on second
-//! timescales, not sub-second — at one spawn per window. Boxes without a
+//! fresh enough for admission math - foreign tenants move on second
+//! timescales, not sub-second - at one spawn per window. Boxes without a
 //! working `nvidia-smi` get `None` and the gate steps aside: the spawn
 //! heuristic in the runtime remains the last line of defense there.
 
@@ -33,7 +33,7 @@ mod tests {
     #[test]
     fn unit__free_vram_mib__caches_within_ttl() {
         // First call probes the real box: on CI without nvidia-smi the
-        // cache stays empty and the gate is a no-op — assert both shapes.
+        // cache stays empty and the gate is a no-op - assert both shapes.
         let first = free_vram_mib(Duration::from_secs(60));
         let second = free_vram_mib(Duration::from_secs(60));
         assert_eq!(first, second, "second hit inside TTL must not re-probe");

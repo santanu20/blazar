@@ -1,6 +1,6 @@
 //! Crash-respawn contract at the GATEWAY boundary: a request whose
 //! forward dies in the crash window (child killed between health gate
-//! and send) must respawn the exact lane and retry ITSELF in-band —
+//! and send) must respawn the exact lane and retry ITSELF in-band -
 //! single-shot clients never observe the 502. The harness disables the
 //! reaper tick (1h interval), so any recovery observed here is the
 //! on-demand reap + in-band retry path alone.
@@ -54,7 +54,7 @@ async fn integration__crash__in_band_respawn_retry_serves_first_post_crash_reque
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Contract (upgraded from bridging-502s): the FIRST request after
-    // the crash self-heals — the failed forward reaps the corpse,
+    // the crash self-heals - the failed forward reaps the corpse,
     // respawns the exact instance lane, and retries once in-band. A 502
     // here means the crash-window retry regressed to next-request-only
     // recovery. The reaper tick is 1h here, so nothing else can save it.

@@ -2,11 +2,11 @@
 //! spawning stub-llama-server children, with the stub shaped as a
 //! thinking-capable model. Proves the two load-bearing contracts:
 //!
-//! 1. raw think-tag suppression on the `OpenAI` chat lane — a child that
+//! 1. raw think-tag suppression on the `OpenAI` chat lane - a child that
 //!    burns reasoning tokens by default must not leak them to a client
 //!    that never asked for thinking (buffered and streamed), and must
 //!    stay untouched when the caller explicitly asks;
-//! 2. mistral.rs dialect normalization — a mistralrs-routed lane
+//! 2. mistral.rs dialect normalization - a mistralrs-routed lane
 //!    receives top-level think controls it actually understands
 //!    (`enable_thinking` / mapped `reasoning_effort`), while explicit
 //!    caller controls pass through unchanged.
@@ -325,7 +325,7 @@ async fn e2e__think_suppression__openai_lane_strips_unasked_and_keeps_asked() {
     assert!(content.contains("stub:"), "answer body kept: {content:?}");
 
     // Streamed, no think controls: the SSE split rides the think block
-    // across frame halves — the filter must hold and re-emit safely.
+    // across frame halves - the filter must hold and re-emit safely.
     let (status, body) = chat(&c, &ts.base, "m1", true, serde_json::json!({})).await;
     assert_eq!(status, 200, "streamed chat: {body}");
     assert!(
@@ -336,7 +336,7 @@ async fn e2e__think_suppression__openai_lane_strips_unasked_and_keeps_asked() {
     assert!(body.contains("[DONE]"), "stream must terminate: {body}");
 
     // Asked for thinking (the kwargs dialect the OpenAI lane speaks):
-    // the raw reasoning must pass through untouched — reflection in the
+    // the raw reasoning must pass through untouched - reflection in the
     // same reply proves the kwargs also reached the child verbatim.
     let asked = serde_json::json!({
         "chat_template_kwargs": {"enable_thinking": true}

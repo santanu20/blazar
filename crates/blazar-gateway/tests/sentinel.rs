@@ -2,7 +2,7 @@
 //! stub-llama-server children with env-shaped response semantics.
 //! Proves the two load-bearing invariants together:
 //! 1. detections land in the ring (`blazar why` data), and
-//! 2. response BYTES are untouched — parity under observation.
+//! 2. response BYTES are untouched - parity under observation.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -187,7 +187,7 @@ async fn integration__sentinel__engine_child_degrade_stamps_requests_and_why() {
     // A live child that logged a flash-attention KV-type degrade must
     // stamp EVERY request it serves: x-blazar-warnings header, an
     // engine_slow_attn detection on the record, and an entry in
-    // /api/why's engine_degrades — the degrade is per-child, the
+    // /api/why's engine_degrades - the degrade is per-child, the
     // visibility is per-request.
     let ts = start(Config::default(), &[], false).await;
     let c = client();
@@ -267,7 +267,7 @@ async fn integration__sentinel__engine_child_degrade_stamps_requests_and_why() {
 #[allow(non_snake_case)]
 async fn integration__sentinel__truncation_and_near_limit() {
     // Contract 1 (default): prompt_preflight refuses the over-ctx prompt
-    // pre-hoc with a teaching 400 — the engine never truncates silently.
+    // pre-hoc with a teaching 400 - the engine never truncates silently.
     let cfg = Config {
         default_ctx: 8,
         ..Config::default()
@@ -297,7 +297,7 @@ async fn integration__sentinel__truncation_and_near_limit() {
     ts.state.sup.shutdown_all().await.unwrap();
 
     // Contract 2 (preflight off): the sentinel catches the engine's
-    // silent truncation post-hoc — the safety net stays pinned.
+    // silent truncation post-hoc - the safety net stays pinned.
     let cfg = Config {
         default_ctx: 8,
         prompt_preflight: false,
@@ -606,7 +606,7 @@ async fn integration__sentinel__responses_api_stream_and_nonstream() {
     ts.state.sup.shutdown_all().await.unwrap();
 
     // slots pinned: the stub reports usage from the compiled argv
-    // --ctx-size, and auto slots scale that total — the mapping math this
+    // --ctx-size, and auto slots scale that total - the mapping math this
     // test proves is orthogonal to slot sizing.
     let ts = start(
         Config {
@@ -988,7 +988,7 @@ async fn integration__bestof__fanout_sums_usage_and_stamps_header() {
 #[allow(non_snake_case)]
 async fn integration__bestof__headroom_degrade_stamps_reason_header() {
     // slots = 1: the child can never afford a second candidate, so the
-    // guard must collapse the fan-out to the normal single-send path —
+    // guard must collapse the fan-out to the normal single-send path -
     // but the ask was heard, and the response must say why it shrank.
     let cfg = Config {
         slots: 1,
@@ -1082,7 +1082,7 @@ async fn integration__bestof__passthrough_chat_lane_teaches_instead_of_ignoring(
 #[tokio::test]
 async fn integration__startup_preload__listed_model_spawns_before_first_request() {
     // F1: a config preload list spawns the model WITHOUT any client
-    // request — the daemon comes up warm. The stub engine serves as
+    // request - the daemon comes up warm. The stub engine serves as
     // the child; readiness is awaited by preload_listed itself.
     let cfg = Config {
         preload: vec!["m1".into()],

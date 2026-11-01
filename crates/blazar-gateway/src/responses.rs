@@ -1,12 +1,12 @@
 //! Responses API conversation state: `previous_response_id` chaining +
-//! `store` semantics — pure gateway value-add (upstream llama-server has
+//! `store` semantics - pure gateway value-add (upstream llama-server has
 //! no storage; verified absent in server.cpp). Bounded LRU, never grows
 //! unbounded, metadata + items only.
 //!
 //! Durability (v0.15): every stored response is written through to the
 //! SQLite ledger (`responses` table, store schema v8) and survives
 //! gateway restarts. Memory stays the hot path; the ledger is only read
-//! on a memory miss (`promote_from_store` re-checks the TTL — a row may
+//! on a memory miss (`promote_from_store` re-checks the TTL - a row may
 //! have aged past the window while the gateway was down).
 
 use std::collections::VecDeque;
@@ -35,7 +35,7 @@ pub struct StoredResponse {
     /// read or continue another key's thread.
     pub owner: Option<String>,
     /// v10: the exact completed body JSON when the gateway kept it
-    /// (background mode always). The RAM registry never reads it —
+    /// (background mode always). The RAM registry never reads it -
     /// only `to_row` carries it into the ledger for GET fidelity.
     pub body_json: Option<String>,
 }
@@ -113,9 +113,9 @@ impl ResponsesRegistry {
         Value::Array(items)
     }
 
-    /// Restart durability: memory miss → ledger lookup. The row's TTL is
+    /// Restart durability: memory miss -> ledger lookup. The row's TTL is
     /// re-checked before use (a response may have aged past the window
-    /// while the gateway was down — expired means miss, not stale hit).
+    /// while the gateway was down - expired means miss, not stale hit).
     /// A found row is promoted into the hot LRU so subsequent hits are
     /// memory-speed. Corrupt JSON degrades to `Null` (`chain_input` treats
     /// it as empty) rather than poisoning the conversation.
@@ -139,7 +139,7 @@ impl ResponsesRegistry {
             owner: row.owner,
             // Inheritance matters: a chained request must land in the same
             // conversation listing even after a restart. The exact body is
-            // deliberately NOT promoted — GET reads the row for fidelity,
+            // deliberately NOT promoted - GET reads the row for fidelity,
             // chaining never needs it, and bodies would bloat the LRU.
             conversation: row.conversation,
             body_json: None,

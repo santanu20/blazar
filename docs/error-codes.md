@@ -2,9 +2,9 @@
 
 Every error the gateway itself renders on an OpenAI-shaped surface
 carries a stable machine-readable `blazar_code` string alongside the
-human message — unlike messages and HTTP statuses, a code never
+human message - unlike messages and HTTP statuses, a code never
 renames, renumbers, or disappears. Codes are **additive-only**: once
-shipped, `code` ↔ HTTP status ↔ meaning are frozen contract.
+shipped, `code` <-> HTTP status <-> meaning are frozen contract.
 
 The live catalog is self-describing:
 
@@ -29,12 +29,12 @@ Envelope shape (typed example):
 the stable classification. Typed choke points (supervision lifecycle,
 admission refusals, auth/key middleware, host guard) emit precise
 codes; every other gateway-rendered error derives a generic code
-(`BAD_REQUEST`, `INTERNAL`, …) from its status, so the field is
+(`BAD_REQUEST`, `INTERNAL`, ...) from its status, so the field is
 present on every path. Errors forwarded verbatim from an engine child
 are untouched (they speak the child's own dialect). The Ollama-dialect
 lane (`/api/chat`, `/api/generate`) keeps its own minimal error shape.
 
-Source of truth: `crates/blazar-gateway/src/error_codes.rs` — a unit
+Source of truth: `crates/blazar-gateway/src/error_codes.rs` - a unit
 test pins this table against the enum, so the two cannot drift.
 
 ## Catalog (v1)

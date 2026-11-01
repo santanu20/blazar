@@ -3,7 +3,7 @@
 //! Covers: dry-run resolve+verify, tampered-digest rejection, a real
 //! self-replace on a *copy* of the binary (never the cargo artifact),
 //! and the post-upgrade daemon-restart lanes (systemd success + no-lane
-//! failure) against a stub daemon and a PATH-shimmed systemctl — never
+//! failure) against a stub daemon and a PATH-shimmed systemctl - never
 //! the real system manager.
 #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
 #![cfg(unix)]
@@ -112,7 +112,7 @@ fn fake_release(tag: &str, payload: &[u8], digest_mangle: Option<fn(String) -> S
 }
 
 /// Dry-run e2es never touch a daemon, but the CLI still parses config
-/// at startup — without an isolated XDG root the developer's real
+/// at startup - without an isolated XDG root the developer's real
 /// config (which may carry sections this binary does not know) fails
 /// the parse before the upgrade flow under test even starts.
 fn hermetic_config_env() -> std::collections::HashMap<String, String> {
@@ -309,7 +309,7 @@ fn with_staged_spawn<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Copy of the cargo binary for self-replacing runs — `upgrade` swaps
+/// Copy of the cargo binary for self-replacing runs - `upgrade` swaps
 /// its own executable, which must never be the shared cargo artifact.
 fn binary_copy() -> std::path::PathBuf {
     let tmp = tempfile::tempdir().unwrap();
@@ -335,9 +335,9 @@ fn e2e__upgrade_with_running_daemon_systemd_lane_restarts_it() {
             .assert()
             .success()
             .stdout(predicates::str::contains(
-                "daemon restarted — the update is live",
+                "daemon restarted - the update is live",
             ))
-            // The fake serves v0.1.3, older than the running binary —
+            // The fake serves v0.1.3, older than the running binary -
             // the summary must name the downgrade instead of rolling
             // back silently.
             .stdout(predicates::str::contains("downgrade from"));

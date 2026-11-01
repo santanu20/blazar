@@ -2,7 +2,7 @@
 # shellcheck disable=SC2086 # $SUDO is INTENTIONALLY unquoted throughout:
 # empty means "run unprivileged" (zero words); quoted it would become
 # argv[0]="". Same privilege convention as install.sh.
-# Blazar clean uninstall — removes EVERYTHING install.sh put here plus
+# Blazar clean uninstall - removes EVERYTHING install.sh put here plus
 # per-user state (config, store, engines, caches). Models are the one
 # exception: they are expensive re-downloads, so removal is ASKED, with
 # a safe keep-by-default. For the quick binary+units-only path use:
@@ -10,17 +10,17 @@
 #
 # Removed, in order:
 #   1. services + processes   systemd system/user units, launchd plists,
-#                             the running daemon (exact pidfile pid —
+#                             the running daemon (exact pidfile pid -
 #                             NEVER pkill -f, which self-matches)
 #   2. system artifacts       binary (BLAZAR_SYSTEM_BIN_DIR), unit file,
 #                             unit drop-ins, stale ~/.local/bin copy
 #   3. user state             ~/.local/share/blazar minus models;
 #                             ~/.config/blazar is KEPT by default (it
-#                             holds your port pin, keys and settings —
+#                             holds your port pin, keys and settings -
 #                             losing it silently re-creates defaults on
 #                             the next install and can collide with
 #                             ollama on 11434). --purge removes it too.
-#   4. models (ASKED)         GGUF models + whisper ggml models — prompt
+#   4. models (ASKED)         GGUF models + whisper ggml models - prompt
 #                             shows sizes first; default keep
 #
 # Options:
@@ -29,7 +29,7 @@
 #   --keep-models     non-interactive, models explicitly kept
 #   --purge           also remove ~/.config/blazar (config + token)
 #   --yes             skip prompts using SAFE defaults (models KEPT);
-#                     never implies --remove-models — data deletion is
+#                     never implies --remove-models - data deletion is
 #                     opt-in only via the explicit flag
 #   --help            this text
 #
@@ -88,7 +88,7 @@ SUDO="${BLAZAR_SUDO-sudo}"
 # cached credentials.
 if [ "$(id -u)" -ne 0 ] && [ "$SUDO" = sudo ] && [ "$DRY" != 1 ] &&
     [ ! -t 0 ] && ! sudo -n true 2>/dev/null; then
-    error "sudo cannot run non-interactively (no tty / no cached credentials) — refusing to start a partial uninstall. Re-run from a terminal for the password prompt, or pipe credentials to 'sudo -S', or set BLAZAR_SUDO for CI."
+    error "sudo cannot run non-interactively (no tty / no cached credentials) - refusing to start a partial uninstall. Re-run from a terminal for the password prompt, or pipe credentials to 'sudo -S', or set BLAZAR_SUDO for CI."
 fi
 
 # run <desc> <cmd...>: every mutation goes through here so --dry-run
@@ -104,7 +104,7 @@ run() {
     if "$@" >/dev/null 2>&1; then
         printf '  %s\n' "$_desc"
     else
-        # F152: never print an action that did not happen — the
+        # F152: never print an action that did not happen - the
         # transcript must not claim success over a failed mutation.
         _rc=$?
         FAILURES=$((FAILURES + 1))
@@ -116,7 +116,7 @@ BIN_DIR="${BLAZAR_SYSTEM_BIN_DIR:-/usr/local/bin}"
 UNIT_PATH="${BLAZAR_UNIT_PATH:-/etc/systemd/system/blazar.service}"
 SYSTEMCTL="${BLAZAR_SYSTEMCTL:-systemctl}"
 # Run-as-root support (parity with install.sh): under `sudo sh
-# uninstall.sh` $HOME is /root — user-keyed state (config, data, models,
+# uninstall.sh` $HOME is /root - user-keyed state (config, data, models,
 # user unit) belongs to the INVOKING user, resolved via SUDO_USER.
 USER_HOME="$HOME"
 if [ "$(id -u)" -eq 0 ] && [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != "root" ]; then
@@ -160,7 +160,7 @@ if [ "$(uname -s)" = Darwin ]; then
 fi
 
 # User-started daemon (not service-managed): TERM the exact pidfile pid.
-# NEVER pkill/pgrep -f — the pattern self-matches this script's own
+# NEVER pkill/pgrep -f - the pattern self-matches this script's own
 # invocation line (documented incident class).
 PIDFILE="$DATA_DIR/run/blazar.pid"
 if [ -f "$PIDFILE" ]; then
@@ -183,7 +183,7 @@ if [ -f "$PIDFILE" ]; then
 fi
 
 # Stray sweep (Linux): any process whose EXECUTABLE is the system binary
-# itself — pidfile-less manual `blazar serve &`, a deleted-pidfile
+# itself - pidfile-less manual `blazar serve &`, a deleted-pidfile
 # daemon. Exact /proc/<pid>/exe match only (no name patterns to
 # self-match); foreign-XDG daemons running OTHER binaries are not ours
 # to kill.
@@ -239,27 +239,27 @@ if [ "$(uname -s)" = Darwin ]; then
 fi
 
 # --------------------------------------------------------- 3. user state
-# Config is user settings (port pin, keys, overlays) — kept unless --purge.
+# Config is user settings (port pin, keys, overlays) - kept unless --purge.
 if [ "$PURGE" -eq 1 ]; then
     if [ -e "$CONFIG_DIR" ]; then
         run "purge $CONFIG_DIR (config.toml, gh-token.env)" rm -rf "$CONFIG_DIR"
     fi
 else
-    status "kept $CONFIG_DIR (config.toml, gh-token.env, backups) — re-run with --purge to remove"
+    status "kept $CONFIG_DIR (config.toml, gh-token.env, backups) - re-run with --purge to remove"
 fi
 status "removing regenerable user state (store + engines + caches)"
 
 # Data dir minus models: remove named subpaths (store, engines, runtime,
-# config snapshots, audit log, KV sessions, spec caches — all regenerable
+# config snapshots, audit log, KV sessions, spec caches - all regenerable
 # or re-downloadable) so a declined model removal leaves the directory
 # itself intact.
 # blazar.db plus its SQLite WAL sidecars (-wal, -shm) that can outlive
-# the db file after a daemon shutdown — orphaned checkpoints, not data.
+# the db file after a daemon shutdown - orphaned checkpoints, not data.
 for _sub in blazar.db blazar.db-wal blazar.db-shm engines run snapshots log sessions speccache; do
     [ -e "$DATA_DIR/$_sub" ] &&
         run "remove $DATA_DIR/$_sub" rm -rf "$DATA_DIR/$_sub"
 done
-# whisper binary lane (server binaries, registry) — re-downloadable.
+# whisper binary lane (server binaries, registry) - re-downloadable.
 [ -e "$DATA_DIR/whisper" ] && [ ! -e "$WHISPER_MODELS_DIR" ] &&
     run "remove $DATA_DIR/whisper" rm -rf "$DATA_DIR/whisper"
 
@@ -267,7 +267,7 @@ done
 _hum() { du -sh "$1" 2>/dev/null | cut -f1 || echo '?'; }
 if [ "$MODELS" = ask ]; then
     if [ ! -d "$MODELS_DIR" ] && [ ! -d "$WHISPER_MODELS_DIR" ]; then
-        status "no models present — nothing to ask"
+        status "no models present - nothing to ask"
         MODELS=none
     elif [ "$DRY" = 1 ]; then
         status "[dry-run] would prompt for model removal"
@@ -307,7 +307,7 @@ if [ "$DRY" != 1 ] && [ -d "$DATA_DIR" ]; then
 fi
 
 if [ "$FAILURES" -gt 0 ]; then
-    status "INCOMPLETE: ${FAILURES} action(s) failed — re-run and investigate the [FAIL] lines above"
+    status "INCOMPLETE: ${FAILURES} action(s) failed - re-run and investigate the [FAIL] lines above"
     exit 1
 fi
 status "done. blazar fully removed (validation sandboxes under ~/.cache untouched)"
@@ -315,6 +315,6 @@ status "done. blazar fully removed (validation sandboxes under ~/.cache untouche
 # script's exit status (POSIX footgun; --remove-models runs used to exit 1
 # after a flawless uninstall).
 if [ "$MODELS" = keep ]; then
-    status "models remain at $MODELS_DIR — delete manually when ready"
+    status "models remain at $MODELS_DIR - delete manually when ready"
 fi
 exit 0

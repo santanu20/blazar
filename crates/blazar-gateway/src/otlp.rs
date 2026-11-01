@@ -4,7 +4,7 @@
 //! shipped to an OpenTelemetry collector in batches. Bounded by design:
 //! the hot path `try_send`s into a fixed channel and never blocks; an
 //! unreachable collector drops batches with a throttled warning. This is
-//! intentionally a hand-rolled minimal exporter — the full opentelemetry
+//! intentionally a hand-rolled minimal exporter - the full opentelemetry
 //! crate family would dwarf blazar's gateway for a local-first server.
 
 use blazar_core::Config;
@@ -26,7 +26,7 @@ pub struct Otlp {
     service: String,
     tx: tokio::sync::mpsc::Sender<OtlpSpan>,
     rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<OtlpSpan>>>,
-    /// Spans never exported (channel saturated or POST failed) —
+    /// Spans never exported (channel saturated or POST failed) -
     /// surfaced via `/metrics` as `blazar_otlp_dropped_total` (F81).
     pub dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -124,7 +124,7 @@ impl Otlp {
     }
 
     /// OTLP/HTTP-JSON trace payload (protobuf-JSON mapping; strictly the
-    /// `ExportTraceServiceRequest` shape — no extra fields).
+    /// `ExportTraceServiceRequest` shape - no extra fields).
     fn encode(&self, spans: &[OtlpSpan]) -> serde_json::Value {
         let otlp_spans: Vec<serde_json::Value> = spans
             .iter()

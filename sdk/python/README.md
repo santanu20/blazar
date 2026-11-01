@@ -10,7 +10,7 @@ pip install .            # from a checkout of this repository
 
 The distribution is named `blazar-sdk`; the import package is `blazar`
 (PyPI's `blazar` belongs to the unrelated OpenStack reservation
-service). You can also drop `blazar/__init__.py` on `PYTHONPATH` —
+service). You can also drop `blazar/__init__.py` on `PYTHONPATH` -
 there is nothing to build.
 
 ## Usage
@@ -43,7 +43,7 @@ blazar.models()
 ```
 
 Errors raise `blazar.BlazarError` carrying the HTTP status and the
-gateway's teaching message (`error.message`) — surface it verbatim;
+gateway's teaching message (`error.message`) - surface it verbatim;
 Blazar errors explain the fix.
 
 ## API
@@ -59,4 +59,4 @@ Blazar errors explain the fix.
 | `mcp_servers()` | `GET /api/mcp` | |
 
 Any other chat-completions field (temperature, max_tokens, response_format,
-…) rides through `**kw` verbatim.
+...) rides through `**kw` verbatim.

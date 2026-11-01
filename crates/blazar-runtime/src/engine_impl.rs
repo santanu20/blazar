@@ -1,7 +1,7 @@
 //! The `Engine` abstraction: everything Blazar needs from a serving
 //! backend. Implementations: `LlamaCppEngine` (upstream llama-server)
 //! and `MistralRsEngine` (upstream mistralrs `serve`). vLLM/SGLang
-//! adapters later implement the same trait — gateway, supervisor and
+//! adapters later implement the same trait - gateway, supervisor and
 //! lifecycle stay engine-agnostic.
 
 use anyhow::{Result, anyhow};
@@ -93,7 +93,7 @@ pub trait Engine: Send + Sync {
     fn capabilities(&self) -> &crate::engine::manifest::Manifest;
 
     /// Dialect selector for the profile compiler: the engines.kind
-    /// column's in-process mirror. No kind lives in the manifest —
+    /// column's in-process mirror. No kind lives in the manifest -
     /// the store row is the single source of truth (b6 rev 1).
     fn kind(&self) -> blazar_core::engine_kind::EngineKind;
 
@@ -122,7 +122,7 @@ pub trait Engine: Send + Sync {
 
     /// Devices the SERVING child context can see (`--list-devices` run
     /// exactly as a serving spawn would). `Ok(None)` = engine build has
-    /// no `--list-devices` or listing failed — callers skip validation.
+    /// no `--list-devices` or listing failed - callers skip validation.
     async fn enumerate_devices(&self) -> Result<Option<Vec<crate::engine::manifest::DeviceDesc>>> {
         Ok(None)
     }
@@ -194,13 +194,13 @@ impl Engine for LlamaCppEngine {
         // EAGERLY at argv-parse and SIGABRTs on a dead endpoint
         // (ggml-rpc.cpp rpc_dispatcher::start), which crash-loops the
         // child into 502s. Refuse the spawn with a teaching error naming
-        // the dead endpoint(s) instead — the engine binary itself is
+        // the dead endpoint(s) instead - the engine binary itself is
         // healthy, so this returns before any child exists (no
         // crash-loop, no engine rollback).
         let dead = probe_rpc_endpoints(argv).await;
         if !dead.is_empty() {
             return Err(anyhow!(
-                "--rpc endpoint(s) unreachable: {} — llama-server aborts at \
+                "--rpc endpoint(s) unreachable: {} - llama-server aborts at \
                  startup when an RPC backend is down; start the RPC worker(s) \
                  or fix `rpc_servers` in the config",
                 dead.join(", ")
@@ -246,7 +246,7 @@ impl Engine for LlamaCppEngine {
     async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
         // TCP probes ride the shared pool client; unix probes use an
         // ephemeral client pinned to the socket (probes run once per
-        // spawn — no pool to warm) with a placeholder host the
+        // spawn - no pool to warm) with a placeholder host the
         // connector ignores.
         let (client, url) = match endpoint {
             Endpoint::Tcp { host, port } => (self.http.clone(), format!("http://{host}:{port}")),
@@ -286,11 +286,11 @@ impl Engine for LlamaCppEngine {
 /// How long each `--rpc` endpoint preflight probe may take. Probes run
 /// in parallel; a live loopback/LAN worker answers in well under a
 /// second, while a dead host with dropped SYNs burns the full budget
-/// once — still cheaper than the child SIGABRT loop it prevents.
+/// once - still cheaper than the child SIGABRT loop it prevents.
 const RPC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Preflight every `--rpc` endpoint in the FINAL child argv (all
-/// occurrences — config knob, model overlay and `extra_args` can each
+/// occurrences - config knob, model overlay and `extra_args` can each
 /// add one): upstream's eager connect would SIGABRT the child at
 /// argv-parse. Returns the offending entries (`host:port (reason)`),
 /// empty when every endpoint answered or no `--rpc` flag is present.
@@ -307,7 +307,7 @@ async fn probe_rpc_endpoints(argv: &[String]) -> Vec<String> {
 }
 
 /// TCP-probe raw `host:port` RPC worker targets in parallel (2s
-/// budget each — see [`RPC_PROBE_TIMEOUT`]). Shared by the spawn
+/// budget each - see [`RPC_PROBE_TIMEOUT`]). Shared by the spawn
 /// preflight (argv form above) and CLI-side diagnostics such as
 /// `blazar doctor`'s fleet check. Returns the offending entries
 /// (`host:port (reason)`), empty when every target answered.
@@ -344,7 +344,7 @@ pub async fn probe_rpc_targets(targets: &[String]) -> Vec<String> {
 /// into /run symlink loops (`Too many levels of symbolic links`). Seating
 /// every child in its engine's install dir keeps relative lookups inside
 /// blazar-owned territory. Bare binary names (no directory component)
-/// keep the inherited cwd — same behavior as before this anchor existed.
+/// keep the inherited cwd - same behavior as before this anchor existed.
 fn child_cwd(server_path: &str) -> Option<std::path::PathBuf> {
     std::path::Path::new(server_path)
         .parent()
@@ -355,7 +355,7 @@ fn child_cwd(server_path: &str) -> Option<std::path::PathBuf> {
 /// Shared child-process mechanics for every engine kind: null stdin,
 /// piped stdio into tracing + the log tail, kill-on-drop, own process
 /// group (§5 H19: acquired = released by construction). `spawn_env`
-/// applies AFTER `child_env` — a same-key override is logged, never a
+/// applies AFTER `child_env` - a same-key override is logged, never a
 /// silent clobber.
 fn spawn_child(
     server_path: &str,
@@ -399,11 +399,11 @@ fn spawn_child(
     // still drops the child.
     cmd.kill_on_drop(true);
     // Inline the io source (ENOENT/EACCES...) into the context: callers
-    // that render only `Display` — the gateway's 500 body — would
+    // that render only `Display` - the gateway's 500 body - would
     // otherwise show a bare `spawn <path>` with no reason for it.
     let mut child = cmd.spawn().map_err(|e| {
         anyhow!(
-            "spawn {server_path}: {e} — engine binary missing or not executable; \
+            "spawn {server_path}: {e} - engine binary missing or not executable; \
                  re-rooted engines adopt the live data dir, so this usually means \
                  `blazar engine update` is needed"
         )
@@ -429,7 +429,7 @@ fn spawn_child(
 /// llama.cpp that shaped this impl (verified against mistral.rs docs):
 /// - no `--list-devices` equivalent (device enumeration unavailable)
 /// - `/health` answers 200 as soon as HTTP is up, BEFORE the model is
-///   served — readiness MUST come from `/v1/models` (per-model status
+///   served - readiness MUST come from `/v1/models` (per-model status
 ///   "loaded")
 /// - child binds `0.0.0.0` by default and has NO auth; Blazar forces
 ///   `--host 127.0.0.1` and the gateway stays the only public face
@@ -624,9 +624,9 @@ fn shard_of(name: &str, base: &str) -> bool {
 
 /// Paged-execution step ceiling for the mistral.rs lane, scaled by the
 /// card's VRAM: v0.9.5's executor reserves activation memory for the
-/// FULL `--max-num-batched-tokens` × `--max-seqs` envelope up front, so
+/// FULL `--max-num-batched-tokens` x `--max-seqs` envelope up front, so
 /// an unscaled envelope starves KV on small cards (live receipt
-/// 2026-10-21: 16k×32 reserved ~2178 MiB and a 512 MiB explicit
+/// 2026-10-21: 16kx32 reserved ~2178 MiB and a 512 MiB explicit
 /// `--kv-cache` still failed fit on 8 GB, while the engine's 4096-class
 /// defaults served the same model). An explicit `--kv-cache` pin
 /// (upstream #2502 workaround) tightens even big cards by one rung:
@@ -657,7 +657,7 @@ fn paged_seqs_ceiling(seqs: u32, profile: &Profile) -> u32 {
 /// A repo id the Hub would resolve: exactly one `org/name` slash pair,
 /// plain identifier characters, no scheme/path/colon junk. Pull records
 /// local imports and sidecar-adopted rows with filesystem paths or
-/// placeholder repos — those must NOT become `--tok-model-id` values
+/// placeholder repos - those must NOT become `--tok-model-id` values
 /// (the child would 404 the Hub on boot).
 #[must_use]
 fn plausible_hf_repo_id(repo: &str) -> Option<String> {
@@ -723,10 +723,10 @@ pub fn mistralrs_argv(
     // `--max-num-batched-tokens` tokens per step and defaults to 4096:
     // any prompt longer than that dies as an HTTP 200 with an empty
     // choices array and `error: service_unavailable` (live-proven on
-    // v0.9.3 — a real-world ~4.3k-token system prompt tripped it). Raise the
+    // v0.9.3 - a real-world ~4.3k-token system prompt tripped it). Raise the
     // step to the serving context so prefill is never chunk-starved,
     // scaled by the card: v0.9.5's paged executor reserves activation
-    // memory for the FULL envelope, and a 16k×32 envelope reserved
+    // memory for the FULL envelope, and a 16kx32 envelope reserved
     // ~2178 MiB, starving KV until even a 512 MiB explicit --kv-cache
     // failed fit on an 8 GB card (live receipt, 2026-10-21) while the
     // engine's own 4096-class defaults served the same model fine.
@@ -760,10 +760,10 @@ pub fn mistralrs_argv(
     }
     // `--tok-model-id` precedence, strongest provenance first:
     // 1. the GGUF's own `general.*` metadata (the file's embedded
-    //    identity — authoritative for repackaged multimodal GGUFs,
+    //    identity - authoritative for repackaged multimodal GGUFs,
     //    live-proven on v0.9.4; overrides a stale user pin, matching
     //    the pinned contract in tests/mistralrs.rs);
-    // 2. an explicit user extra_args pin (deliberate intent — wins
+    // 2. an explicit user extra_args pin (deliberate intent - wins
     //    over every guess);
     // 3. `row.repo` for text GGUFs (pull-time record; plausible-HF-id
     //    gate below refuses registry/local-path junk). Auto-fills the
@@ -807,7 +807,7 @@ pub fn mistralrs_argv(
     // User extra_args ride profile.argv after compile-time strict
     // validation (manifest-gated, reserved-flag refusal). Forward them
     // verbatim here, skipping every token this argv builder already
-    // emitted — where the builder fired (ctx-scaled --max-model-len,
+    // emitted - where the builder fired (ctx-scaled --max-model-len,
     // the derived multimodal --tok-model-id, the tuning passthrough)
     // its value wins. An owned flag the builder did NOT emit is
     // exactly the user escape hatch: a text GGUF cannot encode whether
@@ -846,7 +846,7 @@ pub fn mistralrs_argv(
 /// Forward the dialect's tuning tokens from the compiled profile argv
 /// into the child argv, manifest-gated per flag. Pair flags carry a
 /// value token; bool flags stand alone. The flag lists live in
-/// blazar-core next to `compile_mistralrs` — one source of truth.
+/// blazar-core next to `compile_mistralrs` - one source of truth.
 fn mistralrs_tuning_passthrough(
     dialect: &[String],
     flags: &std::collections::BTreeSet<String>,
@@ -933,7 +933,7 @@ impl Engine for MistralRsEngine {
             {
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
                 // mistralrs reports per-model status; "loaded" is the
-                // serving-ready state. Some builds omit the field —
+                // serving-ready state. Some builds omit the field -
                 // treat a listed model as loaded then.
                 let loaded = body["data"].as_array().is_some_and(|models| {
                     models
@@ -962,7 +962,7 @@ impl Engine for MistralRsEngine {
 /// stable-diffusion.cpp master-890-74988b2):
 /// - the server refuses to boot without model arguments (`model_path/
 ///   diffusion_model` required) and binds its port only after the model
-///   set loads — connection-refused during a health poll is the normal
+///   set loads - connection-refused during a health poll is the normal
 ///   loading phase, not a crash signal.
 /// - no `/health` route (404): readiness is `GET /v1/models` answering
 ///   200 with an OpenAI-shaped `{"data":[...]}` body (a single synthetic
@@ -970,7 +970,7 @@ impl Engine for MistralRsEngine {
 ///   `OpenAI` images dialect (`{"created", "data":[{"b64_json"}],
 ///   "output_format":"png"}`) with only `prompt` required.
 /// - `--list-devices` prints `NAME<TAB>description` lines (no MiB), a
-///   different shape from llama's — parsed by `parse_sd_devices`.
+///   different shape from llama's - parsed by `parse_sd_devices`.
 /// - release binaries carry RUNPATH `$ORIGIN` (verified via readelf),
 ///   so sibling `libggml*.so` resolve with no env wiring.
 /// - no unix-socket transport: `--listen-ip`/`--listen-port` only.
@@ -1091,7 +1091,7 @@ impl Engine for SdCppEngine {
         let started = std::time::Instant::now();
         let mut poll = std::time::Duration::from_millis(25);
         loop {
-            // sd-server has no /health route (404 — verified against
+            // sd-server has no /health route (404 - verified against
             // master-890-74988b2); the port binds only after the model set
             // loads, and GET /v1/models answers 200 with an OpenAI-shaped
             // {"data":[...]} once it does. That 200 IS the ready signal.
@@ -1122,7 +1122,7 @@ impl Engine for SdCppEngine {
 /// sglang v0.5.19 `http_server.py` + `server_args.py`):
 /// - `/health` and `/health_generate` share one handler: 503 while the
 ///   server is `Starting`, 200 once serving (generate-backed). Readiness
-///   is the STATUS alone — there is no `{"status":"ok"}` body contract.
+///   is the STATUS alone - there is no `{"status":"ok"}` body contract.
 /// - no `--list-devices` equivalent; device enumeration unavailable.
 /// - no unix-socket transport: endpoints are always TCP.
 /// - auth exists upstream (`--api-key`): the supervisor's minted
@@ -1150,7 +1150,7 @@ impl SglangEngine {
         // 5s, not the 2s the fast lanes use: sglang 0.5.19's default
         // /health is a GENERATE probe (SGLANG_ENABLE_HEALTH_ENDPOINT_
         // GENERATION defaults true, environ.py) that sleeps in 1s steps
-        // waiting for a 1-token round trip — ~1.2s idle, >2s under load.
+        // waiting for a 1-token round trip - ~1.2s idle, >2s under load.
         // A 2s total timeout never completes one 200 and the poll reports
         // a healthy child as dead for the whole model_load_timeout window
         // (seen live: uvicorn access log full of 200s the daemon never
@@ -1173,20 +1173,20 @@ impl SglangEngine {
 /// mem-fraction-static, ...), so this only PREPENDS what the supervisor
 /// owns: model dir, loopback bind, port, public name. The per-child
 /// `--api-key` secret is appended by the supervisor's child-auth mint
-/// (same as llamacpp) — one choke point, not engine business.
+/// (same as llamacpp) - one choke point, not engine business.
 /// Tool-call detector for the sglang lane, derived from the model's
 /// architecture rather than upstream's `--tool-call-parser auto`.
 ///
 /// `auto` resolves the detector by sniffing the chat template at server
 /// start, but its qwen rule only fires on templates carrying an
-/// `enable_thinking` toggle (sglang 0.5.21 `_is_qwen3`) — qwen2-family
+/// `enable_thinking` toggle (sglang 0.5.21 `_is_qwen3`) - qwen2-family
 /// templates have none, so the resolver disables the parser and the
 /// model's `<tool_call>` markers ship as plain prose. The store's arch
 /// row already names the family in either spelling (GGUF short form
 /// `qwen2`/`qwen3vl`, HF class `Qwen2ForCausalLM`), and each family's
 /// marker dialect is stable, so the detector is named here the way
 /// upstream's own detection table maps it. Families without an
-/// evidenced gap keep `auto` — their vocab-sentinel rules work.
+/// evidenced gap keep `auto` - their vocab-sentinel rules work.
 fn sglang_tool_call_parser(arch: Option<&str>) -> &'static str {
     let Some(arch) = arch.map(str::to_lowercase) else {
         return "auto";
@@ -1220,7 +1220,7 @@ pub fn sglang_argv(
         "--model-path".to_string(),
         model.path.clone(),
         // Forced loopback: even with the API key set, the child is not
-        // the public face — the gateway is (binding revision 3).
+        // the public face - the gateway is (binding revision 3).
         "--host".to_string(),
         "127.0.0.1".to_string(),
         "--port".to_string(),
@@ -1228,7 +1228,7 @@ pub fn sglang_argv(
         // Native tool-call parsing: sglang ships with
         // tool_call_parser = None (verified against the installed
         // 0.5.21 ServerArgs default), which serves a tool-calling
-        // model's `<tool_call>` markers as plain prose — the request
+        // model's `<tool_call>` markers as plain prose - the request
         // succeeds, the structured tool_calls never appear. The
         // detector is derived from the arch row because upstream's
         // `auto` template-sniff cannot see qwen2-family templates
@@ -1251,7 +1251,7 @@ pub fn sglang_argv(
 /// The engine layout contract puts the interpreter at
 /// `<engine-dir>/venv/bin/python` while `server_path` may point at either
 /// the generated `<lane>-server` shell wrapper sitting NEXT TO the venv
-/// or the interpreter itself — so the venv is found by the layout probe
+/// or the interpreter itself - so the venv is found by the layout probe
 /// (nearest ancestor owning `venv/bin/python`), never by loose `bin/` +
 /// `lib/` matching, which happily mis-roots on host dirs like `~/.local`.
 ///
@@ -1337,7 +1337,7 @@ impl Engine for SglangEngine {
         // spawning: sglang helper processes link libcudart directly (see
         // `venv_nvidia_lib_dirs`) and there is no ambient
         // LD_LIBRARY_PATH carrying the venv layout. An explicit user
-        // `[engine_env]` LD_LIBRARY_PATH keeps its entries — ours prepend
+        // `[engine_env]` LD_LIBRARY_PATH keeps its entries - ours prepend
         // so the venv that owns the binary wins for its own libs.
         let mut env: Vec<(String, String)> = self.child_env.clone();
         let cuda_dirs = venv_nvidia_lib_dirs(&self.manifest.server_path);
@@ -1378,7 +1378,7 @@ impl Engine for SglangEngine {
         let started = std::time::Instant::now();
         // Same adaptive poll as the other engines. Readiness = HTTP 200
         // on /health: sglang answers 503 while `Starting` (weights
-        // loading, warmup generate) and 200 once it serves — the body is
+        // loading, warmup generate) and 200 once it serves - the body is
         // not a contract (v0.5.19 http_server.py:662).
         let mut poll = std::time::Duration::from_millis(25);
         loop {
@@ -1410,7 +1410,7 @@ impl Engine for SglangEngine {
 /// serves MLX-quant directories (mlx-community layout: safetensors +
 /// `config.json` with an `mlx` quantization block). On Linux/NVIDIA the
 /// venv carries `mlx-cuda` (CUDA backend wheels); on Apple Silicon the
-/// plain `mlx` build — same lane, platform-chosen backend.
+/// plain `mlx` build - same lane, platform-chosen backend.
 pub struct MlxEngine {
     pub manifest: crate::engine::manifest::Manifest,
     /// HTTP client for health polls (children are loopback).
@@ -1433,7 +1433,7 @@ impl MlxEngine {
     ) -> Self {
         // Same 5s budget class as sglang: mlx_lm.server is a plain
         // python HTTP server whose /v1/models probe is cheap, but the
-        // interpreter itself is torch-class slow to import — a 2s
+        // interpreter itself is torch-class slow to import - a 2s
         // timeout risks eating the first (or only) successful response
         // during boot.
         blazar_core::tls::ensure_tls_provider();
@@ -1452,7 +1452,7 @@ impl MlxEngine {
 /// mlx connection trio + compiled profile. The profile argv is already
 /// `mlx_lm.server` grammar; this prepends what the supervisor owns:
 /// model dir, loopback bind, port. The per-child auth secret (when the
-/// installed mlx-lm build supports `--api-key` — probed at install) is
+/// installed mlx-lm build supports `--api-key` - probed at install) is
 /// appended by the supervisor's child-auth mint, same as the other
 /// lanes: one choke point, not engine business.
 #[must_use]
@@ -1470,7 +1470,7 @@ pub fn mlx_argv(
     let mut argv = vec![
         "--model".to_string(),
         model.path.clone(),
-        // Forced loopback: the child is never the public face — the
+        // Forced loopback: the child is never the public face - the
         // gateway is (binding revision 3), and unlike sglang the mlx-lm
         // server has no built-in API key on every build, so the bind is
         // the load-bearing isolation.
@@ -1510,9 +1510,9 @@ impl Engine for MlxEngine {
     ) -> Result<ChildHandle> {
         // mlx_lm resolves an unrecognized request-body `model` through
         // the HF hub at REQUEST time (live-proven 2026-10-09: a bare
-        // name made it fetch huggingface.co/api/models/<name> → 401 →
+        // name made it fetch huggingface.co/api/models/<name> -> 401 ->
         // every chat 404s). blazar only ever serves local model dirs
-        // here, so a hub round-trip mid-request is never useful — pin
+        // here, so a hub round-trip mid-request is never useful - pin
         // offline so any stray name fails fast and locally instead of
         // phoning home. A user-set value always survives.
         const HF_HUB_OFFLINE: &str = "HF_HUB_OFFLINE";
@@ -1525,7 +1525,7 @@ impl Engine for MlxEngine {
         // Same venv CUDA-lib surgery as sglang: on Linux the mlx-cuda
         // backend links the venv's pip nvidia libs (cublas/nvrtc/cudnn)
         // directly, and no ambient LD_LIBRARY_PATH carries the venv
-        // layout. User [engine_env] entries survive — ours prepend so
+        // layout. User [engine_env] entries survive - ours prepend so
         // the venv that owns the shim wins for its own libs. On Apple
         // Silicon the probe finds no nvidia dirs and this is a no-op.
         let mut env: Vec<(String, String)> = self.child_env.clone();
@@ -1556,7 +1556,7 @@ impl Engine for MlxEngine {
         // NVRTC and resolves headers through CUDA_HOME/CUDA_PATH. System
         // toolkits are routinely older than the headers mlx 0.32's CCCL
         // needs (fp8 types), so the lane installs an engine-local
-        // cuda-home farm (mlx_install::link_cuda_home) — point an unset
+        // cuda-home farm (mlx_install::link_cuda_home) - point an unset
         // CUDA_HOME at it. A user-provided CUDA_HOME/CUDA_PATH always
         // wins. Live-proven 2026-10-02: without this the first chat dies
         // with "generation thread died" on a CUDA 12.0 apt host.
@@ -1647,10 +1647,10 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                 if let Some(note) = classify_child_degrade(line) {
                     // Upstream prints these once per process at plain
                     // log level; at blazar they are user-visible degrades
-                    // with a remedy — warn, not debug — and they land in
+                    // with a remedy - warn, not debug - and they land in
                     // the degrade registry so the sentinel can stamp
                     // requests served by this child (see degrades.rs).
-                    tracing::warn!(target: "blazar::engine", stream, "{line} — {note}");
+                    tracing::warn!(target: "blazar::engine", stream, "{line} - {note}");
                     crate::degrades::record(child.clone(), line.to_string(), note.to_string());
                 }
                 if let Ok(mut t) = tail.lock() {
@@ -1665,18 +1665,18 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 }
 
 /// Known upstream child-log lines that describe a silent performance
-/// degrade (work still succeeds, just slower — often dramatically).
+/// degrade (work still succeeds, just slower - often dramatically).
 /// Matched lines are re-emitted at warn with a teaching note so the
 /// degrade is visible without log-level archaeology.
 fn classify_child_degrade(line: &str) -> Option<&'static str> {
     // llama.cpp/ggml CUDA fattn (verified in b12015 fattn.cu): when the
     // KV cache type pair has no compiled GPU flash-attention kernel, the
-    // engine converts K/V to f16 per step and carries on — on older
+    // engine converts K/V to f16 per step and carries on - on older
     // default builds (issue #28455, build 10791) the whole attention op
     // silently moved to the CPU (~35x slower prefill). Official ggml
     // CUDA release binaries Blazar installs measure full-speed on all
     // cache quant pairs (receipt: bench-artifacts/20261031-kv-fa-quant-audit),
-    // so this firing means a custom/older engine build — the remedy is a
+    // so this firing means a custom/older engine build - the remedy is a
     // supported pair or a rebuild, not a config change on our side.
     if line.contains("no FlashAttention vector kernel compiled for K/V types") {
         return Some(
@@ -1718,7 +1718,7 @@ mod tests {
         // A bare name resolves via PATH; no owned dir exists, so the
         // child keeps the inherited cwd (pre-anchor behavior).
         assert_eq!(child_cwd("sd-server"), None);
-        // "./sd-server" has an empty parent — same inherit rule.
+        // "./sd-server" has an empty parent - same inherit rule.
         assert_eq!(child_cwd("./sd-server"), None);
     }
 
@@ -1728,7 +1728,7 @@ mod tests {
     async fn unit__spawn_child_env__spawn_env_overrides_engine_env_last_wins() {
         // Real child, real env merge: the spawn-time value must reach
         // the process for a shared key while engine_env-only keys
-        // survive untouched — the supervisor's GPU pinning rides on
+        // survive untouched - the supervisor's GPU pinning rides on
         // exactly this ordering (H5: overrides are visible in logs,
         // never a silent clobber).
         let child_env = vec![
@@ -1771,7 +1771,7 @@ mod tests {
         // nvidia/<pkg>/lib dirs on LD_LIBRARY_PATH.
         let tmp = std::env::temp_dir().join(format!("blazar-venv-test-{}", std::process::id()));
         // Engine-install layout: the sglang-server shell wrapper sits
-        // NEXT TO the venv. This is the shape the live repro exposed —
+        // NEXT TO the venv. This is the shape the live repro exposed -
         // probing the wrapper with a loose bin/+lib/ ancestor rule found
         // nothing and the memory-saver child kept dying at exit 127.
         let engine_dir = tmp.join("sglang-0.5.19");
@@ -1884,7 +1884,7 @@ mod tests {
 
     #[tokio::test]
     async fn unit__probe_rpc_targets__malformed_entries_reported_without_connect() {
-        // Doctor feeds raw config strings to the target-level probe —
+        // Doctor feeds raw config strings to the target-level probe -
         // malformed entries must be named, not parsed loosely or skipped.
         let alive = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -2005,7 +2005,7 @@ mod tests {
     /// sglang 0.5.19 /health is a generate probe: the handler sleeps in
     /// 1s steps waiting for a 1-token round trip, so a 200 takes ~1.2s
     /// idle and 2s+ under load. A stub answers every /health with 200
-    /// AFTER a probe-like latency — the health client's total timeout
+    /// AFTER a probe-like latency - the health client's total timeout
     /// must outlive it or the poll declares a healthy child dead (the
     /// live failure: uvicorn logged a steady stream of 200s the daemon
     /// never completed within its old 2s budget, so every spawn was
@@ -2122,7 +2122,7 @@ mod tests {
     }
 
     /// Minimal sd-server dialect stub: `/v1/models` answers the `OpenAI`
-    /// shape, every other route (notably `/health`) 404s — the live
+    /// shape, every other route (notably `/health`) 404s - the live
     /// master-890 contract.
     async fn sdcpp_dialect_stub() -> u16 {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -2178,7 +2178,7 @@ mod tests {
     #[tokio::test]
     async fn unit__sdcpp_health__llama_health_route_alone_is_not_ready() {
         // The probe-latency stub answers 200 to everything EXCEPT it is
-        // not used here: craft the inverse — /health 200 exists but
+        // not used here: craft the inverse - /health 200 exists but
         // /v1/models does not. That is a llama-server, not an sd-server.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -2319,7 +2319,7 @@ mod tests {
     fn unit__mistralrs_tok_model_id__text_gguf_derives_from_row_repo() {
         // The SWA refusal class: a text GGUF (no mmproj) whose loader
         // needs the original tokenizer config. The pull-time repo IS
-        // the HF id — auto-derive instead of forcing the extra_args
+        // the HF id - auto-derive instead of forcing the extra_args
         // escape hatch.
         let mut row = mistralrs_row("/store/qwen2.5-7b-q4.gguf");
         row.repo = "Qwen/Qwen2.5-7B-Instruct-GGUF".into();
@@ -2343,7 +2343,7 @@ mod tests {
     #[test]
     fn unit__mistralrs_tok_model_id__user_pin_wins_and_junk_repos_refused() {
         let flags = ["--tok-model-id".to_string()].into_iter().collect();
-        // An explicit extra_args pin is never overridden — auto-derive
+        // An explicit extra_args pin is never overridden - auto-derive
         // fills absences only.
         let mut row = mistralrs_row("/store/qwen2.5-7b-q4.gguf");
         row.repo = "Qwen/Qwen2.5-7B-Instruct-GGUF".into();
@@ -2367,7 +2367,7 @@ mod tests {
         assert_eq!(hits, vec!["custom/repo".to_string()]);
 
         // Registry-sourced rows (ollama-style three-part repos) and
-        // filesystem placeholders never become Hub ids — the child
+        // filesystem placeholders never become Hub ids - the child
         // would 404 the Hub on boot. No derivation, teaching error
         // stays the engine's own.
         for junk in [
@@ -2396,7 +2396,7 @@ mod tests {
 
     #[test]
     fn unit__paged_envelope__small_card_steps_down_seq_cap() {
-        // The 8 GB receipt: a 16k×32 envelope reserved ~2178 MiB of
+        // The 8 GB receipt: a 16kx32 envelope reserved ~2178 MiB of
         // activations and starved KV until even a pinned 512 MiB
         // --kv-cache failed fit; 4096-class defaults served the same
         // model. Small cards must step down to that class and cap

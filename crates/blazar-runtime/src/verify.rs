@@ -60,7 +60,7 @@ pub enum VerifyReport {
 /// never stalls the async runtime.
 pub async fn verify_model(dirs: &BlazarDirs, name: &str) -> Result<VerifyReport> {
     // Read-only intent: never materialize a store (and a data dir) just to
-    // answer "is it there" — a missing DB means the model cannot exist.
+    // answer "is it there" - a missing DB means the model cannot exist.
     if !dirs.db_file().is_file() {
         return Ok(VerifyReport::NotFound {
             name: name.to_string(),

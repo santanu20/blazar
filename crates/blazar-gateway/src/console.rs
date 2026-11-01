@@ -1,7 +1,7 @@
-//! `/ui` — the embedded web console, served straight from the binary.
+//! `/ui` - the embedded web console, served straight from the binary.
 //!
 //! The page is `console.html`, compiled in with `include_str!`: no
-//! external assets, no CDN, no build pipeline — the console works
+//! external assets, no CDN, no build pipeline - the console works
 //! offline exactly where the daemon works. It is read-only and
 //! composes the existing JSON endpoints (`/api/version`, `/api/tags`,
 //! `/api/ps`, `/api/fabric`, `/api/quantiles`, `/api/benchmarks`,
@@ -10,7 +10,7 @@
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-/// `GET /ui` — the console document, `text/html` + no-cache (live
+/// `GET /ui` - the console document, `text/html` + no-cache (live
 /// daemon state should never be served stale from a browser cache).
 pub async fn ui() -> Response {
     let mut res = axum::response::Html(include_str!("console.html")).into_response();
@@ -53,7 +53,7 @@ mod tests {
                 "section {tab} present"
             );
         }
-        // Endpoints the page composes — if one moves, this pin flags it.
+        // Endpoints the page composes - if one moves, this pin flags it.
         for ep in [
             "/api/version",
             "/api/tags",

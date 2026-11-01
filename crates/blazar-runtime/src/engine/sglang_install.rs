@@ -10,8 +10,8 @@
 //! └── sglang-server         # shim: exec venv/bin/python -m sglang.launch_server "$@"
 //! ```
 //!
-//! Why venv-per-tag (not one shared venv): Blazar's engine lifecycle —
-//! install/use/rollback/prune — requires each tag to be independently
+//! Why venv-per-tag (not one shared venv): Blazar's engine lifecycle -
+//! install/use/rollback/prune - requires each tag to be independently
 //! deletable (`prune` does `remove_dir_all`), and a version pin must be
 //! exact. A shared venv would make rollback a mutation, not a switch.
 //!
@@ -43,11 +43,11 @@ const SGLANG_INSTALL_TIMEOUT_SECS: u64 = 1800;
 
 /// First import of the boot-critical chain can legitimately JIT-compile
 /// (`deep_ep`'s `init_jit` builds its extension at import when no prebuilt
-/// matches, torch import alone is tens of seconds) — the cap catches a
+/// matches, torch import alone is tens of seconds) - the cap catches a
 /// wedged compile, not a slow one.
 const SGLANG_BOOT_SMOKE_TIMEOUT_SECS: u64 = 600;
 
-/// Free bytes under `path`'s filesystem (`df -B1`). Linux-only lane —
+/// Free bytes under `path`'s filesystem (`df -B1`). Linux-only lane -
 /// see the OS gate in [`install_into`].
 pub(crate) fn disk_avail_bytes(path: &Path) -> Result<u64> {
     let out = std::process::Command::new("df")
@@ -157,7 +157,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
         // Compare AND display in the same unit (GiB = 1024^3): an
         // earlier revision divided bytes by 1e9 for the message, so a
         // 9.4-GiB-free disk printed "10.1 GiB avail" while being
-        // refused — an apparent contradiction (live-reported).
+        // refused - an apparent contradiction (live-reported).
         #[allow(clippy::cast_precision_loss)]
         let avail_gib = avail as f64 / f64::from(1024 * 1024 * 1024);
         anyhow::bail!(
@@ -249,18 +249,18 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     // Shim: absolute venv python so the script works from any cwd; argv
     // passthrough keeps probe (--) and spawn argv identical in shape.
     // venv/bin goes first on PATH so JIT build tools shipped inside the
-    // venv (ninja — flashinfer compiles kernels at runtime) resolve.
+    // venv (ninja - flashinfer compiles kernels at runtime) resolve.
     // The pin step above aligns the `nvidia-cuda-nvcc`/`nvidia-nvvm`/
     // `nvidia-cuda-crt` trio with the bundled CUDA torch: put the toolkit's
     // bin dir ahead of the system PATH so flashinfer JIT self-hosts instead
     // of dying on a system nvcc that mismatches the wheels (e.g. system
     // 12.0 vs cu13 torch).
     // Two engine-scoped caches (see `wrapper_script`): SGLANG_CACHE_DIR
-    // covers sglang's own JIT caches (triton, inductor, nv — derived
+    // covers sglang's own JIT caches (triton, inductor, nv - derived
     // from it since v0.5.19). flashinfer is the exception: sglang only
     // setdefaults FLASHINFER_WORKSPACE_BASE inside
     // redirect_third_party_caches(), whose own docstring admits the
-    // redirect "silently does nothing if FlashInfer was imported — it
+    // redirect "silently does nothing if FlashInfer was imported - it
     // resolves its workspace at import time"; any import order that
     // touches flashinfer first freezes its cache at
     // $HOME/.cache/flashinfer where `engine rm` cannot reclaim it (live
@@ -294,7 +294,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     // cleanly (live 2026-09-27: deep_ep's find_cuda_home assert + a rope
     // JIT death both reached serve-time as 502s). Import the real entry
     // chain here with the shim's exact env; failure bubbles out of
-    // install_into and F88 rolls the dir back — an unbootable venv must
+    // install_into and F88 rolls the dir back - an unbootable venv must
     // never become an activatable row.
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let mut smoke = tokio::process::Command::new(&venv_python);
@@ -317,7 +317,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
         SGLANG_BOOT_SMOKE_TIMEOUT_SECS,
     )
     .await
-    .context("boot-smoke failed: the venv cannot import the sglang server entry chain — rerun manually to inspect: <engine>/venv/bin/python -c 'import sglang.srt.entrypoints.engine'")?;
+    .context("boot-smoke failed: the venv cannot import the sglang server entry chain - rerun manually to inspect: <engine>/venv/bin/python -c 'import sglang.srt.entrypoints.engine'")?;
     Ok(shim)
 }
 
@@ -325,7 +325,7 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
 /// toolkit bin) ahead of system JIT tools, the two cache exports scope every
 /// JIT cache to the engine dir (sglang's triton/inductor/nv via
 /// `SGLANG_CACHE_DIR`; the flashinfer package's own
-/// `$BASE/.cache/flashinfer` via `FLASHINFER_WORKSPACE_BASE` — it resolves
+/// `$BASE/.cache/flashinfer` via `FLASHINFER_WORKSPACE_BASE` - it resolves
 /// that constant at import time, so sglang's later setdefault of the same
 /// var arrives too late on some import paths), then exec the venv python.
 /// `${VAR:-}` keeps an explicit user override in charge of both.
@@ -347,7 +347,7 @@ fn wrapper_script(
 
 /// Pin specs aligning the floating CUDA compiler dists with torch's
 /// bundled CUDA line (`torch.version.cuda`, e.g. "13.0"): nvcc itself,
-/// the nvvm frontend (cicc + libdevice — a SEPARATE dist that emits the
+/// the nvvm frontend (cicc + libdevice - a SEPARATE dist that emits the
 /// PTX), and the compilation runtime. Empty when `cuda` is not a
 /// `X.Y[.Z]` numeric line (cpu-only torch or an unexpected shape):
 /// there is nothing coherent to pin against.
@@ -372,7 +372,7 @@ fn torch_cuda_pin_specs(cuda: &str) -> Vec<String> {
 
 /// Re-resolve the CUDA compiler dists onto torch's own CUDA line after
 /// the sglang install (see the call site for the defect this prevents).
-/// A cpu-only/unreadable torch build skips the pin with a warning — the
+/// A cpu-only/unreadable torch build skips the pin with a warning - the
 /// JIT has no bundled compiler to keep coherent in that case.
 async fn pin_jit_compiler_to_torch(venv_python: &Path, use_uv: bool) -> Result<()> {
     let probe = tokio::process::Command::new(venv_python)
@@ -393,7 +393,7 @@ async fn pin_jit_compiler_to_torch(venv_python: &Path, use_uv: bool) -> Result<(
     if specs.is_empty() {
         tracing::warn!(
             target: "blazar::engine",
-            "torch.version.cuda unreadable ({cuda:?}); skipping the CUDA compiler pin — flashinfer JIT coherency is not guaranteed"
+            "torch.version.cuda unreadable ({cuda:?}); skipping the CUDA compiler pin - flashinfer JIT coherency is not guaranteed"
         );
         return Ok(());
     }
@@ -423,7 +423,7 @@ async fn pin_jit_compiler_to_torch(venv_python: &Path, use_uv: bool) -> Result<(
 ///
 /// Two wheel generations, two layouts: CUDA 12-era dists land the
 /// toolkit at `nvidia/cuda_nvcc`, CUDA 13-era at `nvidia/cu13`. Probe
-/// both instead of hardcoding one — a torch float across reinstall
+/// both instead of hardcoding one - a torch float across reinstall
 /// generations silently moved the toolkit and dead-ended every JIT
 /// import while the compiler sat one directory over (live incident
 /// 2026-09-27: sglang-0.5.19 + torch 2.13 cu13 wheels, spawn 502s from
@@ -458,7 +458,7 @@ fn bundled_cuda_toolkit_root(venv: &Path) -> Option<PathBuf> {
         })
         .collect();
     // Deterministic order; a cu<N> generation wins over the legacy name
-    // if both somehow coexist — it matches the wheel set the venv was
+    // if both somehow coexist - it matches the wheel set the venv was
     // just resolved against.
     candidates.sort_by(|a, b| {
         let rank = |p: &Path| {
@@ -476,7 +476,7 @@ fn bundled_cuda_toolkit_root(venv: &Path) -> Option<PathBuf> {
 /// Bridge the pip wheels' runtime layout to the developer layout sglang's
 /// JIT linker specs assume: `toolchain.py` links `-L$CUDA_HOME/lib64
 /// -lcudart`, but the cu13-generation wheels ship `lib/` with versioned
-/// sonames only (`libcudart.so.13`, no unversioned dev link) — ld dies
+/// sonames only (`libcudart.so.13`, no unversioned dev link) - ld dies
 /// with `cannot find -lcudart` right after nvcc compiles cleanly (live
 /// 2026-09-28: rope JIT on `sm_89`). Create the two entries a system dev
 /// toolkit carries: `lib64 -> lib` and `libcudart.so -> libcudart.so.N`.
@@ -591,7 +591,7 @@ pub async fn pypi_latest_sglang() -> Result<String> {
             }
             match resp.json::<PypiResp>().await {
                 Ok(resp) => Attempt::Done(Ok(resp.info.version)),
-                // A connection reset mid-body truncates the 200 —
+                // A connection reset mid-body truncates the 200 -
                 // decode failures are transport-class, worth one more
                 // attempt.
                 Err(e) => Attempt::Retry(anyhow!("pypi sglang json: {e}")),
@@ -661,7 +661,7 @@ mod tests {
     fn unit__torch_cuda_pin_specs__pins_the_compiler_trio_to_torchs_line() {
         // The trio is complete in one shot: nvcc alone still dies (the
         // separate nvidia-nvvm cicc emits newer PTX than the pinned ptxas
-        // accepts — live 2026-10-16: ".version 9.4; current is '9.0'").
+        // accepts - live 2026-10-16: ".version 9.4; current is '9.0'").
         assert_eq!(
             torch_cuda_pin_specs("13.0"),
             [
@@ -693,7 +693,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn unit__bundled_cuda_toolkit_root__detects_both_wheel_generations_and_stays_silent_without() {
-        // The wheel lands nvcc.exe on Windows, bare nvcc elsewhere — the
+        // The wheel lands nvcc.exe on Windows, bare nvcc elsewhere - the
         // probe checks the platform-correct name.
         let nvcc = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
         let site_packages = |venv: &tempfile::TempDir, generation: &str| {
@@ -709,7 +709,7 @@ mod tests {
         assert_eq!(bundled_cuda_toolkit_root(venv.path()), None);
 
         // CUDA 13-era layout: the nvidia-cuda-nvcc wheel moved the whole
-        // toolkit to nvidia/cu13 (bin + include + lib + nvvm) — a torch
+        // toolkit to nvidia/cu13 (bin + include + lib + nvvm) - a torch
         // float across reinstall generations, not a layout blazar picks.
         let cu13 = site_packages(&venv, "cu13");
         std::fs::create_dir_all(cu13.join("bin")).unwrap();
@@ -744,7 +744,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn unit__ensure_dev_toolkit_layout__bridges_runtime_wheels_to_dev_layout() {
         // The cu13-generation wheels ship lib/libcudart.so.13 with no
-        // lib64 and no unversioned dev link — sglang's JIT linker specs
+        // lib64 and no unversioned dev link - sglang's JIT linker specs
         // (`-L$CUDA_HOME/lib64 -lcudart`) need both (live 2026-09-28:
         // `ld: cannot find -lcudart` right after a clean nvcc compile).
         let toolkit = tempfile::tempdir().unwrap();

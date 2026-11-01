@@ -1,10 +1,10 @@
 //! E4 audit log: one JSON line per GENERATION request (all generation
-//! lanes — text chat, images, video, audio) appended to
+//! lanes - text chat, images, video, audio) appended to
 //! `<data>/log/audit.jsonl` when `audit_log = true`.
 //!
 //! Compliance-shaped (who/what/how-long), not a prompt dumper: the line
-//! records identity and outcome — key name, model, status, latency,
-//! priority, queue depth — never request or response content. Writing
+//! records identity and outcome - key name, model, status, latency,
+//! priority, queue depth - never request or response content. Writing
 //! is fully off the request path (P14.4): the middleware `try_send`s
 //! into a bounded channel; a dedicated task owns the file. A full
 //! channel DROPS the line and counts it (an audit trail must never
@@ -17,9 +17,9 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 /// Generation lanes audited. Management, health, key and metric routes
-/// are deliberately excluded — they carry no tokens. Media lanes carry
+/// are deliberately excluded - they carry no tokens. Media lanes carry
 /// no tokens either, but they ARE generation lanes, so they audit too
-/// (multipart bodies just record `model: null` — `extract_model` is
+/// (multipart bodies just record `model: null` - `extract_model` is
 /// JSON-only; the non-`/v1` `/audio/*` routes are aliases of the same
 /// lanes). (Audit MM2: previously chat-only.)
 pub const AUDITED_PATHS: [&str; 14] = [
@@ -41,7 +41,7 @@ pub const AUDITED_PATHS: [&str; 14] = [
 
 /// Bodies above this size skip the `model` extraction buffer (the line
 /// is still written, with `model: null`). Aligned with the gateway's
-/// 50 MiB `DefaultBodyLimit` — audit must never 413 a body the gateway
+/// 50 MiB `DefaultBodyLimit` - audit must never 413 a body the gateway
 /// itself would accept.
 pub const AUDIT_BODY_SNIFF_LIMIT: usize = 50 * 1024 * 1024;
 
@@ -53,7 +53,7 @@ const AUDIT_ROTATE_KEEP: usize = 2000;
 pub const AUDIT_CHANNEL_CAP: usize = 4096;
 
 /// One audit record. Field order is the wire order (serde keeps struct
-/// order) — stable for log parsers.
+/// order) - stable for log parsers.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditLine {
     /// Unix seconds at request START.
@@ -73,7 +73,7 @@ pub struct AuditLine {
     pub queue_depth: usize,
 }
 
-/// Extract the `model` string field from a JSON body (best effort —
+/// Extract the `model` string field from a JSON body (best effort -
 /// non-JSON or missing field returns None). Never fails, never reads
 /// beyond the sniffed bytes.
 #[must_use]
@@ -95,7 +95,7 @@ pub fn should_sniff(method: &axum::http::Method, path: &str, content_len: Option
 
 /// Background writer: owns the file, drains the channel, rotates at the
 /// size cap keeping the newest `AUDIT_ROTATE_KEEP` lines. IO failures
-/// are logged and retried on the next line — never fatal to the daemon.
+/// are logged and retried on the next line - never fatal to the daemon.
 pub async fn writer_task(
     mut rx: tokio::sync::mpsc::Receiver<AuditLine>,
     dir: PathBuf,
@@ -128,7 +128,7 @@ pub async fn writer_task(
                     "audit log rotated at {AUDIT_ROTATE_BYTES} bytes (kept {AUDIT_ROTATE_KEEP} lines)"
                 );
             }
-            // F79: re-stat instead of blindly zeroing — on a failed
+            // F79: re-stat instead of blindly zeroing - on a failed
             // rotate the file is still the old size, and resetting the
             // counter here would let it grow unbounded with a rotate
             // attempt on every line forever.
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn unit__audit__generation_lanes_all_audited() {
-        // Audit MM2: every generation lane — text AND media — must be in
+        // Audit MM2: every generation lane - text AND media - must be in
         // the audited set. A lane missing here = invisible in audit.jsonl.
         for path in [
             "/v1/images/generations",

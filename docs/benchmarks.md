@@ -1,37 +1,37 @@
 ---
 layout: doc
 title: Benchmarks
-description: Measured engine and gateway performance — direct-engine parity, concurrency scaling, tail latency, and lifecycle — with receipts.
+description: Measured engine and gateway performance - direct-engine parity, concurrency scaling, tail latency, and lifecycle - with receipts.
 doc_kind: Documentation
 ---
 ## How we benchmark
 
 Every number on this page comes from a scripted, reproducible campaign against
-real engine binaries on real hardware — direct engine versus the same engine
+real engine binaries on real hardware - direct engine versus the same engine
 behind the Blazar gateway, identical model, quantization, context, sampling,
 and cache state. The full receipt tables, failed cells, and caveats live in
 [BENCHMARK.md](https://github.com/santanu20/blazar/blob/main/BENCHMARK.md);
 this page shows the campaign charts and headline results.
 
-**Test bed (campaign 2026-09-29):** Intel Core i7-14650HX (24 threads) ·
-NVIDIA GeForce RTX 4070 Laptop, 8 GiB, driver 580.173.02 · 16 GiB RAM ·
-Linux Mint 22.3, kernel 7.0.0-31-generic · model Qwen3.5-9B-Q4_K_M.gguf.
+**Test bed (campaign 2026-09-29):** Intel Core i7-14650HX (24 threads) |
+NVIDIA GeForce RTX 4070 Laptop, 8 GiB, driver 580.173.02 | 16 GiB RAM |
+Linux Mint 22.3, kernel 7.0.0-31-generic | model Qwen3.5-9B-Q4_K_M.gguf.
 Gateway measured at blazar 0.13.0; ratios travel better than absolutes.
 
 ## Headline results
 
 <div class="stat-grid" markdown="1">
 
-- **~2%** gateway overhead — 40.6 t/s through the gateway vs 41.5 t/s direct
-- **104.8 t/s** aggregate at C=4 (40.0 → 65.9 → 104.8 across the sweep)
+- **~2%** gateway overhead - 40.6 t/s through the gateway vs 41.5 t/s direct
+- **104.8 t/s** aggregate at C=4 (40.0 -> 65.9 -> 104.8 across the sweep)
 - **554 ms** TTFT p99 at C=4 under sustained bursts
-- **117 ms** tool-call TTFT p50 vs 284 ms (ollama) — 2.4×
+- **117 ms** tool-call TTFT p50 vs 284 ms (ollama) - 2.4x
 - **3.63 s** idle-wake to first token
-- **49.1 → 63.0 t/s** adaptive reshape under sustained load, zero failed requests
+- **49.1 -> 63.0 t/s** adaptive reshape under sustained load, zero failed requests
 
 </div>
 
-## Flagship GGUF campaign — Qwen3.5-9B-Q4_K_M
+## Flagship GGUF campaign - Qwen3.5-9B-Q4_K_M
 
 ### Single-stream decode throughput
 
@@ -67,7 +67,7 @@ Gateway measured at blazar 0.13.0; ratios travel better than absolutes.
 
 ## SGLang safetensors campaign
 
-The same harness against the SGLang lane on quantized safetensors — a
+The same harness against the SGLang lane on quantized safetensors - a
 different engine, the same gateway behavior.
 
 <img src="/blazar/assets/bench/sglang/speed-single-stream.svg" alt="SGLang campaign: single-stream throughput" class="bench-chart">

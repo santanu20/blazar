@@ -1,31 +1,31 @@
 //! Realtime voice lane: one WebSocket per session, one utterance pipeline
-//! per committed buffer — STT (whisper lane) → chat (`OpenAI` lane) → TTS
+//! per committed buffer - STT (whisper lane) -> chat (`OpenAI` lane) -> TTS
 //! (piper lane). Every stage calls the gateway's own handlers, so admission,
 //! queueing, and telemetry apply exactly as on the HTTP lanes.
 //!
 //! Event surface (documented in `docs/4.API_SPEC.md`):
 //!
 //! ```text
-//! client → server : {"type":"input_audio_buffer.append","audio":"<b64>"}
-//! client → server : {"type":"input_audio_buffer.commit"}
-//! client → server : {"type":"input_audio_buffer.clear"}
-//! client → server : {"type":"session.update","session":{voice?,stt_model?,instructions?,tools?,tool_choice?}}
-//! client → server : {"type":"response.create"}
-//! client → server : {"type":"response.cancel"}
-//! client → server : {"type":"conversation.item.create","item":{...}}
-//! server → client : {"type":"session.created","session":{...}}
-//! server → client : {"type":"session.updated","session":{...}}
-//! server → client : {"type":"input_audio_transcription.completed",...}
-//! server → client : {"type":"input_audio_transcription.failed","error":{...}}
-//! server → client : {"type":"response.audio_transcript.delta"/".done",...}
-//! server → client : {"type":"response.audio.delta"/".done",...}
-//! server → client : {"type":"response.output_item.added","item":{type:"function_call",...}}
-//! server → client : {"type":"response.function_call_arguments.done",...}
-//! server → client : {"type":"response.done","response":{"output":[...]}}
-//! server → client : {"type":"response.cancelled",...}
-//! server → client : {"type":"input_audio_buffer.cleared",...}
-//! server → client : {"type":"conversation.item.created","item":{...}}
-//! server → client : {"type":"error","error":{"type","message"}}
+//! client -> server : {"type":"input_audio_buffer.append","audio":"<b64>"}
+//! client -> server : {"type":"input_audio_buffer.commit"}
+//! client -> server : {"type":"input_audio_buffer.clear"}
+//! client -> server : {"type":"session.update","session":{voice?,stt_model?,instructions?,tools?,tool_choice?}}
+//! client -> server : {"type":"response.create"}
+//! client -> server : {"type":"response.cancel"}
+//! client -> server : {"type":"conversation.item.create","item":{...}}
+//! server -> client : {"type":"session.created","session":{...}}
+//! server -> client : {"type":"session.updated","session":{...}}
+//! server -> client : {"type":"input_audio_transcription.completed",...}
+//! server -> client : {"type":"input_audio_transcription.failed","error":{...}}
+//! server -> client : {"type":"response.audio_transcript.delta"/".done",...}
+//! server -> client : {"type":"response.audio.delta"/".done",...}
+//! server -> client : {"type":"response.output_item.added","item":{type:"function_call",...}}
+//! server -> client : {"type":"response.function_call_arguments.done",...}
+//! server -> client : {"type":"response.done","response":{"output":[...]}}
+//! server -> client : {"type":"response.cancelled",...}
+//! server -> client : {"type":"input_audio_buffer.cleared",...}
+//! server -> client : {"type":"conversation.item.created","item":{...}}
+//! server -> client : {"type":"error","error":{"type","message"}}
 //! ```
 //!
 //! Audio is PCM16LE mono 24 kHz (the `OpenAI` realtime convention); the
@@ -40,7 +40,7 @@
 //!   turn snapshots the config).
 //! - `response.cancel` sets a flag checked BETWEEN pipeline stages, so a
 //!   cancel lands after the current stage finishes (chat streams are not
-//!   cut mid-flight — each stage call is atomic here). A cancel that
+//!   cut mid-flight - each stage call is atomic here). A cancel that
 //!   arrives too late (turn already finished) simply has no effect.
 //! - Function calling: `session.update` tools are converted to the chat
 //!   dialect and attached to every chat call. When the model answers with
@@ -50,7 +50,7 @@
 //!   trigger transcript persist into the conversation context. The client
 //!   returns outputs via `conversation.item.create` items of type
 //!   `function_call_output`, then `response.create` (empty buffer) runs a
-//!   continuation turn on the remembered context — no new audio needed.
+//!   continuation turn on the remembered context - no new audio needed.
 //!   A `response.create` while calls are still outstanding is a taught
 //!   error; a new VOICE turn that interrupts pending calls auto-injects
 //!   error tool outputs so the model sees a completed (failed) round.
@@ -58,7 +58,7 @@
 //!   `function_call` items, and `function_call_output` items; other item
 //!   types are taught. Context is capped at 16 items / 8 192 chars,
 //!   oldest evicted first. Items created mid-turn apply to the next turn
-//!   (tool outputs mid-turn are a taught race — send them after
+//!   (tool outputs mid-turn are a taught race - send them after
 //!   `response.done`).
 //! - While a turn runs, only `response.cancel`, `input_audio_buffer.append`,
 //!   and `conversation.item.create` are accepted; anything else gets an
@@ -81,10 +81,10 @@ use crate::state::AppState;
 
 /// No frame for this long closes the session (client vanished mid-phrase).
 const IDLE_TIMEOUT_SECS: u64 = 120;
-/// Hard session ceiling — a realtime socket is not a forever connection.
+/// Hard session ceiling - a realtime socket is not a forever connection.
 const SESSION_MAX_SECS: u64 = 600;
 /// Append-buffer cap: beyond this the client is misbehaving (or not a
-/// voice client at all) — error event, then close.
+/// voice client at all) - error event, then close.
 const AUDIO_BUFFER_CAP_BYTES: usize = 20 * 1024 * 1024;
 /// TTS audio rides ~4 KiB base64 deltas.
 const TTS_CHUNK_BYTES: usize = 4 * 1024;
@@ -168,7 +168,7 @@ struct SessionCfg {
     voice: String,
     stt_model: String,
     instructions: String,
-    /// Function tools in CHAT shape (nested `function` object) — the
+    /// Function tools in CHAT shape (nested `function` object) - the
     /// dialect the local chat lane forwards verbatim.
     tools: Vec<Value>,
     /// `tool_choice` passthrough (`auto`/`none`/`required`/named fn).
@@ -200,12 +200,12 @@ fn session_obj(cfg: &SessionCfg) -> Value {
 
 /// Convert one realtime tool (flat: `type`/`name`/`description`/
 /// `parameters`) into the chat dialect (nested `function` object).
-/// Non-function tools are rejected — the local chat lane speaks
+/// Non-function tools are rejected - the local chat lane speaks
 /// `type:"function"` only.
 fn tool_to_chat_shape(tool: &Value) -> Result<Value, String> {
     if tool.get("type").and_then(Value::as_str) != Some("function") {
         return Err(format!(
-            "tool type '{}' is not supported — this lane forwards type:\"function\" tools only",
+            "tool type '{}' is not supported - this lane forwards type:\"function\" tools only",
             tool.get("type").and_then(Value::as_str).unwrap_or("?")
         ));
     }
@@ -239,7 +239,7 @@ fn validate_tools(raw: &Value) -> Result<Vec<Value>, String> {
         .ok_or_else(|| "`tools` must be an array of function tool objects".to_string())?;
     if arr.len() > TOOLS_MAX_COUNT {
         return Err(format!(
-            "`tools` holds {} entries — the session ceiling is {TOOLS_MAX_COUNT}",
+            "`tools` holds {} entries - the session ceiling is {TOOLS_MAX_COUNT}",
             arr.len()
         ));
     }
@@ -250,7 +250,7 @@ fn validate_tools(raw: &Value) -> Result<Vec<Value>, String> {
     let serialized = serde_json::to_string(&out).unwrap_or_default();
     if serialized.len() > TOOLS_MAX_BYTES {
         return Err(format!(
-            "serialized `tools` exceed {TOOLS_MAX_BYTES} bytes — trim descriptions/schemas"
+            "serialized `tools` exceed {TOOLS_MAX_BYTES} bytes - trim descriptions/schemas"
         ));
     }
     Ok(out)
@@ -329,7 +329,7 @@ fn item_text(item: &Value) -> Result<(String, String), String> {
     )?;
     if content.get("type").and_then(Value::as_str) != Some("text") {
         return Err(format!(
-            "item content type '{}' is not supported — this lane consumes text context only",
+            "item content type '{}' is not supported - this lane consumes text context only",
             content.get("type").and_then(Value::as_str).unwrap_or("?")
         ));
     }
@@ -406,7 +406,7 @@ fn ctx_push(ctx: &mut Vec<CtxItem>, item: CtxItem) {
 
 /// Build the chat-completion `messages` array: optional system
 /// instructions, remembered context items (text, tool calls, tool
-/// outputs in chat dialect), then — for voice turns — the live
+/// outputs in chat dialect), then - for voice turns - the live
 /// transcript as the final user message. Continuation turns pass
 /// `None` and end on whatever the context holds.
 fn ctx_messages(cfg: &SessionCfg, ctx: &[CtxItem], transcript: Option<&str>) -> Value {
@@ -443,7 +443,7 @@ fn ctx_messages(cfg: &SessionCfg, ctx: &[CtxItem], transcript: Option<&str>) -> 
     Value::Array(messages)
 }
 
-/// `GET /v1/realtime?model=...` — upgrade, then run the session loop.
+/// `GET /v1/realtime?model=...` - upgrade, then run the session loop.
 #[allow(clippy::too_many_lines, clippy::implicit_hasher)] // one cohesive upgrade path; bind_remote precedent
 pub async fn realtime_session(
     State(state): State<Arc<AppState>>,
@@ -454,7 +454,7 @@ pub async fn realtime_session(
     let Some(model) = params.get("model").cloned() else {
         return crate::proxy::openai_error(
             400,
-            "missing ?model= — the realtime lane needs the chat model id as a query \
+            "missing ?model= - the realtime lane needs the chat model id as a query \
              parameter (e.g. /v1/realtime?model=qwen3-0.6b:q4_0)",
         );
     };
@@ -470,7 +470,7 @@ pub async fn realtime_session(
     ws.on_upgrade(move |socket| run_session(socket, state, model, voice, stt_model, key))
 }
 /// Emit one JSON text frame; failures (client gone) are quietly the end
-/// of the session — the read loop notices the closed socket next. The
+/// of the session - the read loop notices the closed socket next. The
 /// sink is shared between the turn future and the event loop, so it
 /// rides an async mutex (short sends; held only per frame).
 type WsSink = Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>;
@@ -700,7 +700,7 @@ async fn speak_reply(
             &error_event(
                 "tts_failed",
                 &format!(
-                    "piper lane returned {} (voice '{}') — transcript delivered above, audio skipped",
+                    "piper lane returned {} (voice '{}') - transcript delivered above, audio skipped",
                     tts_status.as_u16(),
                     cfg.voice
                 ),
@@ -720,13 +720,13 @@ async fn speak_reply(
     send_json(socket, &json!({"type": "response.audio.done"})).await;
 }
 
-/// One committed utterance: STT → chat → TTS, each event streamed as it
-/// lands. A stage failure emits an error event and returns — the socket
+/// One committed utterance: STT -> chat -> TTS, each event streamed as it
+/// lands. A stage failure emits an error event and returns - the socket
 /// stays usable for the next utterance. `cancel` is checked between
 /// stages (chat streams are not cut mid-flight); observing it emits
 /// `response.cancelled` and stops the pipeline. When the model answers
 /// with tool calls the TTS stage is skipped: the function-call triad is
-/// emitted (unless cancelled — a cancelled round is dropped whole, no
+/// emitted (unless cancelled - a cancelled round is dropped whole, no
 /// pending recorded) and the calls ride back for the client to answer.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one cohesive staged pipeline
 async fn run_turn(
@@ -777,7 +777,7 @@ async fn run_turn(
     };
     let Some(transcript) = transcript.filter(|t| !t.trim().is_empty()) else {
         let message = format!(
-            "whisper lane returned {} — is a whisper model pulled and the engine installed?",
+            "whisper lane returned {} - is a whisper model pulled and the engine installed?",
             stt_status.as_u16()
         );
         send_json(
@@ -817,7 +817,7 @@ async fn run_turn(
     };
     let calls = reply_tool_calls(&chat_v);
     if !calls.is_empty() {
-        // Cancel-before-emit: a cancelled tool round disappears entirely —
+        // Cancel-before-emit: a cancelled tool round disappears entirely -
         // no events, no pending, nothing persisted.
         if cancel.load(Ordering::Relaxed) {
             send_json(socket, &json!({"type": "response.cancelled"})).await;
@@ -851,7 +851,7 @@ async fn run_turn(
         return TurnEnd::done();
     }
     if cancel.load(Ordering::Relaxed) {
-        // Text exists but audio synthesis is the expensive stage — a
+        // Text exists but audio synthesis is the expensive stage - a
         // cancel here keeps the transcript delivered and skips voice.
         send_json(
             socket,
@@ -876,7 +876,7 @@ async fn run_turn(
     TurnEnd::done()
 }
 
-/// Continuation turn (tool-loop or typed-context): no audio, no STT —
+/// Continuation turn (tool-loop or typed-context): no audio, no STT -
 /// the remembered context (tool outputs last) drives the chat call and
 /// the reply rides the normal transcript + TTS events. Chained tool
 /// rounds are emitted exactly like first-round calls.
@@ -897,7 +897,7 @@ async fn run_continuation_turn(
             socket,
             &error_event(
                 "invalid_request",
-                "continuation turn needs remembered context — create conversation items first",
+                "continuation turn needs remembered context - create conversation items first",
             ),
         )
         .await;
@@ -974,7 +974,7 @@ async fn response_parts(resp: Response) -> (StatusCode, axum::body::Bytes) {
 }
 
 /// Decode one append payload into the session buffer. `Err(Cap)` is the
-/// fatal case (the 20 MiB memory bound was blown — the session resets);
+/// fatal case (the 20 MiB memory bound was blown - the session resets);
 /// `Err(Decode)` is a one-frame client encoding bug that must NOT cost
 /// the conversation context: the caller teaches and keeps the session.
 #[derive(Debug)]
@@ -994,7 +994,7 @@ fn append_audio(buffer: &mut Vec<u8>, b64: &str) -> Result<(), AppendErr> {
 }
 
 /// Teach one append failure: decode bugs stay recoverable (`invalid_request`),
-/// over-capacity is fatal (`buffer_overflow`) — the caller closes after a Cap.
+/// over-capacity is fatal (`buffer_overflow`) - the caller closes after a Cap.
 async fn append_failed(socket: &WsSink, err: &AppendErr) -> bool {
     match err {
         AppendErr::Decode(msg) => {
@@ -1006,7 +1006,7 @@ async fn append_failed(socket: &WsSink, err: &AppendErr) -> bool {
                 socket,
                 &error_event(
                     "buffer_overflow",
-                    "audio buffer exceeded 20 MiB — this lane is for utterances, not files",
+                    "audio buffer exceeded 20 MiB - this lane is for utterances, not files",
                 ),
             )
             .await;
@@ -1034,7 +1034,7 @@ async fn item_created(socket: &WsSink, item: &Value, seq: u64) {
 /// Mid-turn event routing: only cancel / append / item-create are live
 /// while a turn runs; everything else is taught, nothing is dropped
 /// silently. Tool items mid-turn are a client race (outputs belong to
-/// the round that just produced them — send them after `response.done`)
+/// the round that just produced them - send them after `response.done`)
 /// and are taught, while text items keep applying to the next turn.
 /// Returns `true` when the session must close.
 async fn dispatch_mid_turn(
@@ -1088,7 +1088,7 @@ async fn dispatch_mid_turn(
                     &error_event(
                         "invalid_request",
                         &format!(
-                            "item type '{item_type}' mid-turn is a race — function-call items \
+                            "item type '{item_type}' mid-turn is a race - function-call items \
                              belong between turns: send them after response.done"
                         ),
                     ),
@@ -1113,7 +1113,7 @@ async fn dispatch_mid_turn(
                 &error_event(
                     "invalid_request",
                     &format!(
-                        "event '{other}' is not accepted while a response is running — \
+                        "event '{other}' is not accepted while a response is running - \
                          mid-turn this lane accepts response.cancel, \
                          input_audio_buffer.append, and conversation.item.create"
                     ),
@@ -1186,7 +1186,7 @@ async fn run_session(
     let mut cfg = SessionCfg::new(voice, stt_model);
     let mut ctx: Vec<CtxItem> = Vec::new();
     let mut item_seq: u64 = 0;
-    // Independent counter for server-generated function_call item ids —
+    // Independent counter for server-generated function_call item ids -
     // the turn future owns it while drive_turn owns item_seq (mid-turn
     // item.create), so the two mutable borrows never alias.
     let mut fc_seq: u64 = 0;
@@ -1200,7 +1200,7 @@ async fn run_session(
                 &sink,
                 &error_event(
                     "session_expired",
-                    "session hit its 10-minute ceiling — reconnect",
+                    "session hit its 10-minute ceiling - reconnect",
                 ),
             )
             .await;
@@ -1264,7 +1264,7 @@ async fn run_session(
                                     &sink,
                                     &error_event(
                                         "invalid_request",
-                                        "cannot start a response from an empty audio buffer — \
+                                        "cannot start a response from an empty audio buffer - \
                                          append audio first",
                                     ),
                                 )
@@ -1306,7 +1306,7 @@ async fn run_session(
                                     &sink,
                                     &error_event(
                                         "invalid_request",
-                                        "cannot start a response from an empty audio buffer — \
+                                        "cannot start a response from an empty audio buffer - \
                                          append audio first, create conversation items, or \
                                          answer pending function calls",
                                     ),
@@ -1409,7 +1409,7 @@ async fn run_session(
                             &sink,
                             &error_event(
                                 "invalid_request",
-                                "no response in flight — cancel is honored while a \
+                                "no response in flight - cancel is honored while a \
                                  turn is running (sent mid-turn) and lands at the next \
                                  stage checkpoint",
                             ),
@@ -1444,7 +1444,7 @@ async fn run_session(
                             &error_event(
                                 "unknown_event",
                                 &format!(
-                                    "unsupported event '{other}' — this lane speaks \
+                                    "unsupported event '{other}' - this lane speaks \
                                      input_audio_buffer.append/commit/clear, session.update, \
                                      response.create/cancel, and conversation.item.create \
                                      (see docs/4.API_SPEC.md)"
@@ -1508,7 +1508,7 @@ fn persist_round(ctx: &mut Vec<CtxItem>, pending: &mut Vec<PendingCall>, end: &T
     end.pending.clone_into(pending);
 }
 
-// Minimal base64 (standard alphabet, padding) — keeps the realtime lane
+// Minimal base64 (standard alphabet, padding) - keeps the realtime lane
 // free of an extra dependency for two small helpers.
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 

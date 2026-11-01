@@ -1,10 +1,10 @@
 //! Load preflights: named, fail-fast checks that turn silent swap-death
-//! and VRAM overcommit into teaching errors. Pure math — no side effects.
+//! and VRAM overcommit into teaching errors. Pure math - no side effects.
 
 use axum::response::IntoResponse as _;
 use blazar_core::GgufMeta;
 
-/// Flat per-image token estimate (mmproj clip ≈ pixels/750; typical
+/// Flat per-image token estimate (mmproj clip ~ pixels/750; typical
 /// 512-1024px images land ~400-1400 tokens). F82: image data used to
 /// walk as raw base64 bytes/4 into the estimator (a 1 MiB image
 /// estimated ~262K tokens and false-tripped the 90% gate), while the
@@ -39,8 +39,8 @@ pub fn prompt_tokens_est(body: &serde_json::Value) -> u64 {
 
 /// Context bound for prompt-fit admission: the LIVE per-slot ctx of a
 /// resident instance when one exists (auto-fit or explicit slots may
-/// have traded the configured depth for width — e.g. 16K configured,
-/// 4x4096 compiled — and preflight must bound against what a single
+/// have traded the configured depth for width - e.g. 16K configured,
+/// 4x4096 compiled - and preflight must bound against what a single
 /// slot actually holds), the configured effective ctx otherwise
 /// (cold-spawn estimate). Rows whose profile has not compiled yet
 /// (ctx == 0) fall back to the config estimate.
@@ -58,10 +58,10 @@ pub fn admission_ctx(state: &crate::state::AppState, model: &str) -> u32 {
 /// sentinel's most common post-hoc detection, moved to pre-hoc).
 /// Byte-estimate first (hot path, ~free); exact `/tokenize` only when
 /// the estimate crosses the 90% threshold AND the child is running.
-/// F82: multimodal bodies — collect text fields AND count image parts
+/// F82: multimodal bodies - collect text fields AND count image parts
 /// (arrays used to tokenize as empty text and bypass the fit check
 /// entirely). `/api/generate` bodies carry the prompt under `prompt`
-/// (F13 — the exact count must not silently see "").
+/// (F13 - the exact count must not silently see "").
 fn prompt_text_and_images(body: &serde_json::Value) -> (String, u64) {
     body.pointer("/messages")
         .and_then(|m| m.as_array())
@@ -108,7 +108,7 @@ pub async fn enforce_prompt_fits(
         return Ok(());
     }
     let est = prompt_tokens_est(body);
-    // Cheap path: under 90% of ctx — the kernel fits it.
+    // Cheap path: under 90% of ctx - the kernel fits it.
     if est < u64::from(effective_ctx) * 9 / 10 {
         return Ok(());
     }
@@ -164,7 +164,7 @@ pub async fn enforce_prompt_fits(
                 crate::error_codes::BlazarCode::PromptTooLong,
                 &format!(
                     "prompt {tokens} tokens ({how}) exceeds the {effective_ctx}-token context for \
-                     {model:?} — the engine would silently truncate it. Shorten the prompt, raise \
+                     {model:?} - the engine would silently truncate it. Shorten the prompt, raise \
                      ctx (config/[model_overrides] ctx or X-Blazar-Num-Ctx), or set \
                      prompt_preflight = false to allow truncation",
                 ),
@@ -184,7 +184,7 @@ pub fn kv_f16_mib(meta: &GgufMeta, ctx: u64) -> u64 {
     blazar_core::coreside::kv_f16_mib(meta, ctx)
 }
 
-/// What a request strictly asks of the model, extracted from its body —
+/// What a request strictly asks of the model, extracted from its body -
 /// the only features the capability certificate can vouch for. Strict
 /// shapes only: a false positive would refuse legitimate plain chat,
 /// while a false negative merely fails open (the sentinel still watches
@@ -234,7 +234,7 @@ pub fn capability_needs(parsed: &serde_json::Value, ollama_shape: bool) -> Capab
 #[must_use]
 pub fn vision_missing_refusal(name: &str) -> String {
     format!(
-        "\"{name}\" has no projector sidecar attached — vision requests cannot be served. \
+        "\"{name}\" has no projector sidecar attached - vision requests cannot be served. \
          Attach one while the model is stopped: `blazar mmproj {name} <mmproj.gguf path>` \
          (the next spawn picks it up). Plain text chat works unchanged."
     )
@@ -242,7 +242,7 @@ pub fn vision_missing_refusal(name: &str) -> String {
 
 /// Certificate gate (pure): `Some(teaching message)` when a needed
 /// capability is VERIFIED-FAILED. Absent probes, `N/A` verdicts, and
-/// unknown-or-mismatched engine kinds all pass — a stale or partial
+/// unknown-or-mismatched engine kinds all pass - a stale or partial
 /// certificate must never refuse traffic, only a fresh matching FAIL
 /// on the SAME engine kind does (a build bump within the kind keeps
 /// the verdict; `blazar model-doctor` refresh advice covers drift).
@@ -274,7 +274,7 @@ pub fn capability_refusal(
         if needed && status(probe).as_deref() == Some("FAIL") {
             return Some(format!(
                 "model {model:?} failed its verified {what} probe (certificate \
-{verified}, engine {cert_engine_tag}) — the request would burn a turn on \
+{verified}, engine {cert_engine_tag}) - the request would burn a turn on \
 garbage output. Plain chat still works; for {what} pick a sibling whose \
 certificate shows {probe} = PASS (`blazar scorecard {model}` lists them), \
 or re-verify after an engine change: `blazar model-doctor {model}`",
@@ -286,7 +286,7 @@ or re-verify after an engine change: `blazar model-doctor {model}`",
 
 /// The prober is the one actor the certificate gate must never block:
 /// a model whose stored verdict is FAIL would otherwise 400 the very
-/// probe sent to re-measure it — a self-heal deadlock (the probe
+/// probe sent to re-measure it - a self-heal deadlock (the probe
 /// receipt would record the gate's refusal, not the model's behavior).
 /// `model_doctor` tags its in-process probe calls with this header; both
 /// gate call sites stand down for it.
@@ -372,7 +372,7 @@ mod tests {
         assert!(n.tools && n.vision && n.json_mode && n.any());
 
         // Strictness: EMPTY tools array and plain-text-only bodies ask
-        // for nothing — a false positive here would refuse legit chat.
+        // for nothing - a false positive here would refuse legit chat.
         let plain = serde_json::json!({
             "tools": [],
             "messages": [{"role": "user", "content": "hello"}],
@@ -414,7 +414,7 @@ mod tests {
             tools: true,
             ..CapabilityNeeds::default()
         };
-        // FAIL probe + matching need → teaching refusal naming the
+        // FAIL probe + matching need -> teaching refusal naming the
         // probe, the verification date, and the refresh command.
         let msg = capability_refusal(
             "m:8b",
@@ -493,7 +493,7 @@ mod tests {
             .is_none()
         );
 
-        // Retired certificate engine (kind unresolvable) fails open —
+        // Retired certificate engine (kind unresolvable) fails open -
         // the engines row is gone, so the verdict cannot be matched to
         // a serving lane.
         assert!(

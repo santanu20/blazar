@@ -3,8 +3,8 @@
 //!
 //! The old capability auditor classified flags by grepping source literals,
 //! which drifted from reality within one release. This module is the fix at
-//! the source: it compiles real [`crate::profile::ProfileInput`] fixtures —
-//! one per emission posture a configuration can reach — and collects the
+//! the source: it compiles real [`crate::profile::ProfileInput`] fixtures -
+//! one per emission posture a configuration can reach - and collects the
 //! flag tokens the profile compiler ACTUALLY emits. A flag that appears
 //! here is provably wired end to end (config knob or derivation to argv);
 //! a flag absent here is not, no matter what the source looks like.
@@ -239,7 +239,7 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "-np",
 ];
 
-/// Supported-flag superset for the mistral.rs lane — the manifest a
+/// Supported-flag superset for the mistral.rs lane - the manifest a
 /// fully-flagged engine build would advertise. Public because the
 /// runtime registry half feeds it to `mistralrs_argv`, whose
 /// builder-added flags are manifest-gated: the superset keeps builder
@@ -468,7 +468,7 @@ const SGLANG_SUPPORTED: &[&str] = &[
 ///
 /// This is the COMPILE-time slice only: llama.cpp and stable-diffusion.cpp
 /// children spawn `profile.argv` verbatim, but mistral.rs, `SGLang` and `MLX`
-/// add flags in their spawn-time argv builders —
+/// add flags in their spawn-time argv builders -
 /// `blazar_runtime::knob_registry::lane_flags` folds those in and is the
 /// function behind the committed registry JSON.
 #[must_use]
@@ -645,7 +645,7 @@ fn base_input<'a>(
 }
 
 /// Compile one fixture and collect it. A registry fixture that fails to
-/// compile is a bug in this module, not a condition to tolerate — hence
+/// compile is a bug in this module, not a condition to tolerate - hence
 /// the panic with the compile error.
 fn absorb(profiles: &mut Vec<Profile>, inp: &ProfileInput<'_>, tuning: &TuningOverrides) {
     let profile =
@@ -1358,7 +1358,7 @@ fn sdcpp_profiles() -> Vec<Profile> {
 
 /// RAII-free deferred cleanup: returns a closure that removes the fixture
 /// directory; call it when the lane fn is done (panic-safe enough for a
-/// registry builder — nextest isolates panics per process).
+/// registry builder - nextest isolates panics per process).
 fn defer_remove(dir: &std::path::Path) -> impl FnOnce() + '_ {
     let dir = dir.to_path_buf();
     move || {
@@ -1466,7 +1466,7 @@ mod tests {
         for (lane, flags) in &lanes {
             assert!(
                 !flags.is_empty(),
-                "{lane} registry came back empty — fixture matrix broke"
+                "{lane} registry came back empty - fixture matrix broke"
             );
             // Tokens are flags, sorted, unique by construction (BTreeSet).
             assert!(flags.iter().all(|f| is_flag_token(f)));

@@ -1,7 +1,7 @@
 //! Client for the blazar capability-lane registry: a plain JSON file
 //! that maps "architecture mainline can't load yet" to curated fork
 //! lanes (repo + immutable commit) known to support it. The registry
-//! PUBLISHES compatibility; it never defines it — every entry is still
+//! PUBLISHES compatibility; it never defines it - every entry is still
 //! built from source through the same validated fork-lane pipeline as
 //! a user-pinned fork, so a hostile or corrupt registry can at worst
 //! point at a repo that fails validation, never bypass it.
@@ -27,7 +27,7 @@ pub struct RegistryLane {
     /// Immutable commit SHA the lane is built from.
     pub ref_sha: String,
     /// Upstream llama.cpp PR that would make this lane obsolete, when
-    /// known — display-only provenance.
+    /// known - display-only provenance.
     pub upstream_pr: Option<u64>,
     /// Architectures the lane advertises (from its llama-arch.cpp).
     pub architectures: BTreeSet<String>,
@@ -93,7 +93,7 @@ pub fn http() -> &'static reqwest::Client {
 
 /// Bounded fetch of the registry file. Every entry is validated
 /// (non-empty id, repo slug shape, 4..=40-hex SHA); invalid entries are
-/// dropped with a warning — one bad row must not hide the good ones.
+/// dropped with a warning - one bad row must not hide the good ones.
 pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<RegistryLane>> {
     let mut resp = client
         .get(url)
@@ -116,7 +116,7 @@ async fn read_body_bounded(resp: &mut reqwest::Response, url: &str, cap: usize) 
         && len > cap as u64
     {
         anyhow::bail!(
-            "capability registry {url} declares {len} bytes — over the {cap}-byte cap; \
+            "capability registry {url} declares {len} bytes - over the {cap}-byte cap; \
                  point capability_registry_url at a sane mirror"
         );
     }
@@ -128,7 +128,7 @@ async fn read_body_bounded(resp: &mut reqwest::Response, url: &str, cap: usize) 
     {
         if body.len() + chunk.len() > cap {
             anyhow::bail!(
-                "capability registry {url} exceeded the {cap}-byte body cap — refusing to \
+                "capability registry {url} exceeded the {cap}-byte body cap - refusing to \
                  buffer a runaway mirror"
             );
         }
@@ -148,13 +148,13 @@ pub fn parse_registry(text: &str) -> Result<Vec<RegistryLane>> {
             Ok(lane) if lane_entry_valid(&lane) => lanes.push(lane),
             Ok(lane) => {
                 tracing::warn!(
-                    "capability registry: entry {} ({}) failed validation — skipped",
+                    "capability registry: entry {} ({}) failed validation - skipped",
                     idx,
                     lane.id
                 );
             }
             Err(e) => {
-                tracing::warn!("capability registry: entry {idx} malformed ({e}) — skipped");
+                tracing::warn!("capability registry: entry {idx} malformed ({e}) - skipped");
             }
         }
     }
@@ -181,7 +181,7 @@ pub fn offers_for_arch<'a>(lanes: &'a [RegistryLane], arch: &str) -> Vec<&'a Reg
 
 /// Resolve the effective registry URL: explicit config > env > default.
 /// `Some("")` (config set to empty) means the user disabled the
-/// registry — no fetch is attempted anywhere.
+/// registry - no fetch is attempted anywhere.
 #[must_use]
 pub fn resolve_registry_url(configured: Option<&str>) -> Option<String> {
     if let Some(url) = configured {
@@ -295,7 +295,7 @@ mod tests {
     }
 
     /// The shipped default registry document must parse clean through
-    /// the same validator the daemon uses — a malformed shipped file
+    /// the same validator the daemon uses - a malformed shipped file
     /// would 404-and-fail-open silently otherwise. Reads the file from
     /// the repo root relative to this crate, so it never depends on a
     /// machine-specific path.

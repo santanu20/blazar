@@ -6,7 +6,7 @@
 #      make, rust) when a user asked to build from source on a box that
 #      lacks it.
 # The SHIPPED binary has no runtime dependencies (bundled SQLite, rustls)
-# — end users on the release-binary lane never need this script.
+# - end users on the release-binary lane never need this script.
 #
 # Idempotent: installs only what is missing. Linux (apt/dnf/pacman/zypper)
 # + macOS (brew / Xcode CLT). Windows contributors: install Rust from
@@ -18,8 +18,8 @@
 #   --minimal only cc + make + rust (the from-source install lane;
 #             skips git/python3/shellcheck/xz dev extras)
 #
-# Environment: BLAZAR_SUDO — pass-through wrapper, or empty to run
-# unprivileged (unset-only default — sudo), same knob as install.sh.
+# Environment: BLAZAR_SUDO - pass-through wrapper, or empty to run
+# unprivileged (unset-only default - sudo), same knob as install.sh.
 
 # Wrap everything in main() so a truncated partial download cannot execute
 # half a script.
@@ -111,7 +111,7 @@ if [ -n "$MISSING_TOOLS" ]; then
                 status "cc missing: run 'xcode-select --install' for the Command Line Tools, then re-run this script"
                 ;;
         esac
-        have brew || error "brew missing — install from https://brew.sh, then re-run"
+        have brew || error "brew missing - install from https://brew.sh, then re-run"
         PKGS=
         for t in $MISSING_TOOLS; do
             if p=$(pkg_for brew "$t"); then PKGS="$PKGS $p"; fi
@@ -140,11 +140,11 @@ fi
 
 # --- rust toolchain (opt-in flow, minimal profile) ---------------------
 if [ "$RUST_OK" = 1 ]; then
-    have curl || error "curl missing — needed to fetch rustup; install curl and re-run"
+    have curl || error "curl missing - needed to fetch rustup; install curl and re-run"
     status "installing rust via rustup (minimal profile)"
     curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
     . "$HOME/.cargo/env"
-    have cargo || error "rustup finished but cargo not on PATH — open a new shell and re-run"
+    have cargo || error "rustup finished but cargo not on PATH - open a new shell and re-run"
     status "rust installed (persists in ~/.cargo/bin; source ~/.cargo/env in your profile)"
 fi
 

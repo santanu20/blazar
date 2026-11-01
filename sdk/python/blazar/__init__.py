@@ -2,7 +2,7 @@
 
 Speaks the gateway's native OpenAI-compatible surface (`/v1/*`) plus the
 operational endpoints that set Blazar apart (`/api/ps`, `/api/explain`).
-Standard library only — `pip install` nothing.
+Standard library only - `pip install` nothing.
 
     from blazar import Client
 
@@ -57,7 +57,7 @@ class BlazarError(RuntimeError):
     """Gateway rejected or failed a request.
 
     Carries the HTTP status and the teaching message Blazar returns in
-    `error.message` — Blazar errors explain the fix, so surface them
+    `error.message` - Blazar errors explain the fix, so surface them
     verbatim instead of guessing.
     """
 
@@ -107,7 +107,7 @@ class Client:
 
         ``best_of`` fans the request out server-side and returns the
         winner. ``mcp`` selects a configured MCP tool catalog (``"all"``
-        or a server name); the gateway mediates the tool loop — it
+        or a server name); the gateway mediates the tool loop - it
         requires ``stream=False``.
         """
         body: dict[str, t.Any] = {"model": model, "messages": messages, **kwargs}
@@ -129,7 +129,7 @@ class Client:
         messages: list[dict[str, t.Any]],
         **kwargs: t.Any,
     ) -> dict[str, t.Any]:
-        """POST /api/chat — the ollama dialect, for migrant scripts."""
+        """POST /api/chat - the ollama dialect, for migrant scripts."""
         return self._request(
             "/api/chat", {"model": model, "messages": messages, **kwargs}
         )
@@ -141,7 +141,7 @@ class Client:
     def metadata_update(
         self, completion_id: str, metadata: dict[str, str]
     ) -> dict[str, t.Any]:
-        """POST /v1/chat/completions/{id} — edit a completion's metadata.
+        """POST /v1/chat/completions/{id} - edit a completion's metadata.
 
         Works on completions created non-streaming with a ``metadata``
         field; the gateway keeps a bounded card store for them.
@@ -156,17 +156,17 @@ class Client:
     # -- anthropic batches ---------------------------------------------------
 
     def anthropic_batches(self) -> list[dict[str, t.Any]]:
-        """GET /v1/messages/batches — most recent first."""
+        """GET /v1/messages/batches - most recent first."""
         return self._request("/v1/messages/batches", None)["data"]
 
     def anthropic_batch(self, batch_id: str) -> dict[str, t.Any]:
-        """GET /v1/messages/batches/{id} — status and request counts."""
+        """GET /v1/messages/batches/{id} - status and request counts."""
         return self._request(f"/v1/messages/batches/{batch_id}", None)
 
     def anthropic_batch_create(
         self, requests: list[dict[str, t.Any]]
     ) -> dict[str, t.Any]:
-        """POST /v1/messages/batches — queue an Anthropic-dialect batch.
+        """POST /v1/messages/batches - queue an Anthropic-dialect batch.
 
         Each item is ``{"custom_id": ..., "params": {/v1/messages body}}``.
         Poll ``anthropic_batch`` until ``processing_status == "ended"``,
@@ -181,11 +181,11 @@ class Client:
         )
 
     def anthropic_batch_delete(self, batch_id: str) -> dict[str, t.Any]:
-        """DELETE /v1/messages/batches/{id} — archive; stays readable."""
+        """DELETE /v1/messages/batches/{id} - archive; stays readable."""
         return self._request(f"/v1/messages/batches/{batch_id}", None, method="DELETE")
 
     def anthropic_batch_results(self, batch_id: str) -> list[dict[str, t.Any]]:
-        """GET /v1/messages/batches/{id}/results — JSONL rows as dicts.
+        """GET /v1/messages/batches/{id}/results - JSONL rows as dicts.
 
         Only after the batch ``ended``; otherwise the gateway 400s with a
         teaching message (raised as ``BlazarError``).
@@ -204,7 +204,7 @@ class Client:
     ) -> RealtimeSession:
         """Open a /v1/realtime voice session (STT -> chat -> TTS).
 
-        Returns a connected ``RealtimeSession`` — use it as a context
+        Returns a connected ``RealtimeSession`` - use it as a context
         manager, then feed PCM16 mono 24 kHz audio via ``voice_turn``.
         """
         return RealtimeSession(self, model, voice, stt_model)
@@ -212,7 +212,7 @@ class Client:
     # -- media: voices + speech ----------------------------------------------
 
     def voices(self, search: str | None = None) -> dict[str, t.Any]:
-        """GET /v1/audio/voices — the piper voice menu.
+        """GET /v1/audio/voices - the piper voice menu.
 
         Installed voices always come back under ``data``; ``search`` also
         queries HuggingFace for remote voice packs (``search.results`` rows
@@ -234,7 +234,7 @@ class Client:
         response_format: str = "wav",
         **kwargs: t.Any,
     ) -> tuple[str, bytes]:
-        """POST /v1/audio/speech — offline TTS.
+        """POST /v1/audio/speech - offline TTS.
 
         Returns ``(content_type, audio_bytes)``. ``response_format`` is one
         of ``wav`` (default), ``pcm``/``pcm16``, or ``mp3``/``opus``/
@@ -259,7 +259,7 @@ class Client:
         response_format: str | None = None,
         **kwargs: t.Any,
     ) -> t.Any:
-        """POST /v1/audio/transcriptions — speech-to-text.
+        """POST /v1/audio/transcriptions - speech-to-text.
 
         ``path`` is a local audio file (wav/flac/mp3/webm/...). Returns a
         dict for the JSON family (``json`` default, ``verbose_json``,
@@ -267,7 +267,7 @@ class Client:
         Everything else passes through as form fields: ``language``,
         ``prompt``, ``beam_size``, the VAD knobs, ``diarize``,
         ``no_language_probabilities``, and ``timestamp_granularities``
-        (list — sent per-value, forces ``verbose_json`` server-side).
+        (list - sent per-value, forces ``verbose_json`` server-side).
         """
         import mimetypes
         import os
@@ -321,21 +321,21 @@ class Client:
     # -- operations ----------------------------------------------------------
 
     def ps(self) -> dict[str, t.Any]:
-        """GET /api/ps — residents, engine posture, sleep state, remotes."""
+        """GET /api/ps - residents, engine posture, sleep state, remotes."""
         return self._request("/api/ps", None)
 
     def explain(self, model: str) -> dict[str, t.Any]:
-        """GET /api/explain/{model} — the routing decision card."""
+        """GET /api/explain/{model} - the routing decision card."""
         from urllib.parse import quote
 
         return self._request(f"/api/explain/{quote(model, safe='')}", None)
 
     def failover(self) -> dict[str, t.Any]:
-        """GET /api/failover — chain registry state (sticky, benched)."""
+        """GET /api/failover - chain registry state (sticky, benched)."""
         return self._request("/api/failover", None)
 
     def mcp_servers(self) -> t.Any:
-        """GET /api/mcp — configured MCP tool-catalog servers."""
+        """GET /api/mcp - configured MCP tool-catalog servers."""
         return self._request("/api/mcp", None)
 
     # -- transport -----------------------------------------------------------

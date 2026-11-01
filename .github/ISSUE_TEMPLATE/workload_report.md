@@ -7,7 +7,7 @@ body:
     id: workload
     attributes:
       label: The workload
-      description: What you run through Blazar — client(s), concurrency, prompt sizes, streaming or not, models.
+      description: What you run through Blazar - client(s), concurrency, prompt sizes, streaming or not, models.
       placeholder: |
         Codex CLI agent, 1-2 concurrent sessions, long contexts
         (~30k), mostly streaming chat with tool calls.
@@ -24,7 +24,7 @@ body:
     id: measurements
     attributes:
       label: What you measured
-      description: TTFT / tokens-per-second / queue waits / VRAM pressure / failure rates — numbers if you have them (`blazar bench`, `/metrics`, `/api/ps`). Anecdotes are fine too, marked as such.
+      description: TTFT / tokens-per-second / queue waits / VRAM pressure / failure rates - numbers if you have them (`blazar bench`, `/metrics`, `/api/ps`). Anecdotes are fine too, marked as such.
   - type: dropdown
     id: verdict
     attributes:

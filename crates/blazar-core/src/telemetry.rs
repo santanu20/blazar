@@ -6,7 +6,7 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 /// Tracing sink that tees every event to stderr and, when armed, to a
 /// daemon-owned log file. File-side failures (rotated-away file, full
 /// disk) are swallowed on purpose: the durable log must never take the
-/// daemon down, and stderr still emits — an `eprintln!` here would be
+/// daemon down, and stderr still emits - an `eprintln!` here would be
 /// the only stderr writer left standing mid-shutdown, so the write is
 /// simply dropped and the next rotation/daemon start recovers.
 struct TeeWriter {
@@ -53,10 +53,10 @@ impl std::io::Write for TeeWrite {
 /// `RUST_LOG` env var wins when set (standard tracing behavior);
 /// then the config `log_level` directive (daemon escape hatch without
 /// editing the systemd unit); otherwise `verbosity` selects the default.
-/// An invalid directive warns on stderr and falls back — logs are never
+/// An invalid directive warns on stderr and falls back - logs are never
 /// silently dropped. `log_file` arms a durable daemon-owned sink
 /// (the `serve` path passes `run/daemon.log`): under systemd the
-/// journal is a secondary stream that rotation can strand — the file
+/// journal is a secondary stream that rotation can strand - the file
 /// is the one the daemon itself owns end to end.
 #[allow(clippy::needless_pass_by_value)] // PathBuf-free: caller keeps ownership
 pub fn init_tracing(verbosity: u8, log_level: Option<&str>, log_file: Option<&Path>) {
@@ -70,7 +70,7 @@ pub fn init_tracing(verbosity: u8, log_level: Option<&str>, log_file: Option<&Pa
         Err(_) => match log_level.map(|d| EnvFilter::builder().parse(d)) {
             Some(Ok(f)) => f,
             Some(Err(e)) => {
-                eprintln!("blazar: invalid log_level directive ({e}) — using built-in default");
+                eprintln!("blazar: invalid log_level directive ({e}) - using built-in default");
                 EnvFilter::new(default)
             }
             None => EnvFilter::new(default),
@@ -88,7 +88,7 @@ pub fn init_tracing(verbosity: u8, log_level: Option<&str>, log_file: Option<&Pa
             Ok(f) => Some(Arc::new(Mutex::new(f))),
             Err(e) => {
                 eprintln!(
-                    "blazar: cannot open log file {} ({e}) — logging to stderr only",
+                    "blazar: cannot open log file {} ({e}) - logging to stderr only",
                     path.display()
                 );
                 None
@@ -102,7 +102,7 @@ pub fn init_tracing(verbosity: u8, log_level: Option<&str>, log_file: Option<&Pa
     // journald already stamps every line (with the machine's local time);
     // a second RFC3339 UTC stamp from tracing only adds noise and a
     // timezone mismatch. Foreground terminals and the daemon-owned log
-    // file have no outer stamper, so they keep the tracing timestamp —
+    // file have no outer stamper, so they keep the tracing timestamp -
     // when the file sink is armed the stamp stays even under journald
     // (a duplicate stamp in the journal beats an untimestamped durable
     // log, which is the artifact post-mortems actually read).
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn unit__tee_write__unarmed_tee_still_writes() {
         let mut tee = TeeWrite { file: None };
-        // No file, and stderr is not observable here — the contract under
+        // No file, and stderr is not observable here - the contract under
         // test is that the unarmed path returns success, not panics.
         assert_eq!(tee.write(b"x").unwrap(), 1);
         assert!(tee.flush().is_ok());

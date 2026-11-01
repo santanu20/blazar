@@ -2,7 +2,7 @@
 //! the real router + supervisor + stub-llama-server children. The voice
 //! stages (whisper STT, piper TTS) are exercised through their real
 //! in-process lanes: with no whisper engine installed the turn must fail
-//! with the teaching transcription error — never a silent drop — and the
+//! with the teaching transcription error - never a silent drop - and the
 //! socket must stay usable for the next utterance.
 #![allow(non_snake_case)] // scenario__behavior naming
 #![allow(clippy::similar_names)] // ws / ws2 stream handles
@@ -71,7 +71,7 @@ async fn connect_realtime(port_base: &str, query: &str) -> Ws {
         .into_client_request()
         .unwrap_or_else(|e| panic!("build request {shown}: {e}"));
     // The realtime lane sits behind the same key admission as every HTTP
-    // lane — ride the unscoped admin key from the test config.
+    // lane - ride the unscoped admin key from the test config.
     req.headers_mut().insert(
         "authorization",
         "Bearer plm_admin".parse().expect("bearer header value"),
@@ -86,7 +86,7 @@ async fn connect_realtime(port_base: &str, query: &str) -> Ws {
 async fn realtime__missing_model_param__rejected_before_upgrade() {
     let server = support::start(support::config_with_keys()).await;
     // A proper WS upgrade WITH no ?model= must surface the lane's 400
-    // (the teaching message names the missing parameter) — the handshake
+    // (the teaching message names the missing parameter) - the handshake
     // never completes.
     let mut req = format!("ws://{}/v1/realtime", base_port(&server.base))
         .into_client_request()
@@ -207,7 +207,7 @@ async fn realtime__commit_empty_buffer__invalid_request() {
         "{err}"
     );
 
-    // response.create is the alias for commit — same guard.
+    // response.create is the alias for commit - same guard.
     send_ev(&mut ws, json!({"type": "response.create"})).await;
     let alias = next_ev(&mut ws, "empty response.create error").await;
     assert_eq!(alias["error"]["type"], "invalid_request");
@@ -267,7 +267,7 @@ async fn realtime__junk_audio_turn__transcription_failed_and_socket_survives() {
     ws.close(None).await.ok();
 }
 
-/// `http://127.0.0.1:PORT` → `127.0.0.1:PORT` for ws:// URL assembly.
+/// `http://127.0.0.1:PORT` -> `127.0.0.1:PORT` for ws:// URL assembly.
 fn base_port(base: &str) -> String {
     base.trim_start_matches("http://").to_string()
 }
@@ -288,7 +288,7 @@ async fn wait_transcript_done(ws: &mut Ws, what: &str) -> String {
 }
 
 /// After the transcript: audio deltas to `response.audio.done`, or the
-/// taught tts failure (piper is absent in this harness — the transcript
+/// taught tts failure (piper is absent in this harness - the transcript
 /// was already delivered, so both tails are a pass).
 async fn expect_audio_or_tts_error(ws: &mut Ws) {
     loop {

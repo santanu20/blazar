@@ -203,7 +203,7 @@ def hbar_svg(
 ) -> str:
     """Sorted horizontal bars with direct value labels and IQR whiskers.
 
-    rows: (label, value, iqr_lo, iqr_hi, color) — caller sorts. baseline:
+    rows: (label, value, iqr_lo, iqr_hi, color) - caller sorts. baseline:
     (label, x) rendered as a dashed reference line. signed: rows may carry
     negative values (gateway-overhead deltas); the scale then spans both
     sides of a drawn zero axis and value labels sit on the outer side of
@@ -534,7 +534,7 @@ def scatter_svg(
 ) -> str:
     """Labeled dot scatter for tradeoff quadrants.
 
-    points: (x, y, color, label) — caller sorts for deterministic draw
+    points: (x, y, color, label) - caller sorts for deterministic draw
     order. Dashed zero lines appear on whichever axis spans zero; point
     labels alternate above/below the dot to limit collisions.
     """
@@ -606,7 +606,7 @@ def scatter_svg(
         doc.append(
             f'<text x="{px(x):.1f}" y="{py(y) + dy:.1f}" font-family="{SANS}" '
             f'font-size="10" fill="{INK}" text-anchor="middle">'
-            f"{_esc(_fmt(x))}%, {_esc(_fmt(y))}pp — {_esc(lbl)}</text>"
+            f"{_esc(_fmt(x))}%, {_esc(_fmt(y))}pp - {_esc(lbl)}</text>"
         )
     doc.append(
         f'<text x="{left:.1f}" y="{top - 10:.1f}" font-family="{SANS}" '
@@ -637,7 +637,7 @@ def _provenance(recs: list[dict], campaign: str) -> str:
         if not date and r.get("measured_at"):
             date = str(r["measured_at"])[:10]
     model = max(models.items(), key=lambda kv: kv[1])[0] if models else "?"
-    return f"{model} · {date or '?'} · {campaign}"
+    return f"{model} | {date or '?'} | {campaign}"
 
 
 def _ok_speed_rows(recs: list[dict]) -> list[dict]:
@@ -737,7 +737,7 @@ def render_campaign_charts(
             lo = _pctl(runs, 0.25) if runs else v
             hi = _pctl(runs, 0.75) if runs else v
             fam = r.get("provider") or "?"
-            rows.append((f"{fam} · {engine_name(r)}", v, lo, hi, fam))
+            rows.append((f"{fam} | {engine_name(r)}", v, lo, hi, fam))
         fams = sorted({fam for _, _, _, _, fam in rows})
         color_of = {}
         for fam in fams:
@@ -745,7 +745,7 @@ def render_campaign_charts(
             color_of[fam] = {m: _series_color(fam, i) for i, m in enumerate(members)}
         bars = [(lbl, v, lo, hi, color_of[fam][lbl]) for lbl, v, lo, hi, fam in rows]
         bars.sort(key=lambda b: b[1], reverse=True)
-        # baseline from the provider records — bars carry colors, not families
+        # baseline from the provider records - bars carry colors, not families
         directs = [
             float(r["decode_tps_p50"]) for r in speed if r.get("provider") == "direct"
         ]
@@ -874,7 +874,7 @@ def render_campaign_charts(
                 power_pts[key].append((float(lvl), float(r["gpu_power_peak_w"])))
             if r.get("conc_errors"):
                 err_pts[key].append((float(lvl), float(r["conc_errors"])))
-        labels = {k: f"{CONC_FAM_LABEL.get(k[0], k[0])} · {k[1]}" for k in keys}
+        labels = {k: f"{CONC_FAM_LABEL.get(k[0], k[0])} | {k[1]}" for k in keys}
 
         def series_of(pts: dict) -> list:
             out = []
@@ -915,7 +915,7 @@ def render_campaign_charts(
                     if ttfb_pts[k]:
                         ttft_series.append(
                             (
-                                f"{labels[k]} · ttfb p50",
+                                f"{labels[k]} | ttfb p50",
                                 sorted(ttfb_pts[k]),
                                 fam_color[k],
                                 "6 4",
@@ -1046,7 +1046,7 @@ def render_campaign_charts(
             )
             pts[key].append((float(r["ctx"]), float(r["decode_tps_p50"])))
         series = [
-            (f"{k[0]} · {k[1]}", sorted(pts[k]), _series_color(k[0], 0))
+            (f"{k[0]} | {k[1]}", sorted(pts[k]), _series_color(k[0], 0))
             for k in keys
             if pts[k]
         ]
@@ -1085,7 +1085,7 @@ def render_campaign_charts(
                 (float(r["ctx"]), float(r["gpu_peak_mib"]))
             )
         vram_series = [
-            (f"{k[0]} · {k[1]}", sorted(vram_ctx[k]), _series_color(k[0], 0))
+            (f"{k[0]} | {k[1]}", sorted(vram_ctx[k]), _series_color(k[0], 0))
             for k in sorted(vram_ctx)
             if vram_ctx[k]
         ]
@@ -1253,7 +1253,7 @@ def render_campaign_charts(
                 if vals:
                     rows.append(
                         (
-                            f"{s} · {q_fam[pname]}",
+                            f"{s} | {q_fam[pname]}",
                             _median(vals),
                             _median(vals),
                             _median(vals),
@@ -1301,7 +1301,7 @@ def render_campaign_charts(
             b = [v for v in b if v is not None]
             d = [v for v in d if v is not None]
             if b and d:
-                q_pairs.append((f"{suite} · {tag}", _median(b) - _median(d)))
+                q_pairs.append((f"{suite} | {tag}", _median(b) - _median(d)))
     parity_svg = None
     if q_pairs:
         q_pairs.sort(key=lambda kv: kv[1])
@@ -1341,7 +1341,7 @@ def render_campaign_charts(
         base = [v for v in base if v is not None]
         cur = q_overall(r)
         if base and cur is not None:
-            cfg_rows.append((f"{tag} · {q_cfg(r)}", cur - _median(base)))
+            cfg_rows.append((f"{tag} | {q_cfg(r)}", cur - _median(base)))
     cfg_svg = None
     if cfg_rows:
         cfg_rows.sort(key=lambda kv: kv[1])
@@ -1406,7 +1406,7 @@ def render_campaign_charts(
                     (s_now - s_base) / s_base * 100.0,
                     cur - _median(q_base),
                     FAMILY_COLOR["blazar"],
-                    f"{tag} · {label}",
+                    f"{tag} | {label}",
                 )
             )
     trade_svg = None
@@ -1459,7 +1459,7 @@ def render_campaign_charts(
         ):
             kv = str(r.get("params", {}).get("ppl_kv") or "f16")
             rung = r.get("params", {}).get("ppl")
-            lbl = f"{engine_name(r)} · {kv}" + (f" @{rung}" if rung else "")
+            lbl = f"{engine_name(r)} | {kv}" + (f" @{rung}" if rung else "")
             v = float(r["perplexity"])
             err = abs(float(r.get("ppl_error") or 0.0))
             ppl_bars.append((lbl, v, v - err, v + err, _series_color("ppl", 0)))
@@ -1473,7 +1473,7 @@ def render_campaign_charts(
             "ppl",
             baseline=f16_base,
             footnote="llama-perplexity on the offline corpus; whiskers: "
-            "± standard error. Lower is better; values from different "
+            "+/- standard error. Lower is better; values from different "
             "context rungs are not comparable.",
             value_nd=2,
         )

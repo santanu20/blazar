@@ -1,9 +1,9 @@
 #!/bin/sh
 # Hygiene gates: machine-specific absolute paths + AI-agent artifacts +
 # packaging license integrity.
-# Blocks the classes a code review easily misses — real home dirs and
+# Blocks the classes a code review easily misses - real home dirs and
 # agent scratch paths baked into comments/fixtures, external project
-# names leaking into shipped source — at CI time. Exits non-zero
+# names leaking into shipped source - at CI time. Exits non-zero
 # listing every offending file:line.
 #
 # Usage: check_hygiene.sh [paths...]
@@ -13,7 +13,7 @@
 #   that mode.
 #
 # CHANGELOG.md is excluded: historical entries cite past paths and
-# project names as record — rewriting history is not the gate's job.
+# project names as record - rewriting history is not the gate's job.
 
 set -u
 
@@ -33,7 +33,7 @@ PATH_PATTERNS='/home/[a-z]|/Users/[a-z]|/root/|/tmp/opencode'
 # leaked into shipped comments. Extend the denylist as new ones appear.
 ARTIFACT_PATTERNS='geokit'
 
-# license_field_present FILE PATTERN — true when FILE matches the
+# license_field_present FILE PATTERN - true when FILE matches the
 # license declaration pattern. Split out so the self-test can prove
 # both directions (hit on a declaring file, silence on one without).
 license_field_present() {
@@ -60,7 +60,7 @@ check_packaging_licenses() {
     return "$fail"
 }
 
-# scan_files — stdin is one path per line; prints every violating
+# scan_files - stdin is one path per line; prints every violating
 # file:line:content.
 scan_files() {
     while IFS= read -r f; do
@@ -95,7 +95,7 @@ fi
 echo "hygiene gate: clean"
 
 # Self-test: the gate must fire on a violating file and stay silent on
-# a clean one — a gate that cannot fail protects nothing.
+# a clean one - a gate that cannot fail protects nothing.
 tmp=$(mktemp) || exit 1
 trap 'rm -f "$tmp"' EXIT
 

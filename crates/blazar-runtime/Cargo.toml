@@ -41,13 +41,13 @@ sysinfo.workspace = true
 libc = { workspace = true }
 getrandom = { workspace = true }
 # Production dep: engine build lane stages its build tree in a scoped
-# tempdir (engine/build.rs) — not test-only.
+# tempdir (engine/build.rs) - not test-only.
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 # W1: 8.3 short-path conversion for the whisper `-m` argv (upstream
 # aborts on non-ASCII paths, whisper.cpp #4018). Same version the
-# workspace graph already carries transitively — no new code enters
+# workspace graph already carries transitively - no new code enters
 # the build beyond the one linker symbol used here.
 windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",

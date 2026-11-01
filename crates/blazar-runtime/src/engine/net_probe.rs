@@ -1,24 +1,24 @@
 //! Bounded retry for upstream metadata probes (GitHub API, `PyPI`).
 //!
 //! Consumer ISPs intermittently reset or blackhole TLS connections to
-//! these endpoints — observed live: back-to-back curls to pypi.org where
+//! these endpoints - observed live: back-to-back curls to pypi.org where
 //! one connection died mid-TLS and the next returned 200 instantly;
 //! api.github.com unreachable at a 20 s cap, then serving normally
 //! minutes later. Single-shot probes turn that transient into a spurious
 //! "cannot check upstream" failure.
 //!
-//! Policy (bounded, explicit): 3 attempts, flat 500 ms backoff — flat
+//! Policy (bounded, explicit): 3 attempts, flat 500 ms backoff - flat
 //! because each probe is a lone caller re-issuing one small idempotent
 //! GET, no herd to de-synchronize (same reasoning as the spawn retry in
 //! `probe.rs`). Only transport-class failures re-issue: send errors,
 //! the per-attempt deadline, 5xx, and body decodes interrupted
 //! mid-stream. Deterministic answers (4xx: rate limits, missing
-//! repos/tags) fail fast — re-issuing past a 403 is exactly what the
+//! repos/tags) fail fast - re-issuing past a 403 is exactly what the
 //! rate limit asks us not to do.
 //!
-//! Probes wrapped here self-bound (attempts × cap + backoff, ~31.5 s
+//! Probes wrapped here self-bound (attempts x cap + backoff, ~31.5 s
 //! worst case, one attempt on a healthy network): do NOT stack another
-//! `tokio::time::timeout` on top — an outer cap would silently cut the
+//! `tokio::time::timeout` on top - an outer cap would silently cut the
 //! retry budget down to its own deadline. Asset downloads are out of
 //! scope: they are 30-400 MB streams with their own resume logic, not
 //! idempotent metadata GETs.

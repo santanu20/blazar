@@ -8,13 +8,13 @@
 //! is the SQLite write-through ledger behind both lanes plus the unified
 //! read/cancel/events plane at `/v1/jobs`: a completed job survives a
 //! gateway restart with its result, an in-flight one is swept to an honest
-//! `abandoned` state at boot (renders cannot resume mid-frame — the durable
+//! `abandoned` state at boot (renders cannot resume mid-frame - the durable
 //! contract is records + artifacts + idempotent resubmit, never silent
 //! continuation).
 //!
 //! Laws carried over from the lanes: no await under a lock (all store access
 //! is a short synchronous `with_store` closure), and a store write failure
-//! logs loudly but never masks the lane's own answer — the live registry
+//! logs loudly but never masks the lane's own answer - the live registry
 //! stays authoritative while it lives.
 
 use crate::state::AppState;
@@ -33,20 +33,20 @@ const INPUT_ARTIFACT_CAP_BYTES: usize = 64 * 1024 * 1024;
 /// bodies, single images); larger ones become artifact files.
 const INLINE_RESULT_CAP_BYTES: usize = 1024 * 1024;
 /// Terminal jobs older than this are pruned at boot. Completed artifacts
-/// on disk are kept — only the ledger rows go.
+/// on disk are kept - only the ledger rows go.
 const TERMINAL_PRUNE_SECS: i64 = 7 * 24 * 3600;
 /// A row must be this stale before the boot sweep will abandon it. Two
 /// daemons sharing one data dir is unsupported (single port, single WAL
-/// writer); the window only guards the stop→start handoff race where the
+/// writer); the window only guards the stop->start handoff race where the
 /// old process wrote seconds before the new one booted.
 const BOOT_GRACE_SECS: i64 = 5;
-/// Headroom past the grace window before the late cut-off pass runs —
+/// Headroom past the grace window before the late cut-off pass runs -
 /// wide enough that clock wobble between daemons cannot leak a live
 /// row under the daemon-start cutoff.
 const GRACE_MARGIN_SECS: i64 = 10;
 
 pub struct JobRuntime {
-    /// Artifact root (`<data>/jobs/<id>/…`), owned so recordings never
+    /// Artifact root (`<data>/jobs/<id>/...`), owned so recordings never
     /// borrow from `AppState`.
     jobs_dir: std::path::PathBuf,
 }
@@ -67,18 +67,18 @@ impl JobRuntime {
     }
 
     /// Boot hygiene: abandon stale in-flight rows, prune ancient terminal
-    /// ones. Runs detached from `serve()` — sweep latency is not boot
+    /// ones. Runs detached from `serve()` - sweep latency is not boot
     /// latency, and the store may still be settling on first open.
     ///
     /// Two passes: the immediate one spares rows updated within the grace
-    /// window (a concurrent live daemon's fresh work — shared-data-dir two
+    /// window (a concurrent live daemon's fresh work - shared-data-dir two
     /// daemons are unsupported but not reaped silently); a delayed pass at
     /// `grace + margin` cuts at THIS daemon's start time, catching rows
     /// whose last update fell inside the grace window (killed moments
     /// before boot) which the first pass deliberately spared. Anything
-    /// this daemon wrote has `updated_at` >= its start, so live work —
+    /// this daemon wrote has `updated_at` >= its start, so live work -
     /// including a doctor mid-probe silent for its whole 300 s cold-load
-    /// allowance — is never reaped.
+    /// allowance - is never reaped.
     pub fn boot_sweep(&self, state: &Arc<AppState>) {
         let boot_unix = blazar_core::store::unix_now();
         let swept = state
@@ -105,7 +105,7 @@ impl JobRuntime {
                 "boot sweep: pruned terminal job rows older than 7 days"
             );
         }
-        // Spilled files die with their rows — the ledger reference is
+        // Spilled files die with their rows - the ledger reference is
         // gone, so the bytes are unreachable orphans otherwise.
         remove_pruned_artifact_files(artifact_paths);
         let st = Arc::clone(state);
@@ -160,7 +160,7 @@ impl JobRuntime {
             owner: owner.map(str::to_string),
         };
         if let Some(err) = state.with_store(|s| s.insert_job(&row).err()).flatten() {
-            tracing::warn!(target: "blazar::jobs", job = %id, %err, "job ledger insert failed — live lane continues, record not durable");
+            tracing::warn!(target: "blazar::jobs", job = %id, %err, "job ledger insert failed - live lane continues, record not durable");
         }
     }
 
@@ -172,7 +172,7 @@ impl JobRuntime {
         }
         // Extension-only sanitization: the name never round-trips into a
         // shell or a route, but a crafted filename must not escape the
-        // job dir either (`../../x` has no safe extension → none kept).
+        // job dir either (`../../x` has no safe extension -> none kept).
         let ext = filename
             .and_then(|f| f.rsplit_once('.'))
             .map(|(_, e)| e.to_ascii_lowercase())
@@ -181,7 +181,7 @@ impl JobRuntime {
         let dir = self.jobs_dir.join(sanitize_id(id));
         let path = dir.join(format!("input{ext}"));
         if let Err(err) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, data)) {
-            tracing::warn!(target: "blazar::jobs", job = %id, %err, "input artifact write failed — job continues without it");
+            tracing::warn!(target: "blazar::jobs", job = %id, %err, "input artifact write failed - job continues without it");
         }
     }
 
@@ -189,8 +189,8 @@ impl JobRuntime {
         self.transition(state, id, "running", None, None, "running");
     }
 
-    /// Close a job with its result. Bodies ≤1 MiB ride inline (parsed as
-    /// JSON when possible, lossy string otherwise — the same vocabulary
+    /// Close a job with its result. Bodies <=1 MiB ride inline (parsed as
+    /// JSON when possible, lossy string otherwise - the same vocabulary
     /// `AudioJobs::payload` serves); larger ones become artifact files
     /// with a stub envelope so the row stays small.
     pub fn record_completed(&self, state: &AppState, id: &str, body: &[u8], content_type: &str) {
@@ -214,7 +214,7 @@ impl JobRuntime {
                     Some(path.to_string_lossy().into_owned()),
                 ),
                 Err(err) => {
-                    tracing::warn!(target: "blazar::jobs", job = %id, %err, "result artifact write failed — recording stub only");
+                    tracing::warn!(target: "blazar::jobs", job = %id, %err, "result artifact write failed - recording stub only");
                     (
                         serde_json::to_string(&serde_json::json!({
                             "artifact": "dropped",
@@ -256,7 +256,7 @@ impl JobRuntime {
 
     /// Delete a terminal job's render (Sora `DELETE /v1/videos/{id}`):
     /// state flips to `cancelled` and the stored result is dropped, so
-    /// `/content` stops serving the bytes. Open rows are NOT touched —
+    /// `/content` stops serving the bytes. Open rows are NOT touched -
     /// cancel those via [`JobRuntime::record_cancelled`] instead. A
     /// spilled artifact file is removed best-effort (its ledger reference
     /// is already gone). Idempotent: returns silently on an
@@ -273,7 +273,7 @@ impl JobRuntime {
                     serde_json::json!({"artifact": artifact_path.is_some()}),
                 );
             }
-            Some(Ok(false)) => {} // open, already-deleted or missing — caller owns those arms
+            Some(Ok(false)) => {} // open, already-deleted or missing - caller owns those arms
             Some(Err(err)) => {
                 tracing::warn!(target: "blazar::jobs", job = %id, %err, "job delete failed");
             }
@@ -286,7 +286,7 @@ impl JobRuntime {
         }
     }
 
-    /// Append a progress event without a state transition — doctor probe
+    /// Append a progress event without a state transition - doctor probe
     /// verdicts today, lane milestones later. The row must already exist;
     /// a missing row is a debug-level note (the lane stays authoritative).
     #[allow(clippy::needless_pass_by_value)] // serialized into the event row
@@ -324,7 +324,7 @@ impl JobRuntime {
         match outcome {
             Some(true) => {}
             // Unknown row (lane created it before this release, or the
-            // insert failed loudly earlier) — the live answer still wins.
+            // insert failed loudly earlier) - the live answer still wins.
             Some(false) => {
                 tracing::debug!(target: "blazar::jobs", job = %id, to, "job row absent; transition not recorded");
             }
@@ -343,7 +343,7 @@ fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
-/// Unified payload from a row — the `/v1/jobs` wire shape. Superset of the
+/// Unified payload from a row - the `/v1/jobs` wire shape. Superset of the
 /// lane-native shapes: `id`, `status`, `created_at` keep their existing
 /// vocabulary; `kind`, `updated_at`, `result`, `error`, `artifact` are the
 /// durable extras.
@@ -381,14 +381,14 @@ fn not_found(id: &str) -> Response {
     crate::proxy::openai_error(
         404,
         &format!(
-            "job {id} not found — live handles die with their owner (gateway or engine child) \
+            "job {id} not found - live handles die with their owner (gateway or engine child) \
              and completed records live 7 days; submit a new request"
         ),
     )
 }
 
 /// Remove the spilled artifact files of pruned rows (best-effort, logged).
-/// Paths come from the store's own prune result — never from a request —
+/// Paths come from the store's own prune result - never from a request -
 /// so a missing file is simply already-gone, and a failure to unlink is a
 /// disk concern worth a warning, never a boot abort.
 fn remove_pruned_artifact_files(paths: &[String]) {
@@ -406,7 +406,7 @@ fn remove_pruned_artifact_files(paths: &[String]) {
     }
 }
 
-/// GET /v1/jobs?state=&kind=&limit= — the durable ledger, newest first.
+/// GET /v1/jobs?state=&kind=&limit= - the durable ledger, newest first.
 /// Keyed callers see their own rows plus legacy NULL-owner rows (BLZ-1);
 /// keyless listing implies no keys are configured (open gateway).
 #[allow(clippy::unused_async)] // axum's Handler trait requires async fns
@@ -436,7 +436,7 @@ pub async fn jobs_list(
     .into_response()
 }
 
-/// GET /v1/jobs/{id} — terminal rows answer from the ledger; live ones
+/// GET /v1/jobs/{id} - terminal rows answer from the ledger; live ones
 /// dispatch to their lane for fresh state (audio registry, live child
 /// poll for image/video), mirroring whatever terminal state comes back.
 #[allow(clippy::single_match_else)] // two response-shaped arms read clearer than if-let-else across 20 lines
@@ -457,7 +457,7 @@ pub async fn jobs_get(
     else {
         return not_found(&job_id);
     };
-    // Foreign-owned rows answer as if they never existed — a 404 leaks
+    // Foreign-owned rows answer as if they never existed - a 404 leaks
     // neither the id nor the fact that another key owns it (BLZ-1).
     if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
         return not_found(&job_id);
@@ -475,9 +475,9 @@ pub async fn jobs_get(
             axum::Json(row_payload(&row)).into_response()
         }
         // Doctor and background responses: gateway-owned tasks write
-        // their progress through this ledger itself — the row IS the live
+        // their progress through this ledger itself - the row IS the live
         // truth (doctor events carry per-probe verdicts; a background
-        // response flips queued→running→completed on the same row the
+        // response flips queued->running->completed on the same row the
         // client polls).
         "doctor" | "responses" => axum::Json(row_payload(&row)).into_response(),
         // Image/video: the owning child is the only live truth. A poll
@@ -493,7 +493,7 @@ pub async fn jobs_get(
                 axum::Json(payload).into_response()
             }
             None => {
-                let msg = "job's engine child is gone (eviction, crash or restart) — \
+                let msg = "job's engine child is gone (eviction, crash or restart) - \
                            resubmit the generation";
                 state.jobs.record_failed(&state, &job_id, msg);
                 let closed = state
@@ -507,7 +507,7 @@ pub async fn jobs_get(
         },
         other => crate::proxy::openai_error(
             500,
-            &format!("job {job_id} has unknown kind {other:?} — ledger corruption?"),
+            &format!("job {job_id} has unknown kind {other:?} - ledger corruption?"),
         ),
     }
 }
@@ -537,7 +537,7 @@ pub(crate) fn mirror_child_terminal(state: &AppState, id: &str, child_job: &serd
     }
 }
 
-/// POST /v1/jobs/{id}/cancel — idempotent; dispatches by kind: audio
+/// POST /v1/jobs/{id}/cancel - idempotent; dispatches by kind: audio
 /// aborts the task, image/video best-effort cancels on the live child.
 #[allow(clippy::unused_async)] // axum's Handler trait requires async fns
 pub async fn jobs_cancel(
@@ -571,7 +571,7 @@ pub async fn jobs_cancel(
         }
         // Doctor probes check the row between probes and stop once it is
         // terminal; background responses simply stop being polled (any late
-        // completion cannot resurrect the row — the one-way close guarantees
+        // completion cannot resurrect the row - the one-way close guarantees
         // this flip is final).
         "doctor" | "responses" => {
             state.jobs.record_cancelled(&state, &job_id);
@@ -592,7 +592,7 @@ pub async fn jobs_cancel(
         other => {
             return crate::proxy::openai_error(
                 500,
-                &format!("job {job_id} has unknown kind {other:?} — ledger corruption?"),
+                &format!("job {job_id} has unknown kind {other:?} - ledger corruption?"),
             );
         }
     }
@@ -605,7 +605,7 @@ pub async fn jobs_cancel(
     }
 }
 
-/// GET /v1/jobs/{id}/events — the append-only story (created → running →
+/// GET /v1/jobs/{id}/events - the append-only story (created -> running ->
 /// terminal, boot-sweep and artifact notes included).
 #[allow(clippy::unused_async)] // axum's Handler trait requires async fns
 pub async fn jobs_events(
@@ -659,7 +659,7 @@ pub async fn jobs_events(
     .into_response()
 }
 
-/// GET /v1/jobs/{id}/artifact — serve a spilled result artifact with its
+/// GET /v1/jobs/{id}/artifact - serve a spilled result artifact with its
 /// recorded content type. Path comes from the row, never the request.
 #[allow(clippy::unused_async)] // axum's Handler trait requires async fns
 pub async fn jobs_artifact(
@@ -679,7 +679,7 @@ pub async fn jobs_artifact(
     else {
         return not_found(&job_id);
     };
-    // Spilled results are caller-visible output — same owner gate as the
+    // Spilled results are caller-visible output - same owner gate as the
     // row itself (BLZ-1).
     if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
         return not_found(&job_id);
@@ -710,7 +710,7 @@ pub async fn jobs_artifact(
             }),
         Err(err) => crate::proxy::openai_error(
             410,
-            &format!("job {job_id} artifact is no longer on disk ({err}) — pruned or cleaned"),
+            &format!("job {job_id} artifact is no longer on disk ({err}) - pruned or cleaned"),
         ),
     }
 }

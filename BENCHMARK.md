@@ -86,7 +86,7 @@ _Rendered 20260929-flagship-gguf; blazar 0.13.0; power state of gateway rows: ac
 - Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) - wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads - wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.
 - Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.
 - Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.
-- Prompt-diversity disclosure: every speed lane states whether its prompt set repeats across runs; speculative-decode cells (ngram/draft) additionally state the set's diversity, because acceptance rides repetition — home-GPU measurements show a repeated-prompt set inflating ngram speedup to ~4.75x while a diverse set sits at 0.89-1.06x. Repetition-inflated speedups are labeled as such, never presented as general throughput.
+- Prompt-diversity disclosure: every speed lane states whether its prompt set repeats across runs; speculative-decode cells (ngram/draft) additionally state the set's diversity, because acceptance rides repetition - home-GPU measurements show a repeated-prompt set inflating ngram speedup to ~4.75x while a diverse set sits at 0.89-1.06x. Repetition-inflated speedups are labeled as such, never presented as general throughput.
 - Every blazar row records the spawned engine's argv (slots/context shown in tables) and stamps blazar version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.
 - Media lanes run in isolated sandbox daemons (same protocol as text blazar cells); the engine child spawns lazily, so each family's first request is the COLD number (spawn + weights + first artifact), labeled cold_request_s.
 - Media TTFB = time to first BODY byte (first audio sample for streamed PCM, not response headers); buffered WAV TTFB equals its total by construction and the table says so.
@@ -282,7 +282,7 @@ _Exact-match divergence across GPU backends is expected float nondeterminism (ba
 
 ### Quality suites (checker-verified, seeded, greedy)
 
-- _quality lane: **not-measured** — no quality rows in this campaign (lane not reached for the selected providers/engines)_
+- _quality lane: **not-measured** - no quality rows in this campaign (lane not reached for the selected providers/engines)_
 
 _Not measured in this campaign (20260929-flagship-gguf); quality suites lane not run._
 
@@ -624,7 +624,7 @@ _Not measured in this campaign (20261006-matched-conc); tool calls lane not run.
 
 #### Quality suites (checker-verified, seeded, greedy)
 
-- _quality lane: **not-measured** — no quality rows in this campaign (lane not reached for the selected providers/engines)_
+- _quality lane: **not-measured** - no quality rows in this campaign (lane not reached for the selected providers/engines)_
 
 _Not measured in this campaign (20261006-matched-conc); quality suites lane not run._
 

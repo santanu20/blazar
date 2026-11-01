@@ -1,4 +1,4 @@
-//! `/api/benchmarks` — the stored measurement record, read-only.
+//! `/api/benchmarks` - the stored measurement record, read-only.
 //!
 //! One row per (model, engine lane): the plain-bench history from
 //! `blazar bench` (`bench_results` table) merged with the tuned launch
@@ -18,11 +18,11 @@ use blazar_core::store::{BenchResultRow, ProfileRow};
 
 /// Test names from a stored payload. `bench_results` rows are a JSON
 /// array of measurement rows; tuned profiles carry `{score, rows}`.
-/// Raw llama-bench rows carry an EMPTY `test` field — the real name is
+/// Raw llama-bench rows carry an EMPTY `test` field - the real name is
 /// derived from the shape (`pp512`, `tg128`, `pp512 @ tg32`), exactly
 /// the way `BenchRow::test_name` derives it everywhere else. Rows that
 /// derive to nothing are dropped; unparseable payloads yield an empty
-/// list — the row still shows its dates, the tests column just renders
+/// list - the row still shows its dates, the tests column just renders
 /// empty.
 fn payload_test_names(payload: &str) -> Vec<String> {
     use blazar_runtime::bench::BenchRow;
@@ -54,7 +54,7 @@ fn profile_score(profile: &ProfileRow) -> Option<f64> {
 }
 
 /// Pure assembly: merge bench history + tuned profiles into one row per
-/// (model, lane), sorted by model then lane. Each side is optional —
+/// (model, lane), sorted by model then lane. Each side is optional -
 /// `measured_at` without `tuned_at` is a benched-but-untuned model and
 /// vice versa.
 fn benchmarks_rows(benches: &[BenchResultRow], profiles: &[ProfileRow]) -> Vec<Value> {
@@ -95,7 +95,7 @@ fn benchmarks_rows(benches: &[BenchResultRow], profiles: &[ProfileRow]) -> Vec<V
         .collect()
 }
 
-/// `GET /api/benchmarks` — every stored benchmark + tuning record.
+/// `GET /api/benchmarks` - every stored benchmark + tuning record.
 pub async fn benchmarks(State(state): State<Arc<AppState>>) -> Json<Value> {
     // Flat, short store borrows (never nested inside another with_store).
     let benches = state
@@ -130,7 +130,7 @@ mod tests {
             payload_test_names(r#"{"score":41.7,"rows":[{"test":"tg128"},{"test":"tg128"}]}"#);
         assert_eq!(tuned, vec!["tg128".to_string()], "deduped, sorted");
 
-        // Real stored bench rows carry an EMPTY test column — the name
+        // Real stored bench rows carry an EMPTY test column - the name
         // must derive from the shape exactly like the CLI/scorecard do.
         let stored = payload_test_names(
             r#"[{"test":"","t/s":21082.3,"n_prompt":512,"n_gen":0},

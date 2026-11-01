@@ -99,7 +99,7 @@ pub async fn start(config: Config) -> TestServer {
     start_env(config, &[]).await
 }
 
-/// `start` with extra env stamped onto every spawned stub child — the
+/// `start` with extra env stamped onto every spawned stub child - the
 /// sentinel suite's `engine.child_env` pattern, factored for tests that
 /// need marker modes (`STUB_TOOL_CALL`, `STUB_EMPTY`, ...).
 pub async fn start_env(config: Config, stub_env: &[(&str, &str)]) -> TestServer {

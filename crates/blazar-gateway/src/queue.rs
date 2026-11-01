@@ -1,7 +1,7 @@
 //! Priority admission queue: when capacity is exhausted, waiters are
 //! ordered by (priority desc, deadline, arrival); queued (never running)
 //! low-pri waiters yield to high-pri. Within one (priority, SLO-tier)
-//! group, weighted fair queuing interleaves API keys by `weight` — a
+//! group, weighted fair queuing interleaves API keys by `weight` - a
 //! weight-3 key earns ~3x the slots of a weight-1 key under contention.
 //! Explicit `x-blazar-deadline-ms` waiters keep strict EDF (never
 //! WFQ-delayed past their deadline by a later-deadline peer). Bounded
@@ -38,7 +38,7 @@ impl Priority {
 /// lane (`ollama_compat` recipe) whose 2048-class generations hold a slot
 /// ~26 s on a single-slot child; `Interactive` = everything else.
 /// Background is deliberately absent: the gateway has no background
-/// traffic lane today (H24 — no dead values).
+/// traffic lane today (H24 - no dead values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkClass {
     Interactive,
@@ -96,7 +96,7 @@ pub fn classify_work(has_tools: bool, raw_lane: bool) -> WorkClass {
 /// the last `ceil(N/4)` slots; raw long work may not (unless it borrows
 /// while no interactive waiter is queued). `max(1, ..)` keeps the
 /// reservation meaningful on tiny shapes; on N = 1 the clamp makes the
-/// reservation degenerate — single-slot children cannot isolate classes
+/// reservation degenerate - single-slot children cannot isolate classes
 /// (documented tradeoff, see docs/2.ARCHITECTURE.md admission section).
 #[must_use]
 pub fn interactive_reserved(slots: usize) -> usize {
@@ -107,7 +107,7 @@ pub fn interactive_reserved(slots: usize) -> usize {
 struct WaitKey(u8, u8, u128, u64);
 // (inverted priority rank, deadline nanos, arrival seq): BTreeMap's
 // `next()` pops the SMALLEST key = highest priority, then EARLIEST
-// deadline (EDF within a class — SLO tiers), then earliest arrival (FIFO).
+// deadline (EDF within a class - SLO tiers), then earliest arrival (FIFO).
 // No deadline (bulk) sorts last via u128::MAX.
 
 #[derive(Debug)]
@@ -131,7 +131,7 @@ pub struct PriorityQueue {
     /// Fixed instant deadline keys are measured from (stable ordering).
     epoch: std::time::Instant,
     /// Waiters admitted AFTER their SLO deadline expired (the "burn"
-    /// signal — the request was served, but too late for its class).
+    /// signal - the request was served, but too late for its class).
     deadline_exceeded: std::sync::atomic::AtomicU64,
 }
 
@@ -226,7 +226,7 @@ impl PriorityQueue {
             };
             // Class-aware urgency (explicit deadline stays sovereign
             // below): tool work tightens to the tool budget, raw long
-            // work relaxes to the LOW floor — its class is structurally
+            // work relaxes to the LOW floor - its class is structurally
             // patient. Applies before prefill demotion.
             let class_secs = match class {
                 WorkClass::Tool => class_secs.min(SLO_TOOL_SECS),
@@ -234,7 +234,7 @@ impl PriorityQueue {
                 WorkClass::RawLong => class_secs.max(SLO_LOW_SECS),
             };
             // Prefill-heavy: demote the deadline class one tier (the
-            // request KEEPS its priority for ordering vs other classes —
+            // request KEEPS its priority for ordering vs other classes -
             // only its within-class urgency relaxes).
             let tier_secs = if body_len >= PREFILL_HEAVY_BYTES {
                 // Demote one tier; Low cannot go lower.
@@ -273,7 +273,7 @@ impl PriorityQueue {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err("queue shut down".into()),
             Err(_) => {
-                // F59: remove our own entry — on an idle system no future
+                // F59: remove our own entry - on an idle system no future
                 // `signal_free` arrives to lazily clean a timed-out
                 // waiter, and `depth()` would report phantom saturation
                 // (doctor row, /metrics, 503 body) forever.
@@ -291,7 +291,7 @@ impl PriorityQueue {
 
     /// A slot freed: admit the single best waiter, if any. Ordering:
     /// highest priority rank first; explicit-deadline waiters keep strict
-    /// EDF; same-tier waiters interleave by WFQ credit/weight — but never
+    /// EDF; same-tier waiters interleave by WFQ credit/weight - but never
     /// past an explicit-deadline peer (the barrier rule).
     pub fn signal_free(&self) {
         let next = {
@@ -842,7 +842,7 @@ mod tests {
         assert!(tool < inter && inter < raw);
         // Explicit deadlines still dominate class at the tier boundary:
         // an earlier RawLong deadline beats a later Tool one only when
-        // priorities differ — same priority, earlier deadline, raw still
+        // priorities differ - same priority, earlier deadline, raw still
         // second (class first). Documented tradeoff, pinned.
         let raw_early = WaitKey(0, WorkClass::RawLong.rank(), 50, 4);
         assert!(tool < raw_early);
@@ -855,7 +855,7 @@ mod tests {
         assert_eq!(raw_ceiling(4, false), 4);
         assert_eq!(raw_ceiling(1, false), 1);
         // Protected waiter parked: raw cannot consume the reserved
-        // quarter (min 1 raw slot stays admissible — starvation-free).
+        // quarter (min 1 raw slot stays admissible - starvation-free).
         assert_eq!(raw_ceiling(4, true), 3);
         assert_eq!(raw_ceiling(8, true), 6);
         assert_eq!(raw_ceiling(2, true), 1);

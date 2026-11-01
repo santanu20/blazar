@@ -1,6 +1,6 @@
 //! Remote engine instances: `[[remotes]]` entries name external
 //! OpenAI-compatible servers (another blazar, vLLM, an MLX server,
-//! llamactl — anything speaking `/v1/*`). Requests for
+//! llamactl - anything speaking `/v1/*`). Requests for
 //! `<remote-name>:<model>` route there instead of spawning a local
 //! child; nothing local is loaded, quotas still apply at the gateway.
 
@@ -35,7 +35,7 @@ pub struct RemoteHealth {
     pub down_until: Option<std::time::Instant>,
     pub in_flight: u32,
     /// EWMA of observed time-to-response-head in milliseconds (ok
-    /// requests only). `None` until the first success — the scheduler
+    /// requests only). `None` until the first success - the scheduler
     /// then falls back to a neutral default rather than guessing.
     pub ttft_ewma_ms: Option<f64>,
 }
@@ -44,7 +44,7 @@ pub(crate) fn health_key(remote: &Remote) -> String {
     format!("{}|{}", remote.name, remote.url)
 }
 
-/// Bound on the C4 prefix→remote stickiness table: one entry per
+/// Bound on the C4 prefix->remote stickiness table: one entry per
 /// distinct conversation prefix; arbitrary eviction keeps it bounded.
 const REMOTE_AFFINITY_CAP: usize = 4096;
 
@@ -93,7 +93,7 @@ fn unbind_remote(
 
 /// RAII in-flight lease: bumped by `select_remote`, released on drop.
 /// Released when the caller's response HEADERS are ready (forward
-/// functions return at header time); body streaming continues after —
+/// functions return at header time); body streaming continues after -
 /// header-time is the meaningful queue signal for load balancing.
 pub struct RemoteLease {
     map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>>,
@@ -111,11 +111,11 @@ impl Drop for RemoteLease {
 }
 
 /// Select the remote for a `<remote>:<model>` request: filter the
-/// name-pool down to live members (marked-down members are skipped —
+/// name-pool down to live members (marked-down members are skipped -
 /// all-down returns a 503 teaching error with the retry window), then
 /// pick the least-busy (C3). With a conversation `prefix` hint (C4),
-/// prefer the live pool member that last served this prefix — its KV
-/// cache holds the conversation — falling back to least-busy. Returns
+/// prefer the live pool member that last served this prefix - its KV
+/// cache holds the conversation - falling back to least-busy. Returns
 /// the remote, the stripped model, an in-flight lease and the affinity
 /// key to bind/unbind on the result.
 #[allow(clippy::type_complexity, clippy::result_large_err)] // gateway error currency
@@ -132,7 +132,7 @@ pub fn select_remote<'a>(
     };
     let now = std::time::Instant::now();
     // R4: capacity snapshots are plain clones taken before the health
-    // lock — the scorer never nests locks.
+    // lock - the scorer never nests locks.
     let caps: std::collections::HashMap<String, PeerCapacity> = state
         .remote_capacity
         .lock()
@@ -176,7 +176,7 @@ pub fn select_remote<'a>(
             ),
         ));
     }
-    // C4: sticky prefix affinity — the live member holding this
+    // C4: sticky prefix affinity - the live member holding this
     // conversation's KV wins; without a hint (or after eviction/circuit)
     // it is plain least-busy.
     let akey = prefix.map(|p| affinity_key(name, p));
@@ -244,7 +244,7 @@ pub fn note_remote_result(state: &AppState, remote: &Remote, ok: bool) {
 }
 
 /// Fold one observed time-to-response-head (ms) into the remote's EWMA.
-/// Ok requests only — failures measure the wrong thing (connect timeouts
+/// Ok requests only - failures measure the wrong thing (connect timeouts
 /// would inflate decode cost). Takes the map directly (`bind_remote`
 /// precedent) so it stays unit-pinnable without an `AppState`.
 #[allow(clippy::implicit_hasher)] // one concrete hasher app-wide, bind_remote precedent
@@ -296,7 +296,7 @@ pub async fn forward_with_health(
     body: axum::body::Bytes,
 ) -> Response {
     // Affinity hash over the ORIGINAL body (forward_openai rewrites the
-    // model field — the prefix identity lives in the prompt fields).
+    // model field - the prefix identity lives in the prompt fields).
     let prefix = crate::proxy::affinity_hash_bytes(&body);
     let (remote, remote_model, _lease, akey) = match select_remote(state, model, prefix.as_ref()) {
         Ok(x) => x,
@@ -305,7 +305,7 @@ pub async fn forward_with_health(
     // Time-to-response-head: forward_openai returns when the upstream
     // HEADERS are ready, so this is the queue+prefill signal the
     // capacity-aware scheduler wants (buffered dialects blend completion
-    // time — an acceptable smear for a hint, documented not filtered).
+    // time - an acceptable smear for a hint, documented not filtered).
     let t0 = std::time::Instant::now();
     let resp = forward_openai(
         state,
@@ -326,7 +326,7 @@ pub async fn forward_with_health(
 
 /// Forward an OpenAI-shaped request to a remote: rewrite `model` to the
 /// stripped name, attach the remote's bearer key, stream the response
-/// back byte-for-byte (the zero-tax contract holds — the remote is
+/// back byte-for-byte (the zero-tax contract holds - the remote is
 /// someone else's engine).
 pub async fn forward_openai(
     state: &AppState,
@@ -382,7 +382,7 @@ pub async fn forward_openai(
 }
 
 /// Best-effort model rewrite on a JSON body; non-JSON (multipart)
-/// passes through untouched (remote gets the prefixed name — its owner
+/// passes through untouched (remote gets the prefixed name - its owner
 /// can name the model that way if they want).
 /// Rewrite the `model` field of a JSON request body (used by the
 /// remotes lane and failover chains). Non-JSON bodies pass through
@@ -466,7 +466,7 @@ pub struct PeerResident {
 }
 
 /// Cached `GET /api/capacity` for one remote (v0.16 federation). A
-/// non-Blazar remote simply never populates this — absence is the
+/// non-Blazar remote simply never populates this - absence is the
 /// degrade signal, never an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerCapacity {
@@ -532,7 +532,7 @@ fn parse_capacity(v: &serde_json::Value) -> Option<PeerCapacity> {
 }
 
 /// One `GET /api/capacity` against a remote. Any failure (non-Blazar
-/// peer, timeout, 5xx, unparseable body) is `None` — the peer stays a
+/// peer, timeout, 5xx, unparseable body) is `None` - the peer stays a
 /// plain OpenAI-shaped remote with no capacity signals.
 async fn fetch_capacity(state: &AppState, remote: &Remote) -> Option<PeerCapacity> {
     let url = format!("{}/api/capacity", remote.url.trim_end_matches('/'));
@@ -599,7 +599,7 @@ pub fn cached_capacity(state: &AppState, remote: &Remote) -> Option<PeerCapacity
 const REMOTE_TTFT_DEFAULT_MS: f64 = 750.0;
 
 /// Scheduling tier: warm peers always outrank catalog-cold peers, which
-/// outrank unknown-capacity peers — a warm peer's queue wait is measured
+/// outrank unknown-capacity peers - a warm peer's queue wait is measured
 /// while a cold peer's real cost is the model load we cannot see from
 /// here. Numbers, not stringly tiers, so `Ord` derives.
 const REMOTE_TIER_WARM: u8 = 0;
@@ -607,7 +607,7 @@ const REMOTE_TIER_UNKNOWN: u8 = 1;
 const REMOTE_TIER_COLD: u8 = 2;
 
 /// Capacity-aware peer ranking (v0.16). Field order IS the priority:
-/// tier, then estimated wait, then most free VRAM. Derived `Ord` — no
+/// tier, then estimated wait, then most free VRAM. Derived `Ord` - no
 /// hand-written comparator to get wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PeerScore {
@@ -620,7 +620,7 @@ pub struct PeerScore {
 /// so every ordering rule is unit-pinnable without a live peer.
 ///
 /// Estimated wait = queue depth x observed time-to-head: the peer's own
-/// `in_flight` for the model (from its capacity residents — R2: the
+/// `in_flight` for the model (from its capacity residents - R2: the
 /// gateway-side lease alone misses the peer's local load) plus our
 /// leases on it, divided by its slot count, times the EWMA (or the
 /// neutral default before the first success).
@@ -673,7 +673,7 @@ fn force_refresh_due(presence: Option<&PeerPresence>) -> bool {
 
 /// Federation is armed: at least one remote configured and the
 /// `remote_fallback` kill switch is on. One definition shared by the
-/// request hook and the `/v1/models` merge — flipping the config flag
+/// request hook and the `/v1/models` merge - flipping the config flag
 /// rolls the whole feature back to pure-prefix routing.
 #[must_use]
 pub fn fallback_enabled(cfg: &Config) -> bool {
@@ -682,7 +682,7 @@ pub fn fallback_enabled(cfg: &Config) -> bool {
 
 /// Does the peer catalog id `id` satisfy the locally-requested
 /// `requested` name? Peer ids carry a quant tag (`qwen3:q4`), the
-/// caller may request bare names or a `+adapter` variant — compare
+/// caller may request bare names or a `+adapter` variant - compare
 /// exact, then each side's name-part (before `:`), then the
 /// lora-stripped base on both sides. Pure.
 fn peer_id_matches(id: &str, requested: &str) -> bool {
@@ -696,7 +696,7 @@ fn peer_id_matches(id: &str, requested: &str) -> bool {
 }
 
 /// One GET `/v1/models` against a remote, parsed to model ids. Probe
-/// failures return `None` — an unreachable or unparseable peer is
+/// failures return `None` - an unreachable or unparseable peer is
 /// simply not a fallback candidate, never a request error.
 async fn fetch_presence(state: &AppState, remote: &Remote) -> Option<Vec<String>> {
     let url = format!("{}/v1/models", remote.url.trim_end_matches('/'));
@@ -736,7 +736,7 @@ async fn refresh_presence(state: &AppState, remote: &Remote) -> Option<Vec<Strin
     }
     // Presence + capacity ride together: a slow-but-alive peer pays
     // max(3s, 3s) wall, never the sum (F15). Capacity failure alone
-    // never fails presence — a non-Blazar peer stays routable.
+    // never fails presence - a non-Blazar peer stays routable.
     let (entries, capacity) =
         tokio::join!(fetch_presence(state, remote), fetch_capacity(state, remote));
     if let Some(c) = capacity {
@@ -803,7 +803,7 @@ pub async fn peers_serving<'a>(state: &'a AppState, model: &str) -> Vec<&'a Remo
     let mut candidates: Vec<(&Remote, u32)> = Vec::new();
     for remote in &state.config.remotes {
         // Circuit-open peers are excluded by the same health map the
-        // explicit-prefix lane uses — fallback never routes into a
+        // explicit-prefix lane uses - fallback never routes into a
         // remote the breaker already marked down.
         let live = state
             .remote_health
@@ -873,7 +873,7 @@ pub async fn peers_serving_with_refresh<'a>(state: &'a AppState, model: &str) ->
     candidates.into_iter().map(|(r, _)| r).collect()
 }
 
-/// Lane selection for [`try_fallback_forward`] — every lane hook shares
+/// Lane selection for [`try_fallback_forward`] - every lane hook shares
 /// the same miss-detection and peer pick; only the forward call shape
 /// differs per surface.
 pub enum FallbackLane<'a> {
@@ -922,11 +922,11 @@ pub(crate) fn rank_peers_by_capacity<'a>(
 }
 
 /// Federation fallback, one shared path for every lane hook: a bare
-/// model name the local store does not own (PURE not-found — an
+/// model name the local store does not own (PURE not-found - an
 /// ambiguous local match stays local, that is a naming problem) routes
 /// to the best-ranked live peer whose catalog lists it (capacity-aware
 /// since v0.16). Returns `None` when federation is off, the model
-/// resolves locally, or no peer claims it — the caller's existing
+/// resolves locally, or no peer claims it - the caller's existing
 /// local error path stays untouched. Key admission (scope + request
 /// count) runs at the call site before this, exactly like
 /// explicit-prefix routing.
@@ -1050,7 +1050,7 @@ pub async fn ollama_chat_remote(
         })
         .boxed();
     let model_c = remote_model.to_string();
-    // F70: boundary-safe decode — chunk-split UTF-8 chars stay raw until
+    // F70: boundary-safe decode - chunk-split UTF-8 chars stay raw until
     // their final byte arrives.
     let ndjson = futures::stream::unfold(
         (
@@ -1215,7 +1215,7 @@ mod tests {
         assert!(split_remote("localmodel", &cfg).is_none());
         assert!(split_remote("nope:x", &cfg).is_none());
         // A model whose name contains a colon but matches nothing local
-        // must not silently route — split_remote only fires on exact
+        // must not silently route - split_remote only fires on exact
         // remote-name prefixes.
         assert!(split_remote("localhost:11434", &cfg).is_none());
     }
@@ -1343,7 +1343,7 @@ mod tests {
     #[test]
     fn unit__parse_capacity__foreign_body_is_none_not_error() {
         // A vLLM-style /v1/models body or HTML error page: absent, not
-        // an error — the peer stays a plain remote.
+        // an error - the peer stays a plain remote.
         assert!(parse_capacity(&serde_json::json!({"data": [{"id": "m"}]})).is_none());
         assert!(parse_capacity(&serde_json::json!({"object": "other"})).is_none());
         // Missing arrays entirely: no capacity contract.
@@ -1505,7 +1505,7 @@ mod tests {
         h.ttft_ewma_ms = Some(100.0);
         let s = score_peer("m", &h, Some(&cap));
         assert_eq!(s.est_wait_ms, 300, "observed EWMA drives the estimate");
-        // No resident row: cold tier, lease-only queue — two leases at
+        // No resident row: cold tier, lease-only queue - two leases at
         // slots=1 are two waves of the observed ttft.
         let s_cold = score_peer("m", &h, Some(&cap_with(vec![], 0)));
         assert_eq!(s_cold.est_wait_ms, 200);

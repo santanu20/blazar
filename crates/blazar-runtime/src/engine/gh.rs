@@ -3,7 +3,7 @@
 //! (prereleases, 27 assets) plus `vX.Y.Z` stable tags whose single asset
 //! `nightly-tag.txt` contains the current b-tag. Assets are named
 //! `llama-{tag}-bin-{asset}.tar.gz|.zip` and expose `digest:
-//! sha256:...` — verified before extraction.
+//! sha256:...` - verified before extraction.
 
 use anyhow::{Context, Result, anyhow, bail};
 use blazar_core::config::UpdateChannel;
@@ -17,8 +17,8 @@ pub const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
 
 /// Base for the no-API release surfaces (the `releases.atom` feed and
 /// the `releases/expanded_assets/{tag}` HTML table). These ride
-/// github.com — a different, far more generous rate budget than
-/// api.github.com — and serve as the anonymous fallback when the API
+/// github.com - a different, far more generous rate budget than
+/// api.github.com - and serve as the anonymous fallback when the API
 /// 403s. Mirrors/tests override it with `BLAZAR_ATOM_BASE` (same knob
 /// class as `BLAZAR_GH_BASE`).
 fn web_base() -> String {
@@ -26,7 +26,7 @@ fn web_base() -> String {
 }
 
 /// A 403/429 from api.github.com is an IP-budget exhaustion, not a
-/// repo problem — exactly the error class the web fallback covers.
+/// repo problem - exactly the error class the web fallback covers.
 fn is_rate_limited(e: &anyhow::Error) -> bool {
     e.to_string().contains("rate limited")
 }
@@ -71,7 +71,7 @@ fn percent_decode(s: &str) -> String {
 /// feed lists the ~10 most recent releases; the tag is the last path
 /// segment of each entry's `<id>` (e.g.
 /// `tag:github.com,2008:Repository/612354784/b11574`). Plain string
-/// scanning — the feed is flat and machine-generated, so an XML
+/// scanning - the feed is flat and machine-generated, so an XML
 /// dependency would buy nothing.
 fn parse_atom_tags(body: &str) -> Vec<(String, Option<String>)> {
     body.split("<entry>")
@@ -95,7 +95,7 @@ fn parse_atom_tags(body: &str) -> Vec<(String, Option<String>)> {
 /// Assets from a `releases/expanded_assets/{tag}` HTML table: every
 /// `href=".../releases/download/{tag}/{name}"` is one asset row. The
 /// table does not carry digests (GitHub only puts those in the API), so
-/// synthesized assets are `digest: None` — the installer's existing
+/// synthesized assets are `digest: None` - the installer's existing
 /// "unverified" path, the same mark pip-installed engine lanes carry.
 fn parse_asset_hrefs(body: &str, tag: &str, base: &str) -> Vec<GhAsset> {
     let marker = "/releases/download/";
@@ -109,7 +109,7 @@ fn parse_asset_hrefs(body: &str, tag: &str, base: &str) -> Vec<GhAsset> {
             continue;
         };
         let after = &href[di + marker.len()..];
-        // href shape: {tag}/{name} — only this release's rows.
+        // href shape: {tag}/{name} - only this release's rows.
         let Some(name) = after.strip_prefix(&format!("{tag}/")) else {
             continue;
         };
@@ -123,14 +123,14 @@ fn parse_asset_hrefs(body: &str, tag: &str, base: &str) -> Vec<GhAsset> {
     assets
 }
 
-/// Parallel byte-range connections for release-asset downloads — the
+/// Parallel byte-range connections for release-asset downloads - the
 /// same lane and default the model-pull client uses (see `hf_parallel`).
 const ASSET_DOWNLOAD_CONNECTIONS: u32 = 8;
 
 /// Stall-window for [`GhClient::progress_guard`]: one full window under
 /// [`PROGRESS_MIN_BYTES`] of on-disk growth aborts the attempt. 1 MiB in
 /// 60 s (~17 KiB/s) sits above deliberate slow-but-real links and below
-/// every observed CDN-abuse trickle (~11 KiB/s) — an engine asset at
+/// every observed CDN-abuse trickle (~11 KiB/s) - an engine asset at
 /// that rate is a multi-hour install either way.
 const PROGRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
@@ -204,7 +204,7 @@ pub struct GhClient {
     /// daemon fetches.
     download_speed_limit_mb: f64,
     /// On-disk download cache root (see `default_downloads_cache`).
-    /// `None` disables reuse — `with_base` (the test/mirror
+    /// `None` disables reuse - `with_base` (the test/mirror
     /// constructor) always builds cache-off so tests stay hermetic and
     /// never touch the user's cache directory.
     downloads_cache: Option<std::path::PathBuf>,
@@ -269,7 +269,7 @@ fn authed(
 /// Resolve the default engine-download cache root. Precedence:
 /// `BLAZAR_DOWNLOADS_CACHE` (absolute override; `"0"` or empty =
 /// explicitly off), then `$XDG_CACHE_HOME/blazar/downloads`, then the
-/// platform cache dir. `None` when no home/cache dir exists — the
+/// platform cache dir. `None` when no home/cache dir exists - the
 /// cache is always best-effort. Purge is `rm -rf` on the directory;
 /// there is deliberately no eviction or TTL.
 #[must_use]
@@ -306,7 +306,7 @@ fn cache_safe_name(name: &str) -> String {
     s
 }
 
-/// Advisory per-blob mutex built on an exclusive directory create —
+/// Advisory per-blob mutex built on an exclusive directory create -
 /// `mkdir` is atomic on every platform we ship (advisory `flock` is
 /// unix-only), needs no extra dependency, and its mere existence is
 /// the held lock. Holders release by removing the directory on drop.
@@ -320,7 +320,7 @@ pub(crate) struct BlobLock(std::path::PathBuf);
 impl BlobLock {
     /// Locks live for the blob's lifetime; a stale threshold equal to
     /// the slowest engine lane tolerates a crashed holder without
-    /// punishing a slow-but-alive one. (30 minutes — stable Rust has
+    /// punishing a slow-but-alive one. (30 minutes - stable Rust has
     /// no minutes constructor for the lint to rewrite into.)
     #[allow(
         clippy::duration_suboptimal_units,
@@ -381,7 +381,7 @@ fn hardlink_or_copy(src: &std::path::Path, dst: &std::path::Path) -> Result<u64>
     }
     let _ = std::fs::remove_file(dst);
     if std::fs::hard_link(src, dst).is_err() {
-        tracing::debug!(from = %src.display(), to = %dst.display(), "hardlink failed — copying");
+        tracing::debug!(from = %src.display(), to = %dst.display(), "hardlink failed - copying");
         return std::fs::copy(src, dst).with_context(|| format!("copy {}", src.display()));
     }
     let len = std::fs::metadata(src)
@@ -409,7 +409,7 @@ fn cache_hit(asset: &GhAsset, blob: &std::path::Path) -> Option<u64> {
             blob = %blob.display(),
             have = len,
             want = ?asset.size,
-            "engine asset cache size mismatch — evicting"
+            "engine asset cache size mismatch - evicting"
         );
         let _ = std::fs::remove_file(blob);
         let _ = std::fs::remove_file(format!("{}.part", blob.display()));
@@ -429,7 +429,7 @@ impl GhClient {
     }
 
     pub fn with_base(base: &str, token: Option<String>) -> Result<Self> {
-        // An empty env var (GH_TOKEN="") must degrade to anonymous —
+        // An empty env var (GH_TOKEN="") must degrade to anonymous -
         // "Bearer " is an invalid credential and 401s where no-token
         // would succeed.
         let token = token.filter(|t| !t.trim().is_empty());
@@ -475,7 +475,7 @@ impl GhClient {
     }
 
     /// Advisory cross-process lock over a NAMED shared resource in the
-    /// downloads cache root — used for blob downloads (inside
+    /// downloads cache root - used for blob downloads (inside
     /// [`Self::download_asset_file`]) and per-tag engine installs
     /// (`install_with_rollback`). `None` when the cache is off or its
     /// fs refuses lock dirs: callers proceed unlocked and the
@@ -512,13 +512,13 @@ impl GhClient {
             Ok(r) => Ok(r),
             Err(e) if is_rate_limited(&e) => {
                 tracing::info!(
-                    "GitHub API rate limited — listing {repo} via releases.atom \
+                    "GitHub API rate limited - listing {repo} via releases.atom \
                      (anonymous web surface, no API budget)"
                 );
                 self.list_releases_via_web(repo).await.map_err(|web| {
                     anyhow!(
                         "GitHub API rate limited and the anonymous \
-                             releases.atom fallback failed: {web:#} — set GH_TOKEN \
+                             releases.atom fallback failed: {web:#} - set GH_TOKEN \
                              for 5000 req/hr"
                     )
                 })
@@ -532,7 +532,7 @@ impl GhClient {
             .base
             .join(&format!("repos/{repo}/releases?per_page=30"))
             .context(
-                "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+                "GitHub API path failed to resolve - check the repo/tag for invalid characters",
             )?;
         let http = self.http.clone();
         let token = self.token.clone();
@@ -569,7 +569,7 @@ impl GhClient {
                 }
                 match resp.json::<Vec<GhRelease>>().await {
                     Ok(releases) => Attempt::Done(Ok(releases)),
-                    // A connection reset mid-body truncates the 200 —
+                    // A connection reset mid-body truncates the 200 -
                     // decode failures are transport-class, worth one
                     // more attempt.
                     Err(e) => Attempt::Retry(anyhow!("decode releases JSON: {e}")),
@@ -584,14 +584,14 @@ impl GhClient {
             Ok(r) => Ok(r),
             Err(e) if is_rate_limited(&e) => {
                 tracing::info!(
-                    "GitHub API rate limited — resolving {repo} {} via the \
+                    "GitHub API rate limited - resolving {repo} {} via the \
                      anonymous web surface (releases.atom)",
                     version.unwrap_or("latest")
                 );
                 self.release_by_web(repo, version).await.map_err(|web| {
                     anyhow!(
                         "GitHub API rate limited and the anonymous \
-                             releases.atom fallback failed: {web:#} — set GH_TOKEN \
+                             releases.atom fallback failed: {web:#} - set GH_TOKEN \
                              for 5000 req/hr"
                     )
                 })
@@ -602,7 +602,7 @@ impl GhClient {
 
     /// The web-surface variant of [`Self::release_by`]: `None` picks the
     /// newest non-prerelease from the atom feed; a pinned version tries
-    /// its (v-normalized) tag's asset table directly — the feed only
+    /// its (v-normalized) tag's asset table directly - the feed only
     /// carries recent tags, so old pins must bypass it.
     async fn release_by_web(&self, repo: &str, version: Option<&str>) -> Result<GhRelease> {
         match version {
@@ -637,7 +637,7 @@ impl GhClient {
     }
 
     /// The asset table for one tag via the anonymous web surface.
-    /// `Ok(None)` on 404 — a tag without assets or a tag that does not
+    /// `Ok(None)` on 404 - a tag without assets or a tag that does not
     /// exist are both "not installable from here".
     async fn web_assets(&self, repo: &str, tag: &str) -> Result<Option<Vec<GhAsset>>> {
         let base = web_base();
@@ -659,7 +659,7 @@ impl GhClient {
 
     /// Releases via the anonymous web surface: the atom feed's recent
     /// tags (newest first), each with its asset table fetched in
-    /// parallel. Digests do not exist on this surface — synthesized
+    /// parallel. Digests do not exist on this surface - synthesized
     /// assets are `digest: None` and install as "unverified", the same
     /// mark pip-installed engine lanes carry.
     async fn list_releases_via_web(&self, repo: &str) -> Result<Vec<GhRelease>> {
@@ -693,7 +693,7 @@ impl GhClient {
                         Ok(Ok(resp)) if resp.status().is_success() => match resp.text().await {
                             // Body-decode failure means "assets unknown for
                             // this tag" (None), never "release ships zero
-                            // assets" — find-by-name consumers would
+                            // assets" - find-by-name consumers would
                             // misdiagnose an empty table as a missing build.
                             Ok(body) => Some(parse_asset_hrefs(&body, &tag, &base)),
                             Err(_) => None,
@@ -752,7 +752,7 @@ impl GhClient {
 
     async fn release_by_path(&self, path: &str) -> Result<GhRelease> {
         let url = self.base.join(path).context(
-            "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+            "GitHub API path failed to resolve - check the repo/tag for invalid characters",
         )?;
         let http = self.http.clone();
         let token = self.token.clone();
@@ -792,7 +792,7 @@ impl GhClient {
                 }
                 match resp.json::<GhRelease>().await {
                     Ok(release) => Attempt::Done(Ok(release)),
-                    // Mid-body reset truncates the 200 — retry-worthy.
+                    // Mid-body reset truncates the 200 - retry-worthy.
                     Err(e) => Attempt::Retry(anyhow!("decode release JSON: {e}")),
                 }
             }
@@ -833,7 +833,7 @@ impl GhClient {
     /// dereferenced through its `nightly-tag.txt` asset to the concrete
     /// b-build it stamps. Returns `None` when the latest non-prerelease
     /// is itself a b-tag (no stable marker published yet). Advisory by
-    /// design — callers annotate, they never gate on this.
+    /// design - callers annotate, they never gate on this.
     pub async fn stable_marker(&self) -> Result<Option<StableMarker>> {
         let latest = self.release_by(LLAMA_CPP_REPO, None).await?;
         if !latest.tag_name.starts_with('v') {
@@ -865,8 +865,8 @@ impl GhClient {
 
     /// Resolve the target release of an arbitrary repo (whisper.cpp,
     /// blazar self) for an update channel. These upstreams publish
-    /// through GitHub's `/releases/latest` only — no prerelease
-    /// firehose — so both channels coincide; the knob is meaningful for
+    /// through GitHub's `/releases/latest` only - no prerelease
+    /// firehose - so both channels coincide; the knob is meaningful for
     /// the llama.cpp lane (`channel_b_release`).
     pub async fn channel_repo_release(
         &self,
@@ -885,7 +885,7 @@ impl GhClient {
                 .base
                 .join(&format!("repos/{LLAMA_CPP_REPO}/releases/tags/{tag}"))
                 .context(
-                    "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+                    "GitHub API path failed to resolve - check the repo/tag for invalid characters",
                 )?;
             let resp = self
                 .auth(self.http.get(url.clone()))
@@ -920,7 +920,7 @@ impl GhClient {
             .base
             .join(&format!("repos/{repo}/releases/tags/{tag}"))
             .context(
-                "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+                "GitHub API path failed to resolve - check the repo/tag for invalid characters",
             )?;
         let http = self.http.clone();
         let token = self.token.clone();
@@ -967,7 +967,7 @@ impl GhClient {
                 }
                 match resp.json::<GhRelease>().await {
                     Ok(release) => Attempt::Done(Ok(release)),
-                    // Mid-body reset truncates the 200 — retry-worthy.
+                    // Mid-body reset truncates the 200 - retry-worthy.
                     Err(e) => Attempt::Retry(anyhow!("decode release: {e}")),
                 }
             }
@@ -984,7 +984,7 @@ impl GhClient {
             .base
             .join(&format!("repos/{repo}/commits/{git_ref}"))
             .context(
-                "GitHub API path failed to resolve — check the repo/tag for invalid characters",
+                "GitHub API path failed to resolve - check the repo/tag for invalid characters",
             )?;
         let http = self.http.clone();
         let token = self.token.clone();
@@ -1031,7 +1031,7 @@ impl GhClient {
                 }
                 let commit: CommitLookup = match resp.json().await {
                     Ok(commit) => commit,
-                    // Mid-body reset truncates the 200 — retry-worthy.
+                    // Mid-body reset truncates the 200 - retry-worthy.
                     Err(e) => return Attempt::Retry(anyhow!("decode commit-lookup response: {e}")),
                 };
                 Attempt::Done(
@@ -1051,7 +1051,7 @@ impl GhClient {
     }
 
     /// Fetch the raw `src/llama-arch.cpp` at an upstream llama.cpp tag
-    /// — the one-time source for mining the architecture set of a
+    /// - the one-time source for mining the architecture set of a
     /// binary-installed lane (release assets carry no source manifest).
     /// Any failure is the caller's fail-open signal: a missing tag or a
     /// network hiccup must never block engine registration.
@@ -1060,7 +1060,7 @@ impl GhClient {
         let resp = self
             .http
             .get(&url)
-            // A raw llama-arch.cpp is a few hundred KB — the client-wide
+            // A raw llama-arch.cpp is a few hundred KB - the client-wide
             // release-asset timeouts (30s connect / 2min read) would let a
             // blackholed route stall daemon startup; this lane only feeds
             // best-effort architecture mining, so cap it tightly and let
@@ -1077,7 +1077,7 @@ impl GhClient {
     }
 
     /// Newest mistral.rs release by semver (`vtag_semver`, not string
-    /// order — v0.10.0 > v0.9.3).
+    /// order - v0.10.0 > v0.9.3).
     pub async fn latest_mistralrs_release(&self) -> Result<GhRelease> {
         let releases = self.list_releases_repo(MISTRALRS_REPO).await?;
         releases
@@ -1101,7 +1101,7 @@ impl GhClient {
     }
 
     /// Newest whisper.cpp `bNNNN` release. The repo's `vX.Y.Z` tags are
-    /// source-only (zero assets — verified v1.9.4); the b-tags carry the
+    /// source-only (zero assets - verified v1.9.4); the b-tags carry the
     /// prebuilt binaries, so the b-counter is the currency. List trims
     /// `assets`; callers re-fetch the full release by tag.
     pub async fn latest_whisper_release(&self) -> Result<GhRelease> {
@@ -1116,14 +1116,14 @@ impl GhClient {
     /// Newest rhasspy/piper release that ships a prebuilt for this
     /// platform. Piper tags are date-shaped (`2023.11.14-2`) and every
     /// release carries all six platform assets so far, but currency is
-    /// defined by the asset actually existing — a release without the
+    /// defined by the asset actually existing - a release without the
     /// platform tarball is not installable, so it is never the latest.
     /// List trims `assets`; callers re-fetch the full release by tag.
     pub async fn latest_piper_release(&self) -> Result<GhRelease> {
         let asset = crate::piper::asset_name(std::env::consts::OS, std::env::consts::ARCH)
             .ok_or_else(|| {
                 anyhow!(
-                    "piper publishes no {}/{} prebuilt — build the CLI from source \
+                    "piper publishes no {}/{} prebuilt - build the CLI from source \
                      (github.com/rhasspy/piper) and place it under the engines dir",
                     std::env::consts::OS,
                     std::env::consts::ARCH
@@ -1137,7 +1137,7 @@ impl GhClient {
     }
 
     /// Download an asset fully into memory, verifying its sha256 digest
-    /// when the release metadata provides one. Assets are ≤ ~400 MB.
+    /// when the release metadata provides one. Assets are <= ~400 MB.
     pub async fn download_asset_bytes(&self, asset: &GhAsset) -> Result<Vec<u8>> {
         let url = reqwest::Url::parse(&asset.browser_download_url)
             .with_context(|| format!("asset url {:?}", asset.name))?;
@@ -1155,7 +1155,7 @@ impl GhClient {
         }
         let bytes = resp.bytes().await.context("read asset body")?;
         // Truncation guard: a proxy or origin that closes the body early
-        // looks like a clean end-of-stream to reqwest — the digest check
+        // looks like a clean end-of-stream to reqwest - the digest check
         // below only runs when GH published one, so a digest-less asset
         // could install truncated (live case: 14 MiB of a 1+ GiB
         // mistral.rs tarball accepted, gzip EOF mid-extract). The
@@ -1195,8 +1195,8 @@ impl GhClient {
     /// costs zero network; a miss downloads into the cache blob and
     /// hardlinks (or copies, cross-device) to `dest`, so the blob
     /// survives the caller's post-extract archive cleanup and later
-    /// installs — and a stalled parallel download's `.part` state —
-    /// resume across runs. Cache disabled or unusable → plain
+    /// installs - and a stalled parallel download's `.part` state -
+    /// resume across runs. Cache disabled or unusable -> plain
     /// download straight to `dest`.
     pub async fn download_asset_file(
         &self,
@@ -1268,8 +1268,8 @@ impl GhClient {
     /// HTTP client's read-timeout only caps IDLE gaps, so a live CDN
     /// trickle (edge rate-limiting, path policing) keeps an install
     /// "progressing" for hours at kilobytes per second. This watchdog
-    /// samples the destination's on-disk growth — orthogonal to the
-    /// serial/parallel lane internals — and cancels the attempt when a
+    /// samples the destination's on-disk growth - orthogonal to the
+    /// serial/parallel lane internals - and cancels the attempt when a
     /// full window passes under the floor. The parallel lane's chunk
     /// ledger makes the next attempt resume where this one died, so an
     /// operator retry after the underlying condition clears pays only
@@ -1298,7 +1298,7 @@ impl GhClient {
             let start = std::time::Instant::now();
             // Composite progress: the serial lane grows `dest`
             // monotonically, but the parallel lane PREALLOCATES its
-            // `.part` at full (sparse) size before writing a byte —
+            // `.part` at full (sparse) size before writing a byte -
             // size there is a constant. Real parallel progress lands in
             // the chunk ledger `<dest>.part.progress`, which the
             // parallel machinery rewrites on every chunk completion, so
@@ -1358,7 +1358,7 @@ impl GhClient {
         let out = tokio::select! {
             r = fut => r,
             _ = trip_rx.changed() => Err(anyhow!(
-                "asset download stalled: {} grew under {} bytes in {:?} — \
+                "asset download stalled: {} grew under {} bytes in {:?} - \
                  the CDN or path is throttling this transfer (rate-limit or \
                  policing). Retry resumes from the chunk ledger; if it keeps \
                  stalling, wait out the remote rate-limit window or check \
@@ -1387,7 +1387,7 @@ impl GhClient {
         format!("{}-{}", &hex[..16], cache_safe_name(&asset.name))
     }
 
-    /// Stream an asset to `dest` with incremental sha256 — for GiB-class
+    /// Stream an asset to `dest` with incremental sha256 - for GiB-class
     /// assets (mistral.rs CUDA prebuilts are 0.8-1.1 GiB) that must not
     /// be buffered whole in memory. The client's read-timeout is an
     /// idle-gap cap, not a total deadline, so slow links survive.
@@ -1483,7 +1483,7 @@ impl GhClient {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    // Mid-stream death: no partial file may survive —
+                    // Mid-stream death: no partial file may survive -
                     // a retry restarting onto a corrupt prefix is worse
                     // than redownloading.
                     drop(file);
@@ -1578,8 +1578,8 @@ impl GhClient {
     }
 
     /// Post-stream verification for `download_asset_file`: truncation
-    /// and digest. Truncation is checked against two sources — the
-    /// HTTP Content-Length header and the release-API size — because a
+    /// and digest. Truncation is checked against two sources - the
+    /// HTTP Content-Length header and the release-API size - because a
     /// cleanly-closed-early body streams to a short total with NO
     /// error; without this check a digest-less asset installs
     /// truncated and dies later at extraction (live case: 14 MiB of a
@@ -1717,7 +1717,7 @@ pub struct AssetPick {
 ///
 /// `driver_cuda` caps `Versioned` CUDA candidates (win-cuda): a
 /// prebuilt binary newer than the driver cannot start, so versions
-/// above the cap are skipped — when at least one exists — and the
+/// above the cap are skipped - when at least one exists - and the
 /// lane falls through to Vulkan with a warning instead of a
 /// guaranteed probe failure. `None` = cap unknown, pick the newest.
 #[must_use]
@@ -1786,7 +1786,7 @@ pub fn resolve_asset(
                 if skipped_over_cap > 0 {
                     tracing::warn!(
                         "release {tag} ships {skipped_over_cap} {prefix} asset(s) \
-                         but all exceed the driver's CUDA {}.{} — using the \
+                         but all exceed the driver's CUDA {}.{} - using the \
                          next lane (Vulkan/CPU); update the NVIDIA driver or \
                          pin an older release",
                         driver_cuda.map_or(0, |d| d.0),
@@ -1844,7 +1844,7 @@ pub struct SdAssetPattern {
 pub fn sdcpp_asset_patterns(os: &str, arch: &str, nvidia: bool) -> Result<Vec<SdAssetPattern>> {
     // Ordering policy: the vendor-native compute backend first when the
     // box is NVIDIA (a CUDA prebuilt outruns the Vulkan build the day
-    // upstream ships one — picked up with no code change, pinned by
+    // upstream ships one - picked up with no code change, pinned by
     // unit__sdcpp_asset_patterns__future_cuda_prebuilt_is_picked_same_day),
     // then Vulkan (one backend covers every GPU vendor), then CPU as the
     // labeled last resort. The cudart zip (CUDA runtime stripped for
@@ -1911,7 +1911,7 @@ pub fn sdcpp_asset_patterns(os: &str, arch: &str, nvidia: bool) -> Result<Vec<Sd
             "stable-diffusion.cpp publishes no prebuilt for Windows ARM64"
         )),
         (os, arch) => Err(anyhow!(
-            "stable-diffusion.cpp publishes no prebuilt for {os}/{arch} — build from source \
+            "stable-diffusion.cpp publishes no prebuilt for {os}/{arch} - build from source \
              (cmake -DSD_BUILD_SERVER=ON) and place sd-server under the engines dir"
         )),
     }
@@ -1923,7 +1923,7 @@ pub fn sdcpp_asset_patterns(os: &str, arch: &str, nvidia: bool) -> Result<Vec<Sd
 /// GPU-shaped. Names verified against the b5130 asset list:
 /// `whisper-bin-ubuntu-x64.tar.gz`, `whisper-bin-ubuntu-arm64.tar.gz`,
 /// Windows cpu/cuda/opencl zips. macOS ships an xcframework library
-/// only — no server binary.
+/// only - no server binary.
 pub fn whisper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>> {
     match (os, arch) {
         ("linux", "x86_64" | "x64" | "amd64") => Ok(vec![SdAssetPattern {
@@ -1956,11 +1956,11 @@ pub fn whisper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern
             },
         ]),
         ("macos", _) => Err(anyhow!(
-            "whisper.cpp publishes no server binary for macOS (xcframework library only) — \
+            "whisper.cpp publishes no server binary for macOS (xcframework library only) - \
              build whisper-server from source and place it under the engines dir"
         )),
         (os, arch) => Err(anyhow!(
-            "whisper.cpp publishes no prebuilt for {os}/{arch} — build whisper-server \
+            "whisper.cpp publishes no prebuilt for {os}/{arch} - build whisper-server \
              from source and place it under the engines dir"
         )),
     }
@@ -1970,11 +1970,11 @@ pub fn whisper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern
 /// platform tarball per release (the six-asset table lives in
 /// [`crate::piper::asset_name`], single owner), so the pattern list has
 /// one entry and reuses that table instead of duplicating the names.
-/// Piper synthesizes on CPU — the pick is platform-shaped, like
+/// Piper synthesizes on CPU - the pick is platform-shaped, like
 /// whisper's.
 pub fn piper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>> {
     // The const table hands out a `&'static` slice of the matched asset
-    // name — the pattern struct requires static lifetimes.
+    // name - the pattern struct requires static lifetimes.
     const PIPER_ASSETS: &[&str] = &[
         "piper_linux_x86_64.tar.gz",
         "piper_linux_aarch64.tar.gz",
@@ -1985,7 +1985,7 @@ pub fn piper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>>
     ];
     let asset = crate::piper::asset_name(os, arch).ok_or_else(|| {
         anyhow!(
-            "piper publishes no {os}/{arch} prebuilt — build the CLI from source \
+            "piper publishes no {os}/{arch} prebuilt - build the CLI from source \
              (github.com/rhasspy/piper) and place it under the engines dir"
         )
     })?;
@@ -2032,7 +2032,7 @@ pub const MISTRALRS_SMS: [u32; 7] = [80, 86, 89, 90, 100, 120, 121];
 
 /// Parse `vX.Y.Z` numerically: missing patch = 0, `-rc.N` style
 /// pre-release suffixes ignored. Currency for v-tagged repos (mistral.rs,
-/// blazar self) must compare numerically — lexicographic order calls
+/// blazar self) must compare numerically - lexicographic order calls
 /// v0.10.0 a "downgrade" from v0.9.3.
 #[must_use]
 pub fn vtag_semver(tag: &str) -> Option<(u64, u64, u64)> {
@@ -2142,8 +2142,8 @@ pub const ENGINE_OVERLAY_REPO_ENV: &str = "BLAZAR_ENGINE_REPO";
 /// Overlay repo for the prebuilt CUDA channel: `BLAZAR_ENGINE_REPO`
 /// (e.g. a fork publishing `bNNNN-cuda` releases) when set to a
 /// non-empty value, else `None`. The project publishes no llama.cpp
-/// artifacts of its own — the default channel consumes upstream's
-/// official ubuntu-cuda assets directly — so an unset or empty env
+/// artifacts of its own - the default channel consumes upstream's
+/// official ubuntu-cuda assets directly - so an unset or empty env
 /// means "no overlay lane" and callers skip it without a probe.
 #[must_use]
 pub fn engine_overlay_repo() -> Option<String> {
@@ -2157,11 +2157,11 @@ pub fn engine_overlay_repo() -> Option<String> {
 /// `ubuntu-cuda-{X.Y}[-smNN]-{arch}` variant whose toolkit version does
 /// not exceed the driver's reported CUDA version. Works unchanged on
 /// upstream `bNNNN` releases (official ubuntu-cuda assets since b10969)
-/// and overlay `bNNNN-cuda` releases — the tag's lane suffix is
+/// and overlay `bNNNN-cuda` releases - the tag's lane suffix is
 /// stripped before matching. `arch` is `x64` or `arm64`: an x64 box must
 /// never resolve the arm64 asset and vice versa. The bundled
 /// cudart/cublas minor-version compatibility is deliberately NOT
-/// trusted — a driver older than the asset stays on the Vulkan lane
+/// trusted - a driver older than the asset stays on the Vulkan lane
 /// (today's behavior) instead of risking a child that cannot boot.
 #[must_use]
 pub fn resolve_cuda_asset(
@@ -2171,7 +2171,7 @@ pub fn resolve_cuda_asset(
     arch: &str,
 ) -> Option<AssetPick> {
     // Release tag carries the lane suffix (`b10941-cuda`) but the ASSET
-    // name embeds the bare upstream tag (`llama-b10941-bin-...`) — match
+    // name embeds the bare upstream tag (`llama-b10941-bin-...`) - match
     // run-8+ reality, verified against the published overlay release.
     let tag = release
         .tag_name
@@ -2275,7 +2275,7 @@ pub fn newest_asset_cuda(release: &GhRelease) -> Option<(u32, u32)> {
 
 /// Newest overlay release (`bNNNN-cuda`) at or below `target` whose
 /// release carries a driver-runnable CUDA asset. Pure selection over
-/// the overlay's release list — feeds the overlay-lag fallback (the
+/// the overlay's release list - feeds the overlay-lag fallback (the
 /// channel target is not published yet, so take the newest build that
 /// IS). Never returns anything newer than `target` and never one whose
 /// every asset exceeds the driver (that would recreate the very
@@ -2349,7 +2349,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blazar-stall-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("asset.part");
-        // A file that exists and never grows — the CDN-abuse trickle
+        // A file that exists and never grows - the CDN-abuse trickle
         // shape. Tiny window so the test runs in milliseconds.
         std::fs::write(&dest, vec![0u8; 4096]).unwrap();
         let never = std::future::pending::<()>();
@@ -2413,7 +2413,7 @@ mod tests {
     #[tokio::test]
     async fn unit__progress_guard__parallel_prealloc_shape_passes_via_ledger() {
         // The parallel lane's footprint: `.part` PREALLOCATED at full
-        // (sparse) size — constant for the whole download — plus a
+        // (sparse) size - constant for the whole download - plus a
         // `.part.progress` ledger rewritten per completed chunk. Size-
         // only watching false-trips this shape; the ledger credit must
         // carry it.
@@ -2508,7 +2508,7 @@ mod tests {
         let gh = GhClient::with_base(&server.uri(), None).unwrap();
         let rel = gh.release_by("test", Some("9.9.9")).await.unwrap();
         assert_eq!(rel.tag_name, "v9.9.9");
-        // The normalized v-tag resolved on the first request — no
+        // The normalized v-tag resolved on the first request - no
         // verbatim fallback attempt was made.
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
@@ -2542,7 +2542,7 @@ mod tests {
         let server = MockServer::start().await;
         // Transient 500s mounted first with a 2-hit cap, healthy answer
         // second: wiremock matches mounts in mount order, so the first
-        // two connections "drop" and the third serves — the same shape
+        // two connections "drop" and the third serves - the same shape
         // as an ISP resetting the first connections of a probe.
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(500))
@@ -2558,7 +2558,7 @@ mod tests {
         let gh = GhClient::with_base(&server.uri(), None).unwrap();
         let releases = gh.list_releases_repo(LLAMA_CPP_REPO).await.unwrap();
         assert_eq!(releases[0].tag_name, "b1");
-        // Both transient 500s were consumed before the 200 — the retry
+        // Both transient 500s were consumed before the 200 - the retry
         // policy did the recovering, not luck.
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
@@ -2596,7 +2596,7 @@ mod tests {
             "combined teaching error: {err}"
         );
         // Re-issuing past a 403 is what the rate limit asks us not to
-        // do — the API took exactly one hit, the web fallback one more.
+        // do - the API took exactly one hit, the web fallback one more.
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(web.received_requests().await.unwrap().len(), 1);
     }
@@ -2786,7 +2786,7 @@ mod tests {
         assert_eq!(pattern.label, "vulkan");
 
         // today's release (no CUDA zip yet) on an NVIDIA box: vulkan
-        // wins by absence — no error, no cpu mislabel
+        // wins by absence - no error, no cpu mislabel
         let today = rel(
             "master-890-74988b2",
             &[
@@ -2828,7 +2828,7 @@ mod tests {
 
     #[test]
     fn unit__whisper_asset_patterns__single_linux_tar_cpu_first_windows_no_mislabel() {
-        // Linux x86_64 has exactly one asset family (the ubuntu tar) —
+        // Linux x86_64 has exactly one asset family (the ubuntu tar) -
         // no fallback tier exists upstream.
         let lin = whisper_asset_patterns("linux", "x86_64").unwrap();
         assert_eq!(lin.len(), 1);
@@ -3319,7 +3319,7 @@ mod tests {
         let releases = vec![
             rel_cuda("b100-cuda", "12.8"),
             rel_cuda("b101-cuda", "13.0"), // newest <= target, unrunnable
-            rel_cuda("b102-cuda", "12.8"), // newer than target — excluded
+            rel_cuda("b102-cuda", "12.8"), // newer than target - excluded
             rel_cuda("b99-cuda", "13.0"),  // unrunnable AND older
             rel("b103", &[]),              // not an overlay tag
         ];
@@ -3435,7 +3435,7 @@ mod tests {
     #[test]
     fn unit__engine_overlay_repo__env_override_and_default() {
         // Env-dependent: assert both states without assuming the ambient
-        // value by pinning it explicitly. No default home exists — the
+        // value by pinning it explicitly. No default home exists - the
         // channel is upstream-direct, so unset/empty env disables the
         // overlay lanes rather than pointing them at a project repo.
         let saved = std::env::var(ENGINE_OVERLAY_REPO_ENV).ok();
@@ -3511,7 +3511,7 @@ mod tests {
         };
         let k1 = GhClient::asset_cache_key(&a);
         let k2 = GhClient::asset_cache_key(&a);
-        assert_eq!(k1, k2, "same asset → same key");
+        assert_eq!(k1, k2, "same asset -> same key");
         assert_eq!(
             k1.split('-').next().map(str::len),
             Some(16),
@@ -3533,7 +3533,7 @@ mod tests {
             "sanitized: {kb}"
         );
         assert!(kb.len() <= 16 + 1 + 64, "capped: {kb}");
-        // Different URL → different hash prefix (immutability keying).
+        // Different URL -> different hash prefix (immutability keying).
         let key_a = GhClient::asset_cache_key(&a);
         let c = GhAsset {
             browser_download_url: "https://example.com/rel/b11982/x.zip".into(),
@@ -3547,7 +3547,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let blob = tmp.path().join("deadbeefdeadbeef-asset.bin");
         std::fs::write(&blob, vec![1u8; 1024]).expect("blob");
-        // Declared size matches → hit.
+        // Declared size matches -> hit.
         let a = GhAsset {
             name: "asset.bin".into(),
             digest: None,
@@ -3555,7 +3555,7 @@ mod tests {
             browser_download_url: "https://example.com/a.bin".into(),
         };
         assert_eq!(cache_hit(&a, &blob), Some(1024));
-        // Mismatch → None, and the blob plus any in-flight part state
+        // Mismatch -> None, and the blob plus any in-flight part state
         // is evicted so the redownload starts clean.
         let stale = GhAsset {
             size: Some(4096),
@@ -3593,7 +3593,7 @@ mod tests {
     #[tokio::test]
     async fn unit__download_asset_file__second_download_hits_cache_not_network() {
         // serve_once drops its listener after one request: if the
-        // second download goes to the network it errors — only a cache
+        // second download goes to the network it errors - only a cache
         // hit can satisfy it.
         let body: &'static [u8] = Box::leak(vec![7u8; 300_000].into_boxed_slice());
         let url = serve_once(body);
@@ -3669,7 +3669,7 @@ mod tests {
     #[tokio::test]
     async fn unit__download_asset_file__concurrent_calls_serialize_on_blob_lock() {
         // Two installers racing the same asset must not both hit the
-        // network: serve_once allows exactly ONE request — the loser
+        // network: serve_once allows exactly ONE request - the loser
         // either waits for the blob lock and takes the cache hit, or
         // this test fails outright.
         let body: &'static [u8] = Box::leak(vec![9u8; 300_000].into_boxed_slice());
@@ -3737,12 +3737,12 @@ mod tests {
         );
         assert!(
             !dest.exists(),
-            "partial file removed on digest mismatch — a retry starts clean"
+            "partial file removed on digest mismatch - a retry starts clean"
         );
     }
 
     /// One-shot server that ADVERTISES a Content-Length larger than the
-    /// body it sends, then closes — the truncated-download failure shape
+    /// body it sends, then closes - the truncated-download failure shape
     /// (live case: 14 MiB of a 1+ GiB mistral.rs tarball accepted).
     fn serve_truncated(advertised_len: usize, send_len: usize) -> String {
         use std::io::{Read, Write};
@@ -3783,7 +3783,7 @@ mod tests {
         let url = serve_truncated(1_000_000, 140_000);
         let client = GhClient::with_base("http://127.0.0.1", None).expect("client");
         let mut a = asset(&url, None);
-        a.size = None; // no API size either — header/stream guard is the only net
+        a.size = None; // no API size either - header/stream guard is the only net
         let dest = std::env::temp_dir().join("blazar-gh-dl-pin-trunc.bin");
         let err = client
             .download_asset_file(&a, &dest)
@@ -3944,7 +3944,7 @@ mod tests {
     }
 
     /// Loopback server that ALWAYS answers 200 with the full body, even
-    /// to Range requests — the Range-incapable host shape. Serves any
+    /// to Range requests - the Range-incapable host shape. Serves any
     /// number of requests across connections.
     fn serve_200_loop(body: &'static [u8]) -> String {
         use std::io::{Read, Write};

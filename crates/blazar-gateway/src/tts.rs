@@ -1,8 +1,8 @@
-//! POST `/v1/audio/speech` + GET `/v1/audio/voices` — `OpenAI` TTS
+//! POST `/v1/audio/speech` + GET `/v1/audio/voices` - `OpenAI` TTS
 //! shape on the local piper lane.
 //!
 //! `model` IS the piper voice id (honest mapping: `en_US-amy-medium`),
-//! `response_format` speaks WAV (buffered, the default — a documented
+//! `response_format` speaks WAV (buffered, the default - a documented
 //! deviation: `OpenAI` defaults to mp3), `pcm`/`pcm16` (raw s16le PCM
 //! streamed sentence-by-sentence so time-to-first-audio scales with the
 //! first sentence instead of the whole document), and the lossy family
@@ -80,7 +80,7 @@ fn parse_speech_format(raw: Option<&str>) -> Result<SpeechFormat, String> {
         Some("aac") => Ok(SpeechFormat::Lossy(LossyFormat::Aac)),
         Some("flac") => Ok(SpeechFormat::Lossy(LossyFormat::Flac)),
         Some(other) => Err(format!(
-            "response_format {other:?} is not supported on the local lane — supported: \
+            "response_format {other:?} is not supported on the local lane - supported: \
              \"wav\" (default), \"pcm\"/\"pcm16\" (raw streamed s16le), and \"mp3\", \
              \"opus\", \"aac\", \"flac\" (transcoded via the system ffmpeg)"
         )),
@@ -88,8 +88,8 @@ fn parse_speech_format(raw: Option<&str>) -> Result<SpeechFormat, String> {
 }
 
 /// Egress lane combining `response_format` with the optional `stream`
-/// flag. PCM always streams — it is the raw streaming format, byte-stable
-/// with the pre-flag contract — so the flag only upgrades the lossy
+/// flag. PCM always streams - it is the raw streaming format, byte-stable
+/// with the pre-flag contract - so the flag only upgrades the lossy
 /// family from a buffered transcode to a streaming one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamLane {
@@ -109,7 +109,7 @@ fn stream_lane(format: SpeechFormat, stream: bool) -> Result<StreamLane, String>
         (SpeechFormat::Pcm, _) => Ok(StreamLane::PcmStream),
         (_, false) => Ok(StreamLane::Buffered),
         (SpeechFormat::Wav, true) => Err(
-            "streaming wav is not supported — a WAV header needs total lengths up front; \
+            "streaming wav is not supported - a WAV header needs total lengths up front; \
              use \"pcm\" (raw s16le) or a lossy format (\"mp3\", \"opus\", \"aac\", \
              \"flac\"), or drop \"stream\" for the buffered wav"
                 .to_string(),
@@ -129,7 +129,7 @@ fn parse_native_options(req: &Value) -> Result<blazar_runtime::piper::SpeakOptio
         && !raw.is_null()
     {
         return Err(
-            "instructions is not supported — piper voices are fixed personalities with no \
+            "instructions is not supported - piper voices are fixed personalities with no \
              style steering; pick a different voice (model) instead"
                 .to_string(),
         );
@@ -169,8 +169,8 @@ fn parse_native_options(req: &Value) -> Result<blazar_runtime::piper::SpeakOptio
     Ok(opts)
 }
 
-/// ffmpeg argv after the program name: WAV on stdin → the requested
-/// container on stdout. Enum-derived only — no client string reaches
+/// ffmpeg argv after the program name: WAV on stdin -> the requested
+/// container on stdout. Enum-derived only - no client string reaches
 /// the process.
 #[must_use]
 fn ffmpeg_argv(format: LossyFormat) -> Vec<String> {
@@ -197,9 +197,9 @@ fn ffmpeg_argv(format: LossyFormat) -> Vec<String> {
 }
 
 /// ffmpeg argv for the STREAMING transcode lane: raw s16le mono PCM on
-/// stdin → the requested container on stdout. `-ar`/`-ac` pin the input
+/// stdin -> the requested container on stdout. `-ar`/`-ac` pin the input
 /// shape to the voice's own sample rate so piper's raw bytes need no WAV
-/// header. Enum-derived only — no client string reaches the process.
+/// header. Enum-derived only - no client string reaches the process.
 #[must_use]
 fn ffmpeg_stream_argv(format: LossyFormat, sample_rate: u32) -> Vec<String> {
     let (muxer, codec, extra, _) = format.parts();
@@ -250,7 +250,7 @@ fn limit_pcm16_peak(pcm: &mut [u8]) {
 
 /// Teaching for a missing ffmpeg, shared by the buffered and streaming
 /// transcode lanes so the story stays identical.
-const FFMPEG_ABSENT_TEACH: &str = "ffmpeg is not on PATH — mp3/opus/aac/flac transcode \
+const FFMPEG_ABSENT_TEACH: &str = "ffmpeg is not on PATH - mp3/opus/aac/flac transcode \
      through the system ffmpeg; \"wav\" (default) and \"pcm\" need none. Install \
      ffmpeg or switch response_format";
 
@@ -344,7 +344,7 @@ pub async fn audio_speech(
         return openai_error(
             400,
             &format!(
-                "input is {} chars (max {MAX_INPUT_CHARS}) — split long documents",
+                "input is {} chars (max {MAX_INPUT_CHARS}) - split long documents",
                 text.chars().count()
             ),
         );
@@ -389,7 +389,7 @@ pub async fn audio_speech(
         .await;
     }
 
-    // Local lane — same admission the remote branch just paid (audit
+    // Local lane - same admission the remote branch just paid (audit
     // MM1): scope on the voice id (this lane's "model") + rpm/tpm/daily
     // + request charge. Local synthesis is not a free lane.
     if let Err(resp) = state.admit_or_respond(key_ext.as_ref(), voice) {
@@ -397,8 +397,8 @@ pub async fn audio_speech(
     }
 
     // Local lane. WAV: one buffered synthesis (existing contract). PCM:
-    // synthesize the first sentence eagerly — a missing voice or lane
-    // still maps to its teaching status before any bytes flow — then
+    // synthesize the first sentence eagerly - a missing voice or lane
+    // still maps to its teaching status before any bytes flow - then
     // stream the rest so time-to-first-audio tracks the first sentence,
     // not the whole document.
     if matches!(lane, StreamLane::PcmStream) {
@@ -489,14 +489,14 @@ pub async fn audio_speech(
 
     // Streaming lossy ("stream": true + mp3/opus/aac/flac): one persistent
     // ffmpeg fed raw s16le per sentence, so time-to-first-audio tracks the
-    // first sentence for the lossy family too — the posture the PCM lane
+    // first sentence for the lossy family too - the posture the PCM lane
     // has always had. The voice's own sample rate pins ffmpeg's input
     // shape; unreadable voice config teaches instead of guessing.
     if let StreamLane::LossyStream(lossy) = lane {
         let Some(sample_rate) = blazar_runtime::piper::voice_sample_rate(&state.dirs, voice) else {
             return openai_error(
                 400,
-                "voice config is unreadable (missing or malformed .onnx.json) — the \
+                "voice config is unreadable (missing or malformed .onnx.json) - the \
                  streaming transcode needs the voice's sample_rate; retry without \
                  \"stream\": true (the buffered lane reads it from the WAV header)",
             );
@@ -627,7 +627,7 @@ pub async fn audio_speech(
                 Ok(status) if status.success() => {}
                 Ok(status) => {
                     tracing::warn!(
-                        "speech lossy stream: ffmpeg exited {status} — stream truncated"
+                        "speech lossy stream: ffmpeg exited {status} - stream truncated"
                     );
                 }
                 Err(e) => tracing::warn!("speech lossy stream: ffmpeg wait failed: {e}"),
@@ -645,7 +645,7 @@ pub async fn audio_speech(
     }
 
     // Local lane: the runtime error carries the exact teaching (install
-    // vs pull vs voice list) — pass it through with the right status.
+    // vs pull vs voice list) - pass it through with the right status.
     let wav = match blazar_runtime::piper::synthesize(
         &state.dirs,
         voice,
@@ -703,7 +703,7 @@ fn voice_row(id: &str, installed: bool, bytes: Option<u64>) -> Value {
     row
 }
 
-/// Remote catalog rows kept per search response — enough to choose a
+/// Remote catalog rows kept per search response - enough to choose a
 /// voice without dumping the whole multi-thousand-voice tree.
 const VOICES_SEARCH_CAP: usize = 50;
 /// Remote search query cap; the catalog match is a plain substring, so
@@ -713,7 +713,7 @@ const VOICES_QUERY_MAX_CHARS: usize = 100;
 /// language directory).
 const VOICES_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// GET `/v1/audio/voices` — installed piper voices, plus an optional
+/// GET `/v1/audio/voices` - installed piper voices, plus an optional
 /// `?search=` probe of the upstream `rhasspy/piper-voices` catalog
 /// (results capped, marked with installed state). Boots nothing. A
 /// failed search keeps the installed list and surfaces the error as
@@ -798,14 +798,14 @@ fn tts_error(e: &anyhow::Error) -> Response {
 
 /// Piper normalises synthesis to full scale: every WAV peaks at exactly
 /// 0 dBFS, one sample away from clipping under any downstream gain. The
-/// egress scales such peaks down to this ceiling (−1 dBFS) instead of
-/// touching synthesis — quiet audio stays byte-identical because the
+/// egress scales such peaks down to this ceiling (-1 dBFS) instead of
+/// touching synthesis - quiet audio stays byte-identical because the
 /// scale only applies when the peak would exceed it.
 const PEAK_CEILING: f32 = 0.891_250_9; // 10^(-1/20)
 
 /// Scale a PCM16LE WAV's peak down to [`PEAK_CEILING`] when (and only
 /// when) it exceeds it. Anything unexpected in the container is passed
-/// through untouched with a warn log — honest, scope-bounded egress.
+/// through untouched with a warn log - honest, scope-bounded egress.
 pub(crate) fn limit_wav_peak(mut wav: Vec<u8>) -> Vec<u8> {
     match limit_wav_peak_in_place(&mut wav) {
         Ok(()) => wav,
@@ -885,7 +885,7 @@ fn locate_pcm16(wav: &[u8]) -> Result<WavLayout, String> {
 }
 
 /// Sentence chunking for the PCM stream. Sentences end at `.`, `!`, `?`,
-/// `…` or a newline ONLY when followed by whitespace or end-of-text (so
+/// `...` or a newline ONLY when followed by whitespace or end-of-text (so
 /// decimals like `3.14` and abbreviations stay intact), then group into
 /// chunks of at least [`STREAM_MIN_CHUNK_CHARS`] so piper is not spawned
 /// per word, hard-splitting anything over [`STREAM_MAX_CHUNK_CHARS`] so
@@ -895,7 +895,7 @@ const STREAM_MAX_CHUNK_CHARS: usize = 600;
 
 fn split_streaming_chunks(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
-    let terminator = |c: char| matches!(c, '.' | '!' | '?' | '…' | '\n');
+    let terminator = |c: char| matches!(c, '.' | '!' | '?' | '\u{2026}' | '\n');
     let mut sentences: Vec<String> = Vec::new();
     let mut cur = String::new();
     for (i, &c) in chars.iter().enumerate() {
@@ -1273,7 +1273,7 @@ mod tests {
             stream_lane(SpeechFormat::Lossy(LossyFormat::Mp3), false),
             Ok(StreamLane::Buffered)
         );
-        // PCM always streams — flag or not (the pre-flag contract).
+        // PCM always streams - flag or not (the pre-flag contract).
         assert_eq!(
             stream_lane(SpeechFormat::Pcm, false),
             Ok(StreamLane::PcmStream)

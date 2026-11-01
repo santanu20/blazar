@@ -1,6 +1,6 @@
-//! `blazar explain <model>` / `GET /api/explain/{model}` — the effective
+//! `blazar explain <model>` / `GET /api/explain/{model}` - the effective
 //! configuration card, with provenance for every value it shows. Answers
-//! the ollama#18229 class of confusion ("loaded context length: 32768 —
+//! the ollama#18229 class of confusion ("loaded context length: 32768 -
 //! but WHERE did 32768 come from?") before the user has to go digging:
 //! each line names its source (overlay pin, config default, or the live
 //! child's argv) and admits `unknown` when the value is only decided at
@@ -8,7 +8,7 @@
 //!
 //! Data sources are all existing surfaces: the store (model row, engine
 //! rows), `Config::effective_*` resolution (overlay > global), the
-//! supervisor census (`ps()` — what the live child actually holds), and
+//! supervisor census (`ps()` - what the live child actually holds), and
 //! the spec-mode tiering shared with the supervisor. Nothing here spawns
 //! a child or compiles a profile: explain is read-only and honest about
 //! what only a spawn can decide.
@@ -35,7 +35,7 @@ pub fn lane_reason(
     policy: RoutingPolicy,
 ) -> String {
     if matches!(mode, RoutingMode::Manual) {
-        return "engine_routing.mode = manual — the active engine serves every model".into();
+        return "engine_routing.mode = manual - the active engine serves every model".into();
     }
     if pin.is_some() {
         return "model_overrides.<model>.engine pins the lane".into();
@@ -47,7 +47,7 @@ pub fn lane_reason(
         // Checked before the quantized-safetensors arm, mirroring
         // route_format: only mlx-lm decodes MLX dirs, so the format
         // forces the lane ahead of any policy preference.
-        return "MLX quant dir — the mlx lane is the only decoder, format-forced ahead of policy"
+        return "MLX quant dir - the mlx lane is the only decoder, format-forced ahead of policy"
             .into();
     }
     if shape.shards == ShardFormat::QuantizedSafetensors {
@@ -60,7 +60,7 @@ pub fn lane_reason(
             "HF safetensors dir under engine_routing.policy = {policy:?} picks the lane"
         );
     }
-    "GGUF file with no overlay pin — the global active lane serves it".into()
+    "GGUF file with no overlay pin - the global active lane serves it".into()
 }
 
 /// Where the REQUESTED ctx number came from (overlay pin vs config
@@ -79,7 +79,7 @@ pub fn requested_ctx_source(overlay_ctx_set: bool, model: &str, default_ctx: u32
 /// Pure for pinning.
 #[must_use]
 pub fn cold_ctx_note() -> &'static str {
-    "config estimate — model not resident; the spawn-time planner may shrink it to fit VRAM"
+    "config estimate - model not resident; the spawn-time planner may shrink it to fit VRAM"
 }
 
 /// The honest quant label for an MLX dir: the quantization block in
@@ -106,7 +106,7 @@ pub fn mlx_quant_display(path: &str) -> String {
     }
 }
 
-/// `GET /api/explain/{model}` — the effective-config card.
+/// `GET /api/explain/{model}` - the effective-config card.
 /// Store lookup for the routing lane: (global tag, lane resolution).
 type LaneLookup = (
     Option<String>,
@@ -117,8 +117,8 @@ type LaneLookup = (
 pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
     // Store resolution first: unknown models fail with teaching, never a
     // half-empty card that looks authoritative.
-    // Canonical gateway ladder (exact → colon-swap → colonless strip →
-    // prefix → suggestion) so the `name:quant` display form /api/tags emits
+    // Canonical gateway ladder (exact -> colon-swap -> colonless strip ->
+    // prefix -> suggestion) so the `name:quant` display form /api/tags emits
     // resolves here exactly like it does on /api/chat.
     let resolved = match state.with_store(|s| crate::proxy::resolve_model(s, &model)) {
         Some(Ok(row)) => row.name,
@@ -126,7 +126,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         None => {
             return crate::error_response(
                 404,
-                "store unavailable — start the daemon with a writable data dir",
+                "store unavailable - start the daemon with a writable data dir",
             );
         }
     };
@@ -134,7 +134,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         return crate::error_response(
             404,
             &format!(
-                "unknown model: {model} — `blazar ls` lists the store, `blazar pull` adds one"
+                "unknown model: {model} - `blazar ls` lists the store, `blazar pull` adds one"
             ),
         );
     };
@@ -166,7 +166,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         let Some((g_tag, g_kind)) = global else {
             return (
                 None,
-                Err("no engine installed — blazar engine install --kind <kind>".into()),
+                Err("no engine installed - blazar engine install --kind <kind>".into()),
             );
         };
         let installed: Vec<(
@@ -203,7 +203,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             "tag": g_tag,
             "kind": Value::Null,
             "source": "global",
-            "reason": "no per-model lane resolved — the global active engine serves it",
+            "reason": "no per-model lane resolved - the global active engine serves it",
         }),
         Some((_, Err(teach))) => json!({
             "tag": Value::Null,
@@ -212,17 +212,17 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             "reason": teach,
         }),
         // with_store returned None: the store was open for the model row
-        // moments ago and closed under us — surface, never guess.
+        // moments ago and closed under us - surface, never guess.
         None => json!({
             "tag": Value::Null,
             "kind": Value::Null,
             "source": "error",
-            "reason": "store unavailable — engine rows unreadable",
+            "reason": "store unavailable - engine rows unreadable",
         }),
     };
 
     // Context: requested (config precedence) vs effective (what a live
-    // child actually holds — admission_ctx's discipline, stated with
+    // child actually holds - admission_ctx's discipline, stated with
     // sources).
     let requested = state.config.effective_ctx(&resolved);
     let resident_ctx = state
@@ -233,11 +233,11 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         .map(|p| p.ctx);
     let context = if shape.shards == ShardFormat::MlxLayout {
         // mlx_lm owns the context window: the gateway passes no ctx flag
-        // (compile_mlx ships ctx 0) — the shrink-to-fit ladder is a
+        // (compile_mlx ships ctx 0) - the shrink-to-fit ladder is a
         // llama.cpp concept that does not govern this lane.
         json!({
             "requested": "runtime-managed",
-            "requested_source": "mlx_lm owns the context window — no gateway ctx knob for this lane",
+            "requested_source": "mlx_lm owns the context window - no gateway ctx knob for this lane",
             "effective": "runtime-managed",
             "effective_source": "mlx_lm",
             "limitation": "kv-bits / kv-group-size / prompt-cache flags pass through model_overrides argv",
@@ -264,7 +264,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     };
 
     // Slots: live census when resident; honest "sized at spawn" otherwise.
-    // PsRow slot fields are Option (mid-reshape / slot-less engines) — the
+    // PsRow slot fields are Option (mid-reshape / slot-less engines) - the
     // card passes them through rather than guessing.
     let residents: Vec<Value> = state
         .sup
@@ -279,7 +279,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
                 "slots_configured": p.slots_configured,
                 "in_flight": p.in_flight,
                 "ctx": p.ctx,
-                // Runtime-managed lanes only — see ollama::ps; keeps a
+                // Runtime-managed lanes only - see ollama::ps; keeps a
                 // mlx ceiling from reading as a compiled window here too.
                 "capacity": p.capacity,
                 "gpu": p.gpu,
@@ -305,7 +305,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
 
     // Speculation: a live spawn's receipts when resident (its own
     // spec_mode + draft), else the STATIC tier (overlay > config). The
-    // per-request override and the spec governor sit above both — say so,
+    // per-request override and the spec governor sit above both - say so,
     // never pretend the static answer is the whole truth.
     let live_spec = residents
         .iter()
@@ -431,7 +431,7 @@ fn kv_advisory(
             Some("cache_type_k = \"q8_0\" + cache_type_v = \"q8_0\""),
             if long_ctx {
                 "effective ctx >= 32k: q8_0 KV roughly halves the KV footprint with \
-                 near-lossless quality — the standard first step when ctx or VRAM is tight"
+                 near-lossless quality - the standard first step when ctx or VRAM is tight"
             } else {
                 "KV stays f16 unless ctx or VRAM pressure appears (q8_0 is the first \
                  step when it does)"
@@ -470,13 +470,13 @@ fn kv_advisory(
 
 /// Measured KV-quant quality receipts (populated by the ppl A/B
 /// campaign: llama-perplexity on a fixed corpus, identical ctx, only
-/// the cache types varied). The registry now lives in blazar-core —
+/// the cache types varied). The registry now lives in blazar-core -
 /// the tuner's quality-eligibility gate reads the same file, and two
 /// compiled-in copies would drift. The ladder ordering above is
 /// documented llama.cpp behavior; these receipts are the measured
 /// proof for the exact checkpoints that were benched, with conditions
 /// stamped in the artifact the `source` field names. Unknown model =
-/// honest null — a number borrowed from a different checkpoint would
+/// honest null - a number borrowed from a different checkpoint would
 /// be fabrication.
 fn kv_quality_receipts() -> &'static Value {
     blazar_core::kv_quality::receipts()
@@ -491,8 +491,8 @@ fn kv_model_key(model: &str) -> String {
 }
 
 /// Pure matcher so tests can pin the lookup without touching the
-/// compiled-in registry. Returns every receipt for the model — one per
-/// measured context window — as a JSON array, or `Value::Null` when the
+/// compiled-in registry. Returns every receipt for the model - one per
+/// measured context window - as a JSON array, or `Value::Null` when the
 /// model has never been measured. Multiple windows (e.g. ctx 2048 and
 /// 32768) are distinct receipts, not competing numbers.
 fn kv_quality_measured_from(registry: &Value, model: &str) -> Value {
@@ -657,7 +657,7 @@ mod tests {
     fn unit__lane_reason__mlx_dir_is_format_forced_before_policy() {
         use blazar_core::config::{RoutingMode, RoutingPolicy as P};
         // MLX arm must fire even when the quantized-safetensors shape would
-        // otherwise claim the row for policy-based sglang routing — the
+        // otherwise claim the row for policy-based sglang routing - the
         // router checks the mlx axis first and so does this string.
         assert_eq!(
             lane_reason(
@@ -666,7 +666,7 @@ mod tests {
                 fs(false, ShardFormat::MlxLayout),
                 P::Quality
             ),
-            "MLX quant dir — the mlx lane is the only decoder, format-forced ahead of policy"
+            "MLX quant dir - the mlx lane is the only decoder, format-forced ahead of policy"
         );
     }
 
@@ -682,7 +682,7 @@ mod tests {
                 ShardFormat::GgufFile,
                 P::Quality
             ),
-            "engine_routing.mode = manual — the active engine serves every model"
+            "engine_routing.mode = manual - the active engine serves every model"
         );
         assert_eq!(
             r(
@@ -728,7 +728,7 @@ mod tests {
                 ShardFormat::GgufFile,
                 P::Quality
             ),
-            "GGUF file with no overlay pin — the global active lane serves it"
+            "GGUF file with no overlay pin - the global active lane serves it"
         );
     }
 

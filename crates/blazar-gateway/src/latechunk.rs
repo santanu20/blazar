@@ -7,11 +7,11 @@
 //!
 //! Wire protocol (verified against the vendored llama.cpp server):
 //! - `POST /tokenize {content, add_special: false, with_pieces: true}` ->
-//!   `{tokens: [{id, piece: "str" | [bytes]}]}` — exact token stream, no
+//!   `{tokens: [{id, piece: "str" | [bytes]}]}` - exact token stream, no
 //!   BOS; pieces reconstruct the input byte-for-byte for walkable offsets.
 //! - `POST /embedding {content: [token ids]}` (legacy route; the OAI
 //!   `/v1/embeddings` route rejects `--pooling none` as not OAI-compatible
-//!   on stable b10809) — an id array is used
+//!   on stable b10809) - an id array is used
 //!   raw (`tokenize_input_prompts` numbers branch), so matrix row i is
 //!   embedding of token i, no special tokens added, alignment exact.
 
@@ -65,7 +65,7 @@ pub fn piece_walk(doc: &[u8], pieces: &[Vec<u8>]) -> Result<Vec<TokenSpan>, Stri
 }
 
 /// Map tokens to chunks: a token belongs to the chunk that contains its
-/// START byte (jina semantics — tokens merged across a chunk boundary
+/// START byte (jina semantics - tokens merged across a chunk boundary
 /// carry both chunks' context into the earlier chunk). `chunk_bytes` is
 /// each chunk's byte length. Tokens arrive in document order, so a
 /// monotonic cursor classifies them; a chunk whose every byte was merged
@@ -101,7 +101,7 @@ pub fn chunk_token_spans(
 /// upstream mean-pooling: normalize after pooling). A chunk that received
 /// zero tokens (its text fully merged into a token starting in the
 /// previous chunk) falls back to the vector of the token covering its
-/// start byte — dimension stays correct and the context is the one the
+/// start byte - dimension stays correct and the context is the one the
 /// chunk physically lives in.
 pub fn pool_spans(
     matrix: &[Vec<f64>],
@@ -169,7 +169,7 @@ pub fn synthetic_spans(n_tokens: usize) -> Vec<TokenSpan> {
 
 /// Full late-chunking pipeline for string inputs.
 ///
-/// Errors are `(http_status, message)` — explicit, never silent: 400 bad
+/// Errors are `(http_status, message)` - explicit, never silent: 400 bad
 /// input, 413 over token cap / context budget, 422 tokenizer cannot be
 /// offset-walked, 502 child misbehaving (e.g. not actually pooling=none).
 pub async fn late_embed(
@@ -210,7 +210,7 @@ fn guard_token_budget(
 ) -> Result<(), (u16, String)> {
     let cap = state.config.late_chunking_max_tokens;
     // F71: `cap` is an inclusive maximum (a doc of exactly cap tokens is
-    // admissible) — reject only strictly over, matching the message
+    // admissible) - reject only strictly over, matching the message
     // wording; the 90%-ctx margin below keeps its at-margin rejection.
     if n_tokens > cap {
         return Err((
@@ -392,7 +392,7 @@ async fn fetch_matrix(
                 "embedding response missing per-token matrix".to_string(),
             )
         })?;
-    // F72: strict like the semcache sibling — a non-numeric entry is a
+    // F72: strict like the semcache sibling - a non-numeric entry is a
     // malformed matrix and must fail loud, never silently zero-filled.
     let mut rows: Vec<Vec<f64>> = Vec::with_capacity(matrix.len());
     for row in matrix {
@@ -411,7 +411,7 @@ async fn fetch_matrix(
         return Err((
             502,
             format!(
-                "engine returned {} embedding rows for {} tokens — child is not running \
+                "engine returned {} embedding rows for {} tokens - child is not running \
                  --pooling none; evict and reload the model (blazar stop/start or keep_alive \
                  cycle) so the late_chunking profile applies",
                 rows.len(),

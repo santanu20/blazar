@@ -2,7 +2,7 @@
 //!
 //! Redacts the obvious classes that can leak through record details:
 //! emails, blazar bearer secrets (`plm_...`) and IPv4 addresses. Hand-
-//! scanned — no regex dependency, no allocation beyond the output. Numbers,
+//! scanned - no regex dependency, no allocation beyond the output. Numbers,
 //! codes and latencies pass through untouched so `why` stays diagnostic.
 
 use serde_json::Value;
@@ -60,8 +60,8 @@ pub fn scrub_str(s: &str) -> String {
             continue;
         }
         // Non-ASCII: preserve the whole multi-byte char byte-exactly.
-        // (`bytes[i] as char` re-interprets the first byte as Latin-1 —
-        // mojibake — and the `+1` advance lands mid-char, which panics
+        // (`bytes[i] as char` re-interprets the first byte as Latin-1 -
+        // mojibake - and the `+1` advance lands mid-char, which panics
         // on the next `s[i..]` slice.)
         let ch = s[i..].chars().next().unwrap_or('\u{fffd}');
         out.push(ch);
@@ -84,7 +84,7 @@ fn scan_word(s: &str, start: usize) -> (String, usize) {
 /// Consume `[word@domain.tld]` (local part may contain dots) starting at
 /// `start`; None = not an email.
 fn scan_email(s: &str, start: usize) -> Option<usize> {
-    // F84: dotted locals ("first.last@x.com") — the old scan stopped at
+    // F84: dotted locals ("first.last@x.com") - the old scan stopped at
     // the first dot and leaked the local prefix ahead of the redaction.
     let bytes = s.as_bytes();
     let mut i = start;
@@ -93,7 +93,7 @@ fn scan_email(s: &str, start: usize) -> Option<usize> {
     while i < bytes.len() && (is_word(bytes[i]) || bytes[i] == b'.') {
         if bytes[i] == b'.' {
             if !any || prev_dot {
-                return None; // leading or doubled dot — not a local part
+                return None; // leading or doubled dot - not a local part
             }
             prev_dot = true;
         } else {
@@ -229,7 +229,7 @@ mod tests {
         assert!(!out.contains("first"), "{out}");
         assert!(!out.contains("last"), "{out}");
         assert_eq!(out.matches("[email redacted]").count(), 1, "{out}");
-        // Malformed locals never yield a FULL intact address — either the
+        // Malformed locals never yield a FULL intact address - either the
         // address-shaped suffix gets redacted (conservative) or nothing
         // email-shaped existed (trailing-dot case passes through).
         let out = scrub_str("a..b@x.com");

@@ -1,15 +1,15 @@
-//! `POST /v1/classify` — classification as a first-class lane.
+//! `POST /v1/classify` - classification as a first-class lane.
 //!
 //! Decision models (modern-bert classifiers, e.g. Laya-class system-one
 //! scorers) answer with a label distribution, not prose. Two upstream
 //! dialects feed this lane: llama-server's `/v1/systemone` (native
 //! decision checkpoints) and sglang's `/v1/decisions` (typed questions
-//! on ANY chat model with a chat template — live-verified on the 0.5.21
+//! on ANY chat model with a chat template - live-verified on the 0.5.21
 //! release child, 2026-10-12). Both normalize behind a stable contract:
 //! `{model, input, labels[]}` in, `{labels: [{label, probability}],
 //! top, confidence}` out. Translation rides `openai_proxy`, so
 //! admission, routing, the per-lane gate, child auth and retries
-//! are all the proven pipeline — classify only reshapes the two ends.
+//! are all the proven pipeline - classify only reshapes the two ends.
 
 use std::sync::Arc;
 
@@ -21,14 +21,14 @@ use serde_json::Value;
 
 use crate::state::AppState;
 
-/// Maximum labels in one request — the child renders every criterion
+/// Maximum labels in one request - the child renders every criterion
 /// into the prompt; a bound keeps a typo'd unbounded array from
 /// becoming a context bomb.
 pub const CLASSIFY_MAX_LABELS: usize = 16;
 
 /// Pure: `{model, input, labels[]}` -> a `/v1/systemone` body. `None`
 /// when the shape is unusable (missing model/input, <2 or >16 labels,
-/// duplicate/empty labels). Criteria keys carry the labels verbatim —
+/// duplicate/empty labels). Criteria keys carry the labels verbatim -
 /// the child's response keys them back by the same strings.
 #[must_use]
 pub fn classify_request_to_systemone(v: &Value) -> Option<Value> {
@@ -108,7 +108,7 @@ pub fn systemone_to_classify(v: &Value) -> Option<Value> {
 /// Same validation contract as the systemone translation (one shared
 /// shape in, per-dialect bodies out). One `choice` question keyed `q1`
 /// so the answer normalizer mirrors the systemone path; options carry
-/// the labels verbatim — the child's probabilities key back by name.
+/// the labels verbatim - the child's probabilities key back by name.
 #[must_use]
 pub fn classify_request_to_decisions(v: &Value) -> Option<Value> {
     let model = v.get("model")?.as_str()?.to_string();

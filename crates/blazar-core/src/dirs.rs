@@ -6,7 +6,7 @@ use std::path::PathBuf;
 fn warn_fallback(what: &str) {
     eprintln!(
         "blazar: {what} not found (HOME unset?); falling back to the \
-         current directory — set HOME or XDG_* to pin the layout"
+         current directory - set HOME or XDG_* to pin the layout"
     );
 }
 
@@ -30,7 +30,7 @@ impl BlazarDirs {
     /// would pick (macOS `~/Library/Application Support`, Windows
     /// `%APPDATA%`). The override is deliberate user intent; the default
     /// stays whatever the platform expects when the env is unset.
-    /// F123: a missing HOME/XDG root falls back to CWD — loudly. The old
+    /// F123: a missing HOME/XDG root falls back to CWD - loudly. The old
     /// silent `.` fallback hid a broken env until files started landing
     /// in whatever directory the daemon happened to start from.
     #[must_use]
@@ -131,7 +131,7 @@ mod tests {
     #[allow(non_snake_case)] // house test naming: unit__area__behavior
     fn unit__dirs_ensure__config_dir_is_owner_only() {
         // BLZ-4 pin: the config dir holds the persisted [[keys]] bearer
-        // secrets and must end 0700 — including when a pre-existing
+        // secrets and must end 0700 - including when a pre-existing
         // install left it world-readable (the heal-on-boot case).
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();

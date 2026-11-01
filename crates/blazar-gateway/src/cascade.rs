@@ -1,8 +1,8 @@
 //! Agentic cascade routing (A3): try a chain of models cheap-first and
 //! escalate only when a candidate's answer fails the quality bar. The
-//! judge reuses the best-of-N ladder semantics — a candidate passes when
+//! judge reuses the best-of-N ladder semantics - a candidate passes when
 //! it answered 2xx, matched the requested schema (if any) and finished
-//! cleanly — so a request served by the first candidate costs exactly one
+//! cleanly - so a request served by the first candidate costs exactly one
 //! small-model call (AgentRouter-lineage behavior: most agentic steps
 //! route to the smaller model; only the failures pay the big one).
 
@@ -70,11 +70,11 @@ pub(crate) fn resolve_cascade(
         }
     };
     if names.is_empty() {
-        return Err("cascade list is empty — name at least one model".into());
+        return Err("cascade list is empty - name at least one model".into());
     }
     if names.len() > MAX_CASCADE {
         return Err(format!(
-            "cascade lists {} models — the cap is {MAX_CASCADE}",
+            "cascade lists {} models - the cap is {MAX_CASCADE}",
             names.len()
         ));
     }
@@ -82,7 +82,7 @@ pub(crate) fn resolve_cascade(
         && !header_pinned
         && arr.is_empty()
     {
-        return Err("cascade list is empty — name at least one model".into());
+        return Err("cascade list is empty - name at least one model".into());
     }
     Ok(Some(names))
 }
@@ -138,7 +138,7 @@ fn cascade_header(tried: &[String], served_idx: usize, reason: &str) -> String {
 /// point of the chain). None-passed serves the LAST candidate's answer
 /// with an honest marker.
 ///
-/// Returns `None` when the request had no cascade ask — the caller's
+/// Returns `None` when the request had no cascade ask - the caller's
 /// normal path continues untouched.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(
@@ -157,13 +157,13 @@ pub(crate) async fn run(
     if asks_stream {
         return Some(crate::ollama::api_error(
             400,
-            "cascade requires stream=false — a cascade winner cannot be judged before completion",
+            "cascade requires stream=false - a cascade winner cannot be judged before completion",
         ));
     }
     if serde_json::to_vec(req).map_or(true, |b| b.len() > MAX_CASCADE_BODY_BYTES) {
         return Some(crate::ollama::api_error(
             400,
-            "cascade is unavailable for bodies over 1 MiB — send the prompt to one model directly",
+            "cascade is unavailable for bodies over 1 MiB - send the prompt to one model directly",
         ));
     }
     CASCADE_RUNS.fetch_add(1, Ordering::Relaxed);
@@ -179,7 +179,7 @@ pub(crate) async fn run(
             .filter(|n| state.sup.decode_rate_for(n).is_some())
             .count();
         if hinted >= 2 {
-            // Same request ⇒ queue/headroom/prompt/output are equal for
+            // Same request => queue/headroom/prompt/output are equal for
             // every candidate; only rate + cache differentiate.
             let cost = |name: &str| -> f64 {
                 blazar_runtime::supervisor::route_cost(
@@ -210,7 +210,7 @@ pub(crate) async fn run(
             child_req["model"] = Value::String(name.clone());
         }
         let bytes = Bytes::from(serde_json::to_vec(&child_req).ok()?);
-        // Boxed: this re-entry is the recursive edge (chat → run → chat);
+        // Boxed: this re-entry is the recursive edge (chat -> run -> chat);
         // the indirection keeps the future sized (E0733).
         let resp = Box::pin(crate::ollama::chat(
             State(state.clone()),

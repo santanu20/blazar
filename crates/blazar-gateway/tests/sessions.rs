@@ -1,4 +1,4 @@
-//! R3 session pins — integration tests over the real router + stub child:
+//! R3 session pins - integration tests over the real router + stub child:
 //! header touch through the middleware, pass-through without the header,
 //! idempotent close, and the /api/sessions listing.
 
@@ -26,7 +26,7 @@ async fn integration__pin_mw__header_pins_model_full_stack() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    // Canonical model pinned through the whole stack (auth → … → pin → handler).
+    // Canonical model pinned through the whole stack (auth -> ... -> pin -> handler).
     assert!(
         ts.state
             .sup
@@ -104,7 +104,7 @@ async fn integration__session_close__releases_pin_idempotently() {
             .live
     );
 
-    // Close: no model, no filename — the pin is enough.
+    // Close: no model, no filename - the pin is enough.
     let r: serde_json::Value = c
         .post(format!("{}/api/session", ts.base))
         .json(&serde_json::json!({"action": "close", "session": "agent1"}))

@@ -3,7 +3,7 @@
 //! `OpenAI` surface; only the ollama-compat layer translates.
 //!
 //! Cancellation: when the client disconnects, the handler future is
-//! dropped, dropping the upstream reqwest stream — llama-server frees the
+//! dropped, dropping the upstream reqwest stream - llama-server frees the
 //! slot on connection close. No orphan generations.
 
 use std::sync::Arc;
@@ -58,9 +58,9 @@ pub fn child_base(ep: &blazar_core::Endpoint) -> String {
 }
 
 /// Resolve a user-visible model name to the stored row: exact match
-/// (case-insensitive) → ollama-migrant `model:tag` `:`→`-` swap onto an
+/// (case-insensitive) -> ollama-migrant `model:tag` `:`->`-` swap onto an
 /// existing row (the shared `Store::resolve_model_name` rule the CLI and
-/// supervisor use) → unique bare prefix → levenshtein-3 suggestion.
+/// supervisor use) -> unique bare prefix -> levenshtein-3 suggestion.
 /// The tag is never discarded: a colon form that swaps onto no row falls
 /// to the prefix ladder, which reports ambiguity instead of guessing.
 /// An on-demand `LoRA` variant suffix (`model+adapter`) resolves the BASE
@@ -113,7 +113,7 @@ pub struct ProxyOutcome {
 
 /// Run a supervisor load on a detached task. Dropping the request future
 /// (client disconnect mid-spawn) would otherwise cancel an in-flight
-/// spawn — leaking a half-started child and stranding the loader
+/// spawn - leaking a half-started child and stranding the loader
 /// protocol (live-repro'd wedge: one timed-out generate wedged every
 /// later generate on that model). A dropped `JoinHandle` detaches, so the
 /// load always runs to completion; only this request stops waiting.
@@ -156,7 +156,7 @@ pub(crate) async fn ensure_generation_detached(
 /// Vision-aware variant of [`ensure_detached`]: routes through
 /// `Supervisor::ensure_vision` so a `mmproj = "lazy"` spawn respawns
 /// WITH the projector when the request carries images. Text requests
-/// keep the plain path — zero overhead, zero behavior change.
+/// keep the plain path - zero overhead, zero behavior change.
 pub(crate) async fn ensure_vision_detached(
     sup: &std::sync::Arc<blazar_runtime::Supervisor>,
     name: &str,
@@ -175,7 +175,7 @@ pub(crate) async fn ensure_vision_detached(
 
 /// Captive variant of [`ensure_detached`]: the load refuses under
 /// admission pressure instead of evicting resident models. Same detach
-/// contract — the spawn (or its refusal) always runs to completion.
+/// contract - the spawn (or its refusal) always runs to completion.
 pub(crate) async fn ensure_detached_captive(
     sup: &std::sync::Arc<blazar_runtime::Supervisor>,
     name: &str,
@@ -194,14 +194,14 @@ pub(crate) async fn ensure_detached_captive(
 /// Does this parsed chat body carry non-text media? Shapes covered:
 ///
 /// - `OpenAI` chat: `messages[].content[]` items with an `image`/`video`-
-///   prefixed [`type`] (or a bare `image_url`/`video_url` key — some
+///   prefixed [`type`] (or a bare `image_url`/`video_url` key - some
 ///   clients omit the tag; `input_video` is the responses-lane alias)
 /// - `OpenAI` chat/responses: `input_audio` items (typed, bare key, or
-///   the Anthropic `type: "audio"` block) — upstream accepts data or a
+///   the Anthropic `type: "audio"` block) - upstream accepts data or a
 ///   URL (raw base64 / remote / local file path), so audio rides the
 ///   same projector-replica lane as images (audit MM6)
 /// - `OpenAI` responses: `input[]` items with an `image`/`video`-prefixed
-///   [`type`], plus nested `function_call_output.output[]` items — a tool
+///   [`type`], plus nested `function_call_output.output[]` items - a tool
 ///   result may return an image (`{type: "input_image", image_url: ...}`),
 ///   which the child renders as an image part on the tool message
 /// - Anthropic messages: `messages[].content[]` items `type: "image"`
@@ -209,9 +209,9 @@ pub(crate) async fn ensure_detached_captive(
 /// - Ollama chat/generate: `messages[].images` non-empty or a
 ///   top-level `images` array (generate shape)
 ///
-/// Pure inspection of the single-parsed body — no re-parse on lanes
+/// Pure inspection of the single-parsed body - no re-parse on lanes
 /// that already hold one; the responses lane parses once here (it
-/// parses again downstream for translation — one bounded extra parse,
+/// parses again downstream for translation - one bounded extra parse,
 /// noted, not silently hot-pathed).
 #[must_use]
 pub fn body_needs_vision(parsed: &serde_json::Value, ollama_shape: bool) -> bool {
@@ -224,7 +224,7 @@ pub fn body_needs_vision(parsed: &serde_json::Value, ollama_shape: bool) -> bool
             || it.get("input_audio").is_some()
     }
     // Responses-lane tool results: `function_call_output.output[]` can
-    // carry `input_image` items (#22575) — the child converts them to
+    // carry `input_image` items (#22575) - the child converts them to
     // image parts, so they need a projector replica like user images.
     fn tool_media(it: &serde_json::Value) -> bool {
         it.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
@@ -287,7 +287,7 @@ pub(crate) async fn ensure_router_detached(
 /// carries the prompt-affinity hash (B1): chat-family callers pass it
 /// so repeat conversations land on their warm replica; everything else
 /// passes `None`. `needs_vision` routes the first ensure through the
-/// lazy-attach path (projector respawn) — chat callers derive it from
+/// lazy-attach path (projector respawn) - chat callers derive it from
 /// the single-parsed body via [`body_needs_vision`]; every other lane
 /// passes `false`. `allow_diffusion` mirrors [`crate::images::images_gate`]:
 /// the images handlers pass `true` (component sets are their cargo);
@@ -297,7 +297,7 @@ pub(crate) async fn ensure_router_detached(
 /// completion schema (chat/completions/responses/anthropic/ollama
 /// chat+generate): there a `model+adapter` variant rides the dense base
 /// child with per-request adapter selection. Embeddings/rerank/images
-/// lanes pass `false` — those tasks never see the per-request `lora`
+/// lanes pass `false` - those tasks never see the per-request `lora`
 /// field, so their variants keep the dedicated child.
 #[allow(clippy::duration_suboptimal_units)] // 120s admission bound per plan
 #[allow(clippy::too_many_arguments)] // mirrors proxy_request: flat call params, one seam
@@ -326,7 +326,7 @@ pub async fn ensure_with_admission(
             msg => Box::new(openai_error(500, msg)),
         })?;
     // Disk intelligence: stamp spawn activity so `blazar prune --unused`
-    // ages models by real use. Only cold starts touch the store — a
+    // ages models by real use. Only cold starts touch the store - a
     // resident model is fresh by definition, so the hot path never pays
     // the write.
     if !state.sup.ps().iter().any(|r| r.name == row.name) {
@@ -382,7 +382,7 @@ pub async fn ensure_with_admission(
             // Captive loads never queue for capacity: waiting two
             // minutes for the right to evict a generation model is
             // exactly the side-effect a cache probe must not have.
-            // Fail fast — callers treat this as "side load skipped".
+            // Fail fast - callers treat this as "side load skipped".
             return Err(Box::new(openai_error(
                 503,
                 "load refused: model would need to evict resident models \
@@ -391,7 +391,7 @@ pub async fn ensure_with_admission(
         }
         Err(SupervisionError::AllSlotsBusy) => {
             // Capacity exhausted: queue at our priority, bounded wait.
-            // Report the pressure — sustained queueing is the demand
+            // Report the pressure - sustained queueing is the demand
             // signal that drives adaptive slot adoption. Enter/leave
             // bracketing keeps it a gauge (a level the reaper can see
             // on every tick, not a one-shot event).
@@ -424,11 +424,11 @@ pub async fn ensure_with_admission(
 
 /// Prompt-prefix affinity hash (B1) from a parsed request body, stable
 /// across conversation turns and blind to samplers/options on purpose:
-/// chat/completions → system + first user turn; generate → `prompt`;
-/// responses → `input` (string or parts array). Sys-half hashes the
+/// chat/completions -> system + first user turn; generate -> `prompt`;
+/// responses -> `input` (string or parts array). Sys-half hashes the
 /// system prompt at 256 B (F33: comment previously claimed 1 KiB);
 /// convo-half hashes system + first user turn at 1 KiB each. `None`
-/// when no recognizable prompt (embeddings, tools) — no affinity,
+/// when no recognizable prompt (embeddings, tools) - no affinity,
 /// plain load-balance.
 #[must_use]
 pub fn affinity_hash(req: &serde_json::Value) -> Option<PrefixKey> {
@@ -514,10 +514,10 @@ pub fn supervision_error(e: &SupervisionError) -> Response {
         ),
         SupervisionError::AllSlotsBusy => openai_error_code(C::AllSlotsBusy, "all slots busy"),
         // Physically unschedulable load: teaching refusal with numbers,
-        // served immediately — queueing this could only burn the caller's
+        // served immediately - queueing this could only burn the caller's
         // two-minute admission budget for a verdict known at entry.
         SupervisionError::ModelTooLarge(m) => openai_error_code(C::ModelTooLarge, m),
-        // J3 memory floor: the box is exhausted, not broken — 507 until
+        // J3 memory floor: the box is exhausted, not broken - 507 until
         // co-resident engines free their memory (the message names them).
         SupervisionError::InsufficientMemory(m) => openai_error_code(C::InsufficientMemory, m),
         SupervisionError::EngineCrashed(m) => {
@@ -535,7 +535,7 @@ pub fn openai_error_code(code: crate::error_codes::BlazarCode, message: &str) ->
 }
 
 /// OpenAI-shaped error body. The `blazar_code` field is derived from
-/// the (normalized) HTTP status — generic but stable; typed call
+/// the (normalized) HTTP status - generic but stable; typed call
 /// sites use [`openai_error_code`] for precise codes.
 #[must_use]
 pub fn openai_error(status: u16, message: &str) -> Response {
@@ -558,7 +558,7 @@ pub fn openai_error(status: u16, message: &str) -> Response {
 /// Stamp the per-child bearer secret (child `--api-key` hardening) on
 /// a child-bound request. SINGLE CHOKE POINT: every gateway lane that
 /// talks HTTP to a spawned engine child must route its
-/// `reqwest::RequestBuilder` through here — a missed site fails loudly
+/// `reqwest::RequestBuilder` through here - a missed site fails loudly
 /// (the child answers 401), not silently.
 pub fn child_auth(rb: reqwest::RequestBuilder, engine: &EngineRef) -> reqwest::RequestBuilder {
     match &engine.auth {
@@ -570,7 +570,7 @@ pub fn child_auth(rb: reqwest::RequestBuilder, engine: &EngineRef) -> reqwest::R
 /// Forward a request to the child byte-for-byte and stream the response
 /// back. `path_query` includes the leading `/`.
 /// Forward one request to the child. Eight distinct request components
-/// (engine, model, method, path, headers, body, load timing) — a struct
+/// (engine, model, method, path, headers, body, load timing) - a struct
 /// here would only shuffle the same data.
 #[allow(
     clippy::too_many_arguments,
@@ -583,7 +583,7 @@ pub fn child_auth(rb: reqwest::RequestBuilder, engine: &EngineRef) -> reqwest::R
 /// pressure). Reap, respawn the EXACT lane detached, retry ONCE
 /// in-band (H16); the circuit breaker inside `ensure_key` bounds
 /// crash-looping. `build` receives the (possibly fresh) engine ref so
-/// bodied/multipart requests are rebuilt per attempt — reqwest
+/// bodied/multipart requests are rebuilt per attempt - reqwest
 /// builders are single-use. Rides [`child_send`], so the header-phase
 /// bound (and its synchronous wedged-child eviction) covers the image
 /// lanes exactly as it covers every text lane.
@@ -597,7 +597,7 @@ pub(crate) async fn send_with_child_retry(
         Err(e) => e,
     };
     // Busy-child header timeout is TERMINAL: the child is healthy and
-    // still generating — evicting/respawning would kill sibling streams,
+    // still generating - evicting/respawning would kill sibling streams,
     // and a retry would park for another full ceiling on the same busy
     // child. The teaching error reaches the caller unchanged.
     if matches!(&first, ChildSendError::HeaderTimeout { evicted: false, .. }) {
@@ -608,13 +608,13 @@ pub(crate) async fn send_with_child_retry(
         "child send failure ({first}); reaping and retrying once on a respawned lane"
     );
     state.sup.reap_dead_children().await;
-    // A WEDGED child — process alive, HTTP listener dead (observed
+    // A WEDGED child - process alive, HTTP listener dead (observed
     // live: transport-refused while the reaper sees the process
-    // running) — survives the reap, and `ensure_key`'s fast path would
+    // running) - survives the reap, and `ensure_key`'s fast path would
     // hand the retry the SAME dead endpoint. Evict the key outright:
     // state flips to Evicted, terminate_group (TERM, then KILL) cleans
     // the process, the map entry drops. A header-stall child is
-    // already gone (`child_send` evicted it synchronously) — this is
+    // already gone (`child_send` evicted it synchronously) - this is
     // the idempotent no-op side of the same guard. An already-reaped
     // key evicts as a no-op; a healthy replica that took the slot
     // meanwhile is ptr-guarded and survives.
@@ -632,8 +632,8 @@ pub(crate) async fn send_with_child_retry(
 
 /// Reconnect after a failed child send: reap the dead, then respawn the
 /// exact instance lane. The failing child is already gone by the time
-/// this runs — `child_send` evicts header-stalls synchronously, and
-/// transport errors mean the process died — so this is purely
+/// this runs - `child_send` evicts header-stalls synchronously, and
+/// transport errors mean the process died - so this is purely
 /// re-establishment, shared by every in-band retry arm.
 pub(crate) async fn respawn_lane(
     state: &AppState,
@@ -647,7 +647,7 @@ pub(crate) async fn respawn_lane(
 /// INSTANCE lane that died (`model`, replica `model#N`, projector
 /// `model@vision`) instead of re-resolving the model name, which
 /// auto-routing could hand to a sibling replica. Rides the same detach
-/// contract — the respawn must survive a dropped request future.
+/// contract - the respawn must survive a dropped request future.
 pub(crate) async fn ensure_key_detached(
     sup: &std::sync::Arc<blazar_runtime::Supervisor>,
     key: &str,
@@ -665,8 +665,8 @@ pub(crate) async fn ensure_key_detached(
 
 /// Child-bound send failure classes: transport errors mean the child is
 /// gone (crash-window semantics, 502); a header-phase stall means the
-/// child is ALIVE but wedged (504) — [`child_send`] has already evicted
-/// it synchronously by the time this reaches a caller — UNLESS the
+/// child is ALIVE but wedged (504) - [`child_send`] has already evicted
+/// it synchronously by the time this reaches a caller - UNLESS the
 /// post-timeout slot probe found the child mid-generation
 /// (`evicted: false`): then the child is healthy, kept serving, and the
 /// error body teaches the two real remedies instead.
@@ -706,7 +706,7 @@ impl std::fmt::Display for ChildSendError {
                 knob,
             } => write!(
                 f,
-                "no response headers from child within {secs}s — wedged child evicted ({knob})"
+                "no response headers from child within {secs}s - wedged child evicted ({knob})"
             ),
             Self::HeaderTimeout {
                 secs,
@@ -714,7 +714,7 @@ impl std::fmt::Display for ChildSendError {
                 knob,
             } => write!(
                 f,
-                "no response headers from child within {secs}s but the child is healthy — \
+                "no response headers from child within {secs}s but the child is healthy - \
                  its slots are still generating, and a buffered (non-stream) response \
                  emits headers only at completion. Send \"stream\": true for long \
                  generations, or raise {knob} (0 disables the bound). The child was \
@@ -724,7 +724,7 @@ impl std::fmt::Display for ChildSendError {
     }
 }
 
-/// `GET /slots` body → is any slot mid-generation? `None` when the shape
+/// `GET /slots` body -> is any slot mid-generation? `None` when the shape
 /// is not a bare array of slot objects (unknown is not guessed as idle).
 fn slots_any_processing(body: &serde_json::Value) -> Option<bool> {
     body.as_array().map(|slots| {
@@ -736,12 +736,12 @@ fn slots_any_processing(body: &serde_json::Value) -> Option<bool> {
     })
 }
 
-/// Probe the child's own slot activity — the discriminator between a
+/// Probe the child's own slot activity - the discriminator between a
 /// WEDGED child (parked, slots idle: evict) and a HEALTHY one
 /// mid-generation on a buffered request (slots busy: teach and keep).
 /// LlamaCpp-only (`/slots` is a llama-server surface); any probe
 /// failure returns `None` and the caller falls back to the legacy
-/// wedged-child semantics — the probe must never make the decision
+/// wedged-child semantics - the probe must never make the decision
 /// LESS safe. Bounded at 2s: this runs on an already-degraded path.
 async fn child_slots_generating(state: &AppState, engine: &EngineRef) -> Option<bool> {
     if engine.kind != EngineKind::LlamaCpp {
@@ -763,22 +763,22 @@ async fn child_slots_generating(state: &AppState, engine: &EngineRef) -> Option<
     slots_any_processing(&body)
 }
 
-/// Bounded child-bound send — the transport choke point for EVERY
+/// Bounded child-bound send - the transport choke point for EVERY
 /// user-facing child request (proxy lanes AND the ollama dialect's own
 /// sends). The header phase (request written -> first response byte)
 /// must not ride the blanket transport ceiling: a live-wedged child
 /// (observed live: a slot restore raced traffic and one /api/chat
 /// parked 300s+ pre-first-byte while the child served every later
 /// request) parks the client invisibly instead. On expiry the wedged
-/// child is evicted SYNCHRONOUSLY here — state flip, TERM then KILL,
-/// map entry drop — because every caller that retries in-band needs the
+/// child is evicted SYNCHRONOUSLY here - state flip, TERM then KILL,
+/// map entry drop - because every caller that retries in-band needs the
 /// respawn to be guaranteed fresh: `ensure_key`'s fast path would hand
 /// the retry the same wedged endpoint (the async J5 eviction lane
 /// debounces 1/min per model, far too slow to gate a retry). 0 disables
 /// the bound (legacy ceiling only). The ceiling is lane-aware: a
 /// diffusion child answers with the finished artifact, so time to first
 /// header IS the full generation time (minutes at 1024px on an
-/// offloaded box, longer for video) — the text-lane ceiling would evict
+/// offloaded box, longer for video) - the text-lane ceiling would evict
 /// healthy generations mid-flight. `SdCpp` children therefore ride
 /// `sdcpp_child_header_timeout_secs`.
 pub(crate) async fn child_send(
@@ -803,10 +803,10 @@ pub(crate) async fn child_send(
             Ok(result) => result.map_err(ChildSendError::Transport),
             Err(_elapsed) => {
                 // Wedged or busy? A buffered (non-stream) long generation
-                // emits headers only at completion — byte-identical to a
+                // emits headers only at completion - byte-identical to a
                 // wedged child from this bound's point of view. Ask the
                 // child itself: slots mid-generation means healthy (keep
-                // it — eviction would also kill every sibling in-flight
+                // it - eviction would also kill every sibling in-flight
                 // stream; vLLM and ollama cap no generation either);
                 // probe unknown or slots idle means the original
                 // wedged-child case, and the synchronous eviction stands.
@@ -815,7 +815,7 @@ pub(crate) async fn child_send(
                         tracing::warn!(
                             target: "blazar::proxy",
                             model = %engine.key,
-                            "child silent for {secs}s but its slots are generating — \
+                            "child silent for {secs}s but its slots are generating - \
                              buffered long generation; child kept ({knob})"
                         );
                         Err(ChildSendError::HeaderTimeout {
@@ -828,7 +828,7 @@ pub(crate) async fn child_send(
                         tracing::warn!(
                             target: "blazar::proxy",
                             model = %engine.key,
-                            "child produced no response headers in {secs}s — evicting \
+                            "child produced no response headers in {secs}s - evicting \
                              synchronously ({knob}; slot probe: {:?})",
                             slots.map_or("unavailable".to_string(), |b| b.to_string())
                         );
@@ -927,7 +927,7 @@ pub async fn proxy_request(
     let url = format!("{base}{fwd_path}");
     let began = std::time::Instant::now();
 
-    // SGLang LoRA-variant stamp (`base:adapter` — the engine's own
+    // SGLang LoRA-variant stamp (`base:adapter` - the engine's own
     // per-request adapter selection), computed from the body's model
     // spelling; recomputed on the mid-request respawn retry below so
     // the fresh child sees the identical body.
@@ -944,7 +944,7 @@ pub async fn proxy_request(
     // llama.cpp LoRA-variant ride (`base+adapter` on a resident llama.cpp
     // child): resolve the per-request adapter list from the child's own
     // GET /lora-adapters answer. `Some(Err)` = the ride cannot be
-    // honored — surface the teaching BEFORE any child traffic; falling
+    // honored - surface the teaching BEFORE any child traffic; falling
     // back to base weights silently is the wrong-answer failure mode
     // this stamp exists to prevent. Recomputed on the respawn retry
     // below so the fresh child sees the identical body.
@@ -970,14 +970,14 @@ pub async fn proxy_request(
     // parse: R6 include_usage forcing (stream warm/cold classification
     // data; ollama lane does the same in its translator), the per-engine
     // model stamp, and the mistral.rs think bridge. One parse, one
-    // serialization — a chain of per-mutator re-serializations would
+    // serialization - a chain of per-mutator re-serializations would
     // silently drop whichever mutations ran first (each rebuilt the body
     // from the ORIGINAL parse, not its predecessor's output).
     //
     // Recipe lane: the contract here is body == serialize(parsed); the
     // recipe's completion dialect BREAKS that invariant (parsed is the
     // caller's chat shape, body is the gateway render), so the render
-    // must be the mutation source of truth — pass no parse and let the
+    // must be the mutation source of truth - pass no parse and let the
     // mutators evaluate the actual forwarded bytes (model-less
     // completion body: every mutator is a documented no-op).
     let body = apply_child_request_mutations_stamped(
@@ -996,11 +996,11 @@ pub async fn proxy_request(
     // Single-flight (B8, FIX2): identical NON-STREAM chat requests
     // coalesce AT THE CHILD-CALL BOUNDARY. Two acquisition phases:
     // chat lanes that pre-acquired in `sf_gate_before_admission` (held
-    // BEFORE slot admission — duplicates wait without occupying
+    // BEFORE slot admission - duplicates wait without occupying
     // in_flight capacity) arrive as `Held`/`TimedOut` and skip this
     // block; everyone else takes the legacy in-function acquire after
     // admission (queued duplicates are not serialized behind queue
-    // waits). Stream detection rides the pre-parsed Value — prompt
+    // waits). Stream detection rides the pre-parsed Value - prompt
     // text containing `{"stream":true}` cannot fool it (real JSON, not
     // a sniff). Neither mutation above touches the `stream` field, so
     // the pre-parse stays authoritative for it. Bounded wait: after 5s
@@ -1064,7 +1064,7 @@ pub async fn proxy_request(
             let terminal = match &e {
                 ChildSendError::HeaderTimeout { evicted: false, .. } => {
                     // Healthy child mid-generation (slot probe said so in
-                    // `child_send`): terminal teaching error — a respawn
+                    // `child_send`): terminal teaching error - a respawn
                     // would kill the very child that is still serving,
                     // and the retry would ride the same busy lane for
                     // another full ceiling. Drop the singleflight entry
@@ -1077,7 +1077,7 @@ pub async fn proxy_request(
                         target: "blazar::proxy",
                         model,
                         trace = ?trace,
-                        "child produced no response headers in {secs}s — evicting synchronously, retrying once in-band (child_header_timeout_secs)"
+                        "child produced no response headers in {secs}s - evicting synchronously, retrying once in-band (child_header_timeout_secs)"
                     );
                     StatusCode::GATEWAY_TIMEOUT
                 }
@@ -1088,11 +1088,11 @@ pub async fn proxy_request(
             };
             // The child died in the crash window between the health gate
             // and this forward. Reap, respawn the exact lane detached,
-            // and retry ONCE in-band — single-shot clients (run
+            // and retry ONCE in-band - single-shot clients (run
             // --verbose) otherwise eat a 502 for a child they never
             // got to talk to. The circuit breaker inside `ensure_key`
             // bounds crash-looping; exactly one retry (H16). A WEDGED
-            // child — process alive, HTTP listener silent — was already
+            // child - process alive, HTTP listener silent - was already
             // evicted synchronously inside `child_send` before this
             // error surfaced; the respawn is guaranteed a fresh lane.
             match respawn_lane(state, &engine.key).await {
@@ -1188,7 +1188,7 @@ pub async fn proxy_request(
         builder = builder.header("x-blazar-status", "loading");
     }
     // Structured-output receipt (E2-δ): successful responses that rode
-    // a constraint say WHICH one — clients auditing schema conformance
+    // a constraint say WHICH one - clients auditing schema conformance
     // get a machine-readable guarantee marker instead of inferring
     // from the body shape. Error responses carry no receipt (the
     // constraint was not served).
@@ -1212,11 +1212,11 @@ pub async fn proxy_request(
     let sse = content_type.contains("text/event-stream");
     // Per-key token accounting: a bounded tail-sniffer constructed ONLY
     // when the requesting key carries tpm/daily budgets (everyone else
-    // pays nothing — the zero-tax contract holds for unlimited keys).
+    // pays nothing - the zero-tax contract holds for unlimited keys).
     // Dropped with the stream closure: clean drains AND client aborts
     // both charge (same lifetime trick as the sentinel feed).
     // F7 (OpenAI `n`, multi-choice): derive the requested choice count
-    // once — reused by both the token-accounting multiplier below and
+    // once - reused by both the token-accounting multiplier below and
     // the non-stream shape verify in the buffered branch. `parsed` (the
     // hot lane's single body parse) is preferred; only when the caller
     // had no parse does a cheap substring gate precede the fallback
@@ -1244,10 +1244,10 @@ pub async fn proxy_request(
                 .with_completion_multiplier(completion_multiplier)
         });
     // Enforce (opt-in): non-stream chat requests get judged BEFORE any
-    // byte is released — the client waits for the full JSON anyway, so
+    // byte is released - the client waits for the full JSON anyway, so
     // buffering costs no extra round trip. F62: bodies whose declared
     // content-length already exceeds ENFORCE_BODY_CAP skip the
-    // buffering branch (streamed through) — the cap bounds judging,
+    // buffering branch (streamed through) - the cap bounds judging,
     // never the read. Streaming stays warn-only (bytes on the wire).
     let enforce_oversized = resp
         .content_length()
@@ -1270,7 +1270,7 @@ pub async fn proxy_request(
         && sentinel::enforce_enabled(&state.config, headers)
         && !enforce_oversized;
     // F7: a non-stream multi-choice success response gets a shape
-    // check — an engine that ignored `n` (returned 1 choice for n=3)
+    // check - an engine that ignored `n` (returned 1 choice for n=3)
     // is a silent capability lie; fail loud with a teaching 502.
     // Streaming and oversized bodies pass unverified (documented in
     // the API spec).
@@ -1278,7 +1278,7 @@ pub async fn proxy_request(
     // Raw `<think>` suppression (openai chat lane; ollama-lane parity):
     // when the effective request did not ask for thinking, a template
     // that ignores the off-kwargs would leak reasoning into plain
-    // content. Gate mirrors the ollama lane's — only the not-asked case
+    // content. Gate mirrors the ollama lane's - only the not-asked case
     // is touched; an already-split response passes through idempotently.
     // Non-stream bodies ride the buffered branch below (the client waits
     // for the full JSON anyway); SSE streams filter per-delta in the
@@ -1303,10 +1303,10 @@ pub async fn proxy_request(
     let restamp = !enforce_oversized && status.is_success() && child_model_stamp(engine).is_some();
     // JSON-fence normalization (deliverable-side): a `response_format`
     // JSON demand on a lane without decoder-level grammar still comes
-    // back markdown-fenced — strip the whole-content fence in the
+    // back markdown-fenced - strip the whole-content fence in the
     // buffered branch so the contract "content parses as JSON" holds on
     // every lane. `gbnf` demands never fence (decoder-constrained) and
-    // stay out of this path. Plain chat fences are PRESERVED — the
+    // stay out of this path. Plain chat fences are PRESERVED - the
     // demand is what licenses the strip.
     let json_fence = !sse
         && !enforce_oversized
@@ -1318,7 +1318,7 @@ pub async fn proxy_request(
         );
     // Recipe lane (chat surface over the raw completion child): the
     // dialect swap happens gateway-side, so a SUCCESSFUL non-stream
-    // recipe response ALWAYS rides the buffered branch — streaming raw
+    // recipe response ALWAYS rides the buffered branch - streaming raw
     // completion bytes to a chat caller is silent dialect corruption.
     // Child errors keep their own body and status verbatim (the error
     // dialect is shape-neutral; adapting it would mask the teaching).
@@ -1358,12 +1358,12 @@ pub async fn proxy_request(
             None
         };
         // The think-suppress buffered path takes requests the streaming
-        // path previously served — those got a sentinel observation
+        // path previously served - those got a sentinel observation
         // (records + precheck warning header). Preserve that contract:
         // begin the same observation here, feed it the RAW engine bytes
         // (detections judge engine truth, not the suppressed view), and
         // let the feed's Drop finalize the record. Only fires when THIS
-        // path's disjunct is the trigger — n-verify and sentinel-active
+        // path's disjunct is the trigger - n-verify and sentinel-active
         // requests keep their pre-existing observation behavior.
         let mut suppress_feed = if suppress_think && !sse && !sentinel_active && !want_choice_verify
         {
@@ -1384,7 +1384,7 @@ pub async fn proxy_request(
             None
         };
         match resp.bytes().await {
-            // F30: the buffered read failed — finish the sniffer (nothing
+            // F30: the buffered read failed - finish the sniffer (nothing
             // chargeable was generated) and release the single-flight
             // entry before returning; previously both leaked on this arm.
             Err(e) => {
@@ -1399,7 +1399,7 @@ pub async fn proxy_request(
                 // into the chat dialect the caller speaks, then let every
                 // downstream concern (n-verify, sentinel, sniffing,
                 // telemetry, metadata, restamp, fence) operate on the
-                // caller-dialect bytes — the same posture as the ollama
+                // caller-dialect bytes - the same posture as the ollama
                 // recipe lane. A body that does not round-trip fails
                 // CLOSED: the alternative (serving raw dialect to a chat
                 // caller) is silent corruption.
@@ -1447,7 +1447,7 @@ pub async fn proxy_request(
                             Some(m) if m == n => {}
                             Some(m) => {
                                 // Tokens were generated for the choices
-                                // that DID come back — charge before
+                                // that DID come back - charge before
                                 // failing (F30 pattern).
                                 if let Some(mut s) = sniffer.take() {
                                     s.push(&buf);
@@ -1458,7 +1458,7 @@ pub async fn proxy_request(
                                     502,
                                     &format!(
                                         "asked n={n} choices, engine returned {m} \
-                                         — lane ignored n; report this, do not retry blindly"
+                                         - lane ignored n; report this, do not retry blindly"
                                     ),
                                 );
                             }
@@ -1487,7 +1487,7 @@ pub async fn proxy_request(
                             .collect::<Vec<_>>()
                             .join("; ");
                         // F30: a fully-generated enforce-rejected response
-                        // still consumed child tokens — charge the key's
+                        // still consumed child tokens - charge the key's
                         // budgets and release the single-flight entry.
                         if let Some(mut s) = sniffer.take() {
                             s.push(&buf);
@@ -1504,12 +1504,12 @@ pub async fn proxy_request(
                     s.push(&buf);
                     s.finish(&state.keys);
                 }
-                // R6: buffered non-stream chat — classify from the exact
+                // R6: buffered non-stream chat - classify from the exact
                 // JSON (no substring heuristics on this path).
                 record_buffered_chat(&state.obs, model, &buf, began.elapsed().as_secs_f64());
                 // Metadata cards: the one buffered site where the full
                 // completion body and the original request parse are in
-                // hand — persist the id→metadata card when the caller
+                // hand - persist the id->metadata card when the caller
                 // tagged the create.
                 if path_query.starts_with("/v1/chat/completions") {
                     crate::metadata_card::persist_from_response(
@@ -1600,7 +1600,7 @@ pub async fn proxy_request(
     let think_filter_stream = std::sync::Arc::clone(&think_filter_cell);
     // SSE counterpart of the buffered model re-stamp above: per-frame
     // rewrite of the child's echoed id back to the caller's spelling.
-    // Held separately from the think filter — each fires on its own
+    // Held separately from the think filter - each fires on its own
     // lanes (thinking-asked streams still restamp).
     let restamp_cell = std::sync::Arc::new(std::sync::Mutex::new(if restamp && sse {
         Some(crate::translate::SseRestamper::new(caller_model))
@@ -1609,14 +1609,14 @@ pub async fn proxy_request(
     }));
     let restamp_stream = std::sync::Arc::clone(&restamp_cell);
     // Recipe lane: adapt the child's raw completion SSE into chat SSE
-    // BEFORE the evidence loop — sentinel/taps/sniffer/think-filter/
+    // BEFORE the evidence loop - sentinel/taps/sniffer/think-filter/
     // restamper all observe the caller-dialect frames, the same
     // posture as the ollama recipe lane (which feeds its adapted chat
     // value to the sentinel). reqwest errors map to io::Error for the
     // adapter's Item contract; the truncated-stream discipline below
     // emits the same legal-close terminal frames. SSE only: a
     // non-stream body reaching this path is a child error passing
-    // through verbatim (error dialect is shape-neutral — adapting it
+    // through verbatim (error dialect is shape-neutral - adapting it
     // would mask the teaching).
     let upstream = {
         let raw = resp
@@ -1671,7 +1671,7 @@ pub async fn proxy_request(
             }
             // Mid-body upstream failure (sentinel-evicted wedged child,
             // conn churn, respawn race): once headers are committed the
-            // only legal SSE close is a semantic one — an Err item here
+            // only legal SSE close is a semantic one - an Err item here
             // aborts the HTTP body and the client eats a protocol error
             // instead of a readable terminal event.
             Err(e) => {
@@ -1745,7 +1745,7 @@ pub async fn proxy_request(
 }
 
 /// Single-flight token: held from child-call to response-stream end
-/// (FIX2 — the guard rides the SAME drop chain as the in-flight guard,
+/// (FIX2 - the guard rides the SAME drop chain as the in-flight guard,
 /// so clean drains, client aborts, and early errors all release it).
 pub struct SingleFlight {
     key: u64,
@@ -1757,7 +1757,7 @@ pub struct SingleFlight {
 
 /// Result of the pre-admission single-flight phase (see
 /// `sf_gate_before_admission`). Handed straight to `proxy_request`,
-/// which skips its internal acquire for `Held`/`TimedOut` — re-locking
+/// which skips its internal acquire for `Held`/`TimedOut` - re-locking
 /// the same entry from the same task would deadlock (tokio mutexes are
 /// not reentrant), and a timed-out waiter must not pay a second 5s.
 pub enum SfGate {
@@ -1777,12 +1777,12 @@ pub enum SfGate {
 /// runs while the caller holds NO `InFlightGuard`, so identical
 /// duplicates do not occupy gateway slots (`in_flight` capacity, queue
 /// headroom) while merely waiting for the leader. Eligibility mirrors
-/// `proxy_request`'s internal block exactly — same route check, size
-/// cap, stream bit, and key material — so the two phases always agree
+/// `proxy_request`'s internal block exactly - same route check, size
+/// cap, stream bit, and key material - so the two phases always agree
 /// on ownership. The key folds the pre-mutation body here (the handler
 /// runs before `apply_child_request_mutations`); the
 /// legacy block folds the post-mutation body. Twins hashing identically
-/// within their own phase is what matters — the two key spaces never
+/// within their own phase is what matters - the two key spaces never
 /// mix for one request because `Held`/`TimedOut` bypass the internal
 /// acquire.
 pub(crate) async fn sf_gate_before_admission(
@@ -1825,7 +1825,7 @@ pub(crate) async fn sf_gate_before_admission(
     }
 }
 
-// F31: Drop-safe release — client aborts drop the unfold future before
+// F31: Drop-safe release - client aborts drop the unfold future before
 // any explicit cleanup ran, leaking the map entry until the 256-clear.
 impl Drop for SingleFlight {
     fn drop(&mut self) {
@@ -1843,20 +1843,20 @@ fn is_chat_route(path_query: &str) -> bool {
     p.ends_with("/chat/completions") || p.ends_with("/completions") || p.ends_with("/responses")
 }
 
-/// `OpenAI` `n` (choices per request) upper bound — cost scales with n,
+/// `OpenAI` `n` (choices per request) upper bound - cost scales with n,
 /// so one request must not fan into an unbounded bill.
 pub(crate) const MAX_N_CHOICES: u64 = 8;
 
 /// Routes that accept `OpenAI`'s `n` parameter: the completions family.
-/// `/v1/responses` uses `best_of` instead (judged N→1, different knob).
+/// `/v1/responses` uses `best_of` instead (judged N->1, different knob).
 fn accepts_n(path_query: &str) -> bool {
     let p = path_query.split('?').next().unwrap_or(path_query);
     p.ends_with("/chat/completions") || p.ends_with("/completions")
 }
 
-/// Strict `n` extraction for the completions family: absent/null →
-/// `Ok(None)` (`OpenAI` default n=1), integer `1..=MAX_N_CHOICES` →
-/// `Ok(Some(n))`, anything else → `Err(teaching)`. Strictness is the
+/// Strict `n` extraction for the completions family: absent/null ->
+/// `Ok(None)` (`OpenAI` default n=1), integer `1..=MAX_N_CHOICES` ->
+/// `Ok(Some(n))`, anything else -> `Err(teaching)`. Strictness is the
 /// contract: a `"n": 2.0` that silently meant one choice would be a
 /// quiet capability lie. Pure; unit-pinned.
 pub(crate) fn requested_choices(
@@ -1890,11 +1890,11 @@ pub(crate) fn requested_choices(
 /// routes, or bodies that already opted in; any parse/serialize failure
 /// returns the original bytes untouched (the child remains the judge).
 /// mistral.rs children register models under derived ids ("default" +
-/// the staging dir path — verified against v0.9.3), not Blazar names;
+/// the staging dir path - verified against v0.9.3), not Blazar names;
 /// their CLI has no `--alias` equivalent. The gateway owns the facade,
 /// Per-model serving resolution for sites that must answer BEFORE a
 /// spawn exists (request translation + model listings). `tag` is the
-/// engine row that WOULD serve this model right now — the routed lane's
+/// engine row that WOULD serve this model right now - the routed lane's
 /// tag, or the global active row's tag when manual mode (or a pin)
 /// resolves to the global engine. `None` from the fn = store
 /// unavailable; `tag: None` inside = nothing can serve this model.
@@ -1903,13 +1903,13 @@ pub(crate) struct LaneResolution {
     pub kind: blazar_core::engine_kind::EngineKind,
 }
 
-/// Kind of the engine the router will use for `model` — the ROUTED lane,
+/// Kind of the engine the router will use for `model` - the ROUTED lane,
 /// not the global active row: since auto-routing the active tag is a
 /// coincidence for anything but manual mode, so surface gates keyed on it
 /// (llama-only endpoints, slot checkpoints) wrongly 400 models that route
 /// to a llamacpp child. Unknown model: the global active kind (`None`
 /// when no engines, mirroring the old gate-skip). Err lanes resolve to
-/// the global kind inside [`resolve_serving`] — the spawn delivers the
+/// the global kind inside [`resolve_serving`] - the spawn delivers the
 /// real teaching error.
 /// Per-lane ceiling on `OpenAI` `n` (choices per request). The plane-wide
 /// contract is `1..=MAX_N_CHOICES`, but the serving engine may cap lower:
@@ -1951,7 +1951,7 @@ pub(crate) fn resolve_serving(
 ) -> Option<LaneResolution> {
     use blazar_core::engine_kind::{self, EngineKind};
     // Names arriving from the header-extension gates may be the
-    // tags-rendered alias (`m1:q4_k_m`) rather than the store key —
+    // tags-rendered alias (`m1:q4_k_m`) rather than the store key -
     // canonicalize through the shared ladder so overlays, arch probes,
     // and quant signals key on the same name the spawn will use.
     let canonical = state
@@ -1974,7 +1974,7 @@ pub(crate) fn resolve_serving(
             // Capability-rescue preview: when the picked lane provably
             // cannot load the model's GGUF arch and another installed
             // lane advertises it, spawn re-routes after one bounded
-            // crash — predict that end-state lane here so listings and
+            // crash - predict that end-state lane here so listings and
             // routing can never disagree. Never fires under a user pin
             // (the spawn rescue has the same gate) or when the picked
             // lane's arch set is unknown (honest unknown).
@@ -2021,7 +2021,7 @@ pub(crate) fn resolve_serving(
                     kind,
                 }),
                 // Manual mode (or a pin resolving to the global engine): the
-                // GLOBAL engine serves — same contract the pre-routing
+                // GLOBAL engine serves - same contract the pre-routing
                 // daemon-lifetime cache had (rescue preview applies here
                 // too: spawn's re-route is not mode-gated).
                 Ok(None) => {
@@ -2044,7 +2044,7 @@ pub(crate) fn resolve_serving(
 /// Pre-spawn prediction of [`child_model_stamp`] for sites that mutate
 /// the request BEFORE the engine exists (ollama chat translation).
 /// Consults the SAME core `serving_lane` the supervisor routes by, so
-/// the prediction and the actual spawn can never disagree — the
+/// the prediction and the actual spawn can never disagree - the
 /// daemon-global kind cache this replaces was wrong under
 /// `[engine_routing]` (routed mistral.rs children kept the caller's
 /// model name and answered `model ... was not found`).
@@ -2054,7 +2054,7 @@ pub(crate) fn child_model_stamp_predicted(
     model_path: &str,
 ) -> Option<String> {
     use blazar_core::engine_kind::EngineKind;
-    // `tag: None` = nothing can serve (or a bad pin) — the spawn path
+    // `tag: None` = nothing can serve (or a bad pin) - the spawn path
     // delivers the teaching error, so no rewrite fires; matching the
     // pre-refactor contract where every Err predicted "no rewrite".
     let lane = resolve_serving(state, model_name, model_path)?;
@@ -2078,7 +2078,7 @@ pub(crate) fn child_model_stamp_predicted(
                 )),
             }
         }
-        // same mlx contract as `child_model_stamp` — the spawn-time
+        // same mlx contract as `child_model_stamp` - the spawn-time
         // prediction must equal what the running child registers.
         EngineKind::Mlx => Some(model_path.to_string()),
         _ => None,
@@ -2086,7 +2086,7 @@ pub(crate) fn child_model_stamp_predicted(
 }
 
 /// Stamp the child-facing model id into a request body. Never invents a
-/// `model` field (absent stays absent — children judge bodies without
+/// `model` field (absent stays absent - children judge bodies without
 /// one). Returns whether the field actually changed, so composition
 /// callers can keep byte-identical passthrough for untouched bodies.
 pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) -> bool {
@@ -2103,8 +2103,8 @@ pub(crate) fn set_child_model(v: &mut serde_json::Value, stamp: &str) -> bool {
 /// llama.cpp variant ride stamp: the per-request `lora: [{id, scale}]`
 /// completion-schema field that selects the adapter for THIS request
 /// (every spawn-loaded adapter absent from the list deactivates for it).
-/// Unlike the model stamp this INSERTS the field when missing — the
-/// adapter only rides when the list rides the body — and is idempotent:
+/// Unlike the model stamp this INSERTS the field when missing - the
+/// adapter only rides when the list rides the body - and is idempotent:
 /// an identical list leaves the body byte-identical.
 pub(crate) fn set_child_lora(v: &mut serde_json::Value, pairs: &[(i64, f64)]) -> bool {
     let list = serde_json::Value::Array(
@@ -2121,8 +2121,8 @@ pub(crate) fn set_child_lora(v: &mut serde_json::Value, pairs: &[(i64, f64)]) ->
 }
 
 /// Think-dialect bridge for mistral.rs children (chat lane only).
-/// mistral.rs reads TOP-LEVEL body fields — `enable_thinking` (bool) and
-/// `reasoning_effort` (`off|low|medium|high|xhigh`) — and enables
+/// mistral.rs reads TOP-LEVEL body fields - `enable_thinking` (bool) and
+/// `reasoning_effort` (`off|low|medium|high|xhigh`) - and enables
 /// thinking by DEFAULT when both are omitted; it does not read
 /// `chat_template_kwargs`, so the gateway's kwargs dialect silently
 /// no-ops there (upstream: docs.mistralrs.dev, `OpenAI` compatibility).
@@ -2130,7 +2130,7 @@ pub(crate) fn set_child_lora(v: &mut serde_json::Value, pairs: &[(i64, f64)]) ->
 /// an explicit on-toggle becomes `enable_thinking: true`, an effort
 /// request rides natively (kwargs copy stays for the template), and a
 /// request with NO think controls gets the ollama-parity default-off
-/// (`enable_thinking: false`) — the same teaching stance the other lanes
+/// (`enable_thinking: false`) - the same teaching stance the other lanes
 /// take against the reasoning-eats-the-budget spiral. Add-only: kwargs
 /// and user fields are never removed. Returns whether `v` changed;
 /// callers keep the body byte-identical when it does not.
@@ -2176,7 +2176,7 @@ pub(crate) fn normalize_think_in_value(kind: EngineKind, v: &mut serde_json::Val
             changed = true;
         }
     } else if top_level.is_none() {
-        // No think controls at all: mistral.rs defaults thinking ON —
+        // No think controls at all: mistral.rs defaults thinking ON -
         // pin it OFF to match every other lane's default.
         v["enable_thinking"] = serde_json::Value::Bool(false);
         changed = true;
@@ -2215,7 +2215,7 @@ pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<String> {
             &engine.name,
         )),
         // mlx_lm serves the model under its FULL path (it has no
-        // --served-model-name flag, probe-verified) — anything else in
+        // --served-model-name flag, probe-verified) - anything else in
         // the body falls through to its HF-hub resolution and 401s.
         EngineKind::Mlx => Some(engine.model_path.clone()),
         _ => None,
@@ -2224,7 +2224,7 @@ pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<String> {
 
 /// sglang variant stamp: a `model+adapter` request riding the base
 /// child must NAME the adapter in the child's native `base:adapter`
-/// model syntax — the engine's own per-request adapter selection; the
+/// model syntax - the engine's own per-request adapter selection; the
 /// caller's `+stem` spelling selects nothing there. The registered
 /// adapter name is the adapter path's file stem (see
 /// `profile::push_sglang_loras`), resolved through the same matching the
@@ -2265,15 +2265,15 @@ pub(crate) fn sglang_variant_stamp(
 /// llama.cpp LoRA-variant stamp: a `base+adapter` request resolved to a
 /// resident llama.cpp child rides that child (see
 /// `Supervisor::ensure_generation`), selecting the adapter per request
-/// through the body field `lora: [{id, scale}]` — the engine addresses
+/// through the body field `lora: [{id, scale}]` - the engine addresses
 /// adapters by argv index, and every adapter absent from the list
 /// deactivates for that one request (completion-schema semantics).
-/// The id is resolved from the child's own GET /lora-adapters answer —
-/// the only authoritative mapping — and the scale is the store row's
+/// The id is resolved from the child's own GET /lora-adapters answer -
+/// the only authoritative mapping - and the scale is the store row's
 /// (user intent), so the request sees exactly the dedicated variant
 /// child's posture without a second weights load.
 /// `None` = not a llama.cpp variant request (caller keeps the plain
-/// stamp). `Some(Err)` = the ride cannot be honored — surface the
+/// stamp). `Some(Err)` = the ride cannot be honored - surface the
 /// teaching; NEVER fall back silently to base weights (the
 /// wrong-answer failure mode this stamp exists to prevent).
 pub(crate) async fn llamacpp_variant_lora(
@@ -2348,7 +2348,7 @@ pub(crate) async fn llamacpp_variant_lora(
     }
     // Name the observed set so a drifted spawn reads as a mis-loaded
     // child, not a phantom adapter (first three entries, basenames
-    // only — never a wall of paths).
+    // only - never a wall of paths).
     let observed = adapters.as_array().map_or_else(
         || "<unparseable>".to_string(),
         |entries| {
@@ -2377,13 +2377,13 @@ pub(crate) async fn llamacpp_variant_lora(
     );
     Some(Err(format!(
         "adapter {registered} is not loaded on the resident child (spawn loaded a \
-         different set: {observed}) — `blazar stop {base}` then re-request respawns \
+         different set: {observed}) - `blazar stop {base}` then re-request respawns \
          with the current store rows"
     )))
 }
 
 /// Per-engine child stamp with the sglang LoRA-variant override folded
-/// in — the single derivation every direct-stamp callsite should use:
+/// in - the single derivation every direct-stamp callsite should use:
 /// a `base+adapter` request on the sglang lane stamps the engine's
 /// native `base:adapter` form, everything else keeps the plain stamp.
 pub(crate) fn child_model_stamp_for(
@@ -2399,13 +2399,13 @@ pub(crate) fn child_model_stamp_for(
 /// per-engine model stamp (`child_model_stamp`), and the mistral.rs
 /// think bridge. `parsed` = the request body pre-parsed by the hot lane;
 /// `None` = caller had no parse (fallback lanes parse here). Bodies that
-/// need no change — or cannot be parsed — return byte-identical
+/// need no change - or cannot be parsed - return byte-identical
 /// (fail-open: the child reports its own error). This composition
 /// replaced a chain of per-mutator wrappers that each re-serialized from
 /// the ORIGINAL parse, silently dropping every earlier mutation
 /// (mistral.rs chats lost their `default` model stamp whenever the think
 /// bridge fired, and stamped lanes lost `include_usage`).
-/// Plain-stamp convenience wrapper — test-call sites and any lane
+/// Plain-stamp convenience wrapper - test-call sites and any lane
 /// without a variant stamp to thread.
 #[cfg(test)]
 pub(crate) fn apply_child_request_mutations(
@@ -2441,8 +2441,8 @@ pub(crate) fn apply_child_request_mutations_stamped(
     }
     // Decide before cloning: the deep `Value` clone is only worth its
     // cost when some mutator will actually fire. Checking the change
-    // predicates on the borrowed parse keeps no-op bodies — plain
-    // non-stream chats, already-conforming streams — byte-identical
+    // predicates on the borrowed parse keeps no-op bodies - plain
+    // non-stream chats, already-conforming streams - byte-identical
     // without paying clone + re-serialization for nothing.
     let mut owned_parse: Option<serde_json::Value> = None;
     let v_ref: &serde_json::Value = match parsed {
@@ -2487,7 +2487,7 @@ pub(crate) fn apply_child_request_mutations_stamped(
     }
 }
 
-/// Read-only mirror of [`include_usage_in_value`]'s change decision —
+/// Read-only mirror of [`include_usage_in_value`]'s change decision -
 /// keep the two in lockstep (the unit pins assert predicate and
 /// mutator agree on the shared corpus).
 fn include_usage_needed(v: &serde_json::Value) -> bool {
@@ -2513,7 +2513,7 @@ fn normalize_system_first_needed(v: &serde_json::Value) -> bool {
         match m.get("content").and_then(serde_json::Value::as_str) {
             Some(t) if !t.is_empty() => texts += 1,
             Some(_) => {}
-            // Structured (or missing) system content poisons the merge —
+            // Structured (or missing) system content poisons the merge -
             // the mutator leaves the list untouched.
             None => return false,
         }
@@ -2530,7 +2530,7 @@ fn stamp_needed(v: &serde_json::Value, stamp: &str) -> bool {
 }
 
 /// Read-only mirror of [`set_child_lora`]'s change decision: the stamp
-/// fires on ANY mismatch — wrong ids/scales, wrong length, wrong shape,
+/// fires on ANY mismatch - wrong ids/scales, wrong length, wrong shape,
 /// or the field missing entirely (it must be inserted).
 fn lora_stamp_needed(v: &serde_json::Value, pairs: &[(i64, f64)]) -> bool {
     match v.get("lora") {
@@ -2583,7 +2583,7 @@ fn normalize_think_needed(v: &serde_json::Value) -> bool {
 }
 
 /// Value-level core of R6: force the final usage chunk on chat streams
-/// so warm/cold classification has data — most clients never opt in.
+/// so warm/cold classification has data - most clients never opt in.
 /// Additive and spec-compliant (usage-only extra chunk; ollama lane
 /// does the same in its translator). Legacy `/completions` and non-chat
 /// routes never reach this core (path-gated by the caller). Returns
@@ -2607,7 +2607,7 @@ fn include_usage_in_value(v: &mut serde_json::Value) -> bool {
 /// The OpenAI-compatible dialect permits system messages anywhere in
 /// the list, but
 /// many model chat templates (Qwen3-class) raise a Jinja exception for
-/// a system message after the first position — agent harnesses
+/// a system message after the first position - agent harnesses
 /// (opencode & friends) legitimately send mid-list system blocks, so
 /// the gateway adapts the order at the engine boundary instead of
 /// leaking the template error as a 500. Only plain-string contents
@@ -2678,9 +2678,9 @@ pub fn structured_output_kind(v: Option<&serde_json::Value>) -> Option<&'static 
     None
 }
 
-/// Strip a WHOLE-CONTENT markdown fence (```` ```json … ``` ````) down to
+/// Strip a WHOLE-CONTENT markdown fence (```` ```json ... ``` ````) down to
 /// the fenced body. Only fires when the trimmed content both starts with
-/// an opening fence (info string tolerated) and ends with a closing one —
+/// an opening fence (info string tolerated) and ends with a closing one -
 /// prose-wrapped fences, unterminated fences, and fence-free strings come
 /// back verbatim. `gbnf`-constrained lanes never need this (the decoder
 /// cannot emit fences); `response_format` lanes without decoder-level
@@ -2691,7 +2691,7 @@ pub fn strip_json_fence(content: &str) -> &str {
     let Some(after_open) = t.strip_prefix("```") else {
         return content;
     };
-    // Opening fence may carry an info string (`json`, `JSON`, …) up to
+    // Opening fence may carry an info string (`json`, `JSON`, ...) up to
     // the first newline; a fence with no newline treats the rest as body.
     let body = match after_open.find('\n') {
         Some(nl) => &after_open[nl + 1..],
@@ -2704,17 +2704,17 @@ pub fn strip_json_fence(content: &str) -> &str {
 }
 
 /// Strip whole-content fences from every choice's `message.content` in a
-/// chat-completion response — the deliverable-side normalization for a
+/// chat-completion response - the deliverable-side normalization for a
 /// request that demanded JSON via `response_format` (see
 /// [`structured_output_kind`]). Returns whether anything changed so
 /// callers skip a pointless re-serialization.
 ///
 /// Models on grammar-less lanes decorate beyond the whole-content fence
 /// the fast path handles: a fence followed by commentary ("Note: the
-/// value above is…"), or prose introducing a fenced/raw object. For a
+/// value above is..."), or prose introducing a fenced/raw object. For a
 /// request that DEMANDED JSON the contract is "content parses as JSON",
 /// so the fallback extracts the first balanced object/array span and
-/// keeps it only when it parses — decorated garbage without any valid
+/// keeps it only when it parses - decorated garbage without any valid
 /// JSON span ships verbatim (no silent invention).
 pub fn normalize_json_fences(v: &mut serde_json::Value) -> bool {
     let Some(choices) = v
@@ -2743,7 +2743,7 @@ pub fn normalize_json_fences(v: &mut serde_json::Value) -> bool {
         let Some(candidate) = extracted else {
             continue;
         };
-        // Accept only spans that parse to an object or array — a demand
+        // Accept only spans that parse to an object or array - a demand
         // for JSON is satisfied by a JSON document, not a bare scalar.
         let valid = serde_json::from_str::<serde_json::Value>(candidate)
             .is_ok_and(|parsed| parsed.is_object() || parsed.is_array());
@@ -2756,8 +2756,8 @@ pub fn normalize_json_fences(v: &mut serde_json::Value) -> bool {
     touched
 }
 
-/// First balanced `{ … }` / `[ … ]` span in `content`, string- and
-/// escape-aware, or `None` when no complete span exists. Slicing only —
+/// First balanced `{ ... }` / `[ ... ]` span in `content`, string- and
+/// escape-aware, or `None` when no complete span exists. Slicing only -
 /// validation belongs to the caller.
 fn extract_json_span(content: &str) -> Option<&str> {
     let bytes = content.as_bytes();
@@ -2794,13 +2794,13 @@ fn extract_json_span(content: &str) -> Option<&str> {
 }
 
 /// Final buffered-body bytes for the guarded non-stream lanes (think
-/// suppression, model restamp, JSON-fence normalization — applied in
+/// suppression, model restamp, JSON-fence normalization - applied in
 /// that order, one parse, one conditional re-serialization).
 ///
 /// Zero-parse fast path: a think-only lane (no restamp, no fence
 /// demand) whose body carries no marker-risk bytes provably cannot
 /// contain `<think>` in any decoded string, so suppression is an
-/// identity and the engine's ORIGINAL bytes ship untouched — no parse,
+/// identity and the engine's ORIGINAL bytes ship untouched - no parse,
 /// no re-serialization, no key reordering. The same holds after the
 /// parse when nothing changed (`touched` is accurate per mutator), so
 /// clean bodies keep engine byte order even when a risk byte forced
@@ -2844,7 +2844,7 @@ fn finalize_buffered_body(
 }
 
 /// Classify a fully-buffered non-stream chat body (enforce path) from
-/// its exact usage object — no substring heuristics on this route.
+/// its exact usage object - no substring heuristics on this route.
 fn record_buffered_chat(
     obs: &std::sync::Arc<crate::state::CacheObs>,
     model: &str,
@@ -2902,7 +2902,7 @@ struct CacheObsFinisher {
     tap: std::sync::Arc<CacheTap>,
     obs: std::sync::Arc<crate::state::CacheObs>,
     first_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Chat routes only — embeddings/other bodies would pollute the
+    /// Chat routes only - embeddings/other bodies would pollute the
     /// generation warm/cold split.
     chat: bool,
     /// Per-model attribution for the cache-hit surfaces.
@@ -2963,7 +2963,7 @@ impl Drop for InFlightGuard {
 /// predictive rejection (below this, admit and measure instead).
 const PREDICTIVE_MIN_SAMPLES: u64 = 20;
 /// Reject only when the OPTIMISTIC p90 estimate exceeds this multiple of
-/// the caller's explicit deadline — a wide margin so we only early-reject
+/// the caller's explicit deadline - a wide margin so we only early-reject
 /// requests that are near-certain to blow their SLO anyway.
 const PREDICTIVE_MARGIN: f64 = 2.0;
 
@@ -2973,7 +2973,7 @@ const PREDICTIVE_MARGIN: f64 = 2.0;
 /// deadline by a wide margin, reject fast with a `Retry-After` hint
 /// instead of burning queue time on a request that cannot land in time.
 /// Returns `Some(retry_after_secs)` when rejection is warranted.
-/// Pure decision — unit-tested in isolation from histogram state.
+/// Pure decision - unit-tested in isolation from histogram state.
 #[must_use]
 #[allow(
     clippy::cast_possible_truncation,
@@ -3052,7 +3052,7 @@ pub async fn admission_gate_slo(
     }
     loop {
         // Canonical load read: live replicas + requests admitted during
-        // the cold-spawn window (a ps() row cannot express the latter —
+        // the cold-spawn window (a ps() row cannot express the latter -
         // the instance does not exist yet, and the gate must still see
         // the request it just admitted).
         let busy = state.sup.request_load(model);
@@ -3060,7 +3060,7 @@ pub async fn admission_gate_slo(
         // interactive/tool work. RawLong may not take one while any
         // non-raw waiter is queued for this model (borrowing keeps the
         // reservation from idling when nobody needs it). On N = 1 the
-        // clamp degenerates to "no isolation possible" — a single-slot
+        // clamp degenerates to "no isolation possible" - a single-slot
         // child cannot separate classes (documented tradeoff).
         let ceiling = match class {
             crate::queue::WorkClass::Interactive | crate::queue::WorkClass::Tool => max_inflight,
@@ -3110,7 +3110,7 @@ pub async fn admission_gate_slo(
         // candidate itself). Bracket the wait with the slot-pressure
         // gauge so the adaptive reshaper sees currently-parked demand
         // every reaper tick (the ensure-path AllSlotsBusy arm only
-        // covers multi-model spawn contention — live-proven 2026-09-12:
+        // covers multi-model spawn contention - live-proven 2026-09-12:
         // 12 streams on one loaded model queued here for 37s with the
         // gauge reading zero the whole time).
         state.sup.note_slot_pressure(model);
@@ -3132,7 +3132,7 @@ pub async fn admission_gate_slo(
 }
 
 /// Deterministic-isolation predicate (F4): the model carries the knob AND
-/// the request signals reproducibility intent — `temperature <= 0` with
+/// the request signals reproducibility intent - `temperature <= 0` with
 /// an explicit `seed` (a seedless greedy call has nothing to reproduce).
 /// Surfaces without sampling options (embeddings, rerank) pass `None`s
 /// and never qualify.
@@ -3224,7 +3224,7 @@ pub fn begin_accounting(state: &Arc<AppState>, model: &str) -> InFlightGuard {
 /// D5 note-side concurrency: the peak number of OTHER streams that
 /// overlapped one request. The buffered note sites hold their in-flight
 /// guard at BOTH anchors, so each live count includes the noting request
-/// itself — subtract one at each anchor and take the max. The max is what
+/// itself - subtract one at each anchor and take the max. The max is what
 /// kills the tail-of-burst misroute: the last request of an N-deep burst
 /// notes alone (note anchor sees 0 others) but entered at depth N (entry
 /// anchor sees N-1), so it still lands in the loaded class instead of
@@ -3239,7 +3239,7 @@ pub fn others_peak(entry_live: i64, note_live: i64) -> i64 {
 /// Begin accounting as a deterministic-isolation holder: exclusivity was
 /// acquired by the gate (quiescent child verified there); the guard's
 /// `Drop` returns it. Same in-flight accounting as [`begin_accounting`]
-/// — an exclusive request must be visible to `request_load` so a second
+/// - an exclusive request must be visible to `request_load` so a second
 /// exclusive candidate keeps parking.
 #[must_use]
 fn begin_accounting_exclusive(state: &Arc<AppState>, model: &str) -> InFlightGuard {
@@ -3312,7 +3312,7 @@ mod affinity_tests {
 
     /// D5 anchor math: both live counts include the noting request, so
     /// the other-stream peak subtracts 1 per anchor. The tail-of-burst
-    /// case is the reason the max exists — entering at depth 3 but
+    /// case is the reason the max exists - entering at depth 3 but
     /// noting alone still classifies as loaded (2 others), never solo.
     #[test]
     fn unit__others_peak__anchors_and_tail_of_burst() {
@@ -3336,7 +3336,7 @@ mod affinity_tests {
             v["n"] = n;
             v
         };
-        // Absent / null → None (OpenAI default n=1).
+        // Absent / null -> None (OpenAI default n=1).
         assert_eq!(
             requested_choices(chat, &serde_json::json!({"model": "m1"})),
             Ok(None)
@@ -3484,7 +3484,7 @@ mod affinity_tests {
         ]});
         // Structured content is stringified deterministically; the image
         // difference lives past the text head only when the text part is
-        // large enough — here both fit, so they differ.
+        // large enough - here both fit, so they differ.
         assert_ne!(affinity_hash(&a), affinity_hash(&b));
         assert_eq!(affinity_hash(&a), affinity_hash(&a));
     }
@@ -3506,7 +3506,7 @@ mod affinity_tests {
         ]}));
         assert!(s.is_some() && arr.is_some());
         // Same text via either shape sticks together only when the
-        // stringified array head matches — it will not, by design;
+        // stringified array head matches - it will not, by design;
         // what matters is each shape is stable and discriminating.
         assert_eq!(
             s,
@@ -3518,8 +3518,8 @@ mod affinity_tests {
     #[test]
     fn unit__affinity__no_prompt__none() {
         // Bodies with no conversation identity at all: no affinity,
-        // plain load-balance. (`input` arrays ARE identity — responses
-        // lane — and hash deterministically.)
+        // plain load-balance. (`input` arrays ARE identity - responses
+        // lane - and hash deterministically.)
         assert_eq!(affinity_hash(&serde_json::json!({"model": "m"})), None);
         assert_eq!(
             affinity_hash(&serde_json::json!({"messages": []})),
@@ -3646,7 +3646,7 @@ mod cache_obs_tests {
     fn unit__mutations__pre_parsed_matches_fallback_exactly() {
         // The hot lane hands the pre-parsed body in; the byte-identical
         // contract must hold against the None fallback (parse-here)
-        // path for EVERY branch: mutate, already-set, non-stream — and
+        // path for EVERY branch: mutate, already-set, non-stream - and
         // across engines (stamp + think lanes included).
         use blazar_core::engine_kind::EngineKind as K;
         let bodies = [
@@ -3746,7 +3746,7 @@ mod cache_obs_tests {
         // Every body here is a no-op on its lane: conforming streams,
         // non-stream chats, system-list shapes the hoist leaves alone,
         // and stamps already matching the child's registered name.
-        // (Stamped/think lanes carry their own no-op cases below — a
+        // (Stamped/think lanes carry their own no-op cases below - a
         // body that only settles SOME lanes would false-fail here.)
         let llama_bodies = [
             json!({"model": "m", "messages": [], "stream": false}),
@@ -3881,7 +3881,7 @@ mod cache_obs_tests {
 
     #[test]
     fn unit__mutations__mistralrs_stream_chat_keeps_usage_and_model_stamp() {
-        // All three mutations visible in ONE body — impossible under
+        // All three mutations visible in ONE body - impossible under
         // the old chain (last mutator always won).
         let body = json!({
             "model": "store-name",
@@ -3932,7 +3932,7 @@ mod cache_obs_tests {
     fn unit__mutations__sglang_variant_stamp_overrides_registered_name() {
         // A `base+stem` request riding the base child: the child must see
         // the colon form (`base:adapter`) so sglang's native LoRA
-        // resolution selects the adapter — NOT the plain registration
+        // resolution selects the adapter - NOT the plain registration
         // name the engine-wide stamp would emit.
         let body = json!({
             "model": "qwen3-1.7b+eternis-anonymizer",
@@ -4010,7 +4010,7 @@ mod cache_obs_tests {
     fn unit__normalize_json_fences__trailing_commentary_extracts_span() {
         use serde_json::json;
         // The mlx-lane incident shape: fenced JSON followed by a note the
-        // whole-content fast path refuses to touch — the demand licensed
+        // whole-content fast path refuses to touch - the demand licensed
         // extracting the first balanced object instead.
         let mut v = json!({"choices": [
             {"index": 0, "message": {"role": "assistant", "content":
@@ -4029,12 +4029,12 @@ mod cache_obs_tests {
     fn unit__normalize_json_fences__prose_intro_and_array_span() {
         use serde_json::json;
         // prose introducing a fenced object, then a fenced array with a
-        // trailing remark — both extract their first balanced span
+        // trailing remark - both extract their first balanced span
         let mut v = json!({"choices": [
             {"index": 0, "message": {"role": "assistant", "content":
                 "Here is the summary you asked for:\n```json\n{\"city\": \"Oslo\"}\n```\nEnjoy!"}},
             {"index": 1, "message": {"role": "assistant", "content":
-                "```\n[1, 2, 3]\n``` — sorted"}}
+                "```\n[1, 2, 3]\n``` - sorted"}}
         ]});
         assert!(normalize_json_fences(&mut v));
         assert_eq!(
@@ -4048,7 +4048,7 @@ mod cache_obs_tests {
     fn unit__normalize_json_fences__no_valid_span_ships_verbatim() {
         use serde_json::json;
         // decorated text without any complete balanced span must NOT be
-        // silently rewritten — the client sees the raw truth
+        // silently rewritten - the client sees the raw truth
         let decorated = "```json\n{\"unterminated\": ";
         let mut v = json!({"choices": [
             {"index": 0, "message": {"role": "assistant", "content": decorated}}
@@ -4112,7 +4112,7 @@ mod cache_obs_tests {
             }))),
             Some("json_object")
         );
-        // plain text is NOT a constraint — no receipt
+        // plain text is NOT a constraint - no receipt
         assert_eq!(
             structured_output_kind(Some(&json!({"response_format": {"type": "text"}}))),
             None
@@ -4127,7 +4127,7 @@ mod cache_obs_tests {
     fn unit__finalize_buffered_body__marker_free_body_ships_engine_bytes() {
         // Engine-original key order (deliberately NOT alphabetical) with
         // marker-free content: the zero-parse fast path must return the
-        // exact input bytes — no parse, no re-serialization, no reorder.
+        // exact input bytes - no parse, no re-serialization, no reorder.
         let raw = br#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"clean prose answer"},"finish_reason":"stop"}],"model":"m","usage":{"prompt_tokens":5,"completion_tokens":3}}"#;
         assert_eq!(
             finalize_buffered_body(raw, true, false, false, "m"),
@@ -4146,7 +4146,7 @@ mod cache_obs_tests {
     #[test]
     fn unit__finalize_buffered_body__risk_bearing_clean_body_keeps_engine_bytes() {
         // HTML-ish content trips the risk scan (full path runs), but
-        // suppression changes nothing — accurate `touched` keeps the
+        // suppression changes nothing - accurate `touched` keeps the
         // engine's original byte order instead of re-serializing.
         let raw = br#"{"zz":{"a":1},"choices":[{"index":0,"message":{"role":"assistant","content":"<div>hi</div> done"}}],"model":"m"}"#;
         assert_eq!(
@@ -4293,7 +4293,7 @@ mod cache_obs_tests {
     #[test]
     fn unit__cache_finisher__prose_literal_earlier_loses_to_final_usage() {
         // Pin (regression contract): generated prose may contain the
-        // literal `"prompt_tokens"` — classification must read the FINAL
+        // literal `"prompt_tokens"` - classification must read the FINAL
         // usage event, never the prose occurrence.
         let prose = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":",
@@ -4341,7 +4341,7 @@ mod body_needs_vision_tests {
     #[test]
     fn unit__body_needs_vision__chat_video_tag_variants__detected() {
         // b11147 #27921: chat accepts input_video/video_url aliases and
-        // data:video/* URIs — every spelling needs a projector replica.
+        // data:video/* URIs - every spelling needs a projector replica.
         for tag in ["input_video", "video_url"] {
             let body = serde_json::json!({
                 "messages": [{
@@ -4367,7 +4367,7 @@ mod body_needs_vision_tests {
     #[test]
     fn unit__body_needs_vision__chat_input_audio_tag__detected() {
         // Audit MM6: upstream server accepts input_audio items (data or
-        // URL) — they ride the projector lane like images.
+        // URL) - they ride the projector lane like images.
         let body = serde_json::json!({
             "messages": [{
                 "role": "user",
@@ -4408,7 +4408,7 @@ mod body_needs_vision_tests {
 
     #[test]
     fn unit__body_needs_vision__responses_function_call_output_image__detected() {
-        // b11147 #22575: a tool result may return an image — the child
+        // b11147 #22575: a tool result may return an image - the child
         // renders it as an image part on the tool message.
         let body = serde_json::json!({
             "input": [
@@ -4497,7 +4497,7 @@ mod resolve_model_tests {
     fn unit__resolve_model__colon_tag_swaps_onto_exact_row() {
         // Regression pin (2026-09-14 validate run.colon): the live store
         // qwen2.5-0.5b + qwen2.5-0.5b-instruct + qwen2.5-1.5b-instruct
-        // made `qwen2.5:0.5b` 404 as "ambiguous" — the tag was discarded
+        // made `qwen2.5:0.5b` 404 as "ambiguous" - the tag was discarded
         // and the bare prefix matched three rows. The colon form must
         // resolve through the shared exact/swap rule like the CLI does.
         let (_tmp, store) = store_with(&[
@@ -4529,7 +4529,7 @@ mod resolve_model_tests {
     #[test]
     fn unit__resolve_model__wrong_tag_stays_ambiguous_teaching() {
         // A tag that swaps onto no row must fail loud with the candidate
-        // rows — never silently resolve a sibling.
+        // rows - never silently resolve a sibling.
         let (_tmp, store) = store_with(&[
             "qwen2.5-0.5b",
             "qwen2.5-0.5b-instruct",
@@ -4595,7 +4595,7 @@ mod resolve_model_tests {
             child_model_stamp(&ref_for(EngineKind::MistralRs)),
             Some("default".to_string())
         );
-        // sglang: the sanitized --served-model-name — its `model:tail`
+        // sglang: the sanitized --served-model-name - its `model:tail`
         // parsing turns a forwarded quant tag into a phantom LoRA ask,
         // and its startup assert rejects any colon in the registration.
         assert_eq!(
@@ -4641,7 +4641,7 @@ mod resolve_model_tests {
         let chat = "/v1/chat/completions";
         let bytes = |v: &serde_json::Value| axum::body::Bytes::from(v.to_string());
 
-        // No think controls: mistral.rs defaults thinking ON — pin OFF.
+        // No think controls: mistral.rs defaults thinking ON - pin OFF.
         let out = apply_child_request_mutations(
             &eng(EngineKind::MistralRs),
             chat,
@@ -4653,7 +4653,7 @@ mod resolve_model_tests {
             json!({"model": "default", "enable_thinking": false})
         );
 
-        // Kwargs on → mirrored top-level (kwargs preserved, add-only).
+        // Kwargs on -> mirrored top-level (kwargs preserved, add-only).
         let out = apply_child_request_mutations(
             &eng(EngineKind::MistralRs),
             chat,
@@ -4667,7 +4667,7 @@ mod resolve_model_tests {
         assert_eq!(v["enable_thinking"], json!(true));
         assert_eq!(v["chat_template_kwargs"]["thinking"], json!(true));
 
-        // Kwargs off: already-off top-level stays untouched (no change →
+        // Kwargs off: already-off top-level stays untouched (no change ->
         // byte-identical body; the model stamp is a no-op on "default").
         let src = json!({
             "model": "default",
@@ -4678,7 +4678,7 @@ mod resolve_model_tests {
             apply_child_request_mutations(&eng(EngineKind::MistralRs), chat, bytes(&src), None);
         assert_eq!(&out[..], src.to_string().as_bytes());
 
-        // Effort vocabulary bridge: minimal → off, max → xhigh; an
+        // Effort vocabulary bridge: minimal -> off, max -> xhigh; an
         // effort request implies thinking on unless explicitly off.
         let out = apply_child_request_mutations(
             &eng(EngineKind::MistralRs),
@@ -4699,7 +4699,7 @@ mod resolve_model_tests {
         let v = serde_json::from_slice::<serde_json::Value>(&out).unwrap();
         assert_eq!(v["reasoning_effort"], json!("xhigh"));
 
-        // Explicit top-level true survives (kwargs absent → none added).
+        // Explicit top-level true survives (kwargs absent -> none added).
         let out = apply_child_request_mutations(
             &eng(EngineKind::MistralRs),
             chat,
@@ -4753,7 +4753,7 @@ mod resolve_model_tests {
         );
 
         // Non-chat paths (embeddings, tokenize) never gain think pins
-        // (the model stamp still applies — path-independent contract).
+        // (the model stamp still applies - path-independent contract).
         let out = apply_child_request_mutations(
             &eng(EngineKind::MistralRs),
             "/v1/embeddings",
@@ -4792,7 +4792,7 @@ mod resolve_model_tests {
     #[test]
     fn unit__normalize_system_first__mid_list_blocks_hoist_and_merge() {
         use serde_json::json;
-        // The opencode repro shape: a system block after user turns —
+        // The opencode repro shape: a system block after user turns -
         // Qwen3-class templates raise on it verbatim.
         let mut v = json!({"messages": [
             {"role": "user", "content": "hi"},

@@ -1,11 +1,11 @@
-//! Measured KV-cache quantization quality receipts — the evidence base
+//! Measured KV-cache quantization quality receipts - the evidence base
 //! the tuner consults before a quantized KV grade may win a profile.
 //!
 //! The registry (`registry/kv-quant-quality.json`, compiled in with
 //! `include_str!`) holds llama-perplexity A/B receipts: fixed corpus,
 //! identical ctx/chunks/ngl, only the cache type varied. Per the
-//! registry's own contract, `model` is the store name — the same string
-//! `/api/explain/{model}` resolves — so eligibility lookups match
+//! registry's own contract, `model` is the store name - the same string
+//! `/api/explain/{model}` resolves - so eligibility lookups match
 //! EXACTLY. A basename or alias match would borrow one checkpoint's
 //! quality proof for another: fabrication, not evidence.
 //!
@@ -13,7 +13,7 @@
 //! grade is eligible only when a receipt for THIS model measured a rung
 //! containing that grade at a context window at least as long as the
 //! profile being tuned (`grade_evidenced_at_ctx`). A ppl receipt at
-//! ctx 2048 says nothing about 32k retrieval — hence the ctx floor.
+//! ctx 2048 says nothing about 32k retrieval - hence the ctx floor.
 
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -30,11 +30,11 @@ pub fn receipts() -> &'static Value {
 
 /// Whether `grade` (a KV cache type such as `q8_0`) has measured
 /// quality evidence for `model` at a context window of at least
-/// `min_ctx`. Exact store-name match only — see the module docs. Rung
+/// `min_ctx`. Exact store-name match only - see the module docs. Rung
 /// keys are either a single grade (`f16`) or a `k/v` pair
 /// (`q8_0/q8_0`); a grade evidenced on either side of the pair counts.
 pub fn grade_evidenced_at_ctx(model: &str, grade: &str, min_ctx: u32) -> bool {
-    // f16 is the reference every receipt is compared against — the
+    // f16 is the reference every receipt is compared against - the
     // baseline needs no receipt of its own.
     if grade == "f16" {
         return true;
@@ -73,7 +73,7 @@ mod tests {
         assert!(!grade_evidenced_at_ctx("qwen3.5-9b", "q8_0", 65536));
         // q4_0: measured at both windows too.
         assert!(grade_evidenced_at_ctx("qwen3.5-9b", "q4_0", 32768));
-        // q5_0: never measured — throughput alone can never adopt it.
+        // q5_0: never measured - throughput alone can never adopt it.
         assert!(!grade_evidenced_at_ctx("qwen3.5-9b", "q5_0", 2048));
         // Exact-name contract: case or basename variants do not borrow
         // the receipt.
@@ -85,7 +85,7 @@ mod tests {
         assert!(grade_evidenced_at_ctx("qwen3-0.6b", "f16", 131072));
     }
 
-    /// The registry must parse and carry the schema marker — a
+    /// The registry must parse and carry the schema marker - a
     /// malformed file would silently make every grade ineligible,
     /// which is safe for quality but hides the breakage. Pin the parse.
     #[test]

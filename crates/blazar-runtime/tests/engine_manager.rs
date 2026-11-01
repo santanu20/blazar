@@ -122,7 +122,7 @@ async fn mount_releases_list(api: &MockServer, tags: &[&str]) {
 fn manager(dirs: &BlazarDirs, api_uri: &str) -> EngineManager {
     // Diagnostics: surface the probe layer's warn! lines (spawn errno)
     // that probe_output otherwise swallows into None. try_init is
-    // idempotent — the first parallel caller wins, the rest no-op.
+    // idempotent - the first parallel caller wins, the rest no-op.
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
@@ -260,7 +260,7 @@ async fn integration__install_probe_activate_rollback_cycle() {
 
     // Manifest is a real probe of the stub: version/build/devices/flags.
     // The stub banner reports STUB_BUILD 9999, but the install tag (b100)
-    // is the authoritative build identity — same rule that overrides the
+    // is the authoritative build identity - same rule that overrides the
     // shallow-clone "build 1" artifact on source-built engines.
     let mut m: Manifest = serde_json::from_str(&row.manifest).unwrap();
     m.anchor_server_path(&dirs.data_dir);
@@ -400,7 +400,7 @@ async fn integration__latest_btag_from_list() {
 #[allow(non_snake_case)]
 async fn integration__rate_limit__gh_token_hint() {
     // Env mutation helper follows the tests-dir edition-2024 pattern
-    // (nextest runs one test per process — std's safety condition).
+    // (nextest runs one test per process - std's safety condition).
     fn set_env(key: &str, value: &str) {
         #[expect(unsafe_code)]
         unsafe {
@@ -413,7 +413,7 @@ async fn integration__rate_limit__gh_token_hint() {
         .respond_with(ResponseTemplate::new(403))
         .mount(&api)
         .await;
-    // The anonymous web fallback must be pinned to a dead surface —
+    // The anonymous web fallback must be pinned to a dead surface -
     // unset/ambient BLAZAR_ATOM_BASE would hit the real feed and turn
     // the rate limit into a successful (network-dependent) listing.
     let web = MockServer::start().await;
@@ -565,7 +565,7 @@ async fn integration__prune_reports_freed_tag_bytes() {
     let mgr = manager(&dirs, &api.uri());
     let store = Store::open(&dirs).unwrap();
     // Oldest lane past retention carries a known dir size; the two
-    // newest slots survive. No active row, no local row — pure policy.
+    // newest slots survive. No active row, no local row - pure policy.
     for (i, (tag, file_bytes)) in [("b1", 512u64), ("b2", 128), ("b3", 64)].iter().enumerate() {
         let dir = dirs.engines_dir().join(tag);
         std::fs::create_dir_all(&dir).unwrap();
@@ -863,7 +863,7 @@ async fn integration__prune_never_removes_fork_lanes() {
         .collect();
     remaining.sort();
     // Newest KEEP_TAGS upstream builds + active + the fork: the fork rides
-    // along free — no upstream build is evicted to make room for it.
+    // along free - no upstream build is evicted to make room for it.
     let mut expected: Vec<String> = (1..=5)
         .map(|n| format!("b{n}"))
         .collect::<Vec<_>>()
@@ -991,7 +991,7 @@ async fn integration__fork_lane_registration_never_dethrones_active_engine() {
     use std::collections::BTreeSet;
 
     // An active mainstream lane exists: the fork register must stay
-    // additive — inactive row, active tag untouched.
+    // additive - inactive row, active tag untouched.
     let (_t, dirs) = tmp_dirs();
     let api = MockServer::start().await;
     let mgr = manager(&dirs, &api.uri());
@@ -1048,7 +1048,7 @@ async fn integration__fork_lane_registration_never_dethrones_active_engine() {
 }
 
 /// Stage a mainstream (upstream-source) llamacpp row advertising
-/// `archs` — the coverage side of the supersede pins.
+/// `archs` - the coverage side of the supersede pins.
 fn stage_mainstream_row(store: &Store, dirs: &BlazarDirs, tag: &str, at: i64, archs: &[&str]) {
     let dir = dirs.engines_dir().join(tag);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1073,7 +1073,7 @@ fn stage_mainstream_row(store: &Store, dirs: &BlazarDirs, tag: &str, at: i64, ar
 }
 
 /// Stage a fork lane row with full lifecycle control (trust tier and
-/// supersede stamp) — the retirement-sweep fixture shape.
+/// supersede stamp) - the retirement-sweep fixture shape.
 fn stage_lane(
     store: &Store,
     dirs: &BlazarDirs,
@@ -1270,7 +1270,7 @@ async fn integration__supersede_skips_partially_covered_fork_lanes() {
     let store = Store::open(&dirs).unwrap();
 
     // Mainline absorbed qwen35 but NOT qwen35_moe: partial coverage must
-    // keep the fork unstamped — the rescue path still owns the gap.
+    // keep the fork unstamped - the rescue path still owns the gap.
     stage_mainstream_row(&store, &dirs, "b-main", 3000, &["qwen35"]);
     stage_lane(
         &store,
@@ -1381,7 +1381,7 @@ async fn integration__retire_sweep_deletes_only_eligible_curated_lanes() {
 
 /// A lane whose directory cannot be reclaimed (here: no write
 /// permission inside it) must not block retirement of its siblings,
-/// and must still lose its row only once the dir is out of the way —
+/// and must still lose its row only once the dir is out of the way -
 /// the aside copy is left on disk for a human (a leak beats a ghost
 /// row: the row is gone, so nothing advertises the stranded dir).
 #[cfg(unix)]
@@ -1389,7 +1389,7 @@ async fn integration__retire_sweep_deletes_only_eligible_curated_lanes() {
 #[allow(non_snake_case)]
 async fn integration__retire_sweep_continues_past_undeletable_lane_dir() {
     use std::os::unix::fs::PermissionsExt as _;
-    // DAC permissions do not stop root — the poison would silently
+    // DAC permissions do not stop root - the poison would silently
     // succeed and the assertions below would be vacuous.
     let uid = std::process::Command::new("id").arg("-u").output().unwrap();
     if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
@@ -1428,7 +1428,7 @@ async fn integration__retire_sweep_continues_past_undeletable_lane_dir() {
     );
 
     // The poison: the lane's contents cannot be unlinked (rename aside
-    // still works — it only needs write on the engines dir).
+    // still works - it only needs write on the engines dir).
     let poisoned_dir = dirs.engines_dir().join(poisoned);
     let mut perms = std::fs::metadata(&poisoned_dir).unwrap().permissions();
     perms.set_mode(0o500);
@@ -1492,7 +1492,7 @@ async fn integration__register_local_engine() {
 /// A dir containing the stub binary as `llama-server` (what
 /// `register_engine` expects an extracted engine dir to look like).
 /// Stage a llama-server stub into a unique temp dir owned by the caller.
-/// Returns the path plus the drop guard — binding the guard keeps the
+/// Returns the path plus the drop guard - binding the guard keeps the
 /// staged binary alive for the test and guarantees cleanup on exit (the
 /// earlier pid-keyed dir leaked one copy per `cargo test` run).
 fn stub_engine_dir(tag: &str) -> (PathBuf, tempfile::TempDir) {
@@ -1506,7 +1506,7 @@ fn stub_engine_dir(tag: &str) -> (PathBuf, tempfile::TempDir) {
 
 /// A row-less engine dir is disk debris (interrupted install, pre-rollback
 /// upgrade): the sweep must remove it while every dir a row points into
-/// survives — including nested `server_path` references and empty-path
+/// survives - including nested `server_path` references and empty-path
 /// default manifests.
 #[tokio::test]
 #[allow(non_snake_case)]
@@ -1521,7 +1521,7 @@ async fn integration__orphan_engine_dirs__swept_while_referenced_survive() {
     let orphan = dirs.engines_dir().join("b0-ghost");
     std::fs::create_dir_all(&orphan).unwrap();
     std::fs::write(orphan.join("marker"), "ghost").unwrap();
-    // A regular FILE in the engines dir is not engine debris — untouched.
+    // A regular FILE in the engines dir is not engine debris - untouched.
     std::fs::write(dirs.engines_dir().join("README"), "n/a").unwrap();
 
     let freed = mgr.prune_orphan_dirs().unwrap();
@@ -1556,7 +1556,7 @@ async fn integration__sweep_install_debris__gated_matrix() {
     let store = Store::open(&dirs).unwrap();
     stage_mainstream_row(&store, &dirs, "b1-cuda", 2, &["qwen2"]);
     // Fresh row-less dir: indistinguishable from an install building
-    // right now — protected by the grace gate.
+    // right now - protected by the grace gate.
     let fresh_orphan = dirs.engines_dir().join("b2-building");
     std::fs::create_dir_all(&fresh_orphan).unwrap();
     std::fs::write(fresh_orphan.join("archive.tar.gz"), "x").unwrap();
@@ -1606,7 +1606,7 @@ async fn integration__sweep_install_debris__gated_matrix() {
 
     // Zero grace collapses the quiet window: the once-fresh orphan goes,
     // and the building-looking aside's final dir is no longer "recent"
-    // either — the grace window is its only protection, by design.
+    // either - the grace window is its only protection, by design.
     let freed0 = mgr.sweep_install_debris(std::time::Duration::ZERO);
     let names0: Vec<&str> = freed0.iter().map(|(n, _)| n.as_str()).collect();
     assert!(
@@ -1687,7 +1687,7 @@ async fn integration__lazy_whisper_lane_never_claims_serving_active() {
 /// A legacy `whisper/bin/<tag>` tree adopts into the engines lane: the
 /// dir moves, the row registers, and a ghost row (the live b5130
 /// incident shape: row survived while its dir was gone) heals onto the
-/// moved binary — without touching the serving throne.
+/// moved binary - without touching the serving throne.
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn adopt__moves_tree_and_heals_ghost_row() {
@@ -1778,7 +1778,7 @@ async fn adopt__idempotent_second_run_noop() {
 }
 
 /// A pin written against the legacy tree keeps selecting the same tag
-/// after adoption — through the engines-lane row the adoption created.
+/// after adoption - through the engines-lane row the adoption created.
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn adopt__pin_honored_after_adoption() {
@@ -1868,7 +1868,7 @@ async fn unit__use_tag__lazy_lanes_refuse_and_teach_their_pin() {
 }
 
 /// `engine rm` of a pinned lazy-lane tag clears that lane's pin file
-/// with it — a pin naming a removed tag dangled on every later
+/// with it - a pin naming a removed tag dangled on every later
 /// resolution. A pin naming a different tag survives the removal.
 #[tokio::test]
 #[allow(non_snake_case)]
@@ -1980,8 +1980,8 @@ async fn adopt__piper_tree_moves_legacy_dir_and_row_created() {
     );
 }
 
-/// The piper serving pick honors pin > engines row > legacy tree — the
-/// exact precedence whisper serves by — and `installed_tag` reports the
+/// The piper serving pick honors pin > engines row > legacy tree - the
+/// exact precedence whisper serves by - and `installed_tag` reports the
 /// same verdict the serving lane would pick (update hints key on it).
 #[tokio::test]
 #[allow(non_snake_case)]
@@ -2049,7 +2049,7 @@ async fn integration__piper_server_bin__pin_row_legacy_precedence() {
     );
 }
 
-/// `tts --pin` validates against BOTH lanes' install sets — an unknown
+/// `tts --pin` validates against BOTH lanes' install sets - an unknown
 /// tag is refused with the combined known list, and either lane's tag
 /// pins cleanly (one `--pin` flag, two legal homes).
 #[test]
@@ -2089,7 +2089,7 @@ async fn integration__vulkan_never_dethrones_cuda_on_nvidia() {
     let api = MockServer::start().await;
     let mgr = manager(&dirs, &api.uri());
 
-    // CUDA engine installed first (vendor gate off — it must activate).
+    // CUDA engine installed first (vendor gate off - it must activate).
     let cuda = mgr
         .register_engine_with_vendor(
             &stub_engine_dir("b1").0,
@@ -2586,7 +2586,7 @@ fn unit__keep_cuda_skip_pred__truth_table() {
     );
     assert!(
         keep_cuda_skip_pred(Some(&cuda), Vendor::Nvidia, "windows", "x86_64", "auto"),
-        "windows-x86_64 builds CUDA locally too — the dormant-download waste is identical"
+        "windows-x86_64 builds CUDA locally too - the dormant-download waste is identical"
     );
     assert!(
         !keep_cuda_skip_pred(Some(&cuda), Vendor::Nvidia, "macos", "x86_64", "auto"),
@@ -2635,7 +2635,7 @@ async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
 
     // Channel release carries ONLY the host platform's primary asset. No
     // /download mock is mounted: any fetch attempt 404s and fails the
-    // test — the skip must guarantee the standard lane never downloads.
+    // test - the skip must guarantee the standard lane never downloads.
     let primary_asset = format!(
         "llama-b10910-bin-{}.{}",
         host_asset_labels()[0],
@@ -2671,7 +2671,7 @@ async fn integration__update_resolved__keep_cuda_skip_downloads_nothing() {
 
 /// Same-tag idempotency (channel lane): a channel update resolving to
 /// the ALREADY-ACTIVE build must return the active row without touching
-/// the network asset lane — the update used to retire + re-download the
+/// the network asset lane - the update used to retire + re-download the
 /// exact archive the box already held. No /download mock is mounted:
 /// any fetch attempt 404s and fails the test. The vendor hint is Nvidia
 /// so the skip must fire BEFORE the CUDA lane machinery too.
@@ -2868,7 +2868,7 @@ fn unit__remove_engine_row_and_tree__restores_dir_when_row_delete_fails() {
 
 /// Live incident 2026-09-26 pin: a scratch XDG data dir whose engines
 /// root was a symlink into the real store lost five engine installs to
-/// the orphan sweep — the old `remove_dir_all` followed the link and
+/// the orphan sweep - the old `remove_dir_all` followed the link and
 /// reclaimed ~13 GiB of foreign content. The containment guard must
 /// refuse to delete anything that resolves outside the data root.
 #[cfg(unix)]
@@ -2876,7 +2876,7 @@ fn unit__remove_engine_row_and_tree__restores_dir_when_row_delete_fails() {
 #[allow(non_snake_case)]
 async fn integration__orphan_sweep__symlinked_engines_root_spares_target() {
     let (tmp, dirs) = tmp_dirs();
-    // The "real store" the symlink points at — outside dirs.data_dir.
+    // The "real store" the symlink points at - outside dirs.data_dir.
     let real_root = tmp.path().join("real-store/engines");
     let victim = real_root.join("b11193-cuda");
     std::fs::create_dir_all(&victim).unwrap();
@@ -2912,7 +2912,7 @@ async fn integration__prune__escaped_dir_keeps_row_and_target() {
     let mgr = manager(&dirs, &api.uri());
     let store = Store::open(&dirs).unwrap();
     // Three same-kind rows: KEEP_TAGS (2) keep their slots, the oldest
-    // is prune-eligible — but its dir sits behind a symlinked root.
+    // is prune-eligible - but its dir sits behind a symlinked root.
     stage_mainstream_row(&store, &dirs, "b3-cuda", 3, &["qwen2"]);
     stage_mainstream_row(&store, &dirs, "b2-cuda", 2, &["qwen2"]);
     stage_mainstream_row(&store, &dirs, "b1-cuda", 1, &["qwen2"]);
@@ -2941,7 +2941,7 @@ async fn integration__prune__escaped_dir_keeps_row_and_target() {
 
 /// An explicit `engine rm` against a dir behind a symlinked engines
 /// root refuses with a teaching error instead of deleting through the
-/// link — no ghost row over a dir that still exists.
+/// link - no ghost row over a dir that still exists.
 #[cfg(unix)]
 #[test]
 #[allow(non_snake_case)]
@@ -2982,6 +2982,6 @@ fn unit__remove_engine_row_and_tree__escaped_dir_refused() {
             .unwrap()
             .iter()
             .any(|e| e.tag == "fork-acme_llama.cpp-44444444-cpu"),
-        "row kept — no ghost either way"
+        "row kept - no ghost either way"
     );
 }

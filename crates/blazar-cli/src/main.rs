@@ -1,9 +1,9 @@
-//! `blazar` — multi-engine local inference platform (llama.cpp, mistral.rs, `SGLang`).
+//! `blazar` - multi-engine local inference platform (llama.cpp, mistral.rs, `SGLang`).
 //!
 //! Local-first by design: no telemetry, no cloud endpoints; outbound
 //! traffic is user-initiated (engine/model downloads, plus optional
 //! federation peers you configure). Powered by upstream llama.cpp,
-//! mistral.rs and `SGLang` — unmodified.
+//! mistral.rs and `SGLang` - unmodified.
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -31,7 +31,7 @@ use blazar_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
     name = "blazar",
     version,
     about = "multi-engine local inference: llama.cpp, mistral.rs and SGLang orchestrated behind one OpenAI + Ollama + Anthropic gateway",
-    after_help = "Quickstart: blazar pull <model> · blazar run <model> · blazar doctor\n\nLocal-first: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang — unmodified."
+    after_help = "Quickstart: blazar pull <model> | blazar run <model> | blazar doctor\n\nLocal-first: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang - unmodified."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,7 +61,7 @@ enum Cmd {
         #[arg(short = 'f', long)]
         file: Option<PathBuf>,
     },
-    /// Push a model to a registry — refused: no cloud registry by design
+    /// Push a model to a registry - refused: no cloud registry by design
     Push { model: String },
     /// Manage API keys (list / add / rm / rotate against the running daemon)
     Keys {
@@ -83,7 +83,7 @@ enum Cmd {
         #[arg(long)]
         imatrix: Option<PathBuf>,
         /// Allow quantizing a source that is already quantized (upstream
-        /// llama-quantize flag; quality risk — pair with --verify)
+        /// llama-quantize flag; quality risk - pair with --verify)
         #[arg(long)]
         allow_requantize: bool,
         /// Verify the output with llama-perplexity before registering:
@@ -109,13 +109,13 @@ enum Cmd {
         #[arg(long)]
         key: Option<String>,
     },
-    /// blazar account sign-in — refused: no cloud accounts by design
+    /// blazar account sign-in - refused: no cloud accounts by design
     Signin,
-    /// blazar account login — refused: no cloud accounts by design
+    /// blazar account login - refused: no cloud accounts by design
     Login,
-    /// blazar account sign-out — refused: no cloud accounts by design
+    /// blazar account sign-out - refused: no cloud accounts by design
     Signout,
-    /// blazar account logout — refused: no cloud accounts by design
+    /// blazar account logout - refused: no cloud accounts by design
     Logout,
     /// Stop the daemon; with a model name, unload that model now
     Stop { model: Option<String> },
@@ -155,7 +155,7 @@ enum Cmd {
         json: bool,
     },
     /// Attach a vision projector (mmproj GGUF) to an existing model;
-    /// refuses while the model is running — next spawn picks it up
+    /// refuses while the model is running - next spawn picks it up
     Mmproj { model: String, path: PathBuf },
     /// Remove models (refuses while running)
     Rm { models: Vec<String> },
@@ -197,7 +197,7 @@ enum Cmd {
     },
     /// One-shot classification through a decision model (Laya-class
     /// system-one classifiers): the input plus candidate labels in, a
-    /// calibrated label distribution out — no prose generation
+    /// calibrated label distribution out - no prose generation
     Classify {
         /// Decision model to consult (e.g. laya)
         model: String,
@@ -216,7 +216,7 @@ enum Cmd {
     /// inline PROMPT: single-shot, prints and exits
     Run {
         model: String,
-        /// Prompt words (joined); flags go BEFORE the prompt — a leading
+        /// Prompt words (joined); flags go BEFORE the prompt - a leading
         /// `-` word needs quoting or `--` (`trailing_var_arg` would
         /// swallow `--max-tokens`/`--verbose` INTO the prompt, which
         /// live-repro'd: every completion echoed the flag text and
@@ -268,7 +268,7 @@ enum Cmd {
         /// (catalog pair) real children, single-stream wall tok/s; every
         /// arm is saved as a receipt the supervisor later consults when
         /// spec = "auto", and the winner (vs dense by >5%) becomes the
-        /// model's spec override — ngram wins then refine via --ngram
+        /// model's spec override - ngram wins then refine via --ngram
         #[arg(long = "spec-race")]
         race: bool,
         /// Live warmup A/B: spawn the model twice (with/without
@@ -288,7 +288,7 @@ enum Cmd {
         cache_reuse: bool,
     },
     /// One-page scorecard for a model: measured performance (last bench),
-    /// verified capability verdicts (model-doctor certificate), identity —
+    /// verified capability verdicts (model-doctor certificate), identity -
     /// all read from the store, nothing is re-run
     Scorecard {
         model: String,
@@ -299,7 +299,7 @@ enum Cmd {
     /// Evidence-gap adviser for a model: reads the store and judges
     /// benchmark freshness, tuned profile provenance, KV-cache quality
     /// eligibility, speculation receipts, capability certificate and
-    /// workload telemetry — then recommends the exact commands that
+    /// workload telemetry - then recommends the exact commands that
     /// close each gap, with the datum behind every verdict
     Optimize {
         model: String,
@@ -309,7 +309,7 @@ enum Cmd {
         plan: bool,
         /// Screen candidates through the tune grid WITHOUT adopting,
         /// then verify the screen winner against the live gateway via
-        /// alternating A/B (baseline vs candidate, same workload) —
+        /// alternating A/B (baseline vs candidate, same workload) -
         /// the result is a ledger experiment, never a profile change
         #[arg(long, group = "mode")]
         run: bool,
@@ -338,13 +338,13 @@ enum Cmd {
         json: bool,
     },
     /// Pre-run plan for a model: live routing decision (daemon card),
-    /// measured profile, capability certificate, and next actions —
+    /// measured profile, capability certificate, and next actions -
     /// read-only; an unpulled target shows the upstream fit preview
     Plan {
         model: Option<String>,
         /// Ranked pull menu across the whole catalog: census-filtered
         /// (VRAM + disk) upstream variants, scored by predicted decode
-        /// speed and model capacity, best first — read-only
+        /// speed and model capacity, best first - read-only
         #[arg(long, conflicts_with = "model")]
         install: bool,
         /// Preference axis for --install ranking: speed (default)
@@ -356,7 +356,7 @@ enum Cmd {
         json: bool,
     },
     /// Observe every local model and recommend the work that fills a
-    /// real gap (missing/stale bench, tune, capability certificate) —
+    /// real gap (missing/stale bench, tune, capability certificate) -
     /// each rec cites its stored datum; `--apply` runs them sequentially
     Autopilot {
         /// Run the recommended commands (default: report only)
@@ -365,7 +365,7 @@ enum Cmd {
     },
     /// Qualify a model end-to-end and emit a Passport: refreshes missing
     /// or stale evidence (capability certificate via model-doctor, a
-    /// default bench — never tune, that is an expensive search), then
+    /// default bench - never tune, that is an expensive search), then
     /// assembles identity + engine + hardware + profile + measured +
     /// capabilities into one portable object; absent axes stay labeled
     Certify {
@@ -386,7 +386,7 @@ enum Cmd {
     /// Backup config + store + sessions manifest to a timestamped dir
     Snapshot,
     /// Generate shell completions (bash | zsh | fish | powershell) to
-    /// stdout — `blazar completions bash > .../blazar.bash`
+    /// stdout - `blazar completions bash > .../blazar.bash`
     Completions { shell: clap_complete::Shell },
     /// Suggest draft-model candidates (EAGLE3/MTP heads + small
     /// same-family models) for speculative decoding of MODEL
@@ -397,7 +397,7 @@ enum Cmd {
     /// Transcribe an audio file (local whisper.cpp lane, else a whisper:
     /// [[remotes]] entry); lane management: --install/--pull/--list/--pin
     Whisper {
-        /// Audio file (wav/mp3/flac/...) — omit with --install/--pull/--list
+        /// Audio file (wav/mp3/flac/...) - omit with --install/--pull/--list
         file: Option<PathBuf>,
         /// Model name (default: local installed whisper model, else whisper-1 remote)
         #[arg(long)]
@@ -426,7 +426,7 @@ enum Cmd {
             conflicts_with_all = ["install", "tag", "pull", "list", "file", "model", "pin"]
         )]
         search: Option<String>,
-        /// Pin the whisper server to an installed tag ("none" unpins —
+        /// Pin the whisper server to an installed tag ("none" unpins -
         /// tracks the newest installed tag). No download involved.
         #[arg(
             long,
@@ -438,7 +438,7 @@ enum Cmd {
     /// Offline text-to-speech (piper): install the binary, pull a voice,
     /// synthesize text to a WAV file.
     Tts {
-        /// Text to synthesize — omit with --install/--pull/--list
+        /// Text to synthesize - omit with --install/--pull/--list
         text: Option<String>,
         /// Piper voice id (e.g. en_US-amy-medium; default: first pulled)
         #[arg(long)]
@@ -457,7 +457,7 @@ enum Cmd {
         #[arg(long)]
         list: bool,
         /// Search the upstream voice catalog (rhasspy/piper-voices) by
-        /// substring — a voice id (en_US-amy), a language (en, de) or a
+        /// substring - a voice id (en_US-amy), a language (en, de) or a
         /// quality (medium). Voices marked "pulled" are local already.
         #[arg(
             long,
@@ -465,7 +465,7 @@ enum Cmd {
             conflicts_with_all = ["install", "tag", "pull", "list", "text", "pin"]
         )]
         search: Option<String>,
-        /// Pin piper to an installed tag ("none" unpins — tracks the
+        /// Pin piper to an installed tag ("none" unpins - tracks the
         /// newest installed tag). No download involved.
         #[arg(
             long,
@@ -485,7 +485,7 @@ enum Cmd {
     ///
     /// Models route by format: GGUF files serve on the llama.cpp lane,
     /// HF-style safetensors directories serve on the mistral.rs / sglang
-    /// lane — whichever lane is ACTIVE serves its formats, and a format
+    /// lane - whichever lane is ACTIVE serves its formats, and a format
     /// the active engine cannot load fails with a teaching that names
     /// the install + `engine use` remedy. Switching engines
     /// (`update`, `use`, `rollback`, `install`, `build`, `local`)
@@ -507,7 +507,7 @@ enum Cmd {
         #[arg(num_args = 0..)]
         query: Vec<String>,
         /// Weight-format filter, any Hub tag: gguf, safetensors, awq,
-        /// gptq, fp8, mlx, onnx, … — default `any` shows every servable
+        /// gptq, fp8, mlx, onnx, ... - default `any` shows every servable
         /// lane (GGUF + safetensors quants); `--format gguf` narrows to
         /// the llama.cpp lane.
         /// Works in any position: blazar search minicpm --format mlx
@@ -518,9 +518,9 @@ enum Cmd {
             value_parser = clap::builder::NonEmptyStringValueParser::new()
         )]
         format: String,
-        /// Quant filter over each repo's real file set (client-side — the
+        /// Quant filter over each repo's real file set (client-side - the
         /// Hub has no quant facet): `--quant q4` matches the whole Q4
-        /// family (`q4_0`, `q4_k_m`, `iq4_xs`, …), `--quant Q4_K_M` that exact
+        /// family (`q4_0`, `q4_k_m`, `iq4_xs`, ...), `--quant Q4_K_M` that exact
         /// quant, comma-lists OR (`q4,q5`). Bare query tokens that are
         /// themselves quants (`blazar search qwen gguf q4`) are lifted
         /// into the filter too and OR-merged with any --quant values
@@ -625,7 +625,7 @@ enum Cmd {
         cmd: SessionCmd,
     },
     /// Run a ggml RPC worker: expose this machine's GPUs to a remote
-    /// gateway's `rpc_servers` (distributed llama.cpp inference —
+    /// gateway's `rpc_servers` (distributed llama.cpp inference -
     /// weights and KV split across local + remote devices in
     /// proportion to each device's free memory). The RPC protocol
     /// has NO authentication: only ever expose it on a trusted
@@ -655,7 +655,7 @@ enum Cmd {
     },
     /// Run per-model capability probes (chat/stream/JSON/tools/embeds)
     /// through the real gateway path and store a certificate; the cert
-    /// is what routing trust builds on. Runs as a durable job — poll
+    /// is what routing trust builds on. Runs as a durable job - poll
     /// output is live.
     ModelDoctor {
         /// Model name as the store knows it (`blazar ls`)
@@ -664,14 +664,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Load a model now so the next request is warm (synchronous —
+    /// Load a model now so the next request is warm (synchronous -
     /// reports the resident child state when the load completes)
     Warm {
         /// Model name as the store knows it (`blazar ls`)
         model: String,
     },
     /// Warm a model on peer gateways (remote replication): fan a warm
-    /// out to the named peers — or every configured remote — and report
+    /// out to the named peers - or every configured remote - and report
     /// each peer's outcome
     Replicate {
         /// Model name as the store knows it (`blazar ls`)
@@ -683,8 +683,8 @@ enum Cmd {
         #[arg(long)]
         timeout_secs: Option<u64>,
     },
-    /// Show where a request for this model would be served — local
-    /// residency vs per-peer tier, wait estimate and free VRAM — and
+    /// Show where a request for this model would be served - local
+    /// residency vs per-peer tier, wait estimate and free VRAM - and
     /// the decision the gateway would take
     Route {
         /// Model name (any form the gateway resolves)
@@ -716,7 +716,7 @@ enum Cmd {
         watch: bool,
     },
     /// Explain the effective configuration for a model: engine lane,
-    /// context provenance, slots, speculation, caches — every value
+    /// context provenance, slots, speculation, caches - every value
     /// names its source
     Explain {
         /// Model to explain (store name; aliases resolve daemon-side)
@@ -769,7 +769,7 @@ enum RpcCmd {
     Worker {
         /// Address to bind. Default is loopback-only; a remote
         /// gateway needs `0.0.0.0` (all interfaces) or this box's
-        /// LAN address — deliberately opt-in because the RPC
+        /// LAN address - deliberately opt-in because the RPC
         /// protocol has no authentication.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -778,7 +778,7 @@ enum RpcCmd {
         port: u16,
     },
     /// Query RPC workers for reachability, protocol version and
-    /// per-device free/total memory — the fleet detail `doctor` only
+    /// per-device free/total memory - the fleet detail `doctor` only
     /// reachability-checks. Exit code 1 when any endpoint fails.
     Status {
         /// Workers to query, as `host:port`. Default: every endpoint
@@ -812,7 +812,7 @@ enum EngineCmd {
         #[arg(long)]
         no_gate: bool,
         /// Dry-run: report the channel target and the prebuilt asset
-        /// this box would install, then exit — nothing is downloaded,
+        /// this box would install, then exit - nothing is downloaded,
         /// installed, or written
         #[arg(long)]
         check: bool,
@@ -834,7 +834,7 @@ enum EngineCmd {
     },
     /// Activate an installed tag (see `blazar engine list` for tags)
     ///
-    /// Applies to children spawned after the switch — restart the
+    /// Applies to children spawned after the switch - restart the
     /// daemon (`systemctl restart blazar`, or `blazar stop` +
     /// `blazar serve`) so running instances move to the new engine.
     /// GGUF models need a llama.cpp tag active; safetensors (HF-style
@@ -850,7 +850,7 @@ enum EngineCmd {
         kind: Option<String>,
     },
     /// Remove a retired engine (directory + registry row); refuses the
-    /// active tag — `blazar engine use` another first. Reports the
+    /// active tag - `blazar engine use` another first. Reports the
     /// reclaimed bytes.
     Rm { tag: String },
     /// Apply the engine retention policy now: keep the newest engines per
@@ -871,7 +871,7 @@ enum EngineCmd {
     /// (Linux-CUDA prebuilts don't exist upstream; the backend is in-tree)
     ///
     /// Builds the true latest upstream (or a given b-tag) with your
-    /// local toolchain — this is the remedy when `engine update` reports
+    /// local toolchain - this is the remedy when `engine update` reports
     /// the newest prebuilt lags upstream. Installs as a new tag and
     /// activates it; restart the daemon so running spawns pick it up.
     Build {
@@ -880,7 +880,7 @@ enum EngineCmd {
         /// Upstream b-tag to build (default: the update channel's target)
         tag: Option<String>,
         /// Fork capability lane shorthand: owner/repo@commit-sha. Builds
-        /// an immutable pin of a llama.cpp fork — a temporary lane for
+        /// an immutable pin of a llama.cpp fork - a temporary lane for
         /// architectures upstream hasn't merged (see README "Capability
         /// lanes"). Mutually exclusive with --repo/--ref.
         #[arg(long, conflicts_with_all = ["repo", "git_ref"])]
@@ -889,7 +889,7 @@ enum EngineCmd {
         #[arg(long = "repo", requires = "git_ref")]
         repo: Option<String>,
         /// Fork commit SHA, explicit form (with --repo): 4-40 hex digits.
-        /// Branch/tag names are rejected — fork lanes are immutable.
+        /// Branch/tag names are rejected - fork lanes are immutable.
         #[arg(long = "ref", requires = "repo")]
         git_ref: Option<String>,
         /// Upstream anchor (b-tag) the fork builds on, e.g. b10980.
@@ -915,11 +915,11 @@ enum EngineCmd {
     /// or sglang (pip venv lane; Linux + CUDA/ROCm, safetensors models)
     ///
     /// These lanes serve HF-style safetensors directories (e.g.
-    /// qwen2.5-1.5b-instruct.d) — GGUF files stay on llama.cpp. After
+    /// qwen2.5-1.5b-instruct.d) - GGUF files stay on llama.cpp. After
     /// install, `engine use` the tag and restart the daemon to serve
     /// safetensors models.
     Install {
-        /// Engine lane to install: mistralrs | sglang | sdcpp (required —
+        /// Engine lane to install: mistralrs | sglang | sdcpp (required -
         /// bare `engine install` prints the lane chooser; llama.cpp
         /// installs ride `engine update` / `engine build`). With --lane:
         /// build a curated capability lane from the registry by id (see
@@ -927,7 +927,7 @@ enum EngineCmd {
         #[arg(long)]
         kind: Option<String>,
         tag: Option<String>,
-        /// Curated capability lane id from `blazar engine offers` —
+        /// Curated capability lane id from `blazar engine offers` -
         /// builds that registry lane's pinned fork commit locally
         /// (same immutable-pin rules as `engine build --fork`).
         #[arg(long, conflicts_with_all = ["kind", "tag"])]
@@ -939,7 +939,7 @@ enum EngineCmd {
     /// List curated capability lanes from the registry (temporary
     /// llama.cpp forks for architectures upstream hasn't merged)
     ///
-    /// Answers "is there a known-good lane for architecture X?" —
+    /// Answers "is there a known-good lane for architecture X?" -
     /// `blazar engine offers --arch qwen35` filters to one
     /// architecture. Install one with
     /// `blazar engine install --lane <id>`.
@@ -983,7 +983,7 @@ enum ConfigCmd {
         key: String,
     },
     /// Set a knob (`config set slots 1`); the candidate is validated
-    /// against the config schema before the file is touched — a bad
+    /// against the config schema before the file is touched - a bad
     /// value or unknown key is rejected with the file unchanged.
     /// Model-scoped overrides live in `[model_overrides."<model>"]`
     /// tables; edit those in the file directly.
@@ -991,7 +991,7 @@ enum ConfigCmd {
     Set {
         /// Top-level knob name (`slots`) or dotted path into a table
         /// (`sglang.grammar_backend`,
-        /// `model_overrides."qwen2.5-0.5b".mistralrs.prefix_cache_n` —
+        /// `model_overrides."qwen2.5-0.5b".mistralrs.prefix_cache_n` -
         /// a quoted segment stays one segment). `blazar config defaults`
         /// lists every knob; `blazar config edit <model>` hints that
         /// model's engine knobs.
@@ -1010,8 +1010,8 @@ enum ConfigCmd {
         /// `config set --help` for the key grammar)
         key: String,
     },
-    /// Print the built-in defaults as TOML — exactly what a fresh
-    /// install writes — or one knob's default line
+    /// Print the built-in defaults as TOML - exactly what a fresh
+    /// install writes - or one knob's default line
     /// (`config defaults slots`). Shows defaults only; use `get`/`list`
     /// for the effective config.
     Defaults {
@@ -1021,7 +1021,7 @@ enum ConfigCmd {
     /// Open the config file in `$VISUAL`/`$EDITOR`. The daemon keeps
     /// the config it booted with until restarted. With a model name the
     /// editor opens with a comment hint block at the top listing that
-    /// model's engine tuning knobs — delete it or leave it, it strips
+    /// model's engine tuning knobs - delete it or leave it, it strips
     /// itself on save.
     Edit {
         /// Model name (from `blazar list`); its engine's knobs become
@@ -1040,7 +1040,7 @@ enum ConfigCmd {
     },
 }
 
-/// `blazar config --help` footer: the set → get → unset → defaults
+/// `blazar config --help` footer: the set -> get -> unset -> defaults
 /// round-trip in one glance (unset restores the built-in default).
 const CONFIG_EXAMPLES: &str = "\
 Examples:
@@ -1054,9 +1054,9 @@ Examples:
   blazar config edit                 open the file in $VISUAL/$EDITOR
   blazar config edit qwen2.5-0.5b    ...with that model's engine knobs as editor hints";
 
-/// `blazar config set --help` footer: what `set` itself accepts — the
+/// `blazar config set --help` footer: what `set` itself accepts - the
 /// key grammar in canonical lines. The parent `config --help` footer
-/// owns the set → get → unset → defaults round-trip view.
+/// owns the set -> get -> unset -> defaults round-trip view.
 const CONFIG_SET_EXAMPLES: &str = "\
 Examples:
   blazar config set slots 1                      top-level knob
@@ -1174,7 +1174,7 @@ fn render_grouped_help() -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "blazar {} — multi-engine local inference: llama.cpp, mistral.rs and SGLang orchestrated behind one OpenAI + Ollama + Anthropic gateway",
+        "blazar {} - multi-engine local inference: llama.cpp, mistral.rs and SGLang orchestrated behind one OpenAI + Ollama + Anthropic gateway",
         env!("CARGO_PKG_VERSION")
     )
     .unwrap();
@@ -1194,12 +1194,12 @@ fn render_grouped_help() -> String {
     writeln!(out, "  -V, --version  Print version").unwrap();
     writeln!(
         out,
-        "\nQuickstart: blazar pull <model> · blazar run <model> · blazar doctor"
+        "\nQuickstart: blazar pull <model> | blazar run <model> | blazar doctor"
     )
     .unwrap();
     writeln!(
         out,
-        "\nLocal-first: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang — unmodified."
+        "\nLocal-first: no telemetry, no cloud endpoints. Powered by upstream llama.cpp, mistral.rs and SGLang - unmodified."
     )
     .unwrap();
     out
@@ -1210,7 +1210,7 @@ fn render_grouped_help() -> String {
 // it: with DFL, a CDN closing a keep-alive connection mid-download
 // (engine install, pull, search) kills the whole process (writev EPIPE
 // -> SIGPIPE, validate.py 2026-10-29 RC=141 repro). Piping into `head`
-// now costs a broken-pipe panic instead — the lesser evil.
+// now costs a broken-pipe panic instead - the lesser evil.
 
 fn main() {
     // First statement with a side effect by design: every reqwest client
@@ -1248,7 +1248,7 @@ fn main() {
     };
     // Interactive commands keep the styled UX readable: runtime/core INFO
     // lines carry RFC3339 timestamps that stomp progress bars mid-download.
-    // Only the no-explicit-choice TTY case demotes them — a config-file
+    // Only the no-explicit-choice TTY case demotes them - a config-file
     // log_level, RUST_LOG, or the serve path (journal + daemon.log) all
     // keep the full INFO stream.
     let log_level = match log_level {
@@ -1270,7 +1270,7 @@ fn main() {
 
 fn banner() {
     println!(
-        "blazar {} — powered by upstream llama.cpp, mistral.rs and SGLang",
+        "blazar {} - powered by upstream llama.cpp, mistral.rs and SGLang",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1286,7 +1286,7 @@ fn cli_http() -> reqwest::Client {
 }
 
 /// Diffusion sync turns and speech renders run minutes, not the 10s
-/// ops budget of `cli_http` — the generation loops need a patient
+/// ops budget of `cli_http` - the generation loops need a patient
 /// client (job polls stay on `cli_http`: each roundtrip is fast).
 fn gen_http() -> reqwest::Client {
     reqwest::Client::builder()
@@ -1314,7 +1314,7 @@ fn dirs() -> BlazarDirs {
 
 /// Exact-basename fallback for `blazar run <file>.gguf`: the user
 /// knows the file on disk, not the row name. Case-sensitive full
-/// basename equality against every row's path — one hit rewrites to
+/// basename equality against every row's path - one hit rewrites to
 /// that row's name, zero or several hits stay unresolved (ambiguity
 /// is the user's to break, never ours to guess).
 fn match_model_basename(input: &str, rows: &[blazar_core::store::ModelRow]) -> Option<String> {
@@ -1336,7 +1336,7 @@ fn match_model_basename(input: &str, rows: &[blazar_core::store::ModelRow]) -> O
 }
 
 /// `blazar run` auto-fetch: the store first (with the shared colon
-/// rule), then — on a miss — a basename rewrite for file-shaped
+/// rule), then - on a miss - a basename rewrite for file-shaped
 /// input, then a pull when the input parses as an `owner/repo[:QUANT]`
 /// ref or a catalog short name. Anything else is a named error BEFORE
 /// the REPL opens (the daemon's not-found error stays the teacher of
@@ -1376,13 +1376,13 @@ async fn ensure_run_model(name: &str) -> Result<String> {
                 return Ok(local);
             }
             println!(
-                "{resolved} not in the store — pulling {}:{} first \
+                "{resolved} not in the store - pulling {}:{} first \
                      (Ctrl-C keeps the partial for resume)",
                 t.repo, t.quant
             );
             let (row, already) = pull_model(&resolved, false).await?;
             if already {
-                println!("already present as {} — starting", row.name);
+                println!("already present as {} - starting", row.name);
             }
             offer_missing_engine(&d, &row).await;
             return Ok(row.name);
@@ -1397,7 +1397,7 @@ async fn ensure_run_model(name: &str) -> Result<String> {
 }
 
 /// `blazar run` lane routing: the interactive surface a model drives.
-/// Diffusion sets and standalone checkpoints have no chat surface —
+/// Diffusion sets and standalone checkpoints have no chat surface -
 /// image families loop on /v1/images/generations, video families on
 /// /v1/videos/generations; everything else is the chat REPL.
 enum RunLane {
@@ -1418,7 +1418,7 @@ fn run_lane(row: &blazar_core::store::ModelRow) -> RunLane {
 
 /// Piper voices are files, not store rows: a `run` argument naming a
 /// pulled voice (or the bare words "tts"/"piper" when one is installed)
-/// drives the speech loop. Rows always win — a name that is both is a
+/// drives the speech loop. Rows always win - a name that is both is a
 /// model row, never a voice.
 fn tts_voice_target<'a>(name: &str, voices: &'a [String]) -> Option<&'a String> {
     if voices.is_empty() {
@@ -1436,7 +1436,7 @@ fn tts_voice_target<'a>(name: &str, voices: &'a [String]) -> Option<&'a String> 
 fn no_such_model(name: &str) -> anyhow::Error {
     if name.contains(':') {
         anyhow!(
-            "no such model: {name} — blazar names are flat; `{}` would be its flat form \
+            "no such model: {name} - blazar names are flat; `{}` would be its flat form \
              (see `blazar list`)",
             name.replace(':', "-")
         )
@@ -1446,7 +1446,7 @@ fn no_such_model(name: &str) -> anyhow::Error {
 }
 
 /// CLI-boundary wrapper over the shared `Store::resolve_model_name`
-/// rule (exact row first, then `:`→`-` swap, miss = input verbatim so
+/// rule (exact row first, then `:`->`-` swap, miss = input verbatim so
 /// callers keep their own error text). Read-only: a missing store is a
 /// passthrough, never created here.
 fn resolve_model_cli(name: &str) -> String {
@@ -1472,7 +1472,7 @@ fn daemon_base(cfg: &Config) -> String {
 
 /// Fire-and-forget warm ping after a fresh local pull: the daemon
 /// applies its `warm_on_pull` policy (knob, AC power, admission belts).
-/// Absent daemon = nothing to warm — skip without noise.
+/// Absent daemon = nothing to warm - skip without noise.
 async fn notify_daemon_warm(model: &str) {
     let Ok(cfg) = config() else {
         return;
@@ -1493,7 +1493,7 @@ async fn notify_daemon_warm(model: &str) {
 
 /// systemctl lanes tried, in order, to hand the daemon its own scope.
 /// The user unit needs no privileges; the system unit may (hence the
-/// no-ask-password flag — failure stays fast and non-interactive).
+/// no-ask-password flag - failure stays fast and non-interactive).
 fn systemd_start_attempts() -> Vec<Vec<&'static str>> {
     vec![
         vec!["--user", "start", "blazar"],
@@ -1502,7 +1502,7 @@ fn systemd_start_attempts() -> Vec<Vec<&'static str>> {
 }
 
 /// Same lane as a start attempt, as an `is-active` query (used to yield
-/// a poll that can never succeed — the unit is up but serves elsewhere).
+/// a poll that can never succeed - the unit is up but serves elsewhere).
 fn systemd_is_active_args<'a>(start_args: &[&'a str]) -> Vec<&'a str> {
     start_args
         .iter()
@@ -1538,7 +1538,7 @@ fn parse_systemd_state(out: &str) -> SystemdUnitState {
 
 /// After the grace period passes without health, only a unit still
 /// ACTIVATING can still become our daemon. Every other state means the
-/// start "succeeded" but the unit serves a different port (or died) —
+/// start "succeeded" but the unit serves a different port (or died) -
 /// the rest of the poll budget is pure delay, so yield it to the
 /// detached fallback. A late unit daemon that binds after we yielded is
 /// handled by the detached boot's exit-watched retry.
@@ -1547,7 +1547,7 @@ fn systemd_poll_decision(state: &SystemdUnitState) -> bool {
 }
 
 /// Query the unit state on one lane (3s cap). Any trouble maps to
-/// Unknown, which yields — the detached fallback plus its exit-watched
+/// Unknown, which yields - the detached fallback plus its exit-watched
 /// retry converge safely even when the query itself was the problem.
 async fn systemd_unit_state(is_active_args: &[&str]) -> SystemdUnitState {
     let mut query = tokio::process::Command::new("systemctl");
@@ -1561,8 +1561,8 @@ async fn systemd_unit_state(is_active_args: &[&str]) -> SystemdUnitState {
 /// Auto-start (plan G): 1s probe; on refusal, detached self-exec `serve`
 /// (own session, logs to run/daemon.log), then poll /healthz.
 ///
-/// The detached spawn can lose a race for the port — typically another
-/// blazar daemon mid-drain, or a foreign server holding the listener —
+/// The detached spawn can lose a race for the port - typically another
+/// blazar daemon mid-drain, or a foreign server holding the listener -
 /// in which case the child exits within milliseconds of spawning. The
 /// boot loop watches the child process, so an exited spawn is retried
 /// (bounded) instead of burning the whole health budget on a dead
@@ -1582,13 +1582,13 @@ enum DetachedBootOutcome {
 }
 
 /// Policy after a failed attempt: respawn when the child was OBSERVED to
-/// exit (port race or boot crash — a fresh spawn may win the port) and
+/// exit (port race or boot crash - a fresh spawn may win the port) and
 /// attempts remain; stop otherwise. A live-but-unhealthy child never
 /// earns a respawn.
 fn next_boot_action(attempt: usize, outcome: &DetachedBootOutcome) -> bool {
     match outcome {
-        // A live child — healthy (caller returned already), or alive but
-        // wedged — never earns a respawn: no stacking daemons.
+        // A live child - healthy (caller returned already), or alive but
+        // wedged - never earns a respawn: no stacking daemons.
         DetachedBootOutcome::Healthy | DetachedBootOutcome::BudgetElapsed => false,
         DetachedBootOutcome::ChildExited(_) => attempt < DETACHED_BOOT_ATTEMPTS,
     }
@@ -1649,7 +1649,7 @@ async fn try_systemd_boot(base: &str, http: &reqwest::Client) -> Option<String> 
                 let state = systemd_unit_state(&systemd_is_active_args(&args)).await;
                 if !systemd_poll_decision(&state) {
                     eprintln!(
-                        "systemd unit is up but not serving {base} — falling \
+                        "systemd unit is up but not serving {base} - falling \
                          through to a detached daemon"
                     );
                     break;
@@ -1673,7 +1673,7 @@ async fn ensure_daemon() -> Result<String> {
     if let Some(base) = try_systemd_boot(&base, &http).await {
         return Ok(base);
     }
-    eprintln!("no healthy systemd unit — falling back to a detached daemon");
+    eprintln!("no healthy systemd unit - falling back to a detached daemon");
     let log = dirs().run_dir().join("daemon.log");
     let mut attempt = 0usize;
     let mut child_exits = 0usize;
@@ -1709,7 +1709,7 @@ async fn ensure_daemon() -> Result<String> {
                 eprintln!("detached serve exited during boot ({status})");
                 if !next_boot_action(attempt, &DetachedBootOutcome::ChildExited(status)) {
                     return Err(anyhow!(
-                        "detached daemon exited {child_exits}x during boot — see {} \
+                        "detached daemon exited {child_exits}x during boot - see {} \
                          (another process may be holding {base}, or serve itself \
                          failed to start)",
                         log.display()
@@ -1781,7 +1781,7 @@ fn pidfile_pid(pidfile: &std::path::Path) -> Option<u32> {
         .ok()
 }
 
-/// Wait for the daemon PROCESS named by `pidfile` to exit — not just
+/// Wait for the daemon PROCESS named by `pidfile` to exit - not just
 /// its listener. `stop()` delivers a drain-and-exit signal: the daemon
 /// finishes in-flight work (an image generation can run for minutes)
 /// while still holding the daemon lock, and a successor spawn refuses
@@ -1800,7 +1800,7 @@ fn wait_daemon_exit(pidfile: &std::path::Path, deadline: std::time::Instant) -> 
             noted = true;
             println!(
                 "{}",
-                dim_line("waiting for the daemon to finish in-flight work (draining)…")
+                dim_line("waiting for the daemon to finish in-flight work (draining)...")
             );
         }
         if std::time::Instant::now() >= deadline {
@@ -1832,7 +1832,7 @@ async fn run_systemctl(args: &[&str]) -> bool {
 }
 
 /// `launchctl kickstart -k` cycles the agent in place (macOS lane).
-// The unix body awaits; every other platform compiles a plain false —
+// The unix body awaits; every other platform compiles a plain false -
 // nothing to await there by design.
 #[cfg_attr(not(unix), allow(clippy::unused_async))]
 async fn launchd_kickstart() -> bool {
@@ -1867,12 +1867,12 @@ async fn launchd_kickstart() -> bool {
 
 /// Restart a running daemon so a just-landed change (binary swap,
 /// engine switch, tuning adoption) takes effect NOW instead of on the
-/// next manual stop. Silent no-op when no daemon is up — updates must
+/// next manual stop. Silent no-op when no daemon is up - updates must
 /// not grow a daemon-start side effect. Returns true only when a fresh
 /// daemon is provably healthy again.
 ///
 /// Boxed: this future drags in `stop`/`ensure_daemon` frames (~16 KB),
-/// and every command path that can auto-install an engine embeds it —
+/// and every command path that can auto-install an engine embeds it -
 /// inlining it tipped the `run` handler over clippy's future-size limit.
 fn restart_daemon() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
     Box::pin(restart_daemon_impl())
@@ -1893,24 +1893,24 @@ async fn restart_daemon_impl() -> bool {
         return false;
     }
     let up_deadline = tokio_deadline(Duration::from_secs(30));
-    // Lane 1 — systemd. Gated on is-active: `restart` on an inactive
+    // Lane 1 - systemd. Gated on is-active: `restart` on an inactive
     // unit would START it. A plain user without polkit rights falls
     // through to the stop lane, which needs no privileges at all.
     if systemd_unit_is_active().await
         && run_systemctl(&["restart", "blazar", "--no-ask-password"]).await
         && wait_healthz(&base, &http, up_deadline).await
     {
-        println!("{}", ok_line("daemon restarted — the update is live"));
+        println!("{}", ok_line("daemon restarted - the update is live"));
         return true;
     }
-    // Lane 2 — launchd kickstart.
+    // Lane 2 - launchd kickstart.
     if launchd_kickstart().await && wait_healthz(&base, &http, up_deadline).await {
-        println!("{}", ok_line("daemon restarted — the update is live"));
+        println!("{}", ok_line("daemon restarted - the update is live"));
         return true;
     }
-    // Lane 3 — no manager (or no rights): stop must SUCCEED, the
+    // Lane 3 - no manager (or no rights): stop must SUCCEED, the
     // listener must go DOWN, and the draining process must fully EXIT
-    // before any start attempt — the successor spawn refuses to take
+    // before any start attempt - the successor spawn refuses to take
     // the daemon lock while the old owner is still finishing in-flight
     // work. A false "restarted" receipt here would be worse than an
     // honest warning.
@@ -1918,7 +1918,7 @@ async fn restart_daemon_impl() -> bool {
         && wait_healthz_down(&base, &http, tokio_deadline(Duration::from_secs(10))).await
     {
         // The drain wait can outlast any reasonable inline poll (image
-        // generations run minutes) — run it OFF the async worker and
+        // generations run minutes) - run it OFF the async worker and
         // keep this future small.
         let pidfile = dirs().run_dir().join("blazar.pid");
         let exited = tokio::task::spawn_blocking(move || {
@@ -1936,7 +1936,7 @@ async fn restart_daemon_impl() -> bool {
         }
         match ensure_daemon().await {
             Ok(_) => {
-                println!("{}", ok_line("daemon restarted — the update is live"));
+                println!("{}", ok_line("daemon restarted - the update is live"));
                 return true;
             }
             Err(e) => {
@@ -1949,7 +1949,7 @@ async fn restart_daemon_impl() -> bool {
         }
     }
     eprintln!(
-        "warning: the daemon still serves the previous state — restart it \
+        "warning: the daemon still serves the previous state - restart it \
          manually (`systemctl restart blazar`, or `blazar stop` + any command)"
     );
     false
@@ -2023,7 +2023,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             };
             let plan = intent.map(intent_plan);
             // Lane routing: diffusion rows and piper voices never reach
-            // the chat REPL — each drives its own generation loop (an
+            // the chat REPL - each drives its own generation loop (an
             // inline prompt runs a single shot, no loop). Resolution
             // stays soft here: a name that matches neither a row nor a
             // pulled voice falls through to run_dispatch, which owns
@@ -2057,7 +2057,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 // which teaches nothing. Point at the command that fixes it.
                 if plan.is_some_and(|p| p.needs_vision) && row.mmproj_path.is_none() {
                     return Err(anyhow!(
-                        "blazar run {model}: --intent vision refused — no projector sidecar \
+                        "blazar run {model}: --intent vision refused - no projector sidecar \
 attached (the chat model cannot see images without one). Attach one: \
 blazar mmproj <model> <mmproj.gguf path>"
                     ));
@@ -2298,14 +2298,14 @@ blazar mmproj <model> <mmproj.gguf path>"
     }
 }
 
-/// `blazar rpc …` — RPC fleet utilities. The worker is a foreground
+/// `blazar rpc ...` - RPC fleet utilities. The worker is a foreground
 /// proxy: it resolves the ggml-rpc-server binary shipped inside an
 /// installed llama.cpp engine dir (active lane first) and runs it with
 /// inherited stdio, so the worker's own banner, device list and logs
 /// stream straight to the user's terminal.
 ///
 /// Two independent nets keep the worker from outliving this CLI (a
-/// lone orphaned worker keeps holding GPU/VRAM and its port —
+/// lone orphaned worker keeps holding GPU/VRAM and its port -
 /// live-verified failure before these existed):
 ///
 /// 1. On INT/TERM/HUP the CLI kills the worker and exits with the
@@ -2321,7 +2321,7 @@ async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
             // Progress lines to STDERR: stdout stays clean for any
             // scripting around the worker's own output.
             eprintln!("rpc worker: {}", bin.display());
-            eprintln!("endpoint {host}:{port} — point the gateway's rpc_servers here");
+            eprintln!("endpoint {host}:{port} - point the gateway's rpc_servers here");
             eprintln!("no authentication: expose on trusted networks only");
             let mut child_cmd = std::process::Command::new(&bin);
             child_cmd
@@ -2356,12 +2356,12 @@ async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
     }
 }
 
-/// `blazar rpc status` — fleet detail beyond doctor's reachability
+/// `blazar rpc status` - fleet detail beyond doctor's reachability
 /// check: protocol version and per-device free/total memory for every
 /// endpoint (explicit args win; otherwise the configured fleet).
 /// Queries run concurrently so one dead host's 2s connect budget
 /// cannot serialize the whole report. Exit code 1 when any endpoint
-/// failed — every result is still printed first.
+/// failed - every result is still printed first.
 async fn rpc_status(explicit: &[String], json: bool) -> Result<()> {
     let targets: Vec<String> = if explicit.is_empty() {
         let cfg = config()?;
@@ -2373,10 +2373,10 @@ async fn rpc_status(explicit: &[String], json: bool) -> Result<()> {
         if json {
             println!(
                 "{}",
-                serde_json::json!({"status": "ok", "detail": "no RPC workers configured — local devices only"})
+                serde_json::json!({"status": "ok", "detail": "no RPC workers configured - local devices only"})
             );
         } else {
-            println!("no RPC workers configured — local devices only (see rpc_servers)");
+            println!("no RPC workers configured - local devices only (see rpc_servers)");
         }
         return Ok(());
     }
@@ -2622,7 +2622,7 @@ fn ansi(code: &str, text: &str) -> String {
     }
 }
 
-/// Success confirmations (green): "pulled …", "attached …", "installed …".
+/// Success confirmations (green): "pulled ...", "attached ...", "installed ...".
 fn ok_line(text: &str) -> String {
     ansi("32", text)
 }
@@ -2632,7 +2632,7 @@ fn warn_line(text: &str) -> String {
     ansi("33", text)
 }
 
-/// Failures (red) — message text itself stays byte-identical.
+/// Failures (red) - message text itself stays byte-identical.
 fn err_line(text: &str) -> String {
     ansi("31", text)
 }
@@ -2642,12 +2642,12 @@ fn dim_line(text: &str) -> String {
     ansi("2", text)
 }
 
-/// `blazar doctor` — local-state diagnostics: config, store, engine
+/// `blazar doctor` - local-state diagnostics: config, store, engine
 /// manifest, hardware probe, plus bounded-retry upstream currency probes
-/// (engine/whisper/app). Warn-only — never installs or starts anything
+/// (engine/whisper/app). Warn-only - never installs or starts anything
 /// (the engine row executes the engine binary with `--version`, nothing
 /// more).
-/// Resolve which engine tag would serve `name` right now — the ONE
+/// Resolve which engine tag would serve `name` right now - the ONE
 /// resolver behind `blazar list`'s ENGINE column and `blazar doctor`'s
 /// routing rows (the gateway has its own mirror for /v1/models +
 /// /api/tags; both call `serving_lane`). `Ok(None)`-lanes (manual mode,
@@ -2678,17 +2678,17 @@ fn routed_engine_lane(
         path,
     } = *model;
     let Some((g_tag, g_kind)) = global else {
-        return Err("no engine installed — blazar engine install --kind <kind>".to_string());
+        return Err("no engine installed - blazar engine install --kind <kind>".to_string());
     };
     // Block-diffusion LLM GGUFs: the arch loads in llama.cpp's loader
     // but no HTTP server in the family runs the diffusion loop, so the
     // text lane would decode garbage while appearing healthy. Mirror of
-    // the supervisor's route-time paradigm guard — the list ENGINE cell
+    // the supervisor's route-time paradigm guard - the list ENGINE cell
     // must agree with what the gateway would actually do at spawn.
     // Only a FORK lane advertising the arch bypasses the guard:
     // mainstream manifests mine loader-level support (llada is in the
     // 150+ arch set of every overlay build), which is exactly the
-    // hazard — loading is not serving.
+    // hazard - loading is not serving.
     if let Some(arch) = arch
         && blazar_core::DIFFUSION_PARADIGM_ARCHS.contains(&arch)
     {
@@ -2716,7 +2716,7 @@ fn routed_engine_lane(
             .collect();
         if blazar_core::engine_kind::advertising_lanes(arch, None, &lanes).is_empty() {
             return Err(format!(
-                "block-diffusion LLM (arch '{arch}') — no installed lane can serve it: \
+                "block-diffusion LLM (arch '{arch}') - no installed lane can serve it: \
                      llama-server would decode it autoregressively into garbage, and llama.cpp \
                      ships no HTTP diffusion server yet (upstream PR 24423 DiffusionGemma / \
                      PR 17454 LLADA 2.0 tracking). Serve a transformer GGUF, or build a \
@@ -2770,16 +2770,16 @@ fn routed_engine_lane(
 }
 
 /// Architecture-gap marker for `list`'s ENGINE cell. The cell names the
-/// ROUTING lane (format/policy/pin — see `routed_engine_lane`), which
+/// ROUTING lane (format/policy/pin - see `routed_engine_lane`), which
 /// says nothing about whether that engine's build knows the model's GGUF
 /// architecture: a gap crash-classifies at spawn (auto-routing then
 /// rescues via a fork lane when one is installed). Marks only when the
 /// answer is knowable: a GGUF model with a parsed arch routed onto a
 /// llamacpp lane whose manifest carries a non-empty mined arch set.
-/// Empty sets (pre-v2 rows, other kinds) stay unmarked — unknown is not
+/// Empty sets (pre-v2 rows, other kinds) stay unmarked - unknown is not
 /// missing.
 /// List/footer label for GGUF rows that registered with NO architecture
-/// at all (0-KV diffusion-component files) — a file-level fact: no
+/// at all (0-KV diffusion-component files) - a file-level fact: no
 /// llama.cpp lane can ever load them, whatever its advertised set.
 const NO_ARCH_METADATA: &str = "(no architecture metadata)";
 
@@ -2804,7 +2804,7 @@ fn engine_arch_gap(
         Ok(_) => None,
         Err(e) => {
             eprintln!(
-                "warn: engine {lane_tag} manifest undecodable ({e}) — arch gap check skipped"
+                "warn: engine {lane_tag} manifest undecodable ({e}) - arch gap check skipped"
             );
             None
         }
@@ -2814,9 +2814,9 @@ fn engine_arch_gap(
 /// Human label for the ENGINE cell: the engine's kind plus its version
 /// tail, stripping only the redundant `kind-` prefix when the tag
 /// carries one (`sglang-0.5.19` -> `sglang 0.5.19`; `b11147-cuda`,
-/// `master-890-74988b2`, `v0.9.3` keep the full tag as the version —
+/// `master-890-74988b2`, `v0.9.3` keep the full tag as the version -
 /// the release tag IS the version). Lanes without a matching engine
-/// row ("-") keep the raw tag — it IS the identity.
+/// row ("-") keep the raw tag - it IS the identity.
 fn engine_cell_label(engine_rows: &[blazar_core::EngineRow], tag: &str) -> String {
     let Some(row) = engine_rows.iter().find(|r| r.tag == tag) else {
         return tag.to_string();
@@ -2831,7 +2831,7 @@ fn engine_cell_label(engine_rows: &[blazar_core::EngineRow], tag: &str) -> Strin
 
 /// Serving-modality class for the CATEGORY column. Component sets are
 /// diffusion pulls (the curated family table says image vs video; an
-/// uncurated set stays "diffusion" — sets only originate from curated
+/// uncurated set stays "diffusion" - sets only originate from curated
 /// pulls, so the fallback is a near-impossible edge). The projector
 /// marks vision-capable VLMs, trailing-encoder archs are pipeline
 /// encoders (t5/umt5), everything else is text. Whisper STT/TTS models
@@ -2856,7 +2856,7 @@ fn model_category(m: &blazar_core::store::ModelRow) -> &'static str {
 /// Engine cell for one `list` table row: appends the dagger and records
 /// the (lane, arch) gap when the routed lane cannot load the model's
 /// GGUF arch (see [`engine_arch_gap`]). Both the cell and the footer
-/// key carry the decorated label ([`engine_cell_label`]) — the footer
+/// key carry the decorated label ([`engine_cell_label`]) - the footer
 /// receives only the map, so the human-readable name must land here.
 fn engine_cell_with_gap(
     engine_rows: &[blazar_core::EngineRow],
@@ -2899,14 +2899,14 @@ fn print_arch_gap_footer(
         if !archs.is_empty() {
             let archs = archs.join(", ");
             println!(
-                "\u{2020} {tag} cannot load {archs} — the ENGINE column is the routing lane, not a \
+                "\u{2020} {tag} cannot load {archs} - the ENGINE column is the routing lane, not a \
                  capability guarantee; spawn fails with teaching unless a covering fork lane is \
                  installed (blazar engine offers)"
             );
         }
         if component_files {
             println!(
-                "\u{2020} {tag} is routed for GGUF(s) with {NO_ARCH_METADATA} — \
+                "\u{2020} {tag} is routed for GGUF(s) with {NO_ARCH_METADATA} - \
                  diffusion/model-component files; the sdcpp lane serves them from a \
                  component set (DiT + VAE + text encoder): install it if absent \
                  (blazar engine install --kind sdcpp) and re-pull the model to fetch \
@@ -2916,7 +2916,7 @@ fn print_arch_gap_footer(
     }
 }
 
-/// The command that installs `kind` — llamacpp rides the `engine
+/// The command that installs `kind` - llamacpp rides the `engine
 /// update` lane (install --kind has no llamacpp arm).
 fn engine_install_command(kind: blazar_core::engine_kind::EngineKind) -> String {
     use blazar_core::engine_kind::EngineKind;
@@ -2932,26 +2932,26 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
     use blazar_core::engine_kind::EngineKind;
     match kind {
         EngineKind::Sglang => {
-            "sglang (~6 GiB, Linux + NVIDIA) — best quality + batching for safetensors".to_string()
+            "sglang (~6 GiB, Linux + NVIDIA) - best quality + batching for safetensors".to_string()
         }
         EngineKind::Mlx => {
-            "mlx (~3 GiB, CUDA linux + Apple Silicon) — MLX quant dirs (mlx-community)".to_string()
+            "mlx (~3 GiB, CUDA linux + Apple Silicon) - MLX quant dirs (mlx-community)".to_string()
         }
         EngineKind::MistralRs => {
-            "mistral.rs (~0.8 GiB, any platform) — fastest cold boot, GGUF + safetensors"
+            "mistral.rs (~0.8 GiB, any platform) - fastest cold boot, GGUF + safetensors"
                 .to_string()
         }
         EngineKind::LlamaCpp => {
-            "llamacpp (~0.2-0.7 GiB via engine update) — the GGUF default lane".to_string()
+            "llamacpp (~0.2-0.7 GiB via engine update) - the GGUF default lane".to_string()
         }
-        EngineKind::SdCpp => "sdcpp (~0.04-0.3 GiB, any GPU via Vulkan) — diffusion checkpoints: \
+        EngineKind::SdCpp => "sdcpp (~0.04-0.3 GiB, any GPU via Vulkan) - diffusion checkpoints: \
              Qwen-Image-2.1/v1, FLUX.1/2-dev, Z-Image, Chroma, SDXL, SD1.5; Wan 2.1 video"
             .to_string(),
         EngineKind::Whisper => {
-            "whisper (~10 MiB, CPU) — audio transcription + translation (ggml models)".to_string()
+            "whisper (~10 MiB, CPU) - audio transcription + translation (ggml models)".to_string()
         }
         EngineKind::Piper => {
-            "piper (~5 MiB, CPU) — offline text-to-speech (rhasspy/piper voices)".to_string()
+            "piper (~5 MiB, CPU) - offline text-to-speech (rhasspy/piper voices)".to_string()
         }
     }
 }
@@ -2974,7 +2974,7 @@ async fn install_missing_kind(
 
 /// What stands between `row` and a serving lane right now.
 enum LaneState {
-    /// A lane already serves the model — nothing to offer.
+    /// A lane already serves the model - nothing to offer.
     Served,
     /// Missing kinds (best first) plus the teaching text for the
     /// current failure. Empty kinds = installing nothing helps
@@ -2988,12 +2988,12 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
     // None of them failing means "served": a wrong Served verdict skips
     // the install offer and defers the breakage to request time, so a
     // failure surfaces as teaching text instead (empty kinds = no
-    // install can fix it — the user fixes the source first).
+    // install can fix it - the user fixes the source first).
     let Ok(store) = Store::open(d) else {
         return LaneState::Missing(
             Vec::new(),
             format!(
-                "model store unreadable — cannot check this model's lane: {}",
+                "model store unreadable - cannot check this model's lane: {}",
                 d.data_dir.display()
             ),
         );
@@ -3001,7 +3001,7 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
     let Ok(engine_rows) = store.list_engines() else {
         return LaneState::Missing(
             Vec::new(),
-            "engine index unreadable — cannot check this model's lane".to_string(),
+            "engine index unreadable - cannot check this model's lane".to_string(),
         );
     };
     let installed: Vec<(
@@ -3018,7 +3018,7 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
             return LaneState::Missing(
                 Vec::new(),
                 format!(
-                    "config unreadable ({e}) — fix or delete {} to regenerate defaults; \
+                    "config unreadable ({e}) - fix or delete {} to regenerate defaults; \
                      lane advice computed against defaults would be wrong",
                     d.config_file().display()
                 ),
@@ -3026,11 +3026,11 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
         }
     };
     // No engine at all: the product's default lane is llamacpp and
-    // `engine update` is its installer — same offer, one candidate.
+    // `engine update` is its installer - same offer, one candidate.
     match engine_rows.iter().find(|r| r.active) {
         None => LaneState::Missing(
             vec![EngineKind::LlamaCpp],
-            "no engine installed — blazar engine update".to_string(),
+            "no engine installed - blazar engine update".to_string(),
         ),
         Some(active) => {
             let overlay = cfg.overlay_for(&row.name);
@@ -3065,7 +3065,7 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
 }
 
 /// Just-in-time engine install at pull/run: when the model the user
-/// just asked for has no serving lane, ask once — on a real TTY —
+/// just asked for has no serving lane, ask once - on a real TTY -
 /// whether to install the missing engine kind(s) now, then continue.
 /// Piped/CI stdin and `BLAZAR_NO_PROMPT=1` print the teaching line
 /// and return without blocking; the daemon's request paths never reach
@@ -3100,7 +3100,7 @@ async fn offer_missing_engine(d: &BlazarDirs, row: &blazar_core::store::ModelRow
         eprintln!("  1) {}  [recommended]", engine_offer_line(missing[0]));
         eprintln!("  2) {}", engine_offer_line(missing[1]));
         eprintln!("  3) both");
-        eprintln!("  4) skip — print the install commands instead");
+        eprintln!("  4) skip - print the install commands instead");
         eprint!("choose [1-4]: ");
         let _ = std::io::stderr().flush();
         match read_menu_line().as_deref() {
@@ -3111,7 +3111,7 @@ async fn offer_missing_engine(d: &BlazarDirs, row: &blazar_core::store::ModelRow
         }
     };
     if picked.is_empty() {
-        eprintln!("skipped — when you are ready:");
+        eprintln!("skipped - when you are ready:");
         for kind in &missing {
             eprintln!("  {}", engine_install_command(*kind));
         }
@@ -3128,7 +3128,7 @@ fn read_menu_line() -> Option<String> {
     (n > 0).then(|| line.trim().to_string())
 }
 
-/// Run the chosen installs sequentially, then report the lane truth —
+/// Run the chosen installs sequentially, then report the lane truth -
 /// the fresh re-check (not the install result) is what the user reads.
 /// A failing kind does not stop the rest: "both" must still try the
 /// one that fits (e.g. disk too small for sglang, fine for mistral.rs).
@@ -3142,7 +3142,7 @@ async fn install_offer_kinds(
         if let Err(e) = install_missing_kind(d, *kind).await {
             eprintln!("{}", err_line(&format!("engine install failed: {e:#}")));
             eprintln!(
-                "your model is safe in the store — retry with: {}",
+                "your model is safe in the store - retry with: {}",
                 engine_install_command(*kind)
             );
             failures.push(*kind);
@@ -3153,11 +3153,11 @@ async fn install_offer_kinds(
             if failures.is_empty() {
                 eprintln!(
                     "{}",
-                    ok_line("engine ready — this model now has a serving lane")
+                    ok_line("engine ready - this model now has a serving lane")
                 );
             } else {
                 eprintln!(
-                    "engine ready — this model now has a serving lane (skipped: {})",
+                    "engine ready - this model now has a serving lane (skipped: {})",
                     failures
                         .iter()
                         .map(std::string::ToString::to_string)
@@ -3171,7 +3171,7 @@ async fn install_offer_kinds(
 }
 
 /// The `doctor --fix` safe set. Every entry is idempotent, reversible,
-/// and already proven as the `serve()` boot preflight — `--fix` just
+/// and already proven as the `serve()` boot preflight - `--fix` just
 /// runs them on demand. Disk-moving work is skipped while the daemon
 /// holds the trees (adoption mid-serve is unsafe); those fixes re-run
 /// automatically at the next `blazar serve` boot.
@@ -3180,7 +3180,7 @@ async fn doctor_fix(d: &BlazarDirs) -> Vec<(String, String)> {
     if daemon_base_if_up().await.is_some() {
         return vec![(
             "disk fixes".to_string(),
-            "skipped — daemon is running (stop it with `blazar stop` first); these run automatically at `blazar serve` boot".to_string(),
+            "skipped - daemon is running (stop it with `blazar stop` first); these run automatically at `blazar serve` boot".to_string(),
         )];
     }
     let mut out = Vec::new();
@@ -3258,7 +3258,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
             if json {
                 println!("{}", serde_json::json!({"fix": name, "detail": outcome}));
             } else {
-                println!("fix: {name} — {outcome}");
+                println!("fix: {name} - {outcome}");
             }
         }
         if !json {
@@ -3275,7 +3275,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
             if legacy {
                 checks.push(Check::warn(
                     "config",
-                    "parsed with an IN-MEMORY migration (legacy api_keys) — persist with `blazar migrate`".to_string(),
+                    "parsed with an IN-MEMORY migration (legacy api_keys) - persist with `blazar migrate`".to_string(),
                 ));
             } else {
                 checks.push(Check::ok(
@@ -3308,7 +3308,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
             checks.push(Check::fail(
                 "config",
                 format!(
-                    "{} — fix or delete {} to regenerate defaults",
+                    "{} - fix or delete {} to regenerate defaults",
                     e,
                     d.config_file().display()
                 ),
@@ -3488,18 +3488,18 @@ fn print_check_row(name_col: usize, indent: usize, name: &str, status: &str, det
 }
 
 /// Final doctor line: failing checks announce themselves, warnings get
-/// an honest count ("N ok, M warning(s) — no failures"), and only a
+/// an honest count ("N ok, M warning(s) - no failures"), and only a
 /// truly clean board says "all checks pass". Counts instead of
-/// "all checks pass + warnings" — the old pairing contradicted itself
+/// "all checks pass + warnings" - the old pairing contradicted itself
 /// whenever a warning existed.
 fn doctor_footer(checks: &[Check]) -> String {
     let warns = checks.iter().filter(|c| c.warn).count();
     let fails = checks.iter().filter(|c| !c.ok).count();
     if fails > 0 {
-        format!("{fails} failing check(s) — fix the fail rows above")
+        format!("{fails} failing check(s) - fix the fail rows above")
     } else if warns > 0 {
         let ok_n = checks.len() - warns;
-        format!("{ok_n} ok, {warns} warning(s) — no failures")
+        format!("{ok_n} ok, {warns} warning(s) - no failures")
     } else {
         "all checks pass".to_string()
     }
@@ -3556,21 +3556,21 @@ async fn doctor_network() -> Vec<Check> {
 /// time with the same text.
 fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
     // Same law as the doctor config row: a routing input that cannot be
-    // read is a FAIL, not an empty section — advice computed against a
+    // read is a FAIL, not an empty section - advice computed against a
     // default config or a dead store would silently mislead.
     let cfg = match blazar_core::Config::load(d) {
         Ok(cfg) => cfg,
         Err(e) => {
             return vec![Check::fail(
                 "routing",
-                format!("config unreadable — lane advice unavailable: {e}"),
+                format!("config unreadable - lane advice unavailable: {e}"),
             )];
         }
     };
     let Ok(store) = blazar_core::store::Store::open(d) else {
         return vec![Check::fail(
             "routing",
-            "store open failed — lane advice unavailable",
+            "store open failed - lane advice unavailable",
         )];
     };
     let models = match store.list_models() {
@@ -3579,7 +3579,7 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
         Err(e) => {
             return vec![Check::fail(
                 "routing",
-                format!("model list failed — lane advice unavailable: {e}"),
+                format!("model list failed - lane advice unavailable: {e}"),
             )];
         }
     };
@@ -3588,7 +3588,7 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
         Err(e) => {
             return vec![Check::fail(
                 "routing",
-                format!("engine list failed — lane advice unavailable: {e}"),
+                format!("engine list failed - lane advice unavailable: {e}"),
             )];
         }
     };
@@ -3619,7 +3619,7 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
         checks.push(Check::ok(
             "routing",
             format!(
-                "{} mode — all {} pulled model(s) have a serving lane (see `blazar list`)",
+                "{} mode - all {} pulled model(s) have a serving lane (see `blazar list`)",
                 match cfg.engine_routing.mode {
                     blazar_core::config::RoutingMode::Auto => "auto",
                     blazar_core::config::RoutingMode::Manual => "manual",
@@ -3633,7 +3633,7 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
 
 /// RPC fleet: every configured `--rpc` endpoint (llamacpp global
 /// `rpc_servers`, every model overlay's `rpc_servers`, and the
-/// sdcpp `sdcpp_rpc_servers` list) must answer — the spawn preflight
+/// sdcpp `sdcpp_rpc_servers` list) must answer - the spawn preflight
 /// will refuse any serve pinned to a dead worker moments later, so
 /// doctor names the dead endpoint(s) with the same fix hint. Mirrors
 /// `blazar_runtime::engine_impl::probe_rpc_endpoints` semantics
@@ -3669,7 +3669,7 @@ async fn doctor_rpc_fleet(cfg: &Config) -> Vec<Check> {
     if targets.is_empty() {
         return vec![Check::ok(
             "rpc fleet",
-            "no --rpc workers configured — local devices only".to_string(),
+            "no --rpc workers configured - local devices only".to_string(),
         )];
     }
     let dead = blazar_runtime::engine_impl::probe_rpc_targets(&targets).await;
@@ -3686,7 +3686,7 @@ async fn doctor_rpc_fleet(cfg: &Config) -> Vec<Check> {
         vec![Check::fail(
             "rpc fleet",
             format!(
-                "unreachable: {} — serves pinned to them are refused at spawn; start the \
+                "unreachable: {} - serves pinned to them are refused at spawn; start the \
                  worker (`blazar rpc worker` on that host) or fix rpc_servers; \
                  `blazar rpc status` reports per-device memory across the fleet",
                 dead.join(", ")
@@ -3735,7 +3735,7 @@ fn doctor_group(name: &str) -> &'static str {
 
 /// GPU section: NVIDIA driver/CUDA + compute capability facts, VRAM
 /// census, largest-model fit, and active-asset arch match (the per-arch
-/// channel makes this actionable — a wrong-arch slim asset would run
+/// channel makes this actionable - a wrong-arch slim asset would run
 /// but JIT or miss SASS).
 /// Parse the parent PID out of a `/proc/<pid>/stat` line. Field 4 is
 /// ppid, but `comm` (field 2) may contain spaces and parentheses, so
@@ -3747,7 +3747,7 @@ fn ppid_from_stat(stat: &str) -> Option<u32> {
 
 /// True when `pid` is a blazar-owned process (the daemon itself or any
 /// engine child descended from one). Walks `/proc` ancestry with a hop
-/// bound; unknown ancestry (pid exited mid-walk) reads as foreign — the
+/// bound; unknown ancestry (pid exited mid-walk) reads as foreign - the
 /// advisory would rather name a ghost than hide a real tenant.
 fn pid_is_blazar_descendant(pid: u32) -> bool {
     let mut cur = pid;
@@ -3783,7 +3783,7 @@ async fn doctor_gpu(d: &BlazarDirs) -> Vec<Check> {
         )),
         _ => out.push(Check::warn(
             "gpu driver",
-            "no NVIDIA facts (non-NVIDIA box or driver absent) — Vulkan/CPU lanes apply"
+            "no NVIDIA facts (non-NVIDIA box or driver absent) - Vulkan/CPU lanes apply"
                 .to_string(),
         )),
     }
@@ -3797,7 +3797,7 @@ async fn doctor_gpu(d: &BlazarDirs) -> Vec<Check> {
     } else {
         out.push(Check::warn(
             "gpu vram",
-            "no GPUs visible to the probe — CPU-only serving".to_string(),
+            "no GPUs visible to the probe - CPU-only serving".to_string(),
         ));
     }
     // Fit + co-tenants only matter when there IS a GPU; arch match
@@ -3828,7 +3828,7 @@ fn gpu_fit_check(d: &BlazarDirs, vram: u64) -> Option<Check> {
         Check::ok(
             "gpu fit",
             format!(
-                "largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) — KV cache has headroom",
+                "largest model {} ({gib:.1} GiB) fits VRAM ({vram_gib:.1} GiB) - KV cache has headroom",
                 big.name
             ),
         )
@@ -3836,7 +3836,7 @@ fn gpu_fit_check(d: &BlazarDirs, vram: u64) -> Option<Check> {
         Check::warn(
             "gpu fit",
             format!(
-                "largest model {} ({gib:.1} GiB) exceeds VRAM ({vram_gib:.1} GiB) — layers will offload to RAM",
+                "largest model {} ({gib:.1} GiB) exceeds VRAM ({vram_gib:.1} GiB) - layers will offload to RAM",
                 big.name
             ),
         )
@@ -3845,7 +3845,7 @@ fn gpu_fit_check(d: &BlazarDirs, vram: u64) -> Option<Check> {
 
 /// What a GPU compute tenant is, relative to blazar.
 enum GpuTenantClass {
-    /// Under a live blazar server's supervision — none of our business.
+    /// Under a live blazar server's supervision - none of our business.
     Owned,
     /// A blazar engine server whose supervisor died. The kernel
     /// PDEATHSIG tie now reaps these at spawn time, but servers
@@ -3858,7 +3858,7 @@ enum GpuTenantClass {
 
 /// Pure classification (testable): a live blazar descendant is owned;
 /// a non-descendant running a binary from the engines dir is an
-/// orphaned engine server — EXCEPT ggml-rpc-server, the one engines-dir
+/// orphaned engine server - EXCEPT ggml-rpc-server, the one engines-dir
 /// binary blazar never execs (users run it by hand for `--rpc`
 /// offload; `rpc_servers` points at it), so a live one is a deliberate
 /// co-tenant, never a boot sweep target; anything else is foreign.
@@ -3881,7 +3881,7 @@ fn classify_gpu_tenant(
 
 /// Foreign VRAM tenants (advisory): compute processes that are NOT
 /// descended from a blazar server. Co-residency is legal, but an
-/// invisible foreign holder is the #1 cause of opaque mid-job OOM —
+/// invisible foreign holder is the #1 cause of opaque mid-job OOM -
 /// the gate estimates against free VRAM, so name what eats it.
 fn gpu_cotenants_check(d: &BlazarDirs) -> Option<Check> {
     let tenants = blazar_runtime::probe::gpu_compute_tenants()?;
@@ -3903,7 +3903,7 @@ fn gpu_cotenants_check(d: &BlazarDirs) -> Option<Check> {
                     |n| n.to_string_lossy().into_owned(),
                 );
                 orphans.push(format!(
-                    "{name} ({} MiB, pid {}) — kill {} to reclaim",
+                    "{name} ({} MiB, pid {}) - kill {} to reclaim",
                     t.used_mib, t.pid, t.pid
                 ));
                 orphan_mib += t.used_mib;
@@ -3926,7 +3926,7 @@ fn gpu_cotenants_check(d: &BlazarDirs) -> Option<Check> {
     }
     if !foreign.is_empty() {
         sentences.push(format!(
-            "non-blazar processes hold ~{held} MiB of GPU memory: {} — \
+            "non-blazar processes hold ~{held} MiB of GPU memory: {} - \
              blazar budgets against FREE VRAM, so these reduce what fits",
             foreign.join(", ")
         ));
@@ -3957,7 +3957,7 @@ fn orphaned_gpu_tenants<'a>(
 
 /// Boot preflight (2/2): reclaim VRAM from engine servers whose
 /// supervisor died (pre-PDEATHSIG orphans, or a `kill -9` that raced
-/// the tie). SIGTERM — the same graceful signal the kernel tie sends —
+/// the tie). SIGTERM - the same graceful signal the kernel tie sends -
 /// after re-verifying the exe still lives in the engines dir so a
 /// recycled pid can never be hit. Best-effort: failures log, boot
 /// continues. Unix-only: the ancestry check needs /proc.
@@ -3977,10 +3977,10 @@ fn sweep_orphaned_gpu_engines(d: &BlazarDirs) {
     let mut mib = 0u64;
     for t in orphaned {
         // Pid-recycling guard: the classification snapshot can be stale
-        // by one syscall — confirm the child is still ours before the
+        // by one syscall - confirm the child is still ours before the
         // irreversible step. argv[0] of /proc/<pid>/cmdline, NOT
         // readlink(/proc/<pid>/exe): venv interpreters are symlinks, so
-        // the exe resolves to the base python OUTSIDE the engines dir —
+        // the exe resolves to the base python OUTSIDE the engines dir -
         // the exact blindness that let venv engine orphans survive.
         let Ok(cmdline) = std::fs::read(format!("/proc/{}/cmdline", t.pid)) else {
             continue;
@@ -4033,12 +4033,12 @@ fn gpu_arch_match_check(d: &BlazarDirs, sm: Option<u32>) -> Option<Check> {
         (Some(a), Some(g)) => Check::warn(
             "gpu arch match",
             format!(
-                "active asset targets sm{a} but GPU is sm{g} — `blazar engine update` should pick the right per-arch asset"
+                "active asset targets sm{a} but GPU is sm{g} - `blazar engine update` should pick the right per-arch asset"
             ),
         ),
         (None, Some(_)) => Check::ok(
             "gpu arch match",
-            "active CUDA asset is multi-arch (fat) — runs on any sm".to_string(),
+            "active CUDA asset is multi-arch (fat) - runs on any sm".to_string(),
         ),
         _ => return None,
     })
@@ -4072,7 +4072,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
         return out;
     };
     // Forward-written rows (a kind only a newer blazar understands) are
-    // quarantined by the roster read, not fatal — surface them so the
+    // quarantined by the roster read, not fatal - surface them so the
     // upgrade path stays visible instead of a silent roster gap.
     let quarantined: Vec<String> = store
         .unknown_kind_engine_rows()
@@ -4102,7 +4102,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
         if rows.is_empty() {
             out.push(Check::warn(
                 label,
-                format!("none installed — `blazar engine install --kind {kind}`"),
+                format!("none installed - `blazar engine install --kind {kind}`"),
             ));
             continue;
         }
@@ -4121,7 +4121,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
                 };
                 let active_mark = if e.active { " [active]" } else { "" };
                 // Rows can outlive their files (tree deleted under the
-                // store) — flag them here too; `engine list` shows the
+                // store) - flag them here too; `engine list` shows the
                 // same state in its STATE column.
                 let files = d
                     .engines_dir()
@@ -4131,7 +4131,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
                 if !files {
                     any_missing = true;
                     return format!(
-                        "{tag} ({asset}, {provenance}) FILES MISSING — blazar engine install --kind {kind}{active_mark}",
+                        "{tag} ({asset}, {provenance}) FILES MISSING - blazar engine install --kind {kind}{active_mark}",
                         tag = e.tag,
                         asset = e.asset,
                         kind = e.kind
@@ -4148,7 +4148,7 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
             out.push(Check::warn(
                 label,
                 format!(
-                    "{} — row(s) whose engine dir is absent from disk; spawn would fail",
+                    "{} - row(s) whose engine dir is absent from disk; spawn would fail",
                     entries.join(" | ")
                 ),
             ));
@@ -4163,14 +4163,14 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
 /// Retention tail of the ENGINES section: per-kind count vs `KEEP_TAGS`
 /// (local + active protected on top; prune runs on the next install),
 /// plus row-less dirs invisible to those counts (interrupted installs,
-/// pre-rollback upgrades — advisory, `blazar engine prune` reclaims).
+/// pre-rollback upgrades - advisory, `blazar engine prune` reclaims).
 fn doctor_engine_retention(
     d: &BlazarDirs,
     engines: &[blazar_core::store::EngineRow],
 ) -> Vec<Check> {
     let mut out = Vec::new();
     // Advisory display: a config load failure falls back to the default
-    // here — doctor's config section is the right place to surface that
+    // here - doctor's config section is the right place to surface that
     // error, not the retention tail.
     let keep =
         blazar_runtime::engine::effective_keep_tags(d).unwrap_or(blazar_runtime::engine::KEEP_TAGS);
@@ -4212,12 +4212,12 @@ fn doctor_engine_retention(
     if over.is_empty() {
         out.push(Check::ok(
             "engine retention",
-            format!("every kind ≤ {keep} engine dir(s) — `blazar engine prune` enforces"),
+            format!("every kind <= {keep} engine dir(s) - `blazar engine prune` enforces"),
         ));
     } else {
         out.push(Check::warn(
             "engine retention",
-            format!("{} — `blazar engine prune` reclaims disk", over.join(", ")),
+            format!("{} - `blazar engine prune` reclaims disk", over.join(", ")),
         ));
     }
     out
@@ -4235,17 +4235,17 @@ fn doctor_channels() -> Vec<Check> {
     match path {
         Some(p) => vec![Check::ok(
             "ccache",
-            format!("{} — repeat source builds skip recompiling", p.display()),
+            format!("{} - repeat source builds skip recompiling", p.display()),
         )],
         None => vec![Check::warn(
             "ccache",
-            "none on PATH — source-lane builds recompile from scratch (apt install ccache)"
+            "none on PATH - source-lane builds recompile from scratch (apt install ccache)"
                 .to_string(),
         )],
     }
 }
 
-/// Prefill-chunking visibility (pure — config in, rows out): the
+/// Prefill-chunking visibility (pure - config in, rows out): the
 /// effective knobs that shape prompt-processing memory/latency on each
 /// lane. Shows the pinned value or the engine default the knob falls
 /// back to; visibility only, no judgments.
@@ -4276,8 +4276,8 @@ fn doctor_chunking(cfg: &blazar_core::Config) -> Vec<Check> {
 /// header. Anything else (journal text, shell output pasted into the
 /// unit) is returned with its 1-based line number.
 /// Unit-file integrity: a corrupted blazar.service (journal text pasted
-/// into the unit, heredoc/eval accidents) still STARTS — systemd ignores
-/// the junk lines — while silently mis-parsing directives and spamming
+/// into the unit, heredoc/eval accidents) still STARTS - systemd ignores
+/// the junk lines - while silently mis-parsing directives and spamming
 /// "Missing =" into the journal. Doctor catches that class before it
 /// becomes a mystery restart loop.
 fn unit_file_guard() -> Vec<Check> {
@@ -4308,8 +4308,8 @@ fn unit_file_guard() -> Vec<Check> {
                 vec![Check::warn(
                     "systemd unit",
                     format!(
-                        "{} has {} unparsable line(s) — journal text or shell output pasted \
-                         into the unit; systemd is ignoring them. First: {} — restore with \
+                        "{} has {} unparsable line(s) - journal text or shell output pasted \
+                         into the unit; systemd is ignoring them. First: {} - restore with \
                          `sudo scripts/install.sh` (unit generation) after backing the file up",
                         fragment,
                         issues.len(),
@@ -4320,7 +4320,7 @@ fn unit_file_guard() -> Vec<Check> {
         }
         Err(_) => vec![Check::warn(
             "systemd unit",
-            format!("{fragment} not readable — daemon may be user-launched"),
+            format!("{fragment} not readable - daemon may be user-launched"),
         )],
     }
 }
@@ -4384,7 +4384,7 @@ fn doctor_runtime(d: &BlazarDirs) -> Vec<Check> {
             } else {
                 out.push(Check::warn(
                     "daemon uptime",
-                    format!("up since {since}, {restarts} restart(s) — `journalctl -u blazar -e` for the cause"),
+                    format!("up since {since}, {restarts} restart(s) - `journalctl -u blazar -e` for the cause"),
                 ));
             }
         } else {
@@ -4426,7 +4426,7 @@ fn doctor_runtime(d: &BlazarDirs) -> Vec<Check> {
     } else {
         out.push(Check::warn(
             "tempdir hygiene",
-            format!("{stale} stale blazar dir(s) under /tmp — safe to rm"),
+            format!("{stale} stale blazar dir(s) under /tmp - safe to rm"),
         ));
     }
     // Bench baseline: the F7 gate anchor.
@@ -4438,7 +4438,7 @@ fn doctor_runtime(d: &BlazarDirs) -> Vec<Check> {
             )),
             _ => out.push(Check::warn(
                 "bench baseline",
-                "no bench history — `blazar tune <model> --search` records the \
+                "no bench history - `blazar tune <model> --search` records the \
                  argmax baseline the engine-gate anchors on (plain `blazar bench` \
                  measures without recording)"
                     .to_string(),
@@ -4496,7 +4496,7 @@ fn doctor_bench_receipts(d: &BlazarDirs) -> Vec<Check> {
         return vec![Check::fail(
             "bench receipts",
             format!(
-                "store open failed — receipt freshness unavailable: {}",
+                "store open failed - receipt freshness unavailable: {}",
                 d.data_dir.display()
             ),
         )];
@@ -4506,7 +4506,7 @@ fn doctor_bench_receipts(d: &BlazarDirs) -> Vec<Check> {
         Err(e) => {
             return vec![Check::fail(
                 "bench receipts",
-                format!("engine list failed — receipt freshness unavailable: {e}"),
+                format!("engine list failed - receipt freshness unavailable: {e}"),
             )];
         }
     };
@@ -4518,7 +4518,7 @@ fn doctor_bench_receipts(d: &BlazarDirs) -> Vec<Check> {
         Err(e) => {
             return vec![Check::fail(
                 "bench receipts",
-                format!("model list failed — receipt freshness unavailable: {e}"),
+                format!("model list failed - receipt freshness unavailable: {e}"),
             )];
         }
     };
@@ -4529,7 +4529,7 @@ fn doctor_bench_receipts(d: &BlazarDirs) -> Vec<Check> {
                 "bench receipts",
                 format!(
                     "bench receipt for {} predates the active engine (receipt {}, \
-                     active {}) — re-run `blazar bench {}` / `blazar tune {} --search` \
+                     active {}) - re-run `blazar bench {}` / `blazar tune {} --search` \
                      after engine updates so decisions track the serving binary",
                     m.name, tag, active, m.name, m.name
                 ),
@@ -4543,7 +4543,7 @@ fn doctor_bench_receipts(d: &BlazarDirs) -> Vec<Check> {
 }
 
 /// model against the installed sglang engine by running the REAL
-/// profile compile (single source of truth — the numbers here are the
+/// profile compile (single source of truth - the numbers here are the
 /// numbers a spawn would use, never a re-derivation).
 fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
     let mut out = Vec::new();
@@ -4551,7 +4551,7 @@ fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
         return vec![Check::fail(
             "sglang fit",
             format!(
-                "store open failed — fit preview unavailable: {}",
+                "store open failed - fit preview unavailable: {}",
                 d.data_dir.display()
             ),
         )];
@@ -4561,7 +4561,7 @@ fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
         Err(e) => {
             return vec![Check::fail(
                 "sglang fit",
-                format!("engine index unreadable — fit preview unavailable: {e}"),
+                format!("engine index unreadable - fit preview unavailable: {e}"),
             )];
         }
     };
@@ -4583,7 +4583,7 @@ fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
         Err(e) => {
             return vec![Check::fail(
                 "sglang fit",
-                format!("model list failed — fit preview unavailable: {e}"),
+                format!("model list failed - fit preview unavailable: {e}"),
             )];
         }
     };
@@ -4624,22 +4624,22 @@ fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
     out
 }
 
-/// ENGINES section addition — the GGUF/MLX counterpart of `sglang fit`.
+/// ENGINES section addition - the GGUF/MLX counterpart of `sglang fit`.
 /// For every model the llama.cpp / mistral.rs / mlx lanes could serve,
 /// compile the real spawn profile and charge the f16 KV pool against the
-/// 85% VRAM share — the same math the admission fit uses — so the
+/// 85% VRAM share - the same math the admission fit uses - so the
 /// quant-ladder and ctx-shrink decisions show up in `blazar doctor`
 /// BEFORE a doomed spawn 502s its way through retries. Rows where the
 /// fit already engaged a remedy (warnings present) surface as warn with
 /// the remedy text, not ok-with-footnote.
-#[allow(clippy::too_many_lines)] // one row per lane×model pair, cohesive table builder
+#[allow(clippy::too_many_lines)] // one row per lanexmodel pair, cohesive table builder
 fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
         return vec![Check::fail(
             "kv budget",
             format!(
-                "store open failed — KV preview unavailable: {}",
+                "store open failed - KV preview unavailable: {}",
                 d.data_dir.display()
             ),
         )];
@@ -4649,7 +4649,7 @@ fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
         Err(e) => {
             return vec![Check::fail(
                 "kv budget",
-                format!("engine index unreadable — KV preview unavailable: {e}"),
+                format!("engine index unreadable - KV preview unavailable: {e}"),
             )];
         }
     };
@@ -4672,7 +4672,7 @@ fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
         Err(e) => {
             return vec![Check::fail(
                 "kv budget",
-                format!("model list failed — KV preview unavailable: {e}"),
+                format!("model list failed - KV preview unavailable: {e}"),
             )];
         }
     };
@@ -4695,7 +4695,7 @@ fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
             };
             let flags = manifest_flag_set(&engine.manifest);
             // Metadata must outlive `meta` (match-arm temporaries would
-            // dangle) — deferred init in the lane-loop scope keeps the
+            // dangle) - deferred init in the lane-loop scope keeps the
             // borrowed shape alive through build_input/compile.
             let gguf_meta;
             let hf_meta;
@@ -4751,7 +4751,7 @@ fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
                     // Only FIT remedies make the row a warn: profile
                     // warnings also carry informational clamps (ctx
                     // clamp to metadata, derived pa-fraction) that are
-                    // normal tuning, not a budget problem — warning on
+                    // normal tuning, not a budget problem - warning on
                     // those buried the real tight rows in noise.
                     let remedy: Vec<String> = p
                         .warnings
@@ -4773,7 +4773,7 @@ fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
                     let remedy_note = if remedy.is_empty() {
                         String::new()
                     } else {
-                        format!(" — {}", remedy.join("; "))
+                        format!(" - {}", remedy.join("; "))
                     };
                     let check = if demand_mib > budget_mib || !remedy.is_empty() {
                         Check::warn
@@ -4825,7 +4825,7 @@ fn doctor_model_types(d: &BlazarDirs) -> Vec<Check> {
     if missing > 0 {
         let _ = write!(
             detail,
-            ", {missing} MISSING (stale rows — `blazar rm` or re-pull)"
+            ", {missing} MISSING (stale rows - `blazar rm` or re-pull)"
         );
     }
     if missing > 0 {
@@ -4868,7 +4868,7 @@ mod doctor_tests {
         let budget_mib = 6_960u64;
         let demand_mib = weights_mib + kv_mib;
         let detail = format!(
-            "qwen3-4b: ctx {}, weights {} MiB + KV {} MiB vs {} MiB budget ({}%) — {}",
+            "qwen3-4b: ctx {}, weights {} MiB + KV {} MiB vs {} MiB budget ({}%) - {}",
             p.ctx,
             weights_mib,
             kv_mib,
@@ -4879,7 +4879,7 @@ mod doctor_tests {
         assert!(detail.contains("ctx 8192"));
         assert!(detail.contains("weights 4800 MiB + KV 512 MiB"));
         assert!(detail.contains("vs 6960 MiB budget (76%)"));
-        assert!(detail.contains("— unified KV pool fit"));
+        assert!(detail.contains("- unified KV pool fit"));
     }
 
     #[test]
@@ -4988,15 +4988,15 @@ mod doctor_tests {
             repl_lane_suffix_for(&cfg, &engines, global.as_ref(), Some(&model)),
             "via llamacpp (b11349-cuda)"
         );
-        // Unpulled model: the daemon stays the teacher — banner says so.
+        // Unpulled model: the daemon stays the teacher - banner says so.
         assert_eq!(
             repl_lane_suffix_for(&cfg, &engines, global.as_ref(), None),
-            "(not pulled — engine lane resolves on first send)"
+            "(not pulled - engine lane resolves on first send)"
         );
         // Nothing installed: the routing lesson is carried verbatim.
         assert_eq!(
             repl_lane_suffix_for(&cfg, &[], None, Some(&model)),
-            "(engine lane: no engine installed — blazar engine install --kind <kind>)"
+            "(engine lane: no engine installed - blazar engine install --kind <kind>)"
         );
     }
 
@@ -5023,7 +5023,7 @@ mod doctor_tests {
         assert_eq!(with_extras("", "up to date (b1)"), "up to date (b1)");
         assert_eq!(
             with_extras("(+1 older) [active]", "up to date (b1)"),
-            "(+1 older) [active] — up to date (b1)"
+            "(+1 older) [active] - up to date (b1)"
         );
     }
 
@@ -5086,7 +5086,7 @@ fn doctor_next_steps(checks: &[Check]) -> Vec<String> {
 /// Retired-default pins: a config line that still carries a value an old
 /// default shipped with keeps silently overriding the new default
 /// (template pins outlive default changes). One aggregated WARN row so
-/// the check list stays deterministic; a deliberate pin is fine — the
+/// the check list stays deterministic; a deliberate pin is fine - the
 /// row teaches, it does not block.
 fn doctor_config_pins(cfg: &blazar_core::Config) -> Vec<Check> {
     let pins = cfg.retired_default_pins();
@@ -5096,14 +5096,14 @@ fn doctor_config_pins(cfg: &blazar_core::Config) -> Vec<Check> {
     vec![Check::warn(
         "config pins",
         format!(
-            "{} — delete the line(s) to adopt the new default, or keep \
+            "{} - delete the line(s) to adopt the new default, or keep \
              them if the pin is deliberate",
             pins.join("; ")
         ),
     )]
 }
 
-/// F8: keys health — parse, uniqueness, admin existence, gateway
+/// F8: keys health - parse, uniqueness, admin existence, gateway
 /// enforcement state (a config with keys only bites when the daemon
 /// actually runs this config).
 fn doctor_keys(d: &BlazarDirs) -> Vec<Check> {
@@ -5116,7 +5116,7 @@ fn doctor_keys(d: &BlazarDirs) -> Vec<Check> {
     if cfg.keys.is_empty() {
         out.push(Check::ok(
             "keys",
-            "none configured (authless loopback) — add via `blazar keys add` before exposing the port",
+            "none configured (authless loopback) - add via `blazar keys add` before exposing the port",
         ));
         return out;
     }
@@ -5124,7 +5124,7 @@ fn doctor_keys(d: &BlazarDirs) -> Vec<Check> {
     if admins == 0 {
         out.push(Check::warn(
             "keys",
-            "no unscoped (admin) key — /api/keys management is unreachable",
+            "no unscoped (admin) key - /api/keys management is unreachable",
         ));
     }
     let budgets = cfg
@@ -5142,8 +5142,8 @@ fn doctor_keys(d: &BlazarDirs) -> Vec<Check> {
     out
 }
 
-/// F8: remotes health — one 3s probe per [[remotes]] entry (the same
-/// probe `ps` uses; dead remotes warn, not fail — they are optional
+/// F8: remotes health - one 3s probe per [[remotes]] entry (the same
+/// probe `ps` uses; dead remotes warn, not fail - they are optional
 /// lanes).
 async fn doctor_remotes() -> Vec<Check> {
     let mut out = Vec::new();
@@ -5172,7 +5172,7 @@ async fn doctor_remotes() -> Vec<Check> {
             Ok(resp) => out.push(Check::warn(
                 "remote",
                 format!(
-                    "{} answered HTTP {} — check its auth/model list",
+                    "{} answered HTTP {} - check its auth/model list",
                     r.name,
                     resp.status()
                 ),
@@ -5189,7 +5189,7 @@ async fn doctor_remotes() -> Vec<Check> {
 /// Engine binary smoke: execute the active engine's lane-aware probe
 /// (`engine::smoke_probe`, the same spec the supervisor's verify gate
 /// uses). The manifest can say "installed" while the binary is
-/// corrupted or linked against a glibc the box no longer has — this is
+/// corrupted or linked against a glibc the box no longer has - this is
 /// the row that catches it. Native lanes print `--version`; venv lanes
 /// read package metadata through the venv python (their shim's own
 /// `--version` is an argparse error demanding --model-path); whisper
@@ -5206,7 +5206,7 @@ fn engine_smoke_check(
     let Some(probe) = blazar_runtime::engine::smoke_probe(&kind, &d.data_dir, manifest_json) else {
         return Check::warn(
             "engine binary",
-            "no probeable binary behind the row — reinstall: blazar engine update",
+            "no probeable binary behind the row - reinstall: blazar engine update",
         );
     };
     match std::process::Command::new(&probe.bin)
@@ -5228,21 +5228,21 @@ fn engine_smoke_check(
         Ok(out) => Check::warn(
             "engine binary",
             format!(
-                "exited {status} — reinstall: blazar engine update",
+                "exited {status} - reinstall: blazar engine update",
                 status = out.status
             ),
         ),
         Err(e) => Check::warn(
             "engine binary",
             format!(
-                "cannot execute {}: {e} — reinstall: blazar engine update",
+                "cannot execute {}: {e} - reinstall: blazar engine update",
                 probe.bin.display()
             ),
         ),
     }
 }
 
-/// Exposure: join the bind host with auth state — the security fact the
+/// Exposure: join the bind host with auth state - the security fact the
 /// config and keys rows separately can't say. Authless loopback is the
 /// default and fine; anything off-loopback without keys is an open
 /// inference endpoint for the whole network.
@@ -5253,7 +5253,7 @@ fn doctor_exposure(d: &BlazarDirs) -> Vec<Check> {
     let mut checks = vec![exposure_verdict(&cfg.host, cfg.port, cfg.keys.len())];
     // mistral.rs children accept-and-ignore credentials: there is no
     // child-auth lane at all. Blazar forces their bind to loopback and
-    // the gateway stays the only authenticated surface — say so loudly
+    // the gateway stays the only authenticated surface - say so loudly
     // while one is active, so the security model is never silent.
     if let Ok(store) = Store::open(d)
         && let Ok(Some(row)) = store.active_engine()
@@ -5271,7 +5271,7 @@ fn doctor_exposure(d: &BlazarDirs) -> Vec<Check> {
 
 /// Pure verdict over (host, port, `n_keys`): loopback needs no auth;
 /// wildcard/LAN without keys is exposed to the network. Non-loopback
-/// rows also note blazar speaks plain HTTP — TLS belongs in a reverse
+/// rows also note blazar speaks plain HTTP - TLS belongs in a reverse
 /// proxy in front.
 fn exposure_verdict(host: &str, port: u16, n_keys: usize) -> Check {
     let h = host.trim();
@@ -5294,7 +5294,7 @@ fn exposure_verdict(host: &str, port: u16, n_keys: usize) -> Check {
         Check::warn(
             "exposure",
             format!(
-                "{binding}:{port} reachable off-box with NO auth — anyone on the network can \
+                "{binding}:{port} reachable off-box with NO auth - anyone on the network can \
                  use this box; set host=127.0.0.1 or add keys (`blazar keys add`); blazar \
                  is HTTP-only, put TLS in front (reverse proxy) if you stay exposed"
             ),
@@ -5303,7 +5303,7 @@ fn exposure_verdict(host: &str, port: u16, n_keys: usize) -> Check {
         Check::ok(
             "exposure",
             format!(
-                "{binding}:{port} exposed with {n_keys} key(s) enforcing auth (HTTP — front \
+                "{binding}:{port} exposed with {n_keys} key(s) enforcing auth (HTTP - front \
                  it with a TLS proxy for secrets in transit)"
             ),
         )
@@ -5312,7 +5312,7 @@ fn exposure_verdict(host: &str, port: u16, n_keys: usize) -> Check {
 
 /// Store health: sqlite `quick_check` on blazar.db. Absent = fresh
 /// install (ok row); unreadable or failing = warn with the regenerate
-/// hint — usage history is the only casualty.
+/// hint - usage history is the only casualty.
 fn doctor_store(d: &BlazarDirs) -> Vec<Check> {
     let db = d.db_file();
     if !db.is_file() {
@@ -5337,7 +5337,7 @@ fn doctor_store(d: &BlazarDirs) -> Vec<Check> {
                 vec![Check::warn(
                     "store",
                     format!(
-                        "quick_check: {verdict} — back up, then delete {} to regenerate (usage history lost)",
+                        "quick_check: {verdict} - back up, then delete {} to regenerate (usage history lost)",
                         db.display()
                     ),
                 )]
@@ -5346,7 +5346,7 @@ fn doctor_store(d: &BlazarDirs) -> Vec<Check> {
         Err(e) => vec![Check::warn(
             "store",
             format!(
-                "blazar.db unreadable ({e:#}) — back up, then delete {} to regenerate (usage history lost)",
+                "blazar.db unreadable ({e:#}) - back up, then delete {} to regenerate (usage history lost)",
                 db.display()
             ),
         )],
@@ -5355,8 +5355,8 @@ fn doctor_store(d: &BlazarDirs) -> Vec<Check> {
 
 /// Service-manager state: the systemd/launchd unit the installer lanes
 /// create. `BLAZAR_SYSTEMCTL` overrides the systemctl binary (test
-/// seam, mirrors install.sh). No manager found (windows/dev) → no row;
-/// no unit is an informational ok, not a warning — running manually is
+/// seam, mirrors install.sh). No manager found (windows/dev) -> no row;
+/// no unit is an informational ok, not a warning - running manually is
 /// a legitimate lane.
 fn doctor_service() -> Vec<Check> {
     let systemctl = std::env::var("BLAZAR_SYSTEMCTL").unwrap_or_else(|_| "systemctl".into());
@@ -5412,7 +5412,7 @@ fn doctor_service() -> Vec<Check> {
 }
 
 /// Pure verdict over manager probe results: both set = managed, both
-/// unset-but-probed = manual lane, `None` = probe inconclusive → no row.
+/// unset-but-probed = manual lane, `None` = probe inconclusive -> no row.
 fn service_verdict(enabled: Option<bool>, active: Option<bool>, manager: &str) -> Option<Check> {
     match (enabled, active) {
         (Some(true), Some(true)) => Some(Check::ok(
@@ -5421,16 +5421,16 @@ fn service_verdict(enabled: Option<bool>, active: Option<bool>, manager: &str) -
         )),
         (Some(true), Some(false)) => Some(Check::warn(
             "service",
-            format!("{manager} unit enabled but not running — logs: journalctl -u blazar"),
+            format!("{manager} unit enabled but not running - logs: journalctl -u blazar"),
         )),
         (Some(false), Some(true)) => Some(Check::warn(
             "service",
-            "daemon running but unit not enabled — may not survive reboot; run: sh \
+            "daemon running but unit not enabled - may not survive reboot; run: sh \
              scripts/install.sh (or systemctl enable blazar)",
         )),
         (Some(false), Some(false)) => Some(Check::ok(
             "service",
-            format!("no {manager} unit (manual/dev lane — start with `blazar serve`)"),
+            format!("no {manager} unit (manual/dev lane - start with `blazar serve`)"),
         )),
         _ => None,
     }
@@ -5443,7 +5443,7 @@ fn service_verdict(enabled: Option<bool>, active: Option<bool>, manager: &str) -
 async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut active_tag: Option<String> = None;
-    // Install-time (manifest) GPU names — what auto-pick derives from.
+    // Install-time (manifest) GPU names - what auto-pick derives from.
     let mut frozen_gpu_names: Vec<String> = Vec::new();
     match local_engine_manager(d) {
         Ok(mgr) => {
@@ -5474,7 +5474,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                         checks.push(Check::warn(
                             "hardware",
                             format!(
-                                "{note} — CPU-only inference; expect token/s in the single digits"
+                                "{note} - CPU-only inference; expect token/s in the single digits"
                             ),
                         ));
                     } else {
@@ -5494,11 +5494,11 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                 }
                 Ok(None) => checks.push(Check::fail(
                     "engine",
-                    "none installed — run: blazar engine update",
+                    "none installed - run: blazar engine update",
                 )),
                 Err(e) => checks.push(Check::fail(
                     "engine",
-                    format!("{e} — run: blazar engine update"),
+                    format!("{e} - run: blazar engine update"),
                 )),
             }
             // Doctor is the discover-and-heal surface, so legacy audio
@@ -5518,7 +5518,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                 ));
             }
             // Ghost rows: the db row outlived its engine dir (manual
-            // deletion, disk cleanup). Spawn/verify cannot see these —
+            // deletion, disk cleanup). Spawn/verify cannot see these -
             // name them with the heal command instead of failing silently
             // doctor run after doctor run.
             for (tag, kind, path) in mgr.ghost_engine_rows() {
@@ -5534,13 +5534,13 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                 };
                 checks.push(Check::warn(
                 "engine",
-                format!("row {tag} ({kind}) has no engine binary at {path} — heal: {heal}{whisper_note}"),
+                format!("row {tag} ({kind}) has no engine binary at {path} - heal: {heal}{whisper_note}"),
             ));
             }
         }
         Err(e) => checks.push(Check::fail("engine", format!("{e}"))),
     }
-    // The engines row carries the kind (the manifest does not — single
+    // The engines row carries the kind (the manifest does not - single
     // source of truth lives in the store).
     let active_kind = blazar_core::Store::open(d)
         .ok()
@@ -5548,7 +5548,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
         .map(|r| r.kind);
     // CUDA opportunity + toolchain readiness (NVIDIA boxes only): a
     // Vulkan prebuilt on an NVIDIA GPU leaves measured decode/prefill on
-    // the table. mistral.rs-active boxes skip — that lane picks its
+    // the table. mistral.rs-active boxes skip - that lane picks its
     // asset by driver at install time.
     let (driver_cuda, compute_cap) = nvidia_gpu_facts().await;
     checks.extend(cuda_opportunity_rows(
@@ -5559,7 +5559,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
         &detect_toolchain(&path_dirs()),
     ));
     // GPU hardware-vs-driver gap (Linux): PCI display hardware the driver
-    // userspace cannot see — a driverless GPU box silently serves CPU.
+    // userspace cannot see - a driverless GPU box silently serves CPU.
     if std::env::consts::OS == "linux" {
         let pci = blazar_runtime::probe::pci_gpu_vendors();
         let icd = ["/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"]
@@ -5579,11 +5579,11 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     // Enumeration drift from the daemon's reconcile marker: install-time
     // probe names the serving child can no longer see (spawns auto-remap,
     // but the user should know the probe view is stale). The marker's
-    // currency verdict moved to `doctor_engine_versions` — only the
+    // currency verdict moved to `doctor_engine_versions` - only the
     // device census is consumed here.
     // A marker is only trustworthy for the CURRENT channel: one written by a
     // pre-channel daemon (no "channel" key) or under a different channel
-    // reports the other channel's target — reconciling it after a switch
+    // reports the other channel's target - reconciling it after a switch
     // nags about builds the user deliberately left behind.
     let cfg_channel = blazar_core::Config::load(d)
         .map(|c| c.update_channel)
@@ -5603,7 +5603,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                     "engine devices",
                     format!(
                         "enumeration drift: {} known to the install-time probe but \
-                                 invisible to the serving child — spawns auto-remap, \
+                                 invisible to the serving child - spawns auto-remap, \
                                  `blazar engine update` refreshes the probe",
                         drift.join(", ")
                     ),
@@ -5614,7 +5614,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     // CUDA-channel hint: an NVIDIA box serving the Vulkan asset is
     // leaving the measured ~4% Vulkan delta on the table. The channel
     // is zero-touch (upstream official CUDA assets, probed
-    // automatically at every `engine update`) — this row only tells the
+    // automatically at every `engine update`) - this row only tells the
     // user the lane exists and where its assets come from. Keyed on the
     // llama.cpp lane's tag/asset: non-llamacpp actives have no b-tag
     // channel to key on (their kinds' rows live in
@@ -5628,11 +5628,11 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     {
         let detail = match blazar_runtime::engine::gh::engine_overlay_repo() {
             Some(repo) => format!(
-                "NVIDIA GPU on the Vulkan asset — prebuilt CUDA engines are preferred \
+                "NVIDIA GPU on the Vulkan asset - prebuilt CUDA engines are preferred \
                  automatically from the overlay at {repo}; set BLAZAR_ENGINE_REPO to \
                  change it"
             ),
-            None => "NVIDIA GPU on the Vulkan asset — prebuilt CUDA engines are preferred \
+            None => "NVIDIA GPU on the Vulkan asset - prebuilt CUDA engines are preferred \
                  automatically from upstream llama.cpp releases (official ubuntu-cuda \
                  assets); run: blazar engine update"
                 .to_string(),
@@ -5656,7 +5656,7 @@ fn active_engine_asset(d: &BlazarDirs, active_tag: Option<&str>) -> String {
 }
 
 /// True when the ACTIVE llama.cpp engine already serves a CUDA asset
-/// (overlay prebuilt or source-built) — the cuda-channel hint only
+/// (overlay prebuilt or source-built) - the cuda-channel hint only
 /// applies to Vulkan/CPU assets. Probe failures read as "not cuda":
 /// the hint is advisory, a store error must not hide it.
 fn active_asset_is_cuda(d: &BlazarDirs, active_tag: Option<&str>) -> bool {
@@ -5664,7 +5664,7 @@ fn active_asset_is_cuda(d: &BlazarDirs, active_tag: Option<&str>) -> bool {
 }
 
 /// Frozen (install-time) names missing from the serving child's census.
-/// Superset child views and CPU-only empties are healthy — only names the
+/// Superset child views and CPU-only empties are healthy - only names the
 /// child CANNOT see get flagged.
 fn device_drift(frozen: &[String], live: &[String]) -> Vec<String> {
     frozen
@@ -5676,7 +5676,7 @@ fn device_drift(frozen: &[String], live: &[String]) -> Vec<String> {
 
 /// Device names from the engine-check marker's census, `None` when the
 /// census is unknown (key absent or null: pre-census daemon or failed
-/// probe). Unknown must NOT be reported as drift — only a census that
+/// probe). Unknown must NOT be reported as drift - only a census that
 /// actually ran can say a device is invisible.
 fn census_names(marker: &serde_json::Value) -> Option<Vec<String>> {
     marker["devices"].as_array().map(|a| {
@@ -5750,7 +5750,7 @@ fn stable_prefix(marker: Option<&StableMarker>, tag: &str) -> String {
 }
 
 /// The command that updates the ACTIVE engine's lane: source-built
-/// engines (`asset` = `built-*`) refresh by rebuilding the source lane —
+/// engines (`asset` = `built-*`) refresh by rebuilding the source lane -
 /// `engine update` would install the Vulkan prebuilt instead. Overlay
 /// prebuilts (`bNNNN-cuda` from the CUDA channel, `asset` =
 /// `ubuntu-cuda-*`) update through the normal `engine update` lane,
@@ -5801,7 +5801,7 @@ async fn gh_offline_hint() -> String {
 }
 
 /// Live engine-currency probe (marker missing or >48h stale): 4s cap,
-/// warn-only — the update itself stays a human action.
+/// warn-only - the update itself stays a human action.
 async fn live_engine_currency(active: &str, asset: &str) -> Check {
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
@@ -5814,7 +5814,7 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
     match fetched {
         Ok(rel) => {
             // b-tags compare by build number: lane suffixes (-cuda/-cpu)
-            // are the SAME build — string equality would nag a current
+            // are the SAME build - string equality would nag a current
             // source-built engine forever.
             let stable = gh.stable_marker().await.ok().flatten();
             if same_build(active, &rel.tag_name) {
@@ -5829,7 +5829,7 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
                 Check::warn(
                     "engine currency",
                     format!(
-                        "{} available: {}{} (active: {}, channel: {}) — run: {}{}",
+                        "{} available: {}{} (active: {}, channel: {}) - run: {}{}",
                         channel_word(active, &rel.tag_name),
                         rel.tag_name,
                         stable_alias_paren(stable.as_ref(), &rel.tag_name),
@@ -5843,18 +5843,18 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
         }
         Err(e) => Check::warn(
             "engine currency",
-            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
+            format!("check failed ({e:#}) - {}", gh_offline_hint().await),
         ),
     }
 }
 
 /// mistral.rs engine currency (mistral.rs engine active): live
 /// warn-only probe of the mistral.rs release list under the shared
-/// bounded-retry policy, mirroring the llama.cpp live lane — the
+/// bounded-retry policy, mirroring the llama.cpp live lane - the
 /// daemon's daily survey does not track this repo.
 /// sglang pip lane: `PyPI` is the upstream truth, so doctor probes it live
 /// (same bounded, warn-only shape as the mistral.rs row) instead of just
-/// teaching the refresh command — an available minor reads as a warn with
+/// teaching the refresh command - an available minor reads as a warn with
 /// the exact update command.
 async fn live_sglang_currency(active: &str) -> Check {
     let installed_version = active.trim_start_matches("sglang-");
@@ -5873,7 +5873,7 @@ async fn live_sglang_currency(active: &str) -> Check {
                 Check::warn(
                     "engine currency",
                     format!(
-                        "{latest} available on PyPI (active: {active}) — run: \
+                        "{latest} available on PyPI (active: {active}) - run: \
                          blazar engine update --kind sglang {latest}"
                     ),
                 )
@@ -5881,7 +5881,7 @@ async fn live_sglang_currency(active: &str) -> Check {
         }
         Err(e) => Check::warn(
             "engine currency",
-            format!("{active} (sglang pip lane) — PyPI check failed ({e:#}); offline?"),
+            format!("{active} (sglang pip lane) - PyPI check failed ({e:#}); offline?"),
         ),
     }
 }
@@ -5903,14 +5903,14 @@ async fn live_mlx_currency(active: &str) -> Check {
                 Check::warn(
                     "engine currency",
                     format!(
-                        "{latest} available on PyPI (active: {active}) — run:                          blazar engine update --kind mlx {latest}"
+                        "{latest} available on PyPI (active: {active}) - run:                          blazar engine update --kind mlx {latest}"
                     ),
                 )
             }
         }
         Err(e) => Check::warn(
             "engine currency",
-            format!("{active} (mlx-lm pip lane) — PyPI check failed ({e:#}); offline?"),
+            format!("{active} (mlx-lm pip lane) - PyPI check failed ({e:#}); offline?"),
         ),
     }
 }
@@ -5934,7 +5934,7 @@ async fn live_mistralrs_currency(active: &str) -> Check {
                 Check::warn(
                     "engine currency",
                     format!(
-                        "{} available: {} (active: {}, mistral.rs) — run: blazar engine update --kind mistralrs",
+                        "{} available: {} (active: {}, mistral.rs) - run: blazar engine update --kind mistralrs",
                         channel_word(active, &rel.tag_name),
                         rel.tag_name,
                         active
@@ -5944,7 +5944,7 @@ async fn live_mistralrs_currency(active: &str) -> Check {
         }
         Err(e) => Check::warn(
             "engine currency",
-            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
+            format!("check failed ({e:#}) - {}", gh_offline_hint().await),
         ),
     }
 }
@@ -5952,7 +5952,7 @@ async fn live_mistralrs_currency(active: &str) -> Check {
 /// sdcpp engine currency: live warn-only probe of the newest
 /// master-tagged stable-diffusion.cpp release. The master channel is
 /// mutable (no ordering between shas), so any tag difference is an
-/// update — same verdict shape the mistral.rs lane uses.
+/// update - same verdict shape the mistral.rs lane uses.
 async fn live_sdcpp_currency(active: &str) -> Check {
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
@@ -5967,18 +5967,18 @@ async fn live_sdcpp_currency(active: &str) -> Check {
         Ok(rel) => Check::warn(
             "engine currency",
             format!(
-                "update available: {} (active: {}, sdcpp) — run: \
+                "update available: {} (active: {}, sdcpp) - run: \
                  blazar engine update --kind sdcpp",
                 rel.tag_name, active
             ),
         ),
         Err(e) => Check::warn(
             "engine currency",
-            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
+            format!("check failed ({e:#}) - {}", gh_offline_hint().await),
         ),
     }
 }
-/// Per-kind engine versions listing (whisper excepted — it has its own
+/// Per-kind engine versions listing (whisper excepted - it has its own
 /// dedicated currency check). One `versions {kind}` row per kind shows
 /// the installed state (newest tag, `+N older` retained rows, `[active]`
 /// mark), reconciles it against the lane's live upstream, and always
@@ -6026,10 +6026,10 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
             let install = engine_install_command(kind);
             let latest = latest_engine_tag(kind).await;
             let detail = match latest {
-                Some(tag) => format!("none installed — latest {tag} — run: {install}"),
+                Some(tag) => format!("none installed - latest {tag} - run: {install}"),
                 None => format!(
-                    "none installed — latest unknown (probe failed; offline? set GH_TOKEN \
-                     if rate limited) — run: {install}"
+                    "none installed - latest unknown (probe failed; offline? set GH_TOKEN \
+                     if rate limited) - run: {install}"
                 ),
             };
             out.push(Check::warn(name, detail));
@@ -6047,7 +6047,7 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
         if judged.tag == blazar_runtime::LOCAL_TAG {
             out.push(Check::ok(
                 name,
-                with_extras(&extras, "local build — upstream currency not tracked"),
+                with_extras(&extras, "local build - upstream currency not tracked"),
             ));
             continue;
         }
@@ -6094,13 +6094,13 @@ fn with_extras(extras: &str, detail: &str) -> String {
     if extras.is_empty() {
         detail.to_string()
     } else {
-        format!("{extras} — {detail}")
+        format!("{extras} - {detail}")
     }
 }
 
 /// The lane's newest upstream release tag: `PyPI` for the pip lanes
 /// (sglang, mlx), the configured b-build channel for llama.cpp, newest
-/// release for the GitHub lanes. `None` on probe failure — callers
+/// release for the GitHub lanes. `None` on probe failure - callers
 /// degrade to "latest unknown" with the command intact.
 async fn latest_engine_tag(kind: EngineKind) -> Option<String> {
     match kind {
@@ -6178,7 +6178,7 @@ fn cuda_opportunity_rows(
         rows.push(Check::ok(
             "engine backend",
             format!(
-                "NVIDIA GPU (driver CUDA {dmaj}.{dmin}{cc}) — a CUDA engine is faster: \
+                "NVIDIA GPU (driver CUDA {dmaj}.{dmin}{cc}) - a CUDA engine is faster: \
                  `blazar engine build cuda` (compiles upstream) or \
                  `blazar engine install` (mistral.rs prebuilt)"
             ),
@@ -6197,13 +6197,13 @@ fn cuda_opportunity_rows(
     if missing.is_empty() {
         rows.push(Check::ok(
             "cuda toolchain",
-            "ready (git, cmake, nvcc) — `blazar engine build cuda` can run now",
+            "ready (git, cmake, nvcc) - `blazar engine build cuda` can run now",
         ));
     } else {
         rows.push(Check::warn(
             "cuda toolchain",
             format!(
-                "missing {} — install the distro git/cmake packages + the CUDA toolkit \
+                "missing {} - install the distro git/cmake packages + the CUDA toolkit \
                  (https://developer.nvidia.com/cuda-downloads); prebuilt alternative: \
                  `blazar engine install`",
                 missing.join(", ")
@@ -6214,7 +6214,7 @@ fn cuda_opportunity_rows(
 }
 
 /// GPU hardware-vs-driver rows for doctor: PCI display hardware is
-/// present but the matching driver userspace is missing — the box would
+/// present but the matching driver userspace is missing - the box would
 /// silently serve CPU/Vulkan and nobody would be told why. Pure: the PCI
 /// census, vendor hint and Vulkan-ICD presence are passed in (probes are
 /// the caller's job), so the matrix is unit-testable.
@@ -6229,7 +6229,7 @@ fn gpu_driver_rows(
         rows.push(Check::warn(
             "nvidia driver",
             "NVIDIA GPU present (PCI 10de:) but no NVIDIA driver userspace (nvidia-smi missing) \
-             — inference falls back to CPU/Vulkan. Re-run scripts/install.sh (its GPU preflight \
+             - inference falls back to CPU/Vulkan. Re-run scripts/install.sh (its GPU preflight \
              installs the distro driver from first-party repos), reboot, then `blazar engine \
              update` picks the newest CUDA build the driver supports",
         ));
@@ -6237,7 +6237,7 @@ fn gpu_driver_rows(
     if (pci_vendors.iter().any(|v| v == "1002" || v == "8086")) && !vulkan_icd_present {
         rows.push(Check::warn(
             "vulkan driver",
-            "AMD/Intel GPU present but no Vulkan ICD — the Vulkan engine lane is unavailable \
+            "AMD/Intel GPU present but no Vulkan ICD - the Vulkan engine lane is unavailable \
              (CPU fallback). Install mesa-vulkan-drivers (apt/dnf), vulkan-radeon/vulkan-intel \
              (pacman) or Mesa-vulkan-drivers (zypper)",
         ));
@@ -6248,7 +6248,7 @@ fn gpu_driver_rows(
 /// Doctor engine-currency verdict. The marker's `latest`/`checked_at` are
 /// durable (the last upstream survey); its `active`/`update_available` are
 /// write-time derivations that go stale the instant an engine switch lands
-/// between daily daemon ticks — so the verdict is derived here against the
+/// between daily daemon ticks - so the verdict is derived here against the
 /// live active tag, never read from the marker.
 fn currency_verdict(
     active_tag: Option<&str>,
@@ -6261,7 +6261,7 @@ fn currency_verdict(
     if active == blazar_runtime::LOCAL_TAG {
         return Some(Check::ok(
             "engine currency",
-            "local build — upstream currency not tracked",
+            "local build - upstream currency not tracked",
         ));
     }
     let checked_at = marker["checked_at"].as_u64().unwrap_or(0);
@@ -6273,7 +6273,7 @@ fn currency_verdict(
         Some(Check::warn(
             "engine currency",
             format!(
-                "{} available: {latest} (active: {active}, channel: {channel}) — run: {}{}",
+                "{} available: {latest} (active: {active}, channel: {channel}) - run: {}{}",
                 channel_word(active, latest),
                 engine_update_command(active, asset),
                 overlay_lag_note(active, asset)
@@ -6293,15 +6293,15 @@ fn currency_verdict(
 }
 
 /// App currency: the newest blazar release on the same repo/URL the
-/// `blazar upgrade` lane installs from. Warn-only — never installs
+/// `blazar upgrade` lane installs from. Warn-only - never installs
 /// (`blazar upgrade` stays a human action, exactly like engine updates).
-/// `BLAZAR_REPO` unset → informational row (self-upgrade lane not
+/// `BLAZAR_REPO` unset -> informational row (self-upgrade lane not
 /// configured; dev checkouts and manual installs live here).
 async fn doctor_app_currency() -> Vec<Check> {
     let Some(repo) = std::env::var("BLAZAR_REPO").ok().filter(|r| !r.is_empty()) else {
         return vec![Check::ok(
             "app currency",
-            "BLAZAR_REPO unset — self-upgrade lane not configured",
+            "BLAZAR_REPO unset - self-upgrade lane not configured",
         )];
     };
     let base = std::env::var("BLAZAR_INSTALL_BASE_URL")
@@ -6323,7 +6323,7 @@ async fn doctor_app_currency() -> Vec<Check> {
         )],
         Err(e) => vec![Check::warn(
             "app currency",
-            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
+            format!("check failed ({e:#}) - {}", gh_offline_hint().await),
         )],
     }
 }
@@ -6331,17 +6331,17 @@ async fn doctor_app_currency() -> Vec<Check> {
 /// Whisper.cpp currency: engines-table row (`blazar engine install
 /// --kind whisper`) or the legacy versioned tree under
 /// `data/whisper/bin/<tag>/`; compare the resolved install against the
-/// latest upstream release (`WHISPER_REPO`). Optional component — not
+/// latest upstream release (`WHISPER_REPO`). Optional component - not
 /// installed means no row (same policy as remotes). Warn-only; installs
 /// stay a human action.
 async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
     if blazar_runtime::whisper::server_bin(d).is_none() {
         // Optional lane absent: say so instead of silently omitting the
-        // row — doctor is where users discover the lane exists (observed
+        // row - doctor is where users discover the lane exists (observed
         // live: all-green doctor while transcription had no backend).
         return vec![Check::warn(
             "whisper lane",
-            "not installed — optional: `blazar engine install --kind whisper` \
+            "not installed - optional: `blazar engine install --kind whisper` \
              (alias: `blazar whisper --install`) enables local \
              /v1/audio/transcriptions + /v1/audio/translations",
         )];
@@ -6352,7 +6352,7 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
     let installed = blazar_runtime::whisper::installed_tag(d).unwrap_or_else(|| "?".into());
     // `whisper --install` funnels into the engines lane since the
     // legacy-tree redirect, so one update command covers both entry
-    // points — no lane fork needed.
+    // points - no lane fork needed.
     let action = "blazar engine update --kind whisper";
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
@@ -6365,19 +6365,19 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
     };
     let channel = config().map(|c| c.update_channel).unwrap_or_default();
     // Asset-aware: whisper.cpp tags assetless v-releases (v1.9.4) while
-    // the b-tags carry the binaries — currency must never advertise a
+    // the b-tags carry the binaries - currency must never advertise a
     // tag the install lane cannot install.
     let fetched = blazar_runtime::whisper::channel_target(&gh, channel).await;
     match fetched {
         Ok(latest) => vec![whisper_pin_verdict(d, &installed, &latest, action)],
         Err(e) => vec![Check::warn(
             "whisper currency",
-            format!("check failed ({e:#}) — {}", gh_offline_hint().await),
+            format!("check failed ({e:#}) - {}", gh_offline_hint().await),
         )],
     }
 }
 
-/// Pinned-whisper currency verdict (pure): deliberate pin named as such —
+/// Pinned-whisper currency verdict (pure): deliberate pin named as such -
 /// plain --install silently unpins, so updates point at the
 /// pin-preserving --tag form. `action` is the update command for the
 /// unpinned verdict (the pin file is lane-agnostic).
@@ -6398,7 +6398,7 @@ fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str, action: &s
                 Check::warn(
                     "whisper currency",
                     format!(
-                        "update available: {latest} (pinned: {pin}) — run: \
+                        "update available: {latest} (pinned: {pin}) - run: \
                          blazar whisper --install --tag {latest}"
                     ),
                 )
@@ -6409,7 +6409,7 @@ fn whisper_pin_verdict(d: &BlazarDirs, installed: &str, latest: &str, action: &s
 }
 
 /// Local whisper models health: the server binary alone transcribes
-/// nothing — without a pulled ggml model every request 501s (observed
+/// nothing - without a pulled ggml model every request 501s (observed
 /// live in validation: installed server + zero models = broken lane).
 fn doctor_whisper_models(d: &BlazarDirs) -> Vec<Check> {
     if blazar_runtime::whisper::server_bin(d).is_none() {
@@ -6419,7 +6419,7 @@ fn doctor_whisper_models(d: &BlazarDirs) -> Vec<Check> {
     if pulled.is_empty() {
         vec![Check::warn(
             "whisper models",
-            "none pulled — transcription will 501 until `blazar whisper --pull base`",
+            "none pulled - transcription will 501 until `blazar whisper --pull base`",
         )]
     } else {
         vec![Check::ok(
@@ -6431,7 +6431,7 @@ fn doctor_whisper_models(d: &BlazarDirs) -> Vec<Check> {
 
 /// Generic currency verdict (pure): semver-compare when both tags parse;
 /// otherwise fall back to tag inequality (whisper.cpp alternates `vX.Y.Z`
-/// and `bNNNN` tag shapes — a differing latest tag IS an update). Equal
+/// and `bNNNN` tag shapes - a differing latest tag IS an update). Equal
 /// tags are always up to date; the verdict is never silently skipped.
 fn version_currency_verdict(
     name: &'static str,
@@ -6454,11 +6454,11 @@ fn version_currency_verdict(
 fn warn_update(name: &'static str, running: &str, latest: &str, action: &str) -> Check {
     Check::warn(
         name,
-        format!("update available: {latest} (running: {running}) — run: {action}"),
+        format!("update available: {latest} (running: {running}) - run: {action}"),
     )
 }
 
-/// `vX.Y.Z` / `X.Y.Z` → `(X, Y, Z)`. Strict: exactly three numeric parts —
+/// `vX.Y.Z` / `X.Y.Z` -> `(X, Y, Z)`. Strict: exactly three numeric parts -
 /// anything else (suffixes, partial tags) is None so callers warn.
 fn ver_triple(v: &str) -> Option<(u64, u64, u64)> {
     let v = v.trim().strip_prefix('v').unwrap_or(v.trim());
@@ -6472,12 +6472,12 @@ fn ver_triple(v: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Multiple blazar binaries on one box: your shell resolves one order,
-/// system services (gateways, systemd units, cron) resolve another — and
+/// system services (gateways, systemd units, cron) resolve another - and
 /// the stale copy silently wins the daemon race (live incident class).
 /// Found by scanning PATH plus the usual suspects, versions compared by
 /// executing each candidate.
 /// Daemon-binary skew: when a daemon answers on the configured port,
-/// the binary it runs must be THIS CLI binary — any other copy
+/// the binary it runs must be THIS CLI binary - any other copy
 /// (a stale `/usr/local/bin` install, a different worktree's build)
 /// silently serves older behavior while the user's CLI shows the new
 /// one. The exact resurrection path: `ensure_daemon` boots
@@ -6530,7 +6530,7 @@ async fn doctor_daemon_skew(d: &BlazarDirs) -> Vec<Check> {
         (Some(s), Some(c)) => vec![Check::warn(
             "daemon binary",
             format!(
-                "version skew: the serving daemon runs {s} but this CLI is {c} — \
+                "version skew: the serving daemon runs {s} but this CLI is {c} - \
                  the daemon predates or postdates your CLI; `blazar stop && blazar \
                  serve` from the binary you intend to run, or reinstall one copy"
             ),
@@ -6540,7 +6540,7 @@ async fn doctor_daemon_skew(d: &BlazarDirs) -> Vec<Check> {
             "daemon binary",
             format!(
                 "daemon answers {} but its binary is undeterminable (pidfile {}, \
-                 daemon.path {}) — verify by hand: ps -p <pidfile pid>",
+                 daemon.path {}) - verify by hand: ps -p <pidfile pid>",
                 base,
                 if pid.is_some() {
                     "readable"
@@ -6661,9 +6661,9 @@ async fn doctor_port() -> Vec<Check> {
 }
 
 /// Identity, not just liveness: a bound port that answers /healthz
-/// proves nothing about WHO holds it. During the pallama→blazar rename
+/// proves nothing about WHO holds it. During the pallama->blazar rename
 /// this check reported any /healthz-200 stranger as "blazar daemon
-/// already answering" — a pre-rename daemon on the same default port
+/// already answering" - a pre-rename daemon on the same default port
 /// was indistinguishable from ours. The ladder: our daemon advertises
 /// `name: blazar` on /api/version; JSON with a version but no name is a
 /// pre-rename or foreign daemon; /healthz-200 with no JSON endpoint at
@@ -6686,21 +6686,21 @@ fn port_holder_verdict(
     let foreign = |detail: String| Check::warn("port", detail);
     let Some(body) = version_body else {
         return foreign(format!(
-            "{at} answers /healthz but carries no /api/version — a foreign server holds the port, not the blazar daemon"
+            "{at} answers /healthz but carries no /api/version - a foreign server holds the port, not the blazar daemon"
         ));
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return foreign(format!(
-            "{at} answers /healthz with a non-JSON /api/version — a foreign server holds the port, not the blazar daemon"
+            "{at} answers /healthz with a non-JSON /api/version - a foreign server holds the port, not the blazar daemon"
         ));
     };
     if v["name"].as_str() == Some("blazar") {
         let ver = v["version"].as_str().unwrap_or("?");
-        return Check::ok("port", format!("{at} — blazar daemon v{ver} answering"));
+        return Check::ok("port", format!("{at} - blazar daemon v{ver} answering"));
     }
     let ver = v["version"].as_str().unwrap_or("?");
     foreign(format!(
-        "{at} — the answering daemon is not blazar (reports version {ver:?} without the blazar name; a pre-rename pallama or a foreign server) — stop it or move blazar to another port"
+        "{at} - the answering daemon is not blazar (reports version {ver:?} without the blazar name; a pre-rename pallama or a foreign server) - stop it or move blazar to another port"
     ))
 }
 
@@ -6713,7 +6713,7 @@ fn doctor_disk(d: &BlazarDirs) -> Vec<Check> {
         vec![Check::warn(
             "disk",
             format!(
-                "{g:.1} GiB free under {} — model pulls need headroom",
+                "{g:.1} GiB free under {} - model pulls need headroom",
                 d.data_dir.display()
             ),
         )]
@@ -6767,7 +6767,7 @@ fn doctor_sentinel(d: &BlazarDirs) -> Vec<Check> {
         )];
     }
     let top: Vec<String> = counts.iter().map(|(c, n)| format!("{c} x{n}")).collect();
-    // Name the dominant code so the hint is directly runnable — the bare
+    // Name the dominant code so the hint is directly runnable - the bare
     // `blazar why` of record used to be a dead end whenever the flagged
     // population sat older than the newest 10 clean records.
     let top_code = counts
@@ -6777,7 +6777,7 @@ fn doctor_sentinel(d: &BlazarDirs) -> Vec<Check> {
     vec![Check::warn(
         "sentinel",
         format!(
-            "{flagged} of {records} requests in 24h flagged: {} — `blazar why --flagged` for details + retry hints{top_code}",
+            "{flagged} of {records} requests in 24h flagged: {} - `blazar why --flagged` for details + retry hints{top_code}",
             top.join(", ")
         ),
     )]
@@ -6796,7 +6796,7 @@ struct OrphanReport {
 /// One unreferenced GGUF on disk: name for display, bytes so the
 /// "delete to reclaim" teaching can say how much is actually at stake.
 /// `twin_of` names the registered file with identical content, when
-/// one exists — those are manual-download duplicates, not data.
+/// one exists - those are manual-download duplicates, not data.
 #[derive(Debug)]
 struct OrphanFile {
     name: String,
@@ -6805,7 +6805,7 @@ struct OrphanFile {
 }
 
 /// Content hash for orphan-twin detection (advisory display only; the
-/// store keeps authoritative hashes — this is a read-only comparison
+/// store keeps authoritative hashes - this is a read-only comparison
 /// against files the rows already own).
 fn file_sha256(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
@@ -6825,7 +6825,7 @@ fn file_sha256(path: &Path) -> Option<String> {
 
 /// Size-indexed referenced files with model attribution, for
 /// content-twin detection: an orphan whose bytes hash-identical to a
-/// registered file is manual-download debris — safe to delete, and
+/// registered file is manual-download debris - safe to delete, and
 /// saying so changes the advice from "register or reclaim" to just
 /// "reclaim". Values: (canonical path, model name, file leaf).
 fn referenced_by_size(
@@ -6910,7 +6910,7 @@ fn orphan_scan(models: &[blazar_core::store::ModelRow], dir: &Path) -> OrphanRep
                 continue;
             }
         }
-        // Windows: no std inode access — every unreferenced GGUF is
+        // Windows: no std inode access - every unreferenced GGUF is
         // reported as an orphan (twin split unavailable, still correct
         // about which files blazar does not manage). Size comes from
         // the same entry we just stat'd; unreadable metadata reports 0
@@ -6933,7 +6933,7 @@ fn orphan_scan(models: &[blazar_core::store::ModelRow], dir: &Path) -> OrphanRep
                 .iter()
                 .find(|(c, _, _)| file_sha256(c).as_deref() == Some(orphan_hash.as_str()))
         {
-            twin_of = Some(format!("{leaf} — linked to {model}"));
+            twin_of = Some(format!("{leaf} - linked to {model}"));
         }
         out.orphans.push(OrphanFile {
             name: name(),
@@ -6969,8 +6969,8 @@ fn model_artifact_readable(m: &blazar_core::store::ModelRow) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
     {
         // LLM-lane GGUFs carry their architecture in metadata. DiT
-        // (diffusion) exports legitimately ship zero metadata KVs — the
-        // architecture comes from the row's component set — so component
+        // (diffusion) exports legitimately ship zero metadata KVs - the
+        // architecture comes from the row's component set - so component
         // rows get the structural container check instead.
         return if m.components.is_empty() {
             blazar_core::read_metadata_file(path).is_ok()
@@ -7020,7 +7020,7 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
                 .map(|o| {
                     let mut s = format!("{} ({})", o.name, humansize(o.bytes.cast_signed()));
                     if let Some(t) = o.twin_of.as_ref() {
-                        let _ = write!(s, " [byte-identical to {t} — safe to delete]");
+                        let _ = write!(s, " [byte-identical to {t} - safe to delete]");
                     }
                     s
                 })
@@ -7033,7 +7033,7 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
             };
             write!(
                 s,
-                "; {} unmanaged file(s): {}{} — `blazar import <file> --name <n>` to register, or delete to reclaim",
+                "; {} unmanaged file(s): {}{} - `blazar import <file> --name <n>` to register, or delete to reclaim",
                 r.orphans.len(),
                 shown.join(", "),
                 extra
@@ -7081,7 +7081,7 @@ fn doctor_models(d: &BlazarDirs) -> Vec<Check> {
 
 /// Recipe-lane posture (special-token hardening audit): models pinned
 /// to `prompt_recipe = "ollama_compat"` render their prompts
-/// gateway-side — message text can never forge chatml turn boundaries,
+/// gateway-side - message text can never forge chatml turn boundaries,
 /// on BOTH the ollama and `OpenAI` chat surfaces. Everything else keeps
 /// the engine-owned template (upstream behavior). MLX models on the
 /// default posture get an explicit advisory: the mlx chat template
@@ -7111,7 +7111,7 @@ fn doctor_recipe_lanes(d: &BlazarDirs) -> Vec<Check> {
         out.push(Check::ok(
             "prompt-recipe",
             format!(
-                "default (engine-owned templates) on all {} model(s) — pin \
+                "default (engine-owned templates) on all {} model(s) - pin \
                  [model_overrides.\"<name>\"] prompt_recipe = \"ollama_compat\" for the \
                  gateway-rendered neutralized lane",
                 models.len()
@@ -7132,7 +7132,7 @@ fn doctor_recipe_lanes(d: &BlazarDirs) -> Vec<Check> {
         .iter()
         .filter(|m| {
             // MLX checkpoint dir; whisper dirs ride the same suffix but
-            // never serve a chat surface — the tool-call advisory would
+            // never serve a chat surface - the tool-call advisory would
             // be nonsense for them.
             std::path::Path::new(&m.path)
                 .extension()
@@ -7146,7 +7146,7 @@ fn doctor_recipe_lanes(d: &BlazarDirs) -> Vec<Check> {
         out.push(Check::warn(
             "prompt-recipe mlx",
             format!(
-                "engine-owned template drops tool calls: {} — pin prompt_recipe = \
+                "engine-owned template drops tool calls: {} - pin prompt_recipe = \
                  \"ollama_compat\" to serve tools via the gateway grammar lane",
                 mlx_unpinned.join(", ")
             ),
@@ -7213,7 +7213,7 @@ async fn serve() -> Result<()> {
         Ok(lock) => lock,
         Err(e) if e.downcast_ref::<blazar_runtime::LockHeld>().is_some() => {
             eprintln!(
-                "blazar: {e:#} — if this is wrong, remove {}",
+                "blazar: {e:#} - if this is wrong, remove {}",
                 d.run_dir().join("blazar.pid").display()
             );
             std::process::exit(blazar_gateway::EXIT_BIND_CONFLICT);
@@ -7223,13 +7223,13 @@ async fn serve() -> Result<()> {
     rotate_daemon_log(&d);
     // Primary orphan reclaim: children stamped with OUR data-dir marker
     // whose daemon died (SIGKILL bypasses every atexit path). The lock
-    // above guarantees no live sibling owns them. TERM → grace → KILL.
+    // above guarantees no live sibling owns them. TERM -> grace -> KILL.
     for line in blazar_runtime::reclaim_marker_orphans(&d.data_dir) {
         println!("preflight: reclaimed orphan engine child: {line}");
     }
     let store = Store::open(&d)?;
     // Boot preflight (1/2): adopt model files that live in the models dir
-    // without a store row — the uninstall-keeps-models / reinstall case.
+    // without a store row - the uninstall-keeps-models / reinstall case.
     // Rows only; files are never moved or deleted (reconcile_models doc).
     let reconcile = blazar_runtime::models::reconcile_models(&d, &store);
     if !reconcile.adopted.is_empty() {
@@ -7271,7 +7271,7 @@ async fn serve() -> Result<()> {
     }
     // Adopt legacy audio trees (whisper, piper) into the engines lane
     // before the serving pick: resolution already prefers rows, so the
-    // pick is identical — but the trees gain prune/verify coverage and
+    // pick is identical - but the trees gain prune/verify coverage and
     // ghost rows heal instead of being masked by the legacy trees.
     let audio_mgr = local_engine_manager(&d)?;
     let mut adopted = audio_mgr.adopt_whisper_legacy_trees();
@@ -7284,7 +7284,7 @@ async fn serve() -> Result<()> {
     }
     // Self-heal the zero-active state (update interrupted before its
     // activation step): an installed serving engine must never sit
-    // unusable behind one stale flag — activate the best candidate and
+    // unusable behind one stale flag - activate the best candidate and
     // say so. Runs for router and non-router paths alike.
     if let Some(tag) = store.heal_active_engine()? {
         println!("serve: no active engine row found; activated newest serving engine {tag}");
@@ -7341,7 +7341,7 @@ async fn serve() -> Result<()> {
         hw.total_vram_mib()
     );
     // Boot preflight (2/2): VRAM already held before blazar spawns any
-    // child of its own. Advisory only — blazar never kills another
+    // child of its own. Advisory only - blazar never kills another
     // product's process.
     if let Some(tenants) = blazar_runtime::probe::gpu_compute_tenants() {
         let held: u64 = tenants.iter().map(|t| t.used_mib).sum();
@@ -7365,7 +7365,7 @@ async fn serve() -> Result<()> {
         .collect();
     // Engine fork: the active row's kind picks the adapter. Restart is
     // required to switch kinds (the supervisor holds the engine for its
-    // lifetime) — the restart hint covers that.
+    // lifetime) - the restart hint covers that.
     let engine: Arc<dyn Engine> = match engine_row.kind {
         blazar_core::engine_kind::EngineKind::MistralRs => Arc::new(MistralRsEngine::with_staging(
             manifest,
@@ -7386,7 +7386,7 @@ async fn serve() -> Result<()> {
         }
         // Defense: a lazy audio lane can never back the supervisor (it
         // has no model-serving surface). Installs never activate it, so
-        // reaching this arm means a hand-edited store — name recovery.
+        // reaching this arm means a hand-edited store - name recovery.
         audio_kind @ (blazar_core::engine_kind::EngineKind::Whisper
         | blazar_core::engine_kind::EngineKind::Piper) => {
             let surface = match audio_kind {
@@ -7396,7 +7396,7 @@ async fn serve() -> Result<()> {
                 _ => "POST /v1/audio/speech",
             };
             anyhow::bail!(
-                "the active engine row is the {} audio lane — it serves only {surface} and \
+                "the active engine row is the {} audio lane - it serves only {surface} and \
                  cannot back model serving; run `blazar engine use <tag>` on a serving engine \
                  (see `blazar engine list`)",
                 audio_kind.as_str()
@@ -7417,7 +7417,7 @@ async fn serve() -> Result<()> {
     // Startup supersede pass: mine mainstream lanes that arrived as
     // binaries (empty architecture sets), mark fork lanes whose
     // architectures upstream now ships, and sweep retired curated
-    // lanes past their grace window. Maintenance only — never blocks
+    // lanes past their grace window. Maintenance only - never blocks
     // the daemon on a bad network.
     if let Ok(mgr) = local_engine_manager(&d) {
         refresh_after_lane_change(&mgr, &cfg).await;
@@ -7435,7 +7435,7 @@ async fn serve() -> Result<()> {
     ));
     let host = cfg.host.clone();
 
-    // Which binary owns this daemon — one-command visibility into the
+    // Which binary owns this daemon - one-command visibility into the
     // stale-copy race (gateways auto-start blazar from their own PATH).
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::write(d.run_dir().join("daemon.path"), exe.display().to_string());
@@ -7498,7 +7498,7 @@ async fn serve() -> Result<()> {
     if let Err(e) = &served
         && e.downcast_ref::<blazar_gateway::BindConflict>().is_some()
     {
-        eprintln!("blazar: {e} — fix config.toml `port` (or BLAZAR_PORT) and start again");
+        eprintln!("blazar: {e} - fix config.toml `port` (or BLAZAR_PORT) and start again");
         std::process::exit(blazar_gateway::EXIT_BIND_CONFLICT);
     }
     served?;
@@ -7507,7 +7507,7 @@ async fn serve() -> Result<()> {
 }
 
 /// What a stop attempt should report, decided purely from observable
-/// facts — extracted so the branch logic is unit-testable without
+/// facts - extracted so the branch logic is unit-testable without
 /// signals or sockets.
 #[derive(Debug, PartialEq, Eq)]
 enum StopOutcome {
@@ -7516,7 +7516,7 @@ enum StopOutcome {
     /// The pidfile pid no longer existed and nothing serves the port.
     AlreadyStoppedStale(i32),
     /// TERM was delivered (or the pid was stale) but something still
-    /// answers /healthz — the pidfile now names it (pid + binary).
+    /// answers /healthz - the pidfile now names it (pid + binary).
     StillServing {
         signaled: i32,
         serving_pid: Option<i32>,
@@ -7550,7 +7550,7 @@ fn stop_outcome(
 }
 
 // One drain-and-classify sequence: signal, grace-poll the port,
-// re-read the pidfile, classify, report. The ordering IS the contract —
+// re-read the pidfile, classify, report. The ordering IS the contract -
 // splitting it would hide the grace-window/pidfile-re-read dependency.
 #[allow(clippy::too_many_lines)]
 async fn stop() -> Result<()> {
@@ -7586,7 +7586,7 @@ async fn stop() -> Result<()> {
     #[cfg(windows)]
     // F127: `taskkill` (no /F) asks for a close first; a console daemon
     // without a message pump ignores it, so finish with a hard kill after
-    // a grace beat. Never a group — exact pid only, like the unix lane.
+    // a grace beat. Never a group - exact pid only, like the unix lane.
     let term_hit_a_live_pid = {
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string()])
@@ -7603,7 +7603,7 @@ async fn stop() -> Result<()> {
     };
 
     // Grace budget: a draining daemon finishes in-flight work (image
-    // generations run minutes) before closing the listener — poll the
+    // generations run minutes) before closing the listener - poll the
     // port, not the pid, because the listener is what the next start
     // and every CLI call actually contend with.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -7665,7 +7665,7 @@ async fn stop() -> Result<()> {
                 (None, None) => "binary ?".to_string(),
             };
             Err(anyhow!(
-                "{base} still serves after signalling pid {signaled} — pidfile now names pid {} \
+                "{base} still serves after signalling pid {signaled} - pidfile now names pid {} \
                  ({binary_note}): started by another invocation or binary; stop it from there, or \
                  `kill {}`",
                 serving_pid.map_or_else(|| "?".into(), |p| p.to_string()),
@@ -7679,7 +7679,7 @@ async fn stop() -> Result<()> {
 mod signal_stop {
     /// Best-effort exact binary a live pid is running, via the kernel's
     /// /proc link. `None` when the process is gone, the link is
-    /// unreadable, or /proc does not exist — callers degrade to their
+    /// unreadable, or /proc does not exist - callers degrade to their
     /// recorded path string.
     pub fn proc_exe(pid: i32) -> Option<String> {
         std::fs::read_link(format!("/proc/{pid}/exe"))
@@ -7698,7 +7698,7 @@ mod signal_stop {
 }
 
 async fn pull(target: &str, force: bool, verify: bool) -> Result<()> {
-    // Verify-only mode: no network, no pull lock — hash what is already
+    // Verify-only mode: no network, no pull lock - hash what is already
     // on disk against the store row and exit non-zero on any bad answer.
     if verify {
         return match blazar_runtime::verify_model(&dirs(), target).await? {
@@ -7720,22 +7720,22 @@ async fn pull(target: &str, force: bool, verify: bool) -> Result<()> {
                 actual,
                 ..
             } => Err(anyhow::anyhow!(
-                "sha256 mismatch for {name} at {} — expected {expected}, got {actual}; \
+                "sha256 mismatch for {name} at {} - expected {expected}, got {actual}; \
                  re-pull to replace the corrupt file",
                 path.display()
             )),
             VerifyReport::NoDigest { name, path } => Err(anyhow::anyhow!(
-                "{name} ({}) has no recorded sha256 — nothing to verify against; \
+                "{name} ({}) has no recorded sha256 - nothing to verify against; \
                  re-pull to record one",
                 path.display()
             )),
             VerifyReport::DirRowUnsupported { name, path } => Err(anyhow::anyhow!(
-                "{name} is a safetensors directory model ({}) — content verification \
+                "{name} is a safetensors directory model ({}) - content verification \
                  covers single-file GGUF rows only",
                 path.display()
             )),
             VerifyReport::NotFound { name } => Err(anyhow::anyhow!(
-                "model {name:?} not found in the local store — pull it first"
+                "model {name:?} not found in the local store - pull it first"
             )),
         };
     }
@@ -7745,7 +7745,7 @@ async fn pull(target: &str, force: bool, verify: bool) -> Result<()> {
     banner();
     if already_present {
         println!(
-            "already present — {}: {} ({}, {} shards) -> {}",
+            "already present - {}: {} ({}, {} shards) -> {}",
             row.name,
             humansize(row.bytes),
             row.quant,
@@ -7802,7 +7802,7 @@ async fn pull_model(target: &str, force: bool) -> Result<(blazar_core::store::Mo
         r = puller.route_pull(target) => r?,
         () = blazar_runtime::events::interrupted() => {
             return Err(anyhow::anyhow!(
-                "pull interrupted — partial file kept; re-run `blazar pull {target}` to resume"
+                "pull interrupted - partial file kept; re-run `blazar pull {target}` to resume"
             ));
         }
     };
@@ -7810,7 +7810,7 @@ async fn pull_model(target: &str, force: bool) -> Result<(blazar_core::store::Mo
     let already_present = outcome.already_present;
     // The runtime warned via log + event; surface it in the terminal too
     // (tracing is muted at the default level). The event is the REAL
-    // signal — HF metadata fallbacks can still fill `arch`.
+    // signal - HF metadata fallbacks can still fill `arch`.
     while let Ok(ev) = events.try_recv() {
         if let blazar_runtime::BlazarEvent::ModelPulled {
             warning: Some(w), ..
@@ -7886,7 +7886,7 @@ fn mmproj_cmd(model: &str, path: &std::path::Path) -> Result<()> {
     let mmproj_meta = blazar_core::read_metadata_file(path)
         .map_err(|e| anyhow!("not a readable GGUF projector ({}): {e}", path.display()))?;
     // Vision projectors are CLIP-based GGUFs; anything else (e.g. a language
-    // model file) attaches fine but hangs the engine at spawn — reject loudly.
+    // model file) attaches fine but hangs the engine at spawn - reject loudly.
     if mmproj_meta.architecture != "clip" {
         return Err(anyhow!(
             "not a vision projector: {} has architecture `{}`, expected `clip`; use the mmproj GGUF shipped by the model publisher",
@@ -7900,7 +7900,7 @@ fn mmproj_cmd(model: &str, path: &std::path::Path) -> Result<()> {
     store.upsert_model(&row)?;
     println!(
         "{}",
-        ok_line(&format!("mmproj attached: {} → {model}", dest.display()))
+        ok_line(&format!("mmproj attached: {} -> {model}", dest.display()))
     );
     Ok(())
 }
@@ -8016,7 +8016,7 @@ fn import(
 
 /// `blazar import --scan`: discovery half of the zero-redownload story.
 /// Lists models already on disk from other runtimes (ollama store, HF
-/// hub cache, LM Studio) with the command that adopts each — the pull
+/// hub cache, LM Studio) with the command that adopts each - the pull
 /// and import lanes byte-verify before linking, so scanning never
 /// touches the other runtime's files.
 // Keeps Result<()> to sit uniformly in the import dispatch arm (same
@@ -8043,7 +8043,7 @@ fn import_scan(json: bool) -> Result<()> {
         println!(
             "{}",
             warn_line(
-                "no reusable models found — no ollama store, HF hub cache, \
+                "no reusable models found - no ollama store, HF hub cache, \
                  or LM Studio models on this machine"
             )
         );
@@ -8052,7 +8052,7 @@ fn import_scan(json: bool) -> Result<()> {
     println!(
         "{}",
         bold_heading(&format!(
-            "reusable models on this machine ({}) — adopt without a re-download:",
+            "reusable models on this machine ({}) - adopt without a re-download:",
             rows.len()
         ))
     );
@@ -8070,7 +8070,7 @@ fn import_scan(json: bool) -> Result<()> {
 
 /// Fixed-shape scan listing: SOURCE MODEL QUANT SIZE COMMAND, widths
 /// sized to the data (model ids and commands capped so a deep LM Studio
-/// path cannot blow up the layout). Pure function — unit-tested.
+/// path cannot blow up the layout). Pure function - unit-tested.
 fn render_scan_table(rows: &[blazar_runtime::scan::ReusableModel]) -> String {
     const MODEL_CAP: usize = 42;
     const COMMAND_CAP: usize = 56;
@@ -8078,8 +8078,8 @@ fn render_scan_table(rows: &[blazar_runtime::scan::ReusableModel]) -> String {
         if text.chars().count() <= cap {
             return text.to_string();
         }
-        let mut cut: String = text.chars().take(cap - 1).collect();
-        cut.push('…');
+        let mut cut: String = text.chars().take(cap - 3).collect();
+        cut.push_str("...");
         cut
     }
 
@@ -8130,8 +8130,8 @@ fn render_scan_table(rows: &[blazar_runtime::scan::ReusableModel]) -> String {
 /// Display label for the on-disk model format. GGUF = single file; an
 /// HF-style directory (config.json + safetensors shards) feeds the
 /// mistralrs/sglang lanes. `dir?` = a directory without safetensors
-/// (unexpected — `blazar show <name>` to inspect); `missing!` = the
-/// row's path is gone (stale entry — same convention as the VISION
+/// (unexpected - `blazar show <name>` to inspect); `missing!` = the
+/// row's path is gone (stale entry - same convention as the VISION
 /// column's missing projector).
 fn model_type_label(path: &str) -> String {
     let Ok(md) = std::fs::metadata(path) else {
@@ -8152,10 +8152,10 @@ fn model_type_label(path: &str) -> String {
 }
 
 /// `quant_method` from a safetensors checkpoint's config.json (e.g.
-/// `torchao`, `awq`, `gptq`) — top-level key or the transformers
+/// `torchao`, `awq`, `gptq`) - top-level key or the transformers
 /// `quantization_config.quant_method` nesting (where torchao lives).
 /// The store's `quant` column is derived from the repo NAME and lies
-/// for these rows (a torchao int4 dir registers as BF16 — live-proven
+/// for these rows (a torchao int4 dir registers as BF16 - live-proven
 /// when sglang refused the weights); the checkpoint's own declaration
 /// is the truth. GGUF rows have no config.json and MLX layouts carry
 /// no `quant_method`, so both keep their existing labels.
@@ -8176,16 +8176,16 @@ fn trunc_ellipsis(s: &str, cap: usize) -> String {
     if s.chars().count() <= cap {
         return s.to_string();
     }
-    let cut: String = s.chars().take(cap.saturating_sub(1)).collect();
-    format!("{cut}…")
+    let cut: String = s.chars().take(cap.saturating_sub(3)).collect();
+    format!("{cut}...")
 }
 
 /// Adaptive-width table: every column sizes to its widest cell (header
-/// included) so a value can never bleed into the next column — a fixed
+/// included) so a value can never bleed into the next column - a fixed
 /// ARCH width once let `Qwen2ForCausalLM` overlap CTX. NAME is never
 /// truncated; ARCH caps with an ellipsis; SIZE and CTX right-align; the
 /// last column is uncapped. The storage path is deliberately
-/// not shown — `blazar show <model>` carries it.
+/// not shown - `blazar show <model>` carries it.
 fn render_list_table(header: &[&str], rows: &[Vec<String>]) -> String {
     const ARCH_CAP: usize = 18;
     // Positional rules that survive column-count changes: the ARCH
@@ -8253,7 +8253,7 @@ fn render_list_table(header: &[&str], rows: &[Vec<String>]) -> String {
 
 /// `--color` policy: `Auto` keeps the terminal detection in
 /// [`cli_colors`], `Always`/`Never` are explicit user overrides
-/// (`Always` deliberately beats `NO_COLOR` — the user just asked).
+/// (`Always` deliberately beats `NO_COLOR` - the user just asked).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 enum ColorWhen {
     Auto,
@@ -8285,7 +8285,7 @@ fn cli_colors() -> bool {
     }
 }
 
-/// Adaptive-width table shared by `search` and `engine list` — the same
+/// Adaptive-width table shared by `search` and `engine list` - the same
 /// sizing philosophy as [`render_list_table`]: every column sizes to its
 /// widest cell (header included) so a value can never bleed into the
 /// next column; `right` indexes right-align (numbers line up on their
@@ -8348,7 +8348,7 @@ fn render_table(header: &[&str], rows: &[Vec<String>], right: &[usize]) -> Strin
 /// Best measured decode throughput for the catalog's SPEED column: the
 /// fastest `tg` bench test on record (tuned-profile benchmark or plain
 /// bench receipt, whichever `resolve_measured` ranks first). `None` =
-/// never measured — the cell prints an honest dash rather than a guess,
+/// never measured - the cell prints an honest dash rather than a guess,
 /// matching the never-guess pattern of the ENGINE column.
 fn measured_decode_tps(store: &Store, model: &str) -> Option<f64> {
     match resolve_measured(store, model).ok()? {
@@ -8401,7 +8401,7 @@ fn list_json_row(
     let mut row = serde_json::json!({
         "name": m.name,
         // Checkpoint-declared quant_method when present (torchao/awq/gptq
-        // safetensors dirs), null otherwise — the name-derived quant
+        // safetensors dirs), null otherwise - the name-derived quant
         // column lies for those rows (see hf_quant_method).
         "quant_method": hf_quant_method(&m.path),
         "quant": m.quant,
@@ -8414,7 +8414,7 @@ fn list_json_row(
         "engine": engine,
         "engine_kind": engine_kind,
         // Measured decode tok/s on record (best `tg` test); null = never
-        // benched — the JSON mirror of the table's SPEED dash.
+        // benched - the JSON mirror of the table's SPEED dash.
         "speed_tps": speed_tps,
         "path": m.path,
     });
@@ -8510,7 +8510,7 @@ fn list(json: bool) -> Result<()> {
                 }
             };
             // Same marker the JSON lane carries: the routing lane cannot
-            // load this arch — the cell gets a dagger and the footer
+            // load this arch - the cell gets a dagger and the footer
             // teaches the fork-lane rescue.
             let engine_cell = engine_cell_with_gap(&engine_rows, &engine, m, &mut arch_gaps);
             // QUANT cell: the checkpoint's own quant_method declaration
@@ -8518,7 +8518,7 @@ fn list(json: bool) -> Result<()> {
             // column reads BF16 for torchao/awq int4 weights).
             let quant = hf_quant_method(&m.path).unwrap_or_else(|| m.quant.clone());
             // SPEED cell: measured decode tok/s (best `tg` on record) or
-            // the honest dash — never a bandwidth-model guess.
+            // the honest dash - never a bandwidth-model guess.
             let speed = measured_decode_tps(&store, &m.name)
                 .map_or_else(|| "-".to_string(), |v| format!("{v:.0} t/s"));
             vec![
@@ -8568,7 +8568,7 @@ fn show(model: &str, json: bool) -> Result<()> {
     });
     if json {
         // Machine-typed mirror of the key-value view; stored argv and
-        // benchmark arrive as JSON *strings* in the row — embed them as
+        // benchmark arrive as JSON *strings* in the row - embed them as
         // real values so consumers get one object, not double encoding.
         let meta_json = meta.as_ref().map(|m| {
             serde_json::json!({
@@ -8606,7 +8606,7 @@ fn show(model: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     // Field list first, then one aligned pass: the key column sizes to
-    // the longest key, and optional metadata prints its value or "-" —
+    // the longest key, and optional metadata prints its value or "-" -
     // never the Rust Debug form (Some(24)/None leaked here once).
     let mut fields: Vec<(&str, String)> = vec![
         ("name", row.name.clone()),
@@ -8655,7 +8655,7 @@ fn show(model: &str, json: bool) -> Result<()> {
 }
 
 /// Optional GGUF metadata as a show-field value: the number, or "-"
-/// for absent — never the Rust Debug form (`Some(24)`/`None` leaked
+/// for absent - never the Rust Debug form (`Some(24)`/`None` leaked
 /// into `blazar show` output once).
 fn opt_or_dash(v: Option<u64>) -> String {
     v.map_or_else(|| "-".to_string(), |n| n.to_string())
@@ -8668,7 +8668,7 @@ fn embedded_json(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or(serde_json::Value::String(raw.to_string()))
 }
 
-/// UTC calendar date (`YYYY-MM-DD`) for an epoch-seconds stamp —
+/// UTC calendar date (`YYYY-MM-DD`) for an epoch-seconds stamp -
 /// scorecard/plan citations print verification dates, and the CLI crate
 /// carries no date dependency. Shared implementation lives in
 /// `blazar_core::store::epoch_to_utc_date` (the gateway's capability
@@ -8681,7 +8681,7 @@ fn epoch_to_utc_date(secs: i64) -> String {
 /// `(score, per-test rows)` from a stored `benchmark_json` payload:
 /// rows grouped by test name (sorted), mean t/s across repeats, and the
 /// first context size seen for the group. `None` when the column is
-/// absent or does not parse — the scorecard then prints its honest
+/// absent or does not parse - the scorecard then prints its honest
 /// "no benchmark on record" row instead of a zero.
 fn scorecard_bench_summary(payload_raw: &str) -> Option<(f64, Vec<BenchTestRow>)> {
     let payload: blazar_runtime::bench::BenchmarkPayload =
@@ -8721,7 +8721,7 @@ fn group_bench_rows(rows: &[blazar_runtime::bench::BenchRow]) -> Vec<BenchTestRo
 /// Calibration samples for bandwidth predictions: the active lane's
 /// bench history (falling back to every recorded lane), each row
 /// joined with its model's on-disk size. `None` when nothing was ever
-/// measured — the honest "no basis" case, not a guess. Shared by
+/// measured - the honest "no basis" case, not a guess. Shared by
 /// `plan` (single-model prediction) and `plan --install` (catalog
 /// ranking), so both name the SAME basis in their output.
 fn bench_calibration_samples(
@@ -8729,7 +8729,7 @@ fn bench_calibration_samples(
 ) -> Option<(String, Vec<blazar_core::predict::CalibSample>)> {
     let engine = store.active_engine().ok().flatten()?;
     // Exact-lane history first; engine updates prune old engine rows, so a
-    // long-lived store keeps its bench_history under retired tags — fall
+    // long-lived store keeps its bench_history under retired tags - fall
     // back to every row on the machine. The returned basis label names
     // WHICH set backed the prediction so it never overstates precision.
     let lane = store.bench_history_for_lane(&engine.tag).ok()?;
@@ -8870,14 +8870,14 @@ fn measured_json_value(measured: &Measured) -> Option<serde_json::Value> {
 type BenchTestRow = (String, f64, Option<u64>);
 
 /// Execution Score VECTOR for `scorecard`: measured throughput and verified
-/// capability composed per-axis. Deliberately never a scalar composite —
+/// capability composed per-axis. Deliberately never a scalar composite -
 /// latency, throughput, and correctness trade off against each other
 /// (Pareto), and collapsing them into one number would hide exactly the
 /// trade-off the control plane exists to surface. Each throughput axis
 /// names the bench test it came from (`basis`); the capability fraction
 /// counts only PASS/FAIL verdicts (N/A probes are out of scope for the
-/// lane, not failures). Axes without persisted evidence yet — sentinel
-/// runtime quality, workload class — are omitted rather than fabricated.
+/// lane, not failures). Axes without persisted evidence yet - sentinel
+/// runtime quality, workload class - are omitted rather than fabricated.
 fn execution_score_vector(measured: &Measured, caps_json: Option<&str>) -> serde_json::Value {
     // Nested fn (not closure): returns a borrow of the test name, and a
     // closure cannot be lifetime-generic over its inputs.
@@ -8925,7 +8925,7 @@ fn execution_score_vector(measured: &Measured, caps_json: Option<&str>) -> serde
 
 /// Identity rows shared by `plan` MODEL and `scorecard` (`show()`
 /// layout): repo/quant/size always; `params`/`arch`/`ctx_train` only
-/// when known. `with_name` prefixes the model row — scorecard headers
+/// when known. `with_name` prefixes the model row - scorecard headers
 /// carry it, plan already names the model in its title line.
 fn model_identity_rows(
     row: &blazar_core::store::ModelRow,
@@ -8952,7 +8952,7 @@ fn model_identity_rows(
 
 /// Score + per-test mean rows shared by `plan` MEASURED and `scorecard`
 /// performance blocks; callers print them with their own indent. The
-/// score line only exists for tuned profiles — plain bench has rows.
+/// score line only exists for tuned profiles - plain bench has rows.
 fn bench_rows_lines(bench_score: Option<f64>, tests: &[BenchTestRow]) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(s) = bench_score {
@@ -8972,7 +8972,7 @@ fn bench_rows_lines(bench_score: Option<f64>, tests: &[BenchTestRow]) -> Vec<Str
 /// order: `(probe, status)`. The stored `caps_json` is the full
 /// `blazar.model-doctor` certificate object with probes nested under
 /// `.caps` (verified against live certificates); absent probes on an
-/// older certificate render as `-` — a real gap, never a guessed
+/// older certificate render as `-` - a real gap, never a guessed
 /// verdict.
 fn scorecard_caps_rows(caps_raw: &str) -> Option<Vec<(String, String)>> {
     let v: serde_json::Value = serde_json::from_str(caps_raw).ok()?;
@@ -8996,7 +8996,7 @@ fn scorecard_caps_rows(caps_raw: &str) -> Option<Vec<(String, String)>> {
             // accumulate n_runs per probe; surface it once it means
             // something (>1). Legacy certs without counters render bare.
             match verdict["n_runs"].as_u64() {
-                Some(n) if n > 1 => ((*k).to_string(), format!("{status} ×{n}")),
+                Some(n) if n > 1 => ((*k).to_string(), format!("{status} x{n}")),
                 _ => ((*k).to_string(), status),
             }
         })
@@ -9005,7 +9005,7 @@ fn scorecard_caps_rows(caps_raw: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// Base URL (`http://host:port`) when the daemon answers `/api/version`,
-/// else `None` — read-only preview surfaces (`plan`) probe for a live
+/// else `None` - read-only preview surfaces (`plan`) probe for a live
 /// daemon instead of booting one via `ensure_daemon`.
 async fn daemon_base_if_up() -> Option<String> {
     let cfg = config().ok()?;
@@ -9019,7 +9019,7 @@ async fn daemon_base_if_up() -> Option<String> {
         .then_some(base)
 }
 
-/// Classify a DECISION axis by where its value came from — the honesty
+/// Classify a DECISION axis by where its value came from - the honesty
 /// contract of `blazar plan`: nothing renders unlabeled. `live` =
 /// observed on the running child, `predicted` = planner/fit estimate,
 /// `config` = explicit user setting, `decision` = routing choice,
@@ -9056,7 +9056,7 @@ fn evidence_class(axis: &str, v: &serde_json::Value) -> &'static str {
                 "unknown"
             }
         }
-        // The slots census is an observation either way — "cold" is the
+        // The slots census is an observation either way - "cold" is the
         // observed absence of a resident child, not an estimate.
         "warm" => "live",
         "engine" => "decision",
@@ -9065,7 +9065,7 @@ fn evidence_class(axis: &str, v: &serde_json::Value) -> &'static str {
 }
 
 /// The `blazar plan` DECISION block, rendered from the daemon's live
-/// `/api/explain` card — the same card `run` will act on, never a
+/// `/api/explain` card - the same card `run` will act on, never a
 /// client-side re-derivation. Pure over the card value; missing fields
 /// render as `unknown`. Every line carries its evidence class suffix so
 /// a prediction never renders as if it were a measurement.
@@ -9081,14 +9081,14 @@ fn plan_decision_lines(v: &serde_json::Value) -> Vec<String> {
         .map_or_else(|| "cold".to_string(), |n| format!("resident ({n} slot(s))"));
     vec![
         format!(
-            "engine      {} ({}) — {} — {}",
+            "engine      {} ({}) - {} - {}",
             or_unknown(&e["tag"]),
             or_unknown(&e["kind"]),
             or_unknown(&e["reason"]),
             evidence_class("engine", v),
         ),
         format!(
-            "context     {} ({}) — {}",
+            "context     {} ({}) - {}",
             c["effective"]
                 .as_u64()
                 .map_or_else(|| "unknown".into(), |n| n.to_string()),
@@ -9096,18 +9096,18 @@ fn plan_decision_lines(v: &serde_json::Value) -> Vec<String> {
             evidence_class("context", v),
         ),
         format!(
-            "kv          {}/{} — {}",
+            "kv          {}/{} - {}",
             or_unknown(&ca["kv_k"]),
             or_unknown(&ca["kv_v"]),
             evidence_class("kv", v),
         ),
         format!(
-            "spec        {} ({}) — {}",
+            "spec        {} ({}) - {}",
             or_unknown(&sp["mode"]),
             or_unknown(&sp["source"]),
             evidence_class("spec", v),
         ),
-        format!("warm        {warm} — {}", evidence_class("warm", v)),
+        format!("warm        {warm} - {}", evidence_class("warm", v)),
     ]
 }
 
@@ -9164,7 +9164,7 @@ fn ready_card_line(v: &serde_json::Value) -> Option<String> {
         .as_u64()
         .map_or_else(|| "cold".to_string(), |n| format!("resident, {n} slot(s)"));
     Some(format!(
-        "profile: engine {engine} · ctx {ctx} ({}) · kv {}/{} · spec {} · {warm}",
+        "profile: engine {engine} | ctx {ctx} ({}) | kv {}/{} | spec {} | {warm}",
         or_unknown(&v["context"]["effective_source"]),
         or_unknown(&v["cache"]["kv_k"]),
         or_unknown(&v["cache"]["kv_v"]),
@@ -9172,7 +9172,7 @@ fn ready_card_line(v: &serde_json::Value) -> Option<String> {
     ))
 }
 
-/// `blazar plan <model>` — read-only pre-run assembly: identity, the
+/// `blazar plan <model>` - read-only pre-run assembly: identity, the
 /// daemon's live decision card (when up), the measured profile, the
 /// capability certificate, and next actions. Never pulls, never probes,
 /// never boots a daemon. A target that is not local but parses as a
@@ -9186,7 +9186,7 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
     let Some(row) = store.get_model(&name)? else {
         if blazar_runtime::parse_pull_target(model).is_ok() {
             if !json {
-                println!("{model} is not pulled — upstream fit preview:");
+                println!("{model} is not pulled - upstream fit preview:");
                 println!();
             }
             fit(model, json).await?;
@@ -9209,7 +9209,7 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
 
     let measured = resolve_measured(&store, &row.name)?;
     let cert = store.get_model_caps_dated(&row.name)?;
-    // Predictions only fill the gap — never override a measurement.
+    // Predictions only fill the gap - never override a measurement.
     let predicted = match &measured {
         Measured::Absent => predict_for_plan(&store, &row),
         _ => None,
@@ -9268,7 +9268,7 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("PLAN — {} (local)", row.name);
+    println!("PLAN - {} (local)", row.name);
     println!();
     println!("MODEL");
     let identity = model_identity_rows(&row, false);
@@ -9282,17 +9282,17 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
     match (&decision, &base) {
         (Some(card), _) => {
             println!(
-                "  evidence: live = observed on the running child · predicted = planner/fit estimate · config = explicit setting · decision = routing choice"
+                "  evidence: live = observed on the running child | predicted = planner/fit estimate | config = explicit setting | decision = routing choice"
             );
             for line in plan_decision_lines(card) {
                 println!("  {line}");
             }
         }
         (None, Some(_)) => {
-            println!("  unavailable — daemon answered but the explain card fetch failed");
+            println!("  unavailable - daemon answered but the explain card fetch failed");
         }
         (None, None) => println!(
-            "  daemon not running — start it with `blazar serve` to see the live routing card"
+            "  daemon not running - start it with `blazar serve` to see the live routing card"
         ),
     }
 
@@ -9332,11 +9332,11 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 let tps = p.decode_tps.round() as u64;
                 println!(
-                    "  decode ~{tps} t/s (predicted — basis: {} measured model(s) on lane {tag}; verify with: blazar bench {})",
+                    "  decode ~{tps} t/s (predicted - basis: {} measured model(s) on lane {tag}; verify with: blazar bench {})",
                     p.n_samples, row.name
                 );
             }
-            None => println!("  no benchmark on record — run: blazar bench {}", row.name),
+            None => println!("  no benchmark on record - run: blazar bench {}", row.name),
         },
     }
 
@@ -9354,7 +9354,7 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
             println!("  {line}");
         }
         None => println!(
-            "  no certificate on record — run: blazar model-doctor {}",
+            "  no certificate on record - run: blazar model-doctor {}",
             row.name
         ),
     }
@@ -9374,7 +9374,7 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
 
 /// Parse a parameter count out of a model artifact name (`Qwen3-8B`,
 /// `Llama-3.2-3B`, `30B-A3B` `MoE` total). `None` when the name carries
-/// no size token (e.g. `phi-4`) — the honest gap, rendered as such.
+/// no size token (e.g. `phi-4`) - the honest gap, rendered as such.
 fn parse_params_billions(name: &str) -> Option<f64> {
     let lower = name.to_ascii_lowercase();
     let mut best: Option<f64> = None;
@@ -9389,7 +9389,7 @@ fn parse_params_billions(name: &str) -> Option<f64> {
             let number = &lower[start..i];
             // A size token: immediately followed by 'b' (which must end
             // the token or precede a separator) and not part of a quant
-            // word (q4, q8) — those never precede 'b'.
+            // word (q4, q8) - those never precede 'b'.
             if i < bytes.len()
                 && bytes[i] == b'b'
                 && bytes
@@ -9399,7 +9399,7 @@ fn parse_params_billions(name: &str) -> Option<f64> {
                 && let Ok(v) = number.parse::<f64>()
             {
                 // MoE "30b-a3b": the FIRST token is total params
-                // (capacity); keep the largest seen — plain names
+                // (capacity); keep the largest seen - plain names
                 // carry exactly one token anyway.
                 if best.is_none_or(|b| v > b) {
                     best = Some(v);
@@ -9427,9 +9427,9 @@ struct InstallCandidate {
 /// `blazar plan --install`: rank every unpulled catalog entry for THIS
 /// hardware. Census hard-filters first (VRAM fit + disk verdict from
 /// the same analytic estimators `fit` uses), then scores the survivors
-/// on two honest axes — predicted decode speed (bandwidth calibration
+/// on two honest axes - predicted decode speed (bandwidth calibration
 /// over the machine's bench history) and model capacity (params parsed
-/// from the artifact name) — normalized across the candidate set so the
+/// from the artifact name) - normalized across the candidate set so the
 /// preference knob is a weighting, not a unit change. Read-only: the
 /// menu prints the `blazar pull` line, it never pulls.
 #[allow(clippy::too_many_lines, reason = "one ranked-menu render fn")]
@@ -9583,7 +9583,7 @@ async fn plan_install_cmd(prefer: Option<Prefer>, json: bool) -> Result<()> {
     }
 
     println!(
-        "PLAN INSTALL — ranked pull menu (census-filtered, {} MiB VRAM, prefer {})",
+        "PLAN INSTALL - ranked pull menu (census-filtered, {} MiB VRAM, prefer {})",
         vram,
         match prefer {
             Prefer::Speed => "speed",
@@ -9591,24 +9591,24 @@ async fn plan_install_cmd(prefer: Option<Prefer>, json: bool) -> Result<()> {
         }
     );
     println!(
-        "  {} pulled (skipped) · {} unfit for this hardware · {} candidates",
+        "  {} pulled (skipped) | {} unfit for this hardware | {} candidates",
         skipped_pulled,
         skipped_unfit,
         ranked.len()
     );
     if let Some((lane, samples)) = &calibration {
         println!(
-            "  speed axis: bandwidth calibration from {} sample(s) on lane {lane} — predicted, not measured",
+            "  speed axis: bandwidth calibration from {} sample(s) on lane {lane} - predicted, not measured",
             samples.len()
         );
     } else {
         println!(
-            "  speed axis: NO bench history on record — ranking is capacity-only; run `blazar bench` on any model to calibrate"
+            "  speed axis: NO bench history on record - ranking is capacity-only; run `blazar bench` on any model to calibrate"
         );
     }
     println!();
     if ranked.is_empty() {
-        println!("nothing to recommend — every catalog entry is pulled or unfit");
+        println!("nothing to recommend - every catalog entry is pulled or unfit");
         return Ok(());
     }
     println!(
@@ -9646,7 +9646,7 @@ async fn plan_install_cmd(prefer: Option<Prefer>, json: bool) -> Result<()> {
 const AUTOPILOT_CERT_STALE_SECS: i64 = 30 * 86_400;
 
 /// One autopilot recommendation: the command to run, the one-line why,
-/// and the stored datum that justifies it — nothing recommends without
+/// and the stored datum that justifies it - nothing recommends without
 /// evidence.
 #[derive(Debug)]
 struct AutopilotRec {
@@ -9655,7 +9655,7 @@ struct AutopilotRec {
     datum: String,
 }
 
-/// Pure gap analysis for one local model — the autopilot's whole brain.
+/// Pure gap analysis for one local model - the autopilot's whole brain.
 /// Inputs are stored facts (bench stamp, tuned-profile stamp, certificate
 /// stamp vs now) plus whether the model's lane is benchable at all
 /// (diffusion/video lanes have no chat pp/tg to measure); output is
@@ -9707,7 +9707,7 @@ fn autopilot_recs(
     {
         recs.push(AutopilotRec {
             cmd: format!("blazar tune {name}"),
-            why: "bench is newer than the adopted profile — the pins predate the measurement",
+            why: "bench is newer than the adopted profile - the pins predate the measurement",
             datum: format!(
                 "bench {} > tuned {}",
                 epoch_to_utc_date(bench),
@@ -9718,7 +9718,7 @@ fn autopilot_recs(
     match cert_at {
         None => recs.push(AutopilotRec {
             cmd: format!("blazar model-doctor {name}"),
-            why: "no capability certificate on record — the admission gate has nothing to vouch with",
+            why: "no capability certificate on record - the admission gate has nothing to vouch with",
             datum: "model_caps: no row".to_string(),
         }),
         Some(tested) => {
@@ -9726,7 +9726,7 @@ fn autopilot_recs(
             if now - tested > AUTOPILOT_CERT_STALE_SECS {
                 recs.push(AutopilotRec {
                     cmd: format!("blazar model-doctor {name}"),
-                    why: "certificate is stale — engine builds moved under it",
+                    why: "certificate is stale - engine builds moved under it",
                     datum: format!(
                         "verified {}, {age_days}d ago",
                         epoch_to_utc_date(tested)
@@ -9738,7 +9738,7 @@ fn autopilot_recs(
     recs
 }
 
-/// `blazar autopilot` — observe → recommend (→ act with `--apply`).
+/// `blazar autopilot` - observe -> recommend (-> act with `--apply`).
 /// Read-only by construction: the analysis reads stored records and
 /// prints work; only `--apply` runs the recommended commands, and each
 /// one is the same command the user could type. Nothing mutates daemon
@@ -9748,7 +9748,7 @@ async fn autopilot(apply: bool) -> Result<()> {
     let store = Store::open(&d)?;
     let models = store.list_models()?;
     if models.is_empty() {
-        println!("no local models — pull one first: blazar pull <owner/repo:QUANT>");
+        println!("no local models - pull one first: blazar pull <owner/repo:QUANT>");
         return Ok(());
     }
     let now = std::time::SystemTime::now()
@@ -9774,7 +9774,7 @@ async fn autopilot(apply: bool) -> Result<()> {
             .ok()
             .flatten()
             .map(|(_, tested, _)| tested);
-        // Bench drives llama-bench, which reads GGUF files only —
+        // Bench drives llama-bench, which reads GGUF files only -
         // recommending it for a safetensors/mlx model is busywork the
         // bench itself must refuse; gate on format too. Encoder-only
         // arches (embedders, rerankers, MT) get an explicit
@@ -9787,7 +9787,7 @@ async fn autopilot(apply: bool) -> Result<()> {
                 .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
         let bench_note = arch_class.map(|class| {
             format!(
-                "bench: not applicable — encoder-only class '{class}'; \
+                "bench: not applicable - encoder-only class '{class}'; \
 llama-bench measures generative decode; embedding speed is per-request in /metrics"
             )
         });
@@ -9800,19 +9800,19 @@ llama-bench measures generative decode; embedding speed is per-request in /metri
             println!("  {note}");
         }
         if recs.is_empty() {
-            println!("  up to date — measured, tuned, certified");
+            println!("  up to date - measured, tuned, certified");
         }
         for r in recs {
-            println!("  → {} — {} ({})", r.cmd, r.why, r.datum);
+            println!("  -> {} - {} ({})", r.cmd, r.why, r.datum);
         }
         println!();
     }
     if !apply {
         let n: usize = plan.iter().map(|(_, r, _)| r.len()).sum();
         if n == 0 {
-            println!("autopilot: nothing to do — every model is measured, tuned, and certified");
+            println!("autopilot: nothing to do - every model is measured, tuned, and certified");
         } else {
-            println!("autopilot: {n} recommendation(s) — apply with: blazar autopilot --apply");
+            println!("autopilot: {n} recommendation(s) - apply with: blazar autopilot --apply");
         }
         return Ok(());
     }
@@ -9833,7 +9833,7 @@ llama-bench measures generative decode; embedding speed is per-request in /metri
             };
             match outcome {
                 Ok(()) => println!("  done"),
-                Err(e) => println!("  failed: {e:#} — continuing with the remaining work"),
+                Err(e) => println!("  failed: {e:#} - continuing with the remaining work"),
             }
         }
     }
@@ -9848,7 +9848,7 @@ const PASSPORT_SCHEMA_VERSION: u64 = 1;
 /// Assemble a Passport v1 from the store's current state. Pure over the
 /// store (no runs, no prints): `certify` calls it after refreshing
 /// evidence, unit tests seed stores directly. Absent axes are explicit
-/// `null`s — the card layer turns those into labeled gap rows.
+/// `null`s - the card layer turns those into labeled gap rows.
 fn assemble_passport(
     store: &Store,
     name: &str,
@@ -9871,7 +9871,7 @@ fn assemble_passport(
         "mmproj": row.mmproj_path,
     });
     // Engine block = the serving lane (active engine); per-axis engine
-    // tags live in their own sections — evidence may predate a lane
+    // tags live in their own sections - evidence may predate a lane
     // switch and the passport must not paper over that.
     let engine_json = engine.as_ref().map(|e| {
         let manifest: serde_json::Value =
@@ -9934,14 +9934,14 @@ fn assemble_passport(
 }
 
 /// Execute the certification recommendations: `bench` and `model-doctor`
-/// run for real (progress on stderr — stdout is the artifact);
+/// run for real (progress on stderr - stdout is the artifact);
 /// `tune` is deliberately skipped (expensive search) and recorded as a
-/// note. Failures leave a note too — the passport assembles without
+/// note. Failures leave a note too - the passport assembles without
 /// that axis rather than failing the whole command.
 async fn run_certify_recs(recs: &[AutopilotRec], name: &str, notes: &mut Vec<String>) {
     for r in recs {
         if r.cmd.starts_with("blazar tune ") {
-            notes.push(format!("{} — {} ({})", r.cmd, r.why, r.datum));
+            notes.push(format!("{} - {} ({})", r.cmd, r.why, r.datum));
             continue;
         }
         // Progress goes to stderr: stdout is the artifact (card or JSON)
@@ -9954,21 +9954,21 @@ async fn run_certify_recs(recs: &[AutopilotRec], name: &str, notes: &mut Vec<Str
         };
         match outcome {
             Ok(()) => eprintln!("  done"),
-            Err(e) => eprintln!("  failed: {e:#} — passport assembled without this axis"),
+            Err(e) => eprintln!("  failed: {e:#} - passport assembled without this axis"),
         }
     }
 }
 
-/// `blazar certify <model>` — qualify a model and emit a Passport.
+/// `blazar certify <model>` - qualify a model and emit a Passport.
 ///
-/// Runs the evidence work autopilot would recommend — a default bench
-/// and the model-doctor capability certificate (stale past 30 days) —
+/// Runs the evidence work autopilot would recommend - a default bench
+/// and the model-doctor capability certificate (stale past 30 days) -
 /// then assembles one portable object: identity, engine, hardware,
 /// profile, measured axis, verified capabilities, verification block.
 /// `tune` is deliberately not auto-run (expensive search); it surfaces
 /// as a note instead. The human card is a projection of the assembled
 /// object, so card / `--json` / `--export` cannot drift apart. Absent
-/// axes stay labeled with the command that fills them — never hidden.
+/// axes stay labeled with the command that fills them - never hidden.
 async fn certify(name: &str, json: bool, export: Option<PathBuf>, refresh: bool) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
@@ -10007,7 +10007,7 @@ async fn certify(name: &str, json: bool, export: Option<PathBuf>, refresh: bool)
     let mut notes: Vec<String> = Vec::new();
     if let Some(class) = arch_class {
         notes.push(format!(
-            "bench: not applicable — encoder-only class '{class}'; \
+            "bench: not applicable - encoder-only class '{class}'; \
 llama-bench measures generative decode"
         ));
     }
@@ -10029,7 +10029,7 @@ llama-bench measures generative decode"
 
     if let Some(path) = &export {
         // Atomic export: a partially written passport file must never be
-        // observable — write beside the target, then rename over it.
+        // observable - write beside the target, then rename over it.
         let tmp = path.with_extension("passport-tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(&passport)?)?;
         std::fs::rename(&tmp, path)?;
@@ -10045,14 +10045,14 @@ llama-bench measures generative decode"
     Ok(())
 }
 
-/// Render the human card from the assembled passport — a projection,
+/// Render the human card from the assembled passport - a projection,
 /// never a second source of truth: every line reads the same JSON the
-/// `--json`/`--export` paths emit, with `absent — run: …` gap rows for
+/// `--json`/`--export` paths emit, with `absent - run: ...` gap rows for
 /// axes the store could not fill.
 fn print_certify_card(passport: &serde_json::Value, name: &str, benchable: bool) {
     let ident = &passport["identity"];
     println!(
-        "passport v{} — {}",
+        "passport v{} - {}",
         PASSPORT_SCHEMA_VERSION,
         ident["name"].as_str().unwrap_or("")
     );
@@ -10081,7 +10081,7 @@ fn print_certify_card(passport: &serde_json::Value, name: &str, benchable: bool)
                 e["kind"].as_str().unwrap_or("?")
             );
         }
-        None => println!("engine     absent — run: blazar engine update"),
+        None => println!("engine     absent - run: blazar engine update"),
     }
     if let Some(hw) = passport["hardware"].as_object() {
         let vram = hw["total_vram_mib"].as_u64().unwrap_or(0);
@@ -10093,7 +10093,7 @@ fn print_certify_card(passport: &serde_json::Value, name: &str, benchable: bool)
             p["updated_at"].as_str().unwrap_or("?"),
             p["engine_tag"].as_str().unwrap_or("?")
         ),
-        None => println!("profile    absent — run: blazar tune {name}"),
+        None => println!("profile    absent - run: blazar tune {name}"),
     }
     match passport["measured"].as_object() {
         Some(m) => {
@@ -10106,7 +10106,7 @@ fn print_certify_card(passport: &serde_json::Value, name: &str, benchable: bool)
             );
         }
         None if !benchable => println!("measured   not applicable (encoder-only class)"),
-        None => println!("measured   absent — run: blazar bench {name}"),
+        None => println!("measured   absent - run: blazar bench {name}"),
     }
     match passport["capabilities"].as_object() {
         Some(c) => println!(
@@ -10114,7 +10114,7 @@ fn print_certify_card(passport: &serde_json::Value, name: &str, benchable: bool)
             c["verified_at"].as_str().unwrap_or("?"),
             c["engine"].as_str().unwrap_or("?")
         ),
-        None => println!("caps       absent — run: blazar doctor --model {name}"),
+        None => println!("caps       absent - run: blazar doctor --model {name}"),
     }
     let v = &passport["verification"];
     println!(
@@ -10132,7 +10132,7 @@ fn print_certify_card(passport: &serde_json::Value, name: &str, benchable: bool)
 }
 
 /// `blazar scorecard <model>`: one-page card assembled purely from stored
-/// records — identity (store row), measured performance (the active
+/// records - identity (store row), measured performance (the active
 /// engine's last bench payload), verified capabilities (the model-doctor
 /// certificate with its test date). Read-only: no probes, no benches, no
 /// spawns. Missing records print honest gap rows with the command that
@@ -10545,7 +10545,7 @@ fn scorecard(model: &str, json: bool) -> Result<()> {
             }
         }
         Measured::Absent => println!(
-            "performance  no benchmark on record — run: blazar bench {}",
+            "performance  no benchmark on record - run: blazar bench {}",
             row.name
         ),
     }
@@ -10562,7 +10562,7 @@ fn scorecard(model: &str, json: bool) -> Result<()> {
             }
         }
         None => println!(
-            "quality      no certificate on record — run: blazar model-doctor {}",
+            "quality      no certificate on record - run: blazar model-doctor {}",
             row.name
         ),
     }
@@ -10578,16 +10578,16 @@ fn scorecard(model: &str, json: bool) -> Result<()> {
 /// prediction can never masquerade as a measurement here.
 fn print_execution_vector(vector: &serde_json::Value, model: &str) {
     println!();
-    println!("execution vector  (per-axis — axes trade off, there is no single score)");
+    println!("execution vector  (per-axis - axes trade off, there is no single score)");
     let axis =
         |label: &str, value: &serde_json::Value, basis: &serde_json::Value, hint: &str| match (
             value.as_f64(),
             basis.as_str(),
         ) {
             (Some(v), Some(b)) => println!("  {label:<12}  {v:.1}  ({b})"),
-            _ => println!("  {label:<12}  —  ({hint})"),
+            _ => println!("  {label:<12}  -  ({hint})"),
         };
-    let bench_hint = format!("no benchmark — run: blazar bench {model}");
+    let bench_hint = format!("no benchmark - run: blazar bench {model}");
     axis(
         "decode",
         &vector["decode_t_per_s"],
@@ -10606,11 +10606,11 @@ fn print_execution_vector(vector: &serde_json::Value, model: &str) {
             cap["pass"],
             cap["pass"].as_u64().unwrap_or(0) + cap["fail"].as_u64().unwrap_or(0)
         ),
-        None => println!("  capability   —  (no certificate — run: blazar model-doctor {model})"),
+        None => println!("  capability   -  (no certificate - run: blazar model-doctor {model})"),
     }
 }
 
-/// Thousands-suffixed context/token counts (`8K`, `32K`) — keeps the card
+/// Thousands-suffixed context/token counts (`8K`, `32K`) - keeps the card
 /// columns narrow; raw values live in `--json`.
 fn format_k(n: i64) -> String {
     if n >= 1_048_576 && n % 1_048_576 == 0 {
@@ -10625,7 +10625,7 @@ fn format_k(n: i64) -> String {
 /// Per-row table cells for `blazar ps`: GPU label (offload + card),
 /// SPEC label (mode + draft file), and the lifetime cache-hit ratio
 /// (`-` until the gateway has classified a completed response for the
-/// model — never a lying 0%).
+/// model - never a lying 0%).
 fn ps_row_cells(m: &serde_json::Value) -> (String, String, String) {
     // GPU cell: offload label, card-suffixed when placement is known
     // (`full@RTX 4070`); router/unknown placement stays bare.
@@ -10635,7 +10635,7 @@ fn ps_row_cells(m: &serde_json::Value) -> (String, String, String) {
     };
     // Spec cell: the mode this instance spawned under, draft file
     // suffixed when one rode along (`eagle3+qwen3-0.6b-...gguf`).
-    // Router rows carry an empty mode — a shared child has none.
+    // Router rows carry an empty mode - a shared child has none.
     let spec = match (
         m["blazar_spec"].as_str().unwrap_or(""),
         m["blazar_draft"].as_str(),
@@ -10651,16 +10651,16 @@ fn ps_row_cells(m: &serde_json::Value) -> (String, String, String) {
     (gpu, spec, hit)
 }
 
-/// `blazar classify` — one-shot decision-model consultation: the
+/// `blazar classify` - one-shot decision-model consultation: the
 /// normalized /v1/classify lane over the child's systemone surface.
 async fn classify_cmd(model: &str, text: &[String], labels: &[String], json: bool) -> Result<()> {
     if text.is_empty() {
         bail!(
-            "classify needs the text to classify — blazar classify <model> \"the text\" --labels a,b"
+            "classify needs the text to classify - blazar classify <model> \"the text\" --labels a,b"
         );
     }
     if labels.len() < 2 {
-        bail!("classify needs 2..=16 labels — --labels safe,unsafe,unclear");
+        bail!("classify needs 2..=16 labels - --labels safe,unsafe,unclear");
     }
     let base = ensure_daemon().await?;
     let body = serde_json::json!({
@@ -10724,12 +10724,12 @@ async fn usage_cmd(days: Option<i64>, json: bool) -> Result<()> {
     let rows = v["days"].as_array().cloned().unwrap_or_default();
     if rows.is_empty() {
         println!(
-            "no metered traffic in the last {days_n} day(s) — generation lanes \
+            "no metered traffic in the last {days_n} day(s) - generation lanes \
              (/v1/chat/completions, /api/chat, ...) are counted once they serve"
         );
         return Ok(());
     }
-    println!("usage — last {days_n} day(s):");
+    println!("usage - last {days_n} day(s):");
     println!(
         "{:<9} {:<28} {:>10} {:>9} {:>9} {:>7} {:>9} {:>9}",
         "DAY", "MODEL", "IN_TOK", "OUT_TOK", "CACHED", "REQ", "GEN_S", "TTFT_MS"
@@ -10760,8 +10760,8 @@ async fn usage_cmd(days: Option<i64>, json: bool) -> Result<()> {
 }
 
 /// `blazar ps` response contract: a 2xx body whose `models` is an array.
-/// Anything else — an error payload (401/503 mid-lifecycle), a shape
-/// drift — is an ERROR, never an empty list. The pre-2026-10-30 form
+/// Anything else - an error payload (401/503 mid-lifecycle), a shape
+/// drift - is an ERROR, never an empty list. The pre-2026-10-30 form
 /// collapsed every non-conforming body to `[]` and printed "no models
 /// loaded", masking daemon trouble as idleness (live-caught:
 /// intermittent false empties while `/api/ps` answered errors and the
@@ -10791,7 +10791,7 @@ fn ps_models_of(
 }
 
 /// Fetch `/api/ps` under the contract above. Bounded retry (one pass,
-/// 2 s apart) on the transient classes only — transport errors and 5xx
+/// 2 s apart) on the transient classes only - transport errors and 5xx
 /// (the daemon restarting mid-request); a 4xx or a malformed 2xx body
 /// fails immediately (retrying an auth or shape problem just doubles
 /// the wait for the same error).
@@ -10812,7 +10812,7 @@ async fn ps_fetch(base: &str) -> Result<Vec<serde_json::Value>> {
         match outcome {
             Ok(models) => return Ok(models),
             Err(msg) if attempt == 0 && ps_retryable(&msg) => {
-                eprintln!("ps: {msg} — retrying once in 2s");
+                eprintln!("ps: {msg} - retrying once in 2s");
                 attempt += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -10821,7 +10821,7 @@ async fn ps_fetch(base: &str) -> Result<Vec<serde_json::Value>> {
     }
 }
 
-/// Retry classifier for [`ps_fetch`]: transient shapes only — transport
+/// Retry classifier for [`ps_fetch`]: transient shapes only - transport
 /// failures, a truncated/garbled body (the socket dying mid-restart),
 /// and the gateway-family 5xx (502/503/504). A 500 is a real daemon
 /// bug and fails immediately; 4xx never retries.
@@ -10886,7 +10886,7 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
     ) {
         println!("daemon pid {} ({})", pid.trim(), path.trim());
     }
-    // Table contract: the header row is state-invariant — even a fresh
+    // Table contract: the header row is state-invariant - even a fresh
     // daemon with nothing loaded prints it (clients and the golden
     // suite key on NAME existing before any model row).
     println!(
@@ -10927,7 +10927,7 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
             m["blazar_endpoint"].as_str().unwrap_or("-")
         );
         // Profile decisions worth knowing (ctx fit, slot auto, offload
-        // rationale) — one warn line per instance row, after its table
+        // rationale) - one warn line per instance row, after its table
         // line; router rows carry none.
         if let Some(ws) = m["blazar_warnings"].as_array() {
             for w in ws {
@@ -10942,8 +10942,8 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
 
 /// `blazar run` dispatch: inline prompt = single-shot, none = REPL.
 /// Workload postures for `run --intent`: one word instead of a dozen
-/// knobs. The mapping stays thin — queue priority, reasoning default,
-/// multimodal preflight — and is printed so nothing applies silently.
+/// knobs. The mapping stays thin - queue priority, reasoning default,
+/// multimodal preflight - and is printed so nothing applies silently.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
 enum Intent {
     Interactive,
@@ -10976,31 +10976,31 @@ fn intent_plan(intent: Intent) -> IntentPlan {
             priority: None,
             force_think: false,
             needs_vision: false,
-            note: "interactive — default posture, no overrides",
+            note: "interactive - default posture, no overrides",
         },
         Intent::Agent | Intent::Coding => IntentPlan {
             priority: Some("high"),
             force_think: false,
             needs_vision: false,
-            note: "high queue priority — tool and coding turns jump the batch lane",
+            note: "high queue priority - tool and coding turns jump the batch lane",
         },
         Intent::Batch => IntentPlan {
             priority: Some("low"),
             force_think: false,
             needs_vision: false,
-            note: "low queue priority — batch turns yield to interactive traffic",
+            note: "low queue priority - batch turns yield to interactive traffic",
         },
         Intent::Reasoning => IntentPlan {
             priority: None,
             force_think: true,
             needs_vision: false,
-            note: "reasoning requested — think=true rides every turn",
+            note: "reasoning requested - think=true rides every turn",
         },
         Intent::Vision => IntentPlan {
             priority: None,
             force_think: false,
             needs_vision: true,
-            note: "multimodal preflight — projector sidecar verified before the first turn",
+            note: "multimodal preflight - projector sidecar verified before the first turn",
         },
     }
 }
@@ -11053,7 +11053,7 @@ async fn run_dispatch(
         "stream": true,
     });
     // Both per-run knobs ride `options`: num_predict caps generation
-    // (the ollama dialect's slot for it — a top-level max_tokens would
+    // (the ollama dialect's slot for it - a top-level max_tokens would
     // be silently ignored), spec = "off" queues a dense spawn for this
     // request (consume-once at the daemon, re-sent per request).
     let mut options = serde_json::Map::new();
@@ -11066,7 +11066,7 @@ async fn run_dispatch(
     if !options.is_empty() {
         body["options"] = serde_json::Value::Object(options);
     }
-    // The REPL defaults think=true; a one-shot does not — reasoning
+    // The REPL defaults think=true; a one-shot does not - reasoning
     // intent closes that gap for single prompts.
     if plan.as_ref().is_some_and(|p| p.force_think) {
         body["think"] = serde_json::json!(true);
@@ -11082,7 +11082,7 @@ async fn run_dispatch(
         std::process::exit(130);
     }
     // Profile decisions for THIS model (unified-KV ctx fit, slot auto,
-    // offload rationale) stay off the chat stream — `blazar ps` and the
+    // offload rationale) stay off the chat stream - `blazar ps` and the
     // REPL /profile command own that surface.
     if verbose && let Some(v) = &outcome.final_chunk {
         println!("\n\n{}", chat_stats_line(v));
@@ -11099,13 +11099,13 @@ fn cloud_refusal(cmd: &str, model: &str) -> Result<()> {
         format!("{cmd} {model}")
     };
     Err(anyhow!(
-        "blazar {what}: refused — blazar runs no cloud services by design (no registry, no cloud accounts). \
+        "blazar {what}: refused - blazar runs no cloud services by design (no registry, no cloud accounts). \
 Pull models straight from Hugging Face: blazar pull <owner/repo:QUANT> \
-· discover GGUFs first: blazar search <terms>"
+| discover GGUFs first: blazar search <terms>"
     ))
 }
 
-/// `blazar why [trace]` — sentinel ring dump: what the model returned,
+/// `blazar why [trace]` - sentinel ring dump: what the model returned,
 /// what was wrong with it, which knob fixes it. Auto-starts the daemon
 /// like every other serving command. Filters (--code/--model/--flagged)
 /// and --limit ride as /api/why query params; the daemon caps the limit
@@ -11119,7 +11119,7 @@ async fn why(
 ) -> Result<()> {
     let base = ensure_daemon().await?;
     // trace/code/model values are trace ids, snake_case codes, and model
-    // name substrings — all URL-safe shapes (same assumption the old
+    // name substrings - all URL-safe shapes (same assumption the old
     // single-param path made).
     let mut q: Vec<String> = Vec::new();
     if let Some(t) = trace {
@@ -11147,7 +11147,7 @@ async fn why(
     }
     let v: serde_json::Value = resp.json().await?;
     if !v["sentinel"].as_bool().unwrap_or(false) {
-        println!("sentinel is disabled (config: sentinel = false) — no observations recorded");
+        println!("sentinel is disabled (config: sentinel = false) - no observations recorded");
         return Ok(());
     }
     // Live engine degrades come first: they explain WHY everything below
@@ -11169,7 +11169,7 @@ async fn why(
 
 /// Render /api/why's `engine_degrades` for the CLI: live children whose
 /// engine logged a performance degrade (e.g. flash-attention KV-type
-/// conversion). Empty string when none — nothing is printed rather than
+/// conversion). Empty string when none - nothing is printed rather than
 /// a noisy all-clear line. `model_filter` (substring, same semantics as
 /// the records filter) narrows to one lane.
 fn render_engine_degrades(why: &serde_json::Value, model_filter: Option<&str>) -> String {
@@ -11213,7 +11213,7 @@ fn render_engine_degrades(why: &serde_json::Value, model_filter: Option<&str>) -
     out
 }
 
-/// `blazar explain <model>` — the effective-config card from the live
+/// `blazar explain <model>` - the effective-config card from the live
 /// daemon (`GET /api/explain/{model}`). Daemon-required like `why`/`ps`:
 /// half the card (effective ctx, live slots, spawn receipts) only exists
 /// in a running daemon, and a stale offline estimate would be exactly the
@@ -11517,7 +11517,7 @@ fn epoch_to_utc(secs: i64) -> String {
 
 /// Render the capability certificate as a table. Pure; unknown fields
 /// (e.g. engine unresolved on a cold run) print as `unknown`. The
-/// `tested_at` epoch arrives as a NUMBER from the daemon — render it
+/// `tested_at` epoch arrives as a NUMBER from the daemon - render it
 /// human-readable instead of the old `TESTED unknown`.
 fn render_doctor_cert(cert: &serde_json::Value) -> String {
     use std::fmt::Write as _;
@@ -11539,7 +11539,7 @@ fn render_doctor_cert(cert: &serde_json::Value) -> String {
                     let status = v["status"].as_str().unwrap_or("N/A");
                     let mut receipt = v["receipt"].as_str().unwrap_or("").to_string();
                     if receipt.chars().count() > 64 {
-                        receipt = format!("{}…", receipt.chars().take(64).collect::<String>());
+                        receipt = format!("{}...", receipt.chars().take(64).collect::<String>());
                     }
                     (name.clone(), status.to_string(), receipt)
                 })
@@ -11586,7 +11586,7 @@ fn encode_path_segment(s: &str) -> String {
     out
 }
 
-/// Render the daemon's explain card as the scannable text block. Pure —
+/// Render the daemon's explain card as the scannable text block. Pure -
 /// unit-testable without a daemon. Unknowns print as `unknown` with the
 /// daemon's own source/limitation lines; nothing is invented here.
 #[allow(clippy::too_many_lines, clippy::many_single_char_names)] // renderer mirrors the card's sections one-to-one; short locals are the JSON field handles
@@ -11769,7 +11769,7 @@ fn print_record(r: &serde_json::Value) {
     );
     for d in &detections {
         println!(
-            "  [{}] {} — {}",
+            "  [{}] {} - {}",
             d["code"].as_str().unwrap_or("?"),
             d["detail"].as_str().unwrap_or(""),
             d["hint"].as_str().unwrap_or(""),
@@ -11778,11 +11778,11 @@ fn print_record(r: &serde_json::Value) {
     }
 }
 
-/// `blazar watch` — live SSE tail of sentinel records. One line per
+/// `blazar watch` - live SSE tail of sentinel records. One line per
 /// observation, detections + retry hints underneath. Ctrl-C stops.
 async fn watch() -> Result<()> {
     let base = ensure_daemon().await?;
-    // Default reqwest client carries no total-request timeout — exactly
+    // Default reqwest client carries no total-request timeout - exactly
     // what a long-lived tail needs; Ctrl-C is the off switch.
     let mut resp = reqwest::Client::new()
         .get(format!("{base}/api/watch"))
@@ -11792,7 +11792,7 @@ async fn watch() -> Result<()> {
         let text = resp.text().await.unwrap_or_default();
         return Err(anyhow!("daemon: {text}"));
     }
-    println!("watching sentinel — Ctrl-C to stop");
+    println!("watching sentinel - Ctrl-C to stop");
     let mut buf = String::new();
     let mut chunk_lines = blazar_gateway::translate::LineBuffer::new();
     while let Some(chunk) = futures_lite_next(&mut resp).await? {
@@ -11812,7 +11812,7 @@ async fn watch() -> Result<()> {
     Ok(())
 }
 
-/// `blazar cp SOURCE DEST` — zero-byte hardlink alias.
+/// `blazar cp SOURCE DEST` - zero-byte hardlink alias.
 fn cp_cmd(source: &str, destination: &str) -> Result<()> {
     let d = dirs();
     blazar_runtime::models::copy_model(&d, source, destination)?;
@@ -11825,7 +11825,7 @@ fn cp_cmd(source: &str, destination: &str) -> Result<()> {
     Ok(())
 }
 
-/// `blazar rm A B C` — continue past failures, report all, exit non-zero.
+/// `blazar rm A B C` - continue past failures, report all, exit non-zero.
 fn rm_multi(models: &[String]) -> Result<()> {
     let d = dirs();
     let mut failed = Vec::new();
@@ -11845,7 +11845,7 @@ fn rm_multi(models: &[String]) -> Result<()> {
 }
 
 /// Modelfile subset blazar understands. Everything else is collected and
-/// rejected by name — no silent drops.
+/// rejected by name - no silent drops.
 struct CreateSpec {
     base: String,
     ctx: Option<u32>,
@@ -11904,7 +11904,7 @@ fn parse_modelfile(raw: &str) -> Result<CreateSpec> {
     Ok(spec)
 }
 
-/// `blazar create MODEL -f Modelfile` — the anti-ollama version: no blob
+/// `blazar create MODEL -f Modelfile` - the anti-ollama version: no blob
 /// copy, no template overrides. `FROM` maps to a hardlink alias; `num_ctx` and
 /// ADAPTER to a config overlay; everything else is a named rejection.
 fn create_cmd(model: &str, file: Option<&std::path::Path>) -> Result<()> {
@@ -11949,7 +11949,7 @@ Alternatives: model_overrides in ~/.config/blazar/config.toml, or per-request op
     Ok(())
 }
 
-/// `blazar keys [list]|add|rm` — HTTP client to the daemon's
+/// `blazar keys [list]|add|rm` - HTTP client to the daemon's
 /// `/api/keys` (the daemon is the single config writer: no file races).
 #[derive(clap::Subcommand)]
 enum KeysAction {
@@ -11986,7 +11986,7 @@ enum KeysAction {
 /// (admin) [[keys]] entry from config.toml.
 fn admin_bearer() -> Option<String> {
     if let Ok(v) = std::env::var("BLAZAR_KEYS") {
-        // F133: a colon-less entry has no secret half — using the entry
+        // F133: a colon-less entry has no secret half - using the entry
         // itself as the bearer would send the NAME as an auth token.
         // Skip with a loud teaching line, keep scanning valid entries.
         for entry in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -12115,7 +12115,7 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
                 ));
             }
             println!(
-                "created key {} — secret (shown once):",
+                "created key {} - secret (shown once):",
                 out["created"].as_str().unwrap_or(&name)
             );
             println!("  {}", out["key"].as_str().unwrap_or("?"));
@@ -12136,7 +12136,7 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
                 ));
             }
             println!(
-                "rotated key {} — new secret (shown once): {}",
+                "rotated key {} - new secret (shown once): {}",
                 out["rotated"].as_str().unwrap_or(&name),
                 out["key"].as_str().unwrap_or("?")
             );
@@ -12162,13 +12162,13 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
     }
 }
 
-/// `blazar quantize <model> -t Q4_K_M` — run the engine's own
+/// `blazar quantize <model> -t Q4_K_M` - run the engine's own
 /// llama-quantize and register the output in the store.
 ///
 /// RAII guard for a partially written quantization output: the child writes
 /// to a hidden sibling (`.name.gguf.part-<pid>`) and only an atomic rename
-/// promotes it to the final name. Any early return — child failure, verify
-/// gate, unreadable GGUF — drops the guard and removes the partial file, so
+/// promotes it to the final name. Any early return - child failure, verify
+/// gate, unreadable GGUF - drops the guard and removes the partial file, so
 /// an interrupted `quantize` never leaves an orphan at the destination that
 /// blocks the next run with "output already exists".
 struct QuantizeTemp {
@@ -12184,7 +12184,7 @@ impl QuantizeTemp {
         }
     }
 
-    /// Disarm after the atomic rename succeeded — the file now lives at the
+    /// Disarm after the atomic rename succeeded - the file now lives at the
     /// destination and must survive.
     fn defuse(mut self) {
         self.armed = false;
@@ -12242,7 +12242,7 @@ fn quantize_cmd(
                 row.name.replace(['/', '\\', ':'], "_")
             ));
             println!(
-                "calibrating imatrix from {} (a full forward pass — takes minutes)...",
+                "calibrating imatrix from {} (a full forward pass - takes minutes)...",
                 calib.display()
             );
             let im = blazar_runtime::quantize::imatrix(
@@ -12272,12 +12272,12 @@ fn quantize_cmd(
             println!("  {line}");
         },
     )?;
-    // R5: perplexity gate — measure base + output on a fixed probe corpus;
+    // R5: perplexity gate - measure base + output on a fixed probe corpus;
     // a failing output is deleted and never registered.
     if let Some(max_degradation_pct) = verify_gate_pct {
         let pbin = blazar_runtime::quantize::find_perplexity_bin(&d)?;
         let probe = blazar_runtime::quantize::write_verify_probe(&d)?;
-        println!("verify: perplexity pass 1/2 (base) — full forward passes, this takes a while...");
+        println!("verify: perplexity pass 1/2 (base) - full forward passes, this takes a while...");
         let base_ppl = blazar_runtime::quantize::perplexity(
             &pbin,
             std::path::Path::new(&row.path),
@@ -12299,7 +12299,7 @@ fn quantize_cmd(
         #[allow(clippy::cast_precision_loss)] // display only
         let delta_pct = 100.0 * (out_ppl - base_ppl) / base_ppl;
         println!(
-            "verify: PPL {base_ppl:.4} -> {out_ppl:.4} ({delta_pct:+.1}% vs gate {max_degradation_pct:.1}%) — pass"
+            "verify: PPL {base_ppl:.4} -> {out_ppl:.4} ({delta_pct:+.1}% vs gate {max_degradation_pct:.1}%) - pass"
         );
     }
     // Read the result's own metadata (fails loud on truncated output).
@@ -12346,7 +12346,7 @@ fn quantize_cmd(
     #[allow(clippy::cast_precision_loss)] // percent display only
     let pct = 100.0 * out_bytes as f64 / src_bytes as f64;
     println!(
-        "registered {out_name} — {} -> {} MiB ({pct:.0}% of source); projectors inherited: {}",
+        "registered {out_name} - {} -> {} MiB ({pct:.0}% of source); projectors inherited: {}",
         src_bytes / (1024 * 1024),
         out_bytes / (1024 * 1024),
         row.mmproj_path.is_some()
@@ -12354,7 +12354,7 @@ fn quantize_cmd(
     Ok(())
 }
 
-/// `blazar launch <cli> [args...]` — ollama-`launch`-class ergonomics
+/// `blazar launch <cli> [args...]` - ollama-`launch`-class ergonomics
 /// without ollama's coupling: point any OpenAI/Anthropic/ollama-speaking
 /// CLI at the daemon via env, optionally pre-warm a model, exec.
 async fn launch_cmd(command: Vec<String>, warm: Option<String>, key: Option<String>) -> Result<()> {
@@ -12379,7 +12379,7 @@ async fn launch_cmd(command: Vec<String>, warm: Option<String>, key: Option<Stri
             .await?;
         if !resp.status().is_success() {
             return Err(anyhow!(
-                "warm-up failed: HTTP {} — is {model:?} pulled?",
+                "warm-up failed: HTTP {} - is {model:?} pulled?",
                 resp.status()
             ));
         }
@@ -12417,15 +12417,15 @@ async fn launch_cmd(command: Vec<String>, warm: Option<String>, key: Option<Stri
     );
     let status = cmd
         .status()
-        .map_err(|e| anyhow!("exec {program:?}: {e} — is it on PATH?"))?;
+        .map_err(|e| anyhow!("exec {program:?}: {e} - is it on PATH?"))?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// `blazar drafts <model>` — speculative-decoding draft candidates:
+/// `blazar drafts <model>` - speculative-decoding draft candidates:
 /// EAGLE3/MTP head repos first (they exist for common families), then
 /// tiny same-family instruct models (the ngram-class fallback). Ranked
 /// by HF downloads; the bench (`tune --spec`) proves net-positive
-/// before adoption — suggestions are candidates, not pairings.
+/// before adoption - suggestions are candidates, not pairings.
 #[allow(clippy::too_many_lines)] // flat query loop by design
 async fn drafts_cmd(model: &str) -> Result<()> {
     let client = blazar_runtime::hf::HfClient::new(std::env::var("HF_TOKEN").ok())?;
@@ -12460,13 +12460,13 @@ async fn drafts_cmd(model: &str) -> Result<()> {
     }
     if !any {
         println!(
-            "  (no candidates found — pull a small same-family model and set spec = \"draft\")"
+            "  (no candidates found - pull a small same-family model and set spec = \"draft\")"
         );
     }
     Ok(())
 }
 
-/// `blazar migrate` — one-click config persistence: parses (which
+/// `blazar migrate` - one-click config persistence: parses (which
 /// auto-migrates legacy fields in memory), writes the canonical TOML,
 /// keeps a timestamped backup of the previous file. Idempotent: a
 /// second run is a no-op.
@@ -12475,7 +12475,7 @@ fn migrate_cmd() -> Result<()> {
     let path = d.config_file();
     if !path.exists() {
         println!(
-            "no config at {} — nothing to migrate (defaults apply)",
+            "no config at {} - nothing to migrate (defaults apply)",
             path.display()
         );
         return Ok(());
@@ -12485,7 +12485,7 @@ fn migrate_cmd() -> Result<()> {
     if !blazar_core::Config::raw_has_legacy_keys(&raw) {
         println!(
             "{}",
-            ok_line("config already canonical — nothing to migrate")
+            ok_line("config already canonical - nothing to migrate")
         );
         return Ok(());
     }
@@ -12507,7 +12507,7 @@ fn migrate_cmd() -> Result<()> {
     Ok(())
 }
 
-/// `blazar snapshot` — backup the small state (config, store,
+/// `blazar snapshot` - backup the small state (config, store,
 /// sessions list) to `<data>/snapshots/<ts>/`. Models/engines stay in
 /// place (they ARE the bulk; re-pull or re-copy them deliberately).
 /// Snapshots kept on disk; older ones are pruned on each `blazar snapshot`.
@@ -12546,7 +12546,7 @@ fn snapshot_cmd() -> Result<()> {
 }
 
 /// Remove oldest timestamped snapshot dirs beyond `keep`. Only touches
-/// entries whose name parses as a unix-seconds stamp — never stray files.
+/// entries whose name parses as a unix-seconds stamp - never stray files.
 fn prune_snapshots(d: &BlazarDirs, keep: usize) {
     let Ok(entries) = std::fs::read_dir(d.data_dir.join("snapshots")) else {
         return;
@@ -12565,7 +12565,7 @@ fn prune_snapshots(d: &BlazarDirs, keep: usize) {
     }
 }
 
-/// `blazar coreside` — which local models can stay loaded together.
+/// `blazar coreside` - which local models can stay loaded together.
 fn coreside_cmd() -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
@@ -12584,7 +12584,7 @@ fn coreside_cmd() -> Result<()> {
     });
     if vram == 0 {
         return Err(anyhow!(
-            "no GPU detected — coreside planning is a VRAM question; CPU boxes load one model at a time anyway"
+            "no GPU detected - coreside planning is a VRAM question; CPU boxes load one model at a time anyway"
         ));
     }
     let mut fps = Vec::new();
@@ -12607,14 +12607,14 @@ fn coreside_cmd() -> Result<()> {
     }
     let (resident, deferred) = blazar_core::coreside::plan(&fps, vram);
     println!(
-        "VRAM {vram} MiB — co-residency plan (weights + KV @ ctx; KV is device-backed on both lanes, --kv-unified shares one buffer across sequences; 512 MiB headroom):"
+        "VRAM {vram} MiB - co-residency plan (weights + KV @ ctx; KV is device-backed on both lanes, --kv-unified shares one buffer across sequences; 512 MiB headroom):"
     );
     println!(
         "{:<24} {:>8} {:>9} {:>7}",
         "MODEL", "WEIGHTS", "KV@CTX", "CTX"
     );
     for f in &resident {
-        // 0 = unmeasurable (HF rows / unreadable GGUF) — never-guess dash
+        // 0 = unmeasurable (HF rows / unreadable GGUF) - never-guess dash
         let kv_disp = if f.kv_mib > 0 {
             format!("{}M", f.kv_mib)
         } else {
@@ -12644,7 +12644,7 @@ fn coreside_cmd() -> Result<()> {
     Ok(())
 }
 
-/// `blazar tts` — piper lane management + local synthesis through the
+/// `blazar tts` - piper lane management + local synthesis through the
 /// daemon's `/v1/audio/speech` (same key-gating as every route).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn tts_cmd(
@@ -12665,7 +12665,7 @@ async fn tts_cmd(
         let target = if unpin { None } else { Some(value.as_str()) };
         blazar_runtime::piper::set_pin(&d, target)?;
         if unpin {
-            println!("piper pin removed — tracking the newest installed tag");
+            println!("piper pin removed - tracking the newest installed tag");
         } else {
             println!("piper pinned to {}", value.trim());
         }
@@ -12702,7 +12702,7 @@ async fn tts_cmd(
         return Ok(());
     }
     if install {
-        // Engines lane (rows, manifest, prune, rollback) — the legacy
+        // Engines lane (rows, manifest, prune, rollback) - the legacy
         // data/piper tree is only a read-over source until adopted.
         // `--tag X` keeps the historical UX: install X, then pin it.
         engine_install_piper(&d, tag.clone()).await?;
@@ -12733,7 +12733,7 @@ async fn tts_cmd(
     }
     let Some(text) = text else {
         return Err(anyhow!(
-            "no text given — pass text to synthesize, or use --install/--pull/--list"
+            "no text given - pass text to synthesize, or use --install/--pull/--list"
         ));
     };
     tts_speak(&d, &text, voice, out.as_deref(), speed).await
@@ -12750,7 +12750,7 @@ async fn tts_search(d: &BlazarDirs, query: &str) -> Result<()> {
     let voices = blazar_runtime::piper::search_voices(&hf, query).await?;
     if voices.is_empty() {
         return Err(anyhow!(
-            "no piper voice matches {query:?} — try a language (en), a locale \
+            "no piper voice matches {query:?} - try a language (en), a locale \
              (en_GB) or a name (amy)"
         ));
     }
@@ -12768,7 +12768,7 @@ async fn tts_search(d: &BlazarDirs, query: &str) -> Result<()> {
         .collect();
     println!("{}", render_table(&["VOICE", "DISK", "STATE"], &rows, &[1]));
     if total > 40 {
-        println!("# showing 40 of {total} — refine the substring to narrow the list");
+        println!("# showing 40 of {total} - refine the substring to narrow the list");
     }
     println!("# pull: blazar tts --pull <voice>");
     Ok(())
@@ -12790,7 +12790,7 @@ async fn tts_speak(
         blazar_runtime::piper::list_voices(d)
             .first()
             .cloned()
-            .ok_or_else(|| anyhow!("no voice pulled — run: blazar tts --pull en_US-amy-medium"))?
+            .ok_or_else(|| anyhow!("no voice pulled - run: blazar tts --pull en_US-amy-medium"))?
     };
     let base = ensure_daemon().await?;
     let wav = speech_post(&base, &voice, text, speed).await?;
@@ -12839,7 +12839,7 @@ fn wav_duration_secs(wav: &[u8]) -> f64 {
     0.0
 }
 
-/// `blazar whisper file.mp3` — STT via the `whisper` [[remotes]] entry.
+/// `blazar whisper file.mp3` - STT via the `whisper` [[remotes]] entry.
 /// The gateway already forwards `/v1/audio/transcriptions`; this is the
 /// local CLI convenience for it (no separate engine lane to manage).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -12859,7 +12859,7 @@ async fn whisper_cmd(
         let target = if unpin { None } else { Some(value.as_str()) };
         blazar_runtime::whisper::set_pin(&d, target)?;
         if unpin {
-            println!("whisper pin removed — tracking the newest installed tag");
+            println!("whisper pin removed - tracking the newest installed tag");
         } else {
             println!("whisper server pinned to {}", value.trim());
         }
@@ -12925,7 +12925,7 @@ async fn whisper_cmd(
         };
         // Installs land in the engines lane (`engine install --kind
         // whisper`): the legacy installer wrote data/whisper/bin trees
-        // the engines table never saw — masking ghost rows and sitting
+        // the engines table never saw - masking ghost rows and sitting
         // outside `engine prune`'s reach. Pin parity keeps the
         // documented --tag contract: a tag install pins, a channel
         // install returns to tracking the newest tag.
@@ -12959,7 +12959,7 @@ async fn whisper_cmd(
         return Ok(());
     }
     let file = file
-        .ok_or_else(|| anyhow!("no audio file given — pass one, or use --install/--pull/--list"))?;
+        .ok_or_else(|| anyhow!("no audio file given - pass one, or use --install/--pull/--list"))?;
     let bytes = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
     let base = ensure_daemon().await?;
     // `/v1/audio/transcriptions` is key-gated once [[keys]] exist; pick the
@@ -13029,7 +13029,7 @@ async fn whisper_search(d: &BlazarDirs, query: &str) -> Result<()> {
         .collect();
     if rows.is_empty() {
         return Err(anyhow!(
-            "no upstream whisper model matches {query:?} — bare --search lists every size"
+            "no upstream whisper model matches {query:?} - bare --search lists every size"
         ));
     }
     println!("{}", render_table(&["SIZE", "DISK", "STATE"], &rows, &[1]));
@@ -13121,7 +13121,7 @@ fn read_multiline(rl: &mut rustyline::DefaultEditor) -> Option<String> {
 
 /// Synchronous REPL commands (everything that needs no daemon round
 /// trip). `Some(true)` = quit, `Some(false)` = handled, `None` = not a
-/// command — the caller lets the line through to the model.
+/// command - the caller lets the line through to the model.
 fn repl_local_command(
     line: &str,
     history: &mut Vec<serde_json::Value>,
@@ -13150,7 +13150,7 @@ fn repl_local_command(
         }
         "/set system" => match &*system_msg {
             Some(sys) => println!("system: {sys}"),
-            None => println!("(no system message — /set system <text> to set one)"),
+            None => println!("(no system message - /set system <text> to set one)"),
         },
         _ if line.starts_with("/set system ") => {
             let rest = line["/set system ".len()..].trim().to_string();
@@ -13159,7 +13159,7 @@ fn repl_local_command(
                 println!("(system message cleared)");
             } else {
                 *system_msg = Some(rest);
-                println!("(system message set — /set system to show, /set system \"\" to clear)");
+                println!("(system message set - /set system to show, /set system \"\" to clear)");
             }
         }
         _ if line.starts_with("/model ") => {
@@ -13189,7 +13189,7 @@ fn repl_lane_suffix_for(
     row: Option<&blazar_core::store::ModelRow>,
 ) -> String {
     let Some(row) = row else {
-        return "(not pulled — engine lane resolves on first send)".to_string();
+        return "(not pulled - engine lane resolves on first send)".to_string();
     };
     match routed_engine_lane(
         cfg,
@@ -13235,7 +13235,7 @@ fn repl_lane_suffix(model: &str) -> Result<String> {
 
 /// Decision-model carrier architectures: the System One family
 /// (laya, julia-1, lev, openjev, kev) rides GGUFs converted as
-/// `ModernBert` + decision metadata. Embedding-readers, not generators —
+/// `ModernBert` + decision metadata. Embedding-readers, not generators -
 /// the chat loop could only relay the child's "does not support logits
 /// computation" error.
 fn repl_is_decision_model(model: &str) -> Result<bool> {
@@ -13259,7 +13259,7 @@ fn parse_systemone_question(line: &str) -> (String, String, String) {
     match parts.len() {
         0..=1 => (line.trim().to_string(), "yes".to_string(), "no".to_string()),
         // Extra segments fold into the LAST criterion, keeping the
-        // question intact — punctuation like "::" never breaks parsing.
+        // question intact - punctuation like "::" never breaks parsing.
         2 => (parts[0].to_string(), parts[1].to_string(), "no".to_string()),
         _ => (
             parts[0].to_string(),
@@ -13275,7 +13275,7 @@ async fn run_repl_systemone(base: &str, model: &str) -> Result<()> {
     use rustyline::error::ReadlineError;
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut state: Option<String> = None;
-    println!("blazar System One REPL — {model} (decision model) — /help for commands");
+    println!("blazar System One REPL - {model} (decision model) - /help for commands");
     let client = reqwest::Client::new();
     loop {
         let line = match rl.readline("?> ") {
@@ -13347,7 +13347,7 @@ fn read_systemone_state(rl: &mut rustyline::DefaultEditor, first: &str) -> Strin
 
 /// Ask one System One choice question and render the answer (choice +
 /// probabilities + confidence). Returns true when the REPL should exit
-/// (the 501 not-a-decision-model case — staying would only repeat it).
+/// (the 501 not-a-decision-model case - staying would only repeat it).
 async fn ask_systemone(
     client: &reqwest::Client,
     base: &str,
@@ -13383,7 +13383,7 @@ async fn ask_systemone(
         println!("  error ({status}): {msg}");
         if status.as_u16() == 501 {
             println!(
-                "  this model is not a decision model — System One REPL is for laya/julia/lev/openjev/kev-class models"
+                "  this model is not a decision model - System One REPL is for laya/julia/lev/openjev/kev-class models"
             );
             return Ok(true);
         }
@@ -13436,7 +13436,7 @@ async fn run_repl(model: &str, no_draft: bool, priority: Option<&str>) -> Result
     #[cfg(unix)]
     install_repl_sigint();
     println!(
-        "blazar REPL — {model} {} — /help for commands",
+        "blazar REPL - {model} {} - /help for commands",
         repl_lane_suffix(&model)?
     );
     if let Some(p) = priority {
@@ -13454,7 +13454,7 @@ async fn run_repl(model: &str, no_draft: bool, priority: Option<&str>) -> Result
     }
     // Pre-spawn: warm the lane while the user types. The banner is the
     // earliest proof of intent, so a detached /api/warm (wait:true,
-    // reply discarded) rides the standard admission path — the first
+    // reply discarded) rides the standard admission path - the first
     // real turn then coalesces onto the same in-flight load instead of
     // paying the cold start after the prompt is submitted. Silent by
     // design: admission failures surface on the first turn through the
@@ -13583,7 +13583,7 @@ async fn repl_send_turn(
     {
         if *thinks && is_unsupported_think_error(&e.to_string()) {
             *thinks = false;
-            println!("(this model has no thinking mode — answers only)");
+            println!("(this model has no thinking mode - answers only)");
             repl_turn(
                 base, model, history, system_msg, verbose, *thinks, no_draft, priority,
             )
@@ -13627,7 +13627,7 @@ fn parse_gen_steps(v: &str) -> Option<u64> {
     v.parse::<u64>().ok().filter(|n| (1..=100).contains(n))
 }
 
-/// Generation seed — signed because upstream treats negatives as
+/// Generation seed - signed because upstream treats negatives as
 /// re-roll-per-request; a pinned non-negative seed reproduces exactly.
 fn parse_gen_seed(v: &str) -> Option<i64> {
     v.parse::<i64>().ok()
@@ -13687,7 +13687,7 @@ async fn image_post(
     req.send().await.map_err(Into::into)
 }
 
-/// Decode a finished generations response into (bytes, extension) —
+/// Decode a finished generations response into (bytes, extension) -
 /// the payload rides `data[0].b64_json`, the extension follows the
 /// response's declared output format (defaulting to png).
 fn image_payload(resp: &serde_json::Value) -> Option<(Vec<u8>, String)> {
@@ -13702,7 +13702,7 @@ fn image_payload(resp: &serde_json::Value) -> Option<(Vec<u8>, String)> {
     Some((bytes, ext))
 }
 
-/// Async job envelope: `{status, error, result: {b64_json, ...}}` — the
+/// Async job envelope: `{status, error, result: {b64_json, ...}}` - the
 /// payload rides under `result`, unlike the sync `{data: [...]}` shape.
 fn job_payload(job: &serde_json::Value, default_ext: &str) -> Option<(Vec<u8>, String)> {
     use base64::Engine as _;
@@ -13726,7 +13726,7 @@ fn write_gen_out(model: &str, bytes: &[u8], ext: &str) -> Result<String> {
 }
 
 /// One image turn: sync request, PNG (or family format) to the working
-/// directory. Returns Ok even on server rejections — a bad prompt must
+/// directory. Returns Ok even on server rejections - a bad prompt must
 /// not kill the loop; the error line teaches and the next turn waits.
 #[allow(clippy::too_many_arguments)]
 async fn image_turn(
@@ -13752,7 +13752,7 @@ async fn image_turn(
                     }
                     Err(e) => println!("error: {e}"),
                 },
-                None => println!("error: response carried no image data — daemon logs explain"),
+                None => println!("error: response carried no image data - daemon logs explain"),
             },
             Err(e) => println!("error: unreadable response: {e}"),
         },
@@ -13781,7 +13781,7 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
     let mut negative: Option<String> = None;
     #[cfg(unix)]
     install_repl_sigint();
-    println!("blazar image REPL — {model} (a prompt generates; /help; /exit)");
+    println!("blazar image REPL - {model} (a prompt generates; /help; /exit)");
     while let Some(line) = gen_line(&mut rl, "img> ") {
         if line.is_empty() {
             continue;
@@ -13805,7 +13805,7 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                         size = Some(s.clone());
                         println!("(size {s})");
                     }
-                    None => println!("(usage: /size 1024x1024 — digits on both sides)"),
+                    None => println!("(usage: /size 1024x1024 - digits on both sides)"),
                 }
             }
             _ if line.starts_with("/steps ") => {
@@ -13814,7 +13814,7 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                         steps = Some(n);
                         println!("(steps {n})");
                     }
-                    None => println!("(usage: /steps 24 — 1..=100)"),
+                    None => println!("(usage: /steps 24 - 1..=100)"),
                 }
             }
             _ if line.starts_with("/seed ") => {
@@ -13823,7 +13823,7 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                         seed = Some(s);
                         println!("(seed {s})");
                     }
-                    None => println!("(usage: /seed 42 — an integer; -1 re-rolls per turn)"),
+                    None => println!("(usage: /seed 42 - an integer; -1 re-rolls per turn)"),
                 }
             }
             "/negative" => {
@@ -13841,7 +13841,7 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                 }
             }
             _ if line.starts_with('/') => {
-                println!("(unknown command — /help)");
+                println!("(unknown command - /help)");
             }
             _ => {
                 image_turn(
@@ -13862,7 +13862,7 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
     Ok(())
 }
 
-/// Submit one video job (`"async": true` — video turns run minutes, a
+/// Submit one video job (`"async": true` - video turns run minutes, a
 /// sync POST would hold the socket hostage) and return its id.
 /// `frames`/`seed`/`negative_prompt` ride only when set (gateway
 /// canonicalizes `frames` onto the native `video_frames`).
@@ -13982,7 +13982,7 @@ async fn video_wait(base: &str, model: &str, job: &str) {
                     .get("error")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("daemon logs explain (journalctl -u blazar)");
-                println!("{}", err_line(&format!("error: {status} — {why}")));
+                println!("{}", err_line(&format!("error: {status} - {why}")));
                 return;
             }
             _ => {}
@@ -13993,7 +13993,7 @@ async fn video_wait(base: &str, model: &str, job: &str) {
 
 /// Video loop for Wan-family component sets: every line submits a job,
 /// polls it to completion, and writes the clip. Generation cannot be
-/// interrupted from the REPL — Ctrl-C at the prompt stays a nudge; a
+/// interrupted from the REPL - Ctrl-C at the prompt stays a nudge; a
 /// running job is daemon-owned and finishes server-side.
 // Knob-table REPL: one match arm per knob, mutating local state;
 // extracting the arms would trade a linear table for a state struct
@@ -14041,7 +14041,7 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
     let mut negative: Option<String> = None;
     #[cfg(unix)]
     install_repl_sigint();
-    println!("blazar video REPL — {model} (a prompt renders a clip; /help; /exit)");
+    println!("blazar video REPL - {model} (a prompt renders a clip; /help; /exit)");
     while let Some(line) = gen_line(&mut rl, "vid> ") {
         if line.is_empty() {
             continue;
@@ -14056,7 +14056,7 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                 );
                 println!(
                     "input:   plain text prompts; turns run minutes and poll \
-                     server-side jobs — check progress in another terminal with \
+                     server-side jobs - check progress in another terminal with \
                      `curl {base}/v1/videos/jobs/<id>`"
                 );
             }
@@ -14066,7 +14066,7 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                         size = Some(s.clone());
                         println!("(size {s})");
                     }
-                    None => println!("(usage: /size 960x480 — digits on both sides)"),
+                    None => println!("(usage: /size 960x480 - digits on both sides)"),
                 }
             }
             _ if line.starts_with("/duration ") => {
@@ -14075,16 +14075,16 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                         duration = Some(d);
                         println!("(duration {d}s)");
                     }
-                    None => println!("(usage: /duration 5 — 1..=60 seconds)"),
+                    None => println!("(usage: /duration 5 - 1..=60 seconds)"),
                 }
             }
             _ if line.starts_with("/frames ") => {
                 match parse_gen_frames(line["/frames ".len()..].trim()) {
                     Some(f) => {
                         frames = Some(f);
-                        println!("(frames {f} — wan aligns down to 4k+1)");
+                        println!("(frames {f} - wan aligns down to 4k+1)");
                     }
-                    None => println!("(usage: /frames 33 — 1..=201)"),
+                    None => println!("(usage: /frames 33 - 1..=201)"),
                 }
             }
             _ if line.starts_with("/seed ") => {
@@ -14093,7 +14093,7 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                         seed = Some(s);
                         println!("(seed {s})");
                     }
-                    None => println!("(usage: /seed 42 — an integer; -1 re-rolls per turn)"),
+                    None => println!("(usage: /seed 42 - an integer; -1 re-rolls per turn)"),
                 }
             }
             "/negative" => {
@@ -14111,7 +14111,7 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
                 }
             }
             _ if line.starts_with('/') => {
-                println!("(unknown command — /help)");
+                println!("(unknown command - /help)");
             }
             _ => {
                 run_turn(
@@ -14204,7 +14204,7 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
     let mut out: Option<PathBuf> = None;
     #[cfg(unix)]
     install_repl_sigint();
-    println!("blazar speech REPL — {voice} (a line writes a WAV; /help; /exit)");
+    println!("blazar speech REPL - {voice} (a line writes a WAV; /help; /exit)");
     while let Some(line) = gen_line(&mut rl, "tts> ") {
         if line.is_empty() {
             continue;
@@ -14225,7 +14225,7 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
                     voice.clone_from(&v);
                     println!("(voice {voice})");
                 } else {
-                    println!("(voice {v} not pulled — blazar tts --pull {v})");
+                    println!("(voice {v} not pulled - blazar tts --pull {v})");
                 }
             }
             _ if line.starts_with("/speed ") => {
@@ -14234,7 +14234,7 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
                         speed = Some(f);
                         println!("(speed {f}x)");
                     }
-                    None => println!("(usage: /speed 1.2 — 0.1..=4.0, 1.0 = native)"),
+                    None => println!("(usage: /speed 1.2 - 0.1..=4.0, 1.0 = native)"),
                 }
             }
             _ if line.starts_with("/out ") => {
@@ -14246,7 +14246,7 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
                 );
             }
             _ if line.starts_with('/') => {
-                println!("(unknown command — /help)");
+                println!("(unknown command - /help)");
             }
             _ => {
                 run_turn(voice.clone(), line.clone(), speed, out.clone()).await;
@@ -14259,7 +14259,7 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
 }
 
 /// Pulled-voice check the speech loop teaches with (a dir scan, not a
-/// store query — voices are files).
+/// store query - voices are files).
 fn piper_voice_exists(voice: &str) -> bool {
     blazar_runtime::piper::voice_file(&dirs(), voice).is_some()
 }
@@ -14274,7 +14274,7 @@ fn is_unsupported_think_error(msg: &str) -> bool {
 /// One REPL conversation turn: send the history (with any system message
 /// prepended outside it), stream the answer into the terminal, and record
 /// the assistant reply as conversation memory. Returns `true` when Ctrl+C
-/// interrupted the generation — partial output rendered but the turn is
+/// interrupted the generation - partial output rendered but the turn is
 /// discarded, and dropping the response future closes the connection so
 /// the daemon frees the slot on client disconnect (validated behavior).
 ///
@@ -14307,7 +14307,7 @@ async fn repl_turn(
         // Reasoning is requested by default: the gateway translates the
         // ollama-dialect `think` field to the engine's chat_template_kwargs
         // (thinking + enable_thinking) and the engine's reasoning-format
-        // splits thoughts into a separate field — tags never leak into the
+        // splits thoughts into a separate field - tags never leak into the
         // visible stream. Dropped for models the daemon taught us cannot
         // think (is_unsupported_think_error fallback above).
         body["think"] = serde_json::json!(true);
@@ -14354,7 +14354,7 @@ async fn sysinfo_cmd(base: &str) -> Result<()> {
 /// conversation memory).
 struct StreamOutcome {
     /// Ctrl+C was seen mid-stream: partial text rendered, but the turn
-    /// is discarded — callers must not record it as conversation memory.
+    /// is discarded - callers must not record it as conversation memory.
     pub interrupted: bool,
     final_chunk: Option<serde_json::Value>,
     text: String,
@@ -14376,7 +14376,7 @@ fn chat_stats_line(v: &serde_json::Value) -> String {
 }
 
 /// `stream_chat` with an optional `x-blazar-priority` value ("high" /
-/// "low") riding every request — the session-wide lane `run --intent`
+/// "low") riding every request - the session-wide lane `run --intent`
 /// sets. `None` is byte-identical to the historic request shape.
 #[allow(clippy::duration_suboptimal_units)] // 10-minute generation ceiling
 async fn stream_chat_opts(
@@ -14447,7 +14447,7 @@ async fn stream_chat_opts(
                     if after_thinking {
                         // End the thinking block's line, then one blank
                         // line so the answer starts crisp at full
-                        // brightness — the visual split IS the feature.
+                        // brightness - the visual split IS the feature.
                         writeln!(stdout.lock()).ok();
                         writeln!(stdout.lock()).ok();
                         after_thinking = false;
@@ -14468,7 +14468,7 @@ async fn stream_chat_opts(
     } else {
         let model = body["model"].as_str().unwrap_or("model");
         eprintln!(
-            "blazar: {model} returned an empty response — no content arrived \
+            "blazar: {model} returned an empty response - no content arrived \
              (try a different quant or engine lane: blazar engine list)"
         );
     }
@@ -14490,12 +14490,12 @@ async fn futures_lite_next(resp: &mut reqwest::Response) -> Result<Option<Vec<u8
 
 /// llama-bench reads GGUF files only; safetensors/MLX directories are
 /// served-plane models (sglang quants, mlx-community dirs). Handing a
-/// directory to llama-bench dies on `gguf_init_from_reader` — teach the
+/// directory to llama-bench dies on `gguf_init_from_reader` - teach the
 /// lane's real measurement surface instead of leaking the loader error.
 fn dir_bench_refusal(name: &str, mlx: bool) -> String {
     let lane = if mlx { "mlx" } else { "sglang" };
     format!(
-        "bench drives llama-bench, which reads GGUF files only — '{name}' is a \
+        "bench drives llama-bench, which reads GGUF files only - '{name}' is a \
 safetensors directory served by the {lane} lane. Measure it warm through the \
 daemon instead (what a client actually sees): time a /v1/chat/completions \
 call and read tokens/s from the usage block, e.g. max_tokens 128 against \
@@ -14532,7 +14532,7 @@ fn bench(model: &str) -> Result<()> {
     }
     if let Some(class) = bench_arch_refusal(row.arch.as_deref()) {
         anyhow::bail!(
-            "blazar bench {0}: refused — arch '{1}' is encoder-only (class '{class}'); \
+            "blazar bench {0}: refused - arch '{1}' is encoder-only (class '{class}'); \
 llama-bench measures generative decode (pp/tg) and aborts on this family after \
 a long CUDA init. Embedding/rerank speed is measured live per request (/metrics, \
 `blazar scorecard {0}`); capabilities: `blazar model-doctor {0}`",
@@ -14572,7 +14572,7 @@ a long CUDA init. Embedding/rerank speed is measured live per request (/metrics,
             r.type_v.as_deref().unwrap_or("-"),
         );
     }
-    // Persist for scorecards and `plan` MEASURED — durable per
+    // Persist for scorecards and `plan` MEASURED - durable per
     // (model, lane): re-benching the same pair is unnecessary. The v13
     // evidence axes make the row self-contained (quant + hardware
     // fingerprint + the tuned profile's args hash when one exists).
@@ -14594,7 +14594,7 @@ a long CUDA init. Embedding/rerank speed is measured live per request (/metrics,
             };
             store.put_bench_result_with_axes(&row.name, &engine.tag, &payload, &axes)?;
         }
-        None => println!("note: no llamacpp engine row on record — result not persisted"),
+        None => println!("note: no llamacpp engine row on record - result not persisted"),
     }
     Ok(())
 }
@@ -14609,7 +14609,7 @@ a long CUDA init. Embedding/rerank speed is measured live per request (/metrics,
 /// the numbers reflect the exact profile a serve would use. Adoption
 /// is NOT automatic (unlike the llamacpp race): the per-model
 /// `[sglang]` overlay replaces the whole tuning struct, so a partial
-/// write would silently drop sibling pins — print the exact adopt
+/// write would silently drop sibling pins - print the exact adopt
 /// commands and let the user own the edit.
 fn sglang_spec_race_lane(
     d: &BlazarDirs,
@@ -14635,7 +14635,7 @@ fn sglang_spec_race_lane(
             Some(picked)
         })
         .ok_or_else(|| {
-            anyhow!("no sglang engine installed — `blazar engine install --kind sglang` first")
+            anyhow!("no sglang engine installed - `blazar engine install --kind sglang` first")
         })?;
     let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
     manifest.anchor_server_path(&d.data_dir);
@@ -14688,7 +14688,7 @@ fn sglang_spec_race_lane(
         },
     );
     // NGRAM needs both the speculation flag and the attention-backend
-    // flag (the working recipe pins triton — flashinfer verify kernels
+    // flag (the working recipe pins triton - flashinfer verify kernels
     // JIT-crash the 0.5.21 bundle at graph capture). Never invent
     // flags the engine does not advertise.
     let mut race_modes = vec!["dense".to_string()];
@@ -14697,7 +14697,7 @@ fn sglang_spec_race_lane(
     {
         race_modes.push("ngram".to_string());
     } else {
-        println!("note: engine lacks the speculation flags — racing dense only");
+        println!("note: engine lacks the speculation flags - racing dense only");
     }
     println!("sglang spec race: live servers across {race_modes:?} (~2 min each) ...");
     let rows = blazar_runtime::bench::sglang_spec_mode_race(
@@ -14719,7 +14719,7 @@ fn sglang_spec_race_lane(
         println!(
             "{}",
             ok_line(&format!(
-                "ngram wins ({best_tps:.1} tok/s, +{:.0}% over dense) — adopt with:",
+                "ngram wins ({best_tps:.1} tok/s, +{:.0}% over dense) - adopt with:",
                 (best_tps / dense_tps - 1.0) * 100.0
             ))
         );
@@ -14731,7 +14731,7 @@ fn sglang_spec_race_lane(
         );
     } else {
         println!(
-            "no spec mode beat dense by >5% (best {best_tps:.1} vs dense {dense_tps:.1}) — \
+            "no spec mode beat dense by >5% (best {best_tps:.1} vs dense {dense_tps:.1}) - \
              speculation stays off"
         );
     }
@@ -14745,7 +14745,7 @@ fn sglang_spec_race_lane(
 /// the first installed llamacpp lane, loudly), anchors its manifest,
 /// resolves the bench binary, takes a live device census, and gathers
 /// every model-scoped input the profile compiler needs. One source of
-/// truth for engine pick, census, overlay, and draft resolution — the
+/// truth for engine pick, census, overlay, and draft resolution - the
 /// optimize lane measures the exact argv the tune lane would compile.
 struct TuneLane {
     engine_row: blazar_core::store::EngineRow,
@@ -14767,7 +14767,7 @@ fn tune_lane_setup(
     cfg: &Config,
 ) -> Result<TuneLane> {
     // The bench lane drives llama-bench, so the engine row must be a
-    // llamacpp lane — the ACTIVE row may be any kind (a store flipped
+    // llamacpp lane - the ACTIVE row may be any kind (a store flipped
     // by an sglang session would otherwise compile llamacpp argv
     // against a sglang manifest and die on the first flag). Prefer the
     // active engine when it IS llamacpp; otherwise the first installed
@@ -14788,7 +14788,7 @@ fn tune_lane_setup(
             Some(picked)
         })
         .ok_or_else(|| {
-            anyhow!("no llamacpp engine installed; `blazar bench` drives llama-bench — run: blazar engine update")
+            anyhow!("no llamacpp engine installed; `blazar bench` drives llama-bench - run: blazar engine update")
         })?;
     let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
     manifest.anchor_server_path(&d.data_dir);
@@ -14881,7 +14881,7 @@ async fn tune_full(
     // under the hood, so the hours-class abort applies identically.
     if let Some(class) = bench_arch_refusal(row.arch.as_deref()) {
         anyhow::bail!(
-            "blazar tune {}: refused — arch '{}' is encoder-only (class '{class}'); \
+            "blazar tune {}: refused - arch '{}' is encoder-only (class '{class}'); \
 the tuner drives llama-bench, which measures generative decode (pp/tg) and \
 aborts on this family. Profile pins for it would measure nothing",
             row.name,
@@ -14904,12 +14904,12 @@ aborts on this family. Profile pins for it would measure nothing",
         if let Some(mode) = &spec {
             println!(
                 "note: --spec {mode} pins the llamacpp spec family; the sglang lane \
-                 reads [sglang] spec_algorithm instead — pin not persisted"
+                 reads [sglang] spec_algorithm instead - pin not persisted"
             );
         }
         if !race {
             anyhow::bail!(
-                "blazar tune {}: safetensors dirs tune via the sglang spec race — \
+                "blazar tune {}: safetensors dirs tune via the sglang spec race - \
                  rerun with --spec-race (dense vs NGRAM on live spawns); the other \
                  tune lanes drive llama-bench and need a GGUF model",
                 row.name
@@ -14923,7 +14923,7 @@ aborts on this family. Profile pins for it would measure nothing",
     let mut adopted_any = false;
     // Persist --spec BEFORE building the profile input so the compiled
     // argv (and its draft resolution) matches what the daemon will
-    // serve on the next run — mirrors the --ngram lane's
+    // serve on the next run - mirrors the --ngram lane's
     // set-then-reload discipline.
     if let Some(mode) = spec {
         if mode != "off" && mode != "auto" {
@@ -14934,7 +14934,7 @@ aborts on this family. Profile pins for it would measure nothing",
         println!("model_overrides.{model}.spec = {mode}");
     }
     // Shared lane setup (engine pick, manifest anchor, bench bin, live
-    // census, GGUF read, overlay, loras, draft) — same helper as
+    // census, GGUF read, overlay, loras, draft) - same helper as
     // `optimize --run`, one source of truth for the compiled argv.
     let lane = tune_lane_setup(&d, &store, model, &row, &cfg)?;
     let TuneLane {
@@ -15003,7 +15003,7 @@ aborts on this family. Profile pins for it would measure nothing",
             }
         } else {
             eprintln!(
-                "warning: no tg128 row among {} measured rows — bench history not \
+                "warning: no tg128 row among {} measured rows - bench history not \
                  recorded (engine gate left anchorless); tests seen: {}",
                 rows.len(),
                 rows.iter()
@@ -15018,7 +15018,7 @@ aborts on this family. Profile pins for it would measure nothing",
             winning.ctx = Some(n);
             let fixed = tuner.adopt(&store2, &input, &winning)?;
             println!(
-                "tuned {model} — {} configs measured; ctx pinned to {n}:",
+                "tuned {model} - {} configs measured; ctx pinned to {n}:",
                 rows.len()
             );
             println!("  argv: {}", fixed.argv.join(" "));
@@ -15026,7 +15026,7 @@ aborts on this family. Profile pins for it would measure nothing",
             println!(
                 "{}",
                 ok_line(&format!(
-                    "tuned {} — {} configs measured, winner:",
+                    "tuned {} - {} configs measured, winner:",
                     model,
                     rows.len()
                 ))
@@ -15053,7 +15053,7 @@ aborts on this family. Profile pins for it would measure nothing",
         // measure aggregate throughput under `clients` parallel streams.
         let profile = store2
             .get_profile(model, &engine_row.tag)?
-            .ok_or_else(|| anyhow!("no profile yet — run `blazar tune {model} --search` first"))?;
+            .ok_or_else(|| anyhow!("no profile yet - run `blazar tune {model} --search` first"))?;
         let argv: Vec<String> = serde_json::from_str::<serde_json::Value>(&profile.args_json)?
             .as_array()
             .map(|a| {
@@ -15091,7 +15091,7 @@ aborts on this family. Profile pins for it would measure nothing",
             );
         } else {
             println!(
-                "no clear winner (best {best_tps:.1} vs {second:.1}) — slots stays {}; single-slot avoids ctx splitting",
+                "no clear winner (best {best_tps:.1} vs {second:.1}) - slots stays {}; single-slot avoids ctx splitting",
                 cfg.slots
             );
         }
@@ -15109,7 +15109,7 @@ aborts on this family. Profile pins for it would measure nothing",
             println!("model_overrides.{model}.spec = ngram (set by --ngram)");
         }
         let overlay2 = cfg.overlay_for(model);
-        // n-gram speculation self-drafts from context n-grams — no
+        // n-gram speculation self-drafts from context n-grams - no
         // external draft model to resolve.
         let input2 = blazar_runtime::bench::build_input(
             model,
@@ -15162,14 +15162,14 @@ aborts on this family. Profile pins for it would measure nothing",
                 ))
             );
         } else {
-            println!("no clear winner (best {best_tps:.1} vs {second:.1}) — engine defaults stay");
+            println!("no clear winner (best {best_tps:.1} vs {second:.1}) - engine defaults stay");
         }
     }
     if race {
         // Live speculation-mode race: dense vs ngram vs dflash vs draft,
         // one real child each at engine defaults, single-stream wall
         // tok/s (spec decoding is a c=1 win; concurrency would mask it).
-        // Only modes the engine's parsed manifest advertises may race —
+        // Only modes the engine's parsed manifest advertises may race -
         // spec flags are never invented for an engine that lacks them.
         let mut race_modes = vec!["dense".to_string()];
         if manifest.spec_types.iter().any(|s| s == "ngram-simple") {
@@ -15205,7 +15205,7 @@ aborts on this family. Profile pins for it would measure nothing",
         // runs at engine defaults, mirroring the other arms.
         let mut draft_pair: Option<(String, u32)> = None;
         // Lane-aware pick: a GGUF/safetensors mismatch or a self-pair is
-        // skipped BEFORE compiling the draft arm — the reason prints
+        // skipped BEFORE compiling the draft arm - the reason prints
         // instead of surfacing as a compile-degrade warning later.
         let draft_pick = blazar_runtime::pick_draft(
             &store,
@@ -15219,7 +15219,7 @@ aborts on this family. Profile pins for it would measure nothing",
             blazar_runtime::DraftPick::Unavailable => None,
             blazar_runtime::DraftPick::IncompatibleLane(p) => {
                 println!(
-                    "draft arm skipped — catalog draft {p} is not a GGUF file; \
+                    "draft arm skipped - catalog draft {p} is not a GGUF file; \
                      llama.cpp drafts load as GGUF files (pull the draft as a GGUF \
                      row to enable the pair)"
                 );
@@ -15227,7 +15227,7 @@ aborts on this family. Profile pins for it would measure nothing",
             }
             blazar_runtime::DraftPick::SelfPaired(_) => {
                 println!(
-                    "draft arm skipped — catalog draft for {model} resolved to the \
+                    "draft arm skipped - catalog draft for {model} resolved to the \
                      main model file itself; a model cannot draft itself (pull the \
                      paired draft to enable speculation)"
                 );
@@ -15263,7 +15263,7 @@ aborts on this family. Profile pins for it would measure nothing",
                     // Only race the draft arm when the planner actually
                     // ENGAGED the pair: compile degrades self-pairs (the
                     // model is its own catalog draft) and capacity-misfit
-                    // pairs to dense with a warning — racing a degraded
+                    // pairs to dense with a warning - racing a degraded
                     // pair would hand llama-server an argv the planner
                     // already rejected (live repro: self-pair double KV
                     // allocation boot-OOMs an 8 GiB card).
@@ -15286,14 +15286,14 @@ aborts on this family. Profile pins for it would measure nothing",
                         .iter()
                         .find(|w| w.starts_with("spec=auto:") || w.starts_with("spec auto:"))
                     {
-                        println!("draft arm skipped — {why}");
+                        println!("draft arm skipped - {why}");
                     }
                 }
                 Err(e) => {
                     // Fail loud, not silent: a draft profile that cannot
                     // even compile is a real condition the user must see
                     // (the race still runs the other arms).
-                    println!("draft arm skipped — draft profile compile failed: {e}");
+                    println!("draft arm skipped - draft profile compile failed: {e}");
                 }
             }
         }
@@ -15307,7 +15307,7 @@ aborts on this family. Profile pins for it would measure nothing",
         let ngram_knobs = (cfg.ngram_size_m, cfg.ngram_size_n, cfg.ngram_min_hits);
         if race_modes.iter().any(|m| m == "ngram") && ngram_knobs.0 == 0 {
             println!(
-                "ngram arm racing engine defaults (ngram_* untuned — \
+                "ngram arm racing engine defaults (ngram_* untuned - \
                  `blazar tune {model} --ngram` refines the shape first)"
             );
         }
@@ -15326,11 +15326,11 @@ aborts on this family. Profile pins for it would measure nothing",
             if r.1 > acc.1 { (r.0.clone(), r.1) } else { acc }
         });
         let dense_tps = rows.iter().find(|r| r.0 == "dense").map_or(0.0, |r| r.1);
-        // Persist every arm as a receipt — the supervisor's spec=auto
+        // Persist every arm as a receipt - the supervisor's spec=auto
         // resolution consults these measurements on later starts. Each
         // receipt carries its provenance: the hardware that raced, the
         // exact knobs engaged, and whether those knobs were deliberately
-        // tuned (a tuned ngram shape) or engine defaults — an untuned
+        // tuned (a tuned ngram shape) or engine defaults - an untuned
         // ngram arm must never be mistaken for optimized evidence later.
         let race_hw =
             blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&engine_row.manifest);
@@ -15356,7 +15356,7 @@ aborts on this family. Profile pins for it would measure nothing",
                     )
                 }),
                 // dense is the deliberate baseline; dflash runs the
-                // engine's flash decoder as shipped — no tunable knobs
+                // engine's flash decoder as shipped - no tunable knobs
                 // on either arm, so nothing to record beyond the race.
                 _ => (None, true),
             };
@@ -15375,10 +15375,10 @@ aborts on this family. Profile pins for it would measure nothing",
             )?;
         }
         println!(
-            "receipts saved ({} rows) — later `spec = \"auto\"` resolves from these measurements",
+            "receipts saved ({} rows) - later `spec = \"auto\"` resolves from these measurements",
             rows.len()
         );
-        // Adopt against the DENSE baseline — the honest question is
+        // Adopt against the DENSE baseline - the honest question is
         // "does speculation beat no speculation at all", not "which
         // speculation is least bad". Bidirectional: a decisive dense
         // win pins spec off instead of silently leaving a slower
@@ -15418,13 +15418,13 @@ aborts on this family. Profile pins for it would measure nothing",
                 println!(
                     "{}",
                     ok_line(&format!(
-                        "dense beat every spec mode by >5% ({dense_tps:.1} vs {best_spec:.1}) — \
+                        "dense beat every spec mode by >5% ({dense_tps:.1} vs {best_spec:.1}) - \
                          adopted model_overrides.{model}.spec = off"
                     ))
                 );
             } else {
                 println!(
-                    "no spec mode beat dense by >5% (best {best_tps:.1} vs dense {dense_tps:.1}) — \
+                    "no spec mode beat dense by >5% (best {best_tps:.1} vs dense {dense_tps:.1}) - \
                      spec stays as configured"
                 );
             }
@@ -15461,8 +15461,8 @@ aborts on this family. Profile pins for it would measure nothing",
             .map_err(|e| anyhow!("profile: {e}"))?;
         if load {
             // Warmup A/B axis: the two children differ ONLY in --no-warmup.
-            // Orthogonal to spec mode — no ngram-style precondition.
-            println!("load search: warmup A/B — 2 spawns, ready + first-chat each ...");
+            // Orthogonal to spec mode - no ngram-style precondition.
+            println!("load search: warmup A/B - 2 spawns, ready + first-chat each ...");
             let probe = tuner.load_search(&base.argv, 1)?;
             println!("warmup on : {:>6.1}s", probe.warmup_secs);
             println!("warmup off: {:>6.1}s", probe.no_warmup_secs);
@@ -15474,14 +15474,14 @@ aborts on this family. Profile pins for it would measure nothing",
                     (1.0 - probe.no_warmup_secs / probe.warmup_secs) * 100.0
                 );
             } else {
-                println!("warmup stays on (off not >5% faster) — first-token latency wins");
+                println!("warmup stays on (off not >5% faster) - first-token latency wins");
             }
         }
         if replicas {
             // Scaling axis: aggregate tok/s from 8 concurrent clients x 3
             // generations against 1 vs 2 identical children.
             println!(
-                "replica search: 1 vs 2 children — 3 spawns total, 8 clients x 3 gens each ..."
+                "replica search: 1 vs 2 children - 3 spawns total, 8 clients x 3 gens each ..."
             );
             let probe = tuner.replica_search(&base.argv, 1)?;
             let ratio = probe.r2_tps / probe.r1_tps.max(1e-6);
@@ -15503,7 +15503,7 @@ aborts on this family. Profile pins for it would measure nothing",
             // long repeated prompt across {0, 256, 512}. 256 is Blazar's
             // shipped default, so it is the bar to beat.
             println!(
-                "cache-reuse search: grid {{0, 256, 512}} — 3 spawns, long repeated prompt x2 each ..."
+                "cache-reuse search: grid {{0, 256, 512}} - 3 spawns, long repeated prompt x2 each ..."
             );
             let probe = tuner.cache_reuse_search(&base.argv, 1)?;
             for (n, secs) in &probe.grid {
@@ -15556,16 +15556,16 @@ fn key_before_eq(line: &str) -> Option<&str> {
 
 /// Does the config schema know this top-level knob? Two sources,
 /// unioned: the keys `Config::default()` serializes (every non-Option
-/// knob — strings, ints, floats, bools, enums) and parse-only scalar
+/// knob - strings, ints, floats, bools, enums) and parse-only scalar
 /// probes against the serde schema (Option knobs serialize as absent
 /// while None, so they never appear in the default TOML). Probes go
-/// through `toml::from_str`, never `Config::from_toml` — that also
+/// through `toml::from_str`, never `Config::from_toml` - that also
 /// VALIDATES, and probe values are placeholders that must not trip
 /// value validation. `deny_unknown_fields` is the authority either way.
 fn known_config_key(key: &str) -> bool {
     if key.contains('.') {
         // Dotted table-leaf keys probe with the header + one leaf line:
-        // `sglang.grammar_backend` parses as `[sglang]\ngrammar_backend = …`.
+        // `sglang.grammar_backend` parses as `[sglang]\ngrammar_backend = ...`.
         // Any scalar shape the schema accepts proves the path is real.
         return split_table_path(key).is_some_and(|(path, leaf)| {
             let header = table_header(&path);
@@ -15616,7 +15616,7 @@ fn top_level_key_known(key: &str) -> bool {
         }
     }
     // Option knobs serialize as absent while None, so they never appear
-    // in the default TOML — probe the schema at the root scope instead.
+    // in the default TOML - probe the schema at the root scope instead.
     ["\"s\"", "0", "0.5", "true", "[]"]
         .iter()
         .any(|v| toml::from_str::<Config>(&format!("{key} = {v}\n")).is_ok())
@@ -15625,7 +15625,7 @@ fn top_level_key_known(key: &str) -> bool {
 /// Top-level section names the schema knows: every table header of the
 /// serialized default config, plus headers already present in the
 /// user's file (all-Option sections like `[spec_draft]` render only
-/// after a leaf is pinned). First segment only — nested headers
+/// after a leaf is pinned). First segment only - nested headers
 /// (`[model_overrides."m".sglang]`) count as their root table.
 fn config_section_names(extra_raw: &str) -> Vec<String> {
     let defaults = Config::default()
@@ -15653,7 +15653,7 @@ fn is_free_form_map_section(section: &str) -> bool {
 /// Which struct sections carry this bare leaf name? A one-line parse
 /// probe per section: `[sglang]\n<key> = <scalar>` parses only when the
 /// schema really has that leaf (`sglang.grammar_backend`). Map sections
-/// are excluded up front — they accept any key and would always match.
+/// are excluded up front - they accept any key and would always match.
 fn bare_leaf_sections(key: &str, raw_file: &str) -> Vec<String> {
     if !key
         .chars()
@@ -15678,7 +15678,7 @@ fn is_section_parent(key: &str, raw_file: &str) -> bool {
 }
 
 /// Leaf names a struct section accepts, parsed from the serde
-/// `deny_unknown_fields` teaching text ("unknown field … expected one
+/// `deny_unknown_fields` teaching text ("unknown field ... expected one
 /// of `a`, `b`"). Sections whose leaves never serialize ([sglang] is
 /// all-Option) still enumerate this way; map sections and unexpected
 /// error shapes fall back to the leaves the default TOML renders.
@@ -15720,7 +15720,7 @@ fn section_leaf_names(section: &str) -> Vec<String> {
 }
 
 /// Pinned `key = value` lines of a single-segment `[section]` block in
-/// the file (blank lines and comments skipped) — the parent-key view
+/// the file (blank lines and comments skipped) - the parent-key view
 /// for `config get <table>`.
 fn table_pins(raw: &str, section: &str) -> Vec<String> {
     let mut in_section = false;
@@ -15740,7 +15740,7 @@ fn table_pins(raw: &str, section: &str) -> Vec<String> {
 }
 
 /// Remove a top-level pin (`key = ...` before the first `[table]`
-/// header). Table-scoped keys are never touched — the same knob name
+/// header). Table-scoped keys are never touched - the same knob name
 /// inside `[model_overrides."<model>"]` is a different setting. Returns
 /// the candidate file and the removed line (None when the key carries
 /// no top-level pin).
@@ -15793,7 +15793,7 @@ fn quoted_seg_ranges(s: &str) -> Option<Vec<(usize, usize)>> {
 }
 
 /// Resolve a model name against the store and report the ACTIVE engine
-/// lane serving it (kind + tag) — the lane decides which knob families
+/// lane serving it (kind + tag) - the lane decides which knob families
 /// the editor hints list. Unknown models fail with the store's roster.
 fn resolve_model_and_engine(
     model: &str,
@@ -15802,7 +15802,7 @@ fn resolve_model_and_engine(
     let d = dirs();
     if !d.db_file().is_file() {
         return Err(anyhow!(
-            "no blazar store yet — start the daemon once before asking for {model}'s knobs"
+            "no blazar store yet - start the daemon once before asking for {model}'s knobs"
         ));
     }
     let store = blazar_core::store::Store::open(&d).map_err(|e| anyhow!("{e}"))?;
@@ -15834,8 +15834,8 @@ fn resolve_model_and_engine(
 /// TOML prelude listing the engine's tuning knobs and this model's
 /// override-table skeleton. Key sets are pinned to the config schema by
 /// `unit__knob_hint_block__keys_match_config_schema` (stale keys fail
-/// the probe ladder; NEW knobs need a line here — keep families short).
-/// Sglang knob-hint family lines — every `SglangTuning` field must appear
+/// the probe ladder; NEW knobs need a line here - keep families short).
+/// Sglang knob-hint family lines - every `SglangTuning` field must appear
 /// here exactly once (`unit__knob_hint_block__covers_every_tuning_field`
 /// pins the lockstep). Example values must survive `Config::from_toml`
 /// validation.
@@ -15848,7 +15848,7 @@ fn sglang_hint_families() -> Vec<&'static str> {
         "schedule_policy = \"fcfs\"    schedule_conservativeness = 1.0",
         "chunked_prefill_size = 8192    max_prefill_tokens = 16384    stream_interval = 1",
         "random_seed = 0    cuda_graph_max_bs = 8    cuda_graph_bs = [1, 2, 4]",
-        "cuda_graph_backend_prefill = \"breakable\"    # full|breakable|tc_piecewise|disabled — disabled unsticks laptop prefill capture",
+        "cuda_graph_backend_prefill = \"breakable\"    # full|breakable|tc_piecewise|disabled - disabled unsticks laptop prefill capture",
         "max_total_tokens = 4096    hicache_enable = false    hicache_ratio = 2.0    hicache_size = 0    is_embedding = false",
         "metrics = false    skip_warmup = false    torch_compile = false",
         "tokenizer_mode = \"auto\"    tokenizer_backend = \"huggingface\"",
@@ -15875,7 +15875,7 @@ fn sglang_hint_families() -> Vec<&'static str> {
     ]
 }
 
-/// MLX knob-hint family lines — same lockstep contract as the sglang
+/// MLX knob-hint family lines - same lockstep contract as the sglang
 /// family: every `MlxTuning` field appears exactly once, example values
 /// survive `Config::from_toml` validation, comments carry no ` = `.
 fn mlx_hint_families() -> Vec<&'static str> {
@@ -15907,12 +15907,12 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
     };
     out.push(format!("# engine lane: {lane} ({tag})"));
     out.push(
-        "# model-scoped table (uncomment lines you want — everything else stays at the engine default):"
+        "# model-scoped table (uncomment lines you want - everything else stays at the engine default):"
             .into(),
     );
     let knob = |line: &str| format!("#   {line}");
     if let EngineKind::LlamaCpp = kind {
-        // llamacpp knobs are top-level scalars — listed first so an
+        // llamacpp knobs are top-level scalars - listed first so an
         // uncomment-all pass keeps them at root scope; the override
         // table carries the routing/scheduling family.
         out.push("# top-level llama-server child knobs (`config get <key>` shows current):".into());
@@ -15952,16 +15952,16 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
             )),
             EngineKind::LlamaCpp => unreachable!("llamacpp handled above"),
             // Image lane: sd-server tuning rides request parameters
-            // (steps/cfg/sampler/seed per call), not config knobs —
+            // (steps/cfg/sampler/seed per call), not config knobs -
             // no model-scoped families yet. New knobs get a line here.
             EngineKind::SdCpp => Some(("sdcpp", vec![])),
             // Audio lane: whisper-server rides per-request fields
             // (language/temperature/prompt/beam_size on the multipart
-            // call), not config knobs — same discipline as the image
+            // call), not config knobs - same discipline as the image
             // lane.
             EngineKind::Whisper => Some(("whisper", vec![])),
             // TTS lane: voice/speed ride the /v1/audio/speech request
-            // body, not config knobs — same request-driven discipline
+            // body, not config knobs - same request-driven discipline
             // as the other audio lane.
             EngineKind::Piper => Some(("piper", vec![])),
             // MLX lane knobs ride the [mlx] table (MlxTuning): draft
@@ -15972,7 +15972,7 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
             out.push(format!("# [model_overrides.\"{model}\".{table}]"));
             out.extend(families.into_iter().map(knob));
             out.push(format!(
-                "# (also global [{table}] table — model rows override it wholesale)"
+                "# (also global [{table}] table - model rows override it wholesale)"
             ));
         } else {
             // No lane table: point at the generic argv passthrough
@@ -15980,7 +15980,7 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
             out.push(format!(
                 "# extra mlx-lm flags: [model_overrides.\"{model}\"] argv = [\"--flag\"]"
             ));
-            out.push("# (generic engine passthrough — no [mlx] table exists yet)".into());
+            out.push("# (generic engine passthrough - no [mlx] table exists yet)".into());
         }
     }
     out.push(
@@ -15992,7 +15992,7 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
     out.join("\n") + "\n"
 }
 
-/// Remove the hint block injected by `config edit <model>` — only when
+/// Remove the hint block injected by `config edit <model>` - only when
 /// both markers survived the editor untouched; anything mangled stays
 /// (comments are valid TOML, and guessing the end would eat user edits).
 fn strip_hint_block(raw: &str, model: &str) -> String {
@@ -16057,7 +16057,7 @@ fn split_table_path(key: &str) -> Option<(Vec<&str>, &str)> {
 /// too deep and the schema rejects (`unknown field 7b`). Each candidate
 /// merges the model name across a different run of segments (ascending, so
 /// the shortest name wins) and the caller lets `Config::from_toml` decide
-/// which split is the real one — no hardcoded field lists.
+/// which split is the real one - no hardcoded field lists.
 ///
 /// Returns `None` unless the key has at least three parts and targets
 /// `model_overrides`; the straight split stays authoritative everywhere
@@ -16188,7 +16188,7 @@ fn set_table_key(raw: &str, path: &[&str], leaf: &str, stored: &str) -> String {
 /// Set `key = stored` at the ROOT scope only: replace existing root
 /// pins in place, insert above the first table header when new. A root
 /// knob must never rewrite the same leaf name pinned inside a section
-/// (`port` vs an env var pinned as `[engine_env] port`) — that clobber
+/// (`port` vs an env var pinned as `[engine_env] port`) - that clobber
 /// was the old section-blind whole-file scan's failure mode.
 fn set_root_key(raw: &str, key: &str, stored: &str) -> String {
     let mut out: Vec<String> = Vec::new();
@@ -16208,7 +16208,7 @@ fn set_root_key(raw: &str, key: &str, stored: &str) -> String {
     }
     if !replaced {
         // A NEW top-level key must go ABOVE the first table header
-        // (`[engine_env]`, `[model_overrides.x]`…); appending at the
+        // (`[engine_env]`, `[model_overrides.x]`...); appending at the
         // end would nest it inside that table.
         let insert_at = out
             .iter()
@@ -16219,12 +16219,12 @@ fn set_root_key(raw: &str, key: &str, stored: &str) -> String {
     out.join("\n") + "\n"
 }
 
-/// Read `path.leaf` from the config file (pins only — table knobs have no
+/// Read `path.leaf` from the config file (pins only - table knobs have no
 /// defaults in the serialized document). Returns the pinned line, if any.
 /// The full value span for a top-level key: `toml::to_string_pretty`
 /// spreads array values over continuation lines, so the key line may end
 /// at an unbalanced `[`. Walk forward until the bracket depth closes and
-/// return the joined span — `config get preload` must print the whole
+/// return the joined span - `config get preload` must print the whole
 /// list, not a bare `preload = [`. (Config string arrays carry validated
 /// model names; bracket characters inside quoted scalars do not occur.)
 fn top_level_span(lines: &[&str], key: &str) -> Option<String> {
@@ -16307,7 +16307,7 @@ fn set_model_override(model: &str, key: &str, value: &str) -> Result<()> {
         } else if line.starts_with('[') && in_section {
             in_section = false; // next section started
         }
-        // F128: match `key = v`, `key="v"` and indented forms alike —
+        // F128: match `key = v`, `key="v"` and indented forms alike -
         // anything whose text before the first `=` trims to the key.
         if in_section && key_before_eq(line).is_some_and(|k| k == key) {
             out.push(format!("{key} = {value}"));
@@ -16340,7 +16340,7 @@ fn set_model_override(model: &str, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Gate baseline: the most recent measured (engine, tg, model) — the
+/// Gate baseline: the most recent measured (engine, tg, model) - the
 /// row `tune --search` recorded. None when never tuned (gate no-ops).
 fn gate_baseline(store: &Store) -> Result<Option<(String, f64, String)>> {
     // FIX5: MOST RECENT tune row (highest-tg picked the tiny model).
@@ -16349,10 +16349,10 @@ fn gate_baseline(store: &Store) -> Result<Option<(String, f64, String)>> {
 
 /// Guard math for the gate probe: does a llama-bench load of `weights`
 /// bytes fit `free_mib` of measured VRAM? Beyond the weights, llama-bench
-/// allocates CUDA context + compute buffers + a small KV for its rows —
+/// allocates CUDA context + compute buffers + a small KV for its rows -
 /// 1.5 GiB covers that overhead for the model classes this gate benches
 /// (0.5B-70B Q4-Q8); refusing slightly early is safe, the OOM dump it
-/// prevents is not. `None` (no measurable GPU — AMD/Metal/CPU boxes)
+/// prevents is not. `None` (no measurable GPU - AMD/Metal/CPU boxes)
 /// never refuses: no gate data is not zero headroom.
 fn gate_bench_fits(weights_bytes: u64, free_mib: Option<u64>) -> bool {
     const BENCH_HEADROOM_MIB: u64 = 1536;
@@ -16368,7 +16368,7 @@ fn gate_bench_fits(weights_bytes: u64, free_mib: Option<u64>) -> bool {
 /// holds the card, that load OOMs deep inside llama-bench and surfaces
 /// as a raw stderr dump. Fail fast with a teaching error instead.
 fn gate_vram_preflight(model_path: &std::path::Path) -> Result<(), String> {
-    // Unreadable/missing file: skip the guard — the bench itself owns
+    // Unreadable/missing file: skip the guard - the bench itself owns
     // that error with its own message.
     let Ok(meta) = std::fs::metadata(model_path) else {
         return Ok(());
@@ -16381,7 +16381,7 @@ fn gate_vram_preflight(model_path: &std::path::Path) -> Result<(), String> {
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     Err(format!(
         "gate bench cannot fit: {} needs ~{:.1} GiB (+~1.5 GiB bench overhead) but only \
-         {} MiB VRAM is free — a resident model holds the card. Free it first \
+         {} MiB VRAM is free - a resident model holds the card. Free it first \
          (`blazar ps` to see holders, `blazar stop` or evict), re-run when idle, or \
          skip the comparison with `engine update --no-gate` (the gate row stays \
          recorded; nothing else changes).",
@@ -16402,7 +16402,7 @@ fn quick_tg(
     // hand-building a unix-only path.
     let bench_bin = blazar_runtime::bench::find_bench_bin(d)?;
     let tuner = blazar_runtime::bench::Tuner { dirs: d, bench_bin };
-    // llama-bench loads the full model before its first row appears —
+    // llama-bench loads the full model before its first row appears -
     // say so or the probe reads as a silent multi-second hang.
     // Label which engine is under probe: the gate runs this twice (baseline,
     // then candidate) and two identical lines read like a stutter.
@@ -16430,7 +16430,7 @@ fn quick_tg(
 /// F7 regression gate: DEFAULT-config tg128 on the freshly installed
 /// engine vs the recorded baseline engine. Skips when no tune baseline
 /// exists OR its references went stale (baseline model un-pulled /
-/// baseline engine pruned by retention — nothing to gate against, the
+/// baseline engine pruned by retention - nothing to gate against, the
 /// same skip-no-baseline contract as having no record at all). On a
 /// decode drop over 10% it rolls the previous engine back to active
 /// and errors.
@@ -16445,7 +16445,7 @@ fn engine_regression_gate(
             println!(
                 "{}",
                 dim_line(&format!(
-                    "gate: baseline model {model:?} no longer pulled — skipping the comparison \
+                    "gate: baseline model {model:?} no longer pulled - skipping the comparison \
                      (nothing to gate against)"
                 ))
             );
@@ -16459,7 +16459,7 @@ fn engine_regression_gate(
             println!(
                 "{}",
                 dim_line(&format!(
-                    "gate: baseline engine {prev_tag} pruned — skipping the comparison \
+                    "gate: baseline engine {prev_tag} pruned - skipping the comparison \
                      (nothing to gate against)"
                 ))
             );
@@ -16474,7 +16474,7 @@ fn engine_regression_gate(
         if new_tg < prev_tg * 0.9 {
             mgr.use_tag(&prev_tag)?;
             anyhow::bail!(
-                "REGRESSION GATE TRIPPED: {:.0}% decode drop on {model} — \
+                "REGRESSION GATE TRIPPED: {:.0}% decode drop on {model} - \
                  rolled back to {prev_tag} (now active). {row_tag} stays \
                  installed for `blazar engine use {row_tag}` to force.",
                 (1.0 - new_tg / prev_tg) * 100.0,
@@ -16492,7 +16492,7 @@ fn engine_regression_gate(
 }
 
 /// Resolve the update-everything intent for `blazar engine update`: the
-/// `--all` flag, or the positional keyword `all` (an ergonomic alias —
+/// `--all` flag, or the positional keyword `all` (an ergonomic alias -
 /// users type `engine update all` reflexively). A pinned tag alongside
 /// the flag-shaped intent stays an error: `--all` walks every lane, so
 /// a tag has nothing to pin.
@@ -16500,7 +16500,7 @@ fn resolve_engine_update_all(flag: bool, tag: Option<&str>) -> Result<bool> {
     let positional_all = tag == Some("all");
     if (flag || positional_all) && tag.is_some_and(|t| t != "all") {
         anyhow::bail!(
-            "engine update --all walks every installed lane — drop the pinned tag \
+            "engine update --all walks every installed lane - drop the pinned tag \
              (or drop --all)"
         );
     }
@@ -16518,7 +16518,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             check,
             all,
         } => {
-            // Positional `all` reads as the update-everything intent —
+            // Positional `all` reads as the update-everything intent -
             // no engine tag is ever the bare word `all` (llama.cpp b-tags,
             // sglang/mlx version tags), and sending it to the release
             // lookup produces the confusing "release all not found".
@@ -16547,7 +16547,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             // Point-of-need convergence: `engine list` is where install
             // debris becomes visible to a user, so the same grace-gated
             // sweep the daemon boot runs converges here too (fail-open).
-            // Notices go to stderr — the table and JSONL stdout bytes are
+            // Notices go to stderr - the table and JSONL stdout bytes are
             // scripted (install e2e, validate) and must not shift.
             if let Ok(mgr) = local_engine_manager(&d) {
                 for (name, bytes) in mgr.sweep_install_debris(STALLED_INSTALL_GRACE) {
@@ -16572,7 +16572,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     .as_ref()
                     .map(|m| (m.provenance_label(), m.source.as_str().to_string()));
                 // Registry rows can outlive their files (a tree deleted
-                // out from under the store) — the row renders healthy
+                // out from under the store) - the row renders healthy
                 // until the first spawn 500s mid-request. Surface the
                 // disk state at listing time: dir present AND non-empty.
                 let files_present = d
@@ -16581,7 +16581,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     .read_dir()
                     .is_ok_and(|mut rd| rd.next().is_some());
                 if json {
-                    // Full sha256 (the table truncates to 12 chars) —
+                    // Full sha256 (the table truncates to 12 chars) -
                     // scripts verifying assets want the whole digest.
                     // `source`/`provenance`/`superseded_by` are additive
                     // keys.
@@ -16620,7 +16620,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 let notes = if files_present {
                     superseded
                 } else {
-                    let teach = format!("FILES MISSING — blazar engine install --kind {}", e.kind);
+                    let teach = format!("FILES MISSING - blazar engine install --kind {}", e.kind);
                     if superseded.is_empty() {
                         teach
                     } else {
@@ -16656,13 +16656,13 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 );
             }
             // Point-of-need catalog: `engine list` is where users look
-            // for "what can I install" — every lane this blazar can
+            // for "what can I install" - every lane this blazar can
             // run but doesn't have yet gets one discoverability line.
             // The whisper lane reports through the generic table when
             // installed as an engine row; only the legacy voice tree
             // needs its own line. Lane labels share one width so the
             // teaching lines align under the table.
-            let lane = |name: &str, rest: &str| println!("{name:<10} not installed — {rest}");
+            let lane = |name: &str, rest: &str| println!("{name:<10} not installed - {rest}");
             if !seen.contains(&"llamacpp") {
                 lane(
                     "llama.cpp",
@@ -16695,7 +16695,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 (true, _) => {}
                 (false, Some(tag)) => {
                     println!(
-                        "{:<10} {tag} (legacy voice lane) — blazar whisper --list",
+                        "{:<10} {tag} (legacy voice lane) - blazar whisper --list",
                         "whisper"
                     );
                 }
@@ -16723,7 +16723,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                         .map(|r| r.tag.clone())
                         .ok_or_else(|| {
                             anyhow!(
-                                "no {kind} engine installed — blazar engine install --kind {kind}"
+                                "no {kind} engine installed - blazar engine install --kind {kind}"
                             )
                         })?
                 }
@@ -16810,7 +16810,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             backend,
         } => {
             // Registry-curated capability lane: build the published
-            // fork pin locally (never a binary download — the trust
+            // fork pin locally (never a binary download - the trust
             // banner below is the honest cost of that).
             if let Some(lane_id) = lane {
                 engine_install_lane(&d, &lane_id, backend.as_deref()).await?;
@@ -16821,14 +16821,14 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             // mistralrs default started installs users did not ask for.
             let Some(kind) = kind else {
                 return Err(anyhow!(
-                    "engine install needs a lane — each serves different model formats:\n  \
-                     llama.cpp         GGUF files — blazar engine update (prebuilt) or blazar engine build cuda (source)\n  \
-                     --kind mistralrs  HF safetensors dirs — prebuilt mistral.rs server\n  \
-                     --kind sglang     HF safetensors dirs — pip venv (Linux + CUDA/ROCm)\n  \
-                     --kind mlx        MLX quant dirs (mlx-community) — pip venv (CUDA linux + Apple Silicon)\n  \
-                     --kind sdcpp      diffusion GGUF component sets — prebuilt sd-server (Vulkan/CPU/Metal)\n  \
-                     --kind whisper    audio transcription/translation — prebuilt whisper-server (CPU)\n  \
-                     --kind piper      text-to-speech — prebuilt piper CLI, rhasspy voices (CPU)\n  \
+                    "engine install needs a lane - each serves different model formats:\n  \
+                     llama.cpp         GGUF files - blazar engine update (prebuilt) or blazar engine build cuda (source)\n  \
+                     --kind mistralrs  HF safetensors dirs - prebuilt mistral.rs server\n  \
+                     --kind sglang     HF safetensors dirs - pip venv (Linux + CUDA/ROCm)\n  \
+                     --kind mlx        MLX quant dirs (mlx-community) - pip venv (CUDA linux + Apple Silicon)\n  \
+                     --kind sdcpp      diffusion GGUF component sets - prebuilt sd-server (Vulkan/CPU/Metal)\n  \
+                     --kind whisper    audio transcription/translation - prebuilt whisper-server (CPU)\n  \
+                     --kind piper      text-to-speech - prebuilt piper CLI, rhasspy voices (CPU)\n  \
                      capability lane   blazar engine offers + install --lane <id> (fork builds)"
                 ));
             };
@@ -16845,7 +16845,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 EngineKind::LlamaCpp => {
                     return Err(anyhow!(
                         "llama.cpp engines install via `blazar engine update` / `blazar \
-                         engine build` — `engine install --kind` serves mistralrs, sglang, \
+                         engine build` - `engine install --kind` serves mistralrs, sglang, \
                          mlx, sdcpp, whisper and piper"
                     ));
                 }
@@ -16856,10 +16856,10 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
     Ok(())
 }
 
-/// `blazar engine install` — install + activate a prebuilt mistral.rs
+/// `blazar engine install` - install + activate a prebuilt mistral.rs
 /// engine. Asset choice is GPU-aware (CPU / Metal / CUDA-by-driver). The
 /// F7 decode-regression gate is llama-server-only: skipped, and SAID so
-/// (never silently) — llama-bench cannot drive a mistral.rs child.
+/// (never silently) - llama-bench cannot drive a mistral.rs child.
 async fn engine_install_mistralrs(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
     let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
@@ -16881,7 +16881,7 @@ async fn engine_install_mistralrs(d: &BlazarDirs, tag: Option<String>) -> Result
     println!(
         "{}",
         dim_line(
-            "note: decode-regression gate is llama-server-only — skipped for mistral.rs engines"
+            "note: decode-regression gate is llama-server-only - skipped for mistral.rs engines"
         )
     );
     // Same one-build-per-lane contract as the llamacpp/sglang lanes:
@@ -16900,17 +16900,17 @@ async fn engine_install_mistralrs(d: &BlazarDirs, tag: Option<String>) -> Result
     Ok(())
 }
 
-/// `blazar engine update --kind mistralrs [tag]` — lane parity with the
+/// `blazar engine update --kind mistralrs [tag]` - lane parity with the
 /// llamacpp update: a bare call probes mistral.rs GitHub currency and
 /// installs the newest release when one exists (flags are probed fresh
-/// at install, so there is no pinned flag contract to protect — unlike
+/// at install, so there is no pinned flag contract to protect - unlike
 /// the sglang venv lane); an explicit `vX.Y.Z` tag force-installs that
 /// release. `--check` resolves and reports, installing nothing.
 async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: bool) -> Result<()> {
     let store = Store::open(d)?;
     let Some(installed) = newest_mistralrs_tag(&store)? else {
         return Err(anyhow!(
-            "no mistralrs engine installed — `blazar engine install --kind mistralrs` first"
+            "no mistralrs engine installed - `blazar engine install --kind mistralrs` first"
         ));
     };
     let pinned = tag.is_some();
@@ -16926,7 +16926,7 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
         match fetched {
             Ok(rel) => rel.tag_name,
             Err(e) => anyhow::bail!(
-                "cannot check mistral.rs releases: {e:#} — {}",
+                "cannot check mistral.rs releases: {e:#} - {}",
                 gh_offline_hint().await
             ),
         }
@@ -16958,10 +16958,10 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
     engine_install_mistralrs(d, Some(target)).await
 }
 
-/// `blazar engine install --kind sdcpp [tag]` — prebuilt sd-server from
+/// `blazar engine install --kind sdcpp [tag]` - prebuilt sd-server from
 /// leejet/stable-diffusion.cpp. Vulkan-first asset pick covers every
 /// GPU vendor; CPU fallback where no GPU build matched. The F7
-/// decode-regression gate is llama-server-only: skipped, and SAID so —
+/// decode-regression gate is llama-server-only: skipped, and SAID so -
 /// llama-bench cannot drive an sd-server child.
 async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
@@ -16983,7 +16983,7 @@ async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()>
     );
     println!(
         "{}",
-        dim_line("note: decode-regression gate is llama-server-only — skipped for sd.cpp engines")
+        dim_line("note: decode-regression gate is llama-server-only - skipped for sd.cpp engines")
     );
     // Same one-build-per-lane contract as the other engine lanes:
     // superseded sd.cpp dirs free their space on a successful install.
@@ -17000,16 +17000,16 @@ async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()>
     Ok(())
 }
 
-/// `blazar engine update --kind sdcpp [tag]` — currency lane parity with
+/// `blazar engine update --kind sdcpp [tag]` - currency lane parity with
 /// mistral.rs: a bare call probes sd.cpp GitHub and installs the newest
 /// `master-NNN-<sha8>` release when one exists; an explicit tag
-/// force-installs it. sd.cpp cuts no semver — the tag counter is the
+/// force-installs it. sd.cpp cuts no semver - the tag counter is the
 /// ordering (see `sdtag_counter`). `--check` resolves and reports only.
 async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -> Result<()> {
     let store = Store::open(d)?;
     let Some(installed) = newest_sdcpp_tag(&store)? else {
         return Err(anyhow!(
-            "no sdcpp engine installed — `blazar engine install --kind sdcpp` first"
+            "no sdcpp engine installed - `blazar engine install --kind sdcpp` first"
         ));
     };
     let pinned = tag.is_some();
@@ -17018,14 +17018,14 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
     } else {
         // Currency probe: live latest-tag resolve under the shared
         // bounded-retry policy (same policy as the mistral.rs row;
-        // sd.cpp releases are frequent — often several per day around
+        // sd.cpp releases are frequent - often several per day around
         // new-model support).
         let mgr = local_engine_manager(d)?;
         let fetched = mgr.gh.latest_sdcpp_release().await;
         match fetched {
             Ok(rel) => rel.tag_name,
             Err(e) => anyhow::bail!(
-                "cannot check sd.cpp releases: {e:#} — {}",
+                "cannot check sd.cpp releases: {e:#} - {}",
                 gh_offline_hint().await
             ),
         }
@@ -17038,7 +17038,7 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
         (Some(a), Some(b)) if b > a
     );
     // sd.cpp re-uploads assets to the same live master release several
-    // times a day — the tag counter cannot see a backend appearing. A
+    // times a day - the tag counter cannot see a backend appearing. A
     // NVIDIA box that installed vulkan must still pick up a CUDA
     // prebuilt the day it ships, so the "stays" branches re-ask the
     // picker what it WOULD choose for the same tag.
@@ -17056,7 +17056,7 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
             println!(
                 "{}",
                 warn_line(&format!(
-                    "backend check failed: {e:#} — staying on {installed}"
+                    "backend check failed: {e:#} - staying on {installed}"
                 ))
             );
             None
@@ -17073,7 +17073,7 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
             println!("  blazar engine update --kind sdcpp {target}");
         } else if switches {
             println!(
-                "would switch backend: {} -> {} — same tag {installed}",
+                "would switch backend: {} -> {} - same tag {installed}",
                 installed_label.as_deref().unwrap_or("?"),
                 would_label.unwrap_or("?")
             );
@@ -17087,7 +17087,7 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
             println!(
                 "{}",
                 ok_line(&format!(
-                    "backend changed: {} -> {} — updating sd.cpp {installed} (same tag)",
+                    "backend changed: {} -> {} - updating sd.cpp {installed} (same tag)",
                     installed_label.as_deref().unwrap_or("?"),
                     would_label.unwrap_or("?")
                 ))
@@ -17100,7 +17100,7 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
     engine_install_sdcpp(d, Some(target)).await
 }
 
-/// `blazar engine install --kind whisper [tag]` — prebuilt
+/// `blazar engine install --kind whisper [tag]` - prebuilt
 /// whisper-server from ggml-org/whisper.cpp (b-tag releases; the v-tags
 /// are source-only). Serving is CPU-contract, so the asset pick is
 /// platform-shaped. The F7 decode-regression gate is llama-server-only:
@@ -17124,7 +17124,7 @@ async fn engine_install_whisper(d: &BlazarDirs, tag: Option<String>) -> Result<(
     );
     println!(
         "{}",
-        dim_line("note: decode-regression gate is llama-server-only — skipped for whisper engines")
+        dim_line("note: decode-regression gate is llama-server-only - skipped for whisper engines")
     );
     // Same one-build-per-lane contract as the other engine lanes.
     for (tag, bytes) in mgr.prune_siblings(EngineKind::Whisper.as_str(), &row.tag)? {
@@ -17139,7 +17139,7 @@ async fn engine_install_whisper(d: &BlazarDirs, tag: Option<String>) -> Result<(
     Ok(())
 }
 
-/// `blazar engine update --kind whisper [tag]` — currency lane parity:
+/// `blazar engine update --kind whisper [tag]` - currency lane parity:
 /// a bare call probes whisper.cpp GitHub and installs the newest `bNNNN`
 /// release when one exists; an explicit tag force-installs it. The
 /// b-counter is the ordering (see `btag_number`). `--check` resolves and
@@ -17148,7 +17148,7 @@ async fn engine_update_whisper(d: &BlazarDirs, tag: Option<String>, check: bool)
     let store = Store::open(d)?;
     let Some(installed) = newest_whisper_tag(&store)? else {
         return Err(anyhow!(
-            "no whisper engine installed — `blazar engine install --kind whisper` first"
+            "no whisper engine installed - `blazar engine install --kind whisper` first"
         ));
     };
     let pinned = tag.is_some();
@@ -17163,7 +17163,7 @@ async fn engine_update_whisper(d: &BlazarDirs, tag: Option<String>, check: bool)
         match fetched {
             Ok(rel) => rel.tag_name,
             Err(e) => anyhow::bail!(
-                "cannot check whisper.cpp releases: {e:#} — {}",
+                "cannot check whisper.cpp releases: {e:#} - {}",
                 gh_offline_hint().await
             ),
         }
@@ -17196,9 +17196,9 @@ async fn engine_update_whisper(d: &BlazarDirs, tag: Option<String>, check: bool)
 }
 
 /// `blazar engine install --kind piper [tag]` / `blazar tts --install
-/// [--tag]` — prebuilt piper CLI from rhasspy/piper (date-shaped tags,
+/// [--tag]` - prebuilt piper CLI from rhasspy/piper (date-shaped tags,
 /// one CPU asset per platform). A lazy audio lane: the row never takes
-/// the serving-active flag — serving resolves pin-first through
+/// the serving-active flag - serving resolves pin-first through
 /// `/v1/audio/speech`. The F7 decode-regression gate is
 /// llama-server-only: skipped, and SAID so.
 async fn engine_install_piper(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
@@ -17220,7 +17220,7 @@ async fn engine_install_piper(d: &BlazarDirs, tag: Option<String>) -> Result<()>
     );
     println!(
         "{}",
-        dim_line("note: decode-regression gate is llama-server-only — skipped for piper engines")
+        dim_line("note: decode-regression gate is llama-server-only - skipped for piper engines")
     );
     // Same one-build-per-lane contract as the other engine lanes.
     for (tag, bytes) in mgr.prune_siblings(EngineKind::Piper.as_str(), &row.tag)? {
@@ -17235,7 +17235,7 @@ async fn engine_install_piper(d: &BlazarDirs, tag: Option<String>) -> Result<()>
     Ok(())
 }
 
-/// `blazar engine update --kind piper [tag]` — currency lane parity:
+/// `blazar engine update --kind piper [tag]` - currency lane parity:
 /// a bare call probes rhasspy/piper and installs the newest date-tagged
 /// release when one exists; an explicit tag force-installs it. The
 /// date tag is the ordering (see `piper::tag_key`). `--check` resolves
@@ -17244,7 +17244,7 @@ async fn engine_update_piper(d: &BlazarDirs, tag: Option<String>, check: bool) -
     let store = Store::open(d)?;
     let Some(installed) = newest_piper_tag(&store)? else {
         return Err(anyhow!(
-            "no piper engine installed — `blazar engine install --kind piper` (or `blazar \
+            "no piper engine installed - `blazar engine install --kind piper` (or `blazar \
              tts --install`) first"
         ));
     };
@@ -17259,7 +17259,7 @@ async fn engine_update_piper(d: &BlazarDirs, tag: Option<String>, check: bool) -
         match fetched {
             Ok(rel) => rel.tag_name,
             Err(e) => anyhow::bail!(
-                "cannot check rhasspy/piper releases: {e:#} — {}",
+                "cannot check rhasspy/piper releases: {e:#} - {}",
                 gh_offline_hint().await
             ),
         }
@@ -17303,7 +17303,7 @@ fn newest_mistralrs_tag(store: &Store) -> Result<Option<String>> {
         .map(|e| e.tag.clone()))
 }
 
-/// Newest installed sd.cpp tag (`master-NNN-<sha8>`) by tag counter —
+/// Newest installed sd.cpp tag (`master-NNN-<sha8>`) by tag counter -
 /// the same role `newest_mistralrs_tag` plays for the semver lane.
 fn newest_sdcpp_tag(store: &Store) -> Result<Option<String>> {
     Ok(store
@@ -17318,7 +17318,7 @@ fn newest_sdcpp_tag(store: &Store) -> Result<Option<String>> {
 /// BOTH the installed backend label and the label the picker would
 /// choose right now, and they differ (e.g. `vulkan` installed, upstream
 /// just added a CUDA prebuilt to the same live master release). An
-/// unknown label on either side keeps the current build — no switch on
+/// unknown label on either side keeps the current build - no switch on
 /// guesswork.
 fn sdcpp_same_tag_switches(installed: Option<&str>, would: Option<&str>) -> bool {
     match (installed, would) {
@@ -17327,7 +17327,7 @@ fn sdcpp_same_tag_switches(installed: Option<&str>, would: Option<&str>) -> bool
     }
 }
 
-/// Newest installed whisper tag (`bNNNN`) by build counter — mirrors
+/// Newest installed whisper tag (`bNNNN`) by build counter - mirrors
 /// `newest_sdcpp_tag` for the b-tag lane (v-tags ship source only).
 fn newest_whisper_tag(store: &Store) -> Result<Option<String>> {
     Ok(store
@@ -17338,7 +17338,7 @@ fn newest_whisper_tag(store: &Store) -> Result<Option<String>> {
         .map(|e| e.tag.clone()))
 }
 
-/// Newest installed piper tag (`YYYY.MM.DD-N` date shape) by date key —
+/// Newest installed piper tag (`YYYY.MM.DD-N` date shape) by date key -
 /// mirrors `newest_whisper_tag` for the piper lane. Non-conforming tags
 /// rank as zero, so a malformed row can never win the currency pick.
 fn newest_piper_tag(store: &Store) -> Result<Option<String>> {
@@ -17350,8 +17350,8 @@ fn newest_piper_tag(store: &Store) -> Result<Option<String>> {
         .map(|e| e.tag.clone()))
 }
 
-/// `v0.10.0` → `(0, 10, 0)` — numeric, so v0.10 beats v0.9 where string
-/// compare would not. Non-semver tags (`local`) → `None` so callers
+/// `v0.10.0` -> `(0, 10, 0)` - numeric, so v0.10 beats v0.9 where string
+/// compare would not. Non-semver tags (`local`) -> `None` so callers
 /// degrade to equality instead of mis-ranking.
 fn mistralrs_version_tuple(tag: &str) -> Option<(u64, u64, u64)> {
     let mut parts = tag.strip_prefix('v')?.split('.');
@@ -17365,10 +17365,10 @@ fn mistralrs_version_tuple(tag: &str) -> Option<(u64, u64, u64)> {
     Some((tuple[0], tuple[1], tuple[2]))
 }
 
-/// `blazar engine update --kind sglang [version]` — pip venv lane
+/// `blazar engine update --kind sglang [version]` - pip venv lane
 /// (Linux + CUDA/ROCm). Multi-GB download: torch rides the venv. The
 /// F7 decode-regression gate is llama-server-only: skipped, and SAID
-/// so — llama-bench cannot drive an sglang child.
+/// so - llama-bench cannot drive an sglang child.
 async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
     let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
@@ -17376,13 +17376,13 @@ async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Resul
         println!(
             "{}",
             dim_line(&format!(
-                "installing sglang {v} (pip venv lane — multi-GB download incl. torch)"
+                "installing sglang {v} (pip venv lane - multi-GB download incl. torch)"
             ))
         );
     } else {
         println!(
             "{}",
-            dim_line("installing sglang (pip venv lane — multi-GB download incl. torch)")
+            dim_line("installing sglang (pip venv lane - multi-GB download incl. torch)")
         );
     }
     let row = mgr.install_sglang(version.as_deref()).await?;
@@ -17395,7 +17395,7 @@ async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Resul
     );
     println!(
         "{}",
-        dim_line("note: decode-regression gate is llama-server-only — skipped for sglang engines")
+        dim_line("note: decode-regression gate is llama-server-only - skipped for sglang engines")
     );
     // Same one-build-per-lane contract as the llama-server update: the
     // superseded sglang venvs (multi-GB each) are freed on a successful
@@ -17425,13 +17425,13 @@ async fn engine_install_mlx(d: &BlazarDirs, version: Option<String>) -> Result<(
         println!(
             "{}",
             dim_line(&format!(
-                "installing mlx-lm {v} (pip venv lane — multi-GB download incl. CUDA wheels)"
+                "installing mlx-lm {v} (pip venv lane - multi-GB download incl. CUDA wheels)"
             ))
         );
     } else {
         println!(
             "{}",
-            dim_line("installing mlx-lm (pip venv lane — multi-GB download incl. CUDA wheels)")
+            dim_line("installing mlx-lm (pip venv lane - multi-GB download incl. CUDA wheels)")
         );
     }
     let row = mgr.install_mlx(version.as_deref()).await?;
@@ -17444,7 +17444,7 @@ async fn engine_install_mlx(d: &BlazarDirs, version: Option<String>) -> Result<(
     );
     println!(
         "{}",
-        dim_line("note: decode-regression gate is llama-server-only — skipped for mlx engines")
+        dim_line("note: decode-regression gate is llama-server-only - skipped for mlx engines")
     );
     // Same one-build-per-lane contract: superseded mlx venvs (multi-GB
     // each) are freed on a successful install/activate.
@@ -17468,7 +17468,7 @@ async fn engine_install_mlx(d: &BlazarDirs, version: Option<String>) -> Result<(
     Ok(())
 }
 
-/// `engine update --kind mlx [version]` — explicit version installs
+/// `engine update --kind mlx [version]` - explicit version installs
 /// directly; bare call resolves the `PyPI` latest and installs it, the
 /// same lane semantics as sglang. `--check` stays a dry-run currency
 /// report. The version pin (`MLX_LM_DEFAULT_VERSION`) anchors fresh
@@ -17493,7 +17493,7 @@ async fn engine_update_mlx(d: &BlazarDirs, version: Option<String>, check: bool)
         .map(|e| e.tag.trim_start_matches("mlx-").to_string());
     let Some(installed) = installed else {
         return Err(anyhow!(
-            "no mlx engine installed — `blazar engine install --kind mlx` first"
+            "no mlx engine installed - `blazar engine install --kind mlx` first"
         ));
     };
     let latest = match blazar_runtime::engine::mlx_install::pypi_latest_mlx_lm().await {
@@ -17533,7 +17533,7 @@ async fn engine_update_mlx(d: &BlazarDirs, version: Option<String>, check: bool)
     Ok(())
 }
 
-/// `engine update --kind sglang [version]` — explicit version installs
+/// `engine update --kind sglang [version]` - explicit version installs
 /// directly; bare call resolves the `PyPI` latest and installs it, the
 /// same lane semantics as mistralrs/sd.cpp/whisper. `--check` stays a
 /// dry-run currency report. The flag-contract pin
@@ -17561,7 +17561,7 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
         .map(|e| e.tag.trim_start_matches("sglang-").to_string());
     let Some(installed) = installed else {
         return Err(anyhow!(
-            "no sglang engine installed — `blazar engine install --kind sglang` first"
+            "no sglang engine installed - `blazar engine install --kind sglang` first"
         ));
     };
     let latest = match blazar_runtime::engine::sglang_install::pypi_latest_sglang().await {
@@ -17573,7 +17573,7 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
     };
     let pinned = blazar_runtime::engine::sglang_install::SGLANG_DEFAULT_VERSION;
     let flag_contract_note = format!(
-        "note: this Blazar build verifies the sglang flag contract on {pinned} — \
+        "note: this Blazar build verifies the sglang flag contract on {pinned} - \
          newer versions run with unknown flags skipped (profile warnings)"
     );
     match (
@@ -17608,7 +17608,7 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
     Ok(())
 }
 
-/// `blazar engine update` — install + activate the newest (or given)
+/// `blazar engine update` - install + activate the newest (or given)
 /// upstream build, gated by the F7 decode-regression bench.
 /// Backend a source-built engine was compiled with, from its asset
 /// (`built-cuda` / `built-cpu`, exactly as `build_and_install` writes it).
@@ -17622,7 +17622,7 @@ fn built_backend(asset: &str) -> Option<BuildBackend> {
 
 /// Fix A eligibility: route `engine update` to the local build lane when
 /// the active engine is source-built, the channel target is a NEWER
-/// upstream build, and the asset config pins no prebuilt lane — the
+/// upstream build, and the asset config pins no prebuilt lane - the
 /// state where the prebuilt overlay is dead and Update used to no-op
 /// with a dead-end hint. Returns the backend to compile.
 fn build_lane_routing(
@@ -17644,7 +17644,7 @@ fn build_lane_routing(
 
 /// Fix A delegation: when Update would no-op behind a dead prebuilt
 /// lane (see `build_lane_routing`), hand off to the `engine build` flow
-/// — inheriting its F7 gate, progress lines, and restart hint. Returns
+/// - inheriting its F7 gate, progress lines, and restart hint. Returns
 /// `true` when this call produced the command's final output (caller
 /// returns immediately); `false` = routing did not apply.
 async fn route_update_to_build(
@@ -17662,7 +17662,7 @@ async fn route_update_to_build(
     match require_toolchain(&tc, backend) {
         Ok(()) => {
             println!(
-                "engine {active_tag} -> {target_tag}: no prebuilt asset published — \
+                "engine {active_tag} -> {target_tag}: no prebuilt asset published - \
                  building {} locally (source lane)",
                 backend.as_str()
             );
@@ -17686,7 +17686,7 @@ async fn route_update_to_build(
         }
         Err(e) => {
             println!(
-                "engine {active_tag} already active — nothing new installed; to build \
+                "engine {active_tag} already active - nothing new installed; to build \
                  {target_tag} locally, the toolchain is missing:"
             );
             println!("  {e}");
@@ -17717,7 +17717,7 @@ fn installed_engine_kinds(rows: &[blazar_core::EngineRow]) -> Vec<EngineKind> {
 ///
 /// The pre-walk lane stays the user's lane: if a lane install switched
 /// the active tag to another kind, the walk restores the snapshot kind
-/// — at its NEWEST build when the update pruned the exact snapshot tag
+/// - at its NEWEST build when the update pruned the exact snapshot tag
 /// (same semantics as `engine use --kind`). A same-kind change is the
 /// lane's own update and stays. With no pre-walk active engine, the
 /// default llamacpp lane wins when installed. `None` = leave the store
@@ -17749,7 +17749,7 @@ fn restore_active_tag(
 /// `engine update --all`: one-shot currency sweep over every installed
 /// lane. Absent lanes are skipped (installing a lane is a separate
 /// decision), current lanes no-op inside their own update path, and a
-/// failing lane is recorded while the walk continues — the summary
+/// failing lane is recorded while the walk continues - the summary
 /// names the failures and the exit code stays non-zero. The user's
 /// active lane is preserved: a lane install that flips the active tag
 /// to its own kind is restored to the pre-walk lane (newest build of
@@ -17758,7 +17758,7 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
     let store = Store::open(d)?;
     let kinds = installed_engine_kinds(&store.list_engines()?);
     if kinds.is_empty() {
-        anyhow::bail!("no engines installed — `blazar engine update` installs the llama.cpp lane");
+        anyhow::bail!("no engines installed - `blazar engine update` installs the llama.cpp lane");
     }
     // Snapshot BEFORE any lane can flip the active tag: (tag, kind).
     let before = store.active_engine()?.map(|r| (r.tag, r.kind));
@@ -17782,7 +17782,7 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
         if let Err(e) = result {
             // The per-lane error may already carry a live network
             // diagnosis (the "cannot check X releases" wrappers append
-            // one); llamacpp's raw propagation does not — append it
+            // one); llamacpp's raw propagation does not - append it
             // exactly once, and only when a diagnosis exists.
             let text = format!("{e:#}");
             let suffix = if text.contains("egress") || text.contains("captive portal") {
@@ -17792,7 +17792,7 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
                 if hint.is_empty() {
                     String::new()
                 } else {
-                    format!(" — {hint}")
+                    format!(" - {hint}")
                 }
             };
             eprintln!("lane {} failed: {text}{suffix}", kind.as_str());
@@ -17827,7 +17827,7 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
     Ok(())
 }
 
-/// `blazar engine update [tag]` — update the active lane, or every
+/// `blazar engine update [tag]` - update the active lane, or every
 /// installed lane with `--all` (fixed walk order, failures named in the
 /// summary while the walk continues).
 // One dispatcher per lane kind plus the --all walk; each arm is a flat
@@ -17877,7 +17877,7 @@ async fn engine_update(
     };
     // Stable-name context for every report below: upstream's newest
     // non-prerelease vX.Y.Z marker names the b-build it stamps, so
-    // "b11429" can read as "stable v0.6.0". Advisory only — a failed
+    // "b11429" can read as "stable v0.6.0". Advisory only - a failed
     // marker fetch (offline, rate limited) never blocks the update.
     let stable = match mgr.gh.stable_marker().await {
         Ok(m) => m,
@@ -17888,19 +17888,19 @@ async fn engine_update(
     };
     if check {
         // Dry-run: report the channel target and the prebuilt-asset story
-        // for THIS box, then leave — nothing downloaded or written.
+        // for THIS box, then leave - nothing downloaded or written.
         let release = match resolved {
             Some(rel) => rel,
             None => mgr.gh.resolve_tag(&target_tag).await?,
         };
         let lane = mgr.check_lane(&release, !from_channel).await?;
         println!(
-            "update check — llamacpp lane, channel {}",
+            "update check - llamacpp lane, channel {}",
             cfg.update_channel
         );
         match active_tag.as_deref() {
             // Lane-suffixed active tags (b11339-cuda) are the same
-            // build as the channel target (b11339) — raw string
+            // build as the channel target (b11339) - raw string
             // equality would report an update forever on CUDA boxes.
             Some(a) if same_build(a, &target_tag) => {
                 println!(
@@ -17912,51 +17912,51 @@ async fn engine_update(
                 "update available: {a} -> {target_tag}{}{}",
                 stable_alias_paren(stable.as_ref(), &target_tag),
                 if downgrade {
-                    " (channel downgrade — channels are pins, not floors)"
+                    " (channel downgrade - channels are pins, not floors)"
                 } else {
                     ""
                 }
             ),
             None => println!(
-                "no active engine — target {target_tag}{}",
+                "no active engine - target {target_tag}{}",
                 stable_alias_paren(stable.as_ref(), &target_tag)
             ),
         }
         if let (Some((maj, min)), Some(pick)) = (&lane.driver_cuda, &lane.upstream_cuda) {
             println!(
-                "driver CUDA {maj}.{min} — upstream official CUDA asset for this box: {} ({})",
+                "driver CUDA {maj}.{min} - upstream official CUDA asset for this box: {} ({})",
                 pick.name, pick.label
             );
         }
         match (&lane.driver_cuda, &lane.cuda_asset) {
             (Some((maj, min)), Some(pick)) => println!(
-                "driver CUDA {maj}.{min} — prebuilt asset for this box: {} ({})",
+                "driver CUDA {maj}.{min} - prebuilt asset for this box: {} ({})",
                 pick.name, pick.label
             ),
             (Some((maj, min)), None) => match lane.overlay_tag {
                 Some(overlay) => match lane.newest_cuda {
                     Some((need_maj, need_min)) => println!(
                         "overlay {overlay} published, but its CUDA {need_maj}.{need_min} assets \
-                         exceed this driver ({maj}.{min}) — `blazar engine build cuda` compiles \
+                         exceed this driver ({maj}.{min}) - `blazar engine build cuda` compiles \
                          locally for this driver"
                     ),
                     None => println!(
-                        "no CUDA overlay release {overlay} published yet — rerun after \
+                        "no CUDA overlay release {overlay} published yet - rerun after \
                          the overlay publishes, or `blazar engine build cuda`"
                     ),
                 },
                 None => match lane.upstream_cuda {
                     Some(_) => println!(
-                        "driver CUDA {maj}.{min} — no overlay repo configured; the \
+                        "driver CUDA {maj}.{min} - no overlay repo configured; the \
                          upstream official CUDA asset above serves this update"
                     ),
                     None => println!(
-                        "driver CUDA {maj}.{min} — no runnable prebuilt CUDA asset for \
+                        "driver CUDA {maj}.{min} - no runnable prebuilt CUDA asset for \
                          this box; the standard asset lane would serve this update"
                     ),
                 },
             },
-            (None, _) => println!("no NVIDIA driver detected — standard asset lane applies"),
+            (None, _) => println!("no NVIDIA driver detected - standard asset lane applies"),
         }
         println!(
             "{}",
@@ -17970,7 +17970,7 @@ async fn engine_update(
         Some(rel) => println!(
             "{}",
             dim_line(&format!(
-                "installing upstream engine {}{} — runtime companion downloads show their own progress bar",
+                "installing upstream engine {}{} - runtime companion downloads show their own progress bar",
                 rel.tag_name,
                 stable_alias_paren(stable.as_ref(), &rel.tag_name)
             ))
@@ -17978,7 +17978,7 @@ async fn engine_update(
         None => println!(
             "{}",
             dim_line(
-                "installing upstream engine — runtime companion downloads show their own progress bar"
+                "installing upstream engine - runtime companion downloads show their own progress bar"
             )
         ),
     }
@@ -17990,7 +17990,7 @@ async fn engine_update(
     // active engine: nothing new was installed, so there is no fresh
     // binary to gate, compare, or restart the daemon for.
     let unchanged = active_tag.as_deref() == Some(row.tag.as_str());
-    // F7 gate (FIX5): DEFAULT-config tg128 on BOTH engines —
+    // F7 gate (FIX5): DEFAULT-config tg128 on BOTH engines -
     // comparing new-default vs baseline-argmax was apples-to-
     // oranges, biased to trip. Baseline = most recent tune row.
     // Skip: --no-gate, BLAZAR_ENGINE_GATE=0, or channel
@@ -18018,20 +18018,20 @@ async fn engine_update(
             return Ok(());
         }
         println!(
-            "engine {}{} already active — nothing new installed (see the warning above for lane options)",
+            "engine {}{} already active - nothing new installed (see the warning above for lane options)",
             row.tag,
             stable_alias_paren(stable.as_ref(), &row.tag)
         );
     } else if gate_on {
         engine_regression_gate(&mgr, d, &row)?;
     } else if downgrade {
-        println!("channel switch: downgrade to {target_tag} — regression gate skipped");
+        println!("channel switch: downgrade to {target_tag} - regression gate skipped");
     } else {
         println!("engine {} installed; regression gate skipped", row.tag);
     }
     // A verified, ACTIVE update leaves exactly one build per lane: the
     // superseded same-kind siblings (the KEEP_TAGS retention copies) are
-    // deleted outright — "engine update should clean the old builds".
+    // deleted outright - "engine update should clean the old builds".
     // Non-active updates (keep-CUDA guard) keep the incumbent; the gate
     // failure path returns Err above and never reaches this line.
     let mut freed_gib = 0.0;
@@ -18070,7 +18070,7 @@ async fn engine_update(
         // keep-cuda guard fired: an installed CUDA engine stays active.
         println!(
             "engine {} registered (build {}, {} devices, {} flags); the active CUDA \
-             engine was kept — run `blazar engine use {}` to switch",
+             engine was kept - run `blazar engine use {}` to switch",
             row.tag,
             m.build_number,
             m.devices.len(),
@@ -18083,7 +18083,7 @@ async fn engine_update(
     Ok(())
 }
 
-/// `blazar engine build` — compile llama.cpp from source into an
+/// `blazar engine build` - compile llama.cpp from source into an
 /// installable engine (see `engine::build`), then the same F7 gate and
 /// summary as `engine update`. With `--fork`/`--repo`+`--ref` the
 /// source is an immutable fork pin instead of an upstream b-tag.
@@ -18115,7 +18115,7 @@ fn fork_lane_source(a: &BackendArg) -> Result<Option<BuildSource>> {
         return Ok(None);
     };
     println!(
-        "TRUST: building code from fork {repo}@{sha} — it compiles and runs on this \
+        "TRUST: building code from fork {repo}@{sha} - it compiles and runs on this \
          machine with your privileges. Only build forks you trust. The pin is immutable \
          (commit {sha}); Blazar records but cannot audit fork code."
     );
@@ -18154,7 +18154,7 @@ fn engine_gate_on(
 /// count, and how to pin a model onto the lane permanently.
 fn print_fork_lane_howto(row: &blazar_core::EngineRow, m: &blazar_runtime::Manifest) {
     println!(
-        "fork lane {} — {}, advertises {} architectures (from the source's llama-arch.cpp)",
+        "fork lane {} - {}, advertises {} architectures (from the source's llama-arch.cpp)",
         row.tag,
         m.provenance_label(),
         m.architectures.len()
@@ -18186,7 +18186,7 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
     let backend = match a.backend.as_str() {
         "cuda" => BuildBackend::Cuda,
         "cpu" => BuildBackend::Cpu,
-        other => return Err(anyhow!("unknown backend {other:?} — supported: cuda, cpu")),
+        other => return Err(anyhow!("unknown backend {other:?} - supported: cuda, cpu")),
     };
     let source = fork_lane_source(&a)?.unwrap_or(BuildSource::Upstream);
     let fork = matches!(source, BuildSource::Fork { .. });
@@ -18208,7 +18208,7 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
     }
     let lane_word = if fork { " fork lane" } else { "" };
     println!(
-        "building llama.cpp{lane_word} {resolved} (backend {}, from source — this needs \
+        "building llama.cpp{lane_word} {resolved} (backend {}, from source - this needs \
          git + cmake + a C++ compiler{cuda_note})",
         backend.as_str(),
         cuda_note = if backend == BuildBackend::Cuda {
@@ -18242,7 +18242,7 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
         engine_regression_gate(&mgr, d, &row)?;
     } else if fork {
         println!(
-            "engine {} installed; regression gate skipped (fork lane — outside the \
+            "engine {} installed; regression gate skipped (fork lane - outside the \
              upstream b-tag currency)",
             row.tag
         );
@@ -18265,7 +18265,7 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
         );
         // One-build-per-lane contract (see `engine_update`): a freshly
         // built AND activated engine frees its superseded siblings.
-        // Fork lanes are additive — they never trigger sibling cleanup
+        // Fork lanes are additive - they never trigger sibling cleanup
         // (the mainstream line must survive a fork install untouched).
         if !fork {
             for (tag, bytes) in mgr.prune_siblings(row.kind.as_str(), &row.tag)? {
@@ -18283,7 +18283,7 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
         // keep-cuda guard fired: an installed CUDA engine stays active.
         println!(
             "engine {} registered (build {}, {} devices, {} flags); the active CUDA \
-             engine was kept — run `blazar engine use {}` to switch",
+             engine was kept - run `blazar engine use {}` to switch",
             row.tag,
             m.build_number,
             m.devices.len(),
@@ -18302,7 +18302,7 @@ async fn engine_build(d: &BlazarDirs, a: BackendArg) -> Result<()> {
 /// Shared post-install/startup supersede pass: mine mainstream lanes
 /// that arrived as binaries (empty architecture sets), re-check fork
 /// coverage, and sweep retired curated lanes past their grace window.
-/// Failures are maintenance noise — the triggering action already
+/// Failures are maintenance noise - the triggering action already
 /// succeeded, so this never fails the caller.
 async fn refresh_after_lane_change(mgr: &EngineManager, cfg: &blazar_core::Config) {
     let pinned: Vec<String> = cfg
@@ -18318,7 +18318,7 @@ async fn refresh_after_lane_change(mgr: &EngineManager, cfg: &blazar_core::Confi
     }
 }
 
-/// `blazar engine offers` — the curated-lane catalog from the
+/// `blazar engine offers` - the curated-lane catalog from the
 /// capability registry, optionally filtered to one architecture.
 async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
     use blazar_runtime::engine::capability_registry as reg;
@@ -18326,7 +18326,7 @@ async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
     let Some(url) = reg::resolve_registry_url(cfg.capability_registry_url.as_deref()) else {
         return Err(anyhow!(
             "capability registry is disabled (capability_registry_url = \"\" or \
-             BLAZAR_CAPABILITY_REGISTRY = \"\") — unset the knob to use the default registry"
+             BLAZAR_CAPABILITY_REGISTRY = \"\") - unset the knob to use the default registry"
         ));
     };
     println!(
@@ -18386,7 +18386,7 @@ async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `blazar engine install --lane <id>` — build a curated capability
+/// `blazar engine install --lane <id>` - build a curated capability
 /// lane from the registry. Never a binary download: the registry
 /// publishes the pinned commit, the build happens locally, and the
 /// trust banner states exactly what that means.
@@ -18394,7 +18394,7 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
     use blazar_runtime::engine::capability_registry as reg;
     let cfg = config()?;
     let url = reg::resolve_registry_url(cfg.capability_registry_url.as_deref()).ok_or_else(
-        || anyhow!("capability registry is disabled — unset capability_registry_url / BLAZAR_CAPABILITY_REGISTRY"),
+        || anyhow!("capability registry is disabled - unset capability_registry_url / BLAZAR_CAPABILITY_REGISTRY"),
     )?;
     println!(
         "{}",
@@ -18402,15 +18402,15 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
     );
     let lanes = reg::fetch(reg::http(), &url).await?;
     let lane = lanes.iter().find(|l| l.id == lane_id).ok_or_else(|| {
-        anyhow!("no registry lane {lane_id:?} — `blazar engine offers` lists the catalog")
+        anyhow!("no registry lane {lane_id:?} - `blazar engine offers` lists the catalog")
     })?;
     if lane.status == reg::LaneStatus::Retired {
         return Err(anyhow!(
-            "registry lane {lane_id} is retired — upstream llama.cpp already ships this \
+            "registry lane {lane_id} is retired - upstream llama.cpp already ships this \
              capability; `blazar engine update` serves it"
         ));
     }
-    // Defense in depth: registry data is remote input — it never
+    // Defense in depth: registry data is remote input - it never
     // bypasses the fork validators.
     validate_repo_slug(&lane.repo)?;
     validate_commit_sha(&lane.ref_sha)?;
@@ -18422,7 +18422,7 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
         let advertised: Vec<String> = lane.backends.iter().cloned().collect();
         return Err(anyhow!(
             "registry lane {lane_id} does not advertise the {backend_name} backend \
-             (advertises: {}) — retry with --backend {}",
+             (advertises: {}) - retry with --backend {}",
             advertised.join(","),
             advertised.first().map_or("cpu", String::as_str)
         ));
@@ -18430,17 +18430,17 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
     let backend = match backend_name {
         "cuda" => BuildBackend::Cuda,
         "cpu" => BuildBackend::Cpu,
-        other => return Err(anyhow!("unknown backend {other:?} — supported: cuda, cpu")),
+        other => return Err(anyhow!("unknown backend {other:?} - supported: cuda, cpu")),
     };
     let sha8: String = lane.ref_sha.chars().take(8).collect();
     println!(
-        "TRUST: building code from fork {}@{} (curated registry lane {}) — it compiles and \
+        "TRUST: building code from fork {}@{} (curated registry lane {}) - it compiles and \
          runs on this machine with your privileges. Curated lanes are registry-published, \
          not Blazar-audited; the pin is immutable (commit {}).",
         lane.repo, sha8, lane.id, sha8
     );
     println!(
-        "building llama.cpp fork lane {lane_id} = {}@{} (backend {}, from source — this \
+        "building llama.cpp fork lane {lane_id} = {}@{} (backend {}, from source - this \
          needs git + cmake + a C++ compiler)",
         lane.repo,
         sha8,
@@ -18454,7 +18454,7 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
         bus: EventBus::default(),
         asset_override: cfg.engine_asset.clone(),
     };
-    // First-of-its-kind fork lanes activate; additive siblings do not —
+    // First-of-its-kind fork lanes activate; additive siblings do not -
     // the restart hook decides from the returned row, not the lane type.
     let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
     let mut opts = BuildOpts::new(backend, &lane.ref_sha);
@@ -18469,14 +18469,14 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
         .await?;
     let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
     println!(
-        "engine {} installed; regression gate skipped (curated lane — outside the upstream \
+        "engine {} installed; regression gate skipped (curated lane - outside the upstream \
          b-tag currency)",
         row.tag
     );
     print_fork_lane_howto(&row, &m);
     println!(
         "auto-retire: curated lanes are removed {} days after every architecture they serve \
-         ships upstream (fork_retire_days; 0 disables) — a model_overrides pin protects a lane",
+         ships upstream (fork_retire_days; 0 disables) - a model_overrides pin protects a lane",
         cfg.fork_retire_days
     );
     refresh_after_lane_change(&mgr, &cfg).await;
@@ -18520,7 +18520,7 @@ async fn upstream_update_hint(dirs: &BlazarDirs) {
             );
         } else {
             println!(
-                "{} available: {}{} (active: {}, channel: {}) — run: {}",
+                "{} available: {}{} (active: {}, channel: {}) - run: {}",
                 channel_word(&active.tag, &rel.tag_name),
                 rel.tag_name,
                 stable_alias_paren(stable.as_ref(), &rel.tag_name),
@@ -18534,7 +18534,7 @@ async fn upstream_update_hint(dirs: &BlazarDirs) {
 
 /// Background engine-currency check (`engine_check_secs`, default daily):
 /// asks GitHub for the newest llama.cpp b-release and writes a marker the
-/// doctor/ps surfaces read. Never auto-installs — `blazar engine update`
+/// doctor/ps surfaces read. Never auto-installs - `blazar engine update`
 /// stays a human action; failures log at debug and retry next tick.
 fn spawn_engine_check_task(
     dirs: &BlazarDirs,
@@ -18595,7 +18595,7 @@ fn spawn_engine_check_task(
                 };
                 tracing::warn!(
                     target: "blazar::engine",
-                    "engine check failed ({reason}) — retrying in 10 min"
+                    "engine check failed ({reason}) - retrying in 10 min"
                 );
                 delay = retry_delay;
                 continue;
@@ -18604,7 +18604,7 @@ fn spawn_engine_check_task(
             if newer {
                 tracing::info!(
                     target: "blazar::engine",
-                    "{} available: {} (active: {}, channel: {}) — run: {}",
+                    "{} available: {} (active: {}, channel: {}) - run: {}",
                     channel_word(&active.tag, &rel.tag_name),
                     rel.tag_name,
                     active.tag,
@@ -18615,7 +18615,7 @@ fn spawn_engine_check_task(
             // Child-context device census: the serving child's own view of
             // the GPU world. Doctor compares these against the install-time
             // (manifest) names to flag enumeration drift. A failed census
-            // writes null — drift detection simply waits for the next tick.
+            // writes null - drift detection simply waits for the next tick.
             let devices: Option<Vec<serde_json::Value>> =
                 engine.enumerate_devices().await.ok().flatten().map(|ds| {
                     ds.iter()
@@ -18641,8 +18641,8 @@ fn spawn_engine_check_task(
 }
 
 /// Persist the engine-check marker atomically (tmp + rename): a plain
-/// write racing a reader — or a second daemon generation during a
-/// restart — once left two concatenated JSON objects in the file.
+/// write racing a reader - or a second daemon generation during a
+/// restart - once left two concatenated JSON objects in the file.
 /// Readers see either the old or the new marker, never a mix.
 fn write_engine_check_marker(dirs: &BlazarDirs, marker: &serde_json::Value) {
     let path = dirs.run_dir().join("engine-check.json");
@@ -18680,13 +18680,13 @@ fn engine_prune(d: &BlazarDirs) -> Result<()> {
 }
 
 /// The prune report as a single line: per-tag reclaimed sizes for both
-/// retention-pruned engines and row-less dirs, closed by the total —
+/// retention-pruned engines and row-less dirs, closed by the total -
 /// the doctor warnings promise "reclaims disk", this says how much.
 fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
     let store = Store::open(d)?;
     let mgr = local_engine_manager(d)?;
     // Adopt-before-prune: a legacy audio tree that crashed between
-    // move and register is an unregistered engines/<tag> dir — exactly
+    // move and register is an unregistered engines/<tag> dir - exactly
     // what prune_orphan_dirs below deletes. Adopting first closes that
     // crash window; adopting any other leftover is a free heal.
     let mut adopted = mgr.adopt_whisper_legacy_trees();
@@ -18698,7 +18698,7 @@ fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
     let kept: Vec<String> = store.list_engines()?.into_iter().map(|e| e.tag).collect();
     if freed.is_empty() && orphans.is_empty() && adopted.is_empty() {
         return Ok(format!(
-            "nothing to prune — {} engines kept: {}",
+            "nothing to prune - {} engines kept: {}",
             kept.len(),
             kept.join(", ")
         ));
@@ -18730,7 +18730,7 @@ fn engine_prune_summary(d: &BlazarDirs) -> Result<String> {
         ));
     }
     Ok(format!(
-        "{} — reclaimed {} in total",
+        "{} - reclaimed {} in total",
         parts.join("; "),
         humansize(total.cast_signed())
     ))
@@ -18745,7 +18745,7 @@ fn engine_rm(d: &BlazarDirs, tag: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("no such engine: {tag} (see `blazar engine list`)"))?;
     if row.active {
         anyhow::bail!(
-            "engine {tag} is active — `blazar engine use <other>` first \
+            "engine {tag} is active - `blazar engine use <other>` first \
              (a running daemon must not lose its binary)"
         );
     }
@@ -18766,7 +18766,7 @@ fn engine_rm(d: &BlazarDirs, tag: &str) -> Result<()> {
 }
 
 /// Model names whose live child serves from `tag`, out of a daemon
-/// `/api/ps` document. Pure — unit-testable without a daemon.
+/// `/api/ps` document. Pure - unit-testable without a daemon.
 fn ps_rows_using_engine(ps: &serde_json::Value, tag: &str) -> Vec<String> {
     ps["models"].as_array().map_or(Vec::new(), |rows| {
         rows.iter()
@@ -18787,7 +18787,7 @@ fn any_child_pidfile(names: impl IntoIterator<Item = String>) -> bool {
     })
 }
 
-/// Refuse `engine rm` while a live child serves from the engine — the
+/// Refuse `engine rm` while a live child serves from the engine - the
 /// same contract as model rm. Exact answer from the daemon's `/api/ps`
 /// (`blazar_engine` per row); when the daemon is not answering, any
 /// leftover child pidfile means children may still run untracked
@@ -18813,7 +18813,7 @@ async fn refuse_if_engine_in_use(d: &BlazarDirs, tag: &str) -> Result<()> {
         let users = ps_rows_using_engine(&ps, tag);
         if !users.is_empty() {
             anyhow::bail!(
-                "engine {tag} is serving: {} — stop it first \
+                "engine {tag} is serving: {} - stop it first \
                  (`blazar stop <model>` or wait for idle eviction)",
                 users.join(", ")
             );
@@ -18828,7 +18828,7 @@ async fn refuse_if_engine_in_use(d: &BlazarDirs, tag: &str) -> Result<()> {
     });
     if child_pidfiles {
         anyhow::bail!(
-            "child pidfiles exist but the daemon is not answering — start the \
+            "child pidfiles exist but the daemon is not answering - start the \
              daemon once (its boot sweep terminates orphan children) and retry \
              `engine rm {tag}`"
         );
@@ -18857,7 +18857,7 @@ fn local_engine_manager(d: &BlazarDirs) -> Result<EngineManager> {
 /// lane split mirrors how the supervisor routes: a model row whose path
 /// is a directory serves on sglang (HF safetensors lane), a single
 /// checkpoint file serves on llamacpp/mistralrs (GGUF lane). File
-/// EXTENSION on the file lane is not policed — that is the store's
+/// EXTENSION on the file lane is not policed - that is the store's
 /// historical contract, the engine remains the authority there.
 fn validate_lora_attach(
     model: &str,
@@ -18866,13 +18866,13 @@ fn validate_lora_attach(
 ) -> Result<()> {
     let Some(row) = row else {
         bail!(
-            "no such model: {model} — attach adapters to a pulled model \
+            "no such model: {model} - attach adapters to a pulled model \
              (`blazar list`, `blazar pull`)"
         );
     };
     if !path.exists() {
         bail!(
-            "adapter path not found: {} — LoRA rows must point at a real \
+            "adapter path not found: {} - LoRA rows must point at a real \
              adapter (GGUF file or PEFT dir) so the engine can load it",
             path.display()
         );
@@ -18882,7 +18882,7 @@ fn validate_lora_attach(
         if !path.is_dir() || !path.join("adapter_config.json").exists() {
             bail!(
                 "model {model} serves from a safetensors dir (sglang engine): \
-                 attach a PEFT LoRA dir (one containing adapter_config.json) — \
+                 attach a PEFT LoRA dir (one containing adapter_config.json) - \
                  .gguf/.bin adapter files serve on the llamacpp engine"
             );
         }
@@ -18891,7 +18891,7 @@ fn validate_lora_attach(
         bail!(
             "model {model} serves from a single checkpoint file \
              (llamacpp/mistralrs engine): attach a .gguf/.bin adapter file, \
-             not a directory — PEFT adapter dirs serve on the sglang engine \
+             not a directory - PEFT adapter dirs serve on the sglang engine \
              (`blazar engine install --kind sglang`)"
         );
     }
@@ -18900,12 +18900,12 @@ fn validate_lora_attach(
 
 /// Follow-through for `lora add`/`lora rm` when the daemon is up:
 /// hot-attach (or detach) the adapter on a resident sglang base child
-/// without a respawn. Best-effort — a down daemon, a non-resident
+/// without a respawn. Best-effort - a down daemon, a non-resident
 /// model, or a lane that bakes adapters at spawn defers to the next
 /// spawn (the store row drives it). Prints the actionable outcomes: a
 /// hot attach/detach line, a child-side refusal (e.g. adapter rank
 /// above the spawn-time `--max-lora-rank`), or the deferred teaching
-/// (which names the resident's observed adapter set and the remedy —
+/// (which names the resident's observed adapter set and the remedy -
 /// staying silent there would hide why the attach did not go live).
 async fn notify_lora_sync(model: &str, action: &str, lora_name: &str, lora_path: &str) {
     let Some(base) = daemon_base_if_up().await else {
@@ -18939,11 +18939,11 @@ async fn notify_lora_sync(model: &str, action: &str, lora_name: &str, lora_path:
         Some("child_error") => {
             eprintln!(
                 "{}",
-                dim_line(&format!("daemon: adapter not live — {detail}"))
+                dim_line(&format!("daemon: adapter not live - {detail}"))
             );
         }
         // Deferred (lane bakes adapters at spawn / nothing to detach /
-        // no resident): print the teaching — it names the observed
+        // no resident): print the teaching - it names the observed
         // resident adapter set and the remedy, which is exactly what
         // the user needs the moment their attach did not go live.
         Some("ok") => {
@@ -18975,7 +18975,7 @@ async fn lora_cmd(cmd: LoraCmd) -> Result<()> {
             notify_lora_sync(&model, "add", &lora_name, &path.display().to_string()).await;
         }
         LoraCmd::Rm { id } => {
-            // Capture the row before the delete — the daemon sync names
+            // Capture the row before the delete - the daemon sync names
             // the adapter by its path's file stem, and the llamacpp arm
             // matches the path against the resident's loaded set.
             let removed = store.list_loras(None)?.into_iter().find(|l| l.id == id);
@@ -19022,8 +19022,8 @@ async fn lora_cmd(cmd: LoraCmd) -> Result<()> {
 }
 
 /// Search-table repo-id display: shrink the OWNER (leading ellipsis),
-/// never the model name — the model tail is the discriminator users copy
-/// for `blazar pull` (`…-heretic-i1-GGUF` vs `…-heretic-GGUF` are
+/// never the model name - the model tail is the discriminator users copy
+/// for `blazar pull` (`...-heretic-i1-GGUF` vs `...-heretic-GGUF` are
 /// different repos). Slash-less ids and oversized model names fall back
 /// to a tail cut. Char-safe: never slices mid-UTF-8.
 fn truncate_repo_id(id: &str, cap: usize) -> String {
@@ -19032,19 +19032,19 @@ fn truncate_repo_id(id: &str, cap: usize) -> String {
     }
     if let Some((owner, model)) = id.split_once('/') {
         let model_len = model.chars().count();
-        if model_len + 2 <= cap {
-            let keep = cap - model_len - 2; // room for "…/"
+        if model_len + 4 <= cap {
+            let keep = cap - model_len - 4; // room for ".../" + margin
             let head: String = owner.chars().take(keep).collect();
-            return format!("{head}…/{model}");
+            return format!("{head}.../{model}");
         }
     }
-    let head: String = id.chars().take(cap - 1).collect();
-    format!("{head}…")
+    let head: String = id.chars().take(cap - 3).collect();
+    format!("{head}...")
 }
 
 /// Downloads/likes display: round-half-up to one decimal (`2395` ->
 /// `"2.4k"`, not the floored `"2.3k"`), with carry promotion at unit
-/// boundaries (`999_950` -> `"1.0M"`). Integer-only — no float casts.
+/// boundaries (`999_950` -> `"1.0M"`). Integer-only - no float casts.
 fn human_count(n: u64) -> String {
     if n >= 999_950 {
         let t = (n + 50_000) / 100_000; // tenths of a million, rounded
@@ -19069,8 +19069,8 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
     const ARCH_CAP: usize = 18;
     // Quant filtering is client-side (the Hub exposes no quant facet):
     // bare grammar-exact query tokens (`q4`, `Q4_K_M`) always leave the
-    // text query — they are dead weight in the Hub's full-text search
-    // whether or not --quant was given — and --quant filters merge in
+    // text query - they are dead weight in the Hub's full-text search
+    // whether or not --quant was given - and --quant filters merge in
     // alongside them. Rows are retained on the same quant set the QUANTS
     // column renders, so filter and table can never disagree.
     let (query, mut filters) = split_quant_query(query);
@@ -19097,7 +19097,7 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
             // Distinct from the no-results message below: the Hub had
             // candidates, none carried the requested quant(s). An
             // all-quant query (every token lifted) browsed the popular
-            // head — dominated by safetensors repos with no quant files —
+            // head - dominated by safetensors repos with no quant files -
             // so teach the model-query form instead of quoting "".
             if !json {
                 let scope = if query.is_empty() {
@@ -19109,7 +19109,7 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
                     format!("{candidates} results for {query:?}")
                 };
                 println!(
-                    "no repos carry quant(s) {} among {scope} — try a broader query, another quant, or drop the filter",
+                    "no repos carry quant(s) {} among {scope} - try a broader query, another quant, or drop the filter",
                     filters.join(", ")
                 );
             }
@@ -19118,12 +19118,12 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
     }
     let format = format.trim().to_ascii_lowercase();
     if results.is_empty() {
-        // The Hub answers an unknown tag with 200 + [] — teach the valid
+        // The Hub answers an unknown tag with 200 + [] - teach the valid
         // lanes instead of looking like "no such model exists". JSONL
         // consumers get a clean zero-row stream (jq -s reads it as []).
         if !json {
             println!(
-                "no repos matched {query:?} — try a narrower tag: --format gguf | safetensors | awq | gptq | fp8 | mlx"
+                "no repos matched {query:?} - try a narrower tag: --format gguf | safetensors | awq | gptq | fp8 | mlx"
             );
         }
         return Ok(());
@@ -19131,7 +19131,7 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
     if json {
         // Same fields as the table, machine-typed: GGUF rows read the
         // free root metadata; safetensors rows carry a dtype-derived
-        // byte estimate + config arch (ctx stays null — the Hub's search
+        // byte estimate + config arch (ctx stays null - the Hub's search
         // expansion has no context field outside gguf); quants is the
         // FULL list (the table's `+N` collapse is display dressing).
         for r in &results {
@@ -19154,8 +19154,8 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
         }
         return Ok(());
     }
-    // Oversize ids shrink the owner (cap), keeping the model name — the
-    // pull discriminator — fully visible; column widths adapt inside
+    // Oversize ids shrink the owner (cap), keeping the model name - the
+    // pull discriminator - fully visible; column widths adapt inside
     // render_table.
     let cap = 64usize;
     let human_ctx = |c: u64| {
@@ -19207,16 +19207,16 @@ async fn search(query: &str, format: &str, quant: Option<&str>, json: bool) -> R
     );
     match format.as_str() {
         "any" | "all" => println!(
-            "\n# pull: blazar pull <REPO>[:quant] (GGUF → llamacpp) or blazar pull <REPO> (safetensors/AWQ/GPTQ/FP8 → sglang/mistralrs)\n# MLX quant dirs serve via the mlx lane (`blazar engine install --kind mlx`)"
+            "\n# pull: blazar pull <REPO>[:quant] (GGUF -> llamacpp) or blazar pull <REPO> (safetensors/AWQ/GPTQ/FP8 -> sglang/mistralrs)\n# MLX quant dirs serve via the mlx lane (`blazar engine install --kind mlx`)"
         ),
         "gguf" => println!(
             "\n# pull one: blazar pull <REPO>[:quant]   (size = all quants in repo; QUANTS lists the choices)"
         ),
         "safetensors" => println!(
-            "\n# pull one: blazar pull <REPO>   (safetensors serve via the sglang/mistralrs lane — `blazar engine install --kind sglang`)"
+            "\n# pull one: blazar pull <REPO>   (safetensors serve via the sglang/mistralrs lane - `blazar engine install --kind sglang`)"
         ),
         "mlx" => println!(
-            "\n# MLX dirs serve via the mlx lane — `blazar engine install --kind mlx` (CUDA linux + Apple Silicon)"
+            "\n# MLX dirs serve via the mlx lane - `blazar engine install --kind mlx` (CUDA linux + Apple Silicon)"
         ),
         _ => println!(
             "\n# pull one: blazar pull <REPO>   (GGUF/safetensors/MLX dirs serve via their lanes)"
@@ -19252,8 +19252,8 @@ fn parse_quant_filters(raw: &str) -> Vec<String> {
 }
 
 /// True when a row's quant set satisfies any filter. A filter matches by
-/// exact token or family prefix (`q4` covers `q4_0`, `q4_k_m`, …); the
-/// i-quant twin is folded in only for `q`-filters — `q4` also covers
+/// exact token or family prefix (`q4` covers `q4_0`, `q4_k_m`, ...); the
+/// i-quant twin is folded in only for `q`-filters - `q4` also covers
 /// `iq4_xs`, but `iq4` never matches plain `q4_k_m`.
 fn quant_filter_matches(tokens: &[String], filters: &[String]) -> bool {
     let hit = |tok: &str, f: &str| {
@@ -19275,7 +19275,7 @@ fn quant_filter_matches(tokens: &[String], filters: &[String]) -> bool {
 
 /// Split a text query into (query, quant filters): bare tokens that ARE
 /// quant names (`q4`, `Q4_K_M`) leave the text query and filter rows
-/// instead — the Hub cannot facet on quants, so such a token is dead
+/// instead - the Hub cannot facet on quants, so such a token is dead
 /// weight in the full-text search. Non-quant tokens (`qwen`, `gguf`,
 /// `awq`) stay query text.
 fn split_quant_query(query: &str) -> (String, Vec<String>) {
@@ -19295,7 +19295,7 @@ fn split_quant_query(query: &str) -> (String, Vec<String>) {
 }
 
 /// FORMAT column: the repo's weight format from Hub tags, most-specific
-/// first — an MLX repo also carries `safetensors`, an AWQ repo too, so the
+/// first - an MLX repo also carries `safetensors`, an AWQ repo too, so the
 /// specific tag is the actionable one. `gguf` outranks `mlx` because GGUF
 /// mirrors (mradermacher-style) self-tag `mlx` for discoverability while
 /// their actionable payload is the GGUF set; pure MLX repos never carry
@@ -19321,7 +19321,7 @@ fn format_of(tags: &[String]) -> String {
 
 /// FORMAT for a search row: tag priority from [`format_of`], except MLX
 /// repos that never tagged themselves `mlx` (openbmb ships `-MLX`
-/// suffixed safetensors) — the id is the only honest signal there.
+/// suffixed safetensors) - the id is the only honest signal there.
 /// Untagged repos (live: `ComfyUI` `diffusion-single-file` mirrors carry
 /// no format tag at all) fall back to their sibling file extensions.
 fn format_of_entry(r: &blazar_runtime::hf::SearchEntry) -> String {
@@ -19341,7 +19341,7 @@ fn format_of_entry(r: &blazar_runtime::hf::SearchEntry) -> String {
 
 /// FORMAT when tags carry none: first match over sibling extensions,
 /// same specificity order as [`format_of`] (an actionable payload beats
-/// its container — `.safetensors` is the payload of diffusers/pytorch
+/// its container - `.safetensors` is the payload of diffusers/pytorch
 /// repos alike, so the container distinction is left to the tags).
 fn format_of_siblings(siblings: &[blazar_runtime::hf::HfSibling]) -> String {
     let ends_with_any =
@@ -19361,9 +19361,9 @@ fn format_of_siblings(siblings: &[blazar_runtime::hf::HfSibling]) -> String {
 
 /// SIZE for a search row: exact GGUF bytes when the Hub carries
 /// `totalFileSize` (sum over the repo's `.gguf` files); otherwise the
-/// safetensors dtype-derived byte estimate (width × count — what `pull`
+/// safetensors dtype-derived byte estimate (width x count - what `pull`
 /// actually downloads). `gguf.total` is the PARAMETER COUNT and is
-/// never a size — repos the Hub failed to index (MLX-packed,
+/// never a size - repos the Hub failed to index (MLX-packed,
 /// `ComfyUI` single-file) stay honestly empty.
 fn entry_size_bytes(r: &blazar_runtime::hf::SearchEntry) -> Option<u64> {
     r.gguf.as_ref().and_then(|g| g.total_file_size).or_else(|| {
@@ -19388,8 +19388,8 @@ fn entry_arch(r: &blazar_runtime::hf::SearchEntry) -> Option<String> {
 
 /// Quant-method tokens mined from a repo id (display-only dressing): MLX /
 /// AWQ / GPTQ / FP8 repos advertise bit-widths in the NAME
-/// (`…-8bit`, `…-AWQ`, `…-GPTQ-Int4`), not in per-file quants. Never gates
-/// behavior — pull/serve decisions read real file metadata.
+/// (`...-8bit`, `...-AWQ`, `...-GPTQ-Int4`), not in per-file quants. Never gates
+/// behavior - pull/serve decisions read real file metadata.
 /// `iq4_xs`/`q8_0`-style quant token: `prefix` must be followed by a digit.
 fn embedded_quant(token: &str, prefix: &str) -> bool {
     token
@@ -19423,7 +19423,7 @@ fn quant_markers(repo_id: &str) -> Vec<String> {
         {
             format!("INT{digits}")
         } else if embedded_quant(token, "iq") || embedded_quant(token, "q") {
-            // IQ4_XS, iq2m, Q4_K_M, q8_0 — GGUF-style quant names spelled
+            // IQ4_XS, iq2m, Q4_K_M, q8_0 - GGUF-style quant names spelled
             // into repo ids; `optiq`/`qwen2` can't match (needs the prefix
             // immediately followed by a digit).
             token.to_ascii_uppercase()
@@ -19472,7 +19472,7 @@ async fn fit(target: &str, json: bool) -> Result<()> {
     let disk_free = storage::disk_free_bytes(&models_path);
     if json {
         // One object per row (JSONL contract). vram_bytes and repo ride on
-        // every row like doctor's group field — `fits_vram` is meaningless
+        // every row like doctor's group field - `fits_vram` is meaningless
         // without the machine context that produced it. Disk context rides
         // the same way: a row that fits VRAM can still fail the pull gate.
         for r in &rows {
@@ -19490,7 +19490,7 @@ async fn fit(target: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "fit preview for {} (local VRAM: {}) — predicted, analytic estimates, not measured",
+        "fit preview for {} (local VRAM: {}) - predicted, analytic estimates, not measured",
         parsed.repo,
         humansize(i64::try_from(vram_bytes).unwrap_or(i64::MAX))
     );
@@ -19538,17 +19538,17 @@ async fn fit(target: &str, json: bool) -> Result<()> {
     }
     if rows.first().is_some_and(|r| r.quant == "safetensors") {
         println!(
-            "\n# safetensors lane: serves via sglang/mistralrs (`blazar engine install --kind sglang`) — llamacpp cannot load it; SIZE is the full shard set and KV is arch-dependent, measured at serve"
+            "\n# safetensors lane: serves via sglang/mistralrs (`blazar engine install --kind sglang`) - llamacpp cannot load it; SIZE is the full shard set and KV is arch-dependent, measured at serve"
         );
     } else if rows.is_empty() {
-        println!("\n# no sized GGUF or safetensors weights in this repo — nothing to preview");
+        println!("\n# no sized GGUF or safetensors weights in this repo - nothing to preview");
     }
     Ok(())
 }
 
 /// Resident model names from a live daemon, so `prune --unused` and the
 /// storage report never propose deleting a model a child is serving.
-/// Daemon-down degrades to an empty list with a warning — pruning still
+/// Daemon-down degrades to an empty list with a warning - pruning still
 /// works offline, just without the resident guard.
 async fn resident_models() -> (Vec<String>, bool) {
     let base = match config() {
@@ -19584,7 +19584,7 @@ async fn resident_models() -> (Vec<String>, bool) {
     }
 }
 
-/// `blazar storage` — the disk-side counterpart of `fit`: what Blazar
+/// `blazar storage` - the disk-side counterpart of `fit`: what Blazar
 /// stores, where it lives, and what can be reclaimed.
 // One report walked top-to-bottom (stores -> disk -> reclaim -> external);
 // splitting it hides the report order it exists to show.
@@ -19705,7 +19705,7 @@ async fn storage_cmd(json: bool) -> Result<()> {
         _ => println!("  available:   unknown ({})", d.models_dir().display()),
     }
     // Storage hierarchy per model: what is hot (VRAM) vs what is only
-    // on disk, and the remote tier as a pointer — a peer's model list
+    // on disk, and the remote tier as a pointer - a peer's model list
     // is live-probe territory (`blazar route`), not a stored fact.
     if !rows.is_empty() {
         println!("\nMODEL TIERS");
@@ -19717,13 +19717,13 @@ async fn storage_cmd(json: bool) -> Result<()> {
         }
         if remotes > 0 {
             println!(
-                "  remote: {remotes} peer(s) configured — `blazar route <model>` checks who lists it"
+                "  remote: {remotes} peer(s) configured - `blazar route <model>` checks who lists it"
             );
         } else {
             println!("  remote: no peers configured");
         }
         if !daemon_up {
-            println!("  note: daemon down — VRAM tiers reflect the last resident list");
+            println!("  note: daemon down - VRAM tiers reflect the last resident list");
         }
     }
     println!("\nRECLAIM CANDIDATES");
@@ -19738,7 +19738,7 @@ async fn storage_cmd(json: bool) -> Result<()> {
         hs(partial_bytes)
     );
     println!(
-        "  hardlink twins:   {} files, {} (report-only — same inode as owned files)",
+        "  hardlink twins:   {} files, {} (report-only - same inode as owned files)",
         orphans.twins.len(),
         hs(twin_bytes)
     );
@@ -19749,7 +19749,7 @@ async fn storage_cmd(json: bool) -> Result<()> {
         if daemon_up {
             String::new()
         } else {
-            ", daemon down — residents not checked".to_string()
+            ", daemon down - residents not checked".to_string()
         }
     );
     for r in &unused {
@@ -19759,13 +19759,13 @@ async fn storage_cmd(json: bool) -> Result<()> {
             hs(u64::try_from(r.bytes).unwrap_or(0))
         );
     }
-    println!("\n  → `blazar prune --orphans --unused --yes` reclaims orphans + partials + unused");
+    println!("\n  -> `blazar prune --orphans --unused --yes` reclaims orphans + partials + unused");
     if orphans.twins.is_empty()
         && orphans.orphan_files.is_empty()
         && orphans.stale_partials.is_empty()
         && unused.is_empty()
     {
-        println!("  none — nothing to reclaim");
+        println!("  none - nothing to reclaim");
     }
     // Engine-managed caches outside the data dir are reported, never
     // touched: deleting them is the engine's business, not ours.
@@ -19785,7 +19785,7 @@ async fn storage_cmd(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `blazar prune` — reclaim disk. Dry-run by default; `--yes` executes.
+/// `blazar prune` - reclaim disk. Dry-run by default; `--yes` executes.
 /// Twins are never deleted (they ARE owned files, just hardlinked).
 // Flags mirror the CLI surface one-to-one; a struct would just move them.
 #[allow(clippy::fn_params_excessive_bools)]
@@ -19808,7 +19808,7 @@ async fn prune_cmd(
     let (residents, daemon_up) = resident_models().await;
     if !daemon_up {
         eprintln!(
-            "warning: daemon not reachable — resident models are not guarded; a model mid-serve could be deleted"
+            "warning: daemon not reachable - resident models are not guarded; a model mid-serve could be deleted"
         );
     }
     let scan = storage::orphan_scan(&d.models_dir(), &rows);
@@ -19829,7 +19829,7 @@ async fn prune_cmd(
     if !orphans && !unused {
         // Bare `blazar prune` = preview everything it could do.
         println!(
-            "prune preview — {} orphan/partial file(s), {} unused model(s) (idle > {since_days} days)",
+            "prune preview - {} orphan/partial file(s), {} unused model(s) (idle > {since_days} days)",
             scan.orphan_files.len() + scan.stale_partials.len(),
             storage::unused_rows(&rows, since_days * 86_400, &residents, now).len()
         );
@@ -19853,7 +19853,7 @@ async fn prune_cmd(
             );
             total += u64::try_from(r.bytes).unwrap_or(0);
         }
-        println!("dry run — {total} bytes reclaimable; pass --yes to execute");
+        println!("dry run - {total} bytes reclaimable; pass --yes to execute");
         return Ok(());
     }
     let mut reclaimed = 0u64;
@@ -19904,7 +19904,7 @@ async fn prune_cmd(
     }
     if failures > 0 {
         return Err(anyhow!(
-            "prune finished with {failures} failure(s) — {reclaimed} bytes reclaimed anyway"
+            "prune finished with {failures} failure(s) - {reclaimed} bytes reclaimed anyway"
         ));
     }
     if !json {
@@ -19937,11 +19937,11 @@ const CONNECT_CLIENTS: &[&str] = &[
 /// What `connect` will do for one client.
 #[derive(Debug, Clone, PartialEq)]
 enum ConnectAction {
-    /// File absent — --write would create it with this content
+    /// File absent - --write would create it with this content
     Create(String),
-    /// File exists — --write would merge into it (JSON only; backup first)
+    /// File exists - --write would merge into it (JSON only; backup first)
     Merge,
-    /// Writing would risk breaking a hand-tuned config — snippet only
+    /// Writing would risk breaking a hand-tuned config - snippet only
     Snippet,
     /// The client has no writable config (UI or env vars at startup)
     Instructions,
@@ -19999,7 +19999,7 @@ fn continue_model_block(base: &str, model: &str) -> String {
 /// What the agent-harness configs need to know about the connect model:
 /// identity plus the VERIFIED capability flags (from the model-doctor
 /// certificate when present) and the training context. Defaults are
-/// conservative so an uncertified model still connects — flags off,
+/// conservative so an uncertified model still connects - flags off,
 /// context unknown.
 struct ConnectModelMeta {
     id: String,
@@ -20098,9 +20098,9 @@ fn skill_markdown(client: &str, base: &str, model: &str, meta: &ConnectModelMeta
     };
     format!(
         "{frontmatter}\
-# Blazar — local model server\n\n\
+# Blazar - local model server\n\n\
 This machine runs a [Blazar](https://github.com/santanu20/blazar) daemon at `{base}` serving\n\
-local models in THREE wire dialects — pick the one the surrounding tool expects:\n\n\
+local models in THREE wire dialects - pick the one the surrounding tool expects:\n\n\
 | Dialect | Endpoint | Notes |\n\
 |---|---|---|---\n\
 | OpenAI | `{base}/v1/chat/completions` | also `/v1/models`, `/v1/completions`, `/v1/embeddings`, `/v1/responses` |\n\
@@ -20109,7 +20109,7 @@ local models in THREE wire dialects — pick the one the surrounding tool expect
 When no API key is configured the daemon ignores auth headers; send any token when a\n\
 client demands one (e.g. `Authorization: Bearer blazar-local`).\n\n\
 ## Default model\n\n\
-`{model}` — training context `{ctx}` tokens, verified: {caps}.\n\
+`{model}` - training context `{ctx}` tokens, verified: {caps}.\n\
 List everything with `GET {base}/v1/models` or `blazar models`.\n\n\
 ## Quick examples\n\n\
 ```bash\n\
@@ -20126,10 +20126,10 @@ print(client.chat.completions.create(\n\
 ).choices[0].message.content)\n\
 ```\n\n\
 ## Helper commands\n\n\
-- `blazar models` / `blazar ps` — what is installed / what is running\n\
-- `blazar usage` — daily token usage per model (in/out/cached, TTFT)\n\
-- `blazar pull <model>` — fetch another model; `blazar plan --install` ranks what fits the hardware\n\
-- `blazar doctor` / `blazar model-doctor <model>` — health + capability checks\n\n\
+- `blazar models` / `blazar ps` - what is installed / what is running\n\
+- `blazar usage` - daily token usage per model (in/out/cached, TTFT)\n\
+- `blazar pull <model>` - fetch another model; `blazar plan --install` ranks what fits the hardware\n\
+- `blazar doctor` / `blazar model-doctor <model>` - health + capability checks\n\n\
 Prefer these over guessing daemon state; they read the same store the daemon serves from.\n"
     )
 }
@@ -20198,7 +20198,7 @@ fn opencode_provider_merge(
     v
 }
 
-/// pi (and oh-my-pi — same agent directory) models.json block (shape
+/// pi (and oh-my-pi - same agent directory) models.json block (shape
 /// verified against pi-mono's official docs): an OpenAI-completions
 /// endpoint entry with the model list. Idempotent: providers.blazar is
 /// replaced wholesale, other providers untouched.
@@ -20400,7 +20400,7 @@ fn connect_plan(
                 config_path,
                 action,
                 detail: format!(
-                    "provider.blazar block for opencode.json (model shows as blazar/{} — pick it in /models; restart opencode after writing):\n{}",
+                    "provider.blazar block for opencode.json (model shows as blazar/{} - pick it in /models; restart opencode after writing):\n{}",
                     m.id,
                     serde_json::to_string_pretty(&opencode_provider_merge(
                         &serde_json::json!({}),
@@ -20455,7 +20455,7 @@ fn connect_plan(
             config_path: path(&[".config", "Code", "User", "settings.json"]),
             action: ConnectAction::Instructions,
             detail: format!(
-                "Cline stores its API config inside the VS Code UI, not a file Blazar can safely edit:\n  1. open Cline settings → API Provider → OpenAI Compatible\n  2. base URL: {base}/v1\n  3. model: {model}\n  4. any API key value (ignored when Blazar keys are off)"
+                "Cline stores its API config inside the VS Code UI, not a file Blazar can safely edit:\n  1. open Cline settings -> API Provider -> OpenAI Compatible\n  2. base URL: {base}/v1\n  3. model: {model}\n  4. any API key value (ignored when Blazar keys are off)"
             ),
         }),
         "openwebui" => {
@@ -20478,7 +20478,7 @@ fn connect_plan(
             })
         }
         other => Err(anyhow!(
-            "unknown client '{other}' — supported: {} (bare `blazar connect` lists them)",
+            "unknown client '{other}' - supported: {} (bare `blazar connect` lists them)",
             CONNECT_CLIENTS.join(", ")
         )),
     }
@@ -20516,14 +20516,14 @@ async fn connect_test_request(client: &str, base: &str, model: &str) -> Result<b
     Ok(matches!(resp, Ok(r) if r.status().is_success()))
 }
 
-/// Default-model tier for harness connects. Capability-driven — the
-/// certificates exist for exactly this decision — and the store (not
+/// Default-model tier for harness connects. Capability-driven - the
+/// certificates exist for exactly this decision - and the store (not
 /// the daemon's tag list) is the source, so the default also works
 /// daemon-down. `chat_pass` is three-state: `None` = no certificate
 /// (an uncertified text model is still a plausible default), `Some(false)`
-/// = CERTIFIED non-chat (rerankers, embedders — never suggested).
+/// = CERTIFIED non-chat (rerankers, embedders - never suggested).
 ///
-///   tier 3: certificate says chat PASS AND tools PASS — a coding
+///   tier 3: certificate says chat PASS AND tools PASS - a coding
 ///           harness lives on tool calls
 ///   tier 2: certificate says chat PASS
 ///   tier 1: text-lane model, no certificate yet
@@ -20575,7 +20575,7 @@ fn connect_candidates(store: &Store) -> Result<Vec<(String, u8, i64, f64)>> {
                 };
                 (status("chat"), status("tools"))
             });
-        // No certificate → three-state None (uncertified, plausible);
+        // No certificate -> three-state None (uncertified, plausible);
         // certified FAIL must NOT masquerade as uncertified.
         let (chat_pass, tools_pass) = match statuses {
             Some((c, t)) => (Some(c), t),
@@ -20602,7 +20602,7 @@ fn default_test_model(explicit: Option<String>) -> Result<String> {
     }
     let store = Store::open(&dirs())?;
     pick_connect_default(&connect_candidates(&store)?).ok_or_else(|| {
-        anyhow!("no chat-shaped local model to connect — pass --model, or `blazar pull` one first")
+        anyhow!("no chat-shaped local model to connect - pass --model, or `blazar pull` one first")
     })
 }
 
@@ -20668,7 +20668,7 @@ async fn connect_cmd(
     let meta = connect_model_meta(&model);
     // `--all-models`: every certified chat model joins the menu for the
     // multi-model clients. The headline model still leads (plan, test
-    // request, snippet) — the extras only widen the menu.
+    // request, snippet) - the extras only widen the menu.
     let extra_metas: Vec<ConnectModelMeta> = if all_models {
         match client {
             "opencode" | "pi" => {
@@ -20794,7 +20794,7 @@ async fn connect_cmd(
     } else {
         (
             false,
-            "skipped — daemon not reachable (blazar serve)".to_string(),
+            "skipped - daemon not reachable (blazar serve)".to_string(),
         )
     };
 
@@ -20812,7 +20812,7 @@ async fn connect_cmd(
     // `--install-skill`: drop a Blazar skill/rules file into the
     // client's own convention directory. Existing different files are
     // only replaced under `--write` (same discipline as the config
-    // writes); a missing file installs immediately — it touches nothing
+    // writes); a missing file installs immediately - it touches nothing
     // the user already has.
     let mut skill_written: Option<std::path::PathBuf> = None;
     let mut skill_note = String::new();
@@ -20831,7 +20831,7 @@ async fn connect_cmd(
                         skill_written = Some(path);
                         skill_note = "replaced (was present, differed)".to_string();
                     } else {
-                        skill_note = "exists and differs — pass --write to replace".to_string();
+                        skill_note = "exists and differs - pass --write to replace".to_string();
                     }
                 } else {
                     if let Some(parent) = path.parent() {
@@ -20843,7 +20843,7 @@ async fn connect_cmd(
             }
             None => {
                 skill_note = format!(
-                    "{client} has no skill-file convention — paste the snippet below into its \
+                    "{client} has no skill-file convention - paste the snippet below into its \
                      instructions/knowledge area"
                 );
             }
@@ -20887,7 +20887,7 @@ async fn connect_cmd(
         if rolled_back {
             println!(
                 "{}",
-                warn_line("written, then ROLLED BACK — the test request failed")
+                warn_line("written, then ROLLED BACK - the test request failed")
             );
         } else if daemon_up && test_ok {
             println!("{}", ok_line("written + test request PASS"));
@@ -20895,7 +20895,7 @@ async fn connect_cmd(
             println!("written (test {test_note})");
         }
     } else if !write {
-        println!("dry run — pass --write to apply");
+        println!("dry run - pass --write to apply");
     }
     if let Some(bak) = &backup {
         println!("backup:     {}", bak.display());
@@ -20936,7 +20936,7 @@ fn yes_no(b: bool) -> &'static str {
 
 /// One posture knob: `Set` pins a root knob to a stored-form TOML
 /// scalar, `Unset` returns it to the built-in default. Root knobs only
-/// by construction — table-scoped pins (`model_overrides.*`, scoped
+/// by construction - table-scoped pins (`model_overrides.*`, scoped
 /// keys) are power-user territory and presets never touch them.
 enum PresetOp {
     Set(&'static str, &'static str),
@@ -20969,7 +20969,7 @@ const PRESETS: [Preset; 5] = [
     },
     Preset {
         name: "fast",
-        tagline: "one dedicated slot — lowest latency for a single chat",
+        tagline: "one dedicated slot - lowest latency for a single chat",
         ops: &[
             PresetOp::Set("slots", "1"),
             PresetOp::Unset("ubatch_auto"),
@@ -21014,7 +21014,7 @@ const PRESETS: [Preset; 5] = [
     },
     Preset {
         name: "max-throughput",
-        tagline: "adaptive batching, speculation off — no draft overhead under saturation",
+        tagline: "adaptive batching, speculation off - no draft overhead under saturation",
         ops: &[
             PresetOp::Set("spec", "\"off\""),
             PresetOp::Set("ubatch_auto", "true"),
@@ -21084,18 +21084,18 @@ fn apply_preset_ops(raw: &str, preset: &Preset) -> Result<(String, Vec<PresetOpO
                 let line = match removed {
                     Some(old) => match default_pin_line(key) {
                         Some(default_line) => {
-                            format!("{key} unset (was: {old}) — now: {default_line}")
+                            format!("{key} unset (was: {old}) - now: {default_line}")
                         }
-                        None => format!("{key} unset (was: {old}) — not set by default"),
+                        None => format!("{key} unset (was: {old}) - not set by default"),
                     },
-                    None => format!("{key} not pinned — already at the built-in default"),
+                    None => format!("{key} not pinned - already at the built-in default"),
                 };
                 (candidate, line)
             }
         };
         Config::from_toml(&candidate).map_err(|e| {
             anyhow!(
-                "preset {} rejected at knob `{line}`: {e} — file unchanged",
+                "preset {} rejected at knob `{line}`: {e} - file unchanged",
                 preset.name
             )
         })?;
@@ -21117,7 +21117,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         ConfigCmd::Get { key } => {
             let cfg = config()?;
             if let Some((tpath, leaf)) = split_table_path(&key) {
-                // Dotted keys read the pin from the file itself — the
+                // Dotted keys read the pin from the file itself - the
                 // serialized config would dump whole tables instead.
                 let raw = std::fs::read_to_string(dirs().config_file())?;
                 // A dotted MODEL NAME (`model_overrides.qwen3-1.7b.engine`)
@@ -21151,7 +21151,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                     Ok(())
                 } else if top_level_key_known(&key) {
                     // Root knob that serializes as absent while unset
-                    // (Option fields) — known to the schema, not pinned.
+                    // (Option fields) - known to the schema, not pinned.
                     println!("{key} = <not set>");
                     Ok(())
                 } else {
@@ -21165,10 +21165,10 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                         if pins.is_empty() {
                             let leaves = section_leaf_names(&key);
                             if leaves.is_empty() {
-                                println!("{key} is a table — no pins");
+                                println!("{key} is a table - no pins");
                             } else {
                                 println!(
-                                    "{key} is a table — no pins (defaults apply); leaves: {}",
+                                    "{key} is a table - no pins (defaults apply); leaves: {}",
                                     leaves.join(", ")
                                 );
                             }
@@ -21190,7 +21190,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                                 Ok(())
                             }
                             sections if !sections.is_empty() => Err(anyhow!(
-                                "ambiguous key: {key} is a leaf of several sections ({}) — use the dotted form: {}",
+                                "ambiguous key: {key} is a leaf of several sections ({}) - use the dotted form: {}",
                                 sections.join(", "),
                                 sections
                                     .iter()
@@ -21207,7 +21207,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         ConfigCmd::Set { key, value } => {
             let path = dirs().config_file();
             // Fresh-box bootstrap: `config set` may be the first command
-            // ever run — ensure the dirs exist and a config file is
+            // ever run - ensure the dirs exist and a config file is
             // present (Config::load writes a fresh default), instead of
             // crashing with a raw ENOENT on read below.
             let d = dirs();
@@ -21248,14 +21248,14 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                         format!(" (leaves: {})", leaves.join(", "))
                     };
                     return Err(anyhow!(
-                        "{key} is a table, not a value — set individual leaves: {key}.<leaf> <value>{hint}"
+                        "{key} is a table, not a value - set individual leaves: {key}.<leaf> <value>{hint}"
                     ));
                 }
                 match sections.as_slice() {
                     [only] => set_table_key(&raw, &[only.as_str()], &key, &stored),
                     many if !many.is_empty() => {
                         return Err(anyhow!(
-                            "ambiguous key: {key} is a leaf of several sections ({}) — use the dotted form: {}",
+                            "ambiguous key: {key} is a leaf of several sections ({}) - use the dotted form: {}",
                             many.join(", "),
                             many.iter()
                                 .map(|s| format!("{s}.{key}"))
@@ -21268,7 +21268,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             };
             // A dotted MODEL NAME (`model_overrides.qwen3-1.7b.engine`)
             // makes the straight candidate nest one table too deep. Retry
-            // with merged model names — the schema is the oracle, the first
+            // with merged model names - the schema is the oracle, the first
             // candidate it accepts wins, and the final validation below
             // still gates the winner before anything is persisted.
             if Config::from_toml(&candidate).is_err()
@@ -21292,7 +21292,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         }
         ConfigCmd::Unset { key } => {
             // Same fresh-box bootstrap as `set`: unset may be the first
-            // command ever run on a box — the config file must exist
+            // command ever run on a box - the config file must exist
             // before it can be read below.
             let d = dirs();
             d.ensure().ok();
@@ -21324,11 +21324,11 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                         Config::from_toml(&candidate)
                             .map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
                         blazar_core::persist_config(&path, &candidate)?;
-                        println!("{key} unset (was: {old}) — not set by default");
+                        println!("{key} unset (was: {old}) - not set by default");
                         Ok(())
                     }
                     None if known_config_key(&key) || merged.is_some() => {
-                        println!("{key} is not pinned — already at the built-in default");
+                        println!("{key} is not pinned - already at the built-in default");
                         Ok(())
                     }
                     None => Err(anyhow!(
@@ -21341,11 +21341,11 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             if removed.is_none() {
                 // No root pin. A bare SECTION leaf (`ttl_secs`) used to
                 // fall through to "not pinned" while the file kept the
-                // value — resolve it against the sections first, with
+                // value - resolve it against the sections first, with
                 // the same root/table-name/leaf routing as `set`.
                 if is_section_parent(&key, &raw) {
                     return Err(anyhow!(
-                        "{key} is a table — unset individual leaves: {key}.<leaf>"
+                        "{key} is a table - unset individual leaves: {key}.<leaf>"
                     ));
                 }
                 match bare_leaf_sections(&key, &raw).as_slice() {
@@ -21356,7 +21356,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                     }
                     many if !many.is_empty() => {
                         return Err(anyhow!(
-                            "ambiguous key: {key} is a leaf of several sections ({}) — use the dotted form: {}",
+                            "ambiguous key: {key} is a leaf of several sections ({}) - use the dotted form: {}",
                             many.join(", "),
                             many.iter()
                                 .map(|s| format!("{s}.{key}"))
@@ -21380,16 +21380,16 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                         .find(|l| key_before_eq(l) == Some(key.as_str()))
                     {
                         Some(line) => {
-                            println!("{key} unset (was: {old}) — now: {line}");
+                            println!("{key} unset (was: {old}) - now: {line}");
                         }
                         None => {
-                            println!("{key} unset (was: {old}) — not set by default");
+                            println!("{key} unset (was: {old}) - not set by default");
                         }
                     }
                     Ok(())
                 }
                 None if known_config_key(&key) => {
-                    println!("{key} is not pinned — already at the built-in default");
+                    println!("{key} is not pinned - already at the built-in default");
                     Ok(())
                 }
                 None => Err(anyhow!(
@@ -21422,7 +21422,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         }
         ConfigCmd::Edit { model } => {
             // $VISUAL wins over $EDITOR (git convention); no fallback
-            // to a hard-coded editor — guessing vi/nano on a box that
+            // to a hard-coded editor - guessing vi/nano on a box that
             // has neither fails more confusingly than this teaching.
             let editor = std::env::var("VISUAL")
                 .or_else(|_| std::env::var("EDITOR"))
@@ -21475,7 +21475,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
             Config::from_toml(&raw).map_err(|e| {
-                anyhow!("config is invalid after edit: {e} — fix it with another {editor:?} run")
+                anyhow!("config is invalid after edit: {e} - fix it with another {editor:?} run")
             })?;
             println!("{} ok", path.display());
             Ok(())
@@ -21492,7 +21492,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 return Ok(());
             };
             let preset = preset_find(&name).ok_or_else(|| {
-                anyhow!("unknown posture: {name} — available: {}", preset_names())
+                anyhow!("unknown posture: {name} - available: {}", preset_names())
             })?;
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
@@ -21505,7 +21505,7 @@ fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             let changed = outcomes.iter().filter(|o| o.changed).count();
             let kept = outcomes.len() - changed;
             println!(
-                "preset {name} applied ({changed} knob{s} moved, {kept} already in place) — \
+                "preset {name} applied ({changed} knob{s} moved, {kept} already in place) - \
                  restart the daemon (blazar stop && blazar serve) to serve it",
                 s = if changed == 1 { "" } else { "s" }
             );
@@ -21646,7 +21646,7 @@ mod tests {
         write_engine_check_marker(&dirs, &serde_json::json!({"latest": "b1", "n": 1}));
         write_engine_check_marker(&dirs, &serde_json::json!({"latest": "b2", "n": 2}));
         let raw = std::fs::read_to_string(dirs.run_dir().join("engine-check.json")).unwrap();
-        // Exactly one JSON object — the double-write bug this pins left
+        // Exactly one JSON object - the double-write bug this pins left
         // two concatenated objects in the file.
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["latest"], "b2");
@@ -21731,7 +21731,7 @@ mod tests {
         );
         assert_eq!(pp["identity"]["name"], "tiny");
         // No engine installed, no evidence on record: every axis is an
-        // explicit null the card turns into a labeled gap row — never a
+        // explicit null the card turns into a labeled gap row - never a
         // missing key or a fabricated value.
         assert!(pp["engine"].is_null());
         assert!(pp["hardware"].is_null());
@@ -21784,7 +21784,7 @@ mod tests {
             )
             .unwrap();
         // Certificate from a DIFFERENT engine tag on purpose: evidence
-        // may predate a lane switch — the passport surfaces the real
+        // may predate a lane switch - the passport surfaces the real
         // per-axis tag instead of copying the active engine's.
         store
             .put_model_caps("tiny", "b11338-cuda", r#"{"chat": {"status": "pass"}}"#)
@@ -21841,7 +21841,7 @@ mod tests {
         assert_eq!(pp["profile"]["engine_tag"], "b11429-cuda");
         assert_eq!(pp["profile"]["argv"][0], "--ctx");
         // No bench on record: tuned profile present but the measured
-        // axis stays null — the two axes are independent evidence.
+        // axis stays null - the two axes are independent evidence.
         assert!(pp["measured"].is_null());
     }
 
@@ -21870,7 +21870,7 @@ mod tests {
         );
         assert_eq!(restore.as_deref(), Some("b11339-cuda"));
 
-        // Exact snapshot tag still present (retention kept it — e.g. a
+        // Exact snapshot tag still present (retention kept it - e.g. a
         // user pin): restore the exact tag, not just any of the kind.
         let retained = vec![
             row("sglang-0.5.21", EngineKind::Sglang),
@@ -21924,7 +21924,7 @@ mod tests {
     fn unit__encode_path_segment__percent_encodes_non_unreserved() {
         assert_eq!(encode_path_segment("qwen3-8b"), "qwen3-8b");
         assert_eq!(encode_path_segment("a/b:c d"), "a%2Fb%3Ac%20d");
-        // Colon is the repo's alias separator — it MUST be encoded or the
+        // Colon is the repo's alias separator - it MUST be encoded or the
         // /api/explain route would split names like "qwen3:8b" mid-segment.
         assert_eq!(encode_path_segment("qwen3:8b"), "qwen3%3A8b");
     }
@@ -21973,12 +21973,12 @@ mod tests {
 
     #[test]
     fn unit__render_explain_card__unknowns_print_as_unknown_not_blank() {
-        // Cold model: no lane resolved, nothing resident — the card must
+        // Cold model: no lane resolved, nothing resident - the card must
         // say unknown/not resident/none, never invent values.
         let out = render_explain_card(&serde_json::json!({
             "model": {"name": "m"},
             "engine": {"source": "error",
-                       "reason": "no engine installed — blazar engine install --kind <kind>"},
+                       "reason": "no engine installed - blazar engine install --kind <kind>"},
             "context": {"requested": 4096, "requested_source": "config default_ctx = 4096"},
         }));
         assert!(out.contains("MODEL"));
@@ -22019,7 +22019,7 @@ mod tests {
         assert!(out.contains("N/A"));
         // 80-char receipt clamps to 64 + ellipsis, not a wall of x.
         assert!(out.matches('x').count() <= 64 + 1); // rows sorted: receipt column only
-        assert!(out.contains('…'));
+        assert!(out.contains("..."));
     }
 
     #[test]
@@ -22057,7 +22057,7 @@ mod tests {
 
     #[test]
     fn unit__next_boot_action__respawn_only_after_observed_child_exit() {
-        // A live child — healthy, or alive but wedged — never earns a
+        // A live child - healthy, or alive but wedged - never earns a
         // respawn: the boot loop must not stack daemons.
         assert!(!next_boot_action(1, &DetachedBootOutcome::Healthy));
         assert!(!next_boot_action(1, &DetachedBootOutcome::BudgetElapsed));
@@ -22122,7 +22122,7 @@ mod tests {
         // A unit still activating may yet become our daemon.
         assert!(systemd_poll_decision(&SystemdUnitState::Activating));
         // Up-but-elsewhere, dead, or unqueryable: the poll can never
-        // succeed — yield it to the detached fallback.
+        // succeed - yield it to the detached fallback.
         assert!(!systemd_poll_decision(&SystemdUnitState::Active));
         assert!(!systemd_poll_decision(&SystemdUnitState::Failed));
         assert!(!systemd_poll_decision(&SystemdUnitState::Inactive));
@@ -22168,7 +22168,7 @@ mod tests {
             "embeddings":{"status":"PASS"},"think":{"status":"FAIL"},
             "classify":{"status":"N/A"},"vision":{"status":"N/A"}}}"#;
         let v = execution_score_vector(&measured, Some(caps_json));
-        // Best (max-mean) test per axis, named — never an unlabeled number.
+        // Best (max-mean) test per axis, named - never an unlabeled number.
         assert_eq!(v["decode_t_per_s"].as_f64(), Some(41.5));
         assert_eq!(v["decode_basis"].as_str(), Some("tg128"));
         assert_eq!(v["prompt_t_per_s"].as_f64(), Some(1213.0));
@@ -22277,12 +22277,12 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let base = "http://localhost:11435";
         let m1 = test_model_meta("m1");
-        // codex: absent config → Create with the full TOML.
+        // codex: absent config -> Create with the full TOML.
         let plan = connect_plan("codex", home.path(), base, &m1).expect("plan");
         assert_eq!(plan.client, "codex");
         assert!(!plan.installed);
         assert!(matches!(plan.action, ConnectAction::Create(_)));
-        // codex: existing config with a provider already pinned → Snippet.
+        // codex: existing config with a provider already pinned -> Snippet.
         std::fs::create_dir_all(home.path().join(".codex")).expect("mkdir");
         std::fs::write(
             home.path().join(".codex/config.toml"),
@@ -22292,7 +22292,7 @@ mod tests {
         let plan = connect_plan("codex", home.path(), base, &m1).expect("plan");
         assert!(plan.installed);
         assert_eq!(plan.action, ConnectAction::Snippet);
-        // claude: existing settings.json → Merge; detail stays a JSON snippet.
+        // claude: existing settings.json -> Merge; detail stays a JSON snippet.
         std::fs::create_dir_all(home.path().join(".claude")).expect("mkdir");
         std::fs::write(
             home.path().join(".claude/settings.json"),
@@ -22301,7 +22301,7 @@ mod tests {
         .expect("write");
         let plan = connect_plan("claude", home.path(), base, &m1).expect("plan");
         assert_eq!(plan.action, ConnectAction::Merge);
-        // continue: hand-tuned YAML → Snippet, never a blind merge.
+        // continue: hand-tuned YAML -> Snippet, never a blind merge.
         std::fs::create_dir_all(home.path().join(".continue")).expect("mkdir");
         std::fs::write(home.path().join(".continue/config.yaml"), "name: mine\n").expect("write");
         let plan = connect_plan("continue", home.path(), base, &m1).expect("plan");
@@ -22481,7 +22481,7 @@ mod tests {
         // Plain comm, pid == 1 style root
         let stat = "1 (systemd) S 0 1 1 0 -1";
         assert_eq!(ppid_from_stat(stat), Some(0));
-        // Garbage: no closing paren, no numbers — None, never a guess.
+        // Garbage: no closing paren, no numbers - None, never a guess.
         assert_eq!(ppid_from_stat("garbage"), None);
         assert_eq!(ppid_from_stat(""), None);
     }
@@ -22535,7 +22535,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn unit__engine_arch_gap__silent_when_set_empty_honest_unknown() {
-        // Pre-v2 manifests advertise nothing — unknown is not missing.
+        // Pre-v2 manifests advertise nothing - unknown is not missing.
         let rows = vec![gap_engine_row("old-cuda", EngineKind::LlamaCpp, &[])];
         assert_eq!(
             engine_arch_gap(&rows, "old-cuda", Some("instella-moe"), true),
@@ -22561,7 +22561,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn unit__engine_arch_gap__silent_for_non_llamacpp_kind() {
         // sglang/mistralrs arch strings are HF names in a different
-        // domain — the ggml arch-set check must not fire for them.
+        // domain - the ggml arch-set check must not fire for them.
         let rows = vec![gap_engine_row("sglang-1", EngineKind::Sglang, &["qwen2"])];
         assert_eq!(
             engine_arch_gap(&rows, "sglang-1", Some("Qwen2ForCausalLM"), false),
@@ -22573,7 +22573,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn unit__engine_arch_gap__marks_gguf_without_arch_metadata() {
         // The diffusion-component shape: registered with no arch (0-KV
-        // GGUF) — a file-level fact, so the marker fires even when the
+        // GGUF) - a file-level fact, so the marker fires even when the
         // lane's arch set is unknown (empty manifest set).
         let rows = vec![gap_engine_row("b-old", EngineKind::LlamaCpp, &[])];
         assert_eq!(
@@ -22764,7 +22764,7 @@ mod tests {
             _ => panic!("expected Run, got another subcommand"),
         }
         // The documented trap: a prompt STARTING with `-` needs `--`
-        // (or quoting) — clap reads it as an unknown flag otherwise.
+        // (or quoting) - clap reads it as an unknown flag otherwise.
         assert!(Cli::try_parse_from(["blazar", "run", "m1", "-flaggy"]).is_err());
         assert!(Cli::try_parse_from(["blazar", "run", "m1", "--", "-flaggy"]).is_ok());
     }
@@ -22855,12 +22855,12 @@ mod tests {
     #[test]
     fn unit__sdcpp_same_tag_switches__needs_both_labels_and_diff() {
         use super::sdcpp_same_tag_switches as s;
-        // Known flip: vulkan installed, CUDA prebuilt appeared — switch.
+        // Known flip: vulkan installed, CUDA prebuilt appeared - switch.
         assert!(s(Some("vulkan"), Some("cuda")));
         assert!(s(Some("cpu"), Some("vulkan")));
         // Same backend on both sides: stay (no churn on a live tag).
         assert!(!s(Some("vulkan"), Some("vulkan")));
-        // Either label unknown: stay — never switch on guesswork
+        // Either label unknown: stay - never switch on guesswork
         // (offline probe, pre-label engine row).
         assert!(!s(None, Some("cuda")));
         assert!(!s(Some("vulkan"), None));
@@ -22874,7 +22874,7 @@ mod tests {
         assert_eq!(p("Llama-3.2-3B-Instruct-Q4_0.gguf"), Some(3.0));
         assert_eq!(p("qwen2.5-0.5b-q8_0.gguf"), Some(0.5));
         assert_eq!(p("gemma-3-4b-qat-q4_0.gguf"), Some(4.0));
-        // MoE: first (total) token wins — capacity axis.
+        // MoE: first (total) token wins - capacity axis.
         assert_eq!(p("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"), Some(30.0));
         // Quant tokens are not parameter counts.
         assert_eq!(p("model-q4_k_m.gguf"), None);
@@ -23005,7 +23005,7 @@ mod tests {
             vtag: "v0.6.0".to_string(),
             btag: "b11429".to_string(),
         };
-        // Lane suffixes are the same build — the alias must survive them.
+        // Lane suffixes are the same build - the alias must survive them.
         assert_eq!(stable_alias(Some(&marker), "b11429-cuda"), "stable v0.6.0");
         assert_eq!(
             stable_alias(Some(&marker), "b11440"),
@@ -23042,7 +23042,7 @@ mod tests {
                 .upsert_engine(&gap_engine_row("b2-cuda", EngineKind::LlamaCpp, &[]))
                 .unwrap();
             // Baseline recorded against b1-cuda, which retention has
-            // since pruned — the gate has nothing to compare against.
+            // since pruned - the gate has nothing to compare against.
             store.record_bench("b1-cuda", "m", 40.0, 0.0, 0).unwrap();
         }
         let mgr = EngineManager {
@@ -23116,7 +23116,10 @@ mod tests {
         // Long id capped at 42 chars (41 + ellipsis): the id's TAIL is
         // dropped, quant gap shows `-`.
         let lm = lines[2];
-        assert!(lm.contains('…') && !lm.contains("column-cap.gguf"), "{lm}");
+        assert!(
+            lm.contains("...") && !lm.contains("column-cap.gguf"),
+            "{lm}"
+        );
         assert!(lm.ends_with("blazar import /deep/lm-studio/path"));
     }
 
@@ -23165,7 +23168,7 @@ mod tests {
             "prompt_eval_count": 7,
         });
         let line = chat_stats_line(&full);
-        // 43 tokens / 21.5s = 2.0 t/s — the same shape the --verbose
+        // 43 tokens / 21.5s = 2.0 t/s - the same shape the --verbose
         // single-shot lane prints; REPL /verbose shares it dimmed.
         assert!(line.contains("answer 43 tokens at 2.0 t/s"), "{line}");
         assert!(line.contains("prompt 7 tokens"), "{line}");
@@ -23198,7 +23201,7 @@ mod tests {
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
         };
-        // MLX and AWQ repos ALSO carry `safetensors` — the specific tag
+        // MLX and AWQ repos ALSO carry `safetensors` - the specific tag
         // wins because it is the actionable one for engine routing.
         assert_eq!(format_of(&tags(&["safetensors", "mlx"])), "mlx");
         assert_eq!(format_of(&tags(&["safetensors", "awq"])), "awq");
@@ -23213,7 +23216,7 @@ mod tests {
 
     #[test]
     fn unit__format_of_entry__untagged_mlx_detected_from_repo_id() {
-        // openbmb ships -MLX safetensors WITHOUT the mlx tag — the id is
+        // openbmb ships -MLX safetensors WITHOUT the mlx tag - the id is
         // the only honest signal (live-verified against the Hub).
         let entry = |id: &str, tags: &[&str], files: &[&str]| blazar_runtime::hf::SearchEntry {
             id: id.to_string(),
@@ -23236,7 +23239,7 @@ mod tests {
             format_of_entry(&entry("openbmb/MiniCPM5-1B-MLX", &["safetensors"], &[])),
             "mlx"
         );
-        // mlx-community repos tag themselves — the tag path answers.
+        // mlx-community repos tag themselves - the tag path answers.
         assert_eq!(
             format_of_entry(&entry(
                 "mlx-community/Qwen3-8B-4bit",
@@ -23258,7 +23261,7 @@ mod tests {
             "safetensors"
         );
         // Untagged ComfyUI `diffusion-single-file` mirrors (live:
-        // Comfy-Org/Qwen-Image-2.1 — tags carry no format at all): the
+        // Comfy-Org/Qwen-Image-2.1 - tags carry no format at all): the
         // sibling extensions are the only honest signal.
         assert_eq!(
             format_of_entry(&entry(
@@ -23368,7 +23371,7 @@ mod tests {
         let (q, f) = split_quant_query("qwen Q4_K_M iq4");
         assert_eq!(q, "qwen");
         assert_eq!(f, ["q4_k_m", "iq4"]);
-        // Non-quant tokens stay query text — underscored model ids included.
+        // Non-quant tokens stay query text - underscored model ids included.
         let (q, f) = split_quant_query("qwen_image_2.1 gguf awq int4");
         assert_eq!(q, "qwen_image_2.1 gguf awq int4");
         assert_eq!(f.len(), 0);
@@ -23380,7 +23383,7 @@ mod tests {
 
     #[test]
     // Six metadata shapes (tagged MLX, dtype ladder, arch ladder, empty
-    // fallbacks) in one table — one assert per shape would orphan the
+    // fallbacks) in one table - one assert per shape would orphan the
     // fallback contracts from the shapes that trigger them.
     #[allow(clippy::too_many_lines)]
     fn unit__entry_size_and_arch__safetensors_rows_carry_real_metadata() {
@@ -23409,7 +23412,7 @@ mod tests {
             }
         };
         // GGUF size = totalFileSize (exact bytes over all quants), NOT
-        // `total` — that is the parameter count. Live shape:
+        // `total` - that is the parameter count. Live shape:
         // Abiray/Qwen-Image-2.1-GGUF has total=7115124736 (7.1B params)
         // but totalFileSize=3185944736 (the real 2.97 GiB download).
         assert_eq!(
@@ -23425,7 +23428,7 @@ mod tests {
             )),
             Some(3_185_944_736)
         );
-        // Parameter count alone must NEVER render as bytes — even when
+        // Parameter count alone must NEVER render as bytes - even when
         // it is the only field the Hub filled in.
         assert_eq!(
             entry_size_bytes(&base(
@@ -23440,7 +23443,7 @@ mod tests {
             )),
             None
         );
-        // Safetensors fallback: dtype math (2 bytes × 2.5B).
+        // Safetensors fallback: dtype math (2 bytes x 2.5B).
         assert_eq!(
             entry_size_bytes(&base(None, Some(hist(&[("BF16", 2_500_000_000)])), None)),
             Some(5_000_000_000)
@@ -23492,7 +23495,7 @@ mod tests {
             )),
             Some("minicpmv4_6forconditionalgeneration".to_string())
         );
-        // Diffusers repos: no root config.json — the pipeline class is
+        // Diffusers repos: no root config.json - the pipeline class is
         // the only arch signal (live: Qwen/Qwen-Image-2.1).
         assert_eq!(
             entry_arch(&base(
@@ -23657,13 +23660,13 @@ mod tests {
 
     #[test]
     fn unit__scorecard_caps_rows__evidence_suffix_only_when_repeated() {
-        // Failure-KB counters: >1 renders " ×N"; 1 and legacy-absent
+        // Failure-KB counters: >1 renders " xN"; 1 and legacy-absent
         // render bare so old certificates stay byte-identical.
         let caps = r#"{"caps":{"chat":{"status":"PASS","n_runs":3},
                               "json":{"status":"PASS"},
                               "tools":{"status":"FAIL","n_runs":1}}}"#;
         let rows = scorecard_caps_rows(caps).expect("caps parse");
-        assert_eq!(rows[0].1, "PASS ×3", "repeated evidence is surfaced");
+        assert_eq!(rows[0].1, "PASS x3", "repeated evidence is surfaced");
         assert_eq!(
             rows[2].1, "PASS",
             "legacy cert without counters renders bare"
@@ -23692,7 +23695,7 @@ mod tests {
         let lines = plan_decision_lines(&card);
         assert_eq!(lines.len(), 5, "one line per decision axis: {lines:?}");
         assert!(
-            lines[0].contains("b11370-cuda (llamacpp) — active lane"),
+            lines[0].contains("b11370-cuda (llamacpp) - active lane"),
             "{lines:?}"
         );
         assert!(lines[1].contains("32768 (config default_ctx)"), "{lines:?}");
@@ -23728,7 +23731,7 @@ mod tests {
         assert_eq!(evidence_class("context", &mlx), "live");
         let cold = serde_json::json!({
             "context": {"effective_source":
-                "config estimate — model not resident; the spawn-time planner may shrink it to fit VRAM"},
+                "config estimate - model not resident; the spawn-time planner may shrink it to fit VRAM"},
         });
         assert_eq!(evidence_class("context", &cold), "predicted");
         let cfg_ctx = serde_json::json!({
@@ -23772,18 +23775,18 @@ mod tests {
             "slots": {"live": 2},
         });
         let lines = plan_decision_lines(&card);
-        assert!(lines[0].ends_with("— decision"), "{lines:?}");
-        assert!(lines[1].ends_with("— config"), "{lines:?}");
-        assert!(lines[2].ends_with("— predicted"), "{lines:?}");
-        assert!(lines[3].ends_with("— config"), "{lines:?}");
+        assert!(lines[0].ends_with("- decision"), "{lines:?}");
+        assert!(lines[1].ends_with("- config"), "{lines:?}");
+        assert!(lines[2].ends_with("- predicted"), "{lines:?}");
+        assert!(lines[3].ends_with("- config"), "{lines:?}");
         assert!(
-            lines[4].ends_with("resident (2 slot(s)) — live"),
+            lines[4].ends_with("resident (2 slot(s)) - live"),
             "{lines:?}"
         );
         // Absent card: every axis degrades to unknown, never silent.
         let empty = plan_decision_lines(&serde_json::json!({}));
-        assert!(empty[1].ends_with("— unknown"), "{empty:?}");
-        assert!(empty[4].ends_with("cold — live"), "{empty:?}");
+        assert!(empty[1].ends_with("- unknown"), "{empty:?}");
+        assert!(empty[4].ends_with("cold - live"), "{empty:?}");
     }
 
     #[test]
@@ -23821,7 +23824,7 @@ mod tests {
     }
 
     /// The ps contract: only a 2xx body with a models array lists. Error
-    /// payloads and shape drift must ERROR — the old form collapsed them
+    /// payloads and shape drift must ERROR - the old form collapsed them
     /// to an empty list and masked daemon trouble as "no models loaded".
     #[test]
     fn unit__ps_models_of__contract_enforced() {
@@ -23922,15 +23925,15 @@ mod tests {
         let got = pick_connect_default(&cands).expect("a chat default exists");
         assert_eq!(got, "qwen3.5-9b", "tools-capable tier wins over recency");
 
-        // Same tier → most recently used wins.
+        // Same tier -> most recently used wins.
         let cands = vec![("a".into(), 2, 5, 9.0), ("b".into(), 2, 50, 1.0)];
         assert_eq!(pick_connect_default(&cands).as_deref(), Some("b"));
 
-        // Recency tie → larger params wins.
+        // Recency tie -> larger params wins.
         let cands = vec![("small".into(), 1, 7, 0.5), ("big".into(), 1, 7, 9.0)];
         assert_eq!(pick_connect_default(&cands).as_deref(), Some("big"));
 
-        // Nothing chat-shaped → None, the caller teaches instead.
+        // Nothing chat-shaped -> None, the caller teaches instead.
         assert!(pick_connect_default(&[("x".into(), 0, 1, 1.0)]).is_none());
         // Three-state ladder: uncertified text lane is plausible (1);
         // CERTIFIED chat FAIL is excluded (0) even with tools claims.
@@ -23942,7 +23945,7 @@ mod tests {
     #[test]
     fn unit__bench_arch_refusal__encoder_classes_only() {
         // Encoder-only families in Blazar's normalized arch vocabulary
-        // can never produce pp/tg numbers — llama-bench aborts on them
+        // can never produce pp/tg numbers - llama-bench aborts on them
         // after a long CUDA init (observed live, hours-class).
         for arch in [
             "bert",
@@ -23975,7 +23978,7 @@ mod tests {
 
     #[test]
     fn unit__autopilot_recs__only_real_gaps_get_work() {
-        // Fresh everything → empty: a healthy model is never given
+        // Fresh everything -> empty: a healthy model is never given
         // busywork.
         let now = 1_791_072_000;
         assert!(
@@ -23999,7 +24002,7 @@ mod tests {
         assert!(recs[1].cmd.starts_with("blazar model-doctor m"), "{recs:?}");
         assert_eq!(recs[1].datum, "model_caps: no row");
 
-        // Bench newer than the adopted profile → tune rec citing both
+        // Bench newer than the adopted profile -> tune rec citing both
         // stamps.
         let recs = autopilot_recs("m", true, Some(now - 100), Some(now - 500), Some(now), now);
         assert_eq!(recs.len(), 1, "{recs:?}");
@@ -24031,10 +24034,10 @@ mod tests {
         );
         assert!(stale[0].datum.contains("31d ago"), "{stale:?}");
 
-        // A diffusion/video lane has no chat pp/tg to bench — it gets
+        // A diffusion/video lane has no chat pp/tg to bench - it gets
         // certificate work only, never bench busywork. (The same holds
         // for a safetensors/mlx chat model: bench drives llama-bench,
-        // which reads GGUF only — the format gate lives at the caller.)
+        // which reads GGUF only - the format gate lives at the caller.)
         let media = autopilot_recs("img", false, None, None, None, now);
         assert_eq!(media.len(), 1, "{media:?}");
         assert!(
@@ -24053,7 +24056,7 @@ mod tests {
             "slots": {"live": null}
         });
         let line = ready_card_line(&card).expect("tagged card renders");
-        assert!(line.contains("engine b11370-cuda ·"), "{line}");
+        assert!(line.contains("engine b11370-cuda |"), "{line}");
         assert!(
             !line.contains("b11370-cuda ("),
             "null kind must not print a paren after the tag: {line}"
@@ -24103,7 +24106,7 @@ mod tests {
         ] {
             assert!(known_config_key(k), "{k} must be a known knob");
         }
-        // Option knobs: absent from the default TOML while None — only
+        // Option knobs: absent from the default TOML while None - only
         // the parse probes can recognize them.
         for k in [
             "child_auth",
@@ -24125,7 +24128,7 @@ mod tests {
     #[test]
     fn unit__remove_top_level_pin__removes_only_root_scope() {
         // R4 pin: the same knob name at top level and inside a model
-        // override table is TWO settings — unset must only touch root.
+        // override table is TWO settings - unset must only touch root.
         let raw = concat!(
             "cache_type = \"f16\"\n",
             "host = \"127.0.0.1\"\n",
@@ -24337,7 +24340,7 @@ mod tests {
     /// `config edit <model>` hint blocks must stay in lockstep with the
     /// config schema: uncommenting EVERY hinted `key = value` pair (with
     /// the hint's own example values) has to parse through
-    /// `Config::from_toml` — a renamed or removed field fails
+    /// `Config::from_toml` - a renamed or removed field fails
     /// `deny_unknown_fields` here. The missing direction (a new knob
     /// without a hint line) is pinned by
     /// `unit__knob_hint_block__covers_every_tuning_field`.
@@ -24393,7 +24396,7 @@ mod tests {
     /// field of the tuning structs must appear as a hint key, and every
     /// hint key must be a struct field. Field names are parsed from the
     /// blazar-core source (`include_str!`) because serde has no field
-    /// iteration — a knob added to `SglangTuning`/`MistralrsTuning`
+    /// iteration - a knob added to `SglangTuning`/`MistralrsTuning`
     /// without a hint line fails here with its name.
     #[test]
     fn unit__knob_hint_block__covers_every_tuning_field() {
@@ -24439,7 +24442,7 @@ mod tests {
             assert!(
                 missing.is_empty(),
                 "{struct_name} fields without a hint line in knob_hint_block: {missing:?} \
-                 — add them to the family lines"
+                 - add them to the family lines"
             );
             let unknown: Vec<String> = keys
                 .iter()
@@ -24572,7 +24575,7 @@ mod tests {
     #[test]
     fn unit__config_set__dotted_model_name_resolves_via_schema() {
         let raw = "[sglang]\ngrammar_backend = \"xgrammar\"\n";
-        // The straight split nests one table too deep — pins the bug the
+        // The straight split nests one table too deep - pins the bug the
         // merged retry exists to fix.
         let straight = set_table_key(
             raw,
@@ -24614,7 +24617,7 @@ mod tests {
         let raw = "host = \"127.0.0.1\"\n";
         let (out, removed) = remove_top_level_pin(raw, "slots");
         assert!(removed.is_none());
-        assert_eq!(out, raw, "nothing pinned — bytes pass through");
+        assert_eq!(out, raw, "nothing pinned - bytes pass through");
         // Commented-out lines are not pins (no '=' before the comment).
         let (out, _) = remove_top_level_pin("# cache_type = \"f16\"\n", "cache_type");
         assert!(out.contains("# cache_type"));
@@ -24673,7 +24676,7 @@ mod tests {
 
     #[test]
     fn unit__section_leaf_names__schema_enumerates_unrendered_sections() {
-        // [sglang] renders empty in defaults (all-Option) — the deny
+        // [sglang] renders empty in defaults (all-Option) - the deny
         // teaching text is the only enumerator.
         let sglang = section_leaf_names("sglang");
         assert!(sglang.contains(&"grammar_backend".to_string()));
@@ -24702,7 +24705,7 @@ mod tests {
     #[test]
     fn unit__config_unset__bare_section_leaf_finds_the_real_pin() {
         // BUG-2 pin: `config unset ttl_secs` used to report "not
-        // pinned" while the file kept the value — the root scan misses,
+        // pinned" while the file kept the value - the root scan misses,
         // the section-aware retry must find and remove it.
         let raw = "[semantic_cache]\nthreshold = 0.4\nttl_secs = 2\n";
         let (root_cand, root_removed) = remove_top_level_pin(raw, "ttl_secs");
@@ -24768,13 +24771,13 @@ mod tests {
             "foreign sections survive a posture"
         );
         Config::from_toml(&agent_raw).expect("candidate stays schema-valid");
-        // Stale pins produce old→new lines; never-pinned knobs stay
+        // Stale pins produce old->new lines; never-pinned knobs stay
         // honest "not pinned" no-ops instead of claiming credit.
         assert!(
             outcomes
                 .iter()
                 .any(|o| o.changed && o.line.starts_with("spec unset") && o.line.contains("was:")),
-            "stale spec pin must report old→new"
+            "stale spec pin must report old->new"
         );
         let k = outcomes
             .iter()
@@ -24884,7 +24887,7 @@ mod tests {
         let global = ("b-new".to_string(), EngineKind::LlamaCpp);
 
         // Manual mode: the global lane serves, tag echoed back (arch it
-        // advertises — no rescue prediction).
+        // advertises - no rescue prediction).
         assert_eq!(
             routed_engine_lane(
                 &cfg,
@@ -24934,7 +24937,7 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("no mistralrs engine installed"), "{err}");
         // Auto mode routes safetensors away from the llamacpp global.
-        // (is_dir() must see a REAL directory — the format signal.)
+        // (is_dir() must see a REAL directory - the format signal.)
         let dir = std::env::temp_dir();
         let auto = blazar_core::Config::from_toml("[engine_routing]\nmode = \"auto\"\n").unwrap();
         assert_eq!(
@@ -25043,7 +25046,7 @@ mod tests {
         let global = ("b-new".to_string(), EngineKind::LlamaCpp);
 
         // llada with no advertising lane: the ENGINE cell teaches the
-        // paradigm error — same words the gateway spawn guard emits.
+        // paradigm error - same words the gateway spawn guard emits.
         let err = routed_engine_lane(
             &cfg,
             Some(&global),
@@ -25085,7 +25088,7 @@ mod tests {
         assert!(err.contains("block-diffusion LLM"), "{err}");
 
         // A fork lane (manifest source "fork") advertising the arch
-        // bypasses the guard — the capability-rescue symmetry the
+        // bypasses the guard - the capability-rescue symmetry the
         // spawn guard promises.
         let mut fork_row = gap_engine_row("b-diff-fork", EngineKind::LlamaCpp, &["llada"]);
         fork_row.manifest = fork_row.manifest.replace('{', "{\"source\":\"fork\",");
@@ -25161,7 +25164,7 @@ mod tests {
             &rows.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
         );
         let lines: Vec<&str> = out.lines().collect();
-        // One line per model plus the header — no band rows, no blanks.
+        // One line per model plus the header - no band rows, no blanks.
         assert_eq!(lines.len(), 3, "got: {out}");
         // NAME renders in full (no ellipsis on names) and the long fork
         // tag rides the last column uncapped on the same line.
@@ -25245,7 +25248,7 @@ mod tests {
         );
         let row = out2.lines().nth(1).unwrap();
         assert!(row.contains("имя-модели-очень-длинное"));
-        assert!(row.contains('…'), "oversized arch must cap: {row}");
+        assert!(row.contains("..."), "oversized arch must cap: {row}");
     }
 
     #[test]
@@ -25329,7 +25332,10 @@ mod tests {
         let plain = "mradermacher/Parable-Nanbeige4.2-3B-Claude-Fable-5-heretic-GGUF";
         let t = truncate_repo_id(i1, 64);
         assert!(t.ends_with("heretic-i1-GGUF"), "{t}");
-        assert!(t.contains("…/"), "owner must be the part that shrinks: {t}");
+        assert!(
+            t.contains(".../"),
+            "owner must be the part that shrinks: {t}"
+        );
         assert!(t.chars().count() <= 64);
         // Fits: untouched (this row previously truncated at 49 chars).
         assert_eq!(
@@ -25343,7 +25349,7 @@ mod tests {
         // Slash-less / oversized-model fallback: tail cut, never a panic.
         let no_slash = "a-very-long-repository-name-without-any-slash-at-all-0123456789";
         let t2 = truncate_repo_id(no_slash, 32);
-        assert!(t2.chars().count() <= 32 && t2.ends_with('…'), "{t2}");
+        assert!(t2.chars().count() <= 32 && t2.ends_with("..."), "{t2}");
     }
 
     #[test]
@@ -25392,7 +25398,7 @@ mod tests {
     #[test]
     fn unit__currency_verdict__stale_marker_after_update_reports_current() {
         // Live incident shape: daemon surveyed while b10819 was active, the
-        // user then updated to b10831 — the marker's own verdict must NOT
+        // user then updated to b10831 - the marker's own verdict must NOT
         // be trusted against the current store.
         let marker = serde_json::json!({
             "checked_at": 1_788_759_955_u64,
@@ -25417,7 +25423,7 @@ mod tests {
         assert!(c.warn);
         assert_eq!(
             c.detail,
-            "upgrade available: b10831 (active: b10819, channel: latest) — run: blazar engine update"
+            "upgrade available: b10831 (active: b10819, channel: latest) - run: blazar engine update"
         );
     }
 
@@ -25425,7 +25431,7 @@ mod tests {
     fn unit__currency_verdict__lane_suffix_same_build_and_lane_aware_hint() {
         // Live incident: a source-built bNNNN-cuda engine IS the same
         // build as upstream bNNNN (lane suffix ignored), and the remedy
-        // must name the lane that can actually refresh it — `engine
+        // must name the lane that can actually refresh it - `engine
         // update` would install the Vulkan prebuilt instead.
         let same = serde_json::json!({
             "checked_at": 1_000_u64,
@@ -25475,7 +25481,7 @@ mod tests {
 
     #[test]
     fn unit__currency_verdict__overlay_lane_teaches_lag_and_local_escape() {
-        // Live incident: doctor said "b10969 available — run: blazar
+        // Live incident: doctor said "b10969 available - run: blazar
         // engine update", update then installed nothing (overlay hadn't
         // published b10969-cuda yet). The row must explain the overlay
         // cadence and name the local-build escape so the two surfaces
@@ -25540,7 +25546,7 @@ mod tests {
     #[test]
     fn unit__currency_verdict__downgrade_after_check_still_warns() {
         // Marker written while b10819 was active AND current; the user then
-        // rolled back to b10817 — marker claims up-to-date, store disagrees.
+        // rolled back to b10817 - marker claims up-to-date, store disagrees.
         let marker = serde_json::json!({
             "checked_at": 1_000_u64,
             "latest": "b10819",
@@ -25573,7 +25579,7 @@ mod tests {
         let marker = serde_json::json!({"checked_at": 1_u64, "latest": "b10831"});
         let c = currency_verdict(Some("local"), &marker, 2, "").unwrap();
         assert!(c.ok && !c.warn);
-        assert_eq!(c.detail, "local build — upstream currency not tracked");
+        assert_eq!(c.detail, "local build - upstream currency not tracked");
     }
 
     #[test]
@@ -25601,7 +25607,7 @@ mod tests {
         assert!(c.warn);
         assert_eq!(
             c.detail,
-            "update available: v0.4.0 (running: 0.3.0) — run: blazar upgrade"
+            "update available: v0.4.0 (running: 0.3.0) - run: blazar upgrade"
         );
         let w = version_currency_verdict(
             "whisper currency",
@@ -25612,7 +25618,7 @@ mod tests {
         assert!(w.warn);
         assert_eq!(
             w.detail,
-            "update available: v1.7.6 (running: v1.7.5) — run: blazar whisper --install"
+            "update available: v1.7.6 (running: v1.7.5) - run: blazar whisper --install"
         );
     }
 
@@ -25642,7 +25648,7 @@ mod tests {
         assert!(c.warn);
         assert_eq!(
             c.detail,
-            "update available: b4938 (running: v1.7.5) — run: blazar whisper --install"
+            "update available: b4938 (running: v1.7.5) - run: blazar whisper --install"
         );
         // Same unparseable tag on both sides = up to date, not a warn.
         let c = version_currency_verdict("app currency", "nightly", "nightly", "blazar upgrade");
@@ -25747,7 +25753,7 @@ mod tests {
     #[test]
     fn unit__doctor_next_steps__daemon_models_ready() {
         let port_ok = vec![
-            Check::ok("port", "127.0.0.1:11435 — blazar daemon already answering"),
+            Check::ok("port", "127.0.0.1:11435 - blazar daemon already answering"),
             Check::ok("models", "2 pulled, all parse"),
         ];
         // daemon up + models present -> the ready line
@@ -25909,7 +25915,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)] // twin detection is inode identity — a unix filesystem concept
+    #[cfg(unix)] // twin detection is inode identity - a unix filesystem concept
     fn unit__orphan_scan__hardlink_twin_counted_not_listed() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("models");
@@ -25989,7 +25995,7 @@ mod tests {
         std::fs::write(dir.join("registered.gguf"), &payload).unwrap();
         // Manual-download duplicate: same bytes, different name.
         std::fs::write(dir.join("duplicate.gguf"), &payload).unwrap();
-        // Same SIZE, different content — the sha256 gate must not
+        // Same SIZE, different content - the sha256 gate must not
         // libel it as a twin.
         let mut sibling = payload.clone();
         sibling[0] ^= 0xff;
@@ -25999,7 +26005,7 @@ mod tests {
         let by_name = |n: &str| r.orphans.iter().find(|o| o.name == n).unwrap();
         assert_eq!(
             by_name("duplicate.gguf").twin_of.as_deref(),
-            Some("registered.gguf — linked to m"),
+            Some("registered.gguf - linked to m"),
             "byte-identical duplicate flagged with its registered twin"
         );
         assert!(
@@ -26034,7 +26040,7 @@ mod tests {
         assert!(
             orphan_check
                 .detail
-                .contains("dupe.gguf (256 B) [byte-identical to registered.gguf — linked to m — safe to delete]"),
+                .contains("dupe.gguf (256 B) [byte-identical to registered.gguf - linked to m - safe to delete]"),
             "{}",
             orphan_check.detail
         );
@@ -26071,9 +26077,9 @@ mod tests {
         // The boot sweep used to reap a user-run ggml-rpc-server as an
         // "orphaned engine" (engines-dir exe, no blazar parent), killing
         // the endpoint `rpc_servers` depends on at every daemon start.
-        // The daemon never spawns this binary — `blazar rpc worker`
+        // The daemon never spawns this binary - `blazar rpc worker`
         // execs it in the FOREGROUND CLI only, which dies with its
-        // terminal — so a worker with no blazar parent is a deliberate
+        // terminal - so a worker with no blazar parent is a deliberate
         // co-tenant: advisory in doctor, never SIGTERMed.
         assert!(matches!(
             classify_gpu_tenant(rpc.to_str().unwrap(), &engines, false),
@@ -26302,7 +26308,7 @@ mod tests {
             summary.contains("removed orphan engine dir straydir (256 B, no store row)"),
             "{summary}"
         );
-        assert!(summary.ends_with("— reclaimed 768 B in total"), "{summary}");
+        assert!(summary.ends_with("- reclaimed 768 B in total"), "{summary}");
         // Idempotent: a second pass has nothing left to say.
         let again = engine_prune_summary(&d).unwrap();
         assert!(again.starts_with("nothing to prune"), "{again}");
@@ -26346,7 +26352,7 @@ mod tests {
         std::fs::create_dir_all(d.models_dir()).unwrap();
         drop(blazar_core::store::Store::open(&d).unwrap());
         // Diffusers layout: shards live in subdirs, the root only
-        // carries model_index.json — a root-only *.safetensors scan
+        // carries model_index.json - a root-only *.safetensors scan
         // would false-flag this row.
         let dir = d.models_dir().join("sdxl");
         std::fs::create_dir_all(dir.join("unet")).unwrap();
@@ -26547,7 +26553,7 @@ mod tests {
     #[test]
     // The live sglang false-warn regression: the shim's own --version
     // is an argparse error (exit 2), so the smoke must probe the venv
-    // python's metadata read instead — a healthy venv lane reports ok,
+    // python's metadata read instead - a healthy venv lane reports ok,
     // never "reinstall".
     fn unit__engine_smoke_check__venv_lane_probes_python_not_the_shim() {
         let tmp = tempfile::tempdir().unwrap();
@@ -26787,7 +26793,7 @@ mod tests {
     #[test]
     fn unit__mistralrs_version_tuple__numeric_and_malformed() {
         // Numeric per-component compare: 10 > 9 numerically, not
-        // lexicographically — the exact bug class the tuple prevents.
+        // lexicographically - the exact bug class the tuple prevents.
         assert_eq!(mistralrs_version_tuple("v0.9.3"), Some((0, 9, 3)));
         assert_eq!(mistralrs_version_tuple("v0.10.0"), Some((0, 10, 0)));
         assert!(
@@ -26806,7 +26812,7 @@ mod tests {
     fn unit__currency_verdict__direction_and_channel() {
         let now = 1_000_000u64;
         // Marker older than active, stable channel: a downgrade hint with
-        // the channel named — switching is the point, not a regression.
+        // the channel named - switching is the point, not a regression.
         let marker = serde_json::json!({
             "checked_at": now - 60,
             "latest": "b10780",
@@ -26931,7 +26937,7 @@ mod tests {
     }
 
     // Output-format pins (W1-W4 wave): these lock the rendered shapes
-    // the audit fixed — adaptive table alignment, lowercase status
+    // the audit fixed - adaptive table alignment, lowercase status
     // words, no ANSI when piped, no Option-Debug leaks, honest doctor
     // footer wording.
 
@@ -26976,7 +26982,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn unit__render_table__piped_output_carries_no_ansi_escapes() {
         // Under `cargo test` stdout is a pipe, not a terminal, so the
-        // header renders plain — scripts see byte-stable text.
+        // header renders plain - scripts see byte-stable text.
         let out = render_table(&["A", "B"], &[vec!["1".into(), "2".to_string()]], &[]);
         assert!(!out.contains('\x1b'), "no escapes when piped: {out:?}");
     }
@@ -27059,7 +27065,7 @@ mod tests {
         let golden = concat!(
             "NAME           QUANT     SIZE  VISION           ARCH                  CTX  TYPE   CATEGORY  ENGINE\n",
             "qwen2.5-0.5b   q4_0   644 MiB  mmproj: 224 MiB  Qwen2ForCausalLM    32768  text   text      llama.cpp\n",
-            "whisper-b5130  -      151 MiB                   WhisperForConditi…         voice  -         whisper",
+            "whisper-b5130  -      151 MiB                   WhisperForCondi...         voice  -         whisper",
         );
         assert_eq!(
             render_list_table(
@@ -27188,12 +27194,12 @@ mod tests {
         // The old bug: warnings coexisted with "all checks pass".
         assert_eq!(
             doctor_footer(&[ok(), warn(), warn()]),
-            "1 ok, 2 warning(s) — no failures"
+            "1 ok, 2 warning(s) - no failures"
         );
         assert_eq!(doctor_footer(&[ok(), ok()]), "all checks pass");
         assert_eq!(
             doctor_footer(&[ok(), warn(), fail()]),
-            "1 failing check(s) — fix the fail rows above"
+            "1 failing check(s) - fix the fail rows above"
         );
     }
 }

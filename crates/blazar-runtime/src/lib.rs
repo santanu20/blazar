@@ -2,7 +2,7 @@
 //! supervision, event bus, bench runner.
 
 /// File name of a llama.cpp tool binary on the current platform
-/// (`llama-quantize` vs `llama-quantize.exe`) — F91: every discovery
+/// (`llama-quantize` vs `llama-quantize.exe`) - F91: every discovery
 /// site must go through this, not hand-join the unix name.
 #[must_use]
 pub fn tool_file_name(base: &str) -> String {

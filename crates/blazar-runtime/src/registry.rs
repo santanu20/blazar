@@ -6,14 +6,14 @@
 //!   returns a Docker-v2 manifest envelope whose layers are
 //!   `application/vnd.ollama.image.{model,projector,adapter,template,
 //!   params,license}` descriptors. The response `content-type` LIES
-//!   (`text/plain`) — parse the body, not the header.
+//!   (`text/plain`) - parse the body, not the header.
 //! - `GET /v2/{ns}/{model}/blobs/sha256:{digest}` answers 307 to a
-//!   presigned Cloudflare-R2 URL (Range honored) — the same
+//!   presigned Cloudflare-R2 URL (Range honored) - the same
 //!   redirect-allowlist discipline as the HF lane applies, and the token
 //!   (if any) is attached ONLY to first-party registry.ollama.ai requests,
 //!   never to the presigned CDN hop.
-//! - The `…image.model` layer is a raw GGUF (magic-verified live).
-//! - `tags/list` is not served (404) — discovery stays on HF search.
+//! - The `...image.model` layer is a raw GGUF (magic-verified live).
+//! - `tags/list` is not served (404) - discovery stays on HF search.
 //!
 //! Storage follows blazar's plain-file layout (no blob store, ever):
 //! `models/{name}.gguf` with the registry repository as collision slug.
@@ -51,22 +51,22 @@ pub const OLLAMA_REGISTRY_BASE: &str = "https://registry.ollama.ai/v2/";
 const OLLAMA_REGISTRY_HOSTS: &[&str] = &["registry.ollama.ai", "*.r2.cloudflarestorage.com"];
 
 /// Route a pull target to the right lane: ollama-registry shape (explicit
-/// `registry.ollama.ai/…` host, or a shortname with a tag like `qwen3:0.6b`
-/// — HF targets always carry a `/`) vs the `HuggingFace` lane.
+/// `registry.ollama.ai/...` host, or a shortname with a tag like `qwen3:0.6b`
+/// - HF targets always carry a `/`) vs the `HuggingFace` lane.
 #[must_use]
 pub fn is_registry_shape(input: &str) -> bool {
     let input = input.trim();
     input.starts_with("registry.ollama.ai/") || (!input.contains('/') && input.contains(':'))
 }
 
-/// `qwen3:0.6b` / `registry.ollama.ai/library/qwen3:0.6b@sha256:…` ->
+/// `qwen3:0.6b` / `registry.ollama.ai/library/qwen3:0.6b@sha256:...` ->
 /// repository `library/qwen3`, tag `0.6b`, optional digest pin.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegistryTarget {
     /// `namespace/model`, namespace defaulting to `library`.
     pub repository: String,
     pub tag: String,
-    /// `sha256:<hex>` content pin from an `@sha256:…` suffix.
+    /// `sha256:<hex>` content pin from an `@sha256:...` suffix.
     pub digest: Option<String>,
 }
 
@@ -197,12 +197,12 @@ impl HfClient {
             reqwest::StatusCode::NOT_FOUND => {
                 // The registry serves no tag listing (module doc), so a
                 // 404 here conflates "no such repository" with "repo
-                // exists, quant tag miss" — teach both plus the HF
+                // exists, quant tag miss" - teach both plus the HF
                 // search lane instead of echoing the library/ prefix the
                 // user never typed.
                 let display = repository.strip_prefix("library/").unwrap_or(repository);
                 return Err(anyhow!(
-                    "no such model or tag: {display}:{tag} — both the name and the quant tag \
+                    "no such model or tag: {display}:{tag} - both the name and the quant tag \
                      must exist and the registry serves no tag listing; check spelling or run \
                      `blazar search {display}` to discover variants"
                 ));
@@ -211,7 +211,7 @@ impl HfClient {
                 return Err(anyhow!("registry manifest {other} for {repository}:{tag}"));
             }
         }
-        // Content-type lies (text/plain on a JSON body) — parse the body.
+        // Content-type lies (text/plain on a JSON body) - parse the body.
         let body = resp.bytes().await?;
         let manifest: RegistryManifest =
             serde_json::from_slice(&body).map_err(|e| anyhow!("decode manifest JSON: {e}"))?;
@@ -245,7 +245,7 @@ impl HfClient {
         Ok(serde_json::from_slice(&resp.bytes().await?)?)
     }
 
-    /// Blob URL built by string format then parse — the `sha256:hex`
+    /// Blob URL built by string format then parse - the `sha256:hex`
     /// path segment keeps its colon literal by construction.
     pub(crate) fn blob_url(&self, repository: &str, digest: &str) -> Result<reqwest::Url> {
         reqwest::Url::parse(&format!(
@@ -268,9 +268,9 @@ impl Puller {
 
     /// Pull a model from registry.ollama.ai (weight layer + optional
     /// projector; template/params/license/adapter layers are skipped with
-    /// a log line — the GGUF's own chat template and sampler defaults are
+    /// a log line - the GGUF's own chat template and sampler defaults are
     /// authoritative in blazar).
-    #[allow(clippy::too_many_lines)] // one cohesive lane: resolve → manifest → reuse-vs-network decision → materialize
+    #[allow(clippy::too_many_lines)] // one cohesive lane: resolve -> manifest -> reuse-vs-network decision -> materialize
     pub async fn pull_ollama(&self, input: &str) -> Result<PullOutcome> {
         let target = parse_registry_target(input)?;
         let name = registry_display_name(&target.repository, &target.tag);
@@ -278,7 +278,7 @@ impl Puller {
 
         // Dedicated client: registry bases + registry allowlist. A token
         // (optional, for private namespaces) attaches only to the
-        // first-party registry host — never to the presigned R2 hop.
+        // first-party registry host - never to the presigned R2 hop.
         // `BLAZAR_REGISTRY_BASE` points the lane at a mirror (or a test
         // rig); the allowlist follows the base so the mirror is
         // first-party by construction.
@@ -308,7 +308,7 @@ impl Puller {
         .with_download_speed_limit(self.client.download_speed_limit_mb);
 
         // Local-first: a verified ollama store already on this machine
-        // satisfies the pull with zero network — same manifest semantics
+        // satisfies the pull with zero network - same manifest semantics
         // (shared layer selection), bytes gated by the identical
         // size+sha256 check the download lane applies. Any store anomaly
         // falls through to the network lane untouched.
@@ -328,7 +328,7 @@ impl Puller {
 
         // Same re-pull ladder as the HF lane (see pull_locked): registry
         // tags pin a digest, so the sha compare detects any upstream
-        // movement — including mutable tags like `latest`.
+        // movement - including mutable tags like `latest`.
         let existing = store.get_model(&name)?;
         // Registry weights are GGUF-class: guard against flipping an
         // existing safetensors-directory row under the same name.
@@ -587,7 +587,7 @@ impl Puller {
                 );
             }
             // The registry leaf is deterministic (`{name}.gguf`), so any
-            // replaced same-name row collides — prune BEFORE the download
+            // replaced same-name row collides - prune BEFORE the download
             // so the fresh bytes land on the canonical leaf.
             let new_leaf = format!("{name}.gguf");
             if std::path::Path::new(&old.path)
@@ -692,7 +692,7 @@ impl Puller {
 }
 
 /// Store row from the downloaded GGUF itself (GGUF facts win over any
-/// registry metadata — same precedence as the HF lane).
+/// registry metadata - same precedence as the HF lane).
 fn registry_model_row(
     name: &str,
     target: &RegistryTarget,
@@ -704,10 +704,10 @@ fn registry_model_row(
     let gguf_meta = gguf::read_metadata_file(dest).ok();
     if let Some(n) = gguf_meta.as_ref().and_then(|m| m.mtp_layers) {
         // Ollama-side conversions merge the MTP head into the base GGUF
-        // (nextn_predict_layers KV) — surface the win: measured +50%
+        // (nextn_predict_layers KV) - surface the win: measured +50%
         // decode on qwen3.5-9b when spec=auto picks it up.
         tracing::info!(
-            "MTP head ({n} layer(s)) present in {name} — spec = \"auto\" enables draft-mtp automatically"
+            "MTP head ({n} layer(s)) present in {name} - spec = \"auto\" enables draft-mtp automatically"
         );
     }
     let arch = gguf_meta.as_ref().map(|m| m.architecture.clone());
@@ -760,7 +760,7 @@ struct RegistryPlan {
 }
 
 /// Manifest fetch + digest pin + layer selection + config-blob quant.
-/// Template/params/license/adapter layers are skipped with a log line —
+/// Template/params/license/adapter layers are skipped with a log line -
 /// the GGUF's own chat template and sampler defaults are authoritative
 /// in blazar.
 async fn resolve_registry_plan(
@@ -779,7 +779,7 @@ async fn resolve_registry_plan(
     let (model_layer, projector) = select_registry_layers(&manifest, target, name)?;
 
     // Quant from the config blob (file_type, e.g. "Q4_K_M"); config
-    // trouble must not fail the pull — "registry" is the honest fallback.
+    // trouble must not fail the pull - "registry" is the honest fallback.
     let file_type = if let Some(cfg) = &manifest.config {
         client
             .registry_blob_json::<RegistryConfig>(&target.repository, &cfg.digest)
@@ -800,7 +800,7 @@ async fn resolve_registry_plan(
 /// Model + projector layer selection, shared by the network lane and the
 /// local ollama-store reuse lane so the two can never disagree about what
 /// a manifest means. Unknown layer types are skipped with a log line
-/// (template, params, license, adapters — the GGUF is authoritative in
+/// (template, params, license, adapters - the GGUF is authoritative in
 /// blazar).
 fn select_registry_layers(
     manifest: &RegistryManifest,
@@ -838,7 +838,7 @@ fn select_registry_layers(
     Ok((model_layer, projector))
 }
 
-/// Config-blob `file_type` → store-row quant, with the sanitize rules and
+/// Config-blob `file_type` -> store-row quant, with the sanitize rules and
 /// the honest "registry" fallback shared by both lanes (a locally reused
 /// model must record the identical row a network pull would have).
 fn registry_quant(file_type: Option<String>) -> String {
@@ -877,7 +877,7 @@ struct LocalRegistryHit {
 /// (the only override ollama itself honors), the per-user install
 /// (`~/.ollama/models`), then the standard Linux service install (ollama
 /// runs as its own user there, so the store lives under /usr/share).
-/// Non-existent roots are skipped by the caller — probing is read-only.
+/// Non-existent roots are skipped by the caller - probing is read-only.
 pub(crate) fn ollama_store_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(root) = std::env::var_os("OLLAMA_MODELS")
@@ -892,7 +892,7 @@ pub(crate) fn ollama_store_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// `sha256:<hex>` descriptor digest → the store's blob file
+/// `sha256:<hex>` descriptor digest -> the store's blob file
 /// (`<root>/blobs/sha256-<hex>`; the colon becomes a dash on disk).
 pub(crate) fn ollama_blob_path(root: &std::path::Path, digest: &str) -> PathBuf {
     root.join("blobs").join(digest.replace(':', "-"))
@@ -901,8 +901,8 @@ pub(crate) fn ollama_blob_path(root: &std::path::Path, digest: &str) -> PathBuf 
 /// Resolve a pull entirely from a local ollama store when every byte
 /// verifies: manifest (and config blob, for the quant) parsed from disk,
 /// model and projector blobs gated by `reuse_byte_exact` against the
-/// descriptor size + digest. ANY anomaly — missing manifest, digest-pin
-/// mismatch, absent or corrupt blob — yields `None` and the caller falls
+/// descriptor size + digest. ANY anomaly - missing manifest, digest-pin
+/// mismatch, absent or corrupt blob - yields `None` and the caller falls
 /// back to the network lane. Mixing one verified local blob with one
 /// unverified one is refused for the same reason: the reuse gate must be
 /// all-or-nothing per pull.
@@ -1101,7 +1101,7 @@ mod tests {
             .to_string()
     }
 
-    /// Minimal valid GGUF v3 file — passes `gguf::read_metadata_file`
+    /// Minimal valid GGUF v3 file - passes `gguf::read_metadata_file`
     /// (integrity gate). Mirrors the HF test-mod helper.
     fn gguf_seed_bytes() -> Vec<u8> {
         let mut b: Vec<u8> = Vec::new();
@@ -1153,7 +1153,7 @@ mod tests {
             .unwrap();
         assert_eq!(m.schema_version, 2);
 
-        // Correct pin passes…
+        // Correct pin passes...
         let good = format!("sha256:{}", hex(&Sha256::digest(&raw)));
         let (m2, _) = client
             .registry_manifest("library/qwen3", "0.6b")
@@ -1193,7 +1193,7 @@ mod tests {
         };
         dirs.ensure().unwrap();
 
-        // Manifest only — no blob endpoints mounted. Any blob fetch would
+        // Manifest only - no blob endpoints mounted. Any blob fetch would
         // 404 and fail the pull: the gate must resolve from metadata.
         let api = wiremock::MockServer::start().await;
         manifest_mock(&api).await;
@@ -1435,7 +1435,7 @@ mod tests {
     fn unit__local_registry_plan_at__blob_size_mismatch_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         // Manifest advertises the real size, but the blob on disk is
-        // short — the size gate must reject before any hashing matters.
+        // short - the size gate must reject before any hashing matters.
         let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
         let m: RegistryManifest = serde_json::from_str(
             &std::fs::read_to_string(
@@ -1565,7 +1565,7 @@ mod tests {
         crate::test_env::set_env("OLLAMA_MODELS", store_root.display().to_string());
 
         // No mocks mounted at all: ANY registry request would 404 and
-        // fail the pull — the local hit must satisfy it entirely offline.
+        // fail the pull - the local hit must satisfy it entirely offline.
         // (The registry base must be pinned to the empty mock too:
         // `pull_ollama` builds its own client from the env, never
         // `puller.client`.)
@@ -1612,7 +1612,7 @@ mod tests {
         dirs.ensure().unwrap();
 
         // Corrupt the local model blob (same length, different bytes) so
-        // the local gate refuses — the pull must then succeed through the
+        // the local gate refuses - the pull must then succeed through the
         // ordinary network ladder, byte-identically.
         let content = gguf_seed_bytes();
         let store_root = ollama_store_fixture(tmp.path(), &content);

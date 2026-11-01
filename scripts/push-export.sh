@@ -3,7 +3,7 @@
 # publish gates (the squash-mirror flow retired once history was
 # purged of secrets). Hygiene, fmt, clippy, tests, and a
 # credential-shape scan on the exact tree being pushed run as hard
-# blockers — any failure stops before anything reaches the remote.
+# blockers - any failure stops before anything reaches the remote.
 #
 # Flow: clean-tree check -> hygiene -> fmt/clippy/tests ->
 # credential scan on the HEAD tree -> push (fast-forward only; a
@@ -57,7 +57,7 @@ fi
 # Credential-shaped scan on the exact tree being pushed (HEAD), not
 # the working directory: untracked local files are out of scope.
 # git grep exits 0 on a match, 1 when clean, >1 when the scan itself
-# failed — everything but 1 aborts.
+# failed - everything but 1 aborts.
 token_re='ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}'
 scan_rc=0
 git grep -qE "$token_re" HEAD -- || scan_rc=$?

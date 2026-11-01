@@ -73,7 +73,7 @@ pub struct Tuner<'a> {
     pub bench_bin: PathBuf,
 }
 
-/// One `tune --load` A/B measurement: wall seconds (spawn→ready +
+/// One `tune --load` A/B measurement: wall seconds (spawn->ready +
 /// first-chat) for the warmup and no-warmup variants of the same argv.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoadProbe {
@@ -161,10 +161,10 @@ pub fn strip_spec_axis(base_argv: &[String]) -> Vec<String> {
 /// one path shape (shallowest match = deterministic). Only llamacpp
 /// rows are scanned (mistralrs/sglang engines ship no llama-bench), the
 /// active engine wins. A candidate only counts when `llama-server` sits
-/// in the SAME dir — the Tuner spawns load/replica probes from
+/// in the SAME dir - the Tuner spawns load/replica probes from
 /// `bench_bin.parent()` and a tool-only dir would break them with a
 /// confusing error later. A manually registered `local` engine may
-/// lack llama-bench entirely; no external fallback paths — blazar is
+/// lack llama-bench entirely; no external fallback paths - blazar is
 /// self-contained, and the error names remedies that actually produce
 /// a bench binary.
 pub fn find_bench_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
@@ -177,7 +177,7 @@ pub fn find_bench_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
     if llamacpp.is_empty() {
         return Err(anyhow!(
             "no engine installed; run `blazar engine update` (prebuilt \
-             per-arch CUDA assets ship llama-server only — `blazar engine \
+             per-arch CUDA assets ship llama-server only - `blazar engine \
              build cuda` builds the full tool set, incl. llama-bench)"
         ));
     }
@@ -252,7 +252,7 @@ impl Tuner<'_> {
     /// real llama-server (argv cloned from the compiled profile, ports
     /// ephemeral), drive `clients` concurrent non-stream chats, and
     /// measure aggregate wall tokens/s. llama-bench cannot see slot
-    /// concurrency — this is the only honest axis for `-np`.
+    /// concurrency - this is the only honest axis for `-np`.
     pub fn slots_search(
         &self,
         base_argv: &[String],
@@ -322,7 +322,7 @@ impl Tuner<'_> {
     /// spawn the real llama-server with `--spec-type ngram-simple` and the
     /// candidate's typed tuning flags, drive ONE non-stream chat (spec
     /// decoding is a single-stream win; concurrency would mask it), and
-    /// measure wall tokens/s. llama-bench has no spec axis — this is the
+    /// measure wall tokens/s. llama-bench has no spec axis - this is the
     /// only honest measurement lane for ngram knobs.
     pub fn ngram_search(
         &self,
@@ -383,16 +383,16 @@ impl Tuner<'_> {
     }
 
     /// Spec-mode race (`tune --spec-race`): spawn the real llama-server
-    /// once per candidate mode — dense (no speculation), ngram
+    /// once per candidate mode - dense (no speculation), ngram
     /// (`--spec-type ngram-simple` at engine defaults), dflash
     /// (`--spec-type draft-dflash`, draft-free block speculation),
     /// draft (`--spec-type draft-simple` with the catalog's draft
-    /// model and the profile's n-max) — and measure single-stream
+    /// model and the profile's n-max) - and measure single-stream
     /// wall tokens/s. Phase one of the two-phase spec search: the
     /// winning mode (if ngram) goes to [`Self::ngram_search`] for
     /// (`size_m`, `min_hits`) refinement; dflash and dense carry no
     /// refinable knobs on this axis. Only modes the engine's manifest
-    /// advertises may race — the caller filters before invoking.
+    /// advertises may race - the caller filters before invoking.
     /// `draft` additionally requires the caller to pass the draft
     /// pair (`path`, `n_max`) resolved from the catalog.
     pub fn spec_mode_race(
@@ -505,7 +505,7 @@ impl Tuner<'_> {
     /// chat. The prompt is built from one repeated sentence so the engine's
     /// chunked-prompt cache can reuse it. N=0 omits the flag (upstream
     /// default: cache reuse disabled); Blazar's shipped default is 256, so
-    /// adoption must beat 256 by >5% — printing the whole grid keeps the
+    /// adoption must beat 256 by >5% - printing the whole grid keeps the
     /// verdict honest even when nothing wins.
     pub fn cache_reuse_search(
         &self,
@@ -577,11 +577,11 @@ impl Tuner<'_> {
     }
 
     /// Warmup-axis A/B probe (`tune --load`): spawn the real llama-server
-    /// twice, differing ONLY in `--no-warmup`, and measure spawn→ready
+    /// twice, differing ONLY in `--no-warmup`, and measure spawn->ready
     /// plus the first chat round-trip. Warmup trades startup seconds for
     /// first-token latency; the metric prices both into one number. The
     /// no-warmup variant runs FIRST so the second (warmup) spawn enjoys
-    /// the warm page cache — biasing AGAINST adoption, which is the safe
+    /// the warm page cache - biasing AGAINST adoption, which is the safe
     /// direction for a knob that disables an engine default.
     pub fn load_search(&self, base_argv: &[String], idle_secs: u64) -> Result<LoadProbe> {
         let server_bin = self
@@ -682,7 +682,7 @@ impl Tuner<'_> {
             let _ = b2.kill();
             let _ = b2.wait();
             anyhow::bail!(
-                "replica search: second child never became ready — the card likely \
+                "replica search: second child never became ready - the card likely \
                  cannot hold two copies (VRAM/ RAM); keep replicas = 1"
             );
         }
@@ -702,7 +702,7 @@ impl Tuner<'_> {
     }
 
     /// `bench_default` with the serving profile's thread pin: receipts
-    /// must measure the same thread shape the daemon serves with — an
+    /// must measure the same thread shape the daemon serves with - an
     /// unpinned llama-bench run reports its own default (8) while the
     /// adopted profile may serve on all cores, and the stored numbers
     /// then mislead every later tune decision.
@@ -771,16 +771,16 @@ impl Tuner<'_> {
         // cells on the 4-grade KV ladder (decode is bandwidth-bound, so
         // the deeper grades are real candidates) and drops the
         // threads/batch axes, which barely move tg there; a CPU lane
-        // keeps the legacy axes — threads move tg on CPU and exotic KV
+        // keeps the legacy axes - threads move tg on CPU and exotic KV
         // grades are spottier there.
         //
         // The engine refuses a quantized V cache unless flash-attn is on
         // (hard context-creation error that aborts the WHOLE llama-bench
-        // run — receipt: b11946 CUDA, qwen3-0.6b), so the legal search
+        // run - receipt: b11946 CUDA, qwen3-0.6b), so the legal search
         // space is conditional per fa leg instead of a cartesian product:
         //   fa=on  -> full KV ladder on both sides
         //   fa=off -> f16 V (mandatory) x the K-side ladder (K quantizes
-        //             fine without fa — the same differential the
+        //             fine without fa - the same differential the
         //             profile's fa-off rule keeps)
         // One llama-bench run per leg, rows merged before the argmax; the
         // KV axis is never silently dropped for a legal combo again.
@@ -841,7 +841,7 @@ impl Tuner<'_> {
             for reduction in 0..=2 {
                 let mut g = leg.clone();
                 if reduction == 1 {
-                    // KV-quant axis off — collapse every KV-axis value
+                    // KV-quant axis off - collapse every KV-axis value
                     // (the arg right after -ctk/-ctv) to its first leg;
                     // the flag name is the axis identity, so ladder
                     // width does not matter here.
@@ -877,13 +877,13 @@ impl Tuner<'_> {
         }
 
         // Argmax by mean tg t/s across (threads, quant, fa, batch)
-        // combos — restricted to combos whose KV grades carry measured
+        // combos - restricted to combos whose KV grades carry measured
         // quality evidence at the profile's serving context. Throughput
         // alone must never adopt a degrading grade: the ppl registry is
         // the eligibility evidence, a grade without a measured rung for
         // THIS model at >= the compiled ctx stays out of the running,
         // and f16 is the always-eligible baseline. A model with no
-        // receipts at all tunes over f16 only — the conservative
+        // receipts at all tunes over f16 only - the conservative
         // stance until a campaign measures more grades. The gate
         // decides only what the tuner adopts on its own; an explicit
         // `cache_type` model override remains the human override.
@@ -946,7 +946,7 @@ impl Tuner<'_> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Combo {
     pub threads: u64,
-    /// (`type_k`, `type_v`) grades — "f16" when the row omits them.
+    /// (`type_k`, `type_v`) grades - "f16" when the row omits them.
     pub kv: (String, String),
     pub fa_on: bool,
     pub batch: u64,
@@ -1024,7 +1024,7 @@ fn persist_profile(
 ) -> Result<()> {
     let hash = args_hash(input, profile);
     // Tuning knobs are recorded via the winning argv (they ARE the
-    // argv); `tuning` is not serialized separately — it is only quoted
+    // argv); `tuning` is not serialized separately - it is only quoted
     // in the ledger's adoption event below.
     let row = ProfileRow {
         model_name: input.model_name.to_string(),
@@ -1071,7 +1071,7 @@ fn persist_profile(
     // experiment identity (immutable), the raw grid measurements
     // (append-only), the adoption event with its justification, and
     // repoint active_profiles at the winning experiment. Errors
-    // propagate on purpose — a profile without its evidence trail is
+    // propagate on purpose - a profile without its evidence trail is
     // not silently adoptable; the ledger is the trust base every
     // future auto-optimization decision will be judged against.
     let experiment_id = store.insert_experiment(
@@ -1117,7 +1117,7 @@ pub struct BenchmarkPayload {
 }
 
 /// sha256 over (`engine_tag` + overlay + config-relevant fields + model
-/// mtime) — recompile when any input drifts.
+/// mtime) - recompile when any input drifts.
 #[must_use]
 pub fn args_hash(input: &ProfileInput<'_>, profile: &Profile) -> String {
     let mtime = std::fs::metadata(input.model_path)
@@ -1157,7 +1157,7 @@ fn now_secs() -> i64 {
 
 /// Convenience: build a `ProfileInput` from stored state (used by CLI and
 /// supervisor). `draft_path` resolution stays with the caller.
-/// `engine_kind` picks the compile lane the profile is scored against —
+/// `engine_kind` picks the compile lane the profile is scored against -
 /// the CLI bench tune paths pass `LlamaCpp`, doctor's fit preview passes
 /// the engine lane it previews.
 #[allow(clippy::too_many_arguments)]
@@ -1226,10 +1226,10 @@ fn ephemeral_port() -> Result<u16> {
 
 /// Strip-and-rebind for the sglang spec race: the compiled base argv
 /// carries the connection quintet plus any user spec pins, and every arm
-/// must own its speculation axis outright — dense re-keeps the user's
+/// must own its speculation axis outright - dense re-keeps the user's
 /// attention pin (their real dense config), ngram carries the working
 /// recipe (`NGRAM` + triton attention; the flashinfer verify kernels JIT
-/// and die at graph capture with the default backend — live receipt
+/// and die at graph capture with the default backend - live receipt
 /// 2026-10-09, sglang 0.5.21 bundle). Port and served name are rebound
 /// per arm so each child owns its ephemeral endpoint and answers to the
 /// search lane's fixed model id.
@@ -1299,11 +1299,11 @@ fn sglang_race_argv(
 
 /// sglang-lane sibling of [`Tuner::spec_mode_race`]: dense vs draft-free
 /// NGRAM on real `sglang-server` spawns, single-stream greedy wall tok/s.
-/// Free function on purpose — the llamacpp race derives its server from
+/// Free function on purpose - the llamacpp race derives its server from
 /// `bench_bin`; here the caller hands the engine wrapper
 /// (`manifest.server_path`) directly. Ready wait is longer than the
 /// llama lane: a cold sglang child pays torch import plus CUDA-graph
-/// capture before /health (measured 31–43 s on the 0.5.21 bundle).
+/// capture before /health (measured 31-43 s on the 0.5.21 bundle).
 #[allow(clippy::missing_panics_doc)] // no panics; clippy sees through the helper only
 pub fn sglang_spec_mode_race(
     server_bin: &std::path::Path,
@@ -1341,7 +1341,7 @@ pub fn sglang_spec_mode_race(
 
 /// Spawn a search-lane llama-server: stdio-silent and tied to THIS
 /// process's lifetime. Every normal loop path kills the child it
-/// spawned; the kernel tie covers the abnormal ones — the CLI dying
+/// spawned; the kernel tie covers the abnormal ones - the CLI dying
 /// mid-search (terminal close, kill) must not leak a VRAM-holding
 /// server (live-verified failure mode: an orphaned llama-server held
 /// 5.3 GiB after its owner died).
@@ -1361,7 +1361,7 @@ fn spawn_search_server(
     let mut cmd = std::process::Command::new(server_bin);
     // Child stderr lands in a per-port file instead of /dev/null: a
     // child that dies before readiness (OOM, rejected flag) leaves the
-    // reason on disk for the failure path to quote — a nulled stderr
+    // reason on disk for the failure path to quote - a nulled stderr
     // turned every early death into an opaque readiness timeout.
     let f = std::fs::File::create(stderr_log)
         .with_context(|| format!("create {}", stderr_log.display()))?;
@@ -1399,7 +1399,7 @@ fn wait_ready(child: &mut std::process::Child, port: u16, timeout_secs: f64) -> 
     false
 }
 
-/// First `n` bytes of `text` cut at a char boundary — lossy-decoded socket
+/// First `n` bytes of `text` cut at a char boundary - lossy-decoded socket
 /// buffers can end mid-char and a raw slice would panic (F100).
 fn head_bytes(text: &str, n: usize) -> &str {
     let mut cut = text.len().min(n);
@@ -1410,7 +1410,7 @@ fn head_bytes(text: &str, n: usize) -> &str {
 }
 
 /// Wall seconds for ONE tiny non-stream chat round-trip. `tune --load`
-/// adds this to spawn→ready so the no-warmup variant's first-request
+/// adds this to spawn->ready so the no-warmup variant's first-request
 /// lazy-init penalty is priced into its metric instead of silently
 /// vanishing into the user's first prompt.
 fn first_chat_secs(port: u16) -> Result<f64> {
@@ -1419,7 +1419,7 @@ fn first_chat_secs(port: u16) -> Result<f64> {
 
 /// Wall seconds for one non-stream chat with the given user content.
 /// Shared by the load probe (tiny "hi") and the cache-reuse probe
-/// (long repeated prefix — see `cache_reuse_search`).
+/// (long repeated prefix - see `cache_reuse_search`).
 #[allow(clippy::items_after_statements)] // io trait imports sit near their single use
 fn chat_secs(port: u16, content: &str) -> Result<f64> {
     let t0 = std::time::Instant::now();
@@ -1447,7 +1447,7 @@ fn chat_secs(port: u16, content: &str) -> Result<f64> {
 }
 
 /// `clients` concurrent non-stream chats; aggregate tokens/s across all
-/// walls (blocking threads — this runs in a CLI, not the runtime).
+/// walls (blocking threads - this runs in a CLI, not the runtime).
 #[allow(clippy::items_after_statements)] // io trait imports sit near their single use
 #[allow(clippy::cast_precision_loss)] // throughput display only
 fn drive_concurrent(port: u16, clients: u32) -> Result<f64> {
@@ -1458,7 +1458,7 @@ fn drive_concurrent(port: u16, clients: u32) -> Result<f64> {
 /// Greedy on purpose: deterministic receipts for every search lane, and
 /// a speculating engine's verify path only stays kernel-prebuilt for
 /// greedy decode on some bundles (a sampled first request can JIT-fail
-/// the whole child — live receipt, sglang 0.5.21, 2026-10-09).
+/// the whole child - live receipt, sglang 0.5.21, 2026-10-09).
 #[allow(clippy::items_after_statements)] // io trait imports sit near their single use
 fn chat_completion_tokens(port: u16, content: &str) -> Result<u64> {
     let body = serde_json::json!({
@@ -1576,7 +1576,7 @@ mod tests {
             .upsert_engine(&engine_row("b2-cuda", false, EngineKind::LlamaCpp))
             .unwrap();
 
-        // Active engine ships the per-arch slim layout: server only — its
+        // Active engine ships the per-arch slim layout: server only - its
         // lone llama-bench sits in a TOOL-ONLY dir without a sibling
         // llama-server and must NOT be picked.
         let eng1 = dirs.engines_dir().join("b1-cuda");
@@ -1591,7 +1591,7 @@ mod tests {
                 .join(crate::tool_file_name("llama-bench")),
         );
 
-        // Second engine: full bundle in a vendor-suffixed dir — the pick.
+        // Second engine: full bundle in a vendor-suffixed dir - the pick.
         let want = dirs
             .engines_dir()
             .join("b2-cuda")
@@ -1786,7 +1786,7 @@ mod tests {
         .collect::<Vec<_>>();
         let out = sglang_race_argv(&base, "dense", 4243, &race_flags()).unwrap();
         // Dense drops every speculation flag but must keep the user's
-        // real attention pin — that IS their dense config.
+        // real attention pin - that IS their dense config.
         assert_eq!(
             out,
             [

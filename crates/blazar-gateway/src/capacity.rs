@@ -5,14 +5,14 @@
 //! joins three sources, each honest about its own limits:
 //!
 //! - `nvidia-smi` device census (index, name, total/free VRAM,
-//!   utilization) — absent on non-NVIDIA boxes, reported as an empty
+//!   utilization) - absent on non-NVIDIA boxes, reported as an empty
 //!   device list with a note, never guessed.
-//! - `nvidia-smi --query-compute-apps` (pid + used VRAM) — the ONLY
+//! - `nvidia-smi --query-compute-apps` (pid + used VRAM) - the ONLY
 //!   per-process memory authority on the box.
-//! - the supervisor's live instance rows (`Supervisor::ps`) — model,
+//! - the supervisor's live instance rows (`Supervisor::ps`) - model,
 //!   engine, slots, state, placement. Joining by pid attributes VRAM to
 //!   Blazar residents; unmatched compute apps surface as `external`
-//!   (another process eating the GPU — ollama users' "where did my VRAM
+//!   (another process eating the GPU - ollama users' "where did my VRAM
 //!   go" question, answered with data).
 //!
 //! Weights/KV/compute SPLIT per resident is deliberately not claimed:
@@ -30,7 +30,7 @@ use crate::state::AppState;
 
 /// Bounded external-process run: kill past the deadline, drain both pipes
 /// through threads (mirrors the runtime probe helper's fork-pressure
-/// discipline — a wedged probe must never wedge the endpoint).
+/// discipline - a wedged probe must never wedge the endpoint).
 pub(crate) fn bounded_output(
     cmd: &mut std::process::Command,
     secs: u64,
@@ -111,7 +111,7 @@ pub(crate) fn parse_devices(text: &str) -> Vec<DeviceRow> {
         .collect()
 }
 
-/// `pid, used MiB` per line. Drivers without the number print `[N/A]` —
+/// `pid, used MiB` per line. Drivers without the number print `[N/A]` -
 /// those rows report the pid with an unknown footprint (0), never a guess.
 pub(crate) fn parse_compute_apps(text: &str) -> Vec<(u32, u64)> {
     text.lines()
@@ -124,7 +124,7 @@ pub(crate) fn parse_compute_apps(text: &str) -> Vec<(u32, u64)> {
         .collect()
 }
 
-/// GET /api/capacity — device census + per-resident VRAM attribution.
+/// GET /api/capacity - device census + per-resident VRAM attribution.
 #[allow(clippy::too_many_lines)] // census + join + honest notes: one response body assembled in reading order
 pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
     // Two nvidia-smi spawns (~30-60 ms each) + pipe polling: blocking
@@ -170,7 +170,7 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
             .collect()
     } else {
         notes.push(
-            "no nvidia-smi census on this box — non-NVIDIA GPU boxes report an empty \
+            "no nvidia-smi census on this box - non-NVIDIA GPU boxes report an empty \
              device list (residents below still come from the supervisor)",
         );
         Vec::new()
@@ -200,7 +200,7 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
                     Some((_, mib)) => {
                         v["vram_bytes"] = serde_json::json!(mib * 1024 * 1024);
                     }
-                    // Resident but not (yet) holding GPU memory — CPU
+                    // Resident but not (yet) holding GPU memory - CPU
                     // instances and engine kinds without compute apps.
                     None => {
                         v["vram_bytes"] = serde_json::Value::Null;

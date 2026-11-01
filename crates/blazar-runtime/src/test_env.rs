@@ -4,7 +4,7 @@
 //! std requires that no other thread read or write the environment while a
 //! mutation is in flight. These tests run one-test-per-process under
 //! nextest, and the env-reading code under test executes on the calling
-//! thread between mutation and restore — the one condition std demands.
+//! thread between mutation and restore - the one condition std demands.
 //! The single audited `unsafe` block for the whole crate lives here.
 
 /// `std::env::set_var` for tests (see module docs).

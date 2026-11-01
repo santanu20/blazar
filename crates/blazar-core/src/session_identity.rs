@@ -1,11 +1,11 @@
 //! KV-checkpoint identity manifests (#20): every session save writes a
 //! sibling `<file>.identity.json` recording the exact runtime shape the
 //! KV bytes were produced under (engine build, model bytes, ctx, cache
-//! type, KV unification, slots). Restores verify before injecting — KV
+//! type, KV unification, slots). Restores verify before injecting - KV
 //! state from a different shape is silent garbage, not a warm start.
 //!
 //! Unknown-vs-unknown never fails a restore: a missing `model_sha`
-//! (pulled before hashing existed) is "unverifiable", not "mismatched" —
+//! (pulled before hashing existed) is "unverifiable", not "mismatched" -
 //! only fields present on BOTH sides are compared.
 
 use std::path::Path;
@@ -34,7 +34,7 @@ pub struct SessionIdentity {
     pub saved_at_unix: u64,
 }
 
-/// Sibling manifest path: `<session-file>.identity.json` (append — the
+/// Sibling manifest path: `<session-file>.identity.json` (append - the
 /// session name may itself contain dots).
 #[must_use]
 pub fn manifest_path(session_file: &Path) -> PathBuf {
@@ -58,7 +58,7 @@ pub fn build(dirs: &BlazarDirs, config: &Config, model: &str) -> Option<SessionI
         model_sha,
         ctx: config.effective_ctx(model),
         // Symmetric grades record the legacy single value (old manifests
-        // verify unchanged); a differential K/V pair composes "k/v" — the
+        // verify unchanged); a differential K/V pair composes "k/v" - the
         // string compare then refuses cross-quant restores in every
         // old-vs-new direction without a schema change.
         cache_type: {
@@ -67,7 +67,7 @@ pub fn build(dirs: &BlazarDirs, config: &Config, model: &str) -> Option<SessionI
         },
         kv_unified: config.effective_kv_unified(model),
         // F121: record the overlay-effective slot count, not the raw
-        // global — a per-model `slots` override changes what actually
+        // global - a per-model `slots` override changes what actually
         // runs, and the restore check compares against this value.
         // (0 = upstream auto: recorded as configured; the profile
         // compiler resolves auto downstream.)
@@ -98,7 +98,7 @@ pub fn read_manifest(session_file: &Path) -> Option<SessionIdentity> {
 }
 
 /// Field-by-field comparison. Empty vec = safe to restore. Fields
-/// absent (`None`) on either side are skipped — unverifiable is not a
+/// absent (`None`) on either side are skipped - unverifiable is not a
 /// mismatch.
 #[must_use]
 pub fn verify(saved: &SessionIdentity, current: &SessionIdentity) -> Vec<String> {

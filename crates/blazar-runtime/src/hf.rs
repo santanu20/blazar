@@ -8,7 +8,7 @@
 //!   the partial file and fails the pull
 //!
 //! Store layout stays plain files (`models/*.gguf`) so any tool can use
-//! them directly — no blob storage, ever (complaint #4).
+//! them directly - no blob storage, ever (complaint #4).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,7 +43,7 @@ pub fn is_allowed_download_host(host: &str) -> bool {
 
 /// Extra-host match with wildcard support: an exact pattern matches only
 /// itself; a `*.suffix` pattern admits any subdomain of `suffix` (the
-/// apex itself is NOT matched — presigned-CDN families live on
+/// apex itself is NOT matched - presigned-CDN families live on
 /// subdomains, e.g. `*.r2.cloudflarestorage.com`).
 #[must_use]
 pub(crate) fn extra_host_matches(host: &str, pattern: &str) -> bool {
@@ -71,8 +71,8 @@ pub fn registry_name(repo: &str) -> String {
         .to_string()
 }
 
-/// Row name for a pull: the repo tail, or — when the quant slot carries
-/// an exact `.gguf` filename (drafter-in-same-repo pulls) — that file's
+/// Row name for a pull: the repo tail, or - when the quant slot carries
+/// an exact `.gguf` filename (drafter-in-same-repo pulls) - that file's
 /// stem, so `dflash-Qwen3-8B-Q8_0.gguf` and `Qwen3-8B-Q8_0.gguf` from
 /// one repo land as distinct rows (`dflash-qwen3-8b-q8_0` vs
 /// `qwen3-8b`).
@@ -141,8 +141,8 @@ pub struct HfSibling {
 
 /// One entry of the Hub tree API (`api/models/{repo}/tree/main/...`):
 /// files carry `size`; directories do not. Unlike the siblings
-/// expansion — which the Hub truncates on big repos (live:
-/// `rhasspy/piper-voices` returned 3301 of thousands of files) — the
+/// expansion - which the Hub truncates on big repos (live:
+/// `rhasspy/piper-voices` returned 3301 of thousands of files) - the
 /// tree endpoint lists everything through cursor pagination.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HfTreeEntry {
@@ -167,7 +167,7 @@ impl HfTreeEntry {
 }
 
 /// `expand[]=gguf` aggregate over a repo's GGUF files. `total` is the
-/// PARAMETER COUNT (not bytes — never render it as a size); the actual
+/// PARAMETER COUNT (not bytes - never render it as a size); the actual
 /// on-disk bytes live in `totalFileSize` (sum over every `.gguf`, all
 /// quants). `architecture`/`context_length` are read from the first
 /// GGUF's header metadata and may be absent when the Hub could not
@@ -184,7 +184,7 @@ pub struct HfGgufInfo {
     pub context_length: Option<u64>,
 }
 
-/// `expand[]=safetensors` summary — the Hub's per-repo parameter
+/// `expand[]=safetensors` summary - the Hub's per-repo parameter
 /// histogram. `parameters` maps safetensors dtype keys to tensor-element
 /// counts (MLX/GPTQ quants pack 8 weights per U32/I32, so counts are
 /// ELEMENTS, not on-disk cells); `total` is the element sum.
@@ -197,7 +197,7 @@ pub struct HfSafetensorsInfo {
 }
 
 impl HfSafetensorsInfo {
-    /// On-disk byte estimate = Σ dtype-width × element count — exactly
+    /// On-disk byte estimate = Σ dtype-width x element count - exactly
     /// what `pull` downloads (a U32-packed MLX 4-bit cell is still 4
     /// bytes on disk). `None` when the histogram is empty or carries an
     /// unknown dtype (never guess a size).
@@ -227,7 +227,7 @@ fn dtype_width_bytes(dtype: &str) -> Option<u64> {
     })
 }
 
-/// `expand[]=config` summary — enough to label ARCH without pulling
+/// `expand[]=config` summary - enough to label ARCH without pulling
 /// `config.json` per repo (`max_position_embeddings` is NOT part of the
 /// search expansion, so context stays a GGUF-only column). Diffusers
 /// repos have no root `config.json`; their pipeline class arrives under
@@ -253,8 +253,8 @@ pub struct HfDiffusersSummary {
 impl HfConfigSummary {
     /// ARCH ladder for one repo: `model_type` > first `architectures`
     /// entry (lowercased) > diffusers pipeline class as a snake-case
-    /// token (`QwenImage21Pipeline` → `qwen_image21`, `FluxPipeline`
-    /// → `flux`). `None` when the Hub carried none of the three.
+    /// token (`QwenImage21Pipeline` -> `qwen_image21`, `FluxPipeline`
+    /// -> `flux`). `None` when the Hub carried none of the three.
     #[must_use]
     pub fn arch_hint(&self) -> Option<String> {
         if let Some(mt) = self.model_type.as_ref().filter(|m| !m.is_empty()) {
@@ -270,9 +270,9 @@ impl HfConfigSummary {
     }
 }
 
-/// `QwenImage21Pipeline` → `qwen_image21`: strip the trailing
+/// `QwenImage21Pipeline` -> `qwen_image21`: strip the trailing
 /// `Pipeline`, split camel-case words, lowercase, join with `_`.
-/// Digits stay glued to the preceding word (`Image21` → `image21`).
+/// Digits stay glued to the preceding word (`Image21` -> `image21`).
 fn pipeline_class_to_arch(class: &str) -> Option<String> {
     let stem = class.strip_suffix("Pipeline").unwrap_or(class);
     if stem.is_empty() {
@@ -320,7 +320,7 @@ pub struct SelectedFiles {
 /// Pick model files from repo siblings: quant match (case-insensitive),
 /// shard sets (`-00001-of-0000N`), and an optional mmproj projector.
 /// Falls back to the smallest single GGUF (flagged) when the requested
-/// quant is absent — never silently: the fallback is recorded in the row.
+/// quant is absent - never silently: the fallback is recorded in the row.
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // operand pre-lowercased
 pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<SelectedFiles> {
     let wanted = wanted_quant.to_lowercase();
@@ -353,7 +353,7 @@ pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<Select
 
     // Exact-filename request (the quant slot carries a `.gguf` leaf,
     // e.g. `owner/repo:dflash-Model-Q8_0.gguf`): unambiguous single-file
-    // selection — how drafter artifacts that share a quant token with
+    // selection - how drafter artifacts that share a quant token with
     // their target get pulled.
     if wanted.ends_with(".gguf") {
         return exact_filename_selection(siblings, &wanted);
@@ -362,7 +362,7 @@ pub fn select_files(siblings: &[HfSibling], wanted_quant: &str) -> Result<Select
     // Try requested quant among singles first, then shard sets. When
     // several singles share the quant token (a repo hosting both a model
     // and its drafter, or mmproj-F16 beside model-F16), the LARGEST file
-    // is the model — deterministic, no filename-prefix heuristics — and
+    // is the model - deterministic, no filename-prefix heuristics - and
     // the skipped same-quant siblings are named in a warning.
     let mut quant_hits: Vec<&HfSibling> = singles
         .iter()
@@ -432,7 +432,7 @@ fn exact_filename_selection(siblings: &[HfSibling], wanted: &str) -> Result<Sele
         return Err(anyhow!("repo has no file matching {wanted:?}"));
     };
     // The slot is a selector, not a display quant: the row shows the
-    // trailing quant-looking token of the actual filename ("…-Q8_0.gguf"
+    // trailing quant-looking token of the actual filename ("...-Q8_0.gguf"
     // -> "Q8_0") so `blazar list` and est_params see a real quant
     // instead of the whole uppercased filename.
     let stem = wanted.trim_end_matches(".gguf").to_lowercase();
@@ -450,7 +450,7 @@ fn parse_shard_marker(fname: &str) -> Option<(u32, u32, String)> {
 /// heads (`eagle3-gpt-oss-120b-BF16.gguf`), dflash/dspark draft artifacts
 /// (the exact spellings spec-pair pulls reference), and multimodal
 /// projector files. These share quant tokens with the main model, so
-/// quant matching and size fallbacks must skip them — only an explicit
+/// quant matching and size fallbacks must skip them - only an explicit
 /// exact-filename request (`owner/repo:dflash-Model-Q8_0.gguf`) may pull
 /// one. Basename is matched so sharded subdirs (`BF16/...`) stay main.
 #[must_use]
@@ -536,7 +536,7 @@ const HF_AUX_FILES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct SafetensorsSelection {
     /// Aux files (config/tokenizer/index) first, then shards in filename
-    /// order — a partial pull keeps the small metadata early.
+    /// order - a partial pull keeps the small metadata early.
     pub files: Vec<FilePlan>,
     pub shard_count: usize,
 }
@@ -544,7 +544,7 @@ pub struct SafetensorsSelection {
 /// Pick the safetensors file set from repo siblings: every ROOT-level
 /// `*.safetensors` shard plus the loader/config/tokenizer allowlist.
 /// Nested trees (`original/`, `onnx/`, `consolidated/`) and foreign
-/// formats (`.bin`, `.pth`) are skipped — the sglang lane loads the
+/// formats (`.bin`, `.pth`) are skipped - the sglang lane loads the
 /// canonical HF layout only. `config.json` is mandatory (H1: a dir
 /// without it is unloadable; fail at pull time with a teaching error).
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // operand pre-lowercased
@@ -567,7 +567,7 @@ pub fn select_safetensors_files(siblings: &[HfSibling]) -> Result<SafetensorsSel
         .any(|a| a.filename.eq_ignore_ascii_case("config.json"))
     {
         return Err(anyhow!(
-            "repo has safetensors shards but no config.json — not a loadable HF model repo"
+            "repo has safetensors shards but no config.json - not a loadable HF model repo"
         ));
     }
     aux.sort_by(|a, b| a.filename.cmp(&b.filename));
@@ -605,7 +605,7 @@ fn revision_digest(files: &[FilePlan]) -> String {
 }
 
 /// Is the pulled dir complete? Every planned file present with the
-/// exact listed size (cheap metadata check — downloads already
+/// exact listed size (cheap metadata check - downloads already
 /// sha-verified each file).
 fn safetensors_dir_intact(dir: &Path, sel: &SafetensorsSelection) -> bool {
     sel.files.iter().all(|f| {
@@ -620,7 +620,7 @@ fn safetensors_dir_intact(dir: &Path, sel: &SafetensorsSelection) -> bool {
 /// Post-download integrity: every shard named by
 /// `model.safetensors.index.json` (the repo's own manifest) must be on
 /// disk. Missing = the download is incomplete or the repo layout is
-/// non-canonical — refuse now instead of at engine spawn.
+/// non-canonical - refuse now instead of at engine spawn.
 fn verify_index_coverage(dir: &Path) -> Result<()> {
     let idx = dir.join("model.safetensors.index.json");
     if !idx.is_file() {
@@ -645,7 +645,7 @@ fn verify_index_coverage(dir: &Path) -> Result<()> {
 /// Display quant label for an HF model dir: quantization bits when the
 /// repo carries a `quantization_config`, else the weight dtype. Uses
 /// the HF-side vocabulary (BIT/BF16/FP16/F32/FP8), not llama quant
-/// names — labels stay truthful for `est_params`.
+/// names - labels stay truthful for `est_params`.
 pub(crate) fn hf_quant_label(meta: &blazar_core::hfmeta::HfMeta) -> String {
     if let Some(bits) = meta.quant_bits {
         return format!("{bits}BIT");
@@ -730,7 +730,7 @@ impl HfClient {
 
     /// Builder: total download speed cap in MB/s (0 = unlimited).
     /// Applies to the classic single-stream lane and to every parallel
-    /// chunk worker — one shared bucket per file, so the cap holds the
+    /// chunk worker - one shared bucket per file, so the cap holds the
     /// WHOLE download, not each connection.
     #[must_use]
     pub fn with_download_speed_limit(mut self, limit_mb: f64) -> Self {
@@ -793,7 +793,7 @@ impl HfClient {
 
     /// Token rides ONLY on first-party huggingface.co requests (test
     /// stand-ins included); CDN hops never see it. Wildcard extra-host
-    /// patterns ("*.suffix") never receive the token by construction —
+    /// patterns ("*.suffix") never receive the token by construction -
     /// the equality below can't match them; presigned CDN URLs are
     /// already authorized and forwarding credentials there would be
     /// exfiltration.
@@ -913,7 +913,7 @@ impl HfClient {
 
         // A full-length `.part` reaching this lane is a sparse parallel
         // artifact (or a stale upstream size): `bytes=have-` would 416 and
-        // appending past the end can only corrupt. Restart from zero —
+        // appending past the end can only corrupt. Restart from zero -
         // the sha256 gate still owns correctness.
         if have > 0 && plan.bytes > 0 && have >= plan.bytes {
             have = 0;
@@ -938,7 +938,7 @@ impl HfClient {
                 reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
             )
             .then(
-                || " — the repo is gated or private: accept its license on huggingface.co and set HF_TOKEN if you have access",
+                || " - the repo is gated or private: accept its license on huggingface.co and set HF_TOKEN if you have access",
             )
             .unwrap_or("");
             return Err(anyhow!(
@@ -1063,8 +1063,8 @@ pub struct SearchEntry {
     pub safetensors: Option<HfSafetensorsInfo>,
     #[serde(default)]
     pub config: Option<HfConfigSummary>,
-    /// Hub format tags (`gguf`, `mlx`, `safetensors`, `awq`, `onnx`, …).
-    /// MLX repos carry BOTH `mlx` and `safetensors` — callers display with
+    /// Hub format tags (`gguf`, `mlx`, `safetensors`, `awq`, `onnx`, ...).
+    /// MLX repos carry BOTH `mlx` and `safetensors` - callers display with
     /// most-specific-first priority, not first-match.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -1086,14 +1086,14 @@ pub struct SearchEntry {
 ///   (`Q4_K_M.GGUF.gguf`) still finds the quant past the `gguf` noise
 ///   segment;
 /// - when a whole segment carries a leading release token glued with `_`
-///   (live: `qwen_image_2.1_Q5_K_M` — the version dot ends the
+///   (live: `qwen_image_2.1_Q5_K_M` - the version dot ends the
 ///   `-`/`.`-segment at `1_Q5_K_M`), the longest `_`-separated suffix
 ///   tail that matches the grammar is the token;
 /// - when the leaf carries no token at all, the parent folder is tried
 ///   (`Q4_K_M/model.gguf` layouts name the quant in the folder).
 ///
 /// `q4_k_m`, `iq4_xs`, `f16`, `bf16`, `f32` match; model-size tags
-/// (`3b`), dates (`2511`) and finetune words (`heretic`) don't — the
+/// (`3b`), dates (`2511`) and finetune words (`heretic`) don't - the
 /// required digit after the prefix is what separates them.
 fn quant_token_of(fname: &str) -> Option<String> {
     let lower = fname.to_ascii_lowercase();
@@ -1180,7 +1180,7 @@ fn strip_shard_tail(stem: &str) -> &str {
 /// so `blazar pull <REPO>[:quant]` can be chosen from the listing itself.
 ///
 /// A filename segment qualifies only if it parses as `(IQ|TQ|BF|F|Q)` +
-/// digit + `[A-Za-z0-9_]*` — model-size tags (`3B`), dates (`2511`) and
+/// digit + `[A-Za-z0-9_]*` - model-size tags (`3B`), dates (`2511`) and
 /// finetune words (`heretic`, `fable`) don't. Shards (`-00002-of-00005`,
 /// digit-only tail) and `mmproj-*` projectors are excluded by the same
 /// rules.
@@ -1211,7 +1211,7 @@ fn quant_token(filename: &str) -> Option<String> {
 }
 
 /// True when a bare search token IS a quant name (`q4`, `Q4_K_M`,
-/// `iq4_xs`, `f16`) — the CLI lifts such tokens out of the text query
+/// `iq4_xs`, `f16`) - the CLI lifts such tokens out of the text query
 /// into its client-side quant filter. Strict by construction: `qwen`,
 /// `gguf`, `awq`, `int4` fail the grammar and stay query text.
 #[must_use]
@@ -1222,7 +1222,7 @@ pub fn is_quant_token(token: &str) -> bool {
 impl HfClient {
     /// List a repo subtree via the Hub tree API, following cursor
     /// pagination (`Link: rel="next"`, 1000 entries/page) to
-    /// exhaustion. `recursive` walks the whole subtree in one walk —
+    /// exhaustion. `recursive` walks the whole subtree in one walk -
     /// the piper voice index hides thousands of files below a single
     /// locale root. `path` is relative to the repo root ("" = root).
     pub async fn list_tree(
@@ -1250,7 +1250,7 @@ impl HfClient {
                 return Err(anyhow!("HF tree returned {}", resp.status()));
             }
             // The next page rides the Link header; no rel="next" means
-            // the listing is complete. Captured before `json()` — that
+            // the listing is complete. Captured before `json()` - that
             // call consumes the response.
             let next = resp
                 .headers()
@@ -1272,7 +1272,7 @@ impl HfClient {
 
     /// Hub model search across every weight format (complaint #15:
     /// discovery beyond a registry; any community quant is findable).
-    /// `format` picks the lane — see [`search_path`].
+    /// `format` picks the lane - see [`search_path`].
     ///
     /// With a query, the Hub's `sort=downloads` order is re-ranked for
     /// relevance (`relevance_rank`): the 30-day download count is
@@ -1297,7 +1297,7 @@ impl HfClient {
         // short 5xx blips (and connection resets) far more often than it
         // runs cold-down, and every caller is a one-shot CLI invocation
         // (`blazar search`, `blazar drafts` with 4 queries) that would
-        // otherwise die on the first blip. Fixed steps, no jitter — a
+        // otherwise die on the first blip. Fixed steps, no jitter - a
         // single client retrying itself is not a herd, and deterministic
         // steps keep the hard-failure path quick.
         let attempts = 3usize;
@@ -1329,7 +1329,7 @@ impl HfClient {
                 });
             }
             if status.as_u16() == 429 {
-                // The Hub's anonymous window is 5 minutes wide — sleeping
+                // The Hub's anonymous window is 5 minutes wide - sleeping
                 // it out inside a CLI call is wrong. Teach and abort.
                 let retry_after = resp
                     .headers()
@@ -1338,7 +1338,7 @@ impl HfClient {
                     .unwrap_or("the announced window")
                     .to_string();
                 return Err(anyhow!(
-                    "HF search rate limited — set HF_TOKEN for the higher quota, retry after {retry_after}"
+                    "HF search rate limited - set HF_TOKEN for the higher quota, retry after {retry_after}"
                 ));
             }
             if status.is_server_error() {
@@ -1348,11 +1348,11 @@ impl HfClient {
             // 4xx: this request is wrong; retrying an identical request
             // cannot fix it.
             return Err(anyhow!(
-                "HF search rejected the request with {status} — check the query text, --format tag, or token"
+                "HF search rejected the request with {status} - check the query text, --format tag, or token"
             ));
         }
         Err(anyhow!(
-            "HF search API is failing upstream ({last_failure} on all {attempts} attempts) — the Hub itself is in \
+            "HF search API is failing upstream ({last_failure} on all {attempts} attempts) - the Hub itself is in \
              trouble, not this query; retry in a few minutes or check status.huggingface.co (browse mode \
              `blazar search ''` rides a separate, usually healthy path)"
         ))
@@ -1361,13 +1361,13 @@ impl HfClient {
 
 /// Re-rank Hub search results by name relevance to the query.
 ///
-/// Ordering is lexicographic over: (1) query-token coverage desc — a
+/// Ordering is lexicographic over: (1) query-token coverage desc - a
 /// token matches when some repo-name segment contains it; (2) unmatched
-/// name-segment count ASC — derivative finetunes carry long advertising
+/// name-segment count ASC - derivative finetunes carry long advertising
 /// tails (`-The-Defiant-Fable-Uncensored-Heretic-NEO`) that clean
-/// mirrors (`Qwen3.5-9B-GGUF`) never have; (3) likes desc — the
+/// mirrors (`Qwen3.5-9B-GGUF`) never have; (3) likes desc - the
 /// community-curated signal, far costlier to farm than downloads;
-/// (4) downloads desc — tiebreak only. Name evidence only: no owner
+/// (4) downloads desc - tiebreak only. Name evidence only: no owner
 /// lists, no heuristics about who "should" win.
 #[must_use]
 pub fn relevance_rank(entries: &[SearchEntry], query: &str) -> Vec<SearchEntry> {
@@ -1416,7 +1416,7 @@ type RankKey = (
 
 /// (query tokens matched by some name segment, name segments no token
 /// matched). The org prefix (`owner/`) is excluded from the penalty
-/// count — every repo has one and it is never a query target.
+/// count - every repo has one and it is never a query target.
 fn name_match_stats(repo_id: &str, tokens: &[String]) -> (u32, u32) {
     let lower = repo_id.to_ascii_lowercase();
     let segments: Vec<&str> = lower
@@ -1462,13 +1462,13 @@ fn next_link(link: &str) -> Option<&str> {
 
 /// Build the `api/models` query for [`HfClient::search`]. `format` is a
 /// Hub tag filter passed through verbatim (`gguf`, `safetensors`, `mlx`,
-/// `awq`, `gptq`, `fp8`, `onnx`, … — case-insensitive, trimmed); the
+/// `awq`, `gptq`, `fp8`, `onnx`, ... - case-insensitive, trimmed); the
 /// sentinels `any`/`all` drop the filter entirely so every format is
 /// browsable. An empty `query` omits `search=` (browse-most-popular).
 /// `expand[]=tags` feeds the per-row FORMAT column; `expand[]=gguf` and
 /// `expand[]=safetensors` + `expand[]=config` fill SIZE/ARCH for GGUF and
 /// safetensors rows respectively (each is simply absent on the other
-/// format — one code path for every format, zero extra round-trips).
+/// format - one code path for every format, zero extra round-trips).
 #[must_use]
 pub fn search_path(query: &str, format: &str, limit: u32) -> String {
     let mut path = format!(
@@ -1504,7 +1504,7 @@ pub struct FitRow {
 
 /// Rule-6 KV ladder outcome for `bytes` of weights against `vram_bytes`:
 /// (fits at default ctx, recommended ctx, ctx with `q8_0` KV). The same
-/// f16 → q8 → q4 halving the profile compiler applies, pre-download.
+/// f16 -> q8 -> q4 halving the profile compiler applies, pre-download.
 fn kv_ladder(bytes: u64, vram_bytes: u64, default_ctx: u32) -> (bool, u32, u32) {
     let kv_f16 = kv_estimate_f16(default_ctx);
     // F105: mirror the compiler's rule-6 KV ladder (f16 -> q8 -> q4)
@@ -1600,7 +1600,7 @@ pub fn fit_rows(siblings: &[HfSibling], vram_bytes: u64, default_ctx: u32) -> Ve
             recommended_ctx_q8: ctx_q8,
         });
     }
-    // Safetensors lane (sglang/mistralrs): one AGGREGATE row — shards are
+    // Safetensors lane (sglang/mistralrs): one AGGREGATE row - shards are
     // parts of a single quantization state, unlike GGUF where each file
     // is a separate quant choice. Same conservative KV allowance; the
     // arch-true number is measured at serve time.
@@ -1651,18 +1651,18 @@ pub struct Puller {
     pub client: HfClient,
     pub bus: EventBus,
     /// Allow a pull to flip the model's format (safetensors dir <->
-    /// GGUF file) over an existing row. Guarded by [`flip_guard`] —
+    /// GGUF file) over an existing row. Guarded by [`flip_guard`] -
     /// see the incident note there.
     pub force: bool,
 }
 
 /// Format-flip refusal for pulls: replacing an existing model row with
 /// a DIFFERENT format (GGUF file over a safetensors `.d` directory, or
-/// the reverse) is almost never what the user asked for — a short-name
+/// the reverse) is almost never what the user asked for - a short-name
 /// catalog resolve can silently flip formats (live incident 2026-09-17:
 /// `pull qwen2.5-0.5b` replaced a 954 MiB safetensors row with a GGUF
 /// under the same canonical name). Refuse without `--force`; a forced
-/// flip keeps the superseded files on disk — boot preflight re-adopts
+/// flip keeps the superseded files on disk - boot preflight re-adopts
 /// them under a derived name.
 pub(crate) fn flip_guard(
     name: &str,
@@ -1684,7 +1684,7 @@ pub(crate) fn flip_guard(
     };
     anyhow::bail!(
         "model {name} is already pulled as {have} ({}); this pull would replace it with \
-         {want} — pass --force to flip (the old files stay on disk; boot preflight \
+         {want} - pass --force to flip (the old files stay on disk; boot preflight \
          re-adopts them) or pull the exact repo",
         row.path
     )
@@ -1713,7 +1713,7 @@ impl PullLock {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // The lockfile carries the owning pid: a dead owner means
                 // the pull crashed (kill -9, power loss) and the lock is
-                // stale — steal it immediately instead of blocking for the
+                // stale - steal it immediately instead of blocking for the
                 // 6h age fallback. Live owner -> refuse, naming the pid.
                 let path_display = path.display().to_string();
                 let owner = std::fs::read_to_string(&path)
@@ -1753,7 +1753,7 @@ impl Drop for PullLock {
     }
 }
 
-/// Is a process with this pid alive? Linux: `/proc` — no shell-out.
+/// Is a process with this pid alive? Linux: `/proc` - no shell-out.
 /// Other unixes: `kill -0` (signal 0 = existence probe, no delivery).
 /// Windows: `tasklist` filter. Pid reuse can false-positive; the age
 /// fallback and manual delete remain as escape hatches.
@@ -1784,7 +1784,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 /// What a pull produced: the stored row and whether the model was already
-/// present (idempotent fast path — zero bytes moved).
+/// present (idempotent fast path - zero bytes moved).
 #[derive(Debug, Clone)]
 pub struct PullOutcome {
     pub row: ModelRow,
@@ -1794,21 +1794,21 @@ pub struct PullOutcome {
 /// What a re-pull of an already-stored model must do.
 #[derive(Debug)]
 pub(crate) enum Repull {
-    /// Files on disk match repo+quant+sha and are intact — zero bytes.
+    /// Files on disk match repo+quant+sha and are intact - zero bytes.
     Present(Box<ModelRow>),
-    /// Model file intact but the mmproj sidecar differs — download (or
+    /// Model file intact but the mmproj sidecar differs - download (or
     /// drop) ONLY the sidecar instead of the multi-GiB model.
     DeltaMmproj { expected: bool },
     /// Diffusion row with an intact `DiT` but a dead required component
-    /// (`VAE` / text encoder) — re-fetch the component set only.
+    /// (`VAE` / text encoder) - re-fetch the component set only.
     DeltaComponents,
     /// Full download (any dead leaves were already pruned where safe).
     Full,
 }
 
 /// Derive every shard leaf of a sharded download from its recorded launch
-/// path (`…-00001-of-0000N.gguf` is the HF naming convention). `None`
-/// when the recorded path does not follow the pattern — the caller then
+/// path (`...-00001-of-0000N.gguf` is the HF naming convention). `None`
+/// when the recorded path does not follow the pattern - the caller then
 /// keeps the old files and falls back to collision-disambiguation.
 fn shard_set(model_path: &str, shards: i64) -> Option<Vec<PathBuf>> {
     let p = Path::new(model_path);
@@ -1847,7 +1847,7 @@ pub(crate) fn model_file_intact(row: &ModelRow) -> bool {
 /// Container-level GGUF check: header + KV section must parse.
 /// `read_metadata_file` additionally requires
 /// `general.architecture`, which diffusion component files (`DiT` /
-/// encoder splits — 0-KV GGUFs) never carry; for them that exact
+/// encoder splits - 0-KV GGUFs) never carry; for them that exact
 /// error still proves the container walked clean (magic, version,
 /// every KV entry). Same string-match precedent as the reconcile and
 /// `read_model_meta` guards. Any other parse error is real corruption.
@@ -1869,7 +1869,7 @@ pub(crate) fn mmproj_matches(row: &ModelRow, expects_mmproj: bool) -> bool {
 }
 
 /// Drop a leftover `.part` (+ its parallel-download sidecar) once the
-/// final leaf is verified present — a stale partial from an interrupted
+/// final leaf is verified present - a stale partial from an interrupted
 /// attempt is pure garbage at that point.
 pub(crate) fn sweep_stale_part(final_path: &str) {
     for suffix in [".part", ".part.progress"] {
@@ -1900,7 +1900,7 @@ pub(crate) fn repull_gate(
         return Repull::Full;
     }
     // Upstream revision check: recorded sha vs the freshly listed one
-    // (metadata compare — instant, no re-hash of the local file).
+    // (metadata compare - instant, no re-hash of the local file).
     // Unknown on either side (non-LFS files, legacy rows) trusts the
     // local file rather than forcing a multi-GiB redownload.
     let sha_current = expected_sha.is_none_or(|s| {
@@ -1911,7 +1911,7 @@ pub(crate) fn repull_gate(
     if !sha_current {
         tracing::warn!(
             model = %name,
-            "upstream revision changed for {}:{} — replacing the local copy",
+            "upstream revision changed for {}:{} - replacing the local copy",
             row.repo,
             row.quant
         );
@@ -1925,13 +1925,13 @@ pub(crate) fn repull_gate(
             };
         }
         // Component rows: an intact `DiT` with a dead component file is a
-        // component-only repair — never a multi-GiB `DiT` redownload.
+        // component-only repair - never a multi-GiB `DiT` redownload.
         if required_component_missing(row) {
             return Repull::DeltaComponents;
         }
         tracing::info!(
             model = %name,
-            "already present ({}, {} shards) — skipping download",
+            "already present ({}, {} shards) - skipping download",
             row.quant,
             row.shards
         );
@@ -1945,7 +1945,7 @@ pub(crate) fn repull_gate(
 /// Whether a pulled single-shard GGUF belongs to the diffusion domain and
 /// must carry its component set. A curated family repo is diffusion
 /// regardless of GGUF metadata: `city96` `FLUX` `DiTs` ship a proper `flux`
-/// architecture tag while `QuantStack` `Qwen-Image` `DiTs` are kvless — both
+/// architecture tag while `QuantStack` `Qwen-Image` `DiTs` are kvless - both
 /// boot on the sdcpp lane only with their `VAE`/TE sidecars. Kvless
 /// files from unknown families also route here so the attach path can
 /// emit its teaching note; text-model repos (architecture known, no
@@ -1955,10 +1955,10 @@ fn should_attach_diffusion_set(arch_known: bool, repo: &str) -> bool {
 }
 
 /// A diffusion component row whose REQUIRED sidecar (`VAE` or text
-/// encoder) is absent — deleted from disk, or never attached because
+/// encoder) is absent - deleted from disk, or never attached because
 /// the row predates the component-set pull. Known-family rows must
 /// CARRY the set: `None` is as missing as a dead path. The optional
-/// vision encoder is not a repair trigger — its loss only disables
+/// vision encoder is not a repair trigger - its loss only disables
 /// image edits.
 pub(crate) fn required_component_missing(row: &ModelRow) -> bool {
     match crate::diffusion::diffusion_family(&row.repo) {
@@ -2007,7 +2007,7 @@ fn safetensors_model_row(
 impl Puller {
     /// Pull a model into the store. `target` = `owner/repo[:QUANT]` or a
     /// catalog short name. The quant slot may instead carry an exact
-    /// `.gguf` filename (`owner/repo:draft-Model-Q8_0.gguf`) — used for
+    /// `.gguf` filename (`owner/repo:draft-Model-Q8_0.gguf`) - used for
     /// drafter artifacts living in the target's own repo; those rows are
     /// named after the file stem so they never collide with the model row.
     pub async fn pull(&self, target: &str) -> Result<PullOutcome> {
@@ -2028,7 +2028,7 @@ impl Puller {
         }
         // Lane fork: GGUF files (llamacpp/mistralrs engines) vs a
         // safetensors model directory (sglang engine). A repo with BOTH
-        // keeps the GGUF lane — existing behavior unchanged; the log
+        // keeps the GGUF lane - existing behavior unchanged; the log
         // teaches the safetensors half exists.
         let has_gguf = info
             .siblings
@@ -2063,9 +2063,9 @@ impl Puller {
         let store = Store::open(&self.dirs)?;
 
         // Idempotent re-pull ladder, shared with the registry lane:
-        //   Present      — repo+quant+sha match, files intact: no-op.
-        //   DeltaMmproj  — model intact, sidecar differs: sidecar-only pull.
-        //   Full         — replace (dead/replaced leaves pruned where the
+        //   Present      - repo+quant+sha match, files intact: no-op.
+        //   DeltaMmproj  - model intact, sidecar differs: sidecar-only pull.
+        //   Full         - replace (dead/replaced leaves pruned where the
         //                  shard set is derivable, so the fresh download
         //                  lands on the canonical filename instead of the
         //                  `owner--repo--leaf` collision slug).
@@ -2169,7 +2169,7 @@ impl Puller {
         if dir.exists() {
             tracing::info!(
                 model = %name,
-                "reusing {} — completed files re-verify, files dropped upstream are left in place",
+                "reusing {} - completed files re-verify, files dropped upstream are left in place",
                 dir.display()
             );
         }
@@ -2209,7 +2209,7 @@ impl Puller {
             let mut progress_one = |d: u64, t: u64| progress(before + d.min(t), total_bytes);
             let dest = dir.join(&file.filename);
             // Dir-scoped lane: no bare-leaf candidate (shards never lived
-            // in the models dir root) — dest + hub cache only.
+            // in the models dir root) - dest + hub cache only.
             if let Some(_reused) = reuse_on_disk(name, &target.repo, file, &dest, None) {
                 bar.set_position(before + file.bytes);
                 continue;
@@ -2226,7 +2226,7 @@ impl Puller {
         }
         bar.finish_and_clear();
 
-        // Integrity: the shard index is the repo's own manifest — every
+        // Integrity: the shard index is the repo's own manifest - every
         // shard it names must be on disk (H1: fail now, not at load).
         verify_index_coverage(&dir)?;
 
@@ -2244,7 +2244,7 @@ impl Puller {
 
     /// Idempotence + supersede for the safetensors lane:
     /// `Some(outcome)` = resolved (no-op re-pull; caller returns it),
-    /// `None` = proceed with the download — stale files already cleaned.
+    /// `None` = proceed with the download - stale files already cleaned.
     fn safetensors_repull_outcome(
         &self,
         existing: Option<&blazar_core::store::ModelRow>,
@@ -2409,7 +2409,7 @@ impl Puller {
     /// onto the row; an unknown family keeps the file but records the
     /// boot-blocking warning that spawn time will teach verbatim.
     /// Standalone-checkpoint pull (SD 1.5, SDXL): the family's pinned
-    /// file IS the whole model — `VAE` and text encoders live inside
+    /// file IS the whole model - `VAE` and text encoders live inside
     /// the checkpoint, so the row stores a single self-referencing
     /// `--model` component that routes it to the sdcpp lane and emits
     /// `-m/--model <file>` at compile. Quant tags are meaningless here
@@ -2442,7 +2442,7 @@ impl Puller {
     ) -> Result<PullOutcome> {
         let plan = crate::diffusion::standalone_file_plan(info, family).ok_or_else(|| {
             anyhow!(
-                "repo {} hosts none of the {} checkpoint files ({}) — a \
+                "repo {} hosts none of the {} checkpoint files ({}) - a \
                  diffusers shard is not the standalone model",
                 target.repo,
                 family.display,
@@ -2453,7 +2453,7 @@ impl Puller {
         let existing = store.get_model(name)?;
         flip_guard(name, existing.as_ref(), false, self.force)?;
         // Present = same repo with its checkpoint alive on disk. A dead
-        // path (deleted file, stale row) falls through to re-download —
+        // path (deleted file, stale row) falls through to re-download -
         // byte-exact reuse keeps that repair cheap.
         if let Some(row) = existing.as_ref() {
             let intact = row.repo == target.repo
@@ -2489,7 +2489,7 @@ impl Puller {
         // checkpoint is the DiT, booted via `--diffusion-model` with its
         // VAE/text encoder attached. Bare standalone families (SDXL,
         // SD 1.5) embed everything and self-reference through
-        // `--model` — that path is preserved verbatim below.
+        // `--model` - that path is preserved verbatim below.
         let mut components = if family.components.is_empty() {
             vec![blazar_core::store::ComponentFile::new("--model", &dest_str)]
         } else {
@@ -2558,7 +2558,7 @@ impl Puller {
         let Some(family) = crate::diffusion::diffusion_family(&target.repo) else {
             let note = format!(
                 "diffusion component GGUF with no known model family (supported: {}); \
-                 pulled the `DiT` file only — it cannot boot without its VAE/text encoder",
+                 pulled the `DiT` file only - it cannot boot without its VAE/text encoder",
                 crate::diffusion::supported_families().join(", ")
             );
             tracing::warn!(model = %name, "{note}");
@@ -2586,7 +2586,7 @@ impl Puller {
         // Per-spec plans: exact quant first, else the spec's fallback
         // quant (component repos publish fewer quants than `DiT`
         // converters cut). Optional components that are absent upstream
-        // skip with a warning — the set still boots, edits just disable.
+        // skip with a warning - the set still boots, edits just disable.
         let mut plans: Vec<(&crate::diffusion::ComponentSpec, FilePlan, Option<String>)> =
             Vec::new();
         for spec in family.components {
@@ -2704,7 +2704,7 @@ impl Puller {
                 Ok(Some(dest))
             }
             Err(e) if !required => {
-                tracing::warn!(model = %name, "optional component {} failed ({e}) — skipped", plan.filename);
+                tracing::warn!(model = %name, "optional component {} failed ({e}) - skipped", plan.filename);
                 Ok(None)
             }
             Err(e) => Err(anyhow!(
@@ -2746,7 +2746,7 @@ impl Puller {
         }
         if let Repull::DeltaComponents = decision {
             // The `DiT` is intact (gate proved it); only the component set
-            // needs fetching. Family comes from the row's own repo —
+            // needs fetching. Family comes from the row's own repo -
             // the gate reaches here for never-attached rows (predating
             // the component-set pull) and for dead-sidecar rows alike.
             if let Some(old) = existing {
@@ -2766,7 +2766,7 @@ impl Puller {
                     .map(|(flag, path)| blazar_core::store::ComponentFile::new(&flag, &path))
                     .collect();
                 Store::open(&self.dirs)?.upsert_model(&row)?;
-                tracing::info!(model = %name, "component set repaired — DiT untouched");
+                tracing::info!(model = %name, "component set repaired - DiT untouched");
                 self.bus.publish(BlazarEvent::ModelPulled {
                     name: name.to_string(),
                     warning: None,
@@ -2809,7 +2809,7 @@ impl Puller {
                 );
             }
             // Same canonical filename as the new selection means the
-            // download would collide — prune BEFORE it so the fresh bytes
+            // download would collide - prune BEFORE it so the fresh bytes
             // land on the canonical leaf (upstream revision change).
             let new_leaf = selected.shards[0].filename.as_str();
             if Path::new(&old.path)
@@ -2939,7 +2939,7 @@ pub(crate) fn prune_replaced(name: &str, old: &ModelRow, keep: &[&Path], reason:
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!(
                 model = %name,
-                "could not prune replaced file {} ({e}) — remove it manually if disk space matters",
+                "could not prune replaced file {} ({e}) - remove it manually if disk space matters",
                 leaf.display()
             ),
         }
@@ -2948,7 +2948,7 @@ pub(crate) fn prune_replaced(name: &str, old: &ModelRow, keep: &[&Path], reason:
 
 /// Post-download metadata + store row. Health warning: `None` when the
 /// header parses; a LOUD warning otherwise (the engine will most likely
-/// refuse to load the file — the qwen3.5-9b quantizer-metadata class of
+/// refuse to load the file - the qwen3.5-9b quantizer-metadata class of
 /// failure). GGUF header facts win over HF-provided metadata.
 #[allow(clippy::too_many_arguments)] // cohesive pull-facts tuple; splitting hides the fallback chain
 fn build_model_row(
@@ -3020,7 +3020,7 @@ pub fn gguf_health_warning(path: &Path, repo: &str, siblings: &[HfSibling]) -> O
     alts.sort();
     alts.dedup();
     Some(format!(
-        "GGUF metadata unreadable in {} — the engine will likely refuse to load it; `blazar rm` and try another quant of {repo}: {}",
+        "GGUF metadata unreadable in {} - the engine will likely refuse to load it; `blazar rm` and try another quant of {repo}: {}",
         path.display(),
         alts.join(", ")
     ))
@@ -3037,7 +3037,7 @@ pub(crate) fn unique_dest(dir: &Path, filename: &str, repo: &str) -> PathBuf {
     // shipping the same leaf name never clobber each other. Subdir path
     // first (matches the repo's internal layout), then the repo slug for
     // flat filenames (e.g. two Qwen3.5-9B-Q4_K_M.gguf from different
-    // repos — verified live: unsloth base vs unsloth MTP collide).
+    // repos - verified live: unsloth base vs unsloth MTP collide).
     if let Some(parent) = flat.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -3059,7 +3059,7 @@ fn leaf_of(filename: &str) -> String {
 
 /// A file at `candidate` that is byte-exact for `plan`: size gates a
 /// full sha256 (hashing only runs on a size match, so the common miss
-/// costs one stat — the rare hit is a multi-second multi-GiB read that
+/// costs one stat - the rare hit is a multi-second multi-GiB read that
 /// beats re-downloading the same bytes). Unknown published sha falls
 /// back to size-only, matching the download lane's own verification
 /// trust level.
@@ -3114,7 +3114,7 @@ pub(crate) fn hf_hub_root() -> Option<PathBuf> {
 /// per-revision directories mirroring the repo's internal layout, so the
 /// candidate for `vae/ae.safetensors` in repo `black-forest-labs/FLUX.1-schnell`
 /// is `.../models--black-forest-labs--FLUX.1-schnell/snapshots/<rev>/vae/ae.safetensors`.
-/// Content is NOT checked here — `reuse_byte_exact` gates on size + sha256.
+/// Content is NOT checked here - `reuse_byte_exact` gates on size + sha256.
 pub(crate) fn hf_hub_candidates_at(root: &Path, repo: &str, filename: &str) -> Vec<PathBuf> {
     let model_dir = format!("models--{}", repo.replace(['/', '\\'], "--"));
     let snapshots = root.join(model_dir).join("snapshots");
@@ -3135,8 +3135,8 @@ fn hf_hub_candidates(repo: &str, filename: &str) -> Vec<PathBuf> {
 
 /// Bring a hub-cache hit into the models dir under its own name so the
 /// store row never points into the user's hub cache (a later `blazar rm`
-/// must unlink blazar's file, not the hub blob). Hardlink first — same
-/// filesystem, zero bytes copied — then a real copy when the cache lives
+/// must unlink blazar's file, not the hub blob). Hardlink first - same
+/// filesystem, zero bytes copied - then a real copy when the cache lives
 /// on another filesystem, still far cheaper than re-downloading GiB.
 pub(crate) fn materialize_hub_hit(src: &Path, dest: &Path) -> std::io::Result<()> {
     if std::fs::hard_link(src, dest).is_ok() {
@@ -3153,7 +3153,7 @@ pub(crate) fn materialize_hub_hit(src: &Path, dest: &Path) -> std::io::Result<()
 /// downloading, look for a byte-exact copy of `plan` at the bare leaf,
 /// the collision-resolved dest, or the huggingface hub cache (hardlinked
 /// in). `bare` is the pre-collision leaf path for lanes that download
-/// into the models dir root — pass `None` when the dest is dir-scoped
+/// into the models dir root - pass `None` when the dest is dir-scoped
 /// (safetensors shards) or when adopting a bare leaf would strand a
 /// multi-shard set whose siblings sit at the disambiguated dest.
 /// A hit also sweeps a stale `dest.part` from an interrupted attempt
@@ -3168,7 +3168,7 @@ fn reuse_on_disk(
 ) -> Option<PathBuf> {
     for candidate in bare.into_iter().chain(std::iter::once(dest)) {
         if let Some(reused) = reuse_byte_exact(candidate, plan) {
-            tracing::info!(model = %name, "file {} already on disk (byte-exact) — reusing", plan.filename);
+            tracing::info!(model = %name, "file {} already on disk (byte-exact) - reusing", plan.filename);
             if let Some(bare) = bare {
                 sweep_stale_part(&bare.display().to_string());
             }
@@ -3184,12 +3184,12 @@ fn reuse_on_disk(
         if reuse_byte_exact(&candidate, plan).is_some() {
             return match materialize_hub_hit(&candidate, dest) {
                 Ok(()) => {
-                    tracing::info!(model = %name, "file {} found in the huggingface hub cache — hardlinked", plan.filename);
+                    tracing::info!(model = %name, "file {} found in the huggingface hub cache - hardlinked", plan.filename);
                     sweep_stale_part(&dest.display().to_string());
                     Some(dest.to_path_buf())
                 }
                 Err(e) => {
-                    tracing::warn!(model = %name, "hub cache hit for {} but linking failed ({e}) — downloading", plan.filename);
+                    tracing::warn!(model = %name, "hub cache hit for {} but linking failed ({e}) - downloading", plan.filename);
                     None
                 }
             };
@@ -3272,7 +3272,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn unit__should_attach_diffusion_set__arch_tag_does_not_escape_the_family_domain() {
-        // city96 FLUX DiTs carry general.architecture=flux — still diffusion.
+        // city96 FLUX DiTs carry general.architecture=flux - still diffusion.
         assert!(should_attach_diffusion_set(true, "city96/FLUX.1-dev-gguf"));
         assert!(should_attach_diffusion_set(
             true,
@@ -3367,13 +3367,13 @@ mod tests {
             "black-forest-labs/FLUX.1-schnell",
             "vae/ae.safetensors",
         );
-        // Both revision paths are candidates — content gating is
+        // Both revision paths are candidates - content gating is
         // reuse_byte_exact's job; a missing file in one revision must not
         // hide the copy another revision holds.
         assert_eq!(got.len(), 2);
         assert!(got.contains(&snap_a.join("vae").join("ae.safetensors")));
         assert!(got.contains(&snap_b.join("vae").join("ae.safetensors")));
-        // Unknown repo → no candidates, no error.
+        // Unknown repo -> no candidates, no error.
         assert_eq!(
             hf_hub_candidates_at(tmp.path(), "org/never-pulled", "x.bin").len(),
             0
@@ -3405,7 +3405,7 @@ mod tests {
         // registering the cache path directly).
         std::fs::remove_file(&dest).unwrap();
         assert_eq!(std::fs::read(&cache_blob).unwrap(), b"weights");
-        // Re-materializing after a delete works (fresh link or copy —
+        // Re-materializing after a delete works (fresh link or copy -
         // either way the row file comes back with the right bytes).
         let src2 = tmp.path().join("blob2");
         std::fs::write(&src2, b"weights2").unwrap();
@@ -3432,8 +3432,8 @@ mod tests {
         );
         // MLX 4-bit packing: histogram counts are wide-int CELLS (a
         // 1B-param repo live-shows {BF16: 33.8M, U32: 135M} because each
-        // U32 cell packs 8 params), so on-disk bytes stay width × count:
-        // 2×33.8M + 4×135M.
+        // U32 cell packs 8 params), so on-disk bytes stay width x count:
+        // 2x33.8M + 4x135M.
         assert_eq!(
             hist(&[("BF16", 33_842_688), ("U32", 135_069_696)]).byte_estimate(),
             Some(607_964_160)
@@ -3443,7 +3443,7 @@ mod tests {
             hist(&[("F16", 803_402_992), ("I32", 497_025_024)]).byte_estimate(),
             Some(3_594_906_080)
         );
-        // Unknown dtype: never guess — refuse the whole estimate.
+        // Unknown dtype: never guess - refuse the whole estimate.
         assert_eq!(hist(&[("BF16", 10), ("WEIRD_Q", 10)]).byte_estimate(), None);
         // Empty histogram / absent histogram: no estimate.
         assert_eq!(hist(&[]).byte_estimate(), None);
@@ -3561,7 +3561,7 @@ mod tests {
 
     #[test]
     fn unit__search_entry__decodes_live_hub_expand_shapes() {
-        // Byte-for-byte shapes from a live `api/models?expand[]=…`
+        // Byte-for-byte shapes from a live `api/models?expand[]=...`
         // response (Qwen-Image-2.1 search, trimmed to the fields under
         // test): `totalFileSize` beside the parameter-count `total`, the
         // diffusers pipeline class, and repos where the Hub simply lacks
@@ -3593,7 +3593,7 @@ mod tests {
 
     #[test]
     fn unit__pipeline_class_to_arch__camel_split_and_edge_cases() {
-        // Pipeline classes → snake-case arch tokens; digits glue to the
+        // Pipeline classes -> snake-case arch tokens; digits glue to the
         // preceding word.
         assert_eq!(
             pipeline_class_to_arch("QwenImage21Pipeline"),
@@ -3612,7 +3612,7 @@ mod tests {
         assert_eq!(pipeline_class_to_arch(""), None);
     }
 
-    /// Minimal `SearchEntry` — only the re-rank inputs matter.
+    /// Minimal `SearchEntry` - only the re-rank inputs matter.
     fn se(id: &str, downloads: u64, likes: u64) -> SearchEntry {
         SearchEntry {
             id: id.to_string(),
@@ -3771,7 +3771,7 @@ mod tests {
                 .any(|r| r.bytes == 1_600_000_000 || r.bytes == 800_000_000),
             "sidecars dropped: {rows:?}"
         );
-        // Incomplete set (one of two parts listed) is not pullable — no row.
+        // Incomplete set (one of two parts listed) is not pullable - no row.
         let rows = fit_rows(
             &[sib("model-Q5_K_M-00001-of-00002.gguf", 5_000_000_000)],
             60_000_000_000,
@@ -3840,7 +3840,7 @@ mod tests {
             unique_dest(dir, "fresh.gguf", "unsloth/Base-GGUF"),
             dir.join("fresh.gguf")
         );
-        // Flat collision: repo slug prefix — two repos shipping the same
+        // Flat collision: repo slug prefix - two repos shipping the same
         // leaf never clobber each other (live case: unsloth base vs MTP
         // repos both ship Qwen3.5-9B-Q4_K_M.gguf).
         assert_eq!(
@@ -3922,7 +3922,7 @@ mod tests {
     fn unit__select_files__sidecar_heads_never_selected_as_main() {
         // gpt-oss repo shape (verified against ggml-org/gpt-oss-20b-GGUF):
         // eagle3 speculator heads share the BF16/Q8_0 quant tokens with
-        // nothing — the ONLY main model is MXFP4. A quant request that
+        // nothing - the ONLY main model is MXFP4. A quant request that
         // only a sidecar carries must fall through, and the smallest-file
         // fallback must also skip sidecars instead of shipping a 1.5 GiB
         // draft head as "the model".
@@ -3946,7 +3946,7 @@ mod tests {
         let picked = select_files(&siblings, "q4_k_m").unwrap();
         assert_eq!(picked.shards[0].filename, "gpt-oss-20b-MXFP4.gguf");
         // Exact-filename requests are the sanctioned sidecar path (spec
-        // pairs pull drafter artifacts this way) — untouched by the filter.
+        // pairs pull drafter artifacts this way) - untouched by the filter.
         let picked = select_files(&siblings, "eagle3-gpt-oss-20b-Q8_0.gguf").unwrap();
         assert_eq!(picked.shards[0].filename, "eagle3-gpt-oss-20b-Q8_0.gguf");
         // dflash/dspark draft artifacts + mmproj are sidecars too.
@@ -4035,7 +4035,7 @@ mod tests {
             "registry.ollama.ai"
         ));
         // Wildcard: any subdomain, apex EXCLUDED (presigned CDN families
-        // live on subdomains — the apex is a different, untrusted site).
+        // live on subdomains - the apex is a different, untrusted site).
         assert!(extra_host_matches(
             "blob-store.r2.cloudflarestorage.com",
             "*.r2.cloudflarestorage.com"
@@ -4336,7 +4336,7 @@ mod tests {
         hex::encode(Sha256::digest(bytes))
     }
 
-    /// Minimal valid GGUF v3 file (header + one string kv) — passes
+    /// Minimal valid GGUF v3 file (header + one string kv) - passes
     /// `gguf::read_metadata_file`.
     fn gguf_bytes() -> Vec<u8> {
         let mut b: Vec<u8> = Vec::new();
@@ -4420,7 +4420,7 @@ mod tests {
 
         // Known family, set NEVER attached (row predates the
         // component pull): Present would strand a 4.6 GiB DiT that can
-        // never boot — the gate must escalate to component repair.
+        // never boot - the gate must escalate to component repair.
         let row = seed_row(
             "qwen-image-2.1",
             "abenzerps/Qwen-Image-2.1-GGUF",
@@ -4441,7 +4441,7 @@ mod tests {
             Repull::DeltaComponents
         ));
 
-        // Unknown-family GGUF with no set is a plain present model —
+        // Unknown-family GGUF with no set is a plain present model -
         // no repair exists to run.
         let text = seed_row("m", "some/repo", "Q4_K_M", dit, kvless.len() as u64, 1);
         assert!(matches!(
@@ -4484,7 +4484,7 @@ mod tests {
         )));
         // Diffusion component GGUF (0 KVs, valid container): the
         // "missing general.architecture" parse still proves the
-        // container walked clean — intact, or every re-pull would
+        // container walked clean - intact, or every re-pull would
         // prune + redownload a sound 4.6 GiB DiT forever.
         let mut kvless = b"GGUF".to_vec();
         kvless.extend_from_slice(&3u32.to_le_bytes());
@@ -4528,7 +4528,7 @@ mod tests {
         );
         Store::open(&dirs).unwrap().upsert_model(&row).unwrap();
         // Stale partials from an interrupted attempt are garbage once the
-        // final leaf verifies — the fast path sweeps them.
+        // final leaf verifies - the fast path sweeps them.
         std::fs::write(dirs.models_dir().join("r-q4_k_m.gguf.part"), b"junk").unwrap();
         std::fs::write(dirs.models_dir().join("r-q4_k_m.gguf.part.progress"), b"{}").unwrap();
 
@@ -4541,7 +4541,7 @@ mod tests {
             .mount(&api)
             .await;
         // Download server with ZERO mocks: any download attempt would 404
-        // and fail the pull — the fast path must not touch it at all.
+        // and fail the pull - the fast path must not touch it at all.
         let dl = MockServer::start().await;
 
         let client = HfClient::with_bases(
@@ -4595,7 +4595,7 @@ mod tests {
 
         // Store row points at a truncated file: integrity fails, so the
         // pull must clear the dead leaf and land the fresh download on
-        // the CANONICAL filename — not the owner--repo--leaf slug.
+        // the CANONICAL filename - not the owner--repo--leaf slug.
         let content = b"fresh-bytes-here".to_vec();
         let sha = payload(&content);
         let leaf = dirs.models_dir().join("r-q4_k_m.gguf");
@@ -4753,7 +4753,7 @@ mod tests {
         dirs.ensure().unwrap();
 
         // Recorded sha is the OLD revision; the API now lists a different
-        // sha under the same filename — the pull must replace the leaf in
+        // sha under the same filename - the pull must replace the leaf in
         // place (canonical landing), not slug-disambiguate.
         let old_content = gguf_bytes();
         let new_content = b"new-revision-bytes".to_vec();
@@ -5026,7 +5026,7 @@ mod tests {
 
         // Row-less re-pull: the store forgets the model (the gate's
         // Present-branch is unreachable) but the file stays byte-exact
-        // on disk — the main download path must adopt it.
+        // on disk - the main download path must adopt it.
         Store::open(&dirs).unwrap().delete_model("m-repo").unwrap();
         let stale_part = dirs
             .models_dir()
@@ -5041,7 +5041,7 @@ mod tests {
             !Path::new(&format!("{}.part", leaf.display())).exists(),
             "stale partial swept on reuse"
         );
-        // The scoped guard asserts `expect(1)` when dropped — exactly one
+        // The scoped guard asserts `expect(1)` when dropped - exactly one
         // blob transfer across BOTH pulls.
         drop(dl_guard);
     }

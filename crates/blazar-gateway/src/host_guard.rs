@@ -117,8 +117,8 @@ fn machine_hostnames() -> Vec<String> {
 
 /// Is this `Origin` one the default browser policy should serve?
 ///
-/// The default set keeps local web UIs zero-config — any port on
-/// `localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0` — plus the custom
+/// The default set keeps local web UIs zero-config - any port on
+/// `localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0` - plus the custom
 /// schemes used by desktop/webview shells (`app://`, `file://`,
 /// `tauri://`, `vscode-webview://`, `vscode-file://`). Everything else
 /// (public websites) needs an explicit `cors_origins` entry.

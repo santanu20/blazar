@@ -1,6 +1,6 @@
 //! `blazar quantize`: orchestrate the engine's own `llama-quantize`
 //! (ships in the same release tarball as llama-server) to derive a new
-//! quantization of a pulled model — no separate toolchain, no uploads.
+//! quantization of a pulled model - no separate toolchain, no uploads.
 //! The output lands in the plain-GGUF store like any pulled model.
 
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use blazar_core::{BlazarDirs, Store};
 /// `llama-perplexity`) in an installed engine directory. Same discovery
 /// contract as `find_bench_bin`: llamacpp engines only, active engine
 /// first, and the engine module's symlink-safe walk (F86) finds the
-/// binary under any unpack layout — release tarballs nest tools in
+/// binary under any unpack layout - release tarballs nest tools in
 /// versioned dirs (`llama-b11193/`) and CUDA overlay assets in
 /// vendor-suffixed dirs (`llama-b11193-cuda-bin-ubuntu-12-x64/`), so
 /// deriving the inner dir from the tag misses both.
@@ -102,7 +102,7 @@ where
 }
 
 /// Locate `llama-quantize` in an installed engine directory (active
-/// engine first — same discovery order as `find_bench_bin`).
+/// engine first - same discovery order as `find_bench_bin`).
 pub fn find_quantize_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
     find_engine_tool(dirs, "llama-quantize")
 }
@@ -112,7 +112,7 @@ pub fn find_perplexity_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
     find_engine_tool(dirs, "llama-perplexity")
 }
 
-/// Locate `ggml-rpc-server` — the RPC worker binary every engine
+/// Locate `ggml-rpc-server` - the RPC worker binary every engine
 /// tarball ships (`BUILD_TARGETS`) that `blazar rpc worker` execs on
 /// machines donating their GPUs to a remote gateway's `rpc_servers`.
 pub fn find_rpc_server_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
@@ -122,11 +122,11 @@ pub fn find_rpc_server_bin(dirs: &BlazarDirs) -> Result<PathBuf> {
 /// Fixed calibration corpus for the `--verify` gate: ~8.5KB of DIVERSE
 /// one-pass natural text (no repeated sentences, no RNG) so perplexity
 /// sits in a realistic range and quantization damage is actually
-/// measurable — a cycled corpus drives PPL toward 1.0 and hides
-/// degradation (live-proven on qwen2.5-0.5b). ≥1024 tokens satisfies
-/// llama-perplexity's minimum (2× its default 512 ctx) on mainstream
+/// measurable - a cycled corpus drives PPL toward 1.0 and hides
+/// degradation (live-proven on qwen2.5-0.5b). >=1024 tokens satisfies
+/// llama-perplexity's minimum (2x its default 512 ctx) on mainstream
 /// tokenizers. Deterministic, so gate numbers reproduce run-to-run; the
-/// gate measures the RELATIVE base→output delta on this same corpus.
+/// gate measures the RELATIVE base->output delta on this same corpus.
 pub const VERIFY_PROBE_CORPUS: &str = "\
 The transformer architecture processes every token in a single pass. \
 Quantization maps floating-point weights onto a coarse integer lattice. \
@@ -345,7 +345,7 @@ pub fn write_verify_probe(dirs: &BlazarDirs) -> Result<PathBuf> {
 }
 
 /// Sanity-shape for a quant type (llama-quantize owns the real
-/// validation — this only catches obvious shell-hostile junk early).
+/// validation - this only catches obvious shell-hostile junk early).
 #[must_use]
 pub fn plausible_quant_type(t: &str) -> bool {
     !t.is_empty()
@@ -477,8 +477,8 @@ mod tests {
         };
         let p = write_verify_probe(&dirs).unwrap();
         let a = std::fs::read_to_string(&p).unwrap();
-        // ≥ 8 KB (~1024+ tokens on mainstream tokenizers; live-measured
-        // 11.5 KB probe → 3 chunks on qwen2.5).
+        // >= 8 KB (~1024+ tokens on mainstream tokenizers; live-measured
+        // 11.5 KB probe -> 3 chunks on qwen2.5).
         assert!(a.len() > 8_000, "probe too small: {}", a.len());
         let b = std::fs::read_to_string(write_verify_probe(&dirs).unwrap()).unwrap();
         assert_eq!(a, b, "probe must be deterministic");
@@ -486,7 +486,7 @@ mod tests {
 
     /// Regression pin (live-observed 2026-09-26): CUDA overlay tags carry
     /// a `-cuda` suffix while the tarball nests tools in a versioned
-    /// `llama-bNNNN/` dir — deriving the inner dir from the tag
+    /// `llama-bNNNN/` dir - deriving the inner dir from the tag
     /// (`engines/b11193-cuda/llama-b11193-cuda/...`) missed the binary
     /// and quantize refused with "no llama-quantize found" on a store
     /// that had it. Discovery must walk the actual layout (F86), and a
@@ -602,7 +602,7 @@ mod tests {
             "teaching error must name the tool and the fix, got: {err}"
         );
         // Tarball layout: the worker sits next to llama-server under
-        // the versioned inner dir — same walk as the quantize family.
+        // the versioned inner dir - same walk as the quantize family.
         std::fs::write(
             nested.join(crate::tool_file_name("ggml-rpc-server")),
             b"#!/bin/sh\n",

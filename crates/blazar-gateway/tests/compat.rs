@@ -212,7 +212,7 @@ async fn client__remote_instance__routes_by_prefix() {
 
 #[tokio::test]
 async fn client__remote_ollama_lane__scoped_key_rejected() {
-    // F11 pin: the ollama /api/chat remote lane pays key admission — a
+    // F11 pin: the ollama /api/chat remote lane pays key admission - a
     // key scoped to `m1` must NOT reach `far:m1` (pre-fix the remote
     // split returned before keys.check entirely).
     let stub = support::spawn_remote_stub().await;
@@ -321,7 +321,7 @@ async fn client__remote_pool__prefix_sticky_and_remote_header() {
 }
 
 /// E4: `audit_log = true` appends one JSON line per generation request
-/// with identity + outcome (key, model, status) — never content.
+/// with identity + outcome (key, model, status) - never content.
 #[tokio::test]
 async fn client__audit_log__generation_lines_written() {
     let mut cfg = support::config_with_keys();
@@ -425,7 +425,7 @@ async fn client__well_known__capability_discovery() {
             .any(|e| e == "/v1/chat/completions")
     );
     // Audit MM15: the census must advertise EVERY media generation
-    // route (plus the engine-scoped surfaces) — a client discovering
+    // route (plus the engine-scoped surfaces) - a client discovering
     // capabilities needs them as much as the text lanes.
     let openai_eps: Vec<&str> = v["endpoints"]["openai"]
         .as_array()
@@ -464,7 +464,7 @@ async fn client__well_known__capability_discovery() {
         assert!(openai_eps.contains(&path), "census missing {path}");
     }
     // Audit MM16: the non-/v1 audio aliases are real routes, not just
-    // census entries — they must route (auth refusal, not 404).
+    // census entries - they must route (auth refusal, not 404).
     for path in ["/audio/transcriptions", "/audio/translations"] {
         blazar_core::tls::ensure_tls_provider();
         let r = reqwest::Client::new()
@@ -490,7 +490,7 @@ async fn client__well_known__capability_discovery() {
         .unwrap();
     assert_eq!(anon.status(), 401);
     // F4 census rule: /api/usage is advertised in the ollama lane AND
-    // is a mounted route serving the rollup shape (empty is honest —
+    // is a mounted route serving the rollup shape (empty is honest -
     // no traffic has flown through this test server).
     let ollama_eps: Vec<&str> = v["endpoints"]["ollama"]
         .as_array()
@@ -575,7 +575,7 @@ async fn client__keys_rotate__old_secret_dies_new_works() {
 async fn client__ollama_options_spec__invalid_mode_teaches_vocabulary() {
     // `options.spec` is the per-request spec-mode override (REPL
     // --no-draft rides it). A typo must 400 with the full valid-mode
-    // list — NOT fall through to the generic catalog pair, which would
+    // list - NOT fall through to the generic catalog pair, which would
     // silently serve the wrong spawn shape.
     let ts = start(support::config_with_keys()).await;
     let c = client();
@@ -640,7 +640,7 @@ async fn client__ollama_options_spec__off_shapes_the_spawn_and_ps_reports_it() {
         .expect("m1 instance row");
     assert_eq!(row["blazar_spec"].as_str(), Some("off"));
     // Cache-hit surface: the key exists on every row (null until the
-    // gateway has classified a completed response for the model —
+    // gateway has classified a completed response for the model -
     // the earlier chat in this test may or may not have carried
     // usage, so only the key shape is pinned here).
     assert!(row.get("blazar_cache_hit").is_some());
@@ -719,7 +719,7 @@ async fn client__audio_speech__teaches_install_and_unknown_formats() {
 
 /// Native llama-server surface parity (upstream audit 2026-10-05):
 /// /infill, /v1/systemone, /completion, and /embeddings bodies carry no
-/// `model` field upstream — direct-server clients post them bare.
+/// `model` field upstream - direct-server clients post them bare.
 /// Blazar must resolve a target (X-Blazar-Model > ?model= > single hot
 /// child) and forward, not answer the OpenAI-dialect hard 400.
 #[tokio::test]
@@ -748,7 +748,7 @@ async fn client__native_modelless_surfaces__header_target_forwards() {
     stub.shutdown().await;
 }
 
-/// Same native surfaces, `?model=` query resolution — the second rung
+/// Same native surfaces, `?model=` query resolution - the second rung
 /// of the `scoped_proxy` chain.
 #[tokio::test]
 async fn client__native_modelless_surfaces__query_target_forwards() {
@@ -806,7 +806,7 @@ async fn client__rerank_alias_spellings__forward_to_child() {
 }
 
 /// Pin the OTHER side of the audit fix: OpenAI-dialect paths have no
-/// fallback — their clients always name the model, and a silent
+/// fallback - their clients always name the model, and a silent
 /// fallback would route a typo to the wrong lane.
 #[tokio::test]
 async fn client__openai_dialect__missing_model_still_400() {

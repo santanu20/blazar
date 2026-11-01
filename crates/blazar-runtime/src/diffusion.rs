@@ -2,7 +2,7 @@
 //!
 //! A diffusion GGUF pull is not one file: the `DiT` checkpoint that names
 //! the repo is unservable without its `VAE` and text encoder(s) (sd-server
-//! refuses to boot on the `DiT` alone — verified live against
+//! refuses to boot on the `DiT` alone - verified live against
 //! master-890-74988b2). Component files live in DIFFERENT upstream
 //! repos picked per model family; the pairing is upstream policy (which
 //! `VAE` a model version expects), not something derivable from the `DiT`
@@ -17,7 +17,7 @@
 //! A second family shape exists: STANDALONE checkpoints (SD 1.5, SDXL)
 //! carry their `VAE` and text encoders inside the single `.safetensors`
 //! file, so sd-server boots them with `-m/--model <file>` alone. Those
-//! families carry no component specs — the pull pins the model file
+//! families carry no component specs - the pull pins the model file
 //! itself and the row stores a self-referencing `--model` component
 //! that marks it for diffusion routing.
 
@@ -46,8 +46,8 @@ pub struct ComponentSpec {
 }
 
 /// What a family generates. sd-server derives its serving mode from the
-/// LOADED model (capabilities advertises `supported_modes` per boot) —
-/// there is no boot-time mode flag in current builds — so the gateway
+/// LOADED model (capabilities advertises `supported_modes` per boot) -
+/// there is no boot-time mode flag in current builds - so the gateway
 /// uses this field to teach the right surface (`/v1/videos` vs
 /// `/v1/images`) before any child exists.
 pub enum FamilyMode {
@@ -117,7 +117,7 @@ const FAMILIES: &[DiffusionFamily] = &[
     },
     DiffusionFamily {
         // Qwen-Image v1 (upstream docs/qwen_image.md): the DiT pairs
-        // the v1 qwen_image_vae — NOT the 2.1 one — and a Qwen2.5-VL-7B
+        // the v1 qwen_image_vae - NOT the 2.1 one - and a Qwen2.5-VL-7B
         // text encoder. The broad token needs excludes: 2.1 has its own
         // entry above, 2512's VAE pairing is unverified here, and Edit
         // is a separate instruction-tuned DiT with its own set.
@@ -204,7 +204,7 @@ const FAMILIES: &[DiffusionFamily] = &[
             ComponentSpec {
                 flag: "--vae",
                 source: ComponentSource {
-                    // Same file the FLUX.1 family pulls — byte-exact
+                    // Same file the FLUX.1 family pulls - byte-exact
                     // reuse kicks in when both families live on one
                     // box. BFL repos are gated:auto: the pull surfaces
                     // the HF_TOKEN teaching until the license is
@@ -231,7 +231,7 @@ const FAMILIES: &[DiffusionFamily] = &[
         // Curated to the Chroma1-HD line, the current head of
         // silveroxides/Chroma-GGUF (the repo also carries 50+
         // chroma-unlocked-v* variants under the same t5xxl + FLUX.1
-        // VAE contract; HD quants verified: Q4_0/Q8_0/BF16 — the
+        // VAE contract; HD quants verified: Q4_0/Q8_0/BF16 - the
         // fallback lands on Q4_0 for K-quants the repo never cut).
         // Upstream docs/chroma.md.
         token: "chroma",
@@ -267,7 +267,7 @@ const FAMILIES: &[DiffusionFamily] = &[
     DiffusionFamily {
         // Token "flux.2-dev" deliberately excludes the klein variants:
         // klein pairs Qwen3 text encoders while dev pairs
-        // Mistral-Small (upstream docs/flux2.md) — a shared token
+        // Mistral-Small (upstream docs/flux2.md) - a shared token
         // would mis-attach the 24B Mistral encoder to klein pulls.
         // Klein stays unmatched until curated separately.
         token: "flux.2-dev",
@@ -301,7 +301,7 @@ const FAMILIES: &[DiffusionFamily] = &[
     },
     DiffusionFamily {
         // SDXL: the most-downloaded image model on HF. A STANDALONE
-        // checkpoint — sd_xl_base_1.0.safetensors embeds the VAE and
+        // checkpoint - sd_xl_base_1.0.safetensors embeds the VAE and
         // both CLIP text encoders, so sd-server boots it with
         // `-m/--model` alone (upstream docs/sd.md txt2img example). The
         // token also catches sdxl-turbo housings; finetune checkpoints
@@ -329,11 +329,11 @@ const FAMILIES: &[DiffusionFamily] = &[
     },
     DiffusionFamily {
         // Wan 2.1 T2V 1.3B (upstream docs/wan.md): a video diffusion
-        // model — the DiT is a standalone safetensors that still needs
+        // model - the DiT is a standalone safetensors that still needs
         // its VAE and the umt5-xxl text encoder attached. NOTE: the
         // doc's `-M vid_gen` is the sd-cli/library interface; sd-server
         // has no mode flag (verified live on master-890: `-m` is short
-        // for `--model`) — it derives the serving mode from the loaded
+        // for `--model`) - it derives the serving mode from the loaded
         // model, and video parameters (frames/fps) ride requests.
         // Sibling variants (fun/vace/i2v/flf2v) pair different or
         // extra components and stay out; Wan 2.2 A14B needs a second
@@ -342,7 +342,7 @@ const FAMILIES: &[DiffusionFamily] = &[
         display: "Wan 2.1 T2V",
         // Broad token on purpose: the two real housings spell it
         // differently (official `Wan2.1-T2V-1.3B`, Comfy-Org
-        // `Wan_2.1_ComfyUI_repackaged`) — "wan_2.1" alone would miss
+        // `Wan_2.1_ComfyUI_repackaged`) - "wan_2.1" alone would miss
         // the official repos. "2.2" vetoes both Wan 2.2 spellings;
         // the variant suffixes pair different component contracts.
         excludes: &["2.2", "fun", "vace", "i2v", "flf2v"],
@@ -456,7 +456,7 @@ pub fn component_leaf(source: &ComponentSource, quant: &str) -> String {
 
 /// A row's set is repair-worthy when any REQUIRED family component is
 /// absent from the row or dead on disk. Optional components (vision)
-/// never trigger repair — they only disable edits.
+/// never trigger repair - they only disable edits.
 #[must_use]
 pub fn required_component_missing(row: &blazar_core::ModelRow, family: &DiffusionFamily) -> bool {
     family.components.iter().filter(|c| c.required).any(|c| {
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(f.display, "Qwen-Image-2.1");
         assert!(diffusion_family("leejet/qwen-image-2.1-gguf").is_some());
         assert!(diffusion_family("Comfy-Org/Qwen-Image-2.1").is_some());
-        // v1 and unrelated repos stay unmatched by 2.1 — their `VAE`
+        // v1 and unrelated repos stay unmatched by 2.1 - their `VAE`
         // pairing is NOT interchangeable with 2.1.
         assert!(diffusion_family("qwen/qwen3-8b-gguf").is_none());
         // FLUX.1 in all its housings: official dev/schnell, GGUF mirrors,
@@ -581,7 +581,7 @@ mod tests {
             "SD 1.5"
         );
         assert!(diffusion_family("CompVis/stable-diffusion-v1-4").is_some());
-        // SD3.5 pairs clip_l+clip_g+t5xxl — different contract, not
+        // SD3.5 pairs clip_l+clip_g+t5xxl - different contract, not
         // curated, and neither standalone token matches it.
         assert!(diffusion_family("stabilityai/stable-diffusion-3.5-medium").is_none());
     }

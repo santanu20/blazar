@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Tool-calling quality battery — deterministic, per model, live-only.
+"""Tool-calling quality battery - deterministic, per model, live-only.
 
 Measures the dimensions the perf bench matrix cannot: selection
 correctness, argument validity, tool_choice forms, parallel calls,
 multi-turn loop, strict JSON schema, streaming tool deltas, and the
-tools-vs-no-tools latency delta (transport overhead proxy — the child
+tools-vs-no-tools latency delta (transport overhead proxy - the child
 is auth-gated by design, so raw-child comparison is not reachable
 externally; the no-tools request of identical prompt size isolates the
 tool-transport cost instead).
@@ -15,7 +15,7 @@ Usage:
 Outputs bench-artifacts/<date>-toolcall/<model>.json + report rows.
 Every check is deterministic: exact tool name, parseable args, required
 fields with correct types. Parallel-call behavior is MEASURED (recorded
-count), never failed — models legitimately choose one call at a time.
+count), never failed - models legitimately choose one call at a time.
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ class Battery:
         self.results.append(row)
         tag = "PASS" if ok else "FAIL"
         extra = f" ({measured})" if measured is not None else ""
-        print(f"  [{tag}] {name}{extra} — {evidence[:120]}")
+        print(f"  [{tag}] {name}{extra} - {evidence[:120]}")
 
     def chat(self, tools, messages, **kw):
         body = {
@@ -178,7 +178,7 @@ class Battery:
 
         # T3 tool_choice=required must produce a call (any listed tool).
         # Task-bearing prompt + one retry: tiny models occasionally
-        # sample prose on the first draw even under the constraint —
+        # sample prose on the first draw even under the constraint -
         # transport enforcement is what this pins, not draw luck.
         t3_calls, t3_st, attempt = 0, 0, -1
         for _attempt in range(2):
@@ -227,7 +227,7 @@ class Battery:
             f"status={st} picked={names}",
         )
 
-        # T5 parallel calls — MEASURED, never failed (one-at-a-time is a
+        # T5 parallel calls - MEASURED, never failed (one-at-a-time is a
         # legitimate model policy; the transport must carry N calls in
         # one turn when the model emits them).
         st, v, _ = self.chat(
@@ -473,19 +473,19 @@ def main() -> int:
     with open(md, "w") as f:
         f.write("# Tool-calling quality battery\n\n")
         f.write(
-            f"{_dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')} · "
-            f"blazar {ver.get('version')} · commit {commit} · engine {engine}\n\n"
+            f"{_dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')} | "
+            f"blazar {ver.get('version')} | commit {commit} | engine {engine}\n\n"
         )
         for m, rows in all_rows.items():
-            f.write(f"## {m} — {rows['passed']}/{rows['total']} passed\n\n")
+            f.write(f"## {m} - {rows['passed']}/{rows['total']} passed\n\n")
             f.writelines(
-                f"- {'PASS' if r['ok'] else 'FAIL'} · {r['test']} — {r['evidence']}\n"
+                f"- {'PASS' if r['ok'] else 'FAIL'} | {r['test']} - {r['evidence']}\n"
                 for r in rows["results"]
             )
             f.write("\n")
     total_ok = sum(r["passed"] for r in all_rows.values())
     total_n = sum(r["total"] for r in all_rows.values())
-    print(f"\nTOTAL: {total_ok}/{total_n} checks — {out}")
+    print(f"\nTOTAL: {total_ok}/{total_n} checks - {out}")
     print(f"report: {md}")
     return 0 if total_ok == total_n else 1
 

@@ -1,9 +1,9 @@
-//! `/api/quantiles` — latency + cache-effectiveness summary as JSON.
+//! `/api/quantiles` - latency + cache-effectiveness summary as JSON.
 //!
 //! The same histograms `/metrics` renders as Prometheus text, in the
 //! shape dashboards and the console want: per-family p50/p95/p99 in
 //! milliseconds with observation counts, plus the prompt-cache and
-//! semantic-cache tallies. Empty histograms render `null` quantiles —
+//! semantic-cache tallies. Empty histograms render `null` quantiles -
 //! a zero would read as a measured latency, which it never is.
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::histogram::Histogram;
 use crate::state::AppState;
 
-/// One latency family in milliseconds. `count == 0` → null quantiles.
+/// One latency family in milliseconds. `count == 0` -> null quantiles.
 fn latency_block(h: &Histogram) -> Value {
     if h.count() == 0 {
         return json!({"count": 0, "p50_ms": null, "p95_ms": null, "p99_ms": null});
@@ -34,7 +34,7 @@ pub async fn quantiles(State(state): State<Arc<AppState>>) -> Json<Value> {
     let prompt = obs.prompt_tokens.load(Ordering::Relaxed);
     let cached = obs.cached_tokens.load(Ordering::Relaxed);
     let sem = &state.sem;
-    // Cache hit rate stays null until tokens exist — 0.0 would read as
+    // Cache hit rate stays null until tokens exist - 0.0 would read as
     // "measured and terrible", which an idle daemon has not measured.
     // Token counters are request-scale, far below f64's 2^52 exact
     // integer range, so the lossy cast is exact in practice.
@@ -88,10 +88,10 @@ mod tests {
         h.observe_secs(0.15);
         let block = latency_block(&h);
         assert_eq!(block["count"], 2);
-        let p50 = block["p50_ms"].as_f64().expect("observed → numeric");
-        let p99 = block["p99_ms"].as_f64().expect("observed → numeric");
+        let p50 = block["p50_ms"].as_f64().expect("observed -> numeric");
+        let p99 = block["p99_ms"].as_f64().expect("observed -> numeric");
         // 0.15 s samples in a [0, 0.2] bucket interpolate well above
-        // 50 ms; a forgotten secs→ms conversion would stay below 1.0.
+        // 50 ms; a forgotten secs->ms conversion would stay below 1.0.
         assert!(p50 > 50.0 && p50 <= 200.0, "p50 out of bucket: {p50}");
         assert!(p99 >= p50 && p99 <= 200.0, "p99 out of bucket: {p99}");
     }

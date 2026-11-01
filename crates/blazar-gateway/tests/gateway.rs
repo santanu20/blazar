@@ -39,7 +39,7 @@ fn stub_bin() -> PathBuf {
 // Edition 2024 makes env mutation unsafe (std demands no concurrent
 // reader/writer thread). These tests run one-per-process under nextest and
 // only the spawning test thread and its stub children touch the STUB_*
-// knobs — the condition std requires.
+// knobs - the condition std requires.
 fn set_env(key: &str, value: &str) {
     #[expect(unsafe_code)]
     unsafe {
@@ -243,7 +243,7 @@ async fn e2e__healthz_version_tags_models() {
         .await
         .unwrap();
     assert!(v["version"].as_str().is_some_and(|s| !s.is_empty()));
-    // The name marker is doctor's port-identity signal — pin it.
+    // The name marker is doctor's port-identity signal - pin it.
     assert_eq!(v["name"].as_str(), Some("blazar"));
     let t: serde_json::Value = c
         .get(format!("{}/api/tags", ts.base))
@@ -320,7 +320,7 @@ async fn e2e__ollama_evict_accepts_the_tags_rendered_name() {
     let c = client();
     // GET /api/tags renders `name:quant`; a client evicting by that exact
     // string must reach the supervisor. The raw passthrough this replaces
-    // no-op'd 200 on the tags form — instance keys hold bare store names,
+    // no-op'd 200 on the tags form - instance keys hold bare store names,
     // so `model_of_key(k) == model` never matched and the child kept
     // serving (live-repro'd: bge-reranker-v2-m3:q8_0 evicted, still ready).
     let status = c
@@ -332,7 +332,7 @@ async fn e2e__ollama_evict_accepts_the_tags_rendered_name() {
         .status();
     assert_eq!(status, 200, "tags form resolves and unloads");
     // Unloading a not-loaded model stays a 200 no-op (ollama keep_alive:0
-    // semantics) — but only for names that RESOLVE. Garbage teaches 404
+    // semantics) - but only for names that RESOLVE. Garbage teaches 404
     // through the resolver instead of silently ok-ing.
     let status = c
         .post(format!("{}/api/evict", ts.base))
@@ -729,9 +729,9 @@ async fn e2e__openai_chat_nonstream_and_stream() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
-/// `child_transport = "unix"` (upstream #28690 surface): the whole lane —
+/// `child_transport = "unix"` (upstream #28690 surface): the whole lane -
 /// spawn argv (`--host <path>.sock`, no --port), stub bind, readiness,
-/// proxy forward, reply — rides the socket, and teardown reaps the file.
+/// proxy forward, reply - rides the socket, and teardown reaps the file.
 #[tokio::test]
 #[cfg(unix)]
 #[allow(non_snake_case)]
@@ -962,10 +962,10 @@ async fn e2e__num_ctx_restarts_instance_at_requested_size() {
 #[allow(non_snake_case)]
 async fn e2e__num_ctx_refuses_oom_shape_with_q8_hint() {
     // I5 preflight, beyond-the-ladder lane: the stub manifest lacks
-    // --kv-unified, so the charge is full f16 KV — 2M ctx on the 24 GiB
+    // --kv-unified, so the charge is full f16 KV - 2M ctx on the 24 GiB
     // stub card cannot fit at ANY ladder rung (f16/q8_0/q4_0) and must
     // refuse with the q8_0 teaching hint. (The 500k shape one rung
-    // below now SERVES via the ladder — pinned in
+    // below now SERVES via the ladder - pinned in
     // e2e__num_ctx_ladder_serves_q4_hostable_shape.)
     // (The unified 512 MiB-floor branch is pinned at the core level in
     // unit__kv_unified_for__truth_table_for_offline_callers: adding the
@@ -995,7 +995,7 @@ async fn e2e__num_ctx_refuses_oom_shape_with_q8_hint() {
 #[allow(non_snake_case)]
 async fn e2e__num_ctx_ladder_serves_q4_hostable_shape() {
     // Preflight ladder band: 500k ctx overflows f16 and q8_0 on the
-    // 24 GiB stub card but FITS at q4_0 — the unpinned cache_type
+    // 24 GiB stub card but FITS at q4_0 - the unpinned cache_type
     // ladders (mirroring the spawn compiler's kv_quant_ladder) and the
     // request SERVES instead of refusing a shape the spawn itself
     // would host.
@@ -1044,7 +1044,7 @@ async fn e2e__control_plane__scoped_key_refused_admin_key_passes() {
     let scoped = |r: reqwest::RequestBuilder| r.bearer_auth("scoped-secret");
     let admin = |r: reqwest::RequestBuilder| r.bearer_auth("admin-secret");
 
-    // Scoped key: 403 from the guard itself — before any chain or model
+    // Scoped key: 403 from the guard itself - before any chain or model
     // resolution, so existence never leaks through the error shape.
     for (label, req) in [
         ("pin", scoped(c.post(format!("{}/api/failover/nonexistent/pin", ts.base))).json(
@@ -1074,7 +1074,7 @@ async fn e2e__control_plane__scoped_key_refused_admin_key_passes() {
         assert_eq!(resp.status(), 403, "{label}: scoped key must be refused");
         let body: serde_json::Value = resp.json().await.unwrap();
         // failover answers in the OpenAI error shape, federation routes
-        // in the ollama {"error": "<msg>"} shape — accept either.
+        // in the ollama {"error": "<msg>"} shape - accept either.
         let msg = body["error"]["message"]
             .as_str()
             .or_else(|| body["error"].as_str())
@@ -1120,7 +1120,7 @@ async fn e2e__control_plane__scoped_key_refused_admin_key_passes() {
     assert_eq!(admin_warm.status(), 200);
     ts.state.sup.shutdown_all().await.unwrap();
 
-    // Open gateway (no keys): the guard is inert — same unknown-chain 404.
+    // Open gateway (no keys): the guard is inert - same unknown-chain 404.
     let ts_open = start(Config::default()).await;
     let open_pin = c
         .post(format!("{}/api/failover/nonexistent/pin", ts_open.base))
@@ -1225,7 +1225,7 @@ async fn e2e__cors_preflight__answered_before_auth_when_keys_set() {
             .contains_key("access-control-allow-origin"),
         "preflight answer must carry CORS allow headers"
     );
-    // Disallowed origins get no CORS grant — the browser blocks them —
+    // Disallowed origins get no CORS grant - the browser blocks them -
     // but the request still must not leak an auth 401 body shape.
     let evil = c
         .request(
@@ -1241,7 +1241,7 @@ async fn e2e__cors_preflight__answered_before_auth_when_keys_set() {
         !evil.headers().contains_key("access-control-allow-origin"),
         "disallowed origin must not receive a CORS grant"
     );
-    // A real request without a key is still 401 — auth remains armed.
+    // A real request without a key is still 401 - auth remains armed.
     let no_key = c.get(format!("{}/api/tags", ts.base)).send().await.unwrap();
     assert_eq!(no_key.status(), 401);
     // ...and a permitted-origin 401 carries CORS headers so browser
@@ -1269,7 +1269,7 @@ async fn e2e__object_authz__batch_files_two_key_isolation() {
     // BLZ-1: batch-plane durable resources (uploaded files, batches) carry
     // the creating key's name in their on-disk meta; a second valid key
     // must read, consume, cancel and list them exactly like an unknown
-    // id — 404s, no `_owner` leak on the wire, nothing in the listing.
+    // id - 404s, no `_owner` leak on the wire, nothing in the listing.
     let cfg = Config {
         keys: vec![
             blazar_core::ApiKey {
@@ -1334,7 +1334,7 @@ async fn e2e__object_authz__batch_files_two_key_isolation() {
         200
     );
     // beta reads the SAME ids as unknown: meta, content, and as a batch
-    // input — 404 everywhere, no existence leak.
+    // input - 404 everywhere, no existence leak.
     for path in [
         format!("/v1/files/{file_id}"),
         format!("/v1/files/{file_id}/content"),
@@ -1598,7 +1598,7 @@ async fn e2e__keys_scoped_rate_and_accounting() {
     assert_eq!(wrong.status(), 403);
 
     // rpm=2 exhaustion needs model-routed charges; /api/tags (GET, not
-    // model-routed) never consumes budget — prove it stays 200.
+    // model-routed) never consumes budget - prove it stays 200.
     let limited = c
         .get(format!("{}/api/tags", ts.base))
         .bearer_auth("plm_scoped")
@@ -1661,7 +1661,7 @@ async fn e2e__keys_scoped_rate_and_accounting() {
 async fn e2e__local_tts_charges_key_admission() {
     use blazar_core::ApiKey;
     // Audit MM1: the LOCAL piper lane must pass key admission BEFORE its
-    // not-installed teaching — the first request charges rpm, the second
+    // not-installed teaching - the first request charges rpm, the second
     // within the window exhausts it, and a wrongly-scoped key never
     // reaches the lane at all.
     let cfg = Config {
@@ -1679,7 +1679,7 @@ async fn e2e__local_tts_charges_key_admission() {
         "model": "en_US-amy-medium",
         "input": "hello from the local lane",
     });
-    // 404 = tts_error not-installed teaching — admission PASSED (a
+    // 404 = tts_error not-installed teaching - admission PASSED (a
     // bypassed lane would 404 twice without ever exhausting rpm).
     let first = c
         .post(format!("{}/v1/audio/speech", ts.base))
@@ -1740,7 +1740,7 @@ async fn e2e__local_whisper_charges_key_admission() {
                 .unwrap()
         }
     };
-    // First: 501 teaching (no whisper engine/model in the test dirs) —
+    // First: 501 teaching (no whisper engine/model in the test dirs) -
     // admission already charged the request.
     let first = post_multipart("plm_whisper").await;
     assert_eq!(first.status(), 501, "half-missing teaching");
@@ -1752,7 +1752,7 @@ async fn e2e__local_whisper_charges_key_admission() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__whisper_stream_and_async_are_mutually_exclusive() {
-    // F6: `stream` + `async` on one body is a request-shape error — it
+    // F6: `stream` + `async` on one body is a request-shape error - it
     // must 400 before lane availability is even considered.
     let ts = start(Config::default()).await;
     let c = client();
@@ -1784,7 +1784,7 @@ async fn e2e__whisper_stream_and_async_are_mutually_exclusive() {
 #[allow(non_snake_case)]
 async fn e2e__whisper_stream_without_engine_keeps_teaching() {
     // F6: stream on a rig with no whisper engine falls through to the
-    // lane-absent 501 teaching — the streaming branch never bypasses
+    // lane-absent 501 teaching - the streaming branch never bypasses
     // the teaching ladder.
     let ts = start(Config::default()).await;
     let c = client();
@@ -1813,7 +1813,7 @@ async fn e2e__whisper_stream_without_engine_keeps_teaching() {
 #[allow(non_snake_case)]
 async fn e2e__models_capabilities_field_matches_mmproj() {
     // Audit MM13: /v1/models rows carry a capabilities array (blazar-
-    // native shape mirroring /api/show) — [] for text-only rows.
+    // native shape mirroring /api/show) - [] for text-only rows.
     let ts = start(Config::default()).await;
     let c = client();
     let listed: serde_json::Value = c
@@ -1938,7 +1938,7 @@ async fn e2e__tls_serves_https_and_cors_headers() {
         ..Config::default()
     };
     let ts = start(cfg).await;
-    // start() serves plain HTTP; TLS needs the full serve() path — bind
+    // start() serves plain HTTP; TLS needs the full serve() path - bind
     // a second ephemeral port through gateway::serve with the same state.
     let state = Arc::clone(&ts.state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -2274,7 +2274,7 @@ async fn e2e__responses__background_conversations_and_cloud_tools() {
 async fn e2e__keep_alive_zero_unload_ping_idempotent() {
     let ts = start(Config::default()).await;
     let c = client();
-    // The ollama unload idiom: {model, keep_alive: 0} with NO payload —
+    // The ollama unload idiom: {model, keep_alive: 0} with NO payload -
     // idempotent 200 even when the model was never loaded (a 400 here
     // breaks _unload_all-style harness sweeps).
     for (path, lane) in [("/api/generate", "response"), ("/api/chat", "message")] {
@@ -2290,7 +2290,7 @@ async fn e2e__keep_alive_zero_unload_ping_idempotent() {
         assert!(r["done"] == true, "{lane} ping done: {r}");
         assert!(r.get(lane).is_some(), "{lane} ping shape: {r}");
     }
-    // Prompt-less WITHOUT keep_alive 0 is still a hard 400 — inference
+    // Prompt-less WITHOUT keep_alive 0 is still a hard 400 - inference
     // genuinely requires the field; only the release ping is exempt.
     let r = c
         .post(format!("{}/api/generate", ts.base))
@@ -2347,7 +2347,7 @@ async fn e2e__generate_raw_ok_templated_400_and_embeddings() {
     assert!(r2["done"] == true, "system generate works: {r2}");
     assert!(r2["response"].as_str().unwrap().contains("say hi"));
 
-    // template/suffix stay rejected — the engine owns the template.
+    // template/suffix stay rejected - the engine owns the template.
     let templated = serde_json::json!({"model": "m1", "prompt": "x", "template": "{{.System}}"});
     let resp = c
         .post(format!("{}/api/generate", ts.base))
@@ -2508,7 +2508,7 @@ async fn e2e__chat_message_images_translate_to_parts() {
         .json()
         .await
         .unwrap();
-    // The stub echoes the last user content — parts were forwarded (not
+    // The stub echoes the last user content - parts were forwarded (not
     // silently dropped): the text part survives in the echo.
     let content = r["message"]["content"].as_str().unwrap_or_default();
     assert!(
@@ -2576,7 +2576,7 @@ async fn e2e__ps_and_show() {
 async fn e2e__pull_failure_emits_error_line_not_silence() {
     // Regression (found by scripts/validate.py): take_while dropped the
     // terminal line, so failed pulls were silent empty 200s (H1). An
-    // invalid target fails before any network — deterministic, offline.
+    // invalid target fails before any network - deterministic, offline.
     let ts = start(Config::default()).await;
     let c = client();
     let resp = c
@@ -2691,7 +2691,7 @@ async fn e2e__audio_transcriptions_async_without_lane_teaching_501() {
 }
 
 /// Capabilities are gateway-derived: on an empty install the route 200s
-/// with engine.installed=false, no models, no child — and boots nothing.
+/// with engine.installed=false, no models, no child - and boots nothing.
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__audio_capabilities__empty_install_reports_gaps_without_booting() {
@@ -2843,7 +2843,7 @@ async fn e2e__requests__card_lifecycle_and_stop_contracts() {
 }
 
 /// Capacity endpoint: shape contract only (device count depends on the
-/// host — CI boxes may have no nvidia-smi; the endpoint must answer with
+/// host - CI boxes may have no nvidia-smi; the endpoint must answer with
 /// an honest empty census + note, never error).
 #[tokio::test]
 #[allow(non_snake_case)]
@@ -2897,7 +2897,7 @@ async fn e2e__warm__loads_model_and_route_agrees() {
     );
 
     // The scheduling explainer must now agree the model is local and
-    // resident — the decision a chat request would take.
+    // resident - the decision a chat request would take.
     let resp = c
         .get(format!("{}/api/route/m1", ts.base))
         .send()
@@ -2913,7 +2913,7 @@ async fn e2e__warm__loads_model_and_route_agrees() {
     );
     assert!(r["peers"].as_array().is_some_and(std::vec::Vec::is_empty));
 
-    // Unknown model: a 200 decision of "none" with the teaching reason —
+    // Unknown model: a 200 decision of "none" with the teaching reason -
     // absence is a valid answer from an explainer, never a fake target.
     let resp = c
         .get(format!("{}/api/route/nope", ts.base))
@@ -3016,7 +3016,7 @@ async fn e2e__explain__card_provenance_and_unknown_404() {
     assert_eq!(v["object"], "blazar.explain", "shape: {v}");
     assert_eq!(v["model"]["name"], "m1");
     assert_eq!(v["model"]["format"], "gguf");
-    // This harness store seeds models but NO engine rows — the card must
+    // This harness store seeds models but NO engine rows - the card must
     // say so honestly (teaching reason), never fabricate a lane.
     assert_eq!(v["engine"]["source"], "error", "no engine rows: {v}");
     assert!(
@@ -3030,13 +3030,13 @@ async fn e2e__explain__card_provenance_and_unknown_404() {
         ctx["requested_source"]
             .as_str()
             .is_some_and(|s| s.starts_with("config default_ctx = ")),
-        "no overlay on m1 — requested ctx must cite the config default: {ctx}"
+        "no overlay on m1 - requested ctx must cite the config default: {ctx}"
     );
     assert!(
         ctx["effective_source"]
             .as_str()
             .is_some_and(|s| s.contains("not resident")),
-        "m1 is not spawned in the harness — effective ctx must say so: {ctx}"
+        "m1 is not spawned in the harness - effective ctx must say so: {ctx}"
     );
     assert!(
         v["speculation"]["mode"].as_str().is_some(),
@@ -3053,7 +3053,7 @@ async fn e2e__explain__card_provenance_and_unknown_404() {
     );
 
     // Tag-form alias (`name:quant`, the display shape /api/tags emits)
-    // resolves through the canonical ladder — regression pin for the
+    // resolves through the canonical ladder - regression pin for the
     // explain 404 on colon forms.
     let resp = c
         .get(format!("{}/api/explain/m1:bf16", ts.base))
@@ -3100,7 +3100,7 @@ async fn e2e__model_doctor__job_cert_and_stored_caps() {
     );
 
     // Known model: a durable doctor job is created and runs the probes
-    // through the real gateway path (stub engines — verdicts are theirs,
+    // through the real gateway path (stub engines - verdicts are theirs,
     // the CONTRACT here is the shape: every cap classified, terminal
     // state reached, cert queryable after).
     let resp = c
@@ -3256,7 +3256,7 @@ async fn e2e__session_save_restore_erase_roundtrip() {
     assert_eq!(save["status"], "ok", "{save}");
 
     // file landed in the per-model sessions dir (path_safe adds the
-    // stable FNV suffix — derive, never hardcode)
+    // stable FNV suffix - derive, never hardcode)
     let sess_dir = ts
         .dirs
         .sessions_dir()
@@ -3491,7 +3491,7 @@ async fn e2e__client_disconnect_frees_slot() {
 async fn e2e__child_header_stall_bounded_evicted_and_504() {
     // Pin (live evidence): a banked-session slot restore raced traffic
     // and one request hung 300s PRE-FIRST-BYTE while the child served
-    // every later request — invisible to the request log and sentinel
+    // every later request - invisible to the request log and sentinel
     // (both observe from response start) and unbounded up to the blanket
     // transport ceiling. The header phase must instead be bounded,
     // warned, evicted, and retried once; terminal failure is a 504.
@@ -3517,18 +3517,18 @@ async fn e2e__child_header_stall_bounded_evicted_and_504() {
     // spawn overhead is platform-dependent: windows CI runners pay a
     // multi-second real-time-scanning tax per child process spawn
     // (measured 23.3s end-to-end on windows-latest vs ~3s locally).
-    // 60s still pins the contract — bounded far below the ~300s
+    // 60s still pins the contract - bounded far below the ~300s
     // blanket transport ceiling this test exists to guard against.
     assert!(
         elapsed < Duration::from_secs(60),
-        "header-stall took {elapsed:?} — phase unbounded"
+        "header-stall took {elapsed:?} - phase unbounded"
     );
     assert_eq!(
         status, 504,
         "terminal header-stall status, got {status} in {elapsed:?}"
     );
     // Wedge branch (slot probe said idle): the body must say the child
-    // was evicted — the discriminator against the busy-child branch.
+    // was evicted - the discriminator against the busy-child branch.
     let body: serde_json::Value = resp.json().await.unwrap();
     let msg = body["error"]["message"]
         .as_str()
@@ -3546,10 +3546,10 @@ async fn e2e__child_header_stall_bounded_evicted_and_504() {
 async fn e2e__child_header_timeout_busy_child_kept_teaching_504() {
     // Pin (live evidence, 2026-10-05): a buffered (non-stream) think-mode
     // generation ran past child_header_timeout_secs and drew a 504 while
-    // the child was healthy mid-generation — the synchronous eviction
+    // the child was healthy mid-generation - the synchronous eviction
     // then killed the child (and would kill sibling streams on a
     // multi-slot instance). vLLM and ollama cap no generation. The guard
-    // now probes /slots on expiry: slots busy → child KEPT, request
+    // now probes /slots on expiry: slots busy -> child KEPT, request
     // fails alone with a teaching body naming the two remedies.
     let cfg = Config {
         child_header_timeout_secs: 1,
@@ -3678,7 +3678,7 @@ async fn e2e__openai_recipe_lane_pinned_renders_and_adapts() {
     // drives the child's raw /v1/completions surface, adapting the
     // echo back into a chat completion. The stub's completion handler
     // echoes the rendered prompt verbatim, so the response content IS
-    // the render — structure, identity, and usage are all directly
+    // the render - structure, identity, and usage are all directly
     // observable.
     let cfg = Config {
         prompt_recipe: "ollama_compat".into(),
@@ -3761,7 +3761,7 @@ async fn e2e__openai_recipe_lane_neutralizes_forged_turn_spellings() {
         "forged spellings neutralized in the render: {content}"
     );
     // The exact adversarial byte sequence (ASCII bars) must appear
-    // ONLY as the recipe's own structural markers — the render for a
+    // ONLY as the recipe's own structural markers - the render for a
     // single user turn is: user-open + user-close + assistant head.
     let ascii_im_end = content.matches("<|im_end|>").count();
     let ascii_im_start = content.matches("<|im_start|>").count();
@@ -3780,7 +3780,7 @@ async fn e2e__openai_recipe_lane_neutralizes_forged_turn_spellings() {
 #[allow(non_snake_case)]
 async fn e2e__openai_recipe_lane_stream_emits_chat_sse() {
     // Streaming on the pinned lane: the child's raw completion SSE
-    // arrives adapted — chat delta frames carrying the stamped
+    // arrives adapted - chat delta frames carrying the stamped
     // identity, a final usage frame, and the bare [DONE] terminator.
     let cfg = Config {
         prompt_recipe: "ollama_compat".into(),
@@ -3862,7 +3862,7 @@ async fn e2e__openai_recipe_lane_n_gt1_refused() {
 #[allow(non_snake_case)]
 async fn e2e__openai_recipe_lane_unpinned_is_native_passthrough() {
     // Default config (recipe = "child"): the OpenAI chat surface must
-    // behave exactly as before this lane existed — the stub's own chat
+    // behave exactly as before this lane existed - the stub's own chat
     // handler answers, no gateway render, no stamped identity.
     let ts = start(Config::default()).await;
     let c = client();
@@ -3894,7 +3894,7 @@ async fn e2e__openai_recipe_lane_unpinned_is_native_passthrough() {
 async fn e2e__openai_recipe_lane_unparseable_child_body_fails_closed() {
     // A child answering the raw completion surface with 200 + non-JSON
     // is a contract violation on the recipe lane; the dialect swap
-    // must fail CLOSED with a teaching 502 — never stream raw dialect
+    // must fail CLOSED with a teaching 502 - never stream raw dialect
     // bytes to a chat caller (silent corruption) and never hand back
     // an adapted empty completion (masked failure).
     let cfg = Config {
@@ -3932,7 +3932,7 @@ async fn e2e__openai_recipe_lane_child_error_passes_through_verbatim() {
     // A child ERROR keeps its own status and body verbatim: the error
     // dialect is shape-neutral. Adapting an error object into a chat
     // completion (or rewriting the status) would mask the child's
-    // teaching — the caller must see exactly what the child said.
+    // teaching - the caller must see exactly what the child said.
     let cfg = Config {
         prompt_recipe: "ollama_compat".into(),
         ..Config::default()
@@ -3969,7 +3969,7 @@ async fn e2e__openai_recipe_lane_child_error_passes_through_verbatim() {
 #[allow(non_snake_case)]
 async fn e2e__sentinel__body_stall_fires_detection_and_bounded_close() {
     // Pin (live evidence: two 600 s zero-chunk hangs finished with NO
-    // stall detection — finish null, detections [], prompt_tokens
+    // stall detection - finish null, detections [], prompt_tokens
     // null): a child that opens the SSE body then never sends a byte
     // must (1) fire the stall detector, (2) evict the wedged child
     // (which terminates the upstream body), and (3) close the client
@@ -3999,7 +3999,7 @@ async fn e2e__sentinel__body_stall_fires_detection_and_bounded_close() {
         .send()
         .await
         .expect("headers must arrive (body-stall, not header-stall)");
-    // Stall (5 s) + eviction grace + respawn overhead — never minutes.
+    // Stall (5 s) + eviction grace + respawn overhead - never minutes.
     // Same windows spawn-tax note as the header-stall pin above: child
     // respawn costs seconds per spawn on windows CI runners, so the
     // ceiling guards "bounded, not parked until client give-up" rather
@@ -4016,7 +4016,7 @@ async fn e2e__sentinel__body_stall_fires_detection_and_bounded_close() {
     let _ = body;
     // The record must carry the stall detection (answerable via why).
     // Poll: the analyzer commits asynchronously once the dropped feed
-    // signals End — the record lands within moments, not instantly.
+    // signals End - the record lands within moments, not instantly.
     let mut stalled = false;
     for _ in 0..25 {
         let why: serde_json::Value = c
@@ -4049,7 +4049,7 @@ async fn e2e__sentinel__body_stall_fires_detection_and_bounded_close() {
 #[allow(non_snake_case)]
 async fn e2e__client_disconnect_frees_slot_ollama_lane() {
     // F29 pin: the ollama NDJSON lanes must hold accounting for the BODY
-    // lifetime — dropping the response mid-stream frees the slot (the old
+    // lifetime - dropping the response mid-stream frees the slot (the old
     // with_accounting future-bracket leaked the counter forever on abort).
     let ts = start_with(
         Config::default(),
@@ -4397,7 +4397,7 @@ async fn e2e__remote_failover_circuit_and_lb() {
 }
 
 /// Opt-out lane: `child_auth = false` keeps children open (legacy
-/// behavior) — no keyfile, direct access unauthenticated.
+/// behavior) - no keyfile, direct access unauthenticated.
 #[allow(non_snake_case)]
 #[tokio::test]
 async fn e2e__child_auth__disabled_keeps_children_open() {
@@ -4730,7 +4730,7 @@ async fn e2e__anthropic_batch__create_replay_and_results() {
 
     // Create: two good requests + one that the lane refuses at replay
     // (max_tokens missing -> /v1/messages 400 -> errored row, not a dead
-    // batch — the documented per-request error contract).
+    // batch - the documented per-request error contract).
     let batch: serde_json::Value = c
         .post(format!("{}/v1/messages/batches", ts.base))
         .json(&serde_json::json!({"requests": [
@@ -4885,17 +4885,17 @@ async fn e2e__anthropic_batch__create_replay_and_results() {
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__llamacpp_only_gate__non_llamacpp_kinds_get_teaching_400() {
-    // audit GAP-3: the gate used to fire only for mistralrs — an sglang
+    // audit GAP-3: the gate used to fire only for mistralrs - an sglang
     // child proxied /props, /slots, /api/session-save class requests to a
     // bare upstream 404. Every NON-llamacpp kind must get the teaching
     // 400 naming its kind; llamacpp passes the gate untouched. The gates
     // read the store per request (only proxy's model-rewrite memoizes
-    // kind — F34 — and never these), so a post-boot row flip is live.
+    // kind - F34 - and never these), so a post-boot row flip is live.
     let ts = start(Config::default()).await;
     let c = client();
 
     // llamacpp active: the gate must stay silent. /props then fails on
-    // model resolution (no child, no header) — a DIFFERENT error that
+    // model resolution (no child, no header) - a DIFFERENT error that
     // must not carry the gate's teaching.
     let r = c.get(format!("{}/props", ts.base)).send().await.unwrap();
     let text = r.text().await.unwrap();
@@ -4956,7 +4956,7 @@ async fn e2e__llamacpp_only_gate__non_llamacpp_kinds_get_teaching_400() {
             msg.contains("llama-server-only") && msg.contains(name),
             "{name} session save teaching: {msg}"
         );
-        // ...but `close` stays open — it releases a gateway-side pin,
+        // ...but `close` stays open - it releases a gateway-side pin,
         // no slot surface involved (fails on unknown session instead).
         let r = c
             .post(format!("{}/api/session", ts.base))
@@ -4985,11 +4985,11 @@ async fn e2e__llamacpp_only_gates__routed_lane_beats_active_row() {
     let c = client();
 
     // A safetensors-dir model so routing has a mistralrs candidate; the
-    // dir must exist — the router checks `path.is_dir()`.
+    // dir must exist - the router checks `path.is_dir()`.
     let st_dir = ts.dirs.models_dir().join("st1.d");
     std::fs::create_dir_all(&st_dir).unwrap();
     ts.state.with_store(|s| {
-        // The GGUF lane needs an installed llamacpp row to route to —
+        // The GGUF lane needs an installed llamacpp row to route to -
         // this harness seeds no engine rows by default (unlike the
         // support/ harness), so install both lanes explicitly.
         s.upsert_engine(&blazar_core::EngineRow {
@@ -5099,7 +5099,7 @@ async fn e2e__llamacpp_only_gates__routed_lane_beats_active_row() {
 async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
     // Admission contract, wired end to end: with the single slot held,
     // a Tool-class chat must be admitted before an Interactive chat
-    // that queued EARLIER — class rank (plus the Tool deadline
+    // that queued EARLIER - class rank (plus the Tool deadline
     // tightening) decides, not arrival order. Order-based assertion:
     // response completion instants, no duration guessing.
     let mut cfg = Config::default();
@@ -5142,7 +5142,7 @@ async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
     // Deterministic hold: wait until the daemon CONFIRMS m1 is in
     // flight before queueing the waiters. A fixed stagger let slow
     // runners (Windows CI receipt: run 36806193764) queue C before A
-    // reached the gate — C then admitted first and the scenario under
+    // reached the gate - C then admitted first and the scenario under
     // test flipped (tool could no longer jump the earlier-queued
     // interactive because it was not queued behind a held slot).
     let a = tokio::spawn(chat(false));
@@ -5173,10 +5173,10 @@ async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    // C: plain chat (Interactive) — queues FIRST.
+    // C: plain chat (Interactive) - queues FIRST.
     let c = tokio::spawn(chat(false));
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    // B: chat with tools (Tool class) — queues SECOND.
+    // B: chat with tools (Tool class) - queues SECOND.
     let b = tokio::spawn(chat(true));
     let (ra, rc, rb) = tokio::join!(a, c, b);
     let (done_a, done_c, done_b) = (ra.unwrap(), rc.unwrap(), rb.unwrap());
@@ -5192,10 +5192,10 @@ async fn e2e__tool_wins_admission_over_earlier_queued_interactive() {
 #[allow(non_snake_case)]
 async fn e2e__deterministic_isolate__parks_normal_request_until_exclusive_finishes() {
     // F4 contract, wired end to end: with deterministic_isolate on, a
-    // temp-0 seeded request is granted EXCLUSIVE admission — a normal
+    // temp-0 seeded request is granted EXCLUSIVE admission - a normal
     // request for the same model parks until the exclusive one finishes,
     // even though a free slot exists (slots = 2 here so the plain
-    // ceiling would happily admit both concurrently — only the
+    // ceiling would happily admit both concurrently - only the
     // exclusive gate can produce the observed serialization).
     let mut cfg = Config::default();
     cfg.model_overrides.insert(
@@ -5235,7 +5235,7 @@ async fn e2e__deterministic_isolate__parks_normal_request_until_exclusive_finish
     // A: temp-0 + seeded -> exclusive lane, holds it ~6 s.
     let a = tokio::spawn(chat(Some(0.0), Some(42)));
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    // B: normal sampling request — would co-run on the second slot
+    // B: normal sampling request - would co-run on the second slot
     // without the exclusive gate; must park behind A instead.
     let b = tokio::spawn(chat(None, None));
     let (ra, rb) = tokio::join!(a, b);
@@ -5466,7 +5466,7 @@ async fn e2e__mcp__status_plane_and_stream_guard() {
     let ts = start(cfg).await;
     let c = client();
 
-    // Status plane: report-only — `sleep` is not an MCP server and must
+    // Status plane: report-only - `sleep` is not an MCP server and must
     // never have been spawned to answer this.
     let st: serde_json::Value = c
         .get(format!("{}/api/mcp", ts.base))

@@ -1,6 +1,6 @@
-//! R4 semantic cache — integration tests over the real router + stub
+//! R4 semantic cache - integration tests over the real router + stub
 //! child (which serves `/tokenize` + legacy `/embedding`): full-stack
-//! miss→store→hit flow, header bypass, malformed overrides, disabled
+//! miss->store->hit flow, header bypass, malformed overrides, disabled
 //! default, stream bypass, and the metrics surface.
 
 #![allow(non_snake_case)]
@@ -81,7 +81,7 @@ async fn integration__semcache__miss_store_then_hit_full_stack() {
         1
     );
 
-    // Different prompt: below threshold (orthogonal stub embeds) → miss.
+    // Different prompt: below threshold (orthogonal stub embeds) -> miss.
     let r: serde_json::Value = c
         .post(format!("{}/api/chat", ts.base))
         .json(&chat_body("completely unrelated different words here"))
@@ -112,7 +112,7 @@ async fn integration__semcache__same_prompt_different_sampling_class_misses() {
     assert_eq!(r["cache_debug"]["cache_hit"], false);
 
     // Same prompt text, different generation problem (temperature): the
-    // similarity is 1.0 but the class key differs — must be served live.
+    // similarity is 1.0 but the class key differs - must be served live.
     let mut hot = chat_body("hello semantic cache world");
     hot["options"] = serde_json::json!({"temperature": 0.9});
     let resp = c
@@ -173,7 +173,7 @@ async fn integration__semcache__header_off_bypasses() {
         .json()
         .await
         .unwrap();
-    // Same prompt with x-blazar-cache: off — served live, no cache_debug.
+    // Same prompt with x-blazar-cache: off - served live, no cache_debug.
     let resp = c
         .post(format!("{}/api/chat", ts.base))
         .header("x-blazar-cache", "off")
@@ -242,7 +242,7 @@ async fn integration__semcache__malformed_override_headers_400() {
 
 #[tokio::test]
 async fn integration__semcache__disabled_default_and_missing_model_bypass() {
-    // Default config: disabled, no embed model — request flows unchanged.
+    // Default config: disabled, no embed model - request flows unchanged.
     let ts = start(Config::default()).await;
     let c = client();
     let resp = c
@@ -256,7 +256,7 @@ async fn integration__semcache__disabled_default_and_missing_model_bypass() {
     let r: serde_json::Value = resp.json().await.unwrap();
     assert!(r.get("cache_debug").is_none());
 
-    // Header on but no embed model configured → silent bypass, not 400.
+    // Header on but no embed model configured -> silent bypass, not 400.
     let resp = c
         .post(format!("{}/api/chat", ts.base))
         .header("x-blazar-cache", "on")
@@ -295,7 +295,7 @@ async fn integration__semcache__structured_output_bypasses() {
     );
 
     // Same prompt + grammar: no lookup (misses stay 1), no cache_debug,
-    // and the response is computed live — nothing stored either.
+    // and the response is computed live - nothing stored either.
     let mut body = chat_body("hello semantic cache world");
     body["grammar"] = serde_json::json!("root ::= \"yes\" | \"no\"");
     let resp = c

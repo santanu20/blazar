@@ -27,7 +27,7 @@ pub struct SemMetrics {
     pub stores: AtomicU64,
     pub embed_failures: AtomicU64,
     /// Requests carrying tool-result messages that bypassed the cache in
-    /// BOTH directions (no lookup, no store) — see
+    /// BOTH directions (no lookup, no store) - see
     /// [`has_tool_result_messages`].
     pub tool_bypasses: AtomicU64,
 }
@@ -85,7 +85,7 @@ impl SemanticCache {
     }
 
     /// Best-match lookup: exact (lane, model, key, fingerprint) filter,
-    /// then cosine similarity ≥ threshold within that class. Returns
+    /// then cosine similarity >= threshold within that class. Returns
     /// `(cache_id, similarity, response)` of the best entry.
     pub fn lookup(
         &self,
@@ -221,7 +221,7 @@ pub struct SemCtx {
     pub directive: Directive,
     /// API key name that produced the response (None = authless loopback).
     pub key: Option<String>,
-    /// Generation-equivalence class computed from the request — must be
+    /// Generation-equivalence class computed from the request - must be
     /// presented unchanged at store time so lookup and store bucket
     /// identically.
     pub fingerprint: u64,
@@ -237,7 +237,7 @@ pub struct SemCtx {
 ///
 /// Hashed from the ollama-shaped request (`options`, `tools`,
 /// `tool_choice`, `think`, `system`); the message payload itself stays
-/// out — that is what
+/// out - that is what
 /// the embedding compares semantically. In-process only: entries die
 /// with the gateway, so no engine-build or version field is needed.
 #[must_use]
@@ -263,7 +263,7 @@ pub const HDR_CACHE_THRESHOLD: &str = "x-blazar-cache-threshold";
 /// Resolve whether the cache participates for this request and with
 /// what parameters. `None` = bypass (no headers touched beyond the
 /// bypass marker set by the caller). Malformed override values fail
-/// fast with `Err(msg)` (surfaced as 400 — never silently ignored).
+/// fast with `Err(msg)` (surfaced as 400 - never silently ignored).
 #[allow(clippy::cast_possible_truncation)] // config threshold is f64; comparisons run in f32
 pub fn directive(
     enabled: bool,
@@ -369,7 +369,7 @@ pub fn embed_from_value(embedding: &Value) -> Option<Vec<f32>> {
 }
 
 /// Embed `text` with the configured embed model via the engine child
-/// (tokenize → legacy `/embedding` with raw ids → mean-pool/L2). Works
+/// (tokenize -> legacy `/embedding` with raw ids -> mean-pool/L2). Works
 /// on any `--embeddings` child regardless of pooling mode.
 pub async fn embed_prompt(
     state: &std::sync::Arc<crate::state::AppState>,
@@ -380,7 +380,7 @@ pub async fn embed_prompt(
         state,
         embed_model,
         crate::queue::Priority::Normal,
-        // Short, tool-free, never raw — interactive-class admission.
+        // Short, tool-free, never raw - interactive-class admission.
         crate::queue::WorkClass::Interactive,
         None,
         false,
@@ -587,7 +587,7 @@ mod tests {
         sys["system"] = serde_json::json!("you are terse");
         assert_ne!(fp, serving_fingerprint("m1", &sys));
         assert_ne!(fp, serving_fingerprint("m2", &base));
-        // Message payload is deliberately outside the class key — that
+        // Message payload is deliberately outside the class key - that
         // is the embedding's job.
         let mut other_text = base.clone();
         other_text["messages"] = serde_json::json!([{"role": "user", "content": "other"}]);
@@ -606,7 +606,7 @@ mod tests {
             ]
         });
         assert!(!has_tool_result_messages(&base));
-        // Adding the tool RESULT flips the gate — this is the message kind
+        // Adding the tool RESULT flips the gate - this is the message kind
         // whose content the fingerprint cannot see.
         let mut tool_result = base.clone();
         tool_result["messages"]

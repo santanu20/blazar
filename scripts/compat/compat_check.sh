@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Client-compat matrix: fires the wire shapes real clients send and asserts
 # the response contracts they parse. This is the "a local agent should not
-# know it is talking to Blazar" check — run it against a live daemon.
+# know it is talking to Blazar" check - run it against a live daemon.
 #
 #   BASE=http://127.0.0.1:11435 MODEL=qwen3-1.7b scripts/compat/compat_check.sh
 #

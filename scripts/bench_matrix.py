@@ -13,9 +13,9 @@ through the sandboxed gateway, measuring:
    resources  peak RSS, peak GPU memory, peak GPU power, load time
               (spawn->healthy), teardown-verified VRAM return
     efficiency decode tok/s per watt, NET of the pre-generation idle
-               baseline and summed over the measured domains — GPU
+               baseline and summed over the measured domains - GPU
                power.draw (nvidia-smi) + CPU package (RAPL sysfs, where
-               readable) — so rows compare across hosts with different
+               readable) - so rows compare across hosts with different
                idle draw; gross avg W + energy J recorded alongside;
                '-' where no power meter exists
   serving    greedy-parity text quality vs the SAME-engine direct
@@ -31,7 +31,7 @@ v2 semantics (HARNESS_VERSION bump invalidates v1 cells):
   - ollama lane counts thinking + caps num_predict (v1 measured the
     thinking phase as 76s "TTFT" on reasoning models)
   - prefill t/s is prompt_tokens / ttft on a token-targeted prompt
-    (v1 printed ~4 generated tokens / wall — not a prefill number)
+    (v1 printed ~4 generated tokens / wall - not a prefill number)
   - blazar cells record the resolved child argv + a real GPU/RSS
     sampler (v1 showed GPU 0)
   - greedy reference is per-engine; the gateway lane is the headline
@@ -94,13 +94,13 @@ from typing import Any
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
-from bench_charts import (  # noqa: E402 — requires the sys.path bootstrap above
+from bench_charts import (  # noqa: E402 - requires the sys.path bootstrap above
     render_campaign_charts,
 )
 
 # Optional quality-lane dependency: the image lane stamps perceptual
 # metrics (contrast / entropy / color diversity) when Pillow is importable
-# and degrades to an honest "skipped" note otherwise — the harness itself
+# and degrades to an honest "skipped" note otherwise - the harness itself
 # stays stdlib-only.
 try:
     from PIL import Image as PILImage
@@ -333,7 +333,7 @@ def load_done(path: Path) -> set[str]:
 
 def portable_path(text: str) -> str:
     """Rewrite the invoking user's home dir to `~` so receipts and
-    reports stay machine-independent — the repo ships them as
+    reports stay machine-independent - the repo ships them as
     evidence, and a hard-coded /home/<user> path pins the artifact to
     one box. Applied at write time only; resume keys are
     (tag, provider, params) tuples and never carry paths."""
@@ -363,13 +363,13 @@ class Engine:
 
 
 # Kinds load_engines deliberately drops, with the reason the coverage
-# table prints — the artifact must answer "was every engine benched?"
+# table prints - the artifact must answer "was every engine benched?"
 # The sglang reason is STORE-DRIVEN: the lane is swept whenever a text
 # safetensors checkpoint exists, and excluded only when it does not.
 def has_text_safetensors_model(data_dir: Path) -> bool:
     """True when the store carries an HF-format TEXT checkpoint the
     sglang lane can serve. Model rows for GGUF files and diffusion
-    component sets are files; a safetensors pull is a DIRECTORY row —
+    component sets are files; a safetensors pull is a DIRECTORY row -
     the dir itself is the discriminator (media components never form
     dir rows; the components column keeps them out of text picks)."""
     db = data_dir / "blazar.db"
@@ -397,7 +397,7 @@ def engine_exclusion_reasons(data_dir: Path) -> dict[str, str]:
         return {}
     return {
         "sglang": (
-            "no DB-registered HF safetensors text model on this box — "
+            "no DB-registered HF safetensors text model on this box - "
             "sglang cells need one (pull a safetensors checkpoint)"
         )
     }
@@ -407,7 +407,7 @@ def engine_exclusion_reasons(data_dir: Path) -> dict[str, str]:
 # (temp 0). A small toolset keeps function SELECTION non-trivial while
 # parsing stays trivial; each scenario pins expected_fn + required args so
 # selection and schema validity score independently. The control scenario
-# must NOT trigger a call — it measures the false-positive rate, the
+# must NOT trigger a call - it measures the false-positive rate, the
 # number selection accuracy alone can be gamed with.
 TOOL_BENCH_TOOLS = [
     {
@@ -532,7 +532,7 @@ def load_engines(data_dir: Path) -> list[Engine]:
         tag = edir.name
         if tag not in kinds:
             # orphan dir without a store row (install debris): not a
-            # real engine — a blazar cell for it would flip NO row
+            # real engine - a blazar cell for it would flip NO row
             # active and the sandbox daemon exits "no engine installed"
             continue
         kind = kinds[tag]
@@ -591,7 +591,7 @@ def load_engines(data_dir: Path) -> list[Engine]:
 
 
 def power_state() -> dict:
-    """Host power source — battery-capped dGPU clocks taint absolute t/s."""
+    """Host power source - battery-capped dGPU clocks taint absolute t/s."""
     on_battery = False
     pct = None
     name = None
@@ -657,13 +657,13 @@ def _gpu_query(fields: str) -> list[list[float]]:
 # expose them via the intel-rapl powercap driver). energy_uj is a wrapping
 # cumulative counter (wrap modulus = max_energy_range_uj; Intel counters
 # wrap every ~4 kJ, i.e. ~20 s at 200 W), so watts are derived from wrapped
-# per-domain deltas. The files are frequently root-only (mode 0400) —
+# per-domain deltas. The files are frequently root-only (mode 0400) -
 # unreadable simply means CPU power is unmeasured, same contract as a box
 # without nvidia-smi. Overridable so tests can point it at a fake sysfs.
 _RAPL_SYSFS = Path("/sys/class/powercap")
 
 # Aggregate CPU utilization source (/proc/stat first line, Linux only).
-# Module-level path so tests can point it at a fake procfs — same
+# Module-level path so tests can point it at a fake procfs - same
 # contract as _RAPL_SYSFS: unreadable means CPU busy% unmeasured.
 _PROC_STAT = Path("/proc/stat")
 IDLE_BASELINE_S = 2.0
@@ -673,7 +673,7 @@ def _rapl_domains() -> list[tuple[Path, int]]:
     """Top-level RAPL package domains as (energy_uj path, wrap modulus uJ).
 
     Subdomains (intel-rapl:0:0 core/uncore, dram) are folded into their
-    parent package counter — summing them separately would double-count.
+    parent package counter - summing them separately would double-count.
     """
     domains = []
     for d in sorted(_RAPL_SYSFS.glob("intel-rapl:[0-9]*")):
@@ -698,7 +698,7 @@ def _rapl_domains() -> list[tuple[Path, int]]:
 class Sampler(threading.Thread):
     """Peak RSS + GPU memory + power sampler (nvidia-smi + RAPL sysfs).
 
-    pid may be None (global GPU-only sampling — used when the serving
+    pid may be None (global GPU-only sampling - used when the serving
     process is not our child, e.g. the ollama host service or the
     sandbox daemon's engine). pid may also be assigned LATE (blazar
     cells discover the engine child after the first request): RSS
@@ -837,7 +837,7 @@ class Sampler(threading.Thread):
     def cpu_busy_stats(self) -> float:
         """Window-average CPU busy % over accumulated /proc/stat deltas.
 
-        0.0 when /proc/stat is absent (non-Linux) — unmeasured, not idle.
+        0.0 when /proc/stat is absent (non-Linux) - unmeasured, not idle.
         """
         if self._total_j <= 0.0:
             return 0.0
@@ -848,7 +848,7 @@ class Sampler(threading.Thread):
 
         Cell drivers call this right before their first timed generation.
         Direct engine children are loaded by then; gateway/ollama children
-        that spawn on first request sit at unloaded idle — the baseline is
+        that spawn on first request sit at unloaded idle - the baseline is
         'watts just before generation starts', either way. The gross suite
         window still contains these idle seconds, so net power derived from
         it errs slightly conservative (net <= true net).
@@ -875,7 +875,7 @@ def finalize_power(rec: dict, sampler: Sampler) -> None:
     """Fold sampler power telemetry into a cell record.
 
     gpu_power_avg_w / gpu_energy_j / cpu_power_avg_w are suite-window
-    gross figures — the window spans engine load as well as generation.
+    gross figures - the window spans engine load as well as generation.
     decode_tps_per_w_net divides decode t/s by the NET power above the
     pre-generation idle baseline (Sampler.snap_idle), summed across the
     measured domains (GPU via nvidia-smi, CPU package via RAPL sysfs):
@@ -883,7 +883,7 @@ def finalize_power(rec: dict, sampler: Sampler) -> None:
     machines; GPU-only hosts report net-GPU, CPU-only (headless AMD /
     no nvidia-smi) report net-CPU-package. Unmeasured domains
     contribute nothing; nothing measured at all leaves the derived
-    fields absent — the report renders them as '-'.
+    fields absent - the report renders them as '-'.
     """
     rec["gpu_power_peak_w"] = round(sampler.gpu_power_peak_w, 1)
     avg_w, energy_j = sampler.power_stats()
@@ -919,7 +919,7 @@ def mem_guard(floor_mib: float, what: str) -> bool:
     g = gpu_used_mib()
     if g > floor_mib:
         log(
-            f"  ! mem_guard: {what}: GPU {g:.0f} MiB > floor {floor_mib:.0f} MiB — waiting"
+            f"  ! mem_guard: {what}: GPU {g:.0f} MiB > floor {floor_mib:.0f} MiB - waiting"
         )
         for _ in range(30):
             time.sleep(1.0)
@@ -970,7 +970,7 @@ def ollama_release_loaded(port: int = OLLAMA_PORT) -> int:
 
 def cold_cache_files(mfile: Path | None, mmfile: Path | None) -> list[Path]:
     """Files whose page cache a cold probe must drop. A safetensors
-    model is a DIRECTORY row — fadvise on the dir inode drops only
+    model is a DIRECTORY row - fadvise on the dir inode drops only
     dirent metadata while every shard stays cached, handing the probe
     a memory-warm load disguised as cold; expand dirs to their shard
     files so GGUF files and HF dirs get identical coldness."""
@@ -1030,7 +1030,7 @@ def ollama_blob_paths(min_bytes: int = 100 * 1024 * 1024) -> list[Path]:
 
 
 def sudo_systemctl(*args: str, password: str | None = None) -> bool:
-    """systemctl via sudo -S. The password travels on stdin only —
+    """systemctl via sudo -S. The password travels on stdin only -
     NEVER in argv (ps-visible) and never logged. False on any failure."""
     if password is None:
         return False
@@ -1060,7 +1060,7 @@ def pin_active_engine(con, where, param):
 
 
 def sandbox_model_files(sb, model_name: str) -> tuple[Path | None, Path | None]:
-    """(weights file, mmproj file) from the sandbox store row — the cold
+    """(weights file, mmproj file) from the sandbox store row - the cold
     probe drops the page cache on BOTH: a cold VL spawn reads the
     projector (875 MiB on the 9B row) off disk too, and leaving it
     cached would hand blazar a warmer cold start than the ollama lane
@@ -1110,7 +1110,7 @@ def percentile(vals: list[float], pct: int) -> float:
 # from the container specs (PNG/IHDR, EBML/Matroska, RIFF/WAV) and
 # cross-checked against recorded engine artifacts before trusting them
 # for a receipt (a parser bug would silently corrupt every frame count
-# in the table — the failure mode this section exists to prevent).
+# in the table - the failure mode this section exists to prevent).
 
 
 def png_dims(data: bytes) -> tuple[int, int] | None:
@@ -1129,7 +1129,7 @@ def _png_quality_metrics(png_bytes: bytes) -> dict[str, float] | None:
     """PIL-gated perceptual stamps for a generated image: rms contrast
     (luma stddev), luma entropy in bits (detail proxy), mean luma, and
     unique colors on a 256x256 downsample (palette-diversity proxy).
-    Returns None when PIL is absent or the bytes will not decode — the
+    Returns None when PIL is absent or the bytes will not decode - the
     caller stamps an honest 'skipped' note instead of a fake number."""
     if PILImage is None or PILImageStat is None:
         return None
@@ -1291,7 +1291,7 @@ def http_timed(
     byte, not response headers).
 
     Returns status, ttfb_ms, total_s, byte counts and the body. A
-    non-2xx status is a RESULT, not an exception — the gate lane times
+    non-2xx status is a RESULT, not an exception - the gate lane times
     400 rejections, and callers assert expected statuses.
     """
     import http.client
@@ -1337,7 +1337,7 @@ def http_timed(
 def _hardlink_tree(src: Path, dst: Path) -> None:
     """Sandbox-safe staging: hardlink copy (same filesystem), so a
     sandboxed process can unlink its view without touching the real
-    store — mirrors validate.py's engines handling."""
+    store - mirrors validate.py's engines handling."""
     shutil.copytree(src, dst, symlinks=True, copy_function=os.link, dirs_exist_ok=True)
 
 
@@ -1353,7 +1353,7 @@ def media_family(
 
     Mirrors run_blazar_cell's isolation (unique port, BLAZAR_VALIDATE
     reaper protection, teardown-dark verify) but for media families the
-    child spawns lazily on the first lane request — the COLD number is
+    child spawns lazily on the first lane request - the COLD number is
     the spawn+first-media wall, labeled cold_request_s per lane.
 
     Deliberately NOT wait_gpu_idle-gated: media boxes routinely carry a
@@ -1370,7 +1370,7 @@ def media_family(
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
         # exactly ONE active row: the first kind is the family's serving
         # lane (the daemon boots model serving on it); extra kinds ride
-        # along installed-but-inactive — e.g. the whisper audio lane
+        # along installed-but-inactive - e.g. the whisper audio lane
         # routes by endpoint, never by the active flag. Pinning the audio
         # lane active instead makes the daemon teaching-refuse to boot
         # ("audio lane cannot back model serving", live 2026-09-28).
@@ -1556,7 +1556,7 @@ def run_media_image_cell(
             if gw_cfg:
                 # knob-inert detection: the profiler loudly skips flags the
                 # active device cannot honor (live 2026-09-29: sdcpp on this
-                # box is Vulkan, so sage_attn is skipped — the A/B row then
+                # box is Vulkan, so sage_attn is skipped - the A/B row then
                 # measures the default posture twice and its Δ% is noise).
                 # Without this stamp the row masquerades as a sage effect.
                 dlog = Path(fam["sb"].data_dir) / "run" / "daemon.log"
@@ -1686,7 +1686,7 @@ def run_media_video_cell(eng: Engine, model_id: str, cfg: dict) -> dict:
 
 def _tts_input_text(n_chars: int) -> str:
     """Deterministic ~n-char input built from the prefill bank (steady
-    content across campaigns — no per-run prose drift in RTF)."""
+    content across campaigns - no per-run prose drift in RTF)."""
     out = []
     total = 0
     bank = itertools.cycle(PREFILL_BANK)
@@ -1701,7 +1701,7 @@ def run_media_tts_cell(cfg: dict) -> dict:
     """TTS lane: buffered WAV vs streamed PCM on the same input.
 
     WAV: TTFB == total (buffered by design). PCM: first-body-byte is
-    the first synthesized chunk — the interactive-audio number. RTF =
+    the first synthesized chunk - the interactive-audio number. RTF =
     synthesis wall / audio seconds for both formats.
     """
     voice = "en_US-amy-medium"
@@ -1885,11 +1885,11 @@ def _multipart_body(
 
 def run_media_whisper_cell(eng: Engine, cfg: dict) -> dict:
     """Speech lane: transcribe a WAV the TTS lane just synthesized (the
-    family stages voices for exactly this) — no fixture files, the input
+    family stages voices for exactly this) - no fixture files, the input
     provably comes from the piper voice under test."""
     rec: dict = {"lane": "whisper"}
     # whisper alone cannot boot the daemon (audio lane is not a serving
-    # engine by design) — sdcpp is the pinned serving row (lazily idle);
+    # engine by design) - sdcpp is the pinned serving row (lazily idle);
     # whisper rides installed-but-inactive, transcription routes by endpoint
     with media_family(
         f"whisper-{eng.tag}",
@@ -1981,7 +1981,7 @@ def openai_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
     t0 = time.perf_counter()
     ttft = None
     # headers-arrival time: urlopen returns once the server flushes
-    # response headers — the client-visible queue/admission window
+    # response headers - the client-visible queue/admission window
     # (upper bound on queue wait; TTFT - TTFB ~= prefill + first token)
     ttfb = None
     stamps: list[float] = []
@@ -1996,7 +1996,7 @@ def openai_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
         resp = urllib.request.urlopen(req, timeout=timeout)
         ttfb = time.perf_counter()
     except urllib.error.HTTPError:
-        # strict implementations may reject stream_options — retry
+        # strict implementations may reject stream_options - retry
         # without it (chunk-counting fallback); ttfb of the attempt
         # that produced this response is the one that counts
         payload.pop("stream_options", None)
@@ -2027,7 +2027,7 @@ def openai_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
                 continue
             delta = choices[0].get("delta") or {}
             # thinking models (qwen3.5...) stream reasoning_content while
-            # content stays empty — count BOTH as tokens
+            # content stays empty - count BOTH as tokens
             if delta.get("content") or delta.get("reasoning_content"):
                 stamps.append(time.perf_counter())
                 if ttft is None:
@@ -2112,7 +2112,7 @@ def ollama_stream_timed(port: int, body: dict, timeout: float = 300.0) -> dict:
     eval_dur_s = (final.get("eval_duration") or 0) / 1e9
     prompt_eval_count = final.get("prompt_eval_count")
     prompt_eval_dur_s = (final.get("prompt_eval_duration") or 0) / 1e9
-    # ollama's own model-load accounting (ns in the final chunk) — the
+    # ollama's own model-load accounting (ns in the final chunk) - the
     # engine-authoritative number for cold-start rows
     load_dur_s = (final.get("load_duration") or 0) / 1e9
     if eval_count and eval_dur_s > 0:
@@ -2148,7 +2148,7 @@ def count_tokens(port: int, text: str, ollama: bool, model: str) -> int | None:
     """Server-side tokenization; None when the route is unavailable.
 
     Body carries BOTH dialect keys (content for llama-server, prompt +
-    model for the ollama-compatible translation layer) — the blazar
+    model for the ollama-compatible translation layer) - the blazar
     gateway maps /tokenize to the child and needs the routed model."""
     body = {"content": text, "prompt": text, "model": model}
     try:
@@ -2232,7 +2232,7 @@ def sized_prompt(port: int, target_tokens: int, ollama: bool, model: str) -> str
             # engine's own prompt_eval_count from untimed 1-token
             # probes. Without this the char estimate left the ollama
             # lane at 371 real tokens vs the blazar lane's 527 at the
-            # same 512 target — cross-runtime prefill comparisons were
+            # same 512 target - cross-runtime prefill comparisons were
             # invalid (shorter prompt = lower amortized prefill t/s).
             need_chars = len(text)
             for _ in range(3):
@@ -2270,7 +2270,7 @@ def median_run_suite(
     """Warmup + N decode + N prefill runs -> metric medians.
 
     Decode lane: repeated short prompt (runs 2+ ride the child's prompt
-    cache — the measured TTFT is the cache-hit path, labeled as such).
+    cache - the measured TTFT is the cache-hit path, labeled as such).
     Prefill lane: token-targeted pp prompt; run 1 is the COLD prefill
     (uncached), runs 2+ measure the cache-hit path. True prefill t/s =
     prompt_tokens / first-token time (or ollama's engine counters).
@@ -2292,7 +2292,7 @@ def median_run_suite(
         }
 
     t_warm0 = time.perf_counter()
-    fn(port, body(tg, "warmup — reply with one word"), timeout=300.0)
+    fn(port, body(tg, "warmup - reply with one word"), timeout=300.0)
     warmup_s = time.perf_counter() - t_warm0
 
     decode = []
@@ -2444,7 +2444,7 @@ def conc_suite(
         "conc_error_samples": errs[:3],
         # sum of per-stream rates: honest only when streams truly run in
         # parallel; on a single-slot backend streams serialize and the sum
-        # overstates the system rate — read sys_tps for the real number.
+        # overstates the system rate - read sys_tps for the real number.
         "sum_stream_tps": round(sum(r["decode_tps"] for r in ok), 2),
         "sys_tps": round(total_tokens / wall_s, 2) if wall_s > 0 else None,
         "ttft_spread_ms": round(max(ttfts) - min(ttfts), 1) if len(ttfts) > 1 else 0.0,
@@ -2480,7 +2480,7 @@ def conc_suite(
 def stage_mistralrs_view(
     model_path: Path, mmproj: Path | None, stage_root: Path
 ) -> Path:
-    """F3: mistral.rs scans the model's whole directory for projectors —
+    """F3: mistral.rs scans the model's whole directory for projectors -
     a flat shared models dir poisons every text model. Stage a private
     view (symlinks) containing ONLY this model's files, exactly like the
     Blazar serving lane does."""
@@ -2548,7 +2548,7 @@ def teardown_proc(proc: subprocess.Popen, sampler: Sampler) -> dict:
 # mistral.rs refuses vision GGUFs at load without their ORIGINAL HF
 # tokenizer id. The blazar serving lane derives it from the GGUF's own
 # `general.basename`/`general.size_label` metadata (gguf.rs
-# hf_base_model_id) — NOT the pull repo (a mirror repo like
+# hf_base_model_id) - NOT the pull repo (a mirror repo like
 # lmstudio-community/...-GGUF does not satisfy the child's config fetch,
 # live-proven 2026-09-28). This reader mirrors that derivation exactly.
 _GGUF_HF_ID_CACHE: dict[str, str | None] = {}
@@ -2558,7 +2558,7 @@ def gguf_hf_base_model_id(gguf_path: Path) -> str | None:
     """`general.basename` + `general.size_label` -> `org/repo[-size]`.
 
     Walks only the metadata KV section (mmap; tensors are never touched).
-    Returns None on any structural gap — mirroring the product, an
+    Returns None on any structural gap - mirroring the product, an
     underivable file simply keeps the child's own teaching error.
     """
     key = str(gguf_path)
@@ -2580,8 +2580,8 @@ def gguf_hf_base_model_id(gguf_path: Path) -> str | None:
 
 
 def _gguf_metadata_kv(buf) -> dict:
-    """Parse the GGUF v2/v3 header; returns {'basename':…, 'size_label':…,
-    'hf_base_model_id':…} for the `general.*` keys this harness needs."""
+    """Parse the GGUF v2/v3 header; returns {'basename':..., 'size_label':...,
+    'hf_base_model_id':...} for the `general.*` keys this harness needs."""
     pos = 0
 
     def take(n: int) -> bytes:
@@ -2618,7 +2618,7 @@ def _gguf_metadata_kv(buf) -> dict:
     version = u32()
     if version not in (2, 3):
         raise ValueError(f"unsupported GGUF version {version}")
-    u64()  # tensor_count — metadata only here
+    u64()  # tensor_count - metadata only here
     kvs: dict[str, str] = {}
     for _ in range(u64()):
         key = rstring()
@@ -2678,7 +2678,7 @@ def direct_argv(
             # with weights loaded INSIDE it (v0.9.4 --help: "GPU memory
             # utilization"). Stock 0.90 leaves zero KV blocks for a vision
             # GGUF on an 8 GiB card ("Num GPU blocks is 0", live
-            # 2026-09-28) — the blazar serving lane sizes this from KV
+            # 2026-09-28) - the blazar serving lane sizes this from KV
             # geometry instead. Mirror it with the absolute form: the
             # whole idle GPU minus a small host reserve becomes the pool.
             rows_ = _gpu_query("memory.free")
@@ -2686,12 +2686,12 @@ def direct_argv(
                 argv += ["--pa-memory-mb", str(int(rows_[0][0]) - 384)]
         # Vision GGUFs carry multimodal metadata, so mistral.rs demands
         # the ORIGINAL HF tokenizer id at load ("multimodal GGUF requires
-        # its original `config.json` … pass `--tok-model-id`"). The id is
-        # mined from the GGUF's own general.* metadata — mirroring the
-        # blazar serving lane (gguf.rs hf_base_model_id → engine_impl.rs),
+        # its original `config.json` ... pass `--tok-model-id`"). The id is
+        # mined from the GGUF's own general.* metadata - mirroring the
+        # blazar serving lane (gguf.rs hf_base_model_id -> engine_impl.rs),
         # whose gateway v0.9.4 cells pass exactly this way. The pull-repo
         # column does NOT answer it (a mirror repo like lmstudio-community
-        # lacks the original config the child fetches — live-proven
+        # lacks the original config the child fetches - live-proven
         # 2026-09-28: rc=1 persisted until the derived id replaced it).
         if mmproj is not None and mmproj.exists():
             argv += ["--mmproj", str(mmproj)]
@@ -2729,7 +2729,7 @@ def direct_argv(
         ]
     if extras.get("pa") == "on":
         # clean flash-attn pair: the baseline cell passes no flag (engine
-        # default), this cell pins it explicitly on — the kv q8_0 cell
+        # default), this cell pins it explicitly on - the kv q8_0 cell
         # above cannot answer "does FA alone help" because it flips
         # quantization and FA together
         argv += ["--flash-attn", "on"]
@@ -2746,7 +2746,7 @@ def warm_cell_gpu_guard(where: str) -> float:
     ~5 t/s). Drain-wait, then flag what remains on the record."""
     if not wait_gpu_idle(max_mib=512.0, timeout_s=30.0):
         busy = round(gpu_used_mib(), 0)
-        log(f"  ! {where}: GPU busy {busy} MiB — warm numbers are contaminated")
+        log(f"  ! {where}: GPU busy {busy} MiB - warm numbers are contaminated")
         return busy
     return 0.0
 
@@ -2811,7 +2811,7 @@ def run_direct_cell(
         rec["load_s"] = round(time.perf_counter() - t_load0, 2)
         sampler.snap_idle()
         # mistral.rs children register the served model as "default";
-        # the blazar gateway rewrites at the proxy — we do it here.
+        # the blazar gateway rewrites at the proxy - we do it here.
         body_model = "default" if eng.kind == "mistralrs" else model_name
         rec.update(
             median_run_suite(port, body_model, cfg["runs"], cfg["pp"], cfg["tg"])
@@ -2839,7 +2839,7 @@ def run_direct_conc_cell(
 
     `rounds` mirrors the gateway cells' sustained-load profile: the direct
     lane historically ran a single burst, which measures llama-server's
-    fresh-cache best case — the gateway lanes' multi-round medians then
+    fresh-cache best case - the gateway lanes' multi-round medians then
     looked artificially worse (live-verified 2026-10-06: direct C=8 round
     0 = 134 t/s / 49ms ttfb, rounds 1+ = ~122 t/s / ~530ms ttfb; the
     first-burst number is not a sustained rate)."""
@@ -2884,7 +2884,7 @@ def run_direct_conc_cell(
         )
         rec.update(conc_suite(port, body_model, level, cfg["tg"], rounds=rounds))
         # resource/power telemetry for the resource-cost-vs-concurrency
-        # lane — same fold shape as the speed cell (before teardown so
+        # lane - same fold shape as the speed cell (before teardown so
         # the power window is the cell's serving life, not teardown)
         rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
         rec["gpu_peak_mib"] = round(sampler.gpu_peak_mib, 1)
@@ -2904,7 +2904,7 @@ def find_sandbox_engine_pid() -> int | None:
     The sandbox DB carries REAL engine paths (the daemon resolves the
     binary from its manifest), so a path-prefix scan misses it. The
     daemon is spawned with BLAZAR_VALIDATE=1 and the engine child
-    inherits that environ — the same marker validate.py's orphan reaper
+    inherits that environ - the same marker validate.py's orphan reaper
     trusts. Only our sandbox tree can carry it."""
     if not os.path.isdir("/proc"):
         return None
@@ -2941,9 +2941,9 @@ def read_proc_argv(pid: int) -> list[str]:
 # mode = "auto" (routing is format-driven): the 20260928-gguf-full
 # campaign's entire mistral.rs gateway lane silently measured
 # llama-server b11202 that way. Two guards close that class for good:
-# (1) with_engine_pin() — model_overrides.<model>.engine = tag, the
+# (1) with_engine_pin() - model_overrides.<model>.engine = tag, the
 #     load-bearing selector that wins over BOTH routing modes;
-# (2) capture_child_argv() — prove the spawned child's binary kind
+# (2) capture_child_argv() - prove the spawned child's binary kind
 #     matches the cell's engine, else fail the cell LOUD with the
 #     child argv (never publish a cross-engine number). The /proc scan
 #     and this assert cover every engine kind: basename binaries via
@@ -2959,7 +2959,7 @@ CHILD_BINARIES: dict[str, tuple[str, ...]] = {
 
 # Kinds whose child process is not named by CHILD_BINARIES: sglang's
 # server_path is a POSIX sh wrapper, so the real child process is the
-# interpreter running the module — matched as an exact argv element
+# interpreter running the module - matched as an exact argv element
 # (never a substring, to avoid path false-positives).
 CHILD_ARGV_ELEMENTS: dict[str, tuple[str, ...]] = {
     "sglang": ("sglang.launch_server",),
@@ -2986,7 +2986,7 @@ def capture_child_argv(rec: dict, eng: Engine, sampler: Sampler | None = None) -
     child_pid = find_sandbox_engine_pid()
     if child_pid is None:
         rec["child_pid_note"] = (
-            "engine child not found in /proc — either the spawn genuinely "
+            "engine child not found in /proc - either the spawn genuinely "
             "failed, or the child uses a process shape this harness "
             "version does not scan for (see KIND_CMDLINE_MARKERS)"
         )
@@ -3006,7 +3006,7 @@ def capture_child_argv(rec: dict, eng: Engine, sampler: Sampler | None = None) -
     if not matched:
         rec["error"] = (
             f"engine mismatch: cell names {eng.kind} ({eng.tag}) but "
-            f"child binary is {bin_base!r} — routing ignored the cell engine"
+            f"child binary is {bin_base!r} - routing ignored the cell engine"
         )
 
 
@@ -3022,18 +3022,18 @@ def run_blazar_cell(
 
     v2 instrumentation: daemon boot time, cold first-request time (child
     spawn + load + first token), the RESOLVED engine child argv (read
-    from /proc — the profile compiler's exact emission), and a real
+    from /proc - the profile compiler's exact emission), and a real
     GPU/RSS/power sampler attached first globally (captures the load
     spike) then to the discovered child pid (RSS from discovery on).
     """
     # per-campaign unique port BEFORE the lazy import: validate.py reads
-    # BLAZAR_VALIDATE_PORT once at import time — a shared fixed port is
+    # BLAZAR_VALIDATE_PORT once at import time - a shared fixed port is
     # exactly how orphaned sandbox daemons hijacked campaigns (leak class
     # fixed in validate.py; this makes collisions structurally impossible)
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     # F139: the module cache returns the FIRST import on later campaigns
-    # — rebinding PORT on the module is what actually takes effect; the
+    # - rebinding PORT on the module is what actually takes effect; the
     # env re-set above alone is inert past the first import.
     V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
@@ -3069,7 +3069,7 @@ def run_blazar_cell(
                     healthy = True
                     break
                 except json.JSONDecodeError:
-                    # /healthz answers 2xx with a non-JSON body — up is up
+                    # /healthz answers 2xx with a non-JSON body - up is up
                     healthy = True
                     break
                 except (urllib.error.URLError, OSError):
@@ -3079,17 +3079,17 @@ def run_blazar_cell(
             rec["daemon_boot_s"] = round(time.perf_counter() - t_boot0, 2)
             assert port is not None
             # child spawns on first request; the warmup inside
-            # median_run_suite drives it — time the warmup ourselves by
+            # median_run_suite drives it - time the warmup ourselves by
             # wrapping: run one explicit cold request first so the
             # cold-start number is clean, THEN the suite warms up.
             #
             # Parity hardening (same env as the ollama cold lane):
             # (1) drop the page cache on the model file the child will
-            #     mmap — earlier lanes leave multi-GiB cached and a
+            #     mmap - earlier lanes leave multi-GiB cached and a
             #     "cold" load would be memory-fast;
             # (2) assert the GPU drained (no co-resident squatter
             #     inflating the load);
-            # (3) capture the probe's OWN ttft — first-token latency on
+            # (3) capture the probe's OWN ttft - first-token latency on
             #     a cold engine is the user-felt number and was
             #     previously discarded into the wall time.
             mfile, mmfile = sandbox_model_files(sb, model_name)
@@ -3116,7 +3116,7 @@ def run_blazar_cell(
             except Exception as cold_exc:
                 # a failed cold probe (e.g. 502 spawn-failure behind the
                 # gateway) must still carry boot metrics + daemon tail for
-                # diagnosis — return rec; the finally block captures the
+                # diagnosis - return rec; the finally block captures the
                 # rest (sampler peaks, daemon.stop, log tail, teardown)
                 rec["error"] = f"cold probe failed: {cold_exc}"
                 rec["cold_first_request_s"] = round(time.perf_counter() - t_cold0, 2)
@@ -3156,7 +3156,7 @@ def run_blazar_cell(
                 rec["soak_rss_drift_mib"] = round(sampler.rss_peak_mib - rss0, 1)
             # golden-QC gate: one greedy (temp-0, seeded) generation per
             # cell so every config knob carries an output fingerprint
-            # next to its speed deltas — a knob that is fast but changes
+            # next to its speed deltas - a knob that is fast but changes
             # tokens surfaces as drift vs the same-engine default cell.
             try:
                 qc_text = greedy_completions(port, GREEDY_PROMPTS[0], model_name)
@@ -3172,7 +3172,7 @@ def run_blazar_cell(
             finalize_power(rec, sampler)
             rec["rss_peak_mib"] = round(sampler.rss_peak_mib, 1)
             daemon.stop()
-            # forensic tail: the sandbox is destroyed below — keep the
+            # forensic tail: the sandbox is destroyed below - keep the
             # last daemon lines so failed cells can be diagnosed from
             # cells.jsonl alone
             dlog = Path(sb.data_dir) / "run" / "daemon.log"
@@ -3181,7 +3181,7 @@ def run_blazar_cell(
                     dlog.read_text(errors="replace").splitlines()[-12:]
                 )
             # teardown verify: the port must go dark, else the daemon
-            # outlived its cell — record loudly, never silently
+            # outlived its cell - record loudly, never silently
             dark = False
             if port is not None:
                 for _ in range(20):
@@ -3212,14 +3212,14 @@ def run_conc_axis_cell(
 ) -> dict:
     """Concurrency-lane gateway cell for scheduler knobs.
 
-    adaptive_slots and poll are scheduler-tick behavior — a single
+    adaptive_slots and poll are scheduler-tick behavior - a single
     stream never queues, so their A/B must run under burst load. Boots
     the sandboxed gateway with the knob under test, drives `level`
     concurrent streams for `rounds` bursts via conc_suite, and records
     system throughput + tail latency; the conc_default cell is the
     control row (rendered by conc_axes_table).
     """
-    # unique port per cell + module rebind (F139) — same hijack-proofing
+    # unique port per cell + module rebind (F139) - same hijack-proofing
     # as run_blazar_cell
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
@@ -3261,7 +3261,7 @@ def run_conc_axis_cell(
                 return {"error": "sandbox daemon failed to boot"}
             sampler.snap_idle()
             # a failed suite must still carry teardown + daemon tail for
-            # diagnosis — record the error, never re-raise past the
+            # diagnosis - record the error, never re-raise past the
             # finally blocks (mirrors the cold-probe pattern above)
             try:
                 rec.update(conc_suite(port, model_name, level, tg, rounds=rounds))
@@ -3305,10 +3305,10 @@ def run_conc_axis_cell(
 def probe_tools_once(port: int, model_body: str, prompt: str) -> dict:
     """One scenario through /v1/chat/completions with an OpenAI tools array.
 
-    Streams the response (SSE) and accumulates tool_call deltas by index —
+    Streams the response (SSE) and accumulates tool_call deltas by index -
     argument JSON arrives in fragments across chunks. Returns per-scenario
     outcome: http status, accumulated calls, ttft, finish_reason, content.
-    HTTP failure is an OUTCOME (returned), not an exception — the caller
+    HTTP failure is an OUTCOME (returned), not an exception - the caller
     decides whether it is a cell error or a zero score.
     """
     body = json.dumps(
@@ -3589,7 +3589,7 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
         # Fail-loud forensics: a "no reshape" verdict is only meaningful
         # when the poller actually saw the slot shape at least once.
         "detection_error": (
-            "api/ps never reported a slots reading for the model — "
+            "api/ps never reported a slots reading for the model - "
             "reshape verdict is a measurement void, not a product result"
         )
         if not nps
@@ -3619,8 +3619,8 @@ def run_reshape_cell(eng: Engine, body_model: str, duration_s: float = 300.0) ->
 def run_tools_cell(eng: Engine, model_name: str) -> dict:
     """Tool-call quality lane: single-turn selection + schema adherence.
 
-    Mirrors the run_blazar_cell skeleton (sandbox → active engine → daemon
-    → healthz → probe → teardown) minus the cold-start instrumentation:
+    Mirrors the run_blazar_cell skeleton (sandbox -> active engine -> daemon
+    -> healthz -> probe -> teardown) minus the cold-start instrumentation:
     this lane measures QUALITY, not latency of load.
     """
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
@@ -3655,7 +3655,7 @@ def run_tools_cell(eng: Engine, model_name: str) -> dict:
                 return {"error": "sandbox daemon failed to boot"}
             # registry name for every engine: the gateway resolves DB
             # names at routing ('default' is engine-side only and 404s
-            # through the proxy — proven live on the v0.9.3 tools cell)
+            # through the proxy - proven live on the v0.9.3 tools cell)
             body_model = model_name
             per_scenario: list[dict] = []
             for sc in TOOL_BENCH_SCENARIOS:
@@ -3702,7 +3702,7 @@ def run_tools_cell(eng: Engine, model_name: str) -> dict:
             )
             if all("transport_error" in s for s in per_scenario):
                 rec["error"] = (
-                    "tools lane: every scenario failed transport — "
+                    "tools lane: every scenario failed transport - "
                     + str(per_scenario[0].get("transport_error"))[:160]
                 )
             return rec
@@ -3722,7 +3722,7 @@ def run_tools_cell(eng: Engine, model_name: str) -> dict:
 # ---------------------------------------------------------------------------
 # Quality suites: correctness beyond tool-use. Every suite is a seeded
 # generator (deterministic tasks) plus a programmatic checker (no model
-# judges, no dataset downloads) — gateway-parity focus: the same prompts
+# judges, no dataset downloads) - gateway-parity focus: the same prompts
 # run against blazar / direct / ollama, so a pass-rate delta is either
 # gateway damage or config damage, never task variance.
 # ---------------------------------------------------------------------------
@@ -3920,10 +3920,10 @@ def quality_schema_tasks(seed: int, n: int = 6) -> list[dict]:
 
 def quality_niah_probes(seed: int, n_lengths=2, n_depths=3) -> list[dict]:
     """Needle-in-a-haystack: seeded regenerable filler, one needle per
-    (length, depth) cell. The receipt stores the needle, NOT the filler —
+    (length, depth) cell. The receipt stores the needle, NOT the filler -
     the haystack regenerates from the seed."""
     rng = _quality_rng("niah", seed)
-    lengths = [2000, 8000]  # chars ≈ 500/2K tokens; fits every spawn ctx
+    lengths = [2000, 8000]  # chars ~ 500/2K tokens; fits every spawn ctx
     depths = [0.1, 0.5, 0.9]
     probes = []
     idx = 0
@@ -3975,7 +3975,7 @@ def niah_build_prompt(probe: dict, seed: int) -> str:
 
 def quality_multilingual_tasks() -> list[dict]:
     """Fixed self-authored prompts (es/fr/de/hi/bn) with deterministic
-    expected answers — machine-independent, license-clean."""
+    expected answers - machine-independent, license-clean."""
     return [
         {
             "id": "multi-0",
@@ -4036,7 +4036,7 @@ def quality_multilingual_tasks() -> list[dict]:
 
 
 # Safety probes are deliberately non-operational category abstractions:
-# no synthesis routes, no exploit specifics — they test REFUSAL BEHAVIOR,
+# no synthesis routes, no exploit specifics - they test REFUSAL BEHAVIOR,
 # not knowledge. Benign controls catch over-refusal (the failure mode a
 # gateway-side safety filter would introduce).
 QUALITY_SAFETY_HARMFUL = [
@@ -4089,7 +4089,7 @@ def quality_safety_probes() -> list[dict]:
 
 def quality_embed_triples() -> list[dict]:
     """Related-vs-unrelated cosine checks; valid per-engine (embedding
-    spaces differ across engines — never compare across them)."""
+    spaces differ across engines - never compare across them)."""
     return [
         {"id": f"embed-{i}", "checker": "embed", "a": a, "b": b, "u": u}
         for i, (a, b, u) in enumerate(
@@ -4142,7 +4142,7 @@ def _normalize_text(s: str) -> str:
 
 def check_numeric(resp: str, expected: int) -> bool:
     """Last-number extraction: models lead with reasoning, trail with the
-    answer — the final number in the reply is the answer candidate."""
+    answer - the final number in the reply is the answer candidate."""
     m = _NUM_RE.findall(_normalize_text(resp))
     if not m:
         return False
@@ -4207,7 +4207,7 @@ def check_code(resp: str, task: dict) -> bool:
 
 def check_schema(resp: str, schema: dict) -> bool:
     """Strict shape check: parses as JSON object, exact field set, type
-    match (bool before int — bool is an int subclass in python)."""
+    match (bool before int - bool is an int subclass in python)."""
     text = _normalize_text(resp)
     if text.startswith("json"):
         text = text[4:].strip()
@@ -4239,7 +4239,7 @@ def check_niah(resp: str, probe: dict) -> bool:
 
 def check_contains(resp: str, expected: str) -> bool:
     """Case-insensitive, accent-folded substring (models vary in
-    diacritics: 'París' vs 'Paris' — fold to NFKD and drop combining
+    diacritics: 'París' vs 'Paris' - fold to NFKD and drop combining
     marks so both sides normalize to plain ascii)."""
 
     def fold(s: str) -> str:
@@ -4255,7 +4255,7 @@ def check_refusal(resp: str, must_refuse: bool) -> bool:
     if must_refuse:
         return refused
     # benign control: substantive answer (not just a bare word + not a
-    # refusal) — over-refusal is a real gateway filter symptom
+    # refusal) - over-refusal is a real gateway filter symptom
     return not refused and len(low) >= 10
 
 
@@ -4452,11 +4452,11 @@ def run_quality_suites(
                 # multi-step arithmetic needs the reasoning mode hybrid
                 # models are built around: measured 2026-10-05, a no-think
                 # 9B floors this suite at 0/12 while think=true passes
-                # the same seeds — the suite must measure computation
+                # the same seeds - the suite must measure computation
                 # ability, not the no-think mode. 8192 separates the
                 # measured populations cleanly: convergers land <=1.5k
                 # eval tokens, ruminators never converge at any budget
-                # (both measured live, 2026-10-05) — a smaller cap would
+                # (both measured live, 2026-10-05) - a smaller cap would
                 # score slow thinkers with the loopers.
                 prompt = task["prompt"]
                 max_tokens = 8192
@@ -4515,7 +4515,7 @@ def run_quality_suites(
             except (urllib.error.URLError, OSError, json.JSONDecodeError):
                 vecs_raw = None
             if vecs_raw is None:
-                rec["quality_embed_note"] = "endpoint unsupported — skipped"
+                rec["quality_embed_note"] = "endpoint unsupported - skipped"
                 break
             vecs = dict(zip(("a", "b", "u"), vecs_raw, strict=True))
             passed = score_quality_task(t, "", {"vecs": vecs})
@@ -4548,7 +4548,7 @@ def quality_conc_probe(
 
     def worker(task: dict) -> None:
         nonlocal errors
-        # reason tasks keep their think+budget treatment under load —
+        # reason tasks keep their think+budget treatment under load -
         # running them no-think here would compare apples to the serial
         # lane's oranges (the conc delta must be batching, not mode);
         # budget mirrors run_quality_suites so the delta stays pure
@@ -4594,9 +4594,9 @@ def run_quality_blazar_cell(
     blazar_cfg: dict | None = None,
     conc: bool = True,
 ) -> dict:
-    """Quality suites through the full gateway (sandbox → daemon → port),
+    """Quality suites through the full gateway (sandbox -> daemon -> port),
     tools-cell skeleton minus tool probes. The conc probe rides the same
-    daemon boot — a second spawn would measure boot variance, not
+    daemon boot - a second spawn would measure boot variance, not
     behavior. `blazar_cfg` carries the config knob under test for the
     quality-vs-configuration A/B (same axes as the speed variant lane)."""
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
@@ -4618,7 +4618,7 @@ def run_quality_blazar_cell(
                     {
                         "port": V.PORT,
                         # non-streaming think-mode generations emit
-                        # headers only when the whole body is computed —
+                        # headers only when the whole body is computed -
                         # the 120s default ceiling would evict a healthy
                         # mid-computation child (measured live: 8k-token
                         # reasoning runs 504 at the default). 600 is the
@@ -4678,7 +4678,7 @@ def run_quality_direct_cell(
     seed: int,
     stage_root: Path,
 ) -> dict:
-    """Quality suites against a direct engine spawn (no gateway) — the
+    """Quality suites against a direct engine spawn (no gateway) - the
     parity reference. Spawn mirrors _greedy_spawn with a wider ctx so the
     NIAH prompts fit."""
     port = free_port()
@@ -4689,7 +4689,7 @@ def run_quality_direct_cell(
     )
     argv = direct_argv(eng, model, mmproj, port, 8192, 1, DEFAULT_NGL, staged, None)
     errfh_path = stage_root / f"quality-{eng.tag}-{port}.stderr"
-    errfh = open(errfh_path, "wb")  # noqa: SIM115 — owned by the child
+    errfh = open(errfh_path, "wb")  # noqa: SIM115 - owned by the child
     proc = subprocess.Popen(
         argv,
         cwd=str(eng.dir),
@@ -4722,7 +4722,7 @@ def run_quality_direct_cell(
 def run_quality_ollama_cell(model: str, seed: int) -> dict:
     """Quality suites against the resident ollama daemon (11434), same
     reference-model convention as the tools lane. Conc probe rides the
-    resident daemon — no spawn cost, same quality-under-load surface as
+    resident daemon - no spawn cost, same quality-under-load surface as
     the blazar lane's probe."""
     rec = run_quality_suites(11434, model, seed, embed=False, chat=ollama_chat_greedy)
     if "error" not in rec:
@@ -4764,12 +4764,12 @@ def run_blazar_conc_cell(
     expect_slots: int | None = None,
 ) -> dict:
     """Concurrency lane through the full gateway path (admission,
-    queueing, slot leases — Blazar's scheduling surface).
+    queueing, slot leases - Blazar's scheduling surface).
 
     blazar_cfg pins gateway config knobs (the matched lane passes
     slots=level + kv_unified=false so the gateway child mirrors the
     direct lane's -np sizing; the default lane passes None so the
-    profile's own slot policy — adaptive adoption included — stays in
+    profile's own slot policy - adaptive adoption included - stays in
     play). expect_slots, when set, hard-asserts the resolved child
     argv carries that slot count: a pin the profile compiler silently
     dropped fails the cell loudly instead of publishing a mismatched
@@ -4777,7 +4777,7 @@ def run_blazar_conc_cell(
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     # F139: the module cache returns the FIRST import on later campaigns
-    # — rebinding PORT on the module is what actually takes effect; the
+    # - rebinding PORT on the module is what actually takes effect; the
     # env re-set above alone is inert past the first import.
     V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
@@ -4826,7 +4826,7 @@ def run_blazar_conc_cell(
                 },
                 timeout=600.0,
             )
-            # resolved engine argv (auto-slots np/ctx visibility — the
+            # resolved engine argv (auto-slots np/ctx visibility - the
             # speed cells' headline forensics, now recorded for conc too)
             capture_child_argv(rec, eng)
             if rec.get("error"):
@@ -4887,11 +4887,11 @@ def run_blazar_idle_cell(
     eng: Engine, model_name: str, cfg: dict, policy: str = "sleep"
 ) -> dict:
     """Warm the model, let the reaper ladder run its idle policy, then
-    measure the wake TTFT — blazar's structural idle advantage. Two
+    measure the wake TTFT - blazar's structural idle advantage. Two
     policies: `sleep` (child self-sleeps, weights stay RAM-resident,
     wake = in-child CUDA resume) and `evict` (reaper evicts the
     instance, wake = full respawn incl. mmap + KV-bank prefix
-    restore) — the A/B answers which ladder rung wakes faster."""
+    restore) - the A/B answers which ladder rung wakes faster."""
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
@@ -4899,7 +4899,7 @@ def run_blazar_idle_cell(
     if policy == "evict":
         # Evict-ladder A/B: the child still self-sleeps at `idle_sleep`
         # (VRAM drops then), but the measurement target is the reaper's
-        # eviction at `idle_timeout` — the wake probe pays a FULL
+        # eviction at `idle_timeout` - the wake probe pays a FULL
         # respawn, not an in-child resume.
         idle_sleep, idle_timeout = 30, 45
         rec: dict[str, Any] = {
@@ -4962,7 +4962,7 @@ def run_blazar_idle_cell(
             loaded_gpu_mib = gpu_used_mib()
             if policy == "evict":
                 # evict detect: at idle_timeout the reaper unloads the
-                # instance — the model row VANISHES from /api/ps (the
+                # instance - the model row VANISHES from /api/ps (the
                 # VRAM drop at idle_sleep only proves the child
                 # self-slept, not eviction). Deadline covers the
                 # timeout window + the 10s reaper tick + margin.
@@ -4990,7 +4990,7 @@ def run_blazar_idle_cell(
                 if not slept:
                     rec["idle_note"] = (
                         "model was never evicted within "
-                        f"{idle_timeout + 10 + 120}s — wake TTFT below is "
+                        f"{idle_timeout + 10 + 120}s - wake TTFT below is "
                         "sleep-path, not respawn"
                     )
             else:
@@ -5025,7 +5025,7 @@ def run_blazar_idle_cell(
                 if not slept:
                     rec["idle_note"] = (
                         "model never reached Sleeping within "
-                        f"{idle_sleep + 10 + 60}s — wake TTFT below is warm-path"
+                        f"{idle_sleep + 10 + 60}s - wake TTFT below is warm-path"
                     )
             rec["gpu_at_sleep_mib"] = round(gpu_used_mib(), 1)
             m = openai_stream_timed(
@@ -5033,7 +5033,7 @@ def run_blazar_idle_cell(
                 {
                     "model": model_name,
                     "messages": [
-                        {"role": "user", "content": "wake probe — answer in one word"}
+                        {"role": "user", "content": "wake probe - answer in one word"}
                     ],
                     "max_tokens": 8,
                 },
@@ -5073,7 +5073,7 @@ def run_blazar_idle_cell(
 def run_ollama_idle_cell(cfg: dict, args_model: str | None) -> dict:
     """keep_alive expiry = ollama's idle policy: FULL unload. After the
     window the model row leaves /api/ps and the next request pays a
-    complete reload — measure that TTFT against blazar's sleep-wake."""
+    complete reload - measure that TTFT against blazar's sleep-wake."""
     try:
         tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
     except (urllib.error.URLError, OSError):
@@ -5116,7 +5116,7 @@ def run_ollama_idle_cell(cfg: dict, args_model: str | None) -> dict:
         rec["expired"] = gone
         if not gone:
             rec["idle_note"] = (
-                f"model still loaded after keep_alive {keep_alive_s}s+90s — "
+                f"model still loaded after keep_alive {keep_alive_s}s+90s - "
                 "wake TTFT below is warm-path (expiry semantics unverifiable)"
             )
         else:
@@ -5127,7 +5127,7 @@ def run_ollama_idle_cell(cfg: dict, args_model: str | None) -> dict:
             {
                 "model": pick,
                 "messages": [
-                    {"role": "user", "content": "wake probe — answer in one word"}
+                    {"role": "user", "content": "wake probe - answer in one word"}
                 ],
                 "options": {"num_ctx": 8192},
                 "max_tokens": 8,
@@ -5223,7 +5223,7 @@ def run_blazar_ctx_cell(eng: Engine, model_name: str, ctx: int, cfg: dict) -> di
 
 def run_ollama_ctx_cell(cfg: dict, args_model: str | None, ctx: int) -> dict:
     """One ctx point on ollama's curve: evict (runner respawn at the
-    request's num_ctx — ollama reloads when the option changes), then a
+    request's num_ctx - ollama reloads when the option changes), then a
     3-run decode suite pinned to that num_ctx."""
     try:
         tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
@@ -5287,7 +5287,7 @@ def run_ollama_ctx_cell(cfg: dict, args_model: str | None, ctx: int) -> dict:
 def run_ollama_conc_cell(
     cfg: dict, args_model: str | None, level: int, rounds: int = 1
 ) -> dict:
-    """Concurrency parity on the ollama host service — same conc_suite,
+    """Concurrency parity on the ollama host service - same conc_suite,
     same unique-prompt bursts, same sustained rounds as the gateway lane."""
     try:
         tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
@@ -5301,7 +5301,7 @@ def run_ollama_conc_cell(
     sampler = Sampler(None)
     sampler.start()
     try:
-        # first stream of round 1 pays the load — that is the honest
+        # first stream of round 1 pays the load - that is the honest
         # sustained-load shape for a service that starts cold
         rec.update(
             conc_suite(OLLAMA_PORT, pick, level, cfg["tg"], ollama=True, rounds=rounds)
@@ -5324,7 +5324,7 @@ def pick_ollama_model(models: list[str], args_model: str | None) -> str | None:
     """SAME-model reference pick: derive family+size from the matrix model
     name ("Qwen3.5-9B-Q4_K_M" -> family "qwen3.5", size "9b") and match
     the ollama tag exactly, then loosely. A junk fallback is worse than
-    an honest skip — v2.0's stem-needle match missed "qwen3.5:9b" and
+    an honest skip - v2.0's stem-needle match missed "qwen3.5:9b" and
     benchmarked an alphabetically-first OCR model at 70 t/s."""
     if not args_model:
         return None
@@ -5344,7 +5344,7 @@ def pick_ollama_model(models: list[str], args_model: str | None) -> str | None:
 
 def ollama_evict(model: str, timeout_s: float = 90.0) -> bool:
     """keep_alive=0 unload + GPU drain poll. The host service is not our
-    child — "teardown" means the model is actually gone from VRAM."""
+    child - "teardown" means the model is actually gone from VRAM."""
     try:
         http_json(
             f"http://127.0.0.1:{OLLAMA_PORT}/api/generate",
@@ -5360,8 +5360,8 @@ def ollama_evict(model: str, timeout_s: float = 90.0) -> bool:
 def run_ollama_cold_cell(
     cfg: dict, args_model: str | None, service_restart: bool = False
 ) -> dict:
-    """Cold-start parity lane: ollama daemon-boot → disk-cold model load
-    → first token. Mirrors the blazar cold probe exactly (fadvise'd
+    """Cold-start parity lane: ollama daemon-boot -> disk-cold model load
+    -> first token. Mirrors the blazar cold probe exactly (fadvise'd
     blobs, GPU-idle assert, aligned num_ctx) so the coldstart table
     compares the same physical state on both runtimes."""
     try:
@@ -5376,12 +5376,12 @@ def run_ollama_cold_cell(
         return {
             "error": (
                 f"no ollama model comparable to '{args_model}' "
-                f"(have: {', '.join(models[:6])}) — pull a matching tag"
+                f"(have: {', '.join(models[:6])}) - pull a matching tag"
             )
         }
     rec: dict[str, Any] = {"ollama_model": pick}
 
-    # daemon boot (optional — restarting the user's systemd service is
+    # daemon boot (optional - restarting the user's systemd service is
     # opt-in via --ollama-service-restart; without it the daemon is warm
     # and only the model-load path is cold, disclosed via note)
     if service_restart:
@@ -5408,11 +5408,11 @@ def run_ollama_cold_cell(
         else:
             rec["ollama_daemon_boot_note"] = (
                 "service restart unavailable (no BENCH_SUDO_PASSWORD or sudo failed) "
-                "— daemon-warm cold-load measured"
+                "- daemon-warm cold-load measured"
             )
     else:
         rec["ollama_daemon_boot_note"] = (
-            "daemon left warm (no --ollama-service-restart) — model-load path only"
+            "daemon left warm (no --ollama-service-restart) - model-load path only"
         )
 
     sampler = Sampler(None)  # global GPU/power: the service is not our child
@@ -5423,7 +5423,7 @@ def run_ollama_cold_cell(
         rec["cold_fadvise_files"] = fadvise_dontneed(ollama_blob_paths())
         sampler.snap_idle()
         # num_ctx 16384 = the blazar gateway cell's resolved ctx for the
-        # matrix model — identical KV allocation on both runtimes
+        # matrix model - identical KV allocation on both runtimes
         m = ollama_stream_timed(
             OLLAMA_PORT,
             {
@@ -5472,7 +5472,7 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
         return {
             "error": (
                 f"no ollama model comparable to '{args_model}' "
-                f"(have: {', '.join(models[:6])}) — pull a matching tag"
+                f"(have: {', '.join(models[:6])}) - pull a matching tag"
             )
         }
     sampler = Sampler(None)  # global GPU/power: the service is not our child
@@ -5494,10 +5494,10 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
         sampler.stop_evt.set()
         sampler.join(timeout=2.0)
     # Unload the served model so later GPU lanes (conc, ppl, greedy) get
-    # the VRAM — v2.0 left the reference model resident and every
+    # the VRAM - v2.0 left the reference model resident and every
     # following lane starved or died.
     out["teardown_ok"] = ollama_evict(pick)
-    # the reference row sits in the same table as the matrix model —
+    # the reference row sits in the same table as the matrix model -
     # name it loudly when it differs or the t/s columns mislead
     if args_model and args_model.lower() not in pick.lower():
         out["reference_note"] = (
@@ -5519,7 +5519,7 @@ def build_local_corpus(
 
     Selection goes through `git ls-files --exclude-standard` so gitignored
     content (agent memory notes, scratch validation reports) can never
-    enter a bench artifact — a plain rglob() walk once ingested untracked
+    enter a bench artifact - a plain rglob() walk once ingested untracked
     notes carrying operator credentials into corpus.txt (caught 2026-09-29;
     the artifacts are gitignored and local-only, so nothing escaped the
     box). Agent-instruction files and tracked files whose text matches a
@@ -5575,7 +5575,7 @@ def build_local_corpus(
             continue
         # ASCII-only: a repo corpus can carry codepoints that abort
         # some tokenizers ("invalid codepoint" SIGABRT, proven live
-        # on b10809 + qwen3.5) — parity needs identical text, not
+        # on b10809 + qwen3.5) - parity needs identical text, not
         # exotic glyphs
         parts.append(text.encode("ascii", "ignore").decode())
         taken += p.stat().st_size
@@ -5597,7 +5597,7 @@ def run_perplexity(
     # `tool` borrows another engine's llama-perplexity (mistral.rs/sglang
     # engine dirs ship none): ppl measures the checkpoint, not the
     # runtime, so a borrowed-tool number is an honest model-level
-    # measurement — the record stamps the provenance.
+    # measurement - the record stamps the provenance.
     ppl_bin = tool if tool is not None else eng.perplexity
     if ppl_bin is None:
         return {"error": "engine ships no llama-perplexity (mistral.rs: unsupported)"}
@@ -5611,7 +5611,7 @@ def run_perplexity(
         "-f",
         # llama-perplexity runs with the TOOL's engine dir as cwd: a
         # repo-relative corpus path is unresolvable there (same class as
-        # the mistral.rs staging bug) — always hand the child an absolute
+        # the mistral.rs staging bug) - always hand the child an absolute
         # path
         str(corpus.resolve()),
         "--ctx-size",
@@ -5622,7 +5622,7 @@ def run_perplexity(
         "4",
     ]
     # KV-quant rung for the ladder quality receipts: same corpus/ctx/
-    # chunks/ngl, only the cache types move — the ppl delta vs the f16
+    # chunks/ngl, only the cache types move - the ppl delta vs the f16
     # row IS the measured quality cost of that rung. The f16 rung passes
     # no flags (engine default), identical to the historical single cell.
     if cache_k and cache_v:
@@ -5669,7 +5669,7 @@ def greedy_completions(port: int, prompt: str, model: str) -> str:
         j = http_json(f"http://127.0.0.1:{port}/v1/completions", body, timeout=300.0)
     except urllib.error.HTTPError:
         # strict OpenAI implementations may reject top_k/seed in the
-        # body — retry with temperature-only greed (still deterministic)
+        # body - retry with temperature-only greed (still deterministic)
         body = {
             "model": model,
             "prompt": prompt,
@@ -5691,7 +5691,7 @@ def _greedy_spawn(
         else None
     )
     # mistralrs default paged-attn cannot fit this card (Num GPU blocks
-    # is 0 — the product's own profile emits auto-off; direct spawns
+    # is 0 - the product's own profile emits auto-off; direct spawns
     # bypass the compiler, so mirror it here, flag-gated like the axis)
     extras: dict | None = None
     if eng.kind == "mistralrs" and "--paged-attn" in cli_flags(
@@ -5700,7 +5700,7 @@ def _greedy_spawn(
         extras = {"pa": "off"}
     argv = direct_argv(eng, model, mmproj, port, 4096, 1, DEFAULT_NGL, staged, extras)
     errfh_path = stage_root / f"greedy-{eng.tag}-{port}.stderr"
-    errfh = open(errfh_path, "wb")  # noqa: SIM115 — stderr sink handed to Popen, lives with the child
+    errfh = open(errfh_path, "wb")  # noqa: SIM115 - stderr sink handed to Popen, lives with the child
     proc = subprocess.Popen(
         argv,
         cwd=str(eng.dir),
@@ -5799,7 +5799,7 @@ def run_greedy_gateway_cell(
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     # F139: the module cache returns the FIRST import on later campaigns
-    # — rebinding PORT on the module is what actually takes effect; the
+    # - rebinding PORT on the module is what actually takes effect; the
     # env re-set above alone is inert past the first import.
     V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
@@ -5850,7 +5850,7 @@ def run_greedy_gateway_cell(
             rec = _greedy_stats(gots, reference)
         finally:
             daemon.stop()
-            # F141: teardown parity with the speed/conc cells — the port
+            # F141: teardown parity with the speed/conc cells - the port
             # must go dark, else the daemon outlived its cell.
             dark = False
             if port is not None:
@@ -5877,7 +5877,7 @@ def run_greedy_gateway_cell(
 
 
 def run_greedy_ollama_cell(args_model: str | None) -> dict:
-    """Ollama reference determinism — the competitor number the
+    """Ollama reference determinism - the competitor number the
     "llamacpp 20/20 deterministic" differentiator claim never had.
     Same 20 temp-0 prompts, run TWICE against the ollama host; exact
     matches between the passes = run-to-run determinism. Ollama has no
@@ -5911,7 +5911,7 @@ def manifest_flags(data_dir: Path, tag: str) -> set[str]:
 
     Gateway-routed lanes (sglang, media kinds) have no server binary on
     the harness path to introspect, but the product already probed the
-    real binary — the manifest is the honest flag source for gating
+    real binary - the manifest is the honest flag source for gating
     variant axes on actual child capability."""
     try:
         con = sqlite3.connect(f"file:{data_dir / 'blazar.db'}?mode=ro", uri=True)
@@ -6016,7 +6016,7 @@ def _argv_flag(argv: list[str] | None, names: tuple[str, ...]) -> str | None:
 
 def _child_shape(r: dict) -> str:
     """Resolved slot/context shape of a blazar row, from its recorded
-    child argv — auto-slots means 'config=default' alone hides np/ctx."""
+    child argv - auto-slots means 'config=default' alone hides np/ctx."""
     argv = r.get("child_argv")
     np_ = _argv_flag(argv, ("-np", "--parallel", "--np"))
     ctx = _argv_flag(argv, ("--ctx-size", "-c", "--max-model-len"))
@@ -6055,7 +6055,7 @@ def _speed_params(r: dict) -> str:
 
 def _env_failure(err: str) -> bool:
     """Classify a cell error as ENVIRONMENT (harness/box conditions) vs
-    PRODUCT (engine/gateway behavior) — the report must not present a
+    PRODUCT (engine/gateway behavior) - the report must not present a
     co-residency abort as a blazar defect."""
     return any(
         s in err
@@ -6064,7 +6064,7 @@ def _env_failure(err: str) -> bool:
 
 
 def _findings(records: list[dict]) -> list[str]:
-    """Auto-computed notable findings — the report's meaning layer.
+    """Auto-computed notable findings - the report's meaning layer.
     Pure function over records; no new measurement passes."""
     out: list[str] = []
 
@@ -6080,7 +6080,7 @@ def _findings(records: list[dict]) -> list[str]:
         return None
 
     # gateway-vs-direct decode parity per engine: ONE summary line per
-    # tag, outliers itemized — config-sweep campaigns emit dozens of
+    # tag, outliers itemized - config-sweep campaigns emit dozens of
     # per-knob rows and the parity band is the story, not each knob
     parity_by_tag: dict[str, list[tuple[str, float]]] = {}
     for r in records:
@@ -6110,7 +6110,7 @@ def _findings(records: list[dict]) -> list[str]:
         line = (
             f"- gateway vs direct decode (`{tag}`, {len(deltas)} configs): "
             f"median {deltas[len(deltas) // 2]:+.1f}%, "
-            f"{len(in_band)}/{len(deltas)} within ±5% (parity)"
+            f"{len(in_band)}/{len(deltas)} within +/-5% (parity)"
         )
         if outliers:
             line += "; outliers: " + ", ".join(
@@ -6140,14 +6140,14 @@ def _findings(records: list[dict]) -> list[str]:
                         f"{r.get('conc_level')} streams): {r['sys_tps']:.1f} vs direct "
                         f"{sysd:.1f} t/s = {ratio:.2f}x"
                         + (
-                            " — serialized/queued or wall-inflated (see note)."
+                            " - serialized/queued or wall-inflated (see note)."
                             if ratio < 0.6
                             else "."
                         )
                     )
                 break
     # matched-slots twin: the same gateway path with slots pinned to the
-    # stream count (the direct lane's own sizing) — the fairness answer
+    # stream count (the direct lane's own sizing) - the fairness answer
     # to the default lane's scheduling-policy gap above
     for r in records:
         tag = r.get("tag")
@@ -6217,14 +6217,14 @@ def _findings(records: list[dict]) -> list[str]:
             verdict = "transparent" if ex == n else "NOT TRANSPARENT"
             out.append(
                 f"- gateway greedy transparency (`{r['tag']}`): {ex}/{n} exact "
-                f"vs same-engine direct — {verdict}."
+                f"vs same-engine direct - {verdict}."
             )
     # env-failure disclosure
     envfails = [r for r in records if r.get("error") and _env_failure(r["error"])]
     if envfails:
         out.append(
             f"- {len(envfails)} cell(s) aborted on ENVIRONMENT guards (GPU/RAM "
-            "co-residency), not product behavior — see Failed cells."
+            "co-residency), not product behavior - see Failed cells."
         )
     return out
 
@@ -6243,10 +6243,10 @@ def write_markdown_report(
 ) -> None:
     """Slim campaign report: env header, findings, embedded charts, then
     per-config MEDIAN tables (speed, concurrency) plus quality, feature
-    matrix and failures. One row per (engine, provider, config) — repeats
+    matrix and failures. One row per (engine, provider, config) - repeats
     collapse to medians, per-run spread and cold-start detail stay in
     cells.jsonl. charts: (section, filename, caption) triples from
-    render_campaign_charts — each becomes an embedded <img> pointing at
+    render_campaign_charts - each becomes an embedded <img> pointing at
     plots/ beside this report (None = no plottable lane, section
     omitted)."""
     md: list[str] = []
@@ -6256,18 +6256,18 @@ def write_markdown_report(
         f"- **model**: `{model.name}` ({model_bytes_on_disk(model) // (1 << 20)} MiB)"
     )
     md.append(f"- **gpu**: {gpu_name()}")
-    # honesty: the report reflects the FULL resumed campaign — list every
+    # honesty: the report reflects the FULL resumed campaign - list every
     # engine represented in cells, not just this invocation's --engines
     seen_tags = sorted({t for r in records if (t := r.get("tag"))})
     inv_tags = [e.tag for e in engines]
     all_tags = sorted(set(seen_tags) | set(inv_tags)) or inv_tags
     md.append("- **engines**: " + ", ".join(all_tags))
-    md.append(f"- **harness**: bench_matrix v{HARNESS_VERSION} — `{argv_summary}`")
+    md.append(f"- **harness**: bench_matrix v{HARNESS_VERSION} - `{argv_summary}`")
     md.append(f"- **blazar**: `{blazar_version}` (sandbox daemon binary)")
     qstat = quality_status or quality_lane_status(records)
-    md.append(f"- **quality lane**: {qstat['status']} — {qstat['detail']}")
+    md.append(f"- **quality lane**: {qstat['status']} - {qstat['detail']}")
     # provenance disclosure: resumed campaigns mix rows measured by
-    # different binaries — enumerate the stamps actually in the records
+    # different binaries - enumerate the stamps actually in the records
     blazar_owned = [
         r
         for r in records
@@ -6287,7 +6287,7 @@ def write_markdown_report(
     if unstamped:
         md.append(
             f"- {unstamped} blazar-owned row(s) predate version stamping "
-            "(harness v2 era) — binary provenance from the campaign log."
+            "(harness v2 era) - binary provenance from the campaign log."
         )
     md.append("")
 
@@ -6313,7 +6313,7 @@ def write_markdown_report(
             md.append(f"_{caption}_\n")
 
     # One row per (engine, provider, config): repeats of the same config
-    # collapse to their median — per-run spread stays in cells.jsonl.
+    # collapse to their median - per-run spread stays in cells.jsonl.
     speed = [r for r in records if "ttft_ms_p50" in r]
     speed_groups: dict[tuple, list[dict]] = {}
     for r in speed:
@@ -6388,7 +6388,7 @@ def write_markdown_report(
 
     ppl = [r for r in records if r.get("provider") == "ppl"]
     if ppl:
-        md.append("## Quality — perplexity (identical pinned args)\n")
+        md.append("## Quality - perplexity (identical pinned args)\n")
         md.append("| engine | perplexity | +/- err | wall (s) | note |")
         md.append("|---|---|---|---|---|")
         for r in ppl:
@@ -6398,7 +6398,7 @@ def write_markdown_report(
                 f" {fmt(r.get('ppl_error'))} | {fmt(r.get('wall_s'))} | {note} |"
             )
         md.append(
-            "- corpus: deterministic offline repo text (code-heavy) — "
+            "- corpus: deterministic offline repo text (code-heavy) - "
             "PARITY-ONLY; absolute PPL is not comparable to published "
             "wiki-text perplexities.\n"
         )
@@ -6406,7 +6406,7 @@ def write_markdown_report(
     greedy = [r for r in records if r.get("provider") == "greedy"]
     if greedy:
         md.append(
-            f"## Quality — greedy parity vs `{ref_tag or 'reference'}`-direct "
+            f"## Quality - greedy parity vs `{ref_tag or 'reference'}`-direct "
             "(backend numerics)\n"
         )
         md.append(
@@ -6414,7 +6414,7 @@ def write_markdown_report(
         )
         md.append("|---|---|---|---|---|")
         for r in greedy:
-            self_note = " *(self — trivially 1.0)" if r.get("tag") == ref_tag else ""
+            self_note = " *(self - trivially 1.0)" if r.get("tag") == ref_tag else ""
             md.append(
                 f"| {r.get('tag', '-')}{self_note} | {r.get('exact_matches', '-')}/{r.get('prompts', '-')} |"
                 f" {fmt(r.get('ratio_mean'))} | {fmt(r.get('ratio_min'))} |"
@@ -6425,7 +6425,7 @@ def write_markdown_report(
     gw = [r for r in records if r.get("provider") == "greedy_gw"]
     if gw:
         md.append(
-            "## Quality — gateway transparency (blazar path vs direct, same engine)\n"
+            "## Quality - gateway transparency (blazar path vs direct, same engine)\n"
         )
         md.append(
             "| engine | exact matches | ratio mean | ratio min | first divergence (median chars) |"
@@ -6481,7 +6481,7 @@ def write_markdown_report(
         def failed_line(
             tag: str, provider: str, params_list: list[str], head: str
         ) -> str:
-            # first line of the error, capped — the full string lives in
+            # first line of the error, capped - the full string lives in
             # cells.jsonl; identical (tag, provider, error) failures collapse
             # into one counted line so systemic breakage reads as one row
             if len(params_list) == 1:
@@ -6510,7 +6510,7 @@ def write_markdown_report(
             md.extend(failed_rows(prod))
         if env:
             md.append(
-                "\n**environment** (box/co-residency guards — NOT blazar defects):\n"
+                "\n**environment** (box/co-residency guards - NOT blazar defects):\n"
             )
             md.extend(failed_rows(env))
         md.append("")
@@ -6649,9 +6649,9 @@ def main() -> int:
         "--ppl-kv-rungs",
         default="f16",
         help="KV-quant rungs for the ppl lane, comma-separated: 'f16' "
-        "(no cache flags, engine default — the historical single cell) "
+        "(no cache flags, engine default - the historical single cell) "
         "and/or 'k/v' grades like 'q8_0/q8_0,q4_0/q4_0'. One cell per "
-        "rung, identical corpus/ctx/chunks/ngl — the ppl delta across "
+        "rung, identical corpus/ctx/chunks/ngl - the ppl delta across "
         "rungs is the measured quality cost of the KV ladder.",
     )
     ap.add_argument("--skip-greedy", action="store_true")
@@ -6747,7 +6747,7 @@ def main() -> int:
         action="store_true",
         help=(
             "run only the media lanes (image/video/gate/tts/whisper): clears "
-            "the provider sweep and sets every text-lane skip flag — the "
+            "the provider sweep and sets every text-lane skip flag - the "
             "shorthand for a media-focused session (still needs a text model "
             "row in the store for harness bookkeeping)"
         ),
@@ -6761,7 +6761,7 @@ def main() -> int:
         "--blazar-bin",
         help=(
             "blazar binary for sandbox daemons (default: repo release build, "
-            "then PATH) — stamp its --version in the report"
+            "then PATH) - stamp its --version in the report"
         ),
     )
     ap.add_argument(
@@ -6792,7 +6792,7 @@ def main() -> int:
         help=(
             "with --render-only: append another campaign's full report as a "
             "nested chapter (headings demoted one level) after the main "
-            "publication — for lanes the main campaign could not measure, "
+            "publication - for lanes the main campaign could not measure, "
             "e.g. the safetensors-only sglang engine next to a GGUF sweep"
         ),
     )
@@ -6867,14 +6867,14 @@ def main() -> int:
 
     # battery-throttle guard: a discharging laptop caps dGPU clocks; the
     # 2026-09-10 census-fix re-run measured 28 t/s where AC measured 38.7
-    # with an identical argv — burn the battery, not the numbers' meaning
+    # with an identical argv - burn the battery, not the numbers' meaning
     power = power_state()
     if power["on_battery"] and not args.allow_battery:
         bat = power.get("battery_name") or "battery"
         pct = power["battery_pct"]
         pct_s = f"{pct}%" if pct is not None else "charge unknown"
         log(
-            f"host is on battery ({bat} {pct_s}) — dGPU "
+            f"host is on battery ({bat} {pct_s}) - dGPU "
             "power-capped; absolute t/s would not be comparable. Plug in "
             "AC or pass --allow-battery to override."
         )
@@ -6884,7 +6884,7 @@ def main() -> int:
     conc_sweep = tuple(int(x) for x in str(args.conc_sweep).split(",") if x.strip())
 
     data_dir = Path(args.data_dir).expanduser()
-    # Model pick is DB-FIRST: a gateway cell can only serve store ROWS —
+    # Model pick is DB-FIRST: a gateway cell can only serve store ROWS -
     # directory-only files (scratch exports like the collision-slug
     # "mtp-textonly" file, live-caught 2026-09-11) have no row, so a
     # stem-derived name 404s every sandbox daemon. Pick from rows whose
@@ -6892,20 +6892,20 @@ def main() -> int:
     # to get wrong), and its mmproj column owns projector attachment.
     db = data_dir / "blazar.db"
     if not db.exists():
-        log(f"no blazar.db under {data_dir} — nothing servable")
+        log(f"no blazar.db under {data_dir} - nothing servable")
         return 2
     rows: list[tuple[Path, str, str | None]] = []
     st_rows: list[tuple[Path, str, str | None]] = []
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         # Component-set pulls (VAE/text-encoder GGUF bundles) are diffusion
-        # models served by the sdcpp lane — llama-server/mistral.rs/sglang
+        # models served by the sdcpp lane - llama-server/mistral.rs/sglang
         # can never load them. Mirror the product's model_category()
-        # classifier: has_component_set() ⇒ media lane, never a text pick.
+        # classifier: has_component_set() => media lane, never a text pick.
         # Live incident 2026-09-26: the size-sorted default picked the 5.9G
         # qwen-image Q6_K over the 5.6G text 9B by a 300 MiB margin and fed
         # a diffusion GGUF to every text lane (all cells failed at load).
-        # A DIRECTORY row is an HF safetensors pull — the sglang lane's
+        # A DIRECTORY row is an HF safetensors pull - the sglang lane's
         # model class; it joins its own pool (st_rows) so the GGUF default
         # pick below stays byte-identical for GGUF boxes.
         for path, name, mmproj, components in con.execute(
@@ -6954,12 +6954,12 @@ def main() -> int:
         rows = st_rows
     model, gw_model_name, own_mmproj_s = rows[0]
     model_name = gw_model_name
-    # mmproj ownership is a per-model DB column, NOT dir proximity —
+    # mmproj ownership is a per-model DB column, NOT dir proximity -
     # mistral.rs scans the model dir for projectors, so attaching a
     # stray one would poison a text model (the Bug-C class).
     own_mmproj: Path | None = Path(own_mmproj_s) if own_mmproj_s else None
 
-    # Default sweep policy: latest installed version per engine kind —
+    # Default sweep policy: latest installed version per engine kind -
     # benching every historical build doubles runtime and clutters the
     # report with stale rows (--all-engine-versions overrides). Superseded
     # tags are stamped in the inventory with an explicit reason, so
@@ -6979,22 +6979,22 @@ def main() -> int:
         }
         engine_policy = "latest installed version per engine kind"
     # Full policy-selected set, pre---engines-filter: the perplexity lane
-    # BORROWS its tool across the --engines filter — a sglang-only campaign
+    # BORROWS its tool across the --engines filter - a sglang-only campaign
     # still borrows llama-perplexity from any selected llamacpp engine dir.
     engine_inventory = engines
     if args.engines:
         engines = [e for e in engines if e.tag in args.engines]
     if superseded:
         log(
-            "engine policy: latest per kind — skipped "
+            "engine policy: latest per kind - skipped "
             + ", ".join(sorted(superseded))
             + " (--all-engine-versions to include)"
         )
-    # text-capable kinds only — sdcpp/whisper rows exist for the media
+    # text-capable kinds only - sdcpp/whisper rows exist for the media
     # lanes and must never be fed to the model-serving speed lanes.
     # Format-aware: a GGUF-file sweep excludes sglang (HF-checkpoint
     # lane) and a safetensors-dir sweep excludes the GGUF-native
-    # binaries — the pinned sandbox daemon would only teach-refuse,
+    # binaries - the pinned sandbox daemon would only teach-refuse,
     # filling the matrix with expected-failure rows instead of a clean
     # skip + exclusion reason in the inventory stamp.
     model_is_dir = model.is_dir()
@@ -7060,7 +7060,7 @@ def main() -> int:
     for eng in engines:
         if eng.server is None:
             # gateway-routed lanes (sglang, media kinds): no
-            # introspectable server binary on the harness path — gate
+            # introspectable server binary on the harness path - gate
             # axes on the product's probed manifest flags instead
             eng_flags[eng.tag] = manifest_flags(data_dir, eng.tag)
         elif eng.kind == "mistralrs":
@@ -7087,7 +7087,7 @@ def main() -> int:
             # the text model name would be a lie on those rows
             "model": model_name_override or model.name,
             # provenance stamps: rows survive across reruns in one
-            # cells.jsonl — a row must carry WHICH binary measured it
+            # cells.jsonl - a row must carry WHICH binary measured it
             "blazar_version": blazar_version,
             "measured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             # env stamp: 5-min loadavg covers the cell window; a contended
@@ -7109,7 +7109,7 @@ def main() -> int:
             log(f"  CELL FAILED: {rec['error']}")
         elif "note" in rec:
             # structured skip (format/tool boundary): not a failure, no
-            # metrics — log the reason instead of fake zeros
+            # metrics - log the reason instead of fake zeros
             log(f"  note: {rec['note']}")
         elif "conc_level" in rec:
             sys_tps = rec.get("sys_tps")
@@ -7135,7 +7135,7 @@ def main() -> int:
                 f"(min {rec.get('ratio_min') or 0:.4f})"
             )
         elif "ollama_cold_ttft_ms" in rec:
-            # Cold cell: the warm-lane keys are absent by design — print
+            # Cold cell: the warm-lane keys are absent by design - print
             # the cold metric the cell actually measured (cells.jsonl
             # always carried it; the stdout line used to read 0s).
             log(
@@ -7241,7 +7241,7 @@ def main() -> int:
             for params in cells:
                 key = cell_key(eng.tag, "direct", params, model.name)
                 if key in done:
-                    log(f"[direct {eng.tag} {params}] resumed — skipping")
+                    log(f"[direct {eng.tag} {params}] resumed - skipping")
                     continue
                 log(f"[direct {eng.tag} {params}]")
                 if not mem_guard(2048, f"pre-cell {eng.tag}"):
@@ -7274,7 +7274,7 @@ def main() -> int:
             params = {"config": "default"}
             key = cell_key(eng.tag, "blazar", params, model.name)
             if key in done:
-                log(f"[blazar {eng.tag}] resumed — skipping")
+                log(f"[blazar {eng.tag}] resumed - skipping")
             elif not mem_guard(2048.0, f"pre-blazar {eng.tag}"):
                 # guard BEFORE the cell: a prior direct-sweep teardown can
                 # still hold VRAM when the sandbox child spawns (live-caught
@@ -7318,16 +7318,16 @@ def main() -> int:
                     emit(eng.tag, eng.kind, "blazar", params, key, rec)
 
             # ---- blazar single-stream variant (slots=1, classic in-VRAM
-            # KV): the same-settings cell for the ollama parity question —
+            # KV): the same-settings cell for the ollama parity question -
             # ollama serves one slot with KV in VRAM; this pins blazar to
             # the identical layout so any remaining delta is orchestration,
             # not defaults policy. (Inside the engine loop on purpose: it
-            # is per-engine and reads eng — an earlier revision left it
+            # is per-engine and reads eng - an earlier revision left it
             # outside, running once on the leftover loop variable.)
             params = {"config": "single-stream"}
             key = cell_key(eng.tag, "blazar", params, model.name)
             if key in done:
-                log(f"[blazar {eng.tag} single-stream] resumed — skipping")
+                log(f"[blazar {eng.tag} single-stream] resumed - skipping")
             else:
                 log(
                     f"[blazar {eng.tag} single-stream] (sandbox, slots=1, kv_unified=false)"
@@ -7357,7 +7357,7 @@ def main() -> int:
                         if key in done:
                             log(
                                 f"[blazar {eng.tag} {params['config']}] "
-                                "resumed — skipping"
+                                "resumed - skipping"
                             )
                             continue
                         if not mem_guard(
@@ -7390,14 +7390,14 @@ def main() -> int:
             # ---- concurrency-lane scheduler axis (llamacpp lane): the
             # knobs above are engine-argv knobs measured single-stream;
             # adaptive_slots / poll live in the gateway scheduler tick
-            # and only express themselves under queued load — burst
+            # and only express themselves under queued load - burst
             # cells, control row conc_default.
             if not args.skip_variants and eng.kind == "llamacpp":
                 for conc_label, conc_cfg in CONC_AXIS_CELLS:
                     params = {"config": conc_label, "conc": 8}
                     key = cell_key(eng.tag, "blazar", params, model.name)
                     if key in done:
-                        log(f"[blazar {eng.tag} {conc_label}] resumed — skipping")
+                        log(f"[blazar {eng.tag} {conc_label}] resumed - skipping")
                         continue
                     if not mem_guard(2048.0, f"pre-blazar {eng.tag} {conc_label}"):
                         emit(
@@ -7421,7 +7421,7 @@ def main() -> int:
         params = {"reference": True}
         key = cell_key("ollama-host", "ollama", params, model.name)
         if key in done:
-            log("[ollama] resumed — skipping")
+            log("[ollama] resumed - skipping")
         else:
             log("[ollama reference]")
             try:
@@ -7434,7 +7434,7 @@ def main() -> int:
         params = {"cold": True}
         key = cell_key("ollama-host", "cold-ollama", params, model.name)
         if key in done:
-            log("[ollama cold] resumed — skipping")
+            log("[ollama cold] resumed - skipping")
         else:
             log("[ollama cold-start parity]")
             try:
@@ -7489,7 +7489,7 @@ def main() -> int:
                 }
                 key = cell_key(sdcpp_eng.tag, "media-image", params, image_model)
                 if key in done:
-                    log("[media image] resumed — skipping")
+                    log("[media image] resumed - skipping")
                 else:
                     log(
                         f"[media image] {image_model} {MEDIA_IMAGE_SIZE} steps={MEDIA_IMAGE_STEPS}"
@@ -7513,7 +7513,7 @@ def main() -> int:
                 # (fa defaults on; vae-tiling and sage-attn default off).
                 # Runs even when the default cell resumed so each A/B cell
                 # owns its own done-check. A knob the engine build lacks
-                # support for errors its own cell only — the receipt
+                # support for errors its own cell only - the receipt
                 # records "does not work here" honestly.
                 for media_axis in (
                     ("fa_off", {"sdcpp_flash_attention": False}),
@@ -7529,7 +7529,7 @@ def main() -> int:
                     }
                     key = cell_key(sdcpp_eng.tag, "media-image", params, image_model)
                     if key in done:
-                        log(f"[media image {cfg_name}] resumed — skipping")
+                        log(f"[media image {cfg_name}] resumed - skipping")
                         continue
                     log(
                         f"[media image] {image_model} {cfg_name} "
@@ -7551,10 +7551,10 @@ def main() -> int:
                         model_name_override=image_model,
                     )
             else:
-                log("[media image] no diffusion model resolved in store — skipping")
+                log("[media image] no diffusion model resolved in store - skipping")
             if video_model:
                 if not mem_guard(MEDIA_VIDEO_MEM_FLOOR_MIB, "pre-media-video"):
-                    log("[media video] RAM floor exceeded — skipping family")
+                    log("[media video] RAM floor exceeded - skipping family")
                 else:
                     params = {
                         "size": MEDIA_VIDEO_SIZE,
@@ -7565,7 +7565,7 @@ def main() -> int:
                     }
                     key = cell_key(sdcpp_eng.tag, "media-video", params, video_model)
                     if key in done:
-                        log("[media video] resumed — skipping")
+                        log("[media video] resumed - skipping")
                     else:
                         log(
                             f"[media video] {video_model} {MEDIA_VIDEO_SIZE} "
@@ -7587,9 +7587,9 @@ def main() -> int:
                             model_name_override=video_model,
                         )
             else:
-                log("[media video] no video model resolved in store — skipping")
+                log("[media video] no video model resolved in store - skipping")
         else:
-            log("[media] no sdcpp engine installed — image/video lanes skipped")
+            log("[media] no sdcpp engine installed - image/video lanes skipped")
 
         voices_dir = Path(args.data_dir).expanduser() / "voices"
         if voices_dir.is_dir() and any(voices_dir.iterdir()):
@@ -7600,7 +7600,7 @@ def main() -> int:
             }
             key = cell_key("piper", "media-tts", params, "en_US-amy-medium")
             if key in done:
-                log("[media tts] resumed — skipping")
+                log("[media tts] resumed - skipping")
             else:
                 log(f"[media tts] en_US-amy-medium {MEDIA_TTS_CHARS} chars wav+pcm")
                 try:
@@ -7626,7 +7626,7 @@ def main() -> int:
                 "piper", "media-tts-conc", conc_params, "en_US-amy-medium"
             )
             if conc_key in done:
-                log("[media tts-conc] resumed — skipping")
+                log("[media tts-conc] resumed - skipping")
             else:
                 log(f"[media tts-conc] {MEDIA_TTS_CONC_STREAMS} parallel pcm streams")
                 try:
@@ -7643,14 +7643,14 @@ def main() -> int:
                     model_name_override="en_US-amy-medium",
                 )
         else:
-            log("[media tts] no voices pulled — skipping")
+            log("[media tts] no voices pulled - skipping")
 
         whisper_models = Path(args.data_dir).expanduser() / "whisper" / "models"
         if whisper_eng is not None and any(whisper_models.glob("ggml-*.bin")):
             params = {"runs": media_cfg["runs"], "input": "piper-wav"}
             key = cell_key(whisper_eng.tag, "media-whisper", params, "ggml-base")
             if key in done:
-                log("[media whisper] resumed — skipping")
+                log("[media whisper] resumed - skipping")
             else:
                 log("[media whisper] transcribe piper-synthesized wav")
                 try:
@@ -7667,7 +7667,7 @@ def main() -> int:
                     model_name_override="ggml-base",
                 )
         else:
-            log("[media whisper] no whisper engine+model pair — skipping")
+            log("[media whisper] no whisper engine+model pair - skipping")
 
     # ---- idle-wake lane (sleep-vs-expiry: the idle-policy headline)
     if not args.skip_idle:
@@ -7721,7 +7721,7 @@ def main() -> int:
             params = {"idle": True}
             key = cell_key("ollama-host", "idle-ollama", params, model.name)
             if key in done:
-                log("[idle-wake ollama] resumed — skipping")
+                log("[idle-wake ollama] resumed - skipping")
             else:
                 log("[idle-wake ollama (keep_alive expiry)]")
                 try:
@@ -7895,10 +7895,10 @@ def main() -> int:
             if not corpus.exists():
                 log("building deterministic local ppl corpus (repo text)...")
                 if not build_local_corpus(corpus):
-                    log("local corpus build failed — aborting (exit 2)")
+                    log("local corpus build failed - aborting (exit 2)")
                     return 2
         # llama-perplexity ships only inside llama.cpp-family engine dirs;
-        # other kinds BORROW the binary from any llamacpp engine present —
+        # other kinds BORROW the binary from any llamacpp engine present -
         # ppl is a model-level metric (it measures the checkpoint, not the
         # runtime), so a borrowed-tool cell is an honest measurement, and
         # the record stamps which engine dir the tool came from.
@@ -7917,7 +7917,7 @@ def main() -> int:
         if bad_rungs:
             log(
                 f"--ppl-kv-rungs entries must be 'f16' or 'k/v' grades: "
-                f"{bad_rungs} — aborting (exit 2)"
+                f"{bad_rungs} - aborting (exit 2)"
             )
             sys.exit(2)
         for eng in text_engines:
@@ -7940,7 +7940,7 @@ def main() -> int:
                         {"error": "no llama-perplexity binary on this box"},
                     )
                     continue
-                # llama-perplexity loads GGUF files only — an HF safetensors
+                # llama-perplexity loads GGUF files only - an HF safetensors
                 # campaign model is a format boundary for the tool (it exits
                 # 'failed to load model' on the directory). Honest note row,
                 # no error: the cell is structurally unmeasurable, not failed.
@@ -8000,7 +8000,7 @@ def main() -> int:
             # the total-ctx budget across slots. mistral.rs and sglang
             # children carry no slot shape in argv, so a 300s cell can
             # only end as a detection void (20260928/20260929
-            # receipts) — record the boundary instead of burning the
+            # receipts) - record the boundary instead of burning the
             # lane.
             if eng.kind != "llamacpp":
                 emit(
@@ -8044,7 +8044,7 @@ def main() -> int:
         for eng in text_engines:
             key = cell_key(eng.tag, "tools", {"tools": True}, model.name)
             if key in done:
-                log(f"[tools {eng.tag}] resumed — skipping")
+                log(f"[tools {eng.tag}] resumed - skipping")
                 continue
             if not mem_guard(2048.0, f"pre-tools {eng.tag}"):
                 emit(
@@ -8070,7 +8070,7 @@ def main() -> int:
             # handling on the same model family
             key = cell_key("ollama", "tools-ollama", {"tools": True}, model.name)
             if key in done:
-                log("[tools ollama] resumed — skipping")
+                log("[tools ollama] resumed - skipping")
             else:
                 log("[tools ollama]")
                 per: list[dict] = []
@@ -8123,21 +8123,21 @@ def main() -> int:
                         "before greedy spawn"
                     )
             if not mem_guard(2048.0, f"pre-greedy-reference {ref_eng.tag}"):
-                # F140: other lanes error+skip on a failed floor wait —
+                # F140: other lanes error+skip on a failed floor wait -
                 # proceeding anyway produces swap-thrashed reference
                 # tokens that poison every parity comparison.
-                log("  ! GPU floor exceeded — waiting failed; skipping greedy parity")
+                log("  ! GPU floor exceeded - waiting failed; skipping greedy parity")
             else:
                 reference = build_greedy_reference(
                     ref_eng, model, own_mmproj, model_name, stage_root
                 )
         if reference is None:
             if ref_eng is None:
-                log("no llamacpp engine for greedy reference — skipping parity")
+                log("no llamacpp engine for greedy reference - skipping parity")
             else:
                 log(
                     f"greedy reference spawn on {ref_eng.tag} failed "
-                    "(unhealthy child) — skipping parity"
+                    "(unhealthy child) - skipping parity"
                 )
         else:
             for eng in text_engines:
@@ -8177,13 +8177,13 @@ def main() -> int:
                 except Exception as exc:
                     rec = {"error": f"greedy gw cell crashed: {exc}"}
                 emit(eng.tag, eng.kind, "greedy_gw", params, key, rec)
-        # ollama reference determinism — independent of the llamacpp
+        # ollama reference determinism - independent of the llamacpp
         # direct reference above (self-repeat needs no reference spawn)
         if "ollama" in args.providers:
             params = {"greedy_ollama": True}
             key = cell_key("ollama-host", "greedy_ollama", params, model.name)
             if key in done:
-                log("[greedy ollama reference] resumed — skipping")
+                log("[greedy ollama reference] resumed - skipping")
             else:
                 log("[greedy ollama reference (run-to-run determinism)]")
                 try:
@@ -8193,7 +8193,7 @@ def main() -> int:
                 emit("ollama-host", "ollama", "greedy_ollama", params, key, rec)
 
     # ---- quality suites: checker-verified correctness, deliberately
-    # separated from every speed lane — a tok/s number that only holds
+    # separated from every speed lane - a tok/s number that only holds
     # for degraded output is a failed config, not a win. Same seed and
     # task set across providers makes blazar-vs-direct-vs-ollama a pure
     # gateway-parity comparison; params.config mirrors the speed variant
@@ -8205,7 +8205,7 @@ def main() -> int:
                 params = {"config": "default"}
                 key = cell_key(eng.tag, "quality", params, model.name)
                 if key in done:
-                    log(f"[quality {eng.tag}] resumed — skipping")
+                    log(f"[quality {eng.tag}] resumed - skipping")
                     continue
                 if not mem_guard(2048.0, f"pre-quality {eng.tag}"):
                     emit(
@@ -8227,13 +8227,13 @@ def main() -> int:
         if "direct" in args.providers:
             for eng in text_engines:
                 if eng.server is None:
-                    # direct quality needs a spawnable server binary —
+                    # direct quality needs a spawnable server binary -
                     # gateway-only engines compare via their blazar lane
                     continue
                 params = {"config": "direct"}
                 key = cell_key(eng.tag, "quality-direct", params, model.name)
                 if key in done:
-                    log(f"[quality direct {eng.tag}] resumed — skipping")
+                    log(f"[quality direct {eng.tag}] resumed - skipping")
                     continue
                 if not mem_guard(2048.0, f"pre-quality-direct {eng.tag}"):
                     emit(
@@ -8258,7 +8258,7 @@ def main() -> int:
             params = {"config": "ollama"}
             key = cell_key("ollama-host", "quality-ollama", params, model.name)
             if key in done:
-                log("[quality ollama] resumed — skipping")
+                log("[quality ollama] resumed - skipping")
             else:
                 log("[quality ollama]")
                 try:
@@ -8369,7 +8369,7 @@ def main() -> int:
 
     argv_summary = portable_path(" ".join(sys.argv[1:]))
     # the report reflects the FULL campaign (cells.jsonl), not just this
-    # process's additions — resumed cells are earlier records
+    # process's additions - resumed cells are earlier records
     hist: list[dict] = []
     if cells_path.exists():
         for line in cells_path.read_text().splitlines():
@@ -8440,7 +8440,7 @@ def main() -> int:
         log(f"report -> {args.md}")
     write_speed_table(all_records, art / "summary.txt")
     with (art / "summary.txt").open("a", encoding="utf-8") as fh:
-        fh.write(f"\nquality lane: {qstat['status']} — {qstat['detail']}\n")
+        fh.write(f"\nquality lane: {qstat['status']} - {qstat['detail']}\n")
     log(f"summary -> {art / 'summary.txt'}")
     log(f"cells   -> {cells_path} ({len(records)} new, {len(all_records)} total)")
     offenders = qc_drift_gate(all_records)
@@ -8464,7 +8464,7 @@ def main() -> int:
 
 
 # Kind-driven display names: cells carry both `tag` and `kind`, so a label
-# can always say WHAT engine family a build tag belongs to — "v0.9.4" alone
+# can always say WHAT engine family a build tag belongs to - "v0.9.4" alone
 # is a version with no engine, "mistral.rs v0.9.4" is a lane identity.
 KIND_DISPLAY = {
     "llamacpp": "llama.cpp",
@@ -8981,13 +8981,13 @@ def variant_table(recs: list[dict]) -> str:
 # Each axis is measured through the sandboxed gateway (provider=blazar)
 # by pinning the knob to a non-default value; the default-config cell
 # above each axis is the control row (config_axes_table renders deltas
-# against it). Sides that EQUAL the Default-impl value are omitted —
+# against it). Sides that EQUAL the Default-impl value are omitted -
 # re-measuring the default would duplicate the control cell.
 #
 # Key schema notes (verified against blazar-core config.rs / profile.rs):
 # - Config is serde deny_unknown_fields: a key that is not a top-level
 #   Config field (or a [mistralrs]/[sglang] tuning-table field) makes the
-#   daemon REFUSE to boot — every key below is checked against the
+#   daemon REFUSE to boot - every key below is checked against the
 #   shipped structs. There is deliberately NO llamacpp `flash_attention`
 #   axis: llama-lane FA is not config-driven (production builds
 #   TuningOverrides with fa=None -> "--flash-attn auto"); the engine-level
@@ -9043,7 +9043,7 @@ CONFIG_AXES: list[dict] = [
         "kinds": ("llamacpp",),
         "gate": ("--cache-type-k",),
         # q8_0 V-cache requires FA upstream; with fa=auto the profile's
-        # heuristic picks it — if the engine still refuses, the cell
+        # heuristic picks it - if the engine still refuses, the cell
         # records the error honestly
         "cells": [("q8_0", {"cache_type": "q8_0"})],
     },
@@ -9109,7 +9109,7 @@ CONFIG_AXES: list[dict] = [
     },
     # ---- mistralrs lane ([mistralrs] tuning table) ----
     {
-        # top-level Config field (NOT inside [mistralrs] — that table is
+        # top-level Config field (NOT inside [mistralrs] - that table is
         # deny_unknown_fields and does not carry it)
         "name": "pa_mem",
         "kinds": ("mistralrs",),
@@ -9184,7 +9184,7 @@ CONFIG_AXES: list[dict] = [
     },
     {
         # default = auto heuristic (fp8_e5m2 on this box); bf16 pins the
-        # full-width 2-byte KV (quality ceiling, doubles KV bytes — may
+        # full-width 2-byte KV (quality ceiling, doubles KV bytes - may
         # tighten the fit at long ctx), e4m3 swaps the fp8 variant
         "name": "kv_dtype",
         "kinds": ("sglang",),
@@ -9196,7 +9196,7 @@ CONFIG_AXES: list[dict] = [
     },
     {
         # default = product auto-cap (4 on tight cards); 16 is a modest
-        # bump, 256 is the sglang upstream default — on 8 GiB the 256
+        # bump, 256 is the sglang upstream default - on 8 GiB the 256
         # capture is expected to OOM, which receipts exactly why the
         # auto-cap exists
         "name": "cg_bs",
@@ -9221,7 +9221,7 @@ def config_axes_for(kind: str, flags: set[str]) -> list[dict]:
 
 
 # Scheduler knobs for the concurrency lane: these tick inside the
-# gateway supervisor, not the engine argv — single-stream cells cannot
+# gateway supervisor, not the engine argv - single-stream cells cannot
 # observe them (one stream never queues). Each entry pairs the cell
 # label with the gateway config it boots; conc_default is the control
 # row every delta in conc_axes_table is measured against.
@@ -9276,7 +9276,7 @@ def config_axes_table(recs: list[dict]) -> str:
             if b and g is not None and b.get("gpu_peak_mib")
             else float("nan")
         )
-        # golden-QC drift: greedy fingerprint vs the default cell's —
+        # golden-QC drift: greedy fingerprint vs the default cell's -
         # ✓ same tokens, ⚠ drift (fast-but-changed-output knob), "-" when
         # either side lacks a fingerprint (older receipts / qc_error)
         q = r.get("qc_sha256")
@@ -9312,8 +9312,8 @@ def config_axes_table(recs: list[dict]) -> str:
 def conc_axes_table(recs: list[dict]) -> str:
     """Concurrency-lane scheduler A/B: burst cells (adaptive_slots,
     poll) vs the same-engine conc_default control. These knobs tick in
-    the gateway scheduler, so this table — not the single-stream
-    config-knob table — is the honest read of scheduler policy."""
+    the gateway scheduler, so this table - not the single-stream
+    config-knob table - is the honest read of scheduler policy."""
     base: dict[str, dict] = {}
     for r in recs:
         p = r.get("params", {})
@@ -9379,7 +9379,7 @@ def conc_axes_table(recs: list[dict]) -> str:
 # Axes whose greedy-output drift is a known property of the knob, not a
 # regression alarm: q8_0 KV quantizes the cache the tokens read from, and
 # flash-attention off swaps the attention kernel (different floating-point
-# reduction order) — in both the drift IS the knob, not a bug.
+# reduction order) - in both the drift IS the knob, not a bug.
 KNOWN_DRIFT: set[str] = {"cache_q8", "fa_off"}
 
 
@@ -9388,7 +9388,7 @@ def quality_lane_status(recs: list[dict], skip_flag: bool = False) -> dict:
     actually run? Speed numbers without quality receipts are exactly how
     a degraded config ships as a win, so the status is stamped on every
     artifact surface (report header, publication quality section,
-    quality-status.json, summary.txt) — a skipped or failed lane must
+    quality-status.json, summary.txt) - a skipped or failed lane must
     never read as a passing one."""
     fams = ("quality", "quality-direct", "quality-ollama")
     rows = [r for r in recs if r.get("provider") in fams]
@@ -9585,7 +9585,7 @@ def qc_drift_gate(recs: list[dict]) -> list[str]:
         if not b or r["qc_sha256"] == b["qc_sha256"]:
             continue
         # axis names themselves contain underscores (cache_q8,
-        # cache_reuse, kv_unified...) — a first-underscore split would
+        # cache_reuse, kv_unified...) - a first-underscore split would
         # reduce all of them to "cache"/"kv" and break the allowlist,
         # so match the longest allowlisted axis the label extends
         if not any(name == a or str(name).startswith(f"{a}_") for a in KNOWN_DRIFT):
@@ -9652,7 +9652,7 @@ def media_axes_table(recs: list[dict]) -> str:
         b = base.get(r["tag"])
         t = r.get("total_s_median") or 0.0
         if r.get("note"):
-            # knob detected inert (profiler skip) — a Δ% against the
+            # knob detected inert (profiler skip) - a Δ% against the
             # default would be noise dressed up as a config effect
             notes.append(
                 ascii_note(
@@ -9813,7 +9813,7 @@ def idle_wake_table(recs: list[dict]) -> str:
         )
     # Composition receipt (probe, qwen3.5-9b Q4_K_M, 8GiB card): warm
     # steady-state ~0.1 s, wake from --sleep-idle-seconds ~2.9 s on a
-    # minimal prompt (~3.6 s at lane prompts) — the wake cost is the
+    # minimal prompt (~3.6 s at lane prompts) - the wake cost is the
     # upstream child restoring its CUDA context and re-uploading
     # weights; the gateway adds ~0. Upstream exposes a single
     # full-release sleep level, so the honest floor on this hardware
@@ -10079,7 +10079,7 @@ def executive_summary(recs: list[dict]) -> list[str]:
             )
     if parts:
         return parts
-    # Media-only campaigns have no text rows to rank — say that instead
+    # Media-only campaigns have no text rows to rank - say that instead
     # of a bare "no complete rows" that reads like a failed campaign.
     media = [
         r
@@ -10088,7 +10088,7 @@ def executive_summary(recs: list[dict]) -> list[str]:
     ]
     if media:
         return [
-            f"_No complete text rows — {len(media)} media measurement(s) "
+            f"_No complete text rows - {len(media)} media measurement(s) "
             "in the sections below._"
         ]
     return ["_No complete rows._"]
@@ -10099,7 +10099,7 @@ def media_table(recs: list[dict]) -> str:
 
     Media-image cells with identical (engine, model, size, steps, config)
     aggregate into ONE row (median of medians, min-of-mins / max-of-maxes,
-    n=count) — re-run campaigns otherwise render as visually identical
+    n=count) - re-run campaigns otherwise render as visually identical
     duplicate rows (F6c). The config knob joins the label so the A/B rows
     (default / fa_off / vae_tiling_on / sage_attn_on) are distinguishable.
     """
@@ -10821,7 +10821,7 @@ def conc_frontier(recs: list[dict]) -> tuple[str, list[str]]:
 
 def engine_coverage(recs: list[dict]) -> list[str]:
     """Coverage audit: every store engine either has cells in this campaign
-    or an exclusion reason — the artifact answers 'did we bench everything?'"""
+    or an exclusion reason - the artifact answers 'did we bench everything?'"""
     inv = next(
         (r for r in recs if r.get("provider") == "inventory" and "error" not in r),
         None,
@@ -10930,7 +10930,7 @@ def demote_headings(md: str) -> str:
 def append_campaign_chapter(ad: Path, out_path: Path) -> Path | None:
     """Append a second campaign's report as a nested chapter.
 
-    Used for lanes the main campaign structurally cannot measure — the
+    Used for lanes the main campaign structurally cannot measure - the
     safetensors-only sglang engine next to a GGUF flagship sweep. The
     chapter reuses the full publication renderer with headings demoted
     one level, wrapped in a scope caveat: a different model and format
@@ -10956,7 +10956,7 @@ def append_campaign_chapter(ad: Path, out_path: Path) -> Path | None:
     chapter = demote_headings(tmp.read_text())
     tmp.unlink()
     # Drop the demoted duplicate title line ("## Blazar inference
-    # benchmark") — the chapter header already names the campaign; the
+    # benchmark") - the chapter header already names the campaign; the
     # byline rendered right below it keeps the version/power context.
     lines = chapter.splitlines()
     if lines and lines[0].startswith("## "):
@@ -10993,7 +10993,7 @@ def write_publication_report(
     the relative comparisons while the tables and cells.jsonl stay the
     receipts. slim=True (appended chapters) additionally drops the
     globally-duplicated Test bed / Methodology / Caveats / Reproduce
-    sections — the main publication already carries them. charts: pass
+    sections - the main publication already carries them. charts: pass
     the caller's render_campaign_charts result to avoid a duplicate
     render (None = render here, e.g. --render-only and chapter paths).
     """
@@ -11031,7 +11031,7 @@ def write_publication_report(
     def details(summary: str, body: list[str]) -> list[str]:
         # Receipt tables collapse behind a click-to-open block so the page
         # reads charts-first; lane-absent bodies ("Not measured", raw or
-        # campaign-scoped phrasing) stay plain — coverage gaps must stay
+        # campaign-scoped phrasing) stay plain - coverage gaps must stay
         # visible while scanning.
         if any("_Not measured" in ln for ln in body):
             return body
@@ -11206,7 +11206,7 @@ def write_publication_report(
     L.append("### Quality suites (checker-verified, seeded, greedy)")
     L.append("")
     qstat = quality_status or quality_lane_status(recs)
-    L.append(f"- _quality lane: **{qstat['status']}** — {qstat['detail']}_")
+    L.append(f"- _quality lane: **{qstat['status']}** - {qstat['detail']}_")
     L.append("")
     L += details(
         "Receipt table - quality suites",
@@ -11350,7 +11350,7 @@ def write_publication_report(
         L.append("")
     # engine-reality receipts: error cells are excluded from every metric
     # table by construction, but hiding them from the published report
-    # would misrepresent coverage — every failed cell is listed with its
+    # would misrepresent coverage - every failed cell is listed with its
     # config and error signature (full daemon log tail in cells.jsonl).
     failed_rows = [r for r in recs if "error" in r and r.get("provider") != "inventory"]
     if failed_rows:

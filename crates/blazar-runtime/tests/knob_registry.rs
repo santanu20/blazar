@@ -3,7 +3,7 @@
 //! `scripts/first_class_flags.json` is generated from live emission:
 //! `cargo run -p blazar-runtime --example knob_registry > scripts/first_class_flags.json`.
 //! This test recomputes the registry and demands set equality with the
-//! committed file in BOTH directions — emission added without
+//! committed file in BOTH directions - emission added without
 //! regenerating the file fails (stale registry), and a hand-edited file
 //! without matching emission fails (fabricated registry).
 #![allow(non_snake_case)] // house test-naming: integration__subject__behavior
@@ -37,7 +37,7 @@ fn integration__knob_registry__committed_json_matches_live_emission() {
     for (lane, flags) in &live {
         assert!(
             !flags.is_empty(),
-            "{lane} registry came back empty — fixture matrix broke"
+            "{lane} registry came back empty - fixture matrix broke"
         );
         let committed_flags: BTreeSet<&str> = committed[*lane]
             .as_array()
@@ -53,7 +53,7 @@ fn integration__knob_registry__committed_json_matches_live_emission() {
         let extra: Vec<_> = committed_flags.difference(&live_flags).collect();
         assert!(
             missing.is_empty() && extra.is_empty(),
-            "{lane} registry drift — emission not in file: {missing:?}, file not in emission: \
+            "{lane} registry drift - emission not in file: {missing:?}, file not in emission: \
              {extra:?}; {REGEN}"
         );
     }

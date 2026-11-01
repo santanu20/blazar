@@ -3,7 +3,7 @@
 //! breaker, and shut everything down cleanly.
 //!
 //! Invariants (§9): every spawned child has a named stop path (evict /
-//! shutdown), teardown is idempotent, SIGTERM→grace→SIGKILL bounded, and
+//! shutdown), teardown is idempotent, SIGTERM->grace->SIGKILL bounded, and
 //! every state transition publishes an event.
 
 use std::fmt::Write as _;
@@ -36,7 +36,7 @@ use crate::events::{BlazarEvent, EventBus, InstanceState};
 /// Modes that never use an external draft (off/mtp/ngram*) return None
 /// without touching the store. Shared by serve `ensure`, the router
 /// preset, and the CLI bench/tune lanes so every spawn path resolves
-/// drafts identically — profile-compile still gates emission on the
+/// drafts identically - profile-compile still gates emission on the
 /// engine manifest and hard-errors on stale (missing) files.
 /// Shared pooled client for localhost control-plane calls (warm-peg
 /// probes, session-bank save/restore): one connection pool for the
@@ -52,7 +52,7 @@ fn local_http() -> &'static reqwest::Client {
 
 /// Cold-lane child dialing (warm-peg probes, session-bank save/restore):
 /// TCP rides the shared loopback pool; unix builds an ephemeral
-/// socket-pinned client — these calls run once per spawn or idle
+/// socket-pinned client - these calls run once per spawn or idle
 /// transition, so there is no pool worth warming. The unix base's host
 /// is a placeholder the connector ignores; only the path is dialed.
 fn child_dial(endpoint: &blazar_core::Endpoint) -> (reqwest::Client, String) {
@@ -90,9 +90,9 @@ pub fn lane_for(kind: blazar_core::engine_kind::EngineKind) -> DraftLane {
     match kind {
         blazar_core::engine_kind::EngineKind::Sglang
         | blazar_core::engine_kind::EngineKind::Mlx => DraftLane::Safetensors,
-        // Everything else — llama.cpp/mistral.rs LLM lanes plus the
+        // Everything else - llama.cpp/mistral.rs LLM lanes plus the
         // non-LLM lanes (diffusion, audio, tts) that never speculate
-        // and only need the match to be exhaustive — drafts as GGUF.
+        // and only need the match to be exhaustive - drafts as GGUF.
         _ => DraftLane::Gguf,
     }
 }
@@ -108,7 +108,7 @@ pub enum DraftPick {
     Unavailable,
     /// Draft exists but is the wrong on-disk shape for this lane.
     IncompatibleLane(String),
-    /// Draft resolved to the main model's own file — a model cannot
+    /// Draft resolved to the main model's own file - a model cannot
     /// draft itself.
     SelfPaired(String),
 }
@@ -151,21 +151,21 @@ fn warn_draft_skip(model: &str, pick: &DraftPick, lane: DraftLane) {
                 tracing::warn!(
                     target: "blazar::supervisor",
                     "spec draft {path} is a GGUF file; sglang EAGLE drafts must be HF \
-                     safetensors dirs — spawning dense (pull the draft as a safetensors \
+                     safetensors dirs - spawning dense (pull the draft as a safetensors \
                      row to enable the pair)"
                 );
             } else {
                 tracing::warn!(
                     target: "blazar::supervisor",
                     "spec draft {path} is not a GGUF file; {lane:?} drafts load as GGUF \
-                     files — spawning dense (pull the draft as a GGUF row to enable the pair)"
+                     files - spawning dense (pull the draft as a GGUF row to enable the pair)"
                 );
             }
         }
         DraftPick::SelfPaired(_) => {
             tracing::warn!(
                 target: "blazar::supervisor",
-                "catalog draft for {model} resolved to the main model file itself — a \
+                "catalog draft for {model} resolved to the main model file itself - a \
                  model cannot draft itself; spawning dense (pull the paired draft to \
                  enable speculation)"
             );
@@ -176,7 +176,7 @@ fn warn_draft_skip(model: &str, pick: &DraftPick, lane: DraftLane) {
 
 /// Spec engagement for sglang admission: which draft dir (if any) the
 /// spawn will charge and whether speculative decoding engages at all.
-/// Mirrors `push_sglang_speculative` precedence — the knob lane
+/// Mirrors `push_sglang_speculative` precedence - the knob lane
 /// (`spec_algorithm`) owns the spawn, else the resolved catalog pair;
 /// a GGUF path degrades to dense with a compile-side warning, so
 /// admission charges nothing for it either. Flag gates match compile:
@@ -205,7 +205,7 @@ fn sglang_engaged_draft<'a>(
             (draft, draft.is_some())
         }
         // Unknown spellings warn+dense at compile (config validation
-        // rejects them at load) — nothing extra charges here.
+        // rejects them at load) - nothing extra charges here.
         Some(_) => (None, false),
         None => {
             let draft = catalog_draft.filter(|p| !is_gguf(p) && spec_flag && draft_flag);
@@ -226,8 +226,8 @@ pub fn resolve_spec_mode(queued: Option<String>, overlay: Option<String>, config
 /// Evidence consult for `spec = "auto"`: the best MEASURED spec mode
 /// from `blazar tune <model> --spec-race` receipts, gated on what this
 /// engine advertises and whether the catalog's draft pair is actually
-/// available. Returns the override spelling — a winning `draft` receipt
-/// maps to `"auto"` (the profile planner owns pair engagement) — plus
+/// available. Returns the override spelling - a winning `draft` receipt
+/// maps to `"auto"` (the profile planner owns pair engagement) - plus
 /// the measured ratio over dense. `None` keeps the heuristic auto
 /// chain (planner decides per spawn). Receipts never override explicit
 /// pins: callers consult only when the tier chain resolved to "auto".
@@ -245,13 +245,13 @@ pub fn best_measured_spec_mode(
         if r.mode == "dense" || r.ratio < 1.05 {
             continue;
         }
-        // An untuned ngram receipt raced engine-default knobs — a
+        // An untuned ngram receipt raced engine-default knobs - a
         // noisy default arm clearing 1.05 is not adoption-grade
         // evidence (the tuned ngram sizes are the whole point of the
         // mode). draft/dflash arms always carry their deliberate
         // configuration (a chosen pair / engine's flash decoder), so
         // the gate reads ngram only. Pre-v19 rows default tuned=false
-        // — every historical ngram race ran defaults.
+        // - every historical ngram race ran defaults.
         if r.mode == "ngram" && !r.tuned {
             continue;
         }
@@ -297,7 +297,7 @@ const PREFILL_SPEEDUP: f64 = 4.0;
 /// candidate): queued-wait + starved-slot penalty + uncached prefill +
 /// decode, blending the model's measured decode rate and prompt-cache
 /// hit with the live admission snapshot the caller took. Pure on
-/// purpose — callers snapshot `queue_depth`/`headroom` at decision
+/// purpose - callers snapshot `queue_depth`/`headroom` at decision
 /// time, never re-derived here, so the tiering is pinnable.
 #[allow(
     clippy::cast_precision_loss,
@@ -352,25 +352,25 @@ pub struct PrefixKey {
 
 /// Recent `sys` classes remembered per replica key (F8 overlap routing).
 const SYS_RING_CAP: usize = 8;
-/// Bound on the prefix→replica affinity table (B1): one entry per
+/// Bound on the prefix->replica affinity table (B1): one entry per
 /// distinct prompt prefix; eviction keeps it from growing unbounded.
 const PREFIX_AFFINITY_CAP: usize = 512;
-/// LC1: minimum A→B transitions before B is considered a confident
+/// LC1: minimum A->B transitions before B is considered a confident
 /// preload target.
 const PRELOAD_MIN_TRANSITIONS: u64 = 3;
 /// LC1: cap on the transition table (arbitrary-evict on overflow).
 const TRANSITIONS_CAP: usize = 1024;
 /// LC1: cooldown after a failed speculative spawn of a model.
 const PRELOAD_BACKOFF: Duration = Duration::from_mins(5);
-/// F1: idle-to-RAM warm read granularity — large enough to amortize
+/// F1: idle-to-RAM warm read granularity - large enough to amortize
 /// syscall overhead, small enough to yield between chunks on slow disks.
 const RAM_WARM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// Whole-bank save-sweep budget: each per-slot save is individually
 /// bounded at 2 s, but an `-np 32` child must not hold daemon shutdown
-/// for a minute of worst-case timeouts — the sweep stops issuing saves
+/// for a minute of worst-case timeouts - the sweep stops issuing saves
 /// once this budget is spent.
 const BANK_SAVE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
-/// F12: `keep_alive: -1` cap — 100 years, far enough to be forever in
+/// F12: `keep_alive: -1` cap - 100 years, far enough to be forever in
 /// practice without risking `Instant` overflow arithmetic.
 const KEEP_ALIVE_FOREVER: Duration = Duration::from_hours(876_600);
 /// LC4: reaper ticks (10s each) of sustained concurrent load before a
@@ -379,14 +379,14 @@ const SLOTS_STREAK_TICKS: u32 = 6;
 /// D1 burst fast-path: saturated ticks needed when the latched window
 /// peak attests `>= 2x` the effective slots. A 2x overcommitment peak is
 /// demand-attested (every queued arrival climbed through each level), so
-/// 2 ticks (20 s) prove what the 6-tick path re-proves for 60 s — bursts
+/// 2 ticks (20 s) prove what the 6-tick path re-proves for 60 s - bursts
 /// shorter than the standard window still earn their reshape instead of
 /// queueing to death first (spike doc §D1, 2026-10-29).
 const SLOTS_FAST_STREAK_TICKS: u32 = 2;
 /// D1 anti-flap: minimum dwell between two fast-path adoptions on the
 /// same model (burst-quiet-burst sawtooth loads). The standard 6-tick
 /// path stays available inside the cooldown, so eligibility is never
-/// lost — only the shortcut is rate-limited.
+/// lost - only the shortcut is rate-limited.
 const SLOTS_FAST_COOLDOWN: Duration = Duration::from_secs(300);
 /// D3 starvation bound for the reshape drain: parking new admissions
 /// longer than this costs more tail latency than the reshape can
@@ -402,13 +402,13 @@ const SLOTS_PINNED_TEACH_DEDUP: Duration = Duration::from_secs(600);
 /// measured aggregate decode of the loaded class fails to reach this
 /// multiple of the solo rate. `S = loaded_rate x loaded_conc /
 /// solo_rate`; `S < 1.25` on a GPU-bound model means extra slots buy
-/// queue relief at best while paying a reshape transition — the lane
+/// queue relief at best while paying a reshape transition - the lane
 /// is taught instead of reshaped (spike doc §4 finding 1 + §D5,
 /// 2026-10-30).
 const DECODE_SCALE_ADOPT_MIN: f64 = 1.25;
 /// D5 evidence freshness: the scaling ratio is only consulted when
 /// BOTH class EWMAs (solo + loaded) were sampled within this window.
-/// Stale evidence stands the gate down — a model that has not been
+/// Stale evidence stands the gate down - a model that has not been
 /// observed in both regimes recently adapts as before.
 const DECODE_FRESH_WINDOW: Duration = Duration::from_secs(600);
 /// D5 teach episode dedup (same rationale as
@@ -423,9 +423,9 @@ const DECODE_BOUND_TEACH_DEDUP: Duration = Duration::from_secs(600);
 const PREWARM_UNWRAP_ATTEMPTS: usize = 3;
 const PREWARM_UNWRAP_BACKOFF: Duration = Duration::from_millis(100);
 /// LC4: max in-memory slots bump (`tune --slots` for higher). Raised
-/// 4 → 8 on 2026-09-12: the np8 shape measured +19% system t/s and a
+/// 4 -> 8 on 2026-09-12: the np8 shape measured +19% system t/s and a
 /// 5.4x concurrency TTFT-p99 win over np4 under 8-stream load
-/// (scaling flag-space study, flagprobe 2026-09-12). Raised 8 → 16 on
+/// (scaling flag-space study, flagprobe 2026-09-12). Raised 8 -> 16 on
 /// 2026-10-06: the flagship concurrency ladder proved the cap was the
 /// binding constraint under 16-stream sustained load (adoption could
 /// never reach the demanded shape), and the reshape re-spends the same
@@ -464,7 +464,7 @@ const UBATCH_GOV_RECOVER_STREAK: u32 = 10;
 /// compute buffer linearly and can OOM small cards mid-burst.
 const UBATCH_GOV_TIERS: [u32; 2] = [1024, 2048];
 
-/// Model name behind an instance key: `"qwen#2"` → `"qwen"`. Plain keys
+/// Model name behind an instance key: `"qwen#2"` -> `"qwen"`. Plain keys
 /// (no `#`) pass through unchanged, so `replicas = 1` stays
 /// byte-identical with the pre-replica world.
 /// A trailing `@vision` marker (projector-carrying respawn of a
@@ -487,7 +487,7 @@ pub fn model_of_key(key: &str) -> &str {
 
 /// Instance display name: like [`model_of_key`] but KEEPS the `+lora`
 /// marker so `ps` distinguishes an adapted child from the dense one.
-/// `@vision` and `#N` stay hidden — those are the same weights serving
+/// `@vision` and `#N` stay hidden - those are the same weights serving
 /// the same traffic, while a `LoRA` variant is a genuinely different
 /// instance users must be able to tell apart.
 fn display_name_of_key(key: &str) -> &str {
@@ -528,7 +528,7 @@ impl MetaBox {
 /// Read the row's metadata in the on-disk shape, cross-checked against
 /// what the ACTIVE engine kind can consume. Wrong-lane pairs (a
 /// safetensors directory on the llama.cpp lane, a GGUF file on the
-/// sglang lane) return a TEACHING error naming the remedy — the raw
+/// sglang lane) return a TEACHING error naming the remedy - the raw
 /// io-error they used to surface ("Is a directory") told the user
 /// nothing. mistral.rs consumes both shapes, so its read follows the
 /// disk. Errors name the reader so the caller's skip/teach message
@@ -542,12 +542,12 @@ pub(crate) fn read_model_meta(
     match (kind, is_dir) {
         (K::LlamaCpp, true) => Err(format!(
             "safetensors model {path} is not servable by the llama.cpp engine \
-             — run: blazar engine install --kind sglang (or --kind mistralrs), \
+             - run: blazar engine install --kind sglang (or --kind mistralrs), \
              then blazar engine use <tag> and restart the daemon"
         )),
         (K::Sglang, false) => Err(format!(
             "sglang serves safetensors models; {path} is GGUF \
-             — run: blazar engine install --kind mistralrs, \
+             - run: blazar engine install --kind mistralrs, \
              or blazar engine use <llamacpp-tag> for the GGUF lane"
         )),
         // sdcpp rows are diffusion component sets: the DiT GGUF carries
@@ -558,7 +558,7 @@ pub(crate) fn read_model_meta(
         (K::SdCpp, false) => Ok(MetaBox::Gguf(Box::default())),
         (K::SdCpp, true) => Err(format!(
             "sdcpp serves GGUF DiT files from a component set; {path} is a \
-             directory — re-pull the model so the DiT lands as a file"
+             directory - re-pull the model so the DiT lands as a file"
         )),
         (_, true) => blazar_core::read_hf_config(std::path::Path::new(path))
             .map(MetaBox::Hf)
@@ -567,12 +567,12 @@ pub(crate) fn read_model_meta(
             .map(|m| MetaBox::Gguf(Box::new(m)))
             .map_err(|e| {
                 // Diffusion/model-component GGUFs (image-repo DiT /
-                // encoder / VAE splits) carry no general.architecture —
+                // encoder / VAE splits) carry no general.architecture -
                 // the raw parse error teaches nothing. Same guard
                 // pattern as the wrong-lane shape guards above.
                 if e.to_string().contains("missing general.architecture") {
                     format!(
-                        "{path}: GGUF has no architecture metadata — diffusion/model-component \
+                        "{path}: GGUF has no architecture metadata - diffusion/model-component \
                          file (image-repo DiT/encoder/VAE split), not a text model; text engines \
                          cannot serve it. The sdcpp lane serves diffusion component sets (DiT + \
                          VAE + text encoder): blazar engine install --kind sdcpp, then re-pull \
@@ -604,7 +604,7 @@ fn remedy_suffix(
         .iter()
         .find(|(_, k)| *k != current && serving.contains(k))?;
     Some(format!(
-        " — but {tag} is already installed: blazar engine use {tag} \
+        " - but {tag} is already installed: blazar engine use {tag} \
          (then restart the daemon), or let routing pick per model: \
          blazar config set engine_routing.mode auto"
     ))
@@ -641,7 +641,7 @@ fn store_aware_remedy(
 fn not_found_name(name: &str) -> String {
     if name.contains(':') {
         format!(
-            "{name} — blazar names are flat; `{}` would be its flat form (see `blazar list`)",
+            "{name} - blazar names are flat; `{}` would be its flat form (see `blazar list`)",
             name.replace(':', "-")
         )
     } else {
@@ -671,8 +671,8 @@ use crate::engine_impl::{ChildHandle, Engine};
 /// context is not a generation context), so the peg asks the surface
 /// the child actually serves. Live-proven 2026-10-09: bge-small-en
 /// answers /v1/embeddings only, bge-reranker-v2-m3 answers /rerank
-/// (plus /v1/embeddings), and the laya classifier — whose pooling head
-/// makes /v1/embeddings 400 — answers llama-server's native
+/// (plus /v1/embeddings), and the laya classifier - whose pooling head
+/// makes /v1/embeddings 400 - answers llama-server's native
 /// /v1/systemone.
 #[derive(Debug, PartialEq, Eq)]
 enum WarmPegSurface {
@@ -693,13 +693,13 @@ fn warm_peg_surface(argv: &[String]) -> WarmPegSurface {
     }
 }
 
-/// The model id the CHILD serves — what goes in a probe body's `model`
+/// The model id the CHILD serves - what goes in a probe body's `model`
 /// field. `mlx_lm` resolves unrecognized names through the HF hub at
 /// REQUEST time (live-proven: a bare `qwen2.5-0.5b-instruct-4bit` body
-/// field made it fetch huggingface.co/api/models/<name> → 401 → every
+/// field made it fetch huggingface.co/api/models/<name> -> 401 -> every
 /// chat 404s), so the peg echoes the exact id the spawn argv passed:
 /// sglang's `--served-model-name`, else mlx's `--model`. llama.cpp
-/// children (`-m <gguf>`, no served-name flag) accept the flat name —
+/// children (`-m <gguf>`, no served-name flag) accept the flat name -
 /// no echo needed.
 fn warm_peg_served_model(argv: &[String]) -> Option<String> {
     argv.windows(2)
@@ -707,7 +707,7 @@ fn warm_peg_served_model(argv: &[String]) -> Option<String> {
 }
 
 /// Post-spawn warm-peg for JIT-class engines (sglang): the child's
-/// /health flips 200 BEFORE residual warmup drains — the first user
+/// /health flips 200 BEFORE residual warmup drains - the first user
 /// request then eats a ~30s queue (measured live: first post-boot TTFT
 /// 29.9s vs 0.04s warm) and the first concurrent batch pays another
 /// shape-JIT penalty (first bs=4 burst 4.4s vs 0.13s on a warm engine).
@@ -716,7 +716,7 @@ fn warm_peg_served_model(argv: &[String]) -> Option<String> {
 /// graph capture). Runs INSIDE spawn, before Ready publishes, so the
 /// cost lands where it belongs instead of on a random first request.
 /// Warn-and-continue: a failed peg never fails an otherwise healthy
-/// child — the next request pays the JIT instead.
+/// child - the next request pays the JIT instead.
 async fn warm_peg_child(
     model: &str,
     argv: &[String],
@@ -726,14 +726,14 @@ async fn warm_peg_child(
 ) {
     // Unix-endpoint warm-peg is a no-op where UDS transport does not
     // exist: config validation already rejects unix child_transport
-    // there, so no live child can ever answer — return before any
+    // there, so no live child can ever answer - return before any
     // dial machinery touches the network with a bogus localhost base.
     #[cfg(not(unix))]
     if matches!(endpoint, blazar_core::Endpoint::Unix { .. }) {
         tracing::debug!(
             target: "blazar::warmpeg",
             model,
-            "unix endpoint warm-peg skipped — no UDS transport on this platform"
+            "unix endpoint warm-peg skipped - no UDS transport on this platform"
         );
         return;
     }
@@ -744,7 +744,7 @@ async fn warm_peg_child(
     // Probe under the id the child actually serves (see
     // warm_peg_served_model) and against the surface this spawn's
     // class serves. Non-generative children have no decode batch
-    // shapes to peg — one probe of their surface is the whole peg.
+    // shapes to peg - one probe of their surface is the whole peg.
     let served = warm_peg_served_model(argv);
     let body_model = served.as_deref().unwrap_or(model);
     let surface = warm_peg_surface(argv);
@@ -782,7 +782,7 @@ async fn warm_peg_child(
             tracing::warn!(
                 target: "blazar::warmpeg",
                 model,
-                "warm-peg single probe HTTP {} — leaving warmup to the first request",
+                "warm-peg single probe HTTP {} - leaving warmup to the first request",
                 resp.status()
             );
             return;
@@ -791,7 +791,7 @@ async fn warm_peg_child(
             tracing::warn!(
                 target: "blazar::warmpeg",
                 model,
-                "warm-peg single probe failed: {e:#} — leaving warmup to the first request"
+                "warm-peg single probe failed: {e:#} - leaving warmup to the first request"
             );
             return;
         }
@@ -822,7 +822,7 @@ async fn warm_peg_child(
         tracing::warn!(
             target: "blazar::warmpeg",
             model,
-            "warm-peg: {failed}/{} concurrent probes failed — first concurrent batch may still pay shape JIT",
+            "warm-peg: {failed}/{} concurrent probes failed - first concurrent batch may still pay shape JIT",
             concurrency.max(1)
         );
     } else {
@@ -830,7 +830,7 @@ async fn warm_peg_child(
             target: "blazar::warmpeg",
             model,
             concurrency = concurrency.max(1),
-            "spawn warm-peg done in {:.1}s (single {single_s:.1}s + concurrent burst) — first request arrives warm",
+            "spawn warm-peg done in {:.1}s (single {single_s:.1}s + concurrent burst) - first request arrives warm",
             started.elapsed().as_secs_f32()
         );
     }
@@ -838,7 +838,7 @@ async fn warm_peg_child(
 
 /// One bounded probe against the surface a non-generative child
 /// serves (embeddings / rerank / systemone), in ladder order until the
-/// first 2xx. Same contract as the chat peg: warn-and-continue — a
+/// first 2xx. Same contract as the chat peg: warn-and-continue - a
 /// failed probe never fails an otherwise healthy child.
 async fn warm_peg_surface_probe(
     model: &str,
@@ -858,7 +858,7 @@ async fn warm_peg_surface_probe(
                 "/v1/embeddings",
                 serde_json::json!({ "model": body_model, "input": "warm" }),
             ),
-            // Classifier fallback (pooling head absent → embeddings 400):
+            // Classifier fallback (pooling head absent -> embeddings 400):
             // llama-server's native decision surface, minimal choice body.
             (
                 "/v1/systemone",
@@ -892,18 +892,18 @@ async fn warm_peg_surface_probe(
                     target: "blazar::warmpeg",
                     model,
                     surface = path,
-                    "warm-peg ok — child surface answered; no decode shapes to peg on this class"
+                    "warm-peg ok - child surface answered; no decode shapes to peg on this class"
                 );
                 return;
             }
             Ok(resp) => last_status = Some(resp.status().as_u16()),
-            // Transport failure: the child is unreachable/dying — the
+            // Transport failure: the child is unreachable/dying - the
             // chat peg would have warned the same way. Stop the ladder.
             Err(e) => {
                 tracing::warn!(
                     target: "blazar::warmpeg",
                     model,
-                    "warm-peg surface probe {path} failed: {e:#} — leaving warmup to the first request"
+                    "warm-peg surface probe {path} failed: {e:#} - leaving warmup to the first request"
                 );
                 return;
             }
@@ -912,7 +912,7 @@ async fn warm_peg_surface_probe(
     tracing::warn!(
         target: "blazar::warmpeg",
         model,
-        "warm-peg surface probes exhausted (last HTTP {}) — leaving warmup to the first request",
+        "warm-peg surface probes exhausted (last HTTP {}) - leaving warmup to the first request",
         last_status.map_or("n/a".to_string(), |s| s.to_string())
     );
 }
@@ -933,14 +933,14 @@ pub enum SupervisionError {
     #[error("all slots busy: capacity reached and nothing idle to evict")]
     AllSlotsBusy,
     /// The incoming admission floor exceeds every candidate card even on
-    /// an empty box — no eviction or queue wait can ever change the
+    /// an empty box - no eviction or queue wait can ever change the
     /// verdict, so the caller must refuse fast with numbers instead of
     /// parking the request behind the bounded `all_slots_busy` queue.
     #[error("{0}")]
     ModelTooLarge(String),
     /// Spawn-time memory floor (J3): the box cannot host this load
     /// without thrashing swap. Distinct from `ModelTooLarge` (a floor no
-    /// card could ever meet) — here freeing co-resident engines WOULD
+    /// card could ever meet) - here freeing co-resident engines WOULD
     /// change the verdict, so the message names those levers. Maps to
     /// HTTP 507: the resource is exhausted, not "busy".
     #[error("{0}")]
@@ -960,7 +960,7 @@ enum BlockedAction {
 /// RAII release for a per-device spawn reservation: dropping subtracts
 /// the reserved bytes back out of the ledger. Every failure path between
 /// `reserve_device` and the instance insert releases through this Drop
-/// alone — a reservation can never outlive its spawn.
+/// alone - a reservation can never outlive its spawn.
 struct DeviceReservation {
     device: String,
     bytes: u64,
@@ -982,12 +982,12 @@ impl Drop for DeviceReservation {
 #[derive(Debug)]
 pub struct Instance {
     pub name: String,
-    /// Store tag of the engine build THIS child runs from — the daemon
+    /// Store tag of the engine build THIS child runs from - the daemon
     /// global row under manual routing, the routed adapter's row under
     /// auto/pin. `ps` and the `engine rm` live-children guard key off
     /// it: an engine must not be deleted while a child serves from it.
     pub engine_tag: String,
-    /// Kind of the engine THIS child was spawned through — under
+    /// Kind of the engine THIS child was spawned through - under
     /// `[engine_routing]` auto/pin a routed adapter can differ from the
     /// daemon-global active row; the gateway keys per-child protocol
     /// quirks off this (never off the global kind).
@@ -1007,18 +1007,18 @@ pub struct Instance {
     pub model: ModelRow,
     pub profile_ctx: u32,
     /// How `profile_ctx`/`kv_est_bytes` must be read on this lane
-    /// (compiled window vs engine-runtime-managed ceiling) — carried so
+    /// (compiled window vs engine-runtime-managed ceiling) - carried so
     /// `ps` observers never read a runtime-managed lane as "unknown".
     pub capacity: blazar_core::profile::CapacityStatus,
     /// Resolved offload label from the compiled profile ("full" | "cpu" |
-    /// "partial" | "auto") — what `ps` shows so silent CPU fallback is
+    /// "partial" | "auto") - what `ps` shows so silent CPU fallback is
     /// never silent.
     pub gpu: String,
-    /// Display label of the placement card (`full@<card>` in `ps`) —
+    /// Display label of the placement card (`full@<card>` in `ps`) -
     /// the census description when one exists. Pure presentation: the
     /// card-scoped co-residency planner and the per-device VRAM ledger
     /// match on [`Instance::device_id`] (the census backend id), never
-    /// on this label — two cards can share a description, ids cannot.
+    /// on this label - two cards can share a description, ids cannot.
     pub device: Option<String>,
     /// Census backend id (`GpuInfo.name`, e.g. `CUDA0`) of the card this
     /// child was placed on: the auto-pick's id, the single manual
@@ -1026,23 +1026,23 @@ pub struct Instance {
     /// CPU spawns, tensor splits, multi-card manual pins, or unknown
     /// placement (those fall back to the aggregate admission belt).
     pub device_id: Option<String>,
-    /// Post-quantization KV-cache estimate from the compiled profile —
+    /// Post-quantization KV-cache estimate from the compiled profile -
     /// feeds the co-residency planner (A15).
     pub kv_est_bytes: Option<u64>,
     /// Profile-compile warnings (unified-KV fit, slot auto, gpu-offload
-    /// rationale…) — kept on the instance so `ps` and the run path can
+    /// rationale...) - kept on the instance so `ps` and the run path can
     /// surface them; the daemon tracing loop stays for logs.
     pub warnings: Vec<String>,
     /// Spec mode that drove this spawn (queued request override, model
-    /// overlay, or global config — whatever `resolve_spec_mode` picked)
+    /// overlay, or global config - whatever `resolve_spec_mode` picked)
     /// plus the draft model's file name when one rode along. `ps`
     /// surfaces both; the gateway's per-request spec override compares
     /// against `spec_mode` to decide whether a restart is warranted.
-    /// Router children serve many models with per-section drafts — no
-    /// single mode — so they carry an empty string.
+    /// Router children serve many models with per-section drafts - no
+    /// single mode - so they carry an empty string.
     pub spec_mode: String,
     pub draft: Option<String>,
-    /// Measured card free-VRAM delta from the spawn settle report — the
+    /// Measured card free-VRAM delta from the spawn settle report - the
     /// footprint the child ACTUALLY took (weights + context + compute +
     /// KV working set). 0 = not settled yet. The bytes admission prefers
     /// this over the weights sum: on 2026-09-11 a 9B VL spawn measured
@@ -1050,7 +1050,7 @@ pub struct Instance {
     /// 0.5B sibling (~977 MiB actual) join it into an `NVRM NO_MEMORY`
     /// storm. Relaxed ordering: telemetry-grade hint, not a lock.
     /// Arc-wrapped so the detached settle task can outlive the map entry
-    /// without pinning the whole Instance — the prewarm cutover re-keys
+    /// without pinning the whole Instance - the prewarm cutover re-keys
     /// the Arc out of the map, and any long-lived holder would starve
     /// that re-key.
     pub settled_mib: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -1063,7 +1063,7 @@ pub struct Instance {
     /// policy text-only spawns skip the projector (measured: 875 MiB
     /// file, ~3.9 s cold TTFT, 1126 MiB VRAM) and `ensure_vision`
     /// respawns projector-carrying on the first image request. Derived
-    /// from the argv the compiler actually emitted — never assumed.
+    /// from the argv the compiler actually emitted - never assumed.
     pub projector: bool,
     child: tokio::sync::Mutex<ChildHandle>,
     pid: u32,
@@ -1071,7 +1071,7 @@ pub struct Instance {
 
 /// Measured prompt-cache hit rate, shared between the gateway poller
 /// (writer) and profile compiles (reader). Fixed-point milli-units so
-/// the read path is a single atomic load — no lock on the spawn hot path.
+/// the read path is a single atomic load - no lock on the spawn hot path.
 #[derive(Debug)]
 pub struct CacheHint {
     rate_milli: std::sync::atomic::AtomicU32,
@@ -1079,7 +1079,7 @@ pub struct CacheHint {
 
 /// Per-model decode throughput (A2): EWMA of observed completion tokens
 /// per wall-second, blended at gateway completion time. Unlike the
-/// windowed poller hints there is no global fallback — rates from
+/// windowed poller hints there is no global fallback - rates from
 /// different model sizes never mix.
 #[derive(Debug)]
 pub struct ThroughputHint {
@@ -1099,7 +1099,7 @@ impl Default for ThroughputHint {
 /// Per-model windowed rates (C1/G3): prompt-cache hit + speculative
 /// acceptance for ONE model, both `None` until that model's children
 /// have reported the relevant counters. Replicas of the same model
-/// share one entry — same weights, same KV economics.
+/// share one entry - same weights, same KV economics.
 #[derive(Debug, Default)]
 pub struct ModelHints {
     pub cache: CacheHint,
@@ -1121,7 +1121,7 @@ struct DecodeClassState {
 }
 
 impl DecodeClassState {
-    /// Blend one observation (0.7 history / 0.3 sample — the house EWMA
+    /// Blend one observation (0.7 history / 0.3 sample - the house EWMA
     /// shape). Concurrency blends alongside rate so the scaling ratio
     /// reflects the TYPICAL measured depth, not the latest burst.
     fn blend(&mut self, rate: f64, conc: f64) {
@@ -1137,7 +1137,7 @@ impl DecodeClassState {
     }
 }
 
-/// D5 decode-scaling sampler: solo (`in_flight == 0` at note time —
+/// D5 decode-scaling sampler: solo (`in_flight == 0` at note time -
 /// the finishing request was the only live stream) vs loaded traffic.
 /// Feeds the adoption gate's scaling ratio; mutex-guarded because the
 /// state is multi-field and the write path (one note per completion)
@@ -1154,7 +1154,7 @@ pub type ModelHintRow = (String, Option<f64>, Option<f64>, Option<f64>);
 
 /// Auto-pick one GPU: most free VRAM among DISCRETE cards; integrated
 /// cards are considered only when no discrete card exists (their "free"
-/// is shared system RAM — bandwidth-starved for serving). Returns the
+/// is shared system RAM - bandwidth-starved for serving). Returns the
 /// index of the pick plus whether a higher-free integrated card was
 /// skipped (caller logs the teaching note). `None` = nothing to pick.
 fn pick_gpu(gpus: &[blazar_core::GpuInfo]) -> Option<(usize, bool)> {
@@ -1206,7 +1206,7 @@ fn pick_sd_backend_device(
 /// proportional to each card's free VRAM. `None` = no split (fits the
 /// best card, fewer than two discrete cards, or not fixable by
 /// splitting). Integrated cards never join the pool (shared-RAM
-/// bandwidth fiction). Callers gate on every manual pin being unset —
+/// bandwidth fiction). Callers gate on every manual pin being unset -
 /// this fn is placement math, not policy.
 fn plan_auto_tensor_split(
     gpus: &[blazar_core::GpuInfo],
@@ -1227,7 +1227,7 @@ fn plan_auto_tensor_split(
         return None; // beyond splitting: the CPU-spill lane teaches instead
     }
     // Ratios relative to the smallest free card (llama.cpp takes relative
-    // weights): 8188 + 3996 free → "2,1". Clamped ≥1 so a nearly-full
+    // weights): 8188 + 3996 free -> "2,1". Clamped >=1 so a nearly-full
     // card still receives layers (upstream needs every listed device).
     let min_free = discrete.iter().map(|g| g.free_mib).min()?.max(1);
     Some(
@@ -1240,7 +1240,7 @@ fn plan_auto_tensor_split(
 }
 
 /// Reachable remote-VRAM pool for one spawn's fit verdicts. Device
-/// TOTALS (not free) feed the admission denominator — remote
+/// TOTALS (not free) feed the admission denominator - remote
 /// residents (other clients sharing the worker) are invisible from
 /// here, and the upstream engine re-judges placement against live
 /// free memory at load time, owning that failure window. `skipped`
@@ -1284,8 +1284,8 @@ async fn query_rpc_fleet_pool(endpoints: &[String]) -> RpcFleetPool {
 /// Demand-shard plan for the sglang lane: tensor-parallel rank count the
 /// supervisor may emit when weights+KV exceed every single card but fit
 /// the cards per-rank. Input is the per-card capacity list the caller
-/// judged relevant (admission feeds census budgets — an empty-box
-/// verdict; the spawn plan feeds MEASURED free — a right-now verdict).
+/// judged relevant (admission feeds census budgets - an empty-box
+/// verdict; the spawn plan feeds MEASURED free - a right-now verdict).
 /// Returns the rank count (all cards) only when the per-rank share fits
 /// the SMALLEST card: NCCL shards evenly, so the bottleneck rank decides.
 pub(crate) fn plan_auto_tp(cards: &[u64], need_bytes: u64) -> Option<u32> {
@@ -1304,21 +1304,21 @@ pub(crate) fn plan_auto_tp(cards: &[u64], need_bytes: u64) -> Option<u32> {
 
 /// Per-spawn child env for SHARDING spawns. Strategy, in order:
 ///
-/// 1. Vulkan pinning — llamacpp-lane spans whose census names all parse
+/// 1. Vulkan pinning - llamacpp-lane spans whose census names all parse
 ///    as `Vulkan<N>` (the llamacpp build enumerates GPUs via Vulkan):
 ///    emit `GGML_VK_VISIBLE_DEVICES` naming the plan's cards. The env
 ///    FILTERS AND RENUMBERS the child's device ids (verified against
 ///    ggml: child `GGML_VK_VISIBLE_DEVICES=1` shows the survivor
 ///    relabeled `Vulkan0`), so it is only safe while the spawn argv is
-///    device-id-free — auto-spanning argv is ratio-only
+///    device-id-free - auto-spanning argv is ratio-only
 ///    (`--tensor-split` ratios, `--tp-size`), which the caller asserts
 ///    via `argv_device_free`. An identity index set emits nothing (the
 ///    unfiltered child already sees exactly those cards).
-/// 2. CUDA/ROCm pinning — the atomic `CUDA_DEVICE_ORDER=PCI_BUS_ID` +
+/// 2. CUDA/ROCm pinning - the atomic `CUDA_DEVICE_ORDER=PCI_BUS_ID` +
 ///    `CUDA_VISIBLE_DEVICES` pair over a fresh nvidia-smi probe (HIP
 ///    honors the same vars).
-/// 3. Any doubt — non-spanning spawn, unparseable census, probe short
-///    of ranks, argv carrying device ids — yields an EMPTY env:
+/// 3. Any doubt - non-spanning spawn, unparseable census, probe short
+///    of ranks, argv carrying device ids - yields an EMPTY env:
 ///    fail-open to the engine's own self-sorting rather than pinning
 ///    ranks to guessed indices.
 fn spanning_spawn_env(
@@ -1346,7 +1346,7 @@ fn parse_vk_id(census_name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// Pure core of [`spanning_spawn_env`] — decided only by the planned
+/// Pure core of [`spanning_spawn_env`] - decided only by the planned
 /// rank count, the probed NVIDIA card count, the census names, and the
 /// lane/argv gates, so the pin contract is unit-testable on any box.
 fn spanning_env_from_census(
@@ -1361,7 +1361,7 @@ fn spanning_env_from_census(
     };
     // Vulkan census wins for llamacpp spans: those children enumerate
     // via Vulkan, and CUDA env vars provably do not touch that
-    // enumeration — the CUDA pair would silently pin nothing.
+    // enumeration - the CUDA pair would silently pin nothing.
     if lane_allows_vk && argv_device_free {
         let vk_ids: Option<Vec<u32>> = census_names.iter().map(|nm| parse_vk_id(nm)).collect();
         if let Some(ids) = vk_ids
@@ -1369,7 +1369,7 @@ fn spanning_env_from_census(
         {
             if ids.iter().copied().eq(0..n) {
                 // Identity: the unfiltered child sees exactly the
-                // plan's cards — no env needed.
+                // plan's cards - no env needed.
                 tracing::info!(
                     ranks = n,
                     "spanning spawn: Vulkan census is the full plan (no pin needed)"
@@ -1390,7 +1390,7 @@ fn spanning_env_from_census(
     spanning_env_from_probe(Some(n), probed_nvidia)
 }
 
-/// Pure CUDA-pair core — decided only by the planned rank count and the
+/// Pure CUDA-pair core - decided only by the planned rank count and the
 /// probed NVIDIA card count, so the pin contract is unit-testable on
 /// any box.
 fn spanning_env_from_probe(ranks: Option<u32>, probed_nvidia: usize) -> Vec<(String, String)> {
@@ -1420,7 +1420,7 @@ fn spanning_env_from_probe(ranks: Option<u32>, probed_nvidia: usize) -> Vec<(Str
 /// Demand-shard plan for the mistral.rs lane: unlike sglang's even TP
 /// ([`plan_auto_tp`]), mistral.rs distributes MODEL LAYERS across cards
 /// itself when `--device-layers` is omitted, and an uneven split is
-/// legal — a 12 GiB model on 16 GiB + 4 GiB cards serves (9 + 3 layers
+/// legal - a 12 GiB model on 16 GiB + 4 GiB cards serves (9 + 3 layers
 /// or any mix). The spanning criterion is therefore the SUMMED pool:
 /// fire only when the load exceeds the best single card yet fits the
 /// cards combined. Rank count is cosmetic here (nothing is emitted);
@@ -1453,7 +1453,7 @@ fn settle_report(
     };
     // A named pick must exist in the AFTER snapshot (a card that vanished
     // from the census reports garbage, not zero). Without a pick, report
-    // the card whose free VRAM dropped the most — the card the spawn
+    // the card whose free VRAM dropped the most - the card the spawn
     // plausibly landed on.
     let card = match device {
         Some(name) => post.gpus.iter().find(|g| g.name == name)?,
@@ -1487,7 +1487,7 @@ fn card_pressure_exceeds(
     if gpus.is_empty() {
         return None;
     }
-    // The target card's VRAM — fall back to the summed pool only when
+    // The target card's VRAM - fall back to the summed pool only when
     // the placement is unknown (None), matching pre-scoping behavior.
     let vram = blazar_core::Hardware::bytes(match target {
         Some(name) => gpus.iter().find(|g| g.name == name)?.total_mib,
@@ -1569,7 +1569,7 @@ impl ThroughputHint {
 
 impl Supervisor {
     /// Poller write side (C1): record one model's windowed rates. Either
-    /// may be `None` — that counter was absent this window (e.g. spec
+    /// may be `None` - that counter was absent this window (e.g. spec
     /// acceptance on a dense child), which leaves the last measured
     /// value untouched rather than zeroing it.
     pub fn set_model_hints(&self, model: &str, cache: Option<f64>, accept: Option<f64>) {
@@ -1601,16 +1601,16 @@ impl Supervisor {
     }
 
     /// Gateway write side (A2): blend one observed completion into the
-    /// model's decode-rate EWMA (0.7 history / 0.3 sample — same shape
+    /// model's decode-rate EWMA (0.7 history / 0.3 sample - same shape
     /// as the poller hints). Wall time is measured from child-send
     /// start so admission-queue wait never pollutes the rate; zero-token
     /// and non-finite observations are dropped, not recorded as zeroes.
     ///
     /// D5: `concurrent_others` is the PEAK number of OTHER streams that
-    /// overlapped this request (see `proxy::others_peak` — the gateway
+    /// overlapped this request (see `proxy::others_peak` - the gateway
     /// brackets hold the in-flight guard at both anchors, so it computes
     /// `max(entry, note) - 1` per request). `0` = the request ran truly
-    /// alone at both anchors → solo class (conc 1.0); `n > 0` → loaded
+    /// alone at both anchors -> solo class (conc 1.0); `n > 0` -> loaded
     /// class at depth `n + 1` (the noter itself). This kills the
     /// tail-of-burst misroute where the last request of an N-deep burst
     /// noted alone and dragged the solo rate down.
@@ -1649,7 +1649,7 @@ impl Supervisor {
     }
 
     /// Live-stream count for a model across ALL its instance keys
-    /// (replica/warm grammars included) — the D5 note-side input. At
+    /// (replica/warm grammars included) - the D5 note-side input. At
     /// the buffered note sites the in-flight guard is still held, so
     /// the count INCLUDES the noting request; callers derive the
     /// other-stream count via `proxy::others_peak` before routing.
@@ -1662,7 +1662,7 @@ impl Supervisor {
             .sum()
     }
 
-    /// D5 read side: the model's decode scaling ratio — estimated
+    /// D5 read side: the model's decode scaling ratio - estimated
     /// aggregate multiple `loaded_rate x loaded_conc / solo_rate`.
     /// `Some` only when BOTH classes have fresh samples (inside
     /// `DECODE_FRESH_WINDOW`); stale or half-empty samplers yield
@@ -1685,7 +1685,7 @@ impl Supervisor {
 
     /// D5 log/event detail: `(solo_tps, loaded_tps, loaded_conc)` for a
     /// model that already passed [`Self::decode_scaling_ratio`]. Returns
-    /// zeros on lock poisoning — the values are telemetry, never control
+    /// zeros on lock poisoning - the values are telemetry, never control
     /// flow (the ratio call above already gated the decision).
     #[must_use]
     pub fn decode_scaling_detail(&self, model: &str) -> (f64, f64, f64) {
@@ -1703,7 +1703,7 @@ impl Supervisor {
     }
 
     /// A2 read side: the model's measured decode rate. Deliberately no
-    /// cross-model fallback — a 0.5b rate must never size a 9b estimate.
+    /// cross-model fallback - a 0.5b rate must never size a 9b estimate.
     #[must_use]
     pub fn decode_rate_for(&self, model: &str) -> Option<f64> {
         self.model_hints.get(model).and_then(|h| h.decode.get())
@@ -1729,7 +1729,7 @@ impl Supervisor {
         rows
     }
 
-    /// B2 spawn read side: the spec-mode default tier for one model —
+    /// B2 spawn read side: the spec-mode default tier for one model -
     /// the governor's parked override where present, else the config
     /// default. Wired into `resolve_spec_mode` as the LAST tier, so a
     /// per-request pin and an overlay pin always shadow the governor.
@@ -1743,7 +1743,7 @@ impl Supervisor {
     /// B2 spec governor: one 60 s telemetry window for `model`.
     /// `accept` is that model's windowed draft-acceptance rate, `None`
     /// when its child reported no spec counters (dense, or an engine
-    /// without the counters — then only saturation can fire). Called by
+    /// without the counters - then only saturation can fire). Called by
     /// the gateway poller after `set_model_hints`. No-op unless
     /// `spec_auto_manage` is on; the router child and user-pinned
     /// models are exempt.
@@ -1754,7 +1754,7 @@ impl Supervisor {
         let overlay = self.config.overlay_for(model);
         if overlay.spec.is_some() || self.config.spec == "off" {
             // A user pin (or a dense global config) shadows the governor
-            // permanently — clear any stale state so the gauge never
+            // permanently - clear any stale state so the gauge never
             // reports a model it cannot act on.
             self.spec_gov.remove(model);
             self.spec_override.remove(model);
@@ -1763,7 +1763,7 @@ impl Supervisor {
         let parked = self.spec_override.get(model).is_some();
         let saturated = self.spec_model_saturated(model);
         if !parked {
-            // Watching path: two collapse signals, either alone enough —
+            // Watching path: two collapse signals, either alone enough -
             // queue saturation (speculation overhead is feeding the
             // queue) or an acceptance floor breach (draft overhead is
             // pure waste at these rates).
@@ -1789,7 +1789,7 @@ impl Supervisor {
                 tracing::warn!(
                     model = %model,
                     reason,
-                    "spec governor: speculation parked after a collapse streak — respawning dense (a long quiet streak restores it)"
+                    "spec governor: speculation parked after a collapse streak - respawning dense (a long quiet streak restores it)"
                 );
                 self.bus.publish(BlazarEvent::SpecGovernorOff {
                     model: model.to_string(),
@@ -1799,7 +1799,7 @@ impl Supervisor {
             return;
         }
         // Parked path: restore only after a sustained fully-quiet streak
-        // (asymmetric hysteresis — see SPEC_GOV_RECOVER_STREAK). A dense
+        // (asymmetric hysteresis - see SPEC_GOV_RECOVER_STREAK). A dense
         // child reports no spec counters; `None` acceptance counts as
         // quiet on that axis.
         let quiet = !saturated && accept.is_none_or(|a| a >= SPEC_GOV_ACCEPT_FLOOR);
@@ -1818,7 +1818,7 @@ impl Supervisor {
             self.queue_spec_reshape(model);
             tracing::info!(
                 model = %model,
-                "spec governor: quiet streak satisfied — speculation restored"
+                "spec governor: quiet streak satisfied - speculation restored"
             );
             self.bus.publish(BlazarEvent::SpecGovernorRecovered {
                 model: model.to_string(),
@@ -1861,10 +1861,10 @@ impl Supervisor {
     }
 
     /// Free decode slots for `model` right now: the widest headroom
-    /// (effective slots − in-flight) across its Ready replicas. 0 when
+    /// (effective slots - in-flight) across its Ready replicas. 0 when
     /// every replica is full (or none is up). The best-of-N fan-out
     /// guard reads this so extra candidates never queue behind live
-    /// traffic — same definition `spec_model_saturated` walks, exposed
+    /// traffic - same definition `spec_model_saturated` walks, exposed
     /// as a number instead of a boolean.
     #[must_use]
     pub fn slot_headroom(&self, model: &str) -> u32 {
@@ -1900,7 +1900,7 @@ impl Supervisor {
     /// model via the existing reshape machinery (drain waits for
     /// in-flight streams; the KV bank carries conversations across the
     /// reshape). The queue is model-keyed, so a multi-replica model
-    /// reshapes one replica per drain cycle — replicas > 1 is opt-in
+    /// reshapes one replica per drain cycle - replicas > 1 is opt-in
     /// and rare on single-box deployments.
     fn queue_spec_reshape(&self, model: &str) {
         for e in &self.instances {
@@ -1946,7 +1946,7 @@ impl Supervisor {
 
     /// D1 ubatch governor: one 60 s telemetry window for `model`.
     /// Saturated windows climb a two-rung ladder (`--ubatch-size` 1024
-    /// then 2048 — bigger prefill micro-batches drain a saturated queue
+    /// then 2048 - bigger prefill micro-batches drain a saturated queue
     /// faster at the cost of a larger compute buffer); a sustained quiet
     /// streak steps back down. Called by the gateway poller after
     /// `spec_governor_window`. No-op unless `ubatch_auto` is on; the
@@ -1958,7 +1958,7 @@ impl Supervisor {
             return;
         }
         if self.config.ubatch_size != 0 {
-            // A user pin shadows the governor permanently — clear any
+            // A user pin shadows the governor permanently - clear any
             // stale state so the gauge never reports a model it cannot
             // act on.
             self.ubatch_gov.remove(model);
@@ -1982,7 +1982,7 @@ impl Supervisor {
                     tracing::warn!(
                         model = %model,
                         tier,
-                        "ubatch governor: saturation streak — reshaping with a larger prefill micro-batch ceiling"
+                        "ubatch governor: saturation streak - reshaping with a larger prefill micro-batch ceiling"
                     );
                 } else {
                     // Already at the top rung: hold there, streak spent.
@@ -2005,7 +2005,7 @@ impl Supervisor {
             s.quiet_streak >= UBATCH_GOV_RECOVER_STREAK
         };
         if recovered {
-            // Step DOWN one rung (2048 → 1024 → auto), never straight
+            // Step DOWN one rung (2048 -> 1024 -> auto), never straight
             // to auto: the model earned the escalation by real
             // saturation, and a quiet window under a shaped child is
             // exactly the state that produced it.
@@ -2022,7 +2022,7 @@ impl Supervisor {
             self.queue_spec_reshape(model);
             tracing::info!(
                 model = %model,
-                "ubatch governor: quiet streak satisfied — stepping the prefill micro-batch ceiling down"
+                "ubatch governor: quiet streak satisfied - stepping the prefill micro-batch ceiling down"
             );
         }
     }
@@ -2056,7 +2056,7 @@ struct UbatchGovState {
 }
 
 /// Slot shape parsed from an engine child's argv (`-np` / `--parallel`).
-/// One parse shared by the adaptive tick, `slot_cap`, and the `ps` rows —
+/// One parse shared by the adaptive tick, `slot_cap`, and the `ps` rows -
 /// the child's own flag is the source of truth for the live shape.
 fn argv_np(argv: &[String]) -> Option<u32> {
     argv.windows(2)
@@ -2068,7 +2068,7 @@ fn argv_np(argv: &[String]) -> Option<u32> {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PsRow {
     pub name: String,
-    /// Store tag of the engine build serving this row — feeds `ps` and
+    /// Store tag of the engine build serving this row - feeds `ps` and
     /// the `engine rm` live-children guard.
     pub engine: String,
     /// Replica index when the model runs multi-instance (`model#N`,
@@ -2086,7 +2086,7 @@ pub struct PsRow {
     /// lanes' JSON stays byte-identical.
     pub capacity: Option<&'static str>,
     /// Slot shape of the spawned child, parsed from its own argv
-    /// (`-np`/`--parallel`) — the same source of truth the adaptive
+    /// (`-np`/`--parallel`) - the same source of truth the adaptive
     /// tick reads. `None` when the argv carries no slot flag (router
     /// fronts, fabricated rows); observers (`ps`, the bench reshape
     /// lane) treat it as unknown rather than guessing.
@@ -2099,23 +2099,23 @@ pub struct PsRow {
     /// configured ceiling here. `None` for the router front, which no
     /// per-model gate caps.
     pub slots_configured: Option<u32>,
-    /// Which authority owns the shape on this row — the provenance a
+    /// Which authority owns the shape on this row - the provenance a
     /// `slots` vs `slots_configured` divergence begs for:
-    /// `"adapted"` (D1 adoption recorded — includes the delegated
+    /// `"adapted"` (D1 adoption recorded - includes the delegated
     /// pin+`adaptive_override` lane), `"pinned"` (manual `slots`
     /// override), `"auto"` (profile-resolved at spawn, recorded in the
     /// child argv), `"engine"` (slot-less engine owns admission).
     /// `None` for the router front. Mirrors `slot_cap` precedence so
     /// the label never disagrees with the number it explains.
     pub slots_source: Option<&'static str>,
-    /// Offload label ("full" | "cpu" | "partial" | "auto") — surfaces
+    /// Offload label ("full" | "cpu" | "partial" | "auto") - surfaces
     /// silent CPU fallback, ollama's most-common complaint.
     pub gpu: String,
     /// Card the instance was placed on (auto-pick or `devices` config);
     /// `None` for router mode / unknown placement. `ps` renders it as
     /// `full@<card>`.
     pub device: Option<String>,
-    /// Census backend id of the placement card (e.g. `CUDA0`) — the key
+    /// Census backend id of the placement card (e.g. `CUDA0`) - the key
     /// the per-device VRAM ledger accounts by. `None` for CPU instances
     /// and card-spanning (tensor-split) placements.
     pub device_id: Option<String>,
@@ -2126,7 +2126,7 @@ pub struct PsRow {
     pub spec_mode: String,
     pub draft: Option<String>,
     pub pid: u32,
-    /// Model bytes on disk (0 in router mode — the front child serves
+    /// Model bytes on disk (0 in router mode - the front child serves
     /// many models and owns no single size).
     pub bytes: i64,
     /// Prefix heat (computed under the INSTANCE key so replica rows
@@ -2141,15 +2141,15 @@ pub struct PsRow {
 /// Throttle/dedup state for the measured-pressure feedback loop.
 #[derive(Default)]
 struct MeasuredTick {
-    /// Last hardware re-probe (probes spawn `--list-devices`; ≥60s apart).
+    /// Last hardware re-probe (probes spawn `--list-devices`; >=60s apart).
     last_probe: Option<Instant>,
-    /// card name → last pressure-teach instant (10-minute dedup).
+    /// card name -> last pressure-teach instant (10-minute dedup).
     warned_cards: std::collections::HashMap<String, Instant>,
 }
 
 /// Drain phase of a queued reshape (D3). `Parking` holds new admissions
-/// so in-flight can only fall; `Cutover` — tripped once parking exceeds
-/// [`SLOTS_DRAIN_BOUND`] — reopens them, and the reshape then waits for a
+/// so in-flight can only fall; `Cutover` - tripped once parking exceeds
+/// [`SLOTS_DRAIN_BOUND`] - reopens them, and the reshape then waits for a
 /// natural quiesce instead of starving waiters under sustained load.
 /// A NEW adoption (a larger target) re-arms the parking budget.
 #[derive(Debug, Clone, Copy)]
@@ -2163,11 +2163,11 @@ pub struct Supervisor {
     /// Total evictions (ladder + capacity) for the metrics gauge.
     pub evictions: std::sync::atomic::AtomicU64,
     /// Measured prompt-cache hit rate (gateway poller writes, profile
-    /// compiles read — drives the adaptive `--cache-ram` clamp, A16).
+    /// compiles read - drives the adaptive `--cache-ram` clamp, A16).
     pub cache_hint: std::sync::Arc<CacheHint>,
     /// Speculative-decoding acceptance rate (accepted / drafted tokens,
     /// 0.0..=1.0, EWMA'd by the gateway poller). `None` until a
-    /// spec-decoding child has reported counters — drives the
+    /// spec-decoding child has reported counters - drives the
     /// `blazar_spec_accept_rate` gauge (G3).
     pub spec_accept: std::sync::Arc<CacheHint>,
     /// Per-model split of the two hints above (C1): the gateway poller
@@ -2176,7 +2176,7 @@ pub struct Supervisor {
     /// merged globals (single-model boxes steer identically).
     model_hints: DashMap<String, ModelHints>,
     /// B2 spec governor: models whose speculation the governor parked
-    /// ("off"). Consumed as the default spec tier at spawn — per-request
+    /// ("off"). Consumed as the default spec tier at spawn - per-request
     /// and overlay pins always shadow it. Daemon-lifetime memory, like
     /// `adopted_slots`.
     spec_override: DashMap<String, String>,
@@ -2194,7 +2194,7 @@ pub struct Supervisor {
     engine_failures: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Capability-lane pins (capability lanes): model name -> engine tag
     /// of the lane that rescued it after the mainstream lane rejected
-    /// the model's architecture. Daemon-lifetime memory only — never
+    /// the model's architecture. Daemon-lifetime memory only - never
     /// written into the user's config behind their back (an explicit
     /// `model_overrides.<model>.engine` pin always wins over this map).
     capability_pins: std::sync::Mutex<std::collections::HashMap<String, String>>,
@@ -2205,12 +2205,12 @@ pub struct Supervisor {
     instances: DashMap<String, Arc<Instance>>,
     /// F1: names with an evict currently in flight. A spawn that wins the
     /// race against a slow terminate must NOT insert under the name being
-    /// torn down — the evict's cleanup would delete the fresh instance
+    /// torn down - the evict's cleanup would delete the fresh instance
     /// (untracked child, `SIGKILL`ed mid-request by `kill_on_drop`) and shred
     /// its pidfile/apikey. Spins retry after the evict completes.
     /// In-flight evictions (F1). tokio Mutex: the RAII mark lives
     /// across the whole async evict (bank save + terminate grace can
-    /// run ~12s worst-case) — a std Mutex held across those awaits
+    /// run ~12s worst-case) - a std Mutex held across those awaits
     /// pins every worker that touches the set (spawn deferral check,
     /// idle ladder) and panics cascade on poisoning.
     evicting: tokio::sync::Mutex<std::collections::HashSet<String>>,
@@ -2219,8 +2219,8 @@ pub struct Supervisor {
     /// Completed load results for waiters: Ok(port) or error text.
     load_results: DashMap<String, Result<EngineRef, String>>,
     /// Crash-restart timestamps per model (circuit breaker). Recorded
-    /// ONLY for spawns that consume an unclean-death mark — a user
-    /// stop→run churn is a cold start, not a crash restart.
+    /// ONLY for spawns that consume an unclean-death mark - a user
+    /// stop->run churn is a cold start, not a crash restart.
     restarts: DashMap<String, Vec<Instant>>,
     /// Models whose child died UNCLEANLY (non-zero exit) and whose next
     /// successful spawn therefore counts as a crash restart. Set by
@@ -2232,7 +2232,7 @@ pub struct Supervisor {
     /// triggering request is otherwise invisible to an in-flight poll
     /// (`begin_request` counts prenatally until the instance exists).
     /// One-shot ctx override for the NEXT spawn of a model (per-request
-    /// `options.num_ctx` — complaint #13). Consumed on use.
+    /// `options.num_ctx` - complaint #13). Consumed on use.
     pending_ctx: DashMap<String, u32>,
     /// One-shot spec-mode override for the NEXT spawn of a model
     /// (per-request `options.spec` / `X-Blazar-Spec`, e.g. the REPL's
@@ -2241,13 +2241,13 @@ pub struct Supervisor {
     pending_spec: DashMap<String, String>,
     /// Prefix heat per model: (hits, last-hit instant); decayed on read.
     heat: std::sync::Mutex<std::collections::HashMap<String, (u64, Instant)>>,
-    /// Prompt-prefix → replica-key affinity (B1): hashes of
+    /// Prompt-prefix -> replica-key affinity (B1): hashes of
     /// (system + first user turn) pin a conversation to one warm-cache
-    /// replica. Bounded, best-effort — a miss just re-routes.
+    /// replica. Bounded, best-effort - a miss just re-routes.
     prefix_affinity: DashMap<u64, String>,
     /// Per-replica ring of recently served `sys` prefix classes (F8).
     sys_rings: DashMap<String, std::collections::VecDeque<u64>>,
-    /// Model→model transition counts (LC1 predictive pre-loading):
+    /// Model->model transition counts (LC1 predictive pre-loading):
     /// increments when a successful request for B follows one for A.
     transitions: DashMap<(String, String), u64>,
     /// Most recently served model (LC1 transition edge source).
@@ -2255,12 +2255,12 @@ pub struct Supervisor {
     /// Models whose speculative preload failed recently (LC1 backoff).
     preload_failures: DashMap<String, Instant>,
     /// Models live from a predictive preload that have not served yet
-    /// (LC1 negative feedback). Cleared on the first serve — the
+    /// (LC1 negative feedback). Cleared on the first serve - the
     /// prediction came true. An eviction with the entry still set
     /// falsified the prediction and decays the transitions that
     /// spawned it (`decay_transitions_to`), so a stale pattern stops
     /// resurrecting an unwanted resident every reaper tick. Keyed by
-    /// model name, bounded by the store's model count — no cap needed.
+    /// model name, bounded by the store's model count - no cap needed.
     preload_awaiting_use: DashMap<String, ()>,
     /// Weights files being re-paged into the OS cache right now (F1
     /// single-flight: one warm per path, later requests are no-ops).
@@ -2271,14 +2271,14 @@ pub struct Supervisor {
     busy_streak: DashMap<String, u32>,
     /// Models whose queued reshape is in its drain phase right now.
     /// The admission gate parks new requests while the model holds the
-    /// [`ReshapeDrain::Parking`] mark, so in-flight can only fall — a
+    /// [`ReshapeDrain::Parking`] mark, so in-flight can only fall - a
     /// sustained-load stream set reaches zero in one max-stream duration
     /// instead of never. [`ReshapeDrain::Cutover`] is the D3 starvation
     /// bound: after [`SLOTS_DRAIN_BOUND`] of parking the gate reopens
     /// and the reshape waits for the next natural quiesce.
     reshape_draining: DashMap<String, ReshapeDrain>,
     /// D2 pinned teach: consecutive saturated ticks on a model excluded
-    /// from adaptation ONLY by a manual `slots` pin (the pin is policy —
+    /// from adaptation ONLY by a manual `slots` pin (the pin is policy -
     /// the teach makes the silent queueing floor visible instead of
     /// adapting around it).
     pinned_streak: DashMap<String, u32>,
@@ -2294,7 +2294,7 @@ pub struct Supervisor {
     /// In-memory slots bumps adopted by LC4 (restart resets; `tune
     /// --slots` is the permanent path).
     adopted_slots: DashMap<String, u32>,
-    /// LC4 respawn queue: model → instance key adopted this pass. The
+    /// LC4 respawn queue: model -> instance key adopted this pass. The
     /// reaper drain respawns each entry once its streams drain
     /// (in-flight = 0), so a slot-heavy reshape never kills live
     /// streams; under 24/7 saturation it defers to the natural
@@ -2302,7 +2302,7 @@ pub struct Supervisor {
     reshape_queue: DashMap<String, String>,
     /// Admission-pressure events per model since the last reaper tick:
     /// every gateway request that hit `AllSlotsBusy` and queued (the
-    /// demand signal for adaptive slots — engine `in_flight` can never
+    /// demand signal for adaptive slots - engine `in_flight` can never
     /// exceed the slot count because admission caps it, so queue-wait
     /// is the only reachable saturation indicator; live-proven
     /// 2026-09-12 when a 6-stream load left `in_flight` pinned at slots).
@@ -2317,7 +2317,7 @@ pub struct Supervisor {
     slot_pressure_seen: DashMap<String, (std::time::Instant, u32)>,
     /// D1 burst fast-path cooldown: when the fast path last adopted per
     /// model. Presence inside [`SLOTS_FAST_COOLDOWN`] demotes the model
-    /// back to the standard [`SLOTS_STREAK_TICKS`] streak — a fresh burst
+    /// back to the standard [`SLOTS_STREAK_TICKS`] streak - a fresh burst
     /// right after an adoption usually means the reshape has not landed
     /// yet, not that the new shape is already insufficient. Cleared when
     /// the adoption decays away (full quiet reset).
@@ -2327,7 +2327,7 @@ pub struct Supervisor {
     /// map lookup misses; the spawn registration folds the total onto
     /// the live instance so ps()/drain logic see one counter from then
     /// on. Without it the admission gate under-counts exactly during
-    /// spawn — every early request's begin was a silent no-op and the
+    /// spawn - every early request's begin was a silent no-op and the
     /// next arrivals over-admitted onto the busy child (live-repro'd by
     /// `e2e__tool_wins_admission_over_earlier_queued_interactive`,
     /// 2026-09-29). Base-model keyed (replica suffixes canonicalized).
@@ -2336,9 +2336,9 @@ pub struct Supervisor {
     /// exclusive temp-0+seeded request is mid-flight. Every other
     /// admission for that model parks until the holder's guard drops.
     exclusive_holders: DashMap<String, ()>,
-    /// Per-device VRAM reservation ledger: census card id → bytes held
+    /// Per-device VRAM reservation ledger: census card id -> bytes held
     /// by spawns between placement and instance insert (the settle-lag
-    /// window). A std Mutex is correct here — taken only for short map
+    /// window). A std Mutex is correct here - taken only for short map
     /// edits on the spawn path, never held across an await. RAII
     /// [`DeviceReservation`] releases; admission reads it through
     /// `device_load_bytes`.
@@ -2353,7 +2353,7 @@ pub struct Supervisor {
     measured: std::sync::Mutex<MeasuredTick>,
     /// Live-census TTL cache: back-to-back spawns (cold-start burst,
     /// preload, pressure tick within seconds) each paid the ~0.2-0.26 s
-    /// `--list-devices` subprocess — measured on the cold path (2026-09-11
+    /// `--list-devices` subprocess - measured on the cold path (2026-09-11
     /// forensics). Cached for [`CENSUS_TTL`]; invalidated on spawn
     /// failure so the pre-spawn guard never trusts a census that
     /// predates a failed boot.
@@ -2364,7 +2364,7 @@ pub struct Supervisor {
     autotune_advise_at: std::sync::Mutex<Option<Instant>>,
     // Test knobs (prod defaults from config).
     /// User-set health-gate budget (`model_load_timeout_secs`), `None` =
-    /// unset. Resolved PER KIND at the health gate — see
+    /// unset. Resolved PER KIND at the health gate - see
     /// [`Supervisor::resolved_load_timeout`].
     pub load_timeout_secs: Option<u64>,
     pub shutdown_grace: Duration,
@@ -2377,11 +2377,11 @@ pub struct Supervisor {
 pub struct EngineRef {
     pub name: String,
     /// Instance-map key for this lane (`model`, replica `model#N`, or
-    /// projector lane `model@vision`) — the exact address a crash-window
+    /// projector lane `model@vision`) - the exact address a crash-window
     /// respawn must re-`ensure` (`model` alone can resolve to a sibling
     /// replica or a different routed engine under auto-routing).
     pub key: String,
-    /// Per-child serving kind (see `Instance::kind`) — the gateway's
+    /// Per-child serving kind (see `Instance::kind`) - the gateway's
     /// authoritative answer to "which engine owns this child" under
     /// routing.
     pub kind: blazar_core::engine_kind::EngineKind,
@@ -2392,7 +2392,7 @@ pub struct EngineRef {
     pub auth: Option<String>,
     /// Path of the model row this child serves. `mlx_lm` reports the FULL
     /// path as its served model id (no `--served-model-name` flag exists
-    /// — probe-verified), so the gateway's body stamp for the mlx lane
+    /// - probe-verified), so the gateway's body stamp for the mlx lane
     /// reads it from here.
     pub model_path: String,
 }
@@ -2408,7 +2408,7 @@ struct ChildAuth {
 }
 
 /// Token count llama-server reports in slot save/restore responses
-/// (`n_saved` / `n_restored`). `Some(0)` is a real answer — HTTP 200 with
+/// (`n_saved` / `n_restored`). `Some(0)` is a real answer - HTTP 200 with
 /// zero tokens is the silent re-prefill bug class (the restore
 /// "succeeds", the slot stays cold), not a warm start. Missing or
 /// non-numeric fields are `None`: unverifiable, not zero.
@@ -2517,7 +2517,7 @@ impl Supervisor {
     /// Hard instance-count cap: explicit `max_loaded_models` wins as a
     /// pure count; CPU-only boxes pin 1 (page cache is shared, but the
     /// evictor's heat model does not reason about it). `None` on GPU
-    /// boxes in auto mode — the bytes admission below governs there.
+    /// boxes in auto mode - the bytes admission below governs there.
     #[must_use]
     pub fn instance_cap(&self) -> Option<usize> {
         if self.config.max_loaded_models > 0 {
@@ -2569,7 +2569,7 @@ impl Supervisor {
         blazar_core::Hardware::bytes(self.hardware.total_vram_mib())
     }
 
-    /// Resident + reserved bytes against ONE card (census id keyed) —
+    /// Resident + reserved bytes against ONE card (census id keyed) -
     /// the per-device admission arithmetic. Instances with unknown
     /// placement never count here; the aggregate belt catches them.
     fn device_load_bytes(&self, device: &str) -> u64 {
@@ -2607,7 +2607,7 @@ impl Supervisor {
 
     /// Post-reservation admission invariant for the picked card: the
     /// device load already carries this spawn's reservation, so the
-    /// incoming floor must NOT be added again — that double-count
+    /// incoming floor must NOT be added again - that double-count
     /// evicted coexisting residents a placement actually fits (seen
     /// live: a 6.6 GiB floor evicting a 0.7 GiB neighbor on a
     /// 7.6 GiB card that held both). Unknown device budget = fail-open;
@@ -2620,7 +2620,7 @@ impl Supervisor {
     }
 
     /// GPU-resident bytes with no known card (tensor splits, multi-card
-    /// manual pins, placements from before the id was recorded) — the
+    /// manual pins, placements from before the id was recorded) - the
     /// population the aggregate budget belt still guards.
     fn unplaced_gpu_bytes(&self) -> u64 {
         use std::sync::atomic::Ordering;
@@ -2636,7 +2636,7 @@ impl Supervisor {
             .sum()
     }
 
-    /// Hold `bytes` against a card for the pick→insert window. The
+    /// Hold `bytes` against a card for the pick->insert window. The
     /// returned guard releases on drop; insert converts the reservation
     /// into a counted resident.
     fn reserve_device(&self, device: &str, bytes: u64) -> DeviceReservation {
@@ -2654,9 +2654,9 @@ impl Supervisor {
         }
     }
 
-    /// Capacity-eviction victim: the coldest evictable instance — zero
+    /// Capacity-eviction victim: the coldest evictable instance - zero
     /// in-flight, not the incoming key, and not pinned (overlay
-    /// `pin = true`, A13). Ordering: session-pinned models LAST (R3 —
+    /// `pin = true`, A13). Ordering: session-pinned models LAST (R3 -
     /// demoted, never excluded, so pressure can still land on them when
     /// nothing else is free), then prefix heat, then longest idle.
     /// `None` = nothing evictable (caller surfaces `AllSlotsBusy`).
@@ -2685,7 +2685,7 @@ impl Supervisor {
 
     /// What the admission loop does when blocked: evict the coldest
     /// victim, or refuse. Captive loads (the semantic-cache embed
-    /// model) always refuse — a cache probe must never decide which
+    /// model) always refuse - a cache probe must never decide which
     /// generation models stay resident.
     fn blocked_action(&self, key: &str, captive: bool) -> BlockedAction {
         if captive {
@@ -2699,11 +2699,11 @@ impl Supervisor {
 
     /// Admission arithmetic for an incoming spawn: instance cap, or the
     /// per-card VRAM ledger exceeded (an empty GPU box always admits one
-    /// model — the J3 spawn guard owns refusal for loads that cannot fit
+    /// model - the J3 spawn guard owns refusal for loads that cannot fit
     /// at all). Per-device: candidates are the manual `devices` pins, or
     /// every discrete card in auto mode; the spawn fits when ANY
     /// candidate card holds resident + reserved + floor within its OWN
-    /// census budget — the old aggregate-pool admission let two models
+    /// census budget - the old aggregate-pool admission let two models
     /// each fit "the summed VRAM" while colliding on one physical card.
     /// Tensor splits and unknown placements carry no card id, so the
     /// legacy aggregate belt still applies whenever they are resident.
@@ -2713,7 +2713,7 @@ impl Supervisor {
     /// Shared by the busy check and the physical-fit check so the two can
     /// never disagree about which cards were judged. Owned strings: the
     /// manual-pin branch must materialize its own list (spawn path only,
-    /// a card or two — the clone is nothing).
+    /// a card or two - the clone is nothing).
     fn admission_candidates(&self, name: &str) -> Vec<String> {
         let manual = self.config.effective_devices(name).to_vec();
         if !manual.is_empty() {
@@ -2734,7 +2734,7 @@ impl Supervisor {
     }
 
     /// Physical-fit verdict for an incoming floor: `Some(best)` when the
-    /// floor exceeds EVERY known candidate card on an EMPTY box — waiting
+    /// floor exceeds EVERY known candidate card on an EMPTY box - waiting
     /// or evicting can never change that, so the caller refuses with the
     /// numbers instead of queueing a request that can only time out.
     /// `None` = some card could hold it empty (busy is then a resident
@@ -2753,7 +2753,7 @@ impl Supervisor {
     }
 
     /// Refuse-fast verdict for a blocked spawn: `Some(cap)` when no
-    /// arrangement of the box can EVER hold this floor — waiting or
+    /// arrangement of the box can EVER hold this floor - waiting or
     /// evicting cannot change it, so the caller refuses with numbers
     /// instead of queueing a request that can only time out. Sharded
     /// spawns AND rpc-fleet spawns judge the summed pool (local
@@ -2785,8 +2785,8 @@ impl Supervisor {
     /// `tp_size > 1`, a plannable auto TP, or an llamacpp tensor split):
     /// per-card fit is then the wrong question (no single card ever holds
     /// the whole floor), so only the aggregate belt may block it. An
-    /// `rpc_budget_bytes > 0` fleet spawn is the same shape — the child
-    /// places across local+remote devices — so it judges the summed
+    /// `rpc_budget_bytes > 0` fleet spawn is the same shape - the child
+    /// places across local+remote devices - so it judges the summed
     /// local+remote pool too.
     fn admission_blocked(
         &self,
@@ -2806,7 +2806,7 @@ impl Supervisor {
         }
         let fleet_budget = self.vram_budget_bytes().saturating_add(rpc_budget_bytes);
         if spanning {
-            // Sharded spawn: judge the summed pool only — mirroring the
+            // Sharded spawn: judge the summed pool only - mirroring the
             // candidates-empty formula (per-card admission would refuse
             // a load the shard plan can actually place).
             return self.resident_bytes().saturating_add(incoming_bytes) > fleet_budget;
@@ -2814,7 +2814,7 @@ impl Supervisor {
         if rpc_budget_bytes > 0 {
             // RPC-fleet spawn: upstream distributes the child across
             // local+remote devices by its own free-memory ordering, so
-            // the per-card question is as wrong as it is for sharding —
+            // the per-card question is as wrong as it is for sharding -
             // judge the summed pool instead. Local residents count
             // against it; remote residents are invisible (documented
             // crudeness, conservative in the local direction).
@@ -2824,7 +2824,7 @@ impl Supervisor {
         if candidates.is_empty() {
             return self.resident_bytes().saturating_add(incoming_bytes) > fleet_budget;
         }
-        // A card missing from the census cannot be judged — fail open on
+        // A card missing from the census cannot be judged - fail open on
         // it (J3 owns the honest spawn-time refusal), never strand the
         // spawn on an unprobeable id.
         let any_card_fits = candidates.iter().any(|c| {
@@ -2845,7 +2845,7 @@ impl Supervisor {
     /// fit ONLY when spread. RPC exclusion: split ratios map
     /// POSITIONALLY onto the
     /// child's device order and remote RPC devices register BEFORE
-    /// local cards (live-verified at engine b11429) — local-only
+    /// local cards (live-verified at engine b11429) - local-only
     /// ratios would land on the wrong devices, so with `rpc_servers`
     /// configured the upstream engine's own free-memory distribution
     /// owns placement and Blazar emits no ratios at all.
@@ -2887,7 +2887,7 @@ impl Supervisor {
             return false; // no geometry: never guess (H7)
         };
         // Card-scoped: LC2 picks ONE card per spawn, so pressure must be
-        // computed against that card only — a summed-all-GPUs denominator
+        // computed against that card only - a summed-all-GPUs denominator
         // fires late (or never) on mixed iGPU+dGPU boxes. Residents key
         // on the census backend id (`device_id`): the display label two
         // cards can share would under-count pressure silently.
@@ -2915,7 +2915,7 @@ impl Supervisor {
     }
 
     /// Children resident in the instance map as [`EngineRef`]s
-    /// (endpoint + child auth) — the cache-hint poller's and metrics
+    /// (endpoint + child auth) - the cache-hint poller's and metrics
     /// merger's fetch list. Both transports serve the same REST
     /// surface; TCP-only engines (mistralrs/sdcpp/sglang) never carry
     /// unix endpoints, so no engine-kind filter is needed here.
@@ -2956,7 +2956,7 @@ impl Supervisor {
     /// `ensure` for GENERATION surfaces (chat, completions, responses,
     /// anthropic, ollama chat/generate): identical to
     /// [`Self::ensure_routed`] except a `model+adapter` request on the
-    /// llama.cpp lane ALSO rides the base child — the engine selects
+    /// llama.cpp lane ALSO rides the base child - the engine selects
     /// adapters per request through its `lora` body field, so one dense
     /// child (all store rows spawn-attached) serves base and every
     /// variant without a second weights load. Embeddings/rerank surfaces
@@ -3002,7 +3002,7 @@ impl Supervisor {
             if blazar_core::catalog::split_lora_suffix(name).1.is_some() {
                 return Err(SupervisionError::ModelNotFound(format!(
                     "router mode serves adapters dynamically at /v1/adapters; \
-                     `{name}` needs a per-model variant child — disable \
+                     `{name}` needs a per-model variant child - disable \
                      `router` in config.toml or attach the adapter \
                      always-on with `blazar lora add`"
                 )));
@@ -3018,11 +3018,11 @@ impl Supervisor {
         // SGLang LoRA variants ride the BASE child: the engine selects
         // adapters per request through its native `base:adapter` model
         // syntax, so a dedicated variant child would re-load the full
-        // base weights into VRAM a second time — and the legacy `+stem`
+        // base weights into VRAM a second time - and the legacy `+stem`
         // body stamp selected NO adapter there (the child answered with
         // base weights). llamacpp rides too, but ONLY from generation
         // surfaces (per-request `lora` selection lives in the completion
-        // schema; embeddings/rerank tasks never see it) — those lanes
+        // schema; embeddings/rerank tasks never see it) - those lanes
         // keep the dedicated variant child via plain `ensure_routed`
         // (`--lora-file` is baked into spawn argv). mistralrs keeps the
         // dedicated variant child on every surface. Aliasing BEFORE
@@ -3063,8 +3063,8 @@ impl Supervisor {
                 ring.push_back(pk.sys);
             }
         }
-        // LC1 predictive pre-loading: record the A→B edge on every
-        // successful serve (router pseudo-model excluded — it has no
+        // LC1 predictive pre-loading: record the A->B edge on every
+        // successful serve (router pseudo-model excluded - it has no
         // model identity of its own).
         if name != ROUTER_KEY && result.is_ok() {
             self.note_transition(name);
@@ -3072,14 +3072,14 @@ impl Supervisor {
         result
     }
 
-    /// `ensure` for requests that carry images — the mmproj lazy-attach
+    /// `ensure` for requests that carry images - the mmproj lazy-attach
     /// path. Policy (same resolution as the profile compiler's rule 19):
-    /// `attach` → plain `ensure_routed` (projector already on the
-    /// spawn); `skip` → loud teaching error (vision is OFF by config,
-    /// never a silent 404); `lazy` → serve any live projector sibling
+    /// `attach` -> plain `ensure_routed` (projector already on the
+    /// spawn); `skip` -> loud teaching error (vision is OFF by config,
+    /// never a silent 404); `lazy` -> serve any live projector sibling
     /// of the same base model, else spawn the projector variant under a
     /// `@vision` key: projector-less live siblings of the same base are
-    /// evicted first (the projector costs ~1.1 GiB measured VRAM —
+    /// evicted first (the projector costs ~1.1 GiB measured VRAM -
     /// keeping both children of one model is double-loading), then the
     /// KV bank carries the conversation across the respawn.
     pub async fn ensure_vision(
@@ -3088,7 +3088,7 @@ impl Supervisor {
         prefix: Option<PrefixKey>,
     ) -> Result<EngineRef, SupervisionError> {
         if self.config.router && name != ROUTER_KEY {
-            // router child is forced-attach (preset loop) — plain path
+            // router child is forced-attach (preset loop) - plain path
             return Box::pin(self.ensure_routed(name, prefix)).await;
         }
         let policy =
@@ -3098,7 +3098,7 @@ impl Supervisor {
                 Box::pin(self.ensure_routed(name, prefix)).await
             }
             blazar_core::config::MmprojPolicy::Skip => Err(SupervisionError::Internal(anyhow!(
-                "vision disabled: mmproj = skip spawns {name} text-only — set \
+                "vision disabled: mmproj = skip spawns {name} text-only - set \
                  mmproj = true (or \"lazy\") to serve images"
             ))),
             blazar_core::config::MmprojPolicy::Lazy => {
@@ -3127,11 +3127,11 @@ impl Supervisor {
                     return Ok(self.engine_ref(&serve_key, &inst));
                 }
                 // (b) respawn WITH projector: drop the text-only sibling
-                // first (VRAM honesty — never two children of one model)
+                // first (VRAM honesty - never two children of one model)
                 for k in &text_sibs {
                     tracing::warn!(
                         target: "blazar::supervisor",
-                        "mmproj lazy: vision request for {name} — respawning \
+                        "mmproj lazy: vision request for {name} - respawning \
                          text-only instance {k} with the projector (KV bank \
                          carries the conversation)"
                     );
@@ -3155,7 +3155,7 @@ impl Supervisor {
     /// ambiguous, and absent-on-disk rows teach byte-identically to the
     /// variant-child lane. A resident base child spawned before any
     /// adapter was attached (no `--enable-lora` in its argv) cannot
-    /// serve variants — it is evicted first and the ensure that follows
+    /// serve variants - it is evicted first and the ensure that follows
     /// respawns with every row adapter attached (same respawn contract
     /// as the lazy-projector path; the KV bank carries the
     /// conversation). `Ok(false)` = any other engine, or a routing pick
@@ -3171,7 +3171,7 @@ impl Supervisor {
             Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
         let Ok(Some(row)) = store.get_model(base) else {
             // Unknown base: the spawn path delivers the resolver's own
-            // teaching (candidates list) — do not shadow it here.
+            // teaching (candidates list) - do not shadow it here.
             return Ok(false);
         };
         let overlay = self.config.overlay_for(base);
@@ -3201,7 +3201,7 @@ impl Supervisor {
         for key in &stale {
             tracing::info!(
                 model = base,
-                "lora variant +{stem} requested — respawning adapter-less instance \
+                "lora variant +{stem} requested - respawning adapter-less instance \
                  {key} to attach adapters (one child serves base and variants)"
             );
             self.evict(key).await.map_err(|e| {
@@ -3212,7 +3212,7 @@ impl Supervisor {
     }
 
     /// Adapter paths baked into a llama.cpp spawn argv, in flag order
-    /// (`--lora PATH`, `--lora-scaled PATH:SCALE` — single colon-joined
+    /// (`--lora PATH`, `--lora-scaled PATH:SCALE` - single colon-joined
     /// token per blazar's own profile compiler). This order IS the
     /// engine's adapter-id namespace: `POST /lora-adapters` and the
     /// per-request `lora` body field address adapters by argv index.
@@ -3227,7 +3227,7 @@ impl Supervisor {
                 }
                 "--lora-scaled" => {
                     let raw = argv[i + 1].as_str();
-                    // `PATH:SCALE` — split on the LAST colon so Windows
+                    // `PATH:SCALE` - split on the LAST colon so Windows
                     // drive-letter paths never lose their prefix.
                     let path = match raw.rsplit_once(':') {
                         Some((p, scale)) if scale.parse::<f64>().is_ok() => p,
@@ -3265,12 +3265,12 @@ impl Supervisor {
     /// Post-spawn wire-contract probe for adapter-bearing llama.cpp
     /// children: GET /lora-adapters and verify the entries carry the
     /// fields the `LoRA` lanes of `blazar` read (`id`, `scale`, and a file
-    /// key — `path` on b11982+, `name` on older builds) and that the child
+    /// key - `path` on b11982+, `name` on older builds) and that the child
     /// lists one adapter per spawn-loaded `--lora` path. Upstream field
     /// renames would otherwise surface far from the cause as a permanent
     /// "not loaded on the resident" teaching (live-caught 2026-10-29:
-    /// b11982 renamed `name` → `path`); this warn names the drift on the
-    /// spawn that produced it. Best-effort observability only — a child
+    /// b11982 renamed `name` -> `path`); this warn names the drift on the
+    /// spawn that produced it. Best-effort observability only - a child
     /// that answers oddly is REPORTED, never failed or blocked.
     async fn llamacpp_lora_contract_probe(
         endpoint: &Endpoint,
@@ -3316,7 +3316,7 @@ impl Supervisor {
         let Some(entries) = body.as_array() else {
             tracing::warn!(
                 target: "blazar::lora",
-                "lora contract probe: /lora-adapters returned a non-array body — contract drift? keys: {:?}",
+                "lora contract probe: /lora-adapters returned a non-array body - contract drift? keys: {:?}",
                 body.as_object().map(|o| o.keys().collect::<Vec<_>>())
             );
             return;
@@ -3333,7 +3333,7 @@ impl Supervisor {
                 tracing::warn!(
                     target: "blazar::lora",
                     "lora contract probe: /lora-adapters entry lacks the expected fields \
-                     (id: int, scale: number, path|name: string) — contract drift? entry: {e}"
+                     (id: int, scale: number, path|name: string) - contract drift? entry: {e}"
                 );
                 return;
             }
@@ -3342,7 +3342,7 @@ impl Supervisor {
             tracing::warn!(
                 target: "blazar::lora",
                 "lora contract probe: child lists {} adapter(s) for {} spawn-loaded --lora \
-                 path(s) — possible attach shortfall; GET entries: {}",
+                 path(s) - possible attach shortfall; GET entries: {}",
                 entries.len(),
                 expected.len(),
                 Self::llamacpp_loaded_set_brief(
@@ -3367,7 +3367,7 @@ impl Supervisor {
     /// generation surfaces: the engine applies `LoRA` adapters PER REQUEST
     /// (body field `lora: [{id, scale}]`, cache-aware per slot), so a
     /// dense child with every store row spawn-attached serves both base
-    /// and `base+stem` traffic — the dedicated variant child would
+    /// and `base+stem` traffic - the dedicated variant child would
     /// re-load the full base weights a second time. Residents whose
     /// argv adapter set drifted from the store rows (adapter-less dense
     /// child, a legacy dedicated variant child, rows added/removed
@@ -3384,11 +3384,11 @@ impl Supervisor {
             Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
         let Ok(Some(row)) = store.get_model(base) else {
             // Unknown base: the spawn path delivers the resolver's own
-            // teaching (candidates list) — do not shadow it here.
+            // teaching (candidates list) - do not shadow it here.
             return Ok(false);
         };
         let overlay = self.config.overlay_for(base);
-        // `Ok(None)` folds three cases — empty roster, manual mode, and
+        // `Ok(None)` folds three cases - empty roster, manual mode, and
         // auto picking the already-active lane (for a GGUF model on the
         // default llamacpp daemon that is llamacpp itself, the single
         // most common production shape). Only a routed llamacpp pick,
@@ -3403,7 +3403,7 @@ impl Supervisor {
                         .is_ok_and(|rows| rows.iter().any(|e| e.kind == EngineKind::LlamaCpp))
             }
             // A bad pin or an unserved format: the spawn will teach
-            // about it — legacy variant-child behavior.
+            // about it - legacy variant-child behavior.
             Err(_) => false,
         };
         if !routed_llamacpp {
@@ -3415,7 +3415,7 @@ impl Supervisor {
         Self::resolve_lora_lane(&rows, base, Some(stem))?;
         // Consolidate: every llama.cpp resident of this base whose argv
         // adapter set does not match the CURRENT store rows gets evicted
-        // (collect first — the dashmap shard read-ref must never live
+        // (collect first - the dashmap shard read-ref must never live
         // across `evict`'s await points). The respawn attaches all rows,
         // and the gateway's per-request stamp selects the stem on it.
         let want: std::collections::BTreeSet<String> =
@@ -3437,7 +3437,7 @@ impl Supervisor {
         for key in &stale {
             tracing::info!(
                 model = base,
-                "lora variant +{stem} requested — respawning drifted-adapter instance \
+                "lora variant +{stem} requested - respawning drifted-adapter instance \
                  {key} to attach the current store rows (one child serves base and \
                  variants)"
             );
@@ -3467,13 +3467,13 @@ impl Supervisor {
     ) -> Result<String, String> {
         use blazar_core::engine_kind::EngineKind;
         let mut target: Option<(blazar_core::Endpoint, Option<String>, String)> = None;
-        // llama.cpp lane capture: (endpoint, auth, key, argv) — the
+        // llama.cpp lane capture: (endpoint, auth, key, argv) - the
         // reconcile below needs the spawn argv to know which adapter
         // files the child actually loaded.
         let mut llama_target: Option<(blazar_core::Endpoint, Option<String>, String, Vec<String>)> =
             None;
         let mut deferred = String::from(
-            "model not resident — the next spawn attaches the store row automatically",
+            "model not resident - the next spawn attaches the store row automatically",
         );
         for entry in &self.instances {
             if model_of_key(entry.key()) != model {
@@ -3493,7 +3493,7 @@ impl Supervisor {
             }
             if inst.kind != EngineKind::Sglang {
                 deferred = format!(
-                    "resident {} child bakes adapters into its spawn argv — the next \
+                    "resident {} child bakes adapters into its spawn argv - the next \
                      respawn attaches the store row",
                     inst.kind.as_str()
                 );
@@ -3501,7 +3501,7 @@ impl Supervisor {
             }
             if !inst.argv.windows(2).any(|w| w[0] == "--enable-lora") {
                 deferred = format!(
-                    "resident child {key} predates adapters (no --enable-lora) — \
+                    "resident child {key} predates adapters (no --enable-lora) - \
                      `blazar stop {model}` then re-request attaches them now",
                     key = entry.key()
                 );
@@ -3518,7 +3518,7 @@ impl Supervisor {
         // /lora-adapters reconciles scales over the loaded set by argv
         // index (ids absent from the body deactivate to 0.0). GET first
         // to map each loaded path to its engine id, then POST every
-        // store row that is loaded, at its row scale — the dense-spawn
+        // store row that is loaded, at its row scale - the dense-spawn
         // posture, without a respawn.
         if target.is_none()
             && let Some((endpoint, auth, key, argv)) = llama_target
@@ -3526,7 +3526,7 @@ impl Supervisor {
             let loaded = Self::llamacpp_argv_lora_paths(&argv);
             if loaded.is_empty() {
                 return Ok(format!(
-                    "resident llamacpp child {key} was spawned without adapters — \
+                    "resident llamacpp child {key} was spawned without adapters - \
                      `blazar stop {model}` then re-request attaches the store rows now"
                 ));
             }
@@ -3586,7 +3586,7 @@ impl Supervisor {
             });
             if attach && !requested_loaded {
                 return Ok(format!(
-                    "resident llamacpp child {key} cannot hot-load new adapter files — \
+                    "resident llamacpp child {key} cannot hot-load new adapter files - \
                      llama.cpp bakes them into the spawn; `blazar stop {model}` then \
                      re-request attaches the row now (resident loaded set: {})",
                     Self::llamacpp_loaded_set_brief(&ids)
@@ -3594,7 +3594,7 @@ impl Supervisor {
             }
             if !attach && !requested_loaded {
                 return Ok(format!(
-                    "adapter {lora_name} not loaded on resident {key} — nothing to detach \
+                    "adapter {lora_name} not loaded on resident {key} - nothing to detach \
                      (resident loaded set: {})",
                     Self::llamacpp_loaded_set_brief(&ids)
                 ));
@@ -3729,10 +3729,10 @@ impl Supervisor {
         *self.transitions.entry(edge).or_insert(0) += 1;
     }
 
-    /// LC1 negative feedback: halve every (prev → model) transition
+    /// LC1 negative feedback: halve every (prev -> model) transition
     /// count, dropping edges that fall to zero. Called only when a
     /// predictively-preloaded model reaches eviction without a single
-    /// serve — the prediction was falsified, so the graph must learn.
+    /// serve - the prediction was falsified, so the graph must learn.
     /// Halving (not clearing) lets a genuinely alternating workflow
     /// re-earn its preload on the next serve while a dead pattern fades
     /// out over a couple of idle ladders instead of resurrecting the
@@ -3756,9 +3756,9 @@ impl Supervisor {
 
     /// Pick the instance key for a request: `"model"` when
     /// `replicas <= 1` (byte-identical legacy), else `"model#N"`.
-    /// Order: prefix affinity → new-conversation grows a fresh replica
-    /// (own KV cache) → anonymous traffic reuses an idle live replica,
-    /// else grows while all live are busy → least-loaded existing anyway
+    /// Order: prefix affinity -> new-conversation grows a fresh replica
+    /// (own KV cache) -> anonymous traffic reuses an idle live replica,
+    /// else grows while all live are busy -> least-loaded existing anyway
     /// (join its queue).
     fn replica_key(&self, name: &str, prefix: Option<PrefixKey>) -> String {
         if name == ROUTER_KEY {
@@ -3773,7 +3773,7 @@ impl Supervisor {
         if replicas <= 1 {
             return name.to_string();
         }
-        // (a) Sticky prefix: same conversation → same warm cache.
+        // (a) Sticky prefix: same conversation -> same warm cache.
         if let Some(pk) = prefix
             && let Some(hit) = self.prefix_affinity.get(&pk.convo)
         {
@@ -3788,7 +3788,7 @@ impl Supervisor {
         }
         // (b) Scan live replicas: least-loaded + highest replica index.
         // F8: while scanning, also score replicas that recently served the
-        // same `sys` prefix class — a new conversation sharing the system
+        // same `sys` prefix class - a new conversation sharing the system
         // prompt coalesces onto the replica that already holds that KV.
         let mut best: Option<(String, i64)> = None;
         let mut scored: Option<(String, i64)> = None;
@@ -3820,14 +3820,14 @@ impl Supervisor {
             }
         }
         // (a2) Cache-aware coalesce: same system-prompt class, new
-        // conversation → the replica holding that prefix absorbs it
+        // conversation -> the replica holding that prefix absorbs it
         // instead of growing a cold child.
         if let Some((key, _)) = scored {
             return key;
         }
         match (best, prefix.is_some()) {
             // A NEW conversation (prefix present, unpinned): give it its
-            // own cold cache rather than polluting another replica's —
+            // own cold cache rather than polluting another replica's -
             // grow first, fall back to least-loaded at capacity.
             (Some(best), true) => {
                 if max_idx < replicas {
@@ -3835,7 +3835,7 @@ impl Supervisor {
                 }
                 return best.0;
             }
-            // Anonymous traffic: an IDLE live replica absorbs it —
+            // Anonymous traffic: an IDLE live replica absorbs it -
             // sequential single-user traffic never spawns a second child.
             (Some((key, load)), false) if load <= 0 => return key,
             // Anonymous + every live replica busy: scale out first so
@@ -3878,7 +3878,7 @@ impl Supervisor {
     /// request fails at the transport layer (child died mid-request),
     /// `proxy` re-ensures this exact lane detached and retries the
     /// forward once against the fresh child. Callers inside a request
-    /// future MUST detach (`tokio::spawn` + await) — see the
+    /// future MUST detach (`tokio::spawn` + await) - see the
     /// `ensure_detached` contract in `crate::proxy`.
     pub async fn ensure_key(&self, key: &str) -> Result<EngineRef, SupervisionError> {
         self.ensure_key_opts(key, false).await
@@ -3886,7 +3886,7 @@ impl Supervisor {
 
     /// Captive ensure: a load that must never evict resident models to
     /// make room for itself. Under admission pressure the spawn refuses
-    /// (`AllSlotsBusy`) instead of selecting a victim — callers treat
+    /// (`AllSlotsBusy`) instead of selecting a victim - callers treat
     /// that as "side load skipped", not a hard failure. The fast paths
     /// (resident instance, in-flight load join) are identical to
     /// [`Self::ensure_key`].
@@ -3899,7 +3899,7 @@ impl Supervisor {
         key: &str,
         captive: bool,
     ) -> Result<EngineRef, SupervisionError> {
-        // Fast path: running (or sleeping — the child wakes on traffic).
+        // Fast path: running (or sleeping - the child wakes on traffic).
         if let Some(inst) = self.instances.get(key) {
             let snapshot = (
                 *inst.state.read().expect("state lock"),
@@ -3961,7 +3961,7 @@ impl Supervisor {
         self.loading.insert(key.to_string(), notify.clone());
         // Cancellation safety: if THIS loader future is dropped before the
         // completion protocol below runs (the caller went away), parked
-        // waiters would sleep forever on a Notify that never fires —
+        // waiters would sleep forever on a Notify that never fires -
         // live-repro'd wedge (client timeout during cold spawn wedged every
         // later generate). The gateway detaches its loads, so this guard is
         // defense in depth for any other caller that can be dropped.
@@ -3999,7 +3999,7 @@ impl Supervisor {
 /// with NO CUDA engine installed is leaving ~18% first-token latency on
 /// the table (live-measured, BENCHMARK.md 2026-09-11). Upstream ships no
 /// Linux CUDA prebuilts, so the auto-overlay cannot fix this until the
-/// overlay repo publishes — the in-tree build can, today. Once per
+/// overlay repo publishes - the in-tree build can, today. Once per
 /// process; the dethrone guard in `register_engine_with_vendor` keeps an
 /// installed CUDA engine from being silently replaced later.
 fn advise_cuda_build(store: &Store, active: &blazar_core::store::EngineRow) {
@@ -4026,7 +4026,7 @@ fn advise_cuda_build(store: &Store, active: &blazar_core::store::EngineRow) {
     }
     ADVISED.store(true, Ordering::Relaxed);
     tracing::warn!(
-        "NVIDIA GPU with a Vulkan-only llama.cpp engine active — CUDA is ~18% faster on \
+        "NVIDIA GPU with a Vulkan-only llama.cpp engine active - CUDA is ~18% faster on \
          first token here; build it once with: blazar engine build cuda"
     );
 }
@@ -4073,7 +4073,7 @@ impl Supervisor {
     /// Mint a per-child auth secret (child `--api-key` hardening).
     /// `--api-key-file` is the only private lane: the secret lives in a
     /// 0600 run-dir file, never on the child's `/proc` cmdline. An
-    /// argv-only engine gets NO mint — `/proc/<pid>/cmdline` is
+    /// argv-only engine gets NO mint - `/proc/<pid>/cmdline` is
     /// world-readable, so `--api-key <secret>` guards nothing while
     /// exposing the secret to every local process. Engines with
     /// neither flag warn-skip (same contract as every other
@@ -4103,7 +4103,7 @@ impl Supervisor {
                     "; run: blazar engine install --kind mistralrs"
                 }
                 blazar_core::engine_kind::EngineKind::SdCpp => {
-                    "; sd-server ships no auth flag upstream — the child is loopback-only"
+                    "; sd-server ships no auth flag upstream - the child is loopback-only"
                 }
                 _ => "; run: blazar engine update",
             };
@@ -4119,7 +4119,7 @@ impl Supervisor {
             // Only the argv flag exists. /proc/<pid>/cmdline is
             // world-readable on stock Linux, so `--api-key <secret>`
             // guards nothing while leaking the mint to every local
-            // process. Refuse the pretend lane — the boundary stays
+            // process. Refuse the pretend lane - the boundary stays
             // 127.0.0.1 + a random port, identical to engines with no
             // auth flag surface. A future engine update gaining
             // --api-key-file flips this to the keyfile lane with no
@@ -4127,7 +4127,7 @@ impl Supervisor {
             tracing::info!(
                 model = key,
                 "child_auth: engine {} offers only --api-key (world-readable via /proc \
-                 cmdline) — no mint; child boundary stays loopback + random port",
+                 cmdline) - no mint; child boundary stays loopback + random port",
                 manifest.tag
             );
             return Ok(None);
@@ -4163,7 +4163,7 @@ impl Supervisor {
     /// Router-mode spawn: ONE child, no `-m`, `--models-preset` INI
     /// generated from every loadable store model. Models whose GGUF
     /// metadata or manifest-gated profile fail to compile are SKIPPED
-    /// with a warning — one bad model must not take the router down.
+    /// with a warning - one bad model must not take the router down.
     #[allow(clippy::too_many_lines)]
     async fn spawn_router_instance(&self) -> Result<EngineRef, SupervisionError> {
         let store =
@@ -4183,7 +4183,7 @@ impl Supervisor {
                 )
             } else {
                 format!(
-                    "router mode is llama-server-only; engine {} is {} — switch with \
+                    "router mode is llama-server-only; engine {} is {} - switch with \
                      `blazar engine use <llamacpp-tag>` (see `blazar engine list`)",
                     manifest.tag,
                     self.engine.kind()
@@ -4215,11 +4215,11 @@ impl Supervisor {
             // must not silently drop catalog-paired models with a false
             // "not pulled" error. Router mode has no per-request spec
             // (the gateway rejects options.spec there), so resolution
-            // is overlay → config only.
+            // is overlay -> config only.
             let mut spec_mode = resolve_spec_mode(None, overlay.spec.clone(), &self.config.spec);
             // F2 evidence consult: a `tune --spec-race` measurement on
             // this exact hardware beats the heuristic chain, but only
-            // at the auto tier — explicit pins above stay immune.
+            // at the auto tier - explicit pins above stay immune.
             if spec_mode == "auto"
                 && let Ok(receipts) = store.list_spec_receipts(&m.name, &manifest.tag)
             {
@@ -4277,7 +4277,7 @@ impl Supervisor {
                 mmproj_path: m.mmproj_path.as_deref(),
                 components: &component_args(&m.components),
                 // router preset: every pulled model rides one child incl
-                // VL rows — force the projector on regardless of policy
+                // VL rows - force the projector on regardless of policy
                 mmproj_force: true,
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
@@ -4287,7 +4287,7 @@ impl Supervisor {
                     port: 0,
                 },
                 data_dir: &data_dir_str,
-                // Router child serves N models — the merged global hint is
+                // Router child serves N models - the merged global hint is
                 // the only meaningful granularity here.
                 cache_hit_rate: self.cache_hint.get(),
                 resident_ram_mib: self
@@ -4392,7 +4392,7 @@ impl Supervisor {
                 }
             }
             argv.extend(["--models-preset".into(), ini_path.display().to_string()]);
-            // NOTE: no front-level --slot-save-path — a CLI value cascades
+            // NOTE: no front-level --slot-save-path - a CLI value cascades
             // to model children and would OVERRIDE their per-model INI
             // paths (verified live). Sessions stay per-model via the INI.
             if self.config.router_max_models > 0 {
@@ -4422,7 +4422,7 @@ impl Supervisor {
             }
             self.remap_device_argv(&mut argv, ROUTER_KEY).await;
             // Router spawn is single-process by construction: no
-            // sharding, no pinning — empty per-spawn env.
+            // sharding, no pinning - empty per-spawn env.
             let mut child = self
                 .engine
                 .spawn(&argv, &endpoint, &[])
@@ -4472,7 +4472,7 @@ impl Supervisor {
                         in_flight: AtomicI64::new(0),
                         keep_until: std::sync::RwLock::new(None),
                         started_at: Instant::now(),
-                        // router serves EVERY pulled model incl VL rows —
+                        // router serves EVERY pulled model incl VL rows -
                         // the preset compile forces attach, so reflect it
                         projector: argv.windows(2).any(|w| w[0] == "-mm" || w[0] == "--mmproj"),
                         argv,
@@ -4535,11 +4535,11 @@ impl Supervisor {
 
     /// Race the health poll against child liveness: a child that dies
     /// mid-load must fail the spawn IMMEDIATELY, carrying its last output
-    /// lines — never keep polling a corpse for the full `model_load_timeout`
+    /// lines - never keep polling a corpse for the full `model_load_timeout`
     /// (mislabeling an instant crash as a slow model load).
     /// Returns the health result plus `true` when the failure is child death.
     ///
-    /// The engine passed in is the one that SPAWNED the child — for a
+    /// The engine passed in is the one that SPAWNED the child - for a
     /// routed spawn that is the target lane's adapter, not the daemon's
     /// global engine. Health contracts are engine-specific (llamacpp
     /// answers `{"status":"ok"}`; sglang answers a bare 200 with an
@@ -4583,7 +4583,7 @@ impl Supervisor {
     /// Map `--device` names in argv from manifest-era (install-context)
     /// names to the names the SERVING child context enumerates. The two
     /// enumerations can differ (install ran from a shell; serving spawns
-    /// from the daemon) and the child is the authority — a name it does
+    /// from the daemon) and the child is the authority - a name it does
     /// not accept is fatal to it. Name still enumerated: keep. Same
     /// device re-enumerated under a different name: rewrite (identity =
     /// vendor/description overlap + `total_mib` proximity). No live
@@ -4663,8 +4663,8 @@ impl Supervisor {
         *argv = mapped;
     }
 
-    /// One cohesive spawn path (model load → profile → capacity → spawn →
-    /// health → track); splitting it would thread six one-use locals.
+    /// One cohesive spawn path (model load -> profile -> capacity -> spawn ->
+    /// health -> track); splitting it would thread six one-use locals.
     #[allow(clippy::too_many_lines)]
     /// Spawn by INSTANCE key (`model` or `model#N`, B1): everything
     /// user-facing resolves through `model_of_key`, everything
@@ -4698,11 +4698,11 @@ impl Supervisor {
         let adapter_for = |row: &blazar_core::store::EngineRow| -> Option<Arc<dyn Engine>> {
             // The audio lane is gateway-owned and lazy: it never enters
             // the supervised model-serving roster. A whisper row reaching
-            // here means routing surfaced it — log the surface bug
+            // here means routing surfaced it - log the surface bug
             // loudly and treat the row as non-serving.
             if row.kind.is_lazy_lane() {
                 tracing::error!(
-                    "{} engine row reached the supervised-adapter path — the audio lane serves lazily through the /v1/audio endpoints; treating it as non-serving",
+                    "{} engine row reached the supervised-adapter path - the audio lane serves lazily through the /v1/audio endpoints; treating it as non-serving",
                     row.kind
                 );
                 return None;
@@ -4782,7 +4782,7 @@ impl Supervisor {
                             model = %model.name,
                             tag = %tag,
                             coverer = %coverer,
-                            "capability pin dropped — the rescued architectures now ship in a mainstream lane; routing normally"
+                            "capability pin dropped - the rescued architectures now ship in a mainstream lane; routing normally"
                         );
                     } else if let Some(adapter) = adapter_for(row) {
                         tracing::info!(
@@ -4800,13 +4800,13 @@ impl Supervisor {
                     tracing::warn!(
                         model = %model.name,
                         tag = %tag,
-                        "capability pin target no longer installed — routing normally"
+                        "capability pin target no longer installed - routing normally"
                     );
                 }
             }
         }
 
-        // Shared decision (core `serving_lane`) — the gateway consults
+        // Shared decision (core `serving_lane`) - the gateway consults
         // the SAME function to predict the serving lane for per-child
         // protocol quirks, so supervisor and gateway can never disagree.
         // Lane class carries fork provenance so a capability shim never
@@ -4838,7 +4838,7 @@ impl Supervisor {
         };
         let row = rows.iter().find(|r| r.tag == tag).ok_or_else(|| {
             format!(
-                "routing picked {tag:?} but its row vanished — roster: {}",
+                "routing picked {tag:?} but its row vanished - roster: {}",
                 roster()
             )
         })?;
@@ -4846,7 +4846,7 @@ impl Supervisor {
             .map(|a| Some((a, row.tag.clone())))
             .ok_or_else(|| {
                 format!(
-                    "engine {tag:?}: manifest undecodable — reinstall it (blazar engine install)"
+                    "engine {tag:?}: manifest undecodable - reinstall it (blazar engine install)"
                 )
             })
     }
@@ -4855,7 +4855,7 @@ impl Supervisor {
     /// disk: a row adopted mid-download froze a partial size and
     /// reconcile only heals at boot, while engine updates and manual
     /// copies can change a dir between boots. Measurement is an accuracy
-    /// upgrade, never a refusal — unreadable/empty dirs fall back to the
+    /// upgrade, never a refusal - unreadable/empty dirs fall back to the
     /// stored row bytes. File rows (GGUF, mmproj) pass through as-is.
     fn measured_model_bytes(model: &ModelRow) -> u64 {
         let row_bytes = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX);
@@ -4869,7 +4869,7 @@ impl Supervisor {
                     model = %model.name,
                     row_bytes,
                     measured,
-                    "dir row bytes drifted from disk — planning on measured bytes \
+                    "dir row bytes drifted from disk - planning on measured bytes \
                      (reconcile rewrites the row at next boot)"
                 );
                 measured
@@ -4886,7 +4886,7 @@ impl Supervisor {
     /// `anonymizer-1.7b` addresses the whole name) or by STEM
     /// shorthand (`anonymizer-1`); unknown or duplicated
     /// suffixes are teaching errors, never silent drops. A resolved row
-    /// whose adapter vanished from disk is likewise refused here —
+    /// whose adapter vanished from disk is likewise refused here -
     /// passing it downstream would surface as an engine-side load
     /// failure (child crash-loop), not a repairable message.
     fn resolve_lora_lane(
@@ -4917,7 +4917,7 @@ impl Supervisor {
                     many => {
                         let ids: Vec<i64> = many.iter().map(|l| l.id).collect();
                         return Err(SupervisionError::ModelNotFound(format!(
-                            "lora {stem:?} on {name:?} is ambiguous (rows {ids:?}) — \
+                            "lora {stem:?} on {name:?} is ambiguous (rows {ids:?}) - \
                              `blazar lora rm <id>` the duplicates"
                         )));
                     }
@@ -4927,7 +4927,7 @@ impl Supervisor {
         for l in &resolved {
             if !std::path::Path::new(&l.path).exists() {
                 return Err(SupervisionError::ModelNotFound(format!(
-                    "lora {} (row #{}) attached to {name:?} is missing on disk — \
+                    "lora {} (row #{}) attached to {name:?} is missing on disk - \
                      re-download the adapter or `blazar lora rm {}` the row",
                     l.path, l.id, l.id
                 )));
@@ -4955,7 +4955,7 @@ impl Supervisor {
     }
 
     /// `spawn_instance` with the capability-rescue bound: `true` means
-    /// this spawn IS already the single unknown-architecture re-route —
+    /// this spawn IS already the single unknown-architecture re-route -
     /// classification still informs the error teaching, but a second
     /// re-route never happens (one rescue per spawn, however many
     /// in-spawn retries run).
@@ -4988,8 +4988,8 @@ impl Supervisor {
         // Engine routing v1: per-model pin (overlay `engine`, tag or
         // kind) > auto-format route (mode = "auto") > the daemon's
         // global engine (manual, byte-identical to no routing). A
-        // routed spawn builds a LOCAL adapter for the target row —
-        // adapters are cheap manifest+env structs — so the global
+        // routed spawn builds a LOCAL adapter for the target row -
+        // adapters are cheap manifest+env structs - so the global
         // active engine and its daemon-lifetime Arc stay untouched.
         // Co-residency on small cards is handled by the same VRAM
         // ladders that guard any multi-instance box.
@@ -5021,11 +5021,11 @@ impl Supervisor {
         })?;
         // Block-diffusion LLM GGUFs: the arch is mainline in llama.cpp's
         // loader, so llama-server boots the model instead of dying with
-        // the unknown-architecture error the capability rescue keys on —
+        // the unknown-architecture error the capability rescue keys on -
         // and its autoregressive loop then decodes garbage while the
         // child looks healthy. Refuse at the route decision with the
         // paradigm named. Only a FORK lane advertising the arch (when a
-        // diffusion-capable one ships) bypasses the guard — mainstream
+        // diffusion-capable one ships) bypasses the guard - mainstream
         // mined sets record loader support, which is the hazard itself.
         if let blazar_core::hfmeta::ModelMeta::Gguf(g) = meta_box.borrow_meta()
             && let Some(teach) = Self::diffusion_paradigm_block(
@@ -5042,7 +5042,7 @@ impl Supervisor {
         // shape as the diffusion guard above): `.packed` tensor names
         // in the repo's index mark custom research quant formats
         // (PolarQuant/EOQ-style) that only the repo's own Python
-        // loader can dequantize — every lane would die at weight load
+        // loader can dequantize - every lane would die at weight load
         // with an opaque engine error, so the gate refuses at the
         // route decision naming the evidence and the levers.
         if let blazar_core::hfmeta::ModelMeta::Hf(_) = meta_box.borrow_meta()
@@ -5054,7 +5054,7 @@ impl Supervisor {
                 model.path
             )));
         }
-        // SGLang lane admission (config facts that predict engine death —
+        // SGLang lane admission (config facts that predict engine death -
         // same teach-at-the-door pattern as the diffusion guard above): a
         // quant_method this build cannot load crashes the server during
         // weight load, and a vision-tower config without
@@ -5080,13 +5080,13 @@ impl Supervisor {
             lora_suffix_of_key(key),
         )?;
         // Draft resolution mirrors every other spawn path (router
-        // preset, CLI bench/tune): one shared resolver, catalog pair →
+        // preset, CLI bench/tune): one shared resolver, catalog pair ->
         // pulled store row. Compile-time freshness + manifest gates
         // live in profile::compile. A queued per-request spec
         // (`options.spec`) wins over overlay/config; consumed HERE,
         // before every loop in this fn, so retries never re-read it.
         // B2: the governor fills the default tier ONLY where the user
-        // left it unset — per-request > overlay > governor > config.
+        // left it unset - per-request > overlay > governor > config.
         // A pin anywhere permanently exempts the model (the governor
         // itself refuses to act on pinned models).
         let mut spec_mode = resolve_spec_mode(
@@ -5096,10 +5096,10 @@ impl Supervisor {
         );
         // F2 evidence consult: a `tune --spec-race` measurement on
         // this exact hardware beats the heuristic chain, but only at
-        // the auto tier — queued/overlay/governor pins above stay
+        // the auto tier - queued/overlay/governor pins above stay
         // immune, and without receipts the planner chain is unchanged.
         // Lane-aware draft classification needs the main model's own
-        // path (self-pair detection) — one cheap store read.
+        // path (self-pair detection) - one cheap store read.
         let main_path: Option<String> = store.get_model(name).ok().flatten().map(|r| r.path);
         if spec_mode == "auto" {
             let caps = engine.capabilities();
@@ -5142,7 +5142,7 @@ impl Supervisor {
         }
         // Draft header for the planner's device-KV charge (A15): the
         // spec pair allocates its own KV at the compiled ctx. An
-        // unreadable header degrades to dense-only with a warn — it
+        // unreadable header degrades to dense-only with a warn - it
         // must never block the spawn itself. sglang drafts are
         // safetensors dirs (eagle3 class): no GGUF header to read.
         let draft_gguf = if engine.kind() == blazar_core::engine_kind::EngineKind::Sglang {
@@ -5162,7 +5162,7 @@ impl Supervisor {
                 }
             })
         };
-        // Capacity: evict the COLDEST instance first — recency-weighted
+        // Capacity: evict the COLDEST instance first - recency-weighted
         // prefix heat (hot models keep their warm cache across capacity
         // pressure; the radix-lite lane), ties broken by longest-idle.
         // Pinned models (overlay `pin = true`, A13) are never victims:
@@ -5170,18 +5170,18 @@ impl Supervisor {
         // when everything live is pinned+busy the spawn fails loudly.
         // Gates: explicit `max_loaded_models` counts instances; auto on
         // GPU charges MEASURED resident footprints (settle report) plus
-        // the incoming model's admission floor — weights + projector +
+        // the incoming model's admission floor - weights + projector +
         // KV floor + spawn overhead, the same standing charges the
         // unified gpu-layers pin trusts (sglang lane: plus the engaged
         // draft pair and spec verify reserve, minus the host offload
         // the spawn actually runs with). Weights-only planning
         // oversubscribed an 8 GiB card on 2026-09-11 (measured 7302 +
-        // 977 actual vs 5854 weights-sum → NVRM NO_MEMORY crash-loop);
+        // 977 actual vs 5854 weights-sum -> NVRM NO_MEMORY crash-loop);
         // a cold box always admits one model, and the J3 spawn guard
         // owns the honest-refusal path for loads that cannot fit at all.
         // Parallelism-spanning preflight: will this spawn SHARD across
         // cards instead of landing on one? Per-card admission (and the
-        // ModelTooLarge per-card verdict) is then the wrong question —
+        // ModelTooLarge per-card verdict) is then the wrong question -
         // the summed pool is the honest denominator. Covers manual
         // sglang `tp_size`, manual llamacpp tensor-split / multi-device
         // pins, and the AUTO plans (sglang TP over census budgets,
@@ -5196,7 +5196,7 @@ impl Supervisor {
         // Admission floor for the incoming spawn, and the offload /
         // draft facts behind it. The sglang lane charges what the spawn
         // will ACTUALLY put on the GPU: standing floor + engaged draft
-        // weights + spec verify reserve − the host offload it runs with
+        // weights + spec verify reserve - the host offload it runs with
         // (pin or Tier C derive, the same math the argv emission uses).
         // Before 2026-10-16 both directions lied: a 4 GiB offload pin
         // was ignored (7.5 GiB model refused as an 8.7 GiB "impossible
@@ -5223,7 +5223,7 @@ impl Supervisor {
                     || {
                         tracing::warn!(
                             draft = p,
-                            "sglang draft dir unreadable at admission — charging dense-only"
+                            "sglang draft dir unreadable at admission - charging dense-only"
                         );
                         0
                     },
@@ -5293,7 +5293,7 @@ impl Supervisor {
                             && census_budgets.len() >= 2)))
                     .then(|| {
                         // Empty-box verdict: census budgets, not measured
-                        // free — matches largest_card_budget's discipline.
+                        // free - matches largest_card_budget's discipline.
                         plan_auto_tp(&census_budgets, incoming_bytes)
                     })
                     .flatten()
@@ -5307,7 +5307,7 @@ impl Supervisor {
                 // with --device-layers omitted the engine distributes
                 // layers itself (verified: `mistralrs serve --help`,
                 // "Omit for automatic device mapping"), and an uneven
-                // split is legal — so the summed pool is the criterion.
+                // split is legal - so the summed pool is the criterion.
                 (!sglang_lane
                     && engine.kind() == blazar_core::engine_kind::EngineKind::MistralRs
                     && census_budgets.len() >= 2)
@@ -5316,7 +5316,7 @@ impl Supervisor {
             });
         let spanning = spanning_ranks.is_some();
         // Per-spawn child env for SHARDING spawns only. Every
-        // non-spanning spawn gets an empty env — child env
+        // non-spanning spawn gets an empty env - child env
         // byte-identical to before this existed. Computed once per
         // spawn call (fresh probe), not per retry attempt. The Vulkan
         // path is llamacpp-only (its census names come from the
@@ -5337,11 +5337,11 @@ impl Supervisor {
         // child's placement pool extends beyond the local census, so the
         // fit verdicts below must judge the whole pool. Upstream
         // distributes across local+remote devices by its own free-memory
-        // ordering — RPC devices register FIRST in the tensor-split
-        // mapping (live-verified at engine b11429) — so Blazar judges
+        // ordering - RPC devices register FIRST in the tensor-split
+        // mapping (live-verified at engine b11429) - so Blazar judges
         // FIT but never emits cross-fleet split ratios. Queried once
         // per spawn attempt, concurrently; a worker unreachable here is
-        // skipped with a warn (its VRAM simply doesn't count) — the
+        // skipped with a warn (its VRAM simply doesn't count) - the
         // spawn preflight owns the loud refusal if it is still down
         // when the child launches.
         let rpc_configured = engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp
@@ -5362,7 +5362,7 @@ impl Supervisor {
             tracing::warn!(
                 model = name,
                 worker = %why,
-                "rpc worker unreachable at spawn planning — its VRAM is not counted"
+                "rpc worker unreachable at spawn planning - its VRAM is not counted"
             );
         }
         loop {
@@ -5382,7 +5382,7 @@ impl Supervisor {
                 }
                 BlockedAction::Refuse => {
                     // Split the old conflation: an incoming floor larger
-                    // than every card is physically unschedulable — no
+                    // than every card is physically unschedulable - no
                     // queue wait can ever change it, so refuse fast with
                     // numbers. Genuinely-evictable pressure keeps the
                     // queueable AllSlotsBusy. A SHARDING or RPC-FLEET
@@ -5415,7 +5415,7 @@ impl Supervisor {
                         };
                         return Err(SupervisionError::ModelTooLarge(format!(
                             "{name}: admission floor {:.1} GiB{} exceeds {}{} \
-                             even with the box empty — waiting for a slot can never change \
+                             even with the box empty - waiting for a slot can never change \
                              this. Use a smaller quant (`blazar fit`), lower the ctx/slots, \
                              or serve on a larger card",
                             gib(incoming_bytes),
@@ -5442,7 +5442,7 @@ impl Supervisor {
         }
 
         // Spawn-time memory guard (J3): below a hard floor the mmap
-        // engine will thrash swap for minutes instead of loading — fail
+        // engine will thrash swap for minutes instead of loading - fail
         // fast with a named error. Floor = half the model + 512 MiB
         // (zero-false-positive: mmap streaming needs roughly that
         // resident even in the best case) PLUS the sglang host offload:
@@ -5482,8 +5482,8 @@ impl Supervisor {
             None
         };
         // Spawn-time VRAM preflight (J3): warn when even the weights
-        // the spawn keeps ON the GPU exceed free VRAM — for the sglang
-        // lane that is weights + draft pair − host offload, the same
+        // the spawn keeps ON the GPU exceed free VRAM - for the sglang
+        // lane that is weights + draft pair - host offload, the same
         // posture admission judged (raw weights would cry wolf on every
         // offloaded spawn). Teaching warn only: partial offload is
         // legitimate, probe failure is skipped, never blocks a spawn.
@@ -5509,7 +5509,7 @@ impl Supervisor {
                     model = name,
                     weights_mib,
                     free_vram_mib = free_vram,
-                    "model weights exceed free VRAM at spawn time — the engine will spill \
+                    "model weights exceed free VRAM at spawn time - the engine will spill \
                          layers to CPU (slow) or fail mid-load; consider a smaller quant \
                          (blazar fit), freeing GPU memory (blazar ps), or kv quantization"
                 );
@@ -5518,10 +5518,10 @@ impl Supervisor {
         // Auto GPU bin-packing (LC2): with several cards and no manual
         // `devices` choice, place the child on the DISCRETE card with the
         // most free VRAM (integrated GPUs report shared-RAM "free" as if
-        // it were dedicated — a bandwidth-starved trap; they serve only
+        // it were dedicated - a bandwidth-starved trap; they serve only
         // when no discrete card exists) and scope every downstream VRAM
         // estimate (ngl ladder, KV, cache-ram, coresidency) to THAT card
-        // instead of the summed pool — a child lands on one card, not the
+        // instead of the summed pool - a child lands on one card, not the
         // sum. Manual overlay or global `devices` always wins; fail-open
         // (no pick on probe weirdness).
         let mut scoped_hw: Option<Hardware> = None;
@@ -5536,7 +5536,7 @@ impl Supervisor {
         // preflight used census budgets for its empty-box bypass).
         let mut auto_tp: Option<u32> = None;
         // sdcpp placement token (`--backend` module target, e.g.
-        // `Vulkan1`): deliberately NOT `picked_device` — that drives the
+        // `Vulkan1`): deliberately NOT `picked_device` - that drives the
         // census-keyed ledger id, and the engine's token vocabulary is a
         // different namespace from the system census names.
         let mut sd_backend_token: Option<String> = None;
@@ -5556,7 +5556,7 @@ impl Supervisor {
         // pending ctx uses; None keeps the profile heuristic (auto).
         tuning.fa = self.config.flash_attention;
         // D1 ubatch governor fills in ONLY where the user left the
-        // micro-batch ceiling unset (no config `ubatch_size` pin — the
+        // micro-batch ceiling unset (no config `ubatch_size` pin - the
         // governor itself refuses pinned models; nothing else sets
         // tuning.ubatch at spawn). Same shadowing contract as the LC4
         // adaptive-slots adoption above.
@@ -5594,7 +5594,7 @@ impl Supervisor {
                 // own key-derived force below for estimate honesty).
                 // Device-neutral too: this probe ladders KV without the
                 // CUDA symmetric-pair rule the spawn applies once a
-                // device is picked — the estimate errs toward MORE KV
+                // device is picked - the estimate errs toward MORE KV
                 // bytes (mixed 3/8 vs the spawn's q4_0 1/4), so capacity
                 // decisions stay conservative in that narrow window.
                 mmproj_force: key.ends_with("@vision"),
@@ -5636,7 +5636,7 @@ impl Supervisor {
             );
             auto_split = Some(ratios);
         }
-        // Auto tensor-parallelism (sglang): same last-resort posture —
+        // Auto tensor-parallelism (sglang): same last-resort posture -
         // every manual parallel pin unset, and the MEASURED pool says
         // weights+KV fit only when sharded across the discrete cards.
         // The profile ladder then plans per-rank and emits --tp-size.
@@ -5659,7 +5659,7 @@ impl Supervisor {
                 auto_tp = Some(tp);
             }
         }
-        // Spanning spawns cover every card by construction — a single
+        // Spanning spawns cover every card by construction - a single
         // -card pick would scope every downstream estimate wrongly.
         if wants_pick && !spanning {
             let hw = fresh.as_ref().unwrap_or(&self.hardware);
@@ -5699,7 +5699,7 @@ impl Supervisor {
                 }
             }
         }
-        // sdcpp placement vocabulary: sd-server has no --device flag —
+        // sdcpp placement vocabulary: sd-server has no --device flag -
         // its `--backend` names engine-side module assignments using the
         // engine's OWN device tokens (registration-time --list-devices
         // census, e.g. `Vulkan1` on a vulkan build). Resolve the token
@@ -5723,7 +5723,7 @@ impl Supervisor {
             picked_display = Some(display);
         }
         // Placement label for `ps` (`full@<card>`): auto-pick names its
-        // card above; cover the other placements — manual `devices`
+        // card above; cover the other placements - manual `devices`
         // (joined, a multi-card pin spans cards), single-GPU boxes (the
         // child lands on the only card), and auto tensor-split (spans
         // all discrete cards). Nulled for pure-CPU spawns at Instance
@@ -5751,7 +5751,7 @@ impl Supervisor {
         // Census-keyed placement id (the ledger + co-residency key):
         // auto-pick's backend id, a single manual `devices` pin, or the
         // lone card of a single-GPU box. Multi-card pins and tensor
-        // splits span devices — None routes them to the aggregate belt.
+        // splits span devices - None routes them to the aggregate belt.
         let placement_device_id = picked_device
             .clone()
             .or_else(|| {
@@ -5763,7 +5763,7 @@ impl Supervisor {
                 (hw.gpus.len() == 1).then(|| hw.gpus[0].name.clone())
             });
         // Reservation ledger (per-device admission): hold the incoming
-        // floor against the picked card from placement to insert — a
+        // floor against the picked card from placement to insert - a
         // concurrent spawn for another model must see this footprint in
         // admission BEFORE the child settles enough to join the resident
         // sum. The insert converts the reservation into a counted
@@ -5773,7 +5773,7 @@ impl Supervisor {
             .map(|d| self.reserve_device(d, incoming_bytes));
         // Re-check under the reservation: a concurrent spawn may have
         // reserved or inserted between the admission loop and the pick.
-        // The device load already carries this spawn's reservation —
+        // The device load already carries this spawn's reservation -
         // re-adding the incoming floor here would double-count it and
         // evict residents the placement actually fits (seen live: a
         // 6.6 GiB floor evicted a coexisting 0.7 GiB neighbor on a
@@ -5807,7 +5807,7 @@ impl Supervisor {
         let mut child_died_during_load = false;
         // Last dying child's log tail: the single most useful artifact
         // when a spawn fails (upstream's own error, e.g. "failed to
-        // create context") — carried into the EngineCrashed payload.
+        // create context") - carried into the EngineCrashed payload.
         let mut last_load_tail = String::new();
         // Whether any spawn attempt's argv dialed RPC backends
         // (`--rpc`): gates the handshake-failure classification at the
@@ -5847,7 +5847,7 @@ impl Supervisor {
                 // Scoped (picked card) > fresh census > boot snapshot:
                 // single-GPU boxes previously planned against the
                 // BOOT-TIME free VRAM (live-repro'd: daemon booted
-                // while a foreign 5 GiB context held the card → every
+                // while a foreign 5 GiB context held the card -> every
                 // later spawn needlessly CPU-split and declined its
                 // draft, even with 7.8 GiB actually free).
                 hardware: scoped_hw
@@ -5907,7 +5907,7 @@ impl Supervisor {
             }
             // The profile compiler is the teaching layer: its errors
             // name user-fixable conditions (wrong-lane model, unfit
-            // pins, reserved flags) — UnsupportedModel maps them to a
+            // pins, reserved flags) - UnsupportedModel maps them to a
             // 400 on the gateway instead of an opaque 500.
             let profile = profile::compile(&input, &tuning)
                 .map_err(|e| SupervisionError::UnsupportedModel(format!("profile: {e}")))?;
@@ -5943,7 +5943,7 @@ impl Supervisor {
                 .await;
             match health {
                 Ok(()) => {
-                    // F1: an evict is tearing this name down right now —
+                    // F1: an evict is tearing this name down right now -
                     // inserting here would race its cleanup (map remove +
                     // pidfile/apikey deletion). Kill this child and let
                     // the spawn loop retry; the winner inserts after the
@@ -5958,14 +5958,14 @@ impl Supervisor {
                         let _ = child.reap().await;
                         continue;
                     }
-                    // Bank restore, choke point #2 — SYNCHRONOUS and
+                    // Bank restore, choke point #2 - SYNCHRONOUS and
                     // BEFORE any generation touches the child (the
                     // warm-peg below included): a slot restore that
                     // races traffic wedges the racing request forever
-                    // on the child's slot-0 pipeline (observed live ×4:
+                    // on the child's slot-0 pipeline (observed live x4:
                     // a deferred restore posted ~100ms after a
                     // generation completed; the next request never got
-                    // headers — 300s pre-fix, bounded 504 + eviction
+                    // headers - 300s pre-fix, bounded 504 + eviction
                     // post-fix, but the request still dies). On a
                     // freshly spawned child nothing has generated yet,
                     // so restore-then-serve is the only race-free
@@ -5981,7 +5981,7 @@ impl Supervisor {
 
                     // Warm-peg (sglang + llamacpp): drain residual JIT
                     // warmup and peg concurrent batch shapes. sglang
-                    // BLOCKS here — its health flips 200 before the
+                    // BLOCKS here - its health flips 200 before the
                     // residual queue drains, so the first request pays
                     // ~30 s anyway; pegging before Ready hands that cost
                     // to the spawn instead, and every later request
@@ -5993,8 +5993,8 @@ impl Supervisor {
                     // cold-to-first-token instant) and stays unpegged.
                     // Burst width mirrors the compiled slots (unpinned
                     // slots peg the auto default of 4). Probes hit the
-                    // child directly — they never touch gateway slot
-                    // accounting — and are bounded (90 s + 60 s).
+                    // child directly - they never touch gateway slot
+                    // accounting - and are bounded (90 s + 60 s).
                     // Warm-peg kind follows the SPAWN's engine (a routed
                     // adapter), never the global one: the peg's flags and
                     // blocking semantics are engine-specific.
@@ -6039,7 +6039,7 @@ impl Supervisor {
                     }
 
                     // LoRA contract probe (llamacpp with spawn-attached
-                    // adapters): detached, best-effort — verifies the
+                    // adapters): detached, best-effort - verifies the
                     // child's /lora-adapters wire shape right where a
                     // field rename or attach shortfall originates, so
                     // drift is named at spawn instead of masquerading as
@@ -6079,7 +6079,7 @@ impl Supervisor {
                     let np_at_spawn = argv_np(&argv);
                     let inst = Arc::new(Instance {
                         name: key.to_string(),
-                        // routed adapter or daemon global — whichever
+                        // routed adapter or daemon global - whichever
                         // build this child's binary came from
                         engine_tag: engine.capabilities().tag.clone(),
                         kind: engine.kind(),
@@ -6119,7 +6119,7 @@ impl Supervisor {
                         pid,
                     });
                     // Auto-fit visibility: the spawn traded ctx depth for
-                    // parallel slots — surface it as an event so SSE
+                    // parallel slots - surface it as an event so SSE
                     // (/api/events) and API consumers see WHY per-slot
                     // ctx shrank.
                     if let Some((per_slot, slots)) = profile.ctx_autofit {
@@ -6148,12 +6148,12 @@ impl Supervisor {
                     // so ps()/drain/reshape readers see one source of
                     // truth from this point on.
                     self.fold_prenatal_load(key);
-                    // The instance now counts as a resident on its card —
+                    // The instance now counts as a resident on its card -
                     // convert the reservation into that resident and stop
                     // double-charging the ledger.
                     drop(reservation);
                     // A restart only counts when it follows an unclean
-                    // death — churn (stop→run) is a cold start, not a
+                    // death - churn (stop->run) is a cold start, not a
                     // crash loop (live-repro'd: 4 clean churns in 60s
                     // used to open the breaker and 503 the 5th).
                     if self.unclean_dead.remove(key).is_some() {
@@ -6166,14 +6166,14 @@ impl Supervisor {
                     let inst = self.instances.get(key).expect("just inserted");
                     // Measured settle check (#28a), OFF the first-request
                     // critical path: the child is healthy and its
-                    // weights+KV are resident — re-probe the card and
+                    // weights+KV are resident - re-probe the card and
                     // report what the spawn ACTUALLY took vs the
                     // pre-spawn baseline. Teaching only (drift
                     // visibility); needs the pre-spawn probe as a
                     // baseline, skipped silently without one. Runs as a
                     // detached task AFTER the instance is visible so the
                     // cold first token never waits on the census
-                    // subprocess — until the task stores the measured
+                    // subprocess - until the task stores the measured
                     // number, the bytes admission charges the
                     // weights-sum floor (the same pre-settle state that
                     // exists today).
@@ -6210,7 +6210,7 @@ impl Supervisor {
                                         model = %model_name,
                                         card = %card,
                                         used_pct,
-                                        "card is over 95% committed after this load — expect KV pressure; consider kv quantization, a smaller quant (blazar fit), or freeing co-resident engines (blazar ps)"
+                                        "card is over 95% committed after this load - expect KV pressure; consider kv quantization, a smaller quant (blazar fit), or freeing co-resident engines (blazar ps)"
                                     );
                                 }
                             }
@@ -6222,7 +6222,7 @@ impl Supervisor {
                 }
                 Err(e) => {
                     // Health never came up: kill and retry once (port
-                    // race), then surface the failure — classified by
+                    // race), then surface the failure - classified by
                     // WHAT failed, not a blanket timeout label.
                     child_died_during_load |= child_died;
                     if child_died {
@@ -6256,7 +6256,7 @@ impl Supervisor {
         // model's architecture ("unknown model architecture: 'x'") is
         // exactly what fork lanes exist for. Bound the rescue to ONE
         // re-route per spawn (the recursive attempt runs with
-        // forced_lane set) and never override a user pin — the overlay
+        // forced_lane set) and never override a user pin - the overlay
         // pin is the user's explicit choice and stays untouched (H4).
         if let Some(arch) = Self::classify_unknown_arch(&last_load_tail) {
             let advertisers = Self::advertising_lanes(&arch, &store, routed_tag.as_deref());
@@ -6268,7 +6268,7 @@ impl Supervisor {
                     model = name,
                     architecture = %arch,
                     engine = %tag,
-                    "mainstream lane rejected this architecture — re-routing to the \
+                    "mainstream lane rejected this architecture - re-routing to the \
                      installed lane that advertises it (single attempt)"
                 );
                 self.capability_pins
@@ -6284,13 +6284,13 @@ impl Supervisor {
                 if let Some(tag) = advertisers.first() {
                     let _ = write!(
                         msg,
-                        " — engine(s) advertising '{arch}': {tag}; pin one with \
+                        " - engine(s) advertising '{arch}': {tag}; pin one with \
                          model_overrides.{name}.engine in config.toml"
                     );
                 } else {
                     let _ = write!(
                         msg,
-                        " — no installed engine advertises architecture '{arch}'. A llama.cpp \
+                        " - no installed engine advertises architecture '{arch}'. A llama.cpp \
                          fork may already support it: build a temporary capability lane with \
                          `blazar engine build --fork <owner>/llama.cpp@<commit-sha> --backend cpu`"
                     );
@@ -6305,7 +6305,7 @@ impl Supervisor {
             }
         }
         // RPC handshake failure teaching: the spawn preflight only
-        // proves TCP reachability — a worker on a mismatched ggml
+        // proves TCP reachability - a worker on a mismatched ggml
         // build passes it and aborts the child at the first
         // handshake. Classified only when this spawn's argv actually
         // dialed RPC backends, so unrelated connect errors stay raw.
@@ -6314,7 +6314,7 @@ impl Supervisor {
             && let Some(teach) = Self::classify_rpc_handshake_failure(&last_load_tail)
         {
             return Err(SupervisionError::EngineCrashed(format!(
-                "{key} [{}]: {} — {teach}",
+                "{key} [{}]: {} - {teach}",
                 manifest.tag,
                 Self::tail_excerpt(&last_load_tail)
             )));
@@ -6332,7 +6332,7 @@ impl Supervisor {
     /// Installed llama.cpp lanes whose manifest advertises `arch`
     /// (newest first, matching `list_engines` order), excluding the tag
     /// that already failed. The manifest's architecture set is mined
-    /// from the source's `llama-arch.cpp` at build time — advertisement
+    /// from the source's `llama-arch.cpp` at build time - advertisement
     /// is a candidate filter; the actual load on the fork lane is the
     /// verification. The preference itself lives in core
     /// `advertising_lanes` so the listing previews can predict this very
@@ -6361,7 +6361,7 @@ impl Supervisor {
             .collect()
     }
 
-    /// Fork lanes advertising `arch` — the only lanes whose
+    /// Fork lanes advertising `arch` - the only lanes whose
     /// advertisement can mean "serves this arch correctly". Mainstream
     /// manifests mine loader-level support (every overlay build's set
     /// carries llada), which for block-diffusion archs is exactly the
@@ -6394,13 +6394,13 @@ impl Supervisor {
 
     /// Route-time paradigm guard for block-diffusion LLM architectures
     /// (see [`blazar_core::DIFFUSION_PARADIGM_ARCHS`]). The arch loads
-    /// in llama.cpp's loader — no unknown-architecture crash for the
-    /// capability rescue to key on — but no HTTP server in the family
+    /// in llama.cpp's loader - no unknown-architecture crash for the
+    /// capability rescue to key on - but no HTTP server in the family
     /// runs the diffusion decode loop, so the text lane would decode
     /// garbage while the child looks healthy. Returns the teaching
     /// error when `arch` is diffusion-paradigm and no FORK lane
     /// advertises it (callers pass [`Self::fork_advertising_lanes`]:
-    /// mainstream advertisement is loader support, not serving — a
+    /// mainstream advertisement is loader support, not serving - a
     /// diffusion-capable fork lane is the only honest bypass,
     /// mirroring the rescue's lane-capability logic).
     fn diffusion_paradigm_block(arch: &str, fork_advertisers: &[String]) -> Option<String> {
@@ -6408,7 +6408,7 @@ impl Supervisor {
             return None;
         }
         Some(format!(
-            "block-diffusion LLM (arch '{arch}') — no installed lane can serve it: \
+            "block-diffusion LLM (arch '{arch}') - no installed lane can serve it: \
              llama-server would decode it autoregressively into garbage, and llama.cpp \
              ships no HTTP diffusion server yet (upstream PR 24423 DiffusionGemma / \
              PR 17454 LLADA 2.0 tracking). Serve a transformer GGUF, or build a \
@@ -6423,13 +6423,13 @@ impl Supervisor {
     /// `... unknown model architecture: 'qwen35'` -> `qwen35`.
     /// Case-insensitive phrase match (loader wording varies slightly
     /// across versions); the architecture must appear in single quotes
-    /// — anything else classifies as None (conservative: a wrong
+    /// - anything else classifies as None (conservative: a wrong
     /// rescue is worse than no rescue).
     fn classify_unknown_arch(tail: &str) -> Option<String> {
         // Work entirely on the lowercased copy: mixing an offset from
         // `lower` with a slice of `tail` panics on multi-byte case folds
         // (U+0130, U+212A) that shift byte positions before the marker.
-        // Lowercase extraction is also the better key — advertised
+        // Lowercase extraction is also the better key - advertised
         // architecture names are lowercase by llama.cpp convention.
         let lower = tail.to_lowercase();
         let idx = lower.find("unknown model architecture")?;
@@ -6457,7 +6457,7 @@ impl Supervisor {
         const HANDSHAKE_FAILED: &str = "rpc handshake failed for ";
         const CONNECT_ABORT: &str = "failed to connect to ";
         // Lowercase once, extract on the same copy (multi-byte case
-        // folds shift byte positions — same discipline as
+        // folds shift byte positions - same discipline as
         // classify_unknown_arch).
         let lower = tail.to_lowercase();
         let mut version_mismatch = false;
@@ -6491,7 +6491,7 @@ protocol version",
             );
         }
         if !workers.is_empty() {
-            let _ = write!(teach, " — worker(s): {}", workers.join(", "));
+            let _ = write!(teach, " - worker(s): {}", workers.join(", "));
         }
         teach.push_str(
             ". Every --rpc worker must run a ggml-rpc build from the same era as the \
@@ -6503,7 +6503,7 @@ drop them from rpc_servers in config.toml",
     }
 
     /// Ask the capability registry for a curated lane serving `arch`
-    /// (bounded by the fetch's own timeout, fail-open on every error —
+    /// (bounded by the fetch's own timeout, fail-open on every error -
     /// an unreachable registry must never delay or fail a spawn).
     async fn registry_offer(&self, arch: &str) -> Option<String> {
         let url = crate::engine::capability_registry::resolve_registry_url(
@@ -6513,7 +6513,7 @@ drop them from rpc_servers in config.toml",
         let lanes = match crate::engine::capability_registry::fetch(client, &url).await {
             Ok(lanes) => lanes,
             Err(e) => {
-                tracing::debug!(error = %e, "capability registry unreachable — skipping offer");
+                tracing::debug!(error = %e, "capability registry unreachable - skipping offer");
                 return None;
             }
         };
@@ -6551,7 +6551,7 @@ drop them from rpc_servers in config.toml",
     }
 
     /// Last few non-empty lines of a dead child's log tail, for the
-    /// `EngineCrashed` payload — the upstream error line usually sits
+    /// `EngineCrashed` payload - the upstream error line usually sits
     /// right at the end (e.g. "failed to create context").
     fn tail_excerpt(tail: &str) -> String {
         let lines: Vec<&str> = tail
@@ -6567,34 +6567,34 @@ drop them from rpc_servers in config.toml",
     /// roll the active engine back to the previous install when the
     /// evidence points at the ENGINE (not the model):
     ///
-    /// - `llama-server --version` fails on the active binary → immediate
+    /// - `llama-server --version` fails on the active binary -> immediate
     ///   rollback (direct evidence; one model is enough), or
-    /// - the binary probes fine but ≥2 DISTINCT models keep failing to
-    ///   spawn → circumstantial engine evidence (e.g. a serving-path
+    /// - the binary probes fine but >=2 DISTINCT models keep failing to
+    ///   spawn -> circumstantial engine evidence (e.g. a serving-path
     ///   regression that `--version` does not exercise).
     ///
     /// Single-model failures with a healthy probe stay model-level
-    /// (VRAM, bad GGUF, ctx) — no rollback, no misattribution. Affects
+    /// (VRAM, bad GGUF, ctx) - no rollback, no misattribution. Affects
     /// future spawns only; loud (`EngineRolledBack` event + warn) and
     /// reversible (`blazar engine use <tag>`).
     fn note_engine_failure(&self, model: &str) {
         // The failed boot invalidates the census TTL cache: the next
         // spawn must re-measure (the pre-spawn guard never trusts a
-        // census that predates a failure — e.g. an external VRAM
+        // census that predates a failure - e.g. an external VRAM
         // squatter that appeared after the cached reading).
         *self.census_cache.lock().expect("census cache lock") = None;
         // LC4 rollback: a spawn failure after an adaptive adoption is
-        // the capacity answer — the bumped shape did not fit. Drop the
+        // the capacity answer - the bumped shape did not fit. Drop the
         // adoption (and any queued reshape) so the next spawn returns
         // to the last-known-good shape instead of crash-looping on it.
         if self.adopted_slots.remove(model).is_some() {
             self.reshape_queue.remove(model);
-            // The D1 cooldown belongs to the rolled-back adoption — a
+            // The D1 cooldown belongs to the rolled-back adoption - a
             // failed reshape must not rate-limit the retry burst.
             self.fast_adopted_at.remove(model);
             tracing::warn!(
                 model = model,
-                "adaptive slots rolled back after spawn failure — the adopted shape did not fit"
+                "adaptive slots rolled back after spawn failure - the adopted shape did not fit"
             );
         }
         let trigger = {
@@ -6637,7 +6637,7 @@ drop them from rpc_servers in config.toml",
 
     /// Switch the active engine to the previous install (same ordering as
     /// `EngineManager::rollback`: next same-kind entry after the active =
-    /// older — voice lanes and other kinds are never targets). Leaves
+    /// older - voice lanes and other kinds are never targets). Leaves
     /// the tracker armed for a fresh verdict on the new engine.
     fn rollback_active_engine(&self, reason: &str) -> Result<(String, String)> {
         let store = Store::open(&self.dirs)?;
@@ -6659,7 +6659,7 @@ drop them from rpc_servers in config.toml",
         Store::open(&self.dirs)?.set_active_engine(&target)?;
         self.engine_failures.lock().unwrap().clear();
         tracing::warn!(
-            "engine {from} rolled back to {target}: {reason} — new spawns use {target}; \
+            "engine {from} rolled back to {target}: {reason} - new spawns use {target}; \
              `blazar engine use {from}` restores it"
         );
         self.bus.publish(BlazarEvent::EngineRolledBack {
@@ -6673,7 +6673,7 @@ drop them from rpc_servers in config.toml",
     /// Free TCP port (bind 0, read, drop) or a unix socket path.
     /// Socket names ride the shared `path_safe` sanitizer (a key like
     /// `llava@vision` keeps its `@`; hostile separators collapse) and
-    /// must fit `sun_path` — an over-budget path fails the spawn with a
+    /// must fit `sun_path` - an over-budget path fails the spawn with a
     /// teaching error instead of dying inside the child's `bind`.
     fn pick_endpoint(&self, name: &str) -> Result<Endpoint, SupervisionError> {
         if self.config.child_transport == "unix" {
@@ -6703,7 +6703,7 @@ drop them from rpc_servers in config.toml",
         entry.retain(|t| t.elapsed() < self.circuit_window);
     }
 
-    /// True when no name is mid-teardown — leaked marks would defer
+    /// True when no name is mid-teardown - leaked marks would defer
     /// every future spawn of that name (starvation class).
     pub async fn evicting_is_empty(&self) -> bool {
         self.evicting.lock().await.is_empty()
@@ -6716,7 +6716,7 @@ drop them from rpc_servers in config.toml",
             return Ok(());
         };
         // Every eviction path funnels through here (admission capacity,
-        // header-timeout wedge, idle ladder, user stop) — one line so a
+        // header-timeout wedge, idle ladder, user stop) - one line so a
         // vanished resident is always attributable in serve logs.
         tracing::info!(
             model = name,
@@ -6726,7 +6726,7 @@ drop them from rpc_servers in config.toml",
         // F1: mark the name as being torn down for the whole evict; a
         // concurrent spawn retries instead of inserting a fresh child
         // that our cleanup would then race (map remove + pidfile/apikey
-        // deletion under it). Cleared explicitly on every exit path —
+        // deletion under it). Cleared explicitly on every exit path -
         // see EvictingName (no Drop: it cannot await).
         let evicting = EvictingName::guard(self, name).await;
         let result = self.evict_teardown(name, &inst).await;
@@ -6745,14 +6745,14 @@ drop them from rpc_servers in config.toml",
         // the crash history for this key: the next spawn is a cold
         // start, not a respawn-after-crash.
         self.unclean_dead.remove(name);
-        // Session bank, choke point #1 (FIX1): EVERY eviction path —
-        // gateway requests, idle ladder, capacity pressure — flows
+        // Session bank, choke point #1 (FIX1): EVERY eviction path -
+        // gateway requests, idle ladder, capacity pressure - flows
         // through here, so the `_auto-<ctx>` checkpoint is saved exactly
         // once, bounded, and only for idle instances (live requests own
         // their KV).
         self.bank_save(inst).await;
         // LC1 negative feedback: an eviction with the never-served flag
-        // still set falsified the predictive preload — decay the
+        // still set falsified the predictive preload - decay the
         // transitions that spawned it so they stop resurrecting the
         // model every reaper tick. `name` is the instance key; the
         // flag and the graph key by model.
@@ -6784,7 +6784,7 @@ drop them from rpc_servers in config.toml",
             let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.pid")));
             // Child-auth keyfile dies with the child (its secret too).
             let _ = std::fs::remove_file(self.dirs.run_dir().join(format!("{name}.apikey")));
-            // Unix-transport socket dies with the child — under the same
+            // Unix-transport socket dies with the child - under the same
             // ptr-identity guard: a respawn that won the race rebound
             // this exact path, and unlinking it would pull the live
             // child's transport out from under it.
@@ -6794,14 +6794,14 @@ drop them from rpc_servers in config.toml",
         } else {
             tracing::info!(
                 model = name,
-                "evict: map entry was replaced by a respawn during termination — fresh instance left intact"
+                "evict: map entry was replaced by a respawn during termination - fresh instance left intact"
             );
         }
         Ok(())
     }
 
     /// Model-level evict (B1): stop the model AND all its replicas
-    /// (`qwen`, `qwen#1`, `qwen#2`, …). This is the user-facing stop
+    /// (`qwen`, `qwen#1`, `qwen#2`, ...). This is the user-facing stop
     /// (gateway /api/stop, CLI); internal paths (reaper, capacity)
     /// call [`Supervisor::evict`] with one exact key. Force wins over
     /// session pins: they die with the model (R3).
@@ -6812,7 +6812,7 @@ drop them from rpc_servers in config.toml",
         }
         // Every instance-key grammar of this model dies with it: plain,
         // `#replica`, `@vision` (lazy projector respawn), and combined
-        // forms — a bare `model@vision` slot survived keep_alive:0 pings
+        // forms - a bare `model@vision` slot survived keep_alive:0 pings
         // before (live-repro'd: the vision bench lane respawned under the
         // suffixed key, the unload ping evicted only the text slot, and
         // the server still "held a live slot" minutes later).
@@ -6849,8 +6849,8 @@ drop them from rpc_servers in config.toml",
     }
 
     /// Parse a bank filename back to its slot id: `_auto-<ctx>` is slot
-    /// 0 (legacy), `_auto-<ctx>-s<N>` is slot N; anything else — other
-    /// ctx banks, identity manifests — is not part of this set.
+    /// 0 (legacy), `_auto-<ctx>-s<N>` is slot N; anything else - other
+    /// ctx banks, identity manifests - is not part of this set.
     fn bank_slot_of(file: &std::ffi::OsStr, ctx: u32) -> Option<u32> {
         let name = file.to_str()?;
         if name == format!("_auto-{ctx}") {
@@ -6861,7 +6861,7 @@ drop them from rpc_servers in config.toml",
     }
 
     /// The child's decode-slot count from its own argv (`-np` /
-    /// `--parallel`), config fallback, floor 1 — the same walk
+    /// `--parallel`), config fallback, floor 1 - the same walk
     /// `slot_headroom` does per replica.
     fn instance_slot_count(&self, inst: &Arc<Instance>) -> u32 {
         inst.argv
@@ -6875,15 +6875,15 @@ drop them from rpc_servers in config.toml",
     /// Session-bank restore, IN-SPAWN and synchronous: warms the child's
     /// KV for conversation continuations (ctx-matched bank sets) BEFORE
     /// anything generates on the child. Every `_auto-<ctx>` member is
-    /// restored into its own slot id — a `-np N` child wakes with ALL
+    /// restored into its own slot id - a `-np N` child wakes with ALL
     /// banked conversations warm, not just slot 0's. The previous
     /// detached design posted the restore into live traffic after a
-    /// busy-poll race — a request arriving inside the restore window
-    /// wedged on the child's slot pipeline forever (observed ×4 live,
+    /// busy-poll race - a request arriving inside the restore window
+    /// wedged on the child's slot pipeline forever (observed x4 live,
     /// including two benchmark requests). Runs inside the spawn path
     /// only; the trigger request and every later one find the bank
     /// already applied. Bounded (5 s per slot): a slow or dead endpoint
-    /// continues cold — the bank stays on disk for the next spawn.
+    /// continues cold - the bank stays on disk for the next spawn.
     /// A #20 identity mismatch SKIPS the set: injecting KV from a
     /// different runtime shape is worse than a cold start.
     async fn bank_restore_sync(
@@ -6899,14 +6899,14 @@ drop them from rpc_servers in config.toml",
         }
         // Engine capability gate: `/slots/{id}?action=restore` is a
         // llama-server API. On lanes without it the sweep below would
-        // post dead requests (or silently skip) — the honest behavior
+        // post dead requests (or silently skip) - the honest behavior
         // is to not look for banks at all.
         if !kind.supports_slot_banks() {
             return;
         }
         // The bank set of this shape: slot 0's legacy `_auto-<ctx>` plus
         // every `_auto-<ctx>-s<id>` written by the multi-slot sweep
-        // (sorted so slot 0 — the hot path — restores first).
+        // (sorted so slot 0 - the hot path - restores first).
         let file = self.bank_file(key, ctx);
         let mut restores: Vec<(u32, String)> = Vec::new();
         if file.exists() {
@@ -6947,7 +6947,7 @@ drop them from rpc_servers in config.toml",
             tracing::warn!(
                 target: "blazar::bank",
                 model = key,
-                "bank identity mismatch — SKIPPING restore ({}); continuing cold",
+                "bank identity mismatch - SKIPPING restore ({}); continuing cold",
                 diffs.join("; ")
             );
             return;
@@ -7002,7 +7002,7 @@ drop them from rpc_servers in config.toml",
                     Some(0) => tracing::warn!(
                         target: "blazar::bank",
                         model = key,
-                        "bank restore returned ok but restored 0 tokens — empty or incompatible checkpoint; continuing cold"
+                        "bank restore returned ok but restored 0 tokens - empty or incompatible checkpoint; continuing cold"
                     ),
                     Some(n) if id == 0 => tracing::info!(
                         target: "blazar::bank",
@@ -7026,7 +7026,7 @@ drop them from rpc_servers in config.toml",
                 tracing::warn!(
                     target: "blazar::bank",
                     model = key,
-                    "bank restore HTTP {} on slot {id} — continuing cold",
+                    "bank restore HTTP {} on slot {id} - continuing cold",
                     resp.status()
                 );
             }
@@ -7034,18 +7034,18 @@ drop them from rpc_servers in config.toml",
                 tracing::warn!(
                     target: "blazar::bank",
                     model = key,
-                    "bank restore failed on slot {id}: {e:#} — continuing cold"
+                    "bank restore failed on slot {id}: {e:#} - continuing cold"
                 );
             }
         }
     }
     /// Best-effort `_auto-<ctx>` saves before termination: EVERY slot of
-    /// the child, not just slot 0 — with `-np N` the conversation lands
+    /// the child, not just slot 0 - with `-np N` the conversation lands
     /// on a nondeterministic slot and a slot-0-only bank misses it (the
     /// 2026-09-27 prod sweep caught exactly that). Each save is bounded
     /// (2 s) and the sweep stops at `BANK_SAVE_TOTAL_BUDGET`; failures
     /// cost a re-prefill, never the evict. A slot reporting `n_saved: 0`
-    /// held no cached prefix — its file is removed. The truth indicator
+    /// held no cached prefix - its file is removed. The truth indicator
     /// is the save response itself: the `/slots` listing's
     /// `n_prompt_tokens_cache` reads 0 on idle slots even when a save
     /// banks hundreds of tokens (live-probed on b11202).
@@ -7056,7 +7056,7 @@ drop them from rpc_servers in config.toml",
         // Engine capability gate: the save sweep speaks llama-server's
         // `/slots/{id}?action=save`. On any other lane each evict would
         // burn up to 2 s of timeout per slot against an endpoint that
-        // 404s — skip the sweep and say why once, so the absence of
+        // 404s - skip the sweep and say why once, so the absence of
         // session continuity is explicit rather than silent.
         if !inst.kind.supports_slot_banks() {
             tracing::debug!(
@@ -7075,7 +7075,7 @@ drop them from rpc_servers in config.toml",
                 tracing::warn!(
                     target: "blazar::bank",
                     model = %inst.name,
-                    "bank sweep past budget — slots {id}..{slots} left unbanked"
+                    "bank sweep past budget - slots {id}..{slots} left unbanked"
                 );
                 break;
             }
@@ -7116,7 +7116,7 @@ drop them from rpc_servers in config.toml",
                 continue;
             }
             if saved == Some(0) {
-                // The slot held no cached prefix — drop the empty file.
+                // The slot held no cached prefix - drop the empty file.
                 let _ = std::fs::remove_file(&file);
                 continue;
             }
@@ -7140,12 +7140,12 @@ drop them from rpc_servers in config.toml",
                     }
                 }
                 None => {
-                    tracing::warn!(target: "blazar::bank", model = %inst.name, "bank identity indeterminate — checkpoint left unverified");
+                    tracing::warn!(target: "blazar::bank", model = %inst.name, "bank identity indeterminate - checkpoint left unverified");
                 }
             }
         }
         // Hoard guard: a per-model bank set over 512 MiB is storage
-        // abuse, not a cache — drop the whole set and say so once.
+        // abuse, not a cache - drop the whole set and say so once.
         if banked_bytes > 512 * 1024 * 1024 {
             for id in 0..slots {
                 let _ = std::fs::remove_file(self.bank_slot_file(&inst.name, inst.profile_ctx, id));
@@ -7153,7 +7153,7 @@ drop them from rpc_servers in config.toml",
             tracing::warn!(
                 target: "blazar::bank",
                 model = %inst.name,
-                "banked set {} MiB across {slots} slots exceeds the 512 MiB cap — dropped",
+                "banked set {} MiB across {slots} slots exceeds the 512 MiB cap - dropped",
                 banked_bytes / (1024 * 1024)
             );
         }
@@ -7168,8 +7168,8 @@ drop them from rpc_servers in config.toml",
         Ok(())
     }
 
-    /// Reaper: implements the ladder (Ready→Sleeping at `idle_sleep_secs`,
-    /// →Evicted at `idle_timeout_secs`). Runs until the manager is dropped.
+    /// Reaper: implements the ladder (Ready->Sleeping at `idle_sleep_secs`,
+    /// ->Evicted at `idle_timeout_secs`). Runs until the manager is dropped.
     #[must_use]
     pub fn spawn_reaper(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let mgr = Arc::clone(self);
@@ -7192,7 +7192,7 @@ drop them from rpc_servers in config.toml",
     }
 
     /// F1 primitive: sequentially read a file back into the OS page
-    /// cache. Returns the bytes re-paged. Plain buffered reads — the
+    /// cache. Returns the bytes re-paged. Plain buffered reads - the
     /// kernel does the caching; the data itself is discarded.
     fn repage_file(path: &std::path::Path) -> std::io::Result<u64> {
         use std::io::Read;
@@ -7211,7 +7211,7 @@ drop them from rpc_servers in config.toml",
     async fn reap_once(&self) {
         let now = Instant::now();
         // R3 session pins: drop expired windows first, then honor the
-        // rest — a model with a live session skips the idle-eviction
+        // rest - a model with a live session skips the idle-eviction
         // branch (sleep-marking still applies: the process + RAM cache
         // survive a sleep, wake is cheap).
         let session_ttl = self.session_ttl();
@@ -7231,7 +7231,7 @@ drop them from rpc_servers in config.toml",
                 .pins(model_of_key(&inst.name), session_ttl)
                 .live;
             // F12 ollama keep_alive pin: same protection class as a live
-            // session — a client that asked to keep the model loaded gets
+            // session - a client that asked to keep the model loaded gets
             // no evict and no sleep-mark until its window lapses.
             let keep_alive = inst
                 .keep_until
@@ -7278,16 +7278,16 @@ drop them from rpc_servers in config.toml",
     /// How often the `autotune = "advise"` scan re-runs the evidence
     /// adviser across the store. Advice is cheap (local SQLite reads)
     /// but the log/event channel should not repeat every 10s reaper
-    /// tick — once per 10 minutes matches the other teach dedups.
+    /// tick - once per 10 minutes matches the other teach dedups.
     const AUTOTUNE_ADVISE_INTERVAL: Duration = Duration::from_secs(600);
 
     /// `autotune = "advise"` posture: periodically run the read-only
     /// evidence adviser over every model and surface the opportunities
-    /// it finds — one info log line plus a
+    /// it finds - one info log line plus a
     /// [`BlazarEvent::AutotuneAdvice`] per model with recommendations.
     /// Read-only by construction (`build_plan` mutates nothing); the
     /// operator closes each gap by hand (`optimize --plan` to inspect,
-    /// `--run`/`--apply` to act). Skipped entirely — zero store opens —
+    /// `--run`/`--apply` to act). Skipped entirely - zero store opens -
     /// unless the config enables the posture and the interval elapsed.
     /// Public so integration tests drive the exact production scan
     /// without waiting on the reaper timer.
@@ -7373,11 +7373,11 @@ drop them from rpc_servers in config.toml",
     /// census from the engine binary (llama lane; mistral.rs has no
     /// census flag). Falls back to the manifest's install-day snapshot
     /// when the census yields nothing (binary missing, backend init
-    /// failed). The census spawns the engine binary — callers throttle
-    /// to spawn-time and ≥60s periodic.
+    /// failed). The census spawns the engine binary - callers throttle
+    /// to spawn-time and >=60s periodic.
     /// Live census cache lifetime: short enough that the pre-spawn
     /// guard re-measures on any normal (non-burst) spawn, long enough
-    /// that a cold-start burst (spawn → settle → pressure tick → next
+    /// that a cold-start burst (spawn -> settle -> pressure tick -> next
     /// model's spawn) doesn't exec the census subprocess per step.
     const CENSUS_TTL: Duration = Duration::from_secs(10);
 
@@ -7417,10 +7417,10 @@ drop them from rpc_servers in config.toml",
         crate::probe::hardware_census(Vec::new(), manifest)
     }
 
-    /// (at most once per minute — the probe spawns `--list-devices`) and
+    /// (at most once per minute - the probe spawns `--list-devices`) and
     /// teach loudly when any card runs over 95% committed. Card-LEVEL by
     /// design: a co-resident squatter (ollama, a desktop app) counts the
-    /// same as our own children — the number that matters is what the
+    /// same as our own children - the number that matters is what the
     /// NEXT spawn would see. Teach-only; spawn-time policy stays with the
     /// card-scoped planner (A15), whose inputs the spawn-path probe
     /// already refreshes.
@@ -7462,7 +7462,7 @@ drop them from rpc_servers in config.toml",
                     card = %g.name,
                     used_pct,
                     free_mib = g.free_mib,
-                    "measured VRAM pressure: card is over 95% committed — new spawns will spill or degrade; free co-resident engines (blazar ps / ollama stop) or kv-quantize"
+                    "measured VRAM pressure: card is over 95% committed - new spawns will spill or degrade; free co-resident engines (blazar ps / ollama stop) or kv-quantize"
                 );
             }
         }
@@ -7545,7 +7545,7 @@ drop them from rpc_servers in config.toml",
         // instances lock; the fresh free-VRAM preflight below still owns
         // the co-residency verdict on live numbers). Both sides charge
         // admission floors: A's measured footprint (weights floored) and
-        // B's floor — weights-sum planning is what crashed the 8 GiB
+        // B's floor - weights-sum planning is what crashed the 8 GiB
         // card on 2026-09-11.
         if self
             .instance_cap()
@@ -7585,7 +7585,7 @@ drop them from rpc_servers in config.toml",
 
     /// F1 startup preload: spawn every model in `config.preload`, one at
     /// a time, right after the listener binds. Warn-not-fail by
-    /// contract — an unknown name teaches `blazar pull`, a spawn that
+    /// contract - an unknown name teaches `blazar pull`, a spawn that
     /// cannot fit teaches the planner's verdict, and neither ever fails
     /// the daemon. Idempotent: already-live models are skipped.
     pub async fn preload_listed(&self) {
@@ -7609,7 +7609,7 @@ drop them from rpc_servers in config.toml",
                 }
                 Err(e) => tracing::warn!(
                     model = %name,
-                    "startup preload failed: {e:#} — pull it first: blazar pull {name}"
+                    "startup preload failed: {e:#} - pull it first: blazar pull {name}"
                 ),
             }
         }
@@ -7643,7 +7643,7 @@ drop them from rpc_servers in config.toml",
     }
 
     /// AC-power detection for intent-time warming. `None` (unknown,
-    /// non-Linux, or unreadable class) fails OPEN — a server without a
+    /// non-Linux, or unreadable class) fails OPEN - a server without a
     /// battery must never be gate-locked out of warm-on-pull.
     #[cfg(target_os = "linux")]
     fn on_ac_power() -> Option<bool> {
@@ -7681,8 +7681,8 @@ drop them from rpc_servers in config.toml",
 
     /// Wave L pre-spawn: fire when a pull completes so the first
     /// request finds a warm engine instead of paying the cold boot.
-    /// Same contract as [`Self::preload_listed`] — idempotent,
-    /// warn-not-fail — plus the battery gate (a laptop on battery
+    /// Same contract as [`Self::preload_listed`] - idempotent,
+    /// warn-not-fail - plus the battery gate (a laptop on battery
     /// keeps its power; first request cold-starts normally).
     pub async fn warm_on_pull_if_enabled(&self, model: &str) {
         let base = model_of_key(model);
@@ -7696,13 +7696,13 @@ drop them from rpc_servers in config.toml",
         }
         if Self::on_ac_power() == Some(false) {
             tracing::info!(model = %base,
-                "warm_on_pull skipped: running on battery — first request cold-starts normally");
+                "warm_on_pull skipped: running on battery - first request cold-starts normally");
             return;
         }
         match self.spawn_instance(base).await {
             Ok(_) => tracing::info!(model = %base, "warm_on_pull: resident before first request"),
             Err(e) => tracing::warn!(model = %base,
-                "warm_on_pull spawn failed: {e:#} — first request will cold-start"),
+                "warm_on_pull spawn failed: {e:#} - first request will cold-start"),
         }
     }
 
@@ -7726,7 +7726,7 @@ drop them from rpc_servers in config.toml",
     }
 
     /// F1 idle-to-RAM tier: after the idle ladder evicts a child, the
-    /// kernel page cache usually still holds the weights — but under
+    /// kernel page cache usually still holds the weights - but under
     /// memory pressure it may not. A sequential re-read refreshes the
     /// RAM tier so the next spawn faults from memory, not storage.
     /// Detached and single-flight per path; holds no VRAM.
@@ -7774,14 +7774,14 @@ drop them from rpc_servers in config.toml",
     /// (queueing visible as in-flight > live slots across ticks) earns
     /// an in-memory slots bump. The live slot count is read from the
     /// spawned child's argv (`-np`), so capacity-shaped auto spawns
-    /// (config `slots = 0`) adapt too — the pre-2026-09-12 form only
+    /// (config `slots = 0`) adapt too - the pre-2026-09-12 form only
     /// saw `slots = 1` configs and left the default auto shape inert.
     /// Explicit overlay slots, replicas, and `deterministic` exclude
     /// the model (a pin is a policy statement); opt-in via config.
     /// Adoption queues a respawn (see [`Self::drain_reshape_queue`]).
     /// D1 burst fast-path: a window peak of >= 2x the effective slots
     /// shortens the streak to [`SLOTS_FAST_STREAK_TICKS`] (rate-limited
-    /// by [`SLOTS_FAST_COOLDOWN`]) — sub-minute bursts used to queue out
+    /// by [`SLOTS_FAST_COOLDOWN`]) - sub-minute bursts used to queue out
     /// the whole 60 s standard window before the first adoption.
     #[allow(clippy::too_many_lines)] // one saturation story per instance; splitting hides the branch pairs
     fn adaptive_slots_tick(&self) {
@@ -7799,7 +7799,7 @@ drop them from rpc_servers in config.toml",
                 continue;
             }
             // A `#warm` instance is a transitional prewarm child waiting
-            // for its cutover — invisible to routing by key grammar, so
+            // for its cutover - invisible to routing by key grammar, so
             // it must be invisible to adaptation too. Adopting against
             // it would queue a reshape keyed `#warm`, whose cutover
             // "old-gone" guard then evicts the resident warm child
@@ -7809,9 +7809,9 @@ drop them from rpc_servers in config.toml",
             }
             let overlay = self.config.overlay_for(&model);
             // Manual slots, replicas, or deterministic mode exclude the
-            // model (deterministic spawns pin slots = 1 by design —
+            // model (deterministic spawns pin slots = 1 by design -
             // adoption would fight the pin every tick). D2: the pin
-            // arm is liftABLE per model — `adaptive_override on` treats
+            // arm is liftABLE per model - `adaptive_override on` treats
             // the pin as the base shape instead of a ceiling; the
             // replicas/deterministic exclusions stay either way.
             let deterministic = overlay.deterministic.unwrap_or(self.config.deterministic);
@@ -7844,13 +7844,13 @@ drop them from rpc_servers in config.toml",
             let in_flight = i.in_flight.load(Ordering::SeqCst);
             // Demand signal: admission pressure since the last tick (the
             // gateway reports every request that queued on AllSlotsBusy).
-            // in_flight alone is unreachable past the slot count —
+            // in_flight alone is unreachable past the slot count -
             // admission caps it there (live-proven 2026-09-12: 6-stream
             // load left in_flight pinned at 4 while 2 requests queued).
             // gauge PEEK, not a drain: entries live for as long as the
             // queued request is parked, so sustained queueing shows up
             // on every tick in the window (an event-drain resets the
-            // streak after one tick — live-caught 2026-09-12)
+            // streak after one tick - live-caught 2026-09-12)
             let pressure = self.slot_pressure.get(&model).map_or(0, |v| *v);
             tracing::debug!(
                 model = %model,
@@ -7861,11 +7861,11 @@ drop them from rpc_servers in config.toml",
             );
             // The gauge oscillates at request granularity: a parked
             // waiter is released (gauge--), re-checks, is admitted, and
-            // the freed worker's next request parks again (gauge++) —
+            // the freed worker's next request parks again (gauge++) -
             // the level dips below 1 for sub-second windows between
             // completions, and a 10s tick sampling those dips resets
             // the streak (live receipt 2026-09-29: sustained 8-stream
-            // load sampled 4,0,4,1,4,0,3,1 — max 2 consecutive
+            // load sampled 4,0,4,1,4,0,3,1 - max 2 consecutive
             // saturated ticks, adoption never fired). With admission
             // gating, in_flight pins AT the ceiling (never above), so a
             // capacity-pinned child only reads as saturated while the
@@ -7889,7 +7889,7 @@ drop them from rpc_servers in config.toml",
                 // throughput evidence says the model's aggregate decode
                 // barely scales with concurrency (GPU-bound decode), a
                 // reshape buys queue relief at best while paying the
-                // transition — teach instead of adopt. The gate stands
+                // transition - teach instead of adopt. The gate stands
                 // down (None) until both regimes were sampled inside
                 // DECODE_FRESH_WINDOW, and `adaptive_decode_gate` is the
                 // one-knob kill-switch.
@@ -7913,7 +7913,7 @@ drop them from rpc_servers in config.toml",
                             solo_tps,
                             loaded_tps,
                             loaded_conc,
-                            "sustained queueing but decode is the bottleneck — measured aggregate decode barely scales with concurrency, so more slots would pay a reshape for queue relief only — keep the shape (or raise it explicitly with `blazar tune --slots`) or disable this gate per daemon with `adaptive_decode_gate = false`"
+                            "sustained queueing but decode is the bottleneck - measured aggregate decode barely scales with concurrency, so more slots would pay a reshape for queue relief only - keep the shape (or raise it explicitly with `blazar tune --slots`) or disable this gate per daemon with `adaptive_decode_gate = false`"
                         );
                         self.bus.publish(BlazarEvent::SlotsDecodeBound {
                             model: model.clone(),
@@ -7959,7 +7959,7 @@ drop them from rpc_servers in config.toml",
                     // carries the max gauge level seen since the last
                     // adoption (every park climbs through each level, so
                     // the peak is always attested), and the live gauge
-                    // covers a stale-latch edge — one adoption reaches
+                    // covers a stale-latch edge - one adoption reaches
                     // the demanded shape instead of climbing +1 per 60s
                     // streak off dip samples. Fit-safe: the spawn
                     // re-spends the same total-ctx budget across slots
@@ -8005,7 +8005,7 @@ drop them from rpc_servers in config.toml",
             {
                 // Decay: the adopted shape buys queue-latency under load
                 // and costs per-stream ITL (np8 ITL 60ms vs np4 37ms,
-                // flagprobe 2026-09-12) — after a long
+                // flagprobe 2026-09-12) - after a long
                 // fully-quiet window, fall back to the natural shape so
                 // single-stream latency recovers. One-shot to base: the
                 // adopt path re-raises in 60s if demand returns.
@@ -8021,7 +8021,7 @@ drop them from rpc_servers in config.toml",
                     // Full quiet reset clears the D1 cooldown too: the
                     // burst that earned the (now decayed) adoption is
                     // ancient history at this point. The D5 teach dedup
-                    // resets with it — the next queueing episode earns a
+                    // resets with it - the next queueing episode earns a
                     // fresh verdict.
                     self.fast_adopted_at.remove(&model);
                     self.decode_bound_warned_at.remove(&model);
@@ -8029,13 +8029,13 @@ drop them from rpc_servers in config.toml",
                     tracing::info!(
                         model = %model,
                         to = resolved,
-                        "adaptive slots decayed: sustained quiet — respawning at the natural shape (per-stream latency recovers)"
+                        "adaptive slots decayed: sustained quiet - respawning at the natural shape (per-stream latency recovers)"
                     );
                 }
             } else {
                 self.busy_streak.remove(&key);
                 self.idle_streak.remove(&key);
-                // Quiet tick: the demand latch has gone stale — drop it
+                // Quiet tick: the demand latch has gone stale - drop it
                 // so the map never outlives the model's last real queue.
                 self.slot_pressure_seen.remove(&model);
             }
@@ -8044,7 +8044,7 @@ drop them from rpc_servers in config.toml",
 
     /// D2: sustained admission pressure on a lane excluded from
     /// adaptation ONLY by a manual `slots` pin. The pin stays
-    /// authoritative — no adoption happens — this only makes the
+    /// authoritative - no adoption happens - this only makes the
     /// queueing floor visible: after [`SLOTS_STREAK_TICKS`] saturated
     /// ticks, ONE throttled [`BlazarEvent::SlotsPinnedPressure`] event +
     /// log per [`SLOTS_PINNED_TEACH_DEDUP`] window, carrying the
@@ -8098,7 +8098,7 @@ drop them from rpc_servers in config.toml",
             model = %model,
             pinned_slots = effective,
             pressure,
-            "sustained queueing behind a manual slots pin (no adaptation while pinned) — lift it per model with: blazar config set model_overrides.\"{model}\".adaptive_override on"
+            "sustained queueing behind a manual slots pin (no adaptation while pinned) - lift it per model with: blazar config set model_overrides.\"{model}\".adaptive_override on"
         );
         self.bus.publish(BlazarEvent::SlotsPinnedPressure {
             model: model.to_string(),
@@ -8119,7 +8119,7 @@ drop them from rpc_servers in config.toml",
 
     /// True while the model's queued reshape is parking admissions: the
     /// admission gate consults this on every pass through its re-check
-    /// loop. The D3 `Cutover` phase deliberately reports false — the
+    /// loop. The D3 `Cutover` phase deliberately reports false - the
     /// parking budget was exceeded and the gate reopened into the old
     /// shape (the reshape waits for a natural quiesce instead).
     pub fn is_reshaping(&self, model: &str) -> bool {
@@ -8131,7 +8131,7 @@ drop them from rpc_servers in config.toml",
     /// Respawn adopted models once their streams drain. A busy instance
     /// gets its drain mark set: the admission gate then parks NEW
     /// requests for the model, so in-flight falls as streams complete
-    /// and the reshape lands in one max-stream duration — the pre-drain
+    /// and the reshape lands in one max-stream duration - the pre-drain
     /// behavior (skip while busy) deferred the reshape forever under
     /// sustained 24/7 load, leaving the system saturated exactly when
     /// capacity mattered most (live receipt: 20260924-all-engines
@@ -8153,7 +8153,7 @@ drop them from rpc_servers in config.toml",
                 .is_some_and(|i| i.in_flight.load(Ordering::SeqCst) > 0);
             if busy {
                 // Capture the PREVIOUS phase before the insert overwrites
-                // it — reading the age after the write would always see a
+                // it - reading the age after the write would always see a
                 // fresh timestamp and the bound could never trip.
                 let prev = self.reshape_draining.insert(
                     model.clone(),
@@ -8166,7 +8166,7 @@ drop them from rpc_servers in config.toml",
                             "adaptive slots: holding admissions to drain live streams for the reshape"
                         );
                     }
-                    // Cutover phase: admissions are open by decision —
+                    // Cutover phase: admissions are open by decision -
                     // never re-park this episode; the reshape lands at
                     // the next natural quiesce the not-busy arm below
                     // catches.
@@ -8175,7 +8175,7 @@ drop them from rpc_servers in config.toml",
                         let age = since.elapsed();
                         if age >= SLOTS_DRAIN_BOUND {
                             // D3 starvation bound: the reshape is a
-                            // latency optimization — a parking floor
+                            // latency optimization - a parking floor
                             // longer than the budget costs more tail
                             // latency than the reshape recovers.
                             // Reopen admissions into the old shape;
@@ -8186,7 +8186,7 @@ drop them from rpc_servers in config.toml",
                             tracing::warn!(
                                 model = %model,
                                 waited_secs = age.as_secs(),
-                                "adaptive slots: drain exceeded the parking bound — admissions reopen, reshape lands at the next natural quiesce"
+                                "adaptive slots: drain exceeded the parking bound - admissions reopen, reshape lands at the next natural quiesce"
                             );
                             self.bus.publish(BlazarEvent::SlotsDrainCutover {
                                 model: model.clone(),
@@ -8217,19 +8217,19 @@ drop them from rpc_servers in config.toml",
             // old child keeps serving, so the reshape lands with zero
             // admission gap instead of a drain + model-load of parking.
             // Captive spawn: the warm load must never evict the old child
-            // as its VRAM victim — a refusal (common on 8 GB cards: two
+            // as its VRAM victim - a refusal (common on 8 GB cards: two
             // residents of one model) falls back to the drain-reshape
             // verbatim below. Trade-off vs the fallback: the warm child
             // starts before the old one banks its KV, so past-conversation
             // cache warmth re-prefills (~100 ms class) instead of
-            // restoring — in-flight streams are unaffected (this arm only
+            // restoring - in-flight streams are unaffected (this arm only
             // runs at quiesce).
             let warm_key = format!("{model}#warm");
             // A warm child already resident (a prior cutover deferred by
             // Arc contention) must never be re-spawned: the spawn would
             // overwrite the map entry and orphan a live child. Go
             // straight to the cutover instead. Only a Ready warm may
-            // skip the spawn — a crashed one must be replaced (the
+            // skip the spawn - a crashed one must be replaced (the
             // overwrite drops the dead child's Arc; kill_on_drop reaps).
             let warm_waiting = self.instances.get(&warm_key).is_some_and(|w| {
                 matches!(*w.state.read().expect("state lock"), InstanceState::Ready)
@@ -8251,7 +8251,7 @@ drop them from rpc_servers in config.toml",
                     // try_unwrap can fail while a transient gauge or
                     // iterator holds a clone; retry briefly in-line so a
                     // microsecond holder does not cost a whole reaper
-                    // tick — and on final failure the ONLY safe retry
+                    // tick - and on final failure the ONLY safe retry
                     // leaves both children exactly where they are (old
                     // still serving under the plain key, warm still
                     // waiting). Evicting first would strand the lane
@@ -8297,7 +8297,7 @@ drop them from rpc_servers in config.toml",
                             // (pid/apikey are per-key): rebase the
                             // warm child's onto the plain model key
                             // so a later evict cleans the right
-                            // names. Best-effort renames — a missing
+                            // names. Best-effort renames - a missing
                             // file is inert (`let _` cleanup parity
                             // with evict).
                             let run = self.dirs.run_dir();
@@ -8317,7 +8317,7 @@ drop them from rpc_servers in config.toml",
                             tracing::info!(
                                 model = %model,
                                 slots,
-                                "adaptive slots: pre-warm cutover — replacement shape served Ready under #warm, routing swapped with zero admission gap"
+                                "adaptive slots: pre-warm cutover - replacement shape served Ready under #warm, routing swapped with zero admission gap"
                             );
                             self.bus.publish(BlazarEvent::SlotsPrewarmCutover {
                                 model: model.clone(),
@@ -8334,7 +8334,7 @@ drop them from rpc_servers in config.toml",
                             // fall through to the drain-reshape.
                             tracing::warn!(
                                 model = %model,
-                                "adaptive pre-warm child vanished before cutover — falling back to drain-reshape"
+                                "adaptive pre-warm child vanished before cutover - falling back to drain-reshape"
                             );
                             self.fallback_reshape(&model, &key, slots).await;
                         }
@@ -8347,7 +8347,7 @@ drop them from rpc_servers in config.toml",
                             // re-key on the next drain.
                             tracing::warn!(
                                 model = %model,
-                                "adaptive pre-warm cutover deferred: the warm child's Arc is still held — retrying next tick"
+                                "adaptive pre-warm cutover deferred: the warm child's Arc is still held - retrying next tick"
                             );
                         }
                     }
@@ -8357,7 +8357,7 @@ drop them from rpc_servers in config.toml",
                     // drain-reshape path, verbatim semantics.
                     tracing::info!(
                         model = %model,
-                        "adaptive pre-warm refused ({e:#}) — falling back to drain-reshape (two residents of one model will not fit)"
+                        "adaptive pre-warm refused ({e:#}) - falling back to drain-reshape (two residents of one model will not fit)"
                     );
                     self.fallback_reshape(&model, &key, slots).await;
                 }
@@ -8365,14 +8365,14 @@ drop them from rpc_servers in config.toml",
         }
     }
 
-    /// Drain-reshape fallback for the pre-warm path: the pre-D3 shape —
+    /// Drain-reshape fallback for the pre-warm path: the pre-D3 shape -
     /// evict the idle child, respawn at the adopted shape, hold the
     /// parking gate through the child-less window. Kept as its own method
     /// so both call sites (pre-warm refusal, warm-vanished race) share
     /// identical semantics with the pre-warm wave's code.
     /// Retire a warm child the cutover could not install (old-child
     /// teardown failed and the lane must retry clean). The instance is
-    /// already off the map at every call site — this owns only process
+    /// already off the map at every call site - this owns only process
     /// teardown, mirroring `evict`'s `terminate_group` contract.
     async fn terminate_warm(&self, warm: &mut Instance) -> Result<()> {
         let mut child = warm.child.lock().await;
@@ -8402,13 +8402,13 @@ drop them from rpc_servers in config.toml",
             }
             Err(e) => {
                 // Respawn failed: hold admissions one more tick and
-                // retry — never publish completion for a dead lane.
+                // retry - never publish completion for a dead lane.
                 tracing::warn!(model = %model, "adaptive reshape respawn: {e:#}");
             }
         }
     }
 
-    /// Gateway admission brackets queue-waits with enter/leave calls —
+    /// Gateway admission brackets queue-waits with enter/leave calls -
     /// this is a GAUGE of requests currently parked in the admission
     /// queue, not an event counter. Live-proven 2026-09-12: an event
     /// counter drains after the first reaper tick (each queued stream
@@ -8426,7 +8426,7 @@ drop them from rpc_servers in config.toml",
         // Latch the WINDOW MAX alongside the timestamp: the gauge
         // oscillates at request granularity (a parked waiter is released,
         // admitted, and the freed worker's next request re-parks), so the
-        // 10s tick samples whatever slice it lands in — live receipt
+        // 10s tick samples whatever slice it lands in - live receipt
         // 2026-09-29 sized adoptions +1..+3 off dip samples while the
         // window peak was 4 and the demanded shape needed one streak.
         // Every park climbs the gauge through each level, so the peak is
@@ -8443,7 +8443,7 @@ drop them from rpc_servers in config.toml",
     }
 
     /// The leaving half of the admission-pressure gauge: the queued
-    /// request either acquired a slot or gave up — either way it is no
+    /// request either acquired a slot or gave up - either way it is no
     /// longer demand the slot reshaper should react to.
     pub fn note_slot_pressure_release(&self, model: &str) {
         if let Some(mut e) = self.slot_pressure.get_mut(model) {
@@ -8459,8 +8459,8 @@ drop them from rpc_servers in config.toml",
     /// D4 `/metrics` snapshot: per RESIDENT model (canonicalized,
     /// replica keys deduped) the current admission-pressure level, the
     /// adopted slot target when one is active, and the effective live
-    /// cap (adopted → child argv `-np` → config). Sorted by model for a
-    /// stable exposition — the queueing floor used to need offline log
+    /// cap (adopted -> child argv `-np` -> config). Sorted by model for a
+    /// stable exposition - the queueing floor used to need offline log
     /// parsing to see.
     #[must_use]
     pub fn slots_gauge_snapshot(&self) -> Vec<(String, u32, Option<u32>, u32)> {
@@ -8483,13 +8483,13 @@ drop them from rpc_servers in config.toml",
     }
 
     /// Live slot ceiling for the gateway admission gate. The static
-    /// `config.slots` is the AUTO sentinel (0) most of the time — a
+    /// `config.slots` is the AUTO sentinel (0) most of the time - a
     /// hardcoded fallback there would silently cap admission below an
     /// adopted/reshaped child (live-caught 2026-09-12: `slots == 0`
     /// mapped to a flat 4 while the reshape path can adopt up to 8).
-    /// Resolution order: adopted count (the reshaper's decision) → the
+    /// Resolution order: adopted count (the reshaper's decision) -> the
     /// live child argv `-np` (source of truth, same parse as the
-    /// adaptive tick) → explicit config value → modest auto default.
+    /// adaptive tick) -> explicit config value -> modest auto default.
     pub fn slot_cap(&self, model: &str) -> i64 {
         // Canonicalize first: the gateway may hand a replica key
         // ("m#1") while adoption is recorded against the base model.
@@ -8524,7 +8524,7 @@ drop them from rpc_servers in config.toml",
     }
 
     /// True while an exclusive deterministic request is mid-flight for
-    /// the model — every other admission parks until the holder's guard
+    /// the model - every other admission parks until the holder's guard
     /// drops.
     #[must_use]
     pub fn exclusive_active(&self, model: &str) -> bool {
@@ -8536,7 +8536,7 @@ drop them from rpc_servers in config.toml",
     /// is zero, so the holder truly starts on a quiescent child. The
     /// entry-vs-load ordering leaves a microscopic window where a
     /// concurrently-admitting request can slip in between the load read
-    /// and the insert — both are admission-granularity events with no
+    /// and the insert - both are admission-granularity events with no
     /// await between them; the guarantee is "alone from admission
     /// onward", which is the reproducibility contract that matters.
     pub fn try_acquire_exclusive(&self, model: &str) -> bool {
@@ -8578,8 +8578,8 @@ drop them from rpc_servers in config.toml",
     pub fn end_request(&self, name: &str) {
         // Prenatal bracket: a request that began during the spawn window
         // ends either prenatally (spawn still running, entry still > 0)
-        // or — after the registration fold moved its count onto the
-        // instance — on the instance counter (prenatal reads zero then;
+        // or - after the registration fold moved its count onto the
+        // instance - on the instance counter (prenatal reads zero then;
         // fall through). Base-keyed, matching `begin_request`.
         let base = model_of_key(name).to_string();
         if let Some(mut e) = self.prenatal_load.get_mut(&base)
@@ -8590,7 +8590,7 @@ drop them from rpc_servers in config.toml",
         }
         // Replica lanes: the guard may spell a base name while the load
         // landed on a `model#N` replica. Decrement a holder that still
-        // has load (exact key first, then any replica) — the SUM is what
+        // has load (exact key first, then any replica) - the SUM is what
         // admission and drain logic read, so keeping the sum right is
         // the contract; the exact key remains the no-load fallback so
         // `last_used` still refreshes on over-end.
@@ -8630,7 +8630,7 @@ drop them from rpc_servers in config.toml",
     /// True in-flight request load for `model` (base or replica spelling):
     /// every live replica's counter plus requests admitted during the
     /// cold-spawn window that no instance has absorbed yet. The
-    /// admission gates read this — a `ps()` row cannot express load for
+    /// admission gates read this - a `ps()` row cannot express load for
     /// a model whose instance does not exist yet.
     #[must_use]
     pub fn request_load(&self, model: &str) -> i64 {
@@ -8729,7 +8729,7 @@ drop them from rpc_servers in config.toml",
     /// Startup sweep: a SIGKILL'd daemon leaves engine children behind
     /// (own process groups). `<run>/<model>.pid` markers whose recorded
     /// process is still alive get a single-pid TERM followed by the
-    /// shared TERM→grace→KILL escalation (a child hung in graceful
+    /// shared TERM->grace->KILL escalation (a child hung in graceful
     /// shutdown must not survive the sweep that came for it); markers
     /// are cleared. The daemon's own `blazar.pid` and pull locks are NOT
     /// engines.
@@ -8765,7 +8765,7 @@ drop them from rpc_servers in config.toml",
             let _ = std::fs::remove_file(e.path());
         }
         // Pidfile strays carry no env marker (they predate it): identity
-        // is liveness-only here — the marker file was already consumed.
+        // is liveness-only here - the marker file was already consumed.
         #[cfg(unix)]
         crate::daemon::escalate_orphans(&termed, self.shutdown_grace, |_| true);
         swept
@@ -8791,12 +8791,12 @@ drop them from rpc_servers in config.toml",
     /// lane: resolve the catalog pair for (model, mode), pull
     /// `pair.draft_repo` through the standard Puller (progress rides
     /// the event bus like any `blazar pull`), then re-resolve. Never
-    /// fails the spawn — every error logs and returns `None` so the
+    /// fails the spawn - every error logs and returns `None` so the
     /// caller keeps exactly the without-autopull behavior (dense
     /// degrade under auto, hard compile error under explicit modes).
     /// Takes no `&Store`: the store handle is `!Sync`, and holding the
     /// caller's borrow across the download await would make the ensure
-    /// future non-Send — a fresh handle is opened after the pull ends.
+    /// future non-Send - a fresh handle is opened after the pull ends.
     async fn autopull_draft(&self, name: &str, spec_mode: &str) -> Option<String> {
         let pair = blazar_core::pair_for_spec_mode(name, spec_mode)?;
         let client = match crate::hf::HfClient::new(std::env::var("HF_TOKEN").ok()) {
@@ -8862,7 +8862,7 @@ drop them from rpc_servers in config.toml",
     }
 
     /// Prefix heat: +1 per chat-family hit (saturating), decaying with a
-    /// 10-minute half-life on read — recent traffic dominates old, an
+    /// 10-minute half-life on read - recent traffic dominates old, an
     /// hour-old hot model cools to evictable. Drives capacity-eviction
     /// victim choice (hot caches survive).
     pub fn note_prefix_hit(&self, model: &str) {
@@ -8905,7 +8905,7 @@ drop them from rpc_servers in config.toml",
     pub async fn reap_dead_children(&self) {
         // Snapshot FIRST, then await: iterating a DashMap holds a read
         // guard on the current shard, and `child.lock().await` below
-        // would park that guard across an await — every write to the
+        // would park that guard across an await - every write to the
         // shard (spawn `insert`, evict `remove`) then blocks its worker
         // thread in a sync futex. A tick coinciding with an evict that
         // holds the child mutex through a slow terminate was observed
@@ -8920,11 +8920,11 @@ drop them from rpc_servers in config.toml",
                 Ok(Some(status)) => {
                     // Exit 0 = the child shut itself down on purpose
                     // (--sleep-idle-seconds idle exit, upstream clean
-                    // shutdown) — not a crash; ERROR here would cry wolf.
+                    // shutdown) - not a crash; ERROR here would cry wolf.
                     if status.success() {
                         tracing::info!(
                             model = %inst.name,
-                            "engine exited cleanly ({status}) — idle sleep or upstream shutdown; next request will respawn"
+                            "engine exited cleanly ({status}) - idle sleep or upstream shutdown; next request will respawn"
                         );
                     } else {
                         tracing::error!(
@@ -8943,7 +8943,7 @@ drop them from rpc_servers in config.toml",
         }
         for inst in crashed {
             // F1: only drop the map entry (and runtime files) when the
-            // live entry is still the CRASHED instance — a concurrent
+            // live entry is still the CRASHED instance - a concurrent
             // ensure() may have already respawned a fresh child under
             // this name; deleting it here would orphan it. F3: the
             // crash lane now also removes the child-auth keyfile (it
@@ -8967,7 +8967,7 @@ drop them from rpc_servers in config.toml",
 
 /// F1: clears the evict-in-progress mark when the evict lane ends, on
 /// every path (success, error, early return).
-/// F1: in-flight eviction marks. NOT RAII — Drop cannot await, and a
+/// F1: in-flight eviction marks. NOT RAII - Drop cannot await, and a
 /// best-effort sync clear could leak the mark (permanently deferring
 /// spawns). `evict` clears explicitly on every path; the set is
 /// advisory (spawn deferral), so a same-name re-evict race at worst
@@ -9075,7 +9075,7 @@ mod routing_tests {
         std::fs::create_dir_all(&dirs.data_dir).unwrap();
         let store = Store::open(&dirs).unwrap();
         // Real catalog pair for qwen3-0.6b (its generic draft resolves
-        // back to the model itself — the live self-pair case).
+        // back to the model itself - the live self-pair case).
         let pair = blazar_core::catalog::pair_for_spec_mode("qwen3-0.6b", "auto")
             .expect("catalog pair for qwen3-0.6b");
         let (repo, file) = pair
@@ -9206,7 +9206,7 @@ mod routing_tests {
             Supervisor::resolved_load_timeout(None, K::MistralRs),
             D::from_mins(3)
         );
-        // User-set pins EVERY lane — the explicit knob wins, never
+        // User-set pins EVERY lane - the explicit knob wins, never
         // silently widened by the per-kind fallback.
         for kind in [K::Sglang, K::LlamaCpp, K::MistralRs] {
             assert_eq!(
@@ -9219,7 +9219,7 @@ mod routing_tests {
     #[test]
     fn unit__read_model_meta__kvless_component_gguf_teaches_diffusion() {
         use blazar_core::engine_kind::EngineKind as K;
-        // Minimal valid-header GGUF with ZERO metadata KVs — the
+        // Minimal valid-header GGUF with ZERO metadata KVs - the
         // diffusion-component shape (qwen-image DiT: 0 KVs, 297
         // tensors). The raw parse error ("missing
         // general.architecture") taught nothing; the guard must name
@@ -9244,7 +9244,7 @@ mod routing_tests {
 
     #[test]
     fn unit__diffusion_paradigm_block__teaches_only_when_no_lane_advertises() {
-        // llada/llada-moe are mainline-loadable in llama.cpp TODAY — the
+        // llada/llada-moe are mainline-loadable in llama.cpp TODAY - the
         // guard set must carry them; llada2/diffusion-gemma ride the set
         // pre-merge so the merge day needs no blazar change.
         assert_eq!(
@@ -9273,8 +9273,8 @@ mod routing_tests {
     fn unit__fork_advertising_lanes__mainstream_loader_ad_does_not_bypass() {
         // Live-overlay shape, pinned: an overlay build's manifest mines
         // 150+ loader archs INCLUDING llada, provenance upstream. The
-        // paradigm guard must ignore that advertisement — loading is
-        // not serving — while a fork lane advertising llada counts.
+        // paradigm guard must ignore that advertisement - loading is
+        // not serving - while a fork lane advertising llada counts.
         // Hermetic store: routing_sup's fixed /tmp dirs persist across
         // runs, and this very test seeds a fork lane that would poison
         // every later execution of the first assert.
@@ -9328,7 +9328,7 @@ mod routing_tests {
     fn unit__read_model_meta__llada_gguf_parses_so_only_the_paradigm_guard_catches_it() {
         use blazar_core::engine_kind::EngineKind as K;
         // The hazard premise, pinned: a GGUF carrying
-        // general.architecture=llada parses CLEANLY on the text lane —
+        // general.architecture=llada parses CLEANLY on the text lane -
         // no shape error, no missing-arch teaching. The meta layer
         // cannot catch it; only the route-time paradigm guard does.
         let mut gguf = b"GGUF".to_vec();
@@ -9345,7 +9345,7 @@ mod routing_tests {
         let file = std::env::temp_dir().join("blazar-llada.gguf");
         std::fs::write(&file, &gguf).expect("write fixture");
         let meta = read_model_meta(file.to_str().unwrap(), K::LlamaCpp)
-            .expect("llada GGUF parses on the text lane — that IS the hazard");
+            .expect("llada GGUF parses on the text lane - that IS the hazard");
         match meta.borrow_meta() {
             blazar_core::hfmeta::ModelMeta::Gguf(g) => assert_eq!(g.architecture, "llada"),
             other @ blazar_core::hfmeta::ModelMeta::Hf(_) => {
@@ -9357,7 +9357,7 @@ mod routing_tests {
     #[test]
     fn unit__read_model_meta__sdcpp_diT_parses_as_component_not_text() {
         use blazar_core::engine_kind::EngineKind as K;
-        // Same 0-KV component GGUF as the teaching pin above — under the
+        // Same 0-KV component GGUF as the teaching pin above - under the
         // sdcpp lane it must NOT teach (the DiT is expected there): the
         // meta is a placeholder and compile_sdcpp drives off the
         // component set, never off GgufMeta.
@@ -9388,7 +9388,7 @@ mod routing_tests {
     #[test]
     fn unit__read_model_meta__wrong_lane_pairs_teach_the_engine_remedy() {
         use blazar_core::engine_kind::EngineKind as K;
-        // MetaBox is not Debug, so expect_err cannot be used — take the
+        // MetaBox is not Debug, so expect_err cannot be used - take the
         // error arm explicitly.
         fn err_of(r: Result<MetaBox, String>) -> String {
             match r {
@@ -9416,7 +9416,7 @@ mod routing_tests {
         );
         // mistral.rs follows the on-disk shape: a directory goes down
         // the HF-config reader (even when the read itself fails, the
-        // error names that reader — never the GGUF one).
+        // error names that reader - never the GGUF one).
         let err = err_of(read_model_meta(dir.to_str().unwrap(), K::MistralRs));
         assert!(
             err.starts_with("hf config:"),
@@ -9432,7 +9432,7 @@ mod routing_tests {
             ("sglang-0.5.19".to_string(), K::Sglang),
         ];
         // The exact user hit: llamacpp active, safetensors model,
-        // sglang installed — the remedy names the tag + routing.
+        // sglang installed - the remedy names the tag + routing.
         let s = remedy_suffix(&installed, K::LlamaCpp, true).expect("remedy");
         assert!(s.contains("sglang-0.5.19 is already installed"), "{s}");
         assert!(s.contains("blazar engine use sglang-0.5.19"), "{s}");
@@ -9574,7 +9574,7 @@ mod routing_tests {
 
     /// Child-auth mint matrix: the manifest's parsed flag surface decides
     /// the lane. `--api-key-file` (llama-server today) keeps the secret out
-    /// of argv entirely; an argv-only engine (sglang 0.5.21) gets NO mint —
+    /// of argv entirely; an argv-only engine (sglang 0.5.21) gets NO mint -
     /// /proc cmdline is world-readable, so a pretend key only leaks it;
     /// gaining the file flag on an engine update flips the lane with no
     /// blazar-side change.
@@ -9647,7 +9647,7 @@ mod routing_tests {
         }
 
         // Argv-only engine (sglang today): /proc cmdline is world-readable,
-        // so the argv lane is refused outright — no mint, no leak, no
+        // so the argv lane is refused outright - no mint, no leak, no
         // keyfile written.
         assert!(
             auto.mint_child_auth("m2", &tcp, &manifest(&["--api-key"]), K::LlamaCpp)
@@ -9734,7 +9734,7 @@ mod routing_tests {
     #[test]
     fn unit__pick_endpoint__unix_transport_shape_and_determinism() {
         // The sockaddr_un.sun_path budget is 100 bytes and the teaching
-        // error fires by design — but macOS runners get a deep default
+        // error fires by design - but macOS runners get a deep default
         // TMPDIR (/var/folders/...), which made this test unwrap the
         // budget error instead of the shape assertions. Anchor the run
         // dir under a shallow root so every unix host exercises the
@@ -9754,7 +9754,7 @@ mod routing_tests {
         let sup = uds_sup(&dirs, config);
 
         // Sanitized, .sock-suffixed, deterministic (a respawn rebinds the
-        // same path — the boot sweep relies on this).
+        // same path - the boot sweep relies on this).
         let key = "llava@vision";
         let first = sup.pick_endpoint(key).unwrap();
         let second = sup.pick_endpoint(key).unwrap();
@@ -10053,7 +10053,7 @@ mod routing_tests {
                 kind: blazar_core::engine_kind::EngineKind::default(),
             })
             .unwrap();
-        // A fresh model: no bench, no profile, no receipts — the adviser
+        // A fresh model: no bench, no profile, no receipts - the adviser
         // must recommend the full evidence ladder.
         store
             .upsert_model(&blazar_core::store::ModelRow {
@@ -10124,7 +10124,7 @@ mod routing_tests {
         assert!(events.try_recv().is_err());
     }
 
-    /// GPU supervisor with one 8188 MiB card — the 2026-09-11 crash box
+    /// GPU supervisor with one 8188 MiB card - the 2026-09-11 crash box
     /// shape (`NVRM NO_MEMORY` storm from a weights-only admission).
     fn gpu_sup() -> (Supervisor, tempfile::TempDir) {
         gpu_sup_with(
@@ -10138,7 +10138,7 @@ mod routing_tests {
         )
     }
 
-    /// `gpu_sup` with a caller-supplied census and config — the rpc
+    /// `gpu_sup` with a caller-supplied census and config - the rpc
     /// fleet pool tests need multi-card boxes and `rpc_servers` set.
     fn gpu_sup_with(gpus: Vec<GpuInfo>, config: Config) -> (Supervisor, tempfile::TempDir) {
         let bus = EventBus::default();
@@ -10172,7 +10172,7 @@ mod routing_tests {
     }
 
     /// GPU-resident fabricated instance carrying a settle-measured
-    /// footprint — mirrors `fake_instance` but with real weights and a
+    /// footprint - mirrors `fake_instance` but with real weights and a
     /// measured card delta.
     fn gpu_instance(key: &str, weights_bytes: i64, settled_mib: u64) -> (Arc<Instance>, u32) {
         let proc = dummy_process();
@@ -10240,14 +10240,14 @@ mod routing_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].gpu, "full");
         assert_eq!(rows[0].device.as_deref(), Some("RTX 4070"));
-        // The serving engine tag rides every row — the `engine rm`
+        // The serving engine tag rides every row - the `engine rm`
         // live-children guard keys off it.
         assert_eq!(rows[0].engine, "test-engine");
         kill_all(&[pid]);
     }
 
     /// F3 observability: the ps row must carry the child's OWN slot shape
-    /// (argv `-np`), not the adopted ceiling — observers watching a
+    /// (argv `-np`), not the adopted ceiling - observers watching a
     /// reshape (bench lane, `blazar ps`) need the shape the child is
     /// actually serving with. The 20260928-gguf-full reshape verdict was
     /// void precisely because no shape was observable anywhere.
@@ -10263,7 +10263,7 @@ mod routing_tests {
             vec!["llama-server".into(), "-np".into(), "2".into()];
         sup.instances.insert("m".into(), inst);
         // Adoption raises the ceiling, but the child still runs -np 2
-        // until the reshape respawns it — the row must say 2.
+        // until the reshape respawns it - the row must say 2.
         sup.adopted_slots.insert("m".to_string(), 8);
         let rows = sup.ps();
         assert_eq!(rows[0].slots, Some(2));
@@ -10414,7 +10414,7 @@ mod routing_tests {
 
     /// Wave L `warm_on_pull`: a pull event for an already-live model must
     /// not attempt a second spawn (idempotence), and a spawn that fails
-    /// must stay warn-not-fail — no panic, no half-instance.
+    /// must stay warn-not-fail - no panic, no half-instance.
     #[tokio::test]
     async fn unit__warm_on_pull__idempotent_and_warn_not_fail() {
         let mut sup = routing_sup(1);
@@ -10444,7 +10444,7 @@ mod routing_tests {
     }
 
     /// Audit MM5 regression: media-job polls bracket via
-    /// `begin_request`/`end_request` — the bracket must bump `in_flight`
+    /// `begin_request`/`end_request` - the bracket must bump `in_flight`
     /// (holds the child against idle eviction) and refresh `last_used`
     /// on BOTH ends, and end must clamp at zero (a request outliving a
     /// respawn must never read the shared counter negative).
@@ -10486,7 +10486,7 @@ mod routing_tests {
     }
 
     /// Cold-spawn admission window (2026-09-29): requests the gate
-    /// admits BEFORE the instance exists must still count — the gate's
+    /// admits BEFORE the instance exists must still count - the gate's
     /// busy read is `request_load`, so a lost begin here let the next
     /// arrivals over-admit onto the busy child. The registration fold
     /// then moves the prenatal total onto the live counter exactly
@@ -10548,7 +10548,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__warm_peg_sglang__unix_endpoint_noop_fast() {
         // sglang is TCP-only; a unix endpoint must return instantly
-        // without touching the network — the fail-fast guard before any
+        // without touching the network - the fail-fast guard before any
         // HTTP machinery spins up.
         let started = std::time::Instant::now();
         warm_peg_child(
@@ -10604,7 +10604,7 @@ mod routing_tests {
                 last_used_at: 0,
             })
             .unwrap();
-        // No engines installed: routing stays global/indeterminate —
+        // No engines installed: routing stays global/indeterminate -
         // the legacy dedicated variant child must be kept.
         assert!(
             !sup.sglang_variant_rides_base("m", "anonymizer")
@@ -10720,7 +10720,7 @@ mod routing_tests {
                 last_used_at: 0,
             })
             .unwrap();
-        // No engines installed: routing stays global/indeterminate —
+        // No engines installed: routing stays global/indeterminate -
         // the legacy dedicated variant child must be kept.
         assert!(
             !sup.llamacpp_variant_rides_base("m", "anonymizer")
@@ -10805,7 +10805,7 @@ mod routing_tests {
                 .unwrap()
         );
         assert!(sup.instances.contains_key("m"), "loaded resident stays");
-        // A DRIFTED resident (adapter set ≠ current store rows) is
+        // A DRIFTED resident (adapter set != current store rows) is
         // evicted for consolidation onto the current spawn set.
         let (mut drifted, drifted_pid) = fake_instance("m", InstanceState::Ready, 0);
         {
@@ -10887,7 +10887,7 @@ mod routing_tests {
             super::warm_peg_served_model(&mlx).as_deref(),
             Some("/models/q.d")
         );
-        // llama.cpp: -m is not a served-name flag — flat name applies.
+        // llama.cpp: -m is not a served-name flag - flat name applies.
         let llamacpp = vec!["-m".to_string(), "m.gguf".to_string()];
         assert_eq!(super::warm_peg_served_model(&llamacpp), None);
     }
@@ -10957,7 +10957,7 @@ mod routing_tests {
     async fn unit__blocked_action__captive_never_selects_a_victim() {
         // Captive contract: under the same pressure that would evict
         // the resident for a generation spawn, the captive verdict is a
-        // flat refusal — the semantic-cache embed model must never
+        // flat refusal - the semantic-cache embed model must never
         // decide which generation models stay resident.
         let (sup, _root) = gpu_sup();
         let (big, pid) = gpu_instance("big", 5_800 * 1024 * 1024, 7_302);
@@ -11090,7 +11090,7 @@ mod routing_tests {
             gpus,
         };
         // 7000 MiB weights + 500 MiB KV: over the best single free card
-        // (5000), within the combined pool (8000) — a local box splits.
+        // (5000), within the combined pool (8000) - a local box splits.
         assert_eq!(
             sup.auto_split_plan("m", 7_000, 500, &hw, false),
             Some("1,1".to_string()),
@@ -11098,7 +11098,7 @@ mod routing_tests {
         );
         // Same box with the rpc fleet configured: split ratios map
         // POSITIONALLY onto an RPC-FIRST device order upstream, so
-        // local-only ratios would land on the wrong devices —
+        // local-only ratios would land on the wrong devices -
         // suppressed; the engine's own distribution owns placement.
         assert_eq!(
             sup.auto_split_plan("m", 7_000, 500, &hw, true),
@@ -11142,7 +11142,7 @@ mod routing_tests {
         );
     }
 
-    /// Two-card fake box whose descriptions differ from the census ids —
+    /// Two-card fake box whose descriptions differ from the census ids -
     /// the display-label/id split real censuses exhibit. The per-device
     /// ledger and the card-scoped co-residency planner must key on the
     /// id, never on the label.
@@ -11248,7 +11248,7 @@ mod routing_tests {
             "NVIDIA GeForce RTX 4070",
         );
         sup.instances.insert("big0".to_string(), big0);
-        // One card loaded: a 5000 MiB floor still fits the EMPTY card —
+        // One card loaded: a 5000 MiB floor still fits the EMPTY card -
         // per-device and the old aggregate pool agree here.
         assert!(!sup.admission_blocked("other", mib(5_000), false, 0));
         let (big1, _p1) = placed_gpu_instance(
@@ -11259,9 +11259,9 @@ mod routing_tests {
             "NVIDIA GeForce RTX 5070",
         );
         sup.instances.insert("big1".to_string(), big1);
-        // Both cards loaded: 6000 + 3000 > 8188 on EACH card → blocked,
+        // Both cards loaded: 6000 + 3000 > 8188 on EACH card -> blocked,
         // even though the summed pool (12_000 resident + 3000 floor <=
-        // 16_376) still says room — the exact one-card collision the
+        // 16_376) still says room - the exact one-card collision the
         // aggregate admission used to wave through.
         assert!(sup.admission_blocked("other", mib(3_000), false, 0));
     }
@@ -11272,24 +11272,24 @@ mod routing_tests {
         let mib = |m: u64| m * 1024 * 1024;
         let (mut sup, _root) = dual_gpu_sup();
         // Both cards are 8188 MiB: a 9000 MiB floor cannot fit either one
-        // even on an empty box — physically unschedulable, must surface as
+        // even on an empty box - physically unschedulable, must surface as
         // the largest budget so the refusal can teach the numbers.
         assert_eq!(
             sup.largest_card_budget("other", mib(9_000)),
             Some(mib(8_188))
         );
         // 3000 MiB fits an empty card: any blocking is residents in the
-        // way — honestly queueable, never a physical refusal.
+        // way - honestly queueable, never a physical refusal.
         assert_eq!(sup.largest_card_budget("other", mib(3_000)), None);
         // Exactly-budget edge: fits (<=), not impossible.
         assert_eq!(sup.largest_card_budget("other", mib(8_188)), None);
-        // Manual pin to a card the census cannot judge: fail open — the
+        // Manual pin to a card the census cannot judge: fail open - the
         // spawn-time probe owns that refuse, never a false "too large".
         sup.config.devices = vec!["CUDA9".to_string()];
         assert_eq!(sup.largest_card_budget("other", mib(9_000)), None);
         // Reachability of the refusal arm: with a resident on one card,
         // the 9000 MiB floor is admission-blocked AND physically
-        // impossible — the Refuse arm must classify it ModelTooLarge.
+        // impossible - the Refuse arm must classify it ModelTooLarge.
         sup.config.devices = Vec::new();
         let (big0, _p0) = placed_gpu_instance(
             "big0",
@@ -11317,7 +11317,7 @@ mod routing_tests {
         // One card is not a shard pool.
         assert_eq!(plan_auto_tp(&[card], mib(9_000)), None);
         // The SMALLEST card decides (NCCL shards evenly): 17 GiB over a
-        // 16+4 GiB pair is per-rank 8.5 GiB — over the 4 GiB rank.
+        // 16+4 GiB pair is per-rank 8.5 GiB - over the 4 GiB rank.
         assert_eq!(plan_auto_tp(&[mib(16_000), mib(4_000)], mib(17_000)), None);
         // Three cards, per-rank fits: full-pool ranks.
         assert_eq!(plan_auto_tp(&[card, card, card], mib(20_000)), Some(3));
@@ -11329,7 +11329,7 @@ mod routing_tests {
         let mib = |m: u64| m * 1024 * 1024;
         let card = mib(8_188);
         // Over the best card, within the summed pool: span (uneven layer
-        // split is legal — 12 GiB on 16+4 distributes 9+3 or any mix).
+        // split is legal - 12 GiB on 16+4 distributes 9+3 or any mix).
         assert_eq!(
             plan_mistralrs_sum_span(&[mib(16_000), mib(4_000)], mib(17_000)),
             Some(2)
@@ -11404,7 +11404,7 @@ mod routing_tests {
             vec![("GGML_VK_VISIBLE_DEVICES".to_string(), "1,2".to_string())]
         );
         // Identity census: the unfiltered child already sees exactly the
-        // plan's cards — no emission.
+        // plan's cards - no emission.
         assert_eq!(
             spanning_env_from_census(
                 Some(2),
@@ -11470,7 +11470,7 @@ mod routing_tests {
             0
         );
         // Argv carries device ids (manual devices / main-gpu pin): the
-        // VK renumber would invalidate them — the Vulkan path stays
+        // VK renumber would invalidate them - the Vulkan path stays
         // off. The CUDA pair keeps its shipped probe-count contract
         // (remap_device_argv reconciles its --device entries).
         assert_eq!(
@@ -11502,7 +11502,7 @@ mod routing_tests {
         );
         sup.instances.insert("big0".to_string(), big0);
         // Single-rank: a 9000 MiB floor fits neither card next to the
-        // resident — blocked (per-card question, as before).
+        // resident - blocked (per-card question, as before).
         assert!(sup.admission_blocked("other", mib(9_000), false, 0));
         // Sharding spawn: per-card fit is the wrong question; the summed
         // pool (6000 resident + 9000 incoming = 15000 <= 16376) holds.
@@ -11519,7 +11519,7 @@ mod routing_tests {
         let (sup, _root) = dual_gpu_sup();
         // The live over-eviction scenario: a 0.7 GiB resident coexists
         // with a 6.6 GiB incoming floor on an 8 GiB card (697 + 6630 =
-        // 7327 <= 8188) — under the reservation the load already speaks
+        // 7327 <= 8188) - under the reservation the load already speaks
         // for the incoming spawn, so the placement fits.
         let (small, _ps) = placed_gpu_instance(
             "small",
@@ -11569,16 +11569,16 @@ mod routing_tests {
             "NVIDIA GeForce RTX 5070",
         );
         sup.instances.insert("b".to_string(), b);
-        // GPU0 6000+3000 over; GPU1 5000+3000 = 8000 <= 8188 → fits; the
+        // GPU0 6000+3000 over; GPU1 5000+3000 = 8000 <= 8188 -> fits; the
         // only fitting card is GPU1.
         assert!(!sup.admission_blocked("other", mib(3_000), false, 0));
         // A concurrent spawn holds GPU1's remaining headroom for its
-        // pick→insert window (the settling child is not yet a counted
-        // resident): 5000 + 200 reserved + 3000 floor > 8188 → the next
+        // pick->insert window (the settling child is not yet a counted
+        // resident): 5000 + 200 reserved + 3000 floor > 8188 -> the next
         // admission must see the collision the resident sum alone misses.
         let r = sup.reserve_device("GPU1", mib(200));
         assert!(sup.admission_blocked("other", mib(3_000), false, 0));
-        // Releasing the reservation reopens the card — Drop is the only
+        // Releasing the reservation reopens the card - Drop is the only
         // release path, so the guard's lifetime IS the spawn window.
         drop(r);
         assert!(!sup.admission_blocked("other", mib(3_000), false, 0));
@@ -11620,9 +11620,9 @@ mod routing_tests {
         }
         sup.instances.insert("big0".to_string(), big0);
         // 6000 weights + 1000 KV resident + 1000 weights + 1000 KV
-        // candidate = 9000 MiB > 95% of the 8188 card → downgrade fires.
+        // candidate = 9000 MiB > 95% of the 8188 card -> downgrade fires.
         assert!(sup.coresidency_needs_kv_quant(Some("GPU0"), mib(1_000), Some(mib(1_000))));
-        // Targeting GPU1: the GPU0 resident does not count → 2000 fits.
+        // Targeting GPU1: the GPU0 resident does not count -> 2000 fits.
         assert!(!sup.coresidency_needs_kv_quant(Some("GPU1"), mib(1_000), Some(mib(1_000))));
     }
 
@@ -11761,7 +11761,7 @@ mod routing_tests {
 
     fn dummy_process() -> tokio::process::Child {
         // kill_on_drop: the fabricated pid outlives the helper, but the
-        // real process must not — an orphaned child parks tokio's
+        // real process must not - an orphaned child parks tokio's
         // orphan-reaper thread and nextest flags the test as LEAK.
         #[cfg(not(windows))]
         return tokio::process::Command::new("sleep")
@@ -11798,7 +11798,7 @@ mod routing_tests {
     async fn unit__evict__respawn_during_grace_survives() {
         // F1 pin: a fresh instance inserted under the same name while an
         // evict waits in the child mutex (terminate grace) must survive
-        // the evict's cleanup — pre-fix, instances.remove(name) deleted
+        // the evict's cleanup - pre-fix, instances.remove(name) deleted
         // it and the pidfile/apikey went with it.
         let sup = std::sync::Arc::new(routing_sup(1));
         let (old, po) = fake_instance("m", InstanceState::Ready, 0);
@@ -11848,7 +11848,7 @@ mod routing_tests {
         assert_eq!(model_of_key("m#3"), "m");
         assert_eq!(model_of_key("m#3#4"), "m"); // first '#' wins
         // @vision suffix (lazy projector respawn key) must never leak
-        // into model resolution — evict_model-style filters stay correct
+        // into model resolution - evict_model-style filters stay correct
         assert_eq!(model_of_key("m@vision"), "m");
         assert_eq!(model_of_key("m#1@vision"), "m");
         assert_eq!(model_of_key("m@vision#1"), "m"); // '@' stripped first
@@ -11955,7 +11955,7 @@ mod routing_tests {
             scale: 1.0,
         };
         // Dense arm: one missing row sinks the whole admission with the
-        // row id and the repair command — never a silent partial load.
+        // row id and the repair command - never a silent partial load.
         let dense = vec![
             row(7, present.display().to_string()),
             row(8, gone.display().to_string()),
@@ -12178,7 +12178,7 @@ mod routing_tests {
         };
         let advertised = ["ngram-simple".to_string(), "draft-simple".to_string()].to_vec();
         // Draft wins on ratio but the pair is not pulled: receipt is
-        // gated out, ngram (1.10) takes over — hardware truth, not hope.
+        // gated out, ngram (1.10) takes over - hardware truth, not hope.
         let rows = vec![receipt("ngram", 1.10), receipt("draft", 1.30)];
         assert_eq!(
             best(&rows, &advertised, false),
@@ -12235,8 +12235,8 @@ mod routing_tests {
             reps: 1,
         };
         let advertised = ["ngram-simple".to_string()].to_vec();
-        // An untuned ngram receipt — even a LOUD winner above every
-        // tuned arm — raced engine-default knobs: a default-shape fluke
+        // An untuned ngram receipt - even a LOUD winner above every
+        // tuned arm - raced engine-default knobs: a default-shape fluke
         // is not adoption-grade evidence, so it must not select. The
         // tuned arm wins on its honest (smaller) ratio.
         let rows = vec![receipt("ngram", 1.50, false), receipt("ngram", 1.12, true)];
@@ -12245,7 +12245,7 @@ mod routing_tests {
             Some(("ngram", 1.12)),
             "untuned ngram must lose to the tuned arm despite the higher ratio"
         );
-        // Untuned-only evidence: no selection at all — the heuristic
+        // Untuned-only evidence: no selection at all - the heuristic
         // auto chain keeps deciding (this is exactly the pre-v19
         // receipt population's shape: default-shape races).
         let untuned_only = vec![receipt("ngram", 1.50, false)];
@@ -12256,7 +12256,7 @@ mod routing_tests {
         );
         // The gate reads ngram only: a "tuned=false" spelling on other
         // modes (never written today, defensive tomorrow) still selects
-        // when their real eligibility holds — dflash arms carry the
+        // when their real eligibility holds - dflash arms carry the
         // engine's flash decoder by construction.
         let dflash = vec![blazar_core::store::SpecReceiptRow {
             mode: "dflash".into(),
@@ -12587,7 +12587,7 @@ mod routing_tests {
         let overlay = blazar_core::config::ModelOverride::default();
         // Normal auto-routing for this GGUF on a llamacpp-global daemon
         // resolves to the global lane (serving_lane returns None when the
-        // routed kind matches the global engine kind) — the pin is gone
+        // routed kind matches the global engine kind) - the pin is gone
         // and the resolver is back on its normal decision path.
         assert!(
             sup.resolve_routed_engine(&store, &overlay, &model)
@@ -12756,14 +12756,14 @@ mod routing_tests {
         sup.note_transition("b");
         assert!(
             !sup.preload_awaiting_use.contains_key("b"),
-            "a serve is the prediction coming true — flag must clear"
+            "a serve is the prediction coming true - flag must clear"
         );
     }
 
     #[tokio::test]
     async fn unit__evict__unused_predictive_preload_decays_until_loop_dies() {
-        // The live-observed resurrection loop: B preloaded from A→B
-        // edges, never serves, idle-evicts — and the stale edges used
+        // The live-observed resurrection loop: B preloaded from A->B
+        // edges, never serves, idle-evicts - and the stale edges used
         // to re-spawn it on the very next reaper tick, forever. The
         // evict-side decay must break the cycle within two ladders.
         let sup = routing_sup(1);
@@ -12791,13 +12791,13 @@ mod routing_tests {
         }
         assert!(
             sup.transitions.get(&edge).map_or(0, |v| *v) < PRELOAD_MIN_TRANSITIONS,
-            "after two unused ladders the edge sits below the preload threshold — no resurrection"
+            "after two unused ladders the edge sits below the preload threshold - no resurrection"
         );
         // A model that DID serve keeps its edges at evict: the serve
         // clears the flag, so the later eviction is organic.
         sup.note_transition("a"); // refresh prev after the decay rounds
         sup.preload_awaiting_use.insert("b".to_string(), ());
-        sup.note_transition("b"); // serve: a→b back to 2 AND clears the flag
+        sup.note_transition("b"); // serve: a->b back to 2 AND clears the flag
         let (inst, ph) = fake_instance("b", InstanceState::Ready, 0);
         sup.instances.insert("b".to_string(), inst);
         holders.push(ph);
@@ -13136,7 +13136,7 @@ mod routing_tests {
 
     /// 2026-09-24 demand sizing: the parked-waiter gauge sizes the
     /// adoption step so one streak reaches the demanded shape (C=8 on a
-    /// 1-slot child parks 7) — and the adoption cap bounds it.
+    /// 1-slot child parks 7) - and the adoption cap bounds it.
     #[tokio::test]
     async fn unit__adaptive_slots__demand_sized_adoption_capped_at_ceiling() {
         let mut sup = routing_sup(1);
@@ -13161,7 +13161,7 @@ mod routing_tests {
     }
 
     /// 2026-09-12 generalization: capacity-shaped auto spawns (child
-    /// argv carries `-np 4`, config slots = 0) must earn bumps too —
+    /// argv carries `-np 4`, config slots = 0) must earn bumps too -
     /// the old `effective == 1` guard left the default shape inert.
     /// Saturation at in-flight 5 > 4 slots adopts 5 and queues the
     /// reshape respawn.
@@ -13192,12 +13192,12 @@ mod routing_tests {
 
     /// Live receipt 2026-09-29 (reshape campaign + controlled repro):
     /// under sustained gated 8-stream load the pressure gauge oscillates
-    /// at request granularity — sampled across 10s ticks it read
-    /// 4,0,4,1,4,0,3,1 — and every dipped tick reset the streak, so a
+    /// at request granularity - sampled across 10s ticks it read
+    /// 4,0,4,1,4,0,3,1 - and every dipped tick reset the streak, so a
     /// child pinned at `in_flight` == `slots` NEVER reached 6 consecutive
     /// saturated ticks. The demand latch keeps a capacity-pinned child
     /// saturated while pressure was noted within two tick windows, and
-    /// the latched max sizes the adoption step to the window PEAK — a
+    /// the latched max sizes the adoption step to the window PEAK - a
     /// dip caught at the adoption tick must not shrink the step.
     #[tokio::test]
     async fn unit__adaptive_slots__gauge_dip_does_not_reset_streak() {
@@ -13211,7 +13211,7 @@ mod routing_tests {
         // Even ticks: four waiters park (each park climbs the gauge, so
         // the latch records the peak 4). Odd ticks: completions drain
         // the gauge for a sub-second window before the freed workers'
-        // next requests re-park — the 10s sampler catches the dip.
+        // next requests re-park - the 10s sampler catches the dip.
         for i in 0..(SLOTS_STREAK_TICKS - 1) as usize {
             if i % 2 == 0 {
                 for _ in 0..4 {
@@ -13243,7 +13243,7 @@ mod routing_tests {
 
     /// D1 burst fast-path: a window peak of >= 2x the effective slots is
     /// demand-attested, so 2 saturated ticks adopt (the 6-tick window
-    /// used to outlast sub-minute bursts — C4 0.56x/C8 0.61x queueing,
+    /// used to outlast sub-minute bursts - C4 0.56x/C8 0.61x queueing,
     /// spike doc 2026-10-29). The cooldown map records the fast adoption.
     #[tokio::test]
     async fn unit__adaptive_slots__burst_fast_path_adopts_at_two_ticks() {
@@ -13276,7 +13276,7 @@ mod routing_tests {
     }
 
     /// D1 anti-flap: inside the cooldown a fresh burst is demoted to the
-    /// standard 6-tick streak (the reshape has not landed yet — stacking
+    /// standard 6-tick streak (the reshape has not landed yet - stacking
     /// a second bump before the first is testable would overshoot).
     #[tokio::test]
     async fn unit__adaptive_slots__fast_path_cooldown_demotes_to_standard_window() {
@@ -13294,7 +13294,7 @@ mod routing_tests {
         sup.adaptive_slots_tick();
         assert_eq!(sup.adopted_slots.get("m").map(|v| *v), Some(3));
         // The reshape landed; the same burst keeps queueing. The gauge
-        // already sits at 2 — four more parks push the window peak to 6
+        // already sits at 2 - four more parks push the window peak to 6
         // >= 2x3, so ONLY the cooldown can demote this to the standard
         // window (a broken cooldown would adopt 3 + 6 = 9 at tick 2).
         for _ in 0..4 {
@@ -13305,7 +13305,7 @@ mod routing_tests {
         }
         assert!(
             sup.adopted_slots.get("m").map(|v| *v) == Some(3),
-            "cooldown demotes the streak to the standard window — no fast re-adopt"
+            "cooldown demotes the streak to the standard window - no fast re-adopt"
         );
         assert!(
             sup.busy_streak.get(&"m".to_string()).map(|v| *v.value())
@@ -13353,7 +13353,7 @@ mod routing_tests {
     }
 
     /// D3 starvation bound: a busy instance parks admissions while the
-    /// reshape waits for streams to drain — but a parking floor longer
+    /// reshape waits for streams to drain - but a parking floor longer
     /// than the bound costs more tail latency than the reshape
     /// recovers. A backdated mark trips the cutover (admissions reopen,
     /// `is_reshaping` goes false), and a LATER larger adoption re-arms a
@@ -13439,12 +13439,12 @@ mod routing_tests {
 
     /// D5 sampler: notes route by residual concurrency (0 = solo class,
     /// n > 0 = loaded at depth n+1) and the ratio needs BOTH classes
-    /// fresh — a half-empty or stale sampler stands the gate down.
+    /// fresh - a half-empty or stale sampler stands the gate down.
     #[test]
     fn unit__decode_scaling__class_routing_and_freshness() {
         let sup = routing_sup(1);
         // Solo sample: 100 t/s with 0 other streams; loaded: 60 t/s with
-        // 1 other (depth 2 — the noter itself is the +1; see the router
+        // 1 other (depth 2 - the noter itself is the +1; see the router
         // doc and `proxy::others_peak`).
         sup.note_model_throughput("zeta", 100, 1.0, 0);
         sup.note_model_throughput("zeta", 60, 1.0, 1);
@@ -13475,7 +13475,7 @@ mod routing_tests {
 
     /// D5 gate: when measured aggregate decode barely scales with
     /// concurrency (ratio < `DECODE_SCALE_ADOPT_MIN`), a saturated lane
-    /// must NOT pay a reshape for queue relief — it teaches once per
+    /// must NOT pay a reshape for queue relief - it teaches once per
     /// dedup window instead. The kill-switch and a healthy ratio both
     /// restore adoption.
     #[tokio::test]
@@ -13489,7 +13489,7 @@ mod routing_tests {
         sup.instances.insert("m".into(), inst);
         let mut rx = sup.bus.subscribe();
         // GPU-bound shape: solo 100 t/s, loaded 30 t/s at depth 2
-        // (1 other stream) → ratio 0.6 << 1.25.
+        // (1 other stream) -> ratio 0.6 << 1.25.
         sup.note_model_throughput("m", 100, 1.0, 0);
         sup.note_model_throughput("m", 30, 1.0, 1);
         sup.note_slot_pressure("m");
@@ -13523,7 +13523,7 @@ mod routing_tests {
         );
         kill_all(&[ph]);
 
-        // Healthy scaling (ratio 1.6 ≥ 1.25): adoption proceeds.
+        // Healthy scaling (ratio 1.6 >= 1.25): adoption proceeds.
         let mut sup = routing_sup(1);
         sup.config.adaptive_slots = true;
         sup.config.slots = 0;
@@ -13547,14 +13547,14 @@ mod routing_tests {
 
     /// Prewarm cutover: an idle reshape spawns the replacement under
     /// `m#warm` first (the old child serves until the swap), then re-keys
-    /// the warm instance to `m` — one resident, adopted argv, no warm
+    /// the warm instance to `m` - one resident, adopted argv, no warm
     /// residue, `SlotsPrewarmCutover` published.
     #[tokio::test]
     async fn unit__prewarm__cutover_rekeys_and_retires_old() {
         let mut sup = routing_sup(1);
         sup.config.adaptive_slots = true;
         // A prewarm-capable box: the transient double-residency (old +
-        // warm) needs room for two concurrent instances — the default
+        // warm) needs room for two concurrent instances - the default
         // no-GPU harness caps at one, and a one-slot box correctly
         // takes the fallback instead.
         sup.config.max_loaded_models = 2;
@@ -13592,7 +13592,7 @@ mod routing_tests {
         assert!(warm.is_none(), "warm must be re-keyed, not left behind");
         let respawned = sup.instances.get("m").expect("re-keyed instance under m");
         assert_eq!(respawned.name, "m");
-        // (The adopted shape is asserted via the cutover event below —
+        // (The adopted shape is asserted via the cutover event below -
         // FakeEngine's build_argv is empty, so the spawned argv carries
         // no `-np` pair to check here; the integration test pins the
         // real child argv.)
@@ -13632,7 +13632,7 @@ mod routing_tests {
 
     /// Prewarm refusal: when the warm spawn cannot start (unreadable
     /// model metadata here), the drain falls back to the verbatim
-    /// evict-then-ensure shape — which also fails on the same metadata,
+    /// evict-then-ensure shape - which also fails on the same metadata,
     /// so the reshape holds (parked) instead of half-installing.
     #[tokio::test]
     async fn unit__prewarm__refused_falls_back_and_holds() {
@@ -13683,7 +13683,7 @@ mod routing_tests {
 
     /// Shape authority handback (live-caught on the rig): a stale
     /// adopted value must stop shadowing a model the moment the model
-    /// becomes excluded — a pin (or replicas/deterministic) reclaims
+    /// becomes excluded - a pin (or replicas/deterministic) reclaims
     /// authority, so spawns and `slot_cap` fall back to the pin/argv
     /// instead of a value adaptation no longer owns.
     #[tokio::test]
@@ -13702,7 +13702,7 @@ mod routing_tests {
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
         sup.instances.insert("m".into(), inst);
-        // Adoption recorded before the pin landed — now stale.
+        // Adoption recorded before the pin landed - now stale.
         sup.adopted_slots.insert("m".to_string(), 6);
         sup.fast_adopted_at
             .insert("m".to_string(), std::time::Instant::now());
@@ -13718,9 +13718,9 @@ mod routing_tests {
 
     /// `ps()` must say WHERE each resident's slot count comes from,
     /// mirroring `slot_cap` precedence: adapted (adaptation owns the
-    /// shape — including a delegated pin+override) > pinned (manual
+    /// shape - including a delegated pin+override) > pinned (manual
     /// overlay pin) > auto (argv `-np`) > engine (child default). A
-    /// replica key records its override against the base model — the
+    /// replica key records its override against the base model - the
     /// canonicalization `ps()` owes `overlay_for`'s raw lookup.
     #[tokio::test]
     async fn unit__ps__slots_source_reports_precedence() {
@@ -13794,7 +13794,7 @@ mod routing_tests {
 
     /// Churn regression (live-repro'd on the rig): a `#warm` child is
     /// invisible to routing, so the adaptive tick must not adopt or
-    /// queue a reshape against it — that loop evicted the very warm
+    /// queue a reshape against it - that loop evicted the very warm
     /// child the drain had installed, once per 10s tick.
     #[tokio::test]
     async fn unit__adaptive_slots__warm_transitional_child_ignored() {
@@ -13822,7 +13822,7 @@ mod routing_tests {
     }
 
     /// Churn regression: when a Ready warm child is already waiting, the
-    /// drain must consume it (cutover) instead of spawning another —
+    /// drain must consume it (cutover) instead of spawning another -
     /// the old code overwrote `m#warm` every tick, orphaning a live
     /// child each time. Identity of the survivor proves no respawn: the
     /// post-cutover instance under `m` carries the marker planted on
@@ -13861,7 +13861,7 @@ mod routing_tests {
         assert_eq!(
             survivor.warnings,
             vec!["warm-marker".to_string()],
-            "the survivor IS the pre-inserted warm child — no respawn happened"
+            "the survivor IS the pre-inserted warm child - no respawn happened"
         );
         assert!(
             sup.reshape_draining.get("m").is_none() && sup.reshape_queue.get("m").is_none(),
@@ -13878,11 +13878,11 @@ mod routing_tests {
                 Err(_) => break,
             }
         }
-        assert!(cut, "cutover — not the fallback — ran");
+        assert!(cut, "cutover - not the fallback - ran");
         kill_all(&[old_ph, warm_ph]);
     }
 
-    /// D2: a manual `slots` pin stays authoritative — sustained pressure
+    /// D2: a manual `slots` pin stays authoritative - sustained pressure
     /// behind it teaches (ONE event per dedup window, never adopts),
     /// and the streak resets as soon as the lane reads unsaturated.
     #[tokio::test]
@@ -13911,7 +13911,7 @@ mod routing_tests {
         );
         assert!(
             sup.adopted_slots.get("m").is_none(),
-            "the pin stays authoritative — no adoption"
+            "the pin stays authoritative - no adoption"
         );
         let mut taught = 0;
         while let Ok(ev) = rx.try_recv() {
@@ -13947,7 +13947,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    /// D2 escape hatch: `adaptive_override on` lifts the pin exclusion —
+    /// D2 escape hatch: `adaptive_override on` lifts the pin exclusion -
     /// the pinned value becomes the base shape and D1 applies (fast
     /// path at 2 ticks, demand-sized step).
     #[tokio::test]
@@ -13983,7 +13983,7 @@ mod routing_tests {
     }
 
     /// D4 gauge snapshot: per canonical model (replica keys deduped),
-    /// sorted, with adopted → argv → config resolution for the
+    /// sorted, with adopted -> argv -> config resolution for the
     /// effective cap.
     #[tokio::test]
     async fn unit__slots_gauge_snapshot__dedupes_replica_keys() {
@@ -14018,7 +14018,7 @@ mod routing_tests {
 
     /// The latch is CONSUMED at adoption: the window after an adoption
     /// must attest its own peak. A fresh 1-waiter episode steps +1 off
-    /// the new gauge — inheriting the prior window's max would
+    /// the new gauge - inheriting the prior window's max would
     /// overshoot demand on every staggered streak.
     #[tokio::test]
     async fn unit__adaptive_slots__latch_consumed_on_adoption() {
@@ -14065,7 +14065,7 @@ mod routing_tests {
     }
 
     /// The latch's boundary: a child at full occupancy with NO queued
-    /// demand is healthy concurrency, not saturation — it must never
+    /// demand is healthy concurrency, not saturation - it must never
     /// adopt (the demand attestation is what separates the two).
     #[tokio::test]
     async fn unit__adaptive_slots__full_but_unqueued_stays_quiet() {
@@ -14085,7 +14085,7 @@ mod routing_tests {
     }
 
     /// At the adoption cap the saturation streak must not re-adopt
-    /// (to <= from skips) — no event spam, no queue churn.
+    /// (to <= from skips) - no event spam, no queue churn.
     #[tokio::test]
     async fn unit__adaptive_slots__at_cap_does_not_adopt() {
         let mut sup = routing_sup(1);
@@ -14135,7 +14135,7 @@ mod routing_tests {
     /// hold a `DashMap` iteration across `child.lock().await`. The old
     /// loop parked a shard read-guard on the child mutex; with the mutex
     /// held by a concurrent evict (slow terminate), every write to that
-    /// shard parked its worker thread in a sync futex — accept, /health
+    /// shard parked its worker thread in a sync futex - accept, /health
     /// and the SIGTERM drain all starved. Regression shape: while the
     /// reaper awaits a held child lock, instance-map writes must still
     /// go through.
@@ -14359,7 +14359,7 @@ mod routing_tests {
         // 4000 resident + 3500 weights + 500 KV = 8000 MiB > 95% of 8188
         let same = card_pressure_exceeds(Some("dg"), &gpus, &residents, 3_500 * MIB, 500 * MIB);
         assert_eq!(same, Some(true));
-        // Same residents pinned to the OTHER card: nothing on "dg" → fits.
+        // Same residents pinned to the OTHER card: nothing on "dg" -> fits.
         let others = vec![(Some("ig".to_string()), 4_000 * MIB, 0, true)];
         let free = card_pressure_exceeds(Some("dg"), &gpus, &others, 3_500 * MIB, 500 * MIB);
         assert_eq!(free, Some(false));
@@ -14434,7 +14434,7 @@ mod routing_tests {
             gpu("B", "NVIDIA GeForce RTX 4070", 8_188, 100),
         ];
         // need 16_050: over A's 16_000 free, within the 16_100 combined.
-        // min_free = 100 → ratios 160:1 (B clamps to ≥1).
+        // min_free = 100 -> ratios 160:1 (B clamps to >=1).
         let ratios = plan_auto_tensor_split(&gpus, 16_000, 50);
         assert_eq!(ratios.as_deref(), Some("160,1"));
     }
@@ -14560,7 +14560,7 @@ mod routing_tests {
     fn unit__model_hints__none_windows_keep_last_value() {
         let sup = routing_sup(1);
         sup.set_model_hints("m", Some(0.9), Some(0.6));
-        // Idle/dense window: both None — nothing may zero out.
+        // Idle/dense window: both None - nothing may zero out.
         sup.set_model_hints("m", None, None);
         assert_eq!(sup.cache_hint_for("m"), Some(0.9));
         assert_eq!(sup.accept_hint_for("m"), Some(0.6));
@@ -14635,7 +14635,7 @@ mod routing_tests {
             vec![("m".to_string(), false)],
             "watching after one bad window"
         );
-        // Window 2: threshold — parked, reshape queued for the live key.
+        // Window 2: threshold - parked, reshape queued for the live key.
         sup.spec_governor_window("m", None);
         assert_eq!(
             sup.spec_override.get("m").map(|v| v.value().clone()),
@@ -14654,7 +14654,7 @@ mod routing_tests {
     async fn unit__spec_governor__accept_collapse_parks_without_saturation() {
         let mut sup = routing_sup(1);
         sup.config.spec_auto_manage = true;
-        // No instances at all: nothing saturated — only the acceptance
+        // No instances at all: nothing saturated - only the acceptance
         // floor breach can fire (a spec child reporting 0.10).
         sup.spec_governor_window("m", Some(0.10));
         sup.spec_governor_window("m", Some(0.12));
@@ -14691,8 +14691,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__spec_governor__default_on_healthy_never_parks() {
         // Defaults ship speculation (spec=auto, ngram fallback) WITH the
-        // governor armed. Healthy windows — high acceptance, no queue
-        // pressure — must leave both override and streak state empty.
+        // governor armed. Healthy windows - high acceptance, no queue
+        // pressure - must leave both override and streak state empty.
         let sup = routing_sup(1); // defaults: spec_auto_manage = true
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
         sup.instances.insert("m".into(), inst);
@@ -14707,7 +14707,7 @@ mod routing_tests {
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__spec_governor__overlay_pin_and_config_off_exempt() {
-        // Overlay pin: a user policy statement — never governed.
+        // Overlay pin: a user policy statement - never governed.
         let mut sup = routing_sup(1);
         sup.config.spec_auto_manage = true;
         sup.config.model_overrides.insert(
@@ -14830,11 +14830,11 @@ mod routing_tests {
             sup.ubatch_governor_snapshot(),
             vec![("m".to_string(), 1024)]
         );
-        // Another streak reaches the top rung (2048)…
+        // Another streak reaches the top rung (2048)...
         sup.ubatch_governor_window("m");
         sup.ubatch_governor_window("m");
         assert_eq!(sup.governed_ubatch("m"), Some(2048));
-        // …and a further streak holds there without looping.
+        // ...and a further streak holds there without looping.
         sup.ubatch_governor_window("m");
         sup.ubatch_governor_window("m");
         assert_eq!(sup.governed_ubatch("m"), Some(2048));
@@ -14880,7 +14880,7 @@ mod routing_tests {
         sup.config.ubatch_auto = true;
         sup.ubatch_override.insert("m".into(), 2048);
         // A live (idle) instance so step-downs have something to reshape;
-        // load 0 keeps it unsaturated — every window is quiet.
+        // load 0 keeps it unsaturated - every window is quiet.
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         sup.instances.insert("m".into(), inst);
         for _ in 0..(UBATCH_GOV_RECOVER_STREAK - 1) {
@@ -14978,7 +14978,7 @@ mod routing_tests {
         cfg.idle_ram_warm = false;
         assert!(!Supervisor::idle_ram_warm_enabled(&cfg));
         cfg.idle_ram_warm = true;
-        // direct-io exists to bypass the page cache — warming it would
+        // direct-io exists to bypass the page cache - warming it would
         // fight the configured policy.
         cfg.load_mode = "direct-io".into();
         assert!(!Supervisor::idle_ram_warm_enabled(&cfg));

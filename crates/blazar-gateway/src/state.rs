@@ -18,7 +18,7 @@ use crate::sentinel::Sentinel;
 /// usage counters + warm/cold TTFT split. `record` runs exactly once per
 /// COMPLETED response; a response whose usage never surfaced (upstream
 /// omission, aborted before the usage chunk) lands in `unclassified`
-/// instead of guessing a side. Atomics only — lock-free on the hot path.
+/// instead of guessing a side. Atomics only - lock-free on the hot path.
 pub struct CacheObs {
     pub prompt_tokens: AtomicU64,
     pub cached_tokens: AtomicU64,
@@ -29,7 +29,7 @@ pub struct CacheObs {
     /// Per-model split of the same token counters (keyed by the resolved
     /// model name): powers per-model cache-hit surfaces (`ps` HIT column,
     /// `/api/ps`, per-model metrics) without touching child scrapes. One
-    /// entry per distinct model — bounded by the store, not by traffic.
+    /// entry per distinct model - bounded by the store, not by traffic.
     pub per_model: dashmap::DashMap<String, ModelCacheObs>,
 }
 
@@ -76,7 +76,7 @@ impl CacheObs {
                     cached_tokens: AtomicU64::new(0),
                 });
             // Loser of an insert race re-adds its tokens onto the
-            // winner's entry — totals stay exact.
+            // winner's entry - totals stay exact.
             e.prompt_tokens.fetch_add(prompt, Ordering::Relaxed);
             e.cached_tokens.fetch_add(cached, Ordering::Relaxed);
         }
@@ -157,7 +157,7 @@ pub struct AppState {
     /// Loopback client for child traffic + metrics scrape.
     pub http: reqwest::Client,
     /// Timeout-less client for media forwards: a sync image/video
-    /// request holds the connection for the WHOLE render — minutes,
+    /// request holds the connection for the WHOLE render - minutes,
     /// past any total timeout. Liveness comes from the loopback
     /// socket itself (a dead child closes it immediately) plus the
     /// child header/evict lanes, not from a client deadline.
@@ -170,7 +170,7 @@ pub struct AppState {
     /// J5 eviction lane sender (sentinel body-stall fires through it):
     /// the consumer task in `new` debounces (1/min per model) and reaps
     /// the wedged child. Proxy header-stall evicts synchronously in-band
-    /// instead — a debounce is too slow to gate an in-band retry.
+    /// instead - a debounce is too slow to gate an in-band retry.
     pub evict_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// vLLM-style evidence loop: measured at the proxy, owned by the gateway.
     pub ttft: Histogram,
@@ -187,14 +187,14 @@ pub struct AppState {
     pub sentinel: Arc<Sentinel>,
     /// System/tools fingerprint churn detector (agent-client cache-bust
     /// teaching): flags conversations whose prefix mutates every turn.
-    /// Advisory only — never mutates requests.
+    /// Advisory only - never mutates requests.
     pub cache_bust: Arc<crate::cache_bust::CacheBustTracker>,
     /// Per-key scoping / rate limits / usage accounting (`[[keys]]`).
     pub keys: Arc<KeysLimiter>,
     /// OTLP trace export (default off; bounded, never blocks).
     pub otlp: Arc<Otlp>,
     /// Responses API conversation state (`previous_response_id`
-    /// chaining; bounded LRU — upstream has no storage of its own).
+    /// chaining; bounded LRU - upstream has no storage of its own).
     pub responses: std::sync::Mutex<crate::responses::ResponsesRegistry>,
     /// Local whisper.cpp lane (H8): lazily-spawned whisper-server child
     /// for /v1/audio/transcriptions; killed at serve teardown or by the
@@ -209,11 +209,11 @@ pub struct AppState {
     /// Durable job ledger (SQLite write-through behind every async lane:
     /// audio tasks, image/video child jobs) plus the unified
     /// `/v1/jobs` read/cancel/events plane. Owns artifact spillover on
-    /// disk; holds no locks and no tasks — the lanes stay authoritative
+    /// disk; holds no locks and no tasks - the lanes stay authoritative
     /// for live state, this outlives them.
     pub jobs: std::sync::Arc<crate::jobs::JobRuntime>,
     /// Request lifecycle cards (v0.15): in-flight generation tracking +
-    /// programmatic cancel/interrupt via `/v1/requests`. Pure memory —
+    /// programmatic cancel/interrupt via `/v1/requests`. Pure memory -
     /// cards live and die with the process by design (durable history is
     /// the job ledger's role, not this one).
     pub requests: std::sync::Arc<crate::requests::RequestRuntime>,
@@ -246,7 +246,7 @@ pub struct AppState {
     >,
     /// v0.16 federation: per-peer `/api/capacity` snapshots, refreshed
     /// alongside presence (same TTL window). Absent entry = non-Blazar
-    /// peer or not yet probed — capacity-aware routing degrades to the
+    /// peer or not yet probed - capacity-aware routing degrades to the
     /// load/circuit signals above, never errors.
     pub remote_capacity: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, crate::remotes::PeerCapacity>>,
@@ -254,14 +254,14 @@ pub struct AppState {
     /// E4 audit: line sender (`None` = audit off; no request-path tax
     /// when disabled). Dropped-line counter is shared with the writer.
     pub audit_tx: Option<tokio::sync::mpsc::Sender<crate::audit::AuditLine>>,
-    /// Audit lines dropped because the writer channel was full —
+    /// Audit lines dropped because the writer channel was full -
     /// surfaced via `/metrics` as `blazar_audit_dropped_total`.
     pub audit_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Reused `SQLite` handle for per-request store reads (engine kind,
     /// tag lists, usage rows). Previously ~15 gateway sites opened a
     /// fresh connection (open + 3 pragmas) per request. `Mutex`-wrapped
     /// (rusqlite `Connection` is `Send + !Sync`); all uses are
-    /// synchronous — the guard never crosses an `.await`. We cache the
+    /// synchronous - the guard never crosses an `.await`. We cache the
     /// CONNECTION, not data: WAL + per-call queries keep CLI-side
     /// writes immediately visible cross-process.
     pub store: std::sync::Mutex<Option<blazar_core::Store>>,
@@ -284,7 +284,7 @@ pub struct AppState {
 
 /// Client for dialing ONE child endpoint: the shared TCP pool, or the
 /// cached socket-pinned client when the endpoint rides the unix
-/// transport. Pair with `proxy::child_base` — that base names a
+/// transport. Pair with `proxy::child_base` - that base names a
 /// placeholder host the unix connector ignores, only the path is dialed.
 #[must_use]
 pub fn child_client(state: &AppState, ep: &blazar_core::profile::Endpoint) -> reqwest::Client {
@@ -295,7 +295,7 @@ pub fn child_client(state: &AppState, ep: &blazar_core::profile::Endpoint) -> re
 }
 
 /// Client for media forwards that hold one request open across the
-/// whole generation — the timeout-less media client on TCP, the
+/// whole generation - the timeout-less media client on TCP, the
 /// (already deadline-free) per-socket pool on unix transport.
 pub fn media_child_client(
     state: &AppState,
@@ -310,7 +310,7 @@ pub fn media_child_client(
 impl AppState {
     /// Key admission for the gated lanes that live outside the proxy
     /// (images, videos, local whisper, local TTS): scope + rpm/tpm/daily
-    /// check, then the request charge — the exact bracket the text lanes
+    /// check, then the request charge - the exact bracket the text lanes
     /// run inline. Local compute is not a free lane on an authed gateway
     /// (audit MM1). No-op when no key context rode the request (open
     /// gateway) or the key is unknown (the auth middleware already
@@ -375,7 +375,7 @@ impl AppState {
         let keys = KeysLimiter::loaded(store.as_ref(), config.keys.clone());
         // Audio lane: one child slot shared by request paths and the
         // idle reaper. 0 disables the reaper (child lives until
-        // teardown — the pre-reaper behavior).
+        // teardown - the pre-reaper behavior).
         let whisper = std::sync::Arc::new(blazar_runtime::whisper::WhisperRuntime::new());
         if config.whisper_idle_secs > 0 {
             let reaper = std::sync::Arc::clone(&whisper);
@@ -389,7 +389,7 @@ impl AppState {
         }
         let otlp = Arc::new(Otlp::new(&config));
         // J5: consume stall-eviction requests; a wedged child is reaped
-        // (no bank — a stalled child may not answer a save request) and
+        // (no bank - a stalled child may not answer a save request) and
         // the next request respawns it clean.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         // `tx` rides the AppState as `evict_tx`: the proxy lane fires
@@ -402,7 +402,7 @@ impl AppState {
                     std::collections::HashMap::new();
                 while let Some(model) = rx.recv().await {
                     // FIX7 debounce: one transient stall must not churn a
-                    // healthy model — at most one stall-evict per model
+                    // healthy model - at most one stall-evict per model
                     // per minute (ring still records every detection).
                     if last_evict
                         .get(&model)
@@ -473,7 +473,7 @@ impl AppState {
 
     /// Run `f` against the cached store connection, opening lazily on
     /// first use. `None` = store unavailable (callers keep their existing
-    /// degraded paths). A failed open is retried on the next call — same
+    /// degraded paths). A failed open is retried on the next call - same
     /// per-request retry semantics as the old open-per-request sites, at
     /// zero cost once healthy.
     pub fn with_store<T>(&self, f: impl FnOnce(&blazar_core::Store) -> T) -> Option<T> {
@@ -490,7 +490,7 @@ impl AppState {
                 Err(e) => {
                     // Store-open failures retry per call (below), but a
                     // broken store makes every persisted read look like
-                    // "absent" — that conflation must be visible at
+                    // "absent" - that conflation must be visible at
                     // least once per incident, not silently per request.
                     if !self
                         .store_open_warned
@@ -498,7 +498,7 @@ impl AppState {
                     {
                         tracing::warn!(
                             target: "blazar::store",
-                            "store open failed ({}) — persisted state reads as absent until it recovers: {e}",
+                            "store open failed ({}) - persisted state reads as absent until it recovers: {e}",
                             self.dirs.data_dir.display()
                         );
                     }
@@ -510,7 +510,7 @@ impl AppState {
 
     /// Memory-first stored-response lookup with SQLite fallback (restart
     /// durability for `previous_response_id` chaining). Lock order is a
-    /// fixed law: responses mutex → store mutex, never reversed — the
+    /// fixed law: responses mutex -> store mutex, never reversed - the
     /// store mutex is only ever taken while already inside a responses
     /// guard (here and in `store_response`), so no cycle can form.
     pub fn stored_response(&self, id: &str) -> Option<crate::responses::StoredResponse> {
@@ -522,10 +522,10 @@ impl AppState {
     }
 
     /// Persisted put: hot LRU always, then SQLite write-through + prune
-    /// (same 24h TTL / cap as memory). Store failures log loud — durable
-    /// chain degradation must be visible — but never fail the request:
+    /// (same 24h TTL / cap as memory). Store failures log loud - durable
+    /// chain degradation must be visible - but never fail the request:
     /// memory stays authoritative for the live process, the ledger is
-    /// the restart path. Lock order: responses → store (see
+    /// the restart path. Lock order: responses -> store (see
     /// `stored_response`).
     pub fn store_response(&self, id: &str, r: &crate::responses::StoredResponse) {
         let mut reg = self.responses.lock().expect("responses registry");
@@ -542,10 +542,10 @@ impl AppState {
         match durable {
             Some(Ok(())) => {}
             Some(Err(e)) => tracing::warn!(
-                "responses: durable write failed: {e:#} — {id} is memory-only until the next successful put"
+                "responses: durable write failed: {e:#} - {id} is memory-only until the next successful put"
             ),
             None => tracing::warn!(
-                "responses: store unavailable — {id} is memory-only (will not survive a restart)"
+                "responses: store unavailable - {id} is memory-only (will not survive a restart)"
             ),
         }
     }
@@ -613,7 +613,7 @@ mod tests {
         obs.record("a", 100, 96, Some(0.05));
         obs.record("a", 100, 4, Some(0.05));
         obs.record("b", 50, 0, Some(0.5));
-        // Per-model split: a = 100/200, b = 0/50 — independent buckets.
+        // Per-model split: a = 100/200, b = 0/50 - independent buckets.
         assert_eq!(obs.hit_ratio("a"), Some(0.5));
         assert_eq!(obs.hit_ratio("b"), Some(0.0));
         assert_eq!(obs.hit_ratio("c"), None);

@@ -4,7 +4,7 @@
 //! identity, training context ceiling, dtype, quantization bits, and the KV
 //! geometry (layers / kv-heads / head-dim) for VRAM estimation.
 //!
-//! Same contract as `gguf.rs`: anything absent stays `None` — downstream
+//! Same contract as `gguf.rs`: anything absent stays `None` - downstream
 //! rules must skip-with-warning, never estimate. The one derivation here
 //! (`head_dim` from `hidden_size / num_attention_heads`) mirrors HF loader
 //! semantics and `GgufMeta::derived_head_dim()`.
@@ -24,7 +24,7 @@ pub struct KvGeom {
     /// those layers carry the context-scaling KV cache.
     pub layers: Option<u64>,
     /// `num_key_value_heads`; falls back to `num_attention_heads` (HF MHA
-    /// semantics — absent GQA field means every attention head is a KV head).
+    /// semantics - absent GQA field means every attention head is a KV head).
     pub kv_heads: Option<u64>,
     /// Explicit `head_dim` when present; else derived `hidden_size /
     /// num_attention_heads`.
@@ -36,20 +36,20 @@ pub struct KvGeom {
 pub struct HfMeta {
     /// `architectures[0]` (e.g. `Qwen2ForCausalLM`), else `model_type`.
     pub architecture: String,
-    /// `max_position_embeddings` — the training context ceiling.
+    /// `max_position_embeddings` - the training context ceiling.
     pub ctx_train: Option<u64>,
     /// `torch_dtype` / `dtype` (e.g. `bfloat16`).
     pub dtype: Option<String>,
     /// Effective weight bits when a `quantization_config` is present
-    /// (`bits`, bnb `load_in_4bit`/`load_in_8bit`, fp8 → 8).
+    /// (`bits`, bnb `load_in_4bit`/`load_in_8bit`, fp8 -> 8).
     pub quant_bits: Option<u8>,
-    /// Raw `quantization_config.quant_method` (e.g. `awq`, `torchao`) —
+    /// Raw `quantization_config.quant_method` (e.g. `awq`, `torchao`) -
     /// the lane-admission signal. `quant_bits` says how wide the weights
     /// are, not which loader must read them; a lane without the quantizer
     /// dies at weight load.
     pub quant_method: Option<String>,
     /// Config declares a vision/image tower (top-level `vision_config` or
-    /// `image_config` object — the multimodal-wrapper class). Tower models
+    /// `image_config` object - the multimodal-wrapper class). Tower models
     /// need their processor artifact (`preprocessor_config.json`) at engine
     /// load time; `text_config` alone is NOT a tower declaration.
     pub vision_tower: bool,
@@ -103,7 +103,7 @@ fn str_of(v: &Value, key: &str) -> Option<String> {
 /// Per-key nested lookup for multimodal-wrapper configs: Qwen3.5,
 /// Qwen3-VL, Qwen3-Next and Llama-4-class repos keep the LM geometry
 /// inside `text_config`, leaving the top level to `architectures` and
-/// the tower configs. Top-level keys keep absolute priority — only an
+/// the tower configs. Top-level keys keep absolute priority - only an
 /// ABSENT key descends, so flat causal-LM configs behave identically.
 fn u64_of_text_config(v: &Value, key: &str) -> Option<u64> {
     u64_of(v, key).or_else(|| v.get("text_config").and_then(|t| u64_of(t, key)))
@@ -114,7 +114,7 @@ fn str_of_text_config(v: &Value, key: &str) -> Option<String> {
 }
 
 /// Quantization bits from a HF `quantization_config` object. Only reads
-/// fields the quantizers themselves define — no arch guessing.
+/// fields the quantizers themselves define - no arch guessing.
 fn quant_bits_of(q: &Value) -> Option<u8> {
     if let Some(bits) = q.get("bits").and_then(Value::as_u64) {
         return u8::try_from(bits).ok();
@@ -135,7 +135,7 @@ fn quant_bits_of(q: &Value) -> Option<u8> {
 /// Read `config.json` from a safetensors model directory.
 ///
 /// Errors (missing dir / missing config / malformed JSON) are the caller's
-/// signal that this is not a usable HF model directory — the supervisor
+/// signal that this is not a usable HF model directory - the supervisor
 /// skips-with-teach, mirroring the GGUF read-failure path.
 pub fn read_hf_config(dir: &Path) -> CoreResult<HfMeta> {
     let config_path = dir.join("config.json");
@@ -237,7 +237,7 @@ pub const SGLANG_SUPPORTED_QUANT_METHODS: &[&str] = &[
 /// `None` = the lane has no objection. Two gates (both live-validated
 /// failure shapes): (1) a `quant_method` this sglang build cannot load,
 /// (2) a vision-tower config whose model dir lacks
-/// `preprocessor_config.json` — processor init dies at spawn. The working
+/// `preprocessor_config.json` - processor init dies at spawn. The working
 /// tower model on this box ships the artifact, so complete multimodal
 /// dirs and dense text models pass untouched.
 #[must_use]
@@ -255,13 +255,13 @@ pub fn sglang_lane_teach(meta: &HfMeta, dir: &Path) -> Option<String> {
     if meta.vision_tower && !dir.join("preprocessor_config.json").is_file() {
         // Weight evidence splits the remedy. Visual tensors in the
         // index (or no index to read) mean a genuinely incomplete
-        // multimodal pull — re-pulling can complete it. Zero visual
+        // multimodal pull - re-pulling can complete it. Zero visual
         // tensors mean a text-only quant of a multimodal base: the
         // tower declaration is vestigial, so re-pulling this same repo
         // can never produce the artifact.
         let vestigial = matches!(safetensors_index_facts(dir), Some(facts) if facts.visual == 0);
         let remedy = if vestigial {
-            "the weights carry no vision tensors — a text-only quant of a \
+            "the weights carry no vision tensors - a text-only quant of a \
              multimodal base with a vestigial tower declaration, so re-pulling \
              this repo can never produce the artifact. Export the model as \
              text-only (drop the vision keys from config.json) or serve an \
@@ -272,7 +272,7 @@ pub fn sglang_lane_teach(meta: &HfMeta, dir: &Path) -> Option<String> {
         };
         return Some(format!(
             "multimodal config (vision tower declared) but {} lacks \
-             preprocessor_config.json — the engine's processor init dies at \
+             preprocessor_config.json - the engine's processor init dies at \
              spawn. {remedy}",
             dir.display()
         ));
@@ -284,7 +284,7 @@ pub fn sglang_lane_teach(meta: &HfMeta, dir: &Path) -> Option<String> {
 /// own weight manifest): how many tensors are bit-packed quant codes
 /// (`.packed` suffix) and how many belong to a vision tower. `None`
 /// when the index is absent, unreadable, malformed, or carries an
-/// empty `weight_map` — an unknown manifest (a download in flight or
+/// empty `weight_map` - an unknown manifest (a download in flight or
 /// a single-file repo), never "no packed tensors".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SafetensorsIndexFacts {
@@ -317,7 +317,7 @@ pub(crate) fn safetensors_index_facts(dir: &Path) -> Option<SafetensorsIndexFact
 /// PolarQuant/EOQ research repos). Every engine lane dies at weight
 /// load with an opaque engine error; the gate names the evidence and
 /// the levers instead. `None` = no objection (standard weights, or no
-/// index to read — single-file repos are beyond this gate's sight).
+/// index to read - single-file repos are beyond this gate's sight).
 #[must_use]
 pub fn code_store_teach(dir: &Path) -> Option<String> {
     let packed = safetensors_index_facts(dir)?.packed;
@@ -326,7 +326,7 @@ pub fn code_store_teach(dir: &Path) -> Option<String> {
     }
     Some(format!(
         "custom quant code store: {packed} tensors named `*.packed` in \
-         model.safetensors.index.json — bit-packed research formats load only \
+         model.safetensors.index.json - bit-packed research formats load only \
          through the repo's own Python dequantizer, which no engine lane \
          embeds. Export standard safetensors weights (run the repo's loader, \
          save the dequantized model), or serve an official quant of the same \
@@ -334,7 +334,7 @@ pub fn code_store_teach(dir: &Path) -> Option<String> {
     ))
 }
 
-/// Root-level `.safetensors` weights of an HF model dir — the pull
+/// Root-level `.safetensors` weights of an HF model dir - the pull
 /// lane's selection rule (shards live at the root beside a mandatory
 /// `config.json`). Empty when the dir is unreadable or holds no
 /// weights; callers decide what an empty listing means.
@@ -357,7 +357,7 @@ pub fn root_safetensors(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Summed bytes of the root-level `.safetensors` weights, or `None`
-/// when there are none — an empty sum is indistinguishable from "not a
+/// when there are none - an empty sum is indistinguishable from "not a
 /// model dir" (or a download in flight) and must never be written back
 /// as a row size or fed to planning.
 #[must_use]
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__hf_config_nested_top_level_priority__flat_keys_win() {
-        // A key present at BOTH levels resolves top-level first — the
+        // A key present at BOTH levels resolves top-level first - the
         // wrapper object never overrides the LM section.
         let dir = write_dir(&[(
             "config.json",
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__code_store_teach__gptq_style_and_standard_pass() {
-        // GPTQ/AWQ/FP8 quantized repos use these suffixes — they are
+        // GPTQ/AWQ/FP8 quantized repos use these suffixes - they are
         // engine-loadable and must not read as code stores.
         let gptq = write_dir(&[(
             "model.safetensors.index.json",
@@ -738,7 +738,7 @@ mod tests {
     #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__sglang_lane_teach__vestigial_tower_teaches_export_not_repull() {
         // Live shape of the EOQ artifact: tower declared, text-only
-        // weights — re-pulling can never produce the processor file.
+        // weights - re-pulling can never produce the processor file.
         let tower = HfMeta {
             vision_tower: true,
             ..Default::default()
@@ -762,7 +762,7 @@ mod tests {
     #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__sglang_lane_teach__incomplete_multimodal_keeps_repull_advice() {
         // Visual tensors present: a genuinely incomplete multimodal
-        // pull — the original re-pull remedy still applies.
+        // pull - the original re-pull remedy still applies.
         let tower = HfMeta {
             vision_tower: true,
             ..Default::default()

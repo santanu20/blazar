@@ -6,7 +6,7 @@
 //! loopback `/v1/chat/completions` (original auth header forwarded, so
 //! per-key scopes/quotas apply to batch traffic too). Results are written
 //! as an output JSONL file (`response.status_code` + full body per line)
-//! and the batch object tracks counts. State is plain files — restart
+//! and the batch object tracks counts. State is plain files - restart
 //! safety is honest: an in-flight batch stops where it was (status stays
 //! `in_progress`; re-submit to rerun). Sequential one-line-at-a-time
 //! execution by design: batch is a throughput lane, not a latency one.
@@ -30,8 +30,8 @@ const MAX_UPLOAD_BYTES: usize = 48 * 1024 * 1024;
 /// Only the chat-completions endpoint is batched (honest scope; embeddings
 /// lane is a different surface).
 const SUPPORTED_ENDPOINT: &str = "/v1/chat/completions";
-/// Ids are short random hex so they sort/echo like upstream (`file-…`,
-/// `batch-…`). BLZ-6: 48 bits from the OS CSPRNG — the previous
+/// Ids are short random hex so they sort/echo like upstream (`file-...`,
+/// `batch-...`). BLZ-6: 48 bits from the OS CSPRNG - the previous
 /// nanos-XOR-counter scheme was predictable, and ids must stay
 /// unguessable even with object authz in place.
 pub(crate) fn short_id(prefix: &str) -> String {
@@ -97,7 +97,7 @@ fn err(status: StatusCode, message: &str) -> Response {
 
 /// BLZ-1: the creating key's name, stamped into meta JSON as `_owner`
 /// (underscore = internal, never part of a public wire shape). `None`
-/// on the open gateway — such objects stay visible to every caller.
+/// on the open gateway - such objects stay visible to every caller.
 fn owner_name(key_ext: Option<&Extension<crate::keys::KeyCtx>>) -> Option<String> {
     key_ext.map(|k| k.name.clone())
 }
@@ -109,7 +109,7 @@ fn meta_allows(m: &Value, key: Option<&crate::keys::KeyCtx>) -> bool {
 }
 
 /// Drop the internal `_owner` stamp before a meta object reaches the
-/// wire — public shapes stay byte-identical to pre-scope responses.
+/// wire - public shapes stay byte-identical to pre-scope responses.
 fn strip_owner(mut v: Value) -> Value {
     if let Some(o) = v.as_object_mut() {
         o.remove("_owner");
@@ -119,7 +119,7 @@ fn strip_owner(mut v: Value) -> Value {
 
 // ---------- BLZ-6: storage quotas + retention ----------
 
-/// OpenAI-dialect terminal statuses — a batch in any of these states has
+/// OpenAI-dialect terminal statuses - a batch in any of these states has
 /// no worker left and can never make progress again. The superset covers
 /// statuses upstream clients echo back in listings.
 fn openai_terminal(status: &str) -> bool {
@@ -139,8 +139,8 @@ fn batch_terminal(m: &Value) -> bool {
 }
 
 /// Current on-disk footprint of the batch store: total bytes plus a
-/// per-owner breakdown (uploads without an `_owner` stamp — open-gateway
-/// or legacy — count toward the global total only).
+/// per-owner breakdown (uploads without an `_owner` stamp - open-gateway
+/// or legacy - count toward the global total only).
 fn stored_bytes(dirs: &BlazarDirs) -> (u64, HashMap<String, u64>) {
     let mut total = 0u64;
     let mut per_owner: HashMap<String, u64> = HashMap::new();
@@ -215,7 +215,7 @@ fn store_quota_refusal(
 /// Batches still running for `owner`, across both dialects.
 ///
 /// Quota accounting fails CLOSED: a meta row that cannot be read or
-/// parsed is an unknown state, and unknown counts as active — an
+/// parsed is an unknown state, and unknown counts as active - an
 /// undercount would silently admit batches past the per-key bound. A
 /// row that vanished mid-scan (a `NotFound` race with the retention sweep)
 /// is genuinely gone and does not count. A missing batches dir means no
@@ -253,7 +253,7 @@ fn active_batch_count(dirs: &BlazarDirs, owner: &str) -> Result<u64, String> {
                     count = count.saturating_add(1);
                 }
             }
-            // Torn/partial write: owner and terminal state unknowable —
+            // Torn/partial write: owner and terminal state unknowable -
             // count it so corruption cannot undercut the quota. The
             // retention sweep removes such garbage once it ages out.
             Err(_) => {
@@ -264,10 +264,10 @@ fn active_batch_count(dirs: &BlazarDirs, owner: &str) -> Result<u64, String> {
     Ok(count)
 }
 
-/// Retention sweep — BLZ-6. Runs inline at upload/batch-create time (no
+/// Retention sweep - BLZ-6. Runs inline at upload/batch-create time (no
 /// timer thread to leak or race a daemon stop). Conservative by contract:
 /// a batch is removed only when its status is TERMINAL and its finalize
-/// (or creation) stamp is older than the retention window — in-flight
+/// (or creation) stamp is older than the retention window - in-flight
 /// work is never touched. Output files ride along with their batch; an
 /// input/output file is removed only when NO surviving batch references
 /// it and its own `created_at` ages out. Every removal is logged;
@@ -290,7 +290,7 @@ fn sweep_expired(dirs: &BlazarDirs, retention_secs: u64, now: u64) {
     for e in entries.flatten() {
         let Some(m) = read_json(&e.path()) else {
             // Unparseable meta: garbage past the retention window (by
-            // file mtime — the row itself carries no readable stamp).
+            // file mtime - the row itself carries no readable stamp).
             // Removing it keeps a torn write from wedging the
             // fail-closed quota counter forever; a fresh one stays and
             // counts as unknown until it ages out.
@@ -362,7 +362,7 @@ fn sweep_expired(dirs: &BlazarDirs, retention_secs: u64, now: u64) {
         }
     }
 
-    // Pass 3: orphaned files — no surviving batch references them and
+    // Pass 3: orphaned files - no surviving batch references them and
     // their own created_at has aged out.
     let Ok(files) = std::fs::read_dir(files_dir(dirs)) else {
         return;
@@ -389,7 +389,7 @@ fn sweep_expired(dirs: &BlazarDirs, retention_secs: u64, now: u64) {
     }
 }
 
-/// Remove one file's data + meta pair, logging the removal (BLZ-6 —
+/// Remove one file's data + meta pair, logging the removal (BLZ-6 -
 /// deletions must be observable, and so must failed deletions: the
 /// "removed" line only fires when something actually went away).
 fn remove_store_file(dirs: &BlazarDirs, id: &str) {
@@ -409,7 +409,7 @@ fn remove_store_file(dirs: &BlazarDirs, id: &str) {
     }
 }
 
-/// `POST /v1/files` — multipart upload with a `file` part (and optional
+/// `POST /v1/files` - multipart upload with a `file` part (and optional
 /// `purpose` form field, accepted and recorded). Returns an OpenAI-style
 /// file object.
 pub async fn upload_file(
@@ -507,7 +507,7 @@ fn file_meta(dirs: &BlazarDirs, id: &str) -> Option<Value> {
     read_json(&files_dir(dirs).join(format!("{id}.meta.json")))
 }
 
-/// `GET /v1/files/{id}` — file metadata.
+/// `GET /v1/files/{id}` - file metadata.
 pub async fn get_file(
     State(state): State<std::sync::Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -528,7 +528,7 @@ pub async fn get_file(
     }
 }
 
-/// `GET /v1/files/{id}/content` — raw stored JSONL.
+/// `GET /v1/files/{id}/content` - raw stored JSONL.
 pub async fn get_file_content(
     State(state): State<std::sync::Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -540,7 +540,7 @@ pub async fn get_file_content(
     {
         return err(StatusCode::BAD_REQUEST, "invalid file id");
     }
-    // BLZ-1: gate on the meta before serving the bytes — the content
+    // BLZ-1: gate on the meta before serving the bytes - the content
     // route and the meta route must agree on visibility.
     match file_meta(&state.dirs, &id) {
         Some(v) if meta_allows(&v, key_ext.as_deref()) => {}
@@ -557,7 +557,7 @@ pub async fn get_file_content(
     }
 }
 
-/// `POST /v1/batches` — validate the input file and spawn the worker.
+/// `POST /v1/batches` - validate the input file and spawn the worker.
 pub async fn create_batch(
     State(state): State<std::sync::Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -599,7 +599,7 @@ pub async fn create_batch(
         && state.config.batch.max_active_batches_per_key > 0
     {
         // Unreadable index: admitting another batch would bypass the
-        // configured bound — refuse with the cause instead.
+        // configured bound - refuse with the cause instead.
         match active_batch_count(&state.dirs, &owner) {
             Ok(active) if active >= u64::from(state.config.batch.max_active_batches_per_key) => {
                 return err(
@@ -640,7 +640,7 @@ pub async fn create_batch(
 
     // Worker replays lines through the gateway's own loopback listener so
     // auth/quotas/sentinel all apply. Prefer the ACTUAL bound address
-    // (recorded at serve time — config port may be 0 = ephemeral); fold
+    // (recorded at serve time - config port may be 0 = ephemeral); fold
     // wildcard hosts to loopback-reachable.
     let (host, port) = state.http_addr.get().cloned().unwrap_or_else(|| {
         let h = if state.config.host == "0.0.0.0" || state.config.host == "::" {
@@ -735,7 +735,7 @@ async fn run_batch(dirs: BlazarDirs, job: BatchJob, input: String) {
         auth_headers: Vec::new(),
         max_output_bytes,
     };
-    // Output lands in files/ as {output_id}.jsonl — same lookup path the
+    // Output lands in files/ as {output_id}.jsonl - same lookup path the
     // GET /v1/files/{id}/content route serves uploads from.
     let out_path = files_dir(&dirs).join(format!("{output_id}.jsonl"));
     if let Some(d) = out_path.parent() {
@@ -871,7 +871,7 @@ async fn replay_to_row(
 }
 
 /// Append one JSONL row to the output writer; false = abort the batch
-/// (output write failed — F76: disk errors must not masquerade as
+/// (output write failed - F76: disk errors must not masquerade as
 /// success; or the row pushed cumulative output past the BLZ-6
 /// per-batch byte cap).
 fn write_row(
@@ -920,7 +920,7 @@ fn update_progress(dirs: &BlazarDirs, id: &str, completed: u64, failed: u64) {
     let path = batch_meta(dirs, id);
     if let Some(mut m) = read_json(&path) {
         // F75: never clobber a cancel signal that landed between our read
-        // and write — the worker observes it on its next loop iteration.
+        // and write - the worker observes it on its next loop iteration.
         if m["status"] == "cancelling" {
             return;
         }
@@ -942,7 +942,7 @@ fn finish_batch(
     let (id, output_id) = (&job.id, &job.output_id);
     let (completed, failed) = counts;
     let out_path = files_dir(dirs).join(format!("{output_id}.jsonl"));
-    // F76: a failed flush must not report success — downgrade the status
+    // F76: a failed flush must not report success - downgrade the status
     // and surface the reason instead of swallowing it.
     let flush = writer.flush();
     let status = if flush.is_err() { "failed" } else { status };
@@ -995,7 +995,7 @@ fn write_final_meta(
     tracing::info!(target: "blazar::batch", batch = %id, status, completed, failed, "batch finished");
 }
 
-/// `GET /v1/batches/{id}` — live batch object.
+/// `GET /v1/batches/{id}` - live batch object.
 pub async fn get_batch(
     State(state): State<std::sync::Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -1016,7 +1016,7 @@ pub async fn get_batch(
     }
 }
 
-/// `GET /v1/batches` — list all batches (newest first).
+/// `GET /v1/batches` - list all batches (newest first).
 pub async fn list_batches(
     State(state): State<std::sync::Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -1030,7 +1030,7 @@ pub async fn list_batches(
                     .extension()
                     .is_some_and(|e| e == "json")
                 && let Some(v) = read_json(&e.path())
-                // BLZ-1: data-layer filter — only this key's batches (and
+                // BLZ-1: data-layer filter - only this key's batches (and
                 // legacy null-owner rows) reach the listing.
                 && meta_allows(&v, key_ext.as_deref())
             {
@@ -1046,14 +1046,14 @@ pub async fn list_batches(
         .into_response()
 }
 
-/// `POST /v1/batches/{id}/cancel` — flags the worker to stop; final state
+/// `POST /v1/batches/{id}/cancel` - flags the worker to stop; final state
 /// lands asynchronously (`cancelled` once the current item finishes).
 pub async fn cancel_batch(
     State(state): State<std::sync::Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    // F77: same charset contract as get_batch — an unvalidated id would
+    // F77: same charset contract as get_batch - an unvalidated id would
     // traverse (`../`) into arbitrary JSON files for read+rewrite.
     if !id
         .chars()
@@ -1107,7 +1107,7 @@ fn valid_anthropic_custom_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Internal meta → the public `MessageBatch` object. Internal fields carry
+/// Internal meta -> the public `MessageBatch` object. Internal fields carry
 /// `_secs` unix ints; the wire shape is ISO-3339 strings.
 fn anthropic_public_shape(m: &Value) -> Value {
     let created = m["created_at_secs"].as_u64().unwrap_or(0);
@@ -1374,7 +1374,7 @@ async fn run_anthropic_batch(dirs: BlazarDirs, job: AnthropicBatchJob, input: St
     finalize(succeeded, errored, canceled, was_cancelled, &mut writer);
 }
 
-/// `POST /v1/messages/batches` — validate inline requests, persist them
+/// `POST /v1/messages/batches` - validate inline requests, persist them
 /// as an internal JSONL, spawn the worker.
 #[allow(clippy::too_many_lines)] // one cohesive validation + spawn path
 pub async fn anthropic_batches_create(
@@ -1445,7 +1445,7 @@ pub async fn anthropic_batches_create(
     // Internal JSONL: one {custom_id, params} line per request, stored in
     // the same files/ pool the OpenAI lane uses. BLZ-6: retention refresh
     // + store quotas + the per-key concurrent-batch bound apply to this
-    // dialect too — it writes the same disk.
+    // dialect too - it writes the same disk.
     sweep_expired(&state.dirs, state.config.batch.retention_secs, now_secs());
     let owner = owner_name(key_ext.as_ref());
     if let Some(owner) = &owner
@@ -1573,7 +1573,7 @@ fn anthropic_meta(
         return Err(err(StatusCode::BAD_REQUEST, "invalid message batch id"));
     }
     match read_json(&batch_meta(&state.dirs, id)) {
-        // BLZ-1: every anthropic route funnels through here — gate once,
+        // BLZ-1: every anthropic route funnels through here - gate once,
         // and a foreign batch stays indistinguishable from an unknown id
         // (an OpenAI-dialect batch under these routes reads the same way).
         Some(m) if m["dialect"] == "anthropic" && meta_allows(&m, key) => Ok(m),
@@ -1584,7 +1584,7 @@ fn anthropic_meta(
     }
 }
 
-/// `GET /v1/messages/batches/{id}` — idempotent poll target.
+/// `GET /v1/messages/batches/{id}` - idempotent poll target.
 pub async fn anthropic_batches_get(
     State(state): State<std::sync::Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -1596,7 +1596,7 @@ pub async fn anthropic_batches_get(
     }
 }
 
-/// `GET /v1/messages/batches` — newest first.
+/// `GET /v1/messages/batches` - newest first.
 pub async fn anthropic_batches_list(
     State(state): State<std::sync::Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
@@ -1618,7 +1618,7 @@ pub async fn anthropic_batches_list(
             }
         }
     }
-    // UTC ISO-8601 stamps sort correctly as plain strings — newest first.
+    // UTC ISO-8601 stamps sort correctly as plain strings - newest first.
     rows.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
     let first_id = rows
         .first()
@@ -1637,7 +1637,7 @@ pub async fn anthropic_batches_list(
         .into_response()
 }
 
-/// `POST /v1/messages/batches/{id}/cancel` — flags the worker; final state
+/// `POST /v1/messages/batches/{id}/cancel` - flags the worker; final state
 /// lands asynchronously (`ended` once the in-flight request finishes).
 pub async fn anthropic_batches_cancel(
     State(state): State<std::sync::Arc<AppState>>,
@@ -1666,7 +1666,7 @@ pub async fn anthropic_batches_cancel(
     (StatusCode::OK, axum::Json(anthropic_public_shape(&m))).into_response()
 }
 
-/// `DELETE /v1/messages/batches/{id}` — archives the batch (results stay
+/// `DELETE /v1/messages/batches/{id}` - archives the batch (results stay
 /// readable through `expires_at`; upstream semantics, documented honestly).
 pub async fn anthropic_batches_delete(
     State(state): State<std::sync::Arc<AppState>>,
@@ -1687,7 +1687,7 @@ pub async fn anthropic_batches_delete(
     (StatusCode::OK, axum::Json(anthropic_public_shape(&m))).into_response()
 }
 
-/// `GET /v1/messages/batches/{id}/results` — streams the `.jsonl` result
+/// `GET /v1/messages/batches/{id}/results` - streams the `.jsonl` result
 /// file once the batch has ended.
 pub async fn anthropic_batches_results(
     State(state): State<std::sync::Arc<AppState>>,
@@ -1701,7 +1701,7 @@ pub async fn anthropic_batches_results(
     if m["internal_status"] != "ended" {
         return err(
             StatusCode::BAD_REQUEST,
-            "results are streamed only after the batch ends — poll \
+            "results are streamed only after the batch ends - poll \
              GET /v1/messages/batches/{id} until processing_status is \"ended\"",
         );
     }
@@ -1750,7 +1750,7 @@ mod tests {
         assert!(a.starts_with("file-"));
         assert!(b.starts_with("batch-"));
         assert_ne!(a, short_id("file"));
-        // BLZ-6: ids come from the OS CSPRNG — lowercase hex, and a run of
+        // BLZ-6: ids come from the OS CSPRNG - lowercase hex, and a run of
         // a thousand must never collide (predictable ids are not secrets).
         for id in [&a, &b] {
             let tail = &id[id.find('-').unwrap() + 1..];
@@ -1865,7 +1865,7 @@ mod tests {
     }
 
     /// Worker-level cancel pin: a cancel flag in the meta file turns every
-    /// remaining request into a `canceled` row — deterministic, zero network
+    /// remaining request into a `canceled` row - deterministic, zero network
     /// (the worker checks the flag BEFORE its first replay).
     #[tokio::test]
     async fn unit__anthropic_worker__cancel_flag_cancels_remaining_rows() {
@@ -2000,7 +2000,7 @@ mod tests {
     #[test]
     fn unit__sweep_expired__terminal_and_age_gated() {
         let dirs = scratch_dirs("sweep");
-        // now = 10_000, retention = 1_000 → cutoff = 9_000.
+        // now = 10_000, retention = 1_000 -> cutoff = 9_000.
         let now = 10_000_u64;
 
         // Terminal + old (finalized 8_000): swept, output rides along.
@@ -2087,7 +2087,7 @@ mod tests {
             "{files:?}"
         );
         // The expired batch's INPUT file was released by its removal and
-        // its own created_at (7_000) is past cutoff → orphan pass removes it.
+        // its own created_at (7_000) is past cutoff -> orphan pass removes it.
         assert!(
             !files.iter().any(|f| f.starts_with("file-gone.")),
             "{files:?}"
@@ -2178,7 +2178,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(files_dir(&dirs).parent().unwrap());
     }
 
-    /// No batches dir at all = a legitimate zero, not a degradation —
+    /// No batches dir at all = a legitimate zero, not a degradation -
     /// the very first batch must not be refused.
     #[test]
     fn unit__active_batch_count__missing_dir_is_zero() {

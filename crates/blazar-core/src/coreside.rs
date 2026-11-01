@@ -1,9 +1,9 @@
 //! Co-residency planner: which local models can stay loaded together in
 //! a VRAM budget (weights + f16 KV at each model's effective ctx).
 //! Greedy: hot models first (they survive capacity cycles anyway), then
-//! smallest — a plan, not a scheduler; the supervisor still owns eviction.
+//! smallest - a plan, not a scheduler; the supervisor still owns eviction.
 
-/// f16 KV (MiB) for a GGUF at a ctx — shared by the planner and the
+/// f16 KV (MiB) for a GGUF at a ctx - shared by the planner and the
 /// gateway's `num_ctx` preflight. Geometry-strict when the GGUF carries
 /// attention fields (`GgufMeta::kv_f16_bytes`, MLA/SWA-aware); lossy
 /// defaults (1 layer/head, 128 dim) only for metadata-poor files, keeping

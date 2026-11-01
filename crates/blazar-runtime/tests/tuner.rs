@@ -176,7 +176,7 @@ fn integration__tune_search__adopts_argmax_and_persists() {
     let overlay = ModelOverride::default();
     // "qwen3.5-9b" carries measured KV-quality receipts (q8_0 and q4_0
     // at ctx 32768) in the compiled-in registry, so the quality gate
-    // lets the stub's q4_0 winner through — this test pins the winner
+    // lets the stub's q4_0 winner through - this test pins the winner
     // contract for an evidenced model. The gate-blocking case has its
     // own test below with an unevidenced name.
     let inp = test_input("qwen3.5-9b", &model_str, &hw, &cfg, &flags, &overlay);
@@ -259,7 +259,7 @@ fn integration__tune_search__adopts_argmax_and_persists() {
 
     // Optimization-ledger wiring: the adoption must leave an immutable
     // experiment, a measurement row, an adoption event, and the
-    // active-profile pointer — the trust base later --plan/--run
+    // active-profile pointer - the trust base later --plan/--run
     // decisions will be judged against.
     let ledger: (i64, i64, i64) = store
         .conn()
@@ -314,7 +314,7 @@ fn integration__tune_search_screen__measures_without_persisting() {
     };
     let store = Store::open(&dirs).unwrap();
 
-    // Screen pass: identical winner contract, zero persistence — this
+    // Screen pass: identical winner contract, zero persistence - this
     // is the seam `optimize --run` rides to measure candidates without
     // touching the serving profile.
     let (screen_profile, screen_winning, screen_rows, screen_score) =
@@ -420,7 +420,7 @@ fn integration__tune_search_cpu__keeps_legacy_grid_and_q8_winner() {
 /// The quality gate's blocking side: an unevidenced model must never
 /// adopt a quantized KV grade on throughput alone, no matter how fast
 /// the stub says it is. The grid still MEASURES the deeper grades (the
-/// search is not shrunk — evidence, not exploration, is gated); only
+/// search is not shrunk - evidence, not exploration, is gated); only
 /// the adoption argmax is restricted to f16.
 #[test]
 #[allow(non_snake_case)]
@@ -434,7 +434,7 @@ fn integration__tune_search_gpu__kv_quality_gate_blocks_unevidenced_grades() {
     let hw = gpu_hw(8, 12_000, 32_000);
     let flags = all_flags();
     let overlay = ModelOverride::default();
-    // "qwen3-8b" has NO entry in the kv-quality registry — every
+    // "qwen3-8b" has NO entry in the kv-quality registry - every
     // quantized grade is ineligible at any ctx, so the stub's q4_0
     // +30/side bait must lose to the f16 baseline.
     let inp = test_input("qwen3-8b", &model_str, &hw, &cfg, &flags, &overlay);
@@ -449,7 +449,7 @@ fn integration__tune_search_gpu__kv_quality_gate_blocks_unevidenced_grades() {
     // Grid unchanged: the deeper grades are still measured.
     assert!(
         rows.iter().any(|r| r.type_k.as_deref() == Some("q4_0")),
-        "the gate filters adoption, not exploration — q4_0 rows must exist"
+        "the gate filters adoption, not exploration - q4_0 rows must exist"
     );
     // Adoption restricted: f16/f16 is the only eligible pair for an
     // unevidenced model.

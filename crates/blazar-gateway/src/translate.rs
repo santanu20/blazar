@@ -1,11 +1,11 @@
-//! Pure ollama <-> `OpenAI` translation functions. No I/O — every function
+//! Pure ollama <-> `OpenAI` translation functions. No I/O - every function
 //! is table-testable, including stream-chunk splitting across boundaries.
 
 use serde_json::{Value, json};
 
 /// llama-server's default sampler chain (verified live via /props on
 /// b10896). Used when `adaptive_p` is enabled without an explicit
-/// `samplers` list — the engine then appends the adaptive sampler itself.
+/// `samplers` list - the engine then appends the adaptive sampler itself.
 const DEFAULT_SAMPLER_CHAIN: &[&str] = &[
     "penalties",
     "dry",
@@ -82,7 +82,7 @@ pub fn apply_ollama_options(openai_req: &mut Value, options: &Value) -> Vec<Stri
             "adaptive_p" => {
                 // No bool field upstream: adaptive_p activates by joining
                 // the samplers chain (engine appends it at chain end).
-                // Applied post-loop — see the flag comment above.
+                // Applied post-loop - see the flag comment above.
                 if v.as_bool() == Some(true) {
                     adaptive_p = true;
                 }
@@ -92,7 +92,7 @@ pub fn apply_ollama_options(openai_req: &mut Value, options: &Value) -> Vec<Stri
                 // (spawn-shape override, the `--no-draft` rail) are
                 // handled by the caller from the ORIGINAL request; the
                 // rest are accepted-and-ignored only for num_ctx's
-                // siblings — explicitly listed, not silently swallowed.
+                // siblings - explicitly listed, not silently swallowed.
                 if k != "num_ctx" && k != "spec" {
                     unknown.push(format!(
                         "{k} (not settable per-request in blazar; use config)"
@@ -125,7 +125,7 @@ pub fn translate_format(format: &Value) -> Option<Value> {
         // `name` is synthesized: the OpenAI shape requires it and
         // sglang's pydantic union hard-rejects its absence (6
         // validation errors, live-receipted) while llama.cpp ignores
-        // it — one synthesized name keeps every child happy.
+        // it - one synthesized name keeps every child happy.
         Value::Object(_) => Some(json!({
             "type": "json_schema",
             "json_schema": {"name": "blazar_format", "schema": format}
@@ -146,7 +146,7 @@ fn b64_val(c: u8) -> Option<u8> {
     }
 }
 
-/// Decode the first `n` bytes of a standard-alphabet base64 string —
+/// Decode the first `n` bytes of a standard-alphabet base64 string -
 /// enough for magic-byte sniffing without a full decoder (or a new
 /// dependency). Short/garbage input yields fewer bytes than asked.
 fn b64_prefix_bytes(b64: &str, n: usize) -> Vec<u8> {
@@ -191,8 +191,8 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
 /// 12 decoded bytes cover every supported magic; an unrecognized (or
 /// undecodable) prefix fails fast instead of guessing a MIME (H1).
 ///
-/// MIME-tolerant input (RFC 2045): ollama clients — python's
-/// `base64.encodebytes`, go's mime writers — may wrap payloads in
+/// MIME-tolerant input (RFC 2045): ollama clients - python's
+/// `base64.encodebytes`, go's mime writers - may wrap payloads in
 /// newlines every 76 chars. The engine's strict decoder rejects
 /// whitespace inside data-URL base64 (live-caught on b10970: client
 /// fixture images 400'd as "Failed to load image or audio file" while
@@ -353,13 +353,13 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     let mut out = json!({
         "model": model,
         // ollama-style message images[] become multimodal content parts
-        // (children ignore the raw field — this was silent vision loss),
+        // (children ignore the raw field - this was silent vision loss),
         // and ollama tool_calls entries gain the `type` the child demands.
         "messages": normalize_tool_result_names(&normalize_tool_call_types(
             &translate_message_images(&req["messages"])?,
         )),
     });
-    // ollama defaults stream=true; OpenAI defaults false — mirror the
+    // ollama defaults stream=true; OpenAI defaults false - mirror the
     // caller's explicit choice only.
     if let Some(stream) = req["stream"].as_bool() {
         out["stream"] = json!(stream);
@@ -373,7 +373,7 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
     if let Some(rf) = translate_format(&req["format"]) {
         out["response_format"] = rf;
     }
-    // Raw GBNF passthrough (R9): an explicit grammar is forwarded 1:1 —
+    // Raw GBNF passthrough (R9): an explicit grammar is forwarded 1:1 -
     // the child skips schema conversion entirely for it.
     if let Some(g) = req.get("grammar").and_then(Value::as_str)
         && !g.is_empty()
@@ -381,7 +381,7 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
         out["grammar"] = json!(g);
     }
     // Confidence scoring (R2): ollama clients asking for logprobs get
-    // them passed through 1:1 — the sentinel turns them into response
+    // them passed through 1:1 - the sentinel turns them into response
     // confidence in `why`. Absent = unchanged request.
     if let Some(lp) = req.get("logprobs").and_then(Value::as_bool) {
         out["logprobs"] = json!(lp);
@@ -390,7 +390,7 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
         }
     }
     // User-supplied `chat_template_kwargs` forwards 1:1 (audit H1: the
-    // field used to be silently dropped — power users coming from
+    // field used to be silently dropped - power users coming from
     // llama-server/vllm/sglang lost their template switches with no
     // error). Copied BEFORE the think injection so explicit user keys
     // beat blazar's derived pair.
@@ -410,16 +410,16 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
         }
         out["chat_template_kwargs"] = merged;
     }
-    // ollama `think` toggle → template-level switch. No OpenAI
+    // ollama `think` toggle -> template-level switch. No OpenAI
     // equivalent field exists; llama-server consumes
     // `chat_template_kwargs`, whose variable name varies by model
-    // family (qwen3: `enable_thinking`, others: `thinking`) — set both;
+    // family (qwen3: `enable_thinking`, others: `thinking`) - set both;
     // a template only reads the var it knows, so the extra is inert.
     // Absent = template default (unchanged behavior). mistral.rs
     // children ignore unknown body fields; the toggle is llama-lane
     // effective and harmless elsewhere. Keys already present (copied
     // from the user's own chat_template_kwargs above) keep the user's
-    // value — explicit beats derived.
+    // value - explicit beats derived.
     if let Some(think) = req.get("think").and_then(Value::as_bool) {
         if out.get("chat_template_kwargs").is_none() {
             out["chat_template_kwargs"] = json!({});
@@ -429,7 +429,7 @@ pub fn chat_to_openai(req: &Value) -> Result<(Value, Option<i64>), String> {
             .and_then(Value::as_object_mut)
         {
             // Fill-only: a user-supplied key (copied above) keeps its
-            // value — explicit beats derived.
+            // value - explicit beats derived.
             kw.entry("thinking".to_string()).or_insert(json!(think));
             kw.entry("enable_thinking".to_string())
                 .or_insert(json!(think));
@@ -463,7 +463,7 @@ fn timing_ns(openai: &Value, key: &str) -> Option<u64> {
 
 /// Merge child `timings` into an ollama response object: prompt/eval
 /// durations plus an honest `total_duration` (prompt+eval, queue time
-/// excluded — the child never saw it).
+/// excluded - the child never saw it).
 fn merge_timing_fields(v: &mut Value, openai: &Value) {
     let prompt_ns = timing_ns(openai, "prompt_ms");
     let eval_ns = timing_ns(openai, "predicted_ms");
@@ -480,7 +480,7 @@ fn merge_timing_fields(v: &mut Value, openai: &Value) {
 
 /// Extract the cached prompt-token count from an `OpenAI` usage object
 /// (`prompt_tokens_details` -> `cached_tokens`; llama-server emits it on
-/// stream usage chunks and non-stream chat). 0 when absent — callers
+/// stream usage chunks and non-stream chat). 0 when absent - callers
 /// treat absent as "cold, unmeasured".
 #[must_use]
 pub fn cached_prompt_tokens(usage: Option<&Value>) -> u64 {
@@ -545,7 +545,7 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
         v["prompt_eval_cached_count"] = json!(cached);
     }
     // Confidence scoring (R2): map the child's token logprobs back into
-    // ollama's native top-level array (field names align 1:1 — pure clone).
+    // ollama's native top-level array (field names align 1:1 - pure clone).
     if let Some(lp) = choice
         .get("logprobs")
         .and_then(|l| l.get("content"))
@@ -653,7 +653,7 @@ fn tool_calls_line(model: &str, calls: &Value) -> Value {
 /// the child streams fragments (id+name first, argument shards after).
 /// Clients built for the ollama wire (replay-compare harnesses)
 /// `extend()` fragments verbatim and replay them, which the child rejects
-/// ("Missing tool call name") — merging at the edge restores the contract.
+/// ("Missing tool call name") - merging at the edge restores the contract.
 #[must_use]
 pub fn openai_chunk_to_ollama(accum: &mut ToolCallAccum, model: &str, chunk: &Value) -> Vec<Value> {
     let mut out = Vec::new();
@@ -670,7 +670,7 @@ pub fn openai_chunk_to_ollama(accum: &mut ToolCallAccum, model: &str, chunk: &Va
                 .get("tool_calls")
                 .and_then(Value::as_array)
                 .filter(|a| !a.is_empty());
-            // A non-tool delta after fragments means the call is complete —
+            // A non-tool delta after fragments means the call is complete -
             // flush the merged calls as their own line first.
             if fragments.is_none()
                 && !accum.is_empty()
@@ -838,11 +838,11 @@ pub fn openai_embeddings_to_ollama(model: &str, openai: &Value) -> Value {
 /// /api/generate request -> /v1/chat/completions body (chat-bus unified
 /// translation): `system` -> messages[0], `prompt` -> user text part,
 /// `images` -> `image_url` data-URL parts, `think` ->
-/// `chat_template_kwargs` — the same machinery as /api/chat, so the
+/// `chat_template_kwargs` - the same machinery as /api/chat, so the
 /// engine's own template shapes the request exactly like ollama's
 /// (templated) generate. `template`/`suffix` stay unsupported (the
 /// engine owns the template) -> `Ok(None)` for the caller's teaching
-/// 400. Unknown sampling options are an `Err` — the generate lane must
+/// 400. Unknown sampling options are an `Err` - the generate lane must
 /// fail fast exactly like the chat lane, never silently drop what was
 /// asked for.
 pub fn generate_to_openai(req: &Value) -> Result<Option<Value>, String> {
@@ -877,11 +877,11 @@ pub fn generate_to_openai(req: &Value) -> Result<Option<Value>, String> {
     if let Some(stream) = req["stream"].as_bool() {
         out["stream"] = json!(stream);
     }
-    // ollama `think` toggle — identical mapping to the chat lane (both
+    // ollama `think` toggle - identical mapping to the chat lane (both
     // template variable names set; a template reads only the one it knows).
     if let Some(think) = req.get("think").and_then(Value::as_bool) {
         // Fill only missing keys: user-supplied chat_template_kwargs
-        // (forwarded below) beats the derived pair — same precedence
+        // (forwarded below) beats the derived pair - same precedence
         // as the chat lane.
         if out.get("chat_template_kwargs").is_none() {
             out["chat_template_kwargs"] = json!({});
@@ -981,7 +981,7 @@ pub fn openai_chunk_to_generate(model: &str, chunk: &Value) -> Vec<Value> {
 /// `<think>...</think>` blocks inside ordinary content; the ollama
 /// dialect expects the gateway to hide reasoning when thinking is not
 /// requested. Feed each content delta through [`ThinkSplitter::feed`]
-/// and forward only what it returns — think blocks and their markers
+/// and forward only what it returns - think blocks and their markers
 /// vanish, plain text passes through untouched, and a marker split
 /// across chunk boundaries is handled by holding back the ambiguous
 /// tail until it resolves.
@@ -1063,7 +1063,7 @@ impl ThinkSplitter {
 /// Conservative byte scan for anything that could make a data frame
 /// non-verbatim under the think filter: a literal `<think>`/`</think>`
 /// marker or a partial marker prefix (a `<` that could grow into one
-/// at a content end, or any `\u` escape — which could spell `<` as
+/// at a content end, or any `\u` escape - which could spell `<` as
 /// `\u003c`). Marker-free prose never trips it; marker-carrying or
 /// escape-carrying chunks fall through to the full per-frame parse.
 /// Also reused as the no-op proof for complete non-stream bodies
@@ -1077,7 +1077,7 @@ pub(crate) fn marker_risk(chunk: &[u8]) -> bool {
 }
 
 /// Length of the longest proper prefix of `marker` that the string
-/// ends with — the bytes that might grow into the marker on the next
+/// ends with - the bytes that might grow into the marker on the next
 /// delta. Char-boundary checked so multibyte tails never split.
 fn tail_marker_prefix_len(s: &str, marker: &str) -> usize {
     let marker_bytes = marker.as_bytes();
@@ -1123,7 +1123,7 @@ pub fn request_think_on(body: &[u8]) -> bool {
 }
 
 /// Strip raw think blocks from a complete ollama-shaped response
-/// (chat `message.content` and generate `response` — whichever key
+/// (chat `message.content` and generate `response` - whichever key
 /// exists). Idempotent: an already-split response passes through.
 /// Returns whether any content string actually changed so callers can
 /// skip a pointless re-serialization of untouched bodies.
@@ -1165,13 +1165,13 @@ pub fn suppress_raw_think_response(v: &mut Value) -> bool {
 /// speaks: template kwargs (`thinking`/`enable_thinking`), the mistral.rs
 /// top-level `enable_thinking`, or an explicit `reasoning_effort`
 /// (deliberate reasoning steering). Suppression of raw `<think>` blocks
-/// must run only when this returns false — the caller did not ask for
+/// must run only when this returns false - the caller did not ask for
 /// reasoning, so content is expected clean. Unparseable body = no
 /// suppression (fail-open passthrough, same rule as `request_think_on`).
 #[must_use]
 pub fn request_asks_thinking(body: &[u8]) -> bool {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return true; // cannot prove "not asked" — do not touch content
+        return true; // cannot prove "not asked" - do not touch content
     };
     let kwargs = v.get("chat_template_kwargs");
     let kwargs_on = kwargs
@@ -1198,7 +1198,7 @@ pub fn request_asks_thinking(body: &[u8]) -> bool {
 /// from `choices[].delta.content` frames. Frame-preserving: `data:` lines
 /// whose content survives untouched (the common case once thinking is
 /// off) re-emit byte-identical, so exotic clients see the child's own
-/// serialization. Only mutated frames re-serialize (compact JSON — the
+/// serialization. Only mutated frames re-serialize (compact JSON - the
 /// `OpenAI` wire format is JSON, spacing is not semantic). Per-choice
 /// state: each `choices[].index` gets its own [`ThinkSplitter`], so a
 /// multi-choice stream filters independently. Fail-open: a `data:` line
@@ -1231,7 +1231,7 @@ impl SseThinkFilter {
         // Identity fast path: with no buffered partial line, every
         // splitter settled, the chunk ending on a line boundary, and no
         // marker-risk bytes anywhere, every line provably passes through
-        // verbatim — skip the per-frame JSON parse entirely. This is
+        // verbatim - skip the per-frame JSON parse entirely. This is
         // the steady state for engines that never emit think markers;
         // the scan costs nanoseconds against the ~microsecond parse it
         // replaces, and any marker/escape/hold condition falls through
@@ -1253,7 +1253,7 @@ impl SseThinkFilter {
     }
 
     /// Stream ended without a `[DONE]` line (child abort): resolve held
-    /// partial markers the same way the ollama lane's splitter does —
+    /// partial markers the same way the ollama lane's splitter does -
     /// literal tail text ships, an unterminated think block is dropped.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = self.flush_splitters();
@@ -1301,7 +1301,7 @@ impl SseThinkFilter {
         if touched {
             // Line-for-line replacement: the original data line ends with
             // \n (or \r\n) and the frame's blank-line separator follows as
-            // its own (unmodified) line — re-emit only the data line so
+            // its own (unmodified) line - re-emit only the data line so
             // framing stays byte-faithful.
             let line_end = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
             format!("data: {v}{line_end}").into_bytes()
@@ -1332,7 +1332,7 @@ impl SseThinkFilter {
 /// Streaming `text/event-stream` filter that rewrites the top-level
 /// `model` field of `data:` frames to the caller-facing name. Stamped
 /// lanes (mistral.rs, sglang, mlx) answer under their own child-side
-/// ids — `default`, sanitized registration names, or full model paths —
+/// ids - `default`, sanitized registration names, or full model paths -
 /// so this restores the model-name round trip the `OpenAI` wire contract
 /// implies: the client asked for `X`, every frame says `X` back.
 /// Frame-preserving: frames already carrying the target (or carrying no
@@ -1366,7 +1366,7 @@ impl SseRestamper {
         out
     }
 
-    /// Stream ended: any incomplete trailing line ships verbatim — a
+    /// Stream ended: any incomplete trailing line ships verbatim - a
     /// truncated frame is the child's story, not ours to rewrite.
     pub fn finish(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.buf).into_bytes()
@@ -1398,7 +1398,7 @@ impl SseRestamper {
     }
 }
 
-/// Final ollama generate line from usage/finish (stream path — gateway-
+/// Final ollama generate line from usage/finish (stream path - gateway-
 /// measured durations, same contract as `ollama_final_chunk`).
 #[must_use]
 pub fn ollama_generate_final_chunk(
@@ -1918,7 +1918,7 @@ mod tests {
         assert_eq!(call["type"], "function", "type filled");
         assert_eq!(call["function"]["name"], "compute_geochem");
         // ollama sends `arguments` as a parsed object; the child demands a
-        // JSON string — the request translator stringifies it.
+        // JSON string - the request translator stringifies it.
         let want_args = json!({"query": "Mg# Fo=90"}).to_string();
         assert_eq!(
             call["function"]["arguments"], want_args,
@@ -1994,7 +1994,7 @@ mod tests {
     fn unit__image_data_url__strips_mime_wrapped_base64() {
         // RFC 2045 line-wrapped base64 (python base64.encodebytes, go mime
         // writers): the engine's strict decoder rejects whitespace inside
-        // data URLs (live-caught on b10970 — client fixture images 400'd).
+        // data URLs (live-caught on b10970 - client fixture images 400'd).
         let wrapped = "iVBORw0KGgoAAA\nANSUhEUgAAAAg=\n";
         let url = image_data_url(wrapped).unwrap();
         assert_eq!(url, "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAg=");
@@ -2301,7 +2301,7 @@ mod tests {
 
     #[test]
     fn unit__think_splitter__handles_marker_split_across_deltas() {
-        // '<th' is ambiguous (could grow into <think>) — held back; the
+        // '<th' is ambiguous (could grow into <think>) - held back; the
         // next delta completes the marker and the block is suppressed.
         let mut sp = ThinkSplitter::new();
         assert_eq!(sp.feed("A<th"), "A");
@@ -2326,7 +2326,7 @@ mod tests {
     fn unit__think_splitter__partial_marker_tail_ships_literal_at_finish() {
         let mut sp = ThinkSplitter::new();
         // 'hi<' is not a marker prefix... '<' alone IS a prefix of
-        // <think> — held at EOS it must ship literally.
+        // <think> - held at EOS it must ship literally.
         assert_eq!(sp.feed("plain text <"), "plain text ");
         assert_eq!(sp.finish(), "<");
     }
@@ -2361,8 +2361,8 @@ mod tests {
     #[test]
     fn unit__think_splitter__every_two_way_split_never_leaks_or_loses() {
         // Characterization sweep: the full open+close pattern fed as
-        // TWO deltas at EVERY split point — including every boundary
-        // inside both markers — must always yield exactly the outer
+        // TWO deltas at EVERY split point - including every boundary
+        // inside both markers - must always yield exactly the outer
         // text, never the markers, never the hidden block.
         let text = "pre<think>hidden</think>post";
         for split in 1..text.len() {
@@ -2380,8 +2380,8 @@ mod tests {
 
     #[test]
     fn unit__think_splitter__marker_free_text_identity_at_every_split() {
-        // Text with no COMPLETE marker — including partial-prefix
-        // lookalikes — is literal content at every two-way split: what
+        // Text with no COMPLETE marker - including partial-prefix
+        // lookalikes - is literal content at every two-way split: what
         // went in comes out, byte for byte, via feed+finish.
         let text = "a <th <thinkx < b <text </thi end";
         assert!(!text.contains("<think>") && !text.contains("</think>"));
@@ -2430,7 +2430,7 @@ mod tests {
         assert_eq!(marked["message"]["content"], json!("n"));
 
         // Partial-marker tails ("<th" at end) are literal text: one-shot
-        // feed+finish returns them unchanged — no false positive.
+        // feed+finish returns them unchanged - no false positive.
         let mut tail = json!({"choices": [{"message": {"content": "abc<th"}}]});
         assert!(!suppress_raw_think_response(&mut tail));
         assert_eq!(tail["choices"][0]["message"]["content"], json!("abc<th"));
@@ -2510,7 +2510,7 @@ mod tests {
         assert!(!request_asks_thinking(br#"{"reasoning_effort": "none"}"#));
         assert!(!request_asks_thinking(br#"{"reasoning_effort": ""}"#));
         // Unparseable body: fail OPEN (never suppress on a body we could
-        // not read — the worst case is a leaked think block, not a
+        // not read - the worst case is a leaked think block, not a
         // mangled answer).
         assert!(request_asks_thinking(b"not json"));
     }
@@ -2526,7 +2526,7 @@ mod tests {
     #[test]
     fn unit__sse_think_filter__marker_free_chunks_skip_parse_byte_exact() {
         // Steady-state decode traffic: content with quotes, code-style
-        // comparisons, and tag-ish text — none of it marker-risk. The
+        // comparisons, and tag-ish text - none of it marker-risk. The
         // fast path must return each chunk byte-for-byte and leave the
         // filter inert at finish.
         let mut f = SseThinkFilter::new();
@@ -2560,7 +2560,7 @@ mod tests {
             "think content suppressed after skip-prefixed stream: {out:?}"
         );
         // Inside the block: marker-free chunks must NOT take the skip
-        // path (in_think splitters are unsettled) — suppression holds.
+        // path (in_think splitters are unsettled) - suppression holds.
         let mid =
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"still hidden\"}}]}\n\n";
         let out = f.feed(mid.as_bytes());
@@ -2601,7 +2601,7 @@ mod tests {
     #[test]
     fn unit__sse_think_filter__escaped_unicode_takes_full_path() {
         // `\u` escapes could spell `<` as `\u003c` and hide a marker
-        // from the byte scan — such chunks must not skip. The parse
+        // from the byte scan - such chunks must not skip. The parse
         // resolves them to plain text, which passes through verbatim.
         let mut f = SseThinkFilter::new();
         let raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\u003cb\\u003e bold \\u003c/b\\u003e\"}}]}\n\n";
@@ -2627,7 +2627,7 @@ mod tests {
     #[test]
     fn unit__sse_restamper__rewrites_model_split_across_chunks() {
         let mut f = SseRestamper::new("store-name".to_string());
-        // Frame straddles two chunks — the rewrite must survive the split.
+        // Frame straddles two chunks - the rewrite must survive the split.
         let out = f.feed(b"data: {\"model\": \"/engines/m");
         assert!(out.is_empty(), "incomplete line held: {out:?}");
         let out = String::from_utf8(f.feed(b"odel.gguf\", \"choices\": []}\n\n")).unwrap();
@@ -2659,7 +2659,7 @@ mod tests {
         f.feed(b"data: {\"model\": \"trunc");
         // Truncated frame = the child's story; ships untouched.
         assert_eq!(f.finish(), b"data: {\"model\": \"trunc");
-        // finish() is a drain — a second call returns empty.
+        // finish() is a drain - a second call returns empty.
         assert_eq!(f.finish(), b"");
     }
 
@@ -2683,7 +2683,7 @@ mod tests {
         let c2 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"nk>secret \"}}]}\n\n";
         let c3 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"</think>ans\"}}]}\n\n";
         let out1 = String::from_utf8(f.feed(c1.as_bytes())).unwrap();
-        // c1 ends inside the marker → text held; the frame re-emits with
+        // c1 ends inside the marker -> text held; the frame re-emits with
         // empty content so framing stays line-faithful.
         assert!(out1.contains("\"content\":\"\""), "held frame: {out1}");
         let out2 = String::from_utf8(f.feed(c2.as_bytes())).unwrap();
@@ -2707,7 +2707,7 @@ mod tests {
     #[test]
     fn unit__sse_think_filter__done_flushes_held_literal_tail() {
         let mut f = SseThinkFilter::new();
-        // Trailing '<' is a potential marker prefix → held back.
+        // Trailing '<' is a potential marker prefix -> held back.
         f.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer<\"}}]}\n\n");
         let out = String::from_utf8(f.feed(b"data: [DONE]\n\n")).unwrap();
         assert!(
@@ -2767,7 +2767,7 @@ mod tests {
     proptest::proptest! {
         /// Client-supplied base64 is untrusted input: on arbitrary strings
         /// image_data_url must stay total (never panic) and every Ok path
-        /// must be a well-formed data: URL — known mime, no whitespace in
+        /// must be a well-formed data: URL - known mime, no whitespace in
         /// the payload (the forwarded engine URL would break on it).
         #[test]
         #[allow(non_snake_case)] // unit__ prefix matches the suite convention
@@ -2787,8 +2787,8 @@ mod tests {
             }
         }
 
-        /// A valid PNG-magic payload — with arbitrary whitespace woven
-        /// through it, as real client encoders emit — must classify as
+        /// A valid PNG-magic payload - with arbitrary whitespace woven
+        /// through it, as real client encoders emit - must classify as
         /// image/png with the payload equal to the whitespace-stripped
         /// original.
         #[test]

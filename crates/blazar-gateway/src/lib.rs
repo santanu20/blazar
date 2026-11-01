@@ -86,7 +86,7 @@ struct UsageTap {
 /// and unauthenticated). Resolves the presented secret to its key entry
 /// and tags the request with `KeyCtx` for scope/rate/accounting.
 /// Secret sources (in priority order): `Authorization: Bearer <secret>`
-/// (`OpenAI` convention) and `x-api-key: <secret>` (Anthropic convention —
+/// (`OpenAI` convention) and `x-api-key: <secret>` (Anthropic convention -
 /// Claude Code & friends never send Authorization).
 async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
     if !state.keys.is_empty() {
@@ -108,7 +108,7 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
                 Some(k) => {
                     // Concurrency cap is the cheapest gate, so it runs
                     // before scope/rpm/tpm: a capped key cannot even
-                    // probe scopes. The lease rides the response body —
+                    // probe scopes. The lease rides the response body -
                     // freed when the client drains (or drops) it.
                     let lease = match state.keys.acquire(&k.name, k.max_concurrent) {
                         Ok(l) => l,
@@ -122,7 +122,7 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
                     let resp = next.run(req).await;
                     let mut resp = keys::guard_response(resp, lease);
                     // F64: request_log now runs OUTSIDE auth and can no
-                    // longer read KeyCtx off the request — stamp it on
+                    // longer read KeyCtx off the request - stamp it on
                     // the response extensions so the audit/access line
                     // still carries the key name.
                     resp.extensions_mut().insert(keys::KeyCtx {
@@ -145,7 +145,7 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
 }
 
 /// Per-request structured log + trace id (debuggability complaint):
-/// method, path, status, duration, priority, trace id — echoed back as
+/// method, path, status, duration, priority, trace id - echoed back as
 /// `x-blazar-trace-id` so clients can correlate.
 #[allow(clippy::too_many_lines)] // trace+access+otlp+audit pipeline in one middleware
 async fn request_log(
@@ -177,7 +177,7 @@ async fn request_log(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     // E4 audit + F4 usage: buffer the body ONLY when audit is on or
-    // this is a metered generation lane — extract `model`, hand the
+    // this is a metered generation lane - extract `model`, hand the
     // bytes back untouched. Neither on = zero request-path changes.
     let audit_on = state.audit_tx.is_some();
     let usage_lane = crate::usage::USAGE_PATHS.contains(&path.as_str());
@@ -231,7 +231,7 @@ async fn request_log(
         .get::<keys::KeyCtx>()
         .map(|k| k.name.clone())
         .or(key);
-    // E4 audit line: identity + outcome, never content. try_send — a
+    // E4 audit line: identity + outcome, never content. try_send - a
     // saturated writer drops (and counts) rather than stalling the
     // response.
     // The audit line takes ownership of `model`; the usage tap needs
@@ -291,7 +291,7 @@ async fn request_log(
     // F4 usage: re-stream successful generation-lane responses through
     // a tap that keeps the last 8 KiB (usage JSON rides the final
     // chunk in every dialect) plus first/last chunk timings. The meter
-    // records at stream end — one hash bump, no store I/O on this path
+    // records at stream end - one hash bump, no store I/O on this path
     // (flushing is the periodic task's job). No model or non-2xx =
     // nothing metered.
     if usage_lane
@@ -449,7 +449,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/videos/{id}/content", get(images::video_content))
         // Jobs and capabilities are surface-agnostic upstream (one
-        // queue, `kind` distinguishes) — same handlers on both mounts.
+        // queue, `kind` distinguishes) - same handlers on both mounts.
         .route("/v1/videos/jobs/{id}", get(images::jobs_get))
         .route("/v1/videos/jobs/{id}/cancel", post(images::jobs_cancel))
         .route("/v1/videos/capabilities", get(images::capabilities))
@@ -461,7 +461,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Native llama-server dialect (no /v1 prefix, no `model` field
         // in the body upstream): /completion is the raw prompt surface,
         // /embeddings the token-level batch one (pooling=none). Same
-        // handler — model resolution mirrors scoped_proxy for them.
+        // handler - model resolution mirrors scoped_proxy for them.
         .route("/completion", post(openai::openai_proxy))
         .route("/embeddings", post(openai::openai_proxy))
         .route("/v1/chat/completions/control", post(openai::openai_proxy))
@@ -474,7 +474,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/classify", post(classify::classify))
         .route("/responses/input_tokens", post(openai::openai_proxy))
         // Realtime voice lane: WS upgrade, one utterance pipeline per
-        // commit (STT → chat → TTS through the gateway's own lanes).
+        // commit (STT -> chat -> TTS through the gateway's own lanes).
         .route("/v1/realtime", get(realtime::realtime_session))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         // Anthropic Message Batches: inline-request batch dialect. The
@@ -587,7 +587,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // instead of axum's empty-body 404. Inside the layer stack, so
         // auth/CORS/access-log still apply to 404s.
         .fallback(unknown_route)
-        // Session pins (R3): innermost layer — auth/CORS/logging/body
+        // Session pins (R3): innermost layer - auth/CORS/logging/body
         // limit have already run; only header-carrying requests buffer.
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -606,7 +606,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // legit is larger locally).
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         // Auth inside request_log (F64): rejected secrets are still
-        // access-logged and traced — brute-force probing no longer
+        // access-logged and traced - brute-force probing no longer
         // flies blind. Sits INSIDE CORS: browser preflights carry no
         // bearer, so the CORS layer answers them before auth runs, and
         // auth's 401s flow back out through CORS, letting permitted
@@ -637,7 +637,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 )]),
         )
         // Host guard: DNS-rebinding defense (ollama CVE-2024-28224
-        // class). Armed only on loopback binds — a non-loopback bind
+        // class). Armed only on loopback binds - a non-loopback bind
         // is a deliberate LAN exposure decision. Preflights (OPTIONS)
         // and health probes pass through so CORS and orchestrators
         // keep working; anything else with a non-local Host is 403.
@@ -646,7 +646,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             (host_guard::guard_scope(&state.config.host),),
             host_guard::host_guard_mw,
         ))
-        // request_log: outermost — every request, including 401s and
+        // request_log: outermost - every request, including 401s and
         // preflights, gets a trace id and an access-log line.
         .layer(middleware::from_fn_with_state(state.clone(), request_log))
         .with_state(state)
@@ -654,7 +654,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// Translate the config's origin list into tower-http's `AllowOrigin`.
 /// Default: the local browser set (localhost/127.0.0.1/IPv6 loopback/0.0.0.0 on
-/// any port + desktop webview schemes) — local UIs work with zero
+/// any port + desktop webview schemes) - local UIs work with zero
 /// config, other sites get nothing. Configured entries are ADDITIVE on
 /// top of that set; the sole entry "*" restores any-origin.
 fn cors_allow_origin(origins: &[String]) -> tower_http::cors::AllowOrigin {
@@ -683,7 +683,7 @@ fn cors_allow_origin(origins: &[String]) -> tower_http::cors::AllowOrigin {
 /// daemon (SIGHUP reload reads are lock-free but writes serialize), so
 /// two racing mutations can't clobber each other with a stale read.
 /// Returns an error response on failure (the live registry is already
-/// updated; a failed persist is loud, never silent — the next daemon
+/// updated; a failed persist is loud, never silent - the next daemon
 /// restart loses the change).
 fn persist_keys(state: &AppState, entries: &[ApiKey]) -> Response {
     static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -707,7 +707,7 @@ fn persist_keys(state: &AppState, entries: &[ApiKey]) -> Response {
         return error_response(400, &format!("generated config invalid: {e}"));
     }
     // F67: atomic write (temp+rename) + timestamped .bak via the shared
-    // core helper — a crash mid-write can never truncate config.toml and
+    // core helper - a crash mid-write can never truncate config.toml and
     // an overwrite is always recoverable.
     let write = cfg
         .to_toml()
@@ -731,13 +731,13 @@ fn error_response(code: u16, msg: &str) -> Response {
 }
 
 /// Router fallback: every unmatched method+path lands here. The message
-/// names what was asked and where the full mounted-route census lives —
+/// names what was asked and where the full mounted-route census lives -
 /// `GET /.well-known/blazar` is kept in lockstep with the router table.
 async fn unknown_route(method: axum::http::Method, uri: axum::http::Uri) -> Response {
     error_response(
         404,
         &format!(
-            "unknown route: {} {} — GET /.well-known/blazar lists every mounted route",
+            "unknown route: {} {} - GET /.well-known/blazar lists every mounted route",
             method,
             uri.path()
         ),
@@ -747,12 +747,12 @@ async fn unknown_route(method: axum::http::Method, uri: axum::http::Uri) -> Resp
 /// Redacted secret for listings: enough to recognize, not enough to use.
 fn redact(secret: &str) -> String {
     let prefix: String = secret.chars().take(8).collect();
-    format!("{prefix}…")
+    format!("{prefix}...")
 }
 
 /// Management guard: when keys exist, only UNSCOPED keys (empty model
 /// list = admin semantics) may manage the key set. When no keys exist,
-/// the gateway is authless and management is refused — bootstrap the
+/// the gateway is authless and management is refused - bootstrap the
 /// first key via config.toml `[[keys]]` or `BLAZAR_KEYS` (never let an
 /// open gateway mint its own credentials).
 #[allow(clippy::result_large_err)] // Response is the handlers' currency here
@@ -850,7 +850,7 @@ async fn keys_add(
     if name.trim().is_empty() {
         return error_response(400, "name must not be empty");
     }
-    // F68: remove/rotate address keys via `?name=` — restrict the
+    // F68: remove/rotate address keys via `?name=` - restrict the
     // charset at creation so every name stays manageable over HTTP.
     if !name
         .chars()
@@ -885,7 +885,7 @@ async fn keys_add(
             }),
         }
     };
-    // F65: the teaching 400s above are answers, not decoration — an
+    // F65: the teaching 400s above are answers, not decoration - an
     // invalid rpm/tpm/daily_tokens must be REJECTED, not silently
     // coerced to 0 (= unlimited).
     #[allow(clippy::result_large_err)] // the 400 Response IS the error type here
@@ -922,7 +922,7 @@ async fn keys_add(
     }
     (
         StatusCode::CREATED,
-        // The secret appears exactly once, here — listings only ever show
+        // The secret appears exactly once, here - listings only ever show
         // the redacted prefix.
         axum::Json(serde_json::json!({
             "created": entry.name,
@@ -955,7 +955,7 @@ async fn keys_remove(
     if state.keys.entries().len() == 1 {
         return error_response(
             409,
-            "refusing to remove the last key — that would leave the gateway authless; add a replacement first",
+            "refusing to remove the last key - that would leave the gateway authless; add a replacement first",
         );
     }
     if !state.keys.remove(&name) {
@@ -964,7 +964,7 @@ async fn keys_remove(
     let entries = state.keys.entries();
     let persist = persist_keys(&state, &entries);
     if persist.status() != StatusCode::OK {
-        // Nothing to roll back (remove already ran) — the error response
+        // Nothing to roll back (remove already ran) - the error response
         // tells the operator the file write failed.
         return persist;
     }
@@ -975,7 +975,7 @@ async fn keys_remove(
         .into_response()
 }
 
-/// POST /api/keys/rotate?name=N — mint a fresh secret for a key,
+/// POST /api/keys/rotate?name=N - mint a fresh secret for a key,
 /// keeping its name/scopes/limits and usage history. The old secret
 /// dies immediately; the new one is shown exactly once.
 async fn keys_rotate(
@@ -1004,7 +1004,7 @@ async fn keys_rotate(
     state.keys.upsert(rotated.clone());
     let persist = persist_keys(&state, &state.keys.entries());
     if persist.status() != StatusCode::OK {
-        // F66: mirror keys_add's rollback — the file is the source of
+        // F66: mirror keys_add's rollback - the file is the source of
         // truth; without this the shown-once new secret dies silently
         // at the next restart when the old file entry wins.
         state.keys.upsert(entry);
@@ -1020,7 +1020,7 @@ async fn keys_rotate(
         .into_response()
 }
 
-/// GET /.well-known/blazar — capability discovery: routes, limits,
+/// GET /.well-known/blazar - capability discovery: routes, limits,
 /// engine identity. Clients introspect instead of probing.
 async fn well_known(State(state): State<Arc<AppState>>) -> Response {
     let engine = state
@@ -1034,12 +1034,12 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
         "name": "blazar",
         "version": env!("CARGO_PKG_VERSION"),
         "engine": engine,
-        // F52: the messages lane TRANSLATES and refuses passthrough —
+        // F52: the messages lane TRANSLATES and refuses passthrough -
         // the label must not advertise passthrough semantics.
         "apis": ["openai", "ollama", "anthropic"],
         // F69: full route census (verified against the router table).
         // Audit MM15: extended to the media generation lanes and the
-        // engine-scoped surfaces — the census is the machine-readable
+        // engine-scoped surfaces - the census is the machine-readable
         // discovery contract and must not lag the router.
         "endpoints": {
             "openai": ["/v1/chat/completions", "/v1/chat/completions/{id}",
@@ -1129,8 +1129,8 @@ fn counter(text: &str, name: &str) -> Option<u64> {
 }
 
 /// EWMA step shared by the merged-global and per-model hint windows
-/// (0.7 history / 0.3 new — the A16/G3 smoothing constant). Also the
-/// remote time-to-head hint (v0.16 federation) — one constant, one bias.
+/// (0.7 history / 0.3 new - the A16/G3 smoothing constant). Also the
+/// remote time-to-head hint (v0.16 federation) - one constant, one bias.
 pub(crate) fn hint_ewma(prev: Option<f64>, rate: f64) -> f64 {
     match prev {
         Some(e) => e * 0.7 + rate * 0.3,
@@ -1143,7 +1143,7 @@ pub(crate) fn hint_ewma(prev: Option<f64>, rate: f64) -> f64 {
 /// `tls_cert`/`tls_key` are configured, plain HTTP otherwise.
 #[allow(clippy::too_many_lines)]
 /// Serve returned because the configured listen address is already
-/// taken (another server — typically ollama — owns the port). The CLI
+/// taken (another server - typically ollama - owns the port). The CLI
 /// maps this to `EXIT_BIND_CONFLICT` and the systemd unit pins
 /// `RestartPreventExitStatus=` to it: a hard port conflict must fail
 /// loudly once, not crash-loop `Restart=always` into the journal.
@@ -1161,7 +1161,7 @@ impl std::error::Error for BindConflict {}
 /// `blazar serve` exit code for an unrecoverable bind conflict.
 pub const EXIT_BIND_CONFLICT: i32 = 3;
 
-// One wiring function: listener, TLS, flushers, teardown — all the
+// One wiring function: listener, TLS, flushers, teardown - all the
 // serve-lifetime setup in a single readable sequence.
 #[allow(clippy::too_many_lines)]
 pub async fn serve(
@@ -1174,7 +1174,7 @@ pub async fn serve(
     // Durable jobs boot hygiene, detached: sweep latency is not boot
     // latency. Abandons in-flight rows from a previous gateway process
     // (grace-window protected) and prunes terminal rows older than 7
-    // days — the ledger must not grow unbounded.
+    // days - the ledger must not grow unbounded.
     {
         let state = Arc::clone(&state);
         tokio::spawn(async move { state.jobs.boot_sweep(&state) });
@@ -1182,13 +1182,13 @@ pub async fn serve(
     let addr = format!("{host}:{port}");
     // Prompt-cache hit-rate + spec-accept poller (A16/G3): every 60 s,
     // sum the children's Prometheus counters, compute the window delta
-    // rate and EWMA it into the supervisor's CacheHints — the adaptive
+    // rate and EWMA it into the supervisor's CacheHints - the adaptive
     // --cache-ram clamp's input and the spec gauge's source. Bounded
     // (2 s) fetches; failures just skip a window.
     // Wake admission waiters when a child swap changes slot capacity:
     // a completed adaptive reshape (SlotsReshaped) or an engine
     // update/rollback replaced the child while requests were parked on
-    // the admission queue — only stream completions signal otherwise,
+    // the admission queue - only stream completions signal otherwise,
     // so these waiters would sit until the 2-min park timeout.
     let reshape_wake_task = {
         let state = Arc::clone(&state);
@@ -1235,7 +1235,7 @@ pub async fn serve(
                     std::collections::HashMap::new();
                 for e in state.sup.live_http_endpoints() {
                     // Child Prometheus text: aggregate counters (the /slots
-                    // per-slot stats are short-lived and unreliable — the
+                    // per-slot stats are short-lived and unreliable - the
                     // metrics counters are the durable truth). Both
                     // transports serve /metrics; child_client picks the
                     // socket-pinned client for unix children.
@@ -1254,7 +1254,7 @@ pub async fn serve(
                     let Ok(text) = resp.text().await else {
                         continue;
                     };
-                    // Replicas of one model share the entry — same
+                    // Replicas of one model share the entry - same
                     // weights, same KV economics.
                     let slot = by_model.entry(e.name.clone()).or_insert((0, 0, 0, 0));
                     if let (Some(c), Some(p)) = (
@@ -1343,7 +1343,7 @@ pub async fn serve(
     };
     // F4 usage rollup flusher: the request tap records into the meter's
     // in-memory buckets (zero store I/O on the hot path); this task
-    // drains them into `usage_daily` every minute — a crash loses at
+    // drains them into `usage_daily` every minute - a crash loses at
     // most one window, and `/api/usage` + `blazar usage` stay current.
     let usage_flush_task = {
         let meter = std::sync::Arc::clone(&state.usage);
@@ -1361,7 +1361,7 @@ pub async fn serve(
     // OTLP flusher (no-op task when the endpoint is unset).
     let otlp_task = {
         let otlp = Arc::clone(&state.otlp);
-        // F81: bounded POSTs — a black-hole collector used to wedge the
+        // F81: bounded POSTs - a black-hole collector used to wedge the
         // flusher forever (the 5s select only bounds the first-span wait).
         let http = http_pool::tuned(reqwest::Client::builder())
             .timeout(std::time::Duration::from_secs(10))
@@ -1374,7 +1374,7 @@ pub async fn serve(
             // Typed so the CLI can exit 3 and the systemd unit's
             // RestartPreventExitStatus=3 stops the Restart=always loop.
             anyhow::Error::new(BindConflict(e)).context(format!(
-                "bind {addr} — another server (ollama?) on this port? stop it or set BLAZAR_PORT"
+                "bind {addr} - another server (ollama?) on this port? stop it or set BLAZAR_PORT"
             ))
         })?;
         // Record the real bound address for the batch worker (config port
@@ -1389,9 +1389,9 @@ pub async fn serve(
             let _ = state.http_addr.set((h, sa.port()));
         }
         tracing::info!("blazar listening on http://{addr} (OpenAI + ollama APIs)");
-        tracing::info!("powered by upstream llama.cpp, mistral.rs and SGLang — unmodified engines");
+        tracing::info!("powered by upstream llama.cpp, mistral.rs and SGLang - unmodified engines");
         // F1 startup preload: listed models spawn now, one at a time,
-        // while the listener already answers — healthz stays fast.
+        // while the listener already answers - healthz stays fast.
         {
             let sup = Arc::clone(&state.sup);
             tokio::spawn(async move { sup.preload_listed().await });
@@ -1405,7 +1405,7 @@ pub async fn serve(
         }
         // TCP_NODELAY on every accepted socket: NDJSON/SSE streams are strings
         // of small writes, and with Nagle the first content packet waits for
-        // the client's delayed ACK of the headers/role packet — a flat
+        // the client's delayed ACK of the headers/role packet - a flat
         // +40-60ms on first-token latency for every streaming response
         // (live-measured: child's first content SSE at ~77ms reached the
         // client at ~135ms; Go net/http, ollama's stack, sets nodelay too).
@@ -1428,7 +1428,7 @@ pub async fn serve(
         let bind_addr: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| anyhow::anyhow!("bind address {addr}: {e}"))?;
-        // F69: record the bound address on the TLS branch too — the
+        // F69: record the bound address on the TLS branch too - the
         // batch worker's loopback replay must not guess config.port
         // (invalid when 0 = ephemeral). Binding with tokio first gives
         // us the real port the same way the plain-HTTP branch gets it.
@@ -1444,7 +1444,7 @@ pub async fn serve(
             };
             let _ = state.http_addr.set((h, sa.port()));
         }
-        // F1 startup preload on the TLS branch too — same contract as
+        // F1 startup preload on the TLS branch too - same contract as
         // the plain-HTTP branch above.
         {
             let sup = Arc::clone(&state.sup);
@@ -1544,7 +1544,7 @@ mod tests {
         use blazar_runtime::SupervisionError;
         let resp = supervision_error(&SupervisionError::UnsupportedModel(
             "safetensors model /m.d is not servable by the llama.cpp engine \
-             — run: blazar engine install --kind sglang"
+             - run: blazar engine install --kind sglang"
                 .to_string(),
         ));
         assert_eq!(resp.status(), 400);
@@ -1568,7 +1568,7 @@ mod tests {
         use blazar_runtime::SupervisionError;
         let resp = supervision_error(&SupervisionError::ModelTooLarge(
             "qwen: admission floor 17.2 GiB exceeds every GPU budget (largest card 7.6 GiB) \
-             even with the box empty — waiting for a slot can never change this. Use a smaller \
+             even with the box empty - waiting for a slot can never change this. Use a smaller \
              quant (`blazar fit`), lower the ctx/slots, or serve on a larger card"
                 .to_string(),
         ));
@@ -1590,7 +1590,7 @@ mod tests {
         use crate::proxy::supervision_error;
         use blazar_runtime::SupervisionError;
         // Live shape of the 18 GiB bf16 refusal (MemAvailable < spawn
-        // floor): honest and teaching, but it surfaced as a bare 500 —
+        // floor): honest and teaching, but it surfaced as a bare 500 -
         // 507 says "resource exhausted", the levers stay in the body.
         let resp = supervision_error(&SupervisionError::InsufficientMemory(
             "insufficient memory to load \"qwen3.5-9b-bf16\": MemAvailable 1612 MiB < \
@@ -1619,11 +1619,11 @@ mod bind_conflict_tests {
     #[test]
     fn unit__bind_conflict__downcast_survives_context_chain() {
         // The CLI exit-3 path relies on anyhow::downcast_ref finding the
-        // typed cause through a .context() wrapper — pin that mechanic.
+        // typed cause through a .context() wrapper - pin that mechanic.
         let e = anyhow::Error::new(BindConflict(std::io::Error::other(
             "Address already in use",
         )))
-        .context("bind 127.0.0.1:11434 — another server?");
+        .context("bind 127.0.0.1:11434 - another server?");
         assert!(e.downcast_ref::<BindConflict>().is_some());
         assert_eq!(super::EXIT_BIND_CONFLICT, 3);
     }

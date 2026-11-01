@@ -1,7 +1,7 @@
 //! mistral.rs engine lane integration tests: argv dialect (forced
 //! loopback, flag-gated ctx/seqs/mmproj), `/v1/models`-loaded health
 //! gate, and the install e2e (wiremock GitHub + a real tar.gz holding
-//! the stub binary — exercises the tolerant probe + register flow).
+//! the stub binary - exercises the tolerant probe + register flow).
 #![allow(non_snake_case)] // house test-naming: unit__subject__behavior
 
 use std::collections::BTreeSet;
@@ -214,7 +214,7 @@ fn unit__mistralrs_argv__unix_endpoint_port_placeholder() {
 }
 
 /// Minimal GGUF v3 header with string `general.*` KVs (0 tensors, no
-/// tensor data — `parse_metadata` only walks the KV section).
+/// tensor data - `parse_metadata` only walks the KV section).
 fn gguf_bytes(kvs: &[(&str, &str)]) -> Vec<u8> {
     let mut b: Vec<u8> = Vec::new();
     b.extend_from_slice(b"GGUF");
@@ -264,7 +264,7 @@ fn unit__mistralrs_argv__multimodal_gguf_rides_derived_tok_model_id() {
     assert_eq!(argv[i + 1], "Qwen/Qwen3.5-9B");
 
     // Underivable metadata (no org separator) falls back to the row's
-    // pull-time repo when it names a plausible Hub id — the flagged
+    // pull-time repo when it names a plausible Hub id - the flagged
     // pull-era gap (text-GGUF SWA refusals forced the extra_args
     // escape hatch even though the row RECORDS its source repo).
     // Contract chain: file metadata > explicit user pin > row.repo >
@@ -349,7 +349,7 @@ fn unit__mistralrs_argv__text_gguf_user_tok_model_id_rides() {
 fn unit__mistralrs_argv__derived_tok_model_id_wins_over_user_extra() {
     // When the builder CAN derive the id (multimodal GGUF with
     // general.basename), the derived value wins and the user's
-    // extra_args pair is skipped — no duplicate emission, no override
+    // extra_args pair is skipped - no duplicate emission, no override
     // of the computed identity.
     let dir = std::env::temp_dir().join(format!("blazar-mrs-tokid-win-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
@@ -681,7 +681,7 @@ fn staging__stray_projector_excluded_from_view() {
     let models = t.path().join("models");
     std::fs::create_dir_all(&models).unwrap();
     touch(&models.join("m.gguf"));
-    // Another model's projector living in the shared dir — the poison.
+    // Another model's projector living in the shared dir - the poison.
     touch(&models.join("mmproj-F16.gguf"));
     let staging = t.path().join("staging");
     std::fs::create_dir_all(&staging).unwrap();
@@ -863,7 +863,7 @@ fn unit__mistralrs_argv__tuning_passthrough_pairs_and_bools() {
 #[test]
 fn unit__mistralrs_argv__tuning_passthrough_gated_by_manifest() {
     // Old engine (manifest lacks the tuning flags): every tuning token is
-    // dropped from the child argv — the compile-time warning already taught.
+    // dropped from the child argv - the compile-time warning already taught.
     let m = model("/data/m.gguf", None);
     let p = profile(
         8192,

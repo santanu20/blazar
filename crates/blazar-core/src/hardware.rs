@@ -44,7 +44,7 @@ const INTEGRATED_PATTERNS: &[&str] = &[
 impl GpuInfo {
     /// Integrated-GPU heuristic from the device description. Used by the
     /// auto-pick to prefer discrete cards (bandwidth-bound serving) and
-    /// never as a hard exclusion — an integrated-only box still serves.
+    /// never as a hard exclusion - an integrated-only box still serves.
     #[must_use]
     pub fn is_integrated(&self) -> bool {
         let d = self.description.to_lowercase();
@@ -61,12 +61,12 @@ pub struct Hardware {
 
 impl Hardware {
     /// Sum of VRAM across the GPUs that count for capacity math.
-    /// Integrated GPUs report shared system RAM as "VRAM" — summing them
+    /// Integrated GPUs report shared system RAM as "VRAM" - summing them
     /// alongside discrete cards invents capacity (a vulkan census of
     /// [iGPU 10 GiB shared, 8 GiB discrete] must not read as 18 GiB, or
     /// offload pins over-commit the real card). When any discrete card
     /// exists, only discrete cards count; an integrated-only box keeps
-    /// the integrated sum — it still serves.
+    /// the integrated sum - it still serves.
     #[must_use]
     pub fn total_vram_mib(&self) -> u64 {
         if self.gpus.iter().any(|g| !g.is_integrated()) {
@@ -81,7 +81,7 @@ impl Hardware {
     }
 
     /// Spawn-time FREE capacity across the GPUs that count for capacity
-    /// math — same integrated-filter discipline as [`Self::total_vram_mib`]
+    /// math - same integrated-filter discipline as [`Self::total_vram_mib`]
     /// (an iGPU's shared-RAM "free" must never pad a discrete card's
     /// budget). Returns 0 when no GPU counts.
     #[must_use]

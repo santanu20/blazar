@@ -5,7 +5,7 @@
 //! "which workers are out there, and how much memory do they have
 //! free": the mandatory HELLO handshake, `RPC_CMD_DEVICE_COUNT` and
 //! per-device `RPC_CMD_GET_DEVICE_MEMORY`. Nothing here allocates
-//! buffers or ships tensors — a status probe must be safe to point at
+//! buffers or ships tensors - a status probe must be safe to point at
 //! any worker, including a hostile one.
 //!
 //! Wire framing (little-endian; upstream memcpy's native structs, and
@@ -16,7 +16,7 @@
 //! response = u64 output_len || output bytes
 //! ```
 //!
-//! Every connection MUST open with HELLO — the server drops any
+//! Every connection MUST open with HELLO - the server drops any
 //! client whose first command is something else. On any later
 //! protocol error the server closes the socket WITHOUT a reply, so an
 //! EOF mid-conversation is a distinct failure from a timeout.
@@ -31,7 +31,7 @@ use tokio::net::TcpStream;
 
 /// `RPC_CMD_GET_DEVICE_MEMORY` (enum position 11 at protocol v7).
 const CMD_GET_DEVICE_MEMORY: u8 = 11;
-/// `RPC_CMD_HELLO` — upstream `static_assert` pins it at 14 forever.
+/// `RPC_CMD_HELLO` - upstream `static_assert` pins it at 14 forever.
 const CMD_HELLO: u8 = 14;
 /// `RPC_CMD_DEVICE_COUNT` (enum position 15 at protocol v7).
 const CMD_DEVICE_COUNT: u8 = 15;
@@ -60,7 +60,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONVERSATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A device-count reply above this is treated as a protocol fault,
-/// not a fleet — the per-device loop would otherwise amplify a
+/// not a fleet - the per-device loop would otherwise amplify a
 /// misdecoded length into thousands of bogus queries.
 const MAX_SANITY_DEVICES: u32 = 64;
 
@@ -86,7 +86,7 @@ pub struct RpcWorkerInfo {
 
 /// Query one `host:port` worker: HELLO, count devices, fetch each
 /// device's free/total memory. The connection is closed by drop after
-/// the last reply — every command here is read-only, so there is
+/// the last reply - every command here is read-only, so there is
 /// nothing to drain.
 ///
 /// Errors are user-facing sentences (endpoint-prefixed, same shape as
@@ -107,10 +107,10 @@ pub async fn query_worker(endpoint: &str) -> Result<RpcWorkerInfo, String> {
         query_worker_on(endpoint, sock).await
     })
     .await
-    .map_err(|_| format!("{endpoint} (no reply within 10s — worker accepted but went silent)"))?
+    .map_err(|_| format!("{endpoint} (no reply within 10s - worker accepted but went silent)"))?
 }
 
-/// Conversation body once connected: HELLO → device count → memory.
+/// Conversation body once connected: HELLO -> device count -> memory.
 async fn query_worker_on(endpoint: &str, sock: TcpStream) -> Result<RpcWorkerInfo, String> {
     let (mut r, mut w) = sock.into_split();
 
@@ -122,7 +122,7 @@ async fn query_worker_on(endpoint: &str, sock: TcpStream) -> Result<RpcWorkerInf
     if proto_major != PROTO_MAJOR || proto_minor > PROTO_MINOR {
         return Err(format!(
             "{endpoint} (worker speaks rpc protocol v{proto_major}.{proto_minor}.{proto_patch}, \
-             this blazar speaks v{PROTO_MAJOR}.{PROTO_MINOR}.0 — update the engine lane \
+             this blazar speaks v{PROTO_MAJOR}.{PROTO_MINOR}.0 - update the engine lane \
              (`blazar engine update`) or point at a v{PROTO_MAJOR}.x worker)"
         ));
     }
@@ -134,7 +134,7 @@ async fn query_worker_on(endpoint: &str, sock: TcpStream) -> Result<RpcWorkerInf
     let count = u32::from_le_bytes(count_rsp[..4].try_into().unwrap());
     if count > MAX_SANITY_DEVICES {
         return Err(format!(
-            "{endpoint} (worker reported {count} devices — protocol fault, expected <= {MAX_SANITY_DEVICES})"
+            "{endpoint} (worker reported {count} devices - protocol fault, expected <= {MAX_SANITY_DEVICES})"
         ));
     }
 
@@ -177,7 +177,7 @@ async fn send_cmd(
 
 /// Read one framed reply. The announced length MUST equal `expected`:
 /// a mismatch (or an absurd value) is a version fault, and the length
-/// is never trusted for allocation — exactly `expected` bytes are
+/// is never trusted for allocation - exactly `expected` bytes are
 /// read, no more.
 async fn recv_rsp(
     endpoint: &str,
@@ -192,7 +192,7 @@ async fn recv_rsp(
     let announced = u64::from_le_bytes(len_buf);
     if announced != expected as u64 {
         return Err(format!(
-            "{endpoint} ({what} announced {announced} bytes, expected {expected} — \
+            "{endpoint} ({what} announced {announced} bytes, expected {expected} - \
              rpc protocol version mismatch?)"
         ));
     }
@@ -382,7 +382,7 @@ mod tests {
         let drop = spawn_fake(7, 0, 0, vec![(1, 1)], FakeBehavior::DropOnMemory).await;
         let err = query_worker(&drop.endpoint).await.unwrap_err();
         assert!(err.contains("closed the connection"), "{err}");
-        // CONVERSATION_TIMEOUT is 10s — the test budget proves the EOF
+        // CONVERSATION_TIMEOUT is 10s - the test budget proves the EOF
         // path wins long before any timer fires.
     }
 

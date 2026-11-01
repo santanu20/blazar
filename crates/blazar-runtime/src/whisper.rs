@@ -2,7 +2,7 @@
 //!
 //! `whisper-server` (ggml-org/whisper.cpp releases) is installed under
 //! `data/whisper/bin/<tag>/` and ggml models under `data/whisper/models/`.
-//! State is plain files — no DB rows — so the lane stays inspectable and
+//! State is plain files - no DB rows - so the lane stays inspectable and
 //! trivially removable. The gateway lazily spawns ONE server child on the
 //! first `/v1/audio/transcriptions` request and hot-swaps models via the
 //! upstream `/load` endpoint instead of restarting per request.
@@ -20,7 +20,7 @@ use blazar_core::config::UpdateChannel;
 /// macOS server binary (only an xcframework library zip).
 pub const WHISPER_REPO: &str = "ggml-org/whisper.cpp";
 /// Hugging Face model repo hosting the legacy `ggml-*.bin` files. This HF
-/// repo did NOT move with the 2026 GitHub org migration — the engine source
+/// repo did NOT move with the 2026 GitHub org migration - the engine source
 /// lives at ggml-org/whisper.cpp on GitHub, but on HF the ggml-org/whisper*
 /// repos 401 anonymously (verified live 2026-10-03: ggerganov serves the
 /// ggml-*.bin files, ggml-org/whisper.cpp does not exist on HF).
@@ -53,7 +53,7 @@ fn pin_path(dirs: &BlazarDirs) -> PathBuf {
     bin_root(dirs).join("pin")
 }
 
-/// Pin-file location from the bare data dir — engine-removal
+/// Pin-file location from the bare data dir - engine-removal
 /// reconciliation (`engine rm` of a pinned tag) runs from the removal
 /// site, which owns the data dir but not a full `BlazarDirs`.
 #[must_use]
@@ -62,7 +62,7 @@ pub fn pin_path_in(data_dir: &Path) -> PathBuf {
 }
 
 /// Pinned tag from `bin/pin`, trimmed. `None` when unset, empty, or when
-/// the content could escape the bin dir (separators / `..`) — a tag is
+/// the content could escape the bin dir (separators / `..`) - a tag is
 /// external input, never join it unvalidated.
 #[must_use]
 pub fn pinned_tag(dirs: &BlazarDirs) -> Option<String> {
@@ -94,7 +94,7 @@ pub fn asset_name(os: &str, arch: &str) -> Option<&'static str> {
 
 /// Newest release that actually ships `asset`. GitHub serves the list
 /// newest-first. `stable_only` skips prereleases (the `/releases/latest`
-/// contract) — whisper.cpp tags releases (v1.9.4, 2026-09-11) that carry
+/// contract) - whisper.cpp tags releases (v1.9.4, 2026-09-11) that carry
 /// no assets while the prerelease b-tags carry them, so an asset-blind
 /// "latest" can point installs at a tag that can never install.
 fn newest_with_asset<'a>(
@@ -117,7 +117,7 @@ fn newest_with_asset<'a>(
 async fn release_for_channel(gh: &GhClient, channel: UpdateChannel) -> Result<GhRelease> {
     let asset_name = asset_name(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
         anyhow!(
-            "whisper.cpp releases ship no {}/{} server binary (macOS: build from source — \
+            "whisper.cpp releases ship no {}/{} server binary (macOS: build from source - \
              https://github.com/ggml-org/whisper.cpp/blob/master/docs/build.md)",
             std::env::consts::OS,
             std::env::consts::ARCH
@@ -131,14 +131,14 @@ async fn release_for_channel(gh: &GhClient, channel: UpdateChannel) -> Result<Gh
     match newest_with_asset(&releases, asset_name, false) {
         Some(rel) => Err(anyhow!(
             "no stable whisper.cpp release ships the {asset_name} server binary; \
-             newest installable is prerelease {} — set update_channel = latest \
+             newest installable is prerelease {} - set update_channel = latest \
              or install it explicitly: blazar whisper --install --tag {}",
             rel.tag_name,
             rel.tag_name
         )),
         None => Err(anyhow!(
             "no recent whisper.cpp release ({} checked) ships the {asset_name} \
-             server binary — upstream may have renamed assets",
+             server binary - upstream may have renamed assets",
             releases.len()
         )),
     }
@@ -154,7 +154,7 @@ pub async fn channel_target(gh: &GhClient, channel: UpdateChannel) -> Result<Str
 /// Active whisper-server binary plus its directory (needed as
 /// `LD_LIBRARY_PATH` on Linux: the binary dlopens sibling libggml*.so).
 /// Resolution order: the engines-table lane (`blazar engine install
-/// --kind whisper`) first, then the legacy `data/whisper/bin` tree —
+/// --kind whisper`) first, then the legacy `data/whisper/bin` tree -
 /// both stay working installs (the engines lane adopts legacy trees
 /// at serve preflight, doctor, and `engine prune`).
 #[must_use]
@@ -162,7 +162,7 @@ pub fn server_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
     // A pin is lane-agnostic (the user has ONE --pin flag and cannot be
     // expected to know which install channel holds the tag): honor it
     // against the engines table first, then the legacy tree. `--pin`
-    // used to succeed while the engines lane silently ignored it —
+    // used to succeed while the engines lane silently ignored it -
     // live incident 2026-09-26.
     if let Some(tag) = pinned_tag(dirs) {
         if let Some(row) = engines_lane_row(dirs)
@@ -198,7 +198,7 @@ pub fn is_legacy_bin(dirs: &BlazarDirs, bin: &Path) -> bool {
 }
 
 /// The engines-table lane's whisper row: a row matching the pin (see
-/// [`server_bin`] — pins are lane-agnostic) first, else the active row
+/// [`server_bin`] - pins are lane-agnostic) first, else the active row
 /// when one is flagged, else the newest installed. `None` when no
 /// whisper row exists (the legacy tree decides) or the store cannot be
 /// read (warn, never mask).
@@ -226,7 +226,7 @@ fn engines_lane_row(dirs: &BlazarDirs) -> Option<blazar_core::store::EngineRow> 
     }
     // `list_engines` orders newest-installed first; the active row (if
     // any) still wins so a flagged lane is honored. `installed_at`
-    // breaks ties explicitly — max_by_key on the active flag alone
+    // breaks ties explicitly - max_by_key on the active flag alone
     // returns the LAST row among equal keys, i.e. the OLDEST.
     rows.into_iter()
         .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::Whisper)
@@ -243,7 +243,7 @@ fn engines_lane_bin(dirs: &BlazarDirs) -> Option<(PathBuf, PathBuf)> {
     Some((bin, lib))
 }
 
-/// Whether the serving whisper lane is engines-table backed — update
+/// Whether the serving whisper lane is engines-table backed - update
 /// hints must name the lane that can actually update the serving binary
 /// (`blazar whisper --install` writes the legacy tree, which
 /// [`server_bin`] never picks while a row exists).
@@ -253,9 +253,9 @@ pub fn engines_lane_installed(dirs: &BlazarDirs) -> bool {
 }
 
 /// The tag currency verdicts must compare against upstream: a mirror of
-/// [`server_bin`]'s pick (pin first — either lane — then the engines
+/// [`server_bin`]'s pick (pin first - either lane - then the engines
 /// row, then the legacy newest). The binary's LIB DIRECTORY is not a tag
-/// source — the extract subdir name leaked into the verdict once and
+/// source - the extract subdir name leaked into the verdict once and
 /// produced an update warning that no update could clear (live:
 /// "update available: b5130 (running: whisper-bin-ubuntu-x64)").
 #[must_use]
@@ -283,7 +283,7 @@ pub fn installed_tag(dirs: &BlazarDirs) -> Option<String> {
 
 /// Row's binary: the install-time probed path when it still exists,
 /// otherwise re-derived from the tag dir (a relocated data dir must not
-/// brick the lane — same recovery register performs).
+/// brick the lane - same recovery register performs).
 fn engines_lane_server_bin(
     dirs: &BlazarDirs,
     row: &blazar_core::store::EngineRow,
@@ -304,7 +304,7 @@ fn engines_lane_server_bin(
 
 /// Sort key for a whisper.cpp tag: `vX.Y.Z` numeric components (missing
 /// minor/patch = 0). Single-component tags (the old date shape
-/// `v20250101`) and 4+ component tags do not parse — they order after
+/// `v20250101`) and 4+ component tags do not parse - they order after
 /// semver tags, alphabetically within their group.
 type TagKey = Option<(u64, u64, u64)>;
 
@@ -369,8 +369,8 @@ pub fn installed_tags(dirs: &BlazarDirs) -> Vec<String> {
 
 /// Pin the active whisper server to an already-installed tag, or unpin
 /// (`None`) to track the newest installed tag. The tag must pass the
-/// shared sanitizer AND be installed in EITHER lane — the legacy
-/// `data/whisper/bin` tree or the engines table (`kind = whisper`) —
+/// shared sanitizer AND be installed in EITHER lane - the legacy
+/// `data/whisper/bin` tree or the engines table (`kind = whisper`) -
 /// because [`server_bin`] honors the pin across both; accepting only
 /// legacy tags would let the pin succeed while serving ignores it. The
 /// prune pass keeps the pinned dir regardless of retention, so re-run
@@ -388,12 +388,12 @@ pub fn set_pin(dirs: &BlazarDirs, tag: Option<&str>) -> Result<()> {
             known.dedup();
             if !known.iter().any(|installed| installed == t) {
                 anyhow::bail!(
-                    "tag {t} is not installed (installed: {}) — run: blazar whisper --install --tag {t}",
+                    "tag {t} is not installed (installed: {}) - run: blazar whisper --install --tag {t}",
                     known.join(", ")
                 );
             }
             // The pin dir exists on legacy-lane installs but not on a
-            // fresh engines-lane install — mkdir before the write so
+            // fresh engines-lane install - mkdir before the write so
             // `whisper --pin` never fails on a missing parent.
             std::fs::create_dir_all(bin_root(dirs))
                 .with_context(|| format!("mkdir {}", bin_root(dirs).display()))?;
@@ -425,7 +425,7 @@ fn whisper_engine_tags(dirs: &BlazarDirs) -> Result<Vec<String>> {
 }
 
 /// Keep the newest `keep_tags` server dirs (config knob, default
-/// `KEEP_TAGS`); the pinned dir (if any) is never pruned — mirrors the
+/// `KEEP_TAGS`); the pinned dir (if any) is never pruned - mirrors the
 /// llama engine lane's retention policy.
 fn prune(dirs: &BlazarDirs) -> Result<()> {
     let pin = pinned_tag(dirs);
@@ -444,7 +444,7 @@ fn prune(dirs: &BlazarDirs) -> Result<()> {
                 | blazar_core::fs_safety::GuardedRemoval::Absent,
             ) => {}
             Ok(blazar_core::fs_safety::GuardedRemoval::Escaped) => {
-                // Not this store's dir — skip, keep the pass moving.
+                // Not this store's dir - skip, keep the pass moving.
                 continue;
             }
             Err(e) => return Err(anyhow!("prune whisper dir {}: {e}", dir.display())),
@@ -502,7 +502,7 @@ pub fn list_models(dirs: &BlazarDirs) -> Vec<String> {
 }
 
 /// One ggml model in the upstream index (`ggml-org/whisper.cpp`,
-/// with its on-disk byte size — the searchable remote catalog behind
+/// with its on-disk byte size - the searchable remote catalog behind
 /// `whisper --search`.
 #[derive(Debug, Clone)]
 pub struct RemoteModel {
@@ -556,7 +556,7 @@ const MAX_STREAM_CHUNKS: usize = 512;
 /// every subchunk before `data` (the `fmt ` block included) is copied
 /// verbatim into each rebuild and only the `RIFF`/`data` size fields are
 /// repatched, so each slice is a standalone WAV a decoder accepts
-/// unchanged. Splits fall on `block_align` multiples — no frame is ever
+/// unchanged. Splits fall on `block_align` multiples - no frame is ever
 /// cut. Returns None when the input is not a WAV, lacks a usable
 /// `fmt `/`data` pair, or already fits one window (callers stream the
 /// original bytes as a single chunk then). Subchunks trailing `data`
@@ -639,7 +639,7 @@ pub fn split_wav(data: &[u8], chunk_ms: u64) -> Option<Vec<WavChunk>> {
 /// bytes and the MSVC wide-argv handling trips, so the path converts to
 /// its ASCII 8.3 short form first. Best-effort by design: volumes with
 /// 8dot3 naming disabled (or a conversion failure) keep the original
-/// path — the guard never introduces a failure mode of its own.
+/// path - the guard never introduces a failure mode of its own.
 // The one platform-gated unsafe use in the crate: Win32 FFI has no safe
 // wrapper, and CI carries `-D unsafe-code` for everything else.
 #[cfg_attr(windows, allow(unsafe_code))]
@@ -685,9 +685,9 @@ pub fn argv_model_path(model_path: &Path) -> PathBuf {
 }
 
 /// Map the request's `model` field to a pulled size. `whisper-1` /
-/// `whisper-1-latest` / absent → preference order; `whisper-<size>`,
-/// `ggml-<size>` (the HF file naming) or a bare size → exact match;
-/// unknown → None (caller 400s with the list).
+/// `whisper-1-latest` / absent -> preference order; `whisper-<size>`,
+/// `ggml-<size>` (the HF file naming) or a bare size -> exact match;
+/// unknown -> None (caller 400s with the list).
 #[must_use]
 pub fn resolve_model(requested: Option<&str>, available: &[String]) -> Option<String> {
     if available.is_empty() {
@@ -744,7 +744,7 @@ pub async fn pull(
     hf.download_file(WHISPER_MODEL_REPO, &plan, &dest, on_progress)
         .await
         .with_context(|| format!("download {WHISPER_MODEL_REPO}/{display_name}"))?;
-    // F93: read EXACTLY 4 bytes — `fs::read` buffered the whole multi-GB
+    // F93: read EXACTLY 4 bytes - `fs::read` buffered the whole multi-GB
     // ggml into RAM just to inspect the magic (2.9 GB spike for large-v3).
     let mut head = [0u8; 4];
     let magic_ok = std::fs::File::open(&dest)
@@ -755,7 +755,7 @@ pub async fn pull(
         // the first four bytes read "lmgg", not "ggml".
         let _ = std::fs::remove_file(&dest);
         return Err(anyhow!(
-            "{WHISPER_MODEL_REPO}/{size}: payload is not a ggml whisper model (bad magic) — removed"
+            "{WHISPER_MODEL_REPO}/{size}: payload is not a ggml whisper model (bad magic) - removed"
         ));
     }
     Ok(dest)
@@ -766,7 +766,7 @@ pub async fn pull(
 ///
 /// Security posture: upstream whisper-server has NO auth flag (no
 /// `--api-key`; verified against ggml-org/whisper.cpp master
-/// examples/server/README.md, 2026-09-08) — unlike llama.cpp children,
+/// examples/server/README.md, 2026-09-08) - unlike llama.cpp children,
 /// a per-child secret cannot be minted. Mitigation is loopback-only
 /// bind + OS-assigned ephemeral port, pinned by unit test below.
 /// Revisit if upstream grows an auth option.
@@ -783,7 +783,7 @@ pub struct WhisperChild {
     pub child: tokio::process::Child,
     pub port: u16,
     pub loaded: String,
-    /// Last instant the lane served (or swapped) a request — the idle
+    /// Last instant the lane served (or swapped) a request - the idle
     /// reaper's clock. Refreshed on every `ensure` hit, never elsewhere.
     pub last_used: tokio::time::Instant,
 }
@@ -800,10 +800,10 @@ impl WhisperRuntime {
     /// hot-swaps models via POST /load (no restart) when the request
     /// names a different pulled size. `extra` (config
     /// `whisper_extra_args`) rides the spawn argv after the gateway pins
-    /// — unknown flags are gated against this binary's own `--help`
+    /// - unknown flags are gated against this binary's own `--help`
     /// surface so a typo teaches instead of crashing the boot.
     // Spawning needs the full child context (paths, timeouts, VAD, extra
-    // flags) — nothing here is bundleable without hiding a boot decision.
+    // flags) - nothing here is bundleable without hiding a boot decision.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn ensure(
         &self,
@@ -827,7 +827,7 @@ impl WhisperRuntime {
                         .mime_str("text/plain")
                         .context("mime")?;
                     let form = reqwest::multipart::Form::new().part("model", part);
-                    // F94: bounded client — this POST runs under the
+                    // F94: bounded client - this POST runs under the
                     // instance mutex; a hung whisper-server would pin
                     // every later transcription behind it.
                     blazar_core::tls::ensure_tls_provider();
@@ -858,10 +858,10 @@ impl WhisperRuntime {
         }
         // Config extra args: unknown flags are checked against this
         // binary's own --help surface (fail-open when the surface cannot
-        // be captured) — the engine exits at boot on a bad flag, which
+        // be captured) - the engine exits at boot on a bad flag, which
         // would surface as an opaque health timeout instead of a teaching.
         // A flag a first-class config knob already pins may not ALSO ride
-        // extra_args — double-flagging makes the winner build-defined.
+        // extra_args - double-flagging makes the winner build-defined.
         // Unpinned knob flags stay legal in extra_args (pre-existing
         // configs ride them; the knobs just add a first-class path).
         let pinned: std::collections::BTreeSet<&str> = knobs
@@ -875,7 +875,7 @@ impl WhisperRuntime {
                 if pinned.contains(flag) {
                     return Err(anyhow!(
                         "whisper_extra_args carries '{flag}', which a first-class whisper \
-                         config knob already pins — unset the knob or drop the extra_args entry"
+                         config knob already pins - unset the knob or drop the extra_args entry"
                     ));
                 }
             }
@@ -898,7 +898,7 @@ impl WhisperRuntime {
                 if !surface.contains(flag) {
                     return Err(anyhow!(
                         "whisper flag '{flag}' is not in this whisper-server's \
-                         --help surface — the engine would refuse to boot; fix the spelling \
+                         --help surface - the engine would refuse to boot; fix the spelling \
                          or unset the knob"
                     ));
                 }
@@ -974,7 +974,7 @@ impl WhisperRuntime {
     /// `max_idle`. Serialized against `ensure` by the same mutex, so a
     /// request racing the reap simply respawns the child (the lazy-lane
     /// contract; the loser pays one model load). A dead child is
-    /// reaped here too — same hygiene `ensure` does on its next hit,
+    /// reaped here too - same hygiene `ensure` does on its next hit,
     /// just sooner. No-op when no child exists.
     pub async fn reap_idle(&self, max_idle: std::time::Duration) {
         let mut slot = self.child.lock().await;
@@ -1027,7 +1027,7 @@ fn ephemeral_port() -> Result<u16> {
     Ok(l.local_addr().context("local addr")?.port())
 }
 
-/// Flags the gateway itself pins on every spawn — a config `whisper_extra_args`
+/// Flags the gateway itself pins on every spawn - a config `whisper_extra_args`
 /// entry fighting them would break the lane contract (loopback isolation,
 /// port bookkeeping, model loading, VAD), so they are refused, not overridden.
 const RESERVED_WHISPER_FLAGS: [&str; 5] = ["--host", "--port", "--model", "--vad", "--vad-model"];
@@ -1049,7 +1049,7 @@ pub const WHISPER_KNOB_FLAGS: &[&str] = &[
 ];
 
 /// Compose the first-class decode/VAD knobs from config into spawn argv
-/// tokens, in a fixed order. Only set knobs emit — an all-default config
+/// tokens, in a fixed order. Only set knobs emit - an all-default config
 /// yields an empty vec (spawn argv byte-identical to before the knobs).
 #[must_use]
 pub fn knob_args(cfg: &blazar_core::Config) -> Vec<String> {
@@ -1088,7 +1088,7 @@ pub fn knob_args(cfg: &blazar_core::Config) -> Vec<String> {
 }
 
 /// Child argv: loopback bind is a security invariant (upstream has no
-/// auth flag — see `WhisperRuntime` doc); pinned by unit test. VAD
+/// auth flag - see `WhisperRuntime` doc); pinned by unit test. VAD
 /// (PR4083 era) is argv-level: `--vad --vad-model <ggml>` skips
 /// silence/noise segments before decode. None = upstream default.
 /// `extra` (config `whisper_extra_args`) rides after the VAD block;
@@ -1120,7 +1120,7 @@ fn server_args(
             let flag = tok.split('=').next().unwrap_or(tok);
             if RESERVED_WHISPER_FLAGS.contains(&flag) {
                 return Err(format!(
-                    "'{flag}' is reserved — the gateway owns the loopback bind, port, model \
+                    "'{flag}' is reserved - the gateway owns the loopback bind, port, model \
                      and VAD argv; remove it from whisper_extra_args"
                 ));
             }
@@ -1167,7 +1167,7 @@ pub fn knob_surface() -> Vec<String> {
 }
 
 /// Extract the long-flag surface from a `--help` dump. Tokens are shaped
-/// `--flag` / `--flag-name` and must be word-delimited on both sides — a
+/// `--flag` / `--flag-name` and must be word-delimited on both sides - a
 /// `--` inside prose or a value (`path--to--x`, bare `--`) is not a flag.
 /// Hand-rolled scanner: one fixed shape, no regex dependency.
 fn parse_help_flags(text: &str) -> std::collections::BTreeSet<String> {
@@ -1206,9 +1206,9 @@ fn parse_help_flags(text: &str) -> std::collections::BTreeSet<String> {
 }
 
 /// The live binary's own flag surface, parsed from `--help` (stdout and
-/// stderr — builds differ on where usage goes). Used to teach, not crash,
+/// stderr - builds differ on where usage goes). Used to teach, not crash,
 /// on a `whisper_extra_args` flag this build does not know: the engine
-/// would exit at boot with a confusing argv error. Fail-open by design —
+/// would exit at boot with a confusing argv error. Fail-open by design -
 /// a binary whose help cannot be captured (timeout, thin output, exotic
 /// build) skips this gate; structure and reserved-pin validation still
 /// apply, and a genuinely wrong flag then surfaces as the child-exit
@@ -1283,7 +1283,7 @@ mod tests {
                 .map(|r| r.tag_name.as_str()),
             Some("b5130")
         );
-        // Stable channel: non-prerelease only — v1.9.4 is assetless, so
+        // Stable channel: non-prerelease only - v1.9.4 is assetless, so
         // no stable release qualifies.
         assert!(newest_with_asset(&rels, "whisper-bin-ubuntu-x64.tar.gz", true).is_none());
         // A future stable release carrying assets wins over older b-tags.
@@ -1336,7 +1336,7 @@ mod tests {
                 "--model".to_string(),
                 "/data/whisper/models/ggml-base.bin".to_string(),
             ],
-            "whisper-server has no auth flag upstream; loopback bind is the isolation boundary — never widen to 0.0.0.0"
+            "whisper-server has no auth flag upstream; loopback bind is the isolation boundary - never widen to 0.0.0.0"
         );
     }
 
@@ -1387,7 +1387,7 @@ mod tests {
         )
         .expect("value token rides");
         assert_eq!(lone_value.last().map(String::as_str), Some("4"));
-        // Every gateway pin is refused — in both `--flag` and `--flag=v` form.
+        // Every gateway pin is refused - in both `--flag` and `--flag=v` form.
         for pin in [
             "--port",
             "--host",
@@ -1515,7 +1515,7 @@ mod tests {
     }
 
     /// Canonical 44-byte PCM WAV: mono, `byte_rate` bytes per second,
-    /// `block_align` bytes per frame — the minimum a decoder needs.
+    /// `block_align` bytes per frame - the minimum a decoder needs.
     fn wav(bytes_of_audio: usize, byte_rate: u32, block_align: u16) -> Vec<u8> {
         let mut w = b"RIFF----WAVE".to_vec();
         let mut f = Vec::new();
@@ -1613,7 +1613,7 @@ mod tests {
     fn unit__split_wav__extra_subchunks_before_data_ride_every_rebuild() {
         // A LIST chunk (odd-sized, so the word-alignment walk is
         // exercised) BETWEEN fmt and the data header must reach every
-        // slice — byte 36 is right after the 24-byte fmt chunk.
+        // slice - byte 36 is right after the 24-byte fmt chunk.
         let mut src = wav(96_000, 32_000, 2);
         let list_payload = b"INFOx".to_vec(); // odd length
         let mut list = b"LIST".to_vec();
@@ -1643,7 +1643,7 @@ mod tests {
 
     #[test]
     fn unit__argv_model_path__identity_off_windows() {
-        // On non-Windows the guard must be a pure identity — the
+        // On non-Windows the guard must be a pure identity - the
         // W1 conversion only exists on the MSVC argv surface.
         let p = Path::new("/data/models/ggml-base.bin");
         assert_eq!(argv_model_path(p), PathBuf::from(p));
@@ -1764,7 +1764,7 @@ mod tests {
         }
         let rt = WhisperRuntime::new();
         // Fresh child on an unreachable port: "dead" wins even though
-        // last_used is now — a corpse must not squat the lane until the
+        // last_used is now - a corpse must not squat the lane until the
         // idle budget also expires.
         let child = tokio::process::Command::new("sleep")
             .arg("60")
@@ -1786,7 +1786,7 @@ mod tests {
             "dead child {pid} leaked past reap"
         );
 
-        // Idle budget path: reachable port + stale last_used → reaped.
+        // Idle budget path: reachable port + stale last_used -> reaped.
         // A port that answers TCP: bind our own listener.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1901,7 +1901,7 @@ mod tests {
 
     #[test]
     fn unit__server_bin__relative_row_anchors_to_data_dir() {
-        // Storage-invariant rows carry `engines/<tag>/...` server paths —
+        // Storage-invariant rows carry `engines/<tag>/...` server paths -
         // the lane resolver must anchor them against the live data dir
         // instead of missing the file and falling through to a directory
         // search (or worse, the legacy tree).
@@ -1952,7 +1952,7 @@ mod tests {
         // newer row exists; a pin naming a legacy dir serves the legacy
         // tree even when engines rows exist; a pin naming nothing falls
         // through to the engines lane's newest. The superseded contract
-        // — the engines lane silently beating a live pin — is the
+        // - the engines lane silently beating a live pin - is the
         // 2026-09-26 incident this test pins closed.
         let tmp = tempfile::tempdir().expect("tmp");
         let dirs = BlazarDirs {
@@ -1979,7 +1979,7 @@ mod tests {
     #[test]
     fn unit__installed_tag__mirrors_server_bin_pick() {
         // Verdicts must compare upstream against whatever server_bin is
-        // actually about to serve — pin first, then engines lane, then
+        // actually about to serve - pin first, then engines lane, then
         // legacy newest. Also pins the tie-break: with no pin and no
         // active row, the NEWEST whisper row wins (a max_by_key on the
         // active flag alone used to return the oldest).
@@ -2213,7 +2213,7 @@ mod tests {
             config_dir: tmp.path().join("cfg"),
             data_dir: tmp.path().join("data"),
         };
-        // Engines-lane row with a nested extract subdir — the subdir name
+        // Engines-lane row with a nested extract subdir - the subdir name
         // (whisper-bin-ubuntu-x64) is exactly what must never reach a
         // currency verdict (live: an unclearable "update available").
         let nested = dirs.engines_dir().join("b5130/whisper-bin-ubuntu-x64");
@@ -2234,7 +2234,7 @@ mod tests {
 
         assert_eq!(installed_tag(&dirs).as_deref(), Some("b5130"));
         assert!(engines_lane_installed(&dirs));
-        // The serving binary's dir really is the nested one — the tag
+        // The serving binary's dir really is the nested one - the tag
         // derivation must not simply mirror server_bin's second element.
         let (bin, lib) = server_bin(&dirs).expect("serving");
         assert!(bin.ends_with("whisper-server"));

@@ -1,5 +1,5 @@
 //! OpenAI-compatible surface: byte-faithful proxy to the child engine.
-//! Blazar never parses or rewrites these bodies — tool calls, structured
+//! Blazar never parses or rewrites these bodies - tool calls, structured
 //! output, logprobs, `stream_options` ride through untouched (complaint #1
 //! fidelity argument). Two deliberate exceptions, both additive and
 //! user-explicit-wins: top-level `reasoning_effort` is bridged into
@@ -25,11 +25,11 @@ use crate::state::AppState;
 
 use axum::Extension;
 
-/// GET /v1/models — synthesized from the local store (any pulled model is
+/// GET /v1/models - synthesized from the local store (any pulled model is
 /// servable; the engine is hot-swapped underneath).
 /// Admission classification from the RAW request bytes: tool-bearing
 /// bodies carry a `"tools"` member. A substring scan (no re-parse of an
-/// already-validated body — the hot path parsed it once inside the
+/// already-validated body - the hot path parsed it once inside the
 /// preflight block); a prompt that merely MENTIONS `"tools"` only
 /// tightens its own admission class, never correctness.
 fn body_has_tools(bytes: &[u8]) -> bool {
@@ -37,10 +37,10 @@ fn body_has_tools(bytes: &[u8]) -> bool {
 }
 
 /// Engine-advertised output modalities (llama-server b11572+
-/// `architecture` object — e.g. native decision models). Read the
+/// `architecture` object - e.g. native decision models). Read the
 /// cache first; for a RUNNING llamacpp child with no cached row,
 /// ask the child once and persist (bounded probe, same posture as
-/// the `ps()` `/props` sleep check — listing waits at most the child's
+/// the `ps()` `/props` sleep check - listing waits at most the child's
 /// own answer, and a miss changes nothing).
 async fn model_modality_cache(
     state: &Arc<AppState>,
@@ -77,7 +77,7 @@ async fn model_modality_cache(
                             // The child serves exactly one model; its
                             // first data entry is that model's card. A
                             // 200 without output_modalities caches an
-                            // empty list — "none advertised" is a
+                            // empty list - "none advertised" is a
                             // valid, final answer (no re-probe).
                             let card = body["data"].as_array()?.first()?;
                             let modalities: Vec<String> = card["architecture"]["output_modalities"]
@@ -121,12 +121,12 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
         .map(|m| {
             // Which engine row WOULD serve this model right now (routed
             // lane, or the global active row in manual mode). null =
-            // nothing can serve it — the spawn path teaches on use.
+            // nothing can serve it - the spawn path teaches on use.
             let engine =
                 crate::proxy::resolve_serving(&state, &m.name, &m.path).and_then(|lane| lane.tag);
             // Blazar-native capability surface (audit MM13): vision from
             // the row's mmproj sidecar, engine-advertised output
-            // modalities from the cache — union, deduped, sorted so the
+            // modalities from the cache - union, deduped, sorted so the
             // card is stable across calls.
             let mut capabilities: Vec<String> = Vec::new();
             if m.mmproj_path.is_some() {
@@ -151,14 +151,14 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
         })
         .collect();
     // Federation presence merge: peer listings ride along when the
-    // fallback is armed. SNAPSHOT semantics — whatever the presence
+    // fallback is armed. SNAPSHOT semantics - whatever the presence
     // cache holds right now (a peer not yet probed shows nothing until
     // the first fallback request warms it; listing must never block on
     // a network probe).
     let mut data = data;
     if crate::remotes::fallback_enabled(&state.config) {
         // (owner, id) pairs from the presence cache in ONE lock pass;
-        // an id two peers both list appears twice — each row names its
+        // an id two peers both list appears twice - each row names its
         // owner, clients disambiguate by picking one.
         let peer_rows = state
             .remote_presence
@@ -195,7 +195,7 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(json!({"object": "list", "data": data})).into_response()
 }
 
-/// POST /v1/embeddings — byte-proxied for normal models; gateway-
+/// POST /v1/embeddings - byte-proxied for normal models; gateway-
 /// terminated (R1 late chunking) for models opted in via
 /// `[model_overrides.<name>] late_chunking = true` (their child runs
 /// `--pooling none`, which the OAI-compatible child route rejects, so the
@@ -335,7 +335,7 @@ fn late_openai_response(model: &str, out: crate::latechunk::LateChunkOutput) -> 
 }
 
 /// Bridge 's top-level `reasoning_effort` into llama-server's
-/// template dialect (`chat_template_kwargs.reasoning_effort`) — the child
+/// template dialect (`chat_template_kwargs.reasoning_effort`) - the child
 /// ignores the `OpenAI` field, templates that expose an effort knob read it
 /// from the kwargs. Returns true when the kwarg was injected. Explicit
 /// user kwargs always win; non-string/empty values ride verbatim.
@@ -367,7 +367,7 @@ fn inject_reasoning_effort_kwarg(body: &mut serde_json::Value) -> bool {
 
 /// Think-default-off parity on the `OpenAI` chat lane: templates that
 /// render thinking when the toggle is absent (qwen3 dialects) get the
-/// explicit OFF kwargs injected — both family keys, matching the
+/// explicit OFF kwargs injected - both family keys, matching the
 /// translate layer's dual-key rule, so llama-server and sglang
 /// children both honor it. Explicit caller kwargs always win; an
 /// explicit `reasoning_effort` means the caller is steering reasoning
@@ -455,7 +455,7 @@ pub async fn openai_proxy(
             }
         });
     // Native llama-server surfaces whose upstream bodies carry no
-    // `model` field (a router-mode-only field there — direct clients
+    // `model` field (a router-mode-only field there - direct clients
     // post them bare): resolve the target with the `scoped_proxy` chain
     // instead of falling through to the OpenAI-dialect hard 400.
     let model = model.or_else(|| native_modelless_target(&state, &uri, &headers));
@@ -465,14 +465,14 @@ pub async fn openai_proxy(
         return resp;
     }
     // Forced tool_choice on the mlx lane: mlx-lm has no tool_choice
-    // handling at all — a forced call would stream back HTTP 200 prose
+    // handling at all - a forced call would stream back HTTP 200 prose
     // with the constraint silently dropped.
     if let Some(resp) =
         mlx_forced_tool_choice_gate(&state, &uri, model.as_deref(), parsed_body.as_ref())
     {
         return resp;
     }
-    // F7: strict `n` validation at the plane edge — an invalid choice
+    // F7: strict `n` validation at the plane edge - an invalid choice
     // count fails fast, BEFORE admission bills the request.
     if let Some(body) = parsed_body.as_ref()
         && let Err(msg) = crate::proxy::requested_choices(uri.path(), body)
@@ -480,7 +480,7 @@ pub async fn openai_proxy(
         return openai_error(400, &msg);
     }
     // Metadata cards (chat lane): validate at create so a bad shape
-    // fails BEFORE tokens are spent — the update endpoint and the card
+    // fails BEFORE tokens are spent - the update endpoint and the card
     // writer both enforce the same OpenAI limits.
     if uri.path().ends_with("/chat/completions")
         && let Some(meta) = parsed_body.as_ref().and_then(|v| v.get("metadata"))
@@ -493,7 +493,7 @@ pub async fn openai_proxy(
     };
     // Failover chains: a virtual alias resolves to a concrete target
     // (local model or `remote:<name>:<model>`); a failing target is
-    // benched (anti-flap) and the request escalates — bounded by the
+    // benched (anti-flap) and the request escalates - bounded by the
     // target count. The recursion marker prevents re-entering chain
     // resolution for the rewritten model string.
     if !state.failover.is_empty()
@@ -527,7 +527,7 @@ pub async fn openai_proxy(
                             from: sw.benched_index,
                             to: sw.attempt.index,
                             reason: format!(
-                                "target {} failed with HTTP {} — benched, escalating",
+                                "target {} failed with HTTP {} - benched, escalating",
                                 attempt.label,
                                 resp.status().as_u16()
                             ),
@@ -592,7 +592,7 @@ pub async fn openai_proxy(
     // Federation fallback: a bare name the local store does not know
     // routes to a peer that lists it (presence-cached, TTL-bound, with
     // one throttled re-probe when no cached catalog claims it).
-    // Ambiguous local matches stay LOCAL — that is a naming problem,
+    // Ambiguous local matches stay LOCAL - that is a naming problem,
     // not a routing one; the 404 below keeps its teaching text when no
     // peer serves the model either. Billing already ran above.
     if let Some(resp) = crate::remotes::try_fallback_forward(
@@ -609,7 +609,7 @@ pub async fn openai_proxy(
     {
         return resp;
     }
-    // Reasoning-effort bridge (chat lane only — /completions and
+    // Reasoning-effort bridge (chat lane only - /completions and
     // /responses are unverified child surfaces for the kwarg): rewrite
     // the parsed body BEFORE every downstream consumer so lint, affinity
     // hashing, and the forwarded bytes all see the same final body.
@@ -629,7 +629,7 @@ pub async fn openai_proxy(
     // Best-of-N: this lane forwards byte-faithful (both stream and
     // non-stream ride the passthrough proxy), so it cannot judge
     // candidates. Fail loud with the working lanes instead of silently
-    // ignoring the knob — the buffered OpenAI lane is /v1/responses.
+    // ignoring the knob - the buffered OpenAI lane is /v1/responses.
     if uri.path().ends_with("/chat/completions") {
         match crate::bestof::resolve_best_of(
             &headers,
@@ -640,7 +640,7 @@ pub async fn openai_proxy(
                 return openai_error(
                     400,
                     "best_of is not available on /v1/chat/completions (byte-faithful \
-                     passthrough lane) — use /v1/responses, /api/chat, or /v1/messages",
+                     passthrough lane) - use /v1/responses, /api/chat, or /v1/messages",
                 );
             }
             Ok(None) => {}
@@ -658,7 +658,7 @@ pub async fn openai_proxy(
             return openai_error(400, &format!("invalid tools: {err}"));
         }
         // Capability-certificate gate: refuse what the model's own
-        // VERIFIED probe says it cannot do — a fresh matching FAIL only;
+        // VERIFIED probe says it cannot do - a fresh matching FAIL only;
         // absent or stale certificates fail open (the sentinel still
         // watches every response live).
         let cap_needs = crate::preflight::capability_needs(&v, false);
@@ -682,7 +682,7 @@ pub async fn openai_proxy(
             .and_then(|v| v.to_str().ok()),
     );
 
-    // X-Blazar-Num-Ctx: per-request ctx on the OpenAI path — the
+    // X-Blazar-Num-Ctx: per-request ctx on the OpenAI path - the
     // protocol has no such field, the extension header fills the gap
     // (same restart-once semantics as options.num_ctx on the ollama API).
     if let Some(raw) = headers
@@ -703,7 +703,7 @@ pub async fn openai_proxy(
         }
     }
 
-    // X-Blazar-Spec: per-request spec mode on the OpenAI path —
+    // X-Blazar-Spec: per-request spec mode on the OpenAI path -
     // protocol has no such field, the extension header fills the gap
     // (same semantics as options.spec on the ollama API).
     if let Some(raw) = headers.get("x-blazar-spec").and_then(|v| v.to_str().ok())
@@ -736,14 +736,14 @@ pub async fn openai_proxy(
         Err(resp) => return *resp,
     };
     let model_name = engine.name.clone();
-    // Prefix heat (FIX3): chat-family traffic warms the RESOLVED name —
+    // Prefix heat (FIX3): chat-family traffic warms the RESOLVED name -
     // aliases would never match the instance key and the eviction bias
     // would silently no-op.
     if chat_family {
         state.sup.note_prefix_hit(&model_name);
     }
     // Cache-bust telemetry (chat completions only: the messages+tools
-    // shape the detector fingerprints). Strictly advisory — never
+    // shape the detector fingerprints). Strictly advisory - never
     // mutates parsed_body, never blocks the forward.
     if uri.path().ends_with("/chat/completions")
         && let Some(req) = parsed_body.as_ref()
@@ -762,7 +762,7 @@ pub async fn openai_proxy(
     }
 
     // Pinned-recipe lane (chat completions): the caller's chat body is
-    // rendered gateway-side (neutralized chatml — message text can
+    // rendered gateway-side (neutralized chatml - message text can
     // never forge turn boundaries) and spoken to the child's raw
     // completion surface. Fires when the model pins
     // prompt_recipe=ollama_compat, or for mlx engines whose own chat
@@ -788,7 +788,7 @@ pub async fn openai_proxy(
     } else {
         None
     };
-    // The adapter maps one raw completion to one chat choice — an n>1
+    // The adapter maps one raw completion to one chat choice - an n>1
     // fan would silently drop choices the caller paid for.
     if recipe_lane.is_some()
         && parsed_body
@@ -799,13 +799,13 @@ pub async fn openai_proxy(
     {
         return openai_error(
             400,
-            "recipe lane serves one choice per request — n>1 is unsupported with a pinned prompt_recipe",
+            "recipe lane serves one choice per request - n>1 is unsupported with a pinned prompt_recipe",
         );
     }
 
     // MCP tool catalog (opt-in, chat lane): the selector rides the `mcp`
     // body field or `x-blazar-mcp` header. Resolved BEFORE single-flight
-    // registers a leader — the mediated tool loop must not leave followers
+    // registers a leader - the mediated tool loop must not leave followers
     // waiting on an entry that never resolves through proxy_request.
     if chat_family && let Some(v) = parsed_body.as_mut() {
         let sel = match state
@@ -820,13 +820,13 @@ pub async fn openai_proxy(
                 return openai_error(
                     400,
                     "mcp is not available on the recipe-rendered completion lane \
-                     (pinned recipe or mlx tool grammar) — clear the pin or use the chat lane",
+                     (pinned recipe or mlx tool grammar) - clear the pin or use the chat lane",
                 );
             }
             if v["stream"].as_bool().unwrap_or(false) {
                 return openai_error(
                     400,
-                    "mcp tool loop requires stream:false in this release — the gateway mediates buffered tool rounds",
+                    "mcp tool loop requires stream:false in this release - the gateway mediates buffered tool rounds",
                 );
             }
             v["stream"] = serde_json::Value::Bool(false);
@@ -904,7 +904,7 @@ pub async fn openai_proxy(
     // Recipe lane swap: the chat body becomes the neutralized gateway
     // render bound for the child's raw completion surface. The
     // pre-admission single-flight, admission classification, and every
-    // response-side concern keep operating on the ORIGINAL chat body —
+    // response-side concern keep operating on the ORIGINAL chat body -
     // only the child-bound bytes change dialect. OpenAI SDK
     // compatibility: max_completion_tokens normalizes into the
     // max_tokens slot the renderer reads (when the caller did not set
@@ -980,14 +980,14 @@ pub(crate) fn cloud_tool_gate(parsed: &serde_json::Value) -> Option<String> {
         };
         if CLOUD_BUILTIN_TOOL_TYPES.contains(&ty) {
             return Some(format!(
-                "tool type {ty:?} is a cloud-side mechanism a local gateway cannot honor — list the tools you control as {{\"type\":\"function\"}} entries (client-side MCP discovery should materialize its tools as function definitions on the next turn)"
+                "tool type {ty:?} is a cloud-side mechanism a local gateway cannot honor - list the tools you control as {{\"type\":\"function\"}} entries (client-side MCP discovery should materialize its tools as function definitions on the next turn)"
             ));
         }
     }
     None
 }
 
-/// `GET /v1/conversations/{id}` — list the stored responses grouped
+/// `GET /v1/conversations/{id}` - list the stored responses grouped
 /// under one conversation handle (ledger-backed, survives restarts).
 /// BLZ-1: scoped to the calling key; rows the key cannot see are
 /// filtered at the data layer (`owner IS NULL` stays visible to all).
@@ -1007,7 +1007,7 @@ pub async fn conversations_get(
     if rows.is_empty() {
         return openai_error(
             404,
-            "conversation not found — conversations exist once a stored response names one (pass \"conversation\": \"...\" on POST /v1/responses)",
+            "conversation not found - conversations exist once a stored response names one (pass \"conversation\": \"...\" on POST /v1/responses)",
         );
     }
     let responses: Vec<serde_json::Value> = rows
@@ -1034,7 +1034,7 @@ pub async fn conversations_get(
         .into_response()
 }
 
-/// `DELETE /v1/conversations/{id}` — prune every response in the
+/// `DELETE /v1/conversations/{id}` - prune every response in the
 /// conversation (the in-memory registry re-populates on demand from
 /// remaining ledger rows; here there are none, so chains into this
 /// conversation now 404 with the standard teaching message).
@@ -1062,12 +1062,12 @@ pub async fn conversations_delete(
         Some(Err(e)) => openai_error(500, &format!("conversation delete failed: {e}")),
         None => openai_error(
             503,
-            "store unavailable — the conversation list lives in the ledger; retry shortly",
+            "store unavailable - the conversation list lives in the ledger; retry shortly",
         ),
     }
 }
 
-/// `POST /v1/chat/completions/{id}` — update a completion's `metadata`
+/// `POST /v1/chat/completions/{id}` - update a completion's `metadata`
 /// after the fact (`OpenAI` spec v2.3.0 parity). Only completions created
 /// WITH a `metadata` field (non-stream) hold a card; everything else
 /// 404s with teaching instead of pretending the id never existed.
@@ -1097,7 +1097,7 @@ pub async fn chat_completion_update(
         Some(Ok(None)) => openai_error(
             404,
             &format!(
-                "completion {id:?} has no metadata card — it was created without a `metadata` \
+                "completion {id:?} has no metadata card - it was created without a `metadata` \
                  field, streamed (bytes were already on the wire when the id appeared), or its \
                  card aged out of the bounded ledger"
             ),
@@ -1105,17 +1105,17 @@ pub async fn chat_completion_update(
         Some(Err(e)) => openai_error(500, &format!("metadata update failed: {e}")),
         None => openai_error(
             503,
-            "store unavailable — metadata cards live in the ledger; retry shortly",
+            "store unavailable - metadata cards live in the ledger; retry shortly",
         ),
     }
 }
 
-/// `GET /v1/responses/{id}` — retrieve a stored (chained) response:
+/// `GET /v1/responses/{id}` - retrieve a stored (chained) response:
 /// `OpenAI` retrieval surface over the gateway registry (memory-first,
-/// SQLite ledger fallback — stored responses survive restarts). Expired
+/// SQLite ledger fallback - stored responses survive restarts). Expired
 /// or streamed (never stored) ids 404 with the same teaching message as
 /// the chaining path. v10 rows carry the exact completed body
-/// (`body_json`) — returned verbatim; background-mode ids still running
+/// (`body_json`) - returned verbatim; background-mode ids still running
 /// answer through the job plane's state machine instead.
 pub async fn responses_get(
     State(state): State<Arc<AppState>>,
@@ -1128,13 +1128,13 @@ pub async fn responses_get(
         .flatten();
     // BLZ-1: every read path below (ledger body, job plane, memory) is
     // scoped to the calling key; a foreign id reads exactly like an
-    // expired one — the shared 404 leaks no existence.
+    // expired one - the shared 404 leaks no existence.
     if let Some(r) = &row
         && !crate::keys::owner_allows(r.owner.as_deref(), key_ext.as_deref())
     {
         return openai_error(
             404,
-            "response not found — expired (24h TTL), pruned (ledger cap), streamed, or store:false",
+            "response not found - expired (24h TTL), pruned (ledger cap), streamed, or store:false",
         );
     }
     if let Some(r) = &row
@@ -1143,7 +1143,7 @@ pub async fn responses_get(
     {
         return (StatusCode::OK, axum::Json(v)).into_response();
     }
-    // Background lifecycle: no stored body yet — the job row says where
+    // Background lifecycle: no stored body yet - the job row says where
     // the run is (same id namespace by construction).
     if row.is_none()
         && let Some(job) = state
@@ -1205,7 +1205,7 @@ pub async fn responses_get(
         Some(v) => (StatusCode::OK, axum::Json(v)).into_response(),
         None => openai_error(
             404,
-            "response not found — expired (24h TTL), pruned (ledger cap), streamed, or store:false",
+            "response not found - expired (24h TTL), pruned (ledger cap), streamed, or store:false",
         ),
     }
 }
@@ -1250,7 +1250,7 @@ const LLAMACPP_ONLY_PATHS: &[&str] = &[
 /// `http_server.py`: `ScoringRequest`/`DecisionRequest` handlers).
 /// Everything else in the list above stays gated for the sglang lane
 /// (404 on the probed child). Only release-verified surfaces ride here
-/// — nightly-only endpoints wait for a release.
+/// - nightly-only endpoints wait for a release.
 const SGLANG_SERVES_PATHS: &[&str] = &[
     "/tokenize",
     "/detokenize",
@@ -1284,18 +1284,18 @@ fn path_gated_for(kind: blazar_core::engine_kind::EngineKind, path: &str) -> boo
 /// `Some(teaching 400)` when the path is llama-server-only AND the engine
 /// the router will use for `model` is not llamacpp (mistralrs and sglang
 /// children both lack these surfaces). Keys on the ROUTED lane, not the
-/// global active row — auto-routing serves GGUF models on a llamacpp
+/// global active row - auto-routing serves GGUF models on a llamacpp
 /// child regardless of which engine is globally active. Path matching
 /// covers sub-paths (`/slots/{id}`). `model: None` (no resolvable
 /// target) falls back to the global active kind, matching the
 /// pre-routing estimate.
 /// mlx-lm (0.32) parses `tools` and emits voluntary `tool_calls` but has no
 /// `tool_choice` handling anywhere in the package (verified against the
-/// installed venv source) — a forced choice (`"required"` or a named
+/// installed venv source) - a forced choice (`"required"` or a named
 /// function) is silently dropped and the model answers prose: HTTP 200,
 /// zero `tool_calls`, the client never learns the constraint was ignored.
 /// Refuse loudly at the plane edge instead, before tokens are spent
-/// (live receipt: forced-choice battery T2/T3/T4 on the mlx lane —
+/// (live receipt: forced-choice battery T2/T3/T4 on the mlx lane -
 /// 200 + zero calls while voluntary calling passes).
 fn mlx_forced_tool_choice_gate(
     state: &Arc<AppState>,
@@ -1332,7 +1332,7 @@ fn mlx_forced_tool_choice_gate(
     Some(openai_error(
         400,
         "tool_choice is forced but the mlx lane's upstream (mlx-lm) ignores tool_choice \
-         entirely — the request would return HTTP 200 with zero tool_calls. Drop \
+         entirely - the request would return HTTP 200 with zero tool_calls. Drop \
          tool_choice (voluntary tool calling works on this lane) or serve the model \
          on a lane that enforces forcing via model_overrides (see `blazar engine list`)",
     ))
@@ -1340,8 +1340,8 @@ fn mlx_forced_tool_choice_gate(
 
 /// `Some(teaching 400)` when the path is a llama-server-only surface AND
 /// the engine the router will use for `model` does not serve it (see
-/// [`path_gated_for`] — the sglang release provably serves a subset).
-/// Keys on the ROUTED lane, not the global active row — auto-routing
+/// [`path_gated_for`] - the sglang release provably serves a subset).
+/// Keys on the ROUTED lane, not the global active row - auto-routing
 /// serves GGUF models on a llamacpp child regardless of which engine is
 /// globally active. Path matching covers sub-paths (`/slots/{id}`).
 /// `model: None` (no resolvable target) falls back to the global active
@@ -1363,7 +1363,7 @@ fn llamacpp_only_gate(state: &Arc<AppState>, uri: &Uri, model: Option<&str>) -> 
         400,
         &format!(
             "this endpoint is llama-server-only; the {kind} lane that serves this \
-             request does not implement it — switch with `blazar engine use <tag>` \
+             request does not implement it - switch with `blazar engine use <tag>` \
              or a model_overrides engine pin (see `blazar engine list`)",
         ),
     ))
@@ -1377,7 +1377,7 @@ fn header_model(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `?model=` query hint — first matching pair wins.
+/// `?model=` query hint - first matching pair wins.
 fn query_model(uri: &Uri) -> Option<String> {
     uri.query().and_then(|q| {
         q.split('&').find_map(|kv| {
@@ -1387,7 +1387,7 @@ fn query_model(uri: &Uri) -> Option<String> {
     })
 }
 
-/// The single hot child, when exactly one model is loaded — the only
+/// The single hot child, when exactly one model is loaded - the only
 /// unambiguous model-less default. Zero or many loaded: None (the
 /// caller turns that into a teaching 400, never a silent guess).
 fn single_hot_child(state: &Arc<AppState>) -> Option<String> {
@@ -1400,12 +1400,12 @@ fn single_hot_child(state: &Arc<AppState>) -> Option<String> {
 }
 
 /// Native llama-server request surfaces whose upstream bodies carry no
-/// `model` field — it is a router-mode-only field upstream, so direct
+/// `model` field - it is a router-mode-only field upstream, so direct
 /// llama-server clients post them bare. Blazar still needs a target to
 /// route, admission-check, and forward, so mirror the `scoped_proxy`
 /// resolution order: `X-Blazar-Model` header > `?model=` query > the
 /// single hot child. Exact-path match only; OpenAI-dialect paths keep
-/// the hard 400 — their clients always name the model, and silence
+/// the hard 400 - their clients always name the model, and silence
 /// there would route a typo to the wrong lane.
 const NATIVE_MODELLESS_PATHS: [&str; 4] =
     ["/infill", "/v1/systemone", "/completion", "/embeddings"];
@@ -1427,7 +1427,7 @@ fn native_modelless_target(
 /// `/props`, `/slots`, `/slots/{id}`, `/v1/stream`, `/v1/streams/lookup`.
 /// Model resolution order: `X-Blazar-Model` header > `?model=` query >
 /// the single hot child (only when exactly one is loaded). Ambiguity is
-/// a teaching 400 — never a silent guess across children. POST bodies on
+/// a teaching 400 - never a silent guess across children. POST bodies on
 /// `/v1/streams/lookup` may carry `model` themselves (chat-shaped) and
 /// are honored first. Everything else mirrors `openai_proxy`: same key
 /// admission, remote forwarding, queue admission, byte-faithful proxy.
@@ -1443,7 +1443,7 @@ pub async fn scoped_proxy(
 ) -> Response {
     // Model-carrying bodies: /v1/streams/lookup (chat-shaped) plus the
     // llama-only surfaces whose POST bodies name their model
-    // (/tokenize, /detokenize, /apply-template) — the gate needs the
+    // (/tokenize, /detokenize, /apply-template) - the gate needs the
     // target to know which lane will serve it.
     let body_model = if matches!(uri.path(), "/tokenize" | "/detokenize" | "/apply-template")
         || uri.path() == "/v1/streams/lookup"
@@ -1536,12 +1536,12 @@ pub async fn scoped_proxy(
     .await
 }
 
-/// POST /v1/responses — proxied WITH gateway conversation state:
+/// POST /v1/responses - proxied WITH gateway conversation state:
 /// `previous_response_id` chaining and `store` semantics the rest of
 /// the engine fleet does not implement (sglang/mistralrs/mlx have no
 /// server-side storage; llama-server grew a native /v1/responses at
 /// b11785 but its storage story stays child-local and
-/// restart-transient — the gateway layer remains the uniform
+/// restart-transient - the gateway layer remains the uniform
 /// cross-engine contract). Non-streaming responses are stored (bounded
 /// LRU) and re-id'd so clients can chain; streaming responses consume
 /// stored context but are not themselves stored (warned via
@@ -1600,7 +1600,7 @@ pub async fn responses_api(
     if best_of.is_some() && stream {
         return openai_error(
             400,
-            "best_of requires stream=false — a winner cannot be judged before completion",
+            "best_of requires stream=false - a winner cannot be judged before completion",
         );
     }
     let store = parsed
@@ -1616,7 +1616,7 @@ pub async fn responses_api(
     if background && (stream || !store) {
         return openai_error(
             400,
-            "background requires store=true and stream=false — a background response is polled via GET /v1/responses/{id}, never streamed",
+            "background requires store=true and stream=false - a background response is polled via GET /v1/responses/{id}, never streamed",
         );
     }
     if let Some(msg) = cloud_tool_gate(&parsed) {
@@ -1637,14 +1637,14 @@ pub async fn responses_api(
     // Chaining: resolve the stored prefix, rebuild `input`, drop the
     // field (upstream rejects unknown fields less gracefully than we
     // reject stale ids). The lookup is memory-first with the SQLite
-    // ledger as restart fallback — a chain survives a gateway restart.
+    // ledger as restart fallback - a chain survives a gateway restart.
     let mut inherited_model = None;
     let mut inherited_conversation = None;
     if let Some(pid) = previous {
         let found = state
             .stored_response(&pid)
             // BLZ-1: another key's thread id is indistinguishable from an
-            // expired one — same 404 below, no existence leak.
+            // expired one - same 404 below, no existence leak.
             .filter(|s| crate::keys::owner_allows(s.owner.as_deref(), key_ext.as_deref()))
             .map(|s| {
                 (
@@ -1657,7 +1657,7 @@ pub async fn responses_api(
             return openai_error(
                 404,
                 &format!(
-                    "previous_response_id {pid:?} not found — expired (24h TTL), pruned (ledger cap), or the response streamed (streamed responses are not stored)"
+                    "previous_response_id {pid:?} not found - expired (24h TTL), pruned (ledger cap), or the response streamed (streamed responses are not stored)"
                 ),
             );
         };
@@ -1731,7 +1731,7 @@ pub async fn responses_api(
     if stream || !store {
         // Streaming + unstored: pure passthrough. A streaming response
         // asked to be stored gets a named warning header instead of
-        // silent loss (bytes are already on the wire — storage is
+        // silent loss (bytes are already on the wire - storage is
         // physically impossible after the first token). Response headers
         // are still mutable here: nothing has shipped yet.
         let mut r = proxy_request(
@@ -1773,7 +1773,7 @@ pub async fn responses_api(
         .cloned()
         .unwrap_or(serde_json::Value::Array(vec![]));
     // Background mode: same buffered roundtrip, polled instead of held.
-    // The response id doubles as the job id — one namespace, both planes
+    // The response id doubles as the job id - one namespace, both planes
     // (/v1/jobs/{id} shows the run, /v1/responses/{id} shows the result).
     if background {
         let id = crate::responses::new_response_id();
@@ -1893,7 +1893,7 @@ pub async fn responses_api(
 /// foreground call and background mode: forward to the child (best-of-N
 /// or single send with the respawn-retry contract), observe, store under
 /// OUR id, rewrite the body id, and hand back the finished value. The
-/// admission guard stays with the caller — background holds it for the
+/// admission guard stays with the caller - background holds it for the
 /// whole run, the foreground drops it after this returns.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
@@ -1958,7 +1958,7 @@ async fn buffered_response_roundtrip(
                 // Busy-child header timeout: the child is healthy and still
                 // generating (buffered responses emit headers only at
                 // completion). Retrying on a respawned lane re-runs the same
-                // oversized generation into the same ceiling — surface the
+                // oversized generation into the same ceiling - surface the
                 // teaching 504 for the caller instead.
                 if matches!(
                     &e,
@@ -1968,7 +1968,7 @@ async fn buffered_response_roundtrip(
                 }
                 tracing::warn!(
                     model = %model_name,
-                    "responses buffered upstream failed: {e} — respawning lane, retrying once in-band"
+                    "responses buffered upstream failed: {e} - respawning lane, retrying once in-band"
                 );
                 match crate::proxy::respawn_lane(state, &engine.key).await {
                     Ok(fresh) => {
@@ -2035,7 +2035,7 @@ async fn buffered_response_roundtrip(
     // Store under OUR id and rewrite the body's id so the client chains
     // through the gateway (the engine's own id carries no storage). The id
     // comes from the caller so background mode's job row and stored response
-    // share it — polling the 202'd id serves this body once completed.
+    // share it - polling the 202'd id serves this body once completed.
     let usage = out.get("usage").cloned().unwrap_or(serde_json::Value::Null);
     let in_tok = usage["input_tokens"].as_u64();
     let out_tok = usage["output_tokens"].as_u64();
@@ -2049,7 +2049,7 @@ async fn buffered_response_roundtrip(
             crate::proxy::others_peak(entry_live, state.sup.model_live_streams(model_name)),
         );
     }
-    // FIX6: this buffered branch bypasses proxy_request's sniffer —
+    // FIX6: this buffered branch bypasses proxy_request's sniffer -
     // charge token budgets directly from the parsed usage.
     if let Some(Extension(k)) = key_ext.as_ref() {
         let total = in_tok.unwrap_or(0).saturating_add(out_tok.unwrap_or(0));
@@ -2111,7 +2111,7 @@ pub(crate) fn extract_model_multipart(body: &[u8], content_type: &str) -> Option
 }
 
 /// WFQ identity for the admission queue: (key name, weight). Absent for
-/// unauthenticated (open) gateways — those waiters share one bucket.
+/// unauthenticated (open) gateways - those waiters share one bucket.
 fn wfq_of(key_ext: Option<&Extension<crate::keys::KeyCtx>>) -> Option<(&str, u32)> {
     key_ext.map(|Extension(k)| (k.name.as_str(), k.weight))
 }
@@ -2128,7 +2128,7 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// Rank 1 = most-recently-used READY engine (a model-less "list my
 /// adapters" means the engine I am using); rank 2 = first store row.
 /// Without the live preference, an arbitrary store-first model hijacks
-/// the request — on boxes with a draft-only model sorted first that
+/// the request - on boxes with a draft-only model sorted first that
 /// spawns a doomed child and 502s instead of listing the running
 /// engine's adapters. Pure so the ranking is unit-testable.
 fn adapters_target<'a>(
@@ -2153,7 +2153,7 @@ pub async fn lora_adapters(
     body: Bytes,
 ) -> Response {
     // BLZ-2: the adapter surface mutates (POST) or inspects (GET) an
-    // arbitrarily chosen live child — control-plane standing required
+    // arbitrarily chosen live child - control-plane standing required
     // for both; the target picker is not scope-aware.
     if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key_ext.as_deref())
     {
@@ -2228,7 +2228,7 @@ pub async fn lora_adapters(
     }
 }
 
-/// GET /healthz — liveness of the gateway itself (children not required).
+/// GET /healthz - liveness of the gateway itself (children not required).
 pub async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
@@ -2324,7 +2324,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn unit__inject_default_think_off__hf_dir_template_gates_the_bridge() {
         // HF-layout model dir: tokenizer_config.json carries the chat
-        // template (the sglang evidence class — GGUF-only detection used
+        // template (the sglang evidence class - GGUF-only detection used
         // to fail open here and qwen templates thought by default).
         let dir = std::env::temp_dir().join(format!("blazar-think-hf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2353,7 +2353,7 @@ mod tests {
         assert!(inject_default_think_off_row(Some(&row), &mut v));
         assert_eq!(v["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(v["chat_template_kwargs"]["thinking"], false);
-        // Explicit caller kwargs win — no key is forced over them.
+        // Explicit caller kwargs win - no key is forced over them.
         let mut explicit = json!({
             "model": "m",
             "chat_template_kwargs": {"enable_thinking": true}

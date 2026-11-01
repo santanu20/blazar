@@ -4,13 +4,13 @@
 //! Client-disconnect cancellation has always worked implicitly (dropping
 //! the handler future drops the upstream stream and the engine frees the
 //! slot). This module makes the SAME mechanism addressable by id from a
-//! SECOND connection — what IDE agents and orchestration tools need when
+//! SECOND connection - what IDE agents and orchestration tools need when
 //! a generation runs long: list what is in flight, cancel it, keep the
 //! partial output (`interrupt`), all without killing the client socket.
 //!
 //! Design laws (mirrors [`crate::whisper::AudioJobs`]):
 //! - The registry is a [`dashmap::DashMap`] of live entries plus a bounded
-//!   terminal ring; every method is short and synchronous — never a lock
+//!   terminal ring; every method is short and synchronous - never a lock
 //!   across an await.
 //! - Cancellation travels over a `tokio::sync::watch` bool. The buffered
 //!   path races the handler future with the token (dropping the future is
@@ -18,15 +18,15 @@
 //!   streaming path races each body chunk and ends the body cleanly.
 //! - The cancel ROUTE only records intent and fires the token; the party
 //!   holding the request (select! or body wrapper) performs the stop and
-//!   the terminal transition — one finisher, no races.
+//!   the terminal transition - one finisher, no races.
 //! - SSE bodies get the protocol-standard `data: [DONE]` sentinel on
-//!   truncation (it carries no content — no fabricated tokens). ndjson
+//!   truncation (it carries no content - no fabricated tokens). ndjson
 //!   and raw bodies just end; clients detect EOF. We never synthesize a
 //!   fake final record for any dialect.
 //! - Honesty over completeness: `model` comes from a bounded body sniff,
 //!   `engine` is omitted until attribution lands with `/api/capacity`,
 //!   `tokens_generated` is only set when a buffered usage tail was
-//!   parsed — never estimated.
+//!   parsed - never estimated.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
@@ -45,14 +45,14 @@ use tokio::sync::watch;
 use crate::keys::KeyCtx;
 use crate::state::AppState;
 
-/// Bounded partial-output capture per request (bytes, not tokens — chunks
+/// Bounded partial-output capture per request (bytes, not tokens - chunks
 /// may batch tokens). Enough to show the agent what was generated before
 /// the cut; the full text is the client's own stream.
 const PARTIAL_CAP_BYTES: usize = 64 * 1024;
 /// Terminal cards kept for post-mortem listing (bounded ring).
 pub const TERMINAL_RING_CAP: usize = 256;
 /// Model sniff ceiling: bodies larger than this skip the sniff (model
-/// stays unknown) — parsing multi-MiB multimodal payloads per request
+/// stays unknown) - parsing multi-MiB multimodal payloads per request
 /// would tax the hot path for a nicety.
 const MODEL_SNIFF_CAP_BYTES: usize = 8 * 1024 * 1024;
 /// Buffered usage-tail parse ceiling (JSON responses only).
@@ -99,7 +99,7 @@ fn boot_nanos() -> u128 {
 
 /// One tracked request. Fully interior-mutable: the middleware, the body
 /// wrapper, and the cancel routes all share a single live card with no
-/// `&mut` paths — every field is an atomic or a short-lived mutex.
+/// `&mut` paths - every field is an atomic or a short-lived mutex.
 pub struct RequestCard {
     pub id: String,
     pub trace_id: String,
@@ -312,7 +312,7 @@ impl RequestRuntime {
 
     /// Retire a card the holder has already flipped terminal: remove the
     /// live entry (dropping the cancel sender with it) and file the card
-    /// in the bounded terminal ring. Idempotent — the natural-end path and
+    /// in the bounded terminal ring. Idempotent - the natural-end path and
     /// the drop guard may both land here; only the first filing sticks.
     fn retire(&self, card: &Arc<RequestCard>) {
         if !card.retired.swap(true, Ordering::AcqRel) {
@@ -401,7 +401,7 @@ enum StopOutcome {
 }
 
 /// Generation lanes the lifecycle middleware tracks. Fast JSON lanes
-/// (embeddings, rerank, tokenize) and read surfaces stay out — cards are
+/// (embeddings, rerank, tokenize) and read surfaces stay out - cards are
 /// for requests that can run long enough to want cancelling.
 const LIFECYCLE_PATHS: [&str; 7] = [
     "/v1/chat/completions",
@@ -437,7 +437,7 @@ pub async fn lifecycle(
 
     // Bounded body sniff for `model` (the audit lane's proven pattern):
     // buffer, extract, hand the bytes back untouched. Only attempted when
-    // the declared length fits the cap — an over-cap body stays untouched
+    // the declared length fits the cap - an over-cap body stays untouched
     // (model stays unknown) rather than being consumed and destroyed.
     let mut req = req;
     let mut model = None;
@@ -488,7 +488,7 @@ pub async fn lifecycle(
                 axum::Json(serde_json::json!({
                     "error": {
                         "message": format!(
-                            "request {} was {} before completion — the engine slot was released",
+                            "request {} was {} before completion - the engine slot was released",
                             card.id,
                             if terminal == STATE_INTERRUPTED { "interrupted" } else { "cancelled" },
                         ),
@@ -688,7 +688,7 @@ fn sniff_tokens(body: &[u8]) -> Option<u64> {
 // Routes
 // ---------------------------------------------------------------------------
 
-/// GET /v1/requests?model=&state= — live cards then terminal ring.
+/// GET /v1/requests?model=&state= - live cards then terminal ring.
 pub async fn requests_list(
     State(state): State<Arc<AppState>>,
     key: Option<axum::Extension<KeyCtx>>,
@@ -729,17 +729,17 @@ pub async fn requests_get(
         }
         Some(_) => crate::error_response(
             404,
-            "request exists but belongs to another key — cards are key-scoped when keys are configured",
+            "request exists but belongs to another key - cards are key-scoped when keys are configured",
         ),
         None => crate::error_response(
             404,
-            "no such request — live cards die with the gateway process; \
+            "no such request - live cards die with the gateway process; \
              terminal cards live in a bounded 256-entry ring per boot",
         ),
     }
 }
 
-/// POST /v1/requests/{id}/cancel — stop the generation, discard output.
+/// POST /v1/requests/{id}/cancel - stop the generation, discard output.
 pub async fn requests_cancel(
     State(state): State<Arc<AppState>>,
     key: Option<axum::Extension<KeyCtx>>,
@@ -748,7 +748,7 @@ pub async fn requests_cancel(
     request_stop(&state, key.as_ref(), &id, false)
 }
 
-/// POST /v1/requests/{id}/interrupt — stop the generation, keep the
+/// POST /v1/requests/{id}/interrupt - stop the generation, keep the
 /// partial output (streams end cleanly; the card keeps the capture).
 pub async fn requests_interrupt(
     State(state): State<Arc<AppState>>,
@@ -774,7 +774,7 @@ fn request_stop(
         _ => {
             return crate::error_response(
                 404,
-                "no such request visible to this key — live cards die with the \
+                "no such request visible to this key - live cards die with the \
                  gateway process; terminal cards live in a bounded 256-entry ring",
             );
         }

@@ -5,7 +5,7 @@
 #
 # Stages the binary plus shell completions into a proper deb layout and
 # assembles it with dpkg-deb (available on every Debian/Ubuntu runner
-# and dev box — no cargo-deb install needed). The package installs the
+# and dev box - no cargo-deb install needed). The package installs the
 # CLI only: `blazar serve` manages its own daemon lifecycle, so no
 # maintainer scripts or service units ride along.
 set -euo pipefail
@@ -34,7 +34,7 @@ mkdir -p \
   "$stage/usr/share/zsh/site-functions" \
   "$stage/usr/share/fish/vendor_completions.d"
 # NOTE: keep this heredoc UNquoted (version/arch expand) and keep the
-# description free of backticks — an unquoted heredoc would execute
+# description free of backticks - an unquoted heredoc would execute
 # them as command substitution.
 "$stage/usr/bin/blazar" completions bash > "$stage/usr/share/bash-completion/completions/blazar" 2>/dev/null || true
 "$stage/usr/bin/blazar" completions zsh   > "$stage/usr/share/zsh/site-functions/_blazar" 2>/dev/null || true

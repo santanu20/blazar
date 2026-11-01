@@ -13,8 +13,8 @@ use blazar_core::{BlazarDirs, ModelRow};
 /// or serving; the supervisor owns the marker's lifecycle).
 #[must_use]
 pub fn instance_running(dirs: &BlazarDirs, name: &str) -> bool {
-    // Replicas spawn per-key pidfiles (`model#N.pid`); any live pidfile —
-    // plain or replica — counts as running.
+    // Replicas spawn per-key pidfiles (`model#N.pid`); any live pidfile -
+    // plain or replica - counts as running.
     let run = dirs.run_dir();
     if run.join(format!("{name}.pid")).exists() {
         return true;
@@ -45,7 +45,7 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("no such model: {name}"))?;
 
     // Safetensors dir rows (sglang lane): the recorded path IS the model
-    // directory — remove it wholesale. The shared-asset guard applies:
+    // directory - remove it wholesale. The shared-asset guard applies:
     // another row pointing at the same dir keeps it alive.
     let row_path = PathBuf::from(&row.path);
     if row_path.is_dir() {
@@ -93,7 +93,7 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
 
     // Shared-asset guard: aliases reference the SAME mmproj (and are
     // hardlinks of the same weights). Deleting this row must never
-    // destroy a file another row still points at — the incident class
+    // destroy a file another row still points at - the incident class
     // that ate the real 875 MiB projector via `rm <alias>`, twice.
     let other_paths: Vec<String> = store
         .list_models()?
@@ -151,7 +151,7 @@ pub fn ensure_portable_name(name: &str) -> Result<()> {
 #[derive(Debug)]
 pub struct AdoptedModel {
     pub name: String,
-    /// "gguf" or "safetensors" — the lane the row serves on.
+    /// "gguf" or "safetensors" - the lane the row serves on.
     pub format: &'static str,
     pub bytes: i64,
 }
@@ -166,19 +166,19 @@ pub struct ReconcileReport {
     /// reconcile could match it).
     pub relinked: Vec<String>,
     /// (file/dir, reason) for candidates that looked like models but
-    /// were refused — surfaced as boot warnings, never fatal.
+    /// were refused - surfaced as boot warnings, never fatal.
     pub skipped: Vec<(String, String)>,
     /// (model, what drifted) for dir rows re-measured against disk: a
     /// row adopted mid-download froze a partial size (the idempotent
     /// second boot skips owned dirs), so boot re-checks every dir row.
-    /// Only planning-relevant fields refresh — never sha256, quant
+    /// Only planning-relevant fields refresh - never sha256, quant
     /// label, mmproj linkage, or `pulled_at`.
     pub healed: Vec<(String, String)>,
 }
 
 /// Re-measure one safetensors dir row against disk. Heals only when the
 /// dir is a COMPLETE, readable model (weights present AND config parses)
-/// — a re-download in flight must not zero out good row fields. Returns
+/// - a re-download in flight must not zero out good row fields. Returns
 /// the drift description when the row was rewritten.
 fn heal_dir_row(store: &Store, row: &ModelRow) -> Option<String> {
     let dir = Path::new(&row.path);
@@ -227,7 +227,7 @@ fn heal_dir_row(store: &Store, row: &ModelRow) -> Option<String> {
 
 /// Adopt store-external model files living in the models dir: GGUFs (and
 /// GGUF shard sets) whose path no row owns, plus safetensors dirs with a
-/// readable `config.json`. Adds rows ONLY — never moves, renames, or
+/// readable `config.json`. Adds rows ONLY - never moves, renames, or
 /// deletes files, so an uninstall that kept model files stays honest
 /// across reinstalls. Row dialects mirror `blazar import` (GGUF) and the
 /// pull lane (safetensors); `repo` carries an `adopted:<path>` marker so
@@ -301,7 +301,7 @@ pub fn reconcile_models(dirs: &BlazarDirs, store: &Store) -> ReconcileReport {
         }
         let looks_pulled = name.to_lowercase().ends_with(".d");
         if !dir.join("config.json").exists() {
-            continue; // not an HF model dir — never ours to judge
+            continue; // not an HF model dir - never ours to judge
         }
         if !blazar_core::hfmeta::root_safetensors(&dir).is_empty() || looks_pulled {
             adopt_dir(&models_dir, store, name, &owned, &mut report);
@@ -337,7 +337,7 @@ pub fn reconcile_models(dirs: &BlazarDirs, store: &Store) -> ReconcileReport {
 
     // Backfill: rows adopted before their projector sidecar existed (or
     // before prefix matching landed) converge on the next boot. Only
-    // reconcile-adopted rows are healed — pull/import rows carry their
+    // reconcile-adopted rows are healed - pull/import rows carry their
     // own linkage contract.
     let current: Vec<ModelRow> = store.list_models().unwrap_or_default();
     // One working set across iterations: two adopted rows sharing a repo
@@ -373,7 +373,7 @@ pub fn reconcile_models(dirs: &BlazarDirs, store: &Store) -> ReconcileReport {
     // Dir-row heal: bytes frozen at adoption (mid-download boot) or
     // shards added since keep display AND spawn planning wrong forever.
     // One idempotent upsert per drifted row; failures are silent
-    // pass-overs (next boot retries) — heal is an accuracy upgrade,
+    // pass-overs (next boot retries) - heal is an accuracy upgrade,
     // never a boot blocker.
     for row in store.list_models().unwrap_or_default() {
         if let Some(drift) = heal_dir_row(store, &row) {
@@ -465,7 +465,7 @@ fn adopt_gguf(
             // mint rows no engine can serve; the honest outcome is a skip
             // whose reason names the lane they actually belong to.
             let reason = if e.to_string().contains("missing general.architecture") {
-                "diffusion/model-component GGUF (no architecture metadata) — pull it through a diffusion family instead: blazar pull <qwen-image-repo>:QUANT (sdcpp lane)".to_string()
+                "diffusion/model-component GGUF (no architecture metadata) - pull it through a diffusion family instead: blazar pull <qwen-image-repo>:QUANT (sdcpp lane)".to_string()
             } else {
                 format!("not a readable GGUF: {e}")
             };
@@ -513,7 +513,7 @@ fn adopt_gguf(
         // when possible; bare projectors are never guessed.
         mmproj_path,
         // Reconcile adopts parsed GGUFs only; diffusion component sets
-        // (0-metadata files) never reach here — they arrive via pull.
+        // (0-metadata files) never reach here - they arrive via pull.
         components: vec![],
         shards: i64::try_from(leaves.len()).unwrap_or(i64::MAX),
         arch: Some(meta.architecture.clone()),
@@ -539,14 +539,14 @@ fn adopt_gguf(
 /// Pick the projector sidecar belonging to a GGUF, in two rungs:
 ///
 /// 1. Pull convention: model and projector stored under the same
-///    `owner--repo--` prefix — the only disk-surviving proof of the
+///    `owner--repo--` prefix - the only disk-surviving proof of the
 ///    pairing for that dialect.
 /// 2. Publisher filenames: the projector names the model verbatim
 ///    (`mmproj-Qwen3VL-8B-Instruct-F16` beside
 ///    `Qwen3VL-8B-Instruct-Q4_K_M`). The model stem minus its quant
 ///    tail token is the identity; a UNIQUE unattached sidecar whose
 ///    name contains it links. Two or more candidates (or a stem too
-///    short to be an identity) attach none — the same never-guessed
+///    short to be an identity) attach none - the same never-guessed
 ///    rule bare sidecars without any stem signal already follow.
 ///
 /// A sidecar attaches to at most one row (`attached`); quant siblings
@@ -600,7 +600,7 @@ fn adopt_dir(
         ));
         return;
     }
-    // A row already pointing at THIS dir is the idempotent second boot —
+    // A row already pointing at THIS dir is the idempotent second boot -
     // not a collision, and not worth a warning on every start.
     let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
     if owned.contains(&canon) {
@@ -679,10 +679,10 @@ fn is_quant_token(token: &str) -> bool {
 
 /// Derive (quant label, candidate names) from a GGUF's on-disk filename
 /// and metadata. Candidate names, most-faithful first: (1) pull
-/// downloads name files `owner--repo--leaf.gguf` — the repo segment
+/// downloads name files `owner--repo--leaf.gguf` - the repo segment
 /// reproduces the exact pre-uninstall name; (2) GGUF `general.name`;
 /// (3) stem minus a quant-shaped tail; (4) full stem. All keep dots
-/// (`qwen2.5-0.5b`) — these files were written by pull, whose registry
+/// (`qwen2.5-0.5b`) - these files were written by pull, whose registry
 /// names carry them; only interactive import rewrites dots. The quant
 /// tail-token comes from the base name, not the shard leaf
 /// (`base-00001-of-00002` would otherwise derive quant `00002`).
@@ -764,7 +764,7 @@ pub fn copy_model(dirs: &BlazarDirs, src: &str, dst: &str) -> Result<()> {
     // teach the pull-again path instead of failing deep in link(2).
     if src_path.is_dir() {
         return Err(anyhow!(
-            "model {src} is a safetensors directory (sglang lane) — directories cannot be aliased; pull the repo again under the new name"
+            "model {src} is a safetensors directory (sglang lane) - directories cannot be aliased; pull the repo again under the new name"
         ));
     }
     let leaf = src_path
@@ -773,7 +773,7 @@ pub fn copy_model(dirs: &BlazarDirs, src: &str, dst: &str) -> Result<()> {
         .to_string_lossy()
         .to_string();
     // The alias hardlink MUST live at its own path. Reusing the source's
-    // leaf name made the alias row point at the ORIGINAL file — rm on the
+    // leaf name made the alias row point at the ORIGINAL file - rm on the
     // alias then deleted the source (live data-loss incident 2026-09-05).
     let dst_path = dirs.models_dir().join(format!("{dst}__alias__{leaf}"));
     if dst_path == src_path {
@@ -1088,7 +1088,7 @@ mod tests {
         copy_model(&dirs, "m", "m-alias").unwrap();
         let alias = s.get_model("m-alias").unwrap().unwrap();
         // The alias row must point at its OWN path (same-leaf naming made
-        // rm-on-alias delete the source — live incident 2026-09-05).
+        // rm-on-alias delete the source - live incident 2026-09-05).
         assert_ne!(alias.path, gguf.display().to_string());
         assert!(alias.path.contains("m-alias__alias__"), "{}", alias.path);
         #[cfg(unix)]
@@ -1107,7 +1107,7 @@ mod tests {
     // ---- boot-time reconcile (reconcile_models) ----
 
     /// Minimal valid GGUF v3 with a `general.architecture` string kv and
-    /// an optional `general.name` string kv — the same byte dialect as
+    /// an optional `general.name` string kv - the same byte dialect as
     /// the gguf health tests in hf.rs.
     fn write_gguf(path: &std::path::Path, arch: &str, name: Option<&str>) {
         fn str_kv(b: &mut Vec<u8>, k: &str, v: &str) {
@@ -1172,7 +1172,7 @@ mod tests {
         );
         assert!(m.mmproj_path.is_none(), "no mmproj guessing");
 
-        // Second boot: no churn — the file is owned now.
+        // Second boot: no churn - the file is owned now.
         let r2 = reconcile_models(&dirs, &store);
         assert!(
             r2.adopted.is_empty() && r2.skipped.is_empty(),
@@ -1230,7 +1230,7 @@ mod tests {
         assert_eq!(m.ctx_train, Some(32768));
         assert_eq!(m.path, d.display().to_string());
 
-        // Second boot: fully silent — owned dirs are not collisions and
+        // Second boot: fully silent - owned dirs are not collisions and
         // must not warn on every start.
         let r2 = reconcile_models(&dirs, &store);
         assert!(r2.adopted.is_empty(), "{:?}", r2.adopted);
@@ -1281,7 +1281,7 @@ mod tests {
             "ownership dialect kept"
         );
 
-        // Third boot: silent again — heal is a one-shot correction.
+        // Third boot: silent again - heal is a one-shot correction.
         let r3 = reconcile_models(&dirs, &store);
         assert!(r3.healed.is_empty(), "{:?}", r3.healed);
     }
@@ -1321,7 +1321,7 @@ mod tests {
         // embedded general.name ("Qwen2.5 0.5B Instruct") collides with
         // the safetensors dir's own repo name. Dirs adopt first so the
         // dir claims qwen2.5-0.5b-instruct and the GGUF ladder falls
-        // through to its full stem — no shadowing, no warn, both rows.
+        // through to its full stem - no shadowing, no warn, both rows.
         let (_t, dirs) = setup();
         let d = dirs.models_dir();
         let sd = d.join("qwen2.5-0.5b-instruct.d");
@@ -1438,7 +1438,7 @@ mod tests {
         let d = dirs.models_dir();
         // Row `m` exists pointing at ANOTHER path; the orphan's GGUF
         // metadata derives the same name. The ladder must NOT shadow the
-        // existing row — it falls through to the stem-derived name, and
+        // existing row - it falls through to the stem-derived name, and
         // only skips when EVERY candidate is taken.
         let elsewhere = dirs.data_dir.join("elsewhere.gguf");
         write_gguf(&elsewhere, "qwen3", None);
@@ -1461,7 +1461,7 @@ mod tests {
         let (_t, dirs) = setup();
         let d = dirs.models_dir();
         // Row `dup` lives elsewhere; the orphan's stem AND metadata both
-        // derive exactly `dup` — every candidate is taken, so it must
+        // derive exactly `dup` - every candidate is taken, so it must
         // skip with an honest reason instead of shadowing.
         let elsewhere = dirs.data_dir.join("elsewhere.gguf");
         write_gguf(&elsewhere, "qwen3", None);
@@ -1478,7 +1478,7 @@ mod tests {
             "{:?}",
             r.skipped
         );
-        // File survives untouched — adoption never deletes.
+        // File survives untouched - adoption never deletes.
         assert!(d.join("dup.gguf").exists());
     }
 
@@ -1501,7 +1501,7 @@ mod tests {
         let (_t, dirs) = setup();
         let d = dirs.models_dir();
         // Pull-lane on-disk naming: owner--repo--leaf.gguf. The repo
-        // segment (minus -gguf suffix) is the pre-uninstall model name —
+        // segment (minus -gguf suffix) is the pre-uninstall model name -
         // it must win over GGUF-internal general.name.
         write_gguf(
             &d.join("unsloth--Qwen3.5-9B-MTP-GGUF--Qwen3.5-9B-Q4_K_M.gguf"),
@@ -1595,7 +1595,7 @@ mod tests {
         let m = store.get_model("qwen3.5-9b").unwrap().unwrap();
         assert!(
             m.mmproj_path.is_none(),
-            "bare sidecar has no repo signal — never guessed"
+            "bare sidecar has no repo signal - never guessed"
         );
     }
 
@@ -1603,7 +1603,7 @@ mod tests {
     fn unit__reconcile__stem_named_sidecar_links_bare_model() {
         // Live shape from the 09-24 store audit: a publisher-filename
         // GGUF adopted beside a projector that names the model verbatim.
-        // The stem minus its quant tail is the identity — that dialect
+        // The stem minus its quant tail is the identity - that dialect
         // must link at adopt time, not only via backfill.
         let (_t, dirs) = setup();
         let d = dirs.models_dir();
@@ -1690,7 +1690,7 @@ mod tests {
         let m = store.get_model("qwen2.5-vl-7b").unwrap().unwrap();
         assert!(
             m.mmproj_path.is_none(),
-            "ambiguous stem candidates — neither is guessed"
+            "ambiguous stem candidates - neither is guessed"
         );
     }
 
@@ -1823,13 +1823,13 @@ mod tests {
         let r = reconcile_models(&dirs, &store);
         assert_eq!(r.adopted.len(), 2, "{:?}", r.skipped);
         // Base file: meta + stem-minus-tail both taken/invalid (`0.5b` is
-        // not a quant token) → full stem.
+        // not a quant token) -> full stem.
         assert!(
             store.get_model("qwen2.5-0.5b").unwrap().is_some(),
             "{:?}",
             r.adopted
         );
-        // fp16 file: meta taken → stem-minus-quant-tail ALSO taken →
+        // fp16 file: meta taken -> stem-minus-quant-tail ALSO taken ->
         // full stem with quant.
         assert!(
             store

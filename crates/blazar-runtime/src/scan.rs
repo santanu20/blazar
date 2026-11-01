@@ -1,6 +1,6 @@
 //! Cross-runtime model discovery: what this machine already has on disk
-//! from OTHER runtimes — an ollama store, the Hugging Face hub cache, or
-//! an LM Studio install — and the blazar command that adopts each entry
+//! from OTHER runtimes - an ollama store, the Hugging Face hub cache, or
+//! an LM Studio install - and the blazar command that adopts each entry
 //! without a re-download. Discovery is read-only and cheap: sizes come
 //! from manifests or `fs::metadata`, nothing is hashed or opened for
 //! write; the actual reuse at pull/import time is still gated by the
@@ -44,8 +44,8 @@ pub struct ReusableModel {
     /// `None` shows as `-`.
     pub quant: Option<String>,
     pub bytes: u64,
-    /// Ready-to-run command that adopts this model (`blazar pull …` /
-    /// `blazar import …`).
+    /// Ready-to-run command that adopts this model (`blazar pull ...` /
+    /// `blazar import ...`).
     pub suggestion: String,
 }
 
@@ -70,7 +70,7 @@ pub fn scan_reusable_models() -> Vec<ReusableModel> {
 
 /// Walk an ollama store's manifest tree
 /// (`manifests/registry.ollama.ai/<ns>/<model>/<tag>`) and list one row
-/// per (model, tag). Sizes come from the manifest descriptors — no blob
+/// per (model, tag). Sizes come from the manifest descriptors - no blob
 /// hashing at scan time; a later `blazar pull` verifies bytes before
 /// linking. Manifests without a model layer, or unreadable/corrupt ones,
 /// are skipped: a listing must never crash on a weird store.
@@ -221,7 +221,7 @@ fn collect_model_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Candidate LM Studio models directories. The modern default is
 /// `~/.lmstudio/models` (0.3+); older builds used per-OS cache paths.
 /// The location is configurable in-app (no env var), so probing is
-/// best-effort by design — absent roots are a no-op.
+/// best-effort by design - absent roots are a no-op.
 fn lm_studio_roots() -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
@@ -236,8 +236,8 @@ fn lm_studio_roots() -> Vec<PathBuf> {
     ]
 }
 
-/// Loose GGUFs under an LM Studio models tree (`<publisher>/<model>/…`),
-/// one row per file — each is adoptable via `blazar import <path>`.
+/// Loose GGUFs under an LM Studio models tree (`<publisher>/<model>/...`),
+/// one row per file - each is adoptable via `blazar import <path>`.
 pub(crate) fn scan_lm_studio_at(root: &Path) -> Vec<ReusableModel> {
     let mut files = Vec::new();
     collect_gguf_files(root, &mut files);
@@ -315,7 +315,7 @@ mod tests {
             model_bytes.len()
         );
         // Real ollama layout: the TAG is a manifest file directly under
-        // the model dir (…/library/qwen3/0.6b is a file, not a dir).
+        // the model dir (.../library/qwen3/0.6b is a file, not a dir).
         let dir = root
             .join("manifests")
             .join("registry.ollama.ai")

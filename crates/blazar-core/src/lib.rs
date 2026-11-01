@@ -1,5 +1,5 @@
 //! Blazar core: pure, synchronous domain logic. No tokio, no axum, no
-//! network — exhaustively unit-testable. Async lifetimes (process
+//! network - exhaustively unit-testable. Async lifetimes (process
 //! supervision, downloads, HTTP) live in `blazar-runtime`.
 
 pub mod catalog;

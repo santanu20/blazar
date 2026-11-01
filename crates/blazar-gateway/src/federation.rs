@@ -3,18 +3,18 @@
 //! Three operators on the same federation machinery `remotes.rs` already
 //! runs for routing:
 //!
-//! * `POST /api/warm` — make a model resident on THIS gateway (the
+//! * `POST /api/warm` - make a model resident on THIS gateway (the
 //!   replication primitive a peer calls).
-//! * `POST /api/replicate` — fan a warm out to named peers so several
+//! * `POST /api/replicate` - fan a warm out to named peers so several
 //!   nodes hold the model warm (remote replication).
-//! * `GET /api/route/{model}` — the cross-node scheduling decision an
+//! * `GET /api/route/{model}` - the cross-node scheduling decision an
 //!   incoming request would take, with the signals behind it (local
 //!   residency, per-peer tier / wait estimate / free VRAM).
 //!
 //! Honesty contracts:
 //! * warm loads the TEXT lane (`needs_vision = false`): a vision model
 //!   warms its base child; the projector lane attaches on the first
-//!   vision-carrying request. Warm does not pin residency — the idle
+//!   vision-carrying request. Warm does not pin residency - the idle
 //!   TTL governs the child afterwards exactly as if a chat had loaded
 //!   it.
 //! * replicate reports per-peer outcomes verbatim, including peers
@@ -42,7 +42,7 @@ use crate::queue::{Priority, WorkClass};
 const REPLICATE_TIMEOUT_DEFAULT_SECS: u64 = 300;
 const REPLICATE_TIMEOUT_MAX_SECS: u64 = 900;
 
-/// `PeerScore::tier` numbering → the name the API and CLI print.
+/// `PeerScore::tier` numbering -> the name the API and CLI print.
 #[must_use]
 pub fn tier_name(tier: u8) -> &'static str {
     match tier {
@@ -52,7 +52,7 @@ pub fn tier_name(tier: u8) -> &'static str {
     }
 }
 
-/// Per-peer timeout clamp: absent → default; present → bounded
+/// Per-peer timeout clamp: absent -> default; present -> bounded
 /// `[1, 900]` seconds. Pure so the clamp is unit-pinnable.
 #[must_use]
 pub fn clamp_timeout(secs: Option<u64>) -> Duration {
@@ -64,7 +64,7 @@ pub fn clamp_timeout(secs: Option<u64>) -> Duration {
 
 /// Select the remotes a replicate call targets. `None` = every
 /// configured remote. An unknown name is a teaching error listing what
-/// IS configured — silent best-effort matching here would hide typos.
+/// IS configured - silent best-effort matching here would hide typos.
 /// Pure over the config slice.
 pub fn filter_remotes<'a>(
     remotes: &'a [Remote],
@@ -75,7 +75,7 @@ pub fn filter_remotes<'a>(
     };
     if names.is_empty() {
         return Err(
-            "peers list is empty — pass peer names or omit the field for all remotes".into(),
+            "peers list is empty - pass peer names or omit the field for all remotes".into(),
         );
     }
     let mut selected = Vec::new();
@@ -87,7 +87,7 @@ pub fn filter_remotes<'a>(
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
-                "unknown peer '{name}' — configured remotes: {}",
+                "unknown peer '{name}' - configured remotes: {}",
                 if configured.is_empty() {
                     "(none)"
                 } else {
@@ -121,31 +121,31 @@ async fn boxed_to_api_error(boxed: Box<Response>) -> Response {
     api_error(status, &msg)
 }
 
-/// `POST /api/warm {"model", "wait"?}` — make a model resident on this
+/// `POST /api/warm {"model", "wait"?}` - make a model resident on this
 /// gateway. Two modes, one endpoint:
 ///
 /// * notify (default, the deployed `blazar pull` contract): detached
-///   `warm_on_pull_if_enabled` — policy-gated (knob + AC power +
+///   `warm_on_pull_if_enabled` - policy-gated (knob + AC power +
 ///   admission belts, warn-not-fail), answers `{"status": "ok"}`
 ///   immediately. The spawn outlives the request; tying it to the
 ///   handler once let a client disconnect cancel it mid-load.
 /// * `wait: true` (replication + `blazar warm` CLI): synchronous
 ///   ensure through the standard admission path (low priority,
-///   interactive class — never starves real traffic; concurrent loads
+///   interactive class - never starves real traffic; concurrent loads
 ///   of the same model coalesce), then reports the live child state.
 ///
-/// `POST /api/lora/sync` — CLI `blazar lora add/rm` follow-through after
+/// `POST /api/lora/sync` - CLI `blazar lora add/rm` follow-through after
 /// the store write: hot-attach (or detach) the adapter on a RESIDENT
 /// sglang base child through the engine's admin endpoints, no respawn.
 /// Best-effort by design: nothing resident (or a lane that bakes
 /// adapters at spawn) defers to the next spawn, which the store row
-/// already drives — the response `detail` says which happened.
+/// already drives - the response `detail` says which happened.
 pub async fn lora_sync(
     State(state): State<Arc<AppState>>,
     key: Option<Extension<crate::keys::KeyCtx>>,
     body: Bytes,
 ) -> Response {
-    // BLZ-2: hot attach/detach mutates a live child's adapter set —
+    // BLZ-2: hot attach/detach mutates a live child's adapter set -
     // control-plane standing required.
     if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key.as_deref()) {
         return api_error(code, &msg);
@@ -186,7 +186,7 @@ pub async fn lora_sync(
 }
 
 /// BLZ-2 gate for [`warm`]: model-specific control action, so a scoped
-/// key may only warm models inside its allowlist — checked against the
+/// key may only warm models inside its allowlist - checked against the
 /// canonical store name so tag aliases cannot sidestep the scope. An
 /// unresolvable name is refused for scoped keys (the scope cannot be
 /// verified) while admin keys keep the long-standing pull-notify
@@ -217,7 +217,7 @@ fn warm_scope_gate(
                     return Some(api_error(
                         403,
                         &format!(
-                            "key {:?} cannot warm unknown model {model:?} — not in the store, so its scope cannot be checked",
+                            "key {:?} cannot warm unknown model {model:?} - not in the store, so its scope cannot be checked",
                             k.name
                         ),
                     ));
@@ -245,7 +245,7 @@ pub async fn warm(
     }
     if !v["wait"].as_bool().unwrap_or(false) {
         // Notify mode: byte-identical to the long-standing pull-notify
-        // contract — detached, policy-gated, always "ok".
+        // contract - detached, policy-gated, always "ok".
         let sup = Arc::clone(&state.sup);
         tokio::spawn(async move {
             sup.warm_on_pull_if_enabled(&model).await;
@@ -265,13 +265,13 @@ pub async fn warm(
         return api_error(
             StatusCode::NOT_FOUND.as_u16(),
             &format!(
-                "unknown model: {model} — `blazar ls` lists the store, `blazar pull` adds one"
+                "unknown model: {model} - `blazar ls` lists the store, `blazar pull` adds one"
             ),
         );
     };
     // Low priority + interactive class: warm is background work that
     // must never jump the request queue, but still needs a slot to
-    // load. No prefix pin, text lane, no diffusion, no eviction hold —
+    // load. No prefix pin, text lane, no diffusion, no eviction hold -
     // the idle TTL governs residency after this returns, same as a
     // completed chat.
     match ensure_with_admission(
@@ -310,7 +310,7 @@ pub async fn warm(
                 "engine": engine_ref.kind.as_str(),
                 "load_ms": load_ms,
                 "resident": resident,
-                "note": "warm loads the text lane and holds no pin — the idle TTL governs residency; a vision projector attaches on the first vision request",
+                "note": "warm loads the text lane and holds no pin - the idle TTL governs residency; a vision projector attaches on the first vision request",
             }))
             .into_response()
         }
@@ -318,7 +318,7 @@ pub async fn warm(
     }
 }
 
-/// `POST /api/replicate {"model", "peers"?, "timeout_secs"?}` — warm a
+/// `POST /api/replicate {"model", "peers"?, "timeout_secs"?}` - warm a
 /// model on the selected peers concurrently. This is remote
 /// replication: after it, several nodes hold the model warm and the
 /// capacity-aware fallback spreads load across them.
@@ -332,7 +332,7 @@ pub async fn replicate(
     key: Option<Extension<crate::keys::KeyCtx>>,
     body: Bytes,
 ) -> Response {
-    // BLZ-2: replication fans load work out to every named peer — a
+    // BLZ-2: replication fans load work out to every named peer - a
     // fleet-level action, never a scoped key's to start.
     if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key.as_deref()) {
         return api_error(code, &msg);
@@ -342,12 +342,12 @@ pub async fn replicate(
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
     let Some(model) = v["model"].as_str().map(str::trim).filter(|m| !m.is_empty()) else {
-        return api_error(400, "missing 'model' — the model to replicate");
+        return api_error(400, "missing 'model' - the model to replicate");
     };
     if state.config.remotes.is_empty() {
         return api_error(
             400,
-            "no remotes configured — add a [[remotes]] entry before replicating",
+            "no remotes configured - add a [[remotes]] entry before replicating",
         );
     }
     let names: Option<Vec<String>> = v["peers"].as_array().map(|a| {
@@ -395,7 +395,7 @@ pub async fn replicate(
                             "peer": remote.name,
                             "url": remote.url,
                             "ok": false,
-                            "note": "peer has no /api/warm — remote replication needs a Blazar gateway peer",
+                            "note": "peer has no /api/warm - remote replication needs a Blazar gateway peer",
                         })
                     } else {
                         serde_json::json!({
@@ -443,11 +443,11 @@ pub async fn replicate(
     .into_response()
 }
 
-/// `GET /api/route/{model}` — the scheduling decision an incoming
+/// `GET /api/route/{model}` - the scheduling decision an incoming
 /// request for this model would take, with every signal behind it.
 /// Read-only; forces a presence refresh only when the model is not
 /// local (the fallback path would pay that probe anyway).
-// One linear decision tree (local → peers → none) with inline JSON
+// One linear decision tree (local -> peers -> none) with inline JSON
 // assembly per branch; splitting it would hide the decision order it exists to show.
 #[allow(clippy::too_many_lines)]
 pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
@@ -494,7 +494,7 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
     };
     if let Some(row) = local_row {
         // Local ownership wins: chat resolves this model here and never
-        // falls back. Peers stay informational from cache only — no
+        // falls back. Peers stay informational from cache only - no
         // probe cost on the hot path.
         let resident = state
             .sup
@@ -511,9 +511,9 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
                 })
             });
         let reason = if resident.is_some() {
-            "model is owned and resident locally — requests are served by this gateway"
+            "model is owned and resident locally - requests are served by this gateway"
         } else {
-            "model is owned locally — the next request loads it here (federation is not consulted for local models)"
+            "model is owned locally - the next request loads it here (federation is not consulted for local models)"
         };
         let serving: Vec<&Remote> = Vec::new();
         return axum::Json(serde_json::json!({
@@ -525,7 +525,7 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
         }))
         .into_response();
     }
-    // Not local: this is exactly the fallback path — refresh presence
+    // Not local: this is exactly the fallback path - refresh presence
     // (throttled force-probe) and rank whoever serves it.
     let serving = crate::remotes::peers_serving_with_refresh(&state, &model).await;
     let peers = peer_lines(&serving);
@@ -544,7 +544,7 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
             "decision": {
                 "target": format!("remote:{}", best.name),
                 "reason": format!(
-                    "model is not in the local store — best-ranked serving peer (tier {}, est wait {} ms)",
+                    "model is not in the local store - best-ranked serving peer (tier {}, est wait {} ms)",
                     tier_name(score.tier),
                     score.est_wait_ms
                 ),
@@ -559,7 +559,7 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
         "peers": peers,
         "decision": {
             "target": "none",
-            "reason": "unknown model: not in the local store and no peer lists it — `blazar ls` shows local models, `blazar ps` shows peers",
+            "reason": "unknown model: not in the local store and no peer lists it - `blazar ls` shows local models, `blazar ps` shows peers",
         },
     }))
     .into_response()

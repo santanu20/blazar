@@ -1,12 +1,12 @@
 ---
 layout: doc
 title: Engines
-description: The seven serving engines Blazar orchestrates — roles, model formats, and how routing picks between them.
+description: The seven serving engines Blazar orchestrates - roles, model formats, and how routing picks between them.
 doc_kind: Documentation
 ---
 ## One gateway, seven engines
 
-Blazar does not replace inference engines — it orchestrates them. Each lane
+Blazar does not replace inference engines - it orchestrates them. Each lane
 is the real upstream binary, managed end-to-end: download or build, pin,
 configure, supervise, and route requests to it.
 
@@ -25,13 +25,13 @@ configure, supervise, and route requests to it.
 Routing follows model format and engine capability:
 
 ```text
-GGUF                      → llama.cpp / mistral.rs
-Quantized safetensors     → SGLang
-Plain safetensors         → SGLang / mistral.rs
-MLX quant directories     → MLX
-Diffusion component sets  → stable-diffusion.cpp
-Audio transcription       → whisper.cpp
-Offline TTS               → piper
+GGUF                      -> llama.cpp / mistral.rs
+Quantized safetensors     -> SGLang
+Plain safetensors         -> SGLang / mistral.rs
+MLX quant directories     -> MLX
+Diffusion component sets  -> stable-diffusion.cpp
+Audio transcription       -> whisper.cpp
+Offline TTS               -> piper
 ```
 
 The default preserves single-active-engine behavior; per-model engine pins
@@ -71,7 +71,7 @@ here deterministically.
 
 ### SGLang
 
-The throughput lane for quantized safetensors directories — AWQ, GPTQ, FP8.
+The throughput lane for quantized safetensors directories - AWQ, GPTQ, FP8.
 Blazar derives its parallel sizes, memory fraction, and KV-cache budget from
 your hardware before the server ever starts.
 
@@ -85,7 +85,7 @@ Memory and context on this lane are **runtime-managed**: `mlx_lm` sizes its
 own caches and decides residency inside its runtime. Blazar's contract with
 observers is explicit about what that means:
 
-- `ps` shows `blazar_capacity: "runtime-managed"` — the lane is neither
+- `ps` shows `blazar_capacity: "runtime-managed"` - the lane is neither
   unknown-capacity nor unlimited; the engine owns memory admission.
 - `blazar_ctx` reports the model's trained window (`max_position_embeddings`
   from config.json, pulled at model download) as a **fit ceiling**: prompt
@@ -93,14 +93,14 @@ observers is explicit about what that means:
   and no ctx flag is passed to the server. Rows without config.json metadata
   honestly report `0` and admission falls back to the configured default.
 - KV-cache estimate stays unset (`kv_est_bytes: null`) because the runtime,
-  not Blazar, sizes the caches — co-residency planning uses the measured
+  not Blazar, sizes the caches - co-residency planning uses the measured
   settle footprint (weights + actual card delta) instead, the same bytes
   admission that gates every other lane.
 - Session banking (KV checkpoint save/restore) is a llama-server `/slots`
   API and is not invoked on this lane; conversation warmth comes from the
   engine's own prompt cache (`--prompt-cache-*` knobs tune it).
 
-Known upstream issue: mlx-lm 0.32.0 can silently drop a tool call — the
+Known upstream issue: mlx-lm 0.32.0 can silently drop a tool call - the
 response reports `finish_reason: "tool_calls"` while `message.tool_calls`
 is missing and the generated text is lost (the model emitted call markers
 but the parser rejected the text between them; most visible with small
@@ -121,5 +121,5 @@ gating for live audio.
 
 ### piper
 
-Offline neural TTS with local voices — no network, no cloud service, one
+Offline neural TTS with local voices - no network, no cloud service, one
 API surface shared with the rest of the media lanes.

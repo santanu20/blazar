@@ -1,8 +1,8 @@
-//! Cache-bust churn detector — the agent-client teaching layer ollama
+//! Cache-bust churn detector - the agent-client teaching layer ollama
 //! shipped as v0.33.0 "trustworthy prefill restore points", inverted:
 //! blazar's engine already resumes cancelled prefills natively (live
 //! proven: 41 KB prompt aborted at 2 s, retry served 6,154 cached
-//! tokens), so the remaining loss is CLIENT-side — chatty agent clients
+//! tokens), so the remaining loss is CLIENT-side - chatty agent clients
 //! (token counters, timestamps, per-turn tool list reshuffles inside the
 //! system prompt) mutate the prefix every turn and silently re-prefill
 //! from scratch. This module fingerprints system+tools per request and
@@ -24,7 +24,7 @@ struct Entry {
     sys_tools: u64,
     /// Conversation identity (`first_user_fp`). `None`
     /// = the request had no recognizable prompt (embeddings, tools-only
-    /// transforms) — no episode tracking for it.
+    /// transforms) - no episode tracking for it.
     convo: Option<u64>,
     /// Consecutive turns with a changed system+tools fingerprint on a
     /// stable conversation.
@@ -50,7 +50,7 @@ impl CacheBustTracker {
     /// (>= 2 consecutive mutations, first emission only); `None` = silent.
     ///
     /// Episode semantics (review revision 3): a system-stable turn closes
-    /// the episode — resets both the streak and the warned flag, so a
+    /// the episode - resets both the streak and the warned flag, so a
     /// later burst warns anew. A conversation change also resets (new
     /// conversation, fresh baseline).
     fn note(&self, model: &str, sys_tools_fp: u64, convo_fp: Option<u64>) -> Option<u32> {
@@ -98,7 +98,7 @@ impl CacheBustTracker {
 /// Full-length fingerprint of everything a client puts BEFORE the
 /// conversation: all system message contents concatenated plus the
 /// canonical JSON of the tools array when present. Full length, not the
-/// proxy's 256 B sys head — late mutations deep in a long system prompt
+/// proxy's 256 B sys head - late mutations deep in a long system prompt
 /// are exactly the cache busters this detector exists to catch.
 /// `developer` rides with `system`: it is the o-series spelling of the
 /// same prefix slot on the `OpenAI` dialect.
@@ -128,7 +128,7 @@ pub fn system_tools_fp(req: &serde_json::Value) -> u64 {
 
 /// Conversation identity: the FIRST user message, capped at 1 KiB (the
 /// proxy's affinity-hash discipline). Deliberately excludes the system
-/// prompt — the very thing being fingerprinted for churn must not also
+/// prompt - the very thing being fingerprinted for churn must not also
 /// be part of the "same conversation" key, or every mutation would look
 /// like a new conversation and no episode could ever form. The first
 /// user message is the stable anchor of an agent-client conversation:
@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(first_user_fp(&base), first_user_fp(&base));
         let churned = serde_json::json!({
             "messages": [
-                {"role": "system", "content": "sys v2 — tokens left: 8123"},
+                {"role": "system", "content": "sys v2 - tokens left: 8123"},
                 {"role": "user", "content": "fix the bug in foo.rs"},
                 {"role": "assistant", "content": "looking"},
                 {"role": "user", "content": "any progress?"}

@@ -4,7 +4,7 @@
 //! Composition over duplication: each target is either a local model or
 //! a `[[remotes]]` entry, so chains reuse the existing serving and
 //! forwarding lanes verbatim (the chain resolves to a plain model string
-//! — `model` for local hops, `remote:model` for remote hops — and the
+//! - `model` for local hops, `remote:model` for remote hops - and the
 //! lanes route it exactly as a direct request would). No new forwarding
 //! code, one escalation loop per lane.
 //!
@@ -13,7 +13,7 @@
 //!   from index 0 wins; `sticky` remembers the last target that served.
 //! * A failing target is benched for `min_residence_secs` (anti-flap);
 //!   escalation tries the next eligible target. All targets benched is
-//!   a full-outage posture, not a flap — the chain serves the sticky
+//!   a full-outage posture, not a flap - the chain serves the sticky
 //!   target anyway (bench expiry is a flap guard, not an availability
 //!   guard).
 //! * `pin` forces a target regardless of bench state; `unpin` clears.
@@ -42,7 +42,7 @@ pub struct Attempt {
     pub chain: String,
     pub index: usize,
     /// Model string for the serving lane: bare model (local hop) or
-    /// `remote:<name>:<model>` (remote hop — the existing prefix the
+    /// `remote:<name>:<model>` (remote hop - the existing prefix the
     /// remotes lane already routes).
     pub serve_model: String,
     /// Human-readable target label for headers/status (`local:<model>`
@@ -128,7 +128,7 @@ impl Registry {
             st.pinned
                 .unwrap_or_else(|| match st.benched_until.iter().position(Option::is_none) {
                     Some(i) => i,
-                    // Every target benched: serve the sticky target — a
+                    // Every target benched: serve the sticky target - a
                     // fully-benched chain must stay available, the bench
                     // is a flap guard rather than an availability guard.
                     None => st.sticky,
@@ -155,7 +155,7 @@ impl Registry {
             && p == index
         {
             // A pinned target that fails keeps serving (explicit user
-            // choice outranks availability) — no switch to record.
+            // choice outranks availability) - no switch to record.
             return None;
         }
         let next = st
@@ -305,7 +305,7 @@ fn target_label(t: &FailoverTarget) -> String {
 
 // ---------- admin plane ----------
 
-/// GET /api/failover — every chain's live status (targets, bench
+/// GET /api/failover - every chain's live status (targets, bench
 /// state, sticky/pinned, switch history).
 pub async fn list(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
@@ -313,7 +313,7 @@ pub async fn list(
     axum::Json(state.failover.status_json()).into_response()
 }
 
-/// GET /api/failover/{chain} — one chain by name OR alias.
+/// GET /api/failover/{chain} - one chain by name OR alias.
 pub async fn detail(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
     axum::extract::Path(chain): axum::extract::Path<String>,
@@ -323,13 +323,13 @@ pub async fn detail(
         None => crate::proxy::openai_error(
             404,
             &format!(
-                "unknown failover chain {chain:?} — GET /api/failover lists every configured chain"
+                "unknown failover chain {chain:?} - GET /api/failover lists every configured chain"
             ),
         ),
     }
 }
 
-/// POST /api/failover/{chain}/pin {"target": <index>} — force a target
+/// POST /api/failover/{chain}/pin {"target": <index>} - force a target
 /// (immune to benching; even a failing pinned target keeps serving).
 pub async fn pin(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
@@ -338,7 +338,7 @@ pub async fn pin(
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     // BLZ-2: pinning re-routes serving traffic for every caller of the
-    // chain — a fleet-level decision, so it takes an admin key.
+    // chain - a fleet-level decision, so it takes an admin key.
     if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key.as_deref()) {
         return crate::proxy::openai_error(code, &msg);
     }
@@ -367,7 +367,7 @@ pub async fn pin(
     }
 }
 
-/// POST /api/failover/{chain}/unpin — return the chain to automatic
+/// POST /api/failover/{chain}/unpin - return the chain to automatic
 /// resolution.
 pub async fn unpin(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
@@ -375,7 +375,7 @@ pub async fn unpin(
     key: Option<axum::extract::Extension<crate::keys::KeyCtx>>,
 ) -> axum::response::Response {
     // BLZ-2: unpinning hands the chain back to automatic resolution for
-    // every caller — same fleet-level standing as pinning.
+    // every caller - same fleet-level standing as pinning.
     if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key.as_deref()) {
         return crate::proxy::openai_error(code, &msg);
     }
@@ -405,10 +405,10 @@ pub fn stamp(resp: &mut axum::response::Response, attempt: &Attempt) {
 /// Can this response trigger escalation? Success and caller errors
 /// that any target would repeat pass through; gateway infrastructure
 /// failures escalate: 5xx, unknown-model 404, and gate-class 400s
-/// (fit refusal, spawn errors — our error bodies carry the
+/// (fit refusal, spawn errors - our error bodies carry the
 /// `blazar_error` type). Gate-class detection buffers the (small)
 /// error body; anything larger than the cap passes through unbuffered.
-/// Bodies that already streamed cannot be retried — the sentinel and
+/// Bodies that already streamed cannot be retried - the sentinel and
 /// evict lanes own mid-stream failures.
 pub async fn escalate_response(resp: &mut axum::response::Response) -> bool {
     let status = resp.status().as_u16();
@@ -500,7 +500,7 @@ mod tests {
             panic!("poison the registry");
         }));
         assert!(reg.state.is_poisoned());
-        // plan() must still resolve the alias — NOT fall back to the
+        // plan() must still resolve the alias - NOT fall back to the
         // caller's serve-base lane as the old `.ok()?` did.
         let a = reg.plan("assistant").unwrap();
         assert_eq!(a.index, 0);
@@ -515,7 +515,7 @@ mod tests {
         let _ = reg.record_failure("assistant", 0).unwrap();
         let _ = reg.record_success("assistant", 1);
         let _ = reg.record_failure("assistant", 1);
-        // Both benched: sticky (1) keeps serving — availability wins.
+        // Both benched: sticky (1) keeps serving - availability wins.
         assert_eq!(reg.plan("assistant").unwrap().index, 1);
     }
 
@@ -540,7 +540,7 @@ mod tests {
         let reg = Registry::from_config(&[chain()]);
         reg.pin("assistant", 1).unwrap();
         assert_eq!(reg.plan("assistant").unwrap().index, 1);
-        // A failing PINNED target stays pinned — no switch recorded.
+        // A failing PINNED target stays pinned - no switch recorded.
         assert!(reg.record_failure("assistant", 1).is_none());
         assert!(reg.pin("assistant", 9).is_err());
         reg.unpin("assistant").unwrap();

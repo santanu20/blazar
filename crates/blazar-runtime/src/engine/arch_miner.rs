@@ -7,12 +7,12 @@
 //! (verified against upstream master: one `{ LLM_ARCH_X, "name" }`
 //! entry per line, 150+ architectures, terminal
 //! `{ LLM_ARCH_UNKNOWN, "(unknown)" }` sentinel). Advertisement is a
-//! CANDIDATE filter only — the runtime model load is the verification,
+//! CANDIDATE filter only - the runtime model load is the verification,
 //! and a load failure downgrades the claim (see the supervisor's
 //! unknown-architecture classifier).
 //!
 //! Failure policy: a missing or unparseable file yields an EMPTY set
-//! plus a caller-visible warning — never a failed build. An engine
+//! plus a caller-visible warning - never a failed build. An engine
 //! with no mined set simply never matches architecture-based routing.
 
 use std::collections::BTreeSet;
@@ -20,7 +20,7 @@ use std::path::Path;
 
 /// Path of the architecture table inside a llama.cpp checkout.
 const LLAMA_ARCH_TABLE: &str = "src/llama-arch.cpp";
-/// Upstream's terminal sentinel name — a placeholder, not a loadable
+/// Upstream's terminal sentinel name - a placeholder, not a loadable
 /// architecture.
 const UNKNOWN_SENTINEL: &str = "(unknown)";
 
@@ -33,7 +33,7 @@ pub fn mine_architectures(src_root: &Path) -> BTreeSet<String> {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(
-                "architecture mining skipped: cannot read {}: {e} — the \
+                "architecture mining skipped: cannot read {}: {e} - the \
                  engine installs without an advertised architecture set",
                 table.display()
             );
@@ -90,7 +90,7 @@ mod tests {
     use super::*;
 
     /// Slice of the real upstream table (verified master 2026-09):
-    /// varied name shapes — plain, dotted, dashed, sentinel tail.
+    /// varied name shapes - plain, dotted, dashed, sentinel tail.
     const REAL_TABLE_SLICE: &str = r#"
 static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_CLIP,             "clip"             }, // dummy, only used by llama-quantize
@@ -127,7 +127,7 @@ static const std::map<std::string, llm_kv_type> LLM_KV_NAMES = {
     #[test]
     fn unit__parse_arch_table__no_table_is_empty() {
         // A fork that renames the table (or a random file) must mine
-        // nothing — never a guess.
+        // nothing - never a guess.
         assert!(parse_arch_table("int main() {}\n").is_empty());
         assert!(parse_arch_table("").is_empty());
     }

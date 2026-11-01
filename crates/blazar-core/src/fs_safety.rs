@@ -4,14 +4,14 @@
 //! rollback-aside cleanup, piper/whisper lane pruning, snapshot pruning)
 //! removes a path derived from the data root (`engines/<tag>`,
 //! `whisper/bin/<tag>`, ...). When a user symlinks one of those managed
-//! roots elsewhere — a bigger disk, a shared store — a naive
+//! roots elsewhere - a bigger disk, a shared store - a naive
 //! `remove_dir_all` follows the link and deletes content the data root
 //! does not own (live incident 2026-09-26: a scratch XDG data dir with
 //! `engines -> ~/.local/share/blazar/engines` reclaimed five real engine
 //! installs through the link). This module makes that escape impossible:
 //! deletion only proceeds on a path that canonically sits inside the
 //! anchor root, and a symlink at the final component is unlinked as a
-//! link — its target is never descended into.
+//! link - its target is never descended into.
 
 use std::path::Path;
 
@@ -22,7 +22,7 @@ pub enum GuardedRemoval {
     Removed,
     /// Nothing existed at the path.
     Absent,
-    /// The path resolves outside the anchor root — deliberately left
+    /// The path resolves outside the anchor root - deliberately left
     /// untouched. Hygiene sweeps skip it; retention callers keep the
     /// store row so dir and row never desync. Wherever that symlink
     /// points is the user's ground, not the data root's.
@@ -32,12 +32,12 @@ pub enum GuardedRemoval {
 /// Remove `target` only when it canonically sits inside `anchor`.
 ///
 /// The containment check runs on canonicalized paths, so a symlink
-/// anywhere along the target path that redirects outside the anchor —
-/// including a symlinked managed root itself — yields
+/// anywhere along the target path that redirects outside the anchor -
+/// including a symlinked managed root itself - yields
 /// [`GuardedRemoval::Escaped`] instead of a deletion on foreign ground.
 /// A symlink at the final component is removed as a link
 /// (`remove_file`, falling back to `remove_dir` for Windows directory
-/// reparse points); its target is never traversed — but the link is
+/// reparse points); its target is never traversed - but the link is
 /// only unlinked when its parent resolves inside the anchor, so a
 /// final link living on foreign ground (reached through an external
 /// symlinked managed dir) is left in place as `Escaped`.
@@ -45,7 +45,7 @@ pub enum GuardedRemoval {
 /// IO failures propagate for the caller's existing posture: fatal for
 /// explicit prunes, logged-and-skipped for fail-open sweeps. A missing
 /// anchor canonicalizes to an error, which callers treat as "cannot
-/// prove containment" — same [`GuardedRemoval::Escaped`] refusal.
+/// prove containment" - same [`GuardedRemoval::Escaped`] refusal.
 pub fn remove_dir_within(anchor: &Path, target: &Path) -> std::io::Result<GuardedRemoval> {
     let meta = match std::fs::symlink_metadata(target) {
         Ok(m) => m,
@@ -56,7 +56,7 @@ pub fn remove_dir_within(anchor: &Path, target: &Path) -> std::io::Result<Guarde
     };
     if meta.file_type().is_symlink() {
         // BLZ-7: unlink the link only when it LIVES inside the anchor.
-        // Canonicalize the parent — a final link reached through an
+        // Canonicalize the parent - a final link reached through an
         // external symlinked managed dir would otherwise be unlinked
         // on foreign ground. The link's own target is never traversed.
         let parent_inside = target.parent().is_some_and(|p| path_is_within(anchor, p));
@@ -64,7 +64,7 @@ pub fn remove_dir_within(anchor: &Path, target: &Path) -> std::io::Result<Guarde
             return Ok(GuardedRemoval::Escaped);
         }
         // Unlink the link itself. `remove_dir` on a Windows directory
-        // symlink removes the reparse point, not its target — try it
+        // symlink removes the reparse point, not its target - try it
         // when the plain unlink is refused.
         return std::fs::remove_file(target)
             .or_else(|_| std::fs::remove_dir(target))
@@ -79,7 +79,7 @@ pub fn remove_dir_within(anchor: &Path, target: &Path) -> std::io::Result<Guarde
     // (`engines-bak` next to `engines`) never passes as contained.
     if !target_canon.starts_with(&anchor_canon) {
         tracing::warn!(
-            "refusing to remove {} — resolves to {}, outside the data root {} \
+            "refusing to remove {} - resolves to {}, outside the data root {} \
              (symlinked managed dir? remove it by hand if that is intended)",
             target.display(),
             target_canon.display(),
@@ -204,7 +204,7 @@ mod tests {
     }
 
     /// BLZ-7: a final-component symlink reached through an external
-    /// symlinked managed dir LIVES on foreign ground — unlinking it
+    /// symlinked managed dir LIVES on foreign ground - unlinking it
     /// through the link must be refused (`Escaped`), link and target
     /// both survive.
     #[cfg(unix)]

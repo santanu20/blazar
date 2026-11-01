@@ -1,4 +1,4 @@
-//! Completion metadata cards — the id→metadata mapping behind
+//! Completion metadata cards - the id->metadata mapping behind
 //! `POST /v1/chat/completions/{id}` (`OpenAI` spec v2.3.0 parity).
 //!
 //! Contract (documented in `docs/4.API_SPEC.md`):
@@ -92,7 +92,7 @@ pub fn card_from_response(
 /// the request parse and the response bytes are already in hand.
 ///
 /// Failure policy: a malformed response body or a store error logs and
-/// drops the card — the completion itself already succeeded, and
+/// drops the card - the completion itself already succeeded, and
 /// failing the client retroactively over a bookkeeping write would
 /// charge tokens twice on retry (H1 applies to the request, not the
 /// side record).
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn unit__card_from_response__no_metadata_no_card_and_bad_body_dropped() {
-        // No request metadata: nothing happens — the common case is free.
+        // No request metadata: nothing happens - the common case is free.
         assert!(
             card_from_response(
                 "m",

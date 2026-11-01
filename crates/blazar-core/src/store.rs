@@ -14,10 +14,10 @@ use crate::error::{CoreError, CoreResult};
 /// - models:   pulled GGUFs (plain files, no blob store)
 /// - profiles: per-(model, engine) launch argv + benchmark results
 /// - loras:    `LoRA` adapters per model
-/// - jobs / `job_events`: durable background-job spine (v8) — every async
+/// - jobs / `job_events`: durable background-job spine (v8) - every async
 ///   surface (audio, image, video) records its job here so records,
 ///   events, and terminal results survive gateway restarts
-/// - responses: durable Responses-API registry (v8) — `previous_response_id`
+/// - responses: durable Responses-API registry (v8) - `previous_response_id`
 ///   chaining survives restarts
 /// - `model_caps`: per-(model, engine) capability certificates (v8)
 #[derive(Debug)]
@@ -27,20 +27,20 @@ pub struct Store {
 
 // v11 adds `bench_results` (plain-bench payloads persisted by
 // `blazar bench`; scorecards fall back to it when no tuned profile
-// carries benchmark_json). Purely additive — CREATE TABLE IF NOT
+// carries benchmark_json). Purely additive - CREATE TABLE IF NOT
 // EXISTS inside the migration batch covers both fresh and old stores.
 // v12 adds `completion_cards` (slim OpenAI chat-completion metadata
-// cards — the id→metadata mapping behind POST /v1/chat/completions/{id}).
+// cards - the id->metadata mapping behind POST /v1/chat/completions/{id}).
 // Cards exist ONLY for completions created with a `metadata` field;
 // the cap prunes oldest-first so the table stays bounded.
-/// v15: BLZ-1 object ownership — `jobs.owner` + `responses.owner` (the
+/// v15: BLZ-1 object ownership - `jobs.owner` + `responses.owner` (the
 /// creating key's name, for object-level authorization). Bump exists so
 /// v14 stores re-enter the migration block and take the two ALTERs;
 /// without it they sat at the latest version and every owner INSERT
 /// failed (the model-doctor poll 404 on upgraded stores).
 /// v17 adds `spec_receipts` (measured spec-mode race verdicts per
 /// model+engine+mode, written by `blazar tune <model> --spec-race`).
-/// Purely additive — CREATE TABLE IF NOT EXISTS inside the migration
+/// Purely additive - CREATE TABLE IF NOT EXISTS inside the migration
 /// batch covers both fresh and old stores.
 /// v18 adds `usage_daily` (per-model daily token/latency rollups,
 /// flushed by the gateway's in-memory usage meter). Additive the same
@@ -49,7 +49,7 @@ pub struct Store {
 /// fingerprint, exact spec parameters, tuned-vs-default flag,
 /// repetitions) and adds the optimization ledger
 /// (`optimization_experiments` + `optimization_measurements` +
-/// `optimization_events` + `active_profiles`) — the append-only
+/// `optimization_events` + `active_profiles`) - the append-only
 /// evidence base tuning adoption will be judged against. Existing
 /// `spec_receipts` rows keep tuned=0: every pre-v19 ngram race ran
 /// engine defaults, and an honest unknown beats a guessed provenance.
@@ -272,7 +272,7 @@ pub struct EngineRow {
 
 /// One HTTP-lane bench measurement (non-llamacpp engines: prompt/tg via
 /// streaming + usage stats, images via time-to-image). Fields the lane
-/// did not measure stay `None` — the image lane has no TTFT, the text
+/// did not measure stay `None` - the image lane has no TTFT, the text
 /// lane has no images/s.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HttpBenchRecord {
@@ -294,7 +294,7 @@ impl EngineRow {
     /// Routing class of this lane, from the provenance stamped in its
     /// manifest: forks (`"source": "fork"`) are capability shims and
     /// lose same-kind ties to mainstream builds. Undecodable or legacy
-    /// manifests count as mainstream — the pre-fork default.
+    /// manifests count as mainstream - the pre-fork default.
     #[must_use]
     pub fn lane_class(&self) -> crate::engine_kind::LaneClass {
         let fork = serde_json::from_str::<serde_json::Value>(&self.manifest)
@@ -341,7 +341,7 @@ pub struct ModelRow {
     #[serde(default)]
     pub mmproj_path: Option<String>,
     /// Diffusion component set (sdcpp lane): the `DiT` `path` above is
-    /// unservable alone — the VAE and text encoder(s) complete the model.
+    /// unservable alone - the VAE and text encoder(s) complete the model.
     /// Flag-keyed because families differ in dialect: Qwen-Image pairs
     /// `--vae`/`--llm`, FLUX pairs `--vae`/`--t5xxl`/`--clip_l`. Empty on
     /// every text model (that emptiness IS the text/diffusion routing
@@ -365,7 +365,7 @@ pub struct ModelRow {
 }
 
 /// One diffusion component: the sd-server flag it rides and the local
-/// file that satisfies it (`--vae` → VAE, `--t5xxl` → T5 encoder, ...).
+/// file that satisfies it (`--vae` -> VAE, `--t5xxl` -> T5 encoder, ...).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ComponentFile {
     pub flag: String,
@@ -389,7 +389,7 @@ impl ComponentFile {
 const QUANTIZED_SAFETENSORS_TOKENS: [&str; 3] = ["awq", "gptq", "fp8"];
 
 /// GGUF quantization tokens ollama appends to model tags
-/// (`qwen3.5:9b-q4_K_M`). Recognized for name folding ONLY — an unknown
+/// (`qwen3.5:9b-q4_K_M`). Recognized for name folding ONLY - an unknown
 /// tail never strips, and ollama size/recency tags (`latest`, `7b`)
 /// are deliberately absent: folding those would silently rewrite user
 /// intent onto whatever stem happens to exist.
@@ -401,8 +401,8 @@ const GGUF_QUANT_TOKENS: &[&str] = &[
 ];
 
 /// Drop a trailing GGUF quant tag from a colon-swapped migrant name:
-/// `qwen3.5-9b-q4_K_M` → `qwen3.5-9b`. `None` when the tail is not a
-/// known quant token (case-insensitive) — callers must not fold then.
+/// `qwen3.5-9b-q4_K_M` -> `qwen3.5-9b`. `None` when the tail is not a
+/// known quant token (case-insensitive) - callers must not fold then.
 fn strip_quant_tag(swapped: &str) -> Option<String> {
     let (stem, tail) = swapped.rsplit_once(['-', ':'])?;
     let tail = tail.to_ascii_lowercase();
@@ -429,10 +429,10 @@ pub fn quantized_safetensors_signal(name: &str, repo: &str, path: &str) -> bool 
 
 /// MLX-format signal: the pull convention carries the marker in the
 /// repo (`mlx-community/...`) or name/path token, with the on-disk
-/// layout probe as fallback — community dirs renamed away from the
+/// layout probe as fallback - community dirs renamed away from the
 /// `mlx` token still route correctly. Callers gate on the row being a
 /// directory (the safetensors class) exactly as they do for
-/// `safetensors` — a GGUF file from an mlx repo is a GGUF row.
+/// `safetensors` - a GGUF file from an mlx repo is a GGUF row.
 #[must_use]
 pub fn mlx_signal(name: &str, repo: &str, path: &str) -> bool {
     let token = [name, repo, path].iter().any(|s| {
@@ -446,11 +446,11 @@ pub fn mlx_signal(name: &str, repo: &str, path: &str) -> bool {
 /// On-disk MLX-layout fallback for [`mlx_signal`]: MLX quantized dirs
 /// carry a `quantization` (often mirrored as `quantization_config`)
 /// block with NUMERIC `bits` + `group_size` and NO `quant_method`
-/// string — the layout every local MLX pull stamps (mlx-lm
+/// string - the layout every local MLX pull stamps (mlx-lm
 /// `save_shards`). Quantized-safetensors dirs (AWQ/GPTQ/torchao)
 /// always carry `quant_method`, which cleanly excludes them; plain
 /// bf16 dirs carry no quantization block at all. Files, missing or
-/// undecodable `config.json`, and non-MLX layouts return false — the
+/// undecodable `config.json`, and non-MLX layouts return false - the
 /// token signal stays primary, this only closes the renamed-dir gap.
 fn mlx_layout_config(path: &str) -> bool {
     let cfg = std::path::Path::new(path).join("config.json");
@@ -461,7 +461,7 @@ fn mlx_layout_config(path: &str) -> bool {
         return false;
     };
     // A quant_method stamp in EITHER key marks an AWQ/GPTQ/torchao
-    // dir — MLX layouts never carry it anywhere.
+    // dir - MLX layouts never carry it anywhere.
     let stamped = ["quantization", "quantization_config"].iter().any(|k| {
         v.get(k)
             .is_some_and(|b| b.get("quant_method").is_some_and(|m| !m.is_null()))
@@ -482,11 +482,11 @@ fn mlx_layout_config(path: &str) -> bool {
 impl ModelRow {
     /// True for quantized safetensors checkpoints (AWQ/GPTQ/FP8). The
     /// `quant` column is UNRELIABLE for this (an AWQ dir pulls with
-    /// quant `4BIT`, an FP8-dynamic dir with `BF16`) — the honest
+    /// quant `4BIT`, an FP8-dynamic dir with `BF16`) - the honest
     /// signal is the quantization-method token in the name/repo/path,
     /// which the pull convention always carries
     /// (`model-instruct-awq.d`). GGUF rows are never "quantized
-    /// safetensors" — GGUF quants are a different, well-served lane.
+    /// safetensors" - GGUF quants are a different, well-served lane.
     #[must_use]
     pub fn is_quantized_safetensors(&self) -> bool {
         quantized_safetensors_signal(&self.name, &self.repo, &self.path)
@@ -494,7 +494,7 @@ impl ModelRow {
 
     /// True for MLX-format community dirs. The token marker (repo
     /// `mlx-community/...`, or an `mlx` name/path token) plus the
-    /// caller's dir gate is the discriminator — MLX dirs are
+    /// caller's dir gate is the discriminator - MLX dirs are
     /// quantized-safetensors-shaped, so routing consults this BEFORE
     /// [`Self::is_quantized_safetensors`]. Dirs whose tokens lost the
     /// `mlx` marker fall back to the on-disk layout probe (see
@@ -514,7 +514,7 @@ impl ModelRow {
     }
 
     /// Diffusion-domain routing marker: a row carrying any component
-    /// set serves on the sdcpp lane — component families carry
+    /// set serves on the sdcpp lane - component families carry
     /// `--vae`/text-encoder files, standalone checkpoints (SD 1.5,
     /// SDXL) carry a self-referencing `--model` entry. Every text row
     /// has no set at all.
@@ -536,14 +536,14 @@ fn default_shards() -> i64 {
 }
 
 #[derive(Debug, Clone)]
-/// One row of the `bench_results` table — the durable plain-bench
+/// One row of the `bench_results` table - the durable plain-bench
 /// history `blazar bench` upserts (model + lane keyed).
 pub struct BenchResultRow {
     pub model: String,
     pub engine_tag: String,
     pub payload_json: String,
     pub updated_at: i64,
-    /// v13 evidence axes — `None` on every row written before the
+    /// v13 evidence axes - `None` on every row written before the
     /// columns existed (honest unknowns, never backfilled guesses).
     pub quant: Option<String>,
     pub hw_fingerprint: Option<String>,
@@ -552,7 +552,7 @@ pub struct BenchResultRow {
 }
 
 /// v13 knowledge-graph evidence axes stamped on measurement rows so each
-/// row is self-contained (model × engine × quant × hardware) without a
+/// row is self-contained (model x engine x quant x hardware) without a
 /// join against `models`. Fill-at-write is best-effort: a caller that
 /// cannot see an axis passes `None` and the row honestly records the
 /// gap. `workload` is reserved for the upcoming workload classifier.
@@ -566,7 +566,7 @@ pub struct EvidenceAxes {
 
 impl EvidenceAxes {
     /// Canonical hardware fingerprint, `gpu=<name>|vram_mib=<n>|cpu=<arch>`.
-    /// Flat by design — one GROUP BY key in SQL, diffable in a terminal,
+    /// Flat by design - one GROUP BY key in SQL, diffable in a terminal,
     /// and extendable later without breaking existing rows. Callers own
     /// assembly (they hold the engine manifest / probe context); the
     /// store only owns the format.
@@ -577,7 +577,7 @@ impl EvidenceAxes {
             return None;
         }
         // Unknown VRAM omits the segment rather than fabricating
-        // vram_mib=0 — the string stays honest and groupable.
+        // vram_mib=0 - the string stays honest and groupable.
         match vram_mib {
             Some(vram) => format!("gpu={gpu}|vram_mib={vram}|cpu={arch}"),
             None => format!("gpu={gpu}|cpu={arch}"),
@@ -587,7 +587,7 @@ impl EvidenceAxes {
 
     /// Fingerprint from an engine row's `manifest` JSON column
     /// (devices[0] name + `total_mib`). None for unparseable or
-    /// device-less manifests — the row then honestly records no
+    /// device-less manifests - the row then honestly records no
     /// hardware axis instead of guessing.
     #[must_use]
     pub fn hw_fingerprint_from_manifest(manifest_json: &str) -> Option<String> {
@@ -615,7 +615,7 @@ pub struct ProfileRow {
 /// One spec-race verdict from `blazar tune <model> --spec-race`: the
 /// measured single-stream tok/s of a speculation mode against the same
 /// race's dense baseline. Receipts are the evidence base the supervisor
-/// consults when resolving `spec = "auto"` — a measured mode beats the
+/// consults when resolving `spec = "auto"` - a measured mode beats the
 /// heuristic chain only because a user ran the race on this hardware.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SpecReceiptRow {
@@ -628,14 +628,14 @@ pub struct SpecReceiptRow {
     pub ratio: f64,
     pub measured_at: i64,
     /// Canonical hardware string of the machine that raced (None on
-    /// pre-v19 rows — honest unknown).
+    /// pre-v19 rows - honest unknown).
     #[serde(default)]
     pub hw_fingerprint: Option<String>,
     /// Exact speculation knobs raced, as JSON (None = engine defaults).
     #[serde(default)]
     pub spec_params: Option<String>,
     /// True only when the racing knobs were deliberately configured
-    /// (tuned ngram sizes, a chosen draft pair) — an engine-default
+    /// (tuned ngram sizes, a chosen draft pair) - an engine-default
     /// arm racing alongside tuned ones is not adoption-grade evidence.
     #[serde(default)]
     pub tuned: bool,
@@ -728,11 +728,11 @@ pub struct JobEventRow {
     pub data_json: Option<String>,
 }
 
-/// Slim chat-completion card: the id→metadata mapping that lets
+/// Slim chat-completion card: the id->metadata mapping that lets
 /// `POST /v1/chat/completions/{id}` update metadata after the fact.
 /// Stored only for completions whose create request carried
 /// `metadata` (non-stream; streams cannot be persisted after the
-/// fact — bytes are already on the wire).
+/// fact - bytes are already on the wire).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompletionCardRow {
     pub id: String,
@@ -762,7 +762,7 @@ pub struct StoredResponseRow {
     pub owner: Option<String>,
     /// v10: the exact completed body JSON when the gateway kept it
     /// (background mode always; foreground when cheap). `None` on
-    /// pre-v10 rows — GET reconstructs the shape instead.
+    /// pre-v10 rows - GET reconstructs the shape instead.
     pub body_json: Option<String>,
 }
 
@@ -797,7 +797,7 @@ impl Store {
         Ok(())
     }
 
-    /// Column names of `table` — the source of truth for additive
+    /// Column names of `table` - the source of truth for additive
     /// migrations deciding whether an ALTER is still owed.
     fn table_columns(&self, table: &str) -> CoreResult<Vec<String>> {
         let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -816,8 +816,8 @@ impl Store {
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < SCHEMA_VERSION {
             self.conn.execute_batch(SCHEMA_SQL)?;
-            // v10→v11: `bench_results` (plain-bench persistence) is
-            // CREATE-TABLE-IF-NOT-EXISTS in SCHEMA_SQL — nothing more
+            // v10->v11: `bench_results` (plain-bench persistence) is
+            // CREATE-TABLE-IF-NOT-EXISTS in SCHEMA_SQL - nothing more
             // to do here; the version bump replays the batch on
             // existing stores.
             // v4 added engines.kind. CREATE TABLE IF NOT EXISTS covers
@@ -828,7 +828,7 @@ impl Store {
                     [],
                 )?;
             }
-            // v5→v6: the three fixed diffusion columns became one
+            // v5->v6: the three fixed diffusion columns became one
             // flag-keyed `components` JSON column (families differ in
             // dialect: Qwen pairs --vae/--llm, FLUX pairs --t5xxl/
             // --clip_l). Fresh databases get it from SCHEMA_SQL; v5
@@ -867,10 +867,10 @@ impl Store {
                         .execute(&format!("ALTER TABLE models DROP COLUMN {col}"), [])?;
                 }
             }
-            // v9→v10: responses grew `conversation` (listing handle for
+            // v9->v10: responses grew `conversation` (listing handle for
             // /v1/conversations) and `body_json` (the exact completed body,
             // so background-mode polls return what the foreground call would
-            // have received). Both nullable-or-default — no backfill owed:
+            // have received). Both nullable-or-default - no backfill owed:
             // pre-v10 rows keep the reconstructed-shape GET contract.
             let resp_cols = self.table_columns("responses")?;
             if !resp_cols.contains(&"conversation".to_string()) {
@@ -885,7 +885,7 @@ impl Store {
             }
             // Index lives here, not in SCHEMA_SQL: on an upgrade database
             // SCHEMA_SQL runs before these ALTERs and the index references
-            // the not-yet-added column (caught by the v9→v10 upgrade pin).
+            // the not-yet-added column (caught by the v9->v10 upgrade pin).
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_responses_conversation ON responses(conversation, ts)",
                 [],
@@ -895,7 +895,7 @@ impl Store {
             // NULL = created on an open gateway or before scoping existed,
             // and those rows stay visible to every caller (documented
             // legacy trust boundary; fresh keyed rows always carry an
-            // owner). No backfill is owed or possible — ownership was
+            // owner). No backfill is owed or possible - ownership was
             // never recorded.
             if !resp_cols.contains(&"owner".to_string()) {
                 self.conn
@@ -906,7 +906,7 @@ impl Store {
                 self.conn
                     .execute("ALTER TABLE jobs ADD COLUMN owner TEXT", [])?;
             }
-            // v8→v9: models gained `last_used_at` (disk intelligence:
+            // v8->v9: models gained `last_used_at` (disk intelligence:
             // `blazar prune --unused` ages models out by spawn activity).
             // Fresh databases get it from SCHEMA_SQL; v8 databases take the
             // ALTER plus a backfill from `pulled_at` so an existing model
@@ -921,7 +921,7 @@ impl Store {
                     [],
                 )?;
             }
-            // v6→v7: bench_history grew HTTP-lane columns (kind + probe
+            // v6->v7: bench_history grew HTTP-lane columns (kind + probe
             // metrics). Fresh databases get them from SCHEMA_SQL; v6
             // databases take additive ALTERs and keep every legacy row
             // (NULL metrics mark rows the llama-bench lane wrote).
@@ -955,44 +955,44 @@ impl Store {
             // discipline). The index deliberately does NOT live in
             // SCHEMA_SQL (same pattern as idx_responses_conversation
             // above): on an upgrade database the batch runs before this
-            // block, and legacy stores can hold double-active flags —
+            // block, and legacy stores can hold double-active flags -
             // CREATE UNIQUE INDEX would abort the batch before the
             // repair inside could clean them. Repair keeps the row
             // heal_active_engine would pick (llamacpp first, then
-            // mistral.rs/sglang, newest within the kind — rank mirrored
+            // mistral.rs/sglang, newest within the kind - rank mirrored
             // from there; keep the two in step); all-lazy actives demote
             // to zero-active, the same state heal lands on for an
             // audio-only box. Repair + index + stamp share one
             // transaction: a mid-failure rolls back and the next
             // open retries the whole step.
             self.migrate_v14_one_active_engine()?;
-            // v18→v19: `spec_receipts` provenance columns are ALTERs on
+            // v18->v19: `spec_receipts` provenance columns are ALTERs on
             // an existing table (fresh stores get them from SCHEMA_SQL
             // and the guards below no-op); the optimization-ledger
-            // tables are CREATE-IF-NOT-EXISTS in SCHEMA_SQL — replay
+            // tables are CREATE-IF-NOT-EXISTS in SCHEMA_SQL - replay
             // covers them.
             self.migrate_v19_spec_provenance()?;
         }
-        // v15→v16: `model_modalities` (engine-advertised output
+        // v15->v16: `model_modalities` (engine-advertised output
         // modalities, e.g. llama-server's architecture object marking
         // native decision models) is CREATE-TABLE-IF-NOT-EXISTS in
-        // SCHEMA_SQL — nothing more to do here; the version bump
+        // SCHEMA_SQL - nothing more to do here; the version bump
         // replays the batch on existing stores.
-        // v16→v17: `spec_receipts` (spec-race verdicts) is likewise
-        // CREATE-TABLE-IF-NOT-EXISTS in SCHEMA_SQL — replay covers it.
-        // v17→v18: `usage_daily` (usage rollups) same replay story.
-        // v18→v19: see `migrate_v19_spec_provenance` — replay covers
+        // v16->v17: `spec_receipts` (spec-race verdicts) is likewise
+        // CREATE-TABLE-IF-NOT-EXISTS in SCHEMA_SQL - replay covers it.
+        // v17->v18: `usage_daily` (usage rollups) same replay story.
+        // v18->v19: see `migrate_v19_spec_provenance` - replay covers
         // the new ledger tables; the receipt ALTERs live there.
         Ok(())
     }
 
     /// v13: knowledge-graph evidence axes. Every measurement
     /// table gains nullable axis columns so a row is self-contained
-    /// (model × engine × quant × hw), independent of joins against
+    /// (model x engine x quant x hw), independent of joins against
     /// `models` (which a later `blazar rm` would break). Fresh
     /// databases get them from `SCHEMA_SQL`; existing stores take
     /// additive ALTERs. No backfill: rows written before v13 keep
-    /// `NULL` axes — honest unknowns, never guessed.
+    /// `NULL` axes - honest unknowns, never guessed.
     fn migrate_v13_evidence_axes(&self) -> CoreResult<()> {
         let caps_cols = self.table_columns("model_caps")?;
         if !caps_cols.contains(&"quant".to_string()) {
@@ -1033,7 +1033,7 @@ impl Store {
     }
 
     /// v14: repair legacy overlapping `active` flags, then create the
-    /// `one_active_engine` partial unique index — all in ONE transaction
+    /// `one_active_engine` partial unique index - all in ONE transaction
     /// (mid-failure rolls back to v12, the next open retries). The index
     /// lives here instead of `SCHEMA_SQL` on purpose: the schema batch
     /// replays before repair could run, and a `CREATE UNIQUE INDEX` would
@@ -1067,13 +1067,13 @@ impl Store {
                         params![tag],
                     )?;
                     tracing::warn!(
-                        "repaired {active_count} overlapping active engine flags — kept {tag} (heal_active_engine preference)"
+                        "repaired {active_count} overlapping active engine flags - kept {tag} (heal_active_engine preference)"
                     );
                 }
                 _ => {
                     v14.execute("UPDATE engines SET active = 0", [])?;
                     tracing::warn!(
-                        "repaired {active_count} overlapping active engine flags — all lazy lanes; store lands at zero-active until the next heal"
+                        "repaired {active_count} overlapping active engine flags - all lazy lanes; store lands at zero-active until the next heal"
                     );
                 }
             }
@@ -1091,12 +1091,12 @@ impl Store {
     }
 
     /// v19: `spec_receipts` grows the provenance axes the supervisor
-    /// needs before trusting a receipt — which hardware produced it,
+    /// needs before trusting a receipt - which hardware produced it,
     /// which exact knobs the race ran, whether those knobs were
     /// deliberately tuned or engine defaults, and how many repetitions
     /// back the number. Additive ALTERs for pre-v19 stores; fresh ones
     /// carry the columns from SCHEMA_SQL. No backfill: tuned defaults
-    /// to 0 because every pre-v19 ngram arm raced engine defaults —
+    /// to 0 because every pre-v19 ngram arm raced engine defaults -
     /// an honest unknown, never a guessed provenance.
     fn migrate_v19_spec_provenance(&self) -> CoreResult<()> {
         let cols = self.table_columns("spec_receipts")?;
@@ -1119,7 +1119,7 @@ impl Store {
 
     // ---- durable jobs (v8) -------------------------------------------
 
-    /// Insert a job row plus its `created` event in one transaction — a
+    /// Insert a job row plus its `created` event in one transaction - a
     /// crash between the two must never leave an event-less job.
     pub fn insert_job(&self, job: &JobRow) -> CoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -1149,7 +1149,7 @@ impl Store {
     }
 
     /// Transition a job's state (and terminal payload/error). Returns
-    /// `false` when no such job row exists — callers decide whether that
+    /// `false` when no such job row exists - callers decide whether that
     /// is a 404 or an in-memory-only straggler.
     pub fn set_job_state(
         &self,
@@ -1159,7 +1159,7 @@ impl Store {
         error: Option<&str>,
     ) -> CoreResult<bool> {
         // One-way close: only a still-open row (queued/running) may flip
-        // state. First terminal state wins — a cancelled row can never be
+        // state. First terminal state wins - a cancelled row can never be
         // silently resurrected to completed by a late racer (e.g. a
         // doctor/audio task that outlived its cancel).
         let n = self.conn.execute(
@@ -1174,7 +1174,7 @@ impl Store {
     /// `DELETE /v1/videos/{id}`): flips `completed`/`failed` rows to
     /// `cancelled` and drops the stored result/error so the render is no
     /// longer servable. Deliberately narrower than `set_job_state`'s
-    /// one-way close — that invariant still holds (open rows can only be
+    /// one-way close - that invariant still holds (open rows can only be
     /// closed once); this only narrows from an already-terminal state,
     /// which nothing else may do. Returns `false` when the row is open,
     /// already cancelled, or missing.
@@ -1319,12 +1319,12 @@ impl Store {
     }
 
     /// Boot-time honesty sweep: every job still `queued`/`running` whose
-    /// `updated_at` predates `cutoff_unix` belonged to a dead gateway —
+    /// `updated_at` predates `cutoff_unix` belonged to a dead gateway -
     /// mark it `abandoned` with a teaching error and an event. Two callers,
     /// two cutoffs: at boot the cutoff is `now - grace` (the grace window
     /// keeps a concurrently-live second daemon from reaping the other's
     /// fresh work), and a delayed second pass cuts at this daemon's start
-    /// time — catching rows whose last update fell inside the grace window
+    /// time - catching rows whose last update fell inside the grace window
     /// (killed less than `grace` before boot) which the first pass
     /// deliberately spared. This daemon's own jobs always have
     /// `updated_at >= its start`, so live work is never reaped.
@@ -1340,7 +1340,7 @@ impl Store {
         let now = unix_now();
         for id in &swept {
             self.conn.execute(
-                "UPDATE jobs SET state = 'abandoned', error = 'gateway restarted while the job was in flight — resubmit to rerun; completed artifacts were kept', updated_at = ?2 WHERE id = ?1",
+                "UPDATE jobs SET state = 'abandoned', error = 'gateway restarted while the job was in flight - resubmit to rerun; completed artifacts were kept', updated_at = ?2 WHERE id = ?1",
                 params![id, now],
             )?;
             self.conn.execute(
@@ -1354,7 +1354,7 @@ impl Store {
     /// Bounded retention: terminal jobs older than `older_than_secs`
     /// (and their events) are deleted, and the artifact paths of the
     /// deleted rows are returned so the caller can remove the spilled
-    /// files — the store owns the rows, not the disk. Called at boot —
+    /// files - the store owns the rows, not the disk. Called at boot -
     /// the table must not grow forever (and neither may the spill dir).
     pub fn prune_jobs(&self, older_than_secs: i64) -> CoreResult<(u64, Vec<String>)> {
         let cutoff = unix_now() - older_than_secs.max(0);
@@ -1456,7 +1456,7 @@ impl Store {
     }
 
     /// Every visible stored response grouped under `conversation`, oldest
-    /// first — the listing behind `GET /v1/conversations/{id}`. `owner`
+    /// first - the listing behind `GET /v1/conversations/{id}`. `owner`
     /// scopes the rows to the calling key; legacy NULL-owner rows stay
     /// visible to every caller (BLZ-1).
     pub fn list_conversation(
@@ -1485,7 +1485,7 @@ impl Store {
     }
 
     /// Prune the visible responses in `conversation` (DELETE endpoint).
-    /// With `owner`, only that key's rows go — a mixed-owner conversation
+    /// With `owner`, only that key's rows go - a mixed-owner conversation
     /// is deleted piecemeal, mirroring the row-level visibility contract.
     /// Returns the number of rows removed so the API can say what it did.
     pub fn delete_conversation(&self, conversation: &str, owner: Option<&str>) -> CoreResult<u64> {
@@ -1511,7 +1511,7 @@ impl Store {
 
     /// Persist (or overwrite) the slim card for a completion created
     /// with `metadata`. Prunes beyond the cap in the same transaction
-    /// window — a card that ages out simply stops being updatable, which
+    /// window - a card that ages out simply stops being updatable, which
     /// the update endpoint teaches.
     pub fn put_completion_card(&self, card: &CompletionCardRow) -> CoreResult<()> {
         self.conn.execute(
@@ -1541,7 +1541,7 @@ impl Store {
 
     /// Update only the metadata of an existing card. `Ok(None)` = no
     /// card under this id (never created with metadata, streamed,
-    /// expired, or pruned) — the caller turns that into the teaching 404.
+    /// expired, or pruned) - the caller turns that into the teaching 404.
     pub fn update_completion_card(
         &self,
         id: &str,
@@ -1613,7 +1613,7 @@ impl Store {
 
     /// v13 axes-bearing variant: upserts the cert with its evidence axes.
     /// Upsert semantics: a re-write with empty axes deliberately clears
-    /// the axis columns — the row IS the latest measurement, and stale
+    /// the axis columns - the row IS the latest measurement, and stale
     /// axes from an older write must not survive a newer one.
     pub fn put_model_caps_with_axes(
         &self,
@@ -1634,7 +1634,7 @@ impl Store {
     }
 
     /// Exact-pair read for evidence accumulation: `(tested_at, caps_json)`
-    /// for one `(model, engine_tag)` — deliberately NOT latest-wins. A
+    /// for one `(model, engine_tag)` - deliberately NOT latest-wins. A
     /// certificate from a different lane is not prior evidence for this
     /// lane, so the caller must ask for the pair it is about to write.
     pub fn get_model_caps_pair(
@@ -1655,7 +1655,7 @@ impl Store {
 
     pub fn get_model_caps(&self, model: &str) -> CoreResult<Option<(String, String)>> {
         // Latest verification wins: certs are keyed (model, engine_tag),
-        // so a model served by two lanes carries two rows — admission
+        // so a model served by two lanes carries two rows - admission
         // and scorecards must read the most recent measurement, not
         // whichever row SQLite happens to return first.
         self.conn
@@ -1672,7 +1672,7 @@ impl Store {
             })
     }
 
-    /// Same record as [`get_model_caps`] with its `tested_at` epoch stamp —
+    /// Same record as [`get_model_caps`] with its `tested_at` epoch stamp -
     /// scorecards cite the verification date, so it travels with the caps.
     pub fn get_model_caps_dated(&self, model: &str) -> CoreResult<Option<(String, i64, String)>> {
         self.get_model_caps_dated_with_axes(model)
@@ -1755,7 +1755,7 @@ impl Store {
         Ok(())
     }
 
-    /// Latest plain-bench payload for a model — `engine_tag = Some`
+    /// Latest plain-bench payload for a model - `engine_tag = Some`
     /// pins the lane, `None` takes the most recent across lanes.
     pub fn latest_bench_result(
         &self,
@@ -1817,7 +1817,7 @@ impl Store {
             })
     }
 
-    /// Every plain-bench payload on record — one query for the console's
+    /// Every plain-bench payload on record - one query for the console's
     /// Benchmarks view instead of a per-model lookup per row.
     pub fn list_bench_results(&self) -> CoreResult<Vec<BenchResultRow>> {
         let mut stmt = self.conn.prepare(
@@ -1842,7 +1842,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// Every tuned launch profile on record — pairs with
+    /// Every tuned launch profile on record - pairs with
     /// `list_bench_results` to show measured vs tuned per model + lane.
     pub fn list_profiles(&self) -> CoreResult<Vec<ProfileRow>> {
         let mut stmt = self.conn.prepare(
@@ -1869,7 +1869,7 @@ impl Store {
     }
 
     /// Engine-row upsert statement. The conflict-update deliberately
-    /// ignores `active`: row refreshes never move the serving flag —
+    /// ignores `active`: row refreshes never move the serving flag -
     /// only `set_active_engine` (and boot heal) do.
     const UPSERT_ENGINE_SQL: &str =
         "INSERT INTO engines (tag, asset, sha256, installed_at, active, manifest, kind)
@@ -1884,16 +1884,16 @@ impl Store {
         // row a database impossibility, so an active upsert must demote
         // every OTHER row in the same transaction as the write (a crash
         // between the two would otherwise land the store at zero-active
-        // — the exact F120 class set_active_engine already guards).
+        // - the exact F120 class set_active_engine already guards).
         if e.active {
             let tx = self.conn.unchecked_transaction()?;
             // Demote others only when this write actually claims the
             // active slot: a NEW row (INSERT path), or a row that
-            // already holds the flag (cleanup no-op — the demote's
+            // already holds the flag (cleanup no-op - the demote's
             // `tag != ?` excludes it). A conflict-update on an INACTIVE
             // row ignores `active` by contract above, so demoting
             // others there would strand the store at zero-active for
-            // nothing — skip it and keep today's end state.
+            // nothing - skip it and keep today's end state.
             let already_inactive = tx
                 .query_row(
                     "SELECT active FROM engines WHERE tag = ?1",
@@ -1938,9 +1938,9 @@ impl Store {
     }
 
     /// Flip the active engine. Fails (changing nothing) when `tag` is not
-    /// installed — never silently leaves the store with zero active engines.
+    /// installed - never silently leaves the store with zero active engines.
     pub fn set_active_engine(&self, tag: &str) -> CoreResult<()> {
-        // F120: both UPDATEs inside one transaction — a crash between
+        // F120: both UPDATEs inside one transaction - a crash between
         // them used to leave the store with ZERO active engines.
         let tx = self.conn.unchecked_transaction()?;
         let exists: bool = tx
@@ -1962,7 +1962,7 @@ impl Store {
     /// Boot-time self-heal for the active flag. Two states heal:
     ///
     /// 1. Lazy-active: the flagged row is an audio lane (whisper, piper)
-    ///    that a pre-guard store flipped on — a text boot over that
+    ///    that a pre-guard store flipped on - a text boot over that
     ///    store picks no adapter and dies. Demote it, then fall through
     ///    to the pick (an audio-only box lands at zero-active, its
     ///    pre-lane state; serving through `/v1/audio` never read the
@@ -1970,8 +1970,8 @@ impl Store {
     /// 2. Zero-active: no row holds the flag but serving-capable
     ///    engines are installed (the class F120's transaction fixed
     ///    mid-write; an update interrupted before its activation step
-    ///    lands here): activate the best one — llamacpp lanes first
-    ///    (router mode's native lane), newest within the kind — so one
+    ///    lands here): activate the best one - llamacpp lanes first
+    ///    (router mode's native lane), newest within the kind - so one
     ///    stale flag can never brick `serve` while good engines sit
     ///    installed.
     ///
@@ -2026,7 +2026,7 @@ impl Store {
         Ok(())
     }
 
-    /// Kind of a specific engine tag, retired or active — capability
+    /// Kind of a specific engine tag, retired or active - capability
     /// certificates store only the tag, and tags are arbitrary build
     /// strings (`b11370-cuda`, `mlx-0.32.0`); the kind comparison the
     /// certificate gate needs lives here. `None` when the row is gone
@@ -2047,9 +2047,9 @@ impl Store {
     /// Decode-throughput history for one engine lane, oldest first.
     /// llama-bench rows carry the `tg128` median; HTTP-lane rows mirror
     /// their `gen_tps` into the same column (both are decode t/s on the
-    /// lane, and both calibrate the predictor — failed HTTP probes write
+    /// lane, and both calibrate the predictor - failed HTTP probes write
     /// 0.0, which the predictor's positivity filter drops). History for
-    /// deleted models is included — callers join `get_model` for sizes
+    /// deleted models is included - callers join `get_model` for sizes
     /// and skip what is gone.
     /// Every `bench_history` row with a decode-rate reading, oldest first.
     /// Engine updates prune old `engines` rows, so retired tags survive only
@@ -2094,12 +2094,12 @@ impl Store {
                 // An active row the binary cannot parse is treated as
                 // absent: heal_active_engine then claims the slot for
                 // the newest known serving lane instead of bricking
-                // boot. The row itself is never touched — a newer
+                // boot. The row itself is never touched - a newer
                 // binary parses it again.
                 EngineRowRead::UnknownKind { tag, kind } => tracing::warn!(
                     tag = %tag,
                     kind = %kind,
-                    "active engine row kind unknown to this binary — treated as absent, healing picks a known lane"
+                    "active engine row kind unknown to this binary - treated as absent, healing picks a known lane"
                 ),
             }
         }
@@ -2118,7 +2118,7 @@ impl Store {
                 EngineRowRead::UnknownKind { tag, kind } => tracing::warn!(
                     tag = %tag,
                     kind = %kind,
-                    "engine row kind unknown to this binary — quarantined until upgrade"
+                    "engine row kind unknown to this binary - quarantined until upgrade"
                 ),
             }
         }
@@ -2128,7 +2128,7 @@ impl Store {
     /// Roster rows whose kind this binary cannot parse, as `(tag, kind
     /// text)` pairs, for surfaces that teach the upgrade path (doctor).
     /// The rows stay untouched in the store and parse again under a
-    /// newer binary — quarantine is read-side only.
+    /// newer binary - quarantine is read-side only.
     pub fn unknown_kind_engine_rows(&self) -> CoreResult<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines ORDER BY installed_at DESC, rowid DESC",
@@ -2151,7 +2151,7 @@ impl Store {
 
     /// Persist engine-advertised output modalities for a model row
     /// (e.g. `["decisions"]` from llama-server's `architecture`
-    /// object). Overwrites on every child confirmation — the child is
+    /// object). Overwrites on every child confirmation - the child is
     /// the source of truth, the store is the cache.
     pub fn set_model_modalities(&self, model: &str, modalities: &[String]) -> CoreResult<()> {
         let json =
@@ -2213,7 +2213,7 @@ impl Store {
         }
         // `last_used_at = 0` means "never went resident"; a freshly
         // pulled model starts aged at its pull stamp so it is never
-        // instantly "unused" (same semantics the v8→v9 migration
+        // instantly "unused" (same semantics the v8->v9 migration
         // backfills for pre-existing rows).
         let last_used_at = if m.last_used_at == 0 {
             m.pulled_at
@@ -2277,7 +2277,7 @@ impl Store {
     }
 
     /// Stamp `last_used_at = now` for a model going resident (spawn
-    /// admission touch). Returns whether a row was updated — false is a
+    /// admission touch). Returns whether a row was updated - false is a
     /// caller-side curiosity (name vanished mid-flight), not an error.
     pub fn touch_model_used(&self, name: &str) -> CoreResult<bool> {
         let n = self.conn.execute(
@@ -2288,8 +2288,8 @@ impl Store {
     }
 
     /// Map a user-supplied model name onto a store row for ollama
-    /// migrants: exact match first, then a `model:tag` → `model-tag`
-    /// `:`→`-` swap, then a quant-tag fold (`model:tag-q4_K_M` →
+    /// migrants: exact match first, then a `model:tag` -> `model-tag`
+    /// `:`->`-` swap, then a quant-tag fold (`model:tag-q4_K_M` ->
     /// `model-tag`). Returns the input unchanged when nothing matches,
     /// so callers keep their own not-found error text (fail loud, no
     /// hidden rewrite). Shared rule for the CLI boundary and the
@@ -2300,7 +2300,7 @@ impl Store {
     /// The plain colon-swap misses (no row ends in the tag), so as a
     /// LAST resort the ladder strips a trailing quant token from the
     /// swapped form and retries the exact row. The strip only fires
-    /// after every exact form missed — a row that genuinely ends in a
+    /// after every exact form missed - a row that genuinely ends in a
     /// quant token is found before the strip can rewrite it, and an
     /// ambiguity beyond the strip stays the caller's error (this fn
     /// resolves, it never guesses between rows).
@@ -2319,7 +2319,7 @@ impl Store {
         // Ollama migrant names carry the quant as a suffix tag
         // (`qwen3.5:9b-q4_K_M`); when no row keeps that suffix, fold the
         // tag away and try the bare stem. The strip only fires after
-        // every exact form missed — a row genuinely ending in a quant
+        // every exact form missed - a row genuinely ending in a quant
         // token is found by the arms above before this can rewrite it,
         // and unknown tails (e.g. `latest`) never strip, so ambiguity
         // beyond the fold stays the caller's error to raise.
@@ -2370,7 +2370,7 @@ impl Store {
     /// Remove a model's tuned profile row for a lane. The A/B runner
     /// uses this to restore the pre-experiment state on lanes that had
     /// NO tuned profile (baseline = compiled defaults): restore is
-    /// delete-when-absent, upsert-when-present — never a placeholder
+    /// delete-when-absent, upsert-when-present - never a placeholder
     /// row that would masquerade as a tuned profile.
     pub fn delete_profile(&self, model: &str, engine_tag: &str) -> CoreResult<()> {
         self.conn.execute(
@@ -2381,7 +2381,7 @@ impl Store {
     }
 
     /// Upsert one spec-race receipt. Keyed (model, `engine_tag`, mode):
-    /// the latest measurement of a mode replaces the previous one — a
+    /// the latest measurement of a mode replaces the previous one - a
     /// receipt is "current truth for this hardware", not an audit log.
     /// `prov` carries the provenance axes (hw fingerprint, exact knobs,
     /// tuned flag, repetitions) that make the receipt trustworthy.
@@ -2662,7 +2662,7 @@ impl Store {
     }
 
     /// Overwrite one day's counters for a batch of keys (absolute values,
-    /// not deltas — the gateway holds the live counters and writes the
+    /// not deltas - the gateway holds the live counters and writes the
     /// whole day-state behind). One transaction per batch.
     pub fn set_key_usage_day(&self, day: &str, rows: &[(String, u64, u64)]) -> CoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -2686,7 +2686,7 @@ impl Store {
     }
 
     /// Add a whole flush-batch of per-model usage deltas in ONE
-    /// transaction — the gateway's meter hands every drained bucket
+    /// transaction - the gateway's meter hands every drained bucket
     /// here per tick. All-or-nothing on purpose: a mid-batch failure
     /// must leave the day-rows untouched so the caller can requeue the
     /// entire batch and retry next tick without double-counting.
@@ -2731,7 +2731,7 @@ impl Store {
     }
 
     /// Register one optimization experiment (immutable identity row)
-    /// and return its id. Lifecycle NEVER mutates this row —
+    /// and return its id. Lifecycle NEVER mutates this row -
     /// measurements and transitions land in the append-only
     /// [`Store::append_measurement`] / [`Store::append_event`] tables,
     /// so the audit trail reads as history, not as final state.
@@ -2764,7 +2764,7 @@ impl Store {
     }
 
     /// Append one raw measurement to an experiment (bench grid, gateway
-    /// drive, quality probe — `kind` says which; `metrics_json` is the
+    /// drive, quality probe - `kind` says which; `metrics_json` is the
     /// verbatim numbers).
     pub fn append_measurement(
         &self,
@@ -2783,7 +2783,7 @@ impl Store {
     /// Append one lifecycle transition (`measured` | `adopted` |
     /// `rolled-back` | `rejected` | ...) with its human-readable
     /// justification. The current lifecycle state of an experiment is
-    /// derived from these events — never stored as mutable status.
+    /// derived from these events - never stored as mutable status.
     pub fn append_event(&self, experiment_id: i64, kind: &str, reason: &str) -> CoreResult<()> {
         self.conn.execute(
             "INSERT INTO optimization_events (experiment_id, ts, kind, reason)
@@ -2795,7 +2795,7 @@ impl Store {
 
     /// Point `active_profiles` at the experiment whose verified
     /// candidate the (model, engine) lane is now serving. This pointer
-    /// IS the adoption act — rolling back means re-pointing at the
+    /// IS the adoption act - rolling back means re-pointing at the
     /// previous experiment, whose row and measurements never left.
     pub fn set_active_profile(
         &self,
@@ -2816,7 +2816,7 @@ impl Store {
 
     /// Which ledger experiment the (model, engine_tag) lane currently
     /// serves, and when that pointer moved. `None` when the serving
-    /// profile predates the v19 ledger — the caller reports that
+    /// profile predates the v19 ledger - the caller reports that
     /// honestly instead of inventing provenance.
     pub fn active_profile_of(
         &self,
@@ -2866,7 +2866,7 @@ impl Store {
         }
     }
 
-    /// Every lifecycle event for one experiment, oldest first — the
+    /// Every lifecycle event for one experiment, oldest first - the
     /// audit trail `--apply` checks for a `verified` transition (and
     /// the one a future `--why` lane will replay for operators).
     pub fn list_experiment_events(
@@ -2891,7 +2891,7 @@ impl Store {
 }
 
 /// One immutable `optimization_experiments` row: the candidate's
-/// identity — what was tried, on which lane and hardware, with which
+/// identity - what was tried, on which lane and hardware, with which
 /// exact argv. Lifecycle lives in `optimization_events`, never here.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExperimentRow {
@@ -2950,7 +2950,7 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
     let raw_components: Option<String> = r.get(7)?;
     let components = match raw_components.as_deref() {
         // Empty/NULL predates a pull ever attaching a set; anything else
-        // must decode — a silently-dropped set would re-route the row to
+        // must decode - a silently-dropped set would re-route the row to
         // the text lanes and die at spawn with a confusing crash.
         None | Some("") => Vec::new(),
         Some(raw) => serde_json::from_str(raw).map_err(|e| {
@@ -3021,7 +3021,7 @@ mod tests {
         assert_eq!(upd.metadata_json, r#"{"tag":"eval-43"}"#);
         assert_eq!(upd.updated_at, 1_760_000_900);
 
-        // Unknown id: Ok(None) — the API layer turns this into the
+        // Unknown id: Ok(None) - the API layer turns this into the
         // teaching 404, not a store error.
         assert!(
             s.update_completion_card("chatcmpl-nope", "{}", 1)
@@ -3034,7 +3034,7 @@ mod tests {
     #[test]
     fn integration__completion_card__v11_store_migrates_to_v12() {
         // Simulate a v11 database: completion_cards absent, user_version 11.
-        // (Open a real store first, then drop only the new table — a
+        // (Open a real store first, then drop only the new table - a
         // hand-rolled minimal schema would fool the older-step column
         // backfills the migration also replays.)
         let tmp = tempfile::tempdir().unwrap();
@@ -3098,7 +3098,7 @@ mod tests {
         let (_t, s) = tmp_store();
         s.insert_job(&job_row("job_1", "audio", "queued", 1000))
             .unwrap();
-        // insert_job stamps the 'created' event itself — the story starts with one row.
+        // insert_job stamps the 'created' event itself - the story starts with one row.
         let events = s.job_events("job_1", 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "created");
@@ -3170,7 +3170,7 @@ mod tests {
         assert_eq!(for_gamma.len(), 1, "only the legacy row is shared");
         assert_eq!(for_gamma[0].id, "legacy");
 
-        // Roundtrip: the owner survives insert → get.
+        // Roundtrip: the owner survives insert -> get.
         let got = s.get_job("alpha_job").unwrap().unwrap();
         assert_eq!(got.owner.as_deref(), Some("alpha"));
     }
@@ -3214,10 +3214,10 @@ mod tests {
     fn unit__jobs__boot_sweep_abandons_inflight_with_grace() {
         let (_t, s) = tmp_store();
         let now = unix_now();
-        // Stale in-flight row: last touched an hour ago — must be reaped.
+        // Stale in-flight row: last touched an hour ago - must be reaped.
         s.insert_job(&job_row("old", "audio", "running", now - 3600))
             .unwrap();
-        // Fresh in-flight row: last touched now — a live concurrent daemon
+        // Fresh in-flight row: last touched now - a live concurrent daemon
         // must never be reaped by a second gateway's boot sweep.
         s.insert_job(&job_row("fresh", "audio", "running", now))
             .unwrap();
@@ -3245,11 +3245,11 @@ mod tests {
         let (_t, s) = tmp_store();
         let now = unix_now();
         // Killed moments before boot: survived the grace pass (updated_at
-        // inside the window), but predates the daemon — the late pass
+        // inside the window), but predates the daemon - the late pass
         // with the daemon-start cutoff must reap it.
         s.insert_job(&job_row("zombie", "doctor", "running", now - 3))
             .unwrap();
-        // This daemon's own live work: updated after boot — never reaped,
+        // This daemon's own live work: updated after boot - never reaped,
         // even when a long probe keeps the row silent for minutes.
         s.insert_job(&job_row("live", "doctor", "running", now + 30))
             .unwrap();
@@ -3313,7 +3313,7 @@ mod tests {
         assert_eq!(n, 1);
         assert!(artifacts.is_empty(), "no artifact on this row");
         assert!(s.get_job("ancient").unwrap().is_none());
-        // Events die with their job — no orphans.
+        // Events die with their job - no orphans.
         assert_eq!(s.job_events("ancient", 10).unwrap(), Vec::new());
         // Recent terminal and old-but-in-flight both survive (the sweep owns in-flight).
         assert!(s.get_job("recent").unwrap().is_some());
@@ -3336,7 +3336,7 @@ mod tests {
 
         let (n, artifacts) = s.prune_jobs(7 * 86400).unwrap();
         assert_eq!(n, 1);
-        // Only the pruned row's path comes back — the caller deletes
+        // Only the pruned row's path comes back - the caller deletes
         // exactly those files and nothing else.
         assert_eq!(artifacts, vec!["/tmp/jobs/spilled/result".to_string()]);
     }
@@ -3390,7 +3390,7 @@ mod tests {
             sha256: "x".into(),
             installed_at: at,
             active,
-            // Manifest JSON is opaque at this layer — the runtime layer
+            // Manifest JSON is opaque at this layer - the runtime layer
             // parses it; heal only reads kind/active/installed_at.
             manifest: "{}".into(),
             kind,
@@ -3401,7 +3401,7 @@ mod tests {
     fn unit__heal_active_engine__demotes_lazy_active_and_picks_text_lane() {
         let (_t, s) = tmp_store();
         // The pre-guard incident shape: a whisper row holds the serving
-        // flag while text lanes sit installed — a text boot over this
+        // flag while text lanes sit installed - a text boot over this
         // store would pick no adapter and die.
         s.upsert_engine(&engine_row("b5130", 5000, true, EngineKind::Whisper))
             .unwrap();
@@ -3577,7 +3577,7 @@ mod tests {
         )
         .unwrap();
         // The exact pair returns ITS OWN row even though lane-b is newer
-        // (latest-wins would hand back lane-b — wrong for evidence
+        // (latest-wins would hand back lane-b - wrong for evidence
         // accumulation, where a different lane is not prior evidence).
         let (tested_at, caps_json) = s
             .get_model_caps_pair("m1", "lane-a")
@@ -3655,7 +3655,7 @@ mod tests {
     #[test]
     fn unit__store_schema_upgrades__v15_to_v16_modalities() {
         // Simulate a v15 database: no model_modalities table,
-        // user_version 15 — the shape every pre-decisions-discovery
+        // user_version 15 - the shape every pre-decisions-discovery
         // store has. Reopen replays SCHEMA_SQL (IF NOT EXISTS) and
         // stamps 16; modalities writes round-trip on the upgraded
         // store, and the second reopen proves the presence-gated no-op.
@@ -3733,7 +3733,7 @@ mod tests {
     #[test]
     fn unit__store_schema_upgrades__v16_to_v17_spec_receipts() {
         // Simulate a v16 database: no spec_receipts table,
-        // user_version 16 — the shape every pre-F2 store has. Reopen
+        // user_version 16 - the shape every pre-F2 store has. Reopen
         // replays SCHEMA_SQL (IF NOT EXISTS) and stamps 17; a receipt
         // write round-trips on the upgraded store, and the second
         // reopen proves the presence-gated no-op.
@@ -3795,7 +3795,7 @@ mod tests {
         // columns, no ledger tables, user_version 18. Reopen replays
         // SCHEMA_SQL (creates the ledger tables), the guarded ALTERs
         // add the receipt columns, and the stamp lands at 19. A
-        // pre-existing receipt must read back tuned=false / reps=1 —
+        // pre-existing receipt must read back tuned=false / reps=1 -
         // every pre-v19 ngram arm raced engine defaults, and the
         // default says so honestly.
         let tmp = tempfile::tempdir().unwrap();
@@ -3905,7 +3905,7 @@ mod tests {
             requests: req,
             ..UsageDelta::default()
         };
-        // Two buckets in one batch, one of them twice — the batch tx
+        // Two buckets in one batch, one of them twice - the batch tx
         // must accumulate exactly like N sequential single deltas.
         let batch = vec![
             (20261101, "a".to_string(), d(10, 1)),
@@ -4074,7 +4074,7 @@ mod tests {
     #[test]
     fn unit__store_schema_upgrades__v17_to_v18_usage_daily() {
         // Simulate a v17 database: no usage_daily table, user_version
-        // 17 — every pre-F4 store's shape. Reopen replays SCHEMA_SQL
+        // 17 - every pre-F4 store's shape. Reopen replays SCHEMA_SQL
         // and stamps 18; a usage delta round-trips on the upgraded
         // store, and the second reopen proves the no-op path.
         let tmp = tempfile::tempdir().unwrap();
@@ -4123,7 +4123,7 @@ mod tests {
     #[test]
     fn unit__store_schema_upgrades__v14_to_v15() {
         // Simulate a v14 database: jobs and responses without the BLZ-1
-        // `owner` columns, user_version 14 — the exact shape every store
+        // `owner` columns, user_version 14 - the exact shape every store
         // upgraded from v0.26.0 has. (The live repro: a v14 store skipped
         // the whole migration block, so every owner INSERT failed and the
         // model-doctor poll 404'd.)
@@ -4233,7 +4233,7 @@ mod tests {
                 .unwrap();
         }
         // Reopen: migrate() adds the axes columns, keeps legacy rows with
-        // NULL axes (honest — axes capture starts at v13), stamps the
+        // NULL axes (honest - axes capture starts at v13), stamps the
         // current schema version. A second reopen proves the ALTERs are
         // presence-gated no-ops.
         for _ in 0..2 {
@@ -4317,7 +4317,7 @@ mod tests {
             .unwrap();
         assert_eq!(active, "b");
         // Conflict-reupsert of the demoted 'a' with active=true: the row
-        // exists and is inactive — the guard skips the demote so 'b'
+        // exists and is inactive - the guard skips the demote so 'b'
         // stays active, and the conflict-update itself ignores active.
         s.upsert_engine(&engine_row("a", 30, true, EngineKind::LlamaCpp))
             .unwrap();
@@ -4333,7 +4333,7 @@ mod tests {
         // Simulate a v12 database with two active engines (possible only
         // via legacy writers predating the index): migration repairs to a
         // single active engine picked with heal_active_engine's
-        // preference — lane rank beats installed_at, so the older
+        // preference - lane rank beats installed_at, so the older
         // llamacpp lane wins over the newer whisper lane.
         let tmp = tempfile::tempdir().unwrap();
         let dirs = BlazarDirs {
@@ -4369,7 +4369,7 @@ mod tests {
             .conn()
             .execute("UPDATE engines SET active = 1 WHERE tag = 'old-w'", []);
         assert!(dup.is_err());
-        // Reopen is idempotent — nothing left to repair or create.
+        // Reopen is idempotent - nothing left to repair or create.
         drop(s);
         let s = Store::open(&dirs).unwrap();
         let v: i32 = s
@@ -4382,7 +4382,7 @@ mod tests {
     #[test]
     fn unit__store_schema_upgrades__v12_all_lazy_lands_zero_active() {
         // Overlapping actives with no text lane: migration demotes all of
-        // them, matching what heal_active_engine would decide — the store
+        // them, matching what heal_active_engine would decide - the store
         // stays at zero-active until the next heal picks a lane.
         let tmp = tempfile::tempdir().unwrap();
         let dirs = BlazarDirs {
@@ -4439,7 +4439,7 @@ mod tests {
             .unwrap();
         assert_eq!(read, axes);
         // Upsert semantics: a later write with empty axes overwrites the
-        // stored axes — the row IS the latest measurement, not a merge.
+        // stored axes - the row IS the latest measurement, not a merge.
         s.put_bench_result("m1", "lane-a", "[2]").unwrap();
         let (tag, payload, _, empty) = s
             .latest_bench_result_with_axes("m1", None)
@@ -4540,13 +4540,13 @@ mod tests {
 
     #[test]
     fn unit__evidence_axes__fingerprint_format_is_canonical() {
-        // Canonical flat string — the format other code groups by in SQL.
+        // Canonical flat string - the format other code groups by in SQL.
         assert_eq!(
             EvidenceAxes::hw_fingerprint(Some("NVIDIA RTX 4070 Laptop GPU"), Some(8192), "x86_64")
                 .as_deref(),
             Some("gpu=NVIDIA RTX 4070 Laptop GPU|vram_mib=8192|cpu=x86_64")
         );
-        // Missing or blank GPU name → not a fingerprint at all.
+        // Missing or blank GPU name -> not a fingerprint at all.
         assert_eq!(
             EvidenceAxes::hw_fingerprint(None, Some(8192), "x86_64"),
             None
@@ -5015,7 +5015,7 @@ mod tests {
         let row = |name: &str, repo: &str, path: &str| ModelRow {
             name: name.into(),
             repo: repo.into(),
-            quant: "BF16".into(), // unreliable on purpose — never read
+            quant: "BF16".into(), // unreliable on purpose - never read
             path: path.into(),
             bytes: 1,
             sha256: None,
@@ -5040,7 +5040,7 @@ mod tests {
         assert!(row("m-gptq", "r", "/models/m-gptq.d").is_quantized_safetensors());
         assert!(row("m-fp8-dynamic", "r", "/models/m-fp8-dynamic.d").is_quantized_safetensors());
         // Word boundary: 'hawk' embeds awq as a substring but splits
-        // into its own token — stays a normal lane.
+        // into its own token - stays a normal lane.
         assert!(!row("hawk", "r", "/models/hawk.d").is_quantized_safetensors());
         // Plain BF16 dir: the lane mistral.rs serves perfectly.
         assert!(
@@ -5084,7 +5084,7 @@ mod tests {
             "/x"
         ));
         assert!(mlx_signal("m-mlx", "r", "/models/m-mlx.d"));
-        // 'hawkmxl' splits into hawk + mxl — not the mlx token.
+        // 'hawkmxl' splits into hawk + mxl - not the mlx token.
         assert!(!mlx_signal("hawkmxl", "r", "/models/hawkmxl.d"));
 
         // MLX quant layout, no token anywhere: the probe routes it.
@@ -5094,7 +5094,7 @@ mod tests {
         );
         assert!(mlx_signal("renamed-4bit", "someorg/renamed-4bit", &mlx));
 
-        // quant_method present (torchao/AWQ/GPTQ stamps) — NOT mlx.
+        // quant_method present (torchao/AWQ/GPTQ stamps) - NOT mlx.
         let awq = write_cfg(
             "m-awq",
             r#"{"quantization_config":{"bits":4,"group_size":128,"quant_method":"torchao"}}"#,
@@ -5245,7 +5245,7 @@ mod tests {
     fn unit__migrate_v5_db__folds_legacy_component_cols_and_drops_them() {
         // v5 wrote three fixed columns (--vae/--llm/--llm_vision paths).
         // v6 folds them into the flag-keyed components JSON and drops
-        // the legacy columns — FLUX needs --t5xxl/--clip_l, which the
+        // the legacy columns - FLUX needs --t5xxl/--clip_l, which the
         // fixed shape could never carry.
         let tmp = tempfile::tempdir().unwrap();
         let dirs = BlazarDirs {

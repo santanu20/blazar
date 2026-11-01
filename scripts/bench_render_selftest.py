@@ -491,7 +491,7 @@ axes = bm.media_axes_table(
             total_s_max=45.6,
             cold_request_s=57.6,
             note="config knob inert on this box: profiler skipped sage_attn "
-            "(SageAttention requires a CUDA device) — measures the default "
+            "(SageAttention requires a CUDA device) - measures the default "
             "posture",
         ),
     ]
@@ -802,7 +802,7 @@ with tempfile.TemporaryDirectory() as td:
 
 
 # GGUF hf-base-id derivation: mirror of the product's gguf.rs
-# hf_base_model_id — general.basename + general.size_label -> org/repo.
+# hf_base_model_id - general.basename + general.size_label -> org/repo.
 # Synthetic GGUF v2 header (magic, version, tensor_count, kv_count, kvs).
 def _synthetic_gguf(kvs: list[tuple[str, str]]) -> bytes:
     out = bytearray(b"GGUF")
@@ -859,7 +859,7 @@ with tempfile.TemporaryDirectory() as td:
     print("load_done attempts cap: ok/1-err/2-err/3-err OK")
 
 # manifest_flags: gateway-routed engines gate variant axes on the
-# product's probed manifest flags — json parse keeps only long flags,
+# product's probed manifest flags - json parse keeps only long flags,
 # missing manifest / missing db degrade to the empty set
 with tempfile.TemporaryDirectory() as td:
     con = _sq.connect(Path(td) / "blazar.db")
@@ -928,7 +928,7 @@ assert "# not a heading" in _demoted, "fence content must stay untouched"
 print("demote_headings: heading shift + fence immunity OK")
 
 # latest_engine_tags: latest-per-kind selection mirrors the store's
-# active-engine ranking — highest installed_at wins, ties break to the
+# active-engine ranking - highest installed_at wins, ties break to the
 # youngest row (rowid), mirroring list_engines' installed_at DESC, rowid DESC.
 with tempfile.TemporaryDirectory() as td:
     dbp = Path(td) / "blazar.db"
@@ -1180,7 +1180,7 @@ with tempfile.TemporaryDirectory() as td:
     # captions carry provenance + source pointer
     joined = " ".join(c for _, _, c in ch1)
     assert "camp-a/cells.jsonl" in joined, "caption must cite the campaign receipt"
-    # ppl panel: KV-quant bars, ± ppl_error whiskers, f16 dashed baseline,
+    # ppl panel: KV-quant bars, +/- ppl_error whiskers, f16 dashed baseline,
     # lower-is-better, and the cross-rung incomparability caveat
     ppl_svg = (a1 / "plots" / "ppl-kv.svg").read_text()
     assert "KV-cache quantization perplexity" in ppl_svg, "ppl title missing"
@@ -1273,7 +1273,7 @@ with tempfile.TemporaryDirectory() as td:
     pub = out.read_text()
     # charts passthrough: a pre-rendered chart set must embed unchanged
     # (campaign main() renders once and hands the same list to both
-    # writers) — plot bytes stay identical, no re-render occurs
+    # writers) - plot bytes stay identical, no re-render occurs
     plots_before = {
         f.name: f.read_bytes() for f in sorted((art / "plots").glob("*.svg"))
     }
@@ -1688,7 +1688,7 @@ with tempfile.TemporaryDirectory() as td:
 print("quality charts: suites/parity/config svg + determinism + skip OK")
 
 # probe_tools_once: transport failure (daemon down) must surface as an
-# OUTCOME (contract), never an exception — pinned after a down-daemon run
+# OUTCOME (contract), never an exception - pinned after a down-daemon run
 # crashed the whole campaign at the tools-ollama lane.
 _dead = bm.probe_tools_once(bm.free_port(), "qwen3.5:9b", "ping")
 assert _dead.get("status") is None and str(_dead.get("error_body", "")).startswith(

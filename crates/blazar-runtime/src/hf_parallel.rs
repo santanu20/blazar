@@ -10,12 +10,12 @@
 //!   to the classic lane verbatim),
 //! * engages only for totals >= `MIN_PARALLEL_BYTES` and `connections > 1`,
 //! * writes fixed-position chunks (`write_at`) into a preallocated `.part`,
-//!   so a failed chunk is simply re-fetched — never a wrong-offset write,
+//!   so a failed chunk is simply re-fetched - never a wrong-offset write,
 //! * persists a `.part.progress` sidecar ledger at BYTE granularity: the
 //!   completed chunks plus the verified prefix of every in-flight chunk
 //!   (per-chunk counters, snapshotted ~1 Hz by the coordinator, seeded the
 //!   moment the lane engages). An interrupt at any point therefore resumes
-//!   from the last snapshot instead of restarting the file — whole-chunk
+//!   from the last snapshot instead of restarting the file - whole-chunk
 //!   bookkeeping alone loses everything until a chunk (8-128 MiB) lands,
 //!   which uniform spreading defers until the download is nearly done.
 //! * guards against upstream changes: sidecar `url`/`total` mismatch
@@ -58,7 +58,7 @@ const SIDECAR_SNAPSHOT_CADENCE: Duration = Duration::from_secs(1);
 /// CDN throttle bursts last minutes, not milliseconds: the budget spans
 /// ~100s of backoff so one rough window no longer kills a multi-GiB pull.
 const CHUNK_ATTEMPTS: u32 = 6;
-/// Backoff between chunk attempts: 500ms * 4^n (500ms -> 2s -> 8s -> …)
+/// Backoff between chunk attempts: 500ms * 4^n (500ms -> 2s -> 8s -> ...)
 /// capped at 30s. A seconds-form `Retry-After` on a failed response is
 /// honored instead, clamped to [1s, 120s] so a hostile or absurd header
 /// can neither busy-loop nor stall the pull.
@@ -72,7 +72,7 @@ pub(crate) struct ChunkPlan {
 
 /// Chunk sizing: aim for `connections` evenly sized chunks, clamped to
 /// [MIN, MAX] chunk bytes. Clamping may yield fewer chunks than requested
-/// connections — that is fine, extra workers simply exit.
+/// connections - that is fine, extra workers simply exit.
 pub(crate) fn chunk_plan(total: u64, connections: u32) -> ChunkPlan {
     let conns = u64::from(connections.max(1));
     let target = total
@@ -87,7 +87,7 @@ pub(crate) fn chunk_plan(total: u64, connections: u32) -> ChunkPlan {
 }
 
 /// Strict `Content-Range: bytes 0-0/<total>` parse for the probe response:
-/// the range part must echo the exact single-byte probe unit — anything
+/// the range part must echo the exact single-byte probe unit - anything
 /// else means the server ignored the Range semantics.
 fn probe_total(content_range: Option<&str>) -> Option<u64> {
     let v = content_range?;
@@ -151,7 +151,7 @@ fn load_sidecar(part: &Path) -> io::Result<Option<ProgressSidecar>> {
 /// 4. fsync the parent dir so the rename itself survives power loss.
 ///
 /// The fsync steps are best-effort: on filesystems where sync is refused
-/// (e.g. read-only mounts of the data dir) we warn and keep downloading —
+/// (e.g. read-only mounts of the data dir) we warn and keep downloading -
 /// the resume guarantee then degrades to the pre-sync window, which is the
 /// same behavior this lane had before ordered persistence existed.
 fn store_sidecar(part: &Path, sidecar: &ProgressSidecar) -> io::Result<()> {
@@ -159,7 +159,7 @@ fn store_sidecar(part: &Path, sidecar: &ProgressSidecar) -> io::Result<()> {
     let tmp = path.with_extension("progress.tmp");
 
     // .create(true): the first seed call can run before preallocation
-    // has created the .part — syncing a just-created empty file is
+    // has created the .part - syncing a just-created empty file is
     // harmless and keeps this warn for real fs refusals only.
     // .truncate(false) is explicit: an in-progress .part must never be
     // wiped by the fsync helper.
@@ -251,7 +251,7 @@ pub(crate) async fn try_parallel(
             return Ok(None);
         }
         tracing::info!(
-            "orphaned full-length .part without sidecar — re-fetching all chunks in place: {}",
+            "orphaned full-length .part without sidecar - re-fetching all chunks in place: {}",
             part.display()
         );
     }
@@ -427,7 +427,7 @@ async fn execute_chunks(
         partial: ledger.partial,
     };
     // ChunkDone paints alone would leave the bar frozen for a full chunk
-    // (up to MAX_CHUNK_BYTES of silence — minutes on a throttled CDN), which
+    // (up to MAX_CHUNK_BYTES of silence - minutes on a throttled CDN), which
     // reads as a dead download. A 250 ms heartbeat paints the live byte
     // counter between chunk completions; first tick delayed so a fast chunk
     // still paints from its own message.
@@ -491,7 +491,7 @@ async fn execute_chunks(
     }
     if done_count != cp.chunk_count {
         return Err(anyhow!(
-            "parallel download ended with {}/{} chunks — .part kept for resume",
+            "parallel download ended with {}/{} chunks - .part kept for resume",
             done_count,
             cp.chunk_count
         ));
@@ -597,7 +597,7 @@ fn resume_state(
             // No sidecar: fresh download, or an orphaned full-length
             // preallocation whose allocation we keep (every chunk is
             // re-fetched at fixed offsets either way). A short classic
-            // partial never reaches here — try_parallel routes it to
+            // partial never reaches here - try_parallel routes it to
             // the classic lane before we run.
         }
         Err(_) => return Ok(None),
@@ -608,7 +608,7 @@ fn resume_state(
     let done: std::collections::BTreeSet<u64> = ledger.done.iter().copied().collect();
     // Clamp partials to the chunk layout; drop entries duplicating a done
     // chunk; promote full-length prefixes to done (all their bytes are on
-    // disk — the counter only ever counted completed positional writes).
+    // disk - the counter only ever counted completed positional writes).
     let mut map: std::collections::BTreeMap<u64, u64> = ledger
         .partial
         .into_iter()
@@ -766,7 +766,7 @@ async fn fetch_chunk(
                 Err(e) => {
                     // Mid-body read failure (HF resetting the connection
                     // partway through a chunk): consume it as a retryable
-                    // attempt instead of propagating out of the loop —
+                    // attempt instead of propagating out of the loop -
                     // positional writes make re-fetching the range
                     // overwrite-safe. The response's Retry-After (429/503
                     // bodies often fail this way) paces the next attempt.
@@ -888,7 +888,7 @@ mod tests {
     fn unit__sidecar__persists_even_when_part_fsync_degrades() {
         // Durability ordering must degrade, never fail: a .part that
         // cannot be opened for fsync (here: replaced by a directory)
-        // still gets its ledger written — a lost ledger is the exact
+        // still gets its ledger written - a lost ledger is the exact
         // restart-from-zero bug the sidecar exists to prevent.
         let dir = std::env::temp_dir().join(format!("blazar-sc2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1066,8 +1066,8 @@ mod tests {
     async fn integration__fetch_chunk__mid_body_reset_is_retried() {
         // HF occasionally resets the connection partway through a chunk
         // body ("end of file before message length reached"). The
-        // body-read error must consume a retry attempt — not propagate
-        // out of the attempt loop — and the retried range must land
+        // body-read error must consume a retry attempt - not propagate
+        // out of the attempt loop - and the retried range must land
         // byte-exact, with the progress bar refunded for the partial
         // attempt's bytes.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1133,7 +1133,7 @@ mod tests {
 
     #[tokio::test]
     async fn integration__fetch_chunk__retry_after_header_paces_the_retry() {
-        // A throttled 503 carrying `retry-after: 1` must be retried — and
+        // A throttled 503 carrying `retry-after: 1` must be retried - and
         // the wait must honor the server's pace, not the backoff table.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let payload: Vec<u8> = (0u32..32 * 1024).map(|i| (i % 251) as u8).collect();
@@ -1200,7 +1200,7 @@ mod tests {
     async fn integration__try_parallel__orphaned_full_length_part_refetched() {
         // Sidecar lost after a preallocated failure: the full-length .part
         // must be re-fetched in place by the parallel lane (every chunk,
-        // write_at is idempotent) — never handed down to the classic lane,
+        // write_at is idempotent) - never handed down to the classic lane,
         // whose length-based resume would send `bytes=total-` and 416.
         let payload = Arc::new(write_payload(Path::new(".")));
         let payload_len = payload.len() as u64;
@@ -1328,7 +1328,7 @@ mod tests {
 
         // Seed a sidecar claiming chunk 0 done, with .part preallocated and
         // chunk 0's REAL bytes in place (a sparse hole would fail the final
-        // content check — the lane trusts the sidecar, as it should).
+        // content check - the lane trusts the sidecar, as it should).
         let cp = chunk_plan(payload.len() as u64, 4);
         let sc = ProgressSidecar {
             version: SIDECAR_VERSION,
@@ -1366,7 +1366,7 @@ mod tests {
 
     #[tokio::test]
     // One scenario, three movements: seed a prefix + ledger, resume, and
-    // prove the served ranges skip the banked bytes — splitting it would
+    // prove the served ranges skip the banked bytes - splitting it would
     // hide exactly the cross-movement contract under test.
     #[allow(clippy::too_many_lines)]
     async fn integration__try_parallel__partial_chunk_prefix_is_not_refetched() {
@@ -1490,7 +1490,7 @@ mod tests {
     async fn integration__try_parallel__ledger_exists_from_first_byte() {
         // The other half of the bug: the ledger used to be written only on
         // chunk completion, so an interrupted pull left nothing resumable.
-        // The sidecar must be seeded the moment the lane engages — even a
+        // The sidecar must be seeded the moment the lane engages - even a
         // pull that fails on the very first chunk fetch leaves a ledger.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let payload_len: u64 = 40 * 1024 * 1024; // clears MIN_PARALLEL_BYTES
@@ -1554,7 +1554,7 @@ mod tests {
     async fn integration__execute_chunks__heartbeat_paints_before_first_chunk_completes() {
         // Live incident: a throttled CDN left the bar frozen at "0 B (0s)"
         // for the whole first chunk (minutes) because progress painted only
-        // on ChunkDone — the user read a working download as dead and killed
+        // on ChunkDone - the user read a working download as dead and killed
         // it. Here the server delays every response past the observation
         // window, so ZERO chunks can complete; any paint must come from the
         // heartbeat.

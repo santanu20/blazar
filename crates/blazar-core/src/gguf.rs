@@ -5,7 +5,7 @@
 //!
 //! Extracts exactly what Blazar needs: architecture identity + the fields
 //! the profile compiler and `blazar fit` consume. Anything absent stays
-//! `None` — downstream rules must skip-with-warning, never estimate.
+//! `None` - downstream rules must skip-with-warning, never estimate.
 
 use std::io::Read;
 use std::path::Path;
@@ -15,7 +15,7 @@ use crate::error::{CoreError, CoreResult};
 /// GGUF architectures from the block-diffusion LLM family. llama.cpp's
 /// loader accepts them (so `llama-server` boots the model without the
 /// unknown-architecture error the capability rescue keys on), but no
-/// HTTP server in the family runs the diffusion decode loop — the
+/// HTTP server in the family runs the diffusion decode loop - the
 /// autoregressive loop would emit garbage while appearing healthy.
 /// `llada`/`llada-moe` are mainline today; `llada2` (PR 17454) and
 /// `diffusion-gemma` (PR 24423) are the in-flight additions.
@@ -27,12 +27,12 @@ pub const DIFFUSION_PARADIGM_ARCHS: &[&str] = &["llada", "llada-moe", "llada2", 
 pub struct GgufMeta {
     pub architecture: String,
     pub name: Option<String>,
-    /// `general.basename` — upstream repo id with the size suffix stripped
+    /// `general.basename` - upstream repo id with the size suffix stripped
     /// (`Qwen/Qwen3.5` written as `Qwen_Qwen3.5`). Sole source for the
     /// mistral.rs `--tok-model-id` derivation on repackaged multimodal
     /// GGUFs.
     pub basename: Option<String>,
-    /// `general.size_label` — size tag (`9B`) recombined with `basename`.
+    /// `general.size_label` - size tag (`9B`) recombined with `basename`.
     pub size_label: Option<String>,
     pub block_count: Option<u64>,
     pub context_length: Option<u64>,
@@ -46,11 +46,11 @@ pub struct GgufMeta {
     /// Per-head K width (`{arch}.attention.key_length`). MLA-class models
     /// (`DeepSeek`, `Qwen3.5`) carry a latent width that differs from
     /// `head_dim`; the loader allocates from THIS, so KV math uses it as
-    /// the K width (upper bound — absorbed/FA paths allocate less).
+    /// the K width (upper bound - absorbed/FA paths allocate less).
     pub key_length: Option<u64>,
     /// Per-head V width (`{arch}.attention.value_length`); see `key_length`.
     pub value_length: Option<u64>,
-    /// Scalar `{arch}.attention.sliding_window` — uniform SWA window in
+    /// Scalar `{arch}.attention.sliding_window` - uniform SWA window in
     /// tokens. Alone it proves nothing about WHICH layers are windowed
     /// (gemma-2 alternates windowed/full layers with no metadata trace),
     /// so it only shrinks the KV estimate when paired with
@@ -59,22 +59,22 @@ pub struct GgufMeta {
     /// Per-layer `{arch}.attention.sliding_window` array (0 = that layer is
     /// full attention). Fully explicit, so it alone is provable.
     pub sliding_window_per_layer: Option<Vec<u64>>,
-    /// `{arch}.full_attention_interval` — every Nth layer attends over the
+    /// `{arch}.full_attention_interval` - every Nth layer attends over the
     /// full context, the rest over the sliding window (Qwen3.5-9B ships 4).
     pub full_attention_interval: Option<u64>,
-    /// `{arch}.attention.recurrent_layers` — per-layer boolean array marking
+    /// `{arch}.attention.recurrent_layers` - per-layer boolean array marking
     /// linear-attention (gated-delta/SSM) layers that hold a constant-size
     /// recurrent state instead of a ctx-growing KV cache. Read by upstream
     /// `models/qwen35.cpp`, `qwen3next.cpp`, `qwen4exp.cpp`, `minimax-01.cpp`
     /// via `get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, n_layer_all)`;
     /// entries beyond `block_count` are MTP tail layers, not trunk KV.
     pub recurrent_layers: Option<Vec<bool>>,
-    /// `general.quantized_by` — quantizer identity (e.g. "Unsloth");
+    /// `general.quantized_by` - quantizer identity (e.g. "Unsloth");
     /// consumed by the known-bad-quantizer lint.
     pub quantized_by: Option<String>,
-    /// `general.version` — upstream version string.
+    /// `general.version` - upstream version string.
     pub general_version: Option<String>,
-    /// `{arch}.pooling_type` — present only on embedding-class models
+    /// `{arch}.pooling_type` - present only on embedding-class models
     /// (bert/nomic-bert/...). Drives the `--embeddings` profile rule so
     /// `/v1/embeddings` works without manual flags.
     pub pooling_type: Option<u64>,
@@ -84,17 +84,17 @@ pub struct GgufMeta {
     pub chat_template: Option<String>,
     /// MTP (multi-token-prediction) head layers baked into the weights:
     /// `{arch}.n_predict_layers` (llama.cpp master) or
-    /// `{arch}.nextn_predict_layers` (ollama converter) — both accepted,
+    /// `{arch}.nextn_predict_layers` (ollama converter) - both accepted,
     /// first non-zero wins. Drives the `spec = "auto"` draft-mtp lane;
     /// KV-gated upstream, so tensor-only legacy grafts without the key
     /// report None (the engine could not boot draft-mtp on them either).
     pub mtp_layers: Option<u64>,
-    /// `{arch}.num_loops` — loop architectures (e.g. nanbeige) replay each
-    /// block N times: the loader builds `n_layer` = `block_count` × `num_loops`
-    /// KV-holding layers. Live-verified on nanbeige4.2: 22 blocks × 2
-    /// loops = 44 layers → 5632 MiB f16 KV @ 32768 ctx, exactly 2× the
+    /// `{arch}.num_loops` - loop architectures (e.g. nanbeige) replay each
+    /// block N times: the loader builds `n_layer` = `block_count` x `num_loops`
+    /// KV-holding layers. Live-verified on nanbeige4.2: 22 blocks x 2
+    /// loops = 44 layers -> 5632 MiB f16 KV @ 32768 ctx, exactly 2x the
     /// block-only estimate. Clamped 1..=8 at parse; absent = 1. Only the
-    /// dense per-block token math scales with it — per-layer arrays
+    /// dense per-block token math scales with it - per-layer arrays
     /// (recurrent/swa) count physical layers and stay unscaled.
     pub num_loops: Option<u32>,
 }
@@ -130,7 +130,7 @@ const HYBRID_LINEAR_ARCHS: &[&str] = &[
 
 /// Architectures proven to interpret `full_attention_interval` as
 /// recurrent-layer spacing: every `(i + 1) % interval == 0` trunk layer is
-/// full attention, the rest are recurrent (gated delta net) — NOT windowed
+/// full attention, the rest are recurrent (gated delta net) - NOT windowed
 /// SWA. Sources: vendored `models/qwen35.cpp:17-24`, `qwen3next.cpp:17-24`,
 /// `qwen4exp.cpp:128-136`, `minimax-01.cpp:12-19` (interval fallback loop).
 /// Other hybrid archs reading interval differently are deliberately absent:
@@ -166,7 +166,7 @@ impl GgufMeta {
 
     /// Attention layout class by architecture name (upstream lists, see the
     /// const docs). Unknown architectures classify as [`AttentionClass::Full`]
-    /// — the conservative default that keeps the whole-block KV estimate.
+    /// - the conservative default that keeps the whole-block KV estimate.
     #[must_use]
     pub fn attention_class(&self) -> AttentionClass {
         if RECURRENT_ARCHS.contains(&self.architecture.as_str()) {
@@ -180,15 +180,15 @@ impl GgufMeta {
 
     /// Provable count of trunk layers that hold a ctx-growing KV cache.
     /// When the recurrent/full split is NOT provable from metadata this
-    /// returns `Some(block_count)` — the conservative all-layers assumption
+    /// returns `Some(block_count)` - the conservative all-layers assumption
     /// callers fall back to; see [`Self::recurrent_split_provable`] to
     /// distinguish the two.
     ///
     /// Precedence: an explicit `recurrent_layers` array (trunk = first
     /// `block_count` entries; a longer array's tail is MTP layers, outside
     /// trunk KV), else the recurrent-interval formula for the archs proven
-    /// to use it (`blocks / interval`, floor — upstream marks layer i full
-    /// iff `(i + 1) % interval == 0`). A too-short array is ambiguous →
+    /// to use it (`blocks / interval`, floor - upstream marks layer i full
+    /// iff `(i + 1) % interval == 0`). A too-short array is ambiguous ->
     /// `None`.
     #[must_use]
     pub fn full_attn_layers(&self) -> Option<u64> {
@@ -206,7 +206,7 @@ impl GgufMeta {
     /// Whether the recurrent/full-attention layer split is provable from
     /// metadata (explicit array, or the arch-proven interval formula).
     /// Hybrid archs without a provable split keep conservative whole-block
-    /// KV estimates — callers warn on exactly that case.
+    /// KV estimates - callers warn on exactly that case.
     #[must_use]
     pub fn recurrent_split_provable(&self) -> bool {
         self.provable_trunk().is_some()
@@ -214,7 +214,7 @@ impl GgufMeta {
 
     /// Trunk-layer token budget for KV math: recurrent layers contribute 0,
     /// full-attention layers contribute `min(window, ctx)` when a per-layer
-    /// window array proves it, else the whole `ctx` (conservative — a scalar
+    /// window array proves it, else the whole `ctx` (conservative - a scalar
     /// window is never paired with array typing; gemma-2 lesson).
     fn recurrent_aware_token_sum(&self, ctx: u64, trunk: &[bool]) -> u64 {
         let windows = self
@@ -236,15 +236,15 @@ impl GgufMeta {
     }
 
     /// Sum over layers of each layer's KV token capacity for a serving
-    /// context of `ctx` tokens. `None` = geometry ambiguous — the caller
+    /// context of `ctx` tokens. `None` = geometry ambiguous - the caller
     /// must fall back to whole-context math for EVERY layer. Never guesses
     /// LOW: an underestimated cache OOMs at runtime, an overestimated one
     /// only costs headroom.
     ///
     /// Provable shapes only: a per-layer array covering every block, or a
     /// scalar window paired with `full_attention_interval`. A scalar window
-    /// alone is NOT enough — gemma-2 alternates windowed/full layers with
-    /// no metadata trace — and an interval without a window (Qwen3.5 GGUFs
+    /// alone is NOT enough - gemma-2 alternates windowed/full layers with
+    /// no metadata trace - and an interval without a window (Qwen3.5 GGUFs
     /// omit the size) leaves the windowed width unknown.
     #[must_use]
     pub fn swa_token_sum(&self, ctx: u64) -> Option<u64> {
@@ -269,11 +269,11 @@ impl GgufMeta {
     }
 
     /// f16 KV-cache bytes at `ctx`: per-head widths from explicit
-    /// `key_length`/`value_length` (MLA latents — the loader allocates from
+    /// `key_length`/`value_length` (MLA latents - the loader allocates from
     /// these; upper bound, since absorbed/FA paths allocate less), else the
     /// classic `head_dim`. Layer token capacity from `swa_token_sum` when
     /// the SWA shape is provable, else whole-context for every layer.
-    /// `None` when the GGUF lacks the geometry — callers skip-with-warning,
+    /// `None` when the GGUF lacks the geometry - callers skip-with-warning,
     /// never estimate.
     ///
     /// Recurrent/hybrid-linear awareness (R8): recurrent layers hold a
@@ -281,7 +281,7 @@ impl GgufMeta {
     /// `Some(0)` for the growing term (the constant state rides caller
     /// headroom); hybrid archs scale by the provable full-attention
     /// fraction via `full_attn_layers`. Unprovable splits stay
-    /// conservative — every layer, whole context (never guess low).
+    /// conservative - every layer, whole context (never guess low).
     #[must_use]
     pub fn kv_f16_bytes(&self, ctx: u64) -> Option<u64> {
         if self.attention_class() == AttentionClass::Recurrent {
@@ -290,7 +290,7 @@ impl GgufMeta {
             return Some(0);
         }
         // Loop archs multiply the KV-holding layer count: the dense
-        // fallback (and only it — see the field doc) scales with loops.
+        // fallback (and only it - see the field doc) scales with loops.
         let loops = u64::from(self.num_loops.unwrap_or(1));
         let blocks = self.block_count?.saturating_mul(loops);
         let kv_heads = self.head_count_kv.or(self.head_count)?;
@@ -310,7 +310,7 @@ impl GgufMeta {
     /// array covering the trunk (first `block_count` entries; a longer
     /// array's tail is MTP layers outside trunk KV), else the interval
     /// formula for archs proven to use it. Empty when the split is not
-    /// provable — callers keep the conservative whole-block estimate.
+    /// provable - callers keep the conservative whole-block estimate.
     #[must_use]
     fn provable_trunk(&self) -> Option<Vec<bool>> {
         let blocks = self.block_count?;
@@ -334,30 +334,30 @@ impl GgufMeta {
 
     /// Structural metadata lint (H4): verifiable completeness warnings only.
     /// These explain WHY downstream sizing (blazar fit, cache-ram math,
-    /// coresidency) degrades — they never guess at producer quality, which
+    /// coresidency) degrades - they never guess at producer quality, which
     /// cannot be verified from the file alone. Warn-level by contract;
     /// callers must never block on a finding.
     #[must_use]
     pub fn lint(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         if self.context_length.is_none() {
-            out.push("context_length missing — context sizing falls back to engine defaults");
+            out.push("context_length missing - context sizing falls back to engine defaults");
         }
         if self.kv_f16_bytes(4096).is_none() {
             out.push(
-                "attention geometry incomplete — KV/VRAM estimates are disabled (fit, cache-ram, coresidency run blind)",
+                "attention geometry incomplete - KV/VRAM estimates are disabled (fit, cache-ram, coresidency run blind)",
             );
         }
         if let (Some(blocks), Some(windows)) = (self.block_count, &self.sliding_window_per_layer)
             && windows.len() != usize::try_from(blocks).unwrap_or(usize::MAX)
         {
-            out.push("sliding_window array length != block_count — SWA KV savings ignored");
+            out.push("sliding_window array length != block_count - SWA KV savings ignored");
         }
         if self.attention_class() == AttentionClass::HybridLinear
             && !self.recurrent_split_provable()
         {
             out.push(
-                "hybrid-linear architecture without a provable recurrent/full layer split — KV \
+                "hybrid-linear architecture without a provable recurrent/full layer split - KV \
                  estimates count every layer (upper bound)",
             );
         }
@@ -371,7 +371,7 @@ impl GgufMeta {
     /// config.json". `general.basename` carries the upstream repo as
     /// `org_model` (slash flattened to `_`) and `general.size_label` the
     /// size tag; `Qwen_Qwen3.5` + `9B` recombine to `Qwen/Qwen3.5-9B`.
-    /// Only derivable when the org separator is present — single-segment
+    /// Only derivable when the org separator is present - single-segment
     /// basenames (`unsloth` style) stay `None` and the engine's own
     /// teaching error surfaces unchanged.
     #[must_use]
@@ -419,7 +419,7 @@ pub enum GgufValue {
 }
 
 impl GgufValue {
-    /// Integer view. Arrays yield the max of their integer members — some
+    /// Integer view. Arrays yield the max of their integer members - some
     /// models ship `context_length` as an array of candidates.
     pub fn as_u64(&self) -> Option<u64> {
         match self {
@@ -577,14 +577,14 @@ fn read_value_at(cur: &mut Cursor<'_>, vtype: u32, depth: u8) -> CoreResult<Gguf
     })
 }
 
-/// `{arch}.attention.recurrent_layers` — per-layer boolean array marking
+/// `{arch}.attention.recurrent_layers` - per-layer boolean array marking
 /// recurrent (linear-attention / SSM) layers; present on hybrid-linear
 /// conversions (R8). Empty or malformed arrays are ignored (None).
 fn recurrent_layer_array(kvs: &[(String, GgufValue)], arch: &str) -> Option<Vec<bool>> {
     kvs.iter()
         .find(|(k, _)| k == &format!("{arch}.attention.recurrent_layers"))
         .and_then(|(_, v)| match v {
-            // F124: strict per-layer arrays — one wrong-typed item makes
+            // F124: strict per-layer arrays - one wrong-typed item makes
             // the WHOLE array absent (conservative default) instead of
             // silently shifting every later layer index.
             GgufValue::Array(items) => items
@@ -654,7 +654,7 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
     };
     let sliding_window_per_layer = find(format!("{arch}.attention.sliding_window"))
         .and_then(|v| match v {
-            // F124: strict — see recurrent_layers note above.
+            // F124: strict - see recurrent_layers note above.
             GgufValue::Array(items) => items
                 .iter()
                 .map(GgufValue::as_u64)
@@ -765,8 +765,8 @@ fn is_truncated(e: &CoreError) -> bool {
 
 /// Structural GGUF check: valid magic, a supported version, and at least
 /// one tensor. Diffusion-lane `.gguf` exports (`DiT` weights paired with
-/// `--vae`/`--llm` components) legitimately carry zero metadata KVs — the
-/// architecture is supplied by the row's component set, not the file — so
+/// `--vae`/`--llm` components) legitimately carry zero metadata KVs - the
+/// architecture is supplied by the row's component set, not the file - so
 /// they can never satisfy [`read_metadata_file`]'s `general.architecture`
 /// requirement. This answers the narrower question: is this a GGUF
 /// container at all?
@@ -882,7 +882,7 @@ mod tests {
     fn unit__hf_base_model_id__underivable_shapes_stay_none() {
         // Single-segment basenames (unsloth style) have no org separator;
         // missing basename or empty org/repo halves are equally
-        // underivable — the engine's teaching error stays the surface.
+        // underivable - the engine's teaching error stays the surface.
         for base in ["Qwen3.5-9B", "_repo", "org_", ""] {
             let buf = build_gguf(&[
                 ("general.architecture", GgufValue::String("qwen35".into())),
@@ -959,7 +959,7 @@ mod tests {
         }
     }
 
-    /// Array elements carry NO type tag — `elem_type` is stated once for the
+    /// Array elements carry NO type tag - `elem_type` is stated once for the
     /// whole array (this is what tripped the first fixture version).
     fn put_raw(b: &mut Vec<u8>, v: &GgufValue) {
         match v {
@@ -1068,7 +1068,7 @@ mod tests {
         assert_eq!(meta.sliding_window, None);
         assert_eq!(meta.sliding_window_per_layer, None);
         // Interval present but window size absent (real Qwen3.5 files):
-        // ambiguous → caller falls back to whole-context math.
+        // ambiguous -> caller falls back to whole-context math.
         assert_eq!(meta.swa_token_sum(4096), None);
     }
 
@@ -1083,7 +1083,7 @@ mod tests {
         // metadata): whole-context fallback.
         assert_eq!(meta.swa_token_sum(4096), None);
         meta.full_attention_interval = Some(4);
-        // 8 full layers × 4096 + 24 windowed × 512.
+        // 8 full layers x 4096 + 24 windowed x 512.
         assert_eq!(meta.swa_token_sum(4096), Some(8 * 4096 + 24 * 512));
         // Window larger than ctx clamps to ctx.
         meta.sliding_window = Some(8192);
@@ -1153,7 +1153,7 @@ mod tests {
     #[test]
     fn unit__kv_f16_bytes__mla_latent_widths_override_head_dim() {
         // DeepSeek2-flavored: kv_heads=1, explicit K/V latents wider and
-        // narrower than the derived head_dim — both are loader truth.
+        // narrower than the derived head_dim - both are loader truth.
         let meta = GgufMeta {
             block_count: Some(2),
             head_count: Some(16),
@@ -1225,7 +1225,7 @@ mod tests {
             head_count: Some(16),
             head_count_kv: Some(4),
             embedding_length: Some(4096),
-            // 3 windows for 4 blocks: malformed — provable warning.
+            // 3 windows for 4 blocks: malformed - provable warning.
             sliding_window_per_layer: Some(vec![512, 0, 512]),
             ..GgufMeta::default()
         };
@@ -1330,7 +1330,7 @@ mod tests {
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
         b.extend_from_slice(&1u64.to_le_bytes()); // tensor count
-        b.extend_from_slice(&0u64.to_le_bytes()); // kv count — by design
+        b.extend_from_slice(&0u64.to_le_bytes()); // kv count - by design
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("dit.gguf");
         std::fs::write(&p, &b).unwrap();
@@ -1426,7 +1426,7 @@ mod tests {
 
     #[test]
     fn unit__kv_f16_bytes__qwen35_interval_counts_quarter_layers() {
-        // Real Qwen3.5-9B shape: interval 4 → 8 of 32 trunk layers hold KV
+        // Real Qwen3.5-9B shape: interval 4 -> 8 of 32 trunk layers hold KV
         // (upstream qwen35.cpp: non-interval layers are recurrent gated
         // delta net, NOT windowed). per_token = 4 * (256+256) * 2 = 4096 B.
         let (m, _) = parse_metadata(&build_gguf(&qwen35_mla())).unwrap();
@@ -1438,7 +1438,7 @@ mod tests {
 
     #[test]
     fn unit__kv_f16_bytes__interval_floor_division_edge() {
-        // 33 trunk layers, interval 4: full at i=3,7,...,31 → 8 = floor.
+        // 33 trunk layers, interval 4: full at i=3,7,...,31 -> 8 = floor.
         let mut kvs = qwen35_mla();
         kvs.retain(|(k, _)| !k.ends_with("full_attention_interval"));
         kvs.push(("qwen35.block_count", GgufValue::U32(33)));
@@ -1483,7 +1483,7 @@ mod tests {
 
     #[test]
     fn unit__kv_f16_bytes__non_interval_hybrid_stays_conservative() {
-        // kimi-k3 without a layer map: no provable split → every layer
+        // kimi-k3 without a layer map: no provable split -> every layer
         // counts (never guess low), and lint explains the bound.
         let m = hybrid_kv_meta("kimi-k3", 69);
         assert!(!m.recurrent_split_provable());
@@ -1539,7 +1539,7 @@ mod depth_tests {
     #[test]
     fn unit__gguf_depth__nested_arrays_capped_not_stack_overflow() {
         // F125: one KV whose value is a chain of 64 nested single-element
-        // array headers (~12 bytes per level) — must error at the depth
+        // array headers (~12 bytes per level) - must error at the depth
         // cap instead of recursing the stack into oblivion.
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
@@ -1549,7 +1549,7 @@ mod depth_tests {
         // key "deep"
         b.extend_from_slice(&4u64.to_le_bytes());
         b.extend_from_slice(b"deep");
-        // Value: type 9 (array) ONCE — nested levels are just
+        // Value: type 9 (array) ONCE - nested levels are just
         // [elem_type][count] pairs with no repeated type tag.
         b.extend_from_slice(&9u32.to_le_bytes());
         for _ in 0..64 {

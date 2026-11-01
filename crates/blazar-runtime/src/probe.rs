@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 /// Retry budget for spawn-class transients. 4 attempts / 250 ms flat
 /// backoff is the measured-cure bar from the original vulkan-flake fix
 /// (3ce05e1); flat rather than jittered because a single sync caller
-/// retries alone — no in-process herd to de-synchronize, and parallel
+/// retries alone - no in-process herd to de-synchronize, and parallel
 /// test binaries are bounded by the same 4-attempt cap.
 const SPAWN_RETRY_ATTEMPTS: u32 = 4;
 const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(250);
@@ -15,18 +15,18 @@ const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// Is this spawn error environment-transient (worth a bounded retry)?
 /// The classes, all reproduced live under parallel load:
 ///
-/// - EAGAIN/EWOULDBLOCK (fork/thread pressure — `ErrorKind::WouldBlock`),
+/// - EAGAIN/EWOULDBLOCK (fork/thread pressure - `ErrorKind::WouldBlock`),
 ///   EINTR (`Interrupted`), ENOMEM;
-/// - EMFILE/ENFILE (fd pressure — `ulimit -n` repro: the probe's pipe
+/// - EMFILE/ENFILE (fd pressure - `ulimit -n` repro: the probe's pipe
 ///   pair loses the race for the last descriptors);
 /// - ETXTBSY (write->close->exec writeback race on a JUST-INSTALLED
-///   binary — os error 26, captured live: `fs::copy`/tar-extract closes
+///   binary - os error 26, captured live: `fs::copy`/tar-extract closes
 ///   the fd, execve still briefly sees the inode write-open while pages
 ///   flush; hits the real install lane, not only tests).
 ///
-/// Everything else is permanent — ENOENT (missing binary), EACCES,
-/// ENOEXEC (garbage/foreign-arch asset — the register-or-clean fast-fail
-/// pin depends on that one NOT being retried) — and must fail on
+/// Everything else is permanent - ENOENT (missing binary), EACCES,
+/// ENOEXEC (garbage/foreign-arch asset - the register-or-clean fast-fail
+/// pin depends on that one NOT being retried) - and must fail on
 /// attempt one so the loud error is not delayed.
 fn is_transient_spawn_err(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
@@ -49,7 +49,7 @@ fn is_transient_spawn_err(e: &std::io::Error) -> bool {
 /// Run a spawn-class operation under the bounded transient-retry policy
 /// (H16: explicit attempts, backoff, abort on permanent class). Covers
 /// `Command::spawn` and `Command::output` alike; the final error is
-/// returned as-is — retry never masks, it only rides out pressure.
+/// returned as-is - retry never masks, it only rides out pressure.
 pub(crate) fn with_spawn_retry<T>(
     mut op: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
@@ -74,7 +74,7 @@ pub(crate) fn with_spawn_retry<T>(
 }
 
 /// Non-Linux platforms have no reachable PDEATHSIG equivalent (macOS
-/// libc ships no `prctl`; Windows has nothing through std) — there the
+/// libc ships no `prctl`; Windows has nothing through std) - there the
 /// children stay tied to the runtime's `kill_on_drop` plus the
 /// supervisor's graceful terminate lane, same net the doc above
 /// describes for Windows.
@@ -82,8 +82,8 @@ pub(crate) fn with_spawn_retry<T>(
 pub fn parent_death_tie(_cmd: &mut Command) {}
 
 /// Tie a spawned child's lifetime to the spawning PROCESS: when the
-/// parent dies for any reason — crash, SIGKILL, terminal close, runtime
-/// teardown — the kernel delivers SIGTERM to the child. This is the
+/// parent dies for any reason - crash, SIGKILL, terminal close, runtime
+/// teardown - the kernel delivers SIGTERM to the child. This is the
 /// guarantee `kill_on_drop` cannot give: drop handlers only run while
 /// the owning runtime is still alive, so an owner killed mid-flight
 /// would otherwise leak VRAM-holding engine children (live-verified:
@@ -92,7 +92,7 @@ pub fn parent_death_tie(_cmd: &mut Command) {}
 ///
 /// The pre-fork parent pid is captured up front and re-checked inside
 /// the child: if the parent died between fork and prctl, the signal
-/// would never arm — the child exits instead of lingering. Note the
+/// would never arm - the child exits instead of lingering. Note the
 /// kernel granularity is the forking THREAD; tokio worker threads only
 /// exit at runtime shutdown (when children should die anyway), so this
 /// is precisely the desired semantics.
@@ -125,13 +125,13 @@ pub fn parent_death_tie(cmd: &mut Command) {
 /// Run a short-lived probe command (`--version`/`--help`/census class)
 /// under a hard deadline. A hung probe binary must fail fast instead of
 /// wedging the caller forever (F85); on timeout the child is killed and
-/// `None` is returned — callers decide whether that is an error (fatal
+/// `None` is returned - callers decide whether that is an error (fatal
 /// probes) or an empty census (best-effort probes). Long-running tool
 /// invocations (quantize, builds) must NOT route through this.
 ///
 /// Both pipes are drained on reader threads WHILE the child runs: a child
 /// that writes more than the OS pipe buffer (~64 KiB) would otherwise
-/// block on write, never exit, and turn into a guaranteed deadline kill —
+/// block on write, never exit, and turn into a guaranteed deadline kill -
 /// a silent 30 s stall masquerading as a hung binary. Spawn failures are
 /// logged with their `io::Error` (a transient EAGAIN under fork pressure
 /// is retried by [`with_spawn_retry`]; what survives is logged with the
@@ -163,7 +163,7 @@ pub fn probe_output(cmd: &mut Command, secs: u64) -> Option<std::process::Output
             Ok(None) => {
                 if Instant::now() >= deadline {
                     tracing::warn!(
-                        "probe {:?} exceeded {secs}s deadline — killing",
+                        "probe {:?} exceeded {secs}s deadline - killing",
                         cmd.get_program()
                     );
                     let _ = child.kill();
@@ -185,7 +185,7 @@ pub fn probe_output(cmd: &mut Command, secs: u64) -> Option<std::process::Output
 }
 
 /// Reader-thread body: drain a pipe to EOF into a buffer. A panicked
-/// reader (torn pipe) yields an empty buffer — the caller's status check
+/// reader (torn pipe) yields an empty buffer - the caller's status check
 /// already fails the probe.
 fn drain_pipe(mut pipe: impl Read) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -194,7 +194,7 @@ fn drain_pipe(mut pipe: impl Read) -> Vec<u8> {
 }
 
 /// Live `MemAvailable` (MiB). The spawn-time memory guard: below a hard
-/// floor the mmap streaming engine will thrash swap for minutes — fail
+/// floor the mmap streaming engine will thrash swap for minutes - fail
 /// the load with a named error instead (the validate.py heuristic,
 /// tightened to a zero-false-positive floor).
 #[must_use]
@@ -225,7 +225,7 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
         .unwrap_or_default();
     if gpus.is_empty() || gpus.iter().all(|g| g.total_mib == 0) {
         // Engines without a --list-devices census (mistral.rs) leave the
-        // manifest's device list empty too — a GPU the daemon cannot see
+        // manifest's device list empty too - a GPU the daemon cannot see
         // silently starves every capacity decision on that lane (measured:
         // "0 GPUs" banner on a 4070 box, paged-attn auto-fallback blind,
         // 502 loads). Fall back to a system-side NVIDIA census; non-NVIDIA
@@ -234,7 +234,7 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
         // A census that names devices but reports total_mib == 0 on every
         // row (sd-server's --list-devices prints NAME<TAB>description only,
         // no memory) is not a capacity census either: it fed the pool
-        // Vulkan-namespace names with zero free bytes — placement tied at
+        // Vulkan-namespace names with zero free bytes - placement tied at
         // 0 and picked nonsense for llama spawns. Treat it exactly like
         // the empty census and let nvidia-smi speak when it can.
         gpus = nvidia_smi_gpus();
@@ -245,7 +245,7 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
 /// Census precedence shared by the daemon's live path and daemon-less
 /// CLI verbs (`tune`): a live engine `--list-devices` census when one
 /// exists, else the stored-manifest snapshot. `free_mib` is volatile
-/// state, not device identity — a manifest snapshot goes stale the
+/// state, not device identity - a manifest snapshot goes stale the
 /// moment a neighbour spawn holds VRAM (live repro 2026-10-09:
 /// `tune --ctx 4096` refused a fit against a frozen 940 MiB free
 /// snapshot on an idle 7.6 GiB-free card).
@@ -274,11 +274,11 @@ pub fn live_census_hardware(server_path: &std::path::Path, manifest: &Manifest) 
     hardware_census(live, manifest)
 }
 
-/// Best-effort `nvidia-smi` device census. None/skip on any failure —
+/// Best-effort `nvidia-smi` device census. None/skip on any failure -
 /// never a guessed entry. Rows come back in PCI bus order, the contract
 /// `spanning_spawn_env` pairs with `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 pub(crate) fn nvidia_smi_gpus() -> Vec<GpuInfo> {
-    // F85: best-effort census — a hung nvidia-smi yields an empty list,
+    // F85: best-effort census - a hung nvidia-smi yields an empty list,
     // never a wedged caller.
     let Some(out) = probe_output(
         std::process::Command::new("nvidia-smi").args([
@@ -326,7 +326,7 @@ pub struct GpuTenant {
 
 /// Best-effort census of processes holding GPU compute memory
 /// (`nvidia-smi --query-compute-apps`). None when the tool is absent or
-/// fails — the caller reports nothing rather than a guessed tenant list.
+/// fails - the caller reports nothing rather than a guessed tenant list.
 /// Pure parser: `pid, process_name, used_mib` per csv line.
 #[must_use]
 pub fn parse_gpu_tenants(csv: &str) -> Vec<GpuTenant> {
@@ -354,7 +354,7 @@ pub fn parse_gpu_tenants(csv: &str) -> Vec<GpuTenant> {
 }
 
 /// Live GPU compute tenants at boot: whoever is holding VRAM before
-/// blazar has spawned any child of its own. Advisory only — blazar
+/// blazar has spawned any child of its own. Advisory only - blazar
 /// never kills another product's process.
 #[must_use]
 pub fn gpu_compute_tenants() -> Option<Vec<GpuTenant>> {
@@ -372,7 +372,7 @@ pub fn gpu_compute_tenants() -> Option<Vec<GpuTenant>> {
 }
 
 /// Pure parser for the single-column `memory.free` census (MiB per line,
-/// one per GPU). Empty/unparseable output is `None` — never a guessed 0.
+/// one per GPU). Empty/unparseable output is `None` - never a guessed 0.
 fn sum_free_mib_csv(text: &str) -> Option<u64> {
     let total = text
         .lines()
@@ -381,11 +381,11 @@ fn sum_free_mib_csv(text: &str) -> Option<u64> {
     (total > 0).then_some(total)
 }
 
-/// Fresh free VRAM (MiB, summed across NVIDIA cards — matching
+/// Fresh free VRAM (MiB, summed across NVIDIA cards - matching
 /// `Hardware::free_vram_mib` semantics on single-card boxes). Used by the
 /// gateway's submit-time scratch gate, where a spawn-time snapshot is too
 /// stale: a foreign tenant (another product's server) can grab the card
-/// between spawn and submit. `None` when the tool is absent or fails —
+/// between spawn and submit. `None` when the tool is absent or fails -
 /// callers treat that as "no gate data", never as zero headroom.
 #[must_use]
 pub fn nvidia_free_vram_mib() -> Option<u64> {
@@ -421,7 +421,7 @@ pub fn hardware_with(gpus: Vec<GpuInfo>) -> Hardware {
 
 /// PCI vendor ids of display-class hardware (VGA 0300 + 3D 0302), parsed
 /// from `lspci -n -d ::0300`-style output. Works WITHOUT any driver
-/// installed — this is the doctor's hardware-vs-driver oracle for the
+/// installed - this is the doctor's hardware-vs-driver oracle for the
 /// "GPU present but its driver userspace is missing" warning. Sorted,
 /// deduplicated, lowercase. Known ids: `10de` NVIDIA, `1002` AMD, `8086`
 /// Intel; unknown ids pass through verbatim (never guessed into a brand).
@@ -429,7 +429,7 @@ pub fn hardware_with(gpus: Vec<GpuInfo>) -> Hardware {
 pub fn parse_pci_vendors(lspci_text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in lspci_text.lines() {
-        // `0000:01:00.0 0300: 10de:28a0 (rev a1)` — take the token
+        // `0000:01:00.0 0300: 10de:28a0 (rev a1)` - take the token
         // following the class field (` 0300: `), then its vendor half.
         let mut fields = line.split_whitespace();
         let _addr = fields.next();
@@ -453,7 +453,7 @@ pub fn parse_pci_vendors(lspci_text: &str) -> Vec<String> {
 
 /// Live PCI display-hardware census via `lspci -n` (driver-independent).
 /// Empty when lspci is absent or the box has no PCI bus (containers,
-/// WSL1) — callers treat empty as "no oracle", never as "no GPU".
+/// WSL1) - callers treat empty as "no oracle", never as "no GPU".
 #[must_use]
 pub fn pci_gpu_vendors() -> Vec<String> {
     let Some(out) = probe_output(
@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(hw.gpus.len(), 1);
         assert_eq!(hw.total_vram_mib(), 8_188);
         // The None-manifest path may legitimately find GPUs via the
-        // nvidia-smi fallback (environment-dependent) — portability means
+        // nvidia-smi fallback (environment-dependent) - portability means
         // asserting the sysinfo-only merge at the composition point.
         let cpu_only = hardware_with(Vec::new());
         assert_eq!(cpu_only.gpus.len(), 0);
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(gpus[0].free_mib, 5_100);
         assert!(gpus[0].description.contains("NVIDIA"));
         assert!(!gpus[0].is_integrated(), "nvidia entries read discrete");
-        // Garbage lines skip; partial lines skip — never a guessed entry.
+        // Garbage lines skip; partial lines skip - never a guessed entry.
         assert_eq!(parse_nvidia_csv("nope\n\nRTX, only-two\n").len(), 0);
     }
 
@@ -689,7 +689,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unit__probe_output__survives_pipe_buffer_flood() {
-        // 4 MiB of output — far past the ~64 KiB OS pipe buffer. The
+        // 4 MiB of output - far past the ~64 KiB OS pipe buffer. The
         // pre-fix poll-then-read shape deadlocked exactly here: the child
         // blocked on write, never exited, and the probe surfaced as a
         // bogus "timed out or failed to spawn".
@@ -733,7 +733,7 @@ mod tests {
         for e in &transient {
             assert!(is_transient_spawn_err(e), "{e} must classify transient");
         }
-        // Permanent classes fail attempt one — ENOEXEC is the register
+        // Permanent classes fail attempt one - ENOEXEC is the register
         // fast-fail pin's mechanism (garbage asset), it must never retry.
         let permanent = [
             Error::from_raw_os_error(libc::ENOENT),

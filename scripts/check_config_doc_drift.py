@@ -50,10 +50,10 @@ def parse_struct_fields(src: str) -> dict[str, list[str]]:
 
 
 def doc_rows(md: str) -> dict[str, set[str]]:
-    """Section headers like '## Config (top-level keys) — 184 fields' map
+    """Section headers like '## Config (top-level keys) - 184 fields' map
     to the first-column field names of the table that follows."""
     out: dict[str, set[str]] = {}
-    for m in re.finditer(r"^##\s+([^(—\n]+)", md, re.MULTILINE):
+    for m in re.finditer(r"^##\s+([^(-\n]+)", md, re.MULTILINE):
         sec = m.group(1).strip()
         # fields live in the table rows until the next header
         nxt = md.find("\n## ", m.end())
@@ -118,7 +118,7 @@ def main() -> int:
 
     if failures:
         print(
-            f"\n{failures} struct table(s) drifted — update docs/config-code-paths.md"
+            f"\n{failures} struct table(s) drifted - update docs/config-code-paths.md"
         )
         return 1
     print("\ndoc is in sync with config.rs")

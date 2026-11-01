@@ -2,7 +2,7 @@
 //! `VAE` plus text encoder) served by the sdcpp engine's `sd-server`
 //! child. The child's OpenAI-compat routes accept `{model, prompt,
 //! size "WxH", steps, n, ...}` and answer `{created, data:
-//! [{b64_json}], output_format}` — verified live against
+//! [{b64_json}], output_format}` - verified live against
 //! master-890-74988b2. The gateway owns key admission, the diffusion
 //! domain gate and spawn; the child owns generation shaping. Requests
 //! ride the shared 10-minute HTTP budget: one 512x512x20 image
@@ -12,7 +12,7 @@
 //! Two dialects, one route. Plain `OpenAI` requests (the verified
 //! `{model, prompt, size, steps, n, output_format, output_compression}`
 //! set) forward byte-identical to the child's compat route. Anything
-//! richer — cache modes, `LoRA` weights, sampling subtrees, guidance —
+//! richer - cache modes, `LoRA` weights, sampling subtrees, guidance -
 //! rides the child's native async job dialect (`/sdcpp/v1/img_gen` +
 //! `/sdcpp/v1/jobs/{id}`) through a shallow translator, because the
 //! compat route accepts unknown fields without honoring them (probe
@@ -25,8 +25,8 @@
 //! `input_fidelity`) answer teaching 400s instead of being swallowed.
 //! `"async":
 //! true` returns the job handle immediately; `"stream": true` relays
-//! progress as `SSE`; both set → stream wins. Job poll/cancel routes
-//! resolve the LIVE child only — a job dies with its child, and these
+//! progress as `SSE`; both set -> stream wins. Job poll/cancel routes
+//! resolve the LIVE child only - a job dies with its child, and these
 //! routes must never boot a new one.
 
 use axum::body::{Body, Bytes};
@@ -58,8 +58,8 @@ enum DeliveryMode {
 
 /// Keys the compat route is verified to honor (api.md: prompt, n,
 /// size, `output_format`, `output_compression`). Everything else in a
-/// request means the native dialect, where the field is documented —
-/// and actually applied — rather than silently swallowed.
+/// request means the native dialect, where the field is documented -
+/// and actually applied - rather than silently swallowed.
 const PLAIN_GENERATION_KEYS: [&str; 10] = [
     "model",
     "prompt",
@@ -74,7 +74,7 @@ const PLAIN_GENERATION_KEYS: [&str; 10] = [
 ];
 
 /// One `SSE` poll per second. A single failed poll is a transport
-/// hiccup, not child death — three CONSECUTIVE failures (≈3s) declare
+/// hiccup, not child death - three CONSECUTIVE failures (~3s) declare
 /// it, matching the evict-and-retry-once tolerance of the header lane.
 const JOB_POLL_INTERVAL_MS: u64 = 1_000;
 const JOB_POLL_TRANSPORT_RETRIES: u32 = 3;
@@ -90,11 +90,11 @@ fn is_plain_generation_request(v: &serde_json::Value) -> bool {
 //
 // Calibrated 2026-09-23 on a quiet 8 GiB box (wan2.1 1.3B bf16 trio,
 // --offload-to-cpu, steps=8, warm child): child peak minus warm baseline
-// is FLAT ≈ 3.0 GiB from 5 to 33 frames at 320x320 (DiT token count
-// 800 -> 3600) and ≈ 3.5 GiB at 512x512 — the constant is the umt5-xxl
+// is FLAT ~ 3.0 GiB from 5 to 33 frames at 320x320 (DiT token count
+// 800 -> 3600) and ~ 3.5 GiB at 512x512 - the constant is the umt5-xxl
 // staging pass plus the VAE working set, not attention matrices. A 13
 // frame 512x512 request dies deterministically upstream at that same
-// 3.0 GiB ("generate_video returned no results", child alive) — NOT a
+// 3.0 GiB ("generate_video returned no results", child alive) - NOT a
 // VRAM signature, so the gate lets it through and the child's own
 // failure answers. Beyond the 33-frame calibration horizon the floor
 // scales linearly with frames: conservative on purpose, and the 400 it
@@ -102,7 +102,7 @@ fn is_plain_generation_request(v: &serde_json::Value) -> bool {
 
 /// Measured warm-child scratch floor at or below the 320x320 reference.
 const VIDEO_SCRATCH_FLOOR_MIB: u64 = 3_050;
-/// Extra scratch per pixel of frame area beyond the reference — fit
+/// Extra scratch per pixel of frame area beyond the reference - fit
 /// from the 512x512 point (+510 MiB over 161k px²).
 const VIDEO_SCRATCH_AREA_MIB_PER_PX2: f64 = 3.17e-3;
 const VIDEO_SCRATCH_REF_AREA_PX2: u64 = 320 * 320;
@@ -114,13 +114,13 @@ const VIDEO_SCRATCH_SAFETY: f64 = 1.25;
 /// Highest frame count with a measured pass; the floor scales linearly
 /// past it instead of pretending flatness holds forever.
 const VIDEO_SCRATCH_CALIBRATED_FRAMES: u64 = 33;
-/// Warm wan-trio residency (child idle, weights staged) — charged only
+/// Warm wan-trio residency (child idle, weights staged) - charged only
 /// when no warm child exists yet, because a cold spawn lands on the
 /// same card the scratch will claim.
 const VIDEO_CHILD_WEIGHTS_STAGED_MIB: u64 = 2_800;
 /// Leave the driver and desktop a slice; foreign tenants grow too.
 const VIDEO_VRAM_HEADROOM_FRACTION: f64 = 0.95;
-/// Default frame geometry when the request names none — the child's own
+/// Default frame geometry when the request names none - the child's own
 /// 512x512 default, which is also the conservative estimate.
 const VIDEO_DEFAULT_SIZE: (u64, u64) = (512, 512);
 
@@ -128,7 +128,7 @@ const VIDEO_DEFAULT_SIZE: (u64, u64) = (512, 512);
 /// has centrally disabled it. Names the env var so the operator reading
 /// a client's error can find their own switch.
 const VRAM_OVERCOMMIT_DISABLED_TEACH: &str = "operator disabled the per-request VRAM overcommit \
-     lever (BLAZAR_VRAM_OVERCOMMIT=0) — remaining levers: fewer frames (video_frames/duration), \
+     lever (BLAZAR_VRAM_OVERCOMMIT=0) - remaining levers: fewer frames (video_frames/duration), \
      smaller size, or freeing GPU memory held by other processes";
 
 /// Operator kill-switch for the per-request VRAM overcommit lever. The
@@ -141,7 +141,7 @@ static VRAM_OVERCOMMIT_ALLOWED: std::sync::LazyLock<bool> = std::sync::LazyLock:
 
 /// Pure env-value parse so the policy is unit-testable without touching
 /// the process environment. Anything but an explicit off-value leaves
-/// the lever on — an unset or garbage value must not silently flip
+/// the lever on - an unset or garbage value must not silently flip
 /// safety posture.
 fn vram_overcommit_enabled(raw: Option<&str>) -> bool {
     let off = ["0", "false", "off", "no"];
@@ -152,7 +152,7 @@ fn vram_overcommit_enabled(raw: Option<&str>) -> bool {
 }
 
 /// Wan's temporal grid: the engine aligns DOWN to 4k+1 frames (1, 5,
-/// 9, 13, ...) before generating — verified live: a `video_frames:4`
+/// 9, 13, ...) before generating - verified live: a `video_frames:4`
 /// request renders one frame and a 16-frame duration render delivered
 /// 13. The gate prices what the child will actually render.
 fn align_wan_frames(frames: u64) -> u64 {
@@ -192,7 +192,7 @@ fn estimate_video_scratch(
     };
     // Weights residency is deterministic (known model files), so it is added
     // linearly; only the measured-scratch terms carry the uncertainty safety
-    // multiplier — stacking safety on weights over-rejects cold spawns that
+    // multiplier - stacking safety on weights over-rejects cold spawns that
     // demonstrably fit (live 5f@320 on an 8 GiB box).
     let weights = if cold_child {
         VIDEO_CHILD_WEIGHTS_STAGED_MIB
@@ -210,10 +210,10 @@ fn estimate_video_scratch(
 /// Parse the frame geometry the gate prices. Two dialects name it:
 /// `size` (``WxH`` string, translated onto width/height for the child in
 /// `translate_to_native`) and the documented top-level `width`/`height`
-/// pair, which rides to the child verbatim — the gate must price BOTH,
+/// pair, which rides to the child verbatim - the gate must price BOTH,
 /// or a 320x320 request that fits gets billed the 512x512 default and
 /// over-rejected. Absent or unparseable geometry still takes the
-/// child's 512x512 default — the conservative side of the estimate.
+/// child's 512x512 default - the conservative side of the estimate.
 fn gate_size(v: &serde_json::Value) -> (u64, u64) {
     if let Some((w, h)) = v.get("size").and_then(|s| s.as_str()).and_then(|s| {
         s.split_once('x').and_then(|(w, h)| {
@@ -238,10 +238,10 @@ fn gate_size(v: &serde_json::Value) -> (u64, u64) {
 }
 
 /// Frame count the gate prices: the request's own `video_frames` when
-/// it names one (`frames`/`num_frames`/`duration`×fps were canonicalized
+/// it names one (`frames`/`num_frames`/`duration`xfps were canonicalized
 /// onto it upstream), else the calibration horizon. The child's default
-/// for a fully unspecified `vid_gen` is not contracted anywhere — its CLI
-/// flag says 1, but bare live renders have delivered multi-frame video —
+/// for a fully unspecified `vid_gen` is not contracted anywhere - its CLI
+/// flag says 1, but bare live renders have delivered multi-frame video -
 /// and a safety gate must not undersell the one dimension it cannot
 /// know. Naming frames explicitly prices exactly that count.
 fn gate_frames(v: &serde_json::Value) -> u64 {
@@ -253,7 +253,7 @@ fn gate_frames(v: &serde_json::Value) -> u64 {
 /// Submit-time gate: refuse video requests whose measured scratch
 /// envelope cannot fit the card's FREE memory right now (a warm child's
 /// weights are already inside "used", a cold spawn's are not). `Ok(())`
-/// when the request may proceed — including on boxes without an
+/// when the request may proceed - including on boxes without an
 /// nvidia-smi census, where the runtime's spawn heuristic still guards
 /// weights and the request rides through.
 #[allow(
@@ -273,7 +273,7 @@ fn video_scratch_gate(
         == Some(true)
     {
         // Operator's explicit call: attempt it anyway; the child's own
-        // failure (or success) answers. No silent path — the audit log
+        // failure (or success) answers. No silent path - the audit log
         // carries the request that used the lever. A centrally disabled
         // lever (BLAZAR_VRAM_OVERCOMMIT=0) turns the same request away
         // instead of honoring it.
@@ -288,7 +288,7 @@ fn video_scratch_gate(
     let (w, h) = gate_size(parsed);
     // Reference frames are VAE-encoded into latents once (cheaper than
     // a sampler step's scratch), but the calibrated per-frame rate is
-    // the only measured number this gate owns — pricing refs at the
+    // the only measured number this gate owns - pricing refs at the
     // full rate errs conservative, and the refusal already teaches the
     // vram_overcommit lever for the over-refused edge.
     let frames = gate_frames(parsed).saturating_add(ref_frames);
@@ -302,15 +302,15 @@ fn video_scratch_gate(
             String::new()
         };
         // The overcommit lever is only taught when it can actually be
-        // pulled — pointing a client at a disabled switch would be a lie.
+        // pulled - pointing a client at a disabled switch would be a lie.
         let overcommit_hint = if *VRAM_OVERCOMMIT_ALLOWED {
             ", or \\\"vram_overcommit\\\": true to force the attempt"
         } else {
             " (the vram_overcommit lever is operator-disabled)"
         };
         return Err(format!(
-            "video request would exceed free VRAM: scratch ≈ {} MiB ({} aligned frames at \
-             {w}x{h}{spawn_note}, safety ×{VIDEO_SCRATCH_SAFETY}) vs {budget} MiB free of \
+            "video request would exceed free VRAM: scratch ~ {} MiB ({} aligned frames at \
+             {w}x{h}{spawn_note}, safety x{VIDEO_SCRATCH_SAFETY}) vs {budget} MiB free of \
              {free} (95% headroom rule). Levers: fewer frames (video_frames/duration), \
              smaller size, free GPU memory held by other processes{overcommit_hint}",
             est.estimate_mib, est.aligned_frames,
@@ -323,9 +323,9 @@ fn video_scratch_gate(
 /// native knob. sd-server's `vid_gen` field is `video_frames`; clients
 /// raised on OpenAI-ish surfaces reach for `frames` or `num_frames`,
 /// and the verbatim passthrough below would let those ride past the
-/// child unheard (one-frame videos, no error — verified live against
+/// child unheard (one-frame videos, no error - verified live against
 /// sd-server master-890). `duration` seconds (the REPL's `/duration`
-/// knob) joins the vocabulary as `duration` × `fps` frames — sd-server
+/// knob) joins the vocabulary as `duration` x `fps` frames - sd-server
 /// has no duration field, so an untranslated knob is the same silent
 /// one-frame no-op. Contradictory specs fail loud instead of picking a
 /// silent winner.
@@ -361,7 +361,7 @@ fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
 
     // `duration` seconds (the REPL's `/duration` knob): sd-server has no
     // duration field, so the knob translates to `duration` x `fps`
-    // frames here — an untranslated ride past the child is the same
+    // frames here - an untranslated ride past the child is the same
     // silent one-frame no-op the synonyms above would suffer.
     if let Some(val) = obj.get("duration").cloned() {
         let fps = obj
@@ -378,7 +378,7 @@ fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
     }
 
     // `seconds` (the Sora dialect): the same dial as `duration`, except
-    // the Sora SDK ships it as a STRING ("4" | "8" | "12") — number or
+    // the Sora SDK ships it as a STRING ("4" | "8" | "12") - number or
     // clean numeric string both parse; anything else answers by name.
     // Agreeing duration+seconds collapse; disagreeing ones hit the
     // conflict check below like any other duplicate spelling.
@@ -413,7 +413,7 @@ fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join(", ");
         return Err(format!(
-            "conflicting frame specs ({named}): send one — the native field is {NATIVE}"
+            "conflicting frame specs ({named}): send one - the native field is {NATIVE}"
         ));
     }
     let n = specs[0].1;
@@ -428,7 +428,7 @@ fn canonicalize_video_frames(v: &mut serde_json::Value) -> Result<(), String> {
 //
 // OpenAI's generation-quality vocabulary is RELATIVE ("high" spends
 // more compute than "low"). The engine's step budget is per-model, so
-// a tier resolves against the child's own `capabilities` defaults —
+// a tier resolves against the child's own `capabilities` defaults -
 // the multiplier is the curated fact, the base never is.
 
 /// Output containers the child validates per mode (api.md
@@ -455,7 +455,7 @@ fn quality_step_multiplier(quality: &str) -> Result<Option<f64>, String> {
         "max" => 1.5,
         other => {
             return Err(format!(
-                "unknown quality \"{other}\" — supported: auto, low, medium, high, \
+                "unknown quality \"{other}\" - supported: auto, low, medium, high, \
                  xhigh, max (dall-e-2 synonyms: standard, hd)"
             ));
         }
@@ -485,39 +485,39 @@ fn openai_surface_teaching(
     let get = |k: &str| v.get(k).filter(|val| !val.is_null());
     if get("response_format").and_then(serde_json::Value::as_str) == Some("url") {
         return Some(
-            "response_format \"url\" is not served — blazar returns base64 directly \
+            "response_format \"url\" is not served - blazar returns base64 directly \
              (data[].b64_json); omit response_format or send \"b64_json\""
                 .into(),
         );
     }
     if let Some(val) = get("moderation") {
         return Some(format!(
-            "moderation ({val}) is a hosted-OpenAI filter — local generation has no \
+            "moderation ({val}) is a hosted-OpenAI filter - local generation has no \
              moderation service to configure; drop the field"
         ));
     }
     if let Some(val) = get("partial_images") {
         return Some(format!(
-            "partial_images ({val}) is not implemented — \"stream\": true relays job \
+            "partial_images ({val}) is not implemented - \"stream\": true relays job \
              progress as SSE events instead"
         ));
     }
     if let Some(val) = get("background") {
         return Some(format!(
-            "background \"{val}\" is not served — local diffusion has no \
+            "background \"{val}\" is not served - local diffusion has no \
              alpha-controlled generation; PNG alpha only rides init/edit images"
         ));
     }
     if let Some(val) = get("input_fidelity") {
         return Some(format!(
-            "input_fidelity ({val}) is not served — edits approximate fidelity through \
+            "input_fidelity ({val}) is not served - edits approximate fidelity through \
              the native \"strength\" knob (0..1 denoise)"
         ));
     }
     if let Some(style) = get("style").and_then(serde_json::Value::as_str) {
         if style_preset(style).is_none() {
             return Some(format!(
-                "unknown style \"{style}\" — supported: vivid, natural"
+                "unknown style \"{style}\" - supported: vivid, natural"
             ));
         }
         let curated = repo.is_some_and(|r| {
@@ -526,8 +526,8 @@ fn openai_surface_teaching(
         });
         if !curated {
             return Some(format!(
-                "style presets are curated per family — this model{} has none; set \
-                 sample_params.guidance.txt_cfg directly (vivid ≈ higher, natural ≈ lower)",
+                "style presets are curated per family - this model{} has none; set \
+                 sample_params.guidance.txt_cfg directly (vivid ~ higher, natural ~ lower)",
                 repo.map_or_else(String::new, |r| format!(" ({r})"))
             ));
         }
@@ -557,7 +557,7 @@ fn openai_surface_teaching(
 /// Per-model capabilities from the child, memoized per engine for
 /// [`CHILD_DEFAULTS_TTL`]. One model rides one child, so the key is the
 /// engine name; the TTL covers a re-pull swapping quants under the same
-/// name. A failed fetch is NOT cached — the next request retries. The
+/// name. A failed fetch is NOT cached - the next request retries. The
 /// WHOLE capabilities document is cached (`defaults_by_mode` AND
 /// `generation_features`) so every consumer reads one coherent snapshot.
 const CHILD_DEFAULTS_TTL: Duration = Duration::from_secs(600);
@@ -583,7 +583,7 @@ async fn child_mode_defaults(
 /// The child's whole `/sdcpp/v1/capabilities` document, memoized per
 /// engine (see [`CHILD_DEFAULTS_TTL`]). Callers reach for
 /// `/defaults_by_mode/{mode}` (dialect defaults) or
-/// `/generation_features` (runtime capability flags — e.g. whether the
+/// `/generation_features` (runtime capability flags - e.g. whether the
 /// loaded model carries an Audio VAE for reference-audio inputs).
 async fn child_capabilities(
     state: &AppState,
@@ -627,14 +627,14 @@ async fn child_capabilities(
 /// Reference-media inventory parsed once per request: `ref_videos`
 /// (each an array of base64 frame strings), `ref_audios` and
 /// `ref_video_audios` (base64 WAV strings, optionally data-URL
-/// prefixed). Structural validation ONLY — it mirrors sd-server's own
+/// prefixed). Structural validation ONLY - it mirrors sd-server's own
 /// contract (examples/common/common.cpp: non-empty frame arrays,
-/// string elements, soundtracks ≤ videos) so the child stays the sole
+/// string elements, soundtracks <= videos) so the child stays the sole
 /// authority on content decoding; a request that passes here can still
 /// fail there on a corrupt image or non-WAV payload, and that error
 /// rides back verbatim.
 // The `ref_` prefix is the upstream request vocabulary (sd-server's
-// own field names) — renaming for lint symmetry would break the
+// own field names) - renaming for lint symmetry would break the
 // one-to-one trace between validator and child contract.
 #[allow(clippy::struct_field_names)]
 #[derive(Debug)]
@@ -656,7 +656,7 @@ impl RefMedia {
 /// surface any ref-video/audio key is a taught error: sd-server rejects
 /// them outside `vid_gen` ("reference video and audio inputs require
 /// `vid_gen` mode") and the client's fix is the other route, not payload
-/// surgery — so the gateway names the route instead of forwarding.
+/// surgery - so the gateway names the route instead of forwarding.
 fn parse_ref_media(v: &serde_json::Value, video: bool) -> Result<Option<RefMedia>, String> {
     const REF_KEYS: [&str; 3] = ["ref_videos", "ref_audios", "ref_video_audios"];
     if !REF_KEYS.iter().any(|k| v.get(k).is_some()) {
@@ -665,7 +665,7 @@ fn parse_ref_media(v: &serde_json::Value, video: bool) -> Result<Option<RefMedia
     if !video {
         return Err(
             "reference video/audio inputs (ref_videos/ref_audios/ref_video_audios) are \
-             video-lane fields — send them to POST /v1/videos, not the image route"
+             video-lane fields - send them to POST /v1/videos, not the image route"
                 .to_string(),
         );
     }
@@ -710,10 +710,10 @@ fn parse_ref_media(v: &serde_json::Value, video: bool) -> Result<Option<RefMedia
     let ref_audios = audio_count("ref_audios")?;
     let ref_video_audios = audio_count("ref_video_audios")?;
     // sd-server: "each --ref-video-audio needs a corresponding
-    // --ref-video" — paired soundtracks can never outnumber videos.
+    // --ref-video" - paired soundtracks can never outnumber videos.
     if ref_video_audios > ref_video_frames.len() {
         return Err(format!(
-            "\"ref_video_audios\" has {ref_video_audios} entries but \"ref_videos\" has {} — \
+            "\"ref_video_audios\" has {ref_video_audios} entries but \"ref_videos\" has {} - \
              each paired soundtrack needs a reference video",
             ref_video_frames.len()
         ));
@@ -728,7 +728,7 @@ fn parse_ref_media(v: &serde_json::Value, video: bool) -> Result<Option<RefMedia
 /// Capability gate for reference audio: the child's
 /// `/generation_features` map flips `ref_audios`/`ref_video_audios`
 /// false when the loaded model carries no Audio VAE/Encoder. A MISSING
-/// key means an engine build from before the feature existed — the
+/// key means an engine build from before the feature existed - the
 /// request rides and the child's own answer (which may be a perfectly
 /// good generation or its verbatim error) is the truth; the gateway
 /// only pre-empts flags the engine explicitly advertises as absent.
@@ -747,14 +747,14 @@ async fn ref_media_capability_gate(
     };
     if refs.ref_audios > 0 && feature("ref_audios") == Some(false) {
         return Err(
-            "ref_audios requested but the loaded model has no Audio VAE/Encoder — pick a \
+            "ref_audios requested but the loaded model has no Audio VAE/Encoder - pick a \
              model that advertises reference-audio (e.g. an S2V family) or drop \"ref_audios\""
                 .to_string(),
         );
     }
     if refs.ref_video_audios > 0 && feature("ref_video_audios") == Some(false) {
         return Err(
-            "ref_video_audios requested but the loaded model has no Audio VAE — pick a \
+            "ref_video_audios requested but the loaded model has no Audio VAE - pick a \
              model that advertises paired reference audio or drop \"ref_video_audios\""
                 .to_string(),
         );
@@ -767,7 +767,7 @@ async fn ref_media_capability_gate(
 /// native vocabulary before translation. Explicit `steps` or
 /// `sample_params.sample_steps` always wins over a quality tier.
 // Casting policy: step/cfg math runs in f64 (multipliers are fractional)
-// and lands back on u64 knobs the child validates — the trio below is
+// and lands back on u64 knobs the child validates - the trio below is
 // deliberate, mirroring `canonicalize_video_frames`.
 #[allow(
     clippy::result_large_err,
@@ -818,7 +818,7 @@ async fn apply_generation_semantics(
             if has_explicit_steps {
                 return Err(openai_error(
                     400,
-                    "\"steps\" and \"quality\" are two dials for the same budget — send one",
+                    "\"steps\" and \"quality\" are two dials for the same budget - send one",
                 ));
             }
             let base = defaults
@@ -826,7 +826,7 @@ async fn apply_generation_semantics(
                 .and_then(|d| d.pointer("/sample_params/sample_steps"))
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| openai_error(502,
-                    "engine capabilities carry no sample_steps default — set \"steps\" explicitly",
+                    "engine capabilities carry no sample_steps default - set \"steps\" explicitly",
                 ))?;
             let steps = ((base as f64) * mult).round().max(1.0) as u64;
             if let Some(obj) = parsed.as_object_mut() {
@@ -850,7 +850,7 @@ async fn apply_generation_semantics(
             let target = base.map(|b| (b * preset).max(1.0)).ok_or_else(|| {
                 openai_error(
                     502,
-                    "engine capabilities carry no txt_cfg default — set \
+                    "engine capabilities carry no txt_cfg default - set \
                      sample_params.guidance.txt_cfg explicitly",
                 )
             })?;
@@ -877,10 +877,10 @@ async fn apply_generation_semantics(
     Ok(())
 }
 
-/// `n`→`batch_count`, `size "WxH"`→`width`/`height`, `steps`→
+/// `n`->`batch_count`, `size "WxH"`->`width`/`height`, `steps`->
 /// `sample_params.sample_steps` (merged into an existing subtree);
-/// control keys drop; every other key — including whole subtrees like
-/// `guidance`, `cache`, `lora`, `vae_tiling_params` — rides verbatim,
+/// control keys drop; every other key - including whole subtrees like
+/// `guidance`, `cache`, `lora`, `vae_tiling_params` - rides verbatim,
 /// so upstream-additive fields need no translator change.
 fn translate_to_native(v: &serde_json::Value, video: bool) -> serde_json::Value {
     let mut out = serde_json::Map::new();
@@ -893,7 +893,7 @@ fn translate_to_native(v: &serde_json::Value, video: bool) -> serde_json::Value 
             // and the surface teachings); dropped defensively so a
             // stale copy never rides to the child as junk. `seconds`
             // is the Sora ghost-echo the video route plants for the
-            // ledger — never a child field.
+            // ledger - never a child field.
             "model" | "user" | "async" | "stream" | "quality" | "style" | "response_format"
             | "seconds" => {}
             // `img_gen` batches through `batch_count`; the `vid_gen`
@@ -920,7 +920,7 @@ fn translate_to_native(v: &serde_json::Value, video: bool) -> serde_json::Value 
                     out.insert("width".into(), serde_json::json!(w));
                     out.insert("height".into(), serde_json::json!(h));
                 } else {
-                    // Unparseable size passes through untouched — the
+                    // Unparseable size passes through untouched - the
                     // child's own 400 teaches better than we can.
                     out.insert(k.clone(), val.clone());
                 }
@@ -942,7 +942,7 @@ fn delivery_mode(v: &serde_json::Value) -> DeliveryMode {
         DeliveryMode::AsyncNative
     } else if !is_plain_generation_request(v) {
         // Rich dialect, no async flag: the caller still holds OpenAI
-        // sync semantics — wait and answer in the OpenAI shape.
+        // sync semantics - wait and answer in the OpenAI shape.
         DeliveryMode::SyncNative
     } else {
         DeliveryMode::SyncPlain
@@ -950,7 +950,7 @@ fn delivery_mode(v: &serde_json::Value) -> DeliveryMode {
 }
 
 /// Domain gate for the images routes. `row: None` (unknown model) is NOT
-/// a rejection — `ensure_with_admission` owns that 404 — it only means
+/// a rejection - `ensure_with_admission` owns that 404 - it only means
 /// the gate has nothing to check.
 pub(crate) enum ImagesGate {
     Serve,
@@ -969,7 +969,7 @@ pub(crate) enum Surface {
 }
 
 /// Family mode of a stored row: `false` when the repo is not a curated
-/// video family (image family or unknown — both serve image surfaces).
+/// video family (image family or unknown - both serve image surfaces).
 fn row_is_video(row: &blazar_core::store::ModelRow) -> bool {
     matches!(
         blazar_runtime::diffusion::family_mode(&row.repo),
@@ -983,7 +983,7 @@ fn row_is_video(row: &blazar_core::store::ModelRow) -> bool {
 /// direction, same vocabulary both ways.
 pub(crate) fn diffusion_text_refusal(name: &str) -> String {
     format!(
-        "\"{name}\" is a diffusion component set — text endpoints cannot drive it; \
+        "\"{name}\" is a diffusion component set - text endpoints cannot drive it; \
          image generation serves POST /v1/images/generations \
          (instruction edits: POST /v1/images/edits)"
     )
@@ -1002,7 +1002,7 @@ pub(crate) fn images_gate(
     };
     if !row.has_component_set() {
         return ImagesGate::Reject(format!(
-            "\"{}\" is not a diffusion model — /v1/images and /v1/videos serve diffusion \
+            "\"{}\" is not a diffusion model - /v1/images and /v1/videos serve diffusion \
              component sets (DiT + VAE + text encoder, sdcpp lane); chat models serve \
              /v1/chat/completions",
             row.name
@@ -1012,7 +1012,7 @@ pub(crate) fn images_gate(
         Surface::VidGen => {
             if !row_is_video(row) {
                 return ImagesGate::Reject(format!(
-                    "\"{}\" is an image diffusion family — video generation serves \
+                    "\"{}\" is an image diffusion family - video generation serves \
                      /v1/videos/generations on video families (Wan)",
                     row.name
                 ));
@@ -1021,7 +1021,7 @@ pub(crate) fn images_gate(
         Surface::ImgGen => {
             if row_is_video(row) {
                 return ImagesGate::Reject(format!(
-                    "\"{}\" is a video diffusion family — image generation serves \
+                    "\"{}\" is a video diffusion family - image generation serves \
                      /v1/images/generations; video serves POST /v1/videos/generations",
                     row.name
                 ));
@@ -1031,16 +1031,16 @@ pub(crate) fn images_gate(
     }
     if surface == Surface::ImgEdits && !row.serves_image_edits() {
         // Family-aware refusal: a vision-less family (FLUX) would loop
-        // forever on re-pull teaching — its set is already complete.
+        // forever on re-pull teaching - its set is already complete.
         if blazar_runtime::diffusion::family_supports_edits(&row.repo) == Some(false) {
             return ImagesGate::Reject(format!(
-                "\"{}\" belongs to a diffusion family without a vision encoder — \
+                "\"{}\" belongs to a diffusion family without a vision encoder - \
                  instruction edits are not supported; use /v1/images/generations",
                 row.name
             ));
         }
         return ImagesGate::Reject(format!(
-            "image edits need the vision-encoder companion — \"{}\" was pulled without one; \
+            "image edits need the vision-encoder companion - \"{}\" was pulled without one; \
              re-pull it to fetch the set: blazar pull {}",
             row.name, row.name
         ));
@@ -1061,12 +1061,12 @@ async fn forward_images(
     load_ms: u128,
 ) -> Response {
     // Crash-window retry: a dead child (capacity eviction, warm-up
-    // crash) surfaces here as a transport error — respawn + one retry
+    // crash) surfaces here as a transport error - respawn + one retry
     // instead of a 502 the client never caused. Same contract as the
     // proxy text-lane forward.
     let upstream = crate::proxy::send_with_child_retry(state, engine, |eng| {
         // Media client: this forward holds the request open for the
-        // whole render — a total timeout here is the binding ceiling
+        // whole render - a total timeout here is the binding ceiling
         // long before the child's own lanes fire.
         let mut rb = crate::state::media_child_client(state, &eng.endpoint)
             .post(format!("{}{path}", child_base(&eng.endpoint)));
@@ -1100,7 +1100,7 @@ async fn forward_images(
         .unwrap_or_else(|e| openai_error(500, &format!("response build: {e}")).into_response())
 }
 
-/// POST /v1/images/generations — text-to-image on a diffusion set.
+/// POST /v1/images/generations - text-to-image on a diffusion set.
 pub async fn generations(
     State(state): State<Arc<AppState>>,
     key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
@@ -1125,7 +1125,7 @@ pub async fn generations(
     }
     // Image-surface teaching for video-lane reference fields: the child
     // rejects them outside vid_gen, and the client's fix is the other
-    // route — say so here instead of relaying an opaque child error.
+    // route - say so here instead of relaying an opaque child error.
     if let Err(msg) = parse_ref_media(&parsed, false) {
         return openai_error(400, &msg);
     }
@@ -1133,7 +1133,7 @@ pub async fn generations(
         .with_store(|s| resolve_model(s, &model).ok())
         .flatten();
     // Federation fallback: a diffusion model no local row owns serves
-    // from a live peer that lists it — byte-forward the generation
+    // from a live peer that lists it - byte-forward the generation
     // request, the peer's own gate owns capability checks. Local-only
     // teaching below stays untouched when no peer claims it.
     if row.is_none() {
@@ -1172,7 +1172,7 @@ pub async fn generations(
         Priority::Normal,
         WorkClass::Interactive,
         None,
-        false, // images: no mmproj lane — the vision encoder rides argv
+        false, // images: no mmproj lane - the vision encoder rides argv
         true,  // images lane: component sets are its cargo
         false,
         false, // diffusion lane: not a generation surface
@@ -1321,10 +1321,10 @@ async fn deliver_native(
 /// Video timing pass, after semantics: dynamic-fps correction plus the
 /// ghost-seconds echo for the Sora plane's ledger `request` block. The
 /// canonicalizer converted `seconds` with an assumed 16 fps; the loaded
-/// model's own capabilities default says otherwise — recompute the frame
+/// model's own capabilities default says otherwise - recompute the frame
 /// count and pin fps explicitly so the rendered duration matches the
 /// seconds asked. Unreachable capabilities keep the 16-fps conversion
-/// (today's behavior) — the request proceeds either way. The ghost
+/// (today's behavior) - the request proceeds either way. The ghost
 /// `seconds` is gateway vocabulary: the translator drops it, it never
 /// rides to the child.
 #[allow(
@@ -1359,10 +1359,10 @@ async fn apply_video_timing(
     }
 }
 
-/// POST /v1/videos/generations — text-to-video on a video family
+/// POST /v1/videos/generations - text-to-video on a video family
 /// (Wan). Same contract as image generations with two differences:
 /// the gate demands a curated video family, and there is no compat
-/// forward — sd-server's OpenAI-compat route serves images only, so
+/// forward - sd-server's OpenAI-compat route serves images only, so
 /// every request rides the native `vid_gen` dialect.
 #[allow(clippy::too_many_lines)]
 pub async fn video_generations(
@@ -1390,7 +1390,7 @@ pub async fn video_generations(
     if parsed.get("remixed_from_video_id").is_some() {
         return openai_error(
             400,
-            "video remix (remixed_from_video_id) has no local engine primitive — sdcpp \
+            "video remix (remixed_from_video_id) has no local engine primitive - sdcpp \
              vid_gen is text-to-video (plus first/last-frame init images on some families); \
              compose a continuation manually: an image edit, then a new video",
         );
@@ -1406,7 +1406,7 @@ pub async fn video_generations(
     let ref_frames = refs.as_ref().map_or(0, RefMedia::total_ref_frames);
     // Capture the seconds dial BEFORE canonicalization consumes it: the
     // pure converter must assume the 16 fps default, but the honest
-    // frame count derives from the model's own default — corrected once
+    // frame count derives from the model's own default - corrected once
     // the engine is known (below).
     let seconds_based = parsed
         .get("seconds")
@@ -1425,7 +1425,7 @@ pub async fn video_generations(
     }
     // Family gate BEFORE the VRAM scratch gate (audit MM10): a wrong-
     // family request (image set on the video route) must hear the lane
-    // teaching first — complying with VRAM levers (fewer frames, smaller
+    // teaching first - complying with VRAM levers (fewer frames, smaller
     // size) could never fix a family mismatch, so that error order lied.
     let row = state
         .with_store(|s| resolve_model(s, &model).ok())
@@ -1478,7 +1478,7 @@ pub async fn video_generations(
     )
     .await;
     let mode = match delivery_mode(&parsed) {
-        // No compat route exists for video — plain requests also ride
+        // No compat route exists for video - plain requests also ride
         // the native dialect and come back mapped OpenAI-style.
         DeliveryMode::SyncPlain | DeliveryMode::SyncNative => DeliveryMode::SyncNative,
         mode => mode,
@@ -1496,7 +1496,7 @@ pub async fn video_generations(
     .await
 }
 
-/// POST /v1/images/edits — image-to-image; multipart body forwarded
+/// POST /v1/images/edits - image-to-image; multipart body forwarded
 /// byte-for-byte (the boundary is the child's contract, never rebuilt).
 pub async fn edits(
     State(state): State<Arc<AppState>>,
@@ -1555,8 +1555,8 @@ pub async fn edits(
 }
 
 /// Standard-alphabet base64 (RFC 4648, padded). The workspace ships no
-/// base64 crate — every other lane hands the child raw bytes or
-/// pre-encoded payloads — so the media lane owns this tiny codec for the
+/// base64 crate - every other lane hands the child raw bytes or
+/// pre-encoded payloads - so the media lane owns this tiny codec for the
 /// spots where the gateway itself must transcode (variations upload
 /// encode here; video content decode in the Sora verbs).
 const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1601,12 +1601,12 @@ fn variations_payload(parts: &[crate::whisper::Part]) -> Result<serde_json::Valu
     for part in parts {
         if part.name == "image" {
             if image.is_some() {
-                return Err("multiple \"image\" parts — send exactly one image".into());
+                return Err("multiple \"image\" parts - send exactly one image".into());
             }
             image = Some(part);
         } else if part.filename.is_some() {
             return Err(format!(
-                "unexpected file part \"{}\" — variations takes one \"image\" file; \
+                "unexpected file part \"{}\" - variations takes one \"image\" file; \
                  mask/instruction editing is /v1/images/edits",
                 part.name
             ));
@@ -1656,9 +1656,9 @@ fn variations_payload(parts: &[crate::whisper::Part]) -> Result<serde_json::Valu
     Ok(serde_json::Value::Object(obj))
 }
 
-/// POST /v1/images/variations — the `OpenAI` variation verb, served
+/// POST /v1/images/variations - the `OpenAI` variation verb, served
 /// natively: the uploaded image rides as `init_image` (img2img with a
-/// neutral empty prompt — the `OpenAI` contract sends none), random seed
+/// neutral empty prompt - the `OpenAI` contract sends none), random seed
 /// unless set. Answers in the same `{created, data[].b64_json}` shape
 /// generations uses; the native dialect (strength, `negative_prompt`,
 /// `sample_params`, ...) rides as documented extensions, and the
@@ -1726,7 +1726,7 @@ pub async fn variations(
     if let Err(resp) = apply_generation_semantics(&state, &engine, &mut payload, false).await {
         return resp;
     }
-    // `init_image` keeps this off the plain compat lane by construction —
+    // `init_image` keeps this off the plain compat lane by construction -
     // every variation is a native submit with an OpenAI-shaped answer.
     deliver_native(
         state,
@@ -1752,11 +1752,11 @@ fn child_matches_model(query: &str, canonical: Option<&str>, child: &str) -> boo
 }
 
 /// Live `sd-server` children, optionally narrowed to one model. The
-/// job routes resolve against this snapshot ONLY — they never spawn:
+/// job routes resolve against this snapshot ONLY - they never spawn:
 /// a job belongs to the child that accepted it and dies with it.
 /// `model` is caller-spelled (body name or `?model=`); children
 /// register under the canonical row name, so the store resolves the
-/// spelling before narrowing — the same resolution the spawn path
+/// spelling before narrowing - the same resolution the spawn path
 /// (`ensure_with_admission` -> `lane = row.name`) performs.
 fn live_sdcpp_children(state: &AppState, model: Option<&str>) -> Vec<blazar_runtime::EngineRef> {
     let canonical = model.and_then(|m| {
@@ -1782,7 +1782,7 @@ async fn submit_native_job(
     native_path: &str,
     native: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<Response>> {
-    // Crash-window retry — same contract as forward_images above: a
+    // Crash-window retry - same contract as forward_images above: a
     // dead child surfaces as transport error, respawn + one retry.
     let resp = match crate::proxy::send_with_child_retry(state, engine, |eng| {
         let url = format!("{}{native_path}", child_base(&eng.endpoint));
@@ -1815,7 +1815,7 @@ async fn submit_native_job(
 /// so the supervisor's idle clock never sees them: without this bracket
 /// the reaper can evict the child mid-render once `media_job_wait_secs`
 /// outruns `idle_timeout_secs` (audit MM5). Same begin/end bracket the
-/// text lanes hold via `InFlightGuard` — begin marks in-flight (the
+/// text lanes hold via `InFlightGuard` - begin marks in-flight (the
 /// reaper never evicts under load) and both ends refresh `last_used`.
 struct ChildActivityGuard {
     sup: std::sync::Arc<blazar_runtime::Supervisor>,
@@ -1867,7 +1867,7 @@ async fn poll_child_job(
 
 /// Best-effort child-side cancel (stream disconnect). The upstream
 /// endpoint resets the connection after the cancel lands (probe
-/// 2026-09-22, see `jobs_cancel`) — any transport failure here is
+/// 2026-09-22, see `jobs_cancel`) - any transport failure here is
 /// treated as taken-effect, never worth surfacing.
 async fn cancel_child_job(state: &AppState, engine: &blazar_runtime::EngineRef, job_id: &str) {
     let url = format!(
@@ -1904,7 +1904,7 @@ pub(crate) async fn poll_live_child(
     None
 }
 
-/// Locate the owning child and fire a cancel at it — the unified
+/// Locate the owning child and fire a cancel at it - the unified
 /// `/v1/jobs/{id}/cancel` path, which has no `?model=` hint and relies
 /// on the engine name recorded at submit time.
 pub(crate) async fn cancel_child_best_effort(state: &AppState, engine: Option<&str>, job_id: &str) {
@@ -1929,7 +1929,7 @@ fn native_job_to_openai(job: &serde_json::Value) -> serde_json::Value {
         .cloned()
         .unwrap_or_default();
     // vid_gen answers with a FLAT payload (b64_json + fps + frame_count +
-    // mime_type at the result root — verified against sd-server master-890);
+    // mime_type at the result root - verified against sd-server master-890);
     // img_gen nests per-image objects under images[]. Map the flat video
     // bytes into the same data[] envelope so clients read one shape.
     let data = if images.is_empty() {
@@ -1973,7 +1973,7 @@ async fn await_native_job(
     loop {
         if budget_secs != 0 && polled >= budget_secs {
             // The client walk away at the budget, but the child keeps
-            // rendering — cancel it instead of burning the GPU on an
+            // rendering - cancel it instead of burning the GPU on an
             // answer nobody will read (best-effort; upstream reset
             // probe 2026-09-22).
             cancel_child_job(state, engine, job_id).await;
@@ -1981,7 +1981,7 @@ async fn await_native_job(
             return Err(Box::new(openai_error(
                 504,
                 &format!(
-                    "generation did not finish within {budget_secs}s — raise media_job_wait_secs \
+                    "generation did not finish within {budget_secs}s - raise media_job_wait_secs \
                      or use \"async\": true and poll the job handle"
                 ),
             )));
@@ -2020,14 +2020,14 @@ async fn await_native_job(
                         "engine child died mid-generation",
                     )));
                 }
-                // One failed poll is a hiccup, not death — keep polling.
+                // One failed poll is a hiccup, not death - keep polling.
             }
         }
     }
 }
 
 /// `SSE` relay: progress events every poll, one terminal event, then
-/// close. The spawned task stops on client disconnect (send fails —
+/// close. The spawned task stops on client disconnect (send fails -
 /// and cancels the child job so nobody pays GPU for an uncollected
 /// render), child death, or the `media_job_wait_secs` budget.
 fn stream_native_job(
@@ -2052,7 +2052,7 @@ fn stream_native_job(
                 cancel_child_job(&state, &engine, &job_id).await;
                 state.jobs.record_cancelled(&state, &job_id);
                 let msg = format!(
-                    "generation did not finish within {budget_secs}s — raise \
+                    "generation did not finish within {budget_secs}s - raise \
                      media_job_wait_secs or use \"async\": true"
                 );
                 let frame = format!(
@@ -2103,7 +2103,7 @@ fn stream_native_job(
                         let _ = tx.send(Ok(Bytes::from(frame))).await;
                         break;
                     }
-                    // One failed poll is a hiccup, not death — keep polling.
+                    // One failed poll is a hiccup, not death - keep polling.
                     continue;
                 }
             };
@@ -2180,7 +2180,7 @@ fn async_handle_response(submitted: serde_json::Value, load_ms: u128) -> Respons
         .unwrap_or_else(|e| openai_error(500, &format!("response build: {e}")).into_response())
 }
 
-/// GET /v1/images/jobs/{id}?model=NAME — poll a native job on the
+/// GET /v1/images/jobs/{id}?model=NAME - poll a native job on the
 /// LIVE child first (never spawns); the durable ledger answers when the
 /// child is gone, so completed results survive eviction and restarts.
 pub async fn jobs_get(
@@ -2207,9 +2207,9 @@ pub async fn jobs_get(
                 openai_error(500, &format!("response build: {e}")).into_response()
             });
     }
-    // No live child owns the job — none is booted at all, or eviction /
+    // No live child owns the job - none is booted at all, or eviction /
     // crash took the owner: the ledger is the afterlife either way. A
-    // non-terminal row means the child died mid-render — close it
+    // non-terminal row means the child died mid-render - close it
     // honestly instead of leaving a forever-running zombie row.
     let row = state
         .with_store(|s| s.get_job(&job_id).ok().flatten())
@@ -2219,7 +2219,7 @@ pub async fn jobs_get(
             state.jobs.record_failed(
                 &state,
                 &job_id,
-                "job's engine child is gone (eviction, crash or restart) — \
+                "job's engine child is gone (eviction, crash or restart) - \
                  resubmit the generation",
             );
         }
@@ -2233,17 +2233,17 @@ pub async fn jobs_get(
     if children_empty {
         return openai_error(
             404,
-            "no live diffusion child serves jobs — POST /v1/images/generations boots one",
+            "no live diffusion child serves jobs - POST /v1/images/generations boots one",
         );
     }
     openai_error(
         404,
-        "job not found on any live diffusion child — jobs die with their engine child \
+        "job not found on any live diffusion child - jobs die with their engine child \
          (eviction, crash or restart); completed results live on at /v1/jobs/{id}",
     )
 }
 
-/// POST /v1/images/jobs/{id}/cancel — cancel on the LIVE child. The
+/// POST /v1/images/jobs/{id}/cancel - cancel on the LIVE child. The
 /// upstream cancel endpoint resets the connection after taking effect
 /// (probe 2026-09-22): a transport failure here is treated as
 /// likely-success and followed by one state poll whose verdict is the
@@ -2262,7 +2262,7 @@ pub async fn jobs_cancel(
     let children = live_sdcpp_children(&state, params.model.as_deref());
     let mut last_known: Option<(serde_json::Value, blazar_runtime::EngineRef)> = None;
     for engine in &children {
-        // Locate the owning child first — cancel on a non-owner would
+        // Locate the owning child first - cancel on a non-owner would
         // 404 or reset pointlessly.
         if let Ok(Some(job)) = poll_child_job(&state, engine, &job_id).await {
             last_known = Some((job, engine.clone()));
@@ -2290,12 +2290,12 @@ pub async fn jobs_cancel(
         if children.is_empty() {
             return openai_error(
                 404,
-                "no live diffusion child serves jobs — POST /v1/images/generations boots one",
+                "no live diffusion child serves jobs - POST /v1/images/generations boots one",
             );
         }
         return openai_error(
             404,
-            "job not found on any live diffusion child — jobs die with their engine child; \
+            "job not found on any live diffusion child - jobs die with their engine child; \
              completed records live on at /v1/jobs/{id}",
         );
     };
@@ -2314,9 +2314,9 @@ pub async fn jobs_cancel(
         child_base(&engine.endpoint)
     );
     // Upstream cancel answers OR resets the connection after the cancel
-    // lands — both are "probably cancelled"; the poll decides. One real
+    // lands - both are "probably cancelled"; the poll decides. One real
     // refusal exists though (live-verified on master-890): HTTP 409
-    // "job is currently generating and cannot be interrupted yet" — this
+    // "job is currently generating and cannot be interrupted yet" - this
     // build only cancels queued jobs. Relay that truth instead of
     // answering a fake-optimistic 200.
     let sent = child_auth(
@@ -2338,7 +2338,7 @@ pub async fn jobs_cancel(
         return openai_error(
             409,
             &format!(
-                "engine refused the cancel: {upstream_msg} — this build only cancels \
+                "engine refused the cancel: {upstream_msg} - this build only cancels \
                      queued jobs; generating ones run to completion"
             ),
         )
@@ -2365,14 +2365,14 @@ pub async fn jobs_cancel(
 // ---- Sora video plane: /v1/videos -----------------------------------
 //
 // The Sora dialect reads the SAME durable job ledger the video lane
-// writes (`kind: "video"` rows) — no parallel job subsystem. The
+// writes (`kind: "video"` rows) - no parallel job subsystem. The
 // differences are shape only: `object: "video"`, `in_progress`
 // status, a `seconds` echo, content delivery as raw bytes
 // (`GET /{id}/content`) and DELETE-as-cancel. `cancelled` stays a
-// blazar-superset status (Sora's enum has no cancelled) — an honest
+// blazar-superset status (Sora's enum has no cancelled) - an honest
 // superset beats a lying `failed`.
 
-/// Strict RFC 4648 decoder — the inverse of [`b64_encode`], fed by the
+/// Strict RFC 4648 decoder - the inverse of [`b64_encode`], fed by the
 /// child's own padded standard-base64 output. Table-built once; any
 /// non-alphabet byte, misplaced `=` or ragged length is an error by
 /// name rather than a silent partial decode.
@@ -2387,7 +2387,7 @@ static B64_DECODE_TABLE: std::sync::LazyLock<[u8; 256]> = std::sync::LazyLock::n
     table
 });
 
-// Shifts below stay inside u32 then narrow to u8 — values are ≤ 0xFF by
+// Shifts below stay inside u32 then narrow to u8 - values are <= 0xFF by
 // construction (three payload bytes per quad).
 #[allow(clippy::cast_possible_truncation)]
 fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
@@ -2444,11 +2444,11 @@ pub struct VideoListQuery {
 
 /// Map a ledger row (plus optional live child snapshot for fresh
 /// progress) to the Sora video object. `seconds` prefers the completed
-/// result's `frame_count`/`fps` — the engine normalizes the frame
+/// result's `frame_count`/`fps` - the engine normalizes the frame
 /// count (4n+1), so the render's own numbers are the truth over the
 /// request echo.
 // Progress arrives as an f64 fraction from the child; the OpenAI shape
-// wants an integer percentage — truncation toward 0 is the safe side.
+// wants an integer percentage - truncation toward 0 is the safe side.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn sora_video_object(
     row: &blazar_core::store::JobRow,
@@ -2459,7 +2459,7 @@ fn sora_video_object(
         "running" => "in_progress",
         "completed" => "completed",
         "failed" => "failed",
-        other => other, // "cancelled" — documented superset
+        other => other, // "cancelled" - documented superset
     };
     let mut obj = serde_json::json!({
         "id": row.id,
@@ -2582,7 +2582,7 @@ fn completed_video_bytes(
 /// Poll the live child for an in-flight row and mirror any terminal
 /// verdict into the ledger. Returns the fresh child snapshot (progress
 /// carrier) or `None` when the row is terminal. A non-terminal row no
-/// live child owns is a mid-render death (eviction, crash, restart) —
+/// live child owns is a mid-render death (eviction, crash, restart) -
 /// it closes failed right here so the Sora views never serve a
 /// forever-in_progress zombie.
 async fn freshen_video_row(
@@ -2596,7 +2596,7 @@ async fn freshen_video_row(
         state.jobs.record_failed(
             state,
             &row.id,
-            "job's engine child is gone (eviction, crash or restart) — resubmit the generation",
+            "job's engine child is gone (eviction, crash or restart) - resubmit the generation",
         );
         return None;
     };
@@ -2611,7 +2611,7 @@ fn video_row(state: &AppState, id: &str) -> Option<blazar_core::store::JobRow> {
         .filter(|row| row.kind == "video")
 }
 
-/// GET /v1/videos — Sora's list verb over the durable video rows,
+/// GET /v1/videos - Sora's list verb over the durable video rows,
 /// newest first (Sora default limit 10, max 100).
 pub async fn videos_list(
     State(state): State<Arc<AppState>>,
@@ -2657,7 +2657,7 @@ pub async fn videos_list(
     axum::Json(list).into_response()
 }
 
-/// GET /v1/videos/{id} — the Sora video object, live-polled while
+/// GET /v1/videos/{id} - the Sora video object, live-polled while
 /// in flight.
 pub async fn video_get(
     State(state): State<Arc<AppState>>,
@@ -2684,7 +2684,7 @@ pub async fn video_get(
     axum::Json(sora_video_object(current, fresh.as_ref())).into_response()
 }
 
-/// GET /v1/videos/{id}/content — the rendered bytes. Sora semantics:
+/// GET /v1/videos/{id}/content - the rendered bytes. Sora semantics:
 /// 404 until the render is completed, then the container the engine
 /// produced (webm today; webp/avi when asked via `output_format`).
 pub async fn video_content(
@@ -2701,7 +2701,7 @@ pub async fn video_content(
     let Some(row) = video_row(&state, &id) else {
         return openai_error(404, &format!("video {id} not found"));
     };
-    // Rendered bytes are the caller's output — owner gate before the
+    // Rendered bytes are the caller's output - owner gate before the
     // download (BLZ-1).
     if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
         return openai_error(404, &format!("video {id} not found"));
@@ -2717,7 +2717,7 @@ pub async fn video_content(
                 openai_error(
                     404,
                     &format!(
-                        "video {id} was cancelled or deleted — its bytes are gone; \
+                        "video {id} was cancelled or deleted - its bytes are gone; \
                          submit a new generation"
                     ),
                 )
@@ -2725,7 +2725,7 @@ pub async fn video_content(
                 openai_error(
                     404,
                     &format!(
-                        "video {id} is not completed yet — poll GET /v1/videos/{id} until \
+                        "video {id} is not completed yet - poll GET /v1/videos/{id} until \
                          status is \"completed\""
                     ),
                 )
@@ -2735,17 +2735,17 @@ pub async fn video_content(
             410,
             &format!(
                 "video {id}'s rendered bytes outgrew the inline ledger, spilled to disk \
-                 and the spill was lost — regenerate"
+                 and the spill was lost - regenerate"
             ),
         ),
         Err(VideoContentError::Unreadable(msg)) => openai_error(500, &msg),
     }
 }
 
-/// DELETE /v1/videos/{id} — Sora's deprecated cancel verb. Open rows
+/// DELETE /v1/videos/{id} - Sora's deprecated cancel verb. Open rows
 /// (queued/running) get a best-effort child cancel (this engine build
 /// only interrupts queued jobs) and close `cancelled`. Terminal rows
-/// (completed/failed) have their render deleted — the stored result is
+/// (completed/failed) have their render deleted - the stored result is
 /// purged so `/content` 404s afterward, matching the `video.deleted`
 /// claim instead of leaving a zombie download behind. Idempotent on
 /// every state.
@@ -2786,7 +2786,7 @@ pub async fn video_delete(
                 .jobs
                 .record_deleted(&state, &id, row.artifact_path.as_deref());
         }
-        _ => {} // already cancelled/deleted — idempotent
+        _ => {} // already cancelled/deleted - idempotent
     }
     axum::Json(serde_json::json!({
         "id": id,
@@ -2796,7 +2796,7 @@ pub async fn video_delete(
     .into_response()
 }
 
-/// POST /v1/images/upscale — standalone ESRGAN upscale over HTTP
+/// POST /v1/images/upscale - standalone ESRGAN upscale over HTTP
 /// (upstream PR2026, sd-server master-929+). Sync, no diffusion model
 /// load, no job machinery: upscaler weights come from the engine's
 /// `--hires-upscalers-dir`. Serves from a live diffusion child; pass
@@ -2827,12 +2827,12 @@ pub async fn upscale(
         return *resp;
     }
     // Route gate: the standalone endpoint shipped in master-929; on an
-    // older engine the child would answer a confusing 404 — teach
+    // older engine the child would answer a confusing 404 - teach
     // instead. Deliberately fails OPEN on an unreadable store or
     // unparseable manifest (audited F1, posture kept): the upscale
     // child's own response is self-describing, store-open failures
     // already warn once via with_store, and doctor surfaces store
-    // errors loudly — so blocking this lane on a meta-read failure
+    // errors loudly - so blocking this lane on a meta-read failure
     // would trade availability for nothing.
     let too_old = state
         .with_store(|s| {
@@ -2893,9 +2893,9 @@ pub async fn upscale(
     .await
 }
 
-/// GET /v1/images/capabilities?model=NAME — the live child's sampler/
+/// GET /v1/images/capabilities?model=NAME - the live child's sampler/
 /// cache/LoRA menu. Read-only: boots nothing; no live child teaches
-/// instead. `?model=` narrows to that family's child — on a multi-family
+/// instead. `?model=` narrows to that family's child - on a multi-family
 /// box the first live child is otherwise an arbitrary pick (audit MM3).
 pub async fn capabilities(
     State(state): State<Arc<AppState>>,
@@ -2905,9 +2905,9 @@ pub async fn capabilities(
     let Some(engine) = children.first() else {
         return openai_error(
             400,
-            "no live diffusion child — POST /v1/images/generations boots one, \
-             then capabilities serve (pass ?model=NAME — store name or \
-             canonical engine name — to pick a family's child)",
+            "no live diffusion child - POST /v1/images/generations boots one, \
+             then capabilities serve (pass ?model=NAME - store name or \
+             canonical engine name - to pick a family's child)",
         );
     };
     let url = format!("{}/sdcpp/v1/capabilities", child_base(&engine.endpoint));
@@ -3085,7 +3085,7 @@ mod tests {
         assert_eq!(
             v["fps"],
             serde_json::json!(8),
-            "fps is a real child field — it rides"
+            "fps is a real child field - it rides"
         );
 
         // Fractional seconds round; sub-frame durations clamp to one.
@@ -3180,7 +3180,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn unit__estimate_video_scratch__matches_measured_envelope() {
-        // Warm 320x320 points (5/13/33 frames) all measured ≈ 3017 MiB
+        // Warm 320x320 points (5/13/33 frames) all measured ~ 3017 MiB
         // scratch; the gate's estimate must sit above the pass floor and
         // below the 5.3 GiB that was free when they passed.
         let warm_320 = estimate_video_scratch(33, 320, 320, false);
@@ -3192,7 +3192,7 @@ mod tests {
         );
 
         // Warm 512x512: 5-frame pass measured 3527 MiB; 13f@512 is an
-        // upstream no-results bug at the same memory, not VRAM — the
+        // upstream no-results bug at the same memory, not VRAM - the
         // estimate must stay under a quiet box's ~5.3 GiB so the gate
         // does not steal blame from the child's own failure.
         let warm_512 = estimate_video_scratch(13, 512, 512, false);
@@ -3215,7 +3215,7 @@ mod tests {
         let long = estimate_video_scratch(960, 320, 320, false); // 957 aligned after floor
         assert!(long.estimate_mib > 100_000, "got {}", long.estimate_mib);
 
-        // A cold spawn charges the staged weights on top — exactly the
+        // A cold spawn charges the staged weights on top - exactly the
         // deterministic weight size, unscaled by the scratch safety factor.
         let cold = estimate_video_scratch(5, 320, 320, true);
         let warm = estimate_video_scratch(5, 320, 320, false);
@@ -3238,7 +3238,7 @@ mod tests {
             (640, 480)
         );
         // Absent / malformed / zero dims fall back to the child's own
-        // default — the bigger, conservative side.
+        // default - the bigger, conservative side.
         assert_eq!(gate_size(&serde_json::json!({})), (512, 512));
         assert_eq!(gate_size(&serde_json::json!({"size": "big"})), (512, 512));
         assert_eq!(gate_size(&serde_json::json!({"size": "0x0"})), (512, 512));
@@ -3258,7 +3258,7 @@ mod tests {
             gate_size(&serde_json::json!({"width": 768, "height": 432})),
             (768, 432)
         );
-        // Zero/partial/malformed numeric dims are not a geometry — the
+        // Zero/partial/malformed numeric dims are not a geometry - the
         // conservative default still wins.
         assert_eq!(
             gate_size(&serde_json::json!({"width": 0, "height": 320})),
@@ -3279,7 +3279,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn unit__parse_ref_media__accepts_upstream_shapes_and_nulls() {
-        // Absent → nothing to gate.
+        // Absent -> nothing to gate.
         assert!(
             parse_ref_media(&serde_json::json!({}), true)
                 .unwrap()
@@ -3300,7 +3300,7 @@ mod tests {
         assert_eq!(refs.total_ref_frames(), 6);
         assert_eq!(refs.ref_audios, 1);
         assert_eq!(refs.ref_video_audios, 1);
-        // Null clears per sd-server's parser contract — treated as
+        // Null clears per sd-server's parser contract - treated as
         // absent for gating, never an error.
         assert!(
             parse_ref_media(
@@ -3349,7 +3349,7 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn unit__parse_ref_media__image_surface_names_the_video_route() {
-        // On the image surface any ref key teaches the route fix —
+        // On the image surface any ref key teaches the route fix -
         // sd-server rejects these outside vid_gen, so relaying would
         // only obscure the actionable answer.
         let err = parse_ref_media(&serde_json::json!({"ref_videos": [["A"]]}), false).unwrap_err();
@@ -3363,7 +3363,7 @@ mod tests {
     fn unit__gate_frames__absent_priced_at_calibration_horizon() {
         // The child's default for an unspecified vid_gen is not
         // contracted (CLI flag says 1, live bare renders delivered
-        // multi-frame) — a safety gate must not undersell what it
+        // multi-frame) - a safety gate must not undersell what it
         // cannot know. Explicit counts price exactly what was asked.
         assert_eq!(gate_frames(&serde_json::json!({})), 33);
         assert_eq!(
@@ -3375,7 +3375,7 @@ mod tests {
         assert_eq!(
             gate_frames(&serde_json::json!({"video_frames": "33"})),
             33,
-            "string numerals are not u64 — priced at the horizon"
+            "string numerals are not u64 - priced at the horizon"
         );
     }
 
@@ -3448,7 +3448,7 @@ mod tests {
 
     #[test]
     fn unit__images_gate__unknown_row_defers_to_ensure() {
-        // Unknown model is not the gate's call — ensure owns the 404.
+        // Unknown model is not the gate's call - ensure owns the 404.
         assert!(matches!(
             images_gate(None, Surface::ImgEdits),
             ImagesGate::Serve
@@ -3505,7 +3505,7 @@ mod tests {
         );
         assert_eq!(native["prompt"], serde_json::json!("a cat"));
         assert_eq!(native["seed"], serde_json::json!(7));
-        // Subtrees ride verbatim — no re-typing, upstream-additive safe.
+        // Subtrees ride verbatim - no re-typing, upstream-additive safe.
         assert_eq!(native["guidance"], guidance);
         assert_eq!(native["cache"], cache);
         // Control keys and renamed keys never leak under old names.
@@ -3589,7 +3589,7 @@ mod tests {
         let msg = openai_surface_teaching(&url, false, None).unwrap();
         assert!(msg.contains("b64_json"), "{msg}");
 
-        // b64_json is the served shape — no teaching.
+        // b64_json is the served shape - no teaching.
         let b64 = serde_json::json!({"model": "m", "response_format": "b64_json"});
         assert!(openai_surface_teaching(&b64, false, None).is_none());
 
@@ -3769,7 +3769,7 @@ mod tests {
             ),
             DeliveryMode::SyncNative
         );
-        // Both set → stream wins (pinned revision).
+        // Both set -> stream wins (pinned revision).
         assert_eq!(
             delivery_mode(&serde_json::json!({
                 "model": "m", "prompt": "p", "async": true, "stream": true
@@ -3847,7 +3847,7 @@ mod tests {
         assert_eq!(out["created"], serde_json::json!(123));
         assert_eq!(out["output_format"], serde_json::json!("png"));
         assert_eq!(out["data"][0]["b64_json"], serde_json::json!("AAA"));
-        // Missing result → empty data array, never a null.
+        // Missing result -> empty data array, never a null.
         let failed = serde_json::json!({"status": "failed"});
         assert!(
             native_job_to_openai(&failed)["data"]

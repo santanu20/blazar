@@ -4,7 +4,7 @@
 //! the periodic task and opportunistically before reads. Token counts
 //! come from each dialect's final usage JSON (OpenAI/Anthropic/ollama
 //! shapes all land in the response tail), so a stream that never sends
-//! usage still counts its request + generation window — never a fake
+//! usage still counts its request + generation window - never a fake
 //! token number.
 
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use blazar_core::store::{Store, UsageDayRow, UsageDelta};
 #[allow(clippy::struct_field_names)] // token/column naming mirrors usage_daily
 type UsageAcc = UsageDelta;
 
-/// UTC day key (`yyyymmdd`). Usage days are UTC buckets — the same
+/// UTC day key (`yyyymmdd`). Usage days are UTC buckets - the same
 /// convention the OpenAI/Anthropic usage APIs use for server-side
 /// accounting; local-date bucketing would need a date dependency for
 /// a cosmetic difference.
@@ -40,7 +40,7 @@ fn today_key() -> i64 {
 /// Shared meter. `record` is synchronous and lock-scoped (cheap);
 /// `flush` drains everything into the store in one pass. The store
 /// handle lives behind a `Mutex<Option<..>>` and re-opens lazily per
-/// flush — a transient open failure (locked db during a CLI write)
+/// flush - a transient open failure (locked db during a CLI write)
 /// degrades one flush, never the request path, and self-heals on the
 /// next tick. Same shape as the `AppState`'s cached store connection.
 pub struct UsageMeter {
@@ -87,7 +87,7 @@ impl UsageMeter {
     /// transaction. Returns rows written. Failure-safe by construction:
     /// the store is ensured BEFORE anything is drained (an unopenable
     /// database defers the flush with the batch untouched), and a
-    /// failed batch write requeues the whole drained batch additively —
+    /// failed batch write requeues the whole drained batch additively -
     /// `add_usage_deltas` is all-or-nothing, so a mid-batch failure
     /// persists nothing and the retry next tick re-offers exactly what
     /// was measured, plus whatever `record` accumulated meanwhile.
@@ -142,7 +142,7 @@ impl UsageMeter {
 
 /// Fold a failed flush-batch back into the live buckets, ADDITIVELY:
 /// `record` calls that landed while the batch was being written must
-/// survive — assignment would silently erase them. Field-by-field
+/// survive - assignment would silently erase them. Field-by-field
 /// because the accumulator type is core's [`UsageDelta`] and orphan
 /// rules forbid an `AddAssign` impl here.
 fn requeue_additively(
@@ -228,7 +228,7 @@ pub const USAGE_PATHS: &[&str] = &[
 /// Trailing response-body window the usage tap retains while a stream
 /// flows. Streaming lanes put the usage object in a small final
 /// SSE/NDJSON line, but a NON-streaming reply serializes the whole
-/// completion as ONE JSON line — long generations exceed 8 KiB, and a
+/// completion as ONE JSON line - long generations exceed 8 KiB, and a
 /// front-truncated line no longer parses (`from_str` needs the opening
 /// brace). 64 KiB covers non-stream replies up to ~16k output tokens
 /// while staying trivial per in-flight request; beyond it the sniff
@@ -345,7 +345,7 @@ mod tests {
     /// Pin for the flush-ordering bug: the old flush drained buckets
     /// BEFORE ensuring the store, so an unopenable database silently
     /// discarded the whole in-memory batch (the "will retry next tick"
-    /// warning lied — nothing remained to retry). Deferred-open must
+    /// warning lied - nothing remained to retry). Deferred-open must
     /// keep the batch, and the later successful flush must land it.
     #[test]
     #[allow(non_snake_case)] // repo test-name convention: integration__unit__scenario
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(
             m.flush().unwrap(),
             0,
-            "open failure defers the flush — the batch must survive"
+            "open failure defers the flush - the batch must survive"
         );
         // Unblock: the very same meter must land exactly what was
         // recorded, proving nothing was drained into the void.

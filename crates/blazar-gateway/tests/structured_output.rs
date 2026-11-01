@@ -1,4 +1,4 @@
-//! R9 structured-output pre-validation — integration tests over the real
+//! R9 structured-output pre-validation - integration tests over the real
 //! router: malformed `format`/`grammar`/`response_format` fail fast with
 //! 400 BEFORE model admission (no child spawn), format+grammar mutual
 //! exclusion, and the clean-lane passthrough (stub child 200s).

@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 # Native rpm layout for cargo-generate-rpm (release workflow's
 # packages-rpm job). The completion sources are produced by that job
-# AFTER `cargo build --release` — a local `cargo generate-rpm` without
+# AFTER `cargo build --release` - a local `cargo generate-rpm` without
 # them fails; generate them first the same way the job does.
 [package.metadata.generate-rpm]
 assets = [

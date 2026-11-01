@@ -3,8 +3,8 @@
 //! stderr). The gateway reads this to stamp affected requests (sentinel
 //! `engine_slow_attn`) and to expose active degrades on `/api/why`.
 //!
-//! Entries are keyed by the child's endpoint identity — the same string
-//! [`endpoint_id`] derives everywhere — so the gateway can correlate a
+//! Entries are keyed by the child's endpoint identity - the same string
+//! [`endpoint_id`] derives everywhere - so the gateway can correlate a
 //! degrade with the model a request is about to hit. Entries live for
 //! the process lifetime of the child: a respawned child gets a new
 //! endpoint (fresh ports/sockets) and starts clean, which is exactly
@@ -44,7 +44,7 @@ pub fn endpoint_id(endpoint: &blazar_core::profile::Endpoint) -> String {
 }
 
 /// Record (or refresh) a degrade for `child`. Same-child re-detection
-/// keeps the original `since` — the degrade is per child process.
+/// keeps the original `since` - the degrade is per child process.
 pub fn record(child: String, line: String, note: String) {
     let mut guard = REGISTRY
         .lock()

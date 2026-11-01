@@ -1,8 +1,8 @@
 //! Decode-throughput prediction from local benchmark history (v1).
 //!
-//! Physics: single-stream decode is memory-bound — every generated token
+//! Physics: single-stream decode is memory-bound - every generated token
 //! reads essentially the whole weight file. So a measured sample's
-//! `t/s × bytes` estimates a lane's effective memory bandwidth; the
+//! `t/s x bytes` estimates a lane's effective memory bandwidth; the
 //! median across measured neighbors calibrates the lane, and
 //! `median_bandwidth / target_bytes` predicts an unmeasured model on it.
 //!
@@ -37,8 +37,8 @@ pub struct Prediction {
 /// Median effective bandwidth over `samples`, divided by the target's
 /// size.
 ///
-/// Returns `None` — never a fabricated number — when no usable sample
-/// exists, or when the result strays outside `[0.05, 20]×` the fastest
+/// Returns `None` - never a fabricated number - when no usable sample
+/// exists, or when the result strays outside `[0.05, 20]x` the fastest
 /// measured sample (such an outlier means the calibration does not
 /// transfer to this size class). Rows for the target model itself are
 /// excluded: self-prediction would launder a stale measurement in as a
@@ -48,7 +48,7 @@ pub fn predict_decode_tps(
     target_bytes: u64,
     target_model: &str,
 ) -> Option<Prediction> {
-    // Byte counts exceed f64's exact-integer range only past 4.5 PiB —
+    // Byte counts exceed f64's exact-integer range only past 4.5 PiB -
     // no real model file is anywhere near that.
     #![allow(clippy::cast_precision_loss)]
     if target_bytes == 0 {
@@ -67,7 +67,7 @@ pub fn predict_decode_tps(
         .collect();
     bandwidths.sort_by(f64::total_cmp);
     let mid = bandwidths.len() / 2;
-    // Even counts average the middle pair — deterministic and unbiased.
+    // Even counts average the middle pair - deterministic and unbiased.
     let median_bw = if bandwidths.len() % 2 == 1 {
         bandwidths[mid]
     } else {
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn unit__predict__exact_median_math_odd_and_even_counts() {
-        // Bandwidths: 40*2 = 80, 20*4 = 80, 10*8 = 80 GB/s-equivalent —
+        // Bandwidths: 40*2 = 80, 20*4 = 80, 10*8 = 80 GB/s-equivalent -
         // any target size divides the shared median exactly.
         let s = [sample("a", 40.0, 2), sample("b", 20.0, 4)];
         let p = predict_decode_tps(&s, 4, "target").expect("even count predicts");
@@ -117,7 +117,7 @@ mod tests {
             sample("b", 20.0, 4),
             sample("c", 80.0, 1),
         ];
-        // Bandwidths 80, 80, 80 → median 80.
+        // Bandwidths 80, 80, 80 -> median 80.
         let p = predict_decode_tps(&s, 8, "target").expect("odd count predicts");
         assert!((p.decode_tps - 10.0).abs() < 1e-9);
     }
@@ -148,11 +148,11 @@ mod tests {
 
     #[test]
     fn unit__predict__clamp_rejects_far_transfers() {
-        // Bandwidth 20×1e6 = 2e7 → 40 KB target predicts 500 t/s, which
-        // exceeds the 20× cap over the 20 t/s max sample (400).
+        // Bandwidth 20x1e6 = 2e7 -> 40 KB target predicts 500 t/s, which
+        // exceeds the 20x cap over the 20 t/s max sample (400).
         let s = [sample("a", 20.0, 1_000_000)];
         assert!(predict_decode_tps(&s, 40_000, "t").is_none());
-        // 0.05× floor: cannot predict below 1 t/s either.
+        // 0.05x floor: cannot predict below 1 t/s either.
         assert!(predict_decode_tps(&s, 800_000_000, "t").is_none()); // 0.025 t/s
     }
 
@@ -160,7 +160,7 @@ mod tests {
     fn unit__predict__no_samples_or_zero_target_is_none() {
         assert!(predict_decode_tps(&[], 1_000, "t").is_none());
         assert!(predict_decode_tps(&[sample("a", 10.0, 1_000)], 0, "t").is_none());
-        // Only the target's own rows → still None.
+        // Only the target's own rows -> still None.
         assert!(predict_decode_tps(&[sample("t", 10.0, 1_000)], 1_000, "t").is_none());
     }
 }

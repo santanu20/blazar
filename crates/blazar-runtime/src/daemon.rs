@@ -9,7 +9,7 @@ use blazar_core::BlazarDirs;
 
 /// Refusing to start because a live peer owns the daemon lock. Distinct
 /// error type so `blazar serve` can exit with the same hard-conflict
-/// code as a port bind conflict — `Restart=always` must not loop on it.
+/// code as a port bind conflict - `Restart=always` must not loop on it.
 #[derive(Debug)]
 pub struct LockHeld;
 
@@ -53,7 +53,7 @@ impl DaemonLock {
                         Err(why) => {
                             return Err(anyhow::anyhow!(
                                 "pidfile {} is unparseable ({why}): no blazar can be \
-                                 verified running — remove the file if you are certain \
+                                 verified running - remove the file if you are certain \
                                  none is, then retry",
                                 path.display()
                             ));
@@ -62,7 +62,7 @@ impl DaemonLock {
                     Err(why) => {
                         return Err(anyhow::anyhow!(
                             "pidfile {} is unreadable ({why}): no blazar can be verified \
-                             running — fix permissions or remove the file if you are \
+                             running - fix permissions or remove the file if you are \
                              certain none is, then retry",
                             path.display()
                         ));
@@ -77,7 +77,7 @@ impl DaemonLock {
                 }
                 // Stale lock from a dead daemon: take over. F90: loop
                 // back through `create_new` instead of remove+plain-write
-                // — the old sequence had a window where a concurrent
+                // - the old sequence had a window where a concurrent
                 // successor's fresh pidfile landed between our remove and
                 // our write, and we clobbered it (two daemons, both
                 // convinced they hold the lock).
@@ -135,7 +135,7 @@ pub fn process_alive_by_pid(pid: u32) -> bool {
 #[must_use]
 pub fn process_alive_by_pid(pid: u32) -> bool {
     // F89: `/proc` never exists on Windows, so the old probe made stale
-    // takeover ALWAYS win — two daemons on one box. tasklist is the
+    // takeover ALWAYS win - two daemons on one box. tasklist is the
     // dependency-free truth source (CSV rows quote the pid column).
     std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
@@ -153,8 +153,8 @@ pub fn process_alive_by_pid(pid: u32) -> bool {
 }
 
 /// Validate-harness daemons (`BLAZAR_VALIDATE=1` in the environment)
-/// must not outlive their harness: when the parent dies — a `timeout(1)`
-/// SIGKILL bypasses every atexit sweep — the kernel delivers the signal
+/// must not outlive their harness: when the parent dies - a `timeout(1)`
+/// SIGKILL bypasses every atexit sweep - the kernel delivers the signal
 /// installed here. Belt to validate.py's marker sweep; Linux-only
 /// because `PR_SET_PDEATHSIG` is a Linux prctl (other platforms fall
 /// back to the harness sweep + signal-routed cleanup).
@@ -171,7 +171,7 @@ pub fn validate_parent_death_guard() {
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
             return;
         }
-        // Race: the parent may have died between spawn and prctl — the
+        // Race: the parent may have died between spawn and prctl - the
         // signal would never fire. Reparenting to init already happened.
         if libc::getppid() == 1 {
             std::process::exit(0);
@@ -191,13 +191,13 @@ pub const ORPHAN_MARKER_ENV: &str = "BLAZAR_DAEMON_DATA_DIR";
 
 /// Stamp this daemon's data dir into the process environment BEFORE any
 /// engine child can be spawned, so every child (engine servers, whisper,
-/// piper, and their subprocesses — env is inherited down the whole tree)
+/// piper, and their subprocesses - env is inherited down the whole tree)
 /// carries the marker at exec. Idempotent overwrite: a daemon re-exec'd
 /// by a gateway auto-start chain inherits a stale marker from its parent
 /// and must correct it before propagating it further.
 ///
 /// The kernel keeps `/proc/<pid>/environ` at exec-time values, so this
-/// set does NOT make the daemon itself visible to the sweep — only its
+/// set does NOT make the daemon itself visible to the sweep - only its
 /// children, which is exactly the ownership question.
 #[allow(unsafe_code)] // one env::set_var at serve() entry; SAFETY below
 pub fn set_orphan_marker(data_dir: &std::path::Path) {
@@ -227,7 +227,7 @@ fn pid_marks_owner(pid: u32, data_dir: &std::path::Path) -> bool {
 
 /// Every live process whose exec-time env carries OUR data-dir marker.
 /// The sweep runs while this daemon holds [`DaemonLock`], so a match can
-/// only be a stray from a dead predecessor — never a sibling's child
+/// only be a stray from a dead predecessor - never a sibling's child
 /// (a live sibling would hold the lock). Linux-only: `/proc`-based, in
 /// parity with PDEATHSIG being Linux-only.
 #[cfg(target_os = "linux")]
@@ -248,7 +248,7 @@ fn marker_orphan_pids(data_dir: &std::path::Path) -> Vec<u32> {
 /// Escalate already-TERMed stray pids: poll liveness for `grace`, then
 /// SIGKILL every survivor whose identity check still passes. Returns the
 /// pids that needed the KILL. Shared by the marker reclaim and the
-/// pidfile sweep — both signal SIGTERM without waiting and need the same
+/// pidfile sweep - both signal SIGTERM without waiting and need the same
 /// teeth against children that hang in graceful shutdown.
 #[cfg(unix)]
 #[allow(unsafe_code)] // two audited libc::kill calls on exact pids below
@@ -289,7 +289,7 @@ pub(crate) fn escalate_orphans(
 /// Reclaim engine children orphaned by a dead predecessor daemon: every
 /// live process carrying our data-dir marker gets SIGTERM, a bounded
 /// grace window, then SIGKILL. Runs at `serve()` boot after
-/// [`DaemonLock::acquire`] — the lock guarantees no live daemon owns
+/// [`DaemonLock::acquire`] - the lock guarantees no live daemon owns
 /// these processes. Returns one human-readable line per reclaimed pid.
 #[cfg(target_os = "linux")]
 #[must_use = "the caller prints each line as preflight evidence"]
@@ -315,7 +315,7 @@ fn reclaim_marker_orphans_with_grace(
             continue;
         }
         tracing::warn!(
-            "reclaiming orphan engine child pid {pid} (marker {}) — its daemon died without teardown",
+            "reclaiming orphan engine child pid {pid} (marker {}) - its daemon died without teardown",
             data_dir.display()
         );
         // SAFETY: single positive pid whose exec-time env still carries
@@ -405,7 +405,7 @@ pub async fn wait_for_shutdown_signal() {
     }
 }
 
-/// J4: the daemon installs this in `serve` wiring — SIGHUP re-reads
+/// J4: the daemon installs this in `serve` wiring - SIGHUP re-reads
 /// config.toml into the live keys registry (single writer discipline:
 /// file -> registry, never the reverse).
 pub static SIGHUP_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
@@ -481,7 +481,7 @@ mod tests {
         let (tmp, d) = dirs();
         let marker = d.data_dir.display().to_string();
         // Single-process decoy: `exec` replaces bash with sleep in the
-        // SAME pid, and an ignored signal disposition survives exec — so
+        // SAME pid, and an ignored signal disposition survives exec - so
         // exactly one TERM-immune marked process exists for the sweep to
         // kill (a forked sleep child would leak into the next sweep).
         let mut stubborn = std::process::Command::new("bash")
@@ -501,7 +501,7 @@ mod tests {
             .expect("control decoy");
 
         // The sweep can only see the marker once execve has stamped it
-        // into /proc/<pid>/environ — between fork and exec the decoy
+        // into /proc/<pid>/environ - between fork and exec the decoy
         // still shows this process's unmarked env, and under heavy CPU
         // load that window outlives the spawn call. Production never
         // races this (the boot sweep meets children exec'd long ago);
@@ -516,7 +516,7 @@ mod tests {
         }
         assert!(
             marker_visible,
-            "decoy never exposed its marker (exec blocked >5s?) — sweep would race it"
+            "decoy never exposed its marker (exec blocked >5s?) - sweep would race it"
         );
 
         let lines =
@@ -533,7 +533,7 @@ mod tests {
         // Reap before liveness asserts: a KILLed child of THIS test
         // process is a zombie until waited on, and kill(pid,0) happily
         // reports zombies alive (real orphans reparent to init, which
-        // reaps them — this dance is test-only).
+        // reaps them - this dance is test-only).
         let mut exited = None;
         for _ in 0..50 {
             if let Some(status) = stubborn.try_wait().unwrap() {
