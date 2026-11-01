@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::dirs::BlazarDirs;
 use crate::engine_kind::EngineKind;
@@ -2642,10 +2642,11 @@ mod tests {
 
         // Unknown id: Ok(None) — the API layer turns this into the
         // teaching 404, not a store error.
-        assert!(s
-            .update_completion_card("chatcmpl-nope", "{}", 1)
-            .unwrap()
-            .is_none());
+        assert!(
+            s.update_completion_card("chatcmpl-nope", "{}", 1)
+                .unwrap()
+                .is_none()
+        );
         assert!(s.get_completion_card("chatcmpl-nope").unwrap().is_none());
     }
 
@@ -2724,9 +2725,10 @@ mod tests {
         assert!(s.set_job_state("job_1", "running", None, None).unwrap());
         s.append_job_event("job_1", "progress", Some(r#"{"pct":50}"#))
             .unwrap();
-        assert!(s
-            .set_job_state("job_1", "completed", Some(r#"{"text":"hi"}"#), None)
-            .unwrap());
+        assert!(
+            s.set_job_state("job_1", "completed", Some(r#"{"text":"hi"}"#), None)
+                .unwrap()
+        );
         // Unknown id: the contract returns false, not an error.
         assert!(!s.set_job_state("job_9", "completed", None, None).unwrap());
 
@@ -3294,10 +3296,11 @@ mod tests {
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(v, i64::from(SCHEMA_VERSION));
-            assert!(s
-                .table_columns("model_modalities")
-                .unwrap()
-                .contains(&"model".to_string()));
+            assert!(
+                s.table_columns("model_modalities")
+                    .unwrap()
+                    .contains(&"model".to_string())
+            );
             if pass == 0 {
                 s.set_model_modalities("m", &["decisions".into(), "text".into()])
                     .unwrap();
@@ -3523,14 +3526,16 @@ mod tests {
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(v, SCHEMA_VERSION);
-            assert!(s
-                .table_columns("jobs")
-                .unwrap()
-                .contains(&"owner".to_string()));
-            assert!(s
-                .table_columns("responses")
-                .unwrap()
-                .contains(&"owner".to_string()));
+            assert!(
+                s.table_columns("jobs")
+                    .unwrap()
+                    .contains(&"owner".to_string())
+            );
+            assert!(
+                s.table_columns("responses")
+                    .unwrap()
+                    .contains(&"owner".to_string())
+            );
             if pass == 0 {
                 s.insert_job(&JobRow {
                     id: "doc_up_1".into(),
@@ -3659,9 +3664,10 @@ mod tests {
         // SQLite reports partial-index violations in column form (probe:
         // "UNIQUE constraint failed: t.a" for an index on t.a WHERE a=1).
         let err = dup.expect_err("second active row must be rejected");
-        assert!(err
-            .to_string()
-            .contains("UNIQUE constraint failed: engines.active"));
+        assert!(
+            err.to_string()
+                .contains("UNIQUE constraint failed: engines.active")
+        );
     }
 
     #[test]
@@ -4397,24 +4403,28 @@ mod tests {
             last_used_at: 0,
         };
         // The live incident rows: awq/gptq/fp8 dirs quantize true.
-        assert!(row(
-            "qwen2.5-0.5b-instruct-awq",
-            "qwen/qwen2.5-0.5b-instruct-awq",
-            "/models/qwen2.5-0.5b-instruct-awq.d"
-        )
-        .is_quantized_safetensors());
+        assert!(
+            row(
+                "qwen2.5-0.5b-instruct-awq",
+                "qwen/qwen2.5-0.5b-instruct-awq",
+                "/models/qwen2.5-0.5b-instruct-awq.d"
+            )
+            .is_quantized_safetensors()
+        );
         assert!(row("m-gptq", "r", "/models/m-gptq.d").is_quantized_safetensors());
         assert!(row("m-fp8-dynamic", "r", "/models/m-fp8-dynamic.d").is_quantized_safetensors());
         // Word boundary: 'hawk' embeds awq as a substring but splits
         // into its own token — stays a normal lane.
         assert!(!row("hawk", "r", "/models/hawk.d").is_quantized_safetensors());
         // Plain BF16 dir: the lane mistral.rs serves perfectly.
-        assert!(!row(
-            "qwen2.5-0.5b-instruct",
-            "qwen/qwen2.5-0.5b-instruct",
-            "/models/qwen2.5-0.5b-instruct.d"
-        )
-        .is_quantized_safetensors());
+        assert!(
+            !row(
+                "qwen2.5-0.5b-instruct",
+                "qwen/qwen2.5-0.5b-instruct",
+                "/models/qwen2.5-0.5b-instruct.d"
+            )
+            .is_quantized_safetensors()
+        );
         // GGUF never counts, even when the filename carries a token.
         assert!(!row("m-awq", "r", "/models/m-awq-q4_k_m.gguf").is_quantized_safetensors());
         // Repo token alone (a dir renamed clean) still signals.
