@@ -303,10 +303,32 @@ enum Cmd {
     /// close each gap, with the datum behind every verdict
     Optimize {
         model: String,
-        /// Print the advisory plan (Wave 1 is advise-only; execution
-        /// arrives with Wave 2 verification and adoption)
-        #[arg(long)]
+        /// Print the advisory plan (read-only; the default teaching
+        /// mode when no other mode is given)
+        #[arg(long, group = "mode")]
         plan: bool,
+        /// Screen candidates through the tune grid WITHOUT adopting,
+        /// then verify the screen winner against the live gateway via
+        /// alternating A/B (baseline vs candidate, same workload) —
+        /// the result is a ledger experiment, never a profile change
+        #[arg(long, group = "mode")]
+        run: bool,
+        /// Verification objective for --run: throughput (default) |
+        /// interactive | memory
+        #[arg(long)]
+        objective: Option<String>,
+        /// Concurrent probe requests the A/B verification sends per
+        /// repetition
+        #[arg(long, default_value_t = 4)]
+        concurrency: u32,
+        /// Alternating measurement repetitions (warm-up excluded;
+        /// noise is estimated from the rep spread)
+        #[arg(long, default_value_t = 3)]
+        reps: u32,
+        /// Minimum gain (%) over baseline the candidate must clear
+        /// beyond measured noise before `verified`
+        #[arg(long, default_value_t = 5.0)]
+        min_gain_pct: f64,
         /// Machine-readable single JSON object instead of the card
         #[arg(long)]
         json: bool,
@@ -2074,7 +2096,28 @@ blazar mmproj <model> <mmproj.gguf path>"
             .await
         }
         Cmd::Scorecard { model, json } => scorecard(&resolve_model_cli(&model), json),
-        Cmd::Optimize { model, plan, json } => optimize_cmd(&resolve_model_cli(&model), plan, json),
+        Cmd::Optimize {
+            model,
+            plan,
+            run,
+            objective,
+            concurrency,
+            reps,
+            min_gain_pct,
+            json,
+        } => {
+            optimize_cmd(
+                &resolve_model_cli(&model),
+                plan,
+                run,
+                objective.as_deref(),
+                concurrency,
+                reps,
+                min_gain_pct,
+                json,
+            )
+            .await
+        }
         Cmd::Plan {
             model,
             install,
@@ -10128,12 +10171,150 @@ fn scorecard_json(
     );
 }
 
-/// `blazar optimize <model> --plan` — render the advise-only evidence
+/// `blazar optimize <model> --plan` - render the advise-only evidence
 /// plan. Every line is derived from stored receipts, never guessed.
-fn optimize_cmd(model: &str, plan: bool, json: bool) -> Result<()> {
+/// `blazar optimize <model>` - three receipt-driven modes: `--plan`
+/// (read-only evidence advice), `--run` (screen a candidate through
+/// the tune grid, verify it against the live gateway via alternating
+/// A/B - never adopts), and `--apply <id>` (adopt a verified ledger
+/// experiment; rollback = apply the prior verified id).
+#[allow(clippy::too_many_lines)]
+async fn optimize_cmd(
+    model: &str,
+    plan: bool,
+    run: bool,
+    objective: Option<&str>,
+    concurrency: u32,
+    reps: u32,
+    min_gain_pct: f64,
+    json: bool,
+) -> Result<()> {
+    if run {
+        let d = dirs();
+        let store = Store::open(&d)?;
+        let row = store
+            .get_model(model)?
+            .ok_or_else(|| no_such_model(model))?;
+        // Same encoder-class refusal as `tune`: the screen drives
+        // llama-bench, which measures generative decode only.
+        if let Some(class) = bench_arch_refusal(row.arch.as_deref()) {
+            anyhow::bail!(
+                "blazar optimize {}: refused - arch '{}' is encoder-only (class '{class}'); \
+                 the candidate screen drives llama-bench, which measures generative decode \
+                 (pp/tg) and aborts on this family",
+                row.name,
+                row.arch.as_deref().unwrap_or("?")
+            );
+        }
+        // The screen + A/B lane is llamacpp/GGUF; safetensors dirs have
+        // their own race lane under `tune --spec-race`.
+        let model_path = std::path::Path::new(&row.path);
+        if model_path.is_dir() && !row.has_component_set() {
+            anyhow::bail!(
+                "blazar optimize {}: --run drives the llamacpp tune lane, which needs a \
+                 GGUF model; safetensors dirs tune via `blazar tune {} --spec-race`",
+                row.name,
+                row.name
+            );
+        }
+        let cfg = config()?;
+        let objective = blazar_runtime::optimize_run::OptimizeObjective::parse(
+            objective.unwrap_or("throughput"),
+        )?;
+        let base = daemon_base(&cfg);
+        let run_cfg = blazar_runtime::optimize_run::OptimizeRunConfig {
+            base_url: base.clone(),
+            concurrency,
+            reps,
+            num_predict: 128,
+            min_gain_pct,
+        };
+        let lane = tune_lane_setup(&d, &store, model, &row, &cfg)?;
+        let input = lane.input(&row, &cfg, &lane.overlay);
+        let tuner = blazar_runtime::Tuner {
+            dirs: &d,
+            bench_bin: lane.bench_bin.clone(),
+        };
+        println!(
+            "optimize run - {model}: screening the grid (no adoption), then A/B against {} (C={concurrency}, reps={reps}) ...",
+            input.engine_tag
+        );
+        let report = blazar_runtime::optimize_run::run_optimize(
+            &d, &store, &tuner, &input, &run_cfg, objective,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "{e:#} - is the gateway running at {base}? `optimize --run` measures \
+                 through the live serving path (blazar serve)"
+            )
+        })?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "object": "blazar.optimize.run",
+                    "model": report.model,
+                    "engine_tag": report.engine_tag,
+                    "hw_fingerprint": report.hw_fingerprint,
+                    "objective": report.objective,
+                    "experiment_id": report.experiment_id,
+                    "screen_score_tg": report.screen_score_tg,
+                    "concurrency": report.concurrency,
+                    "reps": report.reps,
+                    "baseline": serde_json::to_value(&report.baseline).unwrap_or_default(),
+                    "candidate": serde_json::to_value(&report.candidate).unwrap_or_default(),
+                    "verdict": serde_json::to_value(&report.verdict).unwrap_or_default(),
+                    "status": "verified-no-adoption",
+                })
+            );
+            return Ok(());
+        }
+        let v = &report.verdict;
+        let verdict_word = if v.recommended {
+            "VERIFIED"
+        } else {
+            "REJECTED"
+        };
+        println!();
+        println!("optimize run - {}", report.model);
+        println!("engine       {}", report.engine_tag);
+        if let Some(hw) = &report.hw_fingerprint {
+            println!("hardware     {hw}");
+        }
+        println!(
+            "objective    {} (metric {}, min gain {}%)",
+            report.objective, v.metric, v.threshold
+        );
+        println!(
+            "screen       grid winner scored {:.1} tok/s generation (not adopted)",
+            report.screen_score_tg
+        );
+        println!(
+            "baseline     {:>8.1} tok/s | ttft p95 {:>6.0} ms | itl p95 {:>5.1} ms",
+            report.baseline.aggregate_tps, report.baseline.ttft_p95_ms, report.baseline.itl_p95_ms
+        );
+        println!(
+            "candidate    {:>8.1} tok/s | ttft p95 {:>6.0} ms | itl p95 {:>5.1} ms",
+            report.candidate.aggregate_tps,
+            report.candidate.ttft_p95_ms,
+            report.candidate.itl_p95_ms
+        );
+        println!("noise        {:.1}", v.noise);
+        println!("verdict      {verdict_word} - {}", v.reason);
+        println!(
+            "ledger       experiment #{} (attempted -> measured -> baseline -> candidate -> verdict)",
+            report.experiment_id
+        );
+        println!("profiles     baseline row restored - the active profile is unchanged");
+        return Ok(());
+    }
+
     if !plan {
         return Err(anyhow!(
-            "optimize is advise-only (Wave 1): blazar optimize {model} --plan"
+            "optimize needs a mode: --plan (advice), --run (verify a candidate, no \
+             adoption), or --apply <id> (adopt a verified experiment) - e.g. \
+             blazar optimize {model} --plan"
         ));
     }
     let d = dirs();
@@ -10168,7 +10349,7 @@ fn optimize_cmd(model: &str, plan: bool, json: bool) -> Result<()> {
     }
 
     // Human card: identity, verdict rows, then the priority ladder.
-    println!("optimize plan — {}", built.model);
+    println!("optimize plan - {}", built.model);
     if let Some(tag) = &built.engine_tag {
         println!("engine       {tag}");
     }
@@ -10193,14 +10374,14 @@ fn optimize_cmd(model: &str, plan: bool, json: bool) -> Result<()> {
     println!();
     println!("recommended");
     if built.recs.is_empty() {
-        println!("  nothing to do — every evidence check passed");
+        println!("  nothing to do - every evidence check passed");
     }
     for (idx, r) in built.recs.iter().enumerate() {
-        println!("  {}. {} — {} ({})", idx + 1, r.cmd, r.why, r.datum);
+        println!("  {}. {} - {} ({})", idx + 1, r.cmd, r.why, r.datum);
     }
     println!();
     println!("benchmark budget   {} session(s)", built.benchmark_budget());
-    println!("status             ADVISE ONLY — no configuration changed");
+    println!("status             ADVISE ONLY - no configuration changed");
     Ok(())
 }
 
@@ -14488,6 +14669,126 @@ fn sglang_spec_race_lane(
 
 #[allow(clippy::too_many_lines)] // lane-dispatch shape: one entry fn, sequential lane blocks
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)] // lane flags mirror the CLI flags 1:1
+/// Shared lane setup for the tune-family commands (`tune`, `optimize
+/// --run`): picks the llamacpp engine row (active-when-llamacpp, else
+/// the first installed llamacpp lane, loudly), anchors its manifest,
+/// resolves the bench binary, takes a live device census, and gathers
+/// every model-scoped input the profile compiler needs. One source of
+/// truth for engine pick, census, overlay, and draft resolution — the
+/// optimize lane measures the exact argv the tune lane would compile.
+struct TuneLane {
+    engine_row: blazar_core::store::EngineRow,
+    manifest: blazar_runtime::Manifest,
+    bench_bin: std::path::PathBuf,
+    gguf: blazar_core::gguf::GgufMeta,
+    hw: blazar_core::hardware::Hardware,
+    overlay: blazar_core::ModelOverride,
+    loras: Vec<(String, f64)>,
+    draft: Option<String>,
+    data_dir: String,
+}
+
+fn tune_lane_setup(
+    d: &BlazarDirs,
+    store: &Store,
+    model: &str,
+    row: &blazar_core::store::ModelRow,
+    cfg: &Config,
+) -> Result<TuneLane> {
+    // The bench lane drives llama-bench, so the engine row must be a
+    // llamacpp lane — the ACTIVE row may be any kind (a store flipped
+    // by an sglang session would otherwise compile llamacpp argv
+    // against a sglang manifest and die on the first flag). Prefer the
+    // active engine when it IS llamacpp; otherwise the first installed
+    // llamacpp lane, loudly.
+    let engine_row = store
+        .active_engine()?
+        .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+        .or_else(|| {
+            let picked = store
+                .list_engines()
+                .ok()?
+                .into_iter()
+                .find(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)?;
+            println!(
+                "note: active engine is not the llama-bench lane; benching on {tag}",
+                tag = picked.tag
+            );
+            Some(picked)
+        })
+        .ok_or_else(|| {
+            anyhow!("no llamacpp engine installed; `blazar bench` drives llama-bench — run: blazar engine update")
+        })?;
+    let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
+    manifest.anchor_server_path(&d.data_dir);
+    let bench_bin = blazar_runtime::bench::find_bench_bin(d)?;
+    // Live device census, not the stored-manifest snapshot: the tune
+    // fit verdicts read free_mib, which goes stale the moment a
+    // neighbour spawn holds VRAM (frozen snapshot once refused a
+    // 4096 pin against 940 MiB on an idle card).
+    let hw = blazar_runtime::probe::live_census_hardware(
+        std::path::Path::new(&manifest.server_path),
+        &manifest,
+    );
+    let gguf = blazar_core::read_metadata_file(std::path::Path::new(&row.path))?;
+    let overlay = cfg.overlay_for(model);
+    let loras: Vec<(String, f64)> = store
+        .list_loras(Some(model))?
+        .into_iter()
+        .map(|l| (l.path, l.scale))
+        .collect();
+    let data_dir = d.data_dir.to_string_lossy().into_owned();
+    // Draft resolution identical to the serve path: catalog pair ->
+    // pulled store row. A paired draft must not brick `bench --spec
+    // auto` with a false "not pulled" compile error.
+    let spec_mode = overlay.spec.clone().unwrap_or_else(|| cfg.spec.clone());
+    let draft = blazar_runtime::resolve_draft_path(store, model, &spec_mode);
+    Ok(TuneLane {
+        engine_row,
+        manifest,
+        bench_bin,
+        gguf,
+        hw,
+        overlay,
+        loras,
+        draft,
+        data_dir,
+    })
+}
+
+impl TuneLane {
+    /// Compile the profile input for this lane. The overlay is an
+    /// argument because the tune lanes each pin their own (ngram/race
+    /// rebuild with a mutated overlay); everything else is lane state.
+    fn input<'a>(
+        &'a self,
+        row: &'a blazar_core::store::ModelRow,
+        cfg: &'a Config,
+        overlay: &'a blazar_core::ModelOverride,
+    ) -> blazar_core::profile::ProfileInput<'a> {
+        blazar_runtime::bench::build_input(
+            &row.name,
+            &row.path,
+            u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
+            blazar_core::ModelMeta::Gguf(&self.gguf),
+            &self.hw,
+            cfg,
+            overlay,
+            &self.loras,
+            self.draft.as_deref(),
+            &self.engine_row.tag,
+            &self.manifest.flags,
+            &self.manifest.spec_types,
+            blazar_core::Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            &self.data_dir,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+        )
+    }
+}
+
 async fn tune_full(
     model: &str,
     search: bool,
@@ -14545,33 +14846,6 @@ aborts on this family. Profile pins for it would measure nothing",
         }
         return sglang_spec_race_lane(&d, &store, model, &row);
     }
-    // The bench lane drives llama-bench, so the engine row must be a
-    // llamacpp lane — the ACTIVE row may be any kind (a store flipped
-    // by an sglang session would otherwise compile llamacpp argv
-    // against a sglang manifest and die on the first flag). Prefer the
-    // active engine when it IS llamacpp; otherwise the first installed
-    // llamacpp lane, loudly.
-    let engine_row = store
-        .active_engine()?
-        .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
-        .or_else(|| {
-            let picked = store
-                .list_engines()
-                .ok()?
-                .into_iter()
-                .find(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)?;
-            println!(
-                "note: active engine is not the llama-bench lane; benching on {tag}",
-                tag = picked.tag
-            );
-            Some(picked)
-        })
-        .ok_or_else(|| {
-            anyhow!("no llamacpp engine installed; `blazar bench` drives llama-bench — run: blazar engine update")
-        })?;
-    let mut manifest: blazar_runtime::Manifest = serde_json::from_str(&engine_row.manifest)?;
-    manifest.anchor_server_path(&d.data_dir);
-    let bench_bin = blazar_runtime::bench::find_bench_bin(&d)?;
     let mut cfg = config()?;
     // Any adoption below flips this: the fn tail then restarts a running
     // daemon so the adopted knobs are live instead of hinting at one.
@@ -14588,27 +14862,21 @@ aborts on this family. Profile pins for it would measure nothing",
         cfg = config()?;
         println!("model_overrides.{model}.spec = {mode}");
     }
-    // Live device census, not the stored-manifest snapshot: the tune
-    // fit verdicts read free_mib, which goes stale the moment a
-    // neighbour spawn holds VRAM (frozen snapshot once refused a
-    // 4096 pin against 940 MiB on an idle card).
-    let hw = blazar_runtime::probe::live_census_hardware(
-        std::path::Path::new(&manifest.server_path),
-        &manifest,
-    );
-    let gguf = blazar_core::read_metadata_file(std::path::Path::new(&row.path))?;
-    let overlay = cfg.overlay_for(model);
-    let loras: Vec<(String, f64)> = store
-        .list_loras(Some(model))?
-        .into_iter()
-        .map(|l| (l.path, l.scale))
-        .collect();
-    let data_dir = d.data_dir.to_string_lossy();
-    // Draft resolution identical to the serve path: catalog pair ->
-    // pulled store row. A paired draft must not brick `bench --spec
-    // auto` with a false "not pulled" compile error.
-    let spec_mode = overlay.spec.clone().unwrap_or_else(|| cfg.spec.clone());
-    let draft = blazar_runtime::resolve_draft_path(&store, model, &spec_mode);
+    // Shared lane setup (engine pick, manifest anchor, bench bin, live
+    // census, GGUF read, overlay, loras, draft) — same helper as
+    // `optimize --run`, one source of truth for the compiled argv.
+    let lane = tune_lane_setup(&d, &store, model, &row, &cfg)?;
+    let TuneLane {
+        engine_row,
+        manifest,
+        bench_bin,
+        gguf,
+        hw,
+        overlay,
+        loras,
+        draft,
+        data_dir,
+    } = lane;
     let input = blazar_runtime::bench::build_input(
         model,
         &row.path,

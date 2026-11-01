@@ -296,6 +296,66 @@ fn integration__tune_search__adopts_argmax_and_persists() {
 
 #[test]
 #[allow(non_snake_case)]
+fn integration__tune_search_screen__measures_without_persisting() {
+    let (tmp, dirs) = dirs_setup();
+    let model_path = tmp.path().join("m.gguf");
+    std::fs::write(&model_path, b"x").unwrap();
+    let model_str = model_path.to_str().unwrap().to_string();
+
+    let cfg = Config::default();
+    let hw = gpu_hw(8, 12_000, 32_000);
+    let flags = all_flags();
+    let overlay = ModelOverride::default();
+    let inp = test_input("qwen3.5-9b", &model_str, &hw, &cfg, &flags, &overlay);
+
+    let tuner = Tuner {
+        dirs: &dirs,
+        bench_bin: bench_bin(),
+    };
+    let store = Store::open(&dirs).unwrap();
+
+    // Screen pass: identical winner contract, zero persistence — this
+    // is the seam `optimize --run` rides to measure candidates without
+    // touching the serving profile.
+    let (screen_profile, screen_winning, screen_rows, screen_score) =
+        tuner.tune_search_screen(&inp).unwrap();
+    assert!(!screen_rows.is_empty());
+    assert!(
+        screen_score > 0.0,
+        "screen returns the grid score for the ledger measurement"
+    );
+    assert_eq!(
+        screen_winning
+            .kv_pair
+            .as_ref()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+        Some(("q4_0", "q4_0")),
+        "screen picks the same evidenced winner as the adopting path"
+    );
+    assert!(
+        store.get_profile("qwen3.5-9b", "b-stub").unwrap().is_none(),
+        "screen must not write a profile row"
+    );
+    let persisted: i64 = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM optimization_experiments", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(persisted, 0, "screen must not open a ledger experiment");
+
+    // Wrapper parity: same search again through the persisting path.
+    let (profile, winning, _rows) = tuner.tune_search(&store, &inp).unwrap();
+    assert_eq!(profile.argv, screen_profile.argv, "same compiled profile");
+    assert_eq!(winning.kv_pair, screen_winning.kv_pair, "same overrides");
+    assert!(
+        store.get_profile("qwen3.5-9b", "b-stub").unwrap().is_some(),
+        "wrapper persists the profile row"
+    );
+}
+
+#[test]
+#[allow(non_snake_case)]
 fn integration__tune_search_cpu__keeps_legacy_grid_and_q8_winner() {
     let (tmp, dirs) = dirs_setup();
     let model_path = tmp.path().join("m.gguf");

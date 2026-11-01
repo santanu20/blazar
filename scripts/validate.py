@@ -1094,6 +1094,7 @@ _COMMAND_ATTRS = {
     "plan": (False, False, False, False, True),
     "scorecard": (False, False, False, False, True),
     "optimize.plan": (False, False, False, False, True),
+    "optimize.run": (False, False, True, False, False),
     "autopilot": (False, False, False, False, True),
     "certify": (True, True, False, False, True),
     "classify": (False, False, False, False, True),
@@ -1753,6 +1754,16 @@ _K = [
         "roundtrip",
         None,
         "echo + boot (string knob, default auto)",
+    ),
+    (
+        "autotune",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "staged-autonomy posture: off (default) | advise; 'scheduled' is a "
+        "teaching parse error until manual optimize --run/--apply cycles "
+        "prove reliable",
     ),
     ("server_tools", True, False, "argv", "G4", "--tools all"),
     # every accepted runtime value (docker:/podman:/ssh:) eagerly spawns
@@ -13823,6 +13834,44 @@ def phase_wave13() -> None:
         "run.intent",
         pi.returncode == 0 and "intent:" in out_i,
         f"rc={pi.returncode} note={'intent:' in out_i}",
+    )
+
+    # optimize --run: the full measured-optimizer control path
+    # against the live gateway - tune screen WITHOUT adoption,
+    # gateway A/B at probe cost (C=2, reps=2), noise-gated verdict,
+    # ledger chain, serving profile restored.
+    pr = cli(
+    pr = cli(
+        "optimize",
+        MODEL,
+        "--run",
+        "--concurrency",
+        "2",
+        "--reps",
+        "2",
+        timeout=1200,
+    )
+    out_r = pr.stdout + pr.stderr
+    ok_run = (
+        pr.returncode == 0
+        and "baseline" in out_r
+        and "candidate" in out_r
+        and ("VERIFIED" in out_r or "REJECTED" in out_r)
+        and "row restored" in out_r
+        and "experiment #" in out_r
+    )
+    reg(
+        "optimize.run",
+        ok_run,
+        "rc={0} verdict={1}{2}".format(
+            pr.returncode,
+            "VERIFIED"
+            if "VERIFIED" in out_r
+            else "REJECTED"
+            if "REJECTED" in out_r
+            else "?",
+            "" if ok_run else " tail=" + out_r.strip()[-900:],
+        ),
     )
     check(
         "wave13",

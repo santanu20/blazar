@@ -742,6 +742,20 @@ impl Tuner<'_> {
         store: &Store,
         input: &ProfileInput<'_>,
     ) -> Result<(Profile, TuningOverrides, Vec<BenchRow>)> {
+        let (profile, winning, grid_rows, score) = self.tune_search_screen(input)?;
+        persist_profile(store, input, &winning, &profile, &grid_rows, score)?;
+        Ok((profile, winning, grid_rows))
+    }
+
+    /// The measurement half of `tune_search`: run the llama-bench grid
+    /// under the KV quality gate and pick the winner, but persist
+    /// nothing. `optimize --run` uses this to SCREEN a candidate before
+    /// the gateway A/B decides adoption, so screening never writes
+    /// profile rows, bench receipts, or ledger events by itself.
+    pub fn tune_search_screen(
+        &self,
+        input: &ProfileInput<'_>,
+    ) -> Result<(Profile, TuningOverrides, Vec<BenchRow>, f64)> {
         // Validation gate: profile must compile before we spawn anything.
         // The compiled default also fixes the TARGET context every KV
         // candidate must be quality-evidenced at (the grid never varies
@@ -924,8 +938,7 @@ impl Tuner<'_> {
             ubatch: None,
         };
         let profile = profile::compile(input, &winning).map_err(|e| anyhow::anyhow!("{e}"))?;
-        persist_profile(store, input, &winning, &profile, &grid_rows, score)?;
-        Ok((profile, winning, grid_rows))
+        Ok((profile, winning, grid_rows, score))
     }
 }
 

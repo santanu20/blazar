@@ -2367,6 +2367,19 @@ impl Store {
         Ok(None)
     }
 
+    /// Remove a model's tuned profile row for a lane. The A/B runner
+    /// uses this to restore the pre-experiment state on lanes that had
+    /// NO tuned profile (baseline = compiled defaults): restore is
+    /// delete-when-absent, upsert-when-present — never a placeholder
+    /// row that would masquerade as a tuned profile.
+    pub fn delete_profile(&self, model: &str, engine_tag: &str) -> CoreResult<()> {
+        self.conn.execute(
+            "DELETE FROM profiles WHERE model_name = ?1 AND engine_tag = ?2",
+            params![model, engine_tag],
+        )?;
+        Ok(())
+    }
+
     /// Upsert one spec-race receipt. Keyed (model, `engine_tag`, mode):
     /// the latest measurement of a mode replaces the previous one — a
     /// receipt is "current truth for this hardware", not an audit log.
@@ -2822,7 +2835,9 @@ impl Store {
             Err(e) => Err(e.into()),
         }
     }
+
 }
+
 
 /// Daily usage counters for one key.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -3849,6 +3864,39 @@ mod tests {
             "failed batch must persist nothing (table still absent => no partial rows)"
         );
     }
+
+    #[test]
+    fn unit__profile_row__delete_profile_roundtrips_restore_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let s = Store::open(&dirs).unwrap();
+        assert!(
+            s.get_profile("m", "e").unwrap().is_none(),
+            "fresh store has no profile row"
+        );
+        let row = ProfileRow {
+            model_name: "m".into(),
+            engine_tag: "e".into(),
+            args_hash: "h".into(),
+            args_json: "[]".into(),
+            benchmark_json: None,
+            updated_at: 123,
+        };
+        s.upsert_profile(&row).unwrap();
+        assert!(s.get_profile("m", "e").unwrap().is_some());
+        s.delete_profile("m", "e").unwrap();
+        assert!(
+            s.get_profile("m", "e").unwrap().is_none(),
+            "delete removes the tuned row"
+        );
+        // Restore is delete-when-absent: the guard's Drop on a profile
+        // that never existed must be a no-op, not an error.
+        s.delete_profile("m", "e").unwrap();
+    }
+
 
     #[test]
     fn unit__usage_daily__delta_accumulates_and_windows() {

@@ -12,11 +12,11 @@ Unified OpenAI · Ollama · Anthropic gateway &nbsp;·&nbsp; Multi-engine servin
 
 <div align="center">
 
-![Blazar — the control plane for local AI inference](https://raw.githubusercontent.com/santanu20/blazar/main/docs/assets/BLAZAR_Banner.webp)
+![Blazar - the control plane for local AI inference](https://raw.githubusercontent.com/santanu20/blazar/main/docs/assets/BLAZAR_Banner.webp)
 
 ![Blazar in action](https://raw.githubusercontent.com/santanu20/blazar/main/docs/assets/blazar-demo.svg)
 
-*Live CLI session: single-shot generation, the engine panel with speculation state, the installed-lane inventory, and the routing decision for a model — all from one daemon.*
+*Live CLI session: single-shot generation, the engine panel with speculation state, the installed-lane inventory, and the routing decision for a model - all from one daemon.*
 
 **[Get started in 60 seconds](#60-second-quickstart)** &nbsp;·&nbsp; **[Why use Blazar](#why-use-blazar)** &nbsp;·&nbsp; **[Benchmark evidence](#benchmark-snapshot)** &nbsp;·&nbsp; **[API reference](docs/4.API_SPEC.md)**
 
@@ -65,7 +65,7 @@ Blazar is a **local AI gateway and runtime orchestrator** in one Rust binary. Ap
                Video        to text
 ```
 
-The engines still perform inference. **Blazar is the control plane around them** — it does not replace engines, train models, or require a hosted service.
+The engines still perform inference. **Blazar is the control plane around them** - it does not replace engines, train models, or require a hosted service.
 
 ### At a glance
 
@@ -118,7 +118,7 @@ blazar import --scan                                # list models reusable from 
 
 Pulls never re-download what is already on disk: an existing ollama store, the
 Hugging Face hub cache, and LM Studio models are checked first (size + sha256
-byte-verified, then hardlinked) — a 10 GiB model already in ollama appears in
+byte-verified, then hardlinked) - a 10 GiB model already in ollama appears in
 blazar instantly at zero network cost.
 
 ### 3. Serve and run
@@ -141,16 +141,16 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 ## Use your existing clients
 
-No application rewrite needed — point clients at Blazar's compatible surfaces.
+No application rewrite needed - point clients at Blazar's compatible surfaces.
 
 | Client | Base URL | Surfaces |
 |---|---|---|
 | **OpenAI SDK** | `http://127.0.0.1:11435/v1` | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/v1/batches`, `/v1/files`, `/v1/audio/*`, `/v1/images/*`, `/v1/videos/*` |
 | **Ollama clients** | `OLLAMA_HOST=http://127.0.0.1:11435` | `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/embeddings`, `/api/embed`, `/api/rerank`, model verbs `/api/create`, `/api/copy`, `/api/delete`, `/api/push` |
 | **Anthropic SDK** | `http://127.0.0.1:11435` | `/v1/messages`, `/v1/messages/batches` |
-| **Blazar Python SDK** | `BLAZAR_URL=http://127.0.0.1:11435` | chat + streaming + `best_of`/`mcp` tools, `ps`, `explain`, `failover`, realtime voice, Anthropic batches, metadata cards — zero dependencies (`sdk/python`) |
+| **Blazar Python SDK** | `BLAZAR_URL=http://127.0.0.1:11435` | chat + streaming + `best_of`/`mcp` tools, `ps`, `explain`, `failover`, realtime voice, Anthropic batches, metadata cards - zero dependencies (`sdk/python`) |
 
-Beyond dialect compatibility: `/v1/realtime` voice, `[[failover]]` chains, the `[[mcp]]` tool catalog, completion metadata cards, and idle-sleep visibility — one line each in [Features](#features).
+Beyond dialect compatibility: `/v1/realtime` voice, `[[failover]]` chains, the `[[mcp]]` tool catalog, completion metadata cards, and idle-sleep visibility - one line each in [Features](#features).
 
 Blazar runs alongside an existing Ollama install, and can later serve on `11434` as a port-level replacement.
 
@@ -164,14 +164,14 @@ blazar connect opencode --write --all-models   # agent-harness menu in one write
 blazar connect pi --write                     # pi / oh-my-pi, same treatment
 ```
 
-`connect` configures Codex, Claude Code, Continue, Cline, Open WebUI, opencode, and pi (oh my pi) to talk to Blazar — capability-driven model menus included (`--all-models` lists every certified chat model; the default pick follows the chat+tools > chat > uncertified ladder). Harnesses without a `connect` lane still work: point any OpenAI-compatible client at `http://127.0.0.1:11435/v1`, any Ollama client at the gateway root, or any Anthropic SDK client at `http://127.0.0.1:11435`. Every gateway-rendered error carries a stable machine-readable `blazar_code` (see `docs/error-codes.md` or `GET /api/errors`), so clients can branch on causes instead of parsing messages.
+`connect` configures Codex, Claude Code, Continue, Cline, Open WebUI, opencode, and pi (oh my pi) to talk to Blazar - capability-driven model menus included (`--all-models` lists every certified chat model; the default pick follows the chat+tools > chat > uncertified ladder). Harnesses without a `connect` lane still work: point any OpenAI-compatible client at `http://127.0.0.1:11435/v1`, any Ollama client at the gateway root, or any Anthropic SDK client at `http://127.0.0.1:11435`. Every gateway-rendered error carries a stable machine-readable `blazar_code` (see `docs/error-codes.md` or `GET /api/errors`), so clients can branch on causes instead of parsing messages.
 
 ### MCP tool calling for any client
 
-Any app that speaks OpenAI, Anthropic, or Ollama gets MCP tools through Blazar — the client needs zero MCP knowledge. You register [MCP](https://modelcontextprotocol.io) servers once — local stdio commands or remote Streamable HTTP endpoints — and Blazar injects their tools as `mcp__<server>__<tool>` and runs the whole call loop (tool dispatch, argument passing, result replay) on the server side.
+Any app that speaks OpenAI, Anthropic, or Ollama gets MCP tools through Blazar - the client needs zero MCP knowledge. You register [MCP](https://modelcontextprotocol.io) servers once - local stdio commands or remote Streamable HTTP endpoints - and Blazar injects their tools as `mcp__<server>__<tool>` and runs the whole call loop (tool dispatch, argument passing, result replay) on the server side.
 
 ```toml
-# config.toml — register servers once (stdio command OR http url)
+# config.toml - register servers once (stdio command OR http url)
 [[mcp]]
 name = "fetch"
 command = ["uvx", "mcp-server-fetch"]
@@ -191,13 +191,13 @@ curl http://127.0.0.1:11435/v1/chat/completions -d '{
 }'
 ```
 
-The same `"mcp"` field (or `x-blazar-mcp` header) works on `/api/chat` and `/v1/messages`; the response carries `x-blazar-mcp: rounds=N` proving real tool executions. `stream: false` is required on mediated calls, `"none"` opts a request out when a default is set, and `GET /api/mcp` lists servers without spawning them. The Python SDK takes `Client(...).chat(model, messages, mcp="all")`. Config owners declare servers; keyed clients can only select among them — never add their own. → [`7.SETUP.md`](docs/7.SETUP.md)
+The same `"mcp"` field (or `x-blazar-mcp` header) works on `/api/chat` and `/v1/messages`; the response carries `x-blazar-mcp: rounds=N` proving real tool executions. `stream: false` is required on mediated calls, `"none"` opts a request out when a default is set, and `GET /api/mcp` lists servers without spawning them. The Python SDK takes `Client(...).chat(model, messages, mcp="all")`. Config owners declare servers; keyed clients can only select among them - never add their own. → [`7.SETUP.md`](docs/7.SETUP.md)
 
 ---
 
 ## Why use Blazar?
 
-When local inference has outgrown "run one server for one model", Blazar is the next step — the table above is the short version, [Features](#features) is the long one.
+When local inference has outgrown "run one server for one model", Blazar is the next step - the table above is the short version, [Features](#features) is the long one.
 
 ### Blazar vs. common approaches
 
@@ -210,7 +210,7 @@ Architectural role, not a universal ranking:
 | **SGLang / vLLM-style runtime** | High-throughput serving on one runtime | A higher-level control plane across heterogeneous runtimes |
 | **Custom scripts / many daemons** | Bespoke infrastructure | One API, one config model, one operator workflow |
 
-If you only need one model, one runtime, and one process, a direct engine server is simpler — Blazar is intentionally not necessary for that case.
+If you only need one model, one runtime, and one process, a direct engine server is simpler - Blazar is intentionally not necessary for that case.
 
 ---
 
@@ -238,15 +238,15 @@ Three native dialects with per-engine **thinking management** (effort mapping, `
 
 ### Voice, tools, resilience add-ons
 
-`/v1/realtime` WebSocket voice (whisper STT → chat → piper TTS); `[[mcp]]` tool catalog over stdio or Streamable HTTP — the gateway runs the tool loop for engines with no MCP support of their own, per-request opt-in or config-wide `mcp_default` (`/api/mcp` status); `[[failover]]` alias chains over ordered local/remote targets (anti-flap benching, pin/unpin at `/api/failover`); idle-sleep visibility (`blazar_sleeping` in `/api/ps`). → [`7.SETUP.md`](docs/7.SETUP.md)
+`/v1/realtime` WebSocket voice (whisper STT → chat → piper TTS); `[[mcp]]` tool catalog over stdio or Streamable HTTP - the gateway runs the tool loop for engines with no MCP support of their own, per-request opt-in or config-wide `mcp_default` (`/api/mcp` status); `[[failover]]` alias chains over ordered local/remote targets (anti-flap benching, pin/unpin at `/api/failover`); idle-sleep visibility (`blazar_sleeping` in `/api/ps`). → [`7.SETUP.md`](docs/7.SETUP.md)
 
 ### One-word UX
 
-`plan` previews the run decision, `run` prints the daemon's real ready-card (`--intent agent|batch|coding|reasoning|vision` maps a workload class), `config preset` flips a posture, `scorecard` assembles the stored bench + certificate (never re-runs), `autopilot` recommends only real work (`--apply` runs it), `optimize --plan` audits stored evidence per model and advises the next tuning move (every verdict cites its receipt). Capability certificates gate admission on verified FAILs, with probe and refresh command. → [`9.USAGE.md`](docs/9.USAGE.md)
+`plan` previews the run decision, `run` prints the daemon's real ready-card (`--intent agent|batch|coding|reasoning|vision` maps a workload class), `config preset` flips a posture, `scorecard` assembles the stored bench + certificate (never re-runs), `autopilot` recommends only real work (`--apply` runs it), `optimize --plan` audits stored evidence per model and advises the next tuning move (every verdict cites its receipt), `optimize --run/--apply` measure candidates through the live gateway and adopt only verified winners (every experiment lands in an append-only ledger; `autotune = advise` logs periodic evidence-gap scans, `scheduled` refuses until a manual track record exists). Capability certificates gate admission on verified FAILs, with probe and refresh command. → [`9.USAGE.md`](docs/9.USAGE.md)
 
 ### Resource-aware scheduling and speculation
 
-`fit` previews VRAM/KV/slots/co-residency before download; bounded admission under saturation; adaptive slot reshape from live telemetry. Speculative decoding (MTP/EAGLE/draft pairs) with n-gram auto-fallback and closed-loop governors (`spec_auto_manage`, `ubatch_auto`) that park speculation when acceptance collapses; draft pairing is lane-aware (GGUF drafts to llama.cpp/mistral.rs, safetensors drafts to SGLang/MLX — never a mismatched or self-pair). → [`6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) · [`10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md)
+`fit` previews VRAM/KV/slots/co-residency before download; bounded admission under saturation; adaptive slot reshape from live telemetry. Speculative decoding (MTP/EAGLE/draft pairs) with n-gram auto-fallback and closed-loop governors (`spec_auto_manage`, `ubatch_auto`) that park speculation when acceptance collapses; draft pairing is lane-aware (GGUF drafts to llama.cpp/mistral.rs, safetensors drafts to SGLang/MLX - never a mismatched or self-pair). → [`6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) · [`10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md)
 
 ### Reliability: jobs, requests, durability
 
@@ -266,7 +266,7 @@ Images (generations/edits/ESRGAN upscale), video generation, streaming transcrip
 
 ### Sessions, cache, warm starts
 
-`session save/restore` plus automatic KV session banking on graceful stop — the first request after a restart resumes with the prompt cache warm. Prefix-cache visibility, opt-in semantic cache, warm-on-pull. → [`7.SETUP.md`](docs/7.SETUP.md)
+`session save/restore` plus automatic KV session banking on graceful stop - the first request after a restart resumes with the prompt cache warm. Prefix-cache visibility, opt-in semantic cache, warm-on-pull. → [`7.SETUP.md`](docs/7.SETUP.md)
 
 ### Safe engine lifecycle
 
@@ -274,11 +274,11 @@ Versioned side-by-side installs, SHA-256 verification, capability probing, regre
 
 ### Diagnostics and observability
 
-`doctor` (system/GPU/engines/models/channels, `--fix`), `why` trace explanations, `explain` effective-config card, `model-doctor` capability certificates, `/api/capacity` GPU census, `/metrics`, OTLP, audit JSONL, PII scrubbing. Engine silent degrades (e.g. a flash-attention KV-type fallback in the serving child) are detected and surfaced per-request — `x-blazar-warnings` headers, `engine_slow_attn` detections in `why`, and a live `engine_degrades` panel on `/api/why`. → [`9.USAGE.md`](docs/9.USAGE.md)
+`doctor` (system/GPU/engines/models/channels, `--fix`), `why` trace explanations, `explain` effective-config card, `model-doctor` capability certificates, `/api/capacity` GPU census, `/metrics`, OTLP, audit JSONL, PII scrubbing. Engine silent degrades (e.g. a flash-attention KV-type fallback in the serving child) are detected and surfaced per-request - `x-blazar-warnings` headers, `engine_slow_attn` detections in `why`, and a live `engine_degrades` panel on `/api/why`. → [`9.USAGE.md`](docs/9.USAGE.md)
 
 ### Web console
 
-`/ui` — zero-dependency console served by the daemon (TTFT/TPOT dashboard, models, engines, compute census, benches, jobs, sessions); read-only by construction. `/api/fabric` and `/api/quantiles` expose the same read models as JSON. → [`4.API_SPEC.md`](docs/4.API_SPEC.md)
+`/ui` - zero-dependency console served by the daemon (TTFT/TPOT dashboard, models, engines, compute census, benches, jobs, sessions); read-only by construction. `/api/fabric` and `/api/quantiles` expose the same read models as JSON. → [`4.API_SPEC.md`](docs/4.API_SPEC.md)
 
 ### Security and network
 
@@ -288,7 +288,7 @@ Loopback by default; optional scoped API keys (`keys add/rotate`), TLS, explicit
 
 ## Benchmark snapshot
 
-Two committed campaigns, full receipts in [`BENCHMARK.md`](BENCHMARK.md): the perf + matched-concurrency validation (RTX 4070 Laptop 8 GiB, i7-14650HX, Linux Mint 22.3, installed release binary — same engine build on both sides of every row) and the flagship campaign (Ollama concurrency reference lanes). Measured results from one configuration — evidence, not universal guarantees.
+Two committed campaigns, full receipts in [`BENCHMARK.md`](BENCHMARK.md): the perf + matched-concurrency validation (RTX 4070 Laptop 8 GiB, i7-14650HX, Linux Mint 22.3, installed release binary - same engine build on both sides of every row) and the flagship campaign (Ollama concurrency reference lanes). Measured results from one configuration - evidence, not universal guarantees.
 
 | Workload | Blazar | Reference | Interpretation |
 |---|---:|---:|---|
@@ -299,16 +299,16 @@ Two committed campaigns, full receipts in [`BENCHMARK.md`](BENCHMARK.md): the pe
 | Cold start (page cache dropped) | **4.8 s** | 4.6 s Ollama (warm daemon) | parity incl. full spawn |
 | Idle wake | **2.4–3.5 s** | 6.2 s Ollama | **~2×** faster wake |
 | Tool-call TTFT p50 | **117 ms** | 285 ms Ollama | **~2.4×** lower |
-| Concurrent, matched slots, C=1 | **423.7 t/s** | 373.3 t/s direct engine | **1.14×** — parity-to-better (singleflight default-off) |
+| Concurrent, matched slots, C=1 | **423.7 t/s** | 373.3 t/s direct engine | **1.14×** - parity-to-better (singleflight default-off) |
 | Concurrent, matched slots, C=4 | **604.9 t/s** | 594.7 t/s direct engine | **1.02×** aggregate at load |
 | Concurrent, matched slots, C=8 | **597.2 t/s** | 605.8 t/s direct engine | **0.99×** at saturation (was **0.72×** before the serialization fix) |
 | Concurrent throughput, C=4 | **104.8 t/s** | 33.6 t/s Ollama lane | **~3.1×** system throughput |
 | Concurrent TTFT p99, C=4 | **554 ms** | 15.9 s Ollama lane | Lower tail latency |
-| Adaptive serving | **49 → 63 t/s** | — | **~28%** gain, 0 failed requests |
+| Adaptive serving | **49 → 63 t/s** | - | **~28%** gain, 0 failed requests |
 
 Concurrency rows above the Ollama block are the current-release ladder (8 × 64-token bodies, temp 0, identical child argv both sides; receipt `bench-artifacts/20261031-benchmark-audit/gateway-overhead-ladder-after-fix.json`).
 
-Where the gateway can matter — scheduling, residency, cache, tail control, tools — Blazar leads Ollama by receipt:
+Where the gateway can matter - scheduling, residency, cache, tail control, tools - Blazar leads Ollama by receipt:
 
 | Surface | Blazar | Ollama | Margin |
 |---|---:|---:|---|
@@ -319,9 +319,9 @@ Where the gateway can matter — scheduling, residency, cache, tail control, too
 | Cached-path TTFT | **~0.4 s** | 6.1–6.5 s | **~15×** |
 | Throughput under load, C=4 | **104.8 t/s** | 33.6 t/s | **~3.1×** |
 
-The two parity rows in the table above are physics, not lost ground: single-stream TTFT is the same engine doing prefill in every lane (the relay adds ~0 ms), and cold start is disk-bandwidth-bound model loading — where Ollama's 4.6 s reference even ran on a warm daemon while Blazar's 4.8 s included the full gateway boot.
+The two parity rows in the table above are physics, not lost ground: single-stream TTFT is the same engine doing prefill in every lane (the relay adds ~0 ms), and cold start is disk-bandwidth-bound model loading - where Ollama's 4.6 s reference even ran on a warm daemon while Blazar's 4.8 s included the full gateway boot.
 
-The matched-concurrency rows pin the gateway child to the direct lane's own slot count, isolating orchestration cost from slot-capacity differences; the default lane (slots=4, unified 64k KV) legitimately trades decode speed for context capacity on an 8 GiB card. Campaigns measure more than tokens/s: prefill, saturation, cache reuse, tool-call and structured-output quality, cold starts, scheduling, lifecycle, and media lanes — per-campaign environments and dates are recorded with each receipt in BENCHMARK.md. Reproduce with `blazar bench <model>` or `python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md`.
+The matched-concurrency rows pin the gateway child to the direct lane's own slot count, isolating orchestration cost from slot-capacity differences; the default lane (slots=4, unified 64k KV) legitimately trades decode speed for context capacity on an 8 GiB card. Campaigns measure more than tokens/s: prefill, saturation, cache reuse, tool-call and structured-output quality, cold starts, scheduling, lifecycle, and media lanes - per-campaign environments and dates are recorded with each receipt in BENCHMARK.md. Reproduce with `blazar bench <model>` or `python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md`.
 
 ---
 
@@ -358,7 +358,8 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | One-shot decision scoring | `blazar classify <model> "text" --labels safe,unsafe` |
 | Preview a model before running | `blazar plan <model>` |
 | One-page perf + quality card | `blazar scorecard <model>` |
-| Evidence-gap advice for a model | `blazar optimize <model> --plan` (read-only: names stale benchmarks, untuned speculation, KV grades without quality evidence, missing certificates — and the commands that close each gap) |
+| Evidence-gap advice for a model | `blazar optimize <model> --plan` (read-only: names stale benchmarks, untuned speculation, KV grades without quality evidence, missing certificates - and the commands that close each gap) |
+| Measured optimization run | `blazar optimize <model> --run` (screens the tune grid WITHOUT adopting, A/B-measures baseline vs candidate through the live gateway, verdict is noise-gated; the serving profile is restored untouched) |
 | One-word config posture | `blazar config preset balanced` |
 | Observe → recommend per model | `blazar autopilot`, `blazar autopilot --apply` |
 | Pull / import models | `blazar pull <target>`, `blazar import <file> --name <name>` |
@@ -366,7 +367,7 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | Inspect models | `blazar list`, `blazar show <model>`, `blazar ps` |
 | Stop / remove | `blazar stop` (daemon), `blazar rm <model>` |
 | Quantize / attach projector | `blazar quantize <model> <out-quant>`, `blazar mmproj <model> <mmproj.gguf path>` |
-| Tune generation speed | `blazar tune <model>`, `blazar bench <model>` (results stored as engine-tagged receipts — `doctor` flags models whose receipts predate the active engine) |
+| Tune generation speed | `blazar tune <model>`, `blazar bench <model>` (results stored as engine-tagged receipts - `doctor` flags models whose receipts predate the active engine) |
 | Launch an AI CLI | `blazar launch <command>` |
 | Connect AI clients | `blazar connect --write` (Claude Code, Codex, Continue, Cline, Open WebUI, opencode, pi) |
 | Explain serving config | `blazar explain <model>` |
@@ -460,7 +461,7 @@ This README is the product entry point; depth lives in dedicated documents. The 
 
 1. Read [`docs/8.DO_NOT_BREAK.md`](docs/8.DO_NOT_BREAK.md).
 2. For architectural changes, read [`docs/2.ARCHITECTURE.md`](docs/2.ARCHITECTURE.md) and [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md).
-3. Run the standard formatting, Clippy, test, and installer checks — the CI workflow is the source of truth.
+3. Run the standard formatting, Clippy, test, and installer checks - the CI workflow is the source of truth.
 
 ---
 
