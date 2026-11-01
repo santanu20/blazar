@@ -220,8 +220,11 @@ jobs:
         run: cargo install cargo-generate-rpm --locked
       - name: Build rpm
         run: |
+          # No --sha256: current cargo-generate-rpm dropped the flag, and
+          # its digest sidecar was never uploaded or verified — installers
+          # read digests from the GitHub release metadata API instead.
           cargo generate-rpm -p blazar --target x86_64-unknown-linux-gnu \
-            --sha256 --output "blazar-${GITHUB_REF_NAME#v}-x86_64.rpm"
+            --output "blazar-${GITHUB_REF_NAME#v}-x86_64.rpm"
       - uses: actions/upload-artifact@v4
         with:
           name: packages-rpm
