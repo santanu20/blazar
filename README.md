@@ -288,37 +288,40 @@ Loopback by default; optional scoped API keys (`keys add/rotate`), TLS, explicit
 
 ## Benchmark snapshot
 
-Two committed campaigns, full receipts in [`BENCHMARK.md`](BENCHMARK.md): the October 6, 2026 perf + matched-concurrency validation (RTX 4070 Laptop 8 GiB, i7-14650HX, Linux Mint 22.3, installed release binary with the GPU-offload pin fix — same engine build on both sides of every row) and the September 29, 2026 flagship campaign (Ollama concurrency reference lanes). Measured results from one configuration — evidence, not universal guarantees.
+Two committed campaigns, full receipts in [`BENCHMARK.md`](BENCHMARK.md): the perf + matched-concurrency validation (RTX 4070 Laptop 8 GiB, i7-14650HX, Linux Mint 22.3, installed release binary — same engine build on both sides of every row) and the flagship campaign (Ollama concurrency reference lanes). Measured results from one configuration — evidence, not universal guarantees.
 
-| Workload | Blazar | Reference | Interpretation | Campaign |
-|---|---:|---:|---|---|
-| Single-stream decode | **41.07 t/s** | 41.64 t/s direct engine | **~1.4%** gateway overhead | Oct 6 |
-| Single-stream TTFT p50 / ITL p99 | **120 ms / 25.8 ms** | 121 / 25.2 ms direct; 122 / **75.0 ms** Ollama | parity with direct; **~3×** lower tail than Ollama | Oct 6 |
-| Cached prefill | **7,494 t/s** | 7,359 t/s direct | parity–better | Oct 6 |
-| Long-context hold (2k → 16k) | 41.1 → 40.6 t/s | 6,145 MiB peak vs Ollama 6,829 | −1.2% across the ladder, leaner memory | Oct 6 |
-| Cold start (page cache dropped) | **4.8 s** | 4.6 s Ollama (warm daemon) | parity incl. full spawn | Oct 6 |
-| Idle wake | **2.4–3.5 s** | 6.2 s Ollama | **~2×** faster wake | Oct 6 |
-| Tool-call TTFT p50 | **117 ms** | 285 ms Ollama | **~2.4×** lower | Oct 6 |
-| Concurrent, matched slots, C=1 | **35.0–36.8 t/s** | 40.2 t/s direct engine | ~0.9× at one stream | Oct 6 |
-| Concurrent, matched slots, C=8 | **96.3 t/s** | 134.0 t/s direct engine | full-GPU pin; first-token parity (505 vs 486 ms) | Oct 6 |
-| Concurrent throughput, C=4 | **104.8 t/s** | 33.6 t/s Ollama lane | **~3.1×** system throughput | Sep 29 |
-| Concurrent TTFT p99, C=4 | **554 ms** | 15.9 s Ollama lane | Lower tail latency | Sep 29 |
-| Adaptive serving | **49 → 63 t/s** | — | **~28%** gain, 0 failed requests | Sep 29 |
+| Workload | Blazar | Reference | Interpretation |
+|---|---:|---:|---|
+| Single-stream decode | **41.07 t/s** | 41.64 t/s direct engine | **~1.4%** gateway overhead |
+| Single-stream TTFT p50 / ITL p99 | **120 ms / 25.8 ms** | 121 / 25.2 ms direct; 122 / **75.0 ms** Ollama | parity with direct; **~3×** lower tail than Ollama |
+| Cached prefill | **7,494 t/s** | 7,359 t/s direct | parity–better |
+| Long-context hold (2k → 16k) | 41.1 → 40.6 t/s | 6,145 MiB peak vs Ollama 6,829 | −1.2% across the ladder, leaner memory |
+| Cold start (page cache dropped) | **4.8 s** | 4.6 s Ollama (warm daemon) | parity incl. full spawn |
+| Idle wake | **2.4–3.5 s** | 6.2 s Ollama | **~2×** faster wake |
+| Tool-call TTFT p50 | **117 ms** | 285 ms Ollama | **~2.4×** lower |
+| Concurrent, matched slots, C=1 | **423.7 t/s** | 373.3 t/s direct engine | **1.14×** — parity-to-better (singleflight default-off) |
+| Concurrent, matched slots, C=4 | **604.9 t/s** | 594.7 t/s direct engine | **1.02×** aggregate at load |
+| Concurrent, matched slots, C=8 | **597.2 t/s** | 605.8 t/s direct engine | **0.99×** at saturation (was **0.72×** before the serialization fix) |
+| Concurrent throughput, C=4 | **104.8 t/s** | 33.6 t/s Ollama lane | **~3.1×** system throughput |
+| Concurrent TTFT p99, C=4 | **554 ms** | 15.9 s Ollama lane | Lower tail latency |
+| Adaptive serving | **49 → 63 t/s** | — | **~28%** gain, 0 failed requests |
+
+Concurrency rows above the Ollama block are the current-release ladder (8 × 64-token bodies, temp 0, identical child argv both sides; receipt `bench-artifacts/20261031-benchmark-audit/gateway-overhead-ladder-after-fix.json`).
 
 Where the gateway can matter — scheduling, residency, cache, tail control, tools — Blazar leads Ollama by receipt:
 
-| Surface | Blazar | Ollama | Margin | Campaign |
-|---|---:|---:|---|---|
-| ITL p99 (tail smoothness) | **25.8 ms** | 75.0 ms | **~3×** | Oct 6 |
-| Idle wake | **2.4–3.5 s** | 6.2 s | **~2×** | Oct 6 |
-| Tool-call TTFT p50 | **117 ms** | 285 ms | **~2.4×** | Oct 6 |
-| TTFT p99 under load, C=4 | **554 ms** | 15.9 s | **~28×** | Sep 29 |
-| Cached-path TTFT | **~0.4 s** | 6.1–6.5 s | **~15×** | KV-quality |
-| Throughput under load, C=4 | **104.8 t/s** | 33.6 t/s | **~3.1×** | Sep 29 |
+| Surface | Blazar | Ollama | Margin |
+|---|---:|---:|---|
+| ITL p99 (tail smoothness) | **25.8 ms** | 75.0 ms | **~3×** |
+| Idle wake | **2.4–3.5 s** | 6.2 s | **~2×** |
+| Tool-call TTFT p50 | **117 ms** | 285 ms | **~2.4×** |
+| TTFT p99 under load, C=4 | **554 ms** | 15.9 s | **~28×** |
+| Cached-path TTFT | **~0.4 s** | 6.1–6.5 s | **~15×** |
+| Throughput under load, C=4 | **104.8 t/s** | 33.6 t/s | **~3.1×** |
 
 The two parity rows in the table above are physics, not lost ground: single-stream TTFT is the same engine doing prefill in every lane (the relay adds ~0 ms), and cold start is disk-bandwidth-bound model loading — where Ollama's 4.6 s reference even ran on a warm daemon while Blazar's 4.8 s included the full gateway boot.
 
-The Oct 6 campaign's `blazar-matched` lane pins the gateway child to the direct lane's own slot count, isolating orchestration cost from slot-capacity differences; its default lane (slots=4, unified 64k KV) legitimately trades decode speed for context capacity on an 8 GiB card. Campaigns measure more than tokens/s: prefill, saturation, cache reuse, tool-call and structured-output quality, cold starts, scheduling, lifecycle, and media lanes. Reproduce with `blazar bench <model>` or `python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md`.
+The matched-concurrency rows pin the gateway child to the direct lane's own slot count, isolating orchestration cost from slot-capacity differences; the default lane (slots=4, unified 64k KV) legitimately trades decode speed for context capacity on an 8 GiB card. Campaigns measure more than tokens/s: prefill, saturation, cache reuse, tool-call and structured-output quality, cold starts, scheduling, lifecycle, and media lanes — per-campaign environments and dates are recorded with each receipt in BENCHMARK.md. Reproduce with `blazar bench <model>` or `python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md`.
 
 ---
 
