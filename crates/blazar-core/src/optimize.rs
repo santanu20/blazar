@@ -1,12 +1,12 @@
-//! `blazar optimize --plan` — the deterministic DECIDE stage of the
-//! optimization architecture (docs/research/2026-10-31 §7.6). Reads the
+//! `blazar optimize --plan` - the deterministic DECIDE stage of the
+//! optimization architecture (docs/research/2026-10-31 section 7.6). Reads the
 //! evidence store, names every gap it can prove, and orders the work
 //! that would close it. Pure over the store: no spawns, no writes, no
 //! clocks (the caller passes `now`), so the same builder serves the
 //! read-only adviser today and the Wave-2 experiment runner later.
 //!
 //! Scope discipline: `autopilot` already covers fleet-wide bench/tune/
-//! certificate *staleness*; this module goes deeper per model — receipt
+//! certificate *staleness*; this module goes deeper per model - receipt
 //! provenance (engine tag, hardware fingerprint), the optimization
 //! ledger's adoption pointer, KV-cache quality eligibility at the
 //! serving context, and speculation-receipt qualification under the
@@ -45,12 +45,12 @@ pub struct OptimizeFinding {
     pub area: &'static str,
     /// Plain sentence stating the verdict.
     pub text: String,
-    /// The stored datum the verdict rests on (receipt age, tag, ratio…).
+    /// The stored datum the verdict rests on (receipt age, tag, ratio...).
     pub datum: String,
 }
 
 /// One recommended command, in priority order (the Vec's order IS the
-/// priority — no separate ranking axis to keep honest).
+/// priority - no separate ranking axis to keep honest).
 #[derive(Debug, Clone)]
 pub struct OptimizeRec {
     /// The exact command the operator could type.
@@ -80,7 +80,7 @@ pub struct OptimizePlan {
 }
 
 impl OptimizePlan {
-    /// Sum of benchmark-bearing sessions across the recommendations —
+    /// Sum of benchmark-bearing sessions across the recommendations -
     /// the operator's cost preview. Never estimates runs the commands
     /// themselves do not account for.
     #[must_use]
@@ -91,11 +91,11 @@ impl OptimizePlan {
 
 /// Evidence inputs the CLI resolves before building the plan. Kept
 /// explicit (rather than re-read inside) so unit tests seed stores and
-/// pass exact values — and so the builder stays pure.
+/// pass exact values - and so the builder stays pure.
 pub struct OptimizeInputs<'a> {
     pub row: &'a ModelRow,
     pub engine: Option<&'a EngineRow>,
-    /// `resources.default_ctx` from the effective config — the serving
+    /// `resources.default_ctx` from the effective config - the serving
     /// context used when no tuned profile pins one.
     pub config_ctx: u32,
     /// Epoch seconds (caller-supplied; the builder has no clock).
@@ -107,7 +107,7 @@ pub struct OptimizeInputs<'a> {
 
 /// Evidence-sufficiency threshold used by the CLI. Below this many
 /// requests in the last 30 days the usage telemetry cannot stand for a
-/// workload — the adviser says so instead of pretending otherwise.
+/// workload - the adviser says so instead of pretending otherwise.
 pub const WORKLOAD_MIN_REQUESTS: i64 = 20;
 
 /// Build the advise-only plan. Every rule is deterministic over the
@@ -124,7 +124,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
             findings.push(OptimizeFinding {
                 severity: Severity::Warn,
                 area: "engine",
-                text: "no active engine lane — tuning evidence cannot be produced or judged".into(),
+                text: "no active engine lane - tuning evidence cannot be produced or judged".into(),
                 datum: "engines table holds no active row".into(),
             });
             recs.push(OptimizeRec {
@@ -136,7 +136,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
             (None, None, false)
         }
         Some(e) => {
-            // Tuning/bench/spec surfaces drive llama-bench tooling —
+            // Tuning/bench/spec surfaces drive llama-bench tooling -
             // only the llamacpp lane carries it. Other lanes get an
             // honest scope note, not an empty plan pretending success.
             let tuneable = e.kind == crate::engine_kind::EngineKind::LlamaCpp;
@@ -145,7 +145,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                     severity: Severity::Info,
                     area: "engine",
                     text: format!(
-                        "active lane {:?} has no tuning surface — optimize advises on llamacpp lanes only",
+                        "active lane {:?} has no tuning surface - optimize advises on llamacpp lanes only",
                         e.kind
                     ),
                     datum: format!("engine {} ({:?})", e.tag, e.kind),
@@ -174,14 +174,14 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                 let mut staleness: Option<String> = None;
                 if Some(tag.as_str()) != engine_tag.as_deref() {
                     staleness = Some(format!(
-                        "receipt from lane '{tag}' but '{opt}' is active — engine moved under the evidence",
+                        "receipt from lane '{tag}' but '{opt}' is active - engine moved under the evidence",
                         opt = engine_tag.clone().unwrap_or_default()
                     ));
                 } else if axes.hw_fingerprint.as_deref() != hw_current.as_deref() {
                     // `None` (pre-v13 row) is also a mismatch: the
                     // receipt cannot be attributed to THIS hardware.
                     staleness = Some(if axes.hw_fingerprint.is_none() {
-                        "receipt predates hardware fingerprinting — cannot be attributed to this machine".into()
+                        "receipt predates hardware fingerprinting - cannot be attributed to this machine".into()
                     } else {
                         "receipt was measured on different hardware".into()
                     });
@@ -254,7 +254,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                     Ok(None) => findings.push(OptimizeFinding {
                         severity: Severity::Info,
                         area: "profile",
-                        text: "tuned profile predates the v19 optimization ledger — its adoption is unpointed".into(),
+                        text: "tuned profile predates the v19 optimization ledger - its adoption is unpointed".into(),
                         datum: format!("profile {age_days}d old, hash {}", p.args_hash),
                     }),
                     Err(e) => findings.push(unreadable("profile", e)),
@@ -273,7 +273,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
             .filter(|g| kv_quality::grade_evidenced_at_ctx(name, g, serving_ctx))
             .collect();
         // The profile's own KV flags: compiled argv omits them when the
-        // grade is the f16 default — absence IS the f16 statement.
+        // grade is the f16 default - absence IS the f16 statement.
         let argv_probe = engine_tag
             .as_deref()
             .and_then(|tag| store.get_profile(name, tag).ok().flatten())
@@ -295,7 +295,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                 severity: Severity::Warn,
                 area: "kv",
                 text: format!(
-                    "active profile serves quantized KV without quality evidence at ctx {serving_ctx} — the tune gate now excludes such grades, this profile predates it"
+                    "active profile serves quantized KV without quality evidence at ctx {serving_ctx} - the tune gate now excludes such grades, this profile predates it"
                 ),
                 datum: format!("kv {k}/{v} vs registry evidence at ctx {serving_ctx}"),
             });
@@ -305,7 +305,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                 severity: Severity::Info,
                 area: "kv",
                 text: format!(
-                    "no quantized-KV quality evidence for this model — the tune gate keeps every search on f16 at ctx {serving_ctx}"
+                    "no quantized-KV quality evidence for this model - the tune gate keeps every search on f16 at ctx {serving_ctx}"
                 ),
                 datum: format!("registry has no receipts for {name} at ctx >= {serving_ctx}"),
             });
@@ -314,7 +314,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                 severity: Severity::Ok,
                 area: "kv",
                 text: format!(
-                    "quantized-KV grades {} quality-evidenced at ctx {serving_ctx} — eligible to win a gated tune search",
+                    "quantized-KV grades {} quality-evidenced at ctx {serving_ctx} - eligible to win a gated tune search",
                     evidenced.join(", ")
                 ),
                 datum: format!("ppl registry receipts for {name}"),
@@ -329,7 +329,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                 let dense = rows.iter().any(|r| r.mode == "dense");
                 // Same qualification rules the supervisor applies at
                 // selection time (best_measured_spec_mode): ratio floor
-                // 1.05 and — for ngram — a tuned receipt. An untuned
+                // 1.05 and - for ngram - a tuned receipt. An untuned
                 // ngram row can never be the adviser's "winner".
                 let qualified: Vec<_> = rows
                     .iter()
@@ -360,7 +360,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                             severity: Severity::Warn,
                             area: "spec",
                             text: format!(
-                                "ngram receipt at {:.2}x dense is EXCLUDED from selection — raced engine defaults, never tuned knobs",
+                                "ngram receipt at {:.2}x dense is EXCLUDED from selection - raced engine defaults, never tuned knobs",
                                 r.ratio
                             ),
                             datum: format!(
@@ -387,7 +387,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                             "no speculation mode has qualified against dense (>= 1.05x, tuned)"
                                 .into()
                         } else {
-                            "speculation race never ran on this lane — no dense baseline either"
+                            "speculation race never ran on this lane - no dense baseline either"
                                 .into()
                         },
                         datum: format!(
@@ -408,7 +408,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                 findings.push(OptimizeFinding {
                     severity: Severity::Warn,
                     area: "spec",
-                    text: "no speculation receipts — the lane has never raced its spec modes"
+                    text: "no speculation receipts - the lane has never raced its spec modes"
                         .into(),
                     datum: format!("spec_receipts empty for ({name}, {tag})"),
                 });
@@ -443,14 +443,14 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
         );
     }
 
-    // ---- capability certificate (absence only — staleness is
+    // ---- capability certificate (absence only - staleness is
     // autopilot's lane, thresholds must not fork between advisers) ----
     match store.get_model_caps_dated(name) {
         Ok(None) => {
             findings.push(OptimizeFinding {
                 severity: Severity::Warn,
                 area: "cert",
-                text: "no capability certificate — admission gates run on unverified caps".into(),
+                text: "no capability certificate - admission gates run on unverified caps".into(),
                 datum: "model_caps empty for this model".into(),
             });
             recs.push(OptimizeRec {
@@ -485,7 +485,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                     severity: Severity::Info,
                     area: "workload",
                     text: format!(
-                        "workload evidence thin ({requests} requests in 30d) — workload-representative verification needs real traffic shape"
+                        "workload evidence thin ({requests} requests in 30d) - workload-representative verification needs real traffic shape"
                     ),
                     datum: format!(
                         "usage_daily: {requests} of {} request floor",
@@ -496,7 +496,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                 findings.push(OptimizeFinding {
                     severity: Severity::Ok,
                     area: "workload",
-                    text: format!("{requests} requests in 30d — enough shape for workload-representative verification"),
+                    text: format!("{requests} requests in 30d - enough shape for workload-representative verification"),
                     datum: "usage_daily 30d rollup".into(),
                 });
             }
@@ -519,7 +519,7 @@ fn unreadable(area: &'static str, e: crate::CoreError) -> OptimizeFinding {
         severity: Severity::Warn,
         area,
         text: format!("evidence unreadable: {e}"),
-        datum: "store read failed — fix the store before trusting any plan".into(),
+        datum: "store read failed - fix the store before trusting any plan".into(),
     }
 }
 
@@ -531,16 +531,16 @@ fn is_gguf(row: &ModelRow) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
 }
 
-/// Parse a profile's argv JSON array leniently — a malformed payload
+/// Parse a profile's argv JSON array leniently - a malformed payload
 /// yields an empty argv (every probe then reports the honest default)
 /// rather than failing the whole plan.
 fn parse_argv_json(args_json: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(args_json).unwrap_or_default()
 }
 
-/// Value following `flag` in an argv (`["-c", "4096", …]`). Returns
+/// Value following `flag` in an argv (`["-c", "4096", ...]`). Returns
 /// `None` when the flag is absent or its value looks like another flag
-/// (malformed pair — treated as absent, never guessed).
+/// (malformed pair - treated as absent, never guessed).
 fn argv_value(argv: &[String], flag: &str) -> Option<String> {
     argv.iter()
         .position(|a| a == flag)
@@ -551,6 +551,7 @@ fn argv_value(argv: &[String], flag: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(non_snake_case)] // test names narrate: unit__subject__contract
     use super::*;
     use crate::{
         dirs::BlazarDirs,
@@ -605,7 +606,7 @@ mod tests {
         }
     }
 
-    /// The fingerprint `engine(tag, Some(h))` produces — derived through
+    /// The fingerprint `engine(tag, Some(h))` produces - derived through
     /// the same fn the builder uses, so tests never hand-roll a string
     /// that could drift from the real derivation.
     fn expected_hw(h: &str) -> Option<String> {
@@ -640,7 +641,7 @@ mod tests {
         let plan = build_plan(&s, &inputs(&row, None)).unwrap();
         assert_eq!(finding(&plan, "engine").severity, Severity::Warn);
         assert!(rec_cmds(&plan).contains(&"blazar engine list".to_string()));
-        // No lane → no bench/profile/spec verdicts to fake.
+        // No lane -> no bench/profile/spec verdicts to fake.
         assert!(plan.findings.iter().all(|f| f.area != "bench"));
     }
 
@@ -651,7 +652,7 @@ mod tests {
         let e = engine("b1-cuda", Some("gpu=X"));
         s.upsert_engine(&e).unwrap();
         let plan = build_plan(&s, &inputs(&row, Some(&e))).unwrap();
-        // Order is priority: bench → tune search → ngram → spec-race →
+        // Order is priority: bench -> tune search -> ngram -> spec-race ->
         // model-doctor, with the cert last (non-benchmark).
         assert_eq!(
             rec_cmds(&plan),
@@ -664,7 +665,7 @@ mod tests {
             ]
         );
         assert_eq!(plan.benchmark_budget(), 4);
-        assert_eq!(plan.serving_ctx, 4096, "no profile → config default ctx");
+        assert_eq!(plan.serving_ctx, 4096, "no profile -> config default ctx");
     }
 
     #[test]
@@ -875,7 +876,7 @@ mod tests {
         assert_eq!(finding(&plan, "engine").severity, Severity::Info);
         assert!(finding(&plan, "engine").text.contains("no tuning surface"));
         // No bench/tune/spec recs fabricated for a lane that cannot run
-        // them — only cert/workload still apply.
+        // them - only cert/workload still apply.
         assert!(
             plan.recs
                 .iter()
