@@ -6,6 +6,8 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-01
+
 ### Added
 
 - **Per-request visibility for engine performance degrades.** An engine child that logs a silent performance degrade — the llama.cpp flash-attention class of issue (upstream #28455: quantized KV pairs without a compiled GPU FA kernel quietly convert through f16, or on older builds move attention to the CPU at ~35x slower prefill) — now surfaces on every request it serves instead of drowning in child stderr: a runtime degrade registry (`blazar_runtime::degrades`, endpoint-keyed so a respawned child starts clean) fed by the child-log classifier, a sentinel `engine_slow_attn` detection stamped on each affected record plus the `x-blazar-warnings` response header (with remedy: prefer f16/q8_0/q4_0 cache pairs, rebuild with `GGML_CUDA_FA_QUANTS`, or `blazar tune`), a live model-resolved `engine_degrades[]` array on `/api/why`, and CLI `blazar why` rendering of the same. E2e-pinned: real gateway chat carries header + detection + why entry.
