@@ -3235,13 +3235,19 @@ pub fn persist_config(path: &std::path::Path, body: &str) -> CoreResult<()> {
         // millisecond would otherwise copy into the SAME backup path and
         // the loser dies with a Windows sharing violation on the open.
         let bak = path.with_file_name(format!("config.toml.bak-{ms}.{}.{seq}", std::process::id()));
-        if let Err(e) = retry_on_sharing_violation(|| std::fs::copy(path, &bak)) {
-            // Concurrent rotation can retire the source or the fresh
-            // backup mid-copy on some filesystems (observed as ENOENT on
-            // APFS CI under 8 writers). The body write below is the
-            // authoritative operation and recreates the target, so a
-            // vanished-source backup is vacuous — same philosophy as the
-            // armor guard below. Anything else is a real failure.
+        if let Err(e) = retry_on_transient_fs(|| std::fs::copy(path, &bak)) {
+            // Two distinct benign outcomes, both observed on loaded CI:
+            //  (1) APFS lookup race — copyfile re-resolves the source path
+            //      internally; a concurrent atomic rename(tmp -> path)
+            //      inside that window fails with ENOENT while the path
+            //      exists both before and after. Retrying above resolves
+            //      it; only a NotFound that SURVIVES the bounded retries
+            //      can be a real vanish.
+            //  (2) genuine vanish — concurrent rotation retired the source
+            //      for good. The body write below is the authoritative
+            //      operation and recreates the target, so a vanished-source
+            //      backup is vacuous — same philosophy as the armor guard
+            //      below. Anything else is a real failure.
             if e.kind() == std::io::ErrorKind::NotFound && !path.exists() {
                 // vacuous: source rotated away; skip the backup
             } else {
@@ -3332,6 +3338,32 @@ fn is_sharing_violation(err: &std::io::Error) -> bool {
     {
         let _ = err;
         false
+    }
+}
+
+/// Bounded retry for transient filesystem states: Windows sharing locks
+/// (antivirus/indexer/concurrent writers hold the file open) plus ENOENT
+/// lookup races on copy-style syscalls under concurrent atomic replaces
+/// (observed on APFS CI). At most 8 attempts with linear backoff (10ms
+/// step, ~360ms total worst case), then the last error surfaces
+/// unchanged — loud, never a silent give-up.
+fn retry_on_transient_fs<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let transient =
+                    is_sharing_violation(&e) || e.kind() == std::io::ErrorKind::NotFound;
+                if transient && attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
+                } else {
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 
