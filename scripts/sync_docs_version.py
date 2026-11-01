@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Keep the GitHub Pages site's version strings in lockstep with releases.
+"""Keep user-facing version strings in lockstep with releases.
 
-The site (docs/, served via GitHub Pages from main) carries the release
-version in exactly five places: the hero eyebrow, the two install
-command URLs, and the demo banner in index.html plus its SVG twin.
-These are "current release" claims — a stale one is the site lying
-about what shipping today looks like. Verification-date stamps inside
-the markdown pages ("spot-verified against vX on DATE") are historical
-records and are deliberately NOT touched.
+The site (docs/, served via GitHub Pages from main) and the README
+quickstart carry the release version in exactly seven places: the hero
+eyebrow, the two install command URLs, and the demo banner in
+index.html, the banner's SVG twin, and the two quickstart install URLs
+in README.md. These are "current release" claims — a stale one is the
+site (or README) lying about what shipping today looks like; v0.28.0
+shipped with README still pointing at v0.27.0 install URLs because the
+sync did not cover them. Verification-date stamps inside the markdown
+pages ("spot-verified against vX on DATE") are historical records and
+are deliberately NOT touched.
 
 Mode:
-  default   rewrite the five spots to the workspace version
+  default   rewrite the seven spots to the workspace version
   --check   exit 1 if any spot disagrees with --expect (CI gate)
 
 The workspace version in Cargo.toml is the single source of truth;
@@ -55,6 +58,16 @@ VERSION_SPOTS: list[tuple[str, str, str]] = [
         "docs/assets/blazar-demo.svg",
         r"(blazar )(\d+\.\d+\.\d+)( — powered by)",
         "SVG demo banner",
+    ),
+    (
+        "README.md",
+        r"(raw\.githubusercontent\.com/\S+?/blazar/v)(\d+\.\d+\.\d+)(/scripts/install\.sh)",
+        "README quickstart install URL (sh)",
+    ),
+    (
+        "README.md",
+        r"(raw\.githubusercontent\.com/\S+?/blazar/v)(\d+\.\d+\.\d+)(/scripts/install\.ps1)",
+        "README quickstart install URL (ps1)",
     ),
 ]
 
