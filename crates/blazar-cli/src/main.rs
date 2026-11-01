@@ -296,6 +296,21 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Evidence-gap adviser for a model: reads the store and judges
+    /// benchmark freshness, tuned profile provenance, KV-cache quality
+    /// eligibility, speculation receipts, capability certificate and
+    /// workload telemetry — then recommends the exact commands that
+    /// close each gap, with the datum behind every verdict
+    Optimize {
+        model: String,
+        /// Print the advisory plan (Wave 1 is advise-only; execution
+        /// arrives with Wave 2 verification and adoption)
+        #[arg(long)]
+        plan: bool,
+        /// Machine-readable single JSON object instead of the card
+        #[arg(long)]
+        json: bool,
+    },
     /// Pre-run plan for a model: live routing decision (daemon card),
     /// measured profile, capability certificate, and next actions —
     /// read-only; an unpulled target shows the upstream fit preview
@@ -1065,6 +1080,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "autopilot",
             "bench",
             "tune",
+            "optimize",
             "scorecard",
             "certify",
             "drafts",
@@ -2058,6 +2074,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             .await
         }
         Cmd::Scorecard { model, json } => scorecard(&resolve_model_cli(&model), json),
+        Cmd::Optimize { model, plan, json } => optimize_cmd(&resolve_model_cli(&model), plan, json),
         Cmd::Plan {
             model,
             install,
@@ -10107,6 +10124,117 @@ fn scorecard_json(
             "performance": performance,
             "quality": quality,
             "execution_score": execution_score,
+        })
+    );
+}
+
+/// `blazar optimize <model> --plan` — render the advise-only evidence
+/// plan. Every line is derived from stored receipts, never guessed.
+fn optimize_cmd(model: &str, plan: bool, json: bool) -> Result<()> {
+    if !plan {
+        return Err(anyhow!(
+            "optimize is advise-only (Wave 1): blazar optimize {model} --plan"
+        ));
+    }
+    let d = dirs();
+    let store = Store::open(&d)?;
+    let row = store
+        .get_model(model)?
+        .ok_or_else(|| no_such_model(model))?;
+    let engine = store.active_engine()?;
+    let cfg_path = d.config_file();
+    let cfg = if cfg_path.exists() {
+        let raw = std::fs::read_to_string(&cfg_path)?;
+        blazar_core::Config::from_toml(&raw).map_err(|e| anyhow!("{e}"))?
+    } else {
+        blazar_core::Config::default()
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|dur| dur.as_secs() as i64)
+        .unwrap_or(0);
+    let inputs = blazar_core::optimize::OptimizeInputs {
+        row: &row,
+        engine: engine.as_ref(),
+        config_ctx: cfg.default_ctx,
+        now,
+        workload_min_requests: blazar_core::optimize::WORKLOAD_MIN_REQUESTS,
+    };
+    let built = blazar_core::optimize::build_plan(&store, &inputs)?;
+
+    if json {
+        optimize_json(&built);
+        return Ok(());
+    }
+
+    // Human card: identity, verdict rows, then the priority ladder.
+    println!("optimize plan — {}", built.model);
+    if let Some(tag) = &built.engine_tag {
+        println!("engine       {tag}");
+    }
+    if let Some(hw) = &built.hw_current {
+        println!("hardware     {hw}");
+    }
+    println!(
+        "context      {} tokens (profile -c, else config default)",
+        built.serving_ctx
+    );
+    println!();
+    println!("findings");
+    for f in &built.findings {
+        println!(
+            "  [{:<4}] {:<8}  {} ({})",
+            f.severity.label(),
+            f.area,
+            f.text,
+            f.datum
+        );
+    }
+    println!();
+    println!("recommended");
+    if built.recs.is_empty() {
+        println!("  nothing to do — every evidence check passed");
+    }
+    for (idx, r) in built.recs.iter().enumerate() {
+        println!("  {}. {} — {} ({})", idx + 1, r.cmd, r.why, r.datum);
+    }
+    println!();
+    println!("benchmark budget   {} session(s)", built.benchmark_budget());
+    println!("status             ADVISE ONLY — no configuration changed");
+    Ok(())
+}
+
+fn optimize_json(plan: &blazar_core::optimize::OptimizePlan) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "object": "blazar.optimize.plan",
+            "model": plan.model,
+            "engine_tag": plan.engine_tag,
+            "hw_current": plan.hw_current,
+            "serving_ctx": plan.serving_ctx,
+            "findings": plan
+                .findings
+                .iter()
+                .map(|f| serde_json::json!({
+                    "severity": f.severity.label(),
+                    "area": f.area,
+                    "text": f.text,
+                    "datum": f.datum,
+                }))
+                .collect::<Vec<_>>(),
+            "recommended": plan
+                .recs
+                .iter()
+                .map(|r| serde_json::json!({
+                    "cmd": r.cmd,
+                    "why": r.why,
+                    "datum": r.datum,
+                    "benchmark_sessions": r.benchmark_sessions,
+                }))
+                .collect::<Vec<_>>(),
+            "benchmark_budget": plan.benchmark_budget(),
+            "status": "advise-only",
         })
     );
 }

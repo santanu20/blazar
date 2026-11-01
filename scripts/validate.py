@@ -1093,6 +1093,7 @@ _COMMAND_ATTRS = {
     "doctor.fix": (False, False, False, False, True),
     "plan": (False, False, False, False, True),
     "scorecard": (False, False, False, False, True),
+    "optimize.plan": (False, False, False, False, True),
     "autopilot": (False, False, False, False, True),
     "certify": (True, True, False, False, True),
     "classify": (False, False, False, False, True),
@@ -13698,6 +13699,25 @@ def phase_wave13() -> None:
         "gap line" if "no benchmark" in p.stdout else "measured rows",
     )
 
+    p = cli("optimize", MODEL, "--plan")
+    ok = p.returncode == 0 and "findings" in p.stdout and "ADVISE ONLY" in p.stdout
+    check(
+        "wave13",
+        "optimize --plan renders evidence findings + advice-only card",
+        ok,
+        "advice card present" if ok else p.stdout[:200],
+    )
+    p_json = cli("optimize", MODEL, "--plan", "--json")
+    check(
+        "wave13",
+        "optimize --plan --json emits the machine-readable plan object",
+        p_json.returncode == 0
+        and '"blazar.optimize.plan"' in p_json.stdout
+        and '"findings"' in p_json.stdout
+        and '"status":"advise-only"' in p_json.stdout,
+        p_json.stdout[:120],
+    )
+
     p = cli("autopilot")
     check(
         "wave13",
@@ -13737,6 +13757,11 @@ def phase_wave13() -> None:
     reg("doctor.fix", True, "wave13: per-fix outcomes printed, rc=0")
     reg("plan", True, "wave13: card rendered on pulled model, teaching on unknown")
     reg("scorecard", True, "wave13: identity + measured/gap rows rendered")
+    reg(
+        "optimize.plan",
+        True,
+        "wave13: advise-only evidence card + JSON object rendered",
+    )
     reg("autopilot", True, "wave13: observe-only per-model report, rc=0")
 
     # --- daemon block (real served model) ---

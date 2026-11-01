@@ -2801,6 +2801,27 @@ impl Store {
         Ok(())
     }
 
+    /// Which ledger experiment the (model, engine_tag) lane currently
+    /// serves, and when that pointer moved. `None` when the serving
+    /// profile predates the v19 ledger — the caller reports that
+    /// honestly instead of inventing provenance.
+    pub fn active_profile_of(
+        &self,
+        model: &str,
+        engine_tag: &str,
+    ) -> CoreResult<Option<(i64, i64)>> {
+        let row = self.conn.query_row(
+            "SELECT experiment_id, updated_at FROM active_profiles
+             WHERE model = ?1 AND engine_tag = ?2",
+            params![model, engine_tag],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        );
+        match row {
+            Ok(pair) => Ok(Some(pair)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 /// Daily usage counters for one key.

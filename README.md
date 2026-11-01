@@ -242,7 +242,7 @@ Three native dialects with per-engine **thinking management** (effort mapping, `
 
 ### One-word UX
 
-`plan` previews the run decision, `run` prints the daemon's real ready-card (`--intent agent|batch|coding|reasoning|vision` maps a workload class), `config preset` flips a posture, `scorecard` assembles the stored bench + certificate (never re-runs), `autopilot` recommends only real work (`--apply` runs it). Capability certificates gate admission on verified FAILs, with probe and refresh command. → [`9.USAGE.md`](docs/9.USAGE.md)
+`plan` previews the run decision, `run` prints the daemon's real ready-card (`--intent agent|batch|coding|reasoning|vision` maps a workload class), `config preset` flips a posture, `scorecard` assembles the stored bench + certificate (never re-runs), `autopilot` recommends only real work (`--apply` runs it), `optimize --plan` audits stored evidence per model and advises the next tuning move (every verdict cites its receipt). Capability certificates gate admission on verified FAILs, with probe and refresh command. → [`9.USAGE.md`](docs/9.USAGE.md)
 
 ### Resource-aware scheduling and speculation
 
@@ -358,6 +358,7 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | One-shot decision scoring | `blazar classify <model> "text" --labels safe,unsafe` |
 | Preview a model before running | `blazar plan <model>` |
 | One-page perf + quality card | `blazar scorecard <model>` |
+| Evidence-gap advice for a model | `blazar optimize <model> --plan` (read-only: names stale benchmarks, untuned speculation, KV grades without quality evidence, missing certificates — and the commands that close each gap) |
 | One-word config posture | `blazar config preset balanced` |
 | Observe → recommend per model | `blazar autopilot`, `blazar autopilot --apply` |
 | Pull / import models | `blazar pull <target>`, `blazar import <file> --name <name>` |
