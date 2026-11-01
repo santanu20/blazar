@@ -246,7 +246,7 @@ Three native dialects with per-engine **thinking management** (effort mapping, `
 
 ### Resource-aware scheduling and speculation
 
-`fit` previews VRAM/KV/slots/co-residency before download; bounded admission under saturation; adaptive slot reshape from live telemetry. Speculative decoding (MTP/EAGLE/draft pairs) with n-gram auto-fallback and closed-loop governors (`spec_auto_manage`, `ubatch_auto`) that park speculation when acceptance collapses. → [`6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) · [`10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md)
+`fit` previews VRAM/KV/slots/co-residency before download; bounded admission under saturation; adaptive slot reshape from live telemetry. Speculative decoding (MTP/EAGLE/draft pairs) with n-gram auto-fallback and closed-loop governors (`spec_auto_manage`, `ubatch_auto`) that park speculation when acceptance collapses; draft pairing is lane-aware (GGUF drafts to llama.cpp/mistral.rs, safetensors drafts to SGLang/MLX — never a mismatched or self-pair). → [`6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) · [`10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md)
 
 ### Reliability: jobs, requests, durability
 
@@ -274,7 +274,7 @@ Versioned side-by-side installs, SHA-256 verification, capability probing, regre
 
 ### Diagnostics and observability
 
-`doctor` (system/GPU/engines/models/channels, `--fix`), `why` trace explanations, `explain` effective-config card, `model-doctor` capability certificates, `/api/capacity` GPU census, `/metrics`, OTLP, audit JSONL, PII scrubbing. → [`9.USAGE.md`](docs/9.USAGE.md)
+`doctor` (system/GPU/engines/models/channels, `--fix`), `why` trace explanations, `explain` effective-config card, `model-doctor` capability certificates, `/api/capacity` GPU census, `/metrics`, OTLP, audit JSONL, PII scrubbing. Engine silent degrades (e.g. a flash-attention KV-type fallback in the serving child) are detected and surfaced per-request — `x-blazar-warnings` headers, `engine_slow_attn` detections in `why`, and a live `engine_degrades` panel on `/api/why`. → [`9.USAGE.md`](docs/9.USAGE.md)
 
 ### Web console
 
@@ -365,7 +365,7 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | Inspect models | `blazar list`, `blazar show <model>`, `blazar ps` |
 | Stop / remove | `blazar stop` (daemon), `blazar rm <model>` |
 | Quantize / attach projector | `blazar quantize <model> <out-quant>`, `blazar mmproj <model> <mmproj.gguf path>` |
-| Tune generation speed | `blazar tune <model>`, `blazar bench <model>` (results stored) |
+| Tune generation speed | `blazar tune <model>`, `blazar bench <model>` (results stored as engine-tagged receipts — `doctor` flags models whose receipts predate the active engine) |
 | Launch an AI CLI | `blazar launch <command>` |
 | Connect AI clients | `blazar connect --write` (Claude Code, Codex, Continue, Cline, Open WebUI, opencode, pi) |
 | Explain serving config | `blazar explain <model>` |
