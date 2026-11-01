@@ -13245,6 +13245,11 @@ def _gold_items() -> dict:
             "engine currency",
             "engine retention",
             "bench baseline",
+            # bench-state-conditional: the row appears only when some
+            # model's bench receipt predates the active engine tag —
+            # fresh receipts hide it, engine updates surface it (same
+            # class as "bench baseline" above)
+            "bench receipts",
         }
     )
     items["doctor.check-names"] = "\n".join(names)
