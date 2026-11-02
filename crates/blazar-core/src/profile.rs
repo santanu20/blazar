@@ -2571,7 +2571,7 @@ const UNIFIED_COMPUTE_PER_TOKEN_BYTES: u64 = 24 * 1024;
 /// `server_context_impl::process_tts_slots()` on the first POST /tts;
 /// the same argv without the embedding flags serves /tts fine. Every
 /// embedding arm in section 10c is therefore skipped for these arches.
-fn speech_generation_arch(arch: &str) -> bool {
+pub fn speech_generation_arch(arch: &str) -> bool {
     matches!(arch, "qwen3tts")
 }
 

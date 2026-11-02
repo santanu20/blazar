@@ -3349,6 +3349,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_models(&d));
     checks.extend(doctor_recipe_lanes(&d));
     checks.extend(doctor_model_types(&d));
+    checks.extend(doctor_modality_coverage(&d));
     checks.extend(doctor_sglang_fit(&d));
     checks.extend(doctor_bench_receipts(&d));
     checks.extend(doctor_kv_budget(&d));
@@ -3734,7 +3735,7 @@ fn doctor_group(name: &str) -> &'static str {
         | "whisper currency"
         | "whisper models"
         | "rpc fleet" => "ENGINES",
-        "models" | "unmanaged files" | "model types" => "MODELS",
+        "models" | "unmanaged files" | "model types" | "modality coverage" => "MODELS",
         "ccache" => "CHANNELS",
         "disk" | "store" | "sentinel" | "daemon uptime" | "tempdir hygiene" | "bench baseline"
         | "chunking" => "RUNTIME",
@@ -4844,6 +4845,152 @@ fn doctor_model_types(d: &BlazarDirs) -> Vec<Check> {
     }
 }
 
+/// One store row reduced to the signals the modality census reads: the
+/// GGUF/HF architecture tag, whether an mmproj sidecar is attached
+/// (vision or audio tower), and whether the row rides a diffusion
+/// family (attached component set or a family-token repo).
+struct ModalityProbe<'a> {
+    arch: Option<&'a str>,
+    mmproj: bool,
+    diffusion: bool,
+}
+
+/// Count installed rows per serving class. A row may legitimately count
+/// twice (a speech model with a sidecar is both speech and vision); a
+/// row matching no specialist class counts as text. The lane-scoped
+/// assets that live outside the model store (piper voices, ggml
+/// whisper models) count through the two bool flags.
+fn modality_census(
+    rows: &[ModalityProbe<'_>],
+    piper_voices: bool,
+    whisper_assets: bool,
+) -> std::collections::BTreeMap<&'static str, u32> {
+    let mut census = std::collections::BTreeMap::from([
+        ("text", 0u32),
+        ("vision", 0),
+        ("embeddings", 0),
+        ("clip", 0),
+        ("speech", 0),
+        ("asr", 0),
+        ("diffusion", 0),
+    ]);
+    let bump = |census: &mut std::collections::BTreeMap<&'static str, u32>, class: &str| {
+        if let Some(n) = census.get_mut(class) {
+            *n += 1;
+        }
+    };
+    for row in rows {
+        let arch = row.arch.unwrap_or("").to_ascii_lowercase();
+        let mut specialist = false;
+        if row.mmproj {
+            bump(&mut census, "vision");
+            specialist = true;
+        }
+        if arch == "clipmodel" {
+            bump(&mut census, "clip");
+            specialist = true;
+        } else if arch.contains("bert") || arch.contains("t5encoder") || arch.contains("embedding")
+        {
+            bump(&mut census, "embeddings");
+            specialist = true;
+        }
+        if blazar_core::profile::speech_generation_arch(&arch) || arch == "piper" {
+            bump(&mut census, "speech");
+            specialist = true;
+        }
+        if arch.contains("whisper") || arch.contains("voxtral") {
+            bump(&mut census, "asr");
+            specialist = true;
+        }
+        if row.diffusion {
+            bump(&mut census, "diffusion");
+            specialist = true;
+        }
+        if !specialist {
+            bump(&mut census, "text");
+        }
+    }
+    if piper_voices {
+        bump(&mut census, "speech");
+    }
+    if whisper_assets {
+        bump(&mut census, "asr");
+    }
+    census
+}
+
+/// Classes the catalog can fill with a one-command pull; vision stays
+/// out because no catalog repo converts cleanly - the honest teaching
+/// there is `blazar mmproj`, not a repo suggestion.
+const MODALITY_SUGGESTIBLE: [&str; 5] = ["embeddings", "clip", "speech", "asr", "diffusion"];
+
+/// Render the census into the check detail plus the warn verdict:
+/// covered classes first, then one line per missing suggestible class
+/// naming every catalog pull command for it.
+fn modality_detail(census: &std::collections::BTreeMap<&'static str, u32>) -> (String, bool) {
+    let covered = census.values().filter(|&&n| n > 0).count();
+    let summary = census
+        .iter()
+        .map(|(class, n)| format!("{class} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut detail = format!("{covered}/7 classes: {summary}");
+    let mut suggestible_missing = false;
+    for class in MODALITY_SUGGESTIBLE {
+        if census.get(class).copied().unwrap_or(0) == 0 {
+            suggestible_missing = true;
+            let pulls: Vec<String> = blazar_core::catalog::catalog()
+                .entries
+                .iter()
+                .filter(|e| e.class.as_deref() == Some(class))
+                .map(|e| format!("blazar pull {}", e.short_name))
+                .collect::<Vec<_>>();
+            let _ = write!(detail, "; missing: {class} ({})", pulls.join(" or "));
+        }
+    }
+    if census.get("vision").copied().unwrap_or(0) == 0 {
+        let _ = write!(
+            detail,
+            "; no vision rows: attach an mmproj sidecar (blazar mmproj <model> <file>)"
+        );
+    }
+    (detail, suggestible_missing)
+}
+
+/// Modality-coverage census: which of the seven serving classes this
+/// installation actually has models for, with the exact pull command
+/// for each catalog-fillable class that is absent.
+fn doctor_modality_coverage(d: &BlazarDirs) -> Vec<Check> {
+    let Ok(store) = Store::open(d) else {
+        return Vec::new();
+    };
+    let Ok(models) = store.list_models() else {
+        return Vec::new();
+    };
+    if models.is_empty() {
+        return Vec::new(); // doctor_models owns the empty-store story
+    }
+    let probes: Vec<ModalityProbe<'_>> = models
+        .iter()
+        .map(|m| ModalityProbe {
+            arch: m.arch.as_deref(),
+            mmproj: m.mmproj_path.is_some(),
+            diffusion: !m.components.is_empty()
+                || blazar_runtime::diffusion::diffusion_family(&m.repo.to_ascii_lowercase())
+                    .is_some(),
+        })
+        .collect();
+    let piper_voices = !blazar_runtime::piper::list_voices(d).is_empty();
+    let whisper_assets = !blazar_runtime::whisper::list_models(d).is_empty();
+    let census = modality_census(&probes, piper_voices, whisper_assets);
+    let (detail, missing) = modality_detail(&census);
+    if missing {
+        vec![Check::warn("modality coverage", detail)]
+    } else {
+        vec![Check::ok("modality coverage", detail)]
+    }
+}
+
 #[cfg(test)]
 mod doctor_tests {
     use super::*;
@@ -4857,6 +5004,122 @@ mod doctor_tests {
         assert!(set.contains("--a") && set.contains("--b"));
         assert_eq!(manifest_flag_set("not json at all").len(), 0);
         assert_eq!(manifest_flag_set(r#"{"tag":"x","no_flags":true}"#).len(), 0);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor__modality_census_signals_all_seven_classes() {
+        let rows = [
+            ModalityProbe {
+                arch: Some("bert"),
+                mmproj: false,
+                diffusion: false,
+            },
+            ModalityProbe {
+                arch: Some("CLIPModel"),
+                mmproj: false,
+                diffusion: false,
+            },
+            // Speech row with a sidecar: counts speech AND vision, never text.
+            ModalityProbe {
+                arch: Some("qwen3tts"),
+                mmproj: true,
+                diffusion: false,
+            },
+            ModalityProbe {
+                arch: Some("WhisperForConditionalGeneration"),
+                mmproj: false,
+                diffusion: false,
+            },
+            ModalityProbe {
+                arch: None,
+                mmproj: false,
+                diffusion: true,
+            },
+            ModalityProbe {
+                arch: Some("qwen3"),
+                mmproj: false,
+                diffusion: false,
+            },
+        ];
+        let census = modality_census(&rows, true, true);
+        assert_eq!(census["text"], 1, "only the plain qwen3 row is text");
+        assert_eq!(census["vision"], 1, "sidecar row counts vision");
+        assert_eq!(census["embeddings"], 1);
+        assert_eq!(census["clip"], 1);
+        assert_eq!(census["speech"], 2, "qwen3tts row + piper voice signal");
+        assert_eq!(census["asr"], 2, "whisper-arch row + ggml whisper assets");
+        assert_eq!(census["diffusion"], 1);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor__modality_census_text_only_when_no_specialist_matches() {
+        let rows = [
+            ModalityProbe {
+                arch: Some("llama"),
+                mmproj: false,
+                diffusion: false,
+            },
+            ModalityProbe {
+                arch: None,
+                mmproj: false,
+                diffusion: false,
+            },
+        ];
+        let census = modality_census(&rows, false, false);
+        assert_eq!(census["text"], 2);
+        assert!(census.iter().all(|(k, &n)| *k == "text" || n == 0));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor__catalog_class_tags_are_the_agreed_set() {
+        let entries = &blazar_core::catalog::catalog().entries;
+        let tagged: Vec<_> = entries.iter().filter(|e| e.class.is_some()).collect();
+        assert_eq!(
+            tagged.len(),
+            10,
+            "exactly the ten non-LLM entries carry a class"
+        );
+        for e in &tagged {
+            let ok = matches!(
+                e.class.as_deref(),
+                Some("embeddings" | "clip" | "speech" | "asr" | "diffusion")
+            );
+            assert!(ok, "unknown class token on {}: {:?}", e.short_name, e.class);
+        }
+        let clip = blazar_core::catalog::resolve("clip-vit-base-patch32").unwrap();
+        assert_eq!(clip.class.as_deref(), Some("clip"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor__modality_detail_names_pull_commands_for_missing_classes() {
+        let census = std::collections::BTreeMap::from([
+            ("text", 3u32),
+            ("vision", 1),
+            ("embeddings", 0),
+            ("clip", 0),
+            ("speech", 1),
+            ("asr", 0),
+            ("diffusion", 0),
+        ]);
+        let (detail, missing) = modality_detail(&census);
+        assert!(missing, "three suggestible classes absent -> warn");
+        assert!(detail.starts_with("3/7 classes:"), "got: {detail}");
+        assert!(
+            detail.contains("missing: clip (blazar pull clip-vit-base-patch32)"),
+            "got: {detail}"
+        );
+        assert!(
+            detail.contains("blazar pull whisper-base"),
+            "asr suggestion names the catalog entry: {detail}"
+        );
+        assert!(
+            !detail.contains("no vision rows"),
+            "vision is covered here, report-only line must stay off: {detail}"
+        );
     }
 
     #[test]

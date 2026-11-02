@@ -20,6 +20,12 @@ pub struct CatalogEntry {
     /// A user-passed `--revision` always wins over this pin.
     #[serde(default)]
     pub revision: Option<String>,
+    /// Modality class tag driving `blazar doctor`'s coverage census and
+    /// per-class pull suggestions: embeddings | clip | speech | asr |
+    /// diffusion. Absent = plain text LLM (the historical default, so
+    /// the 35 text entries stay untouched).
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 /// Speculative-decoding draft pairs: models matching `model_glob` (prefix
