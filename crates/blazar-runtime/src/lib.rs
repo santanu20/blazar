@@ -14,6 +14,7 @@ pub fn tool_file_name(base: &str) -> String {
 }
 
 pub mod bench;
+pub mod clip;
 pub mod daemon;
 pub mod degrades;
 pub mod diffusion;

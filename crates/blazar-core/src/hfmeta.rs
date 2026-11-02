@@ -65,6 +65,20 @@ impl HfMeta {
     }
 }
 
+/// Whether a model path is a vision-capable safetensors directory - the
+/// evidence source for lanes where vision is INTRINSIC to the weights
+/// (sglang, mistral.rs) rather than attached through an mmproj sidecar
+/// (llama.cpp). Reads the same `vision_config`/`image_config` facts the
+/// sglang lane-teach gate reads, so admission, advertisement and the
+/// doctor probe can never disagree with the lane's own spawn gate.
+/// GGUF file paths, missing configs and unreadable JSON are honestly
+/// not-vision (llama.cpp vision is mmproj-evidenced instead).
+#[must_use]
+pub fn lane_vision_capable(path: &str) -> bool {
+    let dir = std::path::Path::new(path);
+    dir.join("config.json").is_file() && read_hf_config(dir).is_ok_and(|m| m.vision_tower)
+}
+
 /// Model metadata for either storage lane. The profile compiler branches on
 /// this instead of assuming GGUF.
 #[derive(Debug, Clone, PartialEq)]
@@ -595,6 +609,33 @@ mod tests {
         let m = read_hf_config(dir.path()).unwrap();
         assert_eq!(m.quant_method.as_deref(), Some("torchao"));
         assert!(m.vision_tower);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__lane_vision_capable__truth_table_matches_sglang_spawn_gate() {
+        // Tower dir: intrinsic vision, same evidence the sglang lane gate
+        // reads, so admission, advertise and doctor can never disagree.
+        let tower = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["Qwen2VLForConditionalGeneration"],
+                "vision_config": {"depth": 27}}"#,
+        )]);
+        assert!(lane_vision_capable(tower.path().to_str().unwrap()));
+        // Text-only dir: no tower object.
+        let text_only = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["Qwen3ForCausalLM"], "num_hidden_layers": 16}"#,
+        )]);
+        assert!(!lane_vision_capable(text_only.path().to_str().unwrap()));
+        // GGUF file path (not a directory): never an intrinsic tower.
+        let gguf = write_dir(&[("model.gguf", "not really a gguf")]);
+        assert!(!lane_vision_capable(
+            gguf.path().join("model.gguf").to_str().unwrap()
+        ));
+        // Missing config.json entirely: nothing to read.
+        let bare = write_dir(&[("README.md", "hello")]);
+        assert!(!lane_vision_capable(bare.path().to_str().unwrap()));
     }
 
     #[test]

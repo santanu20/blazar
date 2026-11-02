@@ -224,6 +224,17 @@ pub async fn tags(State(state): State<Arc<AppState>>) -> Response {
                     "mmproj_bytes": mm_bytes,
                 })
             });
+            // Weights-intrinsic vision (safetensors lanes): no projector
+            // sidecar exists to report, but clients deserve the same
+            // "this model sees images" signal the mmproj rows carry.
+            let details_vision = details_vision.or_else(|| {
+                blazar_core::hfmeta::lane_vision_capable(&m.path).then(|| {
+                    json!({
+                        "intrinsic": true,
+                        "arch": m.arch.clone().unwrap_or_default(),
+                    })
+                })
+            });
             // Which engine row WOULD serve this model right now (routed
             // lane, or the global active row in manual mode). null =
             // nothing can serve it - the spawn path teaches on use.
@@ -328,10 +339,12 @@ pub async fn show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         details["expert_count"] = json!(g.expert_count.unwrap_or(0));
     }
     // ollama-parity capability discovery (vision clients read this):
-    // vision iff an mmproj projector is attached to the model -
-    // evidence from the store, never a filename guess.
+    // vision iff the model can actually serve images - an attached
+    // mmproj projector (llama.cpp) or a weights-intrinsic vision tower
+    // (safetensors lanes) - evidence from the store/disk, never a
+    // filename guess.
     let mut capabilities = vec!["completion"];
-    if row.mmproj_path.is_some() {
+    if row.mmproj_path.is_some() || blazar_core::hfmeta::lane_vision_capable(&row.path) {
         capabilities.push("vision");
     }
     // Thinking capability is template-evidenced - the same marker sniff
@@ -1213,11 +1226,41 @@ pub async fn chat(
         .and_then(serde_json::Value::as_str)
         .is_some_and(|s| !s.is_empty())
         || req.get("format").is_some_and(|v| !v.is_null());
+    // Voice reply tee (blazar extension): "voice": "<piper-voice-id>"
+    // synthesizes the reply through the local piper lane - stream replies
+    // interleave audio NDJSON lines after each sentence's text deltas,
+    // buffered replies carry one "audio" object beside the text.
+    // Validated before any queue slot or cache lookup is spent; the
+    // ollama->OpenAI translator never forwards the field to the child.
+    let voice = match req.get("voice").and_then(serde_json::Value::as_str) {
+        Some(v) if !v.is_empty() => {
+            let installed = blazar_runtime::piper::list_voices(&state.dirs);
+            if installed.is_empty() {
+                return api_error(
+                    400,
+                    "no voices installed - pull one with `blazar voice pull <id>` (see `blazar voice search`) and retry",
+                );
+            }
+            if !installed.iter().any(|id| id == v) {
+                return api_error(
+                    400,
+                    &format!(
+                        "unknown voice \"{v}\" - installed: {} (more: `blazar voice search`)",
+                        installed.join(", ")
+                    ),
+                );
+            }
+            Some(v.to_string())
+        }
+        _ => None,
+    };
     let mut sem_ctx: Option<semcache::SemCtx> = None;
     // Tool-result gate: requests carrying role=tool messages bypass the
     // cache in both directions (lookup above, store below) - tool outputs
     // are not in the serving fingerprint, so a prompt-similarity hit could
-    // serve an answer computed against different tool results.
+    // serve an answer computed against different tool results. Voice
+    // requests bypass too: a cached body carries no audio and the synth
+    // must track the live reply.
     let tool_gate = semcache::has_tool_result_messages(&req);
     if tool_gate {
         state
@@ -1225,7 +1268,7 @@ pub async fn chat(
             .tool_bypasses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    if !req["stream"].as_bool().unwrap_or(true) && !constrained && !tool_gate {
+    if !req["stream"].as_bool().unwrap_or(true) && !constrained && !tool_gate && voice.is_none() {
         let sc = &state.config.semantic_cache;
         match semcache::directive(
             sc.enabled,
@@ -1462,6 +1505,8 @@ pub async fn chat(
                 OutputShape::Chat,
                 best_of,
                 mcp_sel,
+                voice,
+                key_ext.as_ref().map(|Extension(k)| k.clone()),
             )
             .await;
             // keep_alive=0: evict right after this response (complaint #12),
@@ -1932,6 +1977,17 @@ impl OutputShape {
     }
 }
 
+/// Per-stream voice-tee state: sentence extractor, resolved voice and
+/// key, the audio-line sequence number, and the degradation note the
+/// final chunk carries when TTS failed mid-stream.
+struct VoiceStream {
+    tee: crate::voice_tee::VoiceTee,
+    voice: String,
+    key: Option<crate::keys::KeyCtx>,
+    seq: usize,
+    audio_error: Option<String>,
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one cohesive translation path
 async fn proxy_core_chat(
     state: &Arc<AppState>,
@@ -1946,6 +2002,8 @@ async fn proxy_core_chat(
     shape: OutputShape,
     best_of: Option<u64>,
     mcp_sel: Option<String>,
+    voice: Option<String>,
+    voice_key: Option<crate::keys::KeyCtx>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     // Pre-render recipe lane: the gateway owns the prompt (chatml wrap
@@ -2286,6 +2344,23 @@ async fn proxy_core_chat(
         if load_ms > 100 {
             ollama["load_duration"] = json!(u64::try_from(load_ms).unwrap_or(u64::MAX) * 1_000_000);
         }
+        // Voice reply (blazar extension): with the full reply in hand,
+        // synthesize it once - buffered requests carry one "audio" object
+        // beside the text. TTS failure degrades to a visible note, never
+        // a dropped request (the text reply is already complete).
+        if let Some(voice) = &voice {
+            let text = ollama
+                .pointer("/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !text.trim().is_empty() {
+                match crate::voice_tee::synthesize_wav(state, voice_key.as_ref(), voice, text).await
+                {
+                    Ok(wav) => ollama["audio"] = crate::voice_tee::audio_field(&wav),
+                    Err(e) => ollama["blazar_audio_error"] = json!(e),
+                }
+            }
+        }
         // R4: file the response for future semantic hits (miss path from
         // chat()). Decorates with cache_debug + miss header so clients can
         // distinguish "computed now" from "served from cache".
@@ -2468,6 +2543,16 @@ async fn proxy_core_chat(
     let buf = String::new();
     let lines = tr::LineBuffer::new();
     let model_owned = model_c.clone();
+    // Voice tee: captured Arc keeps synthesis on the same AppState
+    // (admission, voices, accounting) as the text lane.
+    let voice_state = std::sync::Arc::clone(state);
+    let voice_stream_init = voice.as_ref().map(|v| VoiceStream {
+        tee: crate::voice_tee::VoiceTee::new(),
+        voice: v.clone(),
+        key: voice_key.clone(),
+        seq: 0,
+        audio_error: None,
+    });
     let ndjson = futures::stream::unfold(
         (
             stream,
@@ -2483,6 +2568,8 @@ async fn proxy_core_chat(
             shape,
             tr::ToolCallAccum::default(),
             (!tr::request_think_on(&openai_body)).then(tr::ThinkSplitter::new),
+            voice_state,
+            voice_stream_init,
         ),
         |(
             mut stream,
@@ -2498,6 +2585,8 @@ async fn proxy_core_chat(
             shape,
             mut tool_accum,
             mut think_split,
+            voice_state,
+            mut voice_stream,
         )| async move {
             loop {
                 if done && !usage_sent {
@@ -2572,9 +2661,40 @@ async fn proxy_core_chat(
                         }
                         None => String::new(),
                     };
+                    // Voice tee: speak the trailing sentence (if any)
+                    // after the last text line, before the final chunk.
+                    // The suppressed-think tail fragment is not spoken -
+                    // it is a degenerate marker remainder, usually empty.
+                    let mut audio_tail = String::new();
+                    if let Some(vs) = voice_stream.as_mut()
+                        && let Some(sentence) = vs.tee.finish()
+                    {
+                        match crate::voice_tee::synthesize_wav(
+                            &voice_state,
+                            vs.key.as_ref(),
+                            &vs.voice,
+                            &sentence,
+                        )
+                        .await
+                        {
+                            Ok(wav) => {
+                                vs.seq += 1;
+                                audio_tail =
+                                    crate::voice_tee::ollama_audio_line(&model, vs.seq, &wav);
+                            }
+                            Err(e) => vs.audio_error = Some(e),
+                        }
+                    }
+                    // Mid-stream TTS failure: one visible note line so
+                    // clients can tell "audio ended" from "audio broke".
+                    let audio_note = voice_stream
+                        .as_ref()
+                        .and_then(|vs| vs.audio_error.as_ref())
+                        .map(|e| format!("{{\"model\":{model:?},\"blazar_audio_error\":{e:?}}}\n"))
+                        .unwrap_or_default();
                     return Some((
                         Ok(Bytes::from(format!(
-                            "{flush_prefix}{think_tail}{final_chunk}\n"
+                            "{flush_prefix}{think_tail}{audio_tail}{audio_note}{final_chunk}\n"
                         ))),
                         (
                             stream,
@@ -2590,6 +2710,8 @@ async fn proxy_core_chat(
                             shape,
                             tool_accum,
                             think_split,
+                            voice_state,
+                            voice_stream,
                         ),
                     ));
                 }
@@ -2632,6 +2754,49 @@ async fn proxy_core_chat(
                                 }
                             }
                         }
+                        // Voice tee: feed the post-think-rewrite deltas
+                        // (exactly what the client reads) to the sentence
+                        // extractor; synthesize whatever completed and
+                        // append the audio lines after the text deltas
+                        // that formed them. TTS failure stands the tee
+                        // down - the text stream is the primary product.
+                        let mut audio_body = String::new();
+                        if let Some(vs) = voice_stream.as_mut() {
+                            for ev in &events {
+                                let Some(delta) = ev["choices"][0]["delta"]["content"].as_str()
+                                else {
+                                    continue;
+                                };
+                                if delta.is_empty() {
+                                    continue;
+                                }
+                                for sentence in vs.tee.feed(delta) {
+                                    match crate::voice_tee::synthesize_wav(
+                                        &voice_state,
+                                        vs.key.as_ref(),
+                                        &vs.voice,
+                                        &sentence,
+                                    )
+                                    .await
+                                    {
+                                        Ok(wav) => {
+                                            vs.seq += 1;
+                                            audio_body.push_str(
+                                                &crate::voice_tee::ollama_audio_line(
+                                                    &model, vs.seq, &wav,
+                                                ),
+                                            );
+                                            vs.tee.note_spoken();
+                                        }
+                                        Err(e) => {
+                                            vs.audio_error = Some(e);
+                                            vs.tee.degrade();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let ndjson_lines: Vec<String> = events
                             .iter()
                             .flat_map(|ev| match shape {
@@ -2642,10 +2807,10 @@ async fn proxy_core_chat(
                             })
                             .map(|v| format!("{v}\n"))
                             .collect();
-                        if ndjson_lines.is_empty() {
+                        if ndjson_lines.is_empty() && audio_body.is_empty() {
                             continue; // need more data
                         }
-                        let body = ndjson_lines.join("");
+                        let body = format!("{}{}", ndjson_lines.join(""), audio_body);
                         return Some((
                             Ok(Bytes::from(body)),
                             (
@@ -2662,6 +2827,8 @@ async fn proxy_core_chat(
                                 shape,
                                 tool_accum,
                                 think_split,
+                                voice_state,
+                                voice_stream,
                             ),
                         ));
                     }
@@ -2699,6 +2866,8 @@ async fn proxy_core_chat(
                                 shape,
                                 tool_accum,
                                 think_split,
+                                voice_state,
+                                voice_stream,
                             ),
                         ));
                     }
@@ -3432,6 +3601,8 @@ pub async fn generate(
                 OutputShape::Generate,
                 best_of,
                 mcp_sel,
+                None, // voice tee is chat-lane only (generate has no reply object)
+                None,
             )
             .await;
             // keep_alive=0: evict right after this response (complaint

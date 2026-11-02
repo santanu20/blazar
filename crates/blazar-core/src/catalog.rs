@@ -15,6 +15,11 @@ pub struct CatalogEntry {
     pub short_name: String,
     /// HF repo, e.g. "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF".
     pub repo: String,
+    /// Git ref the entry's files live on, when not `main`. Live case:
+    /// CLIP's safetensors conversion only exists on `refs/pr/15`.
+    /// A user-passed `--revision` always wins over this pin.
+    #[serde(default)]
+    pub revision: Option<String>,
 }
 
 /// Speculative-decoding draft pairs: models matching `model_glob` (prefix
@@ -309,6 +314,50 @@ mod tests {
     fn unit__resolve_missing_far__search_hint() {
         let err = resolve("zzzzzzzzzz").unwrap_err().to_string();
         assert!(err.contains("blazar search"), "{err}");
+    }
+
+    #[test]
+    fn unit__catalog_breadth__non_llm_classes_resolve() {
+        // One entry per non-LLM class the catalog now covers; each repo
+        // carries a live pull receipt or a freeze-time HF listing check.
+        for (name, repo) in [
+            ("bge-small-en", "mradermacher/bge-small-en-GGUF"),
+            ("bge-reranker-v2-m3", "gpustack/bge-reranker-v2-m3-GGUF"),
+            ("laya", "ggml-org/Laya-GGUF"),
+            ("clip-vit-base-patch32", "openai/clip-vit-base-patch32"),
+            ("qwen3-tts-1.7b", "ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF"),
+            ("whisper-base", "openai/whisper-base"),
+            ("moss-image", "leejet/MOSS-Image-Base-GGUF"),
+            ("flux-3-klein", "leejet/flux-3-image-klein-GGUF"),
+            ("qwen-image-edit", "QuantStack/Qwen-Image-Edit-GGUF"),
+            ("wan2.1-t2v", "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
+        ] {
+            let e = resolve(name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(e.repo, repo, "{name}");
+        }
+    }
+
+    #[test]
+    fn unit__catalog_revision__clip_pins_pr15_and_only_clip() {
+        // CLIP's safetensors conversion lives on refs/pr/15 - the entry
+        // pins it so `blazar pull clip-vit-base-patch32` works bare.
+        assert_eq!(
+            resolve("clip-vit-base-patch32")
+                .unwrap()
+                .revision
+                .as_deref(),
+            Some("refs/pr/15")
+        );
+        // Every other entry pulls from main: no accidental pins.
+        for e in &catalog().entries {
+            if e.short_name != "clip-vit-base-patch32" {
+                assert!(
+                    e.revision.as_deref().map_or(true, str::is_empty),
+                    "unexpected revision pin on {}",
+                    e.short_name
+                );
+            }
+        }
     }
 
     #[test]

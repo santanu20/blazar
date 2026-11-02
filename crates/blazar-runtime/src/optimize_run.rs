@@ -140,15 +140,18 @@ pub struct ArmStats {
     pub eval_tokens: u64,
 }
 
+// integer counters -> f64 statistics: values are token counts and
+// millisecond spans far below 2^52, so precision loss is impossible
+#[allow(clippy::cast_precision_loss)]
 impl ArmStats {
     fn from_samples(samples: &[ProbeSample], per_rep: &[RepDigest]) -> Self {
         let mut ttft: Vec<f64> = samples.iter().map(|s| s.ttft_ms).collect();
-        ttft.sort_by(|a, b| a.total_cmp(b));
+        ttft.sort_by(f64::total_cmp);
         let mut itl: Vec<f64> = samples
             .iter()
             .flat_map(|s| s.itl_ms.iter().copied())
             .collect();
-        itl.sort_by(|a, b| a.total_cmp(b));
+        itl.sort_by(f64::total_cmp);
         let eval: u64 = samples.iter().map(|s| s.eval_count).sum();
         let wall_sum: f64 = samples.iter().map(|s| s.wall_ms).sum::<f64>();
         let mean_wall = if samples.is_empty() {
@@ -187,6 +190,13 @@ struct RepDigest {
 }
 
 /// Nearest-rank percentile over an ASCENDING sorted slice. Empty input
+// p/100 and n multiply to at most n <= usize::MAX; nearest-rank
+// ceiling then clamps into the slice - truncation is the algorithm
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 /// returns 0.0 (callers gate on non-empty sample sets long before).
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
@@ -217,7 +227,7 @@ fn noise_for(base_series: &[f64], cand_series: &[f64]) -> f64 {
     // configuration can produce on its own, so take the larger arm's.
     let s = |v: &[f64]| {
         v.iter()
-            .cloned()
+            .copied()
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| {
                 (lo.min(x), hi.max(x))
             })
@@ -230,6 +240,7 @@ fn noise_for(base_series: &[f64], cand_series: &[f64]) -> f64 {
 /// Decide whether the candidate beats the baseline beyond noise plus
 /// the operator's minimum gain. Interactive is lexicographic: p95 TTFT
 /// first, p95 ITL as tie-break only within the TTFT gate.
+#[must_use]
 pub fn verify(
     objective: OptimizeObjective,
     base: &ArmStats,
@@ -367,9 +378,9 @@ impl Drop for RestoreGuard {
 // ---------------------------------------------------------------- HTTP seam
 
 fn http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    reqwest::Client::builder()
         .build()
-        .context("build probe client")?)
+        .context("build probe client")
 }
 
 async fn get_json(client: &reqwest::Client, url: &str) -> Result<serde_json::Value> {
@@ -420,7 +431,6 @@ pub async fn lane_quiet(client: &reqwest::Client, base: &str, model: &str) -> Re
     for line in metrics.lines() {
         if let Some(rest) = line.strip_prefix("blazar_queue_depth ") {
             let value: f64 = rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .unwrap_or("0")
@@ -480,10 +490,7 @@ async fn wait_until_up(
                 ps["models"].as_array().map(|rows| {
                     rows.iter().any(|r| {
                         r["name"].as_str().unwrap_or_default().split('#').next() == Some(model)
-                            && matches!(
-                                r["blazar_state"].as_str(),
-                                Some("ready") | Some("sleeping")
-                            )
+                            && matches!(r["blazar_state"].as_str(), Some("ready" | "sleeping"))
                     })
                 })
             })
@@ -542,11 +549,11 @@ async fn probe_once(
             if ttft_ms.is_none() {
                 ttft_ms = Some(arrivals[0].duration_since(sent).as_secs_f64() * 1000.0);
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v["done"].as_bool().unwrap_or(false) {
-                    eval_count = v["eval_count"].as_u64().unwrap_or(0);
-                    done = true;
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                && v["done"].as_bool().unwrap_or(false)
+            {
+                eval_count = v["eval_count"].as_u64().unwrap_or(0);
+                done = true;
             }
         }
     }
@@ -572,6 +579,9 @@ async fn probe_once(
 
 /// Measure one arm: per rep, `concurrency` parallel probes; the first
 /// post-respawn probe is a warm-up and EXCLUDED (it pays model load).
+// eval counters are u64 from the engine; the f64 blend here only feeds
+// the throughput digest, so precision loss is accepted by design.
+#[allow(clippy::cast_precision_loss)]
 async fn measure_arm(
     client: &reqwest::Client,
     base: &str,
@@ -593,9 +603,9 @@ async fn measure_arm(
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         let mut rep_ttft: Vec<f64> = done.iter().map(|s| s.ttft_ms).collect();
-        rep_ttft.sort_by(|a, b| a.total_cmp(b));
+        rep_ttft.sort_by(f64::total_cmp);
         let mut rep_itl: Vec<f64> = done.iter().flat_map(|s| s.itl_ms.iter().copied()).collect();
-        rep_itl.sort_by(|a, b| a.total_cmp(b));
+        rep_itl.sort_by(f64::total_cmp);
         let rep_eval: u64 = done.iter().map(|s| s.eval_count).sum();
         let rep_wall: f64 = done.iter().map(|s| s.wall_ms).sum::<f64>();
         per_rep.push(RepDigest {
@@ -631,6 +641,10 @@ pub struct OptimizeRunReport {
     pub reps: u32,
 }
 
+// the optimize lifecycle reads top-to-bottom (lease -> screen ->
+// A/B -> verify -> restore); splitting the chain would hide the
+// ordering that the ledger events pin
+#[allow(clippy::too_many_lines)]
 /// Run the full Wave-2 flow: lease -> screen -> baseline A/B -> candidate
 /// A/B -> restore -> verdict -> ledger. NEVER adopts.
 pub async fn run_optimize(
@@ -662,7 +676,8 @@ pub async fn run_optimize(
 
     // Screen the candidate (llama-bench grid, KV-gated argmax) WITHOUT
     // persisting: no profile row, no bench receipt, no adoption.
-    let (cand_profile, _winning, grid_rows, score) = tuner.tune_search_screen(input)?;
+    let (cand_profile, _screen_overrides, grid_rows, screen_score) =
+        tuner.tune_search_screen(input)?;
     let cand_hash = args_hash(input, &cand_profile);
     let cand_row = candidate_row(input, &cand_profile, &cand_hash);
 
@@ -687,7 +702,7 @@ pub async fn run_optimize(
         experiment_id,
         "llama-bench-grid",
         &serde_json::to_string(&crate::bench::BenchmarkPayload {
-            score,
+            score: screen_score,
             rows: grid_rows.clone(),
         })?,
     )?;
@@ -695,7 +710,7 @@ pub async fn run_optimize(
         experiment_id,
         "measured",
         &format!(
-            "grid screen: {n} rows, mean_tg {score:.1} tok/s",
+            "grid screen: {n} rows, mean_tg {screen_score:.1} tok/s",
             n = grid_rows.len()
         ),
     )?;
@@ -775,7 +790,7 @@ pub async fn run_optimize(
         hw_fingerprint: hw,
         objective: objective.label().to_string(),
         experiment_id,
-        screen_score_tg: score,
+        screen_score_tg: screen_score,
         baseline,
         candidate,
         verdict,
@@ -796,8 +811,7 @@ fn candidate_row(input: &ProfileInput<'_>, profile: &Profile, hash: &str) -> Pro
         benchmark_json: None,
         updated_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
     }
 }
 
@@ -864,14 +878,13 @@ pub fn adopt_experiment(store: &Store, experiment_id: i64) -> Result<AdoptOutcom
     if let (Some(exp_hw), Some(now_hw)) = (
         exp.hw_fingerprint.as_deref(),
         blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&active.manifest).as_deref(),
-    ) {
-        if exp_hw != now_hw {
-            anyhow::bail!(
-                "experiment #{experiment_id} was measured on different hardware \
+    ) && exp_hw != now_hw
+    {
+        anyhow::bail!(
+            "experiment #{experiment_id} was measured on different hardware \
                  ({exp_hw}) than the active lane ({now_hw}) - receipts do not \
                  transfer between machines",
-            );
-        }
+        );
     }
     let row = ProfileRow {
         model_name: exp.model.clone(),
@@ -881,8 +894,7 @@ pub fn adopt_experiment(store: &Store, experiment_id: i64) -> Result<AdoptOutcom
         benchmark_json: None,
         updated_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
     };
     store.upsert_profile(&row)?;
     store.append_event(
@@ -922,8 +934,8 @@ mod tests {
     fn adopt_store(manifest: &str) -> (blazar_core::store::Store, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = blazar_core::BlazarDirs {
-            config_dir: std::path::PathBuf::from(tmp.path().join("cfg")),
-            data_dir: std::path::PathBuf::from(tmp.path().join("data")),
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
         };
         let store = blazar_core::store::Store::open(&dirs).unwrap();
         store
@@ -959,10 +971,10 @@ mod tests {
                 "m",
                 engine_tag,
                 hw,
-                Some("Q4_K_M".into()),
-                "[]".into(),
-                "hash-1".into(),
-                "Throughput".into(),
+                Some("Q4_K_M"),
+                "[]",
+                "hash-1",
+                "Throughput",
             )
             .unwrap()
     }
@@ -1055,7 +1067,7 @@ mod tests {
             per_rep_tps: tps_series.to_vec(),
             per_rep_ttft_p95: vec![],
             per_rep_itl_p95: vec![],
-            requests: tps_series.len() as u32,
+            requests: tps_series.len().try_into().unwrap_or(u32::MAX),
             eval_tokens: 0,
         }
     }
@@ -1065,8 +1077,8 @@ mod tests {
         let v: Vec<f64> = (1..=100).map(f64::from).collect();
         assert!((percentile(&v, 50.0) - 50.0).abs() < 1e-9);
         assert!((percentile(&v, 95.0) - 95.0).abs() < 1e-9);
-        assert_eq!(percentile(&v, 100.0), 100.0);
-        assert_eq!(percentile(&[], 95.0), 0.0);
+        assert!((percentile(&v, 100.0) - 100.0).abs() < 1e-9);
+        assert!((percentile(&[], 95.0) - 0.0).abs() < 1e-9);
     }
 
     #[test]

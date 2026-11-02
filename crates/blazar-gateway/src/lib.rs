@@ -24,6 +24,7 @@ pub mod model_doctor;
 pub mod quantiles;
 pub mod requests;
 pub mod usage;
+pub mod voice_tee;
 
 pub mod failover;
 pub mod keys;

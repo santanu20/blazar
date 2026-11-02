@@ -152,6 +152,19 @@ pub struct HfTreeEntry {
     pub kind: String,
     #[serde(default)]
     pub size: Option<u64>,
+    /// LFS detail, present on tree listings requested with
+    /// `expand=true`. The tree API names the content hash `oid` where
+    /// the siblings API calls it `sha256`.
+    #[serde(default)]
+    pub lfs: Option<HfTreeLfs>,
+}
+
+/// LFS block on tree entries (see [`HfTreeEntry::lfs`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HfTreeLfs {
+    pub oid: String,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 impl HfTreeEntry {
@@ -163,6 +176,22 @@ impl HfTreeEntry {
     #[must_use]
     pub fn is_dir(&self) -> bool {
         self.kind == "directory"
+    }
+
+    /// View this entry as a siblings-list row so the file planners
+    /// (`select_files`, `select_safetensors_files`) work identically on
+    /// tree listings. LFS files carry their real size and sha256; plain
+    /// git files keep the tree size and verify nothing.
+    #[must_use]
+    pub fn as_sibling(&self) -> Option<HfSibling> {
+        self.is_file().then(|| HfSibling {
+            rfilename: self.path.clone(),
+            size: self.lfs.as_ref().and_then(|l| l.size).or(self.size),
+            lfs: self.lfs.as_ref().map(|l| HfLfs {
+                sha256: l.oid.clone(),
+                size: l.size,
+            }),
+        })
     }
 }
 
@@ -807,9 +836,22 @@ impl HfClient {
 
     /// GET /api/models/{repo}?blobs=true
     pub async fn model_info(&self, repo: &str) -> Result<HfModelInfo> {
+        self.model_info_at(repo, "main").await
+    }
+
+    /// Revision-scoped model info. NOTE: on non-`main` revisions the
+    /// Hub's siblings list silently omits LFS files (live:
+    /// `openai/clip-vit-base-patch32@refs/pr/15` drops
+    /// `model.safetensors` from siblings while the tree endpoint lists
+    /// it) - revision pulls must plan files from [`Self::list_tree_at`],
+    /// never from these siblings.
+    pub async fn model_info_at(&self, repo: &str, revision: &str) -> Result<HfModelInfo> {
         let url = self
             .api_base
-            .join(&format!("api/models/{repo}?blobs=true"))
+            .join(&format!(
+                "api/models/{repo}?blobs=true&revision={}",
+                encode_revision(revision)
+            ))
             .map_err(|e| anyhow!("bad repo {repo:?}: {e}"))?;
         let mut req = self.http.get(url.clone());
         if let Some(token) = self.token_for(&url) {
@@ -851,16 +893,30 @@ impl HfClient {
         repo: &str,
         plan: &FilePlan,
         dest: &Path,
-        mut on_progress: impl FnMut(u64, u64),
+        mut on_progress: impl FnMut(u64, u64) + Send,
+    ) -> Result<u64> {
+        self.download_file_at(repo, plan, dest, &mut on_progress, "main")
+            .await
+    }
+
+    /// Revision-scoped download (see [`Self::download_file`]).
+    pub async fn download_file_at(
+        &self,
+        repo: &str,
+        plan: &FilePlan,
+        dest: &Path,
+        on_progress: &mut (dyn FnMut(u64, u64) + Send),
+        revision: &str,
     ) -> Result<u64> {
         let url = self
             .dl_base
             .join(&format!(
-                "{repo}/resolve/main/{}",
+                "{repo}/resolve/{}/{}",
+                encode_revision(revision),
                 url_encode_path(&plan.filename)
             ))
             .map_err(|e| anyhow!("bad download URL for {}: {e}", plan.filename))?;
-        self.download_to(url, plan, dest, &mut on_progress).await
+        self.download_to(url, plan, dest, on_progress).await
     }
 
     /// Generic streaming-download core: `.part` resume, Range, sha256
@@ -1013,6 +1069,13 @@ fn url_encode_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Percent-encode a revision for use as a single URL path segment.
+/// Ref-style revisions contain `/` (`refs/pr/15`), which the Hub
+/// accepts both raw and encoded; encoded is unambiguous.
+fn encode_revision(rev: &str) -> String {
+    rev.replace('/', "%2F")
 }
 
 /// Tail-resume seed for the classic lane: hash the existing `.part` bytes
@@ -1231,11 +1294,30 @@ impl HfClient {
         path: &str,
         recursive: bool,
     ) -> Result<Vec<HfTreeEntry>> {
+        self.list_tree_at(repo, path, recursive, "main").await
+    }
+
+    /// Revision-scoped tree listing (see [`Self::list_tree`]). Requested
+    /// with `expand=true` so LFS entries carry their `oid`/size - the
+    /// planner needs real sha256s for revision pulls.
+    pub async fn list_tree_at(
+        &self,
+        repo: &str,
+        path: &str,
+        recursive: bool,
+        revision: &str,
+    ) -> Result<Vec<HfTreeEntry>> {
         let recursive_param = if recursive { "&recursive=true" } else { "" };
+        // No `limit` here: the HF API rejects expand=true combined with a
+        // limit (400 Bad Request), and the default page size already
+        // matches the old explicit 1000 - the Link-header loop below
+        // paginates the remainder.
         let mut url = self
             .api_base
             .join(&format!(
-                "api/models/{repo}/tree/main/{path}?expand=false&limit=1000{recursive_param}"
+                "api/models/{repo}/tree/{}/{}?expand=true{recursive_param}",
+                encode_revision(revision),
+                path
             ))
             .map_err(|e| anyhow!("bad tree URL: {e}"))?;
         let mut out = Vec::new();
@@ -2014,16 +2096,58 @@ impl Puller {
         let parsed = parse_pull_target(target)?;
         let name = draft_aware_name(&parsed.repo, &parsed.quant);
         let _lock = PullLock::acquire(&self.dirs, &name)?;
-        self.pull_locked(&parsed, &name).await
+        self.pull_locked(&parsed, &name, None).await
     }
 
-    async fn pull_locked(&self, target: &PullTarget, name: &str) -> Result<PullOutcome> {
-        let info = self.client.model_info(&target.repo).await?;
+    /// Revision-scoped pull (`blazar pull <repo> --revision <ref>`).
+    /// Needed when the wanted files do not live on `main` - live case:
+    /// `openai/clip-vit-base-patch32` only carries safetensors on
+    /// `refs/pr/15`. On non-main revisions the siblings listing omits
+    /// LFS files, so the file plan comes from the tree API instead.
+    pub async fn pull_at(&self, target: &str, revision: &str) -> Result<PullOutcome> {
+        let parsed = parse_pull_target(target)?;
+        let name = draft_aware_name(&parsed.repo, &parsed.quant);
+        let _lock = PullLock::acquire(&self.dirs, &name)?;
+        self.pull_locked(&parsed, &name, Some(revision)).await
+    }
+
+    // pull pipeline stages share the plan/bar/done handles
+    #[allow(clippy::too_many_lines)]
+    async fn pull_locked(
+        &self,
+        target: &PullTarget,
+        name: &str,
+        revision: Option<&str>,
+    ) -> Result<PullOutcome> {
+        let info = match revision {
+            Some(rev) => {
+                let mut at = self.client.model_info_at(&target.repo, rev).await?;
+                // Siblings from the info API silently drop LFS files on
+                // non-main revisions - rebuild the file list from the
+                // tree so the planners see every file with real shas.
+                let entries = self
+                    .client
+                    .list_tree_at(&target.repo, "", false, rev)
+                    .await?;
+                at.siblings = entries.iter().filter_map(HfTreeEntry::as_sibling).collect();
+                tracing::info!(
+                    model = %name,
+                    "planning {} from revision {rev} via tree listing ({} files)",
+                    target.repo,
+                    at.siblings.len()
+                );
+                at
+            }
+            None => self.client.model_info(&target.repo).await?,
+        };
         // Standalone diffusion checkpoints (SD 1.5, SDXL) take their own
         // lane BEFORE the gguf/safetensors fork: these repos also carry
         // diffusers shards, which the safetensors lane would register as
         // a text model no engine can serve.
-        if let Some(outcome) = self.pull_standalone_lane(target, name, &info).await {
+        if let Some(outcome) = self
+            .pull_standalone_lane(target, name, &info, revision)
+            .await
+        {
             return outcome;
         }
         // Lane fork: GGUF files (llamacpp/mistralrs engines) vs a
@@ -2040,7 +2164,9 @@ impl Puller {
                 .iter()
                 .any(|s| s.rfilename.to_lowercase().ends_with(".safetensors"))
             {
-                return self.pull_safetensors_locked(target, name, &info).await;
+                return self
+                    .pull_safetensors_locked(target, name, &info, revision)
+                    .await;
             }
             return Err(anyhow!(
                 "repo {} has no .gguf or .safetensors model files",
@@ -2081,14 +2207,22 @@ impl Puller {
             selected.mmproj.is_some(),
         );
         if let Some(outcome) = self
-            .handle_repull_decision(name, target, &info, &selected, existing.as_ref(), decision)
+            .handle_repull_decision(
+                name,
+                target,
+                &info,
+                &selected,
+                existing.as_ref(),
+                decision,
+                revision,
+            )
             .await?
         {
             return Ok(outcome);
         }
 
         let (shard_paths, mmproj_dest) = self
-            .download_full_selection(name, target, &selected)
+            .download_full_selection(name, target, &selected, revision)
             .await?;
 
         let (mut row, pull_warning) = build_model_row(
@@ -2136,6 +2270,25 @@ impl Puller {
         })
     }
 
+    /// Download through the revision scoping this pull, if any.
+    async fn fetch_file(
+        &self,
+        repo: &str,
+        plan: &FilePlan,
+        dest: &Path,
+        progress: &mut (dyn FnMut(u64, u64) + Send),
+        revision: Option<&str>,
+    ) -> Result<u64> {
+        match revision {
+            Some(rev) => {
+                self.client
+                    .download_file_at(repo, plan, dest, progress, rev)
+                    .await
+            }
+            None => self.client.download_file(repo, plan, dest, progress).await,
+        }
+    }
+
     /// Safetensors lane: the repo has no GGUFs, so the model is an HF
     /// transformers repo (sharded `*.safetensors` + config + tokenizer).
     /// Everything lands in a `models/<name>.d/` directory consumed by the
@@ -2147,6 +2300,7 @@ impl Puller {
         target: &PullTarget,
         name: &str,
         info: &HfModelInfo,
+        revision: Option<&str>,
     ) -> Result<PullOutcome> {
         let sel = select_safetensors_files(&info.siblings)?;
         let digest = revision_digest(&sel.files);
@@ -2214,8 +2368,7 @@ impl Puller {
                 bar.set_position(before + file.bytes);
                 continue;
             }
-            self.client
-                .download_file(&target.repo, file, &dest, &mut progress_one)
+            self.fetch_file(&target.repo, file, &dest, &mut progress_one, revision)
                 .await
                 .inspect_err(|e| {
                     self.bus.publish(BlazarEvent::PullFailed {
@@ -2304,6 +2457,7 @@ impl Puller {
         name: &str,
         target: &PullTarget,
         selected: &SelectedFiles,
+        revision: Option<&str>,
     ) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
         let models_dir = self.dirs.models_dir();
         std::fs::create_dir_all(&models_dir)?;
@@ -2360,8 +2514,7 @@ impl Puller {
                 shard_paths.push(reused);
                 continue;
             }
-            self.client
-                .download_file(&target.repo, shard, &dest, &mut progress_one)
+            self.fetch_file(&target.repo, shard, &dest, &mut progress_one, revision)
                 .await
                 .inspect_err(|e| {
                     self.bus.publish(BlazarEvent::PullFailed {
@@ -2378,8 +2531,7 @@ impl Puller {
                 bar.set_position(bar.position() + mm.bytes);
                 Some(reused)
             } else {
-                self.client
-                    .download_file(&target.repo, mm, &dest, &mut progress)
+                self.fetch_file(&target.repo, mm, &dest, &mut progress, revision)
                     .await
                     .inspect_err(|e| {
                         // F104: mmproj failure must reach /api/pull watchers
@@ -2424,13 +2576,28 @@ impl Puller {
         target: &PullTarget,
         name: &str,
         info: &HfModelInfo,
+        revision: Option<&str>,
     ) -> Option<Result<PullOutcome>> {
         let family = crate::diffusion::diffusion_family(&target.repo)?;
         family.standalone_files?;
-        Some(
-            self.pull_standalone_checkpoint(target, name, info, family)
-                .await,
-        )
+        match crate::diffusion::standalone_housing(info, family) {
+            // Repo hosts the pinned checkpoint: this lane owns the pull.
+            crate::diffusion::StandaloneHousing::CheckpointHosted => Some(
+                self.pull_standalone_checkpoint(target, name, info, family, revision)
+                    .await,
+            ),
+            // DiT GGUF mirror of the same family (MOSS-Image, SD 3.5):
+            // the gguf lane serves it and `attach_diffusion_set`
+            // completes the identical component set.
+            crate::diffusion::StandaloneHousing::GgufMirror => None,
+            crate::diffusion::StandaloneHousing::DiffusersShards => Some(Err(anyhow!(
+                "repo {} hosts none of the {} checkpoint files ({}) - a \
+                 diffusers shard is not the standalone model",
+                target.repo,
+                family.display,
+                family.standalone_files.unwrap_or(&[]).join(", ")
+            ))),
+        }
     }
 
     async fn pull_standalone_checkpoint(
@@ -2439,6 +2606,7 @@ impl Puller {
         name: &str,
         info: &HfModelInfo,
         family: &crate::diffusion::DiffusionFamily,
+        revision: Option<&str>,
     ) -> Result<PullOutcome> {
         let plan = crate::diffusion::standalone_file_plan(info, family).ok_or_else(|| {
             anyhow!(
@@ -2480,7 +2648,7 @@ impl Puller {
         let mut done = 0u64;
         // required=true: without the checkpoint there is no model.
         let dest = self
-            .fetch_component_file(name, &target.repo, &plan, true, &bar, &mut done)
+            .fetch_component_file(name, &target.repo, &plan, true, &bar, &mut done, revision)
             .await?
             .ok_or_else(|| anyhow!("checkpoint {} failed without an error", plan.filename))?;
         bar.finish_and_clear();
@@ -2650,7 +2818,15 @@ impl Puller {
         let mut components: Vec<(String, String)> = Vec::new();
         for (spec, plan, note) in &plans {
             if let Some(dest) = self
-                .fetch_component_file(name, spec.source.repo, plan, spec.required, &bar, &mut done)
+                .fetch_component_file(
+                    name,
+                    spec.source.repo,
+                    plan,
+                    spec.required,
+                    &bar,
+                    &mut done,
+                    None,
+                )
                 .await?
             {
                 components.push((spec.flag.to_string(), dest.display().to_string()));
@@ -2663,6 +2839,9 @@ impl Puller {
         Ok(components)
     }
 
+    // one param per download concern (repo, file, plan, progress,
+    // revision); this is the transport seam
+    #[allow(clippy::too_many_arguments)]
     /// Fetch one component file with the shared progress bar. Returns
     /// the destination when the file is on disk (fetched now, or
     /// re-used intact from an earlier pull); `None` for an optional
@@ -2675,6 +2854,7 @@ impl Puller {
         required: bool,
         bar: &indicatif::ProgressBar,
         done: &mut u64,
+        revision: Option<&str>,
     ) -> Result<Option<PathBuf>> {
         let models_dir = self.dirs.models_dir();
         let bare = models_dir.join(leaf_of(&plan.filename));
@@ -2689,8 +2869,7 @@ impl Puller {
             bar.set_position(before + d.min(t));
         };
         let fetched = self
-            .client
-            .download_file(repo, plan, &dest, &mut progress)
+            .fetch_file(repo, plan, &dest, &mut progress, revision)
             .await
             .inspect_err(|e| {
                 self.bus.publish(BlazarEvent::PullFailed {
@@ -2715,6 +2894,8 @@ impl Puller {
         }
     }
 
+    // repull arbitration inputs arrive one per axis
+    #[allow(clippy::too_many_arguments)]
     /// Act on the gate's decision. `Some(outcome)` = the pull is already
     /// finished (no-op or delta); `None` = proceed with the full download
     /// (any pre-download pruning is done here).
@@ -2726,6 +2907,7 @@ impl Puller {
         selected: &SelectedFiles,
         existing: Option<&ModelRow>,
         decision: Repull,
+        revision: Option<&str>,
     ) -> Result<Option<PullOutcome>> {
         if let Repull::Present(row) = decision {
             let total = u64::try_from(row.bytes).unwrap_or(0);
@@ -2783,7 +2965,7 @@ impl Puller {
             // those to a full download.
             if let Some(old) = existing.filter(|r| r.shards <= 1) {
                 let (row, pull_warning) = self
-                    .delta_mmproj(name, target, info, selected, old, expected)
+                    .delta_mmproj(name, target, info, selected, old, expected, revision)
                     .await?;
                 if let Some(w) = &pull_warning {
                     tracing::warn!(model = %name, "{w}");
@@ -2826,6 +3008,8 @@ impl Puller {
     /// Sidecar-only pull: the model file is intact and only the mmproj
     // projector differs (repo added one, or dropped it). Moves megabytes,
     // not gigabytes.
+    // delta-download seam mirrors fetch_component_file
+    #[allow(clippy::too_many_arguments)]
     async fn delta_mmproj(
         &self,
         name: &str,
@@ -2834,6 +3018,7 @@ impl Puller {
         selected: &SelectedFiles,
         old: &ModelRow,
         expected: bool,
+        revision: Option<&str>,
     ) -> Result<(ModelRow, Option<String>)> {
         let models_dir = self.dirs.models_dir();
         std::fs::create_dir_all(&models_dir)?;
@@ -2878,8 +3063,7 @@ impl Puller {
                     });
                 }
             };
-            self.client
-                .download_file(&target.repo, mm, &dest, &mut progress)
+            self.fetch_file(&target.repo, mm, &dest, &mut progress, revision)
                 .await
                 .inspect_err(|e| {
                     self.bus.publish(BlazarEvent::PullFailed {

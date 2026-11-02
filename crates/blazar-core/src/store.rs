@@ -1095,7 +1095,7 @@ impl Store {
     /// which exact knobs the race ran, whether those knobs were
     /// deliberately tuned or engine defaults, and how many repetitions
     /// back the number. Additive ALTERs for pre-v19 stores; fresh ones
-    /// carry the columns from SCHEMA_SQL. No backfill: tuned defaults
+    /// carry the columns from `SCHEMA_SQL`. No backfill: tuned defaults
     /// to 0 because every pre-v19 ngram arm raced engine defaults -
     /// an honest unknown, never a guessed provenance.
     fn migrate_v19_spec_provenance(&self) -> CoreResult<()> {
@@ -2730,6 +2730,9 @@ impl Store {
         Ok(())
     }
 
+    // the columns of optimization_experiments, one param each:
+    // bundling a struct here buys nothing over the row it becomes
+    #[allow(clippy::too_many_arguments)]
     /// Register one optimization experiment (immutable identity row)
     /// and return its id. Lifecycle NEVER mutates this row -
     /// measurements and transitions land in the append-only
@@ -2814,7 +2817,7 @@ impl Store {
         Ok(())
     }
 
-    /// Which ledger experiment the (model, engine_tag) lane currently
+    /// Which ledger experiment the (model, `engine_tag`) lane currently
     /// serves, and when that pointer moved. `None` when the serving
     /// profile predates the v19 ledger - the caller reports that
     /// honestly instead of inventing provenance.
@@ -3908,9 +3911,9 @@ mod tests {
         // Two buckets in one batch, one of them twice - the batch tx
         // must accumulate exactly like N sequential single deltas.
         let batch = vec![
-            (20261101, "a".to_string(), d(10, 1)),
-            (20261101, "b".to_string(), d(5, 1)),
-            (20261101, "a".to_string(), d(7, 2)),
+            (2026_1101, "a".to_string(), d(10, 1)),
+            (2026_1101, "b".to_string(), d(5, 1)),
+            (2026_1101, "a".to_string(), d(7, 2)),
         ];
         s.add_usage_deltas(&batch).unwrap();
         let rows = s.list_usage_days(30).unwrap();
@@ -3924,7 +3927,7 @@ mod tests {
         // A failing batch is all-or-nothing: dropping the table makes
         // every row fail together, nothing partial lands.
         s.conn().execute_batch("DROP TABLE usage_daily;").unwrap();
-        let failing = vec![(20261101, "a".to_string(), d(1, 1))];
+        let failing = vec![(2026_1101, "a".to_string(), d(1, 1))];
         assert!(s.add_usage_deltas(&failing).is_err());
         assert!(
             s.list_usage_days(30).is_err(),

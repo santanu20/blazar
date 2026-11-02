@@ -1,14 +1,20 @@
 //! POST `/v1/audio/speech` + GET `/v1/audio/voices` - `OpenAI` TTS
-//! shape on the local piper lane.
+//! shape on two local lanes.
 //!
-//! `model` IS the piper voice id (honest mapping: `en_US-amy-medium`),
-//! `response_format` speaks WAV (buffered, the default - a documented
-//! deviation: `OpenAI` defaults to mp3), `pcm`/`pcm16` (raw s16le PCM
-//! streamed sentence-by-sentence so time-to-first-audio scales with the
-//! first sentence instead of the whole document), and the lossy family
-//! mp3/opus/aac/flac (WAV transcoded through the system ffmpeg).
-//! `speed` maps to piper's inverse length scale; `speaker`, `noise_scale`,
-//! `noise_w`, `sentence_silence` ride as documented native extensions.
+//! Piper lane: `model` IS the piper voice id (honest mapping:
+//! `en_US-amy-medium`), `response_format` speaks WAV (buffered, the
+//! default - a documented deviation: `OpenAI` defaults to mp3),
+//! `pcm`/`pcm16` (raw s16le PCM streamed sentence-by-sentence so
+//! time-to-first-audio scales with the first sentence instead of the
+//! whole document), and the lossy family mp3/opus/aac/flac (WAV
+//! transcoded through the system ffmpeg). `speed` maps to piper's
+//! inverse length scale; `speaker`, `noise_scale`, `noise_w`,
+//! `sentence_silence` ride as documented native extensions.
+//!
+//! Engine lane: a `model` that resolves to a llama.cpp-routed store row
+//! (Qwen3-TTS-class speech GGUFs) posts the child's native `/tts` and
+//! answers on the same WAV/PCM/lossy format surface. `voice`, `lang`,
+//! and `speaker_ref_b64` pass through as engine-native knobs.
 //! Remote intent (`name:model`) forwards like every other lane.
 
 use axum::body::Bytes;
@@ -364,10 +370,6 @@ pub async fn audio_speech(
             None => return openai_error(400, "stream must be a boolean (true | false)"),
         },
     };
-    let lane = match stream_lane(format, stream) {
-        Ok(l) => l,
-        Err(msg) => return openai_error(400, &msg),
-    };
 
     // Remote intent wins: `name:model` never goes local.
     if split_remote(voice, &state.config).is_some() {
@@ -388,6 +390,25 @@ pub async fn audio_speech(
         )
         .await;
     }
+
+    // Engine lane: a model field that resolves to a llama.cpp-routed
+    // store row is speech-model intent, not a piper voice id. A resolve
+    // miss (the piper-voice case) or any other lane falls through to
+    // the piper paths below byte-identically.
+    if let Some(Ok(row)) = state.with_store(|s| crate::proxy::resolve_model(s, voice))
+        && crate::proxy::routed_kind_for(&state, voice)
+            == Some(blazar_core::engine_kind::EngineKind::LlamaCpp)
+    {
+        return llamacpp_tts_lane(&state, key_ext.as_ref(), &row, &req, text, format, stream).await;
+    }
+
+    // Piper-only lane resolution: the wav+stream refusal below teaches
+    // piper streaming semantics, so it must fire only on the piper path -
+    // the engine lane above owns stream handling for llama.cpp rows.
+    let lane = match stream_lane(format, stream) {
+        Ok(l) => l,
+        Err(msg) => return openai_error(400, &msg),
+    };
 
     // Local lane - same admission the remote branch just paid (audit
     // MM1): scope on the voice id (this lane's "model") + rpm/tpm/daily
@@ -680,6 +701,231 @@ pub async fn audio_speech(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Engine /tts lane (llama.cpp speech models)
+// ---------------------------------------------------------------------------
+
+/// `stream` teaching for the engine lane: llama.cpp `/tts` synthesizes
+/// the whole utterance before its first byte - streaming is a piper
+/// lane feature, not something the child can honor.
+const TTS_ENGINE_STREAM_TEACH: &str = "\"stream\": true is a piper-lane feature - \
+     llama.cpp /tts synthesizes the whole utterance before the first byte. \
+     Drop \"stream\" (or switch to a piper voice id) for engine speech models";
+
+/// Piper-native knob teaching for the engine lane: refusing beats
+/// silently dropping a knob the caller asked for by name.
+const TTS_ENGINE_PIPER_OPTS_TEACH: &str = "speed/speaker/noise_scale/noise_w/\
+     sentence_silence/instructions are piper-voice knobs - engine speech models \
+     take voice/lang/speaker_ref_b64";
+
+/// Cached-modality fast teach: a live child has advertised this row's
+/// output modalities and `audio` is not among them - the row is not a
+/// speech model, so refuse before any spawn. An UNCACHED row proceeds
+/// honestly: the child's own `/tts` error surfaces if it was wrong.
+#[must_use]
+fn engine_tts_gate(name: &str, modalities: Option<&Vec<String>>) -> Option<String> {
+    let list = modalities?;
+    if list.iter().any(|m| m == "audio") {
+        return None;
+    }
+    Some(format!(
+        "\"{name}\" does not advertise audio output (cached modalities: [{list:?}]) - \
+         it is not a speech-synthesis model. A piper voice id (see /v1/audio/voices) \
+         or a Qwen3-TTS-class GGUF serves /v1/audio/speech"
+    ))
+}
+
+/// True when the request carries any piper-native knob - the engine
+/// lane cannot honor them and must say so instead of ignoring them.
+#[must_use]
+fn engine_tts_has_piper_opts(req: &Value) -> bool {
+    [
+        "speed",
+        "speaker",
+        "noise_scale",
+        "noise_w",
+        "sentence_silence",
+        "instructions",
+    ]
+    .iter()
+    .any(|k| req.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+/// Request -> child `/tts` body. `input` is the gateway-validated text;
+/// `voice`, `lang`, and `speaker_ref_b64` are engine-native knobs passed
+/// through verbatim. Everything else (model, response_format, stream)
+/// is a gateway concept the child would reject or ignore.
+#[must_use]
+fn engine_tts_child_body(req: &Value, text: &str) -> Value {
+    let mut body = serde_json::Map::new();
+    body.insert("input".to_string(), Value::String(text.to_string()));
+    for knob in ["voice", "lang", "speaker_ref_b64"] {
+        if let Some(v) = req.get(knob) {
+            body.insert(knob.to_string(), v.clone());
+        }
+    }
+    Value::Object(body)
+}
+
+/// Engine `/tts` lane: one buffered POST to a llama.cpp child's native
+/// speech endpoint, answered on the same WAV/PCM/lossy surface the
+/// piper lane serves. Gates run cheapest-first, each refusing with
+/// teaching BEFORE any spawn: stream shape, piper-only knobs, cached
+/// modality teach, codec sidecar. The child's WAV container is
+/// validated (not trusted) so garbage can never egress as audio.
+#[allow(clippy::too_many_lines)] // one cohesive gated lane, mirrors audio_speech
+async fn llamacpp_tts_lane(
+    state: &Arc<AppState>,
+    key_ext: Option<&axum::Extension<crate::keys::KeyCtx>>,
+    row: &blazar_core::store::ModelRow,
+    req: &Value,
+    text: &str,
+    format: SpeechFormat,
+    stream: bool,
+) -> Response {
+    if stream {
+        return openai_error(400, TTS_ENGINE_STREAM_TEACH);
+    }
+    if engine_tts_has_piper_opts(req) {
+        return openai_error(400, TTS_ENGINE_PIPER_OPTS_TEACH);
+    }
+    let cached_modalities = state
+        .with_store(|s| s.model_modalities(&row.name))
+        .and_then(Result::ok)
+        .flatten();
+    if let Some(teach) = engine_tts_gate(&row.name, cached_modalities.as_ref()) {
+        return openai_error(400, &teach);
+    }
+    // The speech codec rides the same sidecar slot vision projectors
+    // use (Qwen3-TTS ships it as mmproj-*.gguf): no sidecar, no
+    // synthesis. Refused here with speech-specific teaching instead of
+    // letting the `needs_vision` ensure below answer with the vision
+    // wording.
+    if row.mmproj_path.is_none() {
+        return openai_error(
+            400,
+            &format!(
+                "\"{}\" has no audio-codec sidecar attached - engine speech models synthesize \
+             through their mmproj codec. Attach one while the model is stopped: \
+             `blazar mmproj {} <mmproj-file>` (the model repo ships it as mmproj-*.gguf)",
+                row.name, row.name
+            ),
+        );
+    }
+    // Same admission bracket the piper lane pays: scope on the row
+    // name, rpm/tpm/daily, request charge. Engine synthesis is not a
+    // free lane either (audit MM1).
+    if let Err(resp) = state.admit_or_respond(key_ext, &row.name) {
+        return *resp;
+    }
+    // needs_vision attaches the sidecar at spawn (the @vision instance
+    // lane is the sidecar-attached instance of a row - for speech
+    // models the sidecar is the audio codec). Ordinary interactive
+    // eviction economics otherwise.
+    let (engine, _load_ms) = match crate::proxy::ensure_with_admission(
+        state,
+        &row.name,
+        crate::queue::Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        None,
+        true, // sidecar-attached instance (audio codec rides mmproj)
+        false,
+        false,
+        false,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
+    let started = std::time::Instant::now();
+    let child_body = engine_tts_child_body(req, text);
+    // Media-class client: one buffered synthesis can legitimately run
+    // for minutes - the loopback socket, not a client deadline, is the
+    // liveness bound (same posture as the image renders).
+    let send = crate::proxy::send_with_child_retry(state, &engine, |eng| {
+        let url = format!("{}/tts", crate::proxy::child_base(&eng.endpoint));
+        crate::proxy::child_auth(
+            crate::state::media_child_client(state, &eng.endpoint)
+                .post(&url)
+                .header("content-type", "application/json"),
+            eng,
+        )
+        .body(serde_json::to_vec(&child_body).unwrap_or_default())
+    })
+    .await;
+    let resp = match send {
+        Ok(r) => r,
+        Err(e) => return openai_error(502, &e),
+    };
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
+        return openai_error(status, &format!("engine error: {text}"));
+    }
+    let raw = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return openai_error(502, &format!("engine /tts body read failed: {e}")),
+    };
+    // Validate the container, never trust the content type: a child
+    // error page masquerading as audio/wav must not egress as audio.
+    if raw.len() < 12 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WAVE" {
+        let head: String = String::from_utf8_lossy(&raw[..raw.len().min(120)]).to_string();
+        return openai_error(502, &format!("engine /tts returned a non-WAV body: {head}"));
+    }
+    let wav = limit_wav_peak(raw.to_vec());
+    tracing::info!(
+        model = %row.name,
+        bytes = wav.len(),
+        total_ms = started.elapsed().as_millis(),
+        "engine /tts speech synthesized"
+    );
+    match format {
+        SpeechFormat::Wav => Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+            .body(axum::body::Body::from(wav))
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+        // Buffered raw s16le: the child synthesizes whole-utterance, so
+        // the stream posture of the piper pcm lane is not available -
+        // the header carries the exact byte layout instead.
+        SpeechFormat::Pcm => match locate_pcm16(&wav) {
+            Ok(l) => {
+                let header_val = format!(
+                    "s16le;rate={};channels={};bits={}",
+                    l.sample_rate, l.channels, l.bits
+                );
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "audio/pcm")
+                    .header("x-blazar-pcm-format", header_val)
+                    .body(axum::body::Body::from(wav[l.data.clone()].to_vec()))
+                    .unwrap_or_else(|_| openai_error(500, "response build").into_response())
+            }
+            Err(reason) => {
+                openai_error(502, &format!("engine /tts WAV is not 16-bit PCM: {reason}"))
+            }
+        },
+        SpeechFormat::Lossy(lossy) => {
+            let (_, _, _, content_type) = lossy.parts();
+            match transcode(wav, lossy).await {
+                Ok(bytes) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, content_type)
+                    .body(axum::body::Body::from(bytes))
+                    .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+                Err(resp) => resp,
+            }
+        }
+    }
+}
+
 /// One voice row in the voices listing: piper ids
 /// (`<locale>-<name>-<quality>`) split into their parts for client-side
 /// filtering and display; unparsable ids still list with null parts.
@@ -712,6 +958,41 @@ const VOICES_QUERY_MAX_CHARS: usize = 100;
 /// Wall clock for one catalog walk (paginated tree API over every
 /// language directory).
 const VOICES_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Speech section of `/v1/audio/capabilities`: both lanes the speech
+/// endpoint serves, their install state, and their lane-specific knobs.
+/// Read-only, boots nothing (same contract as the rest of that
+/// endpoint).
+#[must_use]
+pub fn speech_capabilities(state: &AppState) -> Value {
+    let piper_installed = blazar_runtime::piper::server_bin(&state.dirs).is_some();
+    let llamacpp = state
+        .with_store(|s| s.active_engine().ok().flatten())
+        .flatten()
+        .is_some_and(|row| row.kind == blazar_core::engine_kind::EngineKind::LlamaCpp);
+    serde_json::json!({
+        "endpoint": "/v1/audio/speech",
+        "voices_endpoint": "/v1/audio/voices",
+        "response_formats": ["wav", "pcm", "pcm16", "mp3", "opus", "aac", "flac"],
+        "lanes": {
+            "piper": {
+                "model": "piper voice id (e.g. en_US-amy-medium)",
+                "installed": piper_installed,
+                "stream": "pcm and lossy formats stream per sentence",
+                "knobs": ["speed", "speaker", "noise_scale", "noise_w", "sentence_silence"],
+            },
+            "engine": {
+                "model": "store row on the llama.cpp lane (e.g. a qwen3-tts GGUF)",
+                "available": llamacpp,
+                "child_endpoint": "/tts (llama-server native)",
+                "requires": "speech-capable model row + its audio-codec mmproj sidecar \
+                             (blazar mmproj <model> <file>)",
+                "stream": false,
+                "knobs": ["voice", "lang", "speaker_ref_b64"],
+            },
+        },
+    })
+}
 
 /// GET `/v1/audio/voices` - installed piper voices, plus an optional
 /// `?search=` probe of the upstream `rhasspy/piper-voices` catalog
@@ -1076,6 +1357,56 @@ mod tests {
             err.contains("flac"),
             "teaching lists the lossy family: {err}"
         );
+    }
+
+    #[test]
+    fn unit__engine_tts_gate__cached_without_audio_teaches_uncached_proceeds() {
+        let teach = engine_tts_gate("qwen3-tts", Some(&vec!["text".to_string()])).expect("teaches");
+        assert!(teach.contains("qwen3-tts"), "names the model: {teach}");
+        assert!(teach.contains("audio"), "names the modality: {teach}");
+        // A cached audio modality proceeds.
+        assert!(engine_tts_gate("m", Some(&vec!["text".into(), "audio".into()])).is_none());
+        // An uncached row proceeds honestly - the child error surfaces.
+        assert!(engine_tts_gate("m", None).is_none());
+    }
+
+    #[test]
+    fn unit__engine_tts_child_body__input_plus_native_knobs_only() {
+        let req = serde_json::json!({
+            "model": "qwen3-tts", "input": "ignored", "response_format": "wav",
+            "stream": false, "voice": "female", "lang": "en",
+            "speaker_ref_b64": "QUJD", "speed": 1.5,
+        });
+        let body = engine_tts_child_body(&req, "spoken text");
+        assert_eq!(body["input"], "spoken text");
+        assert_eq!(body["voice"], "female");
+        assert_eq!(body["lang"], "en");
+        assert_eq!(body["speaker_ref_b64"], "QUJD");
+        assert!(body.get("model").is_none(), "model is a gateway concept");
+        assert!(body.get("speed").is_none(), "piper knobs never ride");
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn unit__engine_tts_has_piper_opts__detects_every_piper_knob() {
+        for k in [
+            "speed",
+            "speaker",
+            "noise_scale",
+            "noise_w",
+            "sentence_silence",
+            "instructions",
+        ] {
+            let req = serde_json::json!({ k: 1 });
+            assert!(engine_tts_has_piper_opts(&req), "{k} flagged");
+        }
+        assert!(!engine_tts_has_piper_opts(
+            &serde_json::json!({"voice": "female"})
+        ));
+        // A null knob is an absent knob (JSON null = unset convention).
+        assert!(!engine_tts_has_piper_opts(
+            &serde_json::json!({"speed": null})
+        ));
     }
 
     #[test]

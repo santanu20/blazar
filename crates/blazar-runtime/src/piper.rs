@@ -497,7 +497,7 @@ pub async fn pull_voice(
     hf: &crate::hf::HfClient,
     dirs: &BlazarDirs,
     voice: &str,
-    on_progress: impl FnMut(u64, u64),
+    on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<PathBuf> {
     if !valid_voice(voice) {
         return Err(anyhow!(
@@ -865,6 +865,7 @@ mod tests {
             path: path.to_string(),
             kind: kind.to_string(),
             size: None,
+            lfs: None,
         }
     }
 

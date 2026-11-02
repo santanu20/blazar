@@ -110,6 +110,9 @@ pub struct OptimizeInputs<'a> {
 /// workload - the adviser says so instead of pretending otherwise.
 pub const WORKLOAD_MIN_REQUESTS: i64 = 20;
 
+// one flat rules table per evidence domain: splitting it would
+// scatter the adviser policy across fns without shrinking any rule
+#[allow(clippy::too_many_lines)]
 /// Build the advise-only plan. Every rule is deterministic over the
 /// store snapshot; unreadable evidence degrades to an honest `warn`
 /// finding naming the error, never to silence.
@@ -206,7 +209,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                     }
                 }
             }
-            Err(e) => findings.push(unreadable("bench", e)),
+            Err(e) => findings.push(unreadable("bench", &e)),
         }
     }
 
@@ -257,10 +260,10 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                         text: "tuned profile predates the v19 optimization ledger - its adoption is unpointed".into(),
                         datum: format!("profile {age_days}d old, hash {}", p.args_hash),
                     }),
-                    Err(e) => findings.push(unreadable("profile", e)),
+                    Err(e) => findings.push(unreadable("profile", &e)),
                 }
             }
-            Err(e) => findings.push(unreadable("profile", e)),
+            Err(e) => findings.push(unreadable("profile", &e)),
         }
     }
 
@@ -425,7 +428,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                     benchmark_sessions: 1,
                 });
             }
-            Err(e) => findings.push(unreadable("spec", e)),
+            Err(e) => findings.push(unreadable("spec", &e)),
         }
     }
 
@@ -469,7 +472,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                 datum: format!("verified {age_days}d ago on lane {tag}"),
             });
         }
-        Err(e) => findings.push(unreadable("cert", e)),
+        Err(e) => findings.push(unreadable("cert", &e)),
     }
 
     // ---- workload sufficiency ----------------------------------------
@@ -501,7 +504,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
                 });
             }
         }
-        Err(e) => findings.push(unreadable("workload", e)),
+        Err(e) => findings.push(unreadable("workload", &e)),
     }
 
     Ok(OptimizePlan {
@@ -514,7 +517,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
     })
 }
 
-fn unreadable(area: &'static str, e: crate::CoreError) -> OptimizeFinding {
+fn unreadable(area: &'static str, e: &crate::CoreError) -> OptimizeFinding {
     OptimizeFinding {
         severity: Severity::Warn,
         area,
@@ -747,7 +750,7 @@ mod tests {
         let plan = build_plan(&s, &inputs(&row, Some(&e))).unwrap();
         let f = finding(&plan, "profile");
         assert_eq!(f.severity, Severity::Ok);
-        assert!(f.text.contains(&format!("experiment #{exp}")), "{:?}", f);
+        assert!(f.text.contains(&format!("experiment #{exp}")), "{f:?}");
         assert_eq!(plan.serving_ctx, 16_384, "ctx from profile argv -c");
     }
 
@@ -779,7 +782,7 @@ mod tests {
         let plan = build_plan(&s, &inputs(&row, Some(&e))).unwrap();
         let f = finding(&plan, "spec");
         assert_eq!(f.severity, Severity::Warn);
-        assert!(f.text.contains("EXCLUDED"), "{:?}", f);
+        assert!(f.text.contains("EXCLUDED"), "{f:?}");
         assert!(rec_cmds(&plan).contains(&"blazar tune m --ngram".to_string()));
         // Same race, tuned: qualifies, no ngram rec.
         put("ngram", 150.0, 100.0, true);
@@ -888,7 +891,7 @@ mod tests {
     fn unit__argv_value__pairs_and_malformed() {
         let argv: Vec<String> = ["-c", "16384", "-ctk"]
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         assert_eq!(argv_value(&argv, "-c").as_deref(), Some("16384"));
         assert_eq!(argv_value(&argv, "-ctk"), None, "flag-like value = absent");

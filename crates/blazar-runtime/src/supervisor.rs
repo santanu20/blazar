@@ -561,6 +561,20 @@ pub(crate) fn read_model_meta(
              directory - re-pull the model so the DiT lands as a file"
         )),
         (_, true) => blazar_core::read_hf_config(std::path::Path::new(path))
+            .and_then(|meta| {
+                // CLIP repos are image-embedding models, not chat lanes;
+                // letting them through would hand sglang/mistral.rs a
+                // vision-tower checkpoint it can only fail on confusingly.
+                if meta.architecture == "CLIPModel" {
+                    Err(blazar_core::CoreError::Config(format!(
+                        "{path}: CLIP image-embedding model - no chat engine serves it; \
+                         embed images via POST /v1/embeddings with image_url input \
+                         (blazar pull openai/clip-vit-base-patch32 --revision refs/pr/15)"
+                    )))
+                } else {
+                    Ok(meta)
+                }
+            })
             .map(MetaBox::Hf)
             .map_err(|e| format!("hf config: {e}")),
         (_, false) => blazar_core::read_metadata_file(std::path::Path::new(path))
@@ -3091,6 +3105,15 @@ impl Supervisor {
             // router child is forced-attach (preset loop) - plain path
             return Box::pin(self.ensure_routed(name, prefix)).await;
         }
+        // Intrinsic-vision lanes: safetensors towers (sglang /
+        // mistral.rs VLM directories) ship the vision stack inside the
+        // checkpoint, so the base child already serves images - no
+        // @vision variant, no projector respawn. Only consulted when
+        // no explicit mmproj is attached; projector models keep the
+        // full lazy-attach machinery below.
+        if Self::vision_is_intrinsic(&self.dirs, name) {
+            return Box::pin(self.ensure_routed(name, prefix)).await;
+        }
         let policy =
             profile::mmproj_policy_effective(&self.config, name, &self.config.overlay_for(name));
         match policy {
@@ -3149,8 +3172,26 @@ impl Supervisor {
         }
     }
 
-    /// Should this `model+adapter` request ride the sglang base child?
-    /// `Ok(true)` = alias to the base lane. The adapter stem is
+    /// `true` when the model row has no attached projector but its
+    /// checkpoint directory carries an intrinsic vision tower
+    /// (safetensors VLM). Used by [`Self::ensure_vision`] to route such
+    /// models through the plain spawn path - the base child already
+    /// serves images. Store-open or row-lookup failures read as
+    /// `false`: the mmproj policy path below then delivers its own
+    /// teaching instead of a silent wrong-lane spawn.
+    fn vision_is_intrinsic(dirs: &blazar_core::dirs::BlazarDirs, name: &str) -> bool {
+        let Ok(store) = Store::open(dirs) else {
+            return false;
+        };
+        match store.get_model(name) {
+            Ok(Some(row)) => {
+                row.mmproj_path.is_none() && blazar_core::hfmeta::lane_vision_capable(&row.path)
+            }
+            _ => false,
+        }
+    }
+
+    /// Should this `model+adapter` request ride the sglang base child?    /// `Ok(true)` = alias to the base lane. The adapter stem is
     /// validated with the SAME resolver the spawn uses, so missing,
     /// ambiguous, and absent-on-disk rows teach byte-identically to the
     /// variant-child lane. A resident base child spawned before any
@@ -7329,8 +7370,9 @@ drop them from rpc_servers in config.toml",
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            // epoch seconds cannot exceed i64::MAX physically; saturate
+            // rather than wrap so a clock far in the future stays honest
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         for row in &models {
             let inputs = blazar_core::optimize::OptimizeInputs {
                 row,
@@ -7355,8 +7397,10 @@ drop them from rpc_servers in config.toml",
                             .findings
                             .iter()
                             .filter(|f| matches!(f.severity, blazar_core::optimize::Severity::Warn))
-                            .count() as u32,
-                        recommendations: plan.recs.len() as u32,
+                            .count()
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                        recommendations: plan.recs.len().try_into().unwrap_or(u32::MAX),
                         next,
                     });
                 }
@@ -10030,7 +10074,66 @@ mod routing_tests {
             .active_engine()
             .unwrap()
             .unwrap();
-        assert_eq!(active.tag, "b_good");
+        assert_eq!(active.tag, "b_good"); // LC4: healthy probe or not, two distinct-model spawn failures dethrone the engine
+    }
+
+    #[test]
+    fn unit__vision_is_intrinsic__tower_dir_without_mmproj_rides_plain_routing() {
+        // Same evidence the sglang spawn gate reads: a safetensors dir with
+        // a vision tower carries intrinsic vision, so the mmproj lazy-attach
+        // machinery must stand aside and route the model as-is.
+        let root = tempfile::TempDir::new().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: root.path().join("cfg"),
+            data_dir: root.path().join("data"),
+        };
+        std::fs::create_dir_all(&dirs.config_dir).unwrap();
+        let store = Store::open(&dirs).unwrap();
+        let tower_dir = root.path().join("vlm");
+        std::fs::create_dir_all(&tower_dir).unwrap();
+        std::fs::write(
+            tower_dir.join("config.json"),
+            r#"{"architectures": ["Qwen2VLForConditionalGeneration"],
+                "vision_config": {"depth": 27}}"#,
+        )
+        .unwrap();
+        let row = |name: &str, path: &str, mmproj: Option<String>| blazar_core::store::ModelRow {
+            name: name.into(),
+            repo: "r".into(),
+            quant: "Q4_K_M".into(),
+            path: path.into(),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: mmproj,
+            components: Vec::new(),
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        };
+        store
+            .upsert_model(&row("tower-model", tower_dir.to_str().unwrap(), None))
+            .unwrap();
+        store
+            .upsert_model(&row(
+                "tower-with-mmproj",
+                tower_dir.to_str().unwrap(),
+                Some("proj.gguf".into()),
+            ))
+            .unwrap();
+        store
+            .upsert_model(&row("gguf-model", "/tmp/nonexistent.gguf", None))
+            .unwrap();
+        // Tower dir, no mmproj: intrinsic.
+        assert!(Supervisor::vision_is_intrinsic(&dirs, "tower-model"));
+        // mmproj present: the projector machinery owns vision instead.
+        assert!(!Supervisor::vision_is_intrinsic(&dirs, "tower-with-mmproj"));
+        // Plain GGUF lane without mmproj: not intrinsic.
+        assert!(!Supervisor::vision_is_intrinsic(&dirs, "gguf-model"));
+        // Unknown model: false, so the mmproj path delivers its own teaching.
+        assert!(!Supervisor::vision_is_intrinsic(&dirs, "no-such-model"));
     }
 
     fn autotune_sup(autotune: Option<&str>) -> (Supervisor, tempfile::TempDir, EventBus) {
@@ -10073,8 +10176,10 @@ mod routing_tests {
                 last_used_at: 0,
             })
             .unwrap();
-        let mut cfg = Config::default();
-        cfg.autotune = autotune.map(str::to_string);
+        let cfg = Config {
+            autotune: autotune.map(str::to_string),
+            ..Config::default()
+        };
         let sup = Supervisor::new(
             dirs,
             cfg,

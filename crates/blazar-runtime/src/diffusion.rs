@@ -76,9 +76,58 @@ pub struct DiffusionFamily {
     pub mode: FamilyMode,
 }
 
-/// Verified families. Keep this list honest: an entry asserts the
-/// component pairing boots on sd-server, proven live before landing.
+/// Verified families. Keep this list honest: an entry's component
+/// pairing comes from the upstream sd.cpp docs (docs/<family>.md) and
+/// every source file is verified against its HF repo listing before
+/// landing; entries carrying a receipt note in their comment are
+/// additionally boot-proven live on sd-server.
 const FAMILIES: &[DiffusionFamily] = &[
+    DiffusionFamily {
+        // Qwen-Image-Edit (upstream docs/qwen_image_edit.md): an
+        // instruction-tuned DiT for image editing - it rides the SAME
+        // vae and text encoder as Qwen-Image v1 (byte-identical
+        // sources), plus the Qwen2.5-VL mmproj: the edit surface sends
+        // before/after images through the encoder (--llm_vision),
+        // family_supports_edits keys on exactly that flag. Listed first
+        // because the token is narrower than both v1 and 2.1; the
+        // 2509/2511 mirror repos (QuantStack, unsloth) ride the same
+        // token. GGUF housings spell the file with underscores
+        // (Qwen_Image_Edit-Q4_K_M.gguf - QuantStack, verified).
+        token: "qwen-image-edit",
+        display: "Qwen-Image-Edit",
+        excludes: &[],
+        standalone_files: None,
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/Qwen-Image_ComfyUI",
+                    repo_path: "split_files/vae/qwen_image_vae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "mradermacher/Qwen2.5-VL-7B-Instruct-GGUF",
+                    repo_path: "Qwen2.5-VL-7B-Instruct-{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+            ComponentSpec {
+                flag: "--llm_vision",
+                source: ComponentSource {
+                    repo: "mradermacher/Qwen2.5-VL-7B-Instruct-GGUF",
+                    repo_path: "Qwen2.5-VL-7B-Instruct.mmproj-Q8_0.gguf",
+                },
+                required: false,
+                fallback_quant: None,
+            },
+        ],
+        mode: FamilyMode::Img,
+    },
     DiffusionFamily {
         token: "qwen-image-2.1",
         display: "Qwen-Image-2.1",
@@ -318,8 +367,8 @@ const FAMILIES: &[DiffusionFamily] = &[
         // SD 1.x: second most-downloaded family on HF, same standalone
         // contract as SDXL (v1-5-pruned-emaonly embeds VAE+CLIP). The
         // v1 token cannot collide with SDXL or SD3.5 repos (neither
-        // contains "stable-diffusion-v1"). SD3/3.5 pair a different
-        // component set (clip_l+clip_g+t5xxl) and stay uncurated.
+        // contains "stable-diffusion-v1"). SD3/3.5 pair clip_l+clip_g
+        // +t5xxl and carry their own entry below.
         token: "stable-diffusion-v1",
         display: "SD 1.5",
         excludes: &[],
@@ -372,6 +421,362 @@ const FAMILIES: &[DiffusionFamily] = &[
         ],
         mode: FamilyMode::Vid,
     },
+    DiffusionFamily {
+        // SD 3.5 (upstream docs/sd3.md): DiT + clip_l + clip_g + t5xxl.
+        // The doc command pairs t5xxl_fp16 from the ungated Comfy fp8
+        // repo (avoids the gated stabilityai text encoders); both
+        // large (16.5GB) and medium (5.1GB) DiT are standalone
+        // safetensors that carry no components. The token cannot hit
+        // v1/xl repos (no "stable-diffusion-3" substring there).
+        token: "stable-diffusion-3",
+        display: "SD 3.5",
+        excludes: &[],
+        standalone_files: Some(&["sd3.5_large.safetensors", "sd3.5_medium.safetensors"]),
+        components: &[
+            ComponentSpec {
+                flag: "--clip_g",
+                source: ComponentSource {
+                    repo: "Comfy-Org/stable-diffusion-3.5-fp8",
+                    repo_path: "text_encoders/clip_g.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--clip_l",
+                source: ComponentSource {
+                    repo: "Comfy-Org/stable-diffusion-3.5-fp8",
+                    repo_path: "text_encoders/clip_l.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--t5xxl",
+                source: ComponentSource {
+                    repo: "Comfy-Org/stable-diffusion-3.5-fp8",
+                    repo_path: "text_encoders/t5xxl_fp16.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+        ],
+        mode: FamilyMode::Img,
+    },
+    DiffusionFamily {
+        // FLUX.3 Klein (upstream docs/flux3.md): the DiT pairs the
+        // FLUX.2 VAE and a Qwen3-VL-4B text encoder. VAE source is the
+        // ungated Comfy-Org byte-copy of the FLUX.2 ae (the BFL repo
+        // is gated); the klein-base GGUF repo rides the same token.
+        // The leejet housing has no Q4_K_M - quants run Q2_K..Q8_0
+        // including Q4_K (verified), so the fallback names Q4_K.
+        token: "flux-3-image-klein",
+        display: "FLUX.3 Klein",
+        excludes: &[],
+        standalone_files: None,
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/MOSS-Image",
+                    repo_path: "vae/flux2-vae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+                    repo_path: "Qwen3VL-4B-Instruct-{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+        ],
+        mode: FamilyMode::Img,
+    },
+    DiffusionFamily {
+        // MiniMax-H3 (upstream docs/minimax_h3.md): jointly generates
+        // video and stereo audio - the audio VAE is a second required
+        // component, a flag no other family uses. The leejet GGUF repo
+        // hosts BOTH the DiT and the qwen3vl text encoder; fl2va and
+        // ref2va DiT variants (plus _pruned) share this component set,
+        // and same-quant picks resolve largest-file-wins, so the
+        // pruned DiT needs its exact-filename pull.
+        token: "minimax",
+        display: "MiniMax-H3",
+        excludes: &[],
+        standalone_files: None,
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/MiniMax-H3",
+                    repo_path: "vae/minimax_h3_video_vae_fp16.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--audio-vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/MiniMax-H3",
+                    repo_path: "vae/minimax_h3_audio_vae_fp32.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "leejet/MiniMax-H3-GGUF",
+                    repo_path: "qwen3vl_32b_minimax_h3-{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+        ],
+        mode: FamilyMode::Vid,
+    },
+    DiffusionFamily {
+        // MOSS-Image (upstream docs/moss_image.md): 5B DiT + FLUX.2
+        // VAE + Qwen3.5-9B text encoder + an explicit tokenizer file -
+        // the doc command passes --tokenizer with a locally renamed
+        // copy of MOSS's tokenizer.json. The doc DiT filename carries
+        // an _attn suffix that does not exist in any HF listing (doc
+        // drift); the int8_convrot file is the real one. Base and SFT
+        // housings (GGUF leejet, safetensors Comfy) all ride the token.
+        // Live-boot receipt: MOSS-Image-Base Q8_0 pulled and rendered
+        // through /v1/images/generations on 2026-11-02 (this lane).
+        token: "moss-image",
+        display: "MOSS-Image",
+        excludes: &[],
+        standalone_files: Some(&[
+            "diffusion_models/moss_image_base_int8_convrot.safetensors",
+            "diffusion_models/moss_image_base_bf16.safetensors",
+        ]),
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/MOSS-Image",
+                    repo_path: "vae/flux2-vae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "unsloth/Qwen3.5-9B-GGUF",
+                    repo_path: "Qwen3.5-9B-{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+            ComponentSpec {
+                flag: "--tokenizer",
+                source: ComponentSource {
+                    repo: "OpenMOSS-Team/MOSS-Image-Base",
+                    repo_path: "tokenizer/tokenizer.json",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+        ],
+        mode: FamilyMode::Img,
+    },
+    DiffusionFamily {
+        // Krea 2 (upstream docs/krea2.md): DiT + wan 2.1 VAE (same
+        // bytes as the wan entry) + Qwen3-VL-4B encoder. The GGUF
+        // housing splits quants across BASE/ and TURBO/ subdirs with
+        // identical quant names - same-quant picks resolve
+        // largest-file-wins deterministically and both variants pair
+        // this same component set, so the ambiguity is cosmetic; a
+        // deliberate Base-vs-Turbo choice uses the exact-filename
+        // pull.
+        token: "krea-2",
+        display: "Krea 2",
+        excludes: &[],
+        standalone_files: None,
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+                    repo_path: "split_files/vae/wan_2.1_vae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+                    repo_path: "Qwen3VL-4B-Instruct-{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+        ],
+        mode: FamilyMode::Img,
+    },
+    DiffusionFamily {
+        // Iris 3B (upstream docs/iris.md): pixel-space DiT - no VAE
+        // component at all - plus the Qwen3-VL-4B encoder. The
+        // standalone list names the ROOT model.safetensors only: the
+        // depth/upscaler/turbo subdirs ship their own model.safetensors
+        // but standalone_file_plan matches the exact root path first.
+        token: "iris",
+        display: "Iris 3B",
+        excludes: &[],
+        standalone_files: Some(&["model.safetensors"]),
+        components: &[ComponentSpec {
+            flag: "--llm",
+            source: ComponentSource {
+                repo: "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+                repo_path: "Qwen3VL-4B-Instruct-{quant}.gguf",
+            },
+            required: true,
+            fallback_quant: Some("Q4_K_M"),
+        }],
+        mode: FamilyMode::Img,
+    },
+    DiffusionFamily {
+        // Lens (upstream docs/lens.md): DiT + gpt-oss-20b encoder +
+        // its tokenizer.json + the FLUX.2 VAE (in-repo ungated copy).
+        // The doc command uses UD-Q8_0, absent from the unsloth
+        // listing; Q4_K_M is the verified canonical file (exact path,
+        // no quant placeholder).
+        token: "lens",
+        display: "Lens",
+        excludes: &[],
+        standalone_files: Some(&["diffusion_models/lens_bf16.safetensors"]),
+        components: &[
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "unsloth/gpt-oss-20b-GGUF",
+                    repo_path: "gpt-oss-20b-Q4_K_M.gguf",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--tokenizer",
+                source: ComponentSource {
+                    repo: "openai/gpt-oss-20b",
+                    repo_path: "tokenizer.json",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/Lens",
+                    repo_path: "vae/flux2-vae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+        ],
+        mode: FamilyMode::Img,
+    },
+    DiffusionFamily {
+        // Fibo 2.0 (upstream docs/fibo2.md): DiT + FLUX.2 VAE +
+        // Qwen3-VL-4B encoder (GGUF housing; the Comfy repo also ships
+        // the encoder as safetensors). The edit/turbo DiT variants
+        // live in the same repo and pair this same set.
+        token: "fibo",
+        display: "Fibo 2.0",
+        excludes: &[],
+        standalone_files: Some(&[
+            "diffusion_models/fibo2_dev_int8_convrot.safetensors",
+            "diffusion_models/fibo2_dev_bf16.safetensors",
+        ]),
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/Fibo-2.0",
+                    repo_path: "vae/flux2-vae.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+                    repo_path: "Qwen3VL-4B-Instruct-{quant}.gguf",
+                },
+                required: true,
+                fallback_quant: Some("Q4_K_M"),
+            },
+        ],
+        mode: FamilyMode::Img,
+    },
+    DiffusionFamily {
+        // Ming-Image 0.1 Design (upstream docs/ming_image.md): DiT +
+        // its own VAE + the Ling-mini text encoder (safetensors, not
+        // GGUF - the int8_convrot 19.5GB file is the usable size;
+        // bf16 is 36.7GB, w4a8 12.8GB) + the mllm tokenizer.
+        token: "ming-image",
+        display: "Ming-Image 0.1 Design",
+        excludes: &[],
+        standalone_files: Some(&[
+            "diffusion_models/ming_image_0.1_design_int8_convrot.safetensors",
+            "diffusion_models/ming_image_0.1_design_bf16.safetensors",
+        ]),
+        components: &[
+            ComponentSpec {
+                flag: "--vae",
+                source: ComponentSource {
+                    repo: "Comfy-Org/Ming-Image",
+                    repo_path: "vae/ming_image_vae_bf16.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--llm",
+                source: ComponentSource {
+                    repo: "Comfy-Org/Ming-Image",
+                    repo_path: "text_encoders/ming_image_0.1_ling_mini_2.0_int8_convrot.safetensors",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+            ComponentSpec {
+                flag: "--tokenizer",
+                source: ComponentSource {
+                    repo: "inclusionAI/Ming-Image-0.1-Design",
+                    repo_path: "mllm/tokenizer.json",
+                },
+                required: true,
+                fallback_quant: None,
+            },
+        ],
+        mode: FamilyMode::Img,
+    },
+    DiffusionFamily {
+        // HiDream-O1 (upstream docs/hidream_o1_image.md): a fully
+        // standalone checkpoint - no components, the DiT embeds
+        // everything. dev listed first (the doc command's variant);
+        // fp8_scaled is the size-conscious alternative.
+        token: "hidream",
+        display: "HiDream-O1",
+        excludes: &[],
+        standalone_files: Some(&[
+            "checkpoints/hidream_o1_image_dev_bf16.safetensors",
+            "checkpoints/hidream_o1_image_dev_fp8_scaled.safetensors",
+            "checkpoints/hidream_o1_image_bf16.safetensors",
+        ]),
+        components: &[],
+        mode: FamilyMode::Img,
+    },
 ];
 
 /// Family for a pull repo, if the repo carries a known family token.
@@ -399,6 +804,42 @@ pub fn standalone_file_plan(info: &HfModelInfo, family: &DiffusionFamily) -> Opt
             bytes: s.lfs.as_ref().and_then(|l| l.size).or(s.size).unwrap_or(0),
             sha256: s.lfs.as_ref().map(|l| l.sha256.clone()),
         })
+}
+
+/// How a repo houses a standalone-capable family. Families whose
+/// canonical DiT is a single safetensors checkpoint (SD 1.5, SDXL,
+/// MOSS-Image, SD 3.5...) also ship DiT GGUF mirrors under the same
+/// family token - those must ride the gguf lane, where
+/// `attach_diffusion_set` completes the identical component set, not
+/// the standalone lane (which would reject them for hosting none of
+/// the pinned checkpoint files).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum StandaloneHousing {
+    /// Repo hosts one of the family's pinned standalone files: the
+    /// standalone pull lane owns it.
+    CheckpointHosted,
+    /// Repo carries DiT GGUF files instead: fall through to the gguf
+    /// lane (same component set attaches).
+    GgufMirror,
+    /// Neither: a diffusers-shard or transformer-shard housing the
+    /// safetensors lane would mis-register - teach instead.
+    DiffusersShards,
+}
+
+/// Classify a repo listing against a standalone-capable family.
+#[must_use]
+pub fn standalone_housing(info: &HfModelInfo, family: &DiffusionFamily) -> StandaloneHousing {
+    if standalone_file_plan(info, family).is_some() {
+        return StandaloneHousing::CheckpointHosted;
+    }
+    if info
+        .siblings
+        .iter()
+        .any(|s| s.rfilename.to_lowercase().ends_with(".gguf"))
+    {
+        return StandaloneHousing::GgufMirror;
+    }
+    StandaloneHousing::DiffusersShards
 }
 
 /// Every family display name, for teaching messages.
@@ -526,6 +967,7 @@ mod tests {
         assert_eq!(
             supported_families(),
             vec![
+                "Qwen-Image-Edit",
                 "Qwen-Image-2.1",
                 "Qwen-Image",
                 "FLUX.1",
@@ -534,7 +976,17 @@ mod tests {
                 "FLUX.2-dev",
                 "SDXL",
                 "SD 1.5",
-                "Wan 2.1 T2V"
+                "Wan 2.1 T2V",
+                "SD 3.5",
+                "FLUX.3 Klein",
+                "MiniMax-H3",
+                "MOSS-Image",
+                "Krea 2",
+                "Iris 3B",
+                "Lens",
+                "Fibo 2.0",
+                "Ming-Image 0.1 Design",
+                "HiDream-O1"
             ]
         );
         // Wan 2.1 T2V: the repackaged tree and GGUF-style housings
@@ -565,7 +1017,14 @@ mod tests {
         );
         // Excluded siblings stay uncurated until verified for real.
         assert!(diffusion_family("unsloth/Qwen-Image-2512-GGUF").is_none());
-        assert!(diffusion_family("Qwen/Qwen-Image-Edit-2509").is_none());
+        // Edit repos ride the dedicated Edit entry (listed before v1);
+        // the 2509 mirror carries the same component contract.
+        assert_eq!(
+            diffusion_family("Qwen/Qwen-Image-Edit-2509")
+                .unwrap()
+                .display,
+            "Qwen-Image-Edit"
+        );
         // Standalone families.
         assert_eq!(
             diffusion_family("stabilityai/stable-diffusion-xl-base-1.0")
@@ -581,9 +1040,50 @@ mod tests {
             "SD 1.5"
         );
         assert!(diffusion_family("CompVis/stable-diffusion-v1-4").is_some());
-        // SD3.5 pairs clip_l+clip_g+t5xxl - different contract, not
-        // curated, and neither standalone token matches it.
-        assert!(diffusion_family("stabilityai/stable-diffusion-3.5-medium").is_none());
+        // SD3.5 now carries its own entry (clip_l+clip_g+t5xxl).
+        assert_eq!(
+            diffusion_family("stabilityai/stable-diffusion-3.5-medium")
+                .unwrap()
+                .display,
+            "SD 3.5"
+        );
+    }
+
+    #[test]
+    fn unit__diffusion_family__g3_curation_token_matrix() {
+        // Every G3-curated family resolves from its real repo spelling
+        // (case-insensitive) with the curated display name.
+        for (repo, display) in [
+            ("QuantStack/Qwen-Image-Edit-GGUF", "Qwen-Image-Edit"),
+            ("stabilityai/stable-diffusion-3.5-large", "SD 3.5"),
+            ("leejet/flux-3-image-klein-GGUF", "FLUX.3 Klein"),
+            ("leejet/flux-3-image-klein-base-GGUF", "FLUX.3 Klein"),
+            ("leejet/MiniMax-H3-GGUF", "MiniMax-H3"),
+            ("leejet/MOSS-Image-Base-GGUF", "MOSS-Image"),
+            ("Comfy-Org/MOSS-Image", "MOSS-Image"),
+            ("leejet/MOSS-Image-SFT-GGUF", "MOSS-Image"),
+            ("realrebelai/KREA-2_GGUFs", "Krea 2"),
+            ("speridlabs/iris-3b", "Iris 3B"),
+            ("Comfy-Org/Lens", "Lens"),
+            ("Comfy-Org/Fibo-2.0", "Fibo 2.0"),
+            ("Comfy-Org/Ming-Image", "Ming-Image 0.1 Design"),
+            ("Comfy-Org/HiDream-O1-Image", "HiDream-O1"),
+        ] {
+            assert_eq!(
+                diffusion_family(repo).map(|f| f.display),
+                Some(display),
+                "{repo} must resolve to {display}"
+            );
+        }
+        // Deferred families stay honestly uncurated: PixArt's Sigma
+        // text encoder is sharded safetensors (single-file component
+        // semantics cannot pull it), Wan 2.2 needs a dual-DiT MoE pair
+        // (both spellings vetoed by the wan entry), Ideogram4 requires
+        // a local fp8->bf16 conversion before serving.
+        assert!(diffusion_family("PixArt-alpha/PixArt-Sigma-XL-2-1024px").is_none());
+        assert!(diffusion_family("Comfy-Org/Wan2.2_ComfyUI_repackaged").is_none());
+        assert!(diffusion_family("Wan-AI/Wan_2.2_T2V_A14B_GGUF").is_none());
+        assert!(diffusion_family("ideogram/Ideogram4").is_none());
     }
 
     #[test]
@@ -657,15 +1157,22 @@ mod tests {
     #[allow(non_snake_case)]
     fn unit__family_mode__vid_families_and_img_families_partition() {
         use crate::diffusion::FamilyMode;
-        // Wan is the video lane; every curated image family reports Img.
+        // Wan and MiniMax-H3 are the video lanes (H3 jointly generates
+        // video + stereo audio); every curated image family reports Img.
         assert!(matches!(
             family_mode("Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
+            Some(&FamilyMode::Vid)
+        ));
+        assert!(matches!(
+            family_mode("leejet/MiniMax-H3-GGUF"),
             Some(&FamilyMode::Vid)
         ));
         for repo in [
             "abenzerps/Qwen-Image-2.1-GGUF",
             "city96/FLUX.1-dev-gguf",
             "stabilityai/stable-diffusion-xl-base-1.0",
+            "leejet/MOSS-Image-Base-GGUF",
+            "Comfy-Org/HiDream-O1-Image",
         ] {
             assert!(
                 matches!(family_mode(repo), Some(&FamilyMode::Img)),
@@ -704,6 +1211,146 @@ mod tests {
             Some(false)
         );
         assert_eq!(family_supports_edits("qwen/qwen3-8b-gguf"), None);
+        // The Edit DiT's own entry pairs --llm_vision: the edit
+        // surface (before/after images through the encoder) is live.
+        assert_eq!(
+            family_supports_edits("QuantStack/Qwen-Image-Edit-GGUF"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn unit__component_plan__g3_flags_cover_tokenizer_audio_vae_and_exact_files() {
+        // Moss --tokenizer: exact path, no quant placeholder.
+        let moss = diffusion_family("leejet/MOSS-Image-Base-GGUF").unwrap();
+        let tok = moss
+            .components
+            .iter()
+            .find(|c| c.flag == "--tokenizer")
+            .expect("moss entry carries --tokenizer");
+        let info = HfModelInfo {
+            id: "OpenMOSS-Team/MOSS-Image-Base".into(),
+            siblings: vec![HfSibling {
+                rfilename: "tokenizer/tokenizer.json".into(),
+                size: Some(20_000_000),
+                lfs: None,
+            }],
+            gguf: None,
+        };
+        let plan = component_plan(&info, &tok.source, "Q4_K_M").unwrap();
+        assert_eq!(plan.filename, "tokenizer/tokenizer.json");
+        // MiniMax --audio-vae: the family-unique second VAE flag.
+        let h3 = diffusion_family("leejet/MiniMax-H3-GGUF").unwrap();
+        assert!(
+            h3.components
+                .iter()
+                .any(|c| c.flag == "--audio-vae" && c.required),
+            "minimax entry must carry a required --audio-vae"
+        );
+        // Lens --llm: an exact GGUF file with no quant placeholder -
+        // any quant string must still resolve the fixed name.
+        let lens = diffusion_family("Comfy-Org/Lens").unwrap();
+        let llm = lens
+            .components
+            .iter()
+            .find(|c| c.flag == "--llm")
+            .expect("lens entry carries --llm");
+        let info2 = HfModelInfo {
+            id: "unsloth/gpt-oss-20b-GGUF".into(),
+            siblings: vec![HfSibling {
+                rfilename: "gpt-oss-20b-Q4_K_M.gguf".into(),
+                size: Some(11_620_000_000),
+                lfs: None,
+            }],
+            gguf: None,
+        };
+        let plan = component_plan(&info2, &llm.source, "Q8_0").unwrap();
+        assert_eq!(plan.filename, "gpt-oss-20b-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn unit__standalone_file_plan__iris_root_model_wins_over_subdir_variants() {
+        // The iris repo nests depth//upscaler//turbo/ subdirs that each
+        // carry their own model.safetensors; the curated root plan must
+        // pick the exact root file, never a subdir sibling.
+        let iris = diffusion_family("speridlabs/iris-3b").unwrap();
+        let info = HfModelInfo {
+            id: "speridlabs/iris-3b".into(),
+            siblings: vec![
+                HfSibling {
+                    rfilename: "model.safetensors".into(),
+                    size: Some(11_950_000_000),
+                    lfs: None,
+                },
+                HfSibling {
+                    rfilename: "turbo/model.safetensors".into(),
+                    size: Some(5_980_000_000),
+                    lfs: None,
+                },
+                HfSibling {
+                    rfilename: "upscaler/model.safetensors".into(),
+                    size: Some(2_000_000_000),
+                    lfs: None,
+                },
+            ],
+            gguf: None,
+        };
+        let plan = standalone_file_plan(&info, iris).unwrap();
+        assert_eq!(plan.filename, "model.safetensors");
+        assert_eq!(plan.bytes, 11_950_000_000);
+    }
+
+    #[test]
+    fn unit__standalone_housing__gguf_mirrors_fall_through_to_the_gguf_lane() {
+        // A DiT GGUF mirror of a standalone-capable family (MOSS-Image,
+        // SD 3.5) must ride the gguf lane + attach_diffusion_set, not be
+        // rejected by the standalone lane for hosting none of the pinned
+        // checkpoint files. Live receipt: leejet/MOSS-Image-Base-GGUF:Q4_K
+        // pull failed with the standalone teaching before this split.
+        let moss = diffusion_family("leejet/MOSS-Image-Base-GGUF").unwrap();
+        let gguf_info = HfModelInfo {
+            id: "leejet/MOSS-Image-Base-GGUF".into(),
+            siblings: vec![HfSibling {
+                rfilename: "MOSS-Image-Base-Q4_K.gguf".into(),
+                size: Some(3_330_000_000),
+                lfs: None,
+            }],
+            gguf: None,
+        };
+        assert_eq!(
+            standalone_housing(&gguf_info, moss),
+            StandaloneHousing::GgufMirror
+        );
+        // The Comfy housing of the same family hosts the pinned file:
+        // standalone lane owns it.
+        let comfy_info = HfModelInfo {
+            id: "Comfy-Org/MOSS-Image".into(),
+            siblings: vec![HfSibling {
+                rfilename: "diffusion_models/moss_image_base_int8_convrot.safetensors".into(),
+                size: Some(5_410_000_000),
+                lfs: None,
+            }],
+            gguf: None,
+        };
+        assert_eq!(
+            standalone_housing(&comfy_info, moss),
+            StandaloneHousing::CheckpointHosted
+        );
+        // Diffusers shards (unet/, no root checkpoint, no gguf): teach.
+        let shards_info = HfModelInfo {
+            id: "stabilityai/stable-diffusion-3.5-diffusers".into(),
+            siblings: vec![HfSibling {
+                rfilename: "transformer/diffusion_pytorch_model-00001-of-00002.safetensors".into(),
+                size: Some(5_000_000_000),
+                lfs: None,
+            }],
+            gguf: None,
+        };
+        let sd3 = diffusion_family("stabilityai/stable-diffusion-3.5-large").unwrap();
+        assert_eq!(
+            standalone_housing(&shards_info, sd3),
+            StandaloneHousing::DiffusersShards
+        );
     }
 
     #[test]

@@ -162,6 +162,9 @@ fn integration__bench_default__parses_stub_rows() {
     assert!(rows.iter().any(|r| r.test.starts_with("pp")));
 }
 
+// the adoption chain is asserted end-to-end in one test so the
+// receipt sequence stays visible
+#[allow(clippy::too_many_lines)]
 #[test]
 #[allow(non_snake_case)]
 fn integration__tune_search__adopts_argmax_and_persists() {

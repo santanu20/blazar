@@ -43,6 +43,10 @@ getrandom = { workspace = true }
 # Production dep: engine build lane stages its build tree in a scoped
 # tempdir (engine/build.rs) - not test-only.
 tempfile = "3"
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+candle-transformers = "0.11.1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 
 [target.'cfg(windows)'.dependencies]
 # W1: 8.3 short-path conversion for the whisper `-m` argv (upstream

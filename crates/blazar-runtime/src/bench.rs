@@ -747,6 +747,10 @@ impl Tuner<'_> {
         Ok((profile, winning, grid_rows))
     }
 
+    // the tune grid is one linear pipeline (validate -> gate ->
+    // argmax -> compile); stages share locals, extraction would
+    // thread five params through each
+    #[allow(clippy::too_many_lines)]
     /// The measurement half of `tune_search`: run the llama-bench grid
     /// under the KV quality gate and pick the winner, but persist
     /// nothing. `optimize --run` uses this to SCREEN a candidate before

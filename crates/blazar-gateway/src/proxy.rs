@@ -343,9 +343,15 @@ pub async fn ensure_with_admission(
         )));
     }
     // Same teaching contract one hop earlier: a vision request against
-    // a model with no projector sidecar would reach the lane and die
-    // inside the engine with a buried 500 hint. The row already knows.
-    if needs_vision && row.mmproj_path.is_none() {
+    // a model that cannot serve images would reach the lane and die
+    // inside the engine with a buried 500 hint. The row already knows:
+    // llama.cpp vision is mmproj-evidenced; safetensors lanes (sglang,
+    // mistral.rs) carry the tower in the weights themselves, evidenced
+    // by the same config.json facts their spawn gate reads.
+    if needs_vision
+        && row.mmproj_path.is_none()
+        && !blazar_core::hfmeta::lane_vision_capable(&row.path)
+    {
         return Err(Box::new(openai_error_code(
             crate::error_codes::BlazarCode::VisionProjectorMissing,
             &crate::preflight::vision_missing_refusal(&row.name),

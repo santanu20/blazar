@@ -4327,7 +4327,7 @@ impl Config {
         // scheduled posture stays a parse error with teaching until
         // repeated manual `optimize --run` + `--apply` cycles earn it.
         match self.autotune.as_deref() {
-            None | Some("off") | Some("advise") => {}
+            None | Some("off" | "advise") => {}
             Some("scheduled") => {
                 return Err(CoreError::Config(
                     "autotune = \"scheduled\" is not available yet - run `blazar optimize <model> --run` \
@@ -6193,6 +6193,9 @@ mod tests {
         }
     }
 
+    // one assertion per rejected vocabulary keeps the teaching
+    // text and its expectation adjacent
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn unit__wire_validation__enum_and_range_rejects() {
         // autotune: scheduled is a planned posture refused with a

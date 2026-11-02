@@ -130,6 +130,37 @@ fn judge_chat(code: u16, body: &[u8]) -> Verdict {
     pass(format!("200, {} chars", content.len()))
 }
 
+/// Vision probe fixture: a 64x64 solid red PNG (136 bytes, 184 base64
+/// chars). Deliberately tiny and in-repo - the probe must run offline
+/// and the image content is irrelevant to the structural judge below.
+const VISION_PROBE_IMAGE: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAT0lEQVR42u3PQQkAAAgEsEty/aMYywi+hcEKLNO+FgEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQGBywLKp0DxvxLbjwAAAABJRU5ErkJggg==";
+
+/// vision probe: STRUCTURAL only - 200 plus a non-empty answer means
+/// the lane actually served an image-bearing request end to end
+/// (dialect translation, projector/intrinsic-tower spawn included).
+/// The answer excerpt rides the receipt for human QC; no content
+/// assertions ("mentions red" flakes on model wording).
+fn judge_vision(code: u16, body: &[u8]) -> Verdict {
+    if code != 200 {
+        return fail(format!("HTTP {code}: {}", excerpt(body, 160)));
+    }
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return fail(format!("200 but body is not JSON: {e}")),
+    };
+    let content = parsed["message"]["content"]
+        .as_str()
+        .or(parsed["response"].as_str())
+        .unwrap_or_default();
+    if content.trim().is_empty() {
+        return fail(format!("200 but empty generation: {}", excerpt(body, 160)));
+    }
+    pass(format!(
+        "200, answered: {}",
+        excerpt(content.trim().as_bytes(), 120)
+    ))
+}
+
 /// stream probe: 200 plus streaming evidence in EITHER wire dialect the
 /// gateway emits. The ollama lane streams `application/x-ndjson` (one JSON
 /// object per line); OpenAI-style surfaces stream `text/event-stream` with
@@ -383,15 +414,19 @@ pub async fn run(
         None => return crate::error_response(500, "store unavailable"),
     };
 
-    // Static caps never spawn a child: vision is a pulled-mmproj fact,
-    // thinking is a chat-template fact, classify is an arch fact.
-    let vision = if row.mmproj_path.is_some() {
-        Verdict {
-            status: "PASS",
-            receipt: "mmproj present (capability not exercised by this run)".to_string(),
-        }
+    // Static caps never spawn a child - BUT vision is now probed LIVE
+    // whenever any vision surface exists (attached mmproj or an
+    // intrinsic tower in the checkpoint directory): an exercised
+    // receipt beats an assumed one. Static N/A only when the model has
+    // no vision surface at all.
+    let vision = if row.mmproj_path.is_some() || blazar_core::hfmeta::lane_vision_capable(&row.path)
+    {
+        None // probe live below
     } else {
-        na("no mmproj pulled - vision requests would be text-only".to_string())
+        Some(na(
+            "no mmproj pulled and no intrinsic vision tower - vision requests would be text-only"
+                .to_string(),
+        ))
     };
     // Decision-class checkpoint: the /v1/classify lane is its surface.
     // Probed live below for modern-bert rows; everything else is an
@@ -478,7 +513,7 @@ async fn run_probes(
     state: Arc<AppState>,
     id: String,
     model: String,
-    vision: Verdict,
+    vision: Option<Verdict>,
     think: Verdict,
     classify: Option<Verdict>,
 ) {
@@ -817,7 +852,46 @@ async fn run_probes(
     );
     caps.insert("embeddings".into(), verdict_json(&v_embed));
 
-    caps.insert("vision".into(), verdict_json(&vision));
+    // vision - LIVE whenever a vision surface exists (mmproj attached
+    // or intrinsic tower). Runs LAST on purpose: a lazy-projector
+    // spawn replaces the warm text child the probes above just rode,
+    // and nothing after this needs that child.
+    let v_vision = if let Some(v) = vision {
+        v
+    } else {
+        if row_cancelled(&state) {
+            return;
+        }
+        elicit_with_retry(|| async {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return fail("overall time budget exhausted".to_string());
+            }
+            let body = json!({
+                "model": model,
+                "stream": false,
+                "messages": [{
+                    "role": "user",
+                    "content": "Describe this image in one short sentence.",
+                    "images": [VISION_PROBE_IMAGE],
+                }],
+                "options": {"num_predict": 64},
+            });
+            match tokio::time::timeout(PROBE_TIMEOUT.min(remaining), call_chat(&state, body)).await
+            {
+                Ok((code, _, bytes)) => judge_vision(code, &bytes),
+                Err(_) => fail(format!("no completion within {}s", PROBE_TIMEOUT.as_secs())),
+            }
+        })
+        .await
+    };
+    state.jobs.record_event(
+        &state,
+        &id,
+        "probe:vision",
+        json!({"status": v_vision.status, "receipt": v_vision.receipt}),
+    );
+    caps.insert("vision".into(), verdict_json(&v_vision));
     caps.insert("think".into(), verdict_json(&think));
 
     // Engine tag: prefer the LIVE resident (proof the probes exercised a
@@ -1023,6 +1097,24 @@ mod tests {
         assert_eq!(judge_chat(200, empty).status, "FAIL");
         assert_eq!(judge_chat(500, b"boom").status, "FAIL");
         assert_eq!(judge_chat(200, b"not json").status, "FAIL");
+    }
+
+    #[test]
+    fn unit__judge_vision__structural_only_content_excerpted() {
+        // Structural judging on purpose: model wording varies by family and
+        // quant, so we only require a 200 with non-empty content and keep
+        // an excerpt in the receipt for human QC.
+        let ok = br#"{"message":{"role":"assistant","content":"a red square on white"}}"#;
+        let v = judge_vision(200, ok);
+        assert_eq!(v.status, "PASS");
+        assert!(v.receipt.contains("answered:"));
+        // Blank answer: the lane accepted the image but produced nothing.
+        let empty = br#"{"message":{"role":"assistant","content":"  "}}"#;
+        assert_eq!(judge_vision(200, empty).status, "FAIL");
+        // Transport/engine error: body excerpt surfaces for debugging.
+        let err = judge_vision(500, b"vision tower oom");
+        assert_eq!(err.status, "FAIL");
+        assert!(err.receipt.contains("vision tower oom"));
     }
 
     #[test]

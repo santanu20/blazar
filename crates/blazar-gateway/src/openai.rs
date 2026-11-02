@@ -213,6 +213,25 @@ pub async fn embeddings(
     // Resolve the model's registry row for the override lookup; on any
     // resolve miss fall through to the proxy path (it owns 404 shaping).
     let requested = extract_model(&body);
+    // CLIP image-embedding rows terminate here: no chat child serves
+    // them (the spawn-time arch gate refuses), so this is their only
+    // surface. Model-aware: the candle lane serves CLIPModel-arch rows
+    // ONLY - every other row (VLM with mmproj, unresolvable names,
+    // remote intent) falls to the proxy path, where vision admission
+    // and the child's own multimodal /v1/embeddings (image/audio/video
+    // parts, llama-server with a projector) take over. No model field
+    // keeps the candle lane: shape-only dispatch historically meant
+    // CLIP, and clip::resolve owns the sole-row/pull teaching then.
+    if req_has_image_input(&body)
+        && requested.as_deref().map_or(true, |m| {
+            state
+                .with_store(|s| crate::proxy::resolve_model(s, m).ok())
+                .flatten()
+                .is_some_and(|row| clip_lane_serves(row.arch.as_deref()))
+        })
+    {
+        return clip_embeddings(state, key_ext, requested.as_deref(), body).await;
+    }
     let late = requested.as_deref().is_some_and(|m| {
         state
             .with_store(|s| crate::proxy::resolve_model(s, m).ok())
@@ -305,6 +324,143 @@ pub async fn embeddings(
             late_openai_response(&model, out)
         }
         Err((code, msg)) => openai_error(code, &msg),
+    }
+}
+
+/// True when the /v1/embeddings input array carries at least one
+/// `image_url` part - the multimodal-embedding routing signal.
+fn req_has_image_input(body: &[u8]) -> bool {
+    let Ok(req) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    match &req["input"] {
+        serde_json::Value::Array(items) => items.iter().any(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some("image_url")
+                || v.get("image_url").is_some()
+        }),
+        _ => false,
+    }
+}
+
+/// True when a resolved row belongs to the candle CLIP lane. The one
+/// architecture that lane can load; every other arch (VLM towers,
+/// bert, speech) must ride the child proxy, whose mmproj-equipped
+/// children serve multimodal embeddings natively.
+fn clip_lane_serves(arch: Option<&str>) -> bool {
+    arch == Some("CLIPModel")
+}
+
+/// CLIP image-embedding lane: accepts `input` as an array of
+/// `{ "type": "image_url", "image_url": { "url": "data:image/...;base64,..." } }`
+/// parts and returns one L2-normalized 512-d vector per image. Data-URLs
+/// only - fetching remote images would be network egress this local-first
+/// lane does not do. Text parts are refused with teaching (the CLIP text
+/// tower is a deliberate follow-up, not a silent degradation).
+async fn clip_embeddings(
+    state: State<Arc<AppState>>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+    requested: Option<&str>,
+    body: Bytes,
+) -> Response {
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return openai_error(400, &format!("invalid JSON: {e}")),
+    };
+    let (model, weights) = match blazar_runtime::clip::resolve(&state.dirs, requested) {
+        Ok(ok) => ok,
+        Err(msg) => return openai_error(400, &msg),
+    };
+    // Per-key admission mirrors the late-chunking lane.
+    if let Some(Extension(k)) = &key_ext
+        && let Some(entry) = state.keys.entry(&k.name)
+        && let Err(rej) = state.keys.admit(&entry, &model)
+    {
+        return rej.to_response();
+    }
+    let items = match &req["input"] {
+        serde_json::Value::Array(items) if !items.is_empty() => items.clone(),
+        _ => {
+            return openai_error(
+                400,
+                "image embeddings: \"input\" must be a non-empty array of image_url parts",
+            );
+        }
+    };
+    let mut images = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        if item.as_str().is_some() {
+            return openai_error(
+                400,
+                &format!(
+                    "image embeddings: input[{idx}] is a string - the CLIP lane embeds images only \
+                     (the text tower is a deliberate follow-up); embed text with a text-embedding model"
+                ),
+            );
+        }
+        let url = item
+            .get("image_url")
+            .and_then(|u| u.get("url"))
+            .and_then(|u| u.as_str())
+            .unwrap_or("");
+        let Some(payload) = url.strip_prefix("data:") else {
+            return openai_error(
+                400,
+                &format!(
+                    "image embeddings: input[{idx}] must be a data-URL (data:image/png;base64,...) \
+                     - remote image URLs are network egress this local lane does not perform"
+                ),
+            );
+        };
+        let Some((mime, b64)) = payload.split_once(";base64,") else {
+            return openai_error(
+                400,
+                &format!(
+                    "image embeddings: input[{idx}] must be a data-URL (data:image/png;base64,...) \
+                     - remote image URLs are network egress this local lane does not perform"
+                ),
+            );
+        };
+        if !matches!(mime, "image/png" | "image/jpeg") {
+            return openai_error(
+                400,
+                &format!(
+                    "image embeddings: input[{idx}] is {mime:?} - the CLIP lane decodes png and jpeg"
+                ),
+            );
+        }
+        match crate::realtime::base64_decode(b64) {
+            Ok(bytes) => images.push(bytes),
+            Err(e) => {
+                return openai_error(400, &format!("image embeddings: input[{idx}] base64: {e}"));
+            }
+        }
+    }
+    match blazar_runtime::clip::embed_images(weights, &images).await {
+        Ok(vectors) => {
+            let data: Vec<serde_json::Value> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    serde_json::json!({
+                        "object": "embedding",
+                        "embedding": v,
+                        "index": i,
+                    })
+                })
+                .collect();
+            // Token accounting does not apply to image pixels; usage is
+            // zeroed and the note says so rather than inventing numbers.
+            serde_json::json!({
+                "object": "list",
+                "model": model,
+                "data": data,
+                "usage": { "prompt_tokens": 0, "total_tokens": 0 },
+                "blazar_note": "CLIP image embeddings - token usage is not applicable",
+            })
+            .to_string()
+            .into_response()
+        }
+        Err(msg) => openai_error(500, &msg),
     }
 }
 
@@ -614,15 +770,65 @@ pub async fn openai_proxy(
     // the parsed body BEFORE every downstream consumer so lint, affinity
     // hashing, and the forwarded bytes all see the same final body.
     let mut body = body;
+    // Voice reply (blazar extension), buffered chat only: validated and
+    // STRIPPED here - this lane forwards byte-faithful, so the child
+    // must never see the field; the response seam below synthesizes the
+    // audio. Stream + voice is refused with the working lanes (the
+    // byte-faithful relay cannot interleave audio into SSE).
+    let mut openai_voice = None;
+    let mut openai_voice_key = None;
     if uri.path().ends_with("/chat/completions")
         && let Some(v) = parsed_body.as_mut()
     {
-        let mut rewritten = inject_reasoning_effort_kwarg(v);
+        let mut rewritten = false;
+        if v.get("voice").is_some() {
+            let voice = v
+                .get("voice")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !voice.is_empty() {
+                if v.get("stream")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    return openai_error(
+                        400,
+                        "voice + stream is not available on /v1/chat/completions (byte-faithful \
+                         relay) - /api/chat interleaves audio lines, /v1/realtime speaks it \
+                         natively",
+                    );
+                }
+                let installed = blazar_runtime::piper::list_voices(&state.dirs);
+                if installed.is_empty() {
+                    return openai_error(
+                        400,
+                        "no voices installed - pull one with `blazar voice pull <id>` (see \
+                         `blazar voice search`) and retry",
+                    );
+                }
+                if !installed.iter().any(|id| id == &voice) {
+                    return openai_error(
+                        400,
+                        &format!(
+                            "unknown voice \"{voice}\" - installed: {} (more: `blazar voice \
+                             search`)",
+                            installed.join(", ")
+                        ),
+                    );
+                }
+                openai_voice_key = key_ext.as_ref().map(|Extension(k)| k.clone());
+                openai_voice = Some(voice);
+            }
+            v.as_object_mut().map(|o| o.remove("voice"));
+            rewritten = true;
+        }
+        let mut injected = inject_reasoning_effort_kwarg(v);
         // Think-default-off parity (chat lane): a thinking-capable
         // template with no caller toggle renders reasoning ON and
         // eats the token budget before the answer.
-        rewritten |= inject_default_think_off(&state, v);
-        if rewritten {
+        injected |= inject_default_think_off(&state, v);
+        if rewritten || injected {
             body = Bytes::from(serde_json::to_vec(v).unwrap_or_default());
         }
     }
@@ -935,7 +1141,7 @@ pub async fn openai_proxy(
         }
         None => (body, None),
     };
-    proxy_request(
+    let resp = proxy_request(
         &state,
         &engine,
         &model_name,
@@ -951,7 +1157,60 @@ pub async fn openai_proxy(
         sf_gate,
         recipe,
     )
-    .await
+    .await;
+    // Voice response seam (buffered chat): synthesize the winning reply
+    // and attach it as choices[0].message.audio. TTS failure degrades to
+    // a visible note on the body, never a dropped response.
+    if openai_voice.is_some()
+        && resp.status().as_u16() == 200
+        && let Some(voice) = openai_voice
+    {
+        let (mut parts, body) = resp.into_parts();
+        if let Ok(bytes) = axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+            let mut v: serde_json::Value = if let Ok(v) = serde_json::from_slice(&bytes) {
+                v
+            } else {
+                // Non-JSON body: rebuild verbatim, nothing to attach.
+                let rebuilt =
+                    axum::response::Response::from_parts(parts, axum::body::Body::from(bytes));
+                return rebuilt;
+            };
+            let text = v
+                .pointer("/choices/0/message/content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !text.trim().is_empty() {
+                match crate::voice_tee::synthesize_wav(
+                    &state,
+                    openai_voice_key.as_ref(),
+                    &voice,
+                    &text,
+                )
+                .await
+                {
+                    Ok(wav) => {
+                        if let Some(msg) = v.pointer_mut("/choices/0/message").map(std::mem::take)
+                            && let serde_json::Value::Object(mut map) = msg
+                        {
+                            map.insert("audio".into(), crate::voice_tee::audio_field(&wav));
+                            v["choices"][0]["message"] = serde_json::Value::Object(map);
+                        }
+                    }
+                    Err(e) => v["blazar_audio_error"] = serde_json::json!(e),
+                }
+            }
+            let out = Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            return axum::response::Response::from_parts(parts, axum::body::Body::from(out));
+        }
+        // Body unreadable: return the parts with an empty body
+        // is wrong - rebuild what we can. This path is
+        // practically unreachable for buffered 200s.
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        return axum::response::Response::from_parts(parts, axum::body::Body::empty());
+    }
+    resp
 }
 
 /// Tool types that need a cloud-side catalog or sandbox this local
@@ -2243,6 +2502,47 @@ mod tests {
     use super::*;
 
     const CT: &str = "multipart/form-data; boundary=blazar-b";
+
+    #[test]
+    fn unit__req_has_image_input__truth_table() {
+        let img = br#"{"model":"clip","input":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}"#;
+        assert!(req_has_image_input(img), "image_url part routes to clip");
+        let img_no_type = br#"{"input":[{"image_url":{"url":"data:image/png;base64,AAA"}}]}"#;
+        assert!(
+            req_has_image_input(img_no_type),
+            "bare image_url key routes too"
+        );
+        let text = br#"{"model":"m","input":["a","b"]}"#;
+        assert!(
+            !req_has_image_input(text),
+            "string array stays on the proxy path"
+        );
+        let single = br#"{"model":"m","input":"plain text"}"#;
+        assert!(
+            !req_has_image_input(single),
+            "string input stays on the proxy path"
+        );
+        let garbage = b"not json";
+        assert!(
+            !req_has_image_input(garbage),
+            "garbage body falls through to the proxy 400"
+        );
+    }
+
+    #[test]
+    fn unit__clip_lane_serves__only_clipmodel_arch_rides_candle() {
+        // CLIPModel rows keep the in-process candle lane.
+        assert!(clip_lane_serves(Some("CLIPModel")));
+        // Every other resolved arch rides the child proxy: VLM towers,
+        // bert embedders, speech rows - their children own multimodal
+        // /v1/embeddings via mmproj.
+        assert!(!clip_lane_serves(Some("Qwen3VLForConditionalGeneration")));
+        assert!(!clip_lane_serves(Some("bert")));
+        assert!(!clip_lane_serves(Some("qwen3tts")));
+        // A row with no recorded arch never guesses its way into the
+        // candle lane (weights would not be there).
+        assert!(!clip_lane_serves(None));
+    }
 
     #[test]
     fn unit__multipart_extract__model_field_after_file_part() {

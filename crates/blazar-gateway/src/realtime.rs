@@ -1512,7 +1512,9 @@ fn persist_round(ctx: &mut Vec<CtxItem>, pending: &mut Vec<PendingCall>, end: &T
 // free of an extra dependency for two small helpers.
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn base64_encode(data: &[u8]) -> String {
+/// RFC 4648 standard-alphabet encoder - shared crate-wide so audio
+/// paths (realtime WS deltas, chat voice tee) do not each grow a copy.
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [
@@ -1537,7 +1539,7 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     fn val(c: u8) -> Result<u32, String> {
         match c {
             b'A'..=b'Z' => Ok(u32::from(c - b'A')),

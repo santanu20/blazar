@@ -136,3 +136,4 @@ jobs:
       # script self-tests both directions on every run.
       - run: shellcheck -S warning scripts/check_hygiene.sh
       - run: sh scripts/check_hygiene.sh
+      - run: python3 scripts/check_glyphs.py

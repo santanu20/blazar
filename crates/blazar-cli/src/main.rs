@@ -132,6 +132,14 @@ enum Cmd {
         /// a mismatch.
         #[arg(long)]
         verify: bool,
+        /// Pull from a specific git ref instead of `main`. Needed when
+        /// the wanted files do not live on main (e.g.
+        /// `openai/clip-vit-base-patch32 --revision refs/pr/15` - the
+        /// safetensors conversion only exists on that ref). Catalog
+        /// entries can pin a revision themselves (CLIP does); an
+        /// explicit --revision always overrides the pin.
+        #[arg(long)]
+        revision: Option<String>,
     },
     /// Import an existing GGUF file (hardlinks by default; --copy for a copy)
     Import {
@@ -1380,7 +1388,7 @@ async fn ensure_run_model(name: &str) -> Result<String> {
                      (Ctrl-C keeps the partial for resume)",
                 t.repo, t.quant
             );
-            let (row, already) = pull_model(&resolved, false).await?;
+            let (row, already) = pull_model(&resolved, false, None).await?;
             if already {
                 println!("already present as {} - starting", row.name);
             }
@@ -1979,7 +1987,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             target,
             force,
             verify,
-        } => pull(&target, force, verify).await,
+            revision,
+        } => pull(&target, force, verify, revision.as_deref()).await,
         Cmd::Import {
             path,
             name,
@@ -7697,7 +7706,7 @@ mod signal_stop {
     }
 }
 
-async fn pull(target: &str, force: bool, verify: bool) -> Result<()> {
+async fn pull(target: &str, force: bool, verify: bool, revision: Option<&str>) -> Result<()> {
     // Verify-only mode: no network, no pull lock - hash what is already
     // on disk against the store row and exit non-zero on any bad answer.
     if verify {
@@ -7739,7 +7748,7 @@ async fn pull(target: &str, force: bool, verify: bool) -> Result<()> {
             )),
         };
     }
-    let (row, already_present) = pull_model(target, force).await?;
+    let (row, already_present) = pull_model(target, force, revision).await?;
     // Banner only on success: an upgrade hint decorating a pull FAILURE
     // reads as noise (fit/mmproj already follow this order).
     banner();
@@ -7779,7 +7788,11 @@ async fn pull(target: &str, force: bool, verify: bool) -> Result<()> {
 /// progress, resume-safe `.part` files, pull locks, mmproj attach,
 /// metadata warnings, and the GGUF lint. Returns the store row plus
 /// whether it was already present (caller picks the wording).
-async fn pull_model(target: &str, force: bool) -> Result<(blazar_core::store::ModelRow, bool)> {
+async fn pull_model(
+    target: &str,
+    force: bool,
+    revision: Option<&str>,
+) -> Result<(blazar_core::store::ModelRow, bool)> {
     let d = dirs();
     d.ensure().ok();
     let token = std::env::var("HF_TOKEN").ok();
@@ -7798,8 +7811,23 @@ async fn pull_model(target: &str, force: bool) -> Result<(blazar_core::store::Mo
     // Foreground by contract: the pull runs in THIS terminal and dies with
     // it. On interrupt the future is dropped, which releases the pull
     // lock and keeps the `.part` for a later resume.
+    // A revision rides the owner/repo path, or arrives pinned on a
+    // catalog entry (e.g. CLIP's safetensors live on refs/pr/15).
+    // The user's --revision always wins; an entry pin only fills the
+    // gap. Registry/ollama names never resolve to a catalog entry, so
+    // their pulls stay revision-less exactly as before.
+    let pinned = blazar_core::resolve(target)
+        .ok()
+        .and_then(|e| e.revision.clone());
+    let revision = revision.or(pinned.as_deref());
+    let routed: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<blazar_runtime::hf::PullOutcome>> + Send>,
+    > = match revision {
+        Some(rev) => Box::pin(puller.pull_at(target, rev)),
+        None => Box::pin(puller.route_pull(target)),
+    };
     let outcome = tokio::select! {
-        r = puller.route_pull(target) => r?,
+        r = routed => r?,
         () = blazar_runtime::events::interrupted() => {
             return Err(anyhow::anyhow!(
                 "pull interrupted - partial file kept; re-run `blazar pull {target}` to resume"
@@ -10201,6 +10229,9 @@ async fn notify_daemon_evict(model: &str) {
         .await;
 }
 
+// plan/run/apply share one cmd entrypoint; the flags ARE the CLI
+// surface
+#[allow(clippy::too_many_arguments)]
 /// `blazar optimize <model>` - three receipt-driven modes: `--plan`
 /// (read-only evidence advice), `--run` (screen a candidate through
 /// the tune grid, verify it against the live gateway via alternating
@@ -10403,8 +10434,9 @@ async fn optimize_cmd(
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|dur| dur.as_secs() as i64)
-        .unwrap_or(0);
+        // epoch seconds cannot exceed i64::MAX physically; saturate
+        // rather than wrap so a clock far in the future stays honest
+        .map_or(0, |dur| i64::try_from(dur.as_secs()).unwrap_or(i64::MAX));
     let inputs = blazar_core::optimize::OptimizeInputs {
         row: &row,
         engine: engine.as_ref(),
@@ -14860,6 +14892,13 @@ impl TuneLane {
     }
 }
 
+// the tune entrypoint owns its whole lifecycle (engine pick, lane
+// setup, search, spec-race, receipts); pre-existing shape, kept whole
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools
+)]
 async fn tune_full(
     model: &str,
     search: bool,
@@ -15335,13 +15374,13 @@ aborts on this family. Profile pins for it would measure nothing",
         let race_hw =
             blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&engine_row.manifest);
         for (mode, tps) in &rows {
-            let (spec_params, tuned) = match mode.as_str() {
+            let (spec_params, tuned_arm) = match mode.as_str() {
                 "ngram" => {
-                    let (m, n, min_hits) = ngram_knobs;
-                    if m > 0 {
+                    let (size_m, size_n, min_hits) = ngram_knobs;
+                    if size_m > 0 {
                         (
                             Some(format!(
-                                "{{\"size_m\":{m},\"size_n\":{n},\"min_hits\":{min_hits}}}"
+                                "{{\"size_m\":{size_m},\"size_n\":{size_n},\"min_hits\":{min_hits}}}"
                             )),
                             true,
                         )
@@ -15369,7 +15408,7 @@ aborts on this family. Profile pins for it would measure nothing",
                 &blazar_core::store::SpecProvenance {
                     hw_fingerprint: race_hw.as_deref(),
                     spec_params: spec_params.as_deref(),
-                    tuned,
+                    tuned: tuned_arm,
                     reps: 1,
                 },
             )?;
@@ -17645,8 +17684,8 @@ fn build_lane_routing(
 /// Fix A delegation: when Update would no-op behind a dead prebuilt
 /// lane (see `build_lane_routing`), hand off to the `engine build` flow
 /// - inheriting its F7 gate, progress lines, and restart hint. Returns
-/// `true` when this call produced the command's final output (caller
-/// returns immediately); `false` = routing did not apply.
+///   `true` when this call produced the command's final output (caller
+///   returns immediately); `false` = routing did not apply.
 async fn route_update_to_build(
     d: &BlazarDirs,
     active_asset: &str,
@@ -17718,10 +17757,10 @@ fn installed_engine_kinds(rows: &[blazar_core::EngineRow]) -> Vec<EngineKind> {
 /// The pre-walk lane stays the user's lane: if a lane install switched
 /// the active tag to another kind, the walk restores the snapshot kind
 /// - at its NEWEST build when the update pruned the exact snapshot tag
-/// (same semantics as `engine use --kind`). A same-kind change is the
-/// lane's own update and stays. With no pre-walk active engine, the
-/// default llamacpp lane wins when installed. `None` = leave the store
-/// as-is. `rows` is `list_engines()` order (newest-first).
+///   (same semantics as `engine use --kind`). A same-kind change is the
+///   lane's own update and stays. With no pre-walk active engine, the
+///   default llamacpp lane wins when installed. `None` = leave the store
+///   as-is. `rows` is `list_engines()` order (newest-first).
 fn restore_active_tag(
     rows: &[blazar_core::EngineRow],
     before: Option<(String, EngineKind)>,

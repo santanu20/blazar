@@ -842,7 +842,13 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // gain nothing from --embeddings and keep it off.
     // Late-chunking override (R1) wins over GGUF metadata: pooling MUST be
     // `none` so the gateway receives the per-token embedding matrix.
-    if input.overlay.late_chunking == Some(true) {
+    if speech_generation_arch(&gguf.architecture) {
+        // Speech-generation checkpoints serve /tts; every embedding arm
+        // below (parity arm included) is skipped for them - with
+        // --embeddings llama-server b12020 segfaults inside
+        // process_tts_slots() on the first /tts request (live-bisected:
+        // same argv minus --embeddings/--pooling serves /tts fine).
+    } else if input.overlay.late_chunking == Some(true) {
         if input.supported_flags.contains("--embeddings")
             && input.supported_flags.contains("--pooling")
         {
@@ -2553,6 +2559,22 @@ const UNIFIED_COMPUTE_PER_TOKEN_BYTES: u64 = 24 * 1024;
 /// Raise an existing `<flag> <value>` argv pair to at least `floor`
 /// (late-chunking correctness: one doc must fit one ubatch). No-op when
 /// the flag is absent or already large enough.
+/// Speech-generation GGUF architectures: checkpoints whose purpose is
+/// audio out (llama-server's `/tts` surface), not embeddings. Compiled as
+/// an exact-match list on purpose - a new upstream speech arch must be a
+/// conscious addition, never a silent prefix match. `qwen3tts` is the
+/// only loadable arch of this class in llama.cpp b12020 (the other
+/// mtmd audio-gen towers are projector names, not model arches).
+///
+/// Live receipt (b12020, 2026-11-02): a qwen3tts child spawned with
+/// `--embeddings --pooling last` segfaults inside
+/// `server_context_impl::process_tts_slots()` on the first POST /tts;
+/// the same argv without the embedding flags serves /tts fine. Every
+/// embedding arm in section 10c is therefore skipped for these arches.
+fn speech_generation_arch(arch: &str) -> bool {
+    matches!(arch, "qwen3tts")
+}
+
 fn floor_batch_flag(argv: &mut [String], flag: &str, floor: u32) {
     if let Some(pos) = argv.iter().position(|a| a == flag)
         && let Some(v) = argv.get(pos + 1).and_then(|s| s.parse::<u32>().ok())
@@ -8187,6 +8209,48 @@ mod tests {
             .collect();
         let p2 = compile(&input(&g, &hw, &cfg, &legacy), &TuningOverrides::default()).unwrap();
         assert!(!p2.argv.iter().any(|a| a == "--embeddings"));
+    }
+
+    #[test]
+    fn unit__speech_gen_arch__suppresses_every_embedding_arm() {
+        // Live receipt (b12020, 2026-11-02): qwen3tts + `--embeddings
+        // --pooling last` segfaults in process_tts_slots() on the first
+        // POST /tts. A speech checkpoint must never carry embedding
+        // flags - not the parity arm, not any pooling arm.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut g = meta();
+        g.architecture = "qwen3tts".into();
+        g.pooling_type = None;
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--embeddings"));
+        assert!(!p.argv.iter().any(|a| a == "--pooling"));
+        assert!(!p.argv.iter().any(|a| a == "--reranking"));
+    }
+
+    #[test]
+    fn unit__speech_gen_arch__late_chunking_overlay_still_flagless() {
+        // The late-chunking arm is the FIRST embedding arm; a mis-set
+        // overlay must not sneak --embeddings --pooling none onto a
+        // speech child either - same segfault, different arm.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut g = meta();
+        g.architecture = "qwen3tts".into();
+        g.pooling_type = None;
+        let late = ModelOverride {
+            late_chunking: Some(true),
+            ..ModelOverride::default()
+        };
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.overlay = &late;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--embeddings"));
+        assert!(!p.argv.iter().any(|a| a == "--pooling"));
     }
 
     #[test]

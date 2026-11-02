@@ -2632,11 +2632,12 @@ async fn e2e__audio_transcriptions_no_backend_teaching_501() {
     let ts = start(Config::default()).await;
     let c = client();
     // OpenAI-style multipart: file part (with filename) + model field.
-    // Without a whisper lane installed and without remote intent the
-    // gateway answers a teaching 501 (llama.cpp children cannot STT).
+    // The model names NO pulled row (whisper-1 is the size-shaped
+    // default clients send), so without a whisper lane installed and
+    // without remote intent the gateway answers a teaching 501.
     let boundary = "blazar-test-boundary";
     let mp = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF-binary-bytes-here\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm1\r\n--{boundary}--\r\n"
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF-binary-bytes-here\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--{boundary}--\r\n"
     );
     let resp = c
         .post(format!("{}/v1/audio/transcriptions", ts.base))
@@ -2658,6 +2659,39 @@ async fn e2e__audio_transcriptions_no_backend_teaching_501() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// The model field names a pulled llama.cpp row (the fixture's m1), so
+/// the engine ASR lane owns the request: without an audio-tower
+/// sidecar the answer is the mmproj teaching, NOT the lane-less 501
+/// (llama.cpp children can transcribe - that is this lane).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__audio_transcriptions_engine_row_without_sidecar_teaches_400() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let boundary = "blazar-test-boundary";
+    let mp = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF-binary-bytes-here\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm1\r\n--{boundary}--\r\n"
+    );
+    let resp = c
+        .post(format!("{}/v1/audio/transcriptions", ts.base))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(mp)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let r: serde_json::Value = resp.json().await.unwrap();
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("no audio-tower sidecar") && msg.contains("blazar mmproj"),
+        "engine-row teaching should name both remedies: {r}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 /// The async knob never bypasses the lane checks: with no whisper lane
 /// installed an `async=true` submit gets the SAME teaching 501 as the
 /// sync path (the job machinery only runs on the local lane).
@@ -2668,7 +2702,7 @@ async fn e2e__audio_transcriptions_async_without_lane_teaching_501() {
     let c = client();
     let boundary = "blazar-test-boundary";
     let mp = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"async\"\r\n\r\ntrue\r\n--{boundary}--\r\n"
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"async\"\r\n\r\ntrue\r\n--{boundary}--\r\n"
     );
     let resp = c
         .post(format!("{}/v1/audio/transcriptions", ts.base))

@@ -33,6 +33,7 @@ pub fn receipts() -> &'static Value {
 /// `min_ctx`. Exact store-name match only - see the module docs. Rung
 /// keys are either a single grade (`f16`) or a `k/v` pair
 /// (`q8_0/q8_0`); a grade evidenced on either side of the pair counts.
+#[must_use]
 pub fn grade_evidenced_at_ctx(model: &str, grade: &str, min_ctx: u32) -> bool {
     // f16 is the reference every receipt is compared against - the
     // baseline needs no receipt of its own.
@@ -60,8 +61,8 @@ mod tests {
     use super::*;
 
     /// Pins the truth table against the real compiled-in registry:
-    /// qwen3.5-9b has a q8_0 rung at ctx 2048 AND 32768 (eligible at
-    /// both floors), a q4_0 rung at both ctxs, no q5_0 rung anywhere,
+    /// qwen3.5-9b has a `q8_0` rung at ctx 2048 AND 32768 (eligible at
+    /// both floors), a `q4_0` rung at both ctxs, no `q5_0` rung anywhere,
     /// and an unknown model has no evidence at all. f16 is always
     /// eligible regardless.
     #[test]
@@ -82,7 +83,7 @@ mod tests {
         // Unknown model: honest no.
         assert!(!grade_evidenced_at_ctx("qwen3-0.6b", "q8_0", 2048));
         // Baseline is unconditional.
-        assert!(grade_evidenced_at_ctx("qwen3-0.6b", "f16", 131072));
+        assert!(grade_evidenced_at_ctx("qwen3-0.6b", "f16", 131_072));
     }
 
     /// The registry must parse and carry the schema marker - a

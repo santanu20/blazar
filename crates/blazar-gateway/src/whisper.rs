@@ -1,12 +1,16 @@
-//! `/v1/audio/transcriptions` + `/v1/audio/translations`: local
-//! whisper.cpp lane (H8).
+//! `/v1/audio/transcriptions` + `/v1/audio/translations`: three lanes.
 //!
 //! Decision order:
 //! (1) explicit remote intent (`name:model`) always forwards - the user
 //!     named a remote;
-//! (2) local lane when whisper-server + at least one ggml model are
-//!     installed (lazy child, hot model swap);
-//! (3) otherwise a teaching error (llama.cpp children do not transcribe).
+//! (2) engine-row lane when the model field names a pulled llama.cpp
+//!     row: the request rides the child's native
+//!     `/v1/audio/transcriptions` (mtmd audio tower), buffered-only,
+//!     with the child's `{"type":"transcript.text.done"}` event
+//!     normalized to the OpenAI `{"text": ...}` shape;
+//! (3) local whisper.cpp lane when whisper-server + at least one ggml
+//!     model are installed (lazy child, hot model swap);
+//! (4) otherwise a teaching error.
 //!
 //! Multipart is parsed binary-safe: parts split ONLY on the exact random
 //! boundary - audio bytes cannot forge one.
@@ -1580,6 +1584,9 @@ pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response 
                 "no_language_probabilities",
             ],
         },
+        // Speech generation lives on the same audio plane; the speech
+        // lanes describe themselves (tts.rs owns the domain).
+        "speech": crate::tts::speech_capabilities(&state),
         "idle_timeout_secs": state.config.whisper_idle_secs,
     });
     Response::builder()
@@ -1589,6 +1596,186 @@ pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response 
             serde_json::to_vec(&body).unwrap_or_default(),
         ))
         .unwrap_or_else(|_| openai_error(500, "response build").into_response())
+}
+
+/// Normalize the child's transcription body to the OpenAI response
+/// shape. llama-server answers one buffered event
+/// `{"type":"transcript.text.done","text":...}` (plus usage) - relayed
+/// as `{"text": ...}`; a body that already carries a top-level `text`
+/// passes through byte-unchanged so a future engine revision that
+/// speaks OpenAI natively needs zero gateway change (pure function).
+fn normalize_engine_transcript(body: &[u8]) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("engine returned a non-JSON transcription body: {e}"))?;
+    if v.get("type").and_then(|t| t.as_str()) == Some("transcript.text.done") {
+        let text = v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| "engine transcript event carries no text".to_string())?;
+        let wrapped = serde_json::json!({ "text": text });
+        return serde_json::to_vec(&wrapped).map_err(|e| format!("serialize transcript: {e}"));
+    }
+    if v.get("text").is_some() {
+        return Ok(body.to_vec());
+    }
+    Err("engine transcription body carries no text field".to_string())
+}
+
+/// Engine-row ASR lane: the model field names a pulled llama.cpp row,
+/// so the multipart rides the child's native
+/// `/v1/audio/transcriptions` (mtmd audio tower). Buffered-only - the
+/// engine endpoint rejected `verbose_json` live (b12020) - so the
+/// whisper.cpp lane's stream/async/granularity/diarize surfaces teach
+/// here instead of silently degrading. Transcript quality is a
+/// model+tower property: conversational audio towers answer
+/// conversationally on this endpoint (observed live with Voxtral-Mini);
+/// whisper-encoder-class towers are its designed target.
+#[allow(clippy::too_many_lines)] // gates, admission, spawn, rebuild, forward, normalize
+async fn engine_asr_lane(
+    state: &Arc<AppState>,
+    key_ext: Option<&Extension<crate::keys::KeyCtx>>,
+    row: &blazar_core::store::ModelRow,
+    parts: &[Part],
+    file: &Part,
+    force_translate: bool,
+) -> Response {
+    if wants_stream(parts) || wants_async(parts) {
+        return openai_error(
+            400,
+            "stream and async are whisper.cpp-lane features - the engine endpoint answers \
+             one buffered JSON transcript: drop the flag, or use a ggml whisper model",
+        );
+    }
+    match granularity_plan(parts) {
+        Ok(Some(_)) => {
+            return openai_error(
+                400,
+                "timestamp_granularities needs the whisper.cpp lane's verbose_json segments \
+                 - the engine endpoint answers plain text: drop the field, or use a ggml \
+                 whisper model",
+            );
+        }
+        Err(msg) => return openai_error(400, &msg),
+        Ok(None) => {}
+    }
+    if diarize_requested(parts) {
+        return openai_error(
+            400,
+            "response_format=diarized_json is a whisper.cpp-lane feature - the engine \
+             endpoint answers plain text: drop the field, or use a ggml whisper model",
+        );
+    }
+    if row.mmproj_path.is_none() {
+        return openai_error(
+            400,
+            &format!(
+                "\"{}\" has no audio-tower sidecar attached - engine transcription runs \
+                 through the mmproj audio encoder. Attach one while the model is stopped: \
+                 `blazar mmproj {} <mmproj-file>` (audio-capable repos ship it as \
+                 mmproj-*.gguf), or use the whisper.cpp lane instead: `blazar whisper \
+                 --install` plus a ggml model",
+                row.name, row.name
+            ),
+        );
+    }
+    // Same admission bracket every gated lane pays: scope on the row
+    // name, rpm/tpm/daily, request count (audit MM1 - local compute is
+    // not a free lane on an authed gateway).
+    if let Err(resp) = state.admit_or_respond(key_ext, &row.name) {
+        return *resp;
+    }
+    // needs_vision attaches the sidecar at spawn (the @vision instance
+    // lane is the sidecar-attached instance of a row - here the sidecar
+    // is the audio tower). Ordinary interactive eviction economics.
+    let (engine, _load_ms) = match crate::proxy::ensure_with_admission(
+        state,
+        &row.name,
+        crate::queue::Priority::Normal,
+        crate::queue::WorkClass::Interactive,
+        None,
+        true, // sidecar-attached instance (audio tower rides mmproj)
+        false,
+        false,
+        false,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(resp) => return *resp,
+    };
+    let started = std::time::Instant::now();
+    let fields = forwarded_fields(parts, force_translate);
+    let file_bytes = file.data.clone();
+    let filename = file.filename.clone().unwrap_or_else(|| "audio".to_string());
+    let mime = file
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    // Media-class client + rebuilt multipart (whitelisted fields only -
+    // a client cannot inject engine flags the whitelist does not name,
+    // the same posture as the whisper.cpp lane's rebuild). The form is
+    // rebuilt per attempt: send_with_child_retry may respawn and call
+    // this closure twice, and a Form is consumed by the send.
+    let send = crate::proxy::send_with_child_retry(state, &engine, |eng| {
+        let url = format!(
+            "{}/v1/audio/transcriptions",
+            crate::proxy::child_base(&eng.endpoint)
+        );
+        let mut form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(file_bytes.clone())
+                .file_name(filename.clone())
+                .mime_str(&mime)
+                .unwrap_or_else(|_| reqwest::multipart::Part::bytes(file_bytes.clone())),
+        );
+        for (key, v) in &fields {
+            form = form.text(key.clone(), v.clone());
+        }
+        crate::proxy::child_auth(
+            crate::state::media_child_client(state, &eng.endpoint).post(&url),
+            eng,
+        )
+        .multipart(form)
+    })
+    .await;
+    let resp = match send {
+        Ok(r) => r,
+        Err(e) => return openai_error(502, &e),
+    };
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
+        return openai_error(status, &format!("engine error: {text}"));
+    }
+    let raw = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return openai_error(502, &format!("engine transcription body read failed: {e}")),
+    };
+    let normalized = match normalize_engine_transcript(&raw) {
+        Ok(b) => b,
+        Err(msg) => {
+            let head: String = String::from_utf8_lossy(&raw[..raw.len().min(120)]).to_string();
+            return openai_error(502, &format!("{msg}: {head}"));
+        }
+    };
+    tracing::info!(
+        model = %row.name,
+        bytes = raw.len(),
+        total_ms = started.elapsed().as_millis() as u64,
+        "engine transcription relayed"
+    );
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        normalized,
+    )
+        .into_response()
 }
 
 #[allow(clippy::too_many_lines)] // handler: parse, teach, gate, three delivery lanes
@@ -1643,7 +1830,20 @@ pub async fn audio_transcriptions(
         .await;
     }
 
-    // (2) Local lane: installed binary + pulled ggml model. Name the exact
+    // (2) Engine-row lane: the model names a pulled llama.cpp row, so
+    // transcription rides the child's native endpoint (mtmd audio
+    // tower). Whisper size names ("base", "whisper-1", ...) never
+    // resolve to store rows, so the whisper.cpp lane below is
+    // untouched for every input it serves today.
+    if let Some(name) = model.as_deref()
+        && let Some(Ok(row)) = state.with_store(|s| crate::proxy::resolve_model(s, name))
+        && crate::proxy::routed_kind_for(&state, name)
+            == Some(blazar_core::engine_kind::EngineKind::LlamaCpp)
+    {
+        return engine_asr_lane(&state, key_ext.as_ref(), &row, &parts, file, false).await;
+    }
+
+    // (3) Local lane: installed binary + pulled ggml model. Name the exact
     // missing half - "lane not installed" when the server binary is the
     // gap, "no model pulled" when the server is fine but transcription
     // has nothing to load (both halves observed live in validation).
@@ -1720,7 +1920,7 @@ pub async fn audio_transcriptions(
         .await;
     }
 
-    // (3) Teaching error: no local lane and no remote intent.
+    // (4) Teaching error: no local lane and no remote intent.
     openai_error(
         501,
         &teaching_detail(
@@ -1783,7 +1983,17 @@ pub async fn audio_translations(
         .await;
     }
 
-    // (2) Local lane, forced translation. Same admission as the remote
+    // (2) Engine-row lane (same routing as transcriptions; the child
+    // endpoint is shared - `translate` rides the rebuilt fields).
+    if let Some(name) = model.as_deref()
+        && let Some(Ok(row)) = state.with_store(|s| crate::proxy::resolve_model(s, name))
+        && crate::proxy::routed_kind_for(&state, name)
+            == Some(blazar_core::engine_kind::EngineKind::LlamaCpp)
+    {
+        return engine_asr_lane(&state, key_ext.as_ref(), &row, &parts, file, true).await;
+    }
+
+    // (3) Local lane, forced translation. Same admission as the remote
     // branch and every other gated lane (audit MM1).
     if let Err(resp) =
         state.admit_or_respond(key_ext.as_ref(), model.as_deref().unwrap_or("whisper-1"))
@@ -1855,7 +2065,7 @@ pub async fn audio_translations(
         .await;
     }
 
-    // (3) Teaching error: no local lane and no remote intent.
+    // (4) Teaching error: no local lane and no remote intent.
     openai_error(
         501,
         &teaching_detail(
@@ -1916,6 +2126,33 @@ mod tests {
         b.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
         let ct = format!("multipart/form-data; boundary={boundary}");
         (b, ct)
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__normalize_engine_transcript__event_wraps_text_openshape_passes_through() {
+        // llama-server b12020 event shape (live-probed with Voxtral):
+        // wrapped to the OpenAI {"text": ...} contract, usage dropped
+        // (the transcription response carries no usage; request-count
+        // charging happens at admission like every audio lane).
+        let event =
+            br#"{"type":"transcript.text.done","text":"hello world","usage":{"type":"tokens"}}"#;
+        let out = normalize_engine_transcript(event).expect("event normalizes");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["text"], "hello world");
+        assert!(v.get("usage").is_none() && v.get("type").is_none());
+
+        // A body that already speaks OpenAI passes through byte-unchanged
+        // (future engine revisions need zero gateway change).
+        let openshape = br#"{"text":"already openai","segments":[]}"#;
+        let out = normalize_engine_transcript(openshape).expect("passthrough");
+        assert_eq!(out, openshape.to_vec());
+
+        // Missing text, non-JSON, and textless event bodies are engine
+        // faults - surfaced, never improvised into an empty transcript.
+        assert!(normalize_engine_transcript(br#"{"type":"transcript.text.done"}"#).is_err());
+        assert!(normalize_engine_transcript(b"not json").is_err());
+        assert!(normalize_engine_transcript(br#"{"other":1}"#).is_err());
     }
 
     #[test]

@@ -721,7 +721,7 @@ pub async fn pull(
     hf: &HfClient,
     dirs: &BlazarDirs,
     size: &str,
-    on_progress: impl FnMut(u64, u64),
+    on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<PathBuf> {
     let valid = size
         .chars()
