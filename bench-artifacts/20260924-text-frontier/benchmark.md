@@ -4,22 +4,22 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11147-cuda, ollama-host
-- **harness**: bench_matrix v4 — `regenerated (slim format)`
+- **harness**: bench_matrix v4 - `regenerated (slim format)`
 - **blazar**: `blazar 0.11.0` (sandbox daemon binary)
-- **quality lane**: not-measured — no quality rows in this campaign (lane not reached for the selected providers/engines)
+- **quality lane**: not-measured - no quality rows in this campaign (lane not reached for the selected providers/engines)
 - all blazar-owned rows measured by `blazar 0.11.0`
 
 ## Notable findings
 
-- gateway vs direct decode (`b11147-cuda`, 2 configs): median -0.2%, 2/2 within ±5% (parity).
+- gateway vs direct decode (`b11147-cuda`, 2 configs): median -0.2%, 2/2 within +/-5% (parity).
 - concurrency system throughput (`b11147-cuda`, 1 streams): 38.7 vs direct 38.8 t/s = 1.00x.
-- concurrency system throughput (`b11147-cuda`, 2 streams): 39.0 vs direct 69.9 t/s = 0.56x — serialized/queued or wall-inflated (see note).
-- concurrency system throughput (`b11147-cuda`, 4 streams): 39.3 vs direct 108.3 t/s = 0.36x — serialized/queued or wall-inflated (see note).
-- concurrency system throughput (`b11147-cuda`, 8 streams): 39.3 vs direct 131.7 t/s = 0.30x — serialized/queued or wall-inflated (see note).
+- concurrency system throughput (`b11147-cuda`, 2 streams): 39.0 vs direct 69.9 t/s = 0.56x - serialized/queued or wall-inflated (see note).
+- concurrency system throughput (`b11147-cuda`, 4 streams): 39.3 vs direct 108.3 t/s = 0.36x - serialized/queued or wall-inflated (see note).
+- concurrency system throughput (`b11147-cuda`, 8 streams): 39.3 vs direct 131.7 t/s = 0.30x - serialized/queued or wall-inflated (see note).
 - kv=q8_0 (`b11147-cuda`): decode -0.7% vs baseline
 - spec=ngram-simple (`b11147-cuda`): decode -0.8% vs baseline
 - mmproj=True (`b11147-cuda`): decode +0.3% vs baseline
-- gateway greedy transparency (`b11147-cuda`): 20/20 exact vs same-engine direct — transparent.
+- gateway greedy transparency (`b11147-cuda`): 20/20 exact vs same-engine direct - transparent.
 
 ## Charts
 
@@ -95,13 +95,13 @@ _Seconds to first token after a cold start (page cache dropped) and after idle-p
 - sys t/s = total tokens / wall (true system throughput); flat sys t/s with growing ttft max means streams queued on a fixed slot count instead of being served concurrently.
 
 
-## Quality — greedy parity vs `reference`-direct (backend numerics)
+## Quality - greedy parity vs `reference`-direct (backend numerics)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
 | b11147-cuda | 20/20 | 1.0 | 1.0 | 798.5 |
 
-## Quality — gateway transparency (blazar path vs direct, same engine)
+## Quality - gateway transparency (blazar path vs direct, same engine)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|

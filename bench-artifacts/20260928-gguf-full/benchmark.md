@@ -4,22 +4,22 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11202-cuda, b5130, inventory, master-920-2f88688, ollama-host, piper, v0.9.4
-- **harness**: bench_matrix v4 — `--model qwen3.5-9b --artifacts-dir bench-artifacts/20260928-gguf-full --md BENCHMARK.md`
+- **harness**: bench_matrix v4 - `--model qwen3.5-9b --artifacts-dir bench-artifacts/20260928-gguf-full --md BENCHMARK.md`
 - **blazar**: `blazar 0.13.0` (sandbox daemon binary)
-- **quality lane**: not-measured — no quality rows in this campaign (lane not reached for the selected providers/engines)
+- **quality lane**: not-measured - no quality rows in this campaign (lane not reached for the selected providers/engines)
 - all blazar-owned rows measured by `blazar 0.13.0`
 
 ## Notable findings
 
-- gateway vs direct decode (`b11202-cuda`, 17 configs): median -0.5%, 16/17 within ±5% (parity); outliers: no_kv_offload_on -55.0%.
-- gateway vs direct decode (`v0.9.4`, 12 configs): median +125.4%, 0/12 within ±5% (parity); outliers: mr_prefix_cache_256 +124.8%, mr_enc_cache_512mb +125.0%, deterministic_on +125.1%, pa_mem_0.55 +125.2%, kv_unified_on +125.3%, pa_mem_0.85 +125.3%, kv_unified_off +125.4%, default +125.6%, spec_off +127.4%, single-stream +127.6%, mr_batch_64 +128.1%, paged_attn_off +128.1%.
+- gateway vs direct decode (`b11202-cuda`, 17 configs): median -0.5%, 16/17 within +/-5% (parity); outliers: no_kv_offload_on -55.0%.
+- gateway vs direct decode (`v0.9.4`, 12 configs): median +125.4%, 0/12 within +/-5% (parity); outliers: mr_prefix_cache_256 +124.8%, mr_enc_cache_512mb +125.0%, deterministic_on +125.1%, pa_mem_0.55 +125.2%, kv_unified_on +125.3%, pa_mem_0.85 +125.3%, kv_unified_off +125.4%, default +125.6%, spec_off +127.4%, single-stream +127.6%, mr_batch_64 +128.1%, paged_attn_off +128.1%.
 - concurrency system throughput (`b11202-cuda`, 4 streams): 67.5 vs direct 110.6 t/s = 0.61x.
 - kv=q8_0 (`b11202-cuda`): decode -0.5% vs baseline
 - pa=on (`b11202-cuda`): decode +0.6% vs baseline
 - spec=ngram-simple (`b11202-cuda`): decode -0.5% vs baseline
 - mmproj=True (`b11202-cuda`): decode +0.4% vs baseline
 - pa=off (`v0.9.4`): decode -14.3% vs baseline
-- gateway greedy transparency (`b11202-cuda`): 16/20 exact vs same-engine direct — NOT TRANSPARENT.
+- gateway greedy transparency (`b11202-cuda`): 16/20 exact vs same-engine direct - NOT TRANSPARENT.
 
 ## Charts
 
@@ -150,22 +150,22 @@ _Perplexity per KV-cache quantization configuration (whiskers: standard error); 
 - sys t/s = total tokens / wall (true system throughput); flat sys t/s with growing ttft max means streams queued on a fixed slot count instead of being served concurrently.
 
 
-## Quality — perplexity (identical pinned args)
+## Quality - perplexity (identical pinned args)
 
 | engine | perplexity | +/- err | wall (s) | note |
 |---|---|---|---|---|
 | b11202-cuda | 17.3512 | 0.91919 | 10.0 | lower = better text fit |
 | v0.9.4 | 17.3512 | 0.91919 | 10.4 | lower = better text fit |
-- corpus: deterministic offline repo text (code-heavy) — PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
+- corpus: deterministic offline repo text (code-heavy) - PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
 
-## Quality — greedy parity vs `reference`-direct (backend numerics)
+## Quality - greedy parity vs `reference`-direct (backend numerics)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
 | b11202-cuda | 20/20 | 1.0 | 1.0 | 928.5 |
 | v0.9.4 | 0/20 | 0.5143 | 0.0 | 0.0 |
 
-## Quality — gateway transparency (blazar path vs direct, same engine)
+## Quality - gateway transparency (blazar path vs direct, same engine)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|

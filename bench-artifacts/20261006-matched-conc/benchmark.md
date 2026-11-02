@@ -4,14 +4,14 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11429-cuda, inventory, ollama-host
-- **harness**: bench_matrix v4 — `--artifacts-dir bench-artifacts/20261006-matched-conc --engines b11429-cuda --providers direct blazar blazar-matched --conc-sweep 1,2,4,8 --conc-rounds 3 --skip-ppl --skip-greedy --skip-tools --skip-reshape --skip-features --skip-idle --skip-ctxcurve --skip-quality --skip-variants --skip-media --fresh`
+- **harness**: bench_matrix v4 - `--artifacts-dir bench-artifacts/20261006-matched-conc --engines b11429-cuda --providers direct blazar blazar-matched --conc-sweep 1,2,4,8 --conc-rounds 3 --skip-ppl --skip-greedy --skip-tools --skip-reshape --skip-features --skip-idle --skip-ctxcurve --skip-quality --skip-variants --skip-media --fresh`
 - **blazar**: `blazar 0.21.1` (sandbox daemon binary)
-- **quality lane**: skipped — --skip-quality: no checker-verified receipts back any speed number in this campaign
+- **quality lane**: skipped - --skip-quality: no checker-verified receipts back any speed number in this campaign
 - all blazar-owned rows measured by `blazar 0.21.1`
 
 ## Notable findings
 
-- gateway vs direct decode (`b11429-cuda`, 2 configs): median -0.2%, 2/2 within ±5% (parity).
+- gateway vs direct decode (`b11429-cuda`, 2 configs): median -0.2%, 2/2 within +/-5% (parity).
 - concurrency system throughput (`b11429-cuda`, 1 streams): 36.8 vs direct 40.1 t/s = 0.92x.
 - concurrency system throughput (`b11429-cuda`, 2 streams): 57.9 vs direct 70.7 t/s = 0.82x.
 - concurrency system throughput (`b11429-cuda`, 4 streams): 85.1 vs direct 110.3 t/s = 0.77x.

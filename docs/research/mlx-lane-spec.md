@@ -5,7 +5,7 @@ description: "Research note: the design spec for the MLX engine lane."
 doc_kind: "Research note"
 ---
 
-# MLX lane (F8) — implemented design
+# MLX lane (F8) - implemented design
 
 Status: **implemented on `feat/next-wave`** (2026-10-02). The original spec
 staged this lane behind Mac hardware; MLX now ships an official CUDA backend,
@@ -13,7 +13,7 @@ so the lane ships for Linux+NVIDIA too and was live-validated on the dev box.
 
 ## What the lane is
 
-`EngineKind::Mlx` — a pip-venv lane wrapping `mlx_lm.server` (Apple's official
+`EngineKind::Mlx` - a pip-venv lane wrapping `mlx_lm.server` (Apple's official
 OpenAI-compatible server), identical in shape to the sglang lane:
 
 - **Linux + NVIDIA:** `mlx-lm==0.32.0` + `mlx[cuda12]==0.32.2` (dual pin).
@@ -25,7 +25,7 @@ OpenAI-compatible server), identical in shape to the sglang lane:
 
 The standalone `mlx-cuda` PyPI wheel (0.30.0) was the pre-0.32 distribution.
 Since mlx-lm 0.32, CUDA rides the **standard `mlx` package as extras**
-(`mlx[cuda12]`, `mlx[cuda13]`, `mlx[cpu]`) — that is what mlx-lm's own
+(`mlx[cuda12]`, `mlx[cuda13]`, `mlx[cpu]`) - that is what mlx-lm's own
 dependency metadata resolves. `cuda12` (not `cuda13`) is pinned for the
 broadest driver base (>= 525) and one tested surface. The dual version pins
 are visible in the store row's asset label:
@@ -33,7 +33,7 @@ are visible in the store row's asset label:
 
 ## Install / update / doctor
 
-- `blazar engine install --kind mlx` — venv (uv when present) + shim
+- `blazar engine install --kind mlx` - venv (uv when present) + shim
   `mlx-server` (`python -m mlx_lm.server`) + boot-smoke
   (`import mlx_lm.server`) inside the same rollback discipline as sglang
   (install_with_rollback): an unbootable venv never becomes an activatable
@@ -42,7 +42,7 @@ are visible in the store row's asset label:
   adjacent in the fixed walk order: llamacpp, mistralrs, sglang, mlx, sdcpp,
   whisper).
 - `blazar doctor` shows a PyPI currency row for the lane (`mlx-lm pip lane`).
-- `lane_max_n(Mlx) = 8` (plane default — unprobed, never under-promised).
+- `lane_max_n(Mlx) = 8` (plane default - unprobed, never under-promised).
 
 ## Serving
 
@@ -51,7 +51,7 @@ are visible in the store row's asset label:
   isolation (not every mlx-lm build ships `--api-key`); the supervisor's
   child-auth mint appends the secret when the installed build supports it
   (flag surface is probed into the manifest at install).
-- Health: poll `GET /v1/models` until 200 — mlx_lm.server has no dedicated
+- Health: poll `GET /v1/models` until 200 - mlx_lm.server has no dedicated
   `/health` route; the OpenAI surface answers once weights are loaded.
 - Warm peg: same JIT class as sglang (python import chain is torch-class
   slow; `[warm_peg] mlx` overrides, default on).
@@ -64,14 +64,14 @@ are visible in the store row's asset label:
 
 ## Model routing (two-sided, never silent)
 
-- Detection: `ModelRow::is_mlx()` — a strict `mlx` token in the row's
+- Detection: `ModelRow::is_mlx()` - a strict `mlx` token in the row's
   name/repo/path **and** the path being a directory (MLX dirs are
   quantized-safetensors-shaped; the token + dir gate is the discriminator,
   consulted before `is_quantized_safetensors()`).
 - `route_format(mlx = true)` routes to the Mlx lane **before** the
-  quantized-safetensors arm — an installed sglang must never shadow an MLX
+  quantized-safetensors arm - an installed sglang must never shadow an MLX
   dir, and only mlx-lm can decode those quants.
-- Absent lane: `LaneError::MlxUnserved` teaching at serve time —
+- Absent lane: `LaneError::MlxUnserved` teaching at serve time -
   `blazar engine install --kind mlx`; pulls still succeed (files are
   lane-agnostic) and the search/pull hints name the install command.
 - Pull: mlx-community dirs ride the existing safetensors-dir machinery
@@ -80,7 +80,7 @@ are visible in the store row's asset label:
 
 ## Config
 
-No `[mlx]` table exists yet — extra flags ride the generic
+No `[mlx]` table exists yet - extra flags ride the generic
 `[model_overrides.<name>] argv` passthrough. The knob-hint block says so
 explicitly rather than advertising an unsettable table. A real table lands
 if/when mlx-lm knobs need first-class pins.
@@ -100,4 +100,4 @@ wheels, shim `--help` probe receipt, pull
 `mlx-community/Qwen2.5-0.5B-Instruct-4bit`, chat 200 through the gateway,
 `blazar bench` vs the same-size GGUF on llamacpp (receipt names both quant
 formats), full workspace suite, hygiene gate, deploy ritual
-(stop → copy → md5 verify → start).
+(stop -> copy -> md5 verify -> start).

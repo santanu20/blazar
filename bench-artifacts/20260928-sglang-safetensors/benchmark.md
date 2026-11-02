@@ -4,14 +4,14 @@
 - **model**: `qwen3-1.7b.d` (3890 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: inventory, ollama-host, piper, sglang-0.5.19
-- **harness**: bench_matrix v4 — `--model qwen3-1.7b --engines sglang-0.5.19 --artifacts-dir bench-artifacts/20260928-sglang-safetensors --md bench-artifa`
+- **harness**: bench_matrix v4 - `--model qwen3-1.7b --engines sglang-0.5.19 --artifacts-dir bench-artifacts/20260928-sglang-safetensors --md bench-artifa`
 - **blazar**: `blazar 0.13.0` (sandbox daemon binary)
-- **quality lane**: not-measured — no quality rows in this campaign (lane not reached for the selected providers/engines)
+- **quality lane**: not-measured - no quality rows in this campaign (lane not reached for the selected providers/engines)
 - all blazar-owned rows measured by `blazar 0.13.0`
 
 ## Notable findings
 
-- 2 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior — see Failed cells.
+- 2 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior - see Failed cells.
 
 ## Charts
 
@@ -94,14 +94,14 @@ _Seconds to first token after a cold start (page cache dropped) and after idle-p
 - sys t/s = total tokens / wall (true system throughput); flat sys t/s with growing ttft max means streams queued on a fixed slot count instead of being served concurrently.
 
 
-## Quality — perplexity (identical pinned args)
+## Quality - perplexity (identical pinned args)
 
 | engine | perplexity | +/- err | wall (s) | note |
 |---|---|---|---|---|
 | sglang-0.5.19 | - | - | - | no llama-perplexity binary on this box |
 | sglang-0.5.19 | - | - | - | no PPL line in llama-perplexity output (exit 1); tail: " model from ~/.local/share/blazar/models/qwen3-1.7b.d\n0.00.566.159 E llama_model_load_from_file_impl: failed to load model\n0.00.566.164 E cmn  common_init_: failed to load model '~/.local/share/blazar/models/qwen3-1.7b.d'\n0.00.566.173 E llama_perplexity: unable to load model\n" |
 | sglang-0.5.19 | - | - | - | lower = better text fit |
-- corpus: deterministic offline repo text (code-heavy) — PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
+- corpus: deterministic offline repo text (code-heavy) - PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
 
 ## Feature matrix
 
@@ -132,7 +132,7 @@ _Seconds to first token after a cold start (page cache dropped) and after idle-p
 - `sglang-0.5.19` / ppl / {'ppl': 2048}: no llama-perplexity binary on this box
 - `sglang-0.5.19` / ppl / {'ppl': 2048}: no PPL line in llama-perplexity output (exit 1); tail: " model from ~/.local/share/blazar/models/qwen3-1.7b.d\n0.00.566.159 E llama_model_load_from_file_impl...
 
-**environment** (box/co-residency guards — NOT blazar defects):
+**environment** (box/co-residency guards - NOT blazar defects):
 
 - `sglang-0.5.19` / blazar (2 cells): GPU memory floor exceeded before cell [{'config': 'mem_frac_0.90'}; {'config': 'hicache_on'}]
 

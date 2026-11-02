@@ -36,4 +36,4 @@ v0.9.4 | mistralrs | greedy | {'greedy': True} | - | - | - | - | - | - | - | - |
 b11429-cuda | llamacpp | greedy_gw | {'greedy_gw': True} | - | - | - | - | - | - | - | - | 0 | - | - | - | - | - | - | 0 | -
 ollama-host | ollama | greedy_ollama | {'greedy_ollama': True} | - | - | - | - | - | - | - | - | 0 | - | - | - | - | - | - | 0 | -
 
-quality lane: skipped — --skip-quality: no checker-verified receipts back any speed number in this campaign
+quality lane: skipped - --skip-quality: no checker-verified receipts back any speed number in this campaign

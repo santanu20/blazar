@@ -4,20 +4,20 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11429-cuda, inventory, ollama-host, v0.9.4
-- **harness**: bench_matrix v4 — `--model qwen3.5-9b --engines b11429-cuda --providers direct blazar --conc-sweep 1,2,4,8 --skip-ppl --skip-tools --skip-quality --skip-media --skip-features --skip-ctxcurve --skip-reshape --skip-idle --skip-variants --blazar-bin ./target/release/blazar --artifacts-dir bench-artifacts/2026-10-07-overhead --md bench-artifacts/2026-10-07-overhead/report.md`
+- **harness**: bench_matrix v4 - `--model qwen3.5-9b --engines b11429-cuda --providers direct blazar --conc-sweep 1,2,4,8 --skip-ppl --skip-tools --skip-quality --skip-media --skip-features --skip-ctxcurve --skip-reshape --skip-idle --skip-variants --blazar-bin ./target/release/blazar --artifacts-dir bench-artifacts/2026-10-07-overhead --md bench-artifacts/2026-10-07-overhead/report.md`
 - **blazar**: `blazar 0.22.0` (sandbox daemon binary)
-- **quality lane**: skipped — --skip-quality: no checker-verified receipts back any speed number in this campaign
+- **quality lane**: skipped - --skip-quality: no checker-verified receipts back any speed number in this campaign
 - all blazar-owned rows measured by `blazar 0.22.0`
 
 ## Notable findings
 
-- gateway vs direct decode (`v0.9.4`, 1 configs): median -11.5%, 0/1 within ±5% (parity); outliers: single-stream -11.5%.
+- gateway vs direct decode (`v0.9.4`, 1 configs): median -11.5%, 0/1 within +/-5% (parity); outliers: single-stream -11.5%.
 - concurrency system throughput (`b11429-cuda`, 1 streams): 36.1 vs direct 39.3 t/s = 0.92x.
 - concurrency system throughput (`b11429-cuda`, 2 streams): 59.1 vs direct 70.0 t/s = 0.84x.
 - concurrency system throughput (`b11429-cuda`, 4 streams): 86.1 vs direct 109.1 t/s = 0.79x.
 - concurrency system throughput (`b11429-cuda`, 8 streams): 87.9 vs direct 131.9 t/s = 0.67x.
-- gateway greedy transparency (`b11429-cuda`): 7/20 exact vs same-engine direct — NOT TRANSPARENT.
-- 3 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior — see Failed cells.
+- gateway greedy transparency (`b11429-cuda`): 7/20 exact vs same-engine direct - NOT TRANSPARENT.
+- 3 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior - see Failed cells.
 
 ## Charts
 
@@ -94,14 +94,14 @@ _Seconds to first token after a cold start (page cache dropped) and after idle-p
 - sys t/s = total tokens / wall (true system throughput); flat sys t/s with growing ttft max means streams queued on a fixed slot count instead of being served concurrently.
 
 
-## Quality — greedy parity vs `b11429-cuda`-direct (backend numerics)
+## Quality - greedy parity vs `b11429-cuda`-direct (backend numerics)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
-| b11429-cuda *(self — trivially 1.0) | 20/20 | 1.0 | 1.0 | 928.5 |
+| b11429-cuda *(self - trivially 1.0) | 20/20 | 1.0 | 1.0 | 928.5 |
 | v0.9.4 | 0/20 | 0.5143 | 0.0 | 0.0 |
 
-## Quality — gateway transparency (blazar path vs direct, same engine)
+## Quality - gateway transparency (blazar path vs direct, same engine)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
@@ -136,7 +136,7 @@ _Seconds to first token after a cold start (page cache dropped) and after idle-p
 - `v0.9.4` / direct / {'ctx': 16384, 'np': 1}: child exited rc=1 during load; last output: Error: This model does not fit on the devices ["cuda[0] (avail: 7639MB)", "cpu (avail: 6902MB)"], and exceeds tot...
 - `v0.9.4` / direct / {'ctx': 16384, 'np': 4}: child exited rc=1 during load; last output: Error: This model does not fit on the devices ["cuda[0] (avail: 7639MB)", "cpu (avail: 6932MB)"], and exceeds tot...
 
-**environment** (box/co-residency guards — NOT blazar defects):
+**environment** (box/co-residency guards - NOT blazar defects):
 
 - `b11429-cuda` / blazar / {'config': 'default'}: blazar cell crashed: MemAvailable 7092 MiB < needed ~7731 MiB (model 5366 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop ...
 - `b11429-cuda` / blazar / {'config': 'single-stream'}: blazar cell crashed: MemAvailable 7360 MiB < needed ~7731 MiB (model 5366 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop ...

@@ -4,9 +4,9 @@
 - **model**: `blazar-regen-blazar-regen-blazar-regen-sd_xl_base_1.0.safetensors` (6616 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b5130, master-890-74988b2, piper
-- **harness**: bench_matrix v4 — `regenerated (slim format)`
+- **harness**: bench_matrix v4 - `regenerated (slim format)`
 - **blazar**: `blazar 0.10.0` (sandbox daemon binary)
-- **quality lane**: not-measured — no quality rows in this campaign (lane not reached for the selected providers/engines)
+- **quality lane**: not-measured - no quality rows in this campaign (lane not reached for the selected providers/engines)
 
 ## Feature matrix
 

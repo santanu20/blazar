@@ -4,14 +4,14 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11393-cuda, inventory, ollama-host
-- **harness**: bench_matrix v4 — `--artifacts-dir bench-artifacts/20261005-kv-quality-r3 --model qwen3.5-9b --engines b11393-cuda --providers blazar --ski`
+- **harness**: bench_matrix v4 - `--artifacts-dir bench-artifacts/20261005-kv-quality-r3 --model qwen3.5-9b --engines b11393-cuda --providers blazar --ski`
 - **blazar**: `blazar 0.20.0` (sandbox daemon binary)
-- **quality lane**: ran — 1 scored row(s); suites: code, instruct, multilingual, niah, reason, safety, schema
+- **quality lane**: ran - 1 scored row(s); suites: code, instruct, multilingual, niah, reason, safety, schema
 - all blazar-owned rows measured by `blazar 0.20.0`
 
 ## Notable findings
 
-- 5 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior — see Failed cells.
+- 5 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior - see Failed cells.
 
 ## Charts
 
@@ -102,7 +102,7 @@ _Deterministic-checker pass rates per suite (reasoning, instruction following, c
 
 - `b11393-cuda` / quality / {'config': 'default'}: quality cell crashed: daemon exited early; log:
 
-**environment** (box/co-residency guards — NOT blazar defects):
+**environment** (box/co-residency guards - NOT blazar defects):
 
 - `b11393-cuda` / blazar / {'config': 'default'}: blazar cell crashed: MemAvailable 7102 MiB < needed ~7731 MiB (model 5366 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop ...
 - `b11393-cuda` / blazar / {'config': 'single-stream'}: blazar cell crashed: MemAvailable 7160 MiB < needed ~7731 MiB (model 5366 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop ...

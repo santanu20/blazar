@@ -1,4 +1,4 @@
-# Enterprise cold-start & idle practices — wave 2 receipt (2026-10-09)
+# Enterprise cold-start & idle practices - wave 2 receipt (2026-10-09)
 
 Scope: approved follow-ups from the cold-start wave (sglang /proc key leak,
 idle CPU burn) + survey of how production serving stacks handle cold start,
@@ -15,7 +15,7 @@ back to `--api-key <secret>` for engines without `--api-key-file` (sglang
 that key guarded nothing while publishing a `plm_` secret to every local
 process. The lane is now refused: argv-only engines mint **no** key and log
 one INFO line naming the real boundary (127.0.0.1 bind + random high port +
-residency-bounded lifetime — identical posture to the mlx/freetoken lanes
+residency-bounded lifetime - identical posture to the mlx/freetoken lanes
 that already run auth-less). The llamacpp keyfile lane (0600 file, path-only
 argv) is untouched; `validate.py --phase=knobs_behavior` re-proves
 direct-to-child 401 + proxied 200.
@@ -41,13 +41,13 @@ knob) or a user `extra_args` pin.
 | measurement | before | after |
 |---|---|---|
 | idle scheduler CPU (% of one core, 15s stat delta) | ~101% | **1%** |
-| TTFT warm vs after 70s idle (temp-0, 64 tok stream) | 49ms | 47–63ms band, same 5-probe run |
-| temp-0 output sha across sleep boundary | — | identical (5/5) |
+| TTFT warm vs after 70s idle (temp-0, 64 tok stream) | 49ms | 47-63ms band, same 5-probe run |
+| temp-0 output sha across sleep boundary | - | identical (5/5) |
 
 Wake cost is noise-scale: the after-idle probe sits inside the warm probes'
 own variance band, and deterministic output is unchanged.
 
-Note: this flag is CPU-idle hygiene only — it is NOT vLLM-style weight
+Note: this flag is CPU-idle hygiene only - it is NOT vLLM-style weight
 offload (see mapping below). Blazar's idle story on the sglang lane remains
 full residency + `idle_sleep_secs` eviction; the REPL pre-spawn from the
 previous wave hides the re-spawn cost from the user.
@@ -58,9 +58,9 @@ previous wave hides the re-spawn cost from the user.
 |---|---|---|
 | vLLM sleep mode | `/sleep`+`/wake_up` HTTP; level 1 offloads weights to CPU RAM + drops KV, level 2 drops both; fast wake for same model | gap on sglang lane (upstream has no equivalent); llama lane `--sleep-idle-seconds` is the same spirit; blazar compensates with REPL pre-spawn + admission coalescing |
 | NVIDIA Triton ModelWarmup | config-declared synthetic requests run at model load; readiness gated on warmup completion | shipped: health-gated readiness + warm-peg burst at spawn |
-| Ollama keep_alive | default 5m idle unload | `idle_sleep_secs = 300` default (configurable) — parity |
+| Ollama keep_alive | default 5m idle unload | `idle_sleep_secs = 300` default (configurable) - parity |
 | KServe / Ray Serve | scale-to-zero + min-replicas warm pools + keep-alive windows | single-node posture: resident model + idle eviction + pre-spawn; warm-pool N/A by design |
-| TGI | router warmup + startup probe | warm-peg + healthz gating — parity |
+| TGI | router warmup + startup probe | warm-peg + healthz gating - parity |
 
 Primary sources: docs.vllm.ai sleep_mode feature page; NVIDIA Triton server
 docs (model_configuration.md, ModelWarmup); KServe scaling docs; Ollama
@@ -85,5 +85,5 @@ and are not part of the tree.
 1. sglang: request `--api-key-file` (or env `SGLANG_API_KEY`) so the
    loopback child can carry real auth without argv exposure.
 2. sglang (optional, larger): vLLM-style weight-offload sleep levels for
-   multi-model laptops — would let blazar keep several models "warm" in
+   multi-model laptops - would let blazar keep several models "warm" in
    system RAM without VRAM pressure.

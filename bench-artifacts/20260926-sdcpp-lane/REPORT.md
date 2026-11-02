@@ -40,7 +40,7 @@ b11193-cuda: gateway 41.5 vs direct 41.4 t/s (+0.2%); b11193-cuda prompt-cache p
 | master-919-19bbbca | sdcpp | media | 2 | 0 | benchmarked |
 | b5130 | whisper | media | 1 | 0 | benchmarked |
 | b11193-cuda | llamacpp | text (direct + gateway) | 21 | 0 | benchmarked |
-| sglang-0.5.19 | — | — | 0 | 0 | excluded: needs an HF safetensors model; this box serves GGUF only and 8 GiB VRAM cannot host sglang beside the media children |
+| sglang-0.5.19 | - | - | 0 | 0 | excluded: needs an HF safetensors model; this box serves GGUF only and 8 GiB VRAM cannot host sglang beside the media children |
 
 ## Test bed
 
@@ -65,10 +65,10 @@ b11193-cuda: gateway 41.5 vs direct 41.4 t/s (+0.2%); b11193-cuda prompt-cache p
 - Tool calls: 6 single-turn scenarios (3-tool set: weather/calculate/flights), temperature 0, max 192 tokens (call JSON must complete); scored on well-formed calls, correct function selection, valid JSON arguments with required keys, and a no-tool control for false positives; stream deltas accumulated per OpenAI spec.
 - Gateway transparency: a second greedy lane through the blazar gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.
 - Perplexity: llama-perplexity on an offline ASCII corpus, ctx 2048.
-- Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime — a cold load is disk-cold, not memory-warm.
+- Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime - a cold load is disk-cold, not memory-warm.
 - Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).
 - ollama daemon boot is only measured with --ollama-service-restart (systemd restart, sudo password via BENCH_SUDO_PASSWORD env, stdin-only); without it the daemon stays warm and the row says so.
-- Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) — wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads — wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.
+- Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) - wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads - wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.
 - Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.
 - Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.
 - Every blazar row records the spawned engine's argv (slots/context shown in tables) and stamps blazar version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.
@@ -123,16 +123,16 @@ _sum-stream >> system t/s means streams serialize on one slot; roughly equal mea
 
 ### Adaptive reshape under sustained load (no-lag proof)
 
-| Runtime | reshape | slots | time to reshape s | req before/after | TTFT p50 before→after ms | sys t/s before→after | failed |
+| Runtime | reshape | slots | time to reshape s | req before/after | TTFT p50 before->after ms | sys t/s before->after | failed |
 |---|---|---|---:|---:|---:|---:|---:|
-| blazar gateway - b11193-cuda | NO | -→- | - | 118/0 | 16177→- | 36→- | 0 |
-| blazar gateway - v0.9.4 | NO | -→- | - | 118/0 | 15993→- | 36→- | 0 |
+| blazar gateway - b11193-cuda | NO | -->- | - | 118/0 | 16177->- | 36->- | 0 |
+| blazar gateway - v0.9.4 | NO | -->- | - | 118/0 | 15993->- | 36->- | 0 |
 
 ### Perplexity
 
 | Engine | perplexity (ctx 2048, offline ASCII corpus) |
 |---|---:|
-| b11193-cuda | 17.35 ± 0.92 |
+| b11193-cuda | 17.35 +/- 0.92 |
 | v0.9.4 | not applicable (tool is llama.cpp-family) |
 
 ### Greedy parity and gateway transparency (20 prompts, 256 tokens)
@@ -205,7 +205,7 @@ _Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes
 | blazar - v0.9.4 | sleep at 15s (weights stay RAM-resident) | yes | 2972 | - |  |
 | ollama - qwen3.5:9b | keep_alive 20s -> full unload | yes | 4934 | 4.81 |  |
 
-_blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._
+_blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design - the table measures each runtime's own idle path after the policy verifiably fired._
 
 ### Long-context degradation curve
 
@@ -233,7 +233,7 @@ _blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive
 | tts-conc - en_US-amy-medium (400 chars x4 pcm) | - | 4.50 | 4.58 | - | efficiency 3.91 of 4 streams |  | 1481ms max TTFB |
 | whisper - ggml-base (transcribes piper wav) | 2.16 | 1.90 | - | - | RTF 0.062 |  |  |
 
-_Media cells run through the same sandboxed gateway as text lanes but do not assert GPU-idle: a warm engine child is the normal serving shape, so each row stamps gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5) — media variance is dominated by the model, not the scheduler. Video frame counts are read from the EBML container (lacing-aware), never from an API field; the VRAM gate probe times how fast an over-budget request is rejected with a teaching error._
+_Media cells run through the same sandboxed gateway as text lanes but do not assert GPU-idle: a warm engine child is the normal serving shape, so each row stamps gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5) - media variance is dominated by the model, not the scheduler. Video frame counts are read from the EBML container (lacing-aware), never from an API field; the VRAM gate probe times how fast an over-budget request is rejected with a teaching error._
 
 ## Findings (this campaign)
 

@@ -4,9 +4,9 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11393-cuda, inventory, ollama-host
-- **harness**: bench_matrix v4 — `--artifacts-dir bench-artifacts/20261005-kv-quality-r5 --model qwen3.5-9b --engines b11393-cuda --providers blazar --ski`
+- **harness**: bench_matrix v4 - `--artifacts-dir bench-artifacts/20261005-kv-quality-r5 --model qwen3.5-9b --engines b11393-cuda --providers blazar --ski`
 - **blazar**: `blazar 0.20.0` (sandbox daemon binary)
-- **quality lane**: ran — 1 scored row(s); suites: code, instruct, multilingual, niah, reason, safety, schema
+- **quality lane**: ran - 1 scored row(s); suites: code, instruct, multilingual, niah, reason, safety, schema
 - all blazar-owned rows measured by `blazar 0.20.0`
 
 ## Charts

@@ -186,7 +186,7 @@ _Not measured in this campaign (20261012-e2e-perf-audit); tool calls lane not ru
 
 ### Quality suites (checker-verified, seeded, greedy)
 
-- _quality lane: **skipped** — --skip-quality: no checker-verified receipts back any speed number in this campaign_
+- _quality lane: **skipped** - --skip-quality: no checker-verified receipts back any speed number in this campaign_
 
 _Not measured in this campaign (20261012-e2e-perf-audit); quality suites lane not run._
 

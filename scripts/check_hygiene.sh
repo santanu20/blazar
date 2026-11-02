@@ -1,9 +1,10 @@
 #!/bin/sh
 # Hygiene gates: machine-specific absolute paths + AI-agent artifacts +
-# packaging license integrity.
+# packaging license integrity + CJK-rendering glyph control.
 # Blocks the classes a code review easily misses - real home dirs and
 # agent scratch paths baked into comments/fixtures, external project
-# names leaking into shipped source - at CI time. Exits non-zero
+# names leaking into shipped source, non-ASCII glyphs that render via
+# CJK fallback fonts - at CI time. Exits non-zero
 # listing every offending file:line.
 #
 # Usage: check_hygiene.sh [paths...]
@@ -79,20 +80,50 @@ scan_files() {
     done
 }
 
+# Glyph gate: CJK script outside allowlisted data sites, plus
+# render-fallback punctuation on NEW lines. Repo-anchored, so it runs
+# in no-args mode only. Reports codepoints, never glyph bytes.
+check_glyphs() {
+    command -v python3 >/dev/null 2>&1 ||
+        { echo "glyph gate: python3 required" >&2; return 1; }
+    python3 "$(dirname "$0")/check_glyphs.py"
+}
+
 license_fail=0
+glyph_fail=0
 if [ "$#" -gt 0 ]; then
     hits=$(printf '%s\n' "$@" | scan_files)
 else
     hits=$(git ls-files | scan_files)
     check_packaging_licenses || license_fail=1
+    check_glyphs || glyph_fail=1
 fi
 
-if [ -n "$hits" ] || [ "$license_fail" -ne 0 ]; then
+if [ -n "$hits" ] || [ "$license_fail" -ne 0 ] || [ "$glyph_fail" -ne 0 ]; then
     [ -n "$hits" ] && printf '%s\n' "$hits" >&2
-    echo "hygiene gate: machine-specific paths / AI artifacts / license gaps found (see above)" >&2
+    echo "hygiene gate: machine-specific paths / AI artifacts / license gaps / glyphs found (see above)" >&2
     exit 1
 fi
 echo "hygiene gate: clean"
+
+# Glyph-gate self-test: must fire on a CJK codepoint and stay silent on
+# ASCII (codepoints only - the test never writes a literal glyph).
+glyph_tmp=$(mktemp) || exit 1
+printf 'plain ascii line\n' >"$glyph_tmp"
+if python3 "$(dirname "$0")/check_glyphs.py" "$glyph_tmp" >/dev/null 2>&1; then
+    :
+else
+    echo "hygiene gate: SELF-TEST FAILED (clean file flagged by glyph gate)" >&2
+    rm -f "$glyph_tmp"
+    exit 1
+fi
+printf 'bad \344\270\255 line\n' >"$glyph_tmp"
+if python3 "$(dirname "$0")/check_glyphs.py" "$glyph_tmp" >/dev/null 2>&1; then
+    echo "hygiene gate: SELF-TEST FAILED (CJK codepoint not caught)" >&2
+    rm -f "$glyph_tmp"
+    exit 1
+fi
+rm -f "$glyph_tmp"
 
 # Self-test: the gate must fire on a violating file and stay silent on
 # a clean one - a gate that cannot fail protects nothing.

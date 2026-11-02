@@ -4,9 +4,9 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11393-cuda, inventory, ollama-host
-- **harness**: bench_matrix v4 — `--artifacts-dir bench-artifacts/20261005-kv-quality --model qwen3.5-9b --engines b11393-cuda --providers blazar --skip-p`
+- **harness**: bench_matrix v4 - `--artifacts-dir bench-artifacts/20261005-kv-quality --model qwen3.5-9b --engines b11393-cuda --providers blazar --skip-p`
 - **blazar**: `blazar 0.20.0` (sandbox daemon binary)
-- **quality lane**: ran — 1 scored row(s); suites: code, instruct, multilingual, niah, reason, safety, schema
+- **quality lane**: ran - 1 scored row(s); suites: code, instruct, multilingual, niah, reason, safety, schema
 - all blazar-owned rows measured by `blazar 0.20.0`
 
 ## Charts
@@ -45,14 +45,14 @@ _Perplexity per KV-cache quantization configuration (whiskers: standard error); 
 | b11393-cuda | blazar | config=single-stream child: np=1 ctx=16384 | 1 | 127 | 127 | 26 | 41.3 | 1328.2 | 6070 |
 | ollama-host | ollama | reference=True NOTE: serves 'qwen3.5:9b' - t/s NOT comparable | 1 | 123 | 123 | 75 | 40.5 | 1409.5 | 6566 |
 
-## Quality — perplexity (identical pinned args)
+## Quality - perplexity (identical pinned args)
 
 | engine | perplexity | +/- err | wall (s) | note |
 |---|---|---|---|---|
 | b11393-cuda | 5.3738 | 0.22409 | 18.6 | lower = better text fit |
 | b11393-cuda | 5.3615 | 0.22315 | 10.7 | lower = better text fit |
 | b11393-cuda | 5.3711 | 0.22331 | 8.1 | lower = better text fit |
-- corpus: deterministic offline repo text (code-heavy) — PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
+- corpus: deterministic offline repo text (code-heavy) - PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
 
 ## Feature matrix
 

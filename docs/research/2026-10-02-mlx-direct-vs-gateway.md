@@ -7,7 +7,7 @@ doc_kind: "Research note"
 
 # MLX lane: direct engine vs Blazar gateway (perf + quality receipt)
 
-Date: 2026-10-02 · Blazar 0.18.0 (feat/next-wave @ 6d5b582) · engine lane
+Date: 2026-10-02 | Blazar 0.18.0 (feat/next-wave @ 6d5b582) | engine lane
 `mlx-0.32.0` (`mlx-lm==0.32.0 + mlx[cuda12]==0.32.2`, engine-local cuda-home).
 
 ## Environment
@@ -17,28 +17,28 @@ Date: 2026-10-02 · Blazar 0.18.0 (feat/next-wave @ 6d5b582) · engine lane
 | Model | `mlx-community/Qwen2.5-0.5B-Instruct-4bit` (4-bit MLX dir, 265 MiB) |
 | Hardware | NVIDIA RTX 4070 (sm_89), 24 GB-class box |
 | OS | Linux 6.0-compatible kernel, glibc 2.39, X11 session |
-| Surfaces | direct = `python -m mlx_lm.server` on 127.0.0.1:41240 (CUDA_HOME=engine cuda-home) · gateway = `blazar` daemon :11435 (llamacpp b11344 active; mlx lane auto-routes by format) |
+| Surfaces | direct = `python -m mlx_lm.server` on 127.0.0.1:41240 (CUDA_HOME=engine cuda-home) | gateway = `blazar` daemon :11435 (llamacpp b11344 active; mlx lane auto-routes by format) |
 | Workload | non-stream chat, fixed prompt, max_tokens 128, temperature 0, N=5 per surface after 1 warmup; 1 streaming TTFT sample; 3 parity prompts |
 
 ## Perf (non-stream, warm; 101 completion tokens mean)
 
-| Surface | t₁…t₅ (s) | warm mean (t₂–t₅) | tok/s (completion / wall) |
+| Surface | t₁...t₅ (s) | warm mean (t₂-t₅) | tok/s (completion / wall) |
 |---|---|---|---|
 | direct mlx_lm.server | 1.225, 0.392, 0.382, 0.383, 0.383 | **0.385 s** | ~262 |
 | via Blazar gateway | 0.517, 0.400, 0.393, 0.396, 0.394 | **0.396 s** | ~255 |
-| **gateway overhead** | — | **+11 ms (~2.8%)** | −7 tok/s (−2.7%) |
+| **gateway overhead** | - | **+11 ms (~2.8%)** | -7 tok/s (-2.7%) |
 
-Streaming TTFT (SSE first byte): direct 5.5 ms · gateway 5.6 ms (**+0.1 ms**).
+Streaming TTFT (SSE first byte): direct 5.5 ms | gateway 5.6 ms (**+0.1 ms**).
 
 ## Quality parity (temperature 0)
 
 3/3 prompts byte-identical between surfaces ("sky blue" explanation, "capital
-of France", "count 1–5") — the gateway is a transparent passthrough for this
+of France", "count 1-5") - the gateway is a transparent passthrough for this
 lane: zero quality delta by construction, proven empirically.
 
 ## Reading
 
-- Overhead ≈ 11 ms/request at C=1 warm — admission + routing + streaming
+- Overhead ~ 11 ms/request at C=1 warm - admission + routing + streaming
   relay on top of the child. Well under one decode step (~4 ms/token here).
 - First-request JIT (kernel compile) affects both surfaces identically
   (31.7 s cold on this box, then ~0.4 s warm); the gateway adds nothing to it.

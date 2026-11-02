@@ -4,24 +4,24 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11147-cuda, b5130, inventory, master-890-74988b2, ollama-host, piper, v0.9.3
-- **harness**: bench_matrix v4 — `regenerated (slim format)`
+- **harness**: bench_matrix v4 - `regenerated (slim format)`
 - **blazar**: `blazar 0.11.0` (sandbox daemon binary)
-- **quality lane**: not-measured — no quality rows in this campaign (lane not reached for the selected providers/engines)
+- **quality lane**: not-measured - no quality rows in this campaign (lane not reached for the selected providers/engines)
 - all blazar-owned rows measured by `blazar 0.11.0`
 
 ## Notable findings
 
-- gateway vs direct decode (`b11147-cuda`, 2 configs): median -1.5%, 2/2 within ±5% (parity).
-- gateway vs direct decode (`v0.9.3`, 3 configs): median +109.1%, 0/3 within ±5% (parity); outliers: default +109.1%, single-stream +109.1%, paged_attn_off +109.3%.
+- gateway vs direct decode (`b11147-cuda`, 2 configs): median -1.5%, 2/2 within +/-5% (parity).
+- gateway vs direct decode (`v0.9.3`, 3 configs): median +109.1%, 0/3 within +/-5% (parity); outliers: default +109.1%, single-stream +109.1%, paged_attn_off +109.3%.
 - concurrency system throughput (`b11147-cuda`, 1 streams): 39.2 vs direct 38.8 t/s = 1.01x.
-- concurrency system throughput (`b11147-cuda`, 2 streams): 39.6 vs direct 71.0 t/s = 0.56x — serialized/queued or wall-inflated (see note).
-- concurrency system throughput (`b11147-cuda`, 4 streams): 39.8 vs direct 110.7 t/s = 0.36x — serialized/queued or wall-inflated (see note).
-- concurrency system throughput (`b11147-cuda`, 8 streams): 39.5 vs direct 133.5 t/s = 0.30x — serialized/queued or wall-inflated (see note).
+- concurrency system throughput (`b11147-cuda`, 2 streams): 39.6 vs direct 71.0 t/s = 0.56x - serialized/queued or wall-inflated (see note).
+- concurrency system throughput (`b11147-cuda`, 4 streams): 39.8 vs direct 110.7 t/s = 0.36x - serialized/queued or wall-inflated (see note).
+- concurrency system throughput (`b11147-cuda`, 8 streams): 39.5 vs direct 133.5 t/s = 0.30x - serialized/queued or wall-inflated (see note).
 - kv=q8_0 (`b11147-cuda`): decode -1.3% vs baseline
 - spec=ngram-simple (`b11147-cuda`): decode -2.4% vs baseline
 - mmproj=True (`b11147-cuda`): decode -1.7% vs baseline
-- gateway greedy transparency (`b11147-cuda`): 20/20 exact vs same-engine direct — transparent.
-- 5 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior — see Failed cells.
+- gateway greedy transparency (`b11147-cuda`): 20/20 exact vs same-engine direct - transparent.
+- 5 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior - see Failed cells.
 
 ## Charts
 
@@ -132,7 +132,7 @@ _Perplexity per KV-cache quantization configuration (whiskers: standard error); 
 - sys t/s = total tokens / wall (true system throughput); flat sys t/s with growing ttft max means streams queued on a fixed slot count instead of being served concurrently.
 
 
-## Quality — perplexity (identical pinned args)
+## Quality - perplexity (identical pinned args)
 
 | engine | perplexity | +/- err | wall (s) | note |
 |---|---|---|---|---|
@@ -143,16 +143,16 @@ _Perplexity per KV-cache quantization configuration (whiskers: standard error); 
 | v0.9.3 | - | - | - | llama-perplexity is llama-server-family only |
 | v0.9.3 | - | - | - | llama-perplexity is llama-server-family only |
 | v0.9.3 | - | - | - | llama-perplexity is llama-server-family only |
-- corpus: deterministic offline repo text (code-heavy) — PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
+- corpus: deterministic offline repo text (code-heavy) - PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
 
-## Quality — greedy parity vs `reference`-direct (backend numerics)
+## Quality - greedy parity vs `reference`-direct (backend numerics)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
 | b11147-cuda | 20/20 | 1.0 | 1.0 | 798.5 |
 | v0.9.3 | 0/20 | 0.5261 | 0.0 | 0.0 |
 
-## Quality — gateway transparency (blazar path vs direct, same engine)
+## Quality - gateway transparency (blazar path vs direct, same engine)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
@@ -185,11 +185,11 @@ _Perplexity per KV-cache quantization configuration (whiskers: standard error); 
 
 - `v0.9.3` / direct (32 cells): child exited rc=1 during load; last output: Error: Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/co... [{'ctx': 4096, 'np': 1}; {'ctx': 4096, 'np': 4}; {'ctx': 16384, 'np': 1}; {'ctx': 16384, 'np': 4}; +28 more]
 - `v0.9.3` / ppl (6 cells): llama-perplexity is llama-server-family only [{'ppl': 2048}; {'ppl': 2048}; {'ppl': 2048}; {'ppl': 2048}; +2 more]
-- `b11147-cuda` / tools / {'tools': True}: tools lane: every scenario failed transport — {"error":{"code":404,"message":"model \"Qwen3.5-9B-Q4_K_M.gguf\" not found; try `blazar list`","type":"blazar_e...
-- `v0.9.3` / tools (2 cells): tools lane: every scenario failed transport — {"error":{"code":404,"message":"model \"default\" not found; try `blazar list`","type":"blazar_error"}} [{'tools': True}; {'tools': True}]
+- `b11147-cuda` / tools / {'tools': True}: tools lane: every scenario failed transport - {"error":{"code":404,"message":"model \"Qwen3.5-9B-Q4_K_M.gguf\" not found; try `blazar list`","type":"blazar_e...
+- `v0.9.3` / tools (2 cells): tools lane: every scenario failed transport - {"error":{"code":404,"message":"model \"default\" not found; try `blazar list`","type":"blazar_error"}} [{'tools': True}; {'tools': True}]
 - `v0.9.3` / tools / {'tools': True}: tools cell crashed: '<=' not supported between instances of 'list' and 'set'
 
-**environment** (box/co-residency guards — NOT blazar defects):
+**environment** (box/co-residency guards - NOT blazar defects):
 
 - `v0.9.3` / direct (4 cells): GPU memory floor exceeded before cell [{'ctx': 4096, 'np': 1}; {'ctx': 4096, 'np': 4}; {'ctx': 16384, 'np': 1}; {'ctx': 16384, 'np': 4}]
 - `v0.9.3` / reshape / {'reshape': True}: reshape cell crashed: MemAvailable 6986 MiB < needed ~7795 MiB (model 5417 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop...

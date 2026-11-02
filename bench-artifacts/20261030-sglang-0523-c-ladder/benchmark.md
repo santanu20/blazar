@@ -4,9 +4,9 @@
 - **model**: `qwen3-1.7b.d` (3890 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.99.02
 - **engines**: inventory, ollama-host, sglang-0.5.23
-- **harness**: bench_matrix v4 — `--artifacts-dir bench-artifacts/20261030-sglang-0523-c-ladder --engines sglang-0.5.23 --providers blazar --model qwen3-1.7b.d --conc-sweep 1,2,4,8 --conc-rounds 3 --skip-ppl --skip-greedy --skip-tools --skip-reshape --skip-features --skip-idle --skip-ctxcurve --skip-quality --skip-variants --skip-media --fresh`
+- **harness**: bench_matrix v4 - `--artifacts-dir bench-artifacts/20261030-sglang-0523-c-ladder --engines sglang-0.5.23 --providers blazar --model qwen3-1.7b.d --conc-sweep 1,2,4,8 --conc-rounds 3 --skip-ppl --skip-greedy --skip-tools --skip-reshape --skip-features --skip-idle --skip-ctxcurve --skip-quality --skip-variants --skip-media --fresh`
 - **blazar**: `blazar 0.28.0` (sandbox daemon binary)
-- **quality lane**: skipped — --skip-quality: no checker-verified receipts back any speed number in this campaign
+- **quality lane**: skipped - --skip-quality: no checker-verified receipts back any speed number in this campaign
 - all blazar-owned rows measured by `blazar 0.28.0`
 
 ## Charts

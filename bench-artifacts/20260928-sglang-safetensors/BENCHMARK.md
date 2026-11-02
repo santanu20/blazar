@@ -33,11 +33,11 @@ _Rendered 20260928-sglang-safetensors; blazar 0.13.0; power state of gateway row
 
 | Engine | Kind | Lane | ok cells | err cells | Status |
 |---|---|---|---:|---:|---|
-| sglang-0.5.19 | sglang | — | 23 | 3 | benchmarked |
-| b11202-cuda | — | — | 0 | 0 | excluded: kind 'llamacpp' has no bench lane in this harness |
-| b5130 | — | — | 0 | 0 | excluded: kind 'whisper' has no bench lane in this harness |
-| master-920-2f88688 | — | — | 0 | 0 | excluded: kind 'sdcpp' has no bench lane in this harness |
-| v0.9.4 | — | — | 0 | 0 | excluded: kind 'mistralrs' has no bench lane in this harness |
+| sglang-0.5.19 | sglang | - | 23 | 3 | benchmarked |
+| b11202-cuda | - | - | 0 | 0 | excluded: kind 'llamacpp' has no bench lane in this harness |
+| b5130 | - | - | 0 | 0 | excluded: kind 'whisper' has no bench lane in this harness |
+| master-920-2f88688 | - | - | 0 | 0 | excluded: kind 'sdcpp' has no bench lane in this harness |
+| v0.9.4 | - | - | 0 | 0 | excluded: kind 'mistralrs' has no bench lane in this harness |
 
 ## Test bed
 
@@ -62,10 +62,10 @@ _Rendered 20260928-sglang-safetensors; blazar 0.13.0; power state of gateway row
 - Tool calls: 6 single-turn scenarios (3-tool set: weather/calculate/flights), temperature 0, max 192 tokens (call JSON must complete); scored on well-formed calls, correct function selection, valid JSON arguments with required keys, and a no-tool control for false positives; stream deltas accumulated per OpenAI spec.
 - Gateway transparency: a second greedy lane through the blazar gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.
 - Perplexity: llama-perplexity on an offline ASCII corpus, ctx 2048.
-- Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime — a cold load is disk-cold, not memory-warm.
+- Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime - a cold load is disk-cold, not memory-warm.
 - Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).
 - ollama daemon boot is only measured with --ollama-service-restart (systemd restart, sudo password via BENCH_SUDO_PASSWORD env, stdin-only); without it the daemon stays warm and the row says so.
-- Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) — wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads — wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.
+- Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) - wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads - wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.
 - Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.
 - Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.
 - Every blazar row records the spawned engine's argv (slots/context shown in tables) and stamps blazar version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.
@@ -122,9 +122,9 @@ _sum-stream >> system t/s means streams serialize on one slot; roughly equal mea
 
 ### Adaptive reshape under sustained load (no-lag proof)
 
-| Runtime | reshape | slots | time to reshape s | req before/after | TTFT p50 before→after ms | sys t/s before→after | failed |
+| Runtime | reshape | slots | time to reshape s | req before/after | TTFT p50 before->after ms | sys t/s before->after | failed |
 |---|---|---|---:|---:|---:|---:|---:|
-| blazar gateway - sglang-0.5.19 | NO | -→- | - | 369/0 | 3005→- | 117→- | 0 |
+| blazar gateway - sglang-0.5.19 | NO | -->- | - | 369/0 | 3005->- | 117->- | 0 |
 
 ### Perplexity
 
@@ -153,19 +153,19 @@ _Not measured in this campaign (20260928-sglang-safetensors); optimization axes 
 
 | Engine | config | decode t/s | decode Δ% | ttft p50 ms | ttft Δ% | GPU peak MiB | GPU Δ | output vs default |
 |---|---|---:|---:|---:|---:|---:|---:|:-:|
-| sglang-0.5.19 | single-stream | 67.6 | +0.0% | 33 | +0.6% | 6340 | -130 | ✓ same |
-| sglang-0.5.19 | kv_unified_on | 67.6 | +0.0% | 33 | +0.2% | 6450 | -20 | ✓ same |
-| sglang-0.5.19 | kv_unified_off | 67.6 | +0.0% | 33 | +1.3% | 6490 | +20 | ✓ same |
-| sglang-0.5.19 | spec_off | 67.6 | +0.0% | 33 | +1.9% | 6482 | +12 | ✓ same |
-| sglang-0.5.19 | deterministic_on | 39.5 | -41.6% | 59 | +82.1% | 6742 | +272 | ✓ same |
-| sglang-0.5.19 | radix_session_on | 67.7 | +0.1% | 33 | +1.8% | 6484 | +14 | ✓ same |
-| sglang-0.5.19 | chunked_prefill_4096 | 67.6 | +0.0% | 33 | +1.4% | 6738 | +268 | ✓ same |
-| sglang-0.5.19 | page_64 | 67.6 | -0.0% | 33 | +1.6% | 6490 | +20 | ✓ same |
-| sglang-0.5.19 | torch_compile_on | 68.7 | +1.6% | 32 | -0.0% | 7070 | +600 | ✓ same |
-| sglang-0.5.19 | kv_dtype_bf16 | 67.7 | +0.1% | 33 | +2.4% | 6416 | -54 | ✓ same |
-| sglang-0.5.19 | kv_dtype_e4m3 | 67.4 | -0.3% | 33 | +2.0% | 6474 | +4 | ⚠ drift |
-| sglang-0.5.19 | cg_bs_16 | 67.6 | +0.0% | 33 | +2.1% | 6470 | +0 | ✓ same |
-| sglang-0.5.19 | cg_bs_256 | 67.6 | +0.0% | 33 | +1.1% | 6804 | +334 | ✓ same |
+| sglang-0.5.19 | single-stream | 67.6 | +0.0% | 33 | +0.6% | 6340 | -130 | OK same |
+| sglang-0.5.19 | kv_unified_on | 67.6 | +0.0% | 33 | +0.2% | 6450 | -20 | OK same |
+| sglang-0.5.19 | kv_unified_off | 67.6 | +0.0% | 33 | +1.3% | 6490 | +20 | OK same |
+| sglang-0.5.19 | spec_off | 67.6 | +0.0% | 33 | +1.9% | 6482 | +12 | OK same |
+| sglang-0.5.19 | deterministic_on | 39.5 | -41.6% | 59 | +82.1% | 6742 | +272 | OK same |
+| sglang-0.5.19 | radix_session_on | 67.7 | +0.1% | 33 | +1.8% | 6484 | +14 | OK same |
+| sglang-0.5.19 | chunked_prefill_4096 | 67.6 | +0.0% | 33 | +1.4% | 6738 | +268 | OK same |
+| sglang-0.5.19 | page_64 | 67.6 | -0.0% | 33 | +1.6% | 6490 | +20 | OK same |
+| sglang-0.5.19 | torch_compile_on | 68.7 | +1.6% | 32 | -0.0% | 7070 | +600 | OK same |
+| sglang-0.5.19 | kv_dtype_bf16 | 67.7 | +0.1% | 33 | +2.4% | 6416 | -54 | OK same |
+| sglang-0.5.19 | kv_dtype_e4m3 | 67.4 | -0.3% | 33 | +2.0% | 6474 | +4 | WARN drift |
+| sglang-0.5.19 | cg_bs_16 | 67.6 | +0.0% | 33 | +2.1% | 6470 | +0 | OK same |
+| sglang-0.5.19 | cg_bs_256 | 67.6 | +0.0% | 33 | +1.1% | 6804 | +334 | OK same |
 
 ### Gateway scheduler knobs under concurrent load (C=8 bursts)
 
@@ -221,7 +221,7 @@ _Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes
 | blazar - sglang-0.5.19 | sleep at 15s (weights stay RAM-resident) | yes | 140 | - |  |
 | ollama - qwen3:1.7b | keep_alive 20s -> full unload | yes | 2317 | 2.15 |  |
 
-_blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design — the table measures each runtime's own idle path after the policy verifiably fired._
+_blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design - the table measures each runtime's own idle path after the policy verifiably fired._
 
 ### Long-context degradation curve
 
@@ -243,7 +243,7 @@ _blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive
 
 _Not measured in this campaign (20260928-sglang-safetensors); media config A/B lane not run._
 
-_Media cells run through the same sandboxed gateway as text lanes but do not assert GPU-idle: a warm engine child is the normal serving shape, so each row stamps gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5) — media variance is dominated by the model, not the scheduler. Video frame counts are read from the EBML container (lacing-aware), never from an API field; the VRAM gate probe times how fast an over-budget request is rejected with a teaching error._
+_Media cells run through the same sandboxed gateway as text lanes but do not assert GPU-idle: a warm engine child is the normal serving shape, so each row stamps gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5) - media variance is dominated by the model, not the scheduler. Video frame counts are read from the EBML container (lacing-aware), never from an API field; the VRAM gate probe times how fast an over-budget request is rejected with a teaching error._
 
 ## Findings (this campaign)
 
@@ -276,7 +276,7 @@ _These knobs crashed the engine child on this test bed; the crash signature is t
 
 ## Structured skips (tool/format boundaries)
 
-- sglang-0.5.19 (ppl): skipped: llama-perplexity loads GGUF files only; qwen3-1.7b.d is an HF safetensors directory — model-format boundary, not an engine failure
+- sglang-0.5.19 (ppl): skipped: llama-perplexity loads GGUF files only; qwen3-1.7b.d is an HF safetensors directory - model-format boundary, not an engine failure
 
 ## Caveats
 

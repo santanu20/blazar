@@ -4,19 +4,19 @@
 - **model**: `qwen2.5-0.5b-instruct-q4_k_m.gguf` (468 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.99.02
 - **engines**: b11785-cuda, inventory, ollama-host
-- **harness**: bench_matrix v4 — `--model qwen2.5-0.5b-instruct --engines b11785-cuda --providers direct blazar --conc-sweep 1,2,4,8 --skip-ppl --skip-tools --skip-quality --skip-media --skip-features --skip-ctxcurve --skip-reshape --skip-idle --skip-variants --blazar-bin ./target/release/blazar --artifacts-dir bench-artifacts/20261027-e2e-perf-rebaseline --md bench-artifacts/20261027-e2e-perf-rebaseline/report.md`
+- **harness**: bench_matrix v4 - `--model qwen2.5-0.5b-instruct --engines b11785-cuda --providers direct blazar --conc-sweep 1,2,4,8 --skip-ppl --skip-tools --skip-quality --skip-media --skip-features --skip-ctxcurve --skip-reshape --skip-idle --skip-variants --blazar-bin ./target/release/blazar --artifacts-dir bench-artifacts/20261027-e2e-perf-rebaseline --md bench-artifacts/20261027-e2e-perf-rebaseline/report.md`
 - **blazar**: `blazar 0.28.0` (sandbox daemon binary)
-- **quality lane**: skipped — --skip-quality: no checker-verified receipts back any speed number in this campaign
+- **quality lane**: skipped - --skip-quality: no checker-verified receipts back any speed number in this campaign
 - all blazar-owned rows measured by `blazar 0.28.0`
 
 ## Notable findings
 
-- gateway vs direct decode (`b11785-cuda`, 2 configs): median -6.4%, 0/2 within ±5% (parity); outliers: default -6.9%, single-stream -6.4%.
+- gateway vs direct decode (`b11785-cuda`, 2 configs): median -6.4%, 0/2 within +/-5% (parity); outliers: default -6.9%, single-stream -6.4%.
 - concurrency system throughput (`b11785-cuda`, 1 streams): 319.1 vs direct 294.8 t/s = 1.08x.
 - concurrency system throughput (`b11785-cuda`, 2 streams): 409.6 vs direct 470.0 t/s = 0.87x.
-- concurrency system throughput (`b11785-cuda`, 4 streams): 425.4 vs direct 737.1 t/s = 0.58x — serialized/queued or wall-inflated (see note).
+- concurrency system throughput (`b11785-cuda`, 4 streams): 425.4 vs direct 737.1 t/s = 0.58x - serialized/queued or wall-inflated (see note).
 - concurrency system throughput (`b11785-cuda`, 8 streams): 443.7 vs direct 718.3 t/s = 0.62x.
-- gateway greedy transparency (`b11785-cuda`): 12/20 exact vs same-engine direct — NOT TRANSPARENT.
+- gateway greedy transparency (`b11785-cuda`): 12/20 exact vs same-engine direct - NOT TRANSPARENT.
 
 ## Charts
 
@@ -90,13 +90,13 @@ _Seconds to first token after a cold start (page cache dropped) and after idle-p
 - sys t/s = total tokens / wall (true system throughput); flat sys t/s with growing ttft max means streams queued on a fixed slot count instead of being served concurrently.
 
 
-## Quality — greedy parity vs `b11785-cuda`-direct (backend numerics)
+## Quality - greedy parity vs `b11785-cuda`-direct (backend numerics)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
-| b11785-cuda *(self — trivially 1.0) | 20/20 | 1.0 | 1.0 | 991.0 |
+| b11785-cuda *(self - trivially 1.0) | 20/20 | 1.0 | 1.0 | 991.0 |
 
-## Quality — gateway transparency (blazar path vs direct, same engine)
+## Quality - gateway transparency (blazar path vs direct, same engine)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
@@ -127,8 +127,8 @@ _Seconds to first token after a cold start (page cache dropped) and after idle-p
 
 **product** (engine/gateway behavior):
 
-- `ollama-host` / ollama / {'reference': True}: no ollama model comparable to 'qwen2.5-0.5b-instruct' (have: glm-ocr:latest, qwen3:1.7b, qwen3.5:9b) — pull a matching tag
-- `ollama-host` / cold-ollama / {'cold': True}: no ollama model comparable to 'qwen2.5-0.5b-instruct' (have: glm-ocr:latest, qwen3:1.7b, qwen3.5:9b) — pull a matching tag
+- `ollama-host` / ollama / {'reference': True}: no ollama model comparable to 'qwen2.5-0.5b-instruct' (have: glm-ocr:latest, qwen3:1.7b, qwen3.5:9b) - pull a matching tag
+- `ollama-host` / cold-ollama / {'cold': True}: no ollama model comparable to 'qwen2.5-0.5b-instruct' (have: glm-ocr:latest, qwen3:1.7b, qwen3.5:9b) - pull a matching tag
 - `ollama-host` / conc-ollama (4 cells): no ollama model comparable to 'qwen2.5-0.5b-instruct' [{'conc': 1, 'rounds': 3}; {'conc': 2, 'rounds': 3}; {'conc': 4, 'rounds': 3}; {'conc': 8, 'rounds': 3}]
 - `ollama-host` / greedy_ollama / {'greedy_ollama': True}: no same-family ollama model for greedy reference
 

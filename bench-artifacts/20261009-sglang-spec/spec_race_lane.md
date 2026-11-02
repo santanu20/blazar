@@ -1,4 +1,4 @@
-# sglang --spec-race lane receipt — 2026-10-09
+# sglang --spec-race lane receipt - 2026-10-09
 
 Run: `blazar tune qwen3-1.7b --spec-race` (blazar 24aebf74, daemon stopped, VRAM 15 MiB idle)
 Engine: sglang-0.5.21 (active engine was llamacpp; lane resolved sglang-0.5.21, printed note)

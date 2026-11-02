@@ -1,4 +1,4 @@
-# Gateway relay performance analysis — 2026-10-08
+# Gateway relay performance analysis - 2026-10-08
 
 Question: the 2026-10-07 overhead campaign measured a ~5-6% single-stream
 gateway residual (non-stream +17.9 ms / +5.5% per request; streaming
@@ -28,14 +28,14 @@ at the code level and records the engineering verdict.
    unbounded per-request buffer.
 3. **Sentinel does not parse on the hot path.** `SentinelFeed::bytes` is
    a `try_send` into the analyzer task; serde analysis happens off the
-   relay, and the whole observer is config-gated (`sentinel = false` →
+   relay, and the whole observer is config-gated (`sentinel = false` ->
    inert feed, covered by an integration test).
 
 What remains per chunk: a refcount clone + channel try_send (~100 ns),
 the bounded tap append (~150 ns), three mutex lock/unlock on
-optional-filter cells (~150 ns when inactive), and — the dominant term —
-the scheduler hop structure: child hyper → gateway task → combinator
-chain → axum body → client, versus the direct child → client. The perf
+optional-filter cells (~150 ns when inactive), and - the dominant term -
+the scheduler hop structure: child hyper -> gateway task -> combinator
+chain -> axum body -> client, versus the direct child -> client. The perf
 profile agrees: `tokio runtime Context::run`, allocator `_int_free`,
 `drop_glue<serde_json::Value>`, and `memmove` are all present but
 spread thin; no single gateway function is hot.
@@ -60,7 +60,7 @@ dialect translation) or re-architecting the body pipeline.
 ## Revisit conditions
 
 - Batch-heavy serving profile (many concurrent streams) where per-chunk
-  fixed costs amortize differently — re-measure before touching code.
+  fixed costs amortize differently - re-measure before touching code.
 - A frame-level passthrough prototype that skips the combinator chain
   for untransformed lanes could be evaluated against a strict
   byte-parity + conformance suite; expected reward is the per-token

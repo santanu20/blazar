@@ -194,7 +194,7 @@ _Not measured in this campaign (2026-10-07-overhead); tool calls lane not run._
 
 ### Quality suites (checker-verified, seeded, greedy)
 
-- _quality lane: **skipped** — --skip-quality: no checker-verified receipts back any speed number in this campaign_
+- _quality lane: **skipped** - --skip-quality: no checker-verified receipts back any speed number in this campaign_
 
 _Not measured in this campaign (2026-10-07-overhead); quality suites lane not run._
 

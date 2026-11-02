@@ -4,19 +4,19 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11193-cuda, b5130, inventory, master-919-19bbbca, ollama-host, piper, v0.9.4
-- **harness**: bench_matrix v4 — `regenerated (slim format)`
+- **harness**: bench_matrix v4 - `regenerated (slim format)`
 - **blazar**: `blazar 0.11.0` (sandbox daemon binary)
-- **quality lane**: not-measured — no quality rows in this campaign (lane not reached for the selected providers/engines)
+- **quality lane**: not-measured - no quality rows in this campaign (lane not reached for the selected providers/engines)
 - all blazar-owned rows measured by `blazar 0.11.0`
 
 ## Notable findings
 
-- gateway vs direct decode (`b11193-cuda`, 2 configs): median -0.1%, 2/2 within ±5% (parity).
+- gateway vs direct decode (`b11193-cuda`, 2 configs): median -0.1%, 2/2 within +/-5% (parity).
 - concurrency system throughput (`b11193-cuda`, 4 streams): 70.3 vs direct 112.8 t/s = 0.62x.
 - kv=q8_0 (`b11193-cuda`): decode -1.2% vs baseline
 - spec=ngram-simple (`b11193-cuda`): decode -1.2% vs baseline
 - mmproj=True (`b11193-cuda`): decode +0.4% vs baseline
-- gateway greedy transparency (`b11193-cuda`): 19/20 exact vs same-engine direct — NOT TRANSPARENT.
+- gateway greedy transparency (`b11193-cuda`): 19/20 exact vs same-engine direct - NOT TRANSPARENT.
 
 ## Charts
 
@@ -114,23 +114,23 @@ _Perplexity per KV-cache quantization configuration (whiskers: standard error); 
 - sys t/s = total tokens / wall (true system throughput); flat sys t/s with growing ttft max means streams queued on a fixed slot count instead of being served concurrently.
 
 
-## Quality — perplexity (identical pinned args)
+## Quality - perplexity (identical pinned args)
 
 | engine | perplexity | +/- err | wall (s) | note |
 |---|---|---|---|---|
 | b11193-cuda | 17.3512 | 0.91919 | 8.0 | lower = better text fit |
 | v0.9.4 | - | - | - | llama-perplexity is llama-server-family only |
 | v0.9.4 | - | - | - | llama-perplexity is llama-server-family only |
-- corpus: deterministic offline repo text (code-heavy) — PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
+- corpus: deterministic offline repo text (code-heavy) - PARITY-ONLY; absolute PPL is not comparable to published wiki-text perplexities.
 
-## Quality — greedy parity vs `reference`-direct (backend numerics)
+## Quality - greedy parity vs `reference`-direct (backend numerics)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|
 | b11193-cuda | 20/20 | 1.0 | 1.0 | 928.5 |
 | v0.9.4 | -/- | - | - | - |
 
-## Quality — gateway transparency (blazar path vs direct, same engine)
+## Quality - gateway transparency (blazar path vs direct, same engine)
 
 | engine | exact matches | ratio mean | ratio min | first divergence (median chars) |
 |---|---|---|---|---|

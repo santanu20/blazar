@@ -4,14 +4,14 @@
 - **model**: `Qwen3.5-9B-Q4_K_M.gguf` (5366 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.91.07
 - **engines**: b11202-cuda, inventory, ollama-host, v0.9.4
-- **harness**: bench_matrix v4 — `--artifacts-dir bench-artifacts/20260929-f1f2f3-livecheck --engines b11202-cuda v0.9.4 --providers blazar --skip-ppl --s`
+- **harness**: bench_matrix v4 - `--artifacts-dir bench-artifacts/20260929-f1f2f3-livecheck --engines b11202-cuda v0.9.4 --providers blazar --skip-ppl --s`
 - **blazar**: `blazar 0.13.0` (sandbox daemon binary)
-- **quality lane**: not-measured — no quality rows in this campaign (lane not reached for the selected providers/engines)
+- **quality lane**: not-measured - no quality rows in this campaign (lane not reached for the selected providers/engines)
 - all blazar-owned rows measured by `blazar 0.13.0`
 
 ## Notable findings
 
-- 5 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior — see Failed cells.
+- 5 cell(s) aborted on ENVIRONMENT guards (GPU/RAM co-residency), not product behavior - see Failed cells.
 
 ## Charts
 
@@ -94,7 +94,7 @@ _Seconds to first token after a cold start (page cache dropped) and after idle-p
 - `ollama-host` / ollama / {'reference': True}: ollama not reachable on 11434 (skipped, not started)
 - `ollama-host` / cold-ollama / {'cold': True}: ollama not reachable on 11434 (skipped, not started)
 
-**environment** (box/co-residency guards — NOT blazar defects):
+**environment** (box/co-residency guards - NOT blazar defects):
 
 - `b11202-cuda` / blazar / {'config': 'default'}: blazar cell crashed: MemAvailable 7345 MiB < needed ~7731 MiB (model 5366 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop ...
 - `b11202-cuda` / blazar / {'config': 'single-stream'}: blazar cell crashed: MemAvailable 7381 MiB < needed ~7731 MiB (model 5366 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop ...
