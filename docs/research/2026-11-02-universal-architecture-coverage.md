@@ -156,6 +156,21 @@ engine-ready: when a future engine rev ships the feature, multimodal
 embeddings light up with zero gateway changes. The candle CLIP lane
 remains the image-embedding path for CLIPModel rows today.
 
+G2b addendum (2026-11-03, engine b12072): the engine-limit verdict
+resolved as WRONG-SHAPE, not missing feature. The engine accepts
+multimodal embedding parts only in the OpenRouter content-array shape
+(input elements carrying a content array of parts) - the direct
+{type:image_url} element stays rejected. One gateway gap did hide behind
+that shape: body_needs_vision scanned input elements directly, so a
+content-array request spawned the child WITHOUT its mmproj and the child
+refused it itself. Fixed across all three scanners (body_needs_vision,
+req_has_image_input, candle CLIP item parser - each unwraps
+input[i].content). Live receipts on the user's b12072 engine (g2b-live-
+receipts.json): VLM content-array image 200 dim 4096 unit-norm 6.3 s
+cold, mixed text+image 200, CLIP candle serves BOTH shapes at 512-d,
+bert text 384-d unchanged, direct-shape VLM still returns the child's
+honest 400 verbatim. 790/790 gateway tests green.
+
 Historical record (pre-fix, worktree M2 behavior): the old shape-only
 intercept served image input exclusively from CLIPModel rows and
 refused VLM rows with "no CLIP model named ..." - the reachability gap

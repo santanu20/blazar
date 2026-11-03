@@ -260,10 +260,25 @@ pub fn body_needs_vision(parsed: &serde_json::Value, ollama_shape: bool) -> bool
                     .is_some_and(|items| items.iter().any(media_item))
             })
         });
+    // Multimodal /v1/embeddings elements arrive as objects wrapping a
+    // content array (the OpenRouter shape llama-server accepts - verified
+    // live on b12069: content-array image parts return embeddings, the
+    // direct element shape is refused). The media parts live one level
+    // down; without this scan the child spawns without its projector and
+    // rejects the very request that asked for it.
     let input = parsed
         .get("input")
         .and_then(|i| i.as_array())
-        .is_some_and(|items| items.iter().any(|it| media_item(it) || tool_media(it)));
+        .is_some_and(|items| {
+            items.iter().any(|it| {
+                media_item(it)
+                    || tool_media(it)
+                    || it
+                        .get("content")
+                        .and_then(|c| c.as_array())
+                        .is_some_and(|parts| parts.iter().any(media_item))
+            })
+        });
     msgs || input
 }
 
@@ -4410,6 +4425,30 @@ mod body_needs_vision_tests {
             }]
         });
         assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__embeddings_content_array_image__detected() {
+        // OpenRouter multimodal-embedding shape (accepted by llama-server):
+        // parts nest under input[i].content - without this scan the child
+        // spawns projector-less and rejects the request itself.
+        let body = serde_json::json!({
+            "input": [
+                {"content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]}
+            ]
+        });
+        assert!(body_needs_vision(&body, false));
+    }
+
+    #[test]
+    fn unit__body_needs_vision__embeddings_content_array_text_only__not_detected() {
+        let body = serde_json::json!({
+            "input": [{"content": [{"type": "text", "text": "plain"}]}]
+        });
+        assert!(!body_needs_vision(&body, false));
     }
 
     #[test]

@@ -328,15 +328,22 @@ pub async fn embeddings(
 }
 
 /// True when the /v1/embeddings input array carries at least one
-/// `image_url` part - the multimodal-embedding routing signal.
+/// `image_url` part - the multimodal-embedding routing signal. Parts sit
+/// directly on the element or nested in a content array (the OpenRouter
+/// shape llama-server accepts).
 fn req_has_image_input(body: &[u8]) -> bool {
+    fn image_part(v: &serde_json::Value) -> bool {
+        v.get("type").and_then(|t| t.as_str()) == Some("image_url") || v.get("image_url").is_some()
+    }
     let Ok(req) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
     match &req["input"] {
         serde_json::Value::Array(items) => items.iter().any(|v| {
-            v.get("type").and_then(|t| t.as_str()) == Some("image_url")
-                || v.get("image_url").is_some()
+            image_part(v)
+                || v.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|parts| parts.iter().any(image_part))
         }),
         _ => false,
     }
@@ -386,13 +393,32 @@ async fn clip_embeddings(
             );
         }
     };
-    let mut images = Vec::with_capacity(items.len());
-    for (idx, item) in items.iter().enumerate() {
+    // Elements may wrap their parts in a content array (the OpenRouter
+    // multimodal-embedding shape llama-server accepts) - flatten them so
+    // the candle lane serves the same request shape the child lane would.
+    let mut parts = Vec::with_capacity(items.len());
+    for item in &items {
+        match item.get("content").and_then(|c| c.as_array()) {
+            Some(inner) => parts.extend(inner.iter().cloned()),
+            None => parts.push(item.clone()),
+        }
+    }
+    let mut images = Vec::with_capacity(parts.len());
+    for (idx, item) in parts.iter().enumerate() {
         if item.as_str().is_some() {
             return openai_error(
                 400,
                 &format!(
                     "image embeddings: input[{idx}] is a string - the CLIP lane embeds images only \
+                     (the text tower is a deliberate follow-up); embed text with a text-embedding model"
+                ),
+            );
+        }
+        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+            return openai_error(
+                400,
+                &format!(
+                    "image embeddings: input[{idx}] is a text part - the CLIP lane embeds images only \
                      (the text tower is a deliberate follow-up); embed text with a text-embedding model"
                 ),
             );
@@ -2526,6 +2552,18 @@ mod tests {
         assert!(
             !req_has_image_input(garbage),
             "garbage body falls through to the proxy 400"
+        );
+        // OpenRouter content-array shape (the one llama-server accepts on
+        // /v1/embeddings) must route like a direct image part.
+        let wrapped = br#"{"model":"qwen3vl","input":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}]}"#;
+        assert!(
+            req_has_image_input(wrapped),
+            "content-array image part routes to the image-input lanes"
+        );
+        let wrapped_text = br#"{"model":"m","input":[{"content":[{"type":"text","text":"a"}]}]}"#;
+        assert!(
+            !req_has_image_input(wrapped_text),
+            "content-array text-only stays on the proxy path"
         );
     }
 
