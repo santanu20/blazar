@@ -330,6 +330,19 @@ impl Puller {
         // tags pin a digest, so the sha compare detects any upstream
         // movement - including mutable tags like `latest`.
         let existing = store.get_model(&name)?;
+        // Present-arm steering, same contract as the HF lane: an
+        // ollama-rename row (arch `glmocr` arrives only through this lane)
+        // can never boot, so "already present" must teach instead.
+        if let Some(row) = existing.as_ref()
+            && let Some((official_repo, short_name)) =
+                blazar_core::hfmeta::ollama_remapped_arch(row.arch.as_deref())
+        {
+            anyhow::bail!(
+                "existing row for {name} declares arch '{}' - an ollama export rename that llama-server cannot load; \
+                 pull the official build instead: `blazar pull {short_name}` ({official_repo}), then `blazar rm {name}`",
+                row.arch.as_deref().unwrap_or("?")
+            );
+        }
         // Registry weights are GGUF-class: guard against flipping an
         // existing safetensors-directory row under the same name.
         crate::hf::flip_guard(&name, existing.as_ref(), false, self.force)?;
@@ -419,6 +432,37 @@ impl Puller {
             mmproj_dest.as_ref(),
             quant,
         )?;
+        // Same steering as the HF lane: ollama-export renames (`glmocr`)
+        // arrive through this registry lane by construction. Refuse before
+        // the row lands and delete what this pull materialized - the blobs
+        // are hardlinks into the local ollama store, so unlinking here
+        // never touches the original. Steer to the official GGUF repo.
+        if let Some((official_repo, short_name)) =
+            blazar_core::hfmeta::ollama_remapped_arch(row.arch.as_deref())
+        {
+            let mut doomed: Vec<&std::path::Path> = vec![dest.as_path()];
+            if let Some(mm) = mmproj_dest.as_deref() {
+                doomed.push(mm);
+            }
+            for doomed in &doomed {
+                if let Err(e) = std::fs::remove_file(doomed) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(model = %name, "steering cleanup skipped {}: {e}", doomed.display());
+                    }
+                }
+            }
+            sweep_stale_part(&dest.display().to_string());
+            tracing::warn!(
+                model = %name,
+                arch = row.arch.as_deref().unwrap_or(""),
+                "steered away from ollama-export rename toward {official_repo}"
+            );
+            anyhow::bail!(
+                "the GGUF declares arch '{}' - an ollama export rename that llama-server cannot load; \
+                 pull the official build instead: `blazar pull {short_name}` ({official_repo})",
+                row.arch.as_deref().unwrap_or("?")
+            );
+        }
         store.upsert_model(&row)?;
         // Prune whatever the replaced row owned that the new one does not
         // (cross-lane name collisions; superseded files after a slug

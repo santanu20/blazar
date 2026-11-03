@@ -2196,6 +2196,20 @@ impl Puller {
         //                  lands on the canonical filename instead of the
         //                  `owner--repo--leaf` collision slug).
         let existing = store.get_model(name)?;
+        // Present rows count too: an ollama-rename row can never boot, so a
+        // pull that would answer "already present" must teach instead -
+        // this is the arm a user with a pre-existing ollama-export row
+        // hits first. Fresh downloads steer again after the header lands.
+        if let Some(row) = existing.as_ref()
+            && let Some((official_repo, short_name)) =
+                blazar_core::hfmeta::ollama_remapped_arch(row.arch.as_deref())
+        {
+            anyhow::bail!(
+                "existing row for {name} declares arch '{}' - an ollama export rename that llama-server cannot load; \
+                 pull the official build instead: `blazar pull {short_name}` ({official_repo}), then `blazar rm {name}`",
+                row.arch.as_deref().unwrap_or("?")
+            );
+        }
         flip_guard(name, existing.as_ref(), false, self.force)?;
         let expected_sha = selected.shards[0].sha256.clone();
         let decision = repull_gate(
@@ -2233,6 +2247,35 @@ impl Puller {
             &shard_paths,
             mmproj_dest.as_ref(),
         )?;
+        // Ollama-export renames (`glmocr`, `ggmlc`) download fine but can
+        // never boot - llama-server loads these models under their native
+        // tokens. Refuse before the row lands and steer to the official
+        // repo, rather than letting the engine lane crash at spawn time.
+        if let Some((official_repo, short_name)) =
+            blazar_core::hfmeta::ollama_remapped_arch(row.arch.as_deref())
+        {
+            let mut doomed: Vec<&Path> = shard_paths.iter().map(Path::new).collect();
+            if let Some(mm) = mmproj_dest.as_deref() {
+                doomed.push(Path::new(mm));
+            }
+            for file in &doomed {
+                if let Err(e) = std::fs::remove_file(file) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(model = %name, "steering cleanup skipped {}: {e}", file.display());
+                    }
+                }
+            }
+            tracing::warn!(
+                model = %name,
+                arch = row.arch.as_deref().unwrap_or(""),
+                "steered away from ollama-export rename toward {official_repo}"
+            );
+            anyhow::bail!(
+                "the GGUF declares arch '{}' - an ollama export rename that llama-server cannot load; \
+                 pull the official build instead: `blazar pull {short_name}` ({official_repo})",
+                row.arch.as_deref().unwrap_or("?")
+            );
+        }
         let mut pull_warning = pull_warning;
         if should_attach_diffusion_set(row.arch.is_some(), &target.repo) && shard_paths.len() == 1 {
             self.attach_diffusion_set(target, name, &selected.quant, &mut row, &mut pull_warning)

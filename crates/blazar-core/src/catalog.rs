@@ -337,6 +337,9 @@ mod tests {
             ("flux-3-klein", "leejet/flux-3-image-klein-GGUF"),
             ("qwen-image-edit", "QuantStack/Qwen-Image-Edit-GGUF"),
             ("wan2.1-t2v", "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
+            // The steering target for `glmocr` pulls: the official GGUF
+            // exports under the native glm4 arch llama-server loads.
+            ("glm-ocr", "ggml-org/GLM-OCR-GGUF"),
         ] {
             let e = resolve(name).unwrap_or_else(|err| panic!("{name}: {err}"));
             assert_eq!(e.repo, repo, "{name}");

@@ -79,6 +79,27 @@ pub fn lane_vision_capable(path: &str) -> bool {
     dir.join("config.json").is_file() && read_hf_config(dir).is_ok_and(|m| m.vision_tower)
 }
 
+/// Architectures that are ollama-export renames of models llama.cpp loads
+/// under their native token. Verified on the official GGUFs (range-request
+/// header probes, 2026-11-03): ggml-org/GLM-OCR-GGUF carries
+/// `general.architecture = glm4` plus a standard clip mmproj - the `glmocr`
+/// token exists only in ollama's export tooling, and llama-server cannot
+/// load it (b12020 has glm4/chatglm4 loaders instead). `ggmlc` is the same
+/// story for ggml-org/Laya-GGUF (native arch: modern-bert).
+///
+/// Returns the official repo plus a catalog short-name so both pull lanes
+/// can steer the user to a bootable download instead of landing a row the
+/// engine lane will crash on. Exact-match map: new remaps land consciously
+/// with a probe receipt, never by accident of substring matching.
+#[must_use]
+pub fn ollama_remapped_arch(arch: Option<&str>) -> Option<(&'static str, &'static str)> {
+    match arch? {
+        "glmocr" => Some(("ggml-org/GLM-OCR-GGUF", "glm-ocr")),
+        "ggmlc" => Some(("ggml-org/Laya-GGUF", "laya")),
+        _ => None,
+    }
+}
+
 /// Model metadata for either storage lane. The profile compiler branches on
 /// this instead of assuming GGUF.
 #[derive(Debug, Clone, PartialEq)]
@@ -400,6 +421,27 @@ mod tests {
             fs::write(dir.path().join(name), body).unwrap();
         }
         dir
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__ollama_remapped_arch__rename_map_and_native_passes() {
+        // Probed live on the official GGUFs (2026-11-03): glmocr exports
+        // carry general.architecture glm4 natively, ggmlc is Laya's export
+        // rename. The map steers both pull lanes to bootable repos.
+        assert_eq!(
+            ollama_remapped_arch(Some("glmocr")),
+            Some(("ggml-org/GLM-OCR-GGUF", "glm-ocr"))
+        );
+        assert_eq!(
+            ollama_remapped_arch(Some("ggmlc")),
+            Some(("ggml-org/Laya-GGUF", "laya"))
+        );
+        // Native arches llama-server loads directly stay untouched.
+        assert_eq!(ollama_remapped_arch(Some("glm4")), None);
+        assert_eq!(ollama_remapped_arch(Some("modern-bert")), None);
+        assert_eq!(ollama_remapped_arch(Some("qwen3vl")), None);
+        assert_eq!(ollama_remapped_arch(None), None);
     }
 
     #[test]

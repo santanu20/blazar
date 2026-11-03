@@ -37,7 +37,7 @@ Evidence tags used below:
 | Multimodal embeddings via VLM mmproj | COVERED gateway-side - CLOSED G2 2026-11-02; engine input-parts = b12020 limit (master-only), forwarding engine-ready | see G2 |
 | Audio/video parts on /v1/embeddings | FORWARDED to child (engine 400 on b12020 - master-only feature) | see G2 |
 | Diffusion family breadth | COVERED - 35 curated families incl. standalone/GGUF housing split, dual-DiT MoE (Wan 2.2), encoder-only + pixel-space shapes, PixArt w/ GGUF-T5; Ideogram4/PiD/SeFi/SenseNova/tiny-SD deferred w/ evidence [code diffusion.rs; 6 live render receipts] |
-| glmocr / ggmlc arches (ollama-exported) | UPSTREAM-BOUND G4 - fail-fast + teaching at every layer; filings tracked, engine upgrade picks it up free | 502 + strings [probe] |
+| glmocr / ggmlc arches (ollama-exported) | COVERED G4 - both pull lanes steer to the official native-arch repos (glm-ocr catalog entry, glm4 + auto mmproj); gateway OCR receipt live; spec-auto MTP arch-gated | 4 steering arms + OCR [probe] |
 | llama.cpp in-process ASR lane | COVERED - engine-row lane forwards multipart to child `/v1/audio/transcriptions`, normalizes the event shape; whisper-enc towers are the quality target | live probe + [code] |
 | CLIP breadth (SigLIP, ViT-L, GGUF mmproj reuse) | COVERED - config-driven candle lane, any CLIP size from its own config.json (G6); SigLIP/mmproj ride the G2 child path | live receipt g6-live-receipts.json [probe] |
 | Catalog discovery beyond text LLMs | COVERED - 10 non-LLM entries + entry revision pins (G7 CLOSED 2026-11-02) [probe] |
@@ -188,7 +188,6 @@ varied content). Historical record (pre-fix): the table covered 8 of ~30
 upstream families; unknown-family pulls proceeded with a teaching warning
 but no VAE/text-encoder auto-attach.
 
-### G4 - ollama-exported glmocr / ggmlc GGUFs unloadable (P2) - UPSTREAM-BOUND (documented 2026-11-02)
 ### G3b - deferred-family curation (P1) - CLOSED 2026-11-03
 Shipped: FAMILIES 20 -> 24 entries, gateway-layer only (no engine
 capability implemented in blazar - the m0617 mandate). Wan 2.2 TI2V-5B =
@@ -241,19 +240,42 @@ its qwen3-vl-2b encoder), SenseNova (8-shard + tokenizer-directory
 contract the child spawn cannot pass as files), tiny-SD class (need
 offline diffusers prep; concedo sdxs GGUFs remain exact-file pullable).
 
-Stock llama-server cannot load them (502 ENGINE_CRASHED with child log
-teaching; blazar list dagger explains) - the arch tokens are absent from
-the b12020 arch table (strings-proven) and the GGUF hyperparameter
-layout predates it. Upstream filings exist (blazar#2, ggml-org#19335).
-Verdict after the session's engine work: not solvable gateway-side, and
-honestly so - blazar fails fast with teaching at every layer (spawn
-dagger, 502 with child log tail). Remediation paths, in preference
-order: (1) upstream llama.cpp lands the arches (filings tracked); (2)
-convert-on-import spike (gguf-py rewrite with standard arch keys, e.g.
-glmocr -> glm4-class layout if the graph maps); (3) the same GGUFs
-re-exported from source repos in loadable arches (glm-ocr exists as a
-standard GLM variant upstream). Engine upgrades pick (1) up for free -
-nothing to re-implement in blazar when it lands.
+### G4 - ollama-exported glmocr / ggmlc GGUFs unloadable (P2) - CLOSED 2026-11-03 (pull-side steering)
+
+Research correction (2026-11-03, docs/research/2026-11-03-g4-g8-engine-bound-architecture.md):
+this was never an engine gap. The official ggml-org/GLM-OCR-GGUF exports
+under the native `glm4` arch llama-server already loads, plus a standard
+clip mmproj (range-request header probes); `glmocr` is only ollama's
+export-tooling rename, and `ggmlc` is the same story for ggml-org/Laya-GGUF
+(native `modern-bert`).
+
+Shipped design, live-validated on the sandbox (receipts:
+bench-artifacts/20261102-universal-coverage/g4-steering-live-receipts.json):
+
+- `hfmeta::ollama_remapped_arch` - exact-match rename map to the official
+  repo + catalog short-name.
+- Both pull lanes steer at their choke points, present-row arm AND fresh
+  download arm: the rename pull aborts with teaching
+  (`pull the official build instead: blazar pull <short>`), downloaded
+  files are deleted, no row lands. Verified on all four arms
+  (HF laya-typed-decisions, registry glm-ocr; the registry lane unlinks
+  its ollama-store hardlink without touching the original blob).
+- Catalog carries `glm-ocr -> ggml-org/GLM-OCR-GGUF`; the happy-path pull
+  lands arch glm4 (Q8_0 950 MB) with the mmproj auto-attached (484 MB).
+- Gateway OCR receipt through /v1/chat/completions: exact transcript
+  "HELLO BLAZAR 42" from a rendered-text PNG, 2.5 s on the 8 GB card
+  (g4-ocr-gateway-receipt.json).
+- Root-cause companion fix: `spec = "auto"` no longer engages draft-mtp on
+  unproven arches. glm4/GLM-OCR carries a baked-in MTP head and b12020
+  fails its draft context init (`unordered_map::at`, child exits at load);
+  bisected live - the identical argv without spec flags serves chat + OCR
+  fine. `mtp_arch_proven` gates embedded MTP to receipt-carrying arches
+  (qwen family) with a teaching warning elsewhere; explicit `spec = "mtp"`
+  still forces it for users who want to gamble.
+
+Historical record (2026-11-02 verdict, superseded): stock llama-server
+cannot load the renamed GGUFs (502 ENGINE_CRASHED); filings blazar#2,
+ggml-org#19335 (closed via PR #19677).
 
 ### G8 - kokoro / piper1-gpl voice frontier (P2) - UPSTREAM-BOUND (documented 2026-11-02)
 kokoro-82m GGUFs + voice packs exist on HF, but kokoro is not a llama.cpp

@@ -992,9 +992,9 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // opt-in: fires only because the user set spec = "auto"
         // (spec = "off" never reaches this branch).
         let embedded_mtp = if let Some(n_layers) = gguf.mtp_layers {
-            if input.supported_flags.contains("--spec-type")
-                && input.spec_types.iter().any(|t| t == "draft-mtp")
-            {
+            let engine_has_mtp = input.supported_flags.contains("--spec-type")
+                && input.spec_types.iter().any(|t| t == "draft-mtp");
+            if engine_has_mtp && mtp_arch_proven(&gguf.architecture) {
                 argv.push("--spec-type".into());
                 argv.push("draft-mtp".into());
                 // Draft steps are bounded by the trained head count - more
@@ -1016,12 +1016,22 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                      bench before adopting at scale"
                 ));
                 true
-            } else {
+            } else if !engine_has_mtp {
                 warnings.push(format!(
                     "spec auto: GGUF carries an MTP head but engine {} lacks \
                      draft-mtp - falling back to the catalog draft-pair path (if \
                      one exists); run: blazar engine update",
                     input.engine_tag
+                ));
+                false
+            } else {
+                warnings.push(format!(
+                    "spec auto: GGUF carries an MTP head, but draft-mtp context \
+                     init is unproven for arch '{}' on this engine - glm4/GLM-OCR \
+                     crashes at MTP context init (live receipt 2026-11-03, b12020) \
+                     while the same weights serve fine without it. Falling back to \
+                     the catalog draft-pair path; set spec = \"mtp\" to force.",
+                    gguf.architecture
                 ));
                 false
             }
@@ -2573,6 +2583,19 @@ const UNIFIED_COMPUTE_PER_TOKEN_BYTES: u64 = 24 * 1024;
 /// embedding arm in section 10c is therefore skipped for these arches.
 pub fn speech_generation_arch(arch: &str) -> bool {
     matches!(arch, "qwen3tts")
+}
+
+/// Whether draft-mtp (speculation from the GGUF's own baked-in MTP head)
+/// is proven to initialize on the current engine generation. Prefix match
+/// on the qwen family: qwen3/qwen3.5 MTP GGUFs carry live decode receipts.
+/// Everything else is unproven and `spec = "auto"` must NOT gamble a child
+/// process on it: glm4/GLM-OCR (arch glm4, MTP head in blk.16.nextn.*)
+/// fails context init with `unordered_map::at` on b12020 and the child
+/// exits at load - while the identical argv without draft-mtp serves chat
+/// and OCR fine (live bisect receipt, 2026-11-03). New arches join this
+/// list only with a boot receipt.
+pub fn mtp_arch_proven(arch: &str) -> bool {
+    arch.starts_with("qwen")
 }
 
 fn floor_batch_flag(argv: &mut [String], flag: &str, floor: u32) {
@@ -9532,6 +9555,44 @@ mod tests {
             "{:?}",
             p.warnings
         );
+    }
+
+    #[test]
+    fn unit__spec_auto__unproven_mtp_arch_skips_draft_mtp() {
+        // Live bisect receipt (b12020, 2026-11-03): glm4/GLM-OCR with a
+        // baked-in MTP head fails context init (unordered_map::at) under
+        // draft-mtp and the child exits at load; the identical argv
+        // without the spec flags serves chat + OCR fine. spec = "auto"
+        // must not gamble the child - only receipt-carrying arches ride.
+        let cfg = Config {
+            spec: "auto".into(),
+            slots: 1,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut g = meta_with_mtp(1);
+        g.architecture = "glm4".into();
+        let p = compile(
+            &input_with_spec(&g, &hw, &cfg, &ALL_FLAGS, &MTP_SPEC_TYPES),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-type" && w[1] == "draft-mtp"),
+            "{:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("unproven") && w.contains("glm4")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
     #[test]
     fn unit__sdcpp_components__encoder_only_sets_boot_like_any_family() {
         // Gate receipt (2026-11-03): MiniT2I landed as the first
@@ -9600,8 +9661,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
-    }
-
     }
 
     #[test]
