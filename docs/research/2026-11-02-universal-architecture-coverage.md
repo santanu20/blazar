@@ -36,7 +36,7 @@ Evidence tags used below:
 | TTS (llama.cpp /tts, qwen3-tts family) | COVERED - CLOSED G1 2026-11-02 | engine speech lane live receipts |
 | Multimodal embeddings via VLM mmproj | COVERED gateway-side - CLOSED G2 2026-11-02; engine input-parts = b12020 limit (master-only), forwarding engine-ready | see G2 |
 | Audio/video parts on /v1/embeddings | FORWARDED to child (engine 400 on b12020 - master-only feature) | see G2 |
-| Diffusion family breadth | COVERED - 20 curated families incl. standalone/GGUF housing split; PixArt/Wan2.2/Ideogram4 deferred w/ evidence [code diffusion.rs; live render receipt] |
+| Diffusion family breadth | COVERED - 35 curated families incl. standalone/GGUF housing split, dual-DiT MoE (Wan 2.2), encoder-only + pixel-space shapes, PixArt w/ GGUF-T5; Ideogram4/PiD/SeFi/SenseNova/tiny-SD deferred w/ evidence [code diffusion.rs; 6 live render receipts] |
 | glmocr / ggmlc arches (ollama-exported) | UPSTREAM-BOUND G4 - fail-fast + teaching at every layer; filings tracked, engine upgrade picks it up free | 502 + strings [probe] |
 | llama.cpp in-process ASR lane | COVERED - engine-row lane forwards multipart to child `/v1/audio/transcriptions`, normalizes the event shape; whisper-enc towers are the quality target | live probe + [code] |
 | CLIP breadth (SigLIP, ViT-L, GGUF mmproj reuse) | COVERED - config-driven candle lane, any CLIP size from its own config.json (G6); SigLIP/mmproj ride the G2 child path | live receipt g6-live-receipts.json [probe] |
@@ -168,12 +168,12 @@ Qwen-Image-Edit, SD 3.5, FLUX.3 Klein, MiniMax-H3 (first Vid family with
 Fibo 2.0, Ming-Image, HiDream-O1 - each entry paired from its upstream
 docs/<family>.md command and verified file-by-file against the HF repo
 listing (head comment carries the two-tier honesty contract). Deliberate
-non-entries with evidence: PixArt (Sigma's T5 encoder is a sharded 19GB
-pair - single-file component semantics cannot pull it), Wan 2.2
-(low+high-noise dual-DiT MoE contract; pull assumes one DiT), Ideogram4
-(upstream requires a local fp8->bf16 python conversion before load).
-Those still pull with the unknown-family teaching naming the supported
-set. Architecture fix that landed with it: pull_standalone_lane now
+non-entries with evidence: Ideogram4 (upstream requires a local fp8->bf16
+python conversion of two transformers before any engine sees the weights -
+a converter is engine-side capability, out of gateway scope by design).
+PixArt and Wan 2.2 landed 2026-11-03 (G3b below) once the GGUF ecosystem
+replaced the blockers cited at research time. Unknown families still pull
+with the teaching naming the supported set. Architecture fix that landed with it: pull_standalone_lane now
 classifies standalone-capable families by housing (StandaloneHousing) -
 repos hosting the pinned checkpoint ride the standalone lane, DiT GGUF
 mirrors of the same family (MOSS-Image, SD 3.5) fall through to the GGUF
@@ -189,6 +189,58 @@ upstream families; unknown-family pulls proceeded with a teaching warning
 but no VAE/text-encoder auto-attach.
 
 ### G4 - ollama-exported glmocr / ggmlc GGUFs unloadable (P2) - UPSTREAM-BOUND (documented 2026-11-02)
+### G3b - deferred-family curation (P1) - CLOSED 2026-11-03
+Shipped: FAMILIES 20 -> 24 entries, gateway-layer only (no engine
+capability implemented in blazar - the m0617 mandate). Wan 2.2 TI2V-5B =
+single-DiT GGUF lane (root one-file-per-quant repo, Wan2.2_VAE + umt5
+byte-reuse). Wan 2.2 T2V-A14B = first dual-DiT MoE family: LowNoise
+expert pinned as the standalone main (Low/HighNoise dirs ship
+byte-identical per-quant sizes - largest-wins could never choose a
+role), HighNoise expert attached as an exact-path
+--high-noise-diffusion-model component with no quant fallback; bare
+`blazar pull QuantStack/Wan2.2-T2V-A14B-GGUF` resolves the whole Q2_K
+pair + VAE + byte-reused umt5 in one command. PixArt-Sigma/-alpha: DiT +
+GGUF T5-XXL encoder (same bytes the FLUX.1 lane uses) instead of the
+19GB sharded safetensors text encoder; each carries its own VAE (docs
+warn latent spaces differ). Live receipts on 8 GB VRAM (sandbox
+gateway, no mocks): TI2V-5B 320x320 webm 213 s via
+/v1/videos/generations (ffprobe vp8-clean); A14B 256x256 webm 146 s
+(overcommit + offload); PixArt-Sigma 512x512 PNG 23 s via
+/v1/images/generations (PNG CRC-clean, exact-size IDAT) - this render
+PROVES the GGUF-T5 pairing rather than assuming it
+(bench-artifacts/20261102-universal-coverage/g3b-live-receipts.json +
+3 render artifacts). Bonus receipts: interrupted component download
+resumed from the v2 chunk ledger on relaunch; umt5 byte-reuse skipped a
+re-download across families.
+
+### G3c - remaining-family curation (P1) - CLOSED 2026-11-03
+Shipped: FAMILIES 24 -> 35 entries - every remaining sd.cpp image/video
+family with an expressible pull contract. Fifteen new entries (Anima,
+Boogu-Image, ERNIE-Image, LLaDA-Image, LongCat-Image, LTX-2.3, LTX-2.5,
+Mage-Flow, MiniT2I, Ovis-Image, Z-Image L2P, HunyuanVideo 1.5, Lingbot
+Video, SSD-1B, Segmind Vega), each paired from its upstream
+docs/<family>.md command and verified file-by-file against the HF repo
+listing. New component surfaces exercised: --embeddings-connectors
+(LLaDA, LTX-2.3), encoder-only families (MiniT2I pixel-space DiT +
+exact-path flan-t5-large, no VAE; Z-Image L2P --llm only), A1111
+full-checkpoint zero-component entries (SSD-1B, Vega), a canonical
+redirect-chasing repo id (Comfy-Org/Hunyuan-Video-1.5), and lowercase
+GGUF quant tokens (LLaDA text encoder q4_K). Companion root-cause fix:
+the sdcpp spawn gate mandated a --vae/--model flag per component set,
+which falsely refused the encoder-only and pixel-space shapes - now
+shape-agnostic (any non-empty family set boots; empty set + per-file
+existence checks kept verbatim). Live receipts on 8 GB VRAM (sandbox
+gateway, no mocks): MiniT2I 512x512 PNG 7 s via
+/v1/images/generations; lingbot-video-dense-1.3b 256x256 webm 33 s via
+/v1/videos/generations after the VRAM admission gate taught the
+overcommit lever (bench-artifacts/20261102-universal-coverage/
+g3c-live-receipts.json + 2 render artifacts). Deferred with evidence:
+PiD (.pth weights + value-taking --vae-format flag, not expressible as
+flag+file component), SeFi (org-gated repos + no ungated hosting for
+its qwen3-vl-2b encoder), SenseNova (8-shard + tokenizer-directory
+contract the child spawn cannot pass as files), tiny-SD class (need
+offline diffusers prep; concedo sdxs GGUFs remain exact-file pullable).
+
 Stock llama-server cannot load them (502 ENGINE_CRASHED with child log
 teaching; blazar list dagger explains) - the arch tokens are absent from
 the b12020 arch table (strings-proven) and the GGUF hyperparameter

@@ -3770,16 +3770,18 @@ fn merged_sdcpp_model_args(cfg: &Config, warnings: &mut Vec<String>) -> Option<S
 }
 
 /// Component-set gates shared by every sdcpp compile: a diffusion `DiT`
-/// is unservable alone. An empty set - or one with neither a `--vae`
-/// (component families) nor a `--model` self-reference (standalone
-/// checkpoints) - means a family-blinded pull (older row); dead paths
-/// mean deleted files. Both repair the same way: re-pull.
+/// is unservable alone. An empty set means a family-blinded pull (older
+/// row); dead paths mean deleted files. The set itself can be any family
+/// shape - a `--model` self-reference (bare standalone SDXL/SD 1.5), a
+/// `--vae`-bearing set (most families) or encoder-only (MiniT2I rides
+/// `--t5xxl`, L2P rides `--llm`; pixel-space families carry no VAE) - so
+/// no single flag is mandated here; `compile_sdcpp` maps the shape onto
+/// `--model` vs `--diffusion-model` + per-flag layout. Both failure
+/// classes repair the same way: re-pull. The DiT path itself stays
+/// argv-data like every other lane (a deleted model file surfaces at
+/// child load, and the store's re-pull intactness check repairs it).
 fn sdcpp_components(input: &ProfileInput<'_>) -> Result<(), String> {
-    let serves = input
-        .components
-        .iter()
-        .any(|c| c.flag == "--vae" || c.flag == "--model");
-    if input.components.is_empty() || !serves {
+    if input.components.is_empty() {
         return Err(format!(
             "model {} has no diffusion component set (VAE/text encoder) - the DiT \
              GGUF alone cannot boot; re-pull the model to fetch the set: blazar pull {}",
@@ -9530,6 +9532,76 @@ mod tests {
             "{:?}",
             p.warnings
         );
+    #[test]
+    fn unit__sdcpp_components__encoder_only_sets_boot_like_any_family() {
+        // Gate receipt (2026-11-03): MiniT2I landed as the first
+        // encoder-only family (--t5xxl, pixel space, no VAE) and the old
+        // gate refused it ("no diffusion component set") because it
+        // mandated --vae or --model. Servability is shape-agnostic: any
+        // attached set with every component file alive.
+        let tmp = std::env::temp_dir().join(format!("blazar-sdcpp-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("temp dir");
+        let dit = tmp.join("dit.gguf");
+        let t5 = tmp.join("t5.safetensors");
+        std::fs::write(&dit, b"x").expect("write dit");
+        std::fs::write(&t5, b"x").expect("write t5");
+        let cfg = Config::default();
+        let hw = gpu_hw(8_192, 32_768, 8);
+        let g = meta();
+        let base = || {
+            let mut i = input(&g, &hw, &cfg, &ALL_FLAGS);
+            i.engine_kind = crate::engine_kind::EngineKind::SdCpp;
+            i
+        };
+
+        // Empty set: the family-blinded older-row class still refuses.
+        let err = compile(&base(), &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("no diffusion component set"), "{err}");
+
+        // Encoder-only set (MiniT2I shape) passes and compiles onto the
+        // --diffusion-model layout.
+        let t5c = ComponentArg::new("--t5xxl", t5.to_str().expect("utf8 path"));
+        let mut enc = base();
+        enc.model_path = dit.to_str().expect("utf8 path");
+        enc.components = std::slice::from_ref(&t5c);
+        let p = compile(&enc, &TuningOverrides::default()).expect("encoder-only set compiles");
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--diffusion-model" && w[1] == dit.to_str().expect("utf8 path")),
+            "{:?}",
+            p.argv
+        );
+
+        // Dead component file: the stale-row teaching still fires per
+        // file (pre-existing contract, unchanged by the gate fix).
+        let dead_path = tmp.join("gone.safetensors").display().to_string();
+        let dc = ComponentArg::new("--t5xxl", &dead_path);
+        let mut dead = base();
+        dead.components = std::slice::from_ref(&dc);
+        let err = compile(&dead, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("is missing at") && err.contains("stale"),
+            "{err}"
+        );
+
+        // Standalone rows self-reference through --model: the component
+        // IS the model file, so the layout boots -m instead of
+        // --diffusion-model.
+        let mc = ComponentArg::new("--model", dit.to_str().expect("utf8 path"));
+        let mut standalone = base();
+        standalone.components = std::slice::from_ref(&mc);
+        let ps = compile(&standalone, &TuningOverrides::default())
+            .expect("standalone rides --model alone");
+        assert!(
+            !ps.argv.iter().any(|a| a == "--diffusion-model"),
+            "{:?}",
+            ps.argv
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     }
 
     #[test]
