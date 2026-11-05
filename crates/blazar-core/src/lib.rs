@@ -24,7 +24,8 @@ pub mod tls;
 
 pub use catalog::{catalog, pair_for_spec_mode, resolve, spec_pair_for, spec_pair_for_typed};
 pub use config::{
-    ApiKey, Config, ModelOverride, Remote, SemanticCacheConfig, is_valid_spec_mode, persist_config,
+    AgentPolicy, ApiKey, Config, ConfigHandle, ModelOverride, Remote, SemanticCacheConfig,
+    is_valid_spec_mode, persist_config,
 };
 pub use dirs::BlazarDirs;
 pub use error::{CoreError, CoreResult};

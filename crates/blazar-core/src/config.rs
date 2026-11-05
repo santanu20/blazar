@@ -330,6 +330,58 @@ pub struct Config {
     /// 512 MiB are dropped (not a bank, a hoard).
     #[serde(default = "default_true")]
     pub session_bank: bool,
+    /// Automatic fleet membership: accept `blazar rpc worker --join`
+    /// announcements on the gateway API and merge the announced workers
+    /// into spawn planning (`--rpc`) alongside the static `rpc_servers`
+    /// list. Disabling keeps the fleet exactly as configured - manual
+    /// endpoints only, join attempts answered 404.
+    #[serde(default = "default_true")]
+    pub fleet_enabled: bool,
+    /// Heartbeat cadence the gateway tells joining workers to use. The
+    /// gateway also reads it for its own TTL math, so one knob moves
+    /// both sides. Floor 5s: a lost heartbeat must be detectable within
+    /// one TTL window even on fast test cells.
+    #[serde(default = "default_fleet_heartbeat_secs")]
+    pub fleet_heartbeat_secs: u64,
+    /// A worker missing this many consecutive heartbeat intervals is
+    /// evicted from the registry (the engine preflight still refuses
+    /// dead endpoints loudly at spawn - the TTL only prunes planning).
+    /// Must be >= 3x the heartbeat so one dropped packet never evicts.
+    #[serde(default = "default_fleet_ttl_secs")]
+    pub fleet_ttl_secs: u64,
+    /// Shared secret workers must present to join from a non-loopback
+    /// address. Empty = loopback joins free, remote joins refused.
+    #[serde(default)]
+    pub fleet_token: String,
+    /// Allow ANY remote worker to join without a token. Explicitly
+    /// opt-in: exposed GPU capacity on an open port is a compute
+    /// hijack surface, so the default stays closed.
+    #[serde(default)]
+    pub fleet_open: bool,
+    /// LAN autodiscovery: answer `BLAZAR_DISCOVER_V1` UDP probes on
+    /// `discovery_port` so `blazar rpc worker --discover` can find this
+    /// gateway without static configuration. The reply carries no
+    /// secrets (host/port/token-required only). Off by default: an
+    /// always-on responder announces the inference API to the whole
+    /// LAN, which is only desirable on a trusted network.
+    #[serde(default)]
+    pub discovery_enabled: bool,
+    /// UDP port for the discovery responder. Distinct from the HTTP
+    /// port so either surface can be firewalled independently.
+    #[serde(default = "default_discovery_port")]
+    pub discovery_port: u16,
+    /// TCP port for the `blazar agent` invite listener on a DONOR box
+    /// (a UDP adopt-beacon shares the same number on a different
+    /// protocol). Distinct from every gateway port so a box can be both.
+    #[serde(default = "default_agent_port")]
+    pub agent_port: u16,
+    /// How the donor-side `blazar agent` decides on gateway invites:
+    /// `ask-owner` queues every invite until `blazar agent approve` (or
+    /// an interactive prompt) says yes; `token` auto-approves invites
+    /// that carry the box's own `fleet_token`. Explicit command start is
+    /// the opt-in - there is no agent_enabled knob to forget.
+    #[serde(default = "default_agent_policy")]
+    pub agent_policy: String,
     /// Single-flight: identical NON-STREAM chat requests coalesce at the
     /// child-call boundary (the twin awaits the leader, then rides the
     /// warm prefix). 5s bound - long generations never serialize their
@@ -1507,6 +1559,16 @@ pub struct ModelOverride {
 }
 
 /// Projector attach policy. Accepts the bool spellings the suppress knob
+/// How the donor-side `blazar agent` decides on gateway invites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPolicy {
+    /// Queue every invite until the owner says yes (default).
+    AskOwner,
+    /// Auto-approve invites carrying this box's own `fleet_token`.
+    Token,
+}
+
 /// shipped with (`true`/`false`) plus `"attach"` / `"skip"` / `"lazy"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -3083,6 +3145,15 @@ impl Default for Config {
             load_mode: String::new(),
             spawn_mem_guard: true,
             session_bank: true,
+            fleet_enabled: true,
+            fleet_heartbeat_secs: 15,
+            fleet_ttl_secs: 45,
+            fleet_token: String::new(),
+            fleet_open: false,
+            discovery_enabled: false,
+            discovery_port: default_discovery_port(),
+            agent_port: default_agent_port(),
+            agent_policy: default_agent_policy(),
             singleflight: false,
             prompt_preflight: true,
             spec_cache: true,
@@ -3784,6 +3855,52 @@ impl Config {
         overlay.unwrap_or(self.rpc_servers.trim())
     }
 
+    /// Knobs a hot reload CANNOT apply to a running daemon, by name.
+    ///
+    /// Two classes land here:
+    /// 1. bind-time knobs consumed once at startup (`host`, `port`,
+    ///    `tls_cert`, `tls_key`, `log_level` - the tracing filter is
+    ///    installed before the runtime exists);
+    /// 2. knobs baked into long-lived objects at construction
+    ///    (`child_transport` decides each child's endpoint style at
+    ///    spawn-planning time, `failover`/`mcp`/`sentinel`/`audit_log`
+    ///    build registries and background tasks in `AppState::new`).
+    ///
+    /// Everything else is read per-request/per-spawn, so swapping the
+    /// config live applies it at the next read. The reload surface
+    /// reports this list verbatim so an operator knows exactly what
+    /// still needs a restart - never a silent partial apply.
+    #[must_use]
+    /// Parsed `agent_policy` (validated at load, so this never misses).
+    pub fn agent_policy(&self) -> AgentPolicy {
+        if self.agent_policy == "token" {
+            AgentPolicy::Token
+        } else {
+            AgentPolicy::AskOwner
+        }
+    }
+
+    pub fn cold_only_diff(old: &Config, new: &Config) -> Vec<String> {        let mut cold = Vec::new();
+        let mut push_if = |differs: bool, knob: &str| {
+            if differs {
+                cold.push(knob.to_string());
+            }
+        };
+        push_if(old.host != new.host, "host");
+        push_if(old.port != new.port, "port");
+        push_if(old.tls_cert != new.tls_cert, "tls_cert");
+        push_if(old.tls_key != new.tls_key, "tls_key");
+        push_if(old.log_level != new.log_level, "log_level");
+        push_if(old.child_transport != new.child_transport, "child_transport");
+        push_if(old.failover != new.failover, "failover");
+        push_if(old.mcp != new.mcp, "mcp");
+        push_if(old.mcp_default != new.mcp_default, "mcp_default");
+        push_if(old.sentinel != new.sentinel, "sentinel");
+        push_if(old.sentinel_stall_secs != new.sentinel_stall_secs, "sentinel_stall_secs");
+        push_if(old.audit_log != new.audit_log, "audit_log");
+        cold
+    }
+
     /// Effective `--tensor-split` ratios for a model (C6): a non-empty
     /// overlay replaces the global value; empty/absent inherits it.
     #[must_use]
@@ -4265,6 +4382,36 @@ impl Config {
             return Err(CoreError::Config(format!(
                 "idle_timeout_secs ({}) must be >= idle_sleep_secs ({}) - eviction must not fire before sleep",
                 self.idle_timeout_secs, self.idle_sleep_secs
+            )));
+        }
+        if self.fleet_heartbeat_secs < 5 {
+            return Err(CoreError::Config(format!(
+                "fleet_heartbeat_secs must be >= 5 (fast heartbeats flood the gateway for no TTL gain), got {}",
+                self.fleet_heartbeat_secs
+            )));
+        }
+        if self.fleet_ttl_secs > 3600 {
+            return Err(CoreError::Config(format!(
+                "fleet_ttl_secs must be <= 3600 (an hour-stale worker is dead weight in planning), got {}",
+                self.fleet_ttl_secs
+            )));
+        }
+        if self.fleet_ttl_secs < self.fleet_heartbeat_secs.saturating_mul(3) {
+            return Err(CoreError::Config(format!(
+                "fleet_ttl_secs ({}) must be >= 3x fleet_heartbeat_secs ({}) - one lost heartbeat must never evict a live worker",
+                self.fleet_ttl_secs, self.fleet_heartbeat_secs
+            )));
+        }
+        if self.discovery_enabled && self.discovery_port == self.port {
+            return Err(CoreError::Config(format!(
+                "discovery_port ({}) must differ from the HTTP port ({}) - UDP and TCP may share a number only by accident, and the responder would answer probes meant for the API",
+                self.discovery_port, self.port
+            )));
+        }
+        if !matches!(self.agent_policy.as_str(), "ask-owner" | "token") {
+            return Err(CoreError::Config(format!(
+                "agent_policy must be \"ask-owner\" or \"token\", got {:?}",
+                self.agent_policy
             )));
         }
         if !(1..=32).contains(&self.download_connections) {
@@ -5528,6 +5675,26 @@ fn default_slots() -> u32 {
     0
 }
 
+fn default_fleet_heartbeat_secs() -> u64 {
+    15
+}
+
+fn default_fleet_ttl_secs() -> u64 {
+    45
+}
+
+fn default_discovery_port() -> u16 {
+    11439
+}
+
+fn default_agent_port() -> u16 {
+    11440
+}
+
+fn default_agent_policy() -> String {
+    "ask-owner".into()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -5553,6 +5720,42 @@ fn valid_override_tensor(s: &str) -> bool {
         None => false,
     }
 }
+
+/// Shared, swappable config: the daemon's single source of truth.
+///
+/// The supervisor owns one handle and the gateway reads through it, so a
+/// hot reload swaps ONE object and every reader sees the new generation
+/// at its next read - no second copy to drift stale. Reads clone an
+/// `Arc<Config>` (cheap pointer bump) and never hold the lock beyond
+/// that clone, so no guard can cross an `.await` by construction.
+#[derive(Clone, Debug)]
+pub struct ConfigHandle(std::sync::Arc<std::sync::RwLock<std::sync::Arc<Config>>>);
+
+impl ConfigHandle {
+    #[must_use]
+    pub fn new(config: Config) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+            config,
+        ))))
+    }
+
+    /// Current config generation. The clone is an `Arc` bump; callers
+    /// treat the returned value as a read-only snapshot for the whole
+    /// operation they are inside (snapshot-once discipline - prevents
+    /// torn reads that straddle a reload).
+    #[must_use]
+    pub fn cfg(&self) -> std::sync::Arc<Config> {
+        std::sync::Arc::clone(&self.0.read().expect("config lock"))
+    }
+
+    /// Install a new generation; returns the previous one so callers
+    /// can diff for side effects (preload list changes, reload events).
+    pub fn swap(&self, next: Config) -> std::sync::Arc<Config> {
+        let mut guard = self.0.write().expect("config lock");
+        std::mem::replace(&mut *guard, std::sync::Arc::new(next))
+    }
+}
+
 
 #[cfg(test)]
 #[allow(non_snake_case)]
@@ -6927,6 +7130,44 @@ default_ctx = 16384
             msg.contains("wrong"),
             "error must name the unknown overlay key: {msg}"
         );
+    }
+
+    #[test]
+    fn unit__cold_only_diff__bind_time_flagged_hot_clean() {
+        // Hot-reload contract: only bind-time knobs refuse to apply live;
+        // a runtime knob change must produce an empty cold-only diff.
+        let old = Config::default();
+        let mut next = Config::default();
+        next.idle_timeout_secs = 120;
+        assert!(
+            Config::cold_only_diff(&old, &next).is_empty(),
+            "runtime knob flip must apply hot"
+        );
+        let mut next = Config::default();
+        next.port = 12345;
+        assert_eq!(
+            Config::cold_only_diff(&old, &next),
+            vec!["port"],
+            "bind-time knob must be flagged cold-only"
+        );
+    }
+
+    #[test]
+    fn unit__overlay_dotted_name__rpc_servers_from_toml() {
+        // Model names routinely contain dots (gemma3-270m, qwen3-0.6b):
+        // the overlay key must survive from_toml as ONE literal key, not
+        // split into nested tables by the TOML dotted-key rule.
+        let raw = r#"
+[model_overrides."gemma3-270m"]
+rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
+"#;
+        let cfg = Config::from_toml(raw).unwrap();
+        assert_eq!(
+            cfg.effective_rpc_servers("gemma3-270m"),
+            "127.0.0.1:51001,127.0.0.1:51002",
+            "dotted overlay key must parse and replace the global list"
+        );
+        assert_eq!(cfg.effective_rpc_servers("other"), "");
     }
 
     #[test]
