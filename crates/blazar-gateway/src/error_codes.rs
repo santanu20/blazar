@@ -34,6 +34,7 @@ pub enum BlazarCode {
     ModelTooLarge,
     InsufficientMemory,
     EngineCrashed,
+    RpcEndpointUnreachable,
     Internal,
     // Precise: admission / preflight teaching refusals.
     PromptTooLong,
@@ -45,6 +46,7 @@ pub enum BlazarCode {
     KeyScopeForbidden,
     HostForbidden,
     RateLimited,
+    FleetTokenRequired,
     // Generic status-derived fallbacks (openai_error without a typed map).
     BadRequest,
     NotFound,
@@ -68,12 +70,14 @@ impl BlazarCode {
             Self::ModelTooLarge => "MODEL_TOO_LARGE",
             Self::InsufficientMemory => "INSUFFICIENT_MEMORY",
             Self::EngineCrashed => "ENGINE_CRASHED",
+            Self::RpcEndpointUnreachable => "RPC_ENDPOINT_UNREACHABLE",
             Self::Internal => "INTERNAL",
             Self::PromptTooLong => "PROMPT_TOO_LONG",
             Self::VisionProjectorMissing => "VISION_PROJECTOR_MISSING",
             Self::CapabilityVerifiedFailed => "CAPABILITY_VERIFIED_FAILED",
             Self::DiffusionTextRefusal => "DIFFUSION_TEXT_REFUSAL",
             Self::Unauthorized => "UNAUTHORIZED",
+            Self::FleetTokenRequired => "FLEET_TOKEN_REQUIRED",
             Self::KeyScopeForbidden => "KEY_SCOPE_FORBIDDEN",
             Self::HostForbidden => "HOST_FORBIDDEN",
             Self::RateLimited => "RATE_LIMITED",
@@ -100,7 +104,7 @@ impl BlazarCode {
             | Self::CapabilityVerifiedFailed
             | Self::DiffusionTextRefusal
             | Self::BadRequest => 400,
-            Self::Unauthorized => 401,
+            Self::Unauthorized | Self::FleetTokenRequired => 401,
             Self::KeyScopeForbidden | Self::HostForbidden => 403,
             Self::RateLimited => 429,
             Self::PayloadTooLarge => 413,
@@ -109,6 +113,7 @@ impl BlazarCode {
             | Self::EngineCircuitOpen
             | Self::AllSlotsBusy
             | Self::ModelTooLarge
+            | Self::RpcEndpointUnreachable
             | Self::Unavailable => 503,
             Self::EngineCrashed | Self::BadGateway => 502,
             Self::GatewayTimeout => 504,
@@ -138,6 +143,9 @@ impl BlazarCode {
                 "the box lacks the memory right now; freeing co-resident engines would change the verdict"
             }
             Self::EngineCrashed => "the engine child process crashed while loading or serving",
+            Self::RpcEndpointUnreachable => {
+                "an rpc fleet worker endpoint named in rpc_servers is unreachable"
+            }
             Self::Internal => "unexpected internal error",
             Self::PromptTooLong => {
                 "the prompt exceeds the effective context window and would be silently truncated"
@@ -152,6 +160,9 @@ impl BlazarCode {
                 "a diffusion component-set model was addressed on a text/embedding surface"
             }
             Self::Unauthorized => "missing or invalid API key",
+            Self::FleetTokenRequired => {
+                "a fleet worker tried to join without the shared secret this gateway requires"
+            }
             Self::KeyScopeForbidden => "the API key is not scoped for this model",
             Self::HostForbidden => {
                 "unrecognized Host header on a loopback bind (possible DNS rebinding)"
@@ -190,6 +201,9 @@ impl BlazarCode {
             Self::EngineCrashed => {
                 "check daemon logs for the child's stderr; `blazar ps` shows restart counts"
             }
+            Self::RpcEndpointUnreachable => {
+                "start the worker on that host (`blazar rpc worker`) or fix rpc_servers in the config"
+            }
             Self::Internal => {
                 "check daemon logs; report with the x-blazar-trace-id of the failed request"
             }
@@ -206,6 +220,9 @@ impl BlazarCode {
                 "address the images/videos surface for this model, or use a text model"
             }
             Self::Unauthorized => "send Authorization: Bearer <key> or x-api-key",
+            Self::FleetTokenRequired => {
+                "start the worker with the gateway's fleet_token (blazar rpc worker --fleet-token <token>) or set fleet_open = true on a trusted network"
+            }
             Self::KeyScopeForbidden => "use a key whose scopes cover this model",
             Self::HostForbidden => {
                 "bind blazar to your LAN address, or set host to match the Host header you send"
@@ -233,6 +250,7 @@ pub const ALL: &[BlazarCode] = &[
     BlazarCode::ModelTooLarge,
     BlazarCode::InsufficientMemory,
     BlazarCode::EngineCrashed,
+    BlazarCode::RpcEndpointUnreachable,
     BlazarCode::Internal,
     BlazarCode::PromptTooLong,
     BlazarCode::VisionProjectorMissing,
@@ -242,6 +260,7 @@ pub const ALL: &[BlazarCode] = &[
     BlazarCode::KeyScopeForbidden,
     BlazarCode::HostForbidden,
     BlazarCode::RateLimited,
+    BlazarCode::FleetTokenRequired,
     BlazarCode::BadRequest,
     BlazarCode::NotFound,
     BlazarCode::PayloadTooLarge,

@@ -47,7 +47,7 @@ pub async fn messages(
             "missing `model` field in request body",
         );
     }
-    if crate::remotes::split_remote(&model, &state.config).is_some() {
+    if crate::remotes::split_remote(&model, &state.cfg()).is_some() {
         return anthropic_error(
             400,
             "invalid_request_error",

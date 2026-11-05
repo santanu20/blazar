@@ -150,9 +150,11 @@ impl CacheObs {
 
 pub struct AppState {
     pub dirs: BlazarDirs,
-    pub config: Config,
     pub sup: Arc<Supervisor>,
     pub bus: EventBus,
+    /// One-use join codes for guided onboarding (`blazar adopt` /
+    /// `blazar join`); self-initializing and ephemeral.
+    pub invites: crate::fleet::InviteRegistry,
     pub queue: Arc<PriorityQueue>,
     /// Loopback client for child traffic + metrics scrape.
     pub http: reqwest::Client,
@@ -332,6 +334,14 @@ impl AppState {
         Ok(())
     }
 
+    /// Current config generation, delegated to the supervisor's
+    /// shared handle - the gateway has no second copy to drift stale
+    /// when a hot reload swaps the file.
+    #[must_use]
+    pub fn cfg(&self) -> std::sync::Arc<Config> {
+        self.sup.cfg()
+    }
+
     #[must_use]
     #[allow(clippy::duration_suboptimal_units)] // 10-minute ceiling mirrors long generations
     #[allow(clippy::too_many_lines)] // constructor: field-by-field wiring, splitting would not reduce it
@@ -431,9 +441,9 @@ impl AppState {
         let usage = std::sync::Arc::new(crate::usage::UsageMeter::new(&dirs));
         Self {
             dirs,
-            config,
             sup,
             bus,
+            invites: crate::fleet::InviteRegistry::default(),
             queue: Arc::new(PriorityQueue::new()),
             http,
             media_http,

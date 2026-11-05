@@ -656,7 +656,7 @@ pub fn begin_chat_observation(
     status: u16,
     sse: bool,
 ) -> (SentinelFeed, Vec<&'static str>) {
-    if !state.config.sentinel {
+    if !state.cfg().sentinel {
         return (SentinelFeed::inert(), Vec::new());
     }
     let (ctx, warnings) = request_ctx(state, route, model, body, trace, sse);

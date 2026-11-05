@@ -14,6 +14,8 @@ pub mod console;
 pub mod error_codes;
 pub mod explain;
 pub mod fabric;
+pub mod config_api;
+pub mod fleet;
 pub mod federation;
 pub mod histogram;
 pub mod host_guard;
@@ -52,6 +54,7 @@ pub mod vram;
 pub mod tts;
 pub mod whisper;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -556,6 +559,17 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(ollama::session).get(ollama::session_list),
         )
         .route("/api/sessions", get(sessions::list))
+        // Automatic fleet membership (blazar rpc worker --join writes
+        // here; spawn planning merges the registry into --rpc).
+        .route(
+            "/api/fleet/join",
+            post(fleet::join),
+        )
+        .route("/api/fleet/heartbeat", post(fleet::heartbeat))
+        .route("/api/fleet/leave", post(fleet::leave))
+        .route("/api/fleet/workers", get(fleet::workers))
+        .route("/api/fleet/invite", post(fleet::invite))
+        .route("/api/config/reload", post(config_api::reload))
         .route("/api/why", get(ollama::why))
         .route("/api/watch", get(ollama::watch))
         // Machine-readable stable error-code catalog (self-describing
@@ -626,7 +640,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // get a CORS answer (BLZ-5), not a bare 401 from auth.
         .layer(
             tower_http::cors::CorsLayer::new()
-                .allow_origin(cors_allow_origin(&state.config.cors_origins))
+                .allow_origin(cors_allow_origin(&state.cfg().cors_origins))
                 .allow_methods([
                     axum::http::Method::GET,
                     axum::http::Method::POST,
@@ -644,7 +658,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // keep working; anything else with a non-local Host is 403.
         // Inside request_log so blocks are visible in the access log.
         .layer(middleware::from_fn_with_state(
-            (host_guard::guard_scope(&state.config.host),),
+            (host_guard::guard_scope(&state.cfg().host),),
             host_guard::host_guard_mw,
         ))
         // request_log: outermost - every request, including 401s and
@@ -1092,15 +1106,15 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                     "x-blazar-cache", "x-blazar-cache-ttl", "x-blazar-cache-threshold"],
         "features": {
             "keys": !state.keys.is_empty(),
-            "tls": !state.config.tls_cert.is_empty(),
+            "tls": !state.cfg().tls_cert.is_empty(),
             "otlp": state.otlp.enabled(),
-            "remotes": state.config.remotes.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
-            "singleflight": state.config.singleflight,
-            "session_bank": state.config.session_bank,
-            "prompt_preflight": state.config.prompt_preflight,
-            "session_pins": state.config.session_keep_secs > 0,
-            "semantic_cache": state.config.semantic_cache.enabled
-                && state.config.semantic_cache.model.is_some(),
+            "remotes": state.cfg().remotes.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+            "singleflight": state.cfg().singleflight,
+            "session_bank": state.cfg().session_bank,
+            "prompt_preflight": state.cfg().prompt_preflight,
+            "session_pins": state.cfg().session_keep_secs > 0,
+            "semantic_cache": state.cfg().semantic_cache.enabled
+                && state.cfg().semantic_cache.model.is_some(),
         },
     }))
     .into_response()
@@ -1370,7 +1384,7 @@ pub async fn serve(
             .unwrap_or_default();
         tokio::spawn(async move { otlp.run(http).await })
     };
-    if state.config.tls_cert.is_empty() {
+    if state.cfg().tls_cert.is_empty() {
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             // Typed so the CLI can exit 3 and the systemd unit's
             // RestartPreventExitStatus=3 stops the Restart=always loop.
@@ -1404,16 +1418,61 @@ pub async fn serve(
             let sup = Arc::clone(&state.sup);
             tokio::spawn(async move { sup.listen_warm_on_pull().await });
         }
+        // Hot-reload watcher: one reload attempt per config-file change
+        // (fingerprint debounce inside reload_config_now); a missing file
+        // is never reloaded - Config::load would rewrite it with defaults.
+        {
+            let sup = Arc::clone(&state.sup);
+            tokio::spawn(async move {
+                let mut last = sup.config_file_stamp();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let stamp = sup.config_file_stamp();
+                    if stamp.is_some() && stamp != last {
+                        last = stamp;
+                        match sup.reload_config_now() {
+                            Ok(outcome) if outcome.preload_changed => {
+                                let s2 = Arc::clone(&sup);
+                                tokio::spawn(async move { s2.preload_listed().await });
+                            }
+                            Ok(_) => {}
+                            Err(reason) => {
+                                tracing::warn!("{reason}");
+                            }
+                        }
+                    } else {
+                        last = stamp;
+                    }
+                }
+            });
+        }
+        // LAN autodiscovery: opt-in UDP responder naming this gateway
+        // to `rpc worker --discover` seekers. Spawned unconditionally -
+        // the lifecycle task itself binds/unbinds as discovery_enabled
+        // (and discovery_port) flip through config hot-reloads, so the
+        // flag is fully hot in both directions without a restart.
+        {
+            let sup = Arc::clone(&state.sup);
+            let port = state
+                .http_addr
+                .get()
+                .map(|&(_, p)| p)
+                .unwrap_or_else(|| sup.cfg().port);
+            tokio::spawn(blazar_runtime::discovery::run_discovery_responder(sup, port));
+        }
         // TCP_NODELAY on every accepted socket: NDJSON/SSE streams are strings
-        // of small writes, and with Nagle the first content packet waits for
-        // the client's delayed ACK of the headers/role packet - a flat
+        // of small writes, and with Nagle the first content packet waits for the
+        // client's delayed ACK of the headers/role packet - a flat
         // +40-60ms on first-token latency for every streaming response
         // (live-measured: child's first content SSE at ~77ms reached the
         // client at ~135ms; Go net/http, ollama's stack, sets nodelay too).
         let listener = listener.tap_io(|stream| {
             let _ = stream.set_nodelay(true);
         });
-        axum::serve(listener, app)
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
             .with_graceful_shutdown(shutdown)
             .await
             .map_err(|e| anyhow::anyhow!("server: {e}"))?;
@@ -1423,7 +1482,7 @@ pub async fn serve(
         // if already installed).
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server_config =
-            rustls_server_config(&state.config).map_err(|e| anyhow::anyhow!("TLS config: {e}"))?;
+            rustls_server_config(&state.cfg()).map_err(|e| anyhow::anyhow!("TLS config: {e}"))?;
         let rustls_config =
             axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(server_config));
         let bind_addr: std::net::SocketAddr = addr
@@ -1456,6 +1515,44 @@ pub async fn serve(
             let sup = Arc::clone(&state.sup);
             tokio::spawn(async move { sup.listen_warm_on_pull().await });
         }
+        // Hot-reload watcher on the TLS branch too - same contract as
+        // the plain-HTTP branch above.
+        {
+            let sup = Arc::clone(&state.sup);
+            tokio::spawn(async move {
+                let mut last = sup.config_file_stamp();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let stamp = sup.config_file_stamp();
+                    if stamp.is_some() && stamp != last {
+                        last = stamp;
+                        match sup.reload_config_now() {
+                            Ok(outcome) if outcome.preload_changed => {
+                                let s2 = Arc::clone(&sup);
+                                tokio::spawn(async move { s2.preload_listed().await });
+                            }
+                            Ok(_) => {}
+                            Err(reason) => {
+                                tracing::warn!("{reason}");
+                            }
+                        }
+                    } else {
+                        last = stamp;
+                    }
+                }
+            });
+        }
+        // LAN autodiscovery on the TLS branch too - unconditional
+        // lifecycle task, same contract as the plain-HTTP branch.
+        {
+            let sup = Arc::clone(&state.sup);
+            let port = state
+                .http_addr
+                .get()
+                .map(|&(_, p)| p)
+                .unwrap_or_else(|| sup.cfg().port);
+            tokio::spawn(blazar_runtime::discovery::run_discovery_responder(sup, port));
+        }
         let handle = axum_server::Handle::new();
         let h2 = handle.clone();
         tokio::spawn(async move {
@@ -1473,7 +1570,7 @@ pub async fn serve(
         axum_server::from_tcp_rustls(std_listener, rustls_config)
             .map_err(|e| anyhow::anyhow!("tls acceptor init: {e}"))?
             .handle(handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .map_err(|e| anyhow::anyhow!("tls server: {e}"))?;
     }
@@ -1608,6 +1705,36 @@ mod tests {
         assert!(
             msg.contains("MemAvailable") && msg.contains("spawn_mem_guard"),
             "memory-floor teaching must survive the mapping: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__supervision_error__rpc_endpoints_dead_maps_to_503_teaching() {
+        use crate::proxy::supervision_error;
+        use blazar_runtime::SupervisionError;
+        // A dead rpc fleet member is infrastructure-down, not an internal
+        // bug: the refusal fired before any child existed, so the honest
+        // status is 503 with a precise code clients can branch on.
+        let resp = supervision_error(&SupervisionError::RpcEndpointsUnreachable(
+            "--rpc endpoint(s) unreachable: 127.0.0.1:51099 (unreachable) - llama-server \
+             aborts at startup when an RPC backend is down; start the RPC worker(s) or \
+             fix `rpc_servers` in the config"
+                .to_string(),
+        ));
+        assert_eq!(resp.status(), 503);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            v["error"]["blazar_code"].as_str().expect("code"),
+            "RPC_ENDPOINT_UNREACHABLE"
+        );
+        let msg = v["error"]["message"].as_str().expect("message");
+        assert!(
+            msg.contains("unreachable") && msg.contains("rpc_servers"),
+            "fleet teaching must survive the mapping: {msg}"
         );
     }
 }

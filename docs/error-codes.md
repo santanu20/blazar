@@ -49,6 +49,7 @@ test pins this table against the enum, so the two cannot drift.
 | `MODEL_TOO_LARGE` | 503 | cannot fit this machine even empty (admission floor) | smaller quantization or more VRAM/RAM |
 | `INSUFFICIENT_MEMORY` | 507 | box lacks memory now; freeing co-residents would change it | evict co-resident models (`blazar ps`) or smaller quantization |
 | `ENGINE_CRASHED` | 502 | engine child crashed while loading or serving | check daemon logs for child stderr; `blazar ps` shows restarts |
+| `RPC_ENDPOINT_UNREACHABLE` | 503 | an rpc fleet worker endpoint named in rpc_servers is unreachable | start the worker on that host (`blazar rpc worker`) or fix rpc_servers in the config |
 | `INTERNAL` | 500 | unexpected internal error | check daemon logs; report with the x-blazar-trace-id |
 | `PROMPT_TOO_LONG` | 400 | prompt exceeds effective ctx, would be silently truncated | shorten prompt, raise ctx, or set prompt_preflight = false |
 | `VISION_PROJECTOR_MISSING` | 400 | vision request against a model with no projector sidecar | `blazar mmproj <model> <mmproj.gguf path>` while stopped |
@@ -58,6 +59,7 @@ test pins this table against the enum, so the two cannot drift.
 | `KEY_SCOPE_FORBIDDEN` | 403 | API key not scoped for this model | use a key whose scopes cover the model |
 | `HOST_FORBIDDEN` | 403 | unrecognized Host header on a loopback bind (DNS-rebinding guard) | bind to the LAN address or set host to match |
 | `RATE_LIMITED` | 429 | API key exceeded one of its budgets | retry after retry_after_secs or raise the budget |
+| `FLEET_TOKEN_REQUIRED` | 401 | a fleet worker tried to join without the shared secret this gateway requires | start the worker with the gateway's fleet_token (`blazar rpc worker --fleet-token <token>`) or set fleet_open = true on a trusted network |
 | `BAD_REQUEST` | 400 | malformed or invalid request (generic) | fix the request body per the API docs |
 | `NOT_FOUND` | 404 | resource not found (generic) | check the resource id and route |
 | `PAYLOAD_TOO_LARGE` | 413 | request body too large | send a smaller body |

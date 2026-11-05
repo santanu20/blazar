@@ -544,6 +544,12 @@ pub fn supervision_error(e: &SupervisionError) -> Response {
         SupervisionError::EngineCrashed(m) => {
             openai_error_code(C::EngineCrashed, &format!("engine crashed: {m}"))
         }
+        // F1 preflight refusal: the fleet member named in rpc_servers is
+        // down - infrastructure-unavailable (503) with a precise code,
+        // the remedy stays in the message.
+        SupervisionError::RpcEndpointsUnreachable(m) => {
+            openai_error_code(C::RpcEndpointUnreachable, m)
+        }
         SupervisionError::Internal(e) => openai_error_code(C::Internal, &format!("{e:#}")),
     }
 }
@@ -809,12 +815,12 @@ pub(crate) async fn child_send(
 ) -> Result<reqwest::Response, ChildSendError> {
     let (ceiling, knob) = if engine.kind == EngineKind::SdCpp {
         (
-            state.config.sdcpp_child_header_timeout_secs,
+            state.cfg().sdcpp_child_header_timeout_secs,
             "sdcpp_child_header_timeout_secs",
         )
     } else {
         (
-            state.config.child_header_timeout_secs,
+            state.cfg().child_header_timeout_secs,
             "child_header_timeout_secs",
         )
     };
@@ -1034,7 +1040,7 @@ pub async fn proxy_request(
         // uncoalesced matches the legacy timeout outcome.
         SfGate::TimedOut => {}
         SfGate::Ineligible => {
-            if state.config.singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024 {
+            if state.cfg().singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024 {
                 let asks_stream = parsed
                     .as_ref()
                     .and_then(|v| v.get("stream").and_then(serde_json::Value::as_bool))
@@ -1284,11 +1290,11 @@ pub async fn proxy_request(
     // verify: the same buffered branch serves both, but each keeps its
     // own conditions (verify never judges semantics; the judge never
     // counts choices).
-    let sentinel_active = state.config.sentinel
+    let sentinel_active = state.cfg().sentinel
         && !sse
         && status.is_success()
         && is_chat_route(path_query)
-        && sentinel::enforce_enabled(&state.config, headers)
+        && sentinel::enforce_enabled(&state.cfg(), headers)
         && !enforce_oversized;
     // F7: a non-stream multi-choice success response gets a shape
     // check - an engine that ignored `n` (returned 1 choice for n=3)
@@ -1813,7 +1819,7 @@ pub(crate) async fn sf_gate_before_admission(
     body: &[u8],
     parsed: Option<&serde_json::Value>,
 ) -> SfGate {
-    if !(state.config.singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024) {
+    if !(state.cfg().singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024) {
         return SfGate::Ineligible;
     }
     let asks_stream = parsed
@@ -1979,7 +1985,7 @@ pub(crate) fn resolve_serving(
         .with_store(|s| resolve_model(s, model_name).ok().map(|r| r.name))
         .flatten()
         .unwrap_or_else(|| model_name.to_string());
-    let overlay = state.config.overlay_for(&canonical);
+    let overlay = state.cfg().overlay_for(&canonical);
     state
         .with_store(|s| {
             let rows = s.list_engines().unwrap_or_default();
@@ -2027,8 +2033,8 @@ pub(crate) fn resolve_serving(
                 ),
             };
             let lane = engine_kind::serving_lane(
-                state.config.engine_routing.mode,
-                state.config.engine_routing.policy,
+                state.cfg().engine_routing.mode,
+                state.cfg().engine_routing.policy,
                 overlay.engine.as_deref(),
                 shape,
                 global,

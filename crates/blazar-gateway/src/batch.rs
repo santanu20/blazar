@@ -455,11 +455,11 @@ pub async fn upload_file(
     }
     // BLZ-6: refresh retention first so the quota check counts live data,
     // then enforce the configured store quotas on the incoming bytes.
-    sweep_expired(&state.dirs, state.config.batch.retention_secs, now_secs());
+    sweep_expired(&state.dirs, state.cfg().batch.retention_secs, now_secs());
     let owner = owner_name(key_ext.as_ref());
     if let Some((status, message)) = store_quota_refusal(
         &state.dirs,
-        &state.config.batch,
+        &state.cfg().batch,
         owner.as_deref(),
         file.data.len() as u64,
     ) {
@@ -594,19 +594,19 @@ pub async fn create_batch(
     }
     // BLZ-6: refresh retention, then enforce the per-key concurrent-batch
     // bound before spawning another worker.
-    sweep_expired(&state.dirs, state.config.batch.retention_secs, now_secs());
+    sweep_expired(&state.dirs, state.cfg().batch.retention_secs, now_secs());
     if let Some(owner) = owner_name(key_ext.as_ref())
-        && state.config.batch.max_active_batches_per_key > 0
+        && state.cfg().batch.max_active_batches_per_key > 0
     {
         // Unreadable index: admitting another batch would bypass the
         // configured bound - refuse with the cause instead.
         match active_batch_count(&state.dirs, &owner) {
-            Ok(active) if active >= u64::from(state.config.batch.max_active_batches_per_key) => {
+            Ok(active) if active >= u64::from(state.cfg().batch.max_active_batches_per_key) => {
                 return err(
                     StatusCode::BAD_REQUEST,
                     &format!(
                         "key '{owner}' is already running the configured maximum of {} concurrent batches",
-                        state.config.batch.max_active_batches_per_key
+                        state.cfg().batch.max_active_batches_per_key
                     ),
                 );
             }
@@ -643,12 +643,12 @@ pub async fn create_batch(
     // (recorded at serve time - config port may be 0 = ephemeral); fold
     // wildcard hosts to loopback-reachable.
     let (host, port) = state.http_addr.get().cloned().unwrap_or_else(|| {
-        let h = if state.config.host == "0.0.0.0" || state.config.host == "::" {
+        let h = if state.cfg().host == "0.0.0.0" || state.cfg().host == "::" {
             "127.0.0.1".to_string()
         } else {
-            state.config.host.clone()
+            state.cfg().host.clone()
         };
-        (h, state.config.port)
+        (h, state.cfg().port)
     });
     let auth_headers: Vec<(String, String)> = ["authorization", "x-api-key"]
         .iter()
@@ -667,7 +667,7 @@ pub async fn create_batch(
         host,
         port,
         auth_headers,
-        max_output_bytes: state.config.batch.max_output_bytes_per_batch,
+        max_output_bytes: state.cfg().batch.max_output_bytes_per_batch,
     };
     tokio::spawn(async move { run_batch(dirs, job, lines).await });
 
@@ -1446,20 +1446,20 @@ pub async fn anthropic_batches_create(
     // the same files/ pool the OpenAI lane uses. BLZ-6: retention refresh
     // + store quotas + the per-key concurrent-batch bound apply to this
     // dialect too - it writes the same disk.
-    sweep_expired(&state.dirs, state.config.batch.retention_secs, now_secs());
+    sweep_expired(&state.dirs, state.cfg().batch.retention_secs, now_secs());
     let owner = owner_name(key_ext.as_ref());
     if let Some(owner) = &owner
-        && state.config.batch.max_active_batches_per_key > 0
+        && state.cfg().batch.max_active_batches_per_key > 0
     {
         // Same fail-closed law as the OpenAI dialect's create path: an
         // unreadable index refuses instead of bypassing the bound.
         match active_batch_count(&state.dirs, owner) {
-            Ok(active) if active >= u64::from(state.config.batch.max_active_batches_per_key) => {
+            Ok(active) if active >= u64::from(state.cfg().batch.max_active_batches_per_key) => {
                 return err(
                     StatusCode::BAD_REQUEST,
                     &format!(
                         "key '{owner}' is already running the configured maximum of {} concurrent batches",
-                        state.config.batch.max_active_batches_per_key
+                        state.cfg().batch.max_active_batches_per_key
                     ),
                 );
             }
@@ -1474,7 +1474,7 @@ pub async fn anthropic_batches_create(
     let input_bytes: u64 = lines.iter().map(|l| l.len() as u64 + 1).sum();
     if let Some((status, message)) = store_quota_refusal(
         &state.dirs,
-        &state.config.batch,
+        &state.cfg().batch,
         owner.as_deref(),
         input_bytes,
     ) {
@@ -1523,12 +1523,12 @@ pub async fn anthropic_batches_create(
     }
 
     let (host, port) = state.http_addr.get().cloned().unwrap_or_else(|| {
-        let h = if state.config.host == "0.0.0.0" || state.config.host == "::" {
+        let h = if state.cfg().host == "0.0.0.0" || state.cfg().host == "::" {
             "127.0.0.1".to_string()
         } else {
-            state.config.host.clone()
+            state.cfg().host.clone()
         };
-        (h, state.config.port)
+        (h, state.cfg().port)
     });
     let auth_headers: Vec<(String, String)> = ["authorization", "x-api-key"]
         .iter()
@@ -1546,7 +1546,7 @@ pub async fn anthropic_batches_create(
         host,
         port,
         auth_headers,
-        max_output_bytes: state.config.batch.max_output_bytes_per_batch,
+        max_output_bytes: state.cfg().batch.max_output_bytes_per_batch,
     };
     tokio::spawn(async move { run_anthropic_batch(dirs, job, lines.join("\n")).await });
 

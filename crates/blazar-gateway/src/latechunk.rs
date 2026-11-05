@@ -208,7 +208,7 @@ fn guard_token_budget(
     model: &str,
     n_tokens: usize,
 ) -> Result<(), (u16, String)> {
-    let cap = state.config.late_chunking_max_tokens;
+    let cap = state.cfg().late_chunking_max_tokens;
     // F71: `cap` is an inclusive maximum (a doc of exactly cap tokens is
     // admissible) - reject only strictly over, matching the message
     // wording; the 90%-ctx margin below keeps its at-margin rejection.
@@ -221,7 +221,7 @@ fn guard_token_budget(
             ),
         ));
     }
-    let ctx = u64::from(state.config.effective_ctx(model));
+    let ctx = u64::from(state.cfg().effective_ctx(model));
     let n = u64::try_from(n_tokens).unwrap_or(u64::MAX);
     if n >= ctx.saturating_mul(9) / 10 {
         return Err((
@@ -234,8 +234,8 @@ fn guard_token_budget(
     }
     // One doc must fit a single micro-batch (upstream embedding tasks
     // cannot split): the same number the profile rule assigns the child.
-    let ubatch = if state.config.ubatch_size > 0 {
-        u64::from(state.config.ubatch_size)
+    let ubatch = if state.cfg().ubatch_size > 0 {
+        u64::from(state.cfg().ubatch_size)
     } else {
         u64::from(blazar_core::profile::LATE_CHUNK_UBATCH_DEFAULT).min(ctx)
     };

@@ -50,7 +50,7 @@ pub fn admission_ctx(state: &crate::state::AppState, model: &str) -> u32 {
         .ps()
         .into_iter()
         .find(|p| p.name == model && p.ctx > 0)
-        .map_or_else(|| state.config.effective_ctx(model), |p| p.ctx)
+        .map_or_else(|| state.cfg().effective_ctx(model), |p| p.ctx)
 }
 
 /// Prompt-fit admission (K1): refuse requests that cannot fit the
@@ -104,7 +104,7 @@ pub async fn enforce_prompt_fits(
     body: &serde_json::Value,
     effective_ctx: u32,
 ) -> Result<(), Box<axum::response::Response>> {
-    if !state.config.prompt_preflight || effective_ctx == 0 {
+    if !state.cfg().prompt_preflight || effective_ctx == 0 {
         return Ok(());
     }
     let est = prompt_tokens_est(body);

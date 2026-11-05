@@ -372,7 +372,7 @@ pub async fn audio_speech(
     };
 
     // Remote intent wins: `name:model` never goes local.
-    if split_remote(voice, &state.config).is_some() {
+    if split_remote(voice, &state.cfg()).is_some() {
         if let Some(Extension(k)) = &key_ext
             && let Some(entry) = state.keys.entry(&k.name)
             && let Err(rej) = state.keys.admit(&entry, voice)

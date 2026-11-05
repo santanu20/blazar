@@ -51,7 +51,7 @@ pub async fn version() -> Response {
 /// consumer gets a resync note and keeps streaming. History is `why`'s
 /// job; this is strictly live.
 pub async fn watch(State(state): State<Arc<AppState>>) -> Response {
-    let scrub = state.config.pii_scrub;
+    let scrub = state.cfg().pii_scrub;
     let rx = state.sentinel.watch();
     let stream = futures::stream::unfold((rx, scrub), |(mut rx, scrub)| async move {
         match rx.recv().await {
@@ -162,7 +162,7 @@ pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
         .iter()
         .map(sentinel::SentinelRecord::to_json)
         .collect::<Vec<_>>();
-    let records_json = if state.config.pii_scrub {
+    let records_json = if state.cfg().pii_scrub {
         records_json.iter().map(crate::scrub::scrub_value).collect()
     } else {
         records_json
@@ -194,7 +194,7 @@ pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
         })
         .collect();
     axum::Json(json!({
-        "sentinel": state.config.sentinel,
+        "sentinel": state.cfg().sentinel,
         "records": records_json,
         "engine_degrades": engine_degrades,
     }))
@@ -437,7 +437,7 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
 /// from the engine's own supervisor) instead of blazar instance rows.
 #[allow(clippy::too_many_lines)] // row assembly + sleep probes + remote capacity fold
 pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
-    if state.config.router {
+    if state.cfg().router {
         return ps_router(&state).await;
     }
     let entries = state.sup.ps();
@@ -486,8 +486,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
     let rows: Vec<Value> = entries
         .iter()
         .map(|p| {
-            let idle_remaining = state
-                .config
+            let idle_remaining = state.cfg()
                 .idle_timeout_secs
                 .saturating_sub(p.idle_secs);
             // keep_alive pin extends the visible countdown past the idle
@@ -539,12 +538,12 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
     // Remotes: probed concurrently (3s cap each) so `ps` stays fast
     // even with a dead remote on the list (F15: collected futures are
     // NOT concurrent under a sequential await loop - join them).
-    let remotes: Vec<Value> = if state.config.remotes.is_empty() {
+    let remotes: Vec<Value> = if state.cfg().remotes.is_empty() {
         Vec::new()
     } else {
         let state_for_probe = Arc::clone(&state);
-        let futs: Vec<_> = state
-            .config
+        let cfg = state.cfg();
+        let futs: Vec<_> = cfg
             .remotes
             .iter()
             .map(|r| {
@@ -612,7 +611,7 @@ async fn ps_router(state: &Arc<AppState>) -> Response {
         Ok(v) => v,
         Err(e) => return api_error(502, &format!("router /models parse: {e}")),
     };
-    let idle_remaining = state.config.idle_timeout_secs;
+    let idle_remaining = state.cfg().idle_timeout_secs;
     let rows: Vec<Value> = v["data"]
         .as_array()
         .cloned()
@@ -745,8 +744,8 @@ pub async fn pull(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
 
     // Drive the pull on a task; stream events until ModelPulled/PullFailed.
     let pull_request = target.clone();
-    let dl_conns = state.config.download_connections;
-    let dl_limit = state.config.download_speed_limit_mb;
+    let dl_conns = state.cfg().download_connections;
+    let dl_limit = state.cfg().download_speed_limit_mb;
     tokio::spawn(async move {
         let token = std::env::var("HF_TOKEN").ok();
         let client = match blazar_runtime::hf::HfClient::new(token).map(|c| {
@@ -832,7 +831,7 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
     let rx2 = state.bus.subscribe();
     // F18: scrub parity with /api/watch - event payloads today carry
     // names/counts only, but error strings can surface remote URLs.
-    let scrub = state.config.pii_scrub;
+    let scrub = state.cfg().pii_scrub;
     let events = tokio_stream::wrappers::BroadcastStream::new(rx2);
     let mapped = TsExt::filter_map(events, move |ev| match ev {
         Ok(e) => {
@@ -859,10 +858,12 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
 fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
         AutotuneAdvice, BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated,
-        FailoverSwitched, InstanceStateChanged, ModelPreloaded, ModelPulled, ModelRemoved,
-        PullFailed, PullProgress, QueueDepth, SlotsAutoAdopted, SlotsCtxAutoFit, SlotsDecodeBound,
-        SlotsDrainCutover, SlotsPinnedPressure, SlotsPrewarmCutover, SlotsReshaped,
-        SpecGovernorOff, SpecGovernorRecovered,
+        ConfigReloadFailed, ConfigReloaded, FailoverSwitched, FleetWorkerDeparted,
+        FleetWorkerJoined, InstanceStateChanged,
+        ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress, QueueDepth,
+        SlotsAutoAdopted, SlotsCtxAutoFit, SlotsDecodeBound, SlotsDrainCutover,
+        SlotsPinnedPressure, SlotsPrewarmCutover, SlotsReshaped, SpecGovernorOff,
+        SpecGovernorRecovered,
     };
     match e {
         EngineUpdated { .. } => "engine_updated",
@@ -887,6 +888,10 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
         BenchmarkDone { .. } => "benchmark_done",
         QueueDepth { .. } => "queue_depth",
         FailoverSwitched { .. } => "failover_switched",
+        FleetWorkerJoined { .. } => "fleet_worker_joined",
+        FleetWorkerDeparted { .. } => "fleet_worker_departed",
+        ConfigReloaded { .. } => "config_reloaded",
+        ConfigReloadFailed { .. } => "config_reload_failed",
     }
 }
 
@@ -907,7 +912,7 @@ async fn unload_ping(state: &Arc<AppState>, model: &str, chat_shape: bool) -> Re
         .sessions
         .pins(
             &row.name,
-            std::time::Duration::from_secs(state.config.session_keep_secs),
+            std::time::Duration::from_secs(state.cfg().session_keep_secs),
         )
         .live;
     if !pinned {
@@ -1032,7 +1037,7 @@ pub async fn chat(
     // Remote routing: `<remote>:<model>` on the ollama API too -
     // POOL-aware (C4): select among same-named remotes with prefix
     // stickiness + circuit health, not just the first configured entry.
-    if crate::remotes::split_remote(&model_field, &state.config).is_some() {
+    if crate::remotes::split_remote(&model_field, &state.cfg()).is_some() {
         // F11: remote lanes pay key admission against the full
         // `remote:model` string (same semantics as the OpenAI lane's
         // split: a scope entry like `my-remote:*` admits, anything
@@ -1269,7 +1274,7 @@ pub async fn chat(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if !req["stream"].as_bool().unwrap_or(true) && !constrained && !tool_gate && voice.is_none() {
-        let sc = &state.config.semantic_cache;
+        let sc = &state.cfg().semantic_cache;
         match semcache::directive(
             sc.enabled,
             sc.model.is_some(),
@@ -1345,7 +1350,7 @@ pub async fn chat(
     // child: per-request restarts are impossible - fail fast with the
     // overlay fix instead of silently ignoring (H1).
     if let Some(want) = num_ctx {
-        if state.config.router {
+        if state.cfg().router {
             return api_error(
                 400,
                 &format!(
@@ -1365,7 +1370,7 @@ pub async fn chat(
         .pointer("/options/spec")
         .and_then(serde_json::Value::as_str)
     {
-        if state.config.router {
+        if state.cfg().router {
             return api_error(
                 400,
                 &format!(
@@ -1400,7 +1405,7 @@ pub async fn chat(
     // reachable on a compat model).
     let class = crate::queue::classify_work(
         req.get("tools").is_some_and(serde_json::Value::is_array),
-        state.config.effective_prompt_recipe(&model_field) == crate::prompt_recipe::OLLAMA_COMPAT
+        state.cfg().effective_prompt_recipe(&model_field) == crate::prompt_recipe::OLLAMA_COMPAT
             && !crate::prompt_recipe::has_images(&req),
     );
     // Request-level admission BEFORE the ensure path (same contract as
@@ -1491,7 +1496,7 @@ pub async fn chat(
         guard,
         (async move {
             let enforce =
-                state2.config.sentinel && sentinel::enforce_enabled(&state2.config, &headers);
+                state2.cfg().sentinel && sentinel::enforce_enabled(&state2.cfg(), &headers);
             let resp = proxy_core_chat(
                 &state2,
                 &engine2,
@@ -1519,7 +1524,7 @@ pub async fn chat(
                     .sessions
                     .pins(
                         &model_name,
-                        std::time::Duration::from_secs(state2.config.session_keep_secs),
+                        std::time::Duration::from_secs(state2.cfg().session_keep_secs),
                     )
                     .live
             {
@@ -1610,7 +1615,7 @@ fn emb_prompt_text(req: &Value) -> String {
 fn refuse_remote_prefix(state: &AppState, model: &str) -> Option<Response> {
     if model
         .split_once(':')
-        .is_some_and(|(name, _)| state.config.remotes.iter().any(|r| r.name == name))
+        .is_some_and(|(name, _)| state.cfg().remotes.iter().any(|r| r.name == name))
     {
         return Some(api_error(
             400,
@@ -1854,7 +1859,7 @@ pub(crate) async fn apply_num_ctx(
                 // pin the spawn itself would host (split-brain
                 // observed live: a 65536 vision pin refused at f16
                 // math while the spawn laddered to q8_0 happily).
-                let (eff_k, eff_v) = state.config.effective_cache_type_kv(&model);
+                let (eff_k, eff_v) = state.cfg().effective_cache_type_kv(&model);
                 let pair_set = !eff_k.is_empty() || !eff_v.is_empty();
                 let ladder: Vec<Option<(String, String)>> = if pair_set {
                     vec![Some((eff_k, eff_v))]
@@ -2014,7 +2019,7 @@ async fn proxy_core_chat(
     let ollama_compat = {
         let parsed: Option<serde_json::Value> = serde_json::from_slice(&openai_body).ok();
         let recipe_pinned =
-            state.config.effective_prompt_recipe(model) == crate::prompt_recipe::OLLAMA_COMPAT;
+            state.cfg().effective_prompt_recipe(model) == crate::prompt_recipe::OLLAMA_COMPAT;
         // mlx-lm 0.32.0 reports `finish_reason: "tool_calls"` but drops
         // `message.tool_calls` at serialization (live receipt: 23
         // completion tokens, finish tool_calls, message absent + content
@@ -2064,11 +2069,11 @@ async fn proxy_core_chat(
     let openai_body: Vec<u8> = if ollama_compat {
         let parsed = serde_json::from_slice::<serde_json::Value>(&openai_body)
             .unwrap_or(serde_json::Value::Null);
-        let strict = state.config.effective_decode_policy(model) == "strict";
+        let strict = state.cfg().effective_decode_policy(model) == "strict";
         serde_json::to_vec(&crate::prompt_recipe::to_completion_request(
             &parsed,
             stream,
-            state.config.effective_raw_lane_max_tokens(&engine.name),
+            state.cfg().effective_raw_lane_max_tokens(&engine.name),
             strict,
         ))
         .unwrap_or_default()
@@ -2372,7 +2377,7 @@ async fn proxy_core_chat(
                 sem.emb,
                 openai,
                 sem.directive.ttl,
-                state.config.semantic_cache.max_entries,
+                state.cfg().semantic_cache.max_entries,
                 sem.fingerprint,
             );
             state
@@ -2979,7 +2984,7 @@ pub async fn embeddings(
         guard,
         (async {
             // R1 late chunking: gateway-terminated embed for opted-in models.
-            if state.config.effective_late_chunking(&engine.name) {
+            if state.cfg().effective_late_chunking(&engine.name) {
                 let prompt = req["prompt"].as_str().unwrap_or_default().to_string();
                 return match crate::latechunk::late_embed(&state, &engine, &model, &[prompt]).await
                 {
@@ -3133,7 +3138,7 @@ pub async fn embed(
         (async {
             // R1 late chunking: embed the joined document once (per-token
             // matrix from the pooling=none child), mean-pool per chunk span.
-            if state.config.effective_late_chunking(&engine.name) {
+            if state.cfg().effective_late_chunking(&engine.name) {
                 let strings: Option<Vec<String>> = inputs
                     .iter()
                     .map(|v| v.as_str().map(str::to_string))
@@ -3457,7 +3462,7 @@ pub async fn generate(
         .and_then(serde_json::Value::as_u64)
         .map(|v| u32::try_from(v.min(u64::from(u32::MAX))).unwrap_or(u32::MAX))
     {
-        if state.config.router {
+        if state.cfg().router {
             return api_error(
                 400,
                 &format!(
@@ -3476,7 +3481,7 @@ pub async fn generate(
         .pointer("/options/spec")
         .and_then(serde_json::Value::as_str)
     {
-        if state.config.router {
+        if state.cfg().router {
             return api_error(
                 400,
                 &format!(
@@ -3504,7 +3509,7 @@ pub async fn generate(
     }
     let class = crate::queue::classify_work(
         req.get("tools").is_some_and(serde_json::Value::is_array),
-        state.config.effective_prompt_recipe(&model) == crate::prompt_recipe::OLLAMA_COMPAT,
+        state.cfg().effective_prompt_recipe(&model) == crate::prompt_recipe::OLLAMA_COMPAT,
     );
     // Request-level admission before the ensure path, identical to the
     // /api/chat contract above (resolved-name keying, fair queue, park
@@ -3587,7 +3592,7 @@ pub async fn generate(
         guard,
         (async move {
             let enforce =
-                state_ej.config.sentinel && sentinel::enforce_enabled(&state_ej.config, &headers);
+                state_ej.cfg().sentinel && sentinel::enforce_enabled(&state_ej.cfg(), &headers);
             let resp = proxy_core_chat(
                 &state_ej,
                 &engine,
@@ -3614,7 +3619,7 @@ pub async fn generate(
                     .sessions
                     .pins(
                         &model_name,
-                        std::time::Duration::from_secs(state_ej.config.session_keep_secs),
+                        std::time::Duration::from_secs(state_ej.cfg().session_keep_secs),
                     )
                     .live
             {
@@ -3655,7 +3660,7 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
     // unload to the router child (models stay preset-listed, just unloaded).
     // The child's preset list is built from store rows, so the resolved
     // bare name is what it keys on too.
-    if state.config.router {
+    if state.cfg().router {
         let engine = match crate::proxy::ensure_router_detached(&state.sup).await {
             Ok(e) => e,
             Err(e) => return api_error(503, &e.to_string()),
@@ -3890,7 +3895,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         .ps()
         .into_iter()
         .find(|p| p.name == engine.name)
-        .map_or_else(|| state.config.effective_ctx(&engine.name), |p| p.ctx);
+        .map_or_else(|| state.cfg().effective_ctx(&engine.name), |p| p.ctx);
     let ckpt_dir = state
         .dirs
         .sessions_dir()
@@ -3903,7 +3908,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         match blazar_core::session_identity::read_manifest(&ckpt) {
             Some(saved) => {
                 let current =
-                    blazar_core::session_identity::build(&state.dirs, &state.config, &engine.name)
+                    blazar_core::session_identity::build(&state.dirs, &state.cfg(), &engine.name)
                         .map(|mut id| {
                             id.ctx = live_ctx;
                             id
@@ -3943,7 +3948,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         // `model` rides along for router mode (upstream proxy_post routes
         // by body model); classic children already run per-model dirs and
         // never see the extra key.
-        let body_json = if state.config.router {
+        let body_json = if state.cfg().router {
             json!({"filename": filename, "model": model})
         } else {
             json!({"filename": filename})
@@ -3963,7 +3968,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
                     let ckpt = ckpt_dir.join(filename);
                     match blazar_core::session_identity::build(
                         &state.dirs,
-                        &state.config,
+                        &state.cfg(),
                         &engine.name,
                     )
                     .map(|mut id| {
@@ -4106,7 +4111,7 @@ fn cache_metrics(state: &AppState, merged: &mut String) {
     state.obs.ttft_cold.render(merged);
     state.obs.render_per_model(merged);
     let live_sessions = state.sup.sessions.live_len(std::time::Duration::from_secs(
-        state.config.session_keep_secs,
+        state.cfg().session_keep_secs,
     ));
     let _ = write!(
         merged,
@@ -4170,7 +4175,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     cache_metrics(&state, &mut merged);
     // F25: router mode serves N models through ONE blazar instance -
     // count the router child's loaded models, not supervisor rows.
-    let models_loaded = if state.config.router {
+    let models_loaded = if state.cfg().router {
         match crate::proxy::ensure_router_detached(&state.sup).await {
             Ok(engine) => {
                 let url = format!("{}/models", child_base(&engine.endpoint));
@@ -4297,7 +4302,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // Spec-under-saturation: speculative drafting costs compute the
     // batch needs; flag it so operators flip spec=off under load.
     {
-        let spec_on = !state.config.spec.is_empty() && state.config.spec != "off";
+        let spec_on = !state.cfg().spec.is_empty() && state.cfg().spec != "off";
         let saturated = state.queue.depth() > 0;
         let _ = write!(
             merged,

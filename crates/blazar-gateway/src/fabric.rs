@@ -271,8 +271,7 @@ pub async fn fabric(State(state): State<Arc<AppState>>) -> Response {
         .lock()
         .expect("remote_capacity lock poisoned")
         .clone();
-    let peers: Vec<(String, String, PeerCapacity)> = state
-        .config
+    let peers: Vec<(String, String, PeerCapacity)> = state.cfg()
         .remotes
         .iter()
         .filter_map(|r| {

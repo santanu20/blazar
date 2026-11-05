@@ -344,7 +344,7 @@ pub async fn replicate(
     let Some(model) = v["model"].as_str().map(str::trim).filter(|m| !m.is_empty()) else {
         return api_error(400, "missing 'model' - the model to replicate");
     };
-    if state.config.remotes.is_empty() {
+    if state.cfg().remotes.is_empty() {
         return api_error(
             400,
             "no remotes configured - add a [[remotes]] entry before replicating",
@@ -355,7 +355,8 @@ pub async fn replicate(
             .filter_map(|n| n.as_str().map(str::to_string))
             .collect()
     });
-    let peers = match filter_remotes(&state.config.remotes, names.as_deref()) {
+    let cfg = state.cfg();
+    let peers = match filter_remotes(&cfg.remotes, names.as_deref()) {
         Ok(p) => p,
         Err(teach) => return api_error(StatusCode::NOT_FOUND.as_u16(), &teach),
     };
@@ -470,9 +471,8 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
         .lock()
         .expect("remote_capacity lock poisoned")
         .clone();
-    let peer_lines = |serving: &[&Remote]| -> Vec<serde_json::Value> {
-        state
-            .config
+    let peer_lines = |serving: &[Remote]| -> Vec<serde_json::Value> {
+        state.cfg()
             .remotes
             .iter()
             .map(|remote| {
@@ -515,7 +515,7 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
         } else {
             "model is owned locally - the next request loads it here (federation is not consulted for local models)"
         };
-        let serving: Vec<&Remote> = Vec::new();
+        let serving: Vec<Remote> = Vec::new();
         return axum::Json(serde_json::json!({
             "object": "blazar.route",
             "model": row.name,
@@ -533,7 +533,7 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
         .into_iter()
         .next()
     {
-        let hkey = crate::remotes::health_key(best);
+        let hkey = crate::remotes::health_key(&best);
         let h = healths.get(&hkey).copied().unwrap_or_default();
         let score = crate::remotes::score_peer(&model, &h, caps.get(&hkey));
         return axum::Json(serde_json::json!({

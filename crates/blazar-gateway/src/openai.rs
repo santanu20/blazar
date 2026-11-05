@@ -156,7 +156,7 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
     // the first fallback request warms it; listing must never block on
     // a network probe).
     let mut data = data;
-    if crate::remotes::fallback_enabled(&state.config) {
+    if crate::remotes::fallback_enabled(&state.cfg()) {
         // (owner, id) pairs from the presence cache in ONE lock pass;
         // an id two peers both list appears twice - each row names its
         // owner, clients disambiguate by picking one.
@@ -236,7 +236,7 @@ pub async fn embeddings(
         state
             .with_store(|s| crate::proxy::resolve_model(s, m).ok())
             .flatten()
-            .is_some_and(|row| state.config.effective_late_chunking(&row.name))
+            .is_some_and(|row| state.cfg().effective_late_chunking(&row.name))
     });
     if !late {
         return openai_proxy(state, trace_ext, key_ext, uri, method, headers, body).await;
@@ -760,7 +760,7 @@ pub async fn openai_proxy(
         return rej.to_response();
     }
     // Remote routing: `<remote-name>:<model>` never loads locally.
-    if crate::remotes::split_remote(&model, &state.config).is_some() {
+    if crate::remotes::split_remote(&model, &state.cfg()).is_some() {
         return crate::remotes::forward_with_health(
             &state,
             &model,
@@ -1006,7 +1006,7 @@ pub async fn openai_proxy(
             .as_ref()
             .filter(|v| !crate::prompt_recipe::has_images(v))
             .and_then(|v| {
-                let pinned = state.config.effective_prompt_recipe(&model_name)
+                let pinned = state.cfg().effective_prompt_recipe(&model_name)
                     == crate::prompt_recipe::OLLAMA_COMPAT;
                 let mlx_tools = engine.kind == blazar_core::engine_kind::EngineKind::Mlx
                     && v.get("tools")
@@ -1155,11 +1155,11 @@ pub async fn openai_proxy(
                 .get("stream")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let strict = state.config.effective_decode_policy(&model_name) == "strict";
+            let strict = state.cfg().effective_decode_policy(&model_name) == "strict";
             let rendered = crate::prompt_recipe::to_completion_request(
                 &render_src,
                 stream,
-                state.config.effective_raw_lane_max_tokens(&model_name),
+                state.cfg().effective_raw_lane_max_tokens(&model_name),
                 strict,
             );
             let bytes = serde_json::to_vec(&rendered).unwrap_or_default();
@@ -1757,7 +1757,7 @@ pub async fn scoped_proxy(
     {
         return rej.to_response();
     }
-    if crate::remotes::split_remote(&model, &state.config).is_some() {
+    if crate::remotes::split_remote(&model, &state.cfg()).is_some() {
         return crate::remotes::forward_with_health(
             &state,
             &model,
@@ -1851,7 +1851,7 @@ pub async fn responses_api(
         return rej.to_response();
     }
     // Remote routing first (registry chaining is local-only today).
-    if crate::remotes::split_remote(&model, &state.config).is_some() {
+    if crate::remotes::split_remote(&model, &state.cfg()).is_some() {
         return crate::remotes::forward_with_health(
             &state,
             &model,

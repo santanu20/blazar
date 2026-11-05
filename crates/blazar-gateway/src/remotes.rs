@@ -123,7 +123,7 @@ pub fn select_remote<'a>(
     state: &'a AppState,
     model: &'a str,
     prefix: Option<&blazar_runtime::PrefixKey>,
-) -> Result<(&'a Remote, &'a str, RemoteLease, Option<u64>), Response> {
+) -> Result<(Remote, &'a str, RemoteLease, Option<u64>), Response> {
     let Some((name, rest)) = model.split_once(':') else {
         return Err(crate::proxy::openai_error(
             400,
@@ -142,11 +142,14 @@ pub fn select_remote<'a>(
         .remote_health
         .lock()
         .expect("remote_health lock poisoned");
-    let pool: Vec<&Remote> = state
-        .config
+    let cfg = state.cfg();
+    // Owned clones: the live config can hot-swap under this call, so
+    // nothing here borrows the snapshot beyond its statement.
+    let pool: Vec<Remote> = cfg
         .remotes
         .iter()
         .filter(|r| r.name == name)
+        .cloned()
         .collect();
     if pool.is_empty() {
         return Err(crate::proxy::openai_error(
@@ -159,7 +162,7 @@ pub fn select_remote<'a>(
         .filter_map(|r| {
             let h = map.get(&health_key(r)).copied().unwrap_or_default();
             let down = h.down_until.is_some_and(|t| t > now);
-            (!down).then_some((*r, h))
+            (!down).then_some((r, h))
         })
         .collect();
     if live.is_empty() {
@@ -188,7 +191,7 @@ pub fn select_remote<'a>(
             .get(&k)
             .cloned()
     });
-    let chosen = sticky.as_ref().and_then(|want| {
+    let chosen: Option<&Remote> = sticky.as_ref().and_then(|want| {
         live.iter()
             .find(|(r, _)| health_key(r) == *want)
             .map(|(r, _)| *r)
@@ -196,13 +199,16 @@ pub fn select_remote<'a>(
     // No sticky hit: capacity-aware ranking (warm tier beats catalog,
     // queue wait beats idle-cold, then most free VRAM). `rest` is what
     // the peer actually serves, so the resident lookup keys on it.
-    let remote = chosen.unwrap_or_else(|| {
-        live.iter()
-            .min_by_key(|(r, h)| score_peer(rest, h, caps.get(&health_key(r))))
-            .map(|(r, _)| *r)
-            .expect("live pool non-empty")
-    });
-    let key = health_key(remote);
+    let remote: Remote = chosen
+        .cloned()
+        .unwrap_or_else(|| {
+            live.iter()
+                .min_by_key(|(r, h)| score_peer(rest, h, caps.get(&health_key(r))))
+                .map(|(r, _)| *r)
+                .cloned()
+                .expect("live pool non-empty")
+        });
+    let key = health_key(&remote);
     map.entry(key.clone()).or_default().in_flight += 1;
     let lease = RemoteLease {
         map: std::sync::Arc::clone(&state.remote_health),
@@ -309,7 +315,7 @@ pub async fn forward_with_health(
     let t0 = std::time::Instant::now();
     let resp = forward_openai(
         state,
-        remote,
+        &remote,
         remote_model,
         method,
         path_query,
@@ -319,9 +325,9 @@ pub async fn forward_with_health(
     .await;
     let head_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if resp.status().as_u16() < 500 {
-        note_remote_latency(&state.remote_health, remote, head_ms);
+        note_remote_latency(&state.remote_health, &remote, head_ms);
     }
-    tag_remote_result(state, remote, akey, resp)
+    tag_remote_result(state, &remote, akey, resp)
 }
 
 /// Forward an OpenAI-shaped request to a remote: rewrite `model` to the
@@ -799,9 +805,10 @@ async fn force_refresh_presence(state: &AppState, remote: &Remote) -> Option<Vec
 /// Remotes whose cached-or-fresh catalog lists `model`, live-filtered
 /// (circuit-open peers skip) and ordered least-in-flight first, config
 /// order as the stable tiebreak. First entry is the fallback target.
-pub async fn peers_serving<'a>(state: &'a AppState, model: &str) -> Vec<&'a Remote> {
-    let mut candidates: Vec<(&Remote, u32)> = Vec::new();
-    for remote in &state.config.remotes {
+pub async fn peers_serving(state: &AppState, model: &str) -> Vec<Remote> {
+    let mut candidates: Vec<(Remote, u32)> = Vec::new();
+    let cfg = state.cfg();
+    for remote in &cfg.remotes {
         // Circuit-open peers are excluded by the same health map the
         // explicit-prefix lane uses - fallback never routes into a
         // remote the breaker already marked down.
@@ -826,7 +833,7 @@ pub async fn peers_serving<'a>(state: &'a AppState, model: &str) -> Vec<&'a Remo
                 .ok()
                 .and_then(|m| m.get(&health_key(remote)).map(|h| h.in_flight))
                 .unwrap_or(0);
-            candidates.push((remote, in_flight));
+            candidates.push((remote.clone(), in_flight));
         }
     }
     candidates.sort_by_key(|(_, f)| *f);
@@ -838,13 +845,14 @@ pub async fn peers_serving<'a>(state: &'a AppState, model: &str) -> Vec<&'a Remo
 /// model inside the presence TTL is still found (the first fallback
 /// miss for that model pays the probe, unknown-name traffic never
 /// hammers peers).
-pub async fn peers_serving_with_refresh<'a>(state: &'a AppState, model: &str) -> Vec<&'a Remote> {
+pub async fn peers_serving_with_refresh(state: &AppState, model: &str) -> Vec<Remote> {
     let cached = peers_serving(state, model).await;
     if !cached.is_empty() {
         return cached;
     }
-    let mut candidates: Vec<(&Remote, u32)> = Vec::new();
-    for remote in &state.config.remotes {
+    let mut candidates: Vec<(Remote, u32)> = Vec::new();
+    let cfg = state.cfg();
+    for remote in &cfg.remotes {
         let live = state
             .remote_health
             .lock()
@@ -866,7 +874,7 @@ pub async fn peers_serving_with_refresh<'a>(state: &'a AppState, model: &str) ->
                 .ok()
                 .and_then(|m| m.get(&health_key(remote)).map(|h| h.in_flight))
                 .unwrap_or(0);
-            candidates.push((remote, in_flight));
+            candidates.push((remote.clone(), in_flight));
         }
     }
     candidates.sort_by_key(|(_, f)| *f);
@@ -898,11 +906,11 @@ pub enum FallbackLane<'a> {
 /// Rank already-filtered peers by capacity score. Health and capacity
 /// snapshots are cloned before any comparison (R4: no lock held during
 /// scoring); the stable sort preserves config order as tiebreak.
-pub(crate) fn rank_peers_by_capacity<'a>(
-    state: &'a AppState,
+pub(crate) fn rank_peers_by_capacity(
+    state: &AppState,
     model: &str,
-    peers: &[&'a Remote],
-) -> Vec<&'a Remote> {
+    peers: &[Remote],
+) -> Vec<Remote> {
     let caps = state
         .remote_capacity
         .lock()
@@ -935,7 +943,7 @@ pub async fn try_fallback_forward(
     model: &str,
     lane: FallbackLane<'_>,
 ) -> Option<axum::response::Response> {
-    if !fallback_enabled(&state.config) {
+    if !fallback_enabled(&state.cfg()) {
         return None;
     }
     let local_miss = state
@@ -964,8 +972,8 @@ pub async fn try_fallback_forward(
         FallbackLane::OllamaChat { req, prefix } => {
             let (remote, remote_model, _lease, akey) =
                 select_remote(state, &prefixed, prefix.as_ref()).ok()?;
-            let resp = ollama_chat_remote(state, remote, remote_model, req).await;
-            Some(tag_remote_result(state, remote, akey, resp))
+            let resp = ollama_chat_remote(state, &remote, remote_model, req).await;
+            Some(tag_remote_result(state, &remote, akey, resp))
         }
     }
 }

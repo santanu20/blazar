@@ -622,7 +622,8 @@ fn resolve_vad_model(
     state: &AppState,
     bin: &std::path::Path,
 ) -> Result<Option<std::path::PathBuf>, String> {
-    let Some(name) = state.config.whisper_vad_model.as_deref() else {
+    let cfg = state.cfg();
+    let Some(name) = cfg.whisper_vad_model.as_deref() else {
         return Ok(None);
     };
     let name = name.trim();
@@ -680,8 +681,8 @@ async fn forward_local_raw(
             lib_dir,
             std::time::Duration::from_mins(2),
             vad_model.as_deref(),
-            &whisper::knob_args(&state.config),
-            state.config.whisper_extra_args.as_deref().unwrap_or(&[]),
+            &whisper::knob_args(&state.cfg()),
+            state.cfg().whisper_extra_args.as_deref().unwrap_or(&[]),
         )
         .await
     {
@@ -1116,7 +1117,7 @@ async fn forward_local_stream(
     // Emission plan before the stream opens: WAV splits become windows;
     // anything else is one window carrying the original bytes and mime.
     let windows: Vec<(Vec<u8>, u64, String)> =
-        match whisper::split_wav(&file.data, state.config.whisper_stream_chunk_ms) {
+        match whisper::split_wav(&file.data, state.cfg().whisper_stream_chunk_ms) {
             Some(split) => split
                 .into_iter()
                 .map(|c| (c.bytes, c.offset_ms, "audio/wav".to_string()))
@@ -1154,9 +1155,8 @@ async fn forward_local_stream(
                 &lib_dir,
                 std::time::Duration::from_mins(2),
                 vad_model.as_deref(),
-                &whisper::knob_args(&task_state.config),
-                task_state
-                    .config
+                &whisper::knob_args(&task_state.cfg()),
+                task_state.cfg()
                     .whisper_extra_args
                     .as_deref()
                     .unwrap_or(&[]),
@@ -1539,7 +1539,7 @@ pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response 
             "field": "stream",
             "values": ["true", "1"],
             "local_lane_only": true,
-            "chunk_ms": state.config.whisper_stream_chunk_ms,
+            "chunk_ms": state.cfg().whisper_stream_chunk_ms,
             "events": ["chunk.completed", "transcript.completed", "error"],
             "progressive": "wav pcm splits at frame boundaries; other formats decode as one \
              final event",
@@ -1587,7 +1587,7 @@ pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response 
         // Speech generation lives on the same audio plane; the speech
         // lanes describe themselves (tts.rs owns the domain).
         "speech": crate::tts::speech_capabilities(&state),
-        "idle_timeout_secs": state.config.whisper_idle_secs,
+        "idle_timeout_secs": state.cfg().whisper_idle_secs,
     });
     Response::builder()
         .status(200)
@@ -1808,7 +1808,7 @@ pub async fn audio_transcriptions(
     // token sniffer has nothing to read in whisper JSON (no usage
     // field), so request counts are the charge unit here.
     if let Some(model) = model.as_deref()
-        && split_remote(model, &state.config).is_some()
+        && split_remote(model, &state.cfg()).is_some()
     {
         if let Some(Extension(k)) = &key_ext
             && let Some(entry) = state.keys.entry(&k.name)
@@ -1961,7 +1961,7 @@ pub async fn audio_translations(
     // (1) Explicit remote intent wins (F11 admission, same as
     // transcriptions - request counts are the charge unit here).
     if let Some(model) = model.as_deref()
-        && split_remote(model, &state.config).is_some()
+        && split_remote(model, &state.cfg()).is_some()
     {
         if let Some(Extension(k)) = &key_ext
             && let Some(entry) = state.keys.entry(&k.name)

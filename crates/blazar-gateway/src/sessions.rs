@@ -77,7 +77,7 @@ pub async fn pin_mw(
 ) -> Response {
     // Cheap gates first: feature off or no usable header -> the request
     // flows on untouched, no buffering, no locks (H4).
-    if state.config.session_keep_secs == 0 {
+    if state.cfg().session_keep_secs == 0 {
         return next.run(req).await;
     }
     let raw_session = req
@@ -111,7 +111,7 @@ pub async fn pin_mw(
     if let Some((session, model)) = state
         .with_store(|s| {
             pin_target(
-                state.config.session_keep_secs,
+                state.cfg().session_keep_secs,
                 raw_session.as_deref(),
                 &bytes,
                 s,
@@ -128,7 +128,7 @@ pub async fn pin_mw(
 /// GET /api/sessions - live pins (observability: `blazar` tooling, live
 /// validation, agent dashboards). Oldest idle first.
 pub async fn list(State(state): State<Arc<AppState>>) -> Response {
-    let ttl = std::time::Duration::from_secs(state.config.session_keep_secs);
+    let ttl = std::time::Duration::from_secs(state.cfg().session_keep_secs);
     let sessions: Vec<serde_json::Value> = state
         .sup
         .sessions
@@ -145,7 +145,7 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Response {
         .collect();
     axum::Json(serde_json::json!({
         "sessions": sessions,
-        "keep_secs": state.config.session_keep_secs,
+        "keep_secs": state.cfg().session_keep_secs,
     }))
     .into_response()
 }

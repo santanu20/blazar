@@ -139,7 +139,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         );
     };
 
-    let overlay = state.config.overlay_for(&resolved);
+    let overlay = state.cfg().overlay_for(&resolved);
     let safetensors = std::path::Path::new(&row.path).is_dir();
     // MLX dirs are safetensors-shaped; the token marker plus the
     // dir gate is the discriminator the router uses (folded inside
@@ -178,8 +178,8 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
             .collect();
         let verdict = blazar_core::engine_kind::serving_lane(
-            state.config.engine_routing.mode,
-            state.config.engine_routing.policy,
+            state.cfg().engine_routing.mode,
+            state.cfg().engine_routing.policy,
             overlay.engine.as_deref(),
             shape,
             g_kind,
@@ -193,10 +193,10 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             "kind": format!("{kind:?}").to_lowercase(),
             "source": if overlay.engine.is_some() { "pin" } else { "auto" },
             "reason": lane_reason(
-                state.config.engine_routing.mode,
+                state.cfg().engine_routing.mode,
                 overlay.engine.as_deref(),
                 shape,
-                state.config.engine_routing.policy,
+                state.cfg().engine_routing.policy,
             ),
         }),
         Some((g_tag, Ok(None))) => json!({
@@ -224,7 +224,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     // Context: requested (config precedence) vs effective (what a live
     // child actually holds - admission_ctx's discipline, stated with
     // sources).
-    let requested = state.config.effective_ctx(&resolved);
+    let requested = state.cfg().effective_ctx(&resolved);
     let resident_ctx = state
         .sup
         .ps()
@@ -256,7 +256,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         };
         json!({
             "requested": requested,
-            "requested_source": requested_ctx_source(overlay.ctx.is_some(), &resolved, state.config.default_ctx),
+            "requested_source": requested_ctx_source(overlay.ctx.is_some(), &resolved, state.cfg().default_ctx),
             "effective": effective,
             "effective_source": effective_source,
             "limitation": limitation,
@@ -299,7 +299,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     let slots = json!({
         "live": live,
         "live_in_flight": live_inflight,
-        "adaptive_slots": state.config.adaptive_slots,
+        "adaptive_slots": state.cfg().adaptive_slots,
         "note": if live.is_some() { "" } else { "slots = 0 (auto) is sized at spawn from device capacity" },
     });
 
@@ -312,7 +312,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         .find(|r| !r["spec_mode"].as_str().unwrap_or("").is_empty())
         .map(|r| (r["spec_mode"].clone(), r["draft"].clone()));
     let static_mode =
-        blazar_runtime::resolve_spec_mode(None, overlay.spec.clone(), &state.config.spec);
+        blazar_runtime::resolve_spec_mode(None, overlay.spec.clone(), &state.cfg().spec);
     let static_draft = state
         .with_store(|s| blazar_runtime::resolve_draft_path(s, &resolved, &static_mode))
         .flatten();
@@ -324,7 +324,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             if overlay.spec.is_some() {
                 format!("model_overrides.{resolved}.spec")
             } else {
-                format!("config spec = {}", state.config.spec)
+                format!("config spec = {}", state.cfg().spec)
             },
         ),
     };
@@ -342,7 +342,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
 
     // Cache: KV quant grades (empty = the engine's auto ladder decides)
     // and the semantic cache config surface.
-    let (kv_k, kv_v) = state.config.effective_cache_type_kv(&resolved);
+    let (kv_k, kv_v) = state.cfg().effective_cache_type_kv(&resolved);
     // The KV ladder is a llama.cpp concept; on the mlx lane the runtime
     // manages KV and shaping flags ride argv passthrough.
     let (kv_key_label, kv_value_label) = if shape.shards == ShardFormat::MlxLayout {
@@ -360,10 +360,10 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         "kv_v": kv_value_label,
         "kv_advisory": kv_advisory(shape, kv_k.as_str(), requested, resident_ctx, &resolved),
         "semantic_cache": {
-            "enabled": state.config.semantic_cache.enabled,
-            "model": state.config.semantic_cache.model,
-            "threshold": state.config.semantic_cache.threshold,
-            "ttl_secs": state.config.semantic_cache.ttl_secs,
+            "enabled": state.cfg().semantic_cache.enabled,
+            "model": state.cfg().semantic_cache.model,
+            "threshold": state.cfg().semantic_cache.threshold,
+            "ttl_secs": state.cfg().semantic_cache.ttl_secs,
         },
     });
 

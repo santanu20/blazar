@@ -1967,7 +1967,7 @@ async fn await_native_job(
     engine: &blazar_runtime::EngineRef,
     job_id: &str,
 ) -> Result<serde_json::Value, Box<Response>> {
-    let budget_secs = state.config.media_job_wait_secs;
+    let budget_secs = state.cfg().media_job_wait_secs;
     let mut polled = 0_u64;
     let mut transport_fails = 0_u32;
     loop {
@@ -2041,7 +2041,7 @@ fn stream_native_job(
         // loop must read as activity for as long as it runs, or the
         // reaper can idle-evict the child under a long stream.
         let _activity = ChildActivityGuard::begin(std::sync::Arc::clone(&state.sup), &engine.name);
-        let budget_secs = state.config.media_job_wait_secs;
+        let budget_secs = state.cfg().media_job_wait_secs;
         let mut polled = 0_u64;
         let mut transport_fails = 0_u32;
         loop {
