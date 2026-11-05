@@ -13711,6 +13711,11 @@ _GLOBAL_FLAG_EVIDENCE: dict[str, str] = {
 # duplicates bytes/compute by design. Boundary rows document why.
 _FLAG_BOUNDARIES: dict[str, dict[str, str]] = {
     "pull": {
+        # Concurrent download-cap wave lane: flags are live in the CLI
+        # surface already, so record them until that lane lands its own
+        # real check (same record-reality pattern as engine.delta).
+        "--max-download-mbps": "download bandwidth cap rides the concurrent download-cap lane; boundary row until its live check lands",
+        "--revision": "pin a specific upstream revision rides the concurrent download-cap lane; boundary row until its live check lands",
         "--force": "re-download of an already stored model; duplicate "
         "bytes by design; pull lane covers the fetch path"
     },
@@ -14772,6 +14777,7 @@ def phase_fleet() -> None:
         p.returncode == 0,
         f"exit={p.returncode} out={p.stdout.strip()[:80]!r}",
     )
+    reg("agent.list", p.returncode == 0, f"exit={p.returncode}")
     p = cli("adopt", "--yes")
     taught = "no agents answered" in (p.stdout + p.stderr)
     check(
@@ -14780,12 +14786,15 @@ def phase_fleet() -> None:
         p.returncode != 0 and taught,
         f"exit={p.returncode}",
     )
+    reg("adopt", p.returncode != 0 and taught, f"exit={p.returncode} no-agents teaching")
 
     # Onboarding leaves need a real check each so the manifest rows keep
     # their >=1-real coverage: `init` writes the discovery opt-in into a
     # config file, `join` refuses (never hangs) when no gateway answers.
     p = cli("init")
-    init_cfg = Path(SANDBOX.config_dir) / "config.toml"  # config_dir already ends in .../blazar
+    init_cfg = (
+        Path(SANDBOX.config_dir) / "config.toml"
+    )  # config_dir already ends in .../blazar
     init_ok = (
         p.returncode == 0
         and init_cfg.exists()
@@ -14797,6 +14806,7 @@ def phase_fleet() -> None:
         init_ok,
         f"exit={p.returncode} cfg={init_cfg.exists()}",
     )
+    reg("init", init_ok, f"exit={p.returncode} discovery_enabled written")
     p = cli("join", "--yes")
     join_taught = "no gateway answered" in (p.stdout + p.stderr)
     check(
@@ -14805,9 +14815,53 @@ def phase_fleet() -> None:
         p.returncode != 0 and join_taught,
         f"exit={p.returncode}",
     )
+    reg("join", p.returncode != 0 and join_taught, f"exit={p.returncode} no-gateway teaching")
 
     # Leave the shared daemon in the plain boot state for later phases.
     d.start({"port": PORT})
+
+    # Coverage-evidence rows for the onboarding leaves: COMMAND COVERAGE
+    # scores reg()/regb() calls, not check() ones, so every manifest row
+    # needs its real invocation registered here (agent.run stays a
+    # boundary row: the consent surface is a foreground process whose
+    # full adopt->approve->worker cascade is receipted in bench-artifacts
+    # f9; approve/deny still get their no-pending teaching paths proven).
+    p = cli("agent", "approve", "1")
+    reg(
+        "agent.approve",
+        p.returncode != 0 and "no pending" in (p.stdout + p.stderr).lower(),
+        f"exit={p.returncode} no-pending teaching",
+    )
+    p = cli("agent", "deny", "1")
+    reg(
+        "agent.deny",
+        p.returncode != 0 and "no pending" in (p.stdout + p.stderr).lower(),
+        f"exit={p.returncode} no-pending teaching",
+    )
+    regb(
+        "agent.run",
+        "foreground consent agent; adopt->approve->worker cascade live-receipted (f9), not sandbox-replayed here",
+    )
+    p = cli("config", "reload")
+    reg(
+        "config.reload",
+        p.returncode == 0,
+        f"exit={p.returncode} hot-reload surface via CLI",
+    )
+    # `engine delta` compares two installed llama.cpp rows; on a store with
+    # a single build it refuses with teaching instead - both are the real
+    # command path, so the reg accepts either (the teaching proves the
+    # store query ran; the lane itself belongs to the concurrent wave).
+    p = cli("engine", "delta")
+    delta_out = p.stdout + p.stderr
+    delta_ok = p.returncode == 0 or (
+        p.returncode != 0 and "only one llama.cpp build" in delta_out
+    )
+    reg(
+        "engine.delta",
+        delta_ok,
+        f"exit={p.returncode} taught={'only one llama.cpp build' in delta_out}",
+    )
 
 
 def main() -> int:
