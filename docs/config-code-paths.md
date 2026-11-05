@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 235 fields, 0 dead
+## Config (top-level keys) - 245 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -263,6 +263,16 @@ token quality are surfaced as drift.
 | sdcpp_high_noise_diffusion_model | - | engine-argv | `crates/blazar-core/src/profile.rs:3528` (high-noise MMDiT companion) |
 | sdcpp_uncond_diffusion_model | - | engine-argv | `crates/blazar-core/src/profile.rs:3533` (uncond branch for cfg-distilled flows) |
 | sdcpp_backend | - | engine-argv | `crates/blazar-core/src/profile.rs:3535` (-> `--backend`, per-device placement map) |
+| autotune | None | runtime | `crates/blazar-runtime/src/supervisor.rs` (`autotune_advise_tick` on the reaper tail; `autotune_advise` posture gate - scheduled autonomy only under manual `optimize --run`/`--apply` lease cycles) |
+| fleet_enabled | true | gateway+runtime | `crates/blazar-gateway/src/fleet.rs` (404s join/invite/heartbeat/leave when off); `crates/blazar-runtime/src/supervisor.rs` (spawn planning skips announced-worker merge when off) |
+| fleet_heartbeat_secs | 15 | gateway+runtime | `crates/blazar-gateway/src/fleet.rs` (join ack cadence + workers listing echo); `crates/blazar-runtime/src/fleet.rs` (`FleetRegistry::prune` TTL) |
+| fleet_ttl_secs | 45 | gateway+runtime | `crates/blazar-gateway/src/fleet.rs` (join ack + workers listing echo); `crates/blazar-runtime/src/fleet.rs` (`FleetRegistry::prune` expiry window) |
+| fleet_token | "" | gateway+runtime+cli | `crates/blazar-gateway/src/fleet.rs` (`gate`/`join_gate`/`session_gate` constant-time match, invite mint auth); `crates/blazar-runtime/src/supervisor.rs` (fleet accessors); `crates/blazar-cli/src/main.rs` (`rpc_worker_joined` announce header, `join_cmd`, `adopt_cmd`, `agent_cmd` token policy) |
+| fleet_open | false | gateway | `crates/blazar-gateway/src/fleet.rs` (`gate` - non-loopback peers join without a token on trusted LANs) |
+| discovery_enabled | false | runtime+cli | `crates/blazar-runtime/src/discovery.rs` (lifecycle bind/unbind on `ConfigReloaded`; `serve_beacon` per-probe gate); `crates/blazar-cli/src/main.rs` (`join_cmd` gateway scan, `rpc worker --discover`) |
+| discovery_port | 11439 | runtime+cli | `crates/blazar-runtime/src/discovery.rs` (beacon bind, `seek_gateways`); `crates/blazar-cli/src/main.rs` (`join_cmd`, worker `--discover`); `crates/blazar-core/src/config.rs` (must differ from HTTP `port`) |
+| agent_port | 11440 | runtime+cli | `crates/blazar-runtime/src/adoption.rs` (`run_agent` TCP invite listener + UDP adopt beacon); `crates/blazar-cli/src/main.rs` (`adopt_cmd` `scan_agents`) |
+| agent_policy | "ask-owner" | runtime+cli | `crates/blazar-runtime/src/adoption.rs` (`decide_invite` ask-owner queues / token auto-approves); `crates/blazar-cli/src/main.rs` (`agent_cmd` run/list/approve/deny); `crates/blazar-core/src/config.rs` (validator allows only `ask-owner`/`token`) |
 
 ## MistralrsTuning ([mistralrs]) - 27 fields, 0 dead
 
