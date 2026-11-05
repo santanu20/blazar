@@ -37,6 +37,7 @@ pub mod registry;
 pub mod rpc_fleet;
 pub mod scan;
 pub mod sessionreg;
+pub mod siglip;
 pub mod storage;
 pub mod supervisor;
 pub mod throttle;

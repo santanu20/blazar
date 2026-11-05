@@ -227,7 +227,7 @@ pub async fn embeddings(
             state
                 .with_store(|s| crate::proxy::resolve_model(s, m).ok())
                 .flatten()
-                .is_some_and(|row| clip_lane_serves(row.arch.as_deref()))
+                .is_some_and(|row| candle_lane_serves(row.arch.as_deref()))
         })
     {
         return clip_embeddings(state, key_ext, requested.as_deref(), body).await;
@@ -350,11 +350,12 @@ fn req_has_image_input(body: &[u8]) -> bool {
 }
 
 /// True when a resolved row belongs to the candle CLIP lane. The one
-/// architecture that lane can load; every other arch (VLM towers,
-/// bert, speech) must ride the child proxy, whose mmproj-equipped
-/// children serve multimodal embeddings natively.
-fn clip_lane_serves(arch: Option<&str>) -> bool {
-    arch == Some("CLIPModel")
+/// architecture an in-process candle lane can load (CLIPModel via the
+/// clip module, SiglipModel via the siglip module); every other arch
+/// (VLM towers, bert, speech) must ride the child proxy, whose
+/// mmproj-equipped children serve multimodal embeddings natively.
+fn candle_lane_serves(arch: Option<&str>) -> bool {
+    matches!(arch, Some("CLIPModel") | Some("SiglipModel"))
 }
 
 /// CLIP image-embedding lane: accepts `input` as an array of
@@ -373,7 +374,34 @@ async fn clip_embeddings(
         Ok(v) => v,
         Err(e) => return openai_error(400, &format!("invalid JSON: {e}")),
     };
-    let (model, weights) = match blazar_runtime::clip::resolve(&state.dirs, requested) {
+    // Lane selection rides the resolved row's architecture: a named
+    // SiglipModel row embeds via the siglip candle lane, everything
+    // else via the clip lane. A model-less request (the historical
+    // sole-row shape) tries the clip lane first and falls back to a
+    // sole SigLIP row; when neither lane has anything, both pull
+    // teachings are shown so the remedy names a real candidate.
+    let lane_siglip = requested.is_some_and(|name| {
+        state
+            .with_store(|s| crate::proxy::resolve_model(s, name).ok())
+            .flatten()
+            .is_some_and(|row| row.arch.as_deref() == Some("SiglipModel"))
+    });
+    let resolved: Result<(String, std::path::PathBuf), String> = if lane_siglip {
+        blazar_runtime::siglip::resolve(&state.dirs, requested)
+    } else {
+        match blazar_runtime::clip::resolve(&state.dirs, requested) {
+            Ok(ok) => Ok(ok),
+            Err(clip_err) => match blazar_runtime::siglip::resolve(&state.dirs, requested) {
+                Ok(ok) => Ok(ok),
+                Err(siglip_err) => Err(if requested.is_none() {
+                    format!("{clip_err}; {siglip_err}")
+                } else {
+                    clip_err
+                }),
+            },
+        }
+    };
+    let (model, weights) = match resolved {
         Ok(ok) => ok,
         Err(msg) => return openai_error(400, &msg),
     };
@@ -461,7 +489,12 @@ async fn clip_embeddings(
             }
         }
     }
-    match blazar_runtime::clip::embed_images(weights, &images).await {
+    let embedded = if lane_siglip {
+        blazar_runtime::siglip::embed_images(weights, &images).await
+    } else {
+        blazar_runtime::clip::embed_images(weights, &images).await
+    };
+    match embedded {
         Ok(vectors) => {
             let data: Vec<serde_json::Value> = vectors
                 .iter()
@@ -481,7 +514,11 @@ async fn clip_embeddings(
                 "model": model,
                 "data": data,
                 "usage": { "prompt_tokens": 0, "total_tokens": 0 },
-                "blazar_note": "CLIP image embeddings - token usage is not applicable",
+                "blazar_note": if lane_siglip {
+                    "SigLIP image embeddings - token usage is not applicable"
+                } else {
+                    "CLIP image embeddings - token usage is not applicable"
+                },
             })
             .to_string()
             .into_response()
@@ -2568,18 +2605,20 @@ mod tests {
     }
 
     #[test]
-    fn unit__clip_lane_serves__only_clipmodel_arch_rides_candle() {
-        // CLIPModel rows keep the in-process candle lane.
-        assert!(clip_lane_serves(Some("CLIPModel")));
+    fn unit__candle_lane_serves__clipmodel_and_siglipmodel_only() {
+        // CLIPModel + SiglipModel rows keep the in-process candle lane
+        // (clip.rs and siglip.rs respectively).
+        assert!(candle_lane_serves(Some("CLIPModel")));
+        assert!(candle_lane_serves(Some("SiglipModel")));
         // Every other resolved arch rides the child proxy: VLM towers,
         // bert embedders, speech rows - their children own multimodal
         // /v1/embeddings via mmproj.
-        assert!(!clip_lane_serves(Some("Qwen3VLForConditionalGeneration")));
-        assert!(!clip_lane_serves(Some("bert")));
-        assert!(!clip_lane_serves(Some("qwen3tts")));
+        assert!(!candle_lane_serves(Some("Qwen3VLForConditionalGeneration")));
+        assert!(!candle_lane_serves(Some("bert")));
+        assert!(!candle_lane_serves(Some("qwen3tts")));
         // A row with no recorded arch never guesses its way into the
         // candle lane (weights would not be there).
-        assert!(!clip_lane_serves(None));
+        assert!(!candle_lane_serves(None));
     }
 
     #[test]

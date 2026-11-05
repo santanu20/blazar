@@ -349,6 +349,7 @@ mod tests {
             ("embeddinggemma-2", "ggml-org/embeddinggemma-2-GGUF"),
             // The SigLIP candle lane's reference model: safetensors on
             // main (no revision pin needed), sparse config verified.
+            ("siglip-base-patch16-224", "google/siglip-base-patch16-224"),
         ] {
             let e = resolve(name).unwrap_or_else(|err| panic!("{name}: {err}"));
             assert_eq!(e.repo, repo, "{name}");
