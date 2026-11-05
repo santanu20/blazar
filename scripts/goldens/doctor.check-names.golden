@@ -16,6 +16,7 @@ keys
 kv budget llamacpp
 kv budget mistralrs
 kv budget mlx
+modality coverage
 model types
 models
 network

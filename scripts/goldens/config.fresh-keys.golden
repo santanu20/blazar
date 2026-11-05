@@ -3,6 +3,8 @@ adaptive_decode_gate
 adaptive_slots
 adaptive_target
 agent
+agent_policy
+agent_port
 audit_log
 batch
 batch_size
@@ -31,6 +33,8 @@ default_ctx
 deterministic
 deterministic_isolate
 devices
+discovery_enabled
+discovery_port
 download_connections
 download_speed_limit_mb
 embd_normalize
@@ -39,6 +43,11 @@ engine_check_secs
 engine_env
 engine_routing
 failover
+fleet_enabled
+fleet_heartbeat_secs
+fleet_open
+fleet_token
+fleet_ttl_secs
 fork_retire_days
 host
 idle_ram_warm

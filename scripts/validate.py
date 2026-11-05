@@ -1118,6 +1118,18 @@ _COMMAND_ATTRS = {
     "route.unknown": (True, False, False, False, True),
     "storage": (False, False, False, False, True),
     "warm": (True, True, False, False, True),
+    # Guided onboarding (fleet phase): gateway wizard, donor join, consent agent,
+    # adopter scan; config reload rides the hot-reload endpoint; engine delta
+    # records the concurrent lane present in the tree at authoring time.
+    "init": (False, False, False, False, True),
+    "join": (False, False, False, False, True),
+    "adopt": (False, False, False, False, True),
+    "agent.run": (False, False, False, False, True),
+    "agent.list": (False, False, False, False, True),
+    "agent.approve": (False, False, False, False, True),
+    "agent.deny": (False, False, False, False, True),
+    "config.reload": (True, False, False, False, True),
+    "engine.delta": (True, False, False, False, True),
 }
 
 COMMANDS = [
@@ -2316,6 +2328,88 @@ _K = [
         None,
         "mlx engine tuning section (1:1 mlx_lm.server flags, validated "
         "against the installed build's manifest; lane battery rides it)",
+    ),
+    # Fleet membership / discovery / onboarding knobs (fleet phase evidence:
+    # join+heartbeat+leave, invite one-use, hot reload, beacon seek on/off).
+    (
+        "fleet_enabled",
+        False,
+        False,
+        "config",
+        None,
+        "fleet API 404s when off; announced-worker merge gates spawn planning (fleet phase)",
+    ),
+    (
+        "fleet_heartbeat_secs",
+        False,
+        False,
+        "config",
+        None,
+        "join ack cadence + workers listing echo; registry TTL floor (fleet phase)",
+    ),
+    (
+        "fleet_ttl_secs",
+        False,
+        False,
+        "config",
+        None,
+        "join ack + workers listing echo; registry prune expiry (fleet phase)",
+    ),
+    (
+        "fleet_token",
+        False,
+        False,
+        "config",
+        None,
+        "tokened gateway: join/invite auth + constant-time match; worker announce header (fleet phase)",
+    ),
+    (
+        "fleet_open",
+        False,
+        False,
+        "config",
+        None,
+        "non-loopback peers join without token on trusted LANs (fleet phase)",
+    ),
+    (
+        "discovery_enabled",
+        False,
+        False,
+        "config",
+        None,
+        "beacon lifecycle bind/unbind on hot reload; worker --discover gate (fleet phase)",
+    ),
+    (
+        "discovery_port",
+        False,
+        False,
+        "config",
+        None,
+        "beacon bind + seek; must differ from HTTP port (fleet phase)",
+    ),
+    (
+        "agent_port",
+        False,
+        False,
+        "config",
+        None,
+        "donor agent TCP invite listener + UDP adopt beacon; adopt scan (fleet phase)",
+    ),
+    (
+        "agent_policy",
+        False,
+        False,
+        "config",
+        None,
+        "ask-owner queues invites vs token auto-approve; validator accepts the two values (fleet phase)",
+    ),
+    (
+        "autotune",
+        True,
+        False,
+        "config",
+        None,
+        "None default; advise tick gated on manual optimize lease cycles (supervisor autotune_advise_tick)",
     ),
 ]
 
@@ -8897,13 +8991,13 @@ def phase_wave() -> None:
         taught = "unreachable" in str(body_dead).lower()
         no_child = child_pid(f_small) is None
         d.stop()
-        if st_dead == 500 and taught and no_child:
+        if st_dead == 503 and taught and no_child:
             break
         time.sleep(1)
     check(
         "wave",
         "rpc dead endpoint -> spawn refused with teaching error (no crash-loop)",
-        st_dead == 500 and taught and no_child,
+        st_dead == 503 and taught and no_child,
         f"st={st_dead} elapsed={elapsed:.1f}s child_spawned={not no_child} "
         f"err={str(body_dead)[:140]}",
     )
@@ -12144,6 +12238,19 @@ def _full_toplevel() -> dict:
         "idle_sleep_secs": 77,
         "idle_timeout_secs": 500,
         "whisper_idle_secs": 900,
+        # fleet/discovery/onboarding knobs: config.rs defaults, valid by
+        # construction (validator: hb >= 5, ttl >= 3*hb, agent_policy in
+        # {ask-owner, token}, discovery_port != port).
+        "fleet_enabled": True,
+        "fleet_heartbeat_secs": 15,
+        "fleet_ttl_secs": 45,
+        "fleet_token": "",
+        "fleet_open": False,
+        "discovery_enabled": False,
+        "discovery_port": PORT + 1,
+        "agent_port": PORT + 2,
+        "agent_policy": "ask-owner",
+        "autotune": None,
         # sdcpp parity knobs: config.rs defaults, valid by construction
         "media_job_wait_secs": 900,
         "sdcpp_child_header_timeout_secs": 900,
@@ -14355,6 +14462,354 @@ def phase_coverage() -> None:
                 reg(f"flag.{slug}.{flag}", False, f"evidence lane {ev} never ran")
 
 
+def _fleet_udp_seek(port: int, timeout_s: float = 1.0) -> dict | None:
+    """One discovery probe against 127.0.0.1; returns the beacon reply
+    as a dict, or None when nothing answers within the window."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout_s)
+    try:
+        s.sendto(b"BLAZAR_DISCOVER_V1", ("127.0.0.1", port))
+        data, _ = s.recvfrom(512)
+        return json.loads(data.decode())
+    except (socket.timeout, OSError, ValueError):
+        return None
+    finally:
+        s.close()
+
+
+def _fleet_free_udp_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def phase_fleet() -> None:
+    print(
+        "\n== phase fleet: membership API, worker sessions, invite codes,"
+        " hot config reload, discovery beacon lifecycle =="
+    )
+    d = DAEMON
+
+    # --- Group A: untokened gateway, loopback trust, session tokens ----
+    d.start({"port": PORT})
+    st, _, v = http_json("GET", "/api/fleet/workers")
+    cadence_ok = (
+        isinstance(v, dict)
+        and int(v.get("heartbeat_interval_secs", 0)) > 0
+        and int(v.get("ttl_secs", 0)) >= 3 * int(v.get("heartbeat_interval_secs", 0))
+    )
+    check(
+        "fleet",
+        "workers listing empty + cadence echo",
+        st == 200 and isinstance(v, dict) and v.get("workers") == [] and cadence_ok,
+        f"status={st}",
+    )
+
+    st, _, ack = http_json(
+        "POST",
+        "/api/fleet/join",
+        {
+            "worker_id": "val-harness",
+            "endpoints": ["127.0.0.1:59901"],
+            "hostname": "validate",
+        },
+    )
+    wt = ack.get("worker_token", "") if isinstance(ack, dict) else ""
+    check(
+        "fleet",
+        "loopback join mints a 32-hex worker_token",
+        st == 200 and len(wt) == 32,
+        f"status={st} token_len={len(wt)}",
+    )
+
+    st, _, _ = http_json(
+        "POST",
+        "/api/fleet/heartbeat",
+        {"worker_id": "val-harness", "token": wt, "devices": []},
+        {"x-blazar-fleet-token": wt},
+    )
+    check("fleet", "heartbeat with worker_token accepted", st == 200, f"status={st}")
+
+    st, _, _ = http_json(
+        "POST",
+        "/api/fleet/heartbeat",
+        {"worker_id": "val-ghost", "token": wt},
+        {"x-blazar-fleet-token": wt},
+    )
+    check("fleet", "heartbeat for unknown worker 404s", st == 404, f"status={st}")
+
+    st, _, v = http_json("GET", "/api/fleet/workers")
+    names = (
+        [w.get("worker_id") for w in v.get("workers", [])]
+        if isinstance(v, dict)
+        else None
+    )
+    check(
+        "fleet",
+        "registry lists the joined worker",
+        names is not None and "val-harness" in names,
+        f"workers={names}",
+    )
+
+    st1, _, _ = http_json(
+        "POST",
+        "/api/fleet/leave",
+        {"worker_id": "val-harness", "token": wt},
+        {"x-blazar-fleet-token": wt},
+    )
+    st2, _, _ = http_json(
+        "POST",
+        "/api/fleet/leave",
+        {"worker_id": "val-harness", "token": wt},
+        {"x-blazar-fleet-token": wt},
+    )
+    st3, _, v = http_json("GET", "/api/fleet/workers")
+    names = (
+        [w.get("worker_id") for w in v.get("workers", [])]
+        if isinstance(v, dict)
+        else None
+    )
+    check(
+        "fleet",
+        "leave idempotent + registry empty again",
+        st1 == 200 and st2 == 200 and names == [],
+        f"leave={st1},{st2} workers={names}",
+    )
+
+    # --- Group B: tokened gateway, invite codes, hot reload, beacon ----
+    dp = _fleet_free_udp_port()
+    tok_cfg = {
+        "port": PORT,
+        "fleet_token": "val-master",
+        "discovery_enabled": False,
+        "discovery_port": dp,
+    }
+    d.start(tok_cfg)
+
+    st, _, body = http_json(
+        "POST",
+        "/api/fleet/join",
+        {
+            "worker_id": "val-bare",
+            "endpoints": ["127.0.0.1:59901"],
+        },
+    )
+    bare_refused = isinstance(body, dict) and "FLEET_TOKEN_REQUIRED" in json.dumps(body)
+    check(
+        "fleet",
+        "tokened gateway refuses bare join (loopback included)",
+        st == 401 and bare_refused,
+        f"status={st}",
+    )
+
+    st, _, inv = http_json(
+        "POST", "/api/fleet/invite", {"ttl_secs": 600, "token": "val-master"}
+    )
+    code = inv.get("invite_code", "") if isinstance(inv, dict) else ""
+    check(
+        "fleet",
+        "invite mint returns a one-use code",
+        st == 200 and len(code) == 32,
+        f"status={st} code_len={len(code)}",
+    )
+
+    st, _, ack = http_json(
+        "POST",
+        "/api/fleet/join",
+        {
+            "worker_id": "val-code",
+            "endpoints": ["127.0.0.1:59902"],
+            "token": code,
+        },
+    )
+    wt2 = ack.get("worker_token", "") if isinstance(ack, dict) else ""
+    check(
+        "fleet",
+        "join by invite code mints a fresh session",
+        st == 200 and len(wt2) == 32,
+        f"status={st} token_len={len(wt2)}",
+    )
+
+    st, _, _ = http_json(
+        "POST",
+        "/api/fleet/join",
+        {
+            "worker_id": "val-code2",
+            "endpoints": ["127.0.0.1:59902"],
+            "token": code,
+        },
+    )
+    check(
+        "fleet", "spent invite code never authorizes twice", st == 401, f"status={st}"
+    )
+
+    st, _, _ = http_json(
+        "POST",
+        "/api/fleet/leave",
+        {"worker_id": "val-code", "token": wt2},
+        {"x-blazar-fleet-token": wt2},
+    )
+    check(
+        "fleet",
+        "invite-joined worker leaves with its session",
+        st == 200,
+        f"status={st}",
+    )
+
+    # Hot reload: two identical reloads (fingerprint debounce), invalid
+    # file, recovery.
+    st, _, _ = http_json("POST", "/api/config/reload")
+    st, _, v = http_json("POST", "/api/config/reload")
+    debounce_ok = st == 200 and isinstance(v, dict) and v.get("applied") is False
+    check(
+        "fleet",
+        "second identical reload is a fingerprint no-op",
+        debounce_ok,
+        f"status={st} applied={v.get('applied') if isinstance(v, dict) else '?'}",
+    )
+
+    cfg_path = os.path.join(SANDBOX.config_dir, "config.toml")
+    valid_cfg = open(cfg_path).read()
+    with open(cfg_path, "w") as f:
+        f.write("%%% not toml %%%\n")
+    st, _, body = http_json("POST", "/api/config/reload")
+    refused = isinstance(body, dict) and "config_error" in json.dumps(body)
+    st_alive, _, _ = http_json("GET", "/api/version")
+    check(
+        "fleet",
+        "invalid config refused 422 + daemon keeps the running config",
+        st == 422 and refused and st_alive == 200,
+        f"reload={st} version={st_alive}",
+    )
+    with open(cfg_path, "w") as f:
+        f.write(valid_cfg)
+    st, _, _ = http_json("POST", "/api/config/reload")
+    check("fleet", "restored config reloads clean", st == 200, f"status={st}")
+
+    # Discovery beacon lifecycle on the same boot (flag was OFF at start).
+    silent0 = _fleet_udp_seek(dp, 0.7)
+    check(
+        "fleet",
+        "boot-off beacon silent",
+        silent0 is None,
+        f"reply={silent0}",
+    )
+    with open(cfg_path, "w") as f:
+        f.write(
+            valid_cfg.replace("discovery_enabled = false", "discovery_enabled = true")
+        )
+    http_json("POST", "/api/config/reload")
+    reply = None
+    for _ in range(10):
+        reply = _fleet_udp_seek(dp, 0.7)
+        if reply is not None:
+            break
+        time.sleep(0.5)
+    hot_on_ok = (
+        reply is not None
+        and int(reply.get("http_port", -1)) == PORT
+        and reply.get("fleet_token_required") is True
+    )
+    check(
+        "fleet",
+        "hot-on binds the beacon + reply names port and token policy",
+        hot_on_ok,
+        f"reply={reply}",
+    )
+
+    with open(cfg_path, "w") as f:
+        f.write(valid_cfg)
+    http_json("POST", "/api/config/reload")
+    time.sleep(1.0)
+    silent1 = _fleet_udp_seek(dp, 0.7)
+    check(
+        "fleet",
+        "hot-off releases the beacon",
+        silent1 is None,
+        f"reply={silent1}",
+    )
+
+    # --- Group C: dead rpc endpoint refusal + agent CLI surface -------
+    d.start(
+        {
+            "port": PORT,
+            "model_overrides": {MODEL: {"rpc_servers": "127.0.0.1:59903"}},
+        }
+    )
+    st, _, body = http_json(
+        "POST",
+        "/v1/chat/completions",
+        {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Say OK"}],
+            "max_tokens": 4,
+        },
+        timeout=120,
+    )
+    raw = body if isinstance(body, str) else json.dumps(body)
+    if st == 507:
+        boundary(
+            "fleet",
+            "dead rpc endpoint refuses with 503 teaching",
+            "box too tight for the spawn attempt (507 floor) - mechanism"
+            " receipted live in bench-artifacts/2026-11-03-capability-validation/f1-refusal-dead-endpoint.json",
+        )
+    else:
+        check(
+            "fleet",
+            "dead rpc endpoint refuses with 503 teaching",
+            st == 503 and "RPC_ENDPOINT_UNREACHABLE" in raw,
+            f"status={st}",
+        )
+    d.stop()
+
+    p = cli("agent", "list")
+    check(
+        "fleet",
+        "agent list works with no pending invites",
+        p.returncode == 0,
+        f"exit={p.returncode} out={p.stdout.strip()[:80]!r}",
+    )
+    p = cli("adopt", "--yes")
+    taught = "no agents answered" in (p.stdout + p.stderr)
+    check(
+        "fleet",
+        "adopt with no agents teaches instead of hanging",
+        p.returncode != 0 and taught,
+        f"exit={p.returncode}",
+    )
+
+    # Onboarding leaves need a real check each so the manifest rows keep
+    # their >=1-real coverage: `init` writes the discovery opt-in into a
+    # config file, `join` refuses (never hangs) when no gateway answers.
+    p = cli("init")
+    init_cfg = Path(SANDBOX.config_dir) / "config.toml"  # config_dir already ends in .../blazar
+    init_ok = (
+        p.returncode == 0
+        and init_cfg.exists()
+        and "discovery_enabled = true" in init_cfg.read_text()
+    )
+    check(
+        "fleet",
+        "init wizard enables discovery in the config",
+        init_ok,
+        f"exit={p.returncode} cfg={init_cfg.exists()}",
+    )
+    p = cli("join", "--yes")
+    join_taught = "no gateway answered" in (p.stdout + p.stderr)
+    check(
+        "fleet",
+        "join with no gateway teaches instead of hanging",
+        p.returncode != 0 and join_taught,
+        f"exit={p.returncode}",
+    )
+
+    # Leave the shared daemon in the plain boot state for later phases.
+    d.start({"port": PORT})
+
+
 def main() -> int:
     global SANDBOX, DAEMON, USER_CONFIG_SHA, PHASE_FILTER, CRASHED
     global UPDATE_GOLDENS
@@ -14473,6 +14928,7 @@ def main() -> int:
         ("baseline", phase_baseline),
         ("config", phase_config),
         ("api", phase_api),
+        ("fleet", phase_fleet),
         ("sentinel", phase_sentinel),
         ("engines", phase_engines),
         ("behavior", phase_behavior),

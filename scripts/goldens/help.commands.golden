@@ -1,3 +1,5 @@
+adopt
+agent
 autopilot
 bench
 certify
@@ -15,6 +17,8 @@ explain
 fit
 help
 import
+init
+join
 keys
 launch
 list
@@ -24,6 +28,7 @@ lora
 migrate
 mmproj
 model-doctor
+optimize
 plan
 prune
 ps
