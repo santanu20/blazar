@@ -509,7 +509,9 @@ async fn clip_embeddings(
                 .collect();
             // Token accounting does not apply to image pixels; usage is
             // zeroed and the note says so rather than inventing numbers.
-            serde_json::json!({
+            // axum::Json sets application/json - a bare String body would
+            // ship the same bytes as text/plain and break strict SDKs.
+            axum::Json(serde_json::json!({
                 "object": "list",
                 "model": model,
                 "data": data,
@@ -519,8 +521,7 @@ async fn clip_embeddings(
                 } else {
                     "CLIP image embeddings - token usage is not applicable"
                 },
-            })
-            .to_string()
+            }))
             .into_response()
         }
         Err(msg) => openai_error(500, &msg),
