@@ -79,6 +79,7 @@ The engines still perform inference. **Blazar is the control plane around them**
 | Failures you can diagnose | `doctor`, `why`, `watch`, metrics, trace IDs, teaching errors |
 | Models managed like software | Pull, import, inspect, pin, tune, snapshot, restore |
 | Several machines as one pool | Capacity-aware federation: warm, replicate, route |
+| Other laptops' GPUs joining yours | Opt-in cluster: `blazar init` on the gateway, `blazar join` (or consent-based `agent run` + `adopt` with one-use invite codes) on donors - their VRAM lands in spawn planning behind one API, discovery over the LAN, no addresses typed |
 | Multimodal in one place | Text, embeddings, image (variations, upscale), video (Sora verbs), speech-to-text (word timestamps), TTS (wav/pcm + ffmpeg lossy), realtime voice |
 | Production controls, locally | API keys, TLS, CORS, audit logging, PII scrubbing, OTLP |
 
