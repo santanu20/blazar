@@ -222,9 +222,15 @@ pub fn btag_number(tag: &str) -> Option<u64> {
 }
 
 /// Same-upstream-build comparison: b-tags compare by build number (so
-/// `b10816-cuda` == `b10816`); anything else falls back to equality.
+/// `b10816-cuda` == `b10816`), master-N tags by their counter (`master-
+/// 1043-3be2378` == any re-upload of counter 1043 - sd.cpp re-posts
+/// assets to a live counter, the counter is the currency); anything
+/// else falls back to equality.
 #[must_use]
 pub fn same_build(a: &str, b: &str) -> bool {
+    if let (Some(x), Some(y)) = (sdtag_counter(a), sdtag_counter(b)) {
+        return x == y;
+    }
     match (btag_number(a), btag_number(b)) {
         (Some(x), Some(y)) => x == y,
         _ => a == b,
@@ -2002,24 +2008,219 @@ pub fn piper_asset_patterns(os: &str, arch: &str) -> Result<Vec<SdAssetPattern>>
     }])
 }
 
-/// Walk the pattern list against the release's actual assets, returning
-/// the first match with its pattern (label + fallback flag ride along).
-/// `None` = nothing usable (not even CPU).
+impl SdAssetPattern {
+    /// Does `name` satisfy this pattern's include/exclude substrings?
+    #[must_use]
+    pub fn matches(&self, name: &str) -> bool {
+        self.includes.iter().all(|f| name.contains(f))
+            && self.excludes.iter().all(|f| !name.contains(f))
+    }
+}
+
+/// Ubuntu version token embedded in a prebuilt asset name, when the
+/// uploader named the build distro:
+/// `sd-master-<sha8>-bin-Linux-Ubuntu-26.04-x86_64-vulkan.zip` ->
+/// (26, 4). Upstream CI started stamping the builder distro into
+/// Linux zip names when the builder fleet mixed Ubuntu versions
+/// (master-1044+ Linux zips are built on Ubuntu 26.04 and linked
+/// against its GLIBC_2.43). Token-less names parse to None and stay
+/// ungated - which covers every whisper/piper/mistral.rs asset and
+/// every macOS/Windows zip today.
+#[must_use]
+pub fn asset_ubuntu_distro(name: &str) -> Option<(u32, u32)> {
+    const TOKEN: &str = "Ubuntu-";
+    // Boundary-honest: the token must start the name or follow a
+    // hyphen, so a substring like `notUbuntu-26.04` does not parse.
+    let start = name
+        .match_indices(TOKEN)
+        .map(|(i, _)| i)
+        .find(|&i| i == 0 || name[..i].ends_with('-'))?
+        + TOKEN.len();
+    let segment = name[start..].split('-').next()?;
+    let mut parts = segment.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
+/// Host Ubuntu version parsed from an os-release file's text (pure
+/// seam for the truth-table pins): `ID=ubuntu` + `VERSION_ID=24.04`
+/// -> (24, 4). Any other distro, a missing field, or an unparsable
+/// version yields None - the gate below is an Ubuntu-vs-Ubuntu
+/// presumption only and stays inert everywhere else.
+#[must_use]
+pub fn parse_os_release_ubuntu(text: &str) -> Option<(u32, u32)> {
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key).map(str::trim))
+    };
+    if field("ID=")?.trim_matches('"') != "ubuntu" {
+        return None;
+    }
+    let version = field("VERSION_ID=")?.trim_matches('"');
+    let mut parts = version.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
+/// The Ubuntu base version named by an upstream-release lsb file
+/// (pure seam): `DISTRIB_ID=Ubuntu` + `DISTRIB_RELEASE=24.04` ->
+/// (24, 4). Ubuntu derivatives carry this file naming the base they
+/// are built from (verified on Linux Mint 22.3:
+/// `/etc/upstream-release/lsb-release` -> Ubuntu 24.04, glibc 2.39);
+/// anything else parses to None.
+#[must_use]
+pub fn parse_lsb_release_ubuntu(text: &str) -> Option<(u32, u32)> {
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key).map(str::trim))
+    };
+    if field("DISTRIB_ID=")?.trim_matches('"') != "Ubuntu" {
+        return None;
+    }
+    let version = field("DISTRIB_RELEASE=")?.trim_matches('"');
+    let mut parts = version.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
+/// Host Ubuntu-base version from the two release files, pure over
+/// their texts (test seam): a plain Ubuntu host reports itself in
+/// os-release (`ID=ubuntu`); a derivative reports its Ubuntu BASE in
+/// the upstream-release lsb file. os-release wins when it is Ubuntu
+/// itself - on a derivative its `VERSION_ID` is the derivative's own
+/// numbering (Mint 22.3 != Ubuntu 22.03) and must never gate.
+#[must_use]
+pub fn ubuntu_base_from(os_release: &str, upstream_lsb: &str) -> Option<(u32, u32)> {
+    parse_os_release_ubuntu(os_release).or_else(|| parse_lsb_release_ubuntu(upstream_lsb))
+}
+
+/// Host Ubuntu-base version (plain Ubuntu or derivative via
+/// `/etc/upstream-release/lsb-release`), cached for the process
+/// lifetime (a host does not change distro mid-run). None on any
+/// other distro or unreadable files - the gate stays inert rather
+/// than presume.
+pub fn host_ubuntu_distro() -> Option<(u32, u32)> {
+    static HOST: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    *HOST.get_or_init(|| {
+        let os_release = std::fs::read_to_string("/etc/os-release").ok()?;
+        let upstream = std::fs::read_to_string("/etc/upstream-release/lsb-release").ok();
+        ubuntu_base_from(&os_release, upstream.as_deref().unwrap_or(""))
+    })
+}
+
+/// Gate verdict for one asset name against the host distro:
+/// `Some(reason)` when the asset's Ubuntu token is NEWER than the
+/// host's - such prebuilts are linked against the newer userspace's
+/// glibc and are presumed unloadable here (observed live: sd-server
+/// exits 127 with `error while loading shared libraries: ... needs
+/// GLIBC_2.43` and prints nothing to stdout). Equal/older tokens,
+/// token-less names, and non-Ubuntu hosts are fine (None). This is a
+/// presumption, not proof: channel installs still probe their result,
+/// and explicit pins are never auto-skipped on it.
+#[must_use]
+pub fn asset_distro_gate_reason(name: &str, host: Option<(u32, u32)>) -> Option<String> {
+    let asset = asset_ubuntu_distro(name)?;
+    let host = host?;
+    (asset > host).then(|| {
+        format!(
+            "{name} targets Ubuntu {major}.{minor:02} (newer than this host's Ubuntu \
+             {hmajor}.{hminor:02})",
+            major = asset.0,
+            minor = asset.1,
+            hmajor = host.0,
+            hminor = host.1,
+        )
+    })
+}
+
+/// One pattern-matching asset skipped by the host-distro gate.
+#[derive(Debug, Clone)]
+pub struct GatedAsset {
+    pub name: String,
+    /// The Ubuntu token parsed from `name` - why it was skipped.
+    pub distro: (u32, u32),
+}
+
+/// Outcome of walking [`SdAssetPattern`]s against a release's assets
+/// with the host-distro gate applied.
+#[derive(Debug)]
+pub enum SdAssetPick<'a, 'p> {
+    /// A usable asset plus the pattern that selected it.
+    Matched(&'a GhAsset, &'p SdAssetPattern),
+    /// Pattern-matching assets existed but every one was skipped by
+    /// the host-distro gate; carries the skipped assets with their
+    /// parsed distro. Install-shaped callers treat it as "nothing
+    /// usable", but it stays distinguishable from a plain no-match so
+    /// walk-back lanes can teach WHY a release was passed over and
+    /// pin flows can pre-warn.
+    Gated(Vec<GatedAsset>),
+    /// Nothing matched any pattern at all.
+    NoneUsable,
+}
+
+impl<'a, 'p> SdAssetPick<'a, 'p> {
+    #[must_use]
+    pub fn matched(self) -> Option<(&'a GhAsset, &'p SdAssetPattern)> {
+        match self {
+            Self::Matched(asset, pattern) => Some((asset, pattern)),
+            _ => None,
+        }
+    }
+}
+
+/// Walk the pattern list against the release's actual assets,
+/// returning the first match with its pattern (label + fallback flag
+/// ride along). Assets the host-distro gate presumes unloadable on
+/// this host are skipped - pass `host_distro = None` to disable the
+/// gate (the explicit-pin path does exactly that: a pin attempts the
+/// truth, never a presumption). `NoneUsable` = nothing usable (not
+/// even CPU); `Gated` = candidates existed but all were skipped.
 #[must_use]
 pub fn resolve_sdcpp_asset<'a, 'p>(
     release: &'a GhRelease,
     patterns: &'p [SdAssetPattern],
-) -> Option<(&'a GhAsset, &'p SdAssetPattern)> {
-    patterns.iter().find_map(|p| {
-        release
-            .assets
-            .iter()
-            .find(|a| {
-                p.includes.iter().all(|f| a.name.contains(f))
-                    && p.excludes.iter().all(|f| !a.name.contains(f))
-            })
-            .map(|a| (a, p))
-    })
+    host_distro: Option<(u32, u32)>,
+) -> SdAssetPick<'a, 'p> {
+    let mut gated: Vec<GatedAsset> = Vec::new();
+    for pattern in patterns {
+        for asset in &release.assets {
+            if !pattern.matches(&asset.name) {
+                continue;
+            }
+            if let Some(distro) = asset_ubuntu_distro(&asset.name) {
+                if host_distro.is_some_and(|host| distro > host) {
+                    gated.push(GatedAsset {
+                        name: asset.name.clone(),
+                        distro,
+                    });
+                    continue;
+                }
+            }
+            return SdAssetPick::Matched(asset, pattern);
+        }
+    }
+    if gated.is_empty() {
+        SdAssetPick::NoneUsable
+    } else {
+        SdAssetPick::Gated(gated)
+    }
+}
+
+/// Human rendering of a gate skip for one asset (the honest single
+/// failure line; walk summaries use the structured fields instead).
+#[must_use]
+pub fn gated_asset_reason(gated: &GatedAsset, host: Option<(u32, u32)>) -> String {
+    format!(
+        "{} targets Ubuntu {major}.{minor:02} (newer than this host's Ubuntu {hmajor}.{hminor:02})",
+        gated.name,
+        major = gated.distro.0,
+        minor = gated.distro.1,
+        hmajor = host.map_or(0, |h| h.0),
+        hminor = host.map_or(0, |h| h.1),
+    )
 }
 
 /// CUDA toolkit variants mistral.rs publishes prebuilts for, as the
@@ -2733,7 +2934,9 @@ mod tests {
                 "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-rocm.zip",
             ],
         );
-        let (asset, pattern) = resolve_sdcpp_asset(&release, &picks).unwrap();
+        let (asset, pattern) = resolve_sdcpp_asset(&release, &picks, None)
+            .matched()
+            .unwrap();
         assert!(asset.name.ends_with("vulkan.zip"));
         assert_eq!(pattern.label, "vulkan");
 
@@ -2746,14 +2949,146 @@ mod tests {
                 "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64-rocm.zip",
             ],
         );
-        let (asset, pattern) = resolve_sdcpp_asset(&cpu_only, &picks).unwrap();
+        let (asset, pattern) = resolve_sdcpp_asset(&cpu_only, &picks, None)
+            .matched()
+            .unwrap();
         assert!(!asset.name.contains("rocm"));
         assert_eq!(pattern.label, "cpu");
         assert!(pattern.cpu_fallback);
 
         // nothing usable -> None (caller teaching-errors with wanted list)
         let empty = rel("master-890-74988b2", &["source-code.tar.gz"]);
-        assert!(resolve_sdcpp_asset(&empty, &picks).is_none());
+        assert!(
+            resolve_sdcpp_asset(&empty, &picks, None)
+                .matched()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unit__asset_ubuntu_distro__parses_stamped_token_with_boundaries() {
+        let vulkan = "sd-master-7952693-bin-Linux-Ubuntu-26.04-x86_64-vulkan.zip";
+        assert_eq!(asset_ubuntu_distro(vulkan), Some((26, 4)));
+        let cpu = "sd-master-3be2378-bin-Linux-Ubuntu-24.04-x86_64.zip";
+        assert_eq!(asset_ubuntu_distro(cpu), Some((24, 4)));
+        // token-less names stay ungated (every whisper/piper/macos asset)
+        assert_eq!(asset_ubuntu_distro("whisper-bin-ubuntu-x64.tar.gz"), None);
+        assert_eq!(
+            asset_ubuntu_distro("sd-master-74988b2-bin-Darwin-arm64.zip"),
+            None
+        );
+        // a mid-word hit without a start/hyphen boundary is NOT the token
+        assert_eq!(asset_ubuntu_distro("notUbuntu-26.04.zip"), None);
+        // leading position of the name is a boundary too
+        assert_eq!(asset_ubuntu_distro("Ubuntu-26.04.zip"), Some((26, 4)));
+    }
+
+    #[test]
+    fn unit__parse_os_release_ubuntu__truth_table() {
+        let ubuntu2404 = "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID=24.04\n";
+        assert_eq!(parse_os_release_ubuntu(ubuntu2404), Some((24, 4)));
+        // quoted values parse the same
+        let quoted = "ID=\"ubuntu\"\nVERSION_ID=\"24.04\"\n";
+        assert_eq!(parse_os_release_ubuntu(quoted), Some((24, 4)));
+        // another distro, a missing VERSION_ID, a non-numeric version:
+        // no gate - never a false presumption
+        assert_eq!(parse_os_release_ubuntu("ID=debian\nVERSION_ID=12\n"), None);
+        assert_eq!(parse_os_release_ubuntu("ID=ubuntu\n"), None);
+        assert_eq!(
+            parse_os_release_ubuntu("ID=ubuntu\nVERSION_ID=rolling\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn unit__ubuntu_base_from__derivative_reports_upstream_base() {
+        // Verified live on Linux Mint 22.3: os-release carries Mint's
+        // own numbering (which must NEVER gate - Mint 22.3 is an
+        // Ubuntu 24.04 base, not 22.03), the upstream-release lsb file
+        // names the Ubuntu base.
+        let mint_os = "NAME=\"Linux Mint\"\nID=linuxmint\nID_LIKE=\"ubuntu debian\"\n\
+                       VERSION_ID=\"22.3\"\nUBUNTU_CODENAME=noble\n";
+        let mint_upstream = "DISTRIB_ID=Ubuntu\nDISTRIB_RELEASE=24.04\n\
+                             DISTRIB_CODENAME=noble\n";
+        assert_eq!(ubuntu_base_from(mint_os, mint_upstream), Some((24, 4)));
+        // derivative without the upstream file: no gate, never guess
+        assert_eq!(ubuntu_base_from(mint_os, ""), None);
+        // plain Ubuntu wins over anything the upstream file says
+        let ubuntu_os = "ID=ubuntu\nVERSION_ID=24.04\n";
+        assert_eq!(
+            ubuntu_base_from(ubuntu_os, "DISTRIB_ID=Ubuntu\nDISTRIB_RELEASE=26.04\n"),
+            Some((24, 4))
+        );
+        // non-Ubuntu upstream (a Debian-based derivative) stays ungated
+        let deepin_upstream = "DISTRIB_ID=Debian\nDISTRIB_RELEASE=12\n";
+        assert_eq!(ubuntu_base_from(mint_os, deepin_upstream), None);
+    }
+
+    #[test]
+    fn unit__asset_distro_gate_reason__only_newer_ubuntu_assets_gate() {
+        let host = Some((24, 4));
+        let newer = "sd-master-7952693-bin-Linux-Ubuntu-26.04-x86_64-vulkan.zip";
+        let reason = asset_distro_gate_reason(newer, host).unwrap();
+        assert!(
+            reason.contains("Ubuntu 26.04") && reason.contains("24.04"),
+            "{reason}"
+        );
+        // equal, older, token-less, and gate-disabled all pass
+        assert_eq!(
+            asset_distro_gate_reason("sd-x-bin-Linux-Ubuntu-24.04-x86_64.zip", host),
+            None
+        );
+        assert_eq!(
+            asset_distro_gate_reason("sd-x-bin-Linux-Ubuntu-22.04-x86_64.zip", host),
+            None
+        );
+        assert_eq!(
+            asset_distro_gate_reason("whisper-bin-ubuntu-x64.tar.gz", host),
+            None
+        );
+        assert_eq!(asset_distro_gate_reason(newer, None), None);
+    }
+
+    #[test]
+    fn unit__resolve_sdcpp_asset__distro_gate_skips_and_reports() {
+        let picks = sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+        let host = Some((24, 4));
+        // every tier of the release is built on Ubuntu 26.04 -> Gated
+        // with one reason per pattern-matching asset (vulkan + cpu)
+        let release = rel(
+            "master-1051-7952693",
+            &[
+                "sd-master-7952693-bin-Linux-Ubuntu-26.04-x86_64-vulkan.zip",
+                "sd-master-7952693-bin-Linux-Ubuntu-26.04-x86_64.zip",
+                "sd-master-7952693-bin-Linux-Ubuntu-24.04-x86_64-rocm.zip",
+            ],
+        );
+        match resolve_sdcpp_asset(&release, &picks, host) {
+            SdAssetPick::Gated(skipped) => {
+                assert_eq!(skipped.len(), 2, "{skipped:?}");
+                assert!(skipped.iter().all(|g| g.distro == (26, 4)));
+            }
+            other => panic!("expected Gated, got {other:?}"),
+        }
+        // gate disabled (explicit pin path): the same release resolves
+        // the vulkan zip exactly as before the gate existed
+        let (asset, pattern) = resolve_sdcpp_asset(&release, &picks, None)
+            .matched()
+            .unwrap();
+        assert!(asset.name.ends_with("vulkan.zip"));
+        assert_eq!(pattern.label, "vulkan");
+        // mixed release: a gated vulkan tier falls THROUGH to the cpu
+        // tier's host-compatible zip instead of killing the release
+        let mixed = rel(
+            "master-1051-7952693",
+            &[
+                "sd-master-7952693-bin-Linux-Ubuntu-26.04-x86_64-vulkan.zip",
+                "sd-master-7952693-bin-Linux-Ubuntu-24.04-x86_64.zip",
+            ],
+        );
+        let (_, pattern) = resolve_sdcpp_asset(&mixed, &picks, host).matched().unwrap();
+        assert_eq!(pattern.label, "cpu");
+        assert!(pattern.cpu_fallback);
     }
 
     #[test]
@@ -2773,7 +3108,7 @@ mod tests {
                 "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64.zip",
             ],
         );
-        let (asset, pattern) = resolve_sdcpp_asset(&future, &nv).unwrap();
+        let (asset, pattern) = resolve_sdcpp_asset(&future, &nv, None).matched().unwrap();
         assert_eq!(
             asset.name,
             "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64-cuda12.zip"
@@ -2781,7 +3116,7 @@ mod tests {
         assert_eq!(pattern.label, "cuda");
         assert!(!pattern.cpu_fallback);
 
-        let (asset, pattern) = resolve_sdcpp_asset(&future, &amd).unwrap();
+        let (asset, pattern) = resolve_sdcpp_asset(&future, &amd, None).matched().unwrap();
         assert!(asset.name.ends_with("vulkan.zip"));
         assert_eq!(pattern.label, "vulkan");
 
@@ -2794,7 +3129,7 @@ mod tests {
                 "sd-master-74988b2-bin-Linux-Ubuntu-24.04-x86_64.zip",
             ],
         );
-        let (asset, pattern) = resolve_sdcpp_asset(&today, &nv).unwrap();
+        let (asset, pattern) = resolve_sdcpp_asset(&today, &nv, None).matched().unwrap();
         assert!(asset.name.ends_with("vulkan.zip"));
         assert_eq!(pattern.label, "vulkan");
 
@@ -2806,7 +3141,9 @@ mod tests {
                 "sd-master-ffffffff-bin-Linux-Ubuntu-24.04-x86_64.zip",
             ],
         );
-        let (asset, pattern) = resolve_sdcpp_asset(&cuda_only, &amd).unwrap();
+        let (asset, pattern) = resolve_sdcpp_asset(&cuda_only, &amd, None)
+            .matched()
+            .unwrap();
         assert!(!asset.name.contains("cuda"), "cpu fallback must stay cpu");
         assert_eq!(pattern.label, "cpu");
         assert!(pattern.cpu_fallback);
@@ -2821,7 +3158,9 @@ mod tests {
                 "sd-master-74988b2-bin-win-cpu-x64.zip",
             ],
         );
-        let (asset, pattern) = resolve_sdcpp_asset(&win_rel, &win_nv).unwrap();
+        let (asset, pattern) = resolve_sdcpp_asset(&win_rel, &win_nv, None)
+            .matched()
+            .unwrap();
         assert_eq!(asset.name, "sd-master-74988b2-bin-win-cuda12-x64.zip");
         assert_eq!(pattern.label, "cuda");
     }

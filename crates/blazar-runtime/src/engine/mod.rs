@@ -156,6 +156,84 @@ fn scanback_release<'a>(releases: &'a [GhRelease], lane: &CudaLane) -> Option<&'
 /// upstream ubuntu-cuda asset. Most upstream releases ship none; the
 /// scan stays shallow so we never wander into stale runtimes.
 const UPSTREAM_SCANBACK_DEPTH: usize = 5;
+/// How many of sd.cpp's newest releases the channel walk may examine
+/// for a host-installable prebuilt. Deep enough to step past a builder
+/// distro move (master-1044..1052 all target Ubuntu 26.04), shallow
+/// enough to never land on a stale runtime unasked.
+const SDCPP_WALKBACK_DEPTH: usize = 12;
+
+/// Pure sd.cpp channel walk (test seam, no network): orders releases
+/// by tag counter (newest first), applies the host-distro gate via
+/// [`gh::resolve_sdcpp_asset`], and reports the newest tag, the
+/// installable candidates newest-first, and one teaching line per
+/// skipped release. The channel installer walks `installable`;
+/// `sdcpp_channel_target` surfaces the same facts to the CLI so the
+/// currency verdict and the install lane can never disagree.
+#[derive(Debug, Default)]
+pub struct SdcppChannelWalk<'a> {
+    /// Newest upstream master tag, gated or not.
+    pub newest_tag: Option<&'a str>,
+    /// Releases whose prebuilts resolve for this host, newest first.
+    pub installable: Vec<&'a GhRelease>,
+    /// One teaching line per skipped release (gate reason or no-match).
+    pub skipped: Vec<String>,
+}
+
+fn sdcpp_channel_walk<'a>(
+    releases: &'a [GhRelease],
+    patterns: &[gh::SdAssetPattern],
+    host_distro: Option<(u32, u32)>,
+) -> SdcppChannelWalk<'a> {
+    let mut order: Vec<(u32, &GhRelease)> = releases
+        .iter()
+        .filter_map(|r| gh::sdtag_counter(&r.tag_name).map(|n| (n, r)))
+        .collect();
+    order.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    let mut walk = SdcppChannelWalk::default();
+    walk.newest_tag = order.first().map(|(_, r)| r.tag_name.as_str());
+    for (_, release) in order.into_iter().take(SDCPP_WALKBACK_DEPTH) {
+        match gh::resolve_sdcpp_asset(release, patterns, host_distro) {
+            gh::SdAssetPick::Matched(..) => walk.installable.push(release),
+            gh::SdAssetPick::Gated(skipped) => {
+                // Compact per-release summary: every skipped asset of
+                // one release comes from the same builder distro in
+                // practice; name it once, count the assets.
+                let mut distros: Vec<String> = skipped
+                    .iter()
+                    .map(|g| format!("Ubuntu {}.{:02}", g.distro.0, g.distro.1))
+                    .collect();
+                distros.sort();
+                distros.dedup();
+                let n = skipped.len();
+                walk.skipped.push(format!(
+                    "{}: {n} prebuilt{} target {} (newer than this host)",
+                    release.tag_name,
+                    if n == 1 { "" } else { "s" },
+                    distros.join(", "),
+                ));
+            }
+            gh::SdAssetPick::NoneUsable => walk.skipped.push(format!(
+                "{}: no prebuilt for this platform",
+                release.tag_name
+            )),
+        }
+    }
+    walk
+}
+
+/// Channel truth for the sd.cpp lane, owned for the async boundary to
+/// the CLI (`sdcpp_channel_target`).
+#[derive(Debug, Clone)]
+pub struct SdcppChannelTarget {
+    /// Newest upstream master tag, gate or no gate.
+    pub newest_tag: String,
+    /// Newest tag whose prebuilt resolves for THIS host (None when
+    /// nothing within the walk depth does).
+    pub installable_tag: Option<String>,
+    /// One teaching line per skipped release.
+    pub skipped: Vec<String>,
+}
+
 /// Wait between asset-list re-fetches while a fresh release finishes
 /// uploading (observed: full asset matrix lands ~75-120 s after publish).
 pub const ASSET_UPLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -1654,36 +1732,109 @@ impl EngineManager {
     /// A CUDA-from-source build is deliberately not wired here: the
     /// vulkan prebuilt serves every GPU this daemon runs on.
     pub async fn update_sdcpp(&self, tag: Option<&str>) -> Result<EngineRow> {
-        let release = if let Some(t) = tag {
-            self.gh.release_by_tag_repo(gh::SDCPP_REPO, t).await?
-        } else {
-            let latest = self.gh.latest_sdcpp_release().await?;
-            self.gh
-                .release_by_tag_repo(gh::SDCPP_REPO, &latest.tag_name)
-                .await?
-        };
         // Vendor-native first: an NVIDIA box prefers a CUDA prebuilt the
         // day upstream ships one; every other GPU rides Vulkan.
         let nvidia = build::nvidia_gpu_facts().await.0.is_some();
         let patterns =
             gh::sdcpp_asset_patterns(std::env::consts::OS, std::env::consts::ARCH, nvidia)?;
 
+        if let Some(pin) = tag {
+            // Explicit pin = the repair lane: resolve UNGATED and
+            // attempt the full loud install - a presumed-incompatible
+            // prebuilt still gets its chance, and a failure reports
+            // the real loader error (see `probe_sdcpp`). The CLI
+            // pre-warns via `sdcpp_pin_gate_warnings`.
+            let release = self.gh.release_by_tag_repo(gh::SDCPP_REPO, pin).await?;
+            return self.sdcpp_install_release(&release, &patterns, None).await;
+        }
+
+        // Channel path: newest upstream tag is NOT automatically the
+        // newest installable one. Upstream's Linux prebuilts move
+        // between builder distros (master-1044+ zips are built on
+        // Ubuntu 26.04 and need GLIBC_2.43), so walk newest-behind
+        // for the first release whose prebuilts actually resolve for
+        // THIS host, self-healing past probe failures the name-based
+        // gate cannot foresee (a release can link a too-new libc
+        // without naming it).
+        let releases = self.gh.list_releases_repo(gh::SDCPP_REPO).await?;
+        let host = gh::host_ubuntu_distro();
+        let walk = sdcpp_channel_walk(&releases, &patterns, host);
+        for skipped in &walk.skipped {
+            tracing::info!("sd.cpp channel walk skipped {skipped}");
+        }
+        for candidate in &walk.installable {
+            if let Some(row) = self.sdcpp_installed_row_if_tag(&candidate.tag_name)? {
+                return Ok(row);
+            }
+            match self.sdcpp_install_release(candidate, &patterns, host).await {
+                Ok(row) => return Ok(row),
+                Err(e) if is_probe_failure(&e) => {
+                    // The binary is unusable on THIS host in a way the
+                    // distro gate missed - keep walking, the channel
+                    // owes the newest release that actually runs.
+                    tracing::warn!(
+                        "sd.cpp {} probe failed ({e:#}) - walking to the older release",
+                        candidate.tag_name
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let skipped = if walk.skipped.is_empty() {
+            "none skipped".to_string()
+        } else {
+            walk.skipped.join(" | ")
+        };
+        Err(anyhow!(
+            "no sd.cpp release installable on this host within the {} newest \
+             releases (skipped: {skipped})",
+            SDCPP_WALKBACK_DEPTH
+        ))
+    }
+
+    /// Resolve `release`'s asset and install it under the shared
+    /// download/extract/probe/rollback envelope, waiting out a fresh
+    /// release's asset upload on no-match (the bounded retry every
+    /// lane shares). `host_distro = None` disables the distro gate
+    /// (explicit-pin semantics); a gated-out release errors with the
+    /// gate reasons instead of retrying - waiting for an upload does
+    /// not change which distro the zips were built on.
+    async fn sdcpp_install_release(
+        &self,
+        release: &GhRelease,
+        patterns: &[gh::SdAssetPattern],
+        host_distro: Option<(u32, u32)>,
+    ) -> Result<EngineRow> {
         let mut last_missing: Option<Vec<gh::SdAssetPattern>> = None;
         for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
-            if let Some((asset, pattern)) = gh::resolve_sdcpp_asset(&release, &patterns) {
-                tracing::debug!(tag = %release.tag_name, asset = %asset.name, "sdcpp asset resolved");
-                return self
-                    .install_picked_asset(
-                        &release,
-                        asset,
-                        pattern.label,
-                        pattern.cpu_fallback,
-                        EngineKind::SdCpp,
-                    )
-                    .await;
+            match gh::resolve_sdcpp_asset(release, patterns, host_distro) {
+                gh::SdAssetPick::Matched(asset, pattern) => {
+                    tracing::debug!(tag = %release.tag_name, asset = %asset.name, "sdcpp asset resolved");
+                    return self
+                        .install_picked_asset(
+                            release,
+                            asset,
+                            pattern.label,
+                            pattern.cpu_fallback,
+                            EngineKind::SdCpp,
+                        )
+                        .await;
+                }
+                gh::SdAssetPick::Gated(skipped) => {
+                    return Err(anyhow!(
+                        "release {} prebuilts skipped for this host: {}",
+                        release.tag_name,
+                        skipped
+                            .iter()
+                            .map(|g| gh::gated_asset_reason(g, host_distro))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
+                gh::SdAssetPick::NoneUsable => {}
             }
-            last_missing = Some(patterns.clone());
-            if !release_is_fresh(&release) || attempt == ASSET_UPLOAD_RETRY_ATTEMPTS {
+            last_missing = Some(patterns.to_vec());
+            if !release_is_fresh(release) || attempt == ASSET_UPLOAD_RETRY_ATTEMPTS {
                 break;
             }
             tracing::info!(
@@ -1729,9 +1880,68 @@ impl EngineManager {
         let nvidia = build::nvidia_gpu_facts().await.0.is_some();
         let patterns =
             gh::sdcpp_asset_patterns(std::env::consts::OS, std::env::consts::ARCH, nvidia)?;
-        gh::resolve_sdcpp_asset(&release, &patterns)
+        // Gate-aware, mirroring what the channel install would pick on
+        // this host today.
+        gh::resolve_sdcpp_asset(&release, &patterns, gh::host_ubuntu_distro())
+            .matched()
             .map(|(_, pattern)| pattern.label)
             .ok_or_else(|| anyhow!("no usable sd.cpp asset in release {tag}"))
+    }
+
+    /// Channel truth for `blazar engine update --kind sdcpp`: upstream's
+    /// newest tag, the newest tag THIS host can actually install after
+    /// distro gating, and a teaching line per skipped release. The CLI
+    /// verdict and the install lane both derive from this walk, so they
+    /// can never disagree about what "current" means.
+    pub async fn sdcpp_channel_target(&self) -> Result<SdcppChannelTarget> {
+        let nvidia = build::nvidia_gpu_facts().await.0.is_some();
+        let patterns =
+            gh::sdcpp_asset_patterns(std::env::consts::OS, std::env::consts::ARCH, nvidia)?;
+        let releases = self.gh.list_releases_repo(gh::SDCPP_REPO).await?;
+        let walk = sdcpp_channel_walk(&releases, &patterns, gh::host_ubuntu_distro());
+        Ok(SdcppChannelTarget {
+            newest_tag: walk.newest_tag.unwrap_or_default().to_string(),
+            installable_tag: walk.installable.first().map(|r| r.tag_name.clone()),
+            skipped: walk.skipped,
+        })
+    }
+
+    /// Pre-install teaching for an explicit sd.cpp tag pin: the
+    /// host-distro gate reasons for the release's pattern-matching
+    /// assets. Pins are NEVER auto-skipped (truth over presumption) -
+    /// this only warns before the loud attempt, because the likely
+    /// failure mode is a libc loader error at probe time.
+    pub async fn sdcpp_pin_gate_warnings(&self, tag: &str) -> Result<Vec<String>> {
+        let release = self.gh.release_by_tag_repo(gh::SDCPP_REPO, tag).await?;
+        let nvidia = build::nvidia_gpu_facts().await.0.is_some();
+        let patterns =
+            gh::sdcpp_asset_patterns(std::env::consts::OS, std::env::consts::ARCH, nvidia)?;
+        let host = gh::host_ubuntu_distro();
+        let mut warnings = Vec::new();
+        for pattern in &patterns {
+            for asset in &release.assets {
+                if pattern.matches(&asset.name)
+                    && let Some(reason) = gh::asset_distro_gate_reason(&asset.name, host)
+                {
+                    warnings.push(reason);
+                }
+            }
+        }
+        Ok(warnings)
+    }
+
+    /// Kind-scoped same-tag idempotence for the sd.cpp walk: the newest
+    /// INSTALLED sd.cpp row when its tag is the same upstream build as
+    /// `tag`. Unlike [`Self::active_row_if_tag`] (the GLOBAL active
+    /// engine, usually llama), this never confuses the lane with an
+    /// active engine of another kind.
+    fn sdcpp_installed_row_if_tag(&self, tag: &str) -> Result<Option<EngineRow>> {
+        let newest = Store::open(&self.dirs)?
+            .list_engines()?
+            .into_iter()
+            .filter(|e| e.kind == EngineKind::SdCpp)
+            .max_by_key(|e| gh::sdtag_counter(&e.tag).unwrap_or(0));
+        Ok(newest.filter(|row| gh::same_build(&row.tag, tag)))
     }
 
     /// Install/refresh the whisper lane (prebuilt `whisper-server`).
@@ -1751,7 +1961,9 @@ impl EngineManager {
 
         let mut last_missing: Option<Vec<gh::SdAssetPattern>> = None;
         for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
-            if let Some((asset, pattern)) = gh::resolve_sdcpp_asset(&release, &patterns) {
+            if let Some((asset, pattern)) =
+                gh::resolve_sdcpp_asset(&release, &patterns, gh::host_ubuntu_distro()).matched()
+            {
                 tracing::debug!(tag = %release.tag_name, asset = %asset.name, "whisper asset resolved");
                 return self
                     .install_picked_asset(
@@ -1814,7 +2026,9 @@ impl EngineManager {
 
         let mut last_missing: Option<Vec<gh::SdAssetPattern>> = None;
         for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
-            if let Some((asset, pattern)) = gh::resolve_sdcpp_asset(&release, &patterns) {
+            if let Some((asset, pattern)) =
+                gh::resolve_sdcpp_asset(&release, &patterns, gh::host_ubuntu_distro()).matched()
+            {
                 tracing::debug!(tag = %release.tag_name, asset = %asset.name, "piper asset resolved");
                 return self
                     .install_picked_asset(
@@ -4269,6 +4483,113 @@ mod verify_tests {
             let hit = scanback_release(&releases, &x64_lane(11027))
                 .expect("13.3-only release is skipped, 12.8 picked");
             assert_eq!(hit.tag_name, "b11020");
+        }
+    }
+
+    mod sdcpp_walk_tests {
+        use super::super::*;
+
+        fn sd_release(tag: &str, ubuntu: &str) -> GhRelease {
+            let sha = tag.rsplit('-').next().unwrap_or("deadbeef");
+            GhRelease {
+                tag_name: tag.to_string(),
+                prerelease: false,
+                assets: [
+                    format!("sd-master-{sha}-bin-Linux-Ubuntu-{ubuntu}-x86_64-vulkan.zip"),
+                    format!("sd-master-{sha}-bin-Linux-Ubuntu-{ubuntu}-x86_64.zip"),
+                ]
+                .iter()
+                .map(|n| gh::GhAsset {
+                    name: n.clone(),
+                    digest: None,
+                    size: None,
+                    browser_download_url: format!("https://x/{n}"),
+                })
+                .collect(),
+                published_at: None,
+            }
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__gated_newest_walks_to_host_compatible() {
+            // The live 2026-11 shape: master-1044..1051 prebuilts moved
+            // to Ubuntu 26.04 builders (GLIBC_2.43) while this host runs
+            // Ubuntu 24.04 - the walk lands on master-1043 and teaches
+            // every skipped release.
+            let releases = vec![
+                sd_release("master-1051-7952693", "26.04"),
+                sd_release("master-1050-58bb3c1", "26.04"),
+                sd_release("master-1049-aaaaaaaa", "26.04"),
+                sd_release("master-1043-3be2378", "24.04"),
+            ];
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk(&releases, &picks, Some((24, 4)));
+            assert_eq!(walk.newest_tag, Some("master-1051-7952693"));
+            assert_eq!(
+                walk.installable
+                    .iter()
+                    .map(|r| r.tag_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["master-1043-3be2378"],
+                "only the host-compatible release is installable"
+            );
+            assert_eq!(walk.skipped.len(), 3, "{:?}", walk.skipped);
+            assert!(
+                walk.skipped.iter().all(|s| s.contains("26.04")),
+                "{:?}",
+                walk.skipped
+            );
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__ungated_latest_is_the_single_candidate() {
+            let releases = vec![
+                sd_release("master-1051-7952693", "24.04"),
+                sd_release("master-1050-58bb3c1", "24.04"),
+            ];
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk(&releases, &picks, Some((24, 4)));
+            assert_eq!(walk.newest_tag, Some("master-1051-7952693"));
+            assert_eq!(walk.skipped.len(), 0);
+            assert_eq!(
+                walk.installable.first().map(|r| r.tag_name.as_str()),
+                Some("master-1051-7952693")
+            );
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__depth_cap_teaches_all_skipped() {
+            // More gated releases than the walk depth: the walk examines
+            // only the newest SDCPP_WALKBACK_DEPTH and reports each with
+            // its reason; anything older is never considered.
+            let releases: Vec<GhRelease> = (1040..=1052)
+                .rev()
+                .map(|n| sd_release(&format!("master-{n}-aaaaaaa{n}"), "26.04"))
+                .collect();
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk(&releases, &picks, Some((24, 4)));
+            assert!(walk.installable.is_empty());
+            assert_eq!(
+                walk.skipped.len(),
+                SDCPP_WALKBACK_DEPTH,
+                "the walk stops after the depth cap even when every release is gated"
+            );
+            assert!(walk.skipped.iter().all(|s| s.contains("26.04")));
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__gate_off_makes_newest_installable() {
+            // Pin semantics: host_distro None disables the gate, so the
+            // newest gated release becomes the candidate the loud
+            // attempt will try.
+            let releases = vec![sd_release("master-1051-7952693", "26.04")];
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk(&releases, &picks, None);
+            assert_eq!(walk.skipped.len(), 0);
+            assert_eq!(
+                walk.installable.first().map(|r| r.tag_name.as_str()),
+                Some("master-1051-7952693")
+            );
         }
     }
 }

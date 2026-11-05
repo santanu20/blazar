@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
+use std::process::Output;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -756,6 +757,49 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
     })
 }
 
+/// Explain a zero-flag `--help` parse honestly. Two very different
+/// stories hide behind "no flags parsed":
+/// - non-zero exit: the binary never reached its usage path. The
+///   dynamic loader is the common culprit - a prebuilt linked against
+///   a newer distro's libc (e.g. an Ubuntu 26.04 asset needing
+///   GLIBC_2.43) exits 127 with `error while loading shared
+///   libraries: ...` on stderr and prints NOTHING to stdout, which
+///   used to masquerade as an upstream format change. Report the exit
+///   code plus the first stderr line verbatim, with a libc teaching
+///   when the loader signature is present.
+/// - exit 0 with no parseable flags: genuinely an upstream usage
+///   format change (or an unknown regression) - keep the original
+///   message with a usage preview.
+fn zero_flag_help_error(binary: &str, out: &Output, preview: String) -> anyhow::Error {
+    let stderr_text = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        let code = out
+            .status
+            .code()
+            .map_or_else(|| "killed by signal".to_string(), |c| c.to_string());
+        let first_nonempty = stderr_text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("<no stderr output>");
+        let loader_signature = [
+            "error while loading shared libraries",
+            "GLIBC_",
+            "cannot open shared object",
+        ]
+        .iter()
+        .any(|needle| stderr_text.contains(needle));
+        let mut msg = format!("{binary} --help exited {code}: {first_nonempty}");
+        if loader_signature {
+            msg.push_str(
+                " (prebuilt targets a newer libc than this host - check the asset distro)",
+            );
+        }
+        return anyhow!("{msg}");
+    }
+    anyhow!("{binary} --help parsed to zero flags (output format changed upstream?): {preview}")
+}
+
 /// Probe an sd.cpp `sd-server` binary. Divergences from llama-server
 /// (verified against stable-diffusion.cpp master-890-74988b2):
 /// - `--version` prints `stable-diffusion.cpp version unknown, commit
@@ -809,10 +853,8 @@ fn probe_sdcpp(server_path: &Path, tag: &str) -> Result<Manifest> {
     let help = String::from_utf8_lossy(&help_out.stdout).to_string();
     let (flags, _) = parse_help(&help);
     if flags.is_empty() {
-        return Err(anyhow!(
-            "sd-server --help parsed to zero flags (output format changed upstream?): {}",
-            help.lines().take(3).collect::<Vec<_>>().join(" | ")
-        ));
+        let preview = help.lines().take(3).collect::<Vec<_>>().join(" | ");
+        return Err(zero_flag_help_error("sd-server", &help_out, preview));
     }
 
     let devices = run_sd_list_devices(Path::new(server));
@@ -898,15 +940,13 @@ fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
     };
     let (flags, _) = parse_help(help_text);
     if flags.is_empty() {
-        return Err(anyhow!(
-            "whisper-server --help parsed to zero flags (output format changed upstream?): {}",
-            err_help
-                .lines()
-                .chain(out_help.lines())
-                .take(3)
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ));
+        let preview = err_help
+            .lines()
+            .chain(out_help.lines())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(zero_flag_help_error("whisper-server", &help_out, preview));
     }
 
     Ok(Manifest {
@@ -955,15 +995,13 @@ fn probe_piper(server_path: &Path, tag: &str) -> Result<Manifest> {
     };
     let (flags, _) = parse_help(help_text);
     if flags.is_empty() {
-        return Err(anyhow!(
-            "piper --help parsed to zero flags (output format changed upstream?): {}",
-            err_help
-                .lines()
-                .chain(out_help.lines())
-                .take(3)
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ));
+        let preview = err_help
+            .lines()
+            .chain(out_help.lines())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(zero_flag_help_error("piper", &help_out, preview));
     }
 
     Ok(Manifest {
@@ -1142,6 +1180,69 @@ fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>) {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    /// Platform-neutral `Output` seam for the zero-flag probe-error
+    /// pins: `code` 0 renders a success status, anything else a
+    /// non-zero exit.
+    fn help_output(code: i32, stdout: &str, stderr: &str) -> Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        };
+        #[cfg(not(unix))]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        };
+        Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn unit__zero_flag_help_error__loader_failure_names_exit_stderr_and_teaches() {
+        // Verified live: sd.cpp master-1050 on an Ubuntu 24.04 host -
+        // exit 127, empty stdout, the dynamic-loader error on stderr.
+        let out = help_output(
+            127,
+            "",
+            "sd-server: error while loading shared libraries: libggml-base.so.0: \
+             cannot open shared object file: No such file or directory\n",
+        );
+        let err = zero_flag_help_error("sd-server", &out, String::new()).to_string();
+        assert!(err.contains("exited 127"), "{err}");
+        assert!(
+            err.contains("error while loading shared libraries"),
+            "{err}"
+        );
+        assert!(
+            err.contains("newer libc than this host"),
+            "missing the distro teaching: {err}"
+        );
+    }
+
+    #[test]
+    fn unit__zero_flag_help_error__nonzero_exit_without_loader_signature_stays_plain() {
+        let out = help_output(2, "", "unknown flag --help\n");
+        let err = zero_flag_help_error("piper", &out, String::new()).to_string();
+        assert!(err.contains("exited 2"), "{err}");
+        assert!(err.contains("unknown flag --help"), "{err}");
+        assert!(!err.contains("libc"), "{err}");
+    }
+
+    #[test]
+    fn unit__zero_flag_help_error__exit_zero_keeps_format_change_message() {
+        // A usage that parses to zero flags with a successful exit is
+        // still the upstream-format-change story (unchanged behavior).
+        let out = help_output(0, "usage: sd-server\n--model-path\n", "");
+        let err = zero_flag_help_error("sd-server", &out, "usage: sd-server | --model-path".into())
+            .to_string();
+        assert!(err.contains("output format changed upstream"), "{err}");
+        assert!(err.contains("usage: sd-server"), "{err}");
+    }
 
     #[test]
     fn unit__parse_version__upstream_shape() {

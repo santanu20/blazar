@@ -914,6 +914,14 @@ enum EngineCmd {
     /// `blazar engine build cuda`. Activates the installed tag;
     /// restart the daemon so running spawns pick it up. The positional
     /// `all` (or `--all`) updates every installed lane instead.
+    ///
+    /// Prebuilts are gated by host compatibility: when every newer
+    /// upstream release is skipped (its prebuilts target a newer
+    /// distro/libc than this host can load - sd.cpp moved its release
+    /// builders to Ubuntu 26.04), `update` stays on the newest
+    /// host-installable build and teaches why. To force the attempt
+    /// anyway, pin the exact tag:
+    /// `blazar engine install master-1052-... --kind sdcpp`.
     Update {
         /// Engine lane to update: llamacpp (default) | sglang | mistralrs | sdcpp
         #[arg(long, default_value = "llamacpp")]
@@ -7336,33 +7344,131 @@ async fn live_mistralrs_currency(active: &str) -> Check {
     }
 }
 
-/// sdcpp engine currency: live warn-only probe of the newest
-/// master-tagged stable-diffusion.cpp release. The master channel is
-/// mutable (no ordering between shas), so any tag difference is an
-/// update - same verdict shape the mistral.rs lane uses.
-async fn live_sdcpp_currency(active: &str) -> Check {
-    let token = std::env::var("GH_TOKEN")
-        .or_else(|_| std::env::var("GITHUB_TOKEN"))
-        .ok();
-    let Ok(gh) = GhClient::new(token) else {
-        return Check::warn("engine currency", "cannot build GitHub client");
-    };
-    match gh.latest_sdcpp_release().await {
-        Ok(rel) if rel.tag_name == active => {
-            Check::ok("engine currency", format!("up to date ({active}, sdcpp)"))
+/// sdcpp engine currency: verdict from the SAME host-gated channel
+/// walk `engine update --kind sdcpp` installs through
+/// (`EngineManager::sdcpp_channel_target`), so doctor can never teach
+/// an update the lane would refuse - a newer-but-gated release reads
+/// as current-with-note, not "update available".
+async fn live_sdcpp_currency(d: &BlazarDirs, active: &str) -> Check {
+    let walked = match local_engine_manager(d) {
+        Ok(mgr) => mgr.sdcpp_channel_target().await,
+        Err(e) => {
+            return Check::warn(
+                "engine currency",
+                format!("check failed ({e:#}) - {}", gh_offline_hint().await),
+            );
         }
-        Ok(rel) => Check::warn(
-            "engine currency",
-            format!(
-                "update available: {} (active: {}, sdcpp) - run: \
-                 blazar engine update --kind sdcpp",
-                rel.tag_name, active
-            ),
-        ),
+    };
+    match walked {
+        Ok(target) => sdcpp_currency_check(active, &target),
         Err(e) => Check::warn(
             "engine currency",
             format!("check failed ({e:#}) - {}", gh_offline_hint().await),
         ),
+    }
+}
+
+/// Counter-ordered "b is newer than a" for sd.cpp master tags. False
+/// when either tag carries no counter (conservative) - the same shape
+/// the update lane's `newer` flag uses, so doctor's verdict and the
+/// update decision can never disagree.
+fn sdcpp_counter_newer(a: &str, b: &str) -> bool {
+    matches!(
+        (
+            blazar_runtime::engine::gh::sdtag_counter(a),
+            blazar_runtime::engine::gh::sdtag_counter(b),
+        ),
+        (Some(x), Some(y)) if y > x
+    )
+}
+
+/// Compact skip note shared by the doctor verdict and the list hint:
+/// names the newest gated tag and how many more releases the walk
+/// skipped. `None` when nothing was skipped (current means upstream
+/// latest) or the walk saw no releases.
+fn sdcpp_skip_note(t: &blazar_runtime::engine::SdcppChannelTarget) -> Option<String> {
+    if t.skipped.is_empty() || t.newest_tag.is_empty() {
+        return None;
+    }
+    let more = t.skipped.len().saturating_sub(1);
+    Some(if more == 0 {
+        format!(
+            "upstream newest {} was skipped: prebuilt targets a newer \
+             distro than this host",
+            t.newest_tag
+        )
+    } else {
+        format!(
+            "upstream newest {} + {more} more skipped: prebuilts target \
+             a newer distro than this host",
+            t.newest_tag
+        )
+    })
+}
+
+/// Doctor verdict for the sdcpp lane from the host-gated walk - pure
+/// so the wording is unit-pinnable without network. "Update
+/// available" only ever names a tag this host can actually install.
+fn sdcpp_currency_check(active: &str, t: &blazar_runtime::engine::SdcppChannelTarget) -> Check {
+    let note = sdcpp_skip_note(t);
+    match &t.installable_tag {
+        Some(tag) if sdcpp_counter_newer(active, tag) => {
+            let mut detail = format!(
+                "update available: {tag} (active: {active}, sdcpp) - run: \
+                 blazar engine update --kind sdcpp"
+            );
+            if let Some(n) = note {
+                detail.push_str(&format!(" ({n})"));
+            }
+            Check::warn("engine currency", detail)
+        }
+        Some(_) => {
+            let mut detail = format!("up to date ({active}, sdcpp - newest host-installable)");
+            if let Some(n) = note {
+                detail.push_str(&format!("; {n}"));
+            }
+            Check::ok("engine currency", detail)
+        }
+        // Nothing installable within the walk window (every newer
+        // release gated, or no prebuilts for this platform): the
+        // installed build is this host's ceiling - current, with the
+        // reason, never a nag to run an update that would refuse.
+        None => {
+            let detail = match note {
+                Some(n) => format!("up to date for this host ({active}, sdcpp); {n}"),
+                None => format!("up to date ({active}, sdcpp)"),
+            };
+            Check::ok("engine currency", detail)
+        }
+    }
+}
+
+/// Teaching lines for `engine list`: the sdcpp lane's host-gated
+/// currency in one line, same walk as update/doctor. Empty when the
+/// lane is genuinely current with nothing skipped (nothing to teach).
+fn sdcpp_hint_lines(
+    installed: &str,
+    t: &blazar_runtime::engine::SdcppChannelTarget,
+) -> Vec<String> {
+    match &t.installable_tag {
+        Some(tag) if sdcpp_counter_newer(installed, tag) => vec![format!(
+            "sdcpp update available: {tag} (installed: {installed}) - run: \
+             blazar engine update --kind sdcpp"
+        )],
+        Some(_) => sdcpp_skip_note(t)
+            .map(|note| {
+                vec![format!(
+                    "sdcpp {installed} is the newest host-installable build ({note})"
+                )]
+            })
+            .unwrap_or_default(),
+        None => sdcpp_skip_note(t)
+            .map(|note| {
+                vec![format!(
+                    "sdcpp {installed} stays: no newer release is host-installable ({note})"
+                )]
+            })
+            .unwrap_or_default(),
     }
 }
 /// Per-kind engine versions listing (whisper excepted - it has its own
@@ -7409,8 +7515,33 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
             engines.iter().filter(|e| e.kind == kind).collect();
         let Some(newest) = rows.first().copied() else {
             // Not installed: still resolve the lane's latest version so
-            // the row names a concrete target next to the install command.
+            // the row names a concrete target next to the install
+            // command. The sdcpp lane resolves through the host-gated
+            // walk so the named target is one this box can install -
+            // raw upstream newest may be distro-gated into uselessness.
             let install = engine_install_command(kind);
+            if kind == EngineKind::SdCpp
+                && let Ok(mgr) = local_engine_manager(d)
+                && let Ok(t) = mgr.sdcpp_channel_target().await
+            {
+                let detail = match t.installable_tag.as_deref() {
+                    Some(tag) => match sdcpp_skip_note(&t) {
+                        Some(note) => {
+                            format!(
+                                "none installed - newest host-installable {tag} ({note}) - run: {install}"
+                            )
+                        }
+                        None => format!("none installed - latest {tag} - run: {install}"),
+                    },
+                    None => format!(
+                        "none installed - no host-installable release ({}) - run: {install}",
+                        sdcpp_skip_note(&t)
+                            .unwrap_or_else(|| "no prebuilt for this platform".to_string())
+                    ),
+                };
+                out.push(Check::warn(name, detail));
+                continue;
+            }
             let latest = latest_engine_tag(kind).await;
             let detail = match latest {
                 Some(tag) => format!("none installed - latest {tag} - run: {install}"),
@@ -7442,7 +7573,7 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
             EngineKind::Sglang => live_sglang_currency(&judged.tag).await,
             EngineKind::Mlx => live_mlx_currency(&judged.tag).await,
             EngineKind::MistralRs => live_mistralrs_currency(&judged.tag).await,
-            EngineKind::SdCpp => live_sdcpp_currency(&judged.tag).await,
+            EngineKind::SdCpp => live_sdcpp_currency(d, &judged.tag).await,
             _ => {
                 // Active llama.cpp lane: prefer reconciling the daemon's
                 // last upstream survey (marker fresh + channel-matched);
@@ -18468,9 +18599,31 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
 /// GPU vendor; CPU fallback where no GPU build matched. The F7
 /// decode-regression gate is llama-server-only: skipped, and SAID so -
 /// llama-bench cannot drive an sd-server child.
+/// Pre-warn when an explicitly pinned sd.cpp tag ships prebuilts the
+/// host-distro gate presumes unloadable - the loud attempt still runs
+/// (pins are the escape hatch), but the likely libc loader failure is
+/// better said before the download.
+async fn warn_sdcpp_pin_gate(mgr: &EngineManager, pin: &str) {
+    if let Ok(warnings) = mgr.sdcpp_pin_gate_warnings(pin).await {
+        if !warnings.is_empty() {
+            println!(
+                "{}",
+                warn_line(&format!(
+                    "pinning {pin} anyway: {} - the install may fail with a libc \
+                     loader error",
+                    warnings.join("; ")
+                ))
+            );
+        }
+    }
+}
+
 async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()> {
     let mgr = local_engine_manager(d)?;
     let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
+    if let Some(pin) = tag.as_deref() {
+        warn_sdcpp_pin_gate(&mgr, pin).await;
+    }
     let wanted = tag.clone().unwrap_or_else(|| "latest".to_string());
     println!(
         "{}",
@@ -18518,30 +18671,45 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
         ));
     };
     let pinned = tag.is_some();
-    let target = if let Some(t) = tag {
-        t
+    let mgr = local_engine_manager(d)?;
+    let mut upstream_newest: Option<String> = None;
+    let (target, skipped): (String, Vec<String>) = if let Some(pin) = tag {
+        // Explicit pin: never auto-skipped, but the host-distro gate
+        // teaches BEFORE the loud attempt - the likely failure is a
+        // libc loader error at probe time, better said up front.
+        warn_sdcpp_pin_gate(&mgr, &pin).await;
+        (pin, Vec::new())
     } else {
-        // Currency probe: live latest-tag resolve under the shared
-        // bounded-retry policy (same policy as the mistral.rs row;
-        // sd.cpp releases are frequent - often several per day around
-        // new-model support).
-        let mgr = local_engine_manager(d)?;
-        let fetched = mgr.gh.latest_sdcpp_release().await;
-        match fetched {
-            Ok(rel) => rel.tag_name,
-            Err(e) => anyhow::bail!(
-                "cannot check sd.cpp releases: {e:#} - {}",
-                gh_offline_hint().await
-            ),
+        // Currency probe under the channel walk: upstream's newest tag
+        // may ship prebuilts this host cannot load (builder-distro
+        // moves), in which case "current" means the newest
+        // host-installable tag. The runtime installer walks the same
+        // list, so verdict and install can never disagree.
+        let target = match mgr.sdcpp_channel_target().await {
+            Ok(t) => t,
+            Err(e) => {
+                anyhow::bail!(
+                    "cannot check sd.cpp releases: {e:#} - {}",
+                    gh_offline_hint().await
+                );
+            }
+        };
+        let installable = target.installable_tag.clone().ok_or_else(|| {
+            anyhow!(
+                "no sd.cpp release installable on this host - skipped: {}",
+                if target.skipped.is_empty() {
+                    "no prebuilt found".to_string()
+                } else {
+                    target.skipped.join(" | ")
+                }
+            )
+        })?;
+        if target.newest_tag != installable {
+            upstream_newest = Some(target.newest_tag.clone());
         }
+        (installable, target.skipped)
     };
-    let newer = matches!(
-        (
-            blazar_runtime::engine::gh::sdtag_counter(&installed),
-            blazar_runtime::engine::gh::sdtag_counter(&target),
-        ),
-        (Some(a), Some(b)) if b > a
-    );
+    let newer = sdcpp_counter_newer(&installed, &target);
     // sd.cpp re-uploads assets to the same live master release several
     // times a day - the tag counter cannot see a backend appearing. A
     // NVIDIA box that installed vulkan must still pick up a CUDA
@@ -18552,7 +18720,6 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
         .into_iter()
         .find(|e| e.kind == EngineKind::SdCpp && e.tag == installed)
         .map(|e| e.asset);
-    let mgr = local_engine_manager(d)?;
     let would_label = match mgr.sdcpp_backend_label(&target).await {
         Ok(label) => Some(label),
         Err(e) => {
@@ -18583,8 +18750,15 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
                 would_label.unwrap_or("?")
             );
         } else {
-            println!("sd.cpp {installed} stays (target: {target})");
+            match &upstream_newest {
+                Some(newest) => println!(
+                    "sd.cpp {installed} is current (newest host-installable: {target}; \
+                     upstream newest {newest} was skipped - see below)"
+                ),
+                None => println!("sd.cpp {installed} is current (upstream latest: {target})."),
+            }
         }
+        teach_sdcpp_skipped(&skipped);
         return Ok(());
     }
     if !pinned && !newer {
@@ -18597,12 +18771,37 @@ async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -
                     would_label.unwrap_or("?")
                 ))
             );
+            teach_sdcpp_skipped(&skipped);
             return engine_install_sdcpp(d, Some(target)).await;
         }
-        println!("sd.cpp {installed} is current (upstream latest: {target}).");
+        match &upstream_newest {
+            Some(newest) => println!(
+                "sd.cpp {installed} is current (newest host-installable: {target}; \
+                 upstream newest {newest} was skipped - see below)"
+            ),
+            None => println!("sd.cpp {installed} is current (upstream latest: {target})."),
+        }
+        teach_sdcpp_skipped(&skipped);
         return Ok(());
     }
+    teach_sdcpp_skipped(&skipped);
     engine_install_sdcpp(d, Some(target)).await
+}
+
+/// One teaching block for the sd.cpp channel walk's skipped releases -
+/// shared by the update and --check verdicts so both tell the same
+/// story (entries come pre-formatted from `sdcpp_channel_target`).
+fn teach_sdcpp_skipped(skipped: &[String]) {
+    if skipped.is_empty() {
+        return;
+    }
+    println!(
+        "{}",
+        dim_line("upstream releases skipped (prebuilt targets a newer userspace than this host):")
+    );
+    for entry in skipped {
+        println!("  {entry}");
+    }
 }
 
 /// `blazar engine install --kind whisper [tag]` - prebuilt
@@ -20213,6 +20412,11 @@ fn llama_channel_hint_applies(tag: &str, kind: blazar_core::engine_kind::EngineK
 }
 
 async fn upstream_update_hint(dirs: &BlazarDirs) {
+    llama_update_hint(dirs).await;
+    sdcpp_update_hint(dirs).await;
+}
+
+async fn llama_update_hint(dirs: &BlazarDirs) {
     let Ok(store) = Store::open(dirs) else { return };
     let Ok(Some(active)) = store.active_engine() else {
         return;
@@ -20246,6 +20450,27 @@ async fn upstream_update_hint(dirs: &BlazarDirs) {
                 engine_update_command(&active.tag, &active.asset)
             );
         }
+    }
+}
+
+/// sdcpp lane visibility for `engine list`: the diffusion lane never
+/// owns the serving-active flag the llama hint keys on, so it gets its
+/// own hint line from the same host-gated walk update/doctor use -
+/// the three surfaces can never disagree about what "current" means.
+/// Silent on any failure: a hint must never block a listing.
+async fn sdcpp_update_hint(dirs: &BlazarDirs) {
+    let Ok(store) = Store::open(dirs) else { return };
+    let Ok(Some(installed)) = newest_sdcpp_tag(&store) else {
+        return;
+    };
+    let Ok(mgr) = local_engine_manager(dirs) else {
+        return;
+    };
+    let Ok(target) = mgr.sdcpp_channel_target().await else {
+        return;
+    };
+    for line in sdcpp_hint_lines(&installed, &target) {
+        println!("{line}");
     }
 }
 
@@ -23318,6 +23543,144 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    fn sd_target(
+        newest: &str,
+        installable: Option<&str>,
+        skipped: &[&str],
+    ) -> blazar_runtime::engine::SdcppChannelTarget {
+        blazar_runtime::engine::SdcppChannelTarget {
+            newest_tag: newest.to_string(),
+            installable_tag: installable.map(str::to_string),
+            skipped: skipped.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn unit__sdcpp_skip_note__none_when_nothing_skipped() {
+        let t = sd_target("master-1052-aaa", Some("master-1052-aaa"), &[]);
+        assert!(sdcpp_skip_note(&t).is_none());
+        // No releases seen at all: nothing to teach either.
+        let empty = sd_target("", None, &[]);
+        assert!(sdcpp_skip_note(&empty).is_none());
+    }
+
+    #[test]
+    fn unit__sdcpp_skip_note__single_and_compound_wording() {
+        let one = sd_target(
+            "master-1052-aaa",
+            Some("master-1043-bbb"),
+            &["master-1052-aaa: 2 prebuilts target Ubuntu 26.04 (newer than this host)"],
+        );
+        let note = sdcpp_skip_note(&one).expect("one skip -> note");
+        assert!(
+            note.contains("upstream newest master-1052-aaa was skipped"),
+            "{note}"
+        );
+        assert!(!note.contains("+ "), "{note}");
+        let many = sd_target(
+            "master-1052-aaa",
+            Some("master-1043-bbb"),
+            &[
+                "master-1052-aaa: 2 prebuilts target Ubuntu 26.04 (newer than this host)",
+                "master-1051-ccc: 2 prebuilts target Ubuntu 26.04 (newer than this host)",
+                "master-1050-ddd: 2 prebuilts target Ubuntu 26.04 (newer than this host)",
+            ],
+        );
+        let note = sdcpp_skip_note(&many).expect("three skips -> note");
+        assert!(
+            note.contains("upstream newest master-1052-aaa + 2 more skipped"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn unit__sdcpp_currency_check__gated_newer_reads_current_not_update() {
+        // The live complaint shape: upstream newest is gated; the walk
+        // lands on the installed build. Doctor must NOT nag "update
+        // available" for a release the install lane would refuse.
+        let t = sd_target(
+            "master-1052-aaa",
+            Some("master-1043-bbb"),
+            &["master-1052-aaa: 2 prebuilts target Ubuntu 26.04 (newer than this host)"],
+        );
+        let c = sdcpp_currency_check("master-1043-bbb", &t);
+        assert!(c.ok && !c.warn, "gated-newer is current, not a warning");
+        assert!(c.detail.contains("up to date"), "{}", c.detail);
+        assert!(c.detail.contains("newest host-installable"), "{}", c.detail);
+        assert!(
+            c.detail
+                .contains("upstream newest master-1052-aaa was skipped"),
+            "{}",
+            c.detail
+        );
+        assert!(!c.detail.contains("update available"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__sdcpp_currency_check__installable_newer_warns_with_command() {
+        let t = sd_target(
+            "master-1060-aaa",
+            Some("master-1050-bbb"),
+            &["master-1060-aaa: 2 prebuilts target Ubuntu 26.04 (newer than this host)"],
+        );
+        let c = sdcpp_currency_check("master-1043-ccc", &t);
+        assert!(c.warn, "a host-installable newer tag IS an update");
+        assert!(
+            c.detail.contains("update available: master-1050-bbb"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("blazar engine update --kind sdcpp"),
+            "{}",
+            c.detail
+        );
+        // Names the installable target, never the gated raw newest.
+        assert!(!c.detail.contains("1060-aaa (active"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__sdcpp_currency_check__nothing_installable_is_current_for_host() {
+        let t = sd_target(
+            "master-1052-aaa",
+            None,
+            &["master-1052-aaa: 2 prebuilts target Ubuntu 26.04 (newer than this host)"],
+        );
+        let c = sdcpp_currency_check("master-1043-bbb", &t);
+        assert!(c.ok && !c.warn, "ceiling reached is not a nag");
+        assert!(
+            c.detail.contains("up to date for this host"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("master-1052-aaa"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unit__sdcpp_hint_lines__three_verdicts() {
+        // Update available: one actionable line.
+        let t = sd_target("master-1060-aaa", Some("master-1050-bbb"), &[]);
+        let lines = sdcpp_hint_lines("master-1043-ccc", &t);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("sdcpp update available: master-1050-bbb"),
+            "{}",
+            lines[0]
+        );
+        // Current with skips: one teaching line.
+        let t = sd_target(
+            "master-1052-aaa",
+            Some("master-1043-bbb"),
+            &["master-1052-aaa: 2 prebuilts target Ubuntu 26.04 (newer than this host)"],
+        );
+        let lines = sdcpp_hint_lines("master-1043-bbb", &t);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("newest host-installable"), "{}", lines[0]);
+        // Genuinely current, nothing skipped: silent.
+        let t = sd_target("master-1043-bbb", Some("master-1043-bbb"), &[]);
+        assert!(sdcpp_hint_lines("master-1043-bbb", &t).is_empty());
+    }
 
     #[test]
     fn unit__worker_unit_text__pins_gateway_and_keeps_token_out() {
