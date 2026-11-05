@@ -5958,7 +5958,7 @@ fn modality_census(
             bump(&mut census, "vision");
             specialist = true;
         }
-        if arch == "clipmodel" {
+        if arch == "clipmodel" || arch == "siglipmodel" {
             bump(&mut census, "clip");
             specialist = true;
         } else if arch.contains("bert") || arch.contains("t5encoder") || arch.contains("embedding")
@@ -6092,6 +6092,13 @@ mod doctor_tests {
                 mmproj: false,
                 diffusion: false,
             },
+            // SigLIP rides the same candle lane and the same census
+            // class as CLIP - both are contrastive vision embedders.
+            ModalityProbe {
+                arch: Some("SiglipModel"),
+                mmproj: false,
+                diffusion: false,
+            },
             // Speech row with a sidecar: counts speech AND vision, never text.
             ModalityProbe {
                 arch: Some("qwen3tts"),
@@ -6118,7 +6125,7 @@ mod doctor_tests {
         assert_eq!(census["text"], 1, "only the plain qwen3 row is text");
         assert_eq!(census["vision"], 1, "sidecar row counts vision");
         assert_eq!(census["embeddings"], 1);
-        assert_eq!(census["clip"], 1);
+        assert_eq!(census["clip"], 2, "CLIPModel + SiglipModel towers");
         assert_eq!(census["speech"], 2, "qwen3tts row + piper voice signal");
         assert_eq!(census["asr"], 2, "whisper-arch row + ggml whisper assets");
         assert_eq!(census["diffusion"], 1);
@@ -6163,6 +6170,8 @@ mod doctor_tests {
         }
         let clip = blazar_core::catalog::resolve("clip-vit-base-patch32").unwrap();
         assert_eq!(clip.class.as_deref(), Some("clip"));
+        let siglip = blazar_core::catalog::resolve("siglip-base-patch16-224").unwrap();
+        assert_eq!(siglip.class.as_deref(), Some("clip"));
     }
 
     #[test]
@@ -6181,7 +6190,9 @@ mod doctor_tests {
         assert!(missing, "three suggestible classes absent -> warn");
         assert!(detail.starts_with("3/7 classes:"), "got: {detail}");
         assert!(
-            detail.contains("missing: clip (blazar pull clip-vit-base-patch32)"),
+            detail.contains(
+                "missing: clip (blazar pull clip-vit-base-patch32 or blazar pull siglip-base-patch16-224)"
+            ),
             "got: {detail}"
         );
         assert!(

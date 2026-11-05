@@ -34,6 +34,7 @@ test-util = []
 [dependencies]
 blazar-core = { workspace = true }
 blazar-runtime = { workspace = true }
+getrandom = { workspace = true }
 blazar-gateway = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
