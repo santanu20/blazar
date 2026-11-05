@@ -6158,8 +6158,8 @@ mod doctor_tests {
         let tagged: Vec<_> = entries.iter().filter(|e| e.class.is_some()).collect();
         assert_eq!(
             tagged.len(),
-            12,
-            "exactly the twelve non-LLM entries carry a class"
+            10,
+            "exactly the ten non-LLM entries carry a class"
         );
         for e in &tagged {
             let ok = matches!(
@@ -6170,8 +6170,6 @@ mod doctor_tests {
         }
         let clip = blazar_core::catalog::resolve("clip-vit-base-patch32").unwrap();
         assert_eq!(clip.class.as_deref(), Some("clip"));
-        let siglip = blazar_core::catalog::resolve("siglip-base-patch16-224").unwrap();
-        assert_eq!(siglip.class.as_deref(), Some("clip"));
     }
 
     #[test]
@@ -6191,7 +6189,7 @@ mod doctor_tests {
         assert!(detail.starts_with("3/7 classes:"), "got: {detail}");
         assert!(
             detail.contains(
-                "missing: clip (blazar pull clip-vit-base-patch32 or blazar pull siglip-base-patch16-224)"
+                "missing: clip (blazar pull clip-vit-base-patch32)"
             ),
             "got: {detail}"
         );
