@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 
 use blazar_core::profile::{self, ComponentArg, Endpoint, ProfileInput};
 use blazar_core::store::Store;
-use blazar_core::{BlazarDirs, Config, Hardware, ModelRow};
+use blazar_core::{BlazarDirs, Config, ConfigHandle, Hardware, ModelRow};
 
 /// Borrow a store row's diffusion component set for `ProfileInput` (the
 /// spawn sites own the Vec; the input borrows it).
@@ -370,6 +370,13 @@ const RAM_WARM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// for a minute of worst-case timeouts - the sweep stops issuing saves
 /// once this budget is spent.
 const BANK_SAVE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+/// F3 lead-in before the child's self-sleep: the reaper sweeps the
+/// session bank this many seconds EARLIER than
+/// `--sleep-idle-seconds`, because llama-server drops slot KV at sleep
+/// and an evict-time save is empty (live-repro'd 2026-11-03). Sized
+/// above the 10 s reaper tick plus the [`BANK_SAVE_TOTAL_BUDGET`] so
+/// the bank lands strictly before the sleep, not racing it.
+const BANK_LEADIN_SECS: u64 = 30;
 /// F12: `keep_alive: -1` cap - 100 years, far enough to be forever in
 /// practice without risking `Instant` overflow arithmetic.
 const KEEP_ALIVE_FOREVER: Duration = Duration::from_hours(876_600);
@@ -562,17 +569,27 @@ pub(crate) fn read_model_meta(
         )),
         (_, true) => blazar_core::read_hf_config(std::path::Path::new(path))
             .and_then(|meta| {
-                // CLIP repos are image-embedding models, not chat lanes;
-                // letting them through would hand sglang/mistral.rs a
-                // vision-tower checkpoint it can only fail on confusingly.
-                if meta.architecture == "CLIPModel" {
-                    Err(blazar_core::CoreError::Config(format!(
+                // CLIP/SigLIP repos are image-embedding models, not chat
+                // lanes; letting them through would hand sglang/mistral.rs
+                // a vision-tower checkpoint it can only fail on confusingly
+                // (verified live: sglang crashes on SiglipModel weights).
+                // Each teaching names its own candle lane's pull command.
+                let refusal = match meta.architecture.as_str() {
+                    "CLIPModel" => Some(format!(
                         "{path}: CLIP image-embedding model - no chat engine serves it; \
                          embed images via POST /v1/embeddings with image_url input \
                          (blazar pull openai/clip-vit-base-patch32 --revision refs/pr/15)"
-                    )))
-                } else {
-                    Ok(meta)
+                    )),
+                    "SiglipModel" => Some(format!(
+                        "{path}: SigLIP image-embedding model - no chat engine serves it; \
+                         embed images via POST /v1/embeddings with image_url input \
+                         (blazar pull google/siglip-base-patch16-224)"
+                    )),
+                    _ => None,
+                };
+                match refusal {
+                    Some(err) => Err(blazar_core::CoreError::Config(err)),
+                    None => Ok(meta),
                 }
             })
             .map(MetaBox::Hf)
@@ -959,8 +976,28 @@ pub enum SupervisionError {
     /// HTTP 507: the resource is exhausted, not "busy".
     #[error("{0}")]
     InsufficientMemory(String),
+    /// F1 fleet preflight refusal: an rpc worker named in the effective
+    /// `rpc_servers` did not answer, so the spawn was refused BEFORE any
+    /// child existed. Infrastructure-down, not an internal bug - the
+    /// gateway renders this as 503 `RPC_ENDPOINT_UNREACHABLE`.
+    #[error("{0}")]
+    RpcEndpointsUnreachable(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+impl SupervisionError {
+    /// Convert an `Engine::spawn` anyhow failure into the typed lane:
+    /// the rpc preflight marker maps to
+    /// [`Self::RpcEndpointsUnreachable`] (503-class), everything else
+    /// stays `Internal`.
+    #[must_use]
+    pub fn spawn_failure(e: anyhow::Error) -> Self {
+        match e.downcast_ref::<crate::engine_impl::RpcEndpointsUnreachable>() {
+            Some(marker) => Self::RpcEndpointsUnreachable(marker.to_string()),
+            None => Self::Internal(anyhow!("{e}")),
+        }
+    }
 }
 
 /// Admission-loop verdict when a spawn is blocked (see
@@ -1011,6 +1048,14 @@ pub struct Instance {
     pub state: std::sync::RwLock<InstanceState>,
     pub last_used: std::sync::RwLock<Instant>,
     pub in_flight: AtomicI64,
+    /// F3: KV-dirty marker, set when a request completes (`end_request`),
+    /// cleared by the reaper's bank-before-sleep sweep. llama-server
+    /// drops slot KV when it self-sleeps (`--sleep-idle-seconds`), so a
+    /// bank written at evict time is empty (live-repro'd 2026-11-03:
+    /// sleeping children answer saves with n_saved:0); the checkpoint
+    /// must be swept BEFORE the child sleeps, and only when a request
+    /// since the last sweep could have changed the KV.
+    pub bank_dirty: AtomicBool,
     /// Client-requested pin window (ollama `keep_alive`): `Some(t)` keeps
     /// the instance exempt from idle evict AND idle sleep until `t`
     /// (F12). `-1` maps to a far-future cap; `0` clears and the explicit
@@ -1751,7 +1796,7 @@ impl Supervisor {
     pub fn governed_spec_default(&self, name: &str) -> String {
         self.spec_override
             .get(name)
-            .map_or_else(|| self.config.spec.clone(), |v| v.value().clone())
+            .map_or_else(|| self.cfg().spec.clone(), |v| v.value().clone())
     }
 
     /// B2 spec governor: one 60 s telemetry window for `model`.
@@ -1762,11 +1807,11 @@ impl Supervisor {
     /// `spec_auto_manage` is on; the router child and user-pinned
     /// models are exempt.
     pub fn spec_governor_window(&self, model: &str, accept: Option<f64>) {
-        if !self.config.spec_auto_manage || model == ROUTER_KEY {
+        if !self.cfg().spec_auto_manage || model == ROUTER_KEY {
             return;
         }
-        let overlay = self.config.overlay_for(model);
-        if overlay.spec.is_some() || self.config.spec == "off" {
+        let overlay = self.cfg().overlay_for(model);
+        if overlay.spec.is_some() || self.cfg().spec == "off" {
             // A user pin (or a dense global config) shadows the governor
             // permanently - clear any stale state so the gauge never
             // reports a model it cannot act on.
@@ -1862,7 +1907,7 @@ impl Supervisor {
                 .windows(2)
                 .find(|w| w[0] == "-np" || w[0] == "--parallel")
                 .and_then(|w| w[1].parse::<u32>().ok())
-                .unwrap_or(self.config.slots);
+                .unwrap_or(self.cfg().slots);
             let effective = self
                 .adopted_slots
                 .get(model)
@@ -1896,7 +1941,7 @@ impl Supervisor {
                 .windows(2)
                 .find(|w| w[0] == "-np" || w[0] == "--parallel")
                 .and_then(|w| w[1].parse::<u32>().ok())
-                .unwrap_or(self.config.slots);
+                .unwrap_or(self.cfg().slots);
             let effective = self
                 .adopted_slots
                 .get(model)
@@ -1968,10 +2013,10 @@ impl Supervisor {
     /// exempt. Reshapes ride the same drain-safe queue the spec
     /// governor uses.
     pub fn ubatch_governor_window(&self, model: &str) {
-        if !self.config.ubatch_auto || model == ROUTER_KEY {
+        if !self.cfg().ubatch_auto || model == ROUTER_KEY {
             return;
         }
-        if self.config.ubatch_size != 0 {
+        if self.cfg().ubatch_size != 0 {
             // A user pin shadows the governor permanently - clear any
             // stale state so the gauge never reports a model it cannot
             // act on.
@@ -2172,6 +2217,20 @@ enum ReshapeDrain {
     Cutover,
 }
 
+/// Outcome of a successful config reload pass (`Supervisor::reload_config_now`).
+#[derive(Debug, Clone)]
+pub struct ConfigReloadOutcome {
+    /// False when the file fingerprint matched the last applied
+    /// generation (double-fire debounce - nothing was swapped).
+    pub applied: bool,
+    /// Bind-time/construction-derived knobs NOT applied; a restart
+    /// is needed for these (`Config::cold_only_diff` is the list).
+    pub cold_only: Vec<String>,
+    /// The `preload` list changed - the caller should run
+    /// `preload_listed` in the background to warm new entries.
+    pub preload_changed: bool,
+}
+
 pub struct Supervisor {
     pub dirs: BlazarDirs,
     /// Total evictions (ladder + capacity) for the metrics gauge.
@@ -2212,11 +2271,21 @@ pub struct Supervisor {
     /// written into the user's config behind their back (an explicit
     /// `model_overrides.<model>.engine` pin always wins over this map).
     capability_pins: std::sync::Mutex<std::collections::HashMap<String, String>>,
-    pub config: Config,
+    pub config: ConfigHandle,
+    /// (mtime_ms, size) of the config file at the last APPLIED reload.
+    /// Shared by the watcher and the manual endpoint so a file saved
+    /// once never swaps twice; parse failures leave it untouched so a
+    /// retry after fixing the file still applies.
+    config_fingerprint: std::sync::Mutex<Option<(u64, u64)>>,
+
     pub bus: EventBus,
     pub hardware: Hardware,
     pub engine: Arc<dyn Engine>,
     instances: DashMap<String, Arc<Instance>>,
+    /// Automatic fleet membership: workers announced via
+    /// `blazar rpc worker --join` (gateway `/api/fleet/*` routes write
+    /// here). Spawn planning merges their endpoints into `--rpc`.
+    pub(crate) fleet: crate::fleet::FleetRegistry,
     /// F1: names with an evict currently in flight. A spawn that wins the
     /// race against a slow terminate must NOT insert under the name being
     /// torn down - the evict's cleanup would delete the fresh instance
@@ -2431,6 +2500,107 @@ fn slot_reported_tokens(body: &serde_json::Value, field: &str) -> Option<u64> {
 }
 
 impl Supervisor {
+    /// Current config generation (snapshot-once: callers hold the
+    /// returned `Arc` for the whole operation, so a concurrent hot
+    /// reload can never tear a read).
+    pub fn cfg(&self) -> std::sync::Arc<Config> {
+        self.config.cfg()
+    }
+
+    /// Test/builder escape hatch: mutate the live config in place
+    /// (wraps the handle's swap - readers see the mutation atomically).
+    pub fn mut_config(&self, f: impl FnOnce(&mut Config)) {
+        let mut next = (*self.cfg()).clone();
+        f(&mut next);
+        self.config.swap(next);
+    }
+
+    /// Load, validate, and hot-swap the config file. Shared by the
+    /// watcher task and the manual reload endpoint. A file that fails
+    /// parse/validation NEVER touches the running generation: the old
+    /// config keeps serving and the failure is reported (and evented)
+    /// for the operator to fix.
+    pub fn reload_config_now(&self) -> Result<ConfigReloadOutcome, String> {
+        use std::time::UNIX_EPOCH;
+        let path = self.dirs.config_file();
+        let (mtime_ms, size) = match std::fs::metadata(&path) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                (mtime, meta.len())
+            }
+            Err(e) => {
+                let reason = format!("config file {}: {e}", path.display());
+                let _ = self
+                    .bus
+                    .publish(crate::events::BlazarEvent::ConfigReloadFailed {
+                        reason: reason.clone(),
+                    });
+                return Err(reason);
+            }
+        };
+        let mut fingerprint = self
+            .config_fingerprint
+            .lock()
+            .expect("config fingerprint lock");
+        if *fingerprint == Some((mtime_ms, size)) {
+            return Ok(ConfigReloadOutcome {
+                applied: false,
+                cold_only: Vec::new(),
+                preload_changed: false,
+            });
+        }
+        let next = match Config::load(&self.dirs) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let reason = format!("reload rejected - keeping the running config: {e}");
+                let _ = self
+                    .bus
+                    .publish(crate::events::BlazarEvent::ConfigReloadFailed {
+                        reason: reason.clone(),
+                    });
+                return Err(reason);
+            }
+        };
+        let old = self.cfg();
+        let cold_only = Config::cold_only_diff(&old, &next);
+        let preload_changed = old.preload != next.preload;
+        self.config.swap(next);
+        *fingerprint = Some((mtime_ms, size));
+        drop(fingerprint);
+        let _ = self
+            .bus
+            .publish(crate::events::BlazarEvent::ConfigReloaded {
+                cold_only: cold_only.clone(),
+            });
+        Ok(ConfigReloadOutcome {
+            applied: true,
+            cold_only,
+            preload_changed,
+        })
+    }
+
+    /// Current (mtime_ms, size) stamp of the config file, or `None`
+    /// when it does not exist. The hot-reload watcher polls this to
+    /// attempt one reload per file change - a missing file is never
+    /// reloaded because `Config::load` would rewrite it with defaults.
+    #[must_use]
+    pub fn config_file_stamp(&self) -> Option<(u64, u64)> {
+        use std::time::UNIX_EPOCH;
+        let meta = std::fs::metadata(self.dirs.config_file()).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        Some((mtime, meta.len()))
+    }
+
     /// Health-gate budget for a spawning child when the user leaves
     /// `model_load_timeout_secs` unset. Fits precompiled loaders
     /// (llamacpp/mistralrs) on a warm page cache.
@@ -2488,12 +2658,14 @@ impl Supervisor {
             circuit_window: Duration::from_secs(60),
             max_restarts: 3,
             dirs,
-            config,
+            config: ConfigHandle::new(config),
+            config_fingerprint: std::sync::Mutex::new(None),
             bus,
             hardware,
             engine,
             instances: DashMap::new(),
             evicting: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            fleet: crate::fleet::FleetRegistry::default(),
             loading: DashMap::new(),
             load_results: DashMap::new(),
             restarts: DashMap::new(),
@@ -2534,8 +2706,8 @@ impl Supervisor {
     /// boxes in auto mode - the bytes admission below governs there.
     #[must_use]
     pub fn instance_cap(&self) -> Option<usize> {
-        if self.config.max_loaded_models > 0 {
-            return Some(self.config.max_loaded_models as usize);
+        if self.cfg().max_loaded_models > 0 {
+            return Some(self.cfg().max_loaded_models as usize);
         }
         if !self.hardware.has_gpu() {
             return Some(1);
@@ -2550,7 +2722,7 @@ impl Supervisor {
     /// floor-division formula said capacity 1).
     #[must_use]
     pub fn bytes_admission_active(&self) -> bool {
-        self.config.max_loaded_models == 0 && self.hardware.has_gpu()
+        self.cfg().max_loaded_models == 0 && self.hardware.has_gpu()
     }
 
     /// Sum of resident instance footprints for the bytes admission:
@@ -2681,8 +2853,7 @@ impl Supervisor {
             .filter(|e| {
                 e.in_flight.load(Ordering::SeqCst) <= 0
                     && e.key() != key
-                    && !self
-                        .config
+                    && !self.cfg()
                         .overlay_for(model_of_key(e.key()))
                         .pin
                         .unwrap_or(false)
@@ -2729,7 +2900,7 @@ impl Supervisor {
     /// manual-pin branch must materialize its own list (spawn path only,
     /// a card or two - the clone is nothing).
     fn admission_candidates(&self, name: &str) -> Vec<String> {
-        let manual = self.config.effective_devices(name).to_vec();
+        let manual = self.cfg().effective_devices(name).to_vec();
         if !manual.is_empty() {
             return manual;
         }
@@ -2871,9 +3042,9 @@ impl Supervisor {
         hw: &blazar_core::Hardware,
         rpc_configured: bool,
     ) -> Option<String> {
-        let split_pinned = !self.config.effective_tensor_split(name).is_empty()
-            || !self.config.effective_devices(name).is_empty()
-            || self.config.main_gpu != blazar_core::Config::default().main_gpu;
+        let split_pinned = !self.cfg().effective_tensor_split(name).is_empty()
+            || !self.cfg().effective_devices(name).is_empty()
+            || self.cfg().main_gpu != blazar_core::Config::default().main_gpu;
         if split_pinned || rpc_configured || !self.hardware.has_gpu() {
             return None;
         }
@@ -2882,7 +3053,7 @@ impl Supervisor {
 
     /// Session-pin window (R3); zero = feature off.
     fn session_ttl(&self) -> Duration {
-        Duration::from_secs(self.config.session_keep_secs)
+        Duration::from_secs(self.cfg().session_keep_secs)
     }
 
     /// Co-residency check (A15): would the candidate (weights + f16 KV)
@@ -2926,6 +3097,85 @@ impl Supervisor {
             candidate_kv,
         )
         .unwrap_or(false)
+    }
+
+    /// Automatic fleet membership: record a worker join. `worker_id`
+    /// None = caller wants a derived id (hostname + first endpoint's
+    /// port - stable across worker restarts on the same box). Returns
+    /// the id plus the minted session credential for the ack. Errors
+    /// are teaching strings for the 4xx response, never panics.
+    pub fn fleet_join(
+        &self,
+        worker_id: Option<String>,
+        endpoints: Vec<String>,
+        hostname: Option<String>,
+        devices: Vec<crate::rpc_fleet::RpcDeviceMemory>,
+    ) -> Result<(String, String), String> {
+        let hostname = hostname.unwrap_or_else(|| "unknown".to_string());
+        let id = worker_id.unwrap_or_else(|| {
+            let port = endpoints
+                .first()
+                .and_then(|ep| ep.rsplit_once(':'))
+                .map(|(_, p)| p.to_string())
+                .unwrap_or_else(|| "worker".to_string());
+            let host = hostname
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+                .collect::<String>();
+            format!("{host}-{port}")
+        });
+        self.fleet
+            .join(
+                &id,
+                endpoints,
+                &hostname,
+                devices,
+                std::time::Instant::now(),
+                &self.bus,
+            )
+            .map_err(|e| e.to_string())
+            .map(|worker_token| (id, worker_token))
+    }
+
+    /// Automatic fleet membership: does this presentation match the
+    /// worker's scoped session credential? (Gateway heartbeat/leave
+    /// auth falls back to it when the master token path refused.)
+    #[must_use]
+    pub fn fleet_worker_token_matches(&self, worker_id: &str, presented: &str) -> bool {
+        self.fleet.worker_token_matches(worker_id, presented)
+    }
+
+    /// Automatic fleet membership: refresh liveness (and the device
+    /// self-report) for a joined worker.
+    pub fn fleet_heartbeat(
+        &self,
+        worker_id: &str,
+        devices: Vec<crate::rpc_fleet::RpcDeviceMemory>,
+    ) -> Result<(), String> {
+        self.fleet
+            .heartbeat(worker_id, devices, std::time::Instant::now())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Automatic fleet membership: explicit departure. Returns false
+    /// when the id was unknown (idempotent leave is fine either way -
+    /// the worker may have expired a beat earlier).
+    pub fn fleet_leave(&self, worker_id: &str) -> bool {
+        self.fleet.leave(worker_id, &self.bus).is_some()
+    }
+
+    /// Automatic fleet membership: pruned worker list for
+    /// `/api/fleet/workers`. Empty when fleet_enabled is off.
+    #[must_use]
+    pub fn fleet_workers(&self) -> Vec<crate::fleet::FleetWorkerView> {
+        if !self.cfg().fleet_enabled {
+            return Vec::new();
+        }
+        self.fleet.workers(
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(self.cfg().fleet_ttl_secs),
+            &self.bus,
+        )
     }
 
     /// Children resident in the instance map as [`EngineRef`]s
@@ -3008,7 +3258,7 @@ impl Supervisor {
         // Router mode: every model name resolves to the ONE router child
         // (upstream autoloads the model on request, LRU-evicts at
         // models-max). Unknown names still fail fast against the store.
-        if self.config.router && name != ROUTER_KEY {
+        if self.cfg().router && name != ROUTER_KEY {
             // `model+adapter` variants spawn a per-model child; the
             // router child can't do that (it owns no per-model argv).
             // Reject with the working alternative instead of letting the
@@ -3101,7 +3351,7 @@ impl Supervisor {
         name: &str,
         prefix: Option<PrefixKey>,
     ) -> Result<EngineRef, SupervisionError> {
-        if self.config.router && name != ROUTER_KEY {
+        if self.cfg().router && name != ROUTER_KEY {
             // router child is forced-attach (preset loop) - plain path
             return Box::pin(self.ensure_routed(name, prefix)).await;
         }
@@ -3115,7 +3365,7 @@ impl Supervisor {
             return Box::pin(self.ensure_routed(name, prefix)).await;
         }
         let policy =
-            profile::mmproj_policy_effective(&self.config, name, &self.config.overlay_for(name));
+            profile::mmproj_policy_effective(&self.cfg(), name, &self.cfg().overlay_for(name));
         match policy {
             blazar_core::config::MmprojPolicy::Attach => {
                 Box::pin(self.ensure_routed(name, prefix)).await
@@ -3215,7 +3465,7 @@ impl Supervisor {
             // teaching (candidates list) - do not shadow it here.
             return Ok(false);
         };
-        let overlay = self.config.overlay_for(base);
+        let overlay = self.cfg().overlay_for(base);
         match self.resolve_routed_engine(&store, &overlay, &row) {
             Ok(Some((engine, _))) if engine.kind() == EngineKind::Sglang => {}
             // Non-sglang lane, global-engine mode, or a bad pin the
@@ -3428,7 +3678,7 @@ impl Supervisor {
             // teaching (candidates list) - do not shadow it here.
             return Ok(false);
         };
-        let overlay = self.config.overlay_for(base);
+        let overlay = self.cfg().overlay_for(base);
         // `Ok(None)` folds three cases - empty roster, manual mode, and
         // auto picking the already-active lane (for a GGUF model on the
         // default llamacpp daemon that is llamacpp itself, the single
@@ -3805,8 +4055,7 @@ impl Supervisor {
         if name == ROUTER_KEY {
             return name.to_string();
         }
-        let replicas = self
-            .config
+        let replicas = self.cfg()
             .overlay_for(name)
             .replicas
             .unwrap_or(1)
@@ -4012,7 +4261,7 @@ impl Supervisor {
             notify: notify.clone(),
             armed: true,
         };
-        let result = if self.config.router && key == ROUTER_KEY {
+        let result = if self.cfg().router && key == ROUTER_KEY {
             self.spawn_router_instance().await
         } else if captive {
             self.spawn_instance_captive(key).await
@@ -4126,7 +4375,7 @@ impl Supervisor {
         manifest: &crate::engine::manifest::Manifest,
         kind: blazar_core::engine_kind::EngineKind,
     ) -> Result<Option<ChildAuth>, SupervisionError> {
-        let enabled = match self.config.child_auth {
+        let enabled = match self.cfg().child_auth {
             Some(v) => v,
             // Auto: TCP children are reachable by any local process;
             // UDS sockets already enforce filesystem permissions.
@@ -4235,6 +4484,7 @@ impl Supervisor {
         let _ = self.dirs.ensure();
         let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
 
+        let input_cfg = self.cfg();
         let mut sections: Vec<(String, Vec<String>)> = Vec::new();
         let mut global: Vec<String> = Vec::new();
         for m in &models {
@@ -4245,7 +4495,7 @@ impl Supervisor {
                     continue;
                 }
             };
-            let overlay = self.config.overlay_for(&m.name);
+            let overlay = self.cfg().overlay_for(&m.name);
             let loras: Vec<(String, f64)> = store
                 .list_loras(Some(&m.name))
                 .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
@@ -4257,7 +4507,7 @@ impl Supervisor {
             // "not pulled" error. Router mode has no per-request spec
             // (the gateway rejects options.spec there), so resolution
             // is overlay -> config only.
-            let mut spec_mode = resolve_spec_mode(None, overlay.spec.clone(), &self.config.spec);
+            let mut spec_mode = resolve_spec_mode(None, overlay.spec.clone(), &self.cfg().spec);
             // F2 evidence consult: a `tune --spec-race` measurement on
             // this exact hardware beats the heuristic chain, but only
             // at the auto tier - explicit pins above stay immune.
@@ -4310,7 +4560,7 @@ impl Supervisor {
                 model_bytes: u64::try_from(m.bytes.max(0)).unwrap_or(u64::MAX),
                 meta: blazar_core::ModelMeta::Gguf(&gguf),
                 hardware: &self.hardware,
-                config: &self.config,
+                config: &input_cfg,
                 overlay: &overlay,
                 loras: &loras,
                 draft_path: draft_path.as_deref(),
@@ -4344,7 +4594,7 @@ impl Supervisor {
             match profile::compile(
                 &input,
                 &blazar_core::TuningOverrides {
-                    fa: self.config.flash_attention,
+                    fa: self.cfg().flash_attention,
                     ..Default::default()
                 },
             ) {
@@ -4436,14 +4686,14 @@ impl Supervisor {
             // NOTE: no front-level --slot-save-path - a CLI value cascades
             // to model children and would OVERRIDE their per-model INI
             // paths (verified live). Sessions stay per-model via the INI.
-            if self.config.router_max_models > 0 {
+            if self.cfg().router_max_models > 0 {
                 argv.extend([
                     "--models-max".into(),
-                    self.config.router_max_models.to_string(),
+                    self.cfg().router_max_models.to_string(),
                 ]);
             }
             // Router LRU autoload: None keeps the upstream default (off).
-            match self.config.models_autoload {
+            match self.cfg().models_autoload {
                 Some(true) if manifest.flags.contains("--models-autoload") => {
                     argv.push("--models-autoload".into());
                 }
@@ -4462,6 +4712,17 @@ impl Supervisor {
                 argv.extend(a.argv.iter().cloned());
             }
             self.remap_device_argv(&mut argv, ROUTER_KEY).await;
+            // Router child is always llamacpp: announced fleet workers
+            // ride it exactly like a dedicated spawn (same snapshot
+            // discipline - one read per spawn attempt).
+            if self.cfg().fleet_enabled {
+                let announced = self.fleet.snapshot_targets(
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(self.cfg().fleet_ttl_secs),
+                    &self.bus,
+                );
+                crate::fleet::merge_fleet_argv(&mut argv, &announced);
+            }
             // Router spawn is single-process by construction: no
             // sharding, no pinning - empty per-spawn env.
             let mut child = self
@@ -4472,7 +4733,7 @@ impl Supervisor {
                     if let Some(p) = &auth_keyfile {
                         let _ = std::fs::remove_file(p);
                     }
-                    SupervisionError::Internal(anyhow!("{e}"))
+                    SupervisionError::spawn_failure(e)
                 })?;
             if let Ok(Some(status)) = child.try_status() {
                 tracing::warn!(
@@ -4512,6 +4773,7 @@ impl Supervisor {
                         last_used: std::sync::RwLock::new(Instant::now()),
                         in_flight: AtomicI64::new(0),
                         keep_until: std::sync::RwLock::new(None),
+                        bank_dirty: AtomicBool::new(false),
                         started_at: Instant::now(),
                         // router serves EVERY pulled model incl VL rows -
                         // the preset compile forces attach, so reflect it
@@ -4755,8 +5017,7 @@ impl Supervisor {
             // relative invariant joins the data dir) so the spawn never
             // execs the storage form raw.
             manifest.anchor_server_path(&self.dirs.data_dir);
-            let env: Vec<(String, String)> = self
-                .config
+            let env: Vec<(String, String)> = self.cfg()
                 .engine_env
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -4866,8 +5127,8 @@ impl Supervisor {
             ),
         };
         let Some((tag, _kind)) = blazar_core::engine_kind::serving_lane(
-            self.config.engine_routing.mode,
-            self.config.engine_routing.policy,
+            self.cfg().engine_routing.mode,
+            self.cfg().engine_routing.policy,
             overlay.engine.as_deref(),
             shape,
             self.engine.kind(),
@@ -5014,7 +5275,7 @@ impl Supervisor {
             .get_model(name)
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
             .ok_or_else(|| SupervisionError::ModelNotFound(not_found_name(name)))?;
-        let mut overlay = self.config.overlay_for(name);
+        let mut overlay = self.cfg().overlay_for(name);
         // LC4: in-memory adaptive slots fill in where the user left
         // slots unset (manual overlay always wins; `tune --slots` writes
         // the overlay, which then shadows any adoption). A pin with
@@ -5175,7 +5436,7 @@ impl Supervisor {
             DraftPick::Paired(p) => Some(p),
             _ => None,
         };
-        if draft_path.is_none() && self.config.spec_autopull {
+        if draft_path.is_none() && self.cfg().spec_autopull {
             // opt-in: pull the missing catalog draft, then re-resolve.
             // Any failure falls back to exactly the without-autopull
             // behavior (dense degrade / explicit-mode compile error).
@@ -5228,12 +5489,11 @@ impl Supervisor {
         // pins, and the AUTO plans (sglang TP over census budgets,
         // mirroring largest_card_budget's empty-box discipline).
         let sglang_lane = engine.kind() == blazar_core::engine_kind::EngineKind::Sglang;
-        let tun_probe = self
-            .config
+        let tun_probe = self.cfg()
             .overlay_for(name)
             .sglang
             .clone()
-            .unwrap_or_else(|| self.config.sglang.clone());
+            .unwrap_or_else(|| self.cfg().sglang.clone());
         // Admission floor for the incoming spawn, and the offload /
         // draft facts behind it. The sglang lane charges what the spawn
         // will ACTUALLY put on the GPU: standing floor + engaged draft
@@ -5305,11 +5565,11 @@ impl Supervisor {
             None
         };
         let manual_split_spanning = !sglang_lane
-            && (!self.config.effective_tensor_split(name).is_empty()
-                || self.config.effective_devices(name).len() > 1);
-        let parallel_pins_unset = self.config.effective_tensor_split(name).is_empty()
-            && self.config.effective_devices(name).is_empty()
-            && self.config.main_gpu == blazar_core::Config::default().main_gpu
+            && (!self.cfg().effective_tensor_split(name).is_empty()
+                || self.cfg().effective_devices(name).len() > 1);
+        let parallel_pins_unset = self.cfg().effective_tensor_split(name).is_empty()
+            && self.cfg().effective_devices(name).is_empty()
+            && self.cfg().main_gpu == blazar_core::Config::default().main_gpu
             && !tun_probe.parallel_pinned();
         let census_budgets: Vec<u64> = self
             .hardware
@@ -5366,8 +5626,8 @@ impl Supervisor {
         // carry no ids, but explicit device pins / main-gpu indices
         // would be invalidated by the env's renumbering.
         let lane_allows_vk = engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp;
-        let argv_device_free = self.config.effective_devices(name).is_empty()
-            && self.config.main_gpu == blazar_core::Config::default().main_gpu;
+        let argv_device_free = self.cfg().effective_devices(name).is_empty()
+            && self.cfg().main_gpu == blazar_core::Config::default().main_gpu;
         let spawn_env = spanning_spawn_env(
             spanning_ranks,
             &census_names,
@@ -5385,16 +5645,37 @@ impl Supervisor {
         // skipped with a warn (its VRAM simply doesn't count) - the
         // spawn preflight owns the loud refusal if it is still down
         // when the child launches.
+        //
+        // Automatic membership: announced workers (`--join`) extend the
+        // STATIC list (per-model overlay keeps its replaces-global
+        // semantics; announced endpoints append after it, deduped).
+        // The snapshot is taken ONCE here and reused verbatim for the
+        // argv merge below - two reads could race a mid-spawn join and
+        // hand the budget probe a different fleet than the child dials.
+        let static_rpc: Vec<String> = self.cfg()
+            .effective_rpc_servers(name)
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let fleet_announced: Vec<String> = if self.cfg().fleet_enabled {
+            self.fleet.snapshot_targets(
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(self.cfg().fleet_ttl_secs),
+                &self.bus,
+            )
+        } else {
+            Vec::new()
+        };
         let rpc_configured = engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp
-            && !self.config.effective_rpc_servers(name).is_empty();
+            && !(static_rpc.is_empty() && fleet_announced.is_empty());
         let rpc_pool = if rpc_configured {
-            let targets: Vec<String> = self
-                .config
-                .effective_rpc_servers(name)
-                .split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect();
+            let mut targets = static_rpc.clone();
+            for ep in &fleet_announced {
+                if !targets.contains(ep) {
+                    targets.push(ep.clone());
+                }
+            }
             query_rpc_fleet_pool(&targets).await
         } else {
             RpcFleetPool::default()
@@ -5490,8 +5771,16 @@ impl Supervisor {
         // offloaded weights live resident in RAM, and an offload pin
         // sized against total rather than AVAILABLE RAM OOM'd this box
         // mid-load on 2026-10-16.
-        if self.config.spawn_mem_guard {
-            let avail = crate::probe::mem_available_mib();
+        if self.cfg().spawn_mem_guard {
+            // Unreadable memory = guard cannot enforce its floor; warn and
+            // stand down (a refused snapshot must not brick every spawn).
+            let avail = crate::probe::mem_available_mib().unwrap_or_else(|| {
+                tracing::warn!(
+                    "spawn memory guard skipped for {:?}: MemAvailable unreadable",
+                    name
+                );
+                u64::MAX
+            });
             let model_mib = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX) / (1024 * 1024);
             let offload_mib = sglang_offload_bytes / (1024 * 1024);
             let need = (model_mib / 2) + 512 + offload_mib;
@@ -5507,6 +5796,7 @@ impl Supervisor {
             }
         }
 
+        let input_cfg = self.cfg();
         let manifest = engine.capabilities();
         // Belt over the stored row: dir rows re-measure so a frozen
         // mid-download size never feeds the fit ladder or the J3 warn.
@@ -5514,10 +5804,10 @@ impl Supervisor {
         // One fresh hardware probe serves both spawn-time decisions: the
         // J3 VRAM preflight and the LC2 auto GPU pick. The boot-time
         // snapshot can be stale (other engines came and went).
-        let wants_pick = self.config.effective_devices(name).is_empty()
+        let wants_pick = self.cfg().effective_devices(name).is_empty()
             && self.hardware.gpus.len() > 1
             && manifest.flags.contains("--device");
-        let fresh = if self.config.spawn_mem_guard && self.hardware.has_gpu() || wants_pick {
+        let fresh = if self.cfg().spawn_mem_guard && self.hardware.has_gpu() || wants_pick {
             Some(self.live_hardware())
         } else {
             None
@@ -5532,7 +5822,7 @@ impl Supervisor {
         // fits only with remote workers is the intended configuration,
         // not a spill.
         if let Some(f) = &fresh
-            && self.config.spawn_mem_guard
+            && self.cfg().spawn_mem_guard
             && self.hardware.has_gpu()
         {
             let free_vram: u64 = f
@@ -5595,7 +5885,7 @@ impl Supervisor {
             .unwrap_or_default();
         // Config-level FA override rides the same override path the
         // pending ctx uses; None keeps the profile heuristic (auto).
-        tuning.fa = self.config.flash_attention;
+        tuning.fa = self.cfg().flash_attention;
         // D1 ubatch governor fills in ONLY where the user left the
         // micro-batch ceiling unset (no config `ubatch_size` pin - the
         // governor itself refuses pinned models; nothing else sets
@@ -5624,7 +5914,7 @@ impl Supervisor {
                 model_bytes,
                 meta: meta_box.borrow_meta(),
                 hardware: fresh.as_ref().unwrap_or(&self.hardware),
-                config: &self.config,
+                config: &input_cfg,
                 overlay: &overlay,
                 loras: &loras,
                 draft_path: draft_path.as_deref(),
@@ -5752,7 +6042,7 @@ impl Supervisor {
         if picked_device.is_none()
             && sd_backend_token.is_none()
             && engine.kind() == blazar_core::engine_kind::EngineKind::SdCpp
-            && self.config.effective_devices(name).is_empty()
+            && self.cfg().effective_devices(name).is_empty()
             && let Some((token, display)) = pick_sd_backend_device(&manifest.devices)
         {
             tracing::info!(
@@ -5772,7 +6062,8 @@ impl Supervisor {
         let card_label = picked_display
             .clone()
             .or_else(|| {
-                let manual = self.config.effective_devices(name);
+                let cfg = self.cfg();
+                let manual = cfg.effective_devices(name);
                 (!manual.is_empty()).then(|| manual.join("+"))
             })
             .or_else(|| {
@@ -5796,7 +6087,7 @@ impl Supervisor {
         let placement_device_id = picked_device
             .clone()
             .or_else(|| {
-                let manual = self.config.effective_devices(name).to_vec();
+                let manual = self.cfg().effective_devices(name).to_vec();
                 (manual.len() == 1).then(|| manual[0].clone())
             })
             .or_else(|| {
@@ -5895,7 +6186,7 @@ impl Supervisor {
                     .as_ref()
                     .or(fresh.as_ref())
                     .unwrap_or(&self.hardware),
-                config: &self.config,
+                config: &input_cfg,
                 overlay: &overlay,
                 loras: &loras,
                 draft_path: draft_path.as_deref(),
@@ -5960,6 +6251,12 @@ impl Supervisor {
                 argv.extend(a.argv.iter().cloned());
             }
             self.remap_device_argv(&mut argv, name).await;
+            // Announced fleet workers ride the SAME snapshot the budget
+            // probe used above (llamacpp lane only: sdcpp runs its own
+            // RPC lane and must not grow a `--rpc` it does not parse).
+            if engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp {
+                crate::fleet::merge_fleet_argv(&mut argv, &fleet_announced);
+            }
             argv_dialed_rpc |= argv.iter().any(|flag| flag == "--rpc");
             let mut child = engine
                 .spawn(&argv, &endpoint, &spawn_env)
@@ -5968,7 +6265,7 @@ impl Supervisor {
                     if let Some(p) = &auth_keyfile {
                         let _ = std::fs::remove_file(p);
                     }
-                    SupervisionError::Internal(anyhow!("{e}"))
+                    SupervisionError::spawn_failure(e)
                 })?;
 
             // Child died instantly (port race)? Retry with a fresh port.
@@ -6040,7 +6337,7 @@ impl Supervisor {
                     // adapter), never the global one: the peg's flags and
                     // blocking semantics are engine-specific.
                     let kind = engine.kind();
-                    if self.config.warm_peg.enabled_for(&kind) {
+                    if self.cfg().warm_peg.enabled_for(&kind) {
                         let slots_flag = if kind == blazar_core::engine_kind::EngineKind::Sglang {
                             "--max-running-requests"
                         } else {
@@ -6129,6 +6426,7 @@ impl Supervisor {
                         last_used: std::sync::RwLock::new(Instant::now()),
                         in_flight: AtomicI64::new(0),
                         keep_until: std::sync::RwLock::new(None),
+                        bank_dirty: AtomicBool::new(false),
                         started_at: Instant::now(),
                         projector: argv.windows(2).any(|w| w[0] == "-mm" || w[0] == "--mmproj"),
                         argv,
@@ -6548,7 +6846,7 @@ drop them from rpc_servers in config.toml",
     /// an unreachable registry must never delay or fail a spawn).
     async fn registry_offer(&self, arch: &str) -> Option<String> {
         let url = crate::engine::capability_registry::resolve_registry_url(
-            self.config.capability_registry_url.as_deref(),
+            self.cfg().capability_registry_url.as_deref(),
         )?;
         let client = crate::engine::capability_registry::http();
         let lanes = match crate::engine::capability_registry::fetch(client, &url).await {
@@ -6717,7 +7015,7 @@ drop them from rpc_servers in config.toml",
     /// must fit `sun_path` - an over-budget path fails the spawn with a
     /// teaching error instead of dying inside the child's `bind`.
     fn pick_endpoint(&self, name: &str) -> Result<Endpoint, SupervisionError> {
-        if self.config.child_transport == "unix" {
+        if self.cfg().child_transport == "unix" {
             let socket = self
                 .dirs
                 .run_dir()
@@ -6909,7 +7207,7 @@ drop them from rpc_servers in config.toml",
             .windows(2)
             .find(|w| w[0] == "-np" || w[0] == "--parallel")
             .and_then(|w| w[1].parse::<u32>().ok())
-            .unwrap_or(self.config.slots)
+            .unwrap_or(self.cfg().slots)
             .max(1)
     }
 
@@ -6935,7 +7233,7 @@ drop them from rpc_servers in config.toml",
         auth: Option<&str>,
         kind: blazar_core::engine_kind::EngineKind,
     ) {
-        if !self.config.session_bank {
+        if !self.cfg().session_bank {
             return;
         }
         // Engine capability gate: `/slots/{id}?action=restore` is a
@@ -6976,7 +7274,7 @@ drop them from rpc_servers in config.toml",
         let gate_file = self.bank_slot_file(key, ctx, restores[0].0);
         let diffs = match (
             blazar_core::session_identity::read_manifest(&gate_file),
-            blazar_core::session_identity::build(&self.dirs, &self.config, key),
+            blazar_core::session_identity::build(&self.dirs, &self.cfg(), key),
         ) {
             (Some(saved), Some(mut cur)) => {
                 cur.ctx = ctx;
@@ -7021,7 +7319,7 @@ drop them from rpc_servers in config.toml",
     ) {
         let url = format!("{base}/slots/{id}?action=restore&filename={filename}");
         let mut body = serde_json::json!({ "filename": filename });
-        if self.config.router {
+        if self.cfg().router {
             body["model"] = serde_json::json!(key);
         }
         let mut req = client
@@ -7045,15 +7343,10 @@ drop them from rpc_servers in config.toml",
                         model = key,
                         "bank restore returned ok but restored 0 tokens - empty or incompatible checkpoint; continuing cold"
                     ),
-                    Some(n) if id == 0 => tracing::info!(
+                    Some(n) => tracing::info!(
                         target: "blazar::bank",
                         model = key,
-                        "restored banked session {filename} ({n} tokens into slot KV)"
-                    ),
-                    Some(n) => tracing::debug!(
-                        target: "blazar::bank",
-                        model = key,
-                        "restored banked slot {id} {filename} ({n} tokens into slot KV)"
+                        "restored banked session {filename} into slot {id} ({n} tokens into slot KV)"
                     ),
                     None if id == 0 => tracing::info!(
                         target: "blazar::bank",
@@ -7091,7 +7384,21 @@ drop them from rpc_servers in config.toml",
     /// `n_prompt_tokens_cache` reads 0 on idle slots even when a save
     /// banks hundreds of tokens (live-probed on b11202).
     async fn bank_save(&self, inst: &Arc<Instance>) {
-        if !self.config.session_bank || inst.in_flight.load(Ordering::SeqCst) > 0 {
+        if !self.cfg().session_bank || inst.in_flight.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        // Dirty gate: the sweep exists to persist KV that is NEWER than
+        // the last bank. A not-dirty instance has nothing new - and for
+        // a child that already slept (KV dropped at sleep, live-repro'd
+        // 2026-11-03) a save would answer `n_saved: 0` and the Some(0)
+        // branch would DELETE the good pre-sleep checkpoint. Never dial,
+        // never touch files.
+        if !inst.bank_dirty.load(Ordering::SeqCst) {
+            tracing::debug!(
+                target: "blazar::bank",
+                model = %inst.name,
+                "bank sweep skipped: no requests completed since the last bank"
+            );
             return;
         }
         // Engine capability gate: the save sweep speaks llama-server's
@@ -7111,6 +7418,8 @@ drop them from rpc_servers in config.toml",
         let slots = self.instance_slot_count(inst);
         let t0 = std::time::Instant::now();
         let mut banked_bytes = 0u64;
+        let mut failed = 0u32;
+        let mut complete = true;
         for id in 0..slots {
             if t0.elapsed() > BANK_SAVE_TOTAL_BUDGET {
                 tracing::warn!(
@@ -7118,6 +7427,7 @@ drop them from rpc_servers in config.toml",
                     model = %inst.name,
                     "bank sweep past budget - slots {id}..{slots} left unbanked"
                 );
+                complete = false;
                 break;
             }
             let filename = if id == 0 {
@@ -7128,7 +7438,7 @@ drop them from rpc_servers in config.toml",
             let file = self.bank_slot_file(&inst.name, inst.profile_ctx, id);
             let (client, base) = child_dial(&inst.endpoint);
             let url = format!("{base}/slots/{id}?action=save&filename={filename}");
-            let body = if self.config.router {
+            let body = if self.cfg().router {
                 serde_json::json!({"filename": filename, "model": inst.name})
             } else {
                 serde_json::json!({"filename": filename})
@@ -7154,10 +7464,21 @@ drop them from rpc_servers in config.toml",
                 _ => false,
             };
             if !ok {
+                failed += 1;
+                tracing::debug!(
+                    target: "blazar::bank",
+                    model = %inst.name,
+                    "slot {id} save failed (child busy or gone)"
+                );
                 continue;
             }
             if saved == Some(0) {
                 // The slot held no cached prefix - drop the empty file.
+                tracing::debug!(
+                    target: "blazar::bank",
+                    model = %inst.name,
+                    "slot {id} held no cached prefix - empty bank removed"
+                );
                 let _ = std::fs::remove_file(&file);
                 continue;
             }
@@ -7173,7 +7494,7 @@ drop them from rpc_servers in config.toml",
             }
             // #20 identity manifest: stamp the shape so bank restores
             // can refuse stale KV (built from the LIVE instance ctx).
-            match blazar_core::session_identity::build(&self.dirs, &self.config, &inst.name) {
+            match blazar_core::session_identity::build(&self.dirs, &self.cfg(), &inst.name) {
                 Some(mut id) => {
                     id.ctx = inst.profile_ctx;
                     if let Err(e) = blazar_core::session_identity::write_manifest(&file, &id) {
@@ -7184,6 +7505,29 @@ drop them from rpc_servers in config.toml",
                     tracing::warn!(target: "blazar::bank", model = %inst.name, "bank identity indeterminate - checkpoint left unverified");
                 }
             }
+        }
+        // Sweep summary: the per-slot lines above are debug - a default-
+        // INFO log must still answer "did the bank land, and how much".
+        if failed > 0 {
+            tracing::warn!(
+                target: "blazar::bank",
+                model = %inst.name,
+                "{failed} slot save(s) failed - those sessions restore cold"
+            );
+        } else if complete {
+            // Every slot answered: the on-disk bank now represents the
+            // child's KV. Close the dirty epoch (a later completed
+            // request re-arms it). A failed sweep stays armed and the
+            // reaper retries while the child is still awake.
+            inst.bank_dirty.store(false, Ordering::SeqCst);
+        }
+        if banked_bytes > 0 {
+            tracing::info!(
+                target: "blazar::bank",
+                model = %inst.name,
+                "banked {} MiB of slot KV - session restore covers the next spawn",
+                banked_bytes as f64 / 1048576.0
+            );
         }
         // Hoard guard: a per-model bank set over 512 MiB is storage
         // abuse, not a cache - drop the whole set and say so once.
@@ -7279,12 +7623,37 @@ drop them from rpc_servers in config.toml",
                 .read()
                 .expect("idle lock")
                 .is_some_and(|t| t > now);
-            if idle >= Duration::from_secs(self.config.idle_timeout_secs)
+            if idle >= Duration::from_secs(self.cfg().idle_timeout_secs)
                 && !session_pinned
                 && !keep_alive
             {
                 evictions.push((inst.name.clone(), inst.model.clone()));
-            } else if idle >= Duration::from_secs(self.config.idle_sleep_secs)
+            } else if state == InstanceState::Ready
+                && self.hardware.has_gpu()
+                && !keep_alive
+                && inst.kind.supports_slot_banks()
+                && inst.bank_dirty.load(Ordering::SeqCst)
+                && idle
+                    >= Duration::from_secs(
+                        self.cfg()
+        .idle_sleep_secs
+                            .saturating_sub(BANK_LEADIN_SECS)
+                            .max(1),
+                    )
+            {
+                // F3 bank-before-sleep: the child drops slot KV at its
+                // own sleep threshold, so the checkpoint must be swept
+                // while it is still awake. Same idle clock both sides:
+                // a late request resets this timer AND the child's, and
+                // re-marks the instance dirty, so the next tick banks
+                // again. bank_save owns the dirty marker: it clears the
+                // marker when the sweep completes (a failed sweep stays
+                // armed and retries next tick until sleep or evict ends
+                // the epoch).
+                let inst2 = inst.clone();
+                drop(entry);
+                self.bank_save(&inst2).await;
+            } else if idle >= Duration::from_secs(self.cfg().idle_sleep_secs)
                 && state == InstanceState::Ready
                 && self.hardware.has_gpu()
                 && !keep_alive
@@ -7333,7 +7702,7 @@ drop them from rpc_servers in config.toml",
     /// Public so integration tests drive the exact production scan
     /// without waiting on the reaper timer.
     pub fn autotune_advise_tick(&self) {
-        if !self.config.autotune_advise() {
+        if !self.cfg().autotune_advise() {
             return;
         }
         {
@@ -7377,7 +7746,7 @@ drop them from rpc_servers in config.toml",
             let inputs = blazar_core::optimize::OptimizeInputs {
                 row,
                 engine: engine.as_ref(),
-                config_ctx: self.config.default_ctx,
+                config_ctx: self.cfg().default_ctx,
                 now,
                 workload_min_requests: blazar_core::optimize::WORKLOAD_MIN_REQUESTS,
             };
@@ -7518,7 +7887,7 @@ drop them from rpc_servers in config.toml",
     /// guard is fail-open: any miss (no history, no capacity, no VRAM,
     /// backoff) simply skips this tick.
     async fn maybe_preload(&self) {
-        if !self.config.predictive_preload {
+        if !self.cfg().predictive_preload {
             return;
         }
         // Exactly one live non-router instance, idle.
@@ -7633,10 +8002,10 @@ drop them from rpc_servers in config.toml",
     /// cannot fit teaches the planner's verdict, and neither ever fails
     /// the daemon. Idempotent: already-live models are skipped.
     pub async fn preload_listed(&self) {
-        if self.config.preload.is_empty() {
+        if self.cfg().preload.is_empty() {
             return;
         }
-        let names = self.config.preload.clone();
+        let names = self.cfg().preload.clone();
         tracing::info!(count = names.len(), "startup preload list engaged");
         for name in names {
             if name == ROUTER_KEY
@@ -7717,10 +8086,10 @@ drop them from rpc_servers in config.toml",
     /// an explicit opt-in, never a surprise VRAM claim.
     #[must_use]
     pub fn warm_on_pull_enabled(&self, model: &str) -> bool {
-        self.config
-            .overlay_for(model_of_key(model))
+        self.cfg()
+        .overlay_for(model_of_key(model))
             .warm_on_pull
-            .unwrap_or(self.config.warm_on_pull)
+            .unwrap_or(self.cfg().warm_on_pull)
     }
 
     /// Wave L pre-spawn: fire when a pull completes so the first
@@ -7775,7 +8144,7 @@ drop them from rpc_servers in config.toml",
     /// RAM tier so the next spawn faults from memory, not storage.
     /// Detached and single-flight per path; holds no VRAM.
     fn warm_ram_after_evict(&self, model: &str, row: &ModelRow) {
-        if !Self::idle_ram_warm_enabled(&self.config) || model == ROUTER_KEY {
+        if !Self::idle_ram_warm_enabled(&self.cfg()) || model == ROUTER_KEY {
             return;
         }
         let mut paths = vec![std::path::PathBuf::from(&row.path)];
@@ -7829,7 +8198,7 @@ drop them from rpc_servers in config.toml",
     /// the whole 60 s standard window before the first adoption.
     #[allow(clippy::too_many_lines)] // one saturation story per instance; splitting hides the branch pairs
     fn adaptive_slots_tick(&self) {
-        if !self.config.adaptive_slots {
+        if !self.cfg().adaptive_slots {
             return;
         }
         for e in &self.instances {
@@ -7851,14 +8220,14 @@ drop them from rpc_servers in config.toml",
             if key.ends_with("#warm") {
                 continue;
             }
-            let overlay = self.config.overlay_for(&model);
+            let overlay = self.cfg().overlay_for(&model);
             // Manual slots, replicas, or deterministic mode exclude the
             // model (deterministic spawns pin slots = 1 by design -
             // adoption would fight the pin every tick). D2: the pin
             // arm is liftABLE per model - `adaptive_override on` treats
             // the pin as the base shape instead of a ceiling; the
             // replicas/deterministic exclusions stay either way.
-            let deterministic = overlay.deterministic.unwrap_or(self.config.deterministic);
+            let deterministic = overlay.deterministic.unwrap_or(self.cfg().deterministic);
             let replicated = overlay.replicas.unwrap_or(1) > 1;
             let pin_only = overlay.slots.is_some() && !overlay.adaptive_override.unwrap_or(false);
             if pin_only || replicated || deterministic {
@@ -7880,7 +8249,7 @@ drop them from rpc_servers in config.toml",
             // Live shape from the child's own argv (source of truth);
             // fabricated test instances without argv fall back to the
             // config value, preserving the pre-generalization semantics.
-            let resolved = argv_np(&i.argv).unwrap_or(self.config.slots);
+            let resolved = argv_np(&i.argv).unwrap_or(self.cfg().slots);
             let effective = self
                 .adopted_slots
                 .get(&model)
@@ -7937,7 +8306,7 @@ drop them from rpc_servers in config.toml",
                 // down (None) until both regimes were sampled inside
                 // DECODE_FRESH_WINDOW, and `adaptive_decode_gate` is the
                 // one-knob kill-switch.
-                if self.config.adaptive_decode_gate
+                if self.cfg().adaptive_decode_gate
                     && let Some(ratio) = self.decode_scaling_ratio(&model)
                     && ratio < DECODE_SCALE_ADOPT_MIN
                 {
@@ -8103,7 +8472,7 @@ drop them from rpc_servers in config.toml",
         // Same saturation rule as the adoption path: the pinned cap is
         // argv-resolved (the pin's own `-np`), with the overlay value as
         // the fallback for fabricated/test instances without argv.
-        let effective = argv_np(&i.argv).unwrap_or(overlay.slots.unwrap_or(self.config.slots));
+        let effective = argv_np(&i.argv).unwrap_or(overlay.slots.unwrap_or(self.cfg().slots));
         let in_flight = i.in_flight.load(Ordering::SeqCst);
         let pressure = self.slot_pressure.get(model).map_or(0, |v| *v);
         let demand_recent = self
@@ -8255,7 +8624,7 @@ drop them from rpc_servers in config.toml",
             let slots = self
                 .adopted_slots
                 .get(&model)
-                .map_or(self.config.slots, |v| *v.value());
+                .map_or(self.cfg().slots, |v| *v.value());
             // Replica pre-warm cutover (spike doc §D3 alternative): the
             // replacement-shape child loads UNDER a `#warm` key while the
             // old child keeps serving, so the reshape lands with zero
@@ -8517,7 +8886,7 @@ drop them from rpc_servers in config.toml",
                 let pressure = self.slot_pressure.get(&model).map_or(0, |v| *v);
                 let adopted = self.adopted_slots.get(&model).map(|v| *v.value());
                 let effective =
-                    adopted.unwrap_or_else(|| argv_np(&i.argv).unwrap_or(self.config.slots));
+                    adopted.unwrap_or_else(|| argv_np(&i.argv).unwrap_or(self.cfg().slots));
                 (model, pressure, adopted, effective)
             })
             .collect();
@@ -8549,7 +8918,7 @@ drop them from rpc_servers in config.toml",
         });
         argv_cap
             .or_else(|| {
-                let s = self.config.slots;
+                let s = self.cfg().slots;
                 if s > 0 { Some(i64::from(s)) } else { None }
             })
             .unwrap_or(4)
@@ -8561,10 +8930,10 @@ drop them from rpc_servers in config.toml",
     /// exclusively.
     #[must_use]
     pub fn deterministic_isolate(&self, model: &str) -> bool {
-        self.config
-            .overlay_for(model_of_key(model))
+        self.cfg()
+        .overlay_for(model_of_key(model))
             .deterministic_isolate
-            .unwrap_or(self.config.deterministic_isolate)
+            .unwrap_or(self.cfg().deterministic_isolate)
     }
 
     /// True while an exclusive deterministic request is mid-flight for
@@ -8669,6 +9038,9 @@ drop them from rpc_servers in config.toml",
             }
         }
         *i.last_used.write().expect("idle lock") = Instant::now();
+        // F3: a completed request may have changed slot KV - arm the
+        // bank-before-sleep sweep (cleared by the reaper once banked).
+        i.bank_dirty.store(true, Ordering::SeqCst);
     }
 
     /// True in-flight request load for `model` (base or replica spelling):
@@ -8743,7 +9115,7 @@ drop them from rpc_servers in config.toml",
                         let base = model_of_key(&i.name);
                         Some(if self.adopted_slots.get(base).is_some() {
                             "adapted"
-                        } else if self.config.overlay_for(base).slots.is_some() {
+                        } else if self.cfg().overlay_for(base).slots.is_some() {
                             "pinned"
                         } else if argv_np(&i.argv).is_some() {
                             "auto"
@@ -8845,8 +9217,8 @@ drop them from rpc_servers in config.toml",
         let pair = blazar_core::pair_for_spec_mode(name, spec_mode)?;
         let client = match crate::hf::HfClient::new(std::env::var("HF_TOKEN").ok()) {
             Ok(c) => c
-                .with_download_connections(self.config.download_connections)
-                .with_download_speed_limit(self.config.download_speed_limit_mb),
+                .with_download_connections(self.cfg().download_connections)
+                .with_download_speed_limit(self.cfg().download_speed_limit_mb),
             Err(e) => {
                 tracing::warn!(model = name, "spec_autopull skipped (hf client): {e:#}");
                 return None;
@@ -10295,6 +10667,7 @@ mod routing_tests {
             last_used: std::sync::RwLock::new(Instant::now()),
             in_flight: AtomicI64::new(0),
             keep_until: std::sync::RwLock::new(None),
+            bank_dirty: AtomicBool::new(false),
             started_at: Instant::now(),
             argv: vec![],
             projector: false,
@@ -10415,7 +10788,7 @@ mod routing_tests {
         );
         let sup = {
             let mut s = sup;
-            s.config = config;
+            s.config = ConfigHandle::new(config);
             s
         };
         assert!(sup.deterministic_isolate("m"));
@@ -10467,7 +10840,7 @@ mod routing_tests {
                 ..Default::default()
             },
         );
-        sup.config = config;
+        sup.config = ConfigHandle::new(config);
         assert!(sup.warm_on_pull_enabled("m"), "global on");
         assert!(
             sup.warm_on_pull_enabled("other"),
@@ -10527,7 +10900,7 @@ mod routing_tests {
             warm_on_pull: true,
             ..Config::default()
         };
-        sup.config = config;
+        sup.config = ConfigHandle::new(config);
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         sup.instances.insert("m".to_string(), inst);
 
@@ -11390,12 +11763,12 @@ mod routing_tests {
         assert_eq!(sup.largest_card_budget("other", mib(8_188)), None);
         // Manual pin to a card the census cannot judge: fail open - the
         // spawn-time probe owns that refuse, never a false "too large".
-        sup.config.devices = vec!["CUDA9".to_string()];
+        sup.mut_config(|c| c.devices = vec!["CUDA9".to_string()]);
         assert_eq!(sup.largest_card_budget("other", mib(9_000)), None);
         // Reachability of the refusal arm: with a resident on one card,
         // the 9000 MiB floor is admission-blocked AND physically
         // impossible - the Refuse arm must classify it ModelTooLarge.
-        sup.config.devices = Vec::new();
+        sup.mut_config(|c| c.devices = Vec::new());
         let (big0, _p0) = placed_gpu_instance(
             "big0",
             mib(100).cast_signed(),
@@ -11828,6 +12201,7 @@ mod routing_tests {
             last_used: std::sync::RwLock::new(Instant::now()),
             in_flight: AtomicI64::new(load),
             keep_until: std::sync::RwLock::new(None),
+            bank_dirty: AtomicBool::new(false),
             started_at: Instant::now(),
             argv: vec![],
             projector: false,
@@ -12783,13 +13157,14 @@ mod routing_tests {
         // "hot" is pinned (overlay), "cold" is not: pressure falls on
         // "cold" even though it is the hotter cache.
         let mut sup = routing_sup(1);
-        sup.config.model_overrides.insert(
+        sup.mut_config(|c| { c.model_overrides.insert(
             "hot".into(),
             ModelOverride {
                 pin: Some(true),
                 ..Default::default()
             },
-        );
+    
+        ); });
         let (hot, ph) = fake_instance("hot", InstanceState::Ready, 0);
         let (cold, pc) = fake_instance("cold", InstanceState::Ready, 0);
         sup.instances.insert("hot".into(), hot);
@@ -12803,13 +13178,14 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__victim_key__all_pinned__none() {
         let mut sup = routing_sup(1);
-        sup.config.model_overrides.insert(
+        sup.mut_config(|c| { c.model_overrides.insert(
             "hot".into(),
             ModelOverride {
                 pin: Some(true),
                 ..Default::default()
             },
-        );
+    
+        ); });
         let (hot, ph) = fake_instance("hot", InstanceState::Ready, 0);
         sup.instances.insert("hot".into(), hot);
         assert_eq!(sup.victim_key("incoming"), None);
@@ -12918,10 +13294,10 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__adopts_after_streak_and_respects_manual() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
         // LC4 bumps SINGLE-slot models; the slots=0 auto default makes it
         // intentionally inert (spawn-time sizing owns that case).
-        sup.config.slots = 1;
+        sup.mut_config(|c| c.slots = 1);
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         sup.instances.insert("m".into(), inst);
         for _ in 0..(SLOTS_STREAK_TICKS - 1) {
@@ -12937,15 +13313,16 @@ mod routing_tests {
 
         // Manual overlay slots exclude the model entirely.
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 1;
-        sup.config.model_overrides.insert(
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 1);
+        sup.mut_config(|c| { c.model_overrides.insert(
             "m".into(),
             ModelOverride {
                 slots: Some(1),
                 ..Default::default()
             },
-        );
+    
+        ); });
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         sup.instances.insert("m".into(), inst);
         for _ in 0..(SLOTS_STREAK_TICKS * 2) {
@@ -12998,7 +13375,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__quiet_decay_restores_natural_shape() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
         sup.adopted_slots.insert("m".to_string(), 6);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
@@ -13036,8 +13413,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__admission_pressure_adopts_without_inflight_excess() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 4);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "4".into()];
@@ -13105,7 +13482,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__drain_holds_while_busy_then_reshapes_at_idle() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
         // The reshape respawns through the real spawn path, which
         // resolves the model row from the store and reads its GGUF
         // metadata (FakeEngine supplies the child itself): seed a
@@ -13200,7 +13577,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__decay_blocked_while_reshape_pending_or_draining() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         sup.instances.insert("m".into(), inst);
         sup.adopted_slots.insert("m".to_string(), 6);
@@ -13245,8 +13622,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__demand_sized_adoption_capped_at_ceiling() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "1".into()];
@@ -13273,8 +13650,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__auto_shape_saturation_adopts_and_queues() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0; // auto: the argv is the source of truth
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0); // auto: the argv is the source of truth
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
         Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
             "llama-server".into(),
@@ -13307,8 +13684,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__gauge_dip_does_not_reset_streak() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 4);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "4".into()];
@@ -13353,8 +13730,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__burst_fast_path_adopts_at_two_ticks() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "1".into()];
@@ -13386,8 +13763,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__fast_path_cooldown_demotes_to_standard_window() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "1".into()];
@@ -13425,8 +13802,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__sub_double_peak_keeps_standard_window() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
@@ -13466,8 +13843,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__drain_bound_trips_cutover_opens_gate() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "1".into()];
@@ -13586,8 +13963,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__decode_bound_suppresses_adoption() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "1".into()];
@@ -13617,7 +13994,7 @@ mod routing_tests {
         }
         assert_eq!(bounds, 1, "teach fires once per dedup window");
         // Kill-switch off: the explicit override restores adoption.
-        sup.config.adaptive_decode_gate = false;
+        sup.mut_config(|c| c.adaptive_decode_gate = false);
         for _ in 0..SLOTS_STREAK_TICKS {
             sup.adaptive_slots_tick();
         }
@@ -13630,8 +14007,8 @@ mod routing_tests {
 
         // Healthy scaling (ratio 1.6 >= 1.25): adoption proceeds.
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "1".into()];
@@ -13657,12 +14034,12 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__prewarm__cutover_rekeys_and_retires_old() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
         // A prewarm-capable box: the transient double-residency (old +
         // warm) needs room for two concurrent instances - the default
         // no-GPU harness caps at one, and a one-slot box correctly
         // takes the fallback instead.
-        sup.config.max_loaded_models = 2;
+        sup.mut_config(|c| c.max_loaded_models = 2);
         let model_path = sup.dirs.data_dir.join("models").join("m-q4_0.gguf");
         std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
         write_minimal_qwen3_gguf(&model_path);
@@ -13742,7 +14119,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__prewarm__refused_falls_back_and_holds() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
         let model_path = sup.dirs.data_dir.join("models").join("broken.gguf");
         std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
         std::fs::write(&model_path, b"not a gguf").unwrap();
@@ -13794,15 +14171,16 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__exclusion_returns_shape_authority() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
         // routing_sup seeds a replicas override; replace it with a pin.
-        sup.config.model_overrides.insert(
+        sup.mut_config(|c| { c.model_overrides.insert(
             "m".to_string(),
             blazar_core::ModelOverride {
                 slots: Some(2),
                 ..Default::default()
             },
-        );
+    
+        ); });
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
@@ -13831,27 +14209,29 @@ mod routing_tests {
     async fn unit__ps__slots_source_reports_precedence() {
         let mut sup = routing_sup(1);
         // Delegated pin: adaptation owns the shape once it adopted.
-        sup.config.model_overrides.insert(
+        sup.mut_config(|c| { c.model_overrides.insert(
             "m".to_string(),
             blazar_core::ModelOverride {
                 slots: Some(2),
                 adaptive_override: Some(true),
                 ..Default::default()
             },
-        );
+    
+        ); });
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
         sup.instances.insert("m".into(), inst);
         sup.adopted_slots.insert("m".to_string(), 6);
         // Pin-only lane (no adoption recorded).
-        sup.config.model_overrides.insert(
+        sup.mut_config(|c| { c.model_overrides.insert(
             "p".to_string(),
             blazar_core::ModelOverride {
                 slots: Some(3),
                 ..Default::default()
             },
-        );
+    
+        ); });
         let (mut pinned, ph2) = fake_instance("p", InstanceState::Ready, 0);
         Arc::get_mut(&mut pinned).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "3".into()];
@@ -13904,7 +14284,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__warm_transitional_child_ignored() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
         let (mut inst, ph) = fake_instance("m#warm", InstanceState::Ready, 4);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "1".into()];
@@ -13935,7 +14315,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__prewarm__warm_waiting_skips_respawn() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
         let (mut old, old_ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut old).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "1".into()];
@@ -13993,14 +14373,15 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__pinned_lane__sustained_pressure_teaches_once() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.model_overrides.insert(
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| { c.model_overrides.insert(
             "m".into(),
             ModelOverride {
                 slots: Some(2),
                 ..Default::default()
             },
-        );
+    
+        ); });
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
@@ -14058,15 +14439,16 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__pinned_lane__adaptive_override_lifts_exclusion() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.model_overrides.insert(
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| { c.model_overrides.insert(
             "m".into(),
             ModelOverride {
                 slots: Some(2),
                 adaptive_override: Some(true),
                 ..Default::default()
             },
-        );
+    
+        ); });
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
@@ -14128,8 +14510,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__latch_consumed_on_adoption() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
@@ -14175,8 +14557,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__full_but_unqueued_stays_quiet() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 4);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "4".into()];
@@ -14194,8 +14576,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__at_cap_does_not_adopt() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.slots = 0;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 17);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "16".into()];
@@ -14213,8 +14595,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__adaptive_slots__deterministic_excluded() {
         let mut sup = routing_sup(1);
-        sup.config.adaptive_slots = true;
-        sup.config.deterministic = true;
+        sup.mut_config(|c| c.adaptive_slots = true);
+        sup.mut_config(|c| c.deterministic = true);
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 4);
         sup.instances.insert("m".into(), inst);
         for _ in 0..(SLOTS_STREAK_TICKS * 2) {
@@ -14722,7 +15104,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__spec_governor__saturation_streak_parks_and_queues() {
         let mut sup = routing_sup(1);
-        sup.config.spec_auto_manage = true;
+        sup.mut_config(|c| c.spec_auto_manage = true);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
         Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
             "llama-server".into(),
@@ -14758,7 +15140,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__spec_governor__accept_collapse_parks_without_saturation() {
         let mut sup = routing_sup(1);
-        sup.config.spec_auto_manage = true;
+        sup.mut_config(|c| c.spec_auto_manage = true);
         // No instances at all: nothing saturated - only the acceptance
         // floor breach can fire (a spec child reporting 0.10).
         sup.spec_governor_window("m", Some(0.10));
@@ -14781,7 +15163,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__spec_governor__knob_off_is_inert() {
         let mut sup = routing_sup(1);
-        sup.config.spec_auto_manage = false; // explicit off: default is on
+        sup.mut_config(|c| c.spec_auto_manage = false); // explicit off: default is on
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
         sup.instances.insert("m".into(), inst);
         for _ in 0..5 {
@@ -14814,14 +15196,15 @@ mod routing_tests {
     async fn unit__spec_governor__overlay_pin_and_config_off_exempt() {
         // Overlay pin: a user policy statement - never governed.
         let mut sup = routing_sup(1);
-        sup.config.spec_auto_manage = true;
-        sup.config.model_overrides.insert(
+        sup.mut_config(|c| c.spec_auto_manage = true);
+        sup.mut_config(|c| { c.model_overrides.insert(
             "m".into(),
             ModelOverride {
                 spec: Some("ngram".into()),
                 ..Default::default()
             },
-        );
+    
+        ); });
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
         sup.instances.insert("m".into(), inst);
         for _ in 0..3 {
@@ -14832,8 +15215,8 @@ mod routing_tests {
 
         // Global config already dense: nothing to manage.
         let mut sup = routing_sup(1);
-        sup.config.spec_auto_manage = true;
-        sup.config.spec = "off".into();
+        sup.mut_config(|c| c.spec_auto_manage = true);
+        sup.mut_config(|c| c.spec = "off".into());
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
         sup.instances.insert("m".into(), inst);
         for _ in 0..3 {
@@ -14847,7 +15230,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__spec_governor__recovers_after_quiet_streak_and_resets_on_bad_window() {
         let mut sup = routing_sup(1);
-        sup.config.spec_auto_manage = true;
+        sup.mut_config(|c| c.spec_auto_manage = true);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
             "llama-server".into(),
@@ -14884,10 +15267,10 @@ mod routing_tests {
     #[test]
     fn unit__governed_spec_default__override_then_config() {
         let sup = routing_sup(1);
-        assert_eq!(sup.governed_spec_default("m"), sup.config.spec);
+        assert_eq!(sup.governed_spec_default("m"), sup.cfg().spec);
         sup.spec_override.insert("m".into(), "off".into());
         assert_eq!(sup.governed_spec_default("m"), "off");
-        assert_eq!(sup.governed_spec_default("other"), sup.config.spec);
+        assert_eq!(sup.governed_spec_default("other"), sup.cfg().spec);
     }
 
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
@@ -14912,7 +15295,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__ubatch_governor__saturation_streak_escalates_rung_by_rung() {
         let mut sup = routing_sup(1);
-        sup.config.ubatch_auto = true;
+        sup.mut_config(|c| c.ubatch_auto = true);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
         Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
             "llama-server".into(),
@@ -14964,8 +15347,8 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__ubatch_governor__config_pin_is_exempt() {
         let mut sup = routing_sup(1);
-        sup.config.ubatch_auto = true;
-        sup.config.ubatch_size = 512;
+        sup.mut_config(|c| c.ubatch_auto = true);
+        sup.mut_config(|c| c.ubatch_size = 512);
         // A stale override from before the pin is cleared, never acted on.
         sup.ubatch_override.insert("m".into(), 2048);
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
@@ -14982,7 +15365,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__ubatch_governor__quiet_streak_steps_down_one_rung() {
         let mut sup = routing_sup(1);
-        sup.config.ubatch_auto = true;
+        sup.mut_config(|c| c.ubatch_auto = true);
         sup.ubatch_override.insert("m".into(), 2048);
         // A live (idle) instance so step-downs have something to reshape;
         // load 0 keeps it unsaturated - every window is quiet.
@@ -15170,7 +15553,7 @@ mod routing_tests {
     async fn unit__bank_capability__unsupported_kind_skips_save() {
         use blazar_core::engine_kind::EngineKind;
         let (sup, _root) = gpu_sup();
-        assert!(sup.config.session_bank, "default config must bank");
+        assert!(sup.cfg().session_bank, "default config must bank");
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(
@@ -15220,6 +15603,9 @@ mod routing_tests {
             port: server.address().port(),
         };
         let (inst, pid) = fake_instance_at("m", InstanceState::Ready, 0, endpoint);
+        // A completed request since the last bank: the save sweep is
+        // armed (the dirty gate below turns a cold save into a no-dial).
+        inst.bank_dirty.store(true, Ordering::SeqCst);
         sup.bank_save(&inst).await;
         server.verify().await;
         let hits = server
@@ -15230,6 +15616,396 @@ mod routing_tests {
         assert!(
             url.contains("action=save") && url.contains("filename=_auto-8"),
             "save must target the ctx-scoped slot-0 checkpoint, got {url}"
+        );
+        kill_all(&[pid]);
+    }
+
+    /// Live-repro'd 2026-11-03 (F3 happy-path cell): the evict-time
+    /// save of an already-banked, sleeping child returns `n_saved: 0`
+    /// and the Some(0) branch deleted the GOOD pre-sleep payload. The
+    /// sweep must never dial when nothing changed since the last bank.
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__bank_capability__not_dirty_never_dials_and_keeps_existing_payload() {
+        let (sup, _root) = gpu_sup();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/slots/0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "n_saved": 0 })),
+            )
+            // Zero dials: a not-dirty instance must not even attempt a
+            // save (an attempt against a sleeping child returns 0 and
+            // the Some(0) branch would drop the existing checkpoint).
+            .expect(0)
+            .mount(&server)
+            .await;
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: server.address().port(),
+        };
+        let (inst, pid) = fake_instance_at("m", InstanceState::Sleeping, 0, endpoint);
+        // bank_dirty = false: the pre-sleep reaper sweep already banked
+        // this instance; a payload sits on disk at the exact path the
+        // sweep's Some(0) branch would delete.
+        let payload = sup.bank_slot_file("m", inst.profile_ctx, 1);
+        if let Some(parent) = payload.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&payload, vec![0u8; 2048]).unwrap();
+        sup.bank_save(&inst).await;
+        server.verify().await;
+        assert!(
+            payload.exists(),
+            "not-dirty sweep must leave the existing checkpoint untouched"
+        );
+        kill_all(&[pid]);
+    }
+
+    /// Shared body for the bank-before-sleep reaper pins: one mock
+    /// child endpoint, one fabricated llama instance aged `idle_secs`
+    /// with a chosen `bank_dirty` state, inserted under key "m".
+    async fn bank_reap_fixture(
+        config: Config,
+        idle_secs: u64,
+        dirty: bool,
+        kind: blazar_core::engine_kind::EngineKind,
+    ) -> (Supervisor, wiremock::MockServer, Arc<Instance>, u32) {
+        let (sup, _root) = gpu_sup_with(
+            vec![GpuInfo {
+                name: "g".into(),
+                description: "S".into(),
+                total_mib: 8_188,
+                free_mib: 8_188,
+            }],
+            config,
+        );
+        let server = wiremock::MockServer::start().await;
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: server.address().port(),
+        };
+        let (inst, pid) = fake_instance_of_kind("m", InstanceState::Ready, 0, endpoint, kind);
+        *inst.last_used.write().expect("idle lock") =
+            Instant::now() - Duration::from_secs(idle_secs);
+        inst.bank_dirty.store(dirty, Ordering::SeqCst);
+        sup.instances.insert("m".into(), inst.clone());
+        (sup, server, inst, pid)
+    }
+
+    fn hot_reload_config() -> Config {
+        Config::default()
+    }
+
+    #[tokio::test]
+    async fn unit__reload_config_now__valid_file_swaps_and_publishes() {
+        let sup = gpu_sup_with(
+            vec![GpuInfo {
+                name: "g".into(),
+                description: "S".into(),
+                total_mib: 8_188,
+                free_mib: 8_188,
+            }],
+            hot_reload_config(),
+        )
+        .0;
+        let mut rx = sup.bus.subscribe();
+        std::fs::create_dir_all(sup.dirs.config_file().parent().unwrap()).unwrap();
+        std::fs::write(sup.dirs.config_file(), "idle_timeout_secs = 600\n").unwrap();
+        let outcome = sup.reload_config_now().expect("valid file must apply");
+        assert!(outcome.applied, "first apply of a written file");
+        assert!(outcome.cold_only.is_empty(), "idle_timeout_secs is hot");
+        assert_eq!(sup.cfg().idle_timeout_secs, 600);
+        // Second call is a no-op: the (mtime, size) fingerprint matches.
+        let again = sup.reload_config_now().expect("same file, same result");
+        assert!(!again.applied, "fingerprint debounce");
+        // The swap published ConfigReloaded exactly once per apply.
+        let mut saw_reload = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, crate::events::BlazarEvent::ConfigReloaded { .. }) {
+                saw_reload += 1;
+            }
+        }
+        assert_eq!(saw_reload, 1, "one event for one real apply");
+    }
+
+    #[tokio::test]
+    async fn unit__reload_config_now__cold_knob_flagged_in_diff() {
+        let sup = gpu_sup_with(
+            vec![GpuInfo {
+                name: "g".into(),
+                description: "S".into(),
+                total_mib: 8_188,
+                free_mib: 8_188,
+            }],
+            hot_reload_config(),
+        )
+        .0;
+        std::fs::create_dir_all(sup.dirs.config_file().parent().unwrap()).unwrap();
+        std::fs::write(sup.dirs.config_file(), "port = 12345\n").unwrap();
+        let outcome = sup.reload_config_now().expect("valid file must apply");
+        assert_eq!(
+            outcome.cold_only,
+            vec!["port".to_string()],
+            "bind-time knobs are named, not silently ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__discovery_lifecycle__boot_off_hot_on_hot_off_without_restart() {
+        // The responder is a lifecycle task spawned unconditionally: a
+        // daemon booted with the beacon OFF must start answering the
+        // moment a config hot-reload enables it, and go silent (socket
+        // released) the moment a reload disables it - all through the
+        // REAL reload machinery (file write + reload_config_now), no
+        // restart, no direct config mutation.
+        let probe = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let mut config = Config::default();
+        config.discovery_port = port;
+        config.discovery_enabled = false;
+        let sup = Arc::new(
+            gpu_sup_with(
+                vec![GpuInfo {
+                    name: "g".into(),
+                    description: "S".into(),
+                    total_mib: 8_188,
+                    free_mib: 8_188,
+                }],
+                config,
+            )
+            .0,
+        );
+        let responder = tokio::spawn(crate::discovery::run_discovery_responder(
+            sup.clone(),
+            11438,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let silent = crate::discovery::seek_gateway(port, std::time::Duration::from_millis(700))
+            .await
+            .unwrap();
+        assert!(silent.is_none(), "boot-off must keep the beacon silent");
+        // Hot ON through the real machinery: file + reload.
+        std::fs::create_dir_all(sup.dirs.config_file().parent().unwrap()).unwrap();
+        std::fs::write(
+            sup.dirs.config_file(),
+            format!("discovery_enabled = true\ndiscovery_port = {port}\n"),
+        )
+        .unwrap();
+        sup.reload_config_now().expect("enabling reload must apply");        let found = crate::discovery::seek_gateway(port, std::time::Duration::from_secs(3))
+            .await
+            .unwrap()
+            .expect("flag on must bind and answer without a restart");
+        assert_eq!(found.0, format!("http://127.0.0.1:11438"));
+        // Hot OFF through the same machinery: socket released.
+        std::fs::write(
+            sup.dirs.config_file(),
+            format!("discovery_enabled = false\ndiscovery_port = {port}\n"),
+        )
+        .unwrap();
+        sup.reload_config_now().expect("disabling reload must apply");
+        let silent_again =
+            crate::discovery::seek_gateway(port, std::time::Duration::from_millis(700))
+                .await
+                .unwrap();
+        assert!(silent_again.is_none(), "flag off must unbind the beacon");
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn unit__reload_config_now__invalid_file_keeps_running_config() {
+        let sup = gpu_sup_with(
+            vec![GpuInfo {
+                name: "g".into(),
+                description: "S".into(),
+                total_mib: 8_188,
+                free_mib: 8_188,
+            }],
+            hot_reload_config(),
+        )
+        .0;
+        let mut rx = sup.bus.subscribe();
+        std::fs::create_dir_all(sup.dirs.config_file().parent().unwrap()).unwrap();
+        std::fs::write(sup.dirs.config_file(), "%%% this is not toml %%%\n").unwrap();
+        let err = sup.reload_config_now().expect_err("garbage must be refused");
+        assert!(
+            err.contains("keeping the running config"),
+            "teaching error, got: {err}"
+        );
+        // Defaults stay out: the pre-reload config is still live.
+        assert_eq!(
+            sup.cfg().idle_timeout_secs,
+            Config::default().idle_timeout_secs
+        );
+        let mut failed = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(
+                ev,
+                crate::events::BlazarEvent::ConfigReloadFailed { .. }
+            ) {
+                failed = true;
+            }
+            if matches!(ev, crate::events::BlazarEvent::ConfigReloaded { .. }) {
+                panic!("a refused reload must never publish success");
+            }
+        }
+        assert!(failed, "failure event published for observability");
+    }
+
+    fn bank_reap_config() -> Config {
+        // idle_sleep 60 with a 30 s lead-in: the bank threshold sits at
+        // 30 s of idle, the (mocked) self-sleep at 60 s.
+        let mut config = Config::default();
+        config.idle_sleep_secs = 60;
+        config
+    }
+
+    /// F3: llama-server DROPS slot KV when it self-sleeps
+    /// (--sleep-idle-seconds), so a bank written at evict time is empty
+    /// (live-repro'd 2026-11-03: sleeping children report n_saved:0 and
+    /// write 44-byte header-only files). The reaper must sweep the
+    /// checkpoint BEFORE the child reaches its sleep threshold: a dirty
+    /// llama instance banks once and clears the marker.
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__reaper_banks_before_sleep__dirty_instance_banks_before_sleep_mark() {
+        let (sup, server, inst, pid) = bank_reap_fixture(
+            bank_reap_config(),
+            40,
+            true,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/slots/0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"n_saved": 5})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        sup.reap_once().await;
+        server.verify().await;
+        assert!(
+            !inst.bank_dirty.load(Ordering::SeqCst),
+            "bank sweep must clear the dirty marker"
+        );
+        kill_all(&[pid]);
+    }
+
+    /// A clean instance (no request since the last bank) must not burn
+    /// a sweep - the marker, not idle age alone, arms the bank.
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__reaper_banks_before_sleep__clean_instance_skips_banking() {
+        let (sup, server, _inst, pid) = bank_reap_fixture(
+            bank_reap_config(),
+            40,
+            false,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"n_saved": 5})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        sup.reap_once().await;
+        server.verify().await;
+        kill_all(&[pid]);
+    }
+
+    /// The capability gate rides the same branch: a non-llama child
+    /// never dials (its lanes lack /slots - banking them costs timeouts).
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__reaper_banks_before_sleep__non_llama_kind_skips() {
+        let (sup, server, _inst, pid) = bank_reap_fixture(
+            bank_reap_config(),
+            40,
+            true,
+            blazar_core::engine_kind::EngineKind::Sglang,
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"n_saved": 5})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        sup.reap_once().await;
+        server.verify().await;
+        kill_all(&[pid]);
+    }
+
+    /// Below the lead-in threshold nothing fires: early ticks leave the
+    /// bank armed for later (the sweep only matters near sleep).
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__reaper_banks_before_sleep__below_threshold_waits() {
+        let (sup, server, inst, pid) = bank_reap_fixture(
+            bank_reap_config(),
+            20,
+            true,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"n_saved": 5})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        sup.reap_once().await;
+        server.verify().await;
+        assert!(
+            inst.bank_dirty.load(Ordering::SeqCst),
+            "no sweep ran - the marker must stay armed"
+        );
+        kill_all(&[pid]);
+    }
+
+    /// Long-idle encounter (reaper missed the lead-in window): the bank
+    /// still runs BEFORE the sleep-mark branch can engage - ordering
+    /// inside reap_once is the contract, bank first, sleep later.
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[tokio::test]
+    async fn unit__reaper_banks_before_sleep__past_sleep_threshold_banks_before_marking() {
+        let (sup, server, inst, pid) = bank_reap_fixture(
+            bank_reap_config(),
+            120,
+            true,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+        )
+        .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/slots/0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"n_saved": 5})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        sup.reap_once().await;
+        server.verify().await;
+        assert!(
+            !inst.bank_dirty.load(Ordering::SeqCst),
+            "bank ran before the sleep-mark branch"
+        );
+        assert!(
+            *inst.state.read().expect("state lock") == InstanceState::Ready,
+            "the same tick must not sleep-mark: banking owns this tick, sleep the next"
         );
         kill_all(&[pid]);
     }
@@ -15279,6 +16055,38 @@ mod routing_tests {
         assert!(
             url.contains("action=restore") && url.contains("filename=_auto-8"),
             "restore must target the ctx-scoped checkpoint, got {url}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod spawn_failure_tests {
+    #![allow(non_snake_case)]
+    use super::*;
+
+    #[test]
+    fn unit__spawn_failure__rpc_marker_maps_typed_not_internal() {
+        // The gateway renders Internal as a 500; a dead rpc fleet member
+        // is an infrastructure-down state that must reach the client as
+        // a 503-class typed refusal (live finding 2026-11-03: the dead
+        // endpoint cell returned blazar_code INTERNAL).
+        let marker = crate::engine_impl::RpcEndpointsUnreachable {
+            dead: vec!["127.0.0.1:51099 (unreachable)".to_string()],
+        };
+        let e = SupervisionError::spawn_failure(anyhow::Error::new(marker));
+        let SupervisionError::RpcEndpointsUnreachable(msg) = &e else {
+            panic!("marker must map typed, got {e:?}");
+        };
+        assert!(msg.contains("127.0.0.1:51099"), "{msg}");
+        assert!(msg.contains("rpc_servers"), "{msg}");
+    }
+
+    #[test]
+    fn unit__spawn_failure__ordinary_errors_stay_internal() {
+        let e = SupervisionError::spawn_failure(anyhow::anyhow!("spawn /x: No such file"));
+        assert!(
+            matches!(e, SupervisionError::Internal(_)),
+            "non-rpc spawn errors keep the Internal lane: {e:?}"
         );
     }
 }
