@@ -340,6 +340,15 @@ mod tests {
             // The steering target for `glmocr` pulls: the official GGUF
             // exports under the native glm4 arch llama-server loads.
             ("glm-ocr", "ggml-org/GLM-OCR-GGUF"),
+            // Clover MoE landed upstream (b12069+); the Diffuspace mirror
+            // is the only ungated Q4_K_M hosting verified at freeze.
+            ("clover-35b-a3b", "Diffuspace/Clover-35B-A3B-Preview-GGUF"),
+            // Multimodal embedder (gemma-embedding2 arch + mmproj): text
+            // rides the child embeddings lane, images the G2b content-
+            // array path. No Q4_K_M upstream - quant fallback is fine.
+            ("embeddinggemma-2", "ggml-org/embeddinggemma-2-GGUF"),
+            // The SigLIP candle lane's reference model: safetensors on
+            // main (no revision pin needed), sparse config verified.
         ] {
             let e = resolve(name).unwrap_or_else(|err| panic!("{name}: {err}"));
             assert_eq!(e.repo, repo, "{name}");

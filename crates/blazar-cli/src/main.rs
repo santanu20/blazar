@@ -6190,8 +6190,8 @@ mod doctor_tests {
         let tagged: Vec<_> = entries.iter().filter(|e| e.class.is_some()).collect();
         assert_eq!(
             tagged.len(),
-            10,
-            "exactly the ten non-LLM entries carry a class"
+            11,
+            "exactly the eleven non-LLM entries carry a class"
         );
         for e in &tagged {
             let ok = matches!(
@@ -6220,7 +6220,9 @@ mod doctor_tests {
         assert!(missing, "three suggestible classes absent -> warn");
         assert!(detail.starts_with("3/7 classes:"), "got: {detail}");
         assert!(
-            detail.contains("missing: clip (blazar pull clip-vit-base-patch32)"),
+            detail.contains(
+                "missing: clip (blazar pull clip-vit-base-patch32)"
+            ),
             "got: {detail}"
         );
         assert!(

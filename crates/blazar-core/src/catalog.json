@@ -45,7 +45,9 @@
     { "short_name": "flux-3-klein", "repo": "leejet/flux-3-image-klein-GGUF", "class": "diffusion" },
     { "short_name": "qwen-image-edit", "repo": "QuantStack/Qwen-Image-Edit-GGUF", "class": "diffusion" },
     { "short_name": "wan2.1-t2v", "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged", "class": "diffusion" },
-    { "short_name": "glm-ocr", "repo": "ggml-org/GLM-OCR-GGUF" }
+    { "short_name": "glm-ocr", "repo": "ggml-org/GLM-OCR-GGUF" },
+    { "short_name": "clover-35b-a3b", "repo": "Diffuspace/Clover-35B-A3B-Preview-GGUF" },
+    { "short_name": "embeddinggemma-2", "repo": "ggml-org/embeddinggemma-2-GGUF", "class": "embeddings" }
   ],
   "spec_pairs": [
     { "model_prefix": "qwen3-", "spec_type": "draft-simple", "draft_repo": "ggml-org/Qwen3-0.6B-GGUF:Q4_0" },
