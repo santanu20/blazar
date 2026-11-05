@@ -2572,17 +2572,20 @@ const UNIFIED_COMPUTE_PER_TOKEN_BYTES: u64 = 24 * 1024;
 /// Speech-generation GGUF architectures: checkpoints whose purpose is
 /// audio out (llama-server's `/tts` surface), not embeddings. Compiled as
 /// an exact-match list on purpose - a new upstream speech arch must be a
-/// conscious addition, never a silent prefix match. `qwen3tts` is the
-/// only loadable arch of this class in llama.cpp b12020 (the other
-/// mtmd audio-gen towers are projector names, not model arches).
+/// conscious addition, never a silent prefix match.
 ///
-/// Live receipt (b12020, 2026-11-02): a qwen3tts child spawned with
-/// `--embeddings --pooling last` segfaults inside
-/// `server_context_impl::process_tts_slots()` on the first POST /tts;
-/// the same argv without the embedding flags serves /tts fine. Every
-/// embedding arm in section 10c is therefore skipped for these arches.
+/// Live receipts: a qwen3tts child spawned with `--embeddings --pooling
+/// last` segfaults inside `server_context_impl::process_tts_slots()` on
+/// the first POST /tts (b12020, 2026-11-02); the same argv without the
+/// embedding flags serves /tts fine. `pockettts` joins with the same
+/// class of proof: converted from kyutai/pocket-tts-without-voice-cloning
+/// (english pack, 27 baked voices), booted model+mmproj on b12072 -
+/// /tts answers in 0.5 s, GET /props lists the 27 predefined voices,
+/// speaker_ref is refused ("no voice encoder") - a speech-only checkpoint
+/// (2026-11-03). Every embedding arm in section 10c is therefore skipped
+/// for these arches.
 pub fn speech_generation_arch(arch: &str) -> bool {
-    matches!(arch, "qwen3tts")
+    matches!(arch, "qwen3tts" | "pockettts")
 }
 
 /// Whether draft-mtp (speculation from the GGUF's own baked-in MTP head)
@@ -8238,23 +8241,27 @@ mod tests {
 
     #[test]
     fn unit__speech_gen_arch__suppresses_every_embedding_arm() {
-        // Live receipt (b12020, 2026-11-02): qwen3tts + `--embeddings
-        // --pooling last` segfaults in process_tts_slots() on the first
-        // POST /tts. A speech checkpoint must never carry embedding
-        // flags - not the parity arm, not any pooling arm.
+        // Live receipts: qwen3tts + `--embeddings --pooling last`
+        // segfaults in process_tts_slots() on the first POST /tts
+        // (b12020, 2026-11-02); pockettts joins the class with a
+        // model+mmproj boot on b12072 (2026-11-03). A speech checkpoint
+        // must never carry embedding flags - not the parity arm, not any
+        // pooling arm.
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
-        let mut g = meta();
-        g.architecture = "qwen3tts".into();
-        g.pooling_type = None;
-        let p = compile(
-            &input(&g, &hw, &cfg, &ALL_FLAGS),
-            &TuningOverrides::default(),
-        )
-        .unwrap();
-        assert!(!p.argv.iter().any(|a| a == "--embeddings"));
-        assert!(!p.argv.iter().any(|a| a == "--pooling"));
-        assert!(!p.argv.iter().any(|a| a == "--reranking"));
+        for arch in ["qwen3tts", "pockettts"] {
+            let mut g = meta();
+            g.architecture = arch.into();
+            g.pooling_type = None;
+            let p = compile(
+                &input(&g, &hw, &cfg, &ALL_FLAGS),
+                &TuningOverrides::default(),
+            )
+            .unwrap();
+            assert!(!p.argv.iter().any(|a| a == "--embeddings"), "{arch}");
+            assert!(!p.argv.iter().any(|a| a == "--pooling"), "{arch}");
+            assert!(!p.argv.iter().any(|a| a == "--reranking"), "{arch}");
+        }
     }
 
     #[test]

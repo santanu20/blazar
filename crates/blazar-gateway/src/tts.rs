@@ -989,16 +989,18 @@ pub fn speech_capabilities(state: &AppState) -> Value {
                              (blazar mmproj <model> <file>)",
                 "stream": false,
                 "knobs": ["voice", "lang", "speaker_ref_b64"],
+                "voices": "predefined packs (e.g. pocket-tts) list theirs at /v1/audio/voices once resident",
             },
         },
     })
 }
 
-/// GET `/v1/audio/voices` - installed piper voices, plus an optional
-/// `?search=` probe of the upstream `rhasspy/piper-voices` catalog
-/// (results capped, marked with installed state). Boots nothing. A
-/// failed search keeps the installed list and surfaces the error as
-/// `search_error` instead of failing the endpoint.
+/// GET `/v1/audio/voices` - installed piper voices, the voice packs
+/// advertised by any resident speech-capable engine child, plus an
+/// optional `?search=` probe of the upstream `rhasspy/piper-voices`
+/// catalog (results capped, marked with installed state). Boots
+/// nothing. A failed search keeps the installed list and surfaces the
+/// error as `search_error` instead of failing the endpoint.
 #[allow(clippy::implicit_hasher)] // axum Query extractor fixes the map type
 pub async fn voices(
     State(state): State<Arc<AppState>>,
@@ -1056,12 +1058,128 @@ pub async fn voices(
             }
         }
     }
+    body["engines"] = serde_json::json!(engine_voices(&state).await);
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body.to_string(),
     )
         .into_response()
+}
+
+/// Voice-discovery cache: engine name -> (fetched_at, normalized voice
+/// ids). Mirrors the sdcpp child-capabilities TTL cache - `/props` is
+/// only asked while the answer is fresh-less, and never to boot a
+/// child. Empty lists are cached too, so speech children without
+/// predefined voices (e.g. qwen3-tts base) do not get re-probed on
+/// every call.
+const ENGINE_VOICES_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+static ENGINE_VOICES_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<HashMap<String, (std::time::Instant, Vec<String>)>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// `GET /props` on llama-server advertises `voices` for speech models
+/// (pocket-tts packs predefined voices into the mmproj sidecar,
+/// upstream PR #31429). The upstream field is a bare id list today;
+/// objects carrying an `id` or `name` are accepted defensively so a
+/// shape drift degrades to the same list instead of an error, and any
+/// other shape yields an empty list (the honest no-predefined-voices
+/// answer).
+fn normalize_props_voices(props: &Value) -> Vec<String> {
+    let Some(list) = props.get("voices").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(_) => v
+                .get("id")
+                .or_else(|| v.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Voice ids advertised by resident speech-capable llama.cpp children,
+/// read from their `GET /props`. Discovery only asks children that are
+/// ALREADY resident (speech-generation arch or audio-advertised
+/// modality cache) - this endpoint never boots a model, and an empty
+/// `engines` list is the honest answer when no speech child is up. A
+/// child that fails the props probe is left uncached so the next call
+/// retries it once it has warmed.
+async fn engine_voices(state: &AppState) -> Vec<Value> {
+    let mut out = Vec::new();
+    for eng in state.sup.live_http_endpoints() {
+        if eng.kind != blazar_core::engine_kind::EngineKind::LlamaCpp {
+            continue;
+        }
+        // Instance keys carry lane suffixes (model@vision, model#2) - the
+        // store only knows the bare model name.
+        let model = blazar_runtime::supervisor::model_of_key(&eng.key).to_string();
+        let speech = state
+            .with_store(|s| match s.get_model(&model) {
+                Ok(Some(row)) => {
+                    row.arch
+                        .as_deref()
+                        .is_some_and(blazar_core::profile::speech_generation_arch)
+                        || s.model_modalities(&model)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|m| m.iter().any(|x| x == "audio"))
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+        if !speech {
+            tracing::debug!(key = %eng.key, "voices: skip non-speech child");
+            continue;
+        }
+        if let Some(ids) = ENGINE_VOICES_CACHE
+            .read()
+            .ok()
+            .and_then(|c| c.get(&model).cloned())
+            .and_then(|(at, ids)| (at.elapsed() < ENGINE_VOICES_TTL).then_some(ids))
+        {
+            if !ids.is_empty() {
+                out.push(serde_json::json!({ "model": model, "voices": ids }));
+            }
+            continue;
+        }
+        let send = crate::proxy::send_with_child_retry(state, &eng, |e| {
+            let url = format!("{}/props", crate::proxy::child_base(&e.endpoint));
+            crate::proxy::child_auth(
+                crate::state::media_child_client(state, &e.endpoint).get(url),
+                e,
+            )
+        });
+        match send.await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                Ok(props) => {
+                    let ids = normalize_props_voices(&props);
+                    if let Some(mut cache) = ENGINE_VOICES_CACHE.write().ok() {
+                        cache.insert(model.clone(), (std::time::Instant::now(), ids.clone()));
+                    }
+                    if !ids.is_empty() {
+                        out.push(serde_json::json!({ "model": model, "voices": ids }));
+                    }
+                }
+                // Observability: a resident speech child whose /props cannot
+                // be parsed must say why instead of silently vanishing.
+                Err(e) => {
+                    tracing::warn!(key = %eng.key, error = %e, "voices: child /props body was not JSON")
+                }
+            },
+            Ok(resp) => {
+                tracing::warn!(key = %eng.key, status = resp.status().as_u16(), "voices: child /props probe non-2xx")
+            }
+            Err(e) => {
+                tracing::warn!(key = %eng.key, error = %e, "voices: child /props probe failed")
+            }
+        }
+    }
+    out
 }
 
 /// Map a piper synthesis error to its teaching response (404 for a
@@ -1385,6 +1503,23 @@ mod tests {
         assert!(body.get("model").is_none(), "model is a gateway concept");
         assert!(body.get("speed").is_none(), "piper knobs never ride");
         assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn unit__normalize_props_voices__strings_and_id_name_objects_empty_otherwise() {
+        let strings = serde_json::json!({"voices": ["sean", "bob"]});
+        assert_eq!(normalize_props_voices(&strings), vec!["sean", "bob"]);
+        let objects = serde_json::json!({"voices": [
+            {"id": "sean"}, {"name": "bob"}, {"other": true},
+        ]});
+        assert_eq!(normalize_props_voices(&objects), vec!["sean", "bob"]);
+        let mixed = serde_json::json!({"voices": ["sean", {"id": "bob"}, 7, null]});
+        assert_eq!(normalize_props_voices(&mixed), vec!["sean", "bob"]);
+        assert!(normalize_props_voices(&serde_json::json!({})).is_empty());
+        assert!(
+            normalize_props_voices(&serde_json::json!({"voices": "sean"})).is_empty(),
+            "non-array shape degrades to the no-predefined-voices answer"
+        );
     }
 
     #[test]
