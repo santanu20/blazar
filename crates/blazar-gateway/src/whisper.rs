@@ -1156,7 +1156,8 @@ async fn forward_local_stream(
                 std::time::Duration::from_mins(2),
                 vad_model.as_deref(),
                 &whisper::knob_args(&task_state.cfg()),
-                task_state.cfg()
+                task_state
+                    .cfg()
                     .whisper_extra_args
                     .as_deref()
                     .unwrap_or(&[]),

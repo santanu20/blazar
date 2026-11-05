@@ -1969,7 +1969,8 @@ mod tests {
         .await;
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert!(
-            reported[0].starts_with("127.0.0.1:") && reported[0] != format!("127.0.0.1:{alive_port}"),
+            reported[0].starts_with("127.0.0.1:")
+                && reported[0] != format!("127.0.0.1:{alive_port}"),
             "{reported:?}"
         );
     }
@@ -1995,7 +1996,8 @@ mod tests {
         .await;
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert!(
-            reported[0].starts_with("127.0.0.1:") && reported[0] != format!("127.0.0.1:{alive_port}"),
+            reported[0].starts_with("127.0.0.1:")
+                && reported[0] != format!("127.0.0.1:{alive_port}"),
             "{reported:?}"
         );
     }
@@ -2145,7 +2147,11 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port,
             };
-            async move { engine.health_check(&endpoint, std::time::Duration::from_secs(2)).await }
+            async move {
+                engine
+                    .health_check(&endpoint, std::time::Duration::from_secs(2))
+                    .await
+            }
         })
         .await;
         assert!(err.to_string().contains("model_load_timeout"), "{err:#}");
@@ -2292,7 +2298,11 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port,
             };
-            async move { engine.health_check(&endpoint, std::time::Duration::from_secs(1)).await }
+            async move {
+                engine
+                    .health_check(&endpoint, std::time::Duration::from_secs(1))
+                    .await
+            }
         })
         .await;
         let msg = err.to_string();

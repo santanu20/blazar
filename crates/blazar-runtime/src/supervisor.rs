@@ -2853,7 +2853,8 @@ impl Supervisor {
             .filter(|e| {
                 e.in_flight.load(Ordering::SeqCst) <= 0
                     && e.key() != key
-                    && !self.cfg()
+                    && !self
+                        .cfg()
                         .overlay_for(model_of_key(e.key()))
                         .pin
                         .unwrap_or(false)
@@ -3120,7 +3121,13 @@ impl Supervisor {
                 .unwrap_or_else(|| "worker".to_string());
             let host = hostname
                 .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
                 .collect::<String>();
             format!("{host}-{port}")
         });
@@ -4055,7 +4062,8 @@ impl Supervisor {
         if name == ROUTER_KEY {
             return name.to_string();
         }
-        let replicas = self.cfg()
+        let replicas = self
+            .cfg()
             .overlay_for(name)
             .replicas
             .unwrap_or(1)
@@ -5017,7 +5025,8 @@ impl Supervisor {
             // relative invariant joins the data dir) so the spawn never
             // execs the storage form raw.
             manifest.anchor_server_path(&self.dirs.data_dir);
-            let env: Vec<(String, String)> = self.cfg()
+            let env: Vec<(String, String)> = self
+                .cfg()
                 .engine_env
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -5489,7 +5498,8 @@ impl Supervisor {
         // pins, and the AUTO plans (sglang TP over census budgets,
         // mirroring largest_card_budget's empty-box discipline).
         let sglang_lane = engine.kind() == blazar_core::engine_kind::EngineKind::Sglang;
-        let tun_probe = self.cfg()
+        let tun_probe = self
+            .cfg()
             .overlay_for(name)
             .sglang
             .clone()
@@ -5652,7 +5662,8 @@ impl Supervisor {
         // The snapshot is taken ONCE here and reused verbatim for the
         // argv merge below - two reads could race a mid-spawn join and
         // hand the budget probe a different fleet than the child dials.
-        let static_rpc: Vec<String> = self.cfg()
+        let static_rpc: Vec<String> = self
+            .cfg()
             .effective_rpc_servers(name)
             .split(',')
             .map(|t| t.trim().to_string())
@@ -7630,7 +7641,7 @@ drop them from rpc_servers in config.toml",
                 && idle
                     >= Duration::from_secs(
                         self.cfg()
-        .idle_sleep_secs
+                            .idle_sleep_secs
                             .saturating_sub(BANK_LEADIN_SECS)
                             .max(1),
                     )
@@ -8081,7 +8092,7 @@ drop them from rpc_servers in config.toml",
     #[must_use]
     pub fn warm_on_pull_enabled(&self, model: &str) -> bool {
         self.cfg()
-        .overlay_for(model_of_key(model))
+            .overlay_for(model_of_key(model))
             .warm_on_pull
             .unwrap_or(self.cfg().warm_on_pull)
     }
@@ -8925,7 +8936,7 @@ drop them from rpc_servers in config.toml",
     #[must_use]
     pub fn deterministic_isolate(&self, model: &str) -> bool {
         self.cfg()
-        .overlay_for(model_of_key(model))
+            .overlay_for(model_of_key(model))
             .deterministic_isolate
             .unwrap_or(self.cfg().deterministic_isolate)
     }
@@ -13151,14 +13162,15 @@ mod routing_tests {
         // "hot" is pinned (overlay), "cold" is not: pressure falls on
         // "cold" even though it is the hotter cache.
         let mut sup = routing_sup(1);
-        sup.mut_config(|c| { c.model_overrides.insert(
-            "hot".into(),
-            ModelOverride {
-                pin: Some(true),
-                ..Default::default()
-            },
-    
-        ); });
+        sup.mut_config(|c| {
+            c.model_overrides.insert(
+                "hot".into(),
+                ModelOverride {
+                    pin: Some(true),
+                    ..Default::default()
+                },
+            );
+        });
         let (hot, ph) = fake_instance("hot", InstanceState::Ready, 0);
         let (cold, pc) = fake_instance("cold", InstanceState::Ready, 0);
         sup.instances.insert("hot".into(), hot);
@@ -13172,14 +13184,15 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__victim_key__all_pinned__none() {
         let mut sup = routing_sup(1);
-        sup.mut_config(|c| { c.model_overrides.insert(
-            "hot".into(),
-            ModelOverride {
-                pin: Some(true),
-                ..Default::default()
-            },
-    
-        ); });
+        sup.mut_config(|c| {
+            c.model_overrides.insert(
+                "hot".into(),
+                ModelOverride {
+                    pin: Some(true),
+                    ..Default::default()
+                },
+            );
+        });
         let (hot, ph) = fake_instance("hot", InstanceState::Ready, 0);
         sup.instances.insert("hot".into(), hot);
         assert_eq!(sup.victim_key("incoming"), None);
@@ -13309,14 +13322,15 @@ mod routing_tests {
         let mut sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 1);
-        sup.mut_config(|c| { c.model_overrides.insert(
-            "m".into(),
-            ModelOverride {
-                slots: Some(1),
-                ..Default::default()
-            },
-    
-        ); });
+        sup.mut_config(|c| {
+            c.model_overrides.insert(
+                "m".into(),
+                ModelOverride {
+                    slots: Some(1),
+                    ..Default::default()
+                },
+            );
+        });
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         sup.instances.insert("m".into(), inst);
         for _ in 0..(SLOTS_STREAK_TICKS * 2) {
@@ -14167,14 +14181,15 @@ mod routing_tests {
         let mut sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         // routing_sup seeds a replicas override; replace it with a pin.
-        sup.mut_config(|c| { c.model_overrides.insert(
-            "m".to_string(),
-            blazar_core::ModelOverride {
-                slots: Some(2),
-                ..Default::default()
-            },
-    
-        ); });
+        sup.mut_config(|c| {
+            c.model_overrides.insert(
+                "m".to_string(),
+                blazar_core::ModelOverride {
+                    slots: Some(2),
+                    ..Default::default()
+                },
+            );
+        });
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
@@ -14203,29 +14218,31 @@ mod routing_tests {
     async fn unit__ps__slots_source_reports_precedence() {
         let mut sup = routing_sup(1);
         // Delegated pin: adaptation owns the shape once it adopted.
-        sup.mut_config(|c| { c.model_overrides.insert(
-            "m".to_string(),
-            blazar_core::ModelOverride {
-                slots: Some(2),
-                adaptive_override: Some(true),
-                ..Default::default()
-            },
-    
-        ); });
+        sup.mut_config(|c| {
+            c.model_overrides.insert(
+                "m".to_string(),
+                blazar_core::ModelOverride {
+                    slots: Some(2),
+                    adaptive_override: Some(true),
+                    ..Default::default()
+                },
+            );
+        });
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
         sup.instances.insert("m".into(), inst);
         sup.adopted_slots.insert("m".to_string(), 6);
         // Pin-only lane (no adoption recorded).
-        sup.mut_config(|c| { c.model_overrides.insert(
-            "p".to_string(),
-            blazar_core::ModelOverride {
-                slots: Some(3),
-                ..Default::default()
-            },
-    
-        ); });
+        sup.mut_config(|c| {
+            c.model_overrides.insert(
+                "p".to_string(),
+                blazar_core::ModelOverride {
+                    slots: Some(3),
+                    ..Default::default()
+                },
+            );
+        });
         let (mut pinned, ph2) = fake_instance("p", InstanceState::Ready, 0);
         Arc::get_mut(&mut pinned).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "3".into()];
@@ -14368,14 +14385,15 @@ mod routing_tests {
     async fn unit__pinned_lane__sustained_pressure_teaches_once() {
         let mut sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
-        sup.mut_config(|c| { c.model_overrides.insert(
-            "m".into(),
-            ModelOverride {
-                slots: Some(2),
-                ..Default::default()
-            },
-    
-        ); });
+        sup.mut_config(|c| {
+            c.model_overrides.insert(
+                "m".into(),
+                ModelOverride {
+                    slots: Some(2),
+                    ..Default::default()
+                },
+            );
+        });
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
@@ -14434,15 +14452,16 @@ mod routing_tests {
     async fn unit__pinned_lane__adaptive_override_lifts_exclusion() {
         let mut sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
-        sup.mut_config(|c| { c.model_overrides.insert(
-            "m".into(),
-            ModelOverride {
-                slots: Some(2),
-                adaptive_override: Some(true),
-                ..Default::default()
-            },
-    
-        ); });
+        sup.mut_config(|c| {
+            c.model_overrides.insert(
+                "m".into(),
+                ModelOverride {
+                    slots: Some(2),
+                    adaptive_override: Some(true),
+                    ..Default::default()
+                },
+            );
+        });
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
             vec!["llama-server".into(), "-np".into(), "2".into()];
@@ -15191,14 +15210,15 @@ mod routing_tests {
         // Overlay pin: a user policy statement - never governed.
         let mut sup = routing_sup(1);
         sup.mut_config(|c| c.spec_auto_manage = true);
-        sup.mut_config(|c| { c.model_overrides.insert(
-            "m".into(),
-            ModelOverride {
-                spec: Some("ngram".into()),
-                ..Default::default()
-            },
-    
-        ); });
+        sup.mut_config(|c| {
+            c.model_overrides.insert(
+                "m".into(),
+                ModelOverride {
+                    spec: Some("ngram".into()),
+                    ..Default::default()
+                },
+            );
+        });
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
         sup.instances.insert("m".into(), inst);
         for _ in 0..3 {
@@ -15788,7 +15808,8 @@ mod routing_tests {
             format!("discovery_enabled = true\ndiscovery_port = {port}\n"),
         )
         .unwrap();
-        sup.reload_config_now().expect("enabling reload must apply");        let found = crate::discovery::seek_gateway(port, std::time::Duration::from_secs(3))
+        sup.reload_config_now().expect("enabling reload must apply");
+        let found = crate::discovery::seek_gateway(port, std::time::Duration::from_secs(3))
             .await
             .unwrap()
             .expect("flag on must bind and answer without a restart");
@@ -15799,7 +15820,8 @@ mod routing_tests {
             format!("discovery_enabled = false\ndiscovery_port = {port}\n"),
         )
         .unwrap();
-        sup.reload_config_now().expect("disabling reload must apply");
+        sup.reload_config_now()
+            .expect("disabling reload must apply");
         let silent_again =
             crate::discovery::seek_gateway(port, std::time::Duration::from_millis(700))
                 .await
@@ -15823,7 +15845,9 @@ mod routing_tests {
         let mut rx = sup.bus.subscribe();
         std::fs::create_dir_all(sup.dirs.config_file().parent().unwrap()).unwrap();
         std::fs::write(sup.dirs.config_file(), "%%% this is not toml %%%\n").unwrap();
-        let err = sup.reload_config_now().expect_err("garbage must be refused");
+        let err = sup
+            .reload_config_now()
+            .expect_err("garbage must be refused");
         assert!(
             err.contains("keeping the running config"),
             "teaching error, got: {err}"
@@ -15835,10 +15859,7 @@ mod routing_tests {
         );
         let mut failed = false;
         while let Ok(ev) = rx.try_recv() {
-            if matches!(
-                ev,
-                crate::events::BlazarEvent::ConfigReloadFailed { .. }
-            ) {
+            if matches!(ev, crate::events::BlazarEvent::ConfigReloadFailed { .. }) {
                 failed = true;
             }
             if matches!(ev, crate::events::BlazarEvent::ConfigReloaded { .. }) {

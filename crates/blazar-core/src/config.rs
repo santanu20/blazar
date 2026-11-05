@@ -3880,7 +3880,8 @@ impl Config {
         }
     }
 
-    pub fn cold_only_diff(old: &Config, new: &Config) -> Vec<String> {        let mut cold = Vec::new();
+    pub fn cold_only_diff(old: &Config, new: &Config) -> Vec<String> {
+        let mut cold = Vec::new();
         let mut push_if = |differs: bool, knob: &str| {
             if differs {
                 cold.push(knob.to_string());
@@ -3891,12 +3892,18 @@ impl Config {
         push_if(old.tls_cert != new.tls_cert, "tls_cert");
         push_if(old.tls_key != new.tls_key, "tls_key");
         push_if(old.log_level != new.log_level, "log_level");
-        push_if(old.child_transport != new.child_transport, "child_transport");
+        push_if(
+            old.child_transport != new.child_transport,
+            "child_transport",
+        );
         push_if(old.failover != new.failover, "failover");
         push_if(old.mcp != new.mcp, "mcp");
         push_if(old.mcp_default != new.mcp_default, "mcp_default");
         push_if(old.sentinel != new.sentinel, "sentinel");
-        push_if(old.sentinel_stall_secs != new.sentinel_stall_secs, "sentinel_stall_secs");
+        push_if(
+            old.sentinel_stall_secs != new.sentinel_stall_secs,
+            "sentinel_stall_secs",
+        );
         push_if(old.audit_log != new.audit_log, "audit_log");
         cold
     }
@@ -5734,9 +5741,9 @@ pub struct ConfigHandle(std::sync::Arc<std::sync::RwLock<std::sync::Arc<Config>>
 impl ConfigHandle {
     #[must_use]
     pub fn new(config: Config) -> Self {
-        Self(std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
-            config,
-        ))))
+        Self(std::sync::Arc::new(std::sync::RwLock::new(
+            std::sync::Arc::new(config),
+        )))
     }
 
     /// Current config generation. The clone is an `Arc` bump; callers
@@ -5755,7 +5762,6 @@ impl ConfigHandle {
         std::mem::replace(&mut *guard, std::sync::Arc::new(next))
     }
 }
-
 
 #[cfg(test)]
 #[allow(non_snake_case)]

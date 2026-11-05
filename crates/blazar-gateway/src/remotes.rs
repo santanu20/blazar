@@ -199,15 +199,13 @@ pub fn select_remote<'a>(
     // No sticky hit: capacity-aware ranking (warm tier beats catalog,
     // queue wait beats idle-cold, then most free VRAM). `rest` is what
     // the peer actually serves, so the resident lookup keys on it.
-    let remote: Remote = chosen
-        .cloned()
-        .unwrap_or_else(|| {
-            live.iter()
-                .min_by_key(|(r, h)| score_peer(rest, h, caps.get(&health_key(r))))
-                .map(|(r, _)| *r)
-                .cloned()
-                .expect("live pool non-empty")
-        });
+    let remote: Remote = chosen.cloned().unwrap_or_else(|| {
+        live.iter()
+            .min_by_key(|(r, h)| score_peer(rest, h, caps.get(&health_key(r))))
+            .map(|(r, _)| *r)
+            .cloned()
+            .expect("live pool non-empty")
+    });
     let key = health_key(&remote);
     map.entry(key.clone()).or_default().in_flight += 1;
     let lease = RemoteLease {

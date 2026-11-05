@@ -13,16 +13,16 @@ pub fn tool_file_name(base: &str) -> String {
     }
 }
 
+pub mod adoption;
 pub mod bench;
 pub mod clip;
 pub mod daemon;
 pub mod degrades;
 pub mod diffusion;
+pub mod discovery;
 pub mod engine;
 pub mod engine_impl;
 pub mod events;
-pub mod adoption;
-pub mod discovery;
 pub mod fleet;
 pub mod hf;
 pub mod hf_parallel;

@@ -829,8 +829,7 @@ const FAMILIES: &[DiffusionFamily] = &[
                 flag: "--llm",
                 source: ComponentSource {
                     repo: "Comfy-Org/Ming-Image",
-                    repo_path:
-                        "text_encoders/ming_image_0.1_ling_mini_2.0_int8_convrot.safetensors",
+                    repo_path: "text_encoders/ming_image_0.1_ling_mini_2.0_int8_convrot.safetensors",
                 },
                 required: true,
                 fallback_quant: None,
@@ -1216,8 +1215,7 @@ const FAMILIES: &[DiffusionFamily] = &[
                 flag: "--llm",
                 source: ComponentSource {
                     repo: "Lightricks/LTX-2.5",
-                    repo_path:
-                        "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+                    repo_path: "text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
                 },
                 required: true,
                 fallback_quant: None,
@@ -2123,11 +2121,12 @@ mod tests {
         // LTX-2.3 rides the same connectors flag with the gemma
         // encoder, plus its audio VAE.
         let ltx = diffusion_family("unsloth/LTX-2.3-GGUF").unwrap();
-        assert!(ltx
-            .components
-            .iter()
-            .any(|c| c.flag == "--embeddings-connectors"
-                && c.source.repo_path.contains("embeddings_connectors")));
+        assert!(
+            ltx.components
+                .iter()
+                .any(|c| c.flag == "--embeddings-connectors"
+                    && c.source.repo_path.contains("embeddings_connectors"))
+        );
         assert!(ltx.components.iter().any(|c| c.flag == "--audio-vae"));
         // MiniT2I --t5xxl: flan-t5-large as a fixed fp32 file - the
         // doc command reuses the t5xxl flag for this encoder.

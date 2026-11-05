@@ -11,8 +11,8 @@
 //! budget caps discovery-sweep amplification.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -154,10 +154,7 @@ async fn serve_beacon(socket: UdpSocket, sup: Arc<Supervisor>, http_port: u16) {
 /// `http://<source-ip>:<http_port>` plus whether a fleet token is
 /// required. Same-host unicast guarantees a hit when gateway and
 /// worker share a machine (broadcast loops are not guaranteed).
-pub async fn seek_gateway(
-    port: u16,
-    wait: Duration,
-) -> std::io::Result<Option<(String, bool)>> {
+pub async fn seek_gateway(port: u16, wait: Duration) -> std::io::Result<Option<(String, bool)>> {
     let mut all = seek_gateways(port, wait).await?;
     Ok(all.drain(..).next())
 }
@@ -167,17 +164,17 @@ pub async fn seek_gateway(
 /// by final base URL (a gateway reachable over several interfaces, or
 /// via both the broadcast and the same-host unicast, is one choice,
 /// not three). Ordered by first reply.
-pub async fn seek_gateways(
-    port: u16,
-    wait: Duration,
-) -> std::io::Result<Vec<(String, bool)>> {
+pub async fn seek_gateways(port: u16, wait: Duration) -> std::io::Result<Vec<(String, bool)>> {
     let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
     socket.set_broadcast(true)?;
     socket
         .send_to(DISCOVER_MAGIC, ("255.255.255.255", port))
         .await
         .ok();
-    socket.send_to(DISCOVER_MAGIC, ("127.0.0.1", port)).await.ok();
+    socket
+        .send_to(DISCOVER_MAGIC, ("127.0.0.1", port))
+        .await
+        .ok();
     let mut seen: Vec<SocketAddr> = Vec::new();
     let mut found: Vec<(String, bool)> = Vec::new();
     let deadline = tokio::time::Instant::now() + wait;
@@ -229,10 +226,17 @@ mod tests {
         assert_eq!(v["fleet_token_required"], true);
         assert_eq!(v["blazar_version"], "0.29.0");
         // No secrets: the payload has exactly these four keys.
-        let mut keys: Vec<&str> =
-            v.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["blazar_version", "fleet_token_required", "hostname", "http_port"]);
+        assert_eq!(
+            keys,
+            [
+                "blazar_version",
+                "fleet_token_required",
+                "hostname",
+                "http_port"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -265,7 +269,9 @@ mod tests {
         let dead = bind_responder(0).await.unwrap();
         let port = dead.local_addr().unwrap().port();
         drop(dead);
-        let found = seek_gateway(port, Duration::from_millis(700)).await.unwrap();
+        let found = seek_gateway(port, Duration::from_millis(700))
+            .await
+            .unwrap();
         assert!(found.is_none());
     }
 }

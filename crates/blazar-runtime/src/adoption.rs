@@ -112,7 +112,9 @@ pub fn decide_invite(
         AgentPolicy::AskOwner => (
             AgentReply {
                 status: "queued".into(),
-                reason: Some("owner approval required - run `blazar agent list` on the donor".into()),
+                reason: Some(
+                    "owner approval required - run `blazar agent list` on the donor".into(),
+                ),
             },
             None,
         ),
@@ -151,8 +153,8 @@ pub fn save_pending(dirs: &BlazarDirs, pending: &PendingInvite) -> std::io::Resu
     let dir = pending_dir(dirs);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", pending.received_ms));
-    let body = serde_json::to_string_pretty(pending)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let body =
+        serde_json::to_string_pretty(pending).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(&path, body)
         .and(Ok(path.clone()))
         .map_err(|e| {
@@ -259,8 +261,7 @@ async fn handle_invite_conn(
     };
     // A gateway base with no host part cannot be joined; refuse before
     // anything is queued.
-    if !invite.gateway_base.starts_with("http://") && !invite.gateway_base.starts_with("https://")
-    {
+    if !invite.gateway_base.starts_with("http://") && !invite.gateway_base.starts_with("https://") {
         let reply = AgentReply::denied("gateway_base must be an http(s) URL");
         let _ = stream
             .write_all(serde_json::to_string(&reply).unwrap_or_default().as_bytes())
@@ -402,7 +403,9 @@ pub async fn run_agent(
     let udp = match UdpSocket::bind(("0.0.0.0", port)).await {
         Ok(s) => Some(s),
         Err(e) => {
-            tracing::warn!("adopt beacon not started on udp/{port}: {e} - invites still work over tcp/{port}");
+            tracing::warn!(
+                "adopt beacon not started on udp/{port}: {e} - invites still work over tcp/{port}"
+            );
             None
         }
     };
@@ -474,7 +477,13 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["agent_version", "free_vram_mib", "gpu_name", "hostname", "policy"]
+            [
+                "agent_version",
+                "free_vram_mib",
+                "gpu_name",
+                "hostname",
+                "policy"
+            ]
         );
         assert_eq!(v["policy"], "ask-owner");
         assert_eq!(v["free_vram_mib"], 7_100);
@@ -495,7 +504,10 @@ mod tests {
         assert_eq!(reply.status, "denied");
         assert!(approval.is_none());
 
-        let no_token = AgentInvite { code: None, ..invite.clone() };
+        let no_token = AgentInvite {
+            code: None,
+            ..invite.clone()
+        };
         let (reply, _) = decide_invite(AgentPolicy::Token, "sekrit", &no_token);
         assert_eq!(reply.status, "denied");
 
@@ -602,10 +614,16 @@ mod tests {
             .await;
         });
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        client.write_all(&vec![b'a'; INVITE_MAX_BYTES + 1]).await.unwrap();
+        client
+            .write_all(&vec![b'a'; INVITE_MAX_BYTES + 1])
+            .await
+            .unwrap();
         client.shutdown().await.unwrap();
         task.await.unwrap();
-        assert!(list_pending(&d).is_empty(), "nothing queued from a hostile frame");
+        assert!(
+            list_pending(&d).is_empty(),
+            "nothing queued from a hostile frame"
+        );
     }
 
     #[tokio::test]
@@ -636,7 +654,10 @@ mod tests {
             code: None,
         })
         .unwrap();
-        client.write_all(format!("{invite}\n").as_bytes()).await.unwrap();
+        client
+            .write_all(format!("{invite}\n").as_bytes())
+            .await
+            .unwrap();
         // NO shutdown: reply must arrive while our write side stays open.
         let reply = tokio::time::timeout(Duration::from_secs(3), async {
             let mut buf = Vec::new();

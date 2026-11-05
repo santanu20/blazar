@@ -835,13 +835,9 @@ enum AgentCmd {
     /// List queued invites awaiting a decision
     List,
     /// Approve a queued invite (1-based index) and start its worker
-    Approve {
-        index: usize,
-    },
+    Approve { index: usize },
     /// Deny a queued invite (1-based index)
-    Deny {
-        index: usize,
-    },
+    Deny { index: usize },
 }
 
 #[derive(Subcommand)]
@@ -2341,9 +2337,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             name,
             device,
             foreground,
-        } => {
-            join_cmd(gateway, yes, fleet_token, name, device, foreground).await
-        }
+        } => join_cmd(gateway, yes, fleet_token, name, device, foreground).await,
         Cmd::Agent { cmd } => agent_cmd(cmd).await,
         Cmd::Adopt { yes, ttl_secs } => adopt_cmd(yes, ttl_secs).await,
         Cmd::Upgrade { version, dry_run } => upgrade(version, dry_run).await,
@@ -2501,11 +2495,8 @@ async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
             let joined_base: Option<String> = if discover {
                 let port_to_seek = config()?.discovery_port;
                 eprintln!("discovering a gateway on udp/{port_to_seek} (3s)...");
-                match blazar_runtime::discovery::seek_gateway(
-                    port_to_seek,
-                    Duration::from_secs(3),
-                )
-                .await
+                match blazar_runtime::discovery::seek_gateway(port_to_seek, Duration::from_secs(3))
+                    .await
                 {
                     Ok(Some((base, token_required))) => {
                         let token = fleet_token
@@ -2574,7 +2565,9 @@ async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
                         port,
                         device,
                         fleet_token: fleet_token.or_else(|| {
-                            std::env::var("BLAZAR_FLEET_TOKEN").ok().filter(|s| !s.is_empty())
+                            std::env::var("BLAZAR_FLEET_TOKEN")
+                                .ok()
+                                .filter(|s| !s.is_empty())
                         }),
                         worker_id: name.unwrap_or_else(worker_default_id),
                         restart: !no_restart,
@@ -2607,7 +2600,10 @@ fn worker_command(
     device: Option<&str>,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(bin);
-    cmd.arg("--host").arg(host).arg("--port").arg(port.to_string());
+    cmd.arg("--host")
+        .arg(host)
+        .arg("--port")
+        .arg(port.to_string());
     if let Some(devices) = device {
         // Comma-separated passthrough: the worker validates device
         // names (CPU / CUDA0 / ...) and exits loudly on typos.
@@ -2665,7 +2661,11 @@ fn host_of_base(base: &str) -> String {
     if authority.starts_with('[') {
         authority.to_string()
     } else {
-        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority).to_string()
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+            .to_string()
     }
 }
 
@@ -2754,7 +2754,8 @@ async fn rpc_worker_joined(opts: RpcWorkerOpts) -> Result<()> {
             child_backoff_secs = 1;
         }
 
-        let mut child_cmd = worker_command(&opts.bin, &opts.host, opts.port, opts.device.as_deref());
+        let mut child_cmd =
+            worker_command(&opts.bin, &opts.host, opts.port, opts.device.as_deref());
         blazar_runtime::parent_death_tie(&mut child_cmd);
         let mut child = tokio::process::Command::from(child_cmd)
             .kill_on_drop(true)
@@ -2804,7 +2805,10 @@ async fn rpc_worker_joined(opts: RpcWorkerOpts) -> Result<()> {
                     if let Some(token) = ack.worker_token.clone() {
                         *session_token.borrow_mut() = Some(token);
                     }
-                    eprintln!("announced (heartbeat {cadence_secs}s, ttl {}s)", ack.ttl_secs.max(1));
+                    eprintln!(
+                        "announced (heartbeat {cadence_secs}s, ttl {}s)",
+                        ack.ttl_secs.max(1)
+                    );
                 } else {
                     eprintln!("announced");
                 }
@@ -2921,7 +2925,11 @@ async fn rpc_status(explicit: &[String], json: bool) -> Result<()> {
         let cfg = config()?;
         let mut targets = collect_rpc_fleet_targets(&cfg);
         if let Ok(base) = ensure_daemon().await {
-            if let Ok(resp) = cli_http().get(format!("{base}/api/fleet/workers")).send().await {
+            if let Ok(resp) = cli_http()
+                .get(format!("{base}/api/fleet/workers"))
+                .send()
+                .await
+            {
                 if let Ok(resp) = resp.error_for_status() {
                     if let Ok(body) = resp.json::<serde_json::Value>().await {
                         if let Some(workers) = body.get("workers").and_then(|w| w.as_array()) {
@@ -3035,14 +3043,22 @@ async fn init_cmd(with_token: bool) -> Result<()> {
     let raw = std::fs::read_to_string(&path)?;
     let mut candidate = set_root_key(&raw, "discovery_enabled", "true");
     if with_token {
-        candidate = set_root_key(&candidate, "fleet_token", &format!("{:?}", mint_hex_secret()));
+        candidate = set_root_key(
+            &candidate,
+            "fleet_token",
+            &format!("{:?}", mint_hex_secret()),
+        );
     }
     Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
     blazar_core::persist_config(&path, &candidate)?;
     println!(
         "wrote {} (discovery_enabled = true{})",
         path.display(),
-        if with_token { ", fleet_token = <minted>" } else { "" }
+        if with_token {
+            ", fleet_token = <minted>"
+        } else {
+            ""
+        }
     );
     match ensure_daemon().await {
         Ok(base) => {
@@ -3062,7 +3078,9 @@ async fn init_cmd(with_token: bool) -> Result<()> {
         }
         Err(_) => println!("no daemon yet - start it with `blazar serve`"),
     }
-    println!("donor boxes then join with `blazar join` (or run `blazar agent run` there and `blazar adopt` here)");
+    println!(
+        "donor boxes then join with `blazar join` (or run `blazar agent run` there and `blazar adopt` here)"
+    );
     Ok(())
 }
 
@@ -3095,7 +3113,10 @@ fn spawn_approved_worker(approval: &blazar_runtime::adoption::AgentApproval, dev
                 child.id()
             );
         }
-        Err(e) => eprintln!("approved, but the worker failed to start: {e} - run `blazar rpc worker --join {}` manually", approval.gateway_base),
+        Err(e) => eprintln!(
+            "approved, but the worker failed to start: {e} - run `blazar rpc worker --join {}` manually",
+            approval.gateway_base
+        ),
     }
 }
 
@@ -3250,10 +3271,7 @@ async fn join_cmd(
                     "several gateways answered",
                     &many.iter().map(|(b, _)| b.as_str()).collect::<Vec<_>>(),
                 ) {
-                    let idx = many
-                        .iter()
-                        .position(|(b, _)| *b == pick)
-                        .unwrap_or(0);
+                    let idx = many.iter().position(|(b, _)| *b == pick).unwrap_or(0);
                     (many[idx].0.clone(), many[idx].1)
                 } else {
                     anyhow::bail!(
@@ -3266,7 +3284,12 @@ async fn join_cmd(
     // Token: flag, then environment, then an interactive prompt only
     // when the chosen gateway demands one.
     let token = fleet_token
-        .or_else(|| std::env::var("BLAZAR_FLEET_TOKEN").ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()))
+        .or_else(|| {
+            std::env::var("BLAZAR_FLEET_TOKEN")
+                .ok()
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+        })
         .filter(|t| !t.is_empty())
         .or_else(|| {
             if token_required {
@@ -3276,7 +3299,9 @@ async fn join_cmd(
             }
         });
     if token_required && token.is_none() {
-        anyhow::bail!("this gateway requires a fleet token - pass --fleet-token or set BLAZAR_FLEET_TOKEN");
+        anyhow::bail!(
+            "this gateway requires a fleet token - pass --fleet-token or set BLAZAR_FLEET_TOKEN"
+        );
     }
     // Prove the base is a blazar daemon before installing anything.
     let version: serde_json::Value = cli_http()
@@ -3349,10 +3374,7 @@ async fn install_worker_unit(
     worker_id: &str,
     token: Option<&str>,
 ) -> Result<()> {
-    let unit_dir = d
-        .config_dir
-        .join("systemd")
-        .join("user");
+    let unit_dir = d.config_dir.join("systemd").join("user");
     std::fs::create_dir_all(&unit_dir)?;
     // The token lives in a 0600 env file referenced by the unit - never
     // in the unit text, never in argv (both leak via `ps`).
@@ -3364,7 +3386,10 @@ async fn install_worker_unit(
     let exe = std::env::current_exe().unwrap_or_else(|_| "blazar".into());
     let exe = exe.display().to_string();
     let env_line = if token.is_some() {
-        format!("EnvironmentFile={}\n", d.config_dir.join("worker.env").display())
+        format!(
+            "EnvironmentFile={}\n",
+            d.config_dir.join("worker.env").display()
+        )
     } else {
         String::new()
     };
@@ -3384,7 +3409,9 @@ async fn install_worker_unit(
             .map(|s| s.success())
             .unwrap_or(false);
     if enabled {
-        println!("worker installed as a systemd user unit - follow with\n  journalctl --user -u blazar-worker -f");
+        println!(
+            "worker installed as a systemd user unit - follow with\n  journalctl --user -u blazar-worker -f"
+        );
     } else {
         println!(
             "unit written to {} - enable it with\n  systemctl --user daemon-reload && systemctl --user enable --now blazar-worker",
@@ -3413,9 +3440,10 @@ async fn adopt_cmd(yes: bool, ttl_secs: Option<u64>) -> Result<()> {
     let d = dirs();
     d.ensure().ok();
     let config = Config::load(&d).map_err(|e| anyhow!("{e}"))?;
-    let agents = blazar_runtime::adoption::scan_agents(config.agent_port, Duration::from_millis(2500))
-        .await
-        .map_err(|e| anyhow!("adopt socket: {e}"))?;
+    let agents =
+        blazar_runtime::adoption::scan_agents(config.agent_port, Duration::from_millis(2500))
+            .await
+            .map_err(|e| anyhow!("adopt socket: {e}"))?;
     if agents.is_empty() {
         anyhow::bail!(
             "no agents answered on udp/{} - donors run `blazar agent run`",
@@ -3437,7 +3465,10 @@ async fn adopt_cmd(yes: bool, ttl_secs: Option<u64>) -> Result<()> {
     } else {
         let pick = pick_from_list(
             "invite which donors (comma-separated numbers)",
-            &agents.iter().map(|a| a.hostname.as_str()).collect::<Vec<_>>(),
+            &agents
+                .iter()
+                .map(|a| a.hostname.as_str())
+                .collect::<Vec<_>>(),
         )
         .ok_or_else(|| anyhow!("stdin is not a TTY - pass --yes to invite every listed agent"))?;
         pick.split(',')
@@ -3487,12 +3518,13 @@ async fn adopt_cmd(yes: bool, ttl_secs: Option<u64>) -> Result<()> {
             agent.ip,
             agent.hostname,
             match reply.status.as_str() {
-            "approved" =>
-                format!("approved - worker self-starts (code {}…)", &code[..6]),
-            "queued" =>
-                "queued - the donor owner must run `blazar agent approve`".to_owned(),
-             other => format!("{other}{}", reply.reason.map(|r| format!(" ({r})")).unwrap_or_default()),
-        }
+                "approved" => format!("approved - worker self-starts (code {}…)", &code[..6]),
+                "queued" => "queued - the donor owner must run `blazar agent approve`".to_owned(),
+                other => format!(
+                    "{other}{}",
+                    reply.reason.map(|r| format!(" ({r})")).unwrap_or_default()
+                ),
+            }
         );
     }
     Ok(())
@@ -6188,9 +6220,7 @@ mod doctor_tests {
         assert!(missing, "three suggestible classes absent -> warn");
         assert!(detail.starts_with("3/7 classes:"), "got: {detail}");
         assert!(
-            detail.contains(
-                "missing: clip (blazar pull clip-vit-base-patch32)"
-            ),
+            detail.contains("missing: clip (blazar pull clip-vit-base-patch32)"),
             "got: {detail}"
         );
         assert!(
@@ -29011,9 +29041,12 @@ ctx = 8192
 engine = "sglang"
 "#;
         let pins = map_table_pins(raw, "model_overrides");
-        assert!(pins.contains(&(
-            "model_overrides.\"gemma3-270m\".rpc_servers = \"127.0.0.1:51001\"".to_string()
-        )), "quoted dotted name: {pins:?}");
+        assert!(
+            pins.contains(
+                &("model_overrides.\"gemma3-270m\".rpc_servers = \"127.0.0.1:51001\"".to_string())
+            ),
+            "quoted dotted name: {pins:?}"
+        );
         assert!(
             pins.contains(&"model_overrides.\"gemma3-270m\".ctx = 8192".to_string()),
             "second leaf listed: {pins:?}"

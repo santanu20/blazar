@@ -472,7 +472,8 @@ pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>
         .expect("remote_capacity lock poisoned")
         .clone();
     let peer_lines = |serving: &[Remote]| -> Vec<serde_json::Value> {
-        state.cfg()
+        state
+            .cfg()
             .remotes
             .iter()
             .map(|remote| {

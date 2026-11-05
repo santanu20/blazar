@@ -10,13 +10,13 @@ pub mod cache_bust;
 pub mod capacity;
 pub mod cascade;
 pub mod classify;
+pub mod config_api;
 pub mod console;
 pub mod error_codes;
 pub mod explain;
 pub mod fabric;
-pub mod config_api;
-pub mod fleet;
 pub mod federation;
+pub mod fleet;
 pub mod histogram;
 pub mod host_guard;
 pub mod http_pool;
@@ -561,10 +561,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(sessions::list))
         // Automatic fleet membership (blazar rpc worker --join writes
         // here; spawn planning merges the registry into --rpc).
-        .route(
-            "/api/fleet/join",
-            post(fleet::join),
-        )
+        .route("/api/fleet/join", post(fleet::join))
         .route("/api/fleet/heartbeat", post(fleet::heartbeat))
         .route("/api/fleet/leave", post(fleet::leave))
         .route("/api/fleet/workers", get(fleet::workers))
@@ -1458,7 +1455,9 @@ pub async fn serve(
                 .get()
                 .map(|&(_, p)| p)
                 .unwrap_or_else(|| sup.cfg().port);
-            tokio::spawn(blazar_runtime::discovery::run_discovery_responder(sup, port));
+            tokio::spawn(blazar_runtime::discovery::run_discovery_responder(
+                sup, port,
+            ));
         }
         // TCP_NODELAY on every accepted socket: NDJSON/SSE streams are strings
         // of small writes, and with Nagle the first content packet waits for the
@@ -1473,9 +1472,9 @@ pub async fn serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-            .with_graceful_shutdown(shutdown)
-            .await
-            .map_err(|e| anyhow::anyhow!("server: {e}"))?;
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|e| anyhow::anyhow!("server: {e}"))?;
     } else {
         // Feature unification across the dep graph can leave rustls with
         // both providers enabled; pick ours deterministically (idempotent
@@ -1551,7 +1550,9 @@ pub async fn serve(
                 .get()
                 .map(|&(_, p)| p)
                 .unwrap_or_else(|| sup.cfg().port);
-            tokio::spawn(blazar_runtime::discovery::run_discovery_responder(sup, port));
+            tokio::spawn(blazar_runtime::discovery::run_discovery_responder(
+                sup, port,
+            ));
         }
         let handle = axum_server::Handle::new();
         let h2 = handle.clone();

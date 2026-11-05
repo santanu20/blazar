@@ -857,11 +857,10 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
 
 fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
-        AutotuneAdvice, BenchmarkDone, EngineRemoved, EngineRolledBack, EngineUpdated,
-        ConfigReloadFailed, ConfigReloaded, FailoverSwitched, FleetWorkerDeparted,
-        FleetWorkerJoined, InstanceStateChanged,
-        ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress, QueueDepth,
-        SlotsAutoAdopted, SlotsCtxAutoFit, SlotsDecodeBound, SlotsDrainCutover,
+        AutotuneAdvice, BenchmarkDone, ConfigReloadFailed, ConfigReloaded, EngineRemoved,
+        EngineRolledBack, EngineUpdated, FailoverSwitched, FleetWorkerDeparted, FleetWorkerJoined,
+        InstanceStateChanged, ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress,
+        QueueDepth, SlotsAutoAdopted, SlotsCtxAutoFit, SlotsDecodeBound, SlotsDrainCutover,
         SlotsPinnedPressure, SlotsPrewarmCutover, SlotsReshaped, SpecGovernorOff,
         SpecGovernorRecovered,
     };

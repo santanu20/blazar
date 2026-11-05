@@ -16,10 +16,10 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 
 use crate::error_codes::BlazarCode;
@@ -385,20 +385,33 @@ mod tests {
     fn unit__presented_token__header_wins_then_body_then_empty() {
         let mut headers = HeaderMap::new();
         assert_eq!(presented_token(&headers, &None), "");
-        assert_eq!(presented_token(&headers, &Some("bodytok".into())), "bodytok");
+        assert_eq!(
+            presented_token(&headers, &Some("bodytok".into())),
+            "bodytok"
+        );
         headers.insert(
             "x-blazar-fleet-token",
             axum::http::HeaderValue::from_str("headtok").unwrap(),
         );
-        assert_eq!(presented_token(&headers, &Some("bodytok".into())), "headtok");
+        assert_eq!(
+            presented_token(&headers, &Some("bodytok".into())),
+            "headtok"
+        );
         assert_eq!(presented_token(&headers, &None), "headtok");
     }
 
     #[test]
     fn unit__device_body__maps_to_wire_type_losslessly() {
-        let d = DeviceBody { index: 1, free_bytes: 7 << 20, total_bytes: 8 << 20 };
+        let d = DeviceBody {
+            index: 1,
+            free_bytes: 7 << 20,
+            total_bytes: 8 << 20,
+        };
         let wire = RpcDeviceMemory::from(d);
-        assert_eq!((wire.index, wire.free_bytes, wire.total_bytes), (1, 7 << 20, 8 << 20));
+        assert_eq!(
+            (wire.index, wire.free_bytes, wire.total_bytes),
+            (1, 7 << 20, 8 << 20)
+        );
     }
 
     #[test]
@@ -408,7 +421,10 @@ mod tests {
         assert_eq!(code.len(), 32);
         assert!(reg.redeem(&code), "live code redeems");
         assert!(!reg.redeem(&code), "same code is dead (one-use)");
-        assert!(!reg.redeem("00000000000000000000000000000000"), "unknown code fails");
+        assert!(
+            !reg.redeem("00000000000000000000000000000000"),
+            "unknown code fails"
+        );
     }
 
     #[test]
