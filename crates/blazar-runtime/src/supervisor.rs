@@ -5774,13 +5774,7 @@ impl Supervisor {
         if self.cfg().spawn_mem_guard {
             // Unreadable memory = guard cannot enforce its floor; warn and
             // stand down (a refused snapshot must not brick every spawn).
-            let avail = crate::probe::mem_available_mib().unwrap_or_else(|| {
-                tracing::warn!(
-                    "spawn memory guard skipped for {:?}: MemAvailable unreadable",
-                    name
-                );
-                u64::MAX
-            });
+            let avail = crate::probe::mem_available_mib();
             let model_mib = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX) / (1024 * 1024);
             let offload_mib = sglang_offload_bytes / (1024 * 1024);
             let need = (model_mib / 2) + 512 + offload_mib;
