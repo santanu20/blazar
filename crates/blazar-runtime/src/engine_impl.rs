@@ -199,12 +199,7 @@ impl Engine for LlamaCppEngine {
         // crash-loop, no engine rollback).
         let dead = probe_rpc_endpoints(argv).await;
         if !dead.is_empty() {
-            return Err(anyhow!(
-                "--rpc endpoint(s) unreachable: {} - llama-server aborts at \
-                 startup when an RPC backend is down; start the RPC worker(s) \
-                 or fix `rpc_servers` in the config",
-                dead.join(", ")
-            ));
+            return Err(anyhow::Error::new(RpcEndpointsUnreachable { dead }));
         }
         spawn_child(
             &self.manifest.server_path,
@@ -294,6 +289,23 @@ const RPC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 /// add one): upstream's eager connect would SIGABRT the child at
 /// argv-parse. Returns the offending entries (`host:port (reason)`),
 /// empty when every endpoint answered or no `--rpc` flag is present.
+///
+/// Typed spawn refusal for the same preflight: rides `anyhow` up to the
+/// supervisor, which downcasts it into
+/// `SupervisionError::RpcEndpointsUnreachable` (a 503-class teaching
+/// refusal) instead of the generic 500 `Internal` lane.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "--rpc endpoint(s) unreachable: {} - llama-server aborts at startup \
+     when an RPC backend is down; start the RPC worker(s) or fix \
+     `rpc_servers` in the config",
+    self.dead.join(", ")
+)]
+pub struct RpcEndpointsUnreachable {
+    /// Offending `host:port (reason)` entries, verbatim from the probe.
+    pub dead: Vec<String>,
+}
+
 async fn probe_rpc_endpoints(argv: &[String]) -> Vec<String> {
     let targets: Vec<String> = argv
         .windows(2)
@@ -1852,6 +1864,41 @@ mod tests {
         panic!("could not secure a dead loopback port in 64 tries");
     }
 
+    /// Probe a dead port whose failures must SURFACE as report lines
+    /// (probe_rpc_endpoints). An empty report means the port was stolen
+    /// by a parallel test binary between `dead_port` and the probe:
+    /// redraw and retry rather than fail the assertion (the race seen
+    /// live ~1-in-10 full-parallel runs).
+    async fn dead_port_reported<F, Fut>(probe: F) -> Vec<String>
+    where
+        F: Fn(u16) -> Fut,
+        Fut: std::future::Future<Output = Vec<String>>,
+    {
+        for _ in 0..5 {
+            let reported = probe(dead_port().await).await;
+            if !reported.is_empty() {
+                return reported;
+            }
+        }
+        panic!("dead port kept getting stolen (5 tries) - parallel fleet too noisy");
+    }
+
+    /// Probe a dead port that must FAIL. An Ok means the port was
+    /// stolen by a parallel test binary: redraw and retry rather than
+    /// flake. Returns the error the caller asserts on.
+    async fn dead_port_refused<F, Fut, T>(probe: F) -> anyhow::Error
+    where
+        F: Fn(u16) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        for _ in 0..5 {
+            if let Err(e) = probe(dead_port().await).await {
+                return e;
+            }
+        }
+        panic!("dead port kept answering (5 tries) - parallel fleet too noisy");
+    }
+
     #[tokio::test]
     async fn unit__probe_rpc__no_flag_is_noop() {
         let argv = vec![
@@ -1875,9 +1922,11 @@ mod tests {
     #[tokio::test]
     async fn unit__probe_rpc__dead_endpoint_reported() {
         // Bind then drop: the port is (almost certainly) closed again.
-        let port = dead_port().await;
-        let argv = rpc_argv(&format!("127.0.0.1:{port}"));
-        let dead = probe_rpc_endpoints(&argv).await;
+        let dead = dead_port_reported(|port| {
+            let argv = rpc_argv(&format!("127.0.0.1:{port}"));
+            async move { probe_rpc_endpoints(&argv).await }
+        })
+        .await;
         assert_eq!(dead.len(), 1, "{dead:?}");
         assert!(dead[0].contains("(unreachable)"), "{dead:?}");
     }
@@ -1913,12 +1962,14 @@ mod tests {
             .await
             .unwrap();
         let alive_port = alive.local_addr().unwrap().port();
-        let dead_port = dead_port().await;
-        let argv = rpc_argv(&format!("127.0.0.1:{alive_port},127.0.0.1:{dead_port}"));
-        let reported = probe_rpc_endpoints(&argv).await;
+        let reported = dead_port_reported(|dead_port| {
+            let argv = rpc_argv(&format!("127.0.0.1:{alive_port},127.0.0.1:{dead_port}"));
+            async move { probe_rpc_endpoints(&argv).await }
+        })
+        .await;
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert!(
-            reported[0].contains(&format!("127.0.0.1:{dead_port}")),
+            reported[0].starts_with("127.0.0.1:") && reported[0] != format!("127.0.0.1:{alive_port}"),
             "{reported:?}"
         );
     }
@@ -1931,18 +1982,20 @@ mod tests {
             .await
             .unwrap();
         let alive_port = alive.local_addr().unwrap().port();
-        let dead_port = dead_port().await;
-        let argv = vec![
-            "llama-server".to_string(),
-            "--rpc".to_string(),
-            format!("127.0.0.1:{alive_port}"),
-            "--rpc".to_string(),
-            format!("127.0.0.1:{dead_port}"),
-        ];
-        let reported = probe_rpc_endpoints(&argv).await;
+        let reported = dead_port_reported(|dead_port| {
+            let argv = vec![
+                "llama-server".to_string(),
+                "--rpc".to_string(),
+                format!("127.0.0.1:{alive_port}"),
+                "--rpc".to_string(),
+                format!("127.0.0.1:{dead_port}"),
+            ];
+            async move { probe_rpc_endpoints(&argv).await }
+        })
+        .await;
         assert_eq!(reported.len(), 1, "{reported:?}");
         assert!(
-            reported[0].contains(&format!("127.0.0.1:{dead_port}")),
+            reported[0].starts_with("127.0.0.1:") && reported[0] != format!("127.0.0.1:{alive_port}"),
             "{reported:?}"
         );
     }
@@ -1974,32 +2027,41 @@ mod tests {
 
     #[tokio::test]
     async fn unit__llamacpp_spawn__dead_rpc_refuses_before_exec() {
-        let port = dead_port().await;
-        let manifest = crate::engine::manifest::Manifest {
-            tag: "fake".into(),
-            build_number: 1,
-            version_raw: "b1".into(),
-            devices: vec![],
-            flags: std::collections::BTreeSet::new(),
-            spec_types: vec![],
-            // Deliberately a nonexistent binary: the preflight must bail
-            // BEFORE any exec, so this path is never touched.
-            server_path: "/nonexistent/llama-server".into(),
-            ..Default::default()
-        };
-        let engine = LlamaCppEngine::new(manifest);
-        let argv = rpc_argv(&format!("127.0.0.1:{port}"));
-        let endpoint = Endpoint::Tcp {
-            host: "127.0.0.1".into(),
-            port: 0,
-        };
-        let err = engine
-            .spawn(&argv, &endpoint, &[])
-            .await
-            .expect_err("dead rpc endpoint must refuse the spawn");
+        let err = dead_port_refused(|port| {
+            let manifest = crate::engine::manifest::Manifest {
+                tag: "fake".into(),
+                build_number: 1,
+                version_raw: "b1".into(),
+                devices: vec![],
+                flags: std::collections::BTreeSet::new(),
+                spec_types: vec![],
+                // Deliberately a nonexistent binary: the preflight must bail
+                // BEFORE any exec, so this path is never touched.
+                server_path: "/nonexistent/llama-server".into(),
+                ..Default::default()
+            };
+            let engine = LlamaCppEngine::new(manifest);
+            let argv = rpc_argv(&format!("127.0.0.1:{port}"));
+            let endpoint = Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+            };
+            async move { engine.spawn(&argv, &endpoint, &[]).await }
+        })
+        .await;
         let msg = format!("{err:#}");
         assert!(msg.contains("--rpc endpoint(s) unreachable"), "{msg}");
         assert!(msg.contains("rpc_servers"), "{msg}");
+        // The refusal rides a typed marker so the supervisor can map it
+        // to a 503-class code instead of the generic 500 Internal.
+        let typed = err
+            .downcast_ref::<RpcEndpointsUnreachable>()
+            .expect("dead-rpc refusal must be the typed marker");
+        assert!(
+            typed.dead.iter().all(|d| d.contains("127.0.0.1")),
+            "marker carries the dead endpoint list: {:?}",
+            typed.dead
+        );
     }
 
     /// sglang 0.5.19 /health is a generate probe: the handler sleeps in
@@ -2068,25 +2130,24 @@ mod tests {
 
     #[tokio::test]
     async fn unit__sglang_health__deadline_still_bounded() {
-        let port = dead_port().await;
-        let engine = SglangEngine::new(crate::engine::manifest::Manifest {
-            tag: "fake".into(),
-            build_number: 1,
-            version_raw: "b1".into(),
-            devices: vec![],
-            flags: std::collections::BTreeSet::new(),
-            spec_types: vec![],
-            server_path: String::new(),
-            ..Default::default()
-        });
-        let endpoint = Endpoint::Tcp {
-            host: "127.0.0.1".into(),
-            port,
-        };
-        let err = engine
-            .health_check(&endpoint, std::time::Duration::from_secs(2))
-            .await
-            .expect_err("dead port must fail");
+        let err = dead_port_refused(|port| {
+            let engine = SglangEngine::new(crate::engine::manifest::Manifest {
+                tag: "fake".into(),
+                build_number: 1,
+                version_raw: "b1".into(),
+                devices: vec![],
+                flags: std::collections::BTreeSet::new(),
+                spec_types: vec![],
+                server_path: String::new(),
+                ..Default::default()
+            });
+            let endpoint = Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port,
+            };
+            async move { engine.health_check(&endpoint, std::time::Duration::from_secs(2)).await }
+        })
+        .await;
         assert!(err.to_string().contains("model_load_timeout"), "{err:#}");
     }
 
@@ -2225,16 +2286,15 @@ mod tests {
 
     #[tokio::test]
     async fn unit__sdcpp_health__deadline_still_bounded() {
-        let port = dead_port().await;
-        let engine = sdcpp_engine();
-        let endpoint = Endpoint::Tcp {
-            host: "127.0.0.1".into(),
-            port,
-        };
-        let err = engine
-            .health_check(&endpoint, std::time::Duration::from_secs(1))
-            .await
-            .expect_err("dead port must fail");
+        let err = dead_port_refused(|port| {
+            let engine = sdcpp_engine();
+            let endpoint = Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port,
+            };
+            async move { engine.health_check(&endpoint, std::time::Duration::from_secs(1)).await }
+        })
+        .await;
         let msg = err.to_string();
         assert!(msg.contains("/v1/models"), "{msg}");
         assert!(msg.contains("model_load_timeout"), "{msg}");

@@ -166,6 +166,34 @@ pub enum BlazarEvent {
         to: usize,
         reason: String,
     },
+    /// Automatic fleet membership: a `blazar rpc worker --join` announced
+    /// itself and is now part of spawn planning. `endpoint` is the
+    /// worker's primary (first) RPC endpoint.
+    FleetWorkerJoined {
+        worker_id: String,
+        endpoint: String,
+    },
+    /// Automatic fleet membership: a worker left the registry - it
+    /// announced a shutdown (`leave`), missed its TTL window
+    /// (`expired`), or was displaced by a re-join with a fresh identity
+    /// (`replaced`).
+    FleetWorkerDeparted {
+        worker_id: String,
+        endpoint: String,
+        reason: String,
+    },
+    /// Hot reload applied a new config generation. `cold_only` names the
+    /// knobs that were NOT applied because they are bind-time or baked
+    /// into long-lived objects (see `Config::cold_only_diff`); empty
+    /// means the whole file took effect live.
+    ConfigReloaded {
+        cold_only: Vec<String>,
+    },
+    /// Hot reload rejected the on-disk config (parse/validation error)
+    /// and kept the previous generation running.
+    ConfigReloadFailed {
+        reason: String,
+    },
 }
 
 /// Lifecycle state of a model instance.

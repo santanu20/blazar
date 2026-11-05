@@ -1,7 +1,8 @@
 //! Read-only ggml-RPC wire client for fleet introspection.
 //!
 //! Speaks just enough of the worker protocol (upstream
-//! `tools/rpc/rpc-server.cpp`, protocol v7 at engine b11429) to answer
+//! `ggml/src/ggml-rpc/ggml-rpc.cpp`, protocol families v7 at engine
+//! b11429 and v8 at b12072) to answer
 //! "which workers are out there, and how much memory do they have
 //! free": the mandatory HELLO handshake, `RPC_CMD_DEVICE_COUNT` and
 //! per-device `RPC_CMD_GET_DEVICE_MEMORY`. Nothing here allocates
@@ -36,11 +37,18 @@ const CMD_HELLO: u8 = 14;
 /// `RPC_CMD_DEVICE_COUNT` (enum position 15 at protocol v7).
 const CMD_DEVICE_COUNT: u8 = 15;
 
-/// Protocol family this client speaks. A worker answering with a
-/// different MAJOR (or a higher MINOR) is refused with a teaching
-/// error instead of silently misread fields.
-const PROTO_MAJOR: u8 = 7;
-const PROTO_MINOR: u8 = 0;
+/// Protocol families this client understands, as `(major, highest
+/// minor spoken)` pairs, mirroring the upstream client's handshake
+/// gate: exact major match, worker minor not newer, patch advisory
+/// only.
+///
+/// v7 arrived with engine b11429; v8 with b12072, which appended its
+/// new commands (2D tensor transfer, communicator/allreduce) after
+/// position 17 - every command this client sends or parses keeps its
+/// v7 position and frame, so one query path serves both. A worker on
+/// any other major is refused with a teaching error instead of
+/// silently misread fields.
+const SUPPORTED_PROTOCOLS: &[(u8, u8)] = &[(7, 0), (8, 0)];
 
 /// HELLO request: `conn_caps[24]`, all zero = plain TCP, none of the
 /// optional transport accelerations negotiated.
@@ -66,7 +74,7 @@ const MAX_SANITY_DEVICES: u32 = 64;
 
 /// One worker device as the fleet sees it. Byte counts, not MiB:
 /// callers format (and the JSON surface rounds) at the edge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RpcDeviceMemory {
     pub index: u32,
     pub free_bytes: u64,
@@ -119,12 +127,34 @@ async fn query_worker_on(endpoint: &str, sock: TcpStream) -> Result<RpcWorkerInf
         .map_err(|e| format!("{endpoint} (send failed: {e})"))?;
     let hello = recv_rsp(endpoint, &mut r, HELLO_RSP_LEN, "HELLO reply").await?;
     let (proto_major, proto_minor, proto_patch) = (hello[0], hello[1], hello[2]);
-    if proto_major != PROTO_MAJOR || proto_minor > PROTO_MINOR {
-        return Err(format!(
-            "{endpoint} (worker speaks rpc protocol v{proto_major}.{proto_minor}.{proto_patch}, \
-             this blazar speaks v{PROTO_MAJOR}.{PROTO_MINOR}.0 - update the engine lane \
-             (`blazar engine update`) or point at a v{PROTO_MAJOR}.x worker)"
-        ));
+    match SUPPORTED_PROTOCOLS
+        .iter()
+        .find(|(major, _)| *major == proto_major)
+    {
+        // Known major, minor not newer than the family this client
+        // speaks: the HELLO/count/memory frames are identical across
+        // that family, so the conversation may proceed.
+        Some(&(_, minor)) if proto_minor <= minor => {}
+        // Known major carrying minor features we cannot name yet.
+        Some(_) => {
+            return Err(format!(
+                "{endpoint} (worker speaks rpc protocol v{proto_major}.{proto_minor}.{proto_patch}, \
+                 newer than the v{proto_major}.x this blazar knows - update blazar)"
+            ));
+        }
+        // Any other major, older or future: teach both directions.
+        None => {
+            let spoken_list = SUPPORTED_PROTOCOLS
+                .iter()
+                .map(|(major, _)| format!("v{major}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "{endpoint} (worker speaks rpc protocol v{proto_major}.{proto_minor}.{proto_patch}, \
+                 this blazar speaks {spoken_list} - update blazar for a newer worker, or update the \
+                 engine lane (`blazar engine update`) on the worker's host)"
+            ));
+        }
     }
 
     send_cmd(&mut w, CMD_DEVICE_COUNT, &[])
@@ -340,6 +370,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unit__query_worker__v8_worker_roundtrip() {
+        // The shipped llamacpp lane (b12072) speaks protocol 8.0.1: same
+        // HELLO/DEVICE_COUNT/GET_DEVICE_MEMORY frames as v7 (upstream
+        // appended its new commands after position 17), so the query
+        // path must accept it, not teach a mismatch.
+        let fake = spawn_fake(
+            8,
+            0,
+            1,
+            vec![(5 << 20, 8 << 20), (1 << 20, 2 << 20)],
+            FakeBehavior::Normal,
+        )
+        .await;
+        let info = query_worker(&fake.endpoint).await.unwrap();
+        assert_eq!(
+            (info.proto_major, info.proto_minor, info.proto_patch),
+            (8, 0, 1)
+        );
+        assert_eq!(
+            info.devices,
+            vec![
+                RpcDeviceMemory {
+                    index: 0,
+                    free_bytes: 5 << 20,
+                    total_bytes: 8 << 20
+                },
+                RpcDeviceMemory {
+                    index: 1,
+                    free_bytes: 1 << 20,
+                    total_bytes: 2 << 20
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn unit__query_worker__hello_request_bytes_pin_the_wire_format() {
         let fake = spawn_fake(7, 0, 0, vec![(1, 1)], FakeBehavior::Normal).await;
         query_worker(&fake.endpoint).await.unwrap();
@@ -358,21 +424,34 @@ mod tests {
         assert_eq!(
             &rx[..expect.len()],
             &expect[..],
-            "wire bytes drifted from protocol v7"
+            "wire bytes drifted from the v7/v8 shared wire format"
         );
     }
 
     #[tokio::test]
-    async fn unit__query_worker__version_mismatch_teaches_instead_of_misreading() {
+    async fn unit__query_worker__unknown_major_teaches_instead_of_misreading() {
+        let fake = spawn_fake(9, 0, 0, vec![(1, 1)], FakeBehavior::Normal).await;
+        let err = query_worker(&fake.endpoint).await.unwrap_err();
+        assert!(
+            err.contains("v9.0.0"),
+            "error names the worker version: {err}"
+        );
+        assert!(
+            err.contains("this blazar speaks v7, v8"),
+            "error names the spoken families: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__query_worker__newer_minor_within_known_major_waits_for_blazar() {
         let fake = spawn_fake(8, 1, 0, vec![(1, 1)], FakeBehavior::Normal).await;
         let err = query_worker(&fake.endpoint).await.unwrap_err();
         assert!(
             err.contains("v8.1.0"),
             "error names the worker version: {err}"
         );
-        assert!(err.contains("v7.0"), "error names our version: {err}");
         assert!(
-            err.contains("engine update"),
+            err.contains("update blazar"),
             "error carries the fix hint: {err}"
         );
     }
