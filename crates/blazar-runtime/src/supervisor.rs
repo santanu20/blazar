@@ -15820,11 +15820,23 @@ mod routing_tests {
         )
         .unwrap();
         sup.reload_config_now().expect("enabling reload must apply");
-        let found = crate::discovery::seek_gateway(port, std::time::Duration::from_secs(3))
+        let found = crate::discovery::seek_gateways(port, std::time::Duration::from_secs(3))
             .await
-            .unwrap()
-            .expect("flag on must bind and answer without a restart");
-        assert_eq!(found.0, "http://127.0.0.1:11438".to_string());
+            .unwrap();
+        assert!(
+            !found.is_empty(),
+            "flag on must bind and answer without a restart"
+        );
+        // The beacon answers BOTH the same-host unicast (127.0.0.1) and
+        // the LAN broadcast, so WHICH reply lands first is a race the
+        // host's interface order decides - assert the deterministic
+        // invariant instead: the loopback route carries the served port.
+        assert!(
+            found
+                .iter()
+                .any(|(base, _)| base == "http://127.0.0.1:11438"),
+            "same-host seeker must see the beacon on loopback (replies: {found:?})"
+        );
         // Hot OFF through the same machinery: socket released.
         std::fs::write(
             sup.dirs.config_file(),
