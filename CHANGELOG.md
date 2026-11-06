@@ -6,6 +6,8 @@ tracked here.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-06
+
 ### Added
 
 - **`blazar pull --max-download-mbps`: a one-shot download cap.** Surfaces the existing `download_speed_limit_mb` machinery (config key, `BLAZAR_DOWNLOAD_SPEED_LIMIT_MB` env, chunk-loop throttle shared across parallel connections - and across engine downloads) at the pull command itself: pass a cap for this invocation only, `0` lifts it, the flag beats the config value, and every connection the pull opens is paced. Invalid values teach (`must be a finite number >= 0 (0 = unlimited)`) before any network traffic; the log names the cap when it engages (`download speed-capped ... limit_mb=1`). Live pacing receipt on a 28 MiB pull: 31.6 s capped at 1 MB/s vs 4.6 s uncapped (receipts: `bench-artifacts/20261102-universal-coverage/wc-download-cap-receipts.json`).
