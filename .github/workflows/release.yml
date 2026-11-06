@@ -31,8 +31,11 @@ jobs:
           - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04, cross: true, smoke: false }
           # 32-bit ARM boards (Pi 3/4 on 32-bit OS etc.): musl for old-libc freedom.
           - { target: armv7-unknown-linux-musleabihf, os: ubuntu-22.04, cross: true, smoke: false }
-          - { target: x86_64-apple-darwin, os: macos-14, smoke: false }
-          - { target: aarch64-apple-darwin, os: macos-14, smoke: true }
+          # macos-14 (Intel) retired from GitHub Actions on 2026-11-02; macos-15
+          # is the free standard arm64 image. Xcode's universal clang cross-links
+          # both darwin targets from it, so each lane builds the other arch.
+          - { target: x86_64-apple-darwin, os: macos-15, smoke: false }
+          - { target: aarch64-apple-darwin, os: macos-15, smoke: true }
           - { target: x86_64-pc-windows-msvc, os: windows-latest, smoke: true }
           # Windows on ARM: MSVC ARM64 build tools ship on GH runners; exe not
           # runnable on the x64 host, so no smoke.
@@ -237,7 +240,7 @@ jobs:
   packages-dmg:
     name: package dmg (x64 + arm64)
     needs: [build, checks]
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
