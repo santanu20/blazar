@@ -3434,6 +3434,9 @@ fn set_mode_0600(path: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+// Mirrors the unix twin's Result so the shared caller stays
+// platform-uniform; permissions are a no-op off unix.
+#[allow(clippy::unnecessary_wraps)]
 fn set_mode_0600(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
