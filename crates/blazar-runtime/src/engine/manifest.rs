@@ -1193,7 +1193,9 @@ mod tests {
         #[cfg(not(unix))]
         let status = {
             use std::os::windows::process::ExitStatusExt;
-            std::process::ExitStatus::from_raw(code as u32)
+            std::process::ExitStatus::from_raw(
+                u32::try_from(code).expect("help_output exit codes are non-negative"),
+            )
         };
         Output {
             status,
