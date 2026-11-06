@@ -992,7 +992,7 @@ impl SupervisionError {
     /// [`Self::RpcEndpointsUnreachable`] (503-class), everything else
     /// stays `Internal`.
     #[must_use]
-    pub fn spawn_failure(e: anyhow::Error) -> Self {
+    pub fn spawn_failure(e: &anyhow::Error) -> Self {
         match e.downcast_ref::<crate::engine_impl::RpcEndpointsUnreachable>() {
             Some(marker) => Self::RpcEndpointsUnreachable(marker.to_string()),
             None => Self::Internal(anyhow!("{e}")),
@@ -1052,7 +1052,7 @@ pub struct Instance {
     /// cleared by the reaper's bank-before-sleep sweep. llama-server
     /// drops slot KV when it self-sleeps (`--sleep-idle-seconds`), so a
     /// bank written at evict time is empty (live-repro'd 2026-11-03:
-    /// sleeping children answer saves with n_saved:0); the checkpoint
+    /// sleeping children answer saves with `n_saved:0`); the checkpoint
     /// must be swept BEFORE the child sleeps, and only when a request
     /// since the last sweep could have changed the KV.
     pub bank_dirty: AtomicBool,
@@ -2272,7 +2272,7 @@ pub struct Supervisor {
     /// `model_overrides.<model>.engine` pin always wins over this map).
     capability_pins: std::sync::Mutex<std::collections::HashMap<String, String>>,
     pub config: ConfigHandle,
-    /// (mtime_ms, size) of the config file at the last APPLIED reload.
+    /// (`mtime_ms`, size) of the config file at the last APPLIED reload.
     /// Shared by the watcher and the manual endpoint so a file saved
     /// once never swaps twice; parse failures leave it untouched so a
     /// retry after fixing the file still applies.
@@ -2474,8 +2474,8 @@ pub struct EngineRef {
     /// serialized into `ps`/API output.
     pub auth: Option<String>,
     /// Path of the model row this child serves. `mlx_lm` reports the FULL
-    /// path as its served model id (no `--served-model-name` flag exists
-    /// - probe-verified), so the gateway's body stamp for the mlx lane
+    /// path as its served model id (no `--served-model-name` flag exists -
+    /// probe-verified), so the gateway's body stamp for the mlx lane
     /// reads it from here.
     pub model_path: String,
 }
@@ -2512,7 +2512,7 @@ impl Supervisor {
     pub fn mut_config(&self, f: impl FnOnce(&mut Config)) {
         let mut next = (*self.cfg()).clone();
         f(&mut next);
-        self.config.swap(next);
+        let _ = self.config.swap(next); // swapped-out generation intentionally dropped
     }
 
     /// Load, validate, and hot-swap the config file. Shared by the
@@ -2529,8 +2529,7 @@ impl Supervisor {
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
                 (mtime, meta.len())
             }
             Err(e) => {
@@ -2569,7 +2568,7 @@ impl Supervisor {
         let old = self.cfg();
         let cold_only = Config::cold_only_diff(&old, &next);
         let preload_changed = old.preload != next.preload;
-        self.config.swap(next);
+        let _ = self.config.swap(next); // swapped-out generation intentionally dropped
         *fingerprint = Some((mtime_ms, size));
         drop(fingerprint);
         let _ = self
@@ -2584,7 +2583,7 @@ impl Supervisor {
         })
     }
 
-    /// Current (mtime_ms, size) stamp of the config file, or `None`
+    /// Current (`mtime_ms`, size) stamp of the config file, or `None`
     /// when it does not exist. The hot-reload watcher polls this to
     /// attempt one reload per file change - a missing file is never
     /// reloaded because `Config::load` would rewrite it with defaults.
@@ -2596,8 +2595,7 @@ impl Supervisor {
             .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         Some((mtime, meta.len()))
     }
 
@@ -3117,8 +3115,7 @@ impl Supervisor {
             let port = endpoints
                 .first()
                 .and_then(|ep| ep.rsplit_once(':'))
-                .map(|(_, p)| p.to_string())
-                .unwrap_or_else(|| "worker".to_string());
+                .map_or_else(|| "worker".to_string(), |(_, p)| p.to_string());
             let host = hostname
                 .chars()
                 .map(|c| {
@@ -3172,7 +3169,7 @@ impl Supervisor {
     }
 
     /// Automatic fleet membership: pruned worker list for
-    /// `/api/fleet/workers`. Empty when fleet_enabled is off.
+    /// `/api/fleet/workers`. Empty when `fleet_enabled` is off.
     #[must_use]
     pub fn fleet_workers(&self) -> Vec<crate::fleet::FleetWorkerView> {
         if !self.cfg().fleet_enabled {
@@ -4741,7 +4738,7 @@ impl Supervisor {
                     if let Some(p) = &auth_keyfile {
                         let _ = std::fs::remove_file(p);
                     }
-                    SupervisionError::spawn_failure(e)
+                    SupervisionError::spawn_failure(&e)
                 })?;
             if let Ok(Some(status)) = child.try_status() {
                 tracing::warn!(
@@ -6276,7 +6273,7 @@ impl Supervisor {
                     if let Some(p) = &auth_keyfile {
                         let _ = std::fs::remove_file(p);
                     }
-                    SupervisionError::spawn_failure(e)
+                    SupervisionError::spawn_failure(&e)
                 })?;
 
             // Child died instantly (port race)? Retry with a fresh port.
@@ -6772,8 +6769,8 @@ impl Supervisor {
     /// it choked on:
     /// `... unknown model architecture: 'qwen35'` -> `qwen35`.
     /// Case-insensitive phrase match (loader wording varies slightly
-    /// across versions); the architecture must appear in single quotes
-    /// - anything else classifies as None (conservative: a wrong
+    /// across versions); the architecture must appear in single quotes -
+    /// anything else classifies as None (conservative: a wrong
     /// rescue is worse than no rescue).
     fn classify_unknown_arch(tail: &str) -> Option<String> {
         // Work entirely on the lowercased copy: mixing an offset from
@@ -7394,6 +7391,8 @@ drop them from rpc_servers in config.toml",
     /// is the save response itself: the `/slots` listing's
     /// `n_prompt_tokens_cache` reads 0 on idle slots even when a save
     /// banks hundreds of tokens (live-probed on b11202).
+    // slot listing, per-slot save calls, and the hoard guard form one ledger
+    #[allow(clippy::too_many_lines)]
     async fn bank_save(&self, inst: &Arc<Instance>) {
         if !self.cfg().session_bank || inst.in_flight.load(Ordering::SeqCst) > 0 {
             return;
@@ -7533,11 +7532,14 @@ drop them from rpc_servers in config.toml",
             inst.bank_dirty.store(false, Ordering::SeqCst);
         }
         if banked_bytes > 0 {
+            // u64 byte counts stay exact in f64 far past any real bank size
+            #[allow(clippy::cast_precision_loss)]
+            let banked_mib = banked_bytes as f64 / 1_048_576.0;
             tracing::info!(
                 target: "blazar::bank",
                 model = %inst.name,
                 "banked {} MiB of slot KV - session restore covers the next spawn",
-                banked_bytes as f64 / 1048576.0
+                banked_mib
             );
         }
         // Hoard guard: a per-model bank set over 512 MiB is storage
@@ -11759,7 +11761,7 @@ mod routing_tests {
     #[allow(non_snake_case)]
     async fn unit__largest_card_budget__impossible_vs_busy_vs_fail_open() {
         let mib = |m: u64| m * 1024 * 1024;
-        let (mut sup, _root) = dual_gpu_sup();
+        let (sup, _root) = dual_gpu_sup();
         // Both cards are 8188 MiB: a 9000 MiB floor cannot fit either one
         // even on an empty box - physically unschedulable, must surface as
         // the largest budget so the refusal can teach the numbers.
@@ -13167,7 +13169,7 @@ mod routing_tests {
     async fn unit__victim_key__pinned_never_chosen() {
         // "hot" is pinned (overlay), "cold" is not: pressure falls on
         // "cold" even though it is the hotter cache.
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| {
             c.model_overrides.insert(
                 "hot".into(),
@@ -13189,7 +13191,7 @@ mod routing_tests {
 
     #[tokio::test]
     async fn unit__victim_key__all_pinned__none() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| {
             c.model_overrides.insert(
                 "hot".into(),
@@ -13306,7 +13308,7 @@ mod routing_tests {
 
     #[tokio::test]
     async fn unit__adaptive_slots__adopts_after_streak_and_respects_manual() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         // LC4 bumps SINGLE-slot models; the slots=0 auto default makes it
         // intentionally inert (spawn-time sizing owns that case).
@@ -13325,7 +13327,7 @@ mod routing_tests {
         kill_all(&[ph]);
 
         // Manual overlay slots exclude the model entirely.
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 1);
         sup.mut_config(|c| {
@@ -13388,7 +13390,7 @@ mod routing_tests {
     /// Saturation mid-window resets the decay count.
     #[tokio::test]
     async fn unit__adaptive_slots__quiet_decay_restores_natural_shape() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.adopted_slots.insert("m".to_string(), 6);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
@@ -13426,7 +13428,7 @@ mod routing_tests {
     /// the shape, and releasing the gauge resets the streak.
     #[tokio::test]
     async fn unit__adaptive_slots__admission_pressure_adopts_without_inflight_excess() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 4);
@@ -13495,7 +13497,7 @@ mod routing_tests {
     /// clears the mark, and publishes `SlotsReshaped`.
     #[tokio::test]
     async fn unit__adaptive_slots__drain_holds_while_busy_then_reshapes_at_idle() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         // The reshape respawns through the real spawn path, which
         // resolves the model row from the store and reads its GGUF
@@ -13590,7 +13592,7 @@ mod routing_tests {
     /// fire while the reshape is pending or draining.
     #[tokio::test]
     async fn unit__adaptive_slots__decay_blocked_while_reshape_pending_or_draining() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         sup.instances.insert("m".into(), inst);
@@ -13635,7 +13637,7 @@ mod routing_tests {
     /// 1-slot child parks 7) - and the adoption cap bounds it.
     #[tokio::test]
     async fn unit__adaptive_slots__demand_sized_adoption_capped_at_ceiling() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
@@ -13663,7 +13665,7 @@ mod routing_tests {
     /// reshape respawn.
     #[tokio::test]
     async fn unit__adaptive_slots__auto_shape_saturation_adopts_and_queues() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0); // auto: the argv is the source of truth
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
@@ -13697,7 +13699,7 @@ mod routing_tests {
     /// dip caught at the adoption tick must not shrink the step.
     #[tokio::test]
     async fn unit__adaptive_slots__gauge_dip_does_not_reset_streak() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 4);
@@ -13743,7 +13745,7 @@ mod routing_tests {
     /// spike doc 2026-10-29). The cooldown map records the fast adoption.
     #[tokio::test]
     async fn unit__adaptive_slots__burst_fast_path_adopts_at_two_ticks() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
@@ -13776,7 +13778,7 @@ mod routing_tests {
     /// a second bump before the first is testable would overshoot).
     #[tokio::test]
     async fn unit__adaptive_slots__fast_path_cooldown_demotes_to_standard_window() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
@@ -13815,7 +13817,7 @@ mod routing_tests {
     /// window (the fast path is a burst shortcut, not a lower bar).
     #[tokio::test]
     async fn unit__adaptive_slots__sub_double_peak_keeps_standard_window() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
@@ -13856,7 +13858,7 @@ mod routing_tests {
     /// fresh parking budget for the bigger shape.
     #[tokio::test]
     async fn unit__adaptive_slots__drain_bound_trips_cutover_opens_gate() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
@@ -13976,7 +13978,7 @@ mod routing_tests {
     /// restore adoption.
     #[tokio::test]
     async fn unit__adaptive_slots__decode_bound_suppresses_adoption() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
@@ -14020,7 +14022,7 @@ mod routing_tests {
         kill_all(&[ph]);
 
         // Healthy scaling (ratio 1.6 >= 1.25): adoption proceeds.
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 1);
@@ -14047,7 +14049,7 @@ mod routing_tests {
     /// residue, `SlotsPrewarmCutover` published.
     #[tokio::test]
     async fn unit__prewarm__cutover_rekeys_and_retires_old() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         // A prewarm-capable box: the transient double-residency (old +
         // warm) needs room for two concurrent instances - the default
@@ -14132,7 +14134,7 @@ mod routing_tests {
     /// so the reshape holds (parked) instead of half-installing.
     #[tokio::test]
     async fn unit__prewarm__refused_falls_back_and_holds() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         let model_path = sup.dirs.data_dir.join("models").join("broken.gguf");
         std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
@@ -14184,7 +14186,7 @@ mod routing_tests {
     /// instead of a value adaptation no longer owns.
     #[tokio::test]
     async fn unit__adaptive_slots__exclusion_returns_shape_authority() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         // routing_sup seeds a replicas override; replace it with a pin.
         sup.mut_config(|c| {
@@ -14222,7 +14224,7 @@ mod routing_tests {
     /// canonicalization `ps()` owes `overlay_for`'s raw lookup.
     #[tokio::test]
     async fn unit__ps__slots_source_reports_precedence() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         // Delegated pin: adaptation owns the shape once it adopted.
         sup.mut_config(|c| {
             c.model_overrides.insert(
@@ -14300,7 +14302,7 @@ mod routing_tests {
     /// child the drain had installed, once per 10s tick.
     #[tokio::test]
     async fn unit__adaptive_slots__warm_transitional_child_ignored() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         let (mut inst, ph) = fake_instance("m#warm", InstanceState::Ready, 4);
         Arc::get_mut(&mut inst).expect("sole owner").argv =
@@ -14331,7 +14333,7 @@ mod routing_tests {
     /// the pre-inserted warm child.
     #[tokio::test]
     async fn unit__prewarm__warm_waiting_skips_respawn() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         let (mut old, old_ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut old).expect("sole owner").argv =
@@ -14389,7 +14391,7 @@ mod routing_tests {
     /// and the streak resets as soon as the lane reads unsaturated.
     #[tokio::test]
     async fn unit__pinned_lane__sustained_pressure_teaches_once() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| {
             c.model_overrides.insert(
@@ -14456,7 +14458,7 @@ mod routing_tests {
     /// path at 2 ticks, demand-sized step).
     #[tokio::test]
     async fn unit__pinned_lane__adaptive_override_lifts_exclusion() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| {
             c.model_overrides.insert(
@@ -14528,7 +14530,7 @@ mod routing_tests {
     /// overshoot demand on every staggered streak.
     #[tokio::test]
     async fn unit__adaptive_slots__latch_consumed_on_adoption() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
@@ -14575,7 +14577,7 @@ mod routing_tests {
     /// adopt (the demand attestation is what separates the two).
     #[tokio::test]
     async fn unit__adaptive_slots__full_but_unqueued_stays_quiet() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 4);
@@ -14594,7 +14596,7 @@ mod routing_tests {
     /// (to <= from skips) - no event spam, no queue churn.
     #[tokio::test]
     async fn unit__adaptive_slots__at_cap_does_not_adopt() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.slots = 0);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 17);
@@ -14613,7 +14615,7 @@ mod routing_tests {
     /// slots = 1 by design and adoption would fight the pin every tick.
     #[tokio::test]
     async fn unit__adaptive_slots__deterministic_excluded() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.adaptive_slots = true);
         sup.mut_config(|c| c.deterministic = true);
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 4);
@@ -15122,7 +15124,7 @@ mod routing_tests {
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__spec_governor__saturation_streak_parks_and_queues() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.spec_auto_manage = true);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
         Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
@@ -15158,7 +15160,7 @@ mod routing_tests {
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__spec_governor__accept_collapse_parks_without_saturation() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.spec_auto_manage = true);
         // No instances at all: nothing saturated - only the acceptance
         // floor breach can fire (a spec child reporting 0.10).
@@ -15181,7 +15183,7 @@ mod routing_tests {
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__spec_governor__knob_off_is_inert() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.spec_auto_manage = false); // explicit off: default is on
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
         sup.instances.insert("m".into(), inst);
@@ -15214,7 +15216,7 @@ mod routing_tests {
     #[tokio::test]
     async fn unit__spec_governor__overlay_pin_and_config_off_exempt() {
         // Overlay pin: a user policy statement - never governed.
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.spec_auto_manage = true);
         sup.mut_config(|c| {
             c.model_overrides.insert(
@@ -15234,7 +15236,7 @@ mod routing_tests {
         kill_all(&[ph]);
 
         // Global config already dense: nothing to manage.
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.spec_auto_manage = true);
         sup.mut_config(|c| c.spec = "off".into());
         let (inst, ph) = fake_instance("m", InstanceState::Ready, 9);
@@ -15249,7 +15251,7 @@ mod routing_tests {
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__spec_governor__recovers_after_quiet_streak_and_resets_on_bad_window() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.spec_auto_manage = true);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
         Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
@@ -15314,7 +15316,7 @@ mod routing_tests {
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__ubatch_governor__saturation_streak_escalates_rung_by_rung() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.ubatch_auto = true);
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 5);
         Arc::get_mut(&mut inst).expect("sole owner").argv = vec![
@@ -15366,7 +15368,7 @@ mod routing_tests {
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__ubatch_governor__config_pin_is_exempt() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.ubatch_auto = true);
         sup.mut_config(|c| c.ubatch_size = 512);
         // A stale override from before the pin is cleared, never acted on.
@@ -15384,7 +15386,7 @@ mod routing_tests {
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__ubatch_governor__quiet_streak_steps_down_one_rung() {
-        let mut sup = routing_sup(1);
+        let sup = routing_sup(1);
         sup.mut_config(|c| c.ubatch_auto = true);
         sup.ubatch_override.insert("m".into(), 2048);
         // A live (idle) instance so step-downs have something to reshape;
@@ -15707,8 +15709,9 @@ mod routing_tests {
             port: server.address().port(),
         };
         let (inst, pid) = fake_instance_of_kind("m", InstanceState::Ready, 0, endpoint, kind);
-        *inst.last_used.write().expect("idle lock") =
-            Instant::now() - Duration::from_secs(idle_secs);
+        *inst.last_used.write().expect("idle lock") = Instant::now()
+            .checked_sub(Duration::from_secs(idle_secs))
+            .unwrap();
         inst.bank_dirty.store(dirty, Ordering::SeqCst);
         sup.instances.insert("m".into(), inst.clone());
         (sup, server, inst, pid)
@@ -15783,9 +15786,11 @@ mod routing_tests {
         let probe = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
-        let mut config = Config::default();
-        config.discovery_port = port;
-        config.discovery_enabled = false;
+        let config = Config {
+            discovery_port: port,
+            discovery_enabled: false,
+            ..Config::default()
+        };
         let sup = Arc::new(
             gpu_sup_with(
                 vec![GpuInfo {
@@ -15819,7 +15824,7 @@ mod routing_tests {
             .await
             .unwrap()
             .expect("flag on must bind and answer without a restart");
-        assert_eq!(found.0, format!("http://127.0.0.1:11438"));
+        assert_eq!(found.0, "http://127.0.0.1:11438".to_string());
         // Hot OFF through the same machinery: socket released.
         std::fs::write(
             sup.dirs.config_file(),
@@ -15878,14 +15883,15 @@ mod routing_tests {
     fn bank_reap_config() -> Config {
         // idle_sleep 60 with a 30 s lead-in: the bank threshold sits at
         // 30 s of idle, the (mocked) self-sleep at 60 s.
-        let mut config = Config::default();
-        config.idle_sleep_secs = 60;
-        config
+        Config {
+            idle_sleep_secs: 60,
+            ..Config::default()
+        }
     }
 
     /// F3: llama-server DROPS slot KV when it self-sleeps
     /// (--sleep-idle-seconds), so a bank written at evict time is empty
-    /// (live-repro'd 2026-11-03: sleeping children report n_saved:0 and
+    /// (live-repro'd 2026-11-03: sleeping children report `n_saved:0` and
     /// write 44-byte header-only files). The reaper must sweep the
     /// checkpoint BEFORE the child reaches its sleep threshold: a dirty
     /// llama instance banks once and clears the marker.
@@ -15998,7 +16004,7 @@ mod routing_tests {
 
     /// Long-idle encounter (reaper missed the lead-in window): the bank
     /// still runs BEFORE the sleep-mark branch can engage - ordering
-    /// inside reap_once is the contract, bank first, sleep later.
+    /// inside `reap_once` is the contract, bank first, sleep later.
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__reaper_banks_before_sleep__past_sleep_threshold_banks_before_marking() {
@@ -16094,7 +16100,7 @@ mod spawn_failure_tests {
         let marker = crate::engine_impl::RpcEndpointsUnreachable {
             dead: vec!["127.0.0.1:51099 (unreachable)".to_string()],
         };
-        let e = SupervisionError::spawn_failure(anyhow::Error::new(marker));
+        let e = SupervisionError::spawn_failure(&anyhow::Error::new(marker));
         let SupervisionError::RpcEndpointsUnreachable(msg) = &e else {
             panic!("marker must map typed, got {e:?}");
         };
@@ -16104,7 +16110,7 @@ mod spawn_failure_tests {
 
     #[test]
     fn unit__spawn_failure__ordinary_errors_stay_internal() {
-        let e = SupervisionError::spawn_failure(anyhow::anyhow!("spawn /x: No such file"));
+        let e = SupervisionError::spawn_failure(&anyhow::anyhow!("spawn /x: No such file"));
         assert!(
             matches!(e, SupervisionError::Internal(_)),
             "non-rpc spawn errors keep the Internal lane: {e:?}"

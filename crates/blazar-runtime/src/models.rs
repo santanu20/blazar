@@ -177,8 +177,8 @@ pub struct ReconcileReport {
 }
 
 /// Re-measure one safetensors dir row against disk. Heals only when the
-/// dir is a COMPLETE, readable model (weights present AND config parses)
-/// - a re-download in flight must not zero out good row fields. Returns
+/// dir is a COMPLETE, readable model (weights present AND config parses) -
+/// a re-download in flight must not zero out good row fields. Returns
 /// the drift description when the row was rewritten.
 fn heal_dir_row(store: &Store, row: &ModelRow) -> Option<String> {
     let dir = Path::new(&row.path);

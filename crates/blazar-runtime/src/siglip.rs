@@ -1,4 +1,4 @@
-//! In-process SigLIP image-embedding lane (candle, CPU).
+//! In-process `SigLIP` image-embedding lane (candle, CPU).
 //!
 //! Serves models pulled with HF architecture `SiglipModel` (for example
 //! `blazar pull google/siglip-base-patch16-224`) at whatever size their
@@ -23,7 +23,7 @@ use std::sync::Mutex;
 
 /// One resolved model layout: the candle config the weights were
 /// trained with plus the preprocessing size it expects. Debug is
-/// derived for test assertions (expect_err needs it on the Ok side).
+/// derived for test assertions (`expect_err` needs it on the Ok side).
 #[derive(Debug)]
 struct SiglipSpec {
     config: Config,
@@ -83,7 +83,7 @@ fn patch_activation(section: &serde_json::Value) -> Result<serde_json::Value, St
     Ok(patched)
 }
 
-/// Translate an HF SigLIP `config.json` into candle's siglip `Config`.
+/// Translate an HF `SigLIP` `config.json` into candle's siglip `Config`.
 /// Verified against google/siglip-base-patch16-224, whose sections
 /// carry only a handful of fields (`patch_size`, dims, `vocab_size`) -
 /// the sparse rest is exactly what candle's serde defaults exist for.
@@ -98,7 +98,9 @@ fn spec_from_hf_config(config: &serde_json::Value) -> Result<SiglipSpec, String>
         .map_err(|e| format!("vision_config: {e}"))?;
     let text_config: TextConfig =
         serde_json::from_value(patch_activation(text)?).map_err(|e| format!("text_config: {e}"))?;
-    let image_size = vision_config.image_size as u32;
+    let image_size = u32::try_from(vision_config.image_size).map_err(|_| {
+        "vision_config.image_size exceeds u32 - not a real SigLIP config".to_string()
+    })?;
     Ok(SiglipSpec {
         config: Config {
             text_config,
@@ -160,9 +162,9 @@ fn siglip_rows(store: &Store) -> Result<Vec<blazar_core::store::ModelRow>, Strin
         })
 }
 
-/// Resolve the SigLIP model to serve: the requested name when given
+/// Resolve the `SigLIP` model to serve: the requested name when given
 /// (exact match, mirroring the rest of the gateway), otherwise the
-/// single installed SigLIP model. Every failure teaches the remedy.
+/// single installed `SigLIP` model. Every failure teaches the remedy.
 pub fn resolve(dirs: &BlazarDirs, requested: Option<&str>) -> Result<(String, PathBuf), String> {
     let store = Store::open(dirs).map_err(|e| format!("store: {e}"))?;
     let rows = siglip_rows(&store)?;
@@ -209,7 +211,7 @@ fn weights_file(model_dir: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Preprocessing is shared with the CLIP lane: SigLIP's HF processor
+/// Preprocessing is shared with the CLIP lane: `SigLIP`'s HF processor
 /// normalizes with mean 0.5 / std 0.5, which is exactly the
 /// `[-1,1]` affine the CLIP path already emits - one decoder, one
 /// resize, correct pixels for both towers.
@@ -244,7 +246,7 @@ fn load(
 }
 
 /// Embed a batch of images (raw encoded bytes, png/jpeg) with the
-/// resolved SigLIP model, returning one L2-normalized vector per image
+/// resolved `SigLIP` model, returning one L2-normalized vector per image
 /// (768-d for the base towers, per the model's own config). Runs the
 /// forward pass on a blocking thread; safe to call from async handlers.
 pub async fn embed_images(weights: PathBuf, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>, String> {
@@ -289,7 +291,7 @@ mod tests {
     use super::*;
 
     /// The exact sparse shape of the live google/siglip-base-patch16-224
-    /// config.json: vision carries only model_type + patch_size, text a
+    /// config.json: vision carries only `model_type` + `patch_size`, text a
     /// handful of dims - everything else rides candle's serde defaults.
     fn google_sparse_config() -> serde_json::Value {
         serde_json::json!({

@@ -8,11 +8,14 @@ use serde_json::json;
 mod support;
 
 #[tokio::test]
+#[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
 async fn integration__invite_code__one_join_then_consumed() {
-    let mut config = Config::default();
-    // A tokened gateway refuses bare joins from ANY peer; invite codes
-    // are the guided-onboarding bootstrap around exactly that.
-    config.fleet_token = "master-tok".into();
+    let config = Config {
+        // A tokened gateway refuses bare joins from ANY peer; invite codes
+        // are the guided-onboarding bootstrap around exactly that.
+        fleet_token: "master-tok".into(),
+        ..Config::default()
+    };
     let ts = support::start(config).await;
     let client = reqwest::Client::new();
 

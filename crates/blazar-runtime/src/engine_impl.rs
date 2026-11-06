@@ -1865,7 +1865,7 @@ mod tests {
     }
 
     /// Probe a dead port whose failures must SURFACE as report lines
-    /// (probe_rpc_endpoints). An empty report means the port was stolen
+    /// (`probe_rpc_endpoints`). An empty report means the port was stolen
     /// by a parallel test binary between `dead_port` and the probe:
     /// redraw and retry rather than fail the assertion (the race seen
     /// live ~1-in-10 full-parallel runs).

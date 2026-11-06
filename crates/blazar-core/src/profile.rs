@@ -2581,9 +2581,10 @@ const UNIFIED_COMPUTE_PER_TOKEN_BYTES: u64 = 24 * 1024;
 /// class of proof: converted from kyutai/pocket-tts-without-voice-cloning
 /// (english pack, 27 baked voices), booted model+mmproj on b12072 -
 /// /tts answers in 0.5 s, GET /props lists the 27 predefined voices,
-/// speaker_ref is refused ("no voice encoder") - a speech-only checkpoint
+/// `speaker_ref` is refused ("no voice encoder") - a speech-only checkpoint
 /// (2026-11-03). Every embedding arm in section 10c is therefore skipped
 /// for these arches.
+#[must_use]
 pub fn speech_generation_arch(arch: &str) -> bool {
     matches!(arch, "qwen3tts" | "pockettts")
 }
@@ -2597,6 +2598,7 @@ pub fn speech_generation_arch(arch: &str) -> bool {
 /// exits at load - while the identical argv without draft-mtp serves chat
 /// and OCR fine (live bisect receipt, 2026-11-03). New arches join this
 /// list only with a boot receipt.
+#[must_use]
 pub fn mtp_arch_proven(arch: &str) -> bool {
     arch.starts_with("qwen")
 }
@@ -3799,11 +3801,11 @@ fn merged_sdcpp_model_args(cfg: &Config, warnings: &mut Vec<String>) -> Option<S
 /// is unservable alone. An empty set means a family-blinded pull (older
 /// row); dead paths mean deleted files. The set itself can be any family
 /// shape - a `--model` self-reference (bare standalone SDXL/SD 1.5), a
-/// `--vae`-bearing set (most families) or encoder-only (MiniT2I rides
+/// `--vae`-bearing set (most families) or encoder-only (`MiniT2I` rides
 /// `--t5xxl`, L2P rides `--llm`; pixel-space families carry no VAE) - so
 /// no single flag is mandated here; `compile_sdcpp` maps the shape onto
 /// `--model` vs `--diffusion-model` + per-flag layout. Both failure
-/// classes repair the same way: re-pull. The DiT path itself stays
+/// classes repair the same way: re-pull. The `DiT` path itself stays
 /// argv-data like every other lane (a deleted model file surfaces at
 /// child load, and the store's re-pull intactness check repairs it).
 fn sdcpp_components(input: &ProfileInput<'_>) -> Result<(), String> {
@@ -6488,8 +6490,8 @@ fn resolve_ctx(
 /// thresholds. Estimated f16 KV is `2*blocks*kv_heads*head_dim*ctx*2`
 /// bytes; `q8_0` halves it, `q4_0` quarters it. The cheapest grade that keeps
 /// weights+KV within 0.9x VRAM wins, with one differential rung between the
-/// symmetric `q8_0` and `q4_0` grades: K at `q8_0` + V at `q4_0` (3/8 of f16)
-/// - K precision dominates attention retrieval, V tolerates the heavier
+/// symmetric `q8_0` and `q4_0` grades: K at `q8_0` + V at `q4_0` (3/8 of f16) -
+/// K precision dominates attention retrieval, V tolerates the heavier
 /// quant at better quality than symmetric `q4_0` (SnapKV/PyramidKV lineage).
 /// Missing GGUF fields skip with a named warning - never guessed.
 /// True when the spawn's device hint resolves to a CUDA-class GPU
@@ -6679,8 +6681,8 @@ fn effective_cache_ram_mib(input: &ProfileInput<'_>) -> Option<u64> {
 
 /// Verdict for a PINNED unified-KV ctx against the GPU: the 2b fit
 /// constraint as ONE decision shared by profile compilation and the
-/// gateway `num_ctx` preflight. Both sites must refuse the same shapes
-/// - a split brain here is how a doomed pin evicts a healthy instance
+/// gateway `num_ctx` preflight. Both sites must refuse the same shapes -
+/// a split brain here is how a doomed pin evicts a healthy instance
 /// and 502-loops the requester (live-repro'd 2026-09-13: 21x
 /// spawn-retry of a child that could never create its context).
 #[must_use]

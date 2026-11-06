@@ -30,8 +30,8 @@ struct ClipSpec {
 }
 
 /// HF `hidden_act` string -> candle's CLIP activation. candle 0.11
-/// implements only QuickGelu for CLIP towers; the OpenAI CLIP family
-/// ships quick_gelu throughout, so anything else refuses with the
+/// implements only `QuickGelu` for CLIP towers; the `OpenAI` CLIP family
+/// ships `quick_gelu` throughout, so anything else refuses with the
 /// value named rather than silently loading a numerically different
 /// gelu.
 fn activation_from_hf(
@@ -51,6 +51,21 @@ fn field<'a>(section: &'a serde_json::Value, key: &str) -> Result<&'a serde_json
     section
         .get(key)
         .ok_or_else(|| format!("config field \"{key}\" missing"))
+}
+
+/// Read one u64 dimension field, narrowing into the target integer
+/// type. Real configs carry small dims; a silently truncating cast
+/// would corrupt tensor shapes, so an out-of-range value refuses
+/// loudly with the field named.
+fn dimension<T: TryFrom<u64>>(
+    section: &serde_json::Value,
+    key: &str,
+    label: &str,
+) -> Result<T, String> {
+    let raw = field(section, key)?
+        .as_u64()
+        .ok_or_else(|| format!("{label} not an integer"))?;
+    T::try_from(raw).map_err(|_| format!("{label} out of range"))
 }
 
 /// Translate an HF CLIP `config.json` (verified against
@@ -73,79 +88,68 @@ fn spec_from_hf_config(config: &serde_json::Value) -> Result<ClipSpec, String> {
             .unwrap_or("quick_gelu"),
     )?;
     let act_t = activation_from_hf(field(text, "hidden_act")?.as_str().unwrap_or("quick_gelu"))?;
-    let image_size = field(vision, "image_size")?
-        .as_u64()
-        .ok_or("vision_config.image_size not an integer")? as u32;
+    let image_size = dimension::<u32>(vision, "image_size", "vision_config.image_size")?;
 
     let vision_config = ClipVisionConfig {
-        embed_dim: field(vision, "hidden_size")?
-            .as_u64()
-            .ok_or("vision_config.hidden_size not an integer")? as usize,
+        embed_dim: dimension(vision, "hidden_size", "vision_config.hidden_size")?,
         activation: act_v,
-        intermediate_size: field(vision, "intermediate_size")?
-            .as_u64()
-            .ok_or("vision_config.intermediate_size not an integer")?
-            as usize,
-        num_hidden_layers: field(vision, "num_hidden_layers")?
-            .as_u64()
-            .ok_or("vision_config.num_hidden_layers not an integer")?
-            as usize,
-        num_attention_heads: field(vision, "num_attention_heads")?
-            .as_u64()
-            .ok_or("vision_config.num_attention_heads not an integer")?
-            as usize,
-        projection_dim: field(vision, "projection_dim")?
-            .as_u64()
-            .ok_or("vision_config.projection_dim not an integer")? as usize,
+        intermediate_size: dimension(
+            vision,
+            "intermediate_size",
+            "vision_config.intermediate_size",
+        )?,
+        num_hidden_layers: dimension(
+            vision,
+            "num_hidden_layers",
+            "vision_config.num_hidden_layers",
+        )?,
+        num_attention_heads: dimension(
+            vision,
+            "num_attention_heads",
+            "vision_config.num_attention_heads",
+        )?,
+        projection_dim: dimension(vision, "projection_dim", "vision_config.projection_dim")?,
         // every CLIP tower ships RGB inputs; the field only appears in newer configs
         num_channels: vision
             .get("num_channels")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3) as usize,
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|c| usize::try_from(c).ok())
+            .unwrap_or(3),
         image_size: image_size as usize,
-        patch_size: field(vision, "patch_size")?
-            .as_u64()
-            .ok_or("vision_config.patch_size not an integer")? as usize,
+        patch_size: dimension(vision, "patch_size", "vision_config.patch_size")?,
     };
     let text_config = ClipTextConfig {
-        vocab_size: field(text, "vocab_size")?
-            .as_u64()
-            .ok_or("text_config.vocab_size not an integer")? as usize,
-        embed_dim: field(text, "hidden_size")?
-            .as_u64()
-            .ok_or("text_config.hidden_size not an integer")? as usize,
+        vocab_size: dimension(text, "vocab_size", "text_config.vocab_size")?,
+        embed_dim: dimension(text, "hidden_size", "text_config.hidden_size")?,
         activation: act_t,
-        intermediate_size: field(text, "intermediate_size")?
-            .as_u64()
-            .ok_or("text_config.intermediate_size not an integer")?
-            as usize,
-        max_position_embeddings: field(text, "max_position_embeddings")?
-            .as_u64()
-            .ok_or("text_config.max_position_embeddings not an integer")?
-            as usize,
+        intermediate_size: dimension(text, "intermediate_size", "text_config.intermediate_size")?,
+        max_position_embeddings: dimension(
+            text,
+            "max_position_embeddings",
+            "text_config.max_position_embeddings",
+        )?,
         // HF has no padding-token override; only the text tower would consume it
         pad_with: None,
-        num_hidden_layers: field(text, "num_hidden_layers")?
-            .as_u64()
-            .ok_or("text_config.num_hidden_layers not an integer")?
-            as usize,
-        num_attention_heads: field(text, "num_attention_heads")?
-            .as_u64()
-            .ok_or("text_config.num_attention_heads not an integer")?
-            as usize,
-        projection_dim: field(text, "projection_dim")?
-            .as_u64()
-            .ok_or("text_config.projection_dim not an integer")? as usize,
+        num_hidden_layers: dimension(text, "num_hidden_layers", "text_config.num_hidden_layers")?,
+        num_attention_heads: dimension(
+            text,
+            "num_attention_heads",
+            "text_config.num_attention_heads",
+        )?,
+        projection_dim: dimension(text, "projection_dim", "text_config.projection_dim")?,
     };
+    // f64 -> f32 narrows only sub-f32 mantissa bits (HF ships 2.6592)
+    #[allow(clippy::cast_possible_truncation)]
+    let logit_scale_init_value = config
+        .get("logit_scale_init_value")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(2.6592) as f32;
     Ok(ClipSpec {
         config: ClipConfig {
             text_config,
             vision_config,
             // contrastive-logit scale; only the paired forward pass reads it
-            logit_scale_init_value: config
-                .get("logit_scale_init_value")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(2.6592) as f32,
+            logit_scale_init_value,
             image_size: image_size as usize,
         },
         image_size,
@@ -403,6 +407,7 @@ mod tests {
     /// Minimal but faithful HF CLIP config.json shape - field names and
     /// nesting match the live openai/clip-vit-base-patch32 config
     /// (legacy generation-time keys omitted; the reader ignores them).
+    #[allow(clippy::needless_pass_by_value)] // json! interpolation borrows; call sites stay value-shaped
     fn hf_config(vision: serde_json::Value, text: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "vision_config": vision, "text_config": text })
     }

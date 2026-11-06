@@ -201,6 +201,8 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
 /// `--pooling none`, which the OAI-compatible child route rejects, so the
 /// gateway must pool). Input may be a string, an array of strings, or an
 /// array of pre-tokenized int arrays.
+// input lanes (string / string-array / pre-tokenized) + pooling dispatch
+#[allow(clippy::too_many_lines)]
 pub async fn embeddings(
     state: State<Arc<AppState>>,
     trace_ext: Option<Extension<TraceId>>,
@@ -223,7 +225,7 @@ pub async fn embeddings(
     // keeps the candle lane: shape-only dispatch historically meant
     // CLIP, and clip::resolve owns the sole-row/pull teaching then.
     if req_has_image_input(&body)
-        && requested.as_deref().map_or(true, |m| {
+        && requested.as_deref().is_none_or(|m| {
             state
                 .with_store(|s| crate::proxy::resolve_model(s, m).ok())
                 .flatten()
@@ -329,7 +331,7 @@ pub async fn embeddings(
 
 /// True when the /v1/embeddings input array carries at least one
 /// `image_url` part - the multimodal-embedding routing signal. Parts sit
-/// directly on the element or nested in a content array (the OpenRouter
+/// directly on the element or nested in a content array (the `OpenRouter`
 /// shape llama-server accepts).
 fn req_has_image_input(body: &[u8]) -> bool {
     fn image_part(v: &serde_json::Value) -> bool {
@@ -350,12 +352,12 @@ fn req_has_image_input(body: &[u8]) -> bool {
 }
 
 /// True when a resolved row belongs to the candle CLIP lane. The one
-/// architecture an in-process candle lane can load (CLIPModel via the
-/// clip module, SiglipModel via the siglip module); every other arch
+/// architecture an in-process candle lane can load (`CLIPModel` via the
+/// clip module, `SiglipModel` via the siglip module); every other arch
 /// (VLM towers, bert, speech) must ride the child proxy, whose
 /// mmproj-equipped children serve multimodal embeddings natively.
 fn candle_lane_serves(arch: Option<&str>) -> bool {
-    matches!(arch, Some("CLIPModel") | Some("SiglipModel"))
+    matches!(arch, Some("CLIPModel" | "SiglipModel"))
 }
 
 /// CLIP image-embedding lane: accepts `input` as an array of
@@ -364,6 +366,8 @@ fn candle_lane_serves(arch: Option<&str>) -> bool {
 /// only - fetching remote images would be network egress this local-first
 /// lane does not do. Text parts are refused with teaching (the CLIP text
 /// tower is a deliberate follow-up, not a silent degradation).
+// one endpoint owns data-url decode, lane split, and normalization together
+#[allow(clippy::too_many_lines)]
 async fn clip_embeddings(
     state: State<Arc<AppState>>,
     key_ext: Option<Extension<crate::keys::KeyCtx>>,

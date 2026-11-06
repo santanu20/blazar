@@ -753,7 +753,7 @@ fn engine_tts_has_piper_opts(req: &Value) -> bool {
 
 /// Request -> child `/tts` body. `input` is the gateway-validated text;
 /// `voice`, `lang`, and `speaker_ref_b64` are engine-native knobs passed
-/// through verbatim. Everything else (model, response_format, stream)
+/// through verbatim. Everything else (model, `response_format`, stream)
 /// is a gateway concept the child would reject or ignore.
 #[must_use]
 fn engine_tts_child_body(req: &Value, text: &str) -> Value {
@@ -1067,16 +1067,16 @@ pub async fn voices(
         .into_response()
 }
 
-/// Voice-discovery cache: engine name -> (fetched_at, normalized voice
+/// Voice-discovery cache: engine name -> (`fetched_at`, normalized voice
 /// ids). Mirrors the sdcpp child-capabilities TTL cache - `/props` is
 /// only asked while the answer is fresh-less, and never to boot a
 /// child. Empty lists are cached too, so speech children without
 /// predefined voices (e.g. qwen3-tts base) do not get re-probed on
 /// every call.
 const ENGINE_VOICES_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-static ENGINE_VOICES_CACHE: std::sync::LazyLock<
-    std::sync::RwLock<HashMap<String, (std::time::Instant, Vec<String>)>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+type EngineVoices = HashMap<String, (std::time::Instant, Vec<String>)>;
+static ENGINE_VOICES_CACHE: std::sync::LazyLock<std::sync::RwLock<EngineVoices>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 
 /// `GET /props` on llama-server advertises `voices` for speech models
 /// (pocket-tts packs predefined voices into the mmproj sidecar,
@@ -1158,7 +1158,7 @@ async fn engine_voices(state: &AppState) -> Vec<Value> {
             Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
                 Ok(props) => {
                     let ids = normalize_props_voices(&props);
-                    if let Some(mut cache) = ENGINE_VOICES_CACHE.write().ok() {
+                    if let Ok(mut cache) = ENGINE_VOICES_CACHE.write() {
                         cache.insert(model.clone(), (std::time::Instant::now(), ids.clone()));
                     }
                     if !ids.is_empty() {
@@ -1168,14 +1168,14 @@ async fn engine_voices(state: &AppState) -> Vec<Value> {
                 // Observability: a resident speech child whose /props cannot
                 // be parsed must say why instead of silently vanishing.
                 Err(e) => {
-                    tracing::warn!(key = %eng.key, error = %e, "voices: child /props body was not JSON")
+                    tracing::warn!(key = %eng.key, error = %e, "voices: child /props body was not JSON");
                 }
             },
             Ok(resp) => {
-                tracing::warn!(key = %eng.key, status = resp.status().as_u16(), "voices: child /props probe non-2xx")
+                tracing::warn!(key = %eng.key, status = resp.status().as_u16(), "voices: child /props probe non-2xx");
             }
             Err(e) => {
-                tracing::warn!(key = %eng.key, error = %e, "voices: child /props probe failed")
+                tracing::warn!(key = %eng.key, error = %e, "voices: child /props probe failed");
             }
         }
     }

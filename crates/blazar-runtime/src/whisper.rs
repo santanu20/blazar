@@ -799,8 +799,8 @@ impl WhisperRuntime {
     /// Port of a live server loaded with `size`; spawns on first use and
     /// hot-swaps models via POST /load (no restart) when the request
     /// names a different pulled size. `extra` (config
-    /// `whisper_extra_args`) rides the spawn argv after the gateway pins
-    /// - unknown flags are gated against this binary's own `--help`
+    /// `whisper_extra_args`) rides the spawn argv after the gateway pins -
+    /// unknown flags are gated against this binary's own `--help`
     /// surface so a typo teaches instead of crashing the boot.
     // Spawning needs the full child context (paths, timeouts, VAD, extra
     // flags) - nothing here is bundleable without hiding a boot decision.

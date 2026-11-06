@@ -2259,10 +2259,10 @@ impl Puller {
                 doomed.push(Path::new(mm));
             }
             for file in &doomed {
-                if let Err(e) = std::fs::remove_file(file) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(model = %name, "steering cleanup skipped {}: {e}", file.display());
-                    }
+                if let Err(e) = std::fs::remove_file(file)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(model = %name, "steering cleanup skipped {}: {e}", file.display());
                 }
             }
             tracing::warn!(

@@ -762,7 +762,7 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
 /// - non-zero exit: the binary never reached its usage path. The
 ///   dynamic loader is the common culprit - a prebuilt linked against
 ///   a newer distro's libc (e.g. an Ubuntu 26.04 asset needing
-///   GLIBC_2.43) exits 127 with `error while loading shared
+///   `GLIBC_2.43`) exits 127 with `error while loading shared
 ///   libraries: ...` on stderr and prints NOTHING to stdout, which
 ///   used to masquerade as an upstream format change. Report the exit
 ///   code plus the first stderr line verbatim, with a libc teaching
@@ -770,7 +770,7 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
 /// - exit 0 with no parseable flags: genuinely an upstream usage
 ///   format change (or an unknown regression) - keep the original
 ///   message with a usage preview.
-fn zero_flag_help_error(binary: &str, out: &Output, preview: String) -> anyhow::Error {
+fn zero_flag_help_error(binary: &str, out: &Output, preview: &str) -> anyhow::Error {
     let stderr_text = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
         let code = out
@@ -854,7 +854,7 @@ fn probe_sdcpp(server_path: &Path, tag: &str) -> Result<Manifest> {
     let (flags, _) = parse_help(&help);
     if flags.is_empty() {
         let preview = help.lines().take(3).collect::<Vec<_>>().join(" | ");
-        return Err(zero_flag_help_error("sd-server", &help_out, preview));
+        return Err(zero_flag_help_error("sd-server", &help_out, &preview));
     }
 
     let devices = run_sd_list_devices(Path::new(server));
@@ -946,7 +946,7 @@ fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
             .take(3)
             .collect::<Vec<_>>()
             .join(" | ");
-        return Err(zero_flag_help_error("whisper-server", &help_out, preview));
+        return Err(zero_flag_help_error("whisper-server", &help_out, &preview));
     }
 
     Ok(Manifest {
@@ -1001,7 +1001,7 @@ fn probe_piper(server_path: &Path, tag: &str) -> Result<Manifest> {
             .take(3)
             .collect::<Vec<_>>()
             .join(" | ");
-        return Err(zero_flag_help_error("piper", &help_out, preview));
+        return Err(zero_flag_help_error("piper", &help_out, &preview));
     }
 
     Ok(Manifest {
@@ -1212,7 +1212,7 @@ mod tests {
             "sd-server: error while loading shared libraries: libggml-base.so.0: \
              cannot open shared object file: No such file or directory\n",
         );
-        let err = zero_flag_help_error("sd-server", &out, String::new()).to_string();
+        let err = zero_flag_help_error("sd-server", &out, "").to_string();
         assert!(err.contains("exited 127"), "{err}");
         assert!(
             err.contains("error while loading shared libraries"),
@@ -1227,7 +1227,7 @@ mod tests {
     #[test]
     fn unit__zero_flag_help_error__nonzero_exit_without_loader_signature_stays_plain() {
         let out = help_output(2, "", "unknown flag --help\n");
-        let err = zero_flag_help_error("piper", &out, String::new()).to_string();
+        let err = zero_flag_help_error("piper", &out, "").to_string();
         assert!(err.contains("exited 2"), "{err}");
         assert!(err.contains("unknown flag --help"), "{err}");
         assert!(!err.contains("libc"), "{err}");
@@ -1238,8 +1238,8 @@ mod tests {
         // A usage that parses to zero flags with a successful exit is
         // still the upstream-format-change story (unchanged behavior).
         let out = help_output(0, "usage: sd-server\n--model-path\n", "");
-        let err = zero_flag_help_error("sd-server", &out, "usage: sd-server | --model-path".into())
-            .to_string();
+        let err =
+            zero_flag_help_error("sd-server", &out, "usage: sd-server | --model-path").to_string();
         assert!(err.contains("output format changed upstream"), "{err}");
         assert!(err.contains("usage: sd-server"), "{err}");
     }

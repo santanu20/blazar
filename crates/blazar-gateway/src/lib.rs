@@ -1453,8 +1453,7 @@ pub async fn serve(
             let port = state
                 .http_addr
                 .get()
-                .map(|&(_, p)| p)
-                .unwrap_or_else(|| sup.cfg().port);
+                .map_or_else(|| sup.cfg().port, |&(_, p)| p);
             tokio::spawn(blazar_runtime::discovery::run_discovery_responder(
                 sup, port,
             ));
@@ -1548,8 +1547,7 @@ pub async fn serve(
             let port = state
                 .http_addr
                 .get()
-                .map(|&(_, p)| p)
-                .unwrap_or_else(|| sup.cfg().port);
+                .map_or_else(|| sup.cfg().port, |&(_, p)| p);
             tokio::spawn(blazar_runtime::discovery::run_discovery_responder(
                 sup, port,
             ));

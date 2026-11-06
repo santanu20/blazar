@@ -76,6 +76,7 @@ pub struct AgentApproval {
 
 /// Policy decision for one invitation. `approval` is set exactly when
 /// the reply is `approved`.
+#[must_use]
 pub fn decide_invite(
     policy: AgentPolicy,
     donor_token: &str,
@@ -123,6 +124,7 @@ pub fn decide_invite(
 
 /// Beacon payload: what a scanning gateway learns about this box.
 /// Exactly these keys - no identifiers beyond the hostname, no secrets.
+#[must_use]
 pub fn beacon_payload(policy: AgentPolicy, gpu_name: Option<&str>, free_vram_mib: u64) -> String {
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into());
     serde_json::json!({
@@ -157,13 +159,13 @@ pub fn save_pending(dirs: &BlazarDirs, pending: &PendingInvite) -> std::io::Resu
         serde_json::to_string_pretty(pending).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(&path, body)
         .and(Ok(path.clone()))
-        .map_err(|e| {
+        .inspect_err(|_e| {
             let _ = std::fs::remove_file(&path);
-            e
         })
 }
 
 /// Every queued invitation, oldest first.
+#[must_use]
 pub fn list_pending(dirs: &BlazarDirs) -> Vec<(PathBuf, PendingInvite)> {
     let Ok(entries) = std::fs::read_dir(pending_dir(dirs)) else {
         return Vec::new();
@@ -215,8 +217,8 @@ pub fn deny_pending(dirs: &BlazarDirs, path: &std::path::Path) -> std::io::Resul
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        // u128 millis overflow u64 only past year ~584M; saturate, never truncate
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 async fn handle_invite_conn(
@@ -269,16 +271,16 @@ async fn handle_invite_conn(
         return;
     }
     let (reply, approval) = decide_invite(policy, &donor_token, &invite);
-    if reply.status == "queued" {
-        if let Err(e) = save_pending(
+    if reply.status == "queued"
+        && let Err(e) = save_pending(
             dirs,
             &PendingInvite {
                 invite,
                 received_ms: now_ms(),
             },
-        ) {
-            tracing::warn!("could not queue invite: {e}");
-        }
+        )
+    {
+        tracing::warn!("could not queue invite: {e}");
     }
     let _ = stream
         .write_all(serde_json::to_string(&reply).unwrap_or_default().as_bytes())
@@ -364,7 +366,10 @@ pub async fn scan_agents(port: u16, wait: Duration) -> std::io::Result<Vec<Agent
                     .and_then(|g| g.as_str())
                     .filter(|g| !g.is_empty())
                     .map(str::to_owned);
-                let free_vram_mib = v.get("free_vram_mib").and_then(|m| m.as_u64()).unwrap_or(0);
+                let free_vram_mib = v
+                    .get("free_vram_mib")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 let policy = v
                     .get("policy")
                     .and_then(|p| p.as_str())
@@ -470,6 +475,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__beacon_payload__lists_hardware_and_policy_only() {
         let body = beacon_payload(AgentPolicy::AskOwner, Some("RTX 4070"), 7_100);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -490,6 +496,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__decide_invite__token_policy_matrix() {
         let invite = AgentInvite {
             gateway_name: "gw".into(),
@@ -516,6 +523,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__decide_invite__ask_owner_queues_for_owner() {
         let invite = AgentInvite {
             gateway_name: "gw".into(),
@@ -528,6 +536,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__pending_store__queue_list_approve_roundtrip() {
         let (d, _root) = dirs();
         let invite = AgentInvite {
@@ -565,6 +574,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__pending_store__code_bearing_invite_approves_with_the_code() {
         // Ask-owner approval must hand the cascade a credential the
         // gateway will actually accept: the invite's one-use code, not
@@ -596,6 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     async fn unit__invite_conn__oversized_frame_refused_before_parse() {
         let (d, _root) = dirs();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -627,6 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     async fn unit__invite_conn__newline_terminated_invite_answers_without_eof() {
         // The adopter keeps its write side OPEN while waiting for the reply
         // (it never half-closes), so the agent must decide on the newline

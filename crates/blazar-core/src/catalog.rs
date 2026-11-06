@@ -371,7 +371,7 @@ mod tests {
         for e in &catalog().entries {
             if e.short_name != "clip-vit-base-patch32" {
                 assert!(
-                    e.revision.as_deref().map_or(true, str::is_empty),
+                    e.revision.as_deref().is_none_or(str::is_empty),
                     "unexpected revision pin on {}",
                     e.short_name
                 );

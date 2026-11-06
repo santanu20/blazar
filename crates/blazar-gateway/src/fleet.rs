@@ -87,9 +87,13 @@ pub struct InviteRegistry {
 impl InviteRegistry {
     /// Mint a fresh 32-hex code valid for `ttl`.
     pub fn mint(&self, ttl: std::time::Duration) -> String {
+        use std::fmt::Write as _;
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).expect("OS entropy source");
-        let code: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let mut code = String::with_capacity(32);
+        for b in bytes {
+            let _ = write!(code, "{b:02x}");
+        }
         let expires = std::time::Instant::now() + ttl;
         self.codes
             .lock()
@@ -139,12 +143,12 @@ fn token_matches(expected: &str, presented: &str) -> bool {
     acc == 0
 }
 
-fn presented_token(headers: &HeaderMap, body_token: &Option<String>) -> String {
+fn presented_token(headers: &HeaderMap, body_token: Option<&str>) -> String {
     headers
         .get(FLEET_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
-        .or_else(|| body_token.clone())
+        .or_else(|| body_token.map(str::to_string))
         .unwrap_or_default()
 }
 
@@ -167,7 +171,7 @@ fn gate(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
-    body_token: &Option<String>,
+    body_token: Option<&str>,
 ) -> Option<Response> {
     let cfg = state.cfg();
     let presented = presented_token(headers, body_token);
@@ -185,8 +189,8 @@ fn gate(
     Some(token_required())
 }
 
-/// Join gate: the master fleet_token, a live one-use invite code, or
-/// the no-token trust domain (loopback / fleet_open). An invite code
+/// Join gate: the master `fleet_token`, a live one-use invite code, or
+/// the no-token trust domain (loopback / `fleet_open`). An invite code
 /// authorizes exactly one join from ANY peer - the kubeadm-style
 /// bootstrap that makes remote `blazar adopt` possible on gateways
 /// that never expose the long-lived token.
@@ -194,7 +198,7 @@ fn join_gate(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
-    body_token: &Option<String>,
+    body_token: Option<&str>,
 ) -> Option<Response> {
     let cfg = state.cfg();
     let presented = presented_token(headers, body_token);
@@ -213,19 +217,17 @@ fn join_gate(
     Some(token_required())
 }
 
-/// Session gate for heartbeat/leave: the master fleet_token, or the
+/// Session gate for heartbeat/leave: the master `fleet_token`, or the
 /// per-worker token minted at THIS worker's join (revoked with its
 /// registry record).
 fn session_gate(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
-    body_token: &Option<String>,
+    body_token: Option<&str>,
     worker_id: &str,
 ) -> Option<Response> {
-    if gate(state, peer, headers, body_token).is_none() {
-        return None;
-    }
+    gate(state, peer, headers, body_token)?;
     let presented = presented_token(headers, body_token);
     if state.sup.fleet_worker_token_matches(worker_id, &presented) {
         return None;
@@ -247,7 +249,7 @@ pub async fn join(
         )
             .into_response();
     }
-    if let Some(denied) = join_gate(&state, peer, &headers, &body.token) {
+    if let Some(denied) = join_gate(&state, peer, &headers, body.token.as_deref()) {
         return denied;
     }
     let devices = body.devices.into_iter().map(Into::into).collect();
@@ -285,8 +287,8 @@ pub async fn invite(
             .into_response();
     }
     let body = body.map(|Json(b)| b);
-    let body_token = body.as_ref().and_then(|b| b.token.clone());
-    if let Some(denied) = gate(&state, peer, &headers, &body_token) {
+    let body_token = body.as_ref().and_then(|b| b.token.as_deref());
+    if let Some(denied) = gate(&state, peer, &headers, body_token) {
         return denied;
     }
     let asked = body
@@ -316,7 +318,13 @@ pub async fn heartbeat(
         )
             .into_response();
     }
-    if let Some(denied) = session_gate(&state, peer, &headers, &body.token, &body.worker_id) {
+    if let Some(denied) = session_gate(
+        &state,
+        peer,
+        &headers,
+        body.token.as_deref(),
+        &body.worker_id,
+    ) {
         return denied;
     }
     let devices = body.devices.into_iter().map(Into::into).collect();
@@ -340,7 +348,13 @@ pub async fn leave(
         )
             .into_response();
     }
-    if let Some(denied) = session_gate(&state, peer, &headers, &body.token, &body.worker_id) {
+    if let Some(denied) = session_gate(
+        &state,
+        peer,
+        &headers,
+        body.token.as_deref(),
+        &body.worker_id,
+    ) {
         return denied;
     }
     // Unknown id = already gone: an idempotent 200 beats a 404 for a
@@ -364,6 +378,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__token_matches__full_length_compare() {
         assert!(token_matches("s3cret", "s3cret"));
         assert!(!token_matches("s3cret", "s3creT"));
@@ -373,6 +388,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__loopback_gate__loopback_free_remote_needs_token() {
         let lo = "127.0.0.1:50000".parse::<SocketAddr>().unwrap();
         let remote = "10.0.0.9:50000".parse::<SocketAddr>().unwrap();
@@ -382,25 +398,21 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__presented_token__header_wins_then_body_then_empty() {
         let mut headers = HeaderMap::new();
-        assert_eq!(presented_token(&headers, &None), "");
-        assert_eq!(
-            presented_token(&headers, &Some("bodytok".into())),
-            "bodytok"
-        );
+        assert_eq!(presented_token(&headers, None), "");
+        assert_eq!(presented_token(&headers, Some("bodytok")), "bodytok");
         headers.insert(
             "x-blazar-fleet-token",
             axum::http::HeaderValue::from_str("headtok").unwrap(),
         );
-        assert_eq!(
-            presented_token(&headers, &Some("bodytok".into())),
-            "headtok"
-        );
-        assert_eq!(presented_token(&headers, &None), "headtok");
+        assert_eq!(presented_token(&headers, Some("bodytok")), "headtok");
+        assert_eq!(presented_token(&headers, None), "headtok");
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__device_body__maps_to_wire_type_losslessly() {
         let d = DeviceBody {
             index: 1,
@@ -415,6 +427,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__invite_registry__mint_redeem_exactly_once() {
         let reg = InviteRegistry::default();
         let code = reg.mint(std::time::Duration::from_secs(300));
@@ -428,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__invite_registry__expired_code_refused() {
         let reg = InviteRegistry::default();
         let code = reg.mint(std::time::Duration::from_millis(1));

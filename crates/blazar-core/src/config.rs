@@ -379,7 +379,7 @@ pub struct Config {
     /// `ask-owner` queues every invite until `blazar agent approve` (or
     /// an interactive prompt) says yes; `token` auto-approves invites
     /// that carry the box's own `fleet_token`. Explicit command start is
-    /// the opt-in - there is no agent_enabled knob to forget.
+    /// the opt-in - there is no `agent_enabled` knob to forget.
     #[serde(default = "default_agent_policy")]
     pub agent_policy: String,
     /// Single-flight: identical NON-STREAM chat requests coalesce at the
@@ -3880,6 +3880,7 @@ impl Config {
         }
     }
 
+    #[must_use]
     pub fn cold_only_diff(old: &Config, new: &Config) -> Vec<String> {
         let mut cold = Vec::new();
         let mut push_if = |differs: bool, knob: &str| {
@@ -5757,6 +5758,7 @@ impl ConfigHandle {
 
     /// Install a new generation; returns the previous one so callers
     /// can diff for side effects (preload list changes, reload events).
+    #[must_use]
     pub fn swap(&self, next: Config) -> std::sync::Arc<Config> {
         let mut guard = self.0.write().expect("config lock");
         std::mem::replace(&mut *guard, std::sync::Arc::new(next))
@@ -7143,14 +7145,18 @@ default_ctx = 16384
         // Hot-reload contract: only bind-time knobs refuse to apply live;
         // a runtime knob change must produce an empty cold-only diff.
         let old = Config::default();
-        let mut next = Config::default();
-        next.idle_timeout_secs = 120;
+        let next = Config {
+            idle_timeout_secs: 120,
+            ..Config::default()
+        };
         assert!(
             Config::cold_only_diff(&old, &next).is_empty(),
             "runtime knob flip must apply hot"
         );
-        let mut next = Config::default();
-        next.port = 12345;
+        let next = Config {
+            port: 12345,
+            ..Config::default()
+        };
         assert_eq!(
             Config::cold_only_diff(&old, &next),
             vec!["port"],

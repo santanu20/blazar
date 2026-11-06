@@ -445,10 +445,10 @@ impl Puller {
                 doomed.push(mm);
             }
             for doomed in &doomed {
-                if let Err(e) = std::fs::remove_file(doomed) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(model = %name, "steering cleanup skipped {}: {e}", doomed.display());
-                    }
+                if let Err(e) = std::fs::remove_file(doomed)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(model = %name, "steering cleanup skipped {}: {e}", doomed.display());
                 }
             }
             sweep_stale_part(&dest.display().to_string());

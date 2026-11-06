@@ -1056,8 +1056,8 @@ impl GhClient {
         .await
     }
 
-    /// Fetch the raw `src/llama-arch.cpp` at an upstream llama.cpp tag
-    /// - the one-time source for mining the architecture set of a
+    /// Fetch the raw `src/llama-arch.cpp` at an upstream llama.cpp tag -
+    /// the one-time source for mining the architecture set of a
     /// binary-installed lane (release assets carry no source manifest).
     /// Any failure is the caller's fail-open signal: a missing tag or a
     /// network hiccup must never block engine registration.
@@ -2023,7 +2023,7 @@ impl SdAssetPattern {
 /// (26, 4). Upstream CI started stamping the builder distro into
 /// Linux zip names when the builder fleet mixed Ubuntu versions
 /// (master-1044+ Linux zips are built on Ubuntu 26.04 and linked
-/// against its GLIBC_2.43). Token-less names parse to None and stay
+/// against its `GLIBC_2.43`). Token-less names parse to None and stay
 /// ungated - which covers every whisper/piper/mistral.rs asset and
 /// every macOS/Windows zip today.
 #[must_use]
@@ -2190,14 +2190,14 @@ pub fn resolve_sdcpp_asset<'a, 'p>(
             if !pattern.matches(&asset.name) {
                 continue;
             }
-            if let Some(distro) = asset_ubuntu_distro(&asset.name) {
-                if host_distro.is_some_and(|host| distro > host) {
-                    gated.push(GatedAsset {
-                        name: asset.name.clone(),
-                        distro,
-                    });
-                    continue;
-                }
+            if let Some(distro) = asset_ubuntu_distro(&asset.name)
+                && host_distro.is_some_and(|host| distro > host)
+            {
+                gated.push(GatedAsset {
+                    name: asset.name.clone(),
+                    distro,
+                });
+                continue;
             }
             return SdAssetPick::Matched(asset, pattern);
         }

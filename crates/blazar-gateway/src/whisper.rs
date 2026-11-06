@@ -7,7 +7,7 @@
 //!     row: the request rides the child's native
 //!     `/v1/audio/transcriptions` (mtmd audio tower), buffered-only,
 //!     with the child's `{"type":"transcript.text.done"}` event
-//!     normalized to the OpenAI `{"text": ...}` shape;
+//!     normalized to the `OpenAI` `{"text": ...}` shape;
 //! (3) local whisper.cpp lane when whisper-server + at least one ggml
 //!     model are installed (lazy child, hot model swap);
 //! (4) otherwise a teaching error.
@@ -1599,12 +1599,12 @@ pub async fn audio_capabilities(State(state): State<Arc<AppState>>) -> Response 
         .unwrap_or_else(|_| openai_error(500, "response build").into_response())
 }
 
-/// Normalize the child's transcription body to the OpenAI response
+/// Normalize the child's transcription body to the `OpenAI` response
 /// shape. llama-server answers one buffered event
 /// `{"type":"transcript.text.done","text":...}` (plus usage) - relayed
 /// as `{"text": ...}`; a body that already carries a top-level `text`
 /// passes through byte-unchanged so a future engine revision that
-/// speaks OpenAI natively needs zero gateway change (pure function).
+/// speaks `OpenAI` natively needs zero gateway change (pure function).
 fn normalize_engine_transcript(body: &[u8]) -> Result<Vec<u8>, String> {
     let v: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| format!("engine returned a non-JSON transcription body: {e}"))?;
@@ -1768,7 +1768,7 @@ async fn engine_asr_lane(
     tracing::info!(
         model = %row.name,
         bytes = raw.len(),
-        total_ms = started.elapsed().as_millis() as u64,
+        total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "engine transcription relayed"
     );
     (

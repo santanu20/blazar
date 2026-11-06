@@ -176,7 +176,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
     let reaper = sup.spawn_reaper();
     let state = Arc::new(AppState::new(
         dirs.clone(),
-        config,
+        &config,
         sup.clone(),
         EventBus::default(),
     ));

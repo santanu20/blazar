@@ -1465,8 +1465,8 @@ pub fn standalone_file_plan(info: &HfModelInfo, family: &DiffusionFamily) -> Opt
 }
 
 /// How a repo houses a standalone-capable family. Families whose
-/// canonical DiT is a single safetensors checkpoint (SD 1.5, SDXL,
-/// MOSS-Image, SD 3.5...) also ship DiT GGUF mirrors under the same
+/// canonical `DiT` is a single safetensors checkpoint (SD 1.5, SDXL,
+/// MOSS-Image, SD 3.5...) also ship `DiT` GGUF mirrors under the same
 /// family token - those must ride the gguf lane, where
 /// `attach_diffusion_set` completes the identical component set, not
 /// the standalone lane (which would reject them for hosting none of
@@ -1476,7 +1476,7 @@ pub enum StandaloneHousing {
     /// Repo hosts one of the family's pinned standalone files: the
     /// standalone pull lane owns it.
     CheckpointHosted,
-    /// Repo carries DiT GGUF files instead: fall through to the gguf
+    /// Repo carries `DiT` GGUF files instead: fall through to the gguf
     /// lane (same component set attaches).
     GgufMirror,
     /// Neither: a diffusers-shard or transformer-shard housing the
@@ -2115,7 +2115,7 @@ mod tests {
             .iter()
             .find(|c| c.flag == "--llm")
             .expect("llada entry carries --llm");
-        assert_eq!(encoder.fallback_quant.as_deref(), Some("q4_K"));
+        assert_eq!(encoder.fallback_quant, Some("q4_K"));
         let enc_plan = component_plan(&info, &encoder.source, "q4_K").unwrap();
         assert_eq!(enc_plan.filename, "llada-image-text_encoder-q4_K.gguf");
         // LTX-2.3 rides the same connectors flag with the gemma

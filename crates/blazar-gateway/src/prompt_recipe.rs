@@ -360,8 +360,8 @@ pub(crate) fn extract_tool_names(body: &Value) -> Option<Vec<String>> {
 /// request's tools and whose `arguments` is an arbitrary JSON object.
 /// Rule names are `plm`-prefixed on purpose: the llama.cpp OAI
 /// completion endpoint carries preloaded grammar rules (`string`,
-/// `object`, `value`, ...) that silently shadow same-named user rules
-/// - colliding names were the difference between the grammar being
+/// `object`, `value`, ...) that silently shadow same-named user rules -
+/// colliding names were the difference between the grammar being
 /// followed exactly and not applying at all (verified live). `root`
 /// stays unprefixed: the endpoint requires it.
 fn build_tool_grammar(names: &[String]) -> String {

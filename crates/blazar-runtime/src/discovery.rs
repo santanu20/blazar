@@ -193,12 +193,12 @@ pub async fn seek_gateways(port: u16, wait: Duration) -> std::io::Result<Vec<(St
                 let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..len]) else {
                     continue;
                 };
-                let Some(http_port) = v.get("http_port").and_then(|p| p.as_u64()) else {
+                let Some(http_port) = v.get("http_port").and_then(serde_json::Value::as_u64) else {
                     continue;
                 };
                 let token_required = v
                     .get("fleet_token_required")
-                    .and_then(|t| t.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 let host = peer.ip();
                 let base = format!("http://{host}:{http_port}");
@@ -219,6 +219,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__reply_payload__names_port_and_token_flag_only() {
         let v: serde_json::Value =
             serde_json::from_str(&reply_payload(11438, true, "0.29.0")).unwrap();
@@ -240,6 +241,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     async fn unit__discovery_roundtrip__seeker_gets_gateway_from_reply_source() {
         // Bind a responder-like socket on an ephemeral port, run the
         // seeker against it, and prove the reply's SOURCE address
@@ -263,6 +265,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     async fn unit__seek_gateway__silence_times_out_with_none() {
         // Port with no listener: broadcast may go nowhere, unicast to
         // 127.0.0.1 gets ECONNREFUSED surfaced as a timeout -> None.

@@ -240,7 +240,7 @@ async fn start(think_wrap: &str) -> TestServer {
     let reaper = sup.spawn_reaper();
     let state = Arc::new(AppState::new(
         dirs.clone(),
-        config,
+        &config,
         sup.clone(),
         EventBus::default(),
     ));

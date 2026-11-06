@@ -133,7 +133,7 @@ async fn start(config: Config, stub_env: &[(&str, &str)], bare_template: bool) -
     let reaper = sup.spawn_reaper();
     let state = Arc::new(AppState::new(
         dirs.clone(),
-        config,
+        &config,
         sup.clone(),
         EventBus::default(),
     ));

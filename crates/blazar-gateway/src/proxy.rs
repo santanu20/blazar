@@ -3265,8 +3265,8 @@ pub fn others_peak(entry_live: i64, note_live: i64) -> i64 {
 
 /// Begin accounting as a deterministic-isolation holder: exclusivity was
 /// acquired by the gate (quiescent child verified there); the guard's
-/// `Drop` returns it. Same in-flight accounting as [`begin_accounting`]
-/// - an exclusive request must be visible to `request_load` so a second
+/// `Drop` returns it. Same in-flight accounting as [`begin_accounting`] -
+/// an exclusive request must be visible to `request_load` so a second
 /// exclusive candidate keeps parking.
 #[must_use]
 fn begin_accounting_exclusive(state: &Arc<AppState>, model: &str) -> InFlightGuard {

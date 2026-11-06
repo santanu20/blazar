@@ -171,7 +171,7 @@ pub async fn start_env(config: Config, stub_env: &[(&str, &str)]) -> TestServer 
     let reaper = sup.spawn_reaper();
     let state = Arc::new(AppState::new(
         dirs.clone(),
-        config,
+        &config,
         sup.clone(),
         EventBus::default(),
     ));

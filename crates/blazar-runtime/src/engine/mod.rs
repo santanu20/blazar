@@ -189,8 +189,10 @@ fn sdcpp_channel_walk<'a>(
         .filter_map(|r| gh::sdtag_counter(&r.tag_name).map(|n| (n, r)))
         .collect();
     order.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-    let mut walk = SdcppChannelWalk::default();
-    walk.newest_tag = order.first().map(|(_, r)| r.tag_name.as_str());
+    let mut walk = SdcppChannelWalk {
+        newest_tag: order.first().map(|(_, r)| r.tag_name.as_str()),
+        ..SdcppChannelWalk::default()
+    };
     for (_, release) in order.into_iter().take(SDCPP_WALKBACK_DEPTH) {
         match gh::resolve_sdcpp_asset(release, patterns, host_distro) {
             gh::SdAssetPick::Matched(..) => walk.installable.push(release),
@@ -1786,9 +1788,8 @@ impl EngineManager {
             walk.skipped.join(" | ")
         };
         Err(anyhow!(
-            "no sd.cpp release installable on this host within the {} newest \
-             releases (skipped: {skipped})",
-            SDCPP_WALKBACK_DEPTH
+            "no sd.cpp release installable on this host within the {SDCPP_WALKBACK_DEPTH} newest \
+             releases (skipped: {skipped})"
         ))
     }
 

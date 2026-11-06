@@ -76,7 +76,7 @@ impl FleetWorker {
     /// The endpoint used in events and status summaries.
     #[must_use]
     pub fn primary_endpoint(&self) -> &str {
-        self.endpoints.first().map(String::as_str).unwrap_or("")
+        self.endpoints.first().map_or("", String::as_str)
     }
 }
 
@@ -116,9 +116,14 @@ pub fn valid_worker_id(id: &str) -> bool {
 /// Mint a 32-hex session credential from 16 OS-entropy bytes. Scoped to
 /// one registry record; never derived from the master fleet token.
 fn mint_worker_token() -> String {
+    use std::fmt::Write as _;
     let mut raw = [0u8; 16];
     getrandom::fill(&mut raw).expect("OS entropy source");
-    raw.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(32);
+    for b in raw {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Validate one `host:port` endpoint (host nonempty, <= 253 chars,
@@ -288,7 +293,7 @@ impl FleetRegistry {
     pub fn snapshot_targets(&self, now: Instant, ttl: Duration, bus: &EventBus) -> Vec<String> {
         self.prune(now, ttl, bus);
         let mut out = Vec::with_capacity(self.workers.len());
-        for entry in self.workers.iter() {
+        for entry in &self.workers {
             out.extend(entry.value().endpoints.iter().cloned());
         }
         out
@@ -349,32 +354,29 @@ pub fn merge_fleet_argv(argv: &mut Vec<String>, announced: &[String]) {
     if announced.is_empty() {
         return;
     }
-    match argv.iter().position(|flag| flag == "--rpc") {
-        Some(i) => {
-            let mut parts: Vec<String> = argv
-                .get(i + 1)
-                .map(|v| {
-                    v.split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            for ep in announced {
-                if !parts.contains(ep) {
-                    parts.push(ep.clone());
-                }
-            }
-            if i + 1 < argv.len() {
-                argv[i + 1] = parts.join(",");
-            } else {
-                argv.push(parts.join(","));
+    if let Some(i) = argv.iter().position(|flag| flag == "--rpc") {
+        let mut parts: Vec<String> = argv
+            .get(i + 1)
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for ep in announced {
+            if !parts.contains(ep) {
+                parts.push(ep.clone());
             }
         }
-        None => {
-            argv.push("--rpc".to_string());
-            argv.push(announced.join(","));
+        if i + 1 < argv.len() {
+            argv[i + 1] = parts.join(",");
+        } else {
+            argv.push(parts.join(","));
         }
+    } else {
+        argv.push("--rpc".to_string());
+        argv.push(announced.join(","));
     }
 }
 
@@ -395,6 +397,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__join_heartbeat_leave__full_membership_cycle() {
         let reg = FleetRegistry::default();
         let bus = bus();
@@ -419,6 +422,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__ttl_prune__silent_worker_evicted_after_window() {
         let reg = FleetRegistry::default();
         let bus = bus();
@@ -439,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__ttl_prune__live_worker_survives() {
         let reg = FleetRegistry::default();
         let bus = bus();
@@ -460,6 +465,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__join__replaces_same_id_without_growing() {
         let reg = FleetRegistry::default();
         let bus = bus();
@@ -488,6 +494,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__join__bad_ids_and_endpoints_refused() {
         let reg = FleetRegistry::default();
         let bus = bus();
@@ -516,6 +523,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__registry_cap__refuses_beyond_64() {
         let reg = FleetRegistry::default();
         let bus = bus();
@@ -545,6 +553,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__heartbeat__unknown_worker_must_rejoin() {
         let reg = FleetRegistry::default();
         let err = reg.heartbeat("ghost", vec![], Instant::now());
@@ -552,6 +561,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__events__join_and_depart_ride_the_bus() {
         let reg = FleetRegistry::default();
         let bus = EventBus::new(64);
@@ -566,7 +576,7 @@ mod tests {
             &bus,
         )
         .unwrap();
-        reg.leave("w1", &bus);
+        reg.leave("w1", &bus).expect("live worker departs on leave");
         let mut kinds = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             kinds.push(ev);
@@ -583,6 +593,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__endpoint_validation__bracketed_ipv6_accepted() {
         assert!(valid_endpoint("[::1]:50052"));
         assert!(!valid_endpoint("just-host"));
@@ -591,6 +602,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__merge_fleet_argv__existing_rpc_list_appends_dedup() {
         let mut argv = vec![
             "llama-server".to_string(),
@@ -605,6 +617,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__merge_fleet_argv__absent_rpc_flag_inserts() {
         let mut argv = vec![
             "llama-server".to_string(),
@@ -617,6 +630,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__merge_fleet_argv__empty_announced_leaves_argv_identical() {
         let mut argv = vec![
             "llama-server".to_string(),

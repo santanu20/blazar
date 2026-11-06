@@ -623,10 +623,10 @@ enum Cmd {
         cmd: ConfigCmd,
     },
     /// One-time gateway setup: enable LAN discovery (+ optional
-    /// fleet_token) so donor boxes can find this machine with
+    /// `fleet_token`) so donor boxes can find this machine with
     /// `blazar join` / `blazar adopt`
     Init {
-        /// Also generate a fleet_token and require it for every join
+        /// Also generate a `fleet_token` and require it for every join
         /// (recommended on shared networks; donors then need the token
         /// or a minted invite code)
         #[arg(long)]
@@ -636,7 +636,7 @@ enum Cmd {
     /// (installs a systemd user unit so the worker survives reboots;
     /// `--foreground` runs it in this terminal instead)
     Join {
-        /// Gateway base URL, skipping the LAN scan (e.g. http://192.168.1.10:11434)
+        /// Gateway base URL, skipping the LAN scan (e.g. <http://192.168.1.10:11434>)
         #[arg(long)]
         gateway: Option<String>,
         /// Non-interactive: join the first discovered gateway
@@ -2480,6 +2480,8 @@ blazar mmproj <model> <mmproj.gguf path>"
 ///    `PR_SET_PDEATHSIG`, so even a `SIGKILL`ed or crashed CLI takes the
 ///    worker down with it (kernel-delivered; see
 ///    `blazar_runtime::parent_death_tie`).
+// dispatcher: one arm per worker subcommand
+#[allow(clippy::too_many_lines)]
 async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
     match cmd {
         RpcCmd::Worker {
@@ -2625,7 +2627,7 @@ fn worker_command(
 /// restarts inside the loop reuse the identical identity and argv.
 struct RpcWorkerOpts {
     bin: std::path::PathBuf,
-    /// Gateway base URL, e.g. http://127.0.0.1:11435
+    /// Gateway base URL, e.g. <http://127.0.0.1:11435>
     base: String,
     host: String,
     port: u16,
@@ -2661,9 +2663,9 @@ fn announce_host(host: &str, gateway_host: &str) -> String {
 }
 
 /// Host portion of a base URL ("http://h:p/x" -> "h"), for route
-/// resolution above. IPv6 brackets are kept so UdpSocket can parse it.
+/// resolution above. IPv6 brackets are kept so `UdpSocket` can parse it.
 fn host_of_base(base: &str) -> String {
-    let no_scheme = base.split_once("://").map(|(_, rest)| rest).unwrap_or(base);
+    let no_scheme = base.split_once("://").map_or(base, |(_, rest)| rest);
     let authority = no_scheme.split(['/', '?']).next().unwrap_or(no_scheme);
     // Strip an explicit :port (outside IPv6 brackets).
     if authority.starts_with('[') {
@@ -2671,8 +2673,7 @@ fn host_of_base(base: &str) -> String {
     } else {
         authority
             .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
+            .map_or(authority, |(h, _)| h)
             .to_string()
     }
 }
@@ -2695,6 +2696,8 @@ struct FleetJoinAck {
 /// - child dies -> restart with backoff and re-announce (join replaces)
 /// - gateway send fails -> keep serving, rejoin with backoff
 /// - INT/TERM/HUP -> graceful leave, kill child, exit 128+signal
+// supervision loop: join / heartbeat / leave healing reads best as one flow
+#[allow(clippy::too_many_lines)]
 async fn rpc_worker_joined(opts: RpcWorkerOpts) -> Result<()> {
     let gateway_host = host_of_base(&opts.base);
     let announced_host = announce_host(&opts.host, &gateway_host);
@@ -2932,26 +2935,20 @@ async fn rpc_status(explicit: &[String], json: bool) -> Result<()> {
         // disabled -> static-only, which is the pre-registry behavior.
         let cfg = config()?;
         let mut targets = collect_rpc_fleet_targets(&cfg);
-        if let Ok(base) = ensure_daemon().await {
-            if let Ok(resp) = cli_http()
+        if let Ok(base) = ensure_daemon().await
+            && let Ok(resp) = cli_http()
                 .get(format!("{base}/api/fleet/workers"))
                 .send()
                 .await
-            {
-                if let Ok(resp) = resp.error_for_status() {
-                    if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        if let Some(workers) = body.get("workers").and_then(|w| w.as_array()) {
-                            for worker in workers {
-                                if let Some(endpoints) =
-                                    worker.get("endpoints").and_then(|e| e.as_array())
-                                {
-                                    for endpoint in endpoints.iter().filter_map(|e| e.as_str()) {
-                                        if !targets.iter().any(|t| t == endpoint) {
-                                            targets.push(endpoint.to_string());
-                                        }
-                                    }
-                                }
-                            }
+            && let Ok(resp) = resp.error_for_status()
+            && let Ok(body) = resp.json::<serde_json::Value>().await
+            && let Some(workers) = body.get("workers").and_then(|w| w.as_array())
+        {
+            for worker in workers {
+                if let Some(endpoints) = worker.get("endpoints").and_then(|e| e.as_array()) {
+                    for endpoint in endpoints.iter().filter_map(|e| e.as_str()) {
+                        if !targets.iter().any(|t| t == endpoint) {
+                            targets.push(endpoint.to_string());
                         }
                     }
                 }
@@ -3033,9 +3030,14 @@ async fn rpc_status(explicit: &[String], json: bool) -> Result<()> {
 /// One-use invite-code generator shared by `init --with-token` and the
 /// gateway's invite endpoint: 16 OS-entropy bytes as 32 hex chars.
 fn mint_hex_secret() -> String {
+    use std::fmt::Write as _;
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("OS entropy source");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// `blazar init` - gateway-side onboarding: turn on LAN discovery
@@ -3074,8 +3076,7 @@ async fn init_cmd(with_token: bool) -> Result<()> {
                 .get(format!("{base}/api/version"))
                 .send()
                 .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false);
+                .is_ok_and(|r| r.status().is_success());
             if up {
                 println!(
                     "daemon is running - the discovery beacon spawns at BOOT: restart it now\n  systemctl --user restart blazar   (or ctrl-c the foreground `blazar serve` and start it again)"
@@ -3140,7 +3141,7 @@ async fn agent_cmd(cmd: AgentCmd) -> Result<()> {
             let policy = config.agent_policy();
             let hardware = blazar_runtime::probe::probe_hardware(None);
             let gpu_name = hardware.gpus.first().map(|g| g.name.clone());
-            let free_vram_mib: u64 = hardware.gpus.iter().map(|g| g.free_mib as u64).sum();
+            let free_vram_mib: u64 = hardware.gpus.iter().map(|g| g.free_mib).sum();
             let (approved_tx, mut approved_rx) =
                 tokio::sync::mpsc::channel::<blazar_runtime::adoption::AgentApproval>(4);
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -3184,11 +3185,10 @@ async fn agent_cmd(cmd: AgentCmd) -> Result<()> {
                 return Ok(());
             }
             for (i, (_path, p)) in pending.iter().enumerate() {
-                let age = (std::time::SystemTime::now()
+                let age = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|t| t.as_secs())
-                    .unwrap_or(0)
-                    .saturating_sub(p.received_ms / 1000)) as u64;
+                    .map_or(0, |t| t.as_secs())
+                    .saturating_sub(p.received_ms / 1000);
                 println!(
                     "{}) {} ({}m {}s old) - approve: blazar agent approve {}",
                     i + 1,
@@ -3225,12 +3225,11 @@ async fn agent_cmd(cmd: AgentCmd) -> Result<()> {
 /// Read one line from the TTY (token prompts, gateway pickers). Empty
 /// input returns None - the caller teaches instead of looping.
 fn prompt_line(prompt: &str) -> Option<String> {
-    use std::io::{BufRead, IsTerminal};
+    use std::io::{BufRead, IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
         return None;
     }
     print!("{prompt}");
-    use std::io::Write;
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line).ok()?;
@@ -3344,7 +3343,7 @@ async fn join_cmd(
         })
         .await
     } else {
-        install_worker_unit(&d, &base, &worker_id, token.as_deref()).await
+        install_worker_unit(&d, &base, &worker_id, token.as_deref())
     }
 }
 
@@ -3369,14 +3368,14 @@ fn pick_from_list(title: &str, items: &[&str]) -> Option<String> {
 /// commands - onboarding never hard-fails at the last mile.
 /// Unit text for the `blazar-worker` systemd user unit. Kept pure so the
 /// security posture is pinnable: gateway is pinned via `--join`, the token
-/// NEVER appears here (it rides the 0600 EnvironmentFile).
+/// NEVER appears here (it rides the 0600 `EnvironmentFile`).
 fn worker_unit_text(exe: &str, base: &str, worker_id: &str, env_line: &str) -> String {
     format!(
         "[Unit]\nDescription=blazar RPC fleet worker (gateway {base})\n\n[Service]\nExecStart={exe} rpc worker --join {base} --name {worker_id}\n{env_line}Restart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n"
     )
 }
 
-async fn install_worker_unit(
+fn install_worker_unit(
     d: &blazar_core::BlazarDirs,
     base: &str,
     worker_id: &str,
@@ -3409,13 +3408,11 @@ async fn install_worker_unit(
     let enabled = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
         && std::process::Command::new("systemctl")
             .args(["--user", "enable", "--now", "blazar-worker.service"])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
     if enabled {
         println!(
             "worker installed as a systemd user unit - follow with\n  journalctl --user -u blazar-worker -f"
@@ -3556,7 +3553,7 @@ async fn send_invite(
     stream.shutdown().await?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await?;
-    Ok(serde_json::from_slice(&raw).map_err(|e| anyhow!("bad agent reply: {e}"))?)
+    serde_json::from_slice(&raw).map_err(|e| anyhow!("bad agent reply: {e}"))
 }
 
 /// Resolve which shutdown signal ended the foreground worker run, as
@@ -7410,6 +7407,7 @@ fn sdcpp_skip_note(t: &blazar_runtime::engine::SdcppChannelTarget) -> Option<Str
 /// so the wording is unit-pinnable without network. "Update
 /// available" only ever names a tag this host can actually install.
 fn sdcpp_currency_check(active: &str, t: &blazar_runtime::engine::SdcppChannelTarget) -> Check {
+    use std::fmt::Write as _;
     let note = sdcpp_skip_note(t);
     match &t.installable_tag {
         Some(tag) if sdcpp_counter_newer(active, tag) => {
@@ -7418,14 +7416,14 @@ fn sdcpp_currency_check(active: &str, t: &blazar_runtime::engine::SdcppChannelTa
                  blazar engine update --kind sdcpp"
             );
             if let Some(n) = note {
-                detail.push_str(&format!(" ({n})"));
+                let _ = write!(detail, " ({n})");
             }
             Check::warn("engine currency", detail)
         }
         Some(_) => {
             let mut detail = format!("up to date ({active}, sdcpp - newest host-installable)");
             if let Some(n) = note {
-                detail.push_str(&format!("; {n}"));
+                let _ = write!(detail, "; {n}");
             }
             Check::ok("engine currency", detail)
         }
@@ -8947,7 +8945,7 @@ async fn serve() -> Result<()> {
     }
     let state = Arc::new(blazar_gateway::state::AppState::new(
         d.clone(),
-        cfg.clone(),
+        &cfg,
         sup.clone(),
         bus,
     ));
@@ -17294,7 +17292,7 @@ fn section_leaf_names(section: &str) -> Vec<String> {
 /// parse). `model_overrides` is a map of per-model tables, so the
 /// struct-section probes above cannot discover these names - the
 /// section probe would scrape serde type words instead (live finding
-/// 2026-11-04: "leaves: struct, ModelOverride").
+/// 2026-11-04: "leaves: struct, `ModelOverride`").
 fn override_leaf_names() -> Vec<String> {
     let probe = "[model_overrides.m]\nzzz_probe_leaf = 0\n";
     if let Err(err) = toml::from_str::<Config>(probe) {
@@ -18487,7 +18485,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             }
         }
         EngineCmd::Offers { arch, json } => engine_offers(arch.as_deref(), json).await?,
-        EngineCmd::Delta { tag, json } => engine_delta(&d, tag.as_deref(), json).await?,
+        EngineCmd::Delta { tag, json } => engine_delta(&d, tag.as_deref(), json)?,
     }
     Ok(())
 }
@@ -18604,17 +18602,17 @@ async fn engine_update_mistralrs(d: &BlazarDirs, tag: Option<String>, check: boo
 /// (pins are the escape hatch), but the likely libc loader failure is
 /// better said before the download.
 async fn warn_sdcpp_pin_gate(mgr: &EngineManager, pin: &str) {
-    if let Ok(warnings) = mgr.sdcpp_pin_gate_warnings(pin).await {
-        if !warnings.is_empty() {
-            println!(
-                "{}",
-                warn_line(&format!(
-                    "pinning {pin} anyway: {} - the install may fail with a libc \
+    if let Ok(warnings) = mgr.sdcpp_pin_gate_warnings(pin).await
+        && !warnings.is_empty()
+    {
+        println!(
+            "{}",
+            warn_line(&format!(
+                "pinning {pin} anyway: {} - the install may fail with a libc \
                      loader error",
-                    warnings.join("; ")
-                ))
-            );
-        }
+                warnings.join("; ")
+            ))
+        );
     }
 }
 
@@ -18663,6 +18661,8 @@ async fn engine_install_sdcpp(d: &BlazarDirs, tag: Option<String>) -> Result<()>
 /// `master-NNN-<sha8>` release when one exists; an explicit tag
 /// force-installs it. sd.cpp cuts no semver - the tag counter is the
 /// ordering (see `sdtag_counter`). `--check` resolves and reports only.
+// resolve + install + report mirror the mistral.rs update lane
+#[allow(clippy::too_many_lines)]
 async fn engine_update_sdcpp(d: &BlazarDirs, tag: Option<String>, check: bool) -> Result<()> {
     let store = Store::open(d)?;
     let Some(installed) = newest_sdcpp_tag(&store)? else {
@@ -20060,54 +20060,53 @@ fn manifest_sets_diff(
 /// `blazar engine delta [TAG]` - post-update absorption checklist.
 /// Read-only: picks two installed llama.cpp rows (newer vs newest
 /// other), diffs their mined manifests, prints what the update brought.
-async fn engine_delta(d: &BlazarDirs, tag: Option<&str>, json: bool) -> Result<()> {
+// two-row pick + manifest diff print as one report
+#[allow(clippy::too_many_lines)]
+fn engine_delta(d: &BlazarDirs, tag: Option<&str>, json: bool) -> Result<()> {
     let store = Store::open(d)?;
     let llama_rows: Vec<_> = store
         .list_engines()?
         .into_iter()
         .filter(|e| e.kind == EngineKind::LlamaCpp)
         .collect();
-    let (new_row, old_row) = match tag {
-        Some(want) => {
-            let Some(new_row) = llama_rows.iter().find(|e| e.tag == want) else {
-                // A tag that exists on another lane gets the kind
-                // teaching, not "unknown" - both are honest, one saves
-                // the user a listing round-trip.
-                if let Some(other) = store.list_engines()?.iter().find(|e| e.tag == want) {
-                    return Err(anyhow!(
-                        "delta compares llama.cpp lanes - {want} is a {} engine",
-                        other.kind.as_str()
-                    ));
-                }
+    let (new_row, old_row) = if let Some(want) = tag {
+        let Some(new_row) = llama_rows.iter().find(|e| e.tag == want) else {
+            // A tag that exists on another lane gets the kind
+            // teaching, not "unknown" - both are honest, one saves
+            // the user a listing round-trip.
+            if let Some(other) = store.list_engines()?.iter().find(|e| e.tag == want) {
                 return Err(anyhow!(
-                    "unknown engine tag {want:?}; blazar engine list shows installed tags"
-                ));
-            };
-            let Some(old_row) = llama_rows.iter().find(|e| e.tag != want) else {
-                return Err(anyhow!(
-                    "no previous llama.cpp build to compare against {want} - delta needs two installed llama.cpp rows"
-                ));
-            };
-            (new_row, old_row)
-        }
-        None => {
-            if llama_rows.len() < 2 {
-                return Err(anyhow!(
-                    "only one llama.cpp build installed - delta compares two installed llama.cpp rows (run blazar engine update first)"
+                    "delta compares llama.cpp lanes - {want} is a {} engine",
+                    other.kind.as_str()
                 ));
             }
-            // Newest-first listing: the active row is the natural "new"
-            // side; fall back to the newest row when the active lane is
-            // another engine kind.
-            let active = store.active_engine()?;
-            let new_row = active
-                .as_ref()
-                .filter(|a| a.kind == EngineKind::LlamaCpp)
-                .and_then(|a| llama_rows.iter().find(|e| e.tag == a.tag))
-                .unwrap_or(&llama_rows[0]);
-            let old_row = llama_rows.iter().find(|e| e.tag != new_row.tag).unwrap();
-            (new_row, old_row)
+            return Err(anyhow!(
+                "unknown engine tag {want:?}; blazar engine list shows installed tags"
+            ));
+        };
+        let Some(old_row) = llama_rows.iter().find(|e| e.tag != want) else {
+            return Err(anyhow!(
+                "no previous llama.cpp build to compare against {want} - delta needs two installed llama.cpp rows"
+            ));
+        };
+        (new_row, old_row)
+    } else {
+        if llama_rows.len() < 2 {
+            return Err(anyhow!(
+                "only one llama.cpp build installed - delta compares two installed llama.cpp rows (run blazar engine update first)"
+            ));
         }
+        // Newest-first listing: the active row is the natural "new"
+        // side; fall back to the newest row when the active lane is
+        // another engine kind.
+        let active = store.active_engine()?;
+        let new_row = active
+            .as_ref()
+            .filter(|a| a.kind == EngineKind::LlamaCpp)
+            .and_then(|a| llama_rows.iter().find(|e| e.tag == a.tag))
+            .unwrap_or(&llama_rows[0]);
+        let old_row = llama_rows.iter().find(|e| e.tag != new_row.tag).unwrap();
+        (new_row, old_row)
     };
     let parse = |row: &blazar_core::store::EngineRow| {
         serde_json::from_str::<blazar_runtime::Manifest>(&row.manifest).map_err(|_| {
@@ -20151,10 +20150,11 @@ async fn engine_delta(d: &BlazarDirs, tag: Option<&str>, json: bool) -> Result<(
     );
     println!(
         "  + {}",
-        list(&diff.added_arches)
-            .is_empty()
-            .then(|| "(none)".to_string())
-            .unwrap_or_else(|| list(&diff.added_arches))
+        if list(&diff.added_arches).is_empty() {
+            "(none)".to_string()
+        } else {
+            list(&diff.added_arches)
+        }
     );
     if !diff.dropped_arches.is_empty() {
         println!("  - {}", list(&diff.dropped_arches));
@@ -20162,18 +20162,20 @@ async fn engine_delta(d: &BlazarDirs, tag: Option<&str>, json: bool) -> Result<(
     println!("new flags      +{}", diff.added_flags.len());
     println!(
         "  + {}",
-        list(&diff.added_flags)
-            .is_empty()
-            .then(|| "(none)".to_string())
-            .unwrap_or_else(|| list(&diff.added_flags))
+        if list(&diff.added_flags).is_empty() {
+            "(none)".to_string()
+        } else {
+            list(&diff.added_flags)
+        }
     );
     println!("spec types     +{}", diff.added_spec.len());
     println!(
         "  + {}",
-        list(&diff.added_spec)
-            .is_empty()
-            .then(|| "(none)".to_string())
-            .unwrap_or_else(|| list(&diff.added_spec))
+        if list(&diff.added_spec).is_empty() {
+            "(none)".to_string()
+        } else {
+            list(&diff.added_spec)
+        }
     );
     Ok(())
 }
@@ -20186,10 +20188,11 @@ mod download_limit_tests {
     #[test]
     fn unit__effective_download_limit__flag_wins_validates_and_falls_back() {
         // one-shot flag overrides the config knob, 0 meaning unlimited
-        assert_eq!(effective_download_limit(Some(0.0), 12.5).unwrap(), 0.0);
-        assert_eq!(effective_download_limit(Some(3.0), 12.5).unwrap(), 3.0);
+        let eps = 1e-9_f64;
+        assert!(effective_download_limit(Some(0.0), 12.5).unwrap().abs() < eps);
+        assert!((effective_download_limit(Some(3.0), 12.5).unwrap() - 3.0).abs() < eps);
         // no flag = the config.toml value passes through untouched
-        assert_eq!(effective_download_limit(None, 12.5).unwrap(), 12.5);
+        assert!((effective_download_limit(None, 12.5).unwrap() - 12.5).abs() < eps);
         // same finite-and-nonnegative contract as the config knob
         let err = effective_download_limit(Some(-1.0), 12.5).unwrap_err();
         assert!(err.contains("0 = unlimited"), "{err}");
@@ -20203,14 +20206,18 @@ mod engine_delta_tests {
 
     fn manifest(arches: &[&str], flags: &[&str], spec: &[&str]) -> blazar_runtime::Manifest {
         blazar_runtime::Manifest {
-            architectures: arches.iter().map(|s| s.to_string()).collect(),
-            flags: flags.iter().map(|s| s.to_string()).collect(),
-            spec_types: spec.iter().map(|s| s.to_string()).collect(),
+            architectures: arches
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            flags: flags.iter().map(std::string::ToString::to_string).collect(),
+            spec_types: spec.iter().map(std::string::ToString::to_string).collect(),
             ..Default::default()
         }
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__manifest_sets_diff__added_dropped_and_empty_sides() {
         let old = manifest(&["llama", "qwen3", "gpt-oss"], &["--ctx-size"], &["draft"]);
         let new = manifest(
@@ -20226,6 +20233,7 @@ mod engine_delta_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__manifest_sets_diff__identical_manifests_diff_nothing() {
         let m = manifest(&["llama"], &["--ctx-size"], &["draft"]);
         let d = manifest_sets_diff(&m, &m);
@@ -23375,10 +23383,8 @@ async fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 return Err(anyhow!("{msg}"));
             }
             let applied = v.get("applied").and_then(serde_json::Value::as_bool);
-            match applied {
-                Some(false) => println!("config unchanged since the last apply - nothing to do"),
-                Some(true) => {}
-                None => {}
+            if let Some(false) = applied {
+                println!("config unchanged since the last apply - nothing to do");
             }
             if let Some(note) = v.get("note").and_then(serde_json::Value::as_str) {
                 println!("{note}");
@@ -23552,7 +23558,10 @@ mod tests {
         blazar_runtime::engine::SdcppChannelTarget {
             newest_tag: newest.to_string(),
             installable_tag: installable.map(str::to_string),
-            skipped: skipped.iter().map(|s| s.to_string()).collect(),
+            skipped: skipped
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
         }
     }
 

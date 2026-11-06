@@ -3,8 +3,8 @@
 //!
 //! Composition over duplication: each target is either a local model or
 //! a `[[remotes]]` entry, so chains reuse the existing serving and
-//! forwarding lanes verbatim (the chain resolves to a plain model string
-//! - `model` for local hops, `remote:model` for remote hops - and the
+//! forwarding lanes verbatim (the chain resolves to a plain model string -
+//! `model` for local hops, `remote:model` for remote hops - and the
 //! lanes route it exactly as a direct request would). No new forwarding
 //! code, one escalation loop per lane.
 //!
