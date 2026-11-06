@@ -13976,7 +13976,7 @@ def phase_wave13() -> None:
     reg(
         "optimize.run",
         ok_run,
-        "rc={0} verdict={1}{2}".format(
+        "rc={} verdict={}{}".format(
             pr.returncode,
             "VERIFIED"
             if "VERIFIED" in out_r
@@ -14476,7 +14476,7 @@ def _fleet_udp_seek(port: int, timeout_s: float = 1.0) -> dict | None:
         s.sendto(b"BLAZAR_DISCOVER_V1", ("127.0.0.1", port))
         data, _ = s.recvfrom(512)
         return json.loads(data.decode())
-    except (socket.timeout, OSError, ValueError):
+    except (TimeoutError, OSError, ValueError):
         return None
     finally:
         s.close()
@@ -14570,7 +14570,7 @@ def phase_fleet() -> None:
         {"worker_id": "val-harness", "token": wt},
         {"x-blazar-fleet-token": wt},
     )
-    st3, _, v = http_json("GET", "/api/fleet/workers")
+    _st3, _, v = http_json("GET", "/api/fleet/workers")
     names = (
         [w.get("worker_id") for w in v.get("workers", [])]
         if isinstance(v, dict)
@@ -14676,7 +14676,8 @@ def phase_fleet() -> None:
     )
 
     cfg_path = os.path.join(SANDBOX.config_dir, "config.toml")
-    valid_cfg = open(cfg_path).read()
+    with open(cfg_path) as f:
+        valid_cfg = f.read()
     with open(cfg_path, "w") as f:
         f.write("%%% not toml %%%\n")
     st, _, body = http_json("POST", "/api/config/reload")

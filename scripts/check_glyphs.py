@@ -70,10 +70,13 @@ TIER2_CODEPOINTS = frozenset(
         0x2260,
         0x2261,
         0x00B1,
+        # arrows (2190-21FF) and math operators (2200-22FF) covered as
+        # ranges below; smart quotes join the explicit set
+        0x2018,
+        0x2019,
+        0x201C,
+        0x201D,
     ]
-    # arrows (2190-21FF) and math operators (2200-22FF) covered as
-    # ranges below; smart quotes join the explicit set
-    + [0x2018, 0x2019, 0x201C, 0x201D]
 )
 TIER2_RANGES = ((0x2190, 0x21FF), (0x2200, 0x22FF))
 EXEMPT_CODEPOINTS = frozenset((0x2713, 0x2717, 0x2705))
@@ -190,38 +193,53 @@ def main() -> int:
         diff_text = ""
         if os.environ.get("GITHUB_SHA"):
             base = subprocess.run(
-                ["git", "rev-parse", "--verify", "-q", "origin/main"],
+                check=False,
+                args=[
+                    "git",
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    "origin/main",
+                ],
                 capture_output=True,
                 text=True,
             ).stdout.strip()
             if base:
                 merge_base = subprocess.run(
-                    ["git", "merge-base", base, "HEAD"],
+                    check=False,
+                    args=["git", "merge-base", base, "HEAD"],
                     capture_output=True,
                     text=True,
                 ).stdout.strip()
                 if merge_base:
                     diff_text = subprocess.run(
-                        ["git", "diff", f"{merge_base}..HEAD"],
+                        check=False,
+                        args=["git", "diff", f"{merge_base}..HEAD"],
                         capture_output=True,
                         text=True,
                     ).stdout
         else:
             staged = subprocess.run(
-                ["git", "diff", "--cached"], capture_output=True, text=True
+                ["git", "diff", "--cached"], capture_output=True, text=True, check=False
             ).stdout
             if staged:
                 diff_text = staged
             else:
                 diff_text = subprocess.run(
-                    ["git", "diff"], capture_output=True, text=True
+                    ["git", "diff"], capture_output=True, text=True, check=False
                 ).stdout
         for path, lines in added_lines_from_diff(diff_text).items():
             if looks_binary(path):
                 continue
             findings.extend(scan_text_lines(path, lines, True))
         untracked = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
+            check=False,
+            args=[
+                "git",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+            ],
             capture_output=True,
             text=True,
         ).stdout.splitlines()

@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import csv
 import json
+import math
 import os
 import sqlite3
-import math
 import statistics
 import struct
 import subprocess
@@ -91,7 +92,7 @@ def pct(samples: list[float], p: float) -> float:
     if not samples:
         return float("nan")
     s = sorted(samples)
-    k = min(len(s) - 1, max(0, int(round((p / 100.0) * (len(s) - 1)))))
+    k = min(len(s) - 1, max(0, round((p / 100.0) * (len(s) - 1))))
     return s[k]
 
 
@@ -164,7 +165,8 @@ class VramSampler(threading.Thread):
         while not self._halt.is_set():
             try:
                 out = subprocess.run(
-                    [
+                    check=False,
+                    args=[
                         "nvidia-smi",
                         "--query-gpu=memory.used",
                         "--format=csv,noheader,nounits",
@@ -222,10 +224,8 @@ class Child:
             self.proc.terminate()
             self.proc.wait(timeout=10)
         except Exception:
-            try:
+            with contextlib.suppress(Exception):
                 self.proc.kill()
-            except Exception:
-                pass
 
 
 def spawn_child(
@@ -241,10 +241,10 @@ def spawn_child(
     log_path = os.path.join(log_dir, f"child-{port}.log")
     env = dict(os.environ)
     env.update(env_extra)
-    log = open(log_path, "wb")
-    proc = subprocess.Popen(
-        argv, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
-    )
+    with open(log_path, "wb") as log:
+        proc = subprocess.Popen(
+            argv, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        )
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -300,11 +300,11 @@ def environment_block(gateway: str, store_path: str, note: str) -> dict:
         "gateway": gateway,
         "note": note,
         "kernel": subprocess.run(
-            ["uname", "-sr"], capture_output=True, text=True
+            ["uname", "-sr"], capture_output=True, text=True, check=False
         ).stdout.strip(),
     }
     try:
-        st, ver, _, _ = http_json(f"{gateway}/api/version", timeout=10)
+        _st, ver, _, _ = http_json(f"{gateway}/api/version", timeout=10)
         env["gateway_version"] = str(ver)[:200]
     except Exception:
         env["gateway_version"] = "unreachable"
@@ -312,7 +312,8 @@ def environment_block(gateway: str, store_path: str, note: str) -> dict:
     env["active_llamacpp_engine"] = tag or "unknown"
     try:
         q = subprocess.run(
-            [
+            check=False,
+            args=[
                 "nvidia-smi",
                 "--query-gpu=name,driver_version,memory.total",
                 "--format=csv,noheader",
@@ -693,7 +694,7 @@ def lane_speech_direct(args, rc: Receipts, env: dict) -> None:
         rows = []
         for c in [int(x) for x in args.conc.split(",")]:
             m = run_ladder(one, c, args.reps)
-            st2, raw2, _, _ = http_json(
+            _st2, raw2, _, _ = http_json(
                 f"http://127.0.0.1:{port}/tts", {"input": text}, timeout=args.timeout
             )
             audio_s = (
@@ -736,7 +737,7 @@ IMAGE_CSV = ["mode", "rep", "wall_s", "bytes", "valid_png", "vram_watermark_mib"
 
 def _sd_argv(row: dict, engines_root: str, port: int) -> tuple[list[str], str]:
     """Build a direct sd-server argv from the store row: the row IS the contract."""
-    eng_dir, bin_path = find_binary(
+    _, bin_path = find_binary(
         engines_root, "master-1", ["sd-server", "sdcpp-server"]
     )
     argv = [
@@ -768,15 +769,13 @@ def lane_image(args, rc: Receipts, env: dict) -> None:
     )  # warmup boot
     rows = []
     for rep in range(args.reps):
-        st, resp, wall, raw = http_json(
+        st, resp, wall, _raw = http_json(
             f"{args.gateway}/v1/images/generations", body, timeout=args.timeout
         )
         b64 = ""
         if st == 200 and isinstance(resp, dict):
-            try:
+            with contextlib.suppress(Exception):
                 b64 = resp["data"][0].get("b64_json", "")
-            except Exception:
-                pass
         png = base64.b64decode(b64) if b64 else b""
         valid = png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 1000
         rows.append(
@@ -862,7 +861,7 @@ def lane_image_direct(args, rc: Receipts, env: dict) -> None:
         direct_call(f"{base}/v1/images/generations", body, timeout=args.timeout)
         rows = []
         for rep in range(args.reps):
-            st, resp, wall, raw, dropped = direct_call(
+            _st, resp, wall, _raw, dropped = direct_call(
                 f"{base}/v1/images/generations", body, timeout=args.timeout
             )
             b64 = resp["data"][0].get("b64_json", "") if isinstance(resp, dict) else ""
@@ -917,15 +916,13 @@ def lane_video(args, rc: Receipts, env: dict) -> None:
     http_json(f"{args.gateway}/v1/videos/generations", body, timeout=args.timeout)
     rows = []
     for rep in range(args.reps):
-        st, resp, wall, raw = http_json(
+        st, resp, wall, _raw = http_json(
             f"{args.gateway}/v1/videos/generations", body, timeout=args.timeout
         )
         b64 = ""
         if st == 200 and isinstance(resp, dict):
-            try:
+            with contextlib.suppress(Exception):
                 b64 = resp["data"][0].get("b64_json", "")
-            except Exception:
-                pass
         webm = base64.b64decode(b64) if b64 else b""
         valid = webm[:4] == b"\x1a\x45\xdf\xa3" and len(webm) > 1000
         rows.append(
