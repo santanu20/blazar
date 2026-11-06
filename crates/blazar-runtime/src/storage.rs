@@ -35,9 +35,7 @@ pub const PART_MIN_AGE_SECS: u64 = 24 * 60 * 60;
 #[must_use]
 pub fn disk_free_bytes(path: &Path) -> Option<u64> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    // sysinfo 0.40 made the mount-table read fallible; an unreadable
-    // table is the same "unknown" as no matching mount.
-    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
     let mut best: Option<(&Path, u64)> = None;
     for disk in &disks {
         let mount = disk.mount_point();
@@ -55,7 +53,7 @@ pub fn disk_free_bytes(path: &Path) -> Option<u64> {
 #[must_use]
 pub fn disk_total_bytes(path: &Path) -> Option<u64> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
     let mut best: Option<(&Path, u64)> = None;
     for disk in &disks {
         let mount = disk.mount_point();

@@ -196,12 +196,11 @@ fn drain_pipe(mut pipe: impl Read) -> Vec<u8> {
 /// Live `MemAvailable` (MiB). The spawn-time memory guard: below a hard
 /// floor the mmap streaming engine will thrash swap for minutes - fail
 /// the load with a named error instead (the validate.py heuristic,
-/// tightened to a zero-false-positive floor). `None` when the platform
-/// refuses a memory snapshot (sysinfo made construction fallible in
-/// 0.40); the guard then logs and stands down rather than guessing.
+/// tightened to a zero-false-positive floor). `None` when no snapshot is
+/// available; the guard then logs and stands down rather than guessing.
 #[must_use]
 pub fn mem_available_mib() -> Option<u64> {
-    let mut sys = sysinfo::System::new().ok()?;
+    let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     Some(sys.available_memory() / (1024 * 1024))
 }
@@ -406,20 +405,9 @@ pub fn nvidia_free_vram_mib() -> Option<u64> {
 /// LIVE `--list-devices` census (see `engine::manifest::run_list_devices`).
 #[must_use]
 pub fn hardware_with(gpus: Vec<GpuInfo>) -> Hardware {
-    // Census must degrade, not die: a refused snapshot still answers with
-    // the conservative defaults here (sysinfo 0.40 made construction
-    // fallible, so there is no empty System to fall back to).
-    let mut sys = match sysinfo::System::new() {
-        Ok(sys) => sys,
-        Err(err) => {
-            tracing::warn!("hardware census degraded: sysinfo snapshot failed: {err}");
-            return Hardware {
-                physical_cores: 1,
-                total_ram_mib: 0,
-                gpus,
-            };
-        }
-    };
+    // Census must degrade, not die: conservative defaults below whenever a
+    // counter cannot be read (core count is already Option-shaped).
+    let mut sys = sysinfo::System::new();
     sys.refresh_cpu_usage();
     sys.refresh_memory();
     // Associated function since sysinfo 0.34 (no receiver needed).
