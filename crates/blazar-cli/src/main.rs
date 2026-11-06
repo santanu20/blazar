@@ -23684,7 +23684,7 @@ mod tests {
 
     #[test]
     fn unit__worker_unit_text__pins_gateway_and_keeps_token_out() {
-        let env_line = "EnvironmentFile=/home/x/.config/blazar/worker.env\n";
+        let env_line = "EnvironmentFile=/home/other/.config/blazar/worker.env\n";
         let text = worker_unit_text(
             "/usr/local/bin/blazar",
             "http://192.168.1.10:11435",
@@ -23693,7 +23693,7 @@ mod tests {
         );
         assert!(text.contains("ExecStart=/usr/local/bin/blazar rpc worker --join http://192.168.1.10:11435 --name donor-1"));
         assert!(text.contains("Restart=always"));
-        assert!(text.contains("EnvironmentFile=/home/x/.config/blazar/worker.env"));
+        assert!(text.contains("EnvironmentFile=/home/other/.config/blazar/worker.env"));
         // Security posture: the token itself never appears in the unit
         // (it rides the 0600 env file) - checked with a sentinel secret.
         assert!(!text.contains("BLAZAR_FLEET_TOKEN="));

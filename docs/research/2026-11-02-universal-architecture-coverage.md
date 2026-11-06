@@ -407,17 +407,18 @@ is closed except the two upstream-bound verdicts:
 Sandbox daemon (worktree code, isolated store):
 
     cd <repo>
-    CARGO_TARGET_DIR=/tmp/opencode/blazar-sbx-tgt cargo build --workspace
+    CARGO_TARGET_DIR=$SCRATCH/blazar-sbx-tgt cargo build --workspace
     # XDG skeleton: symlink models/, engines/ into $XDG_DATA_HOME/blazar/,
+    # $SCRATCH = any disposable working dir (scratch checkout / probe space)
     # real dirs for run/ sessions/ speccache/ voices/, python sqlite3 .backup
     # of store.db/blazar.db/models.db, port patched to 11599
-    XDG_CONFIG_HOME=/tmp/opencode/blazar-sbx/config \
-    XDG_DATA_HOME=/tmp/opencode/blazar-sbx/data \
-      /tmp/opencode/blazar-sbx-tgt/debug/blazar serve
+    XDG_CONFIG_HOME=$SCRATCH/blazar-sbx/config \
+    XDG_DATA_HOME=$SCRATCH/blazar-sbx/data \
+      $SCRATCH/blazar-sbx-tgt/debug/blazar serve
 
 TTS engine capability (standalone child, CPU):
 
-    cd /tmp/opencode/blazar-tts-probe   # ggml-org Qwen3-TTS-1.7B-Base Q4_K_M + mmproj Q8_0
+    cd $SCRATCH/blazar-tts-probe   # ggml-org Qwen3-TTS-1.7B-Base Q4_K_M + mmproj Q8_0
     LD_LIBRARY_PATH=<engines>/b12020-cuda/llama-b12020 llama-server \
       -m qwen3-tts-1.7b-base-Q4_K_M.gguf --mmproj mmproj-qwen3-tts-Q8_0.gguf \
       --port 18234 -ngl 0 -c 4096

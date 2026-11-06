@@ -21,9 +21,11 @@ set -u
 # Each allowlisted hit must carry a functional justification:
 # - /home/other (manifest.rs): invented-user fixture proving that a
 #   manifest recorded on a foreign machine re-roots onto this install.
+# - /home/other (blazar-cli main.rs, worker.env): invented-user fixture
+#   proving the 0600 systemd EnvironmentFile line rides the unit verbatim.
 # - /home/other (blazar-cli main.rs): invented-user fixture proving the
 #   list rendering never truncates long foreign model paths.
-ALLOWLIST='crates/blazar-runtime/src/engine/manifest\.rs:[0-9]*:.*"/home/other/\.local/share/blazar.*|crates/blazar-cli/src/main\.rs:[0-9]*:.*"/home/other/\.local/share/blazar.*'
+ALLOWLIST='crates/blazar-runtime/src/engine/manifest\.rs:[0-9]*:.*"/home/other/\.local/share/blazar.*|crates/blazar-cli/src/main\.rs:[0-9]*:.*"/home/other/\.local/share/blazar.*|crates/blazar-cli/src/main\.rs:[0-9]*:.*EnvironmentFile=/home/other/\.config/blazar/worker\.env.*'
 
 # Machine-specific absolute paths: real home dirs and agent scratch
 # areas. Functionally-required system prefixes (/usr/local/bin,
