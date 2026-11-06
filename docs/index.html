@@ -8,7 +8,7 @@ permalink: /
 <section class="hero">
   <div class="hero-inner">
     <div>
-      <span class="hero-eyebrow">v0.29.0 · one Rust binary · Apache-2.0 / MIT</span>
+      <span class="hero-eyebrow">v0.29.0 | one Rust binary | Apache-2.0 / MIT</span>
       <h1>The control plane for <span class="grad">local AI inference</span>.</h1>
       <p class="hero-lede">
         Unified APIs. Intelligent routing. Resource-aware scheduling. Multi-engine serving.
@@ -52,7 +52,7 @@ permalink: /
 <span class="p">$</span> blazar pull qwen3-0.6b         <span class="c"># registry shortname</span>
 <span class="p">$</span> blazar serve                   <span class="c"># gateway on http://127.0.0.1:11435</span>
 <span class="p">$</span> blazar run qwen3-0.6b          <span class="c"># interactive REPL</span>
-<span class="o">blazar 0.29.0 — powered by upstream llama.cpp, mistral.rs and SGLang</span></pre>
+<span class="o">blazar 0.29.0 - powered by upstream llama.cpp, mistral.rs and SGLang</span></pre>
   </div>
   <p class="hero-meta" style="margin-top:14px">
     also available: <code>cargo install blazar</code> ·
@@ -89,7 +89,7 @@ permalink: /
     <div class="card">
       <div class="glyph"><svg viewBox="0 0 24 24"><path d="M4 17l6-6 4 4 6-8"/><path d="M14 7h6v6"/></svg></div>
       <h3>Multimodal in one place</h3>
-      <p>Image generation and upscaling, streaming transcription with Silero VAD, text-to-speech — same gateway, same API surface, same diagnostics.</p>
+      <p>Image generation and upscaling, CLIP/SigLIP image embeddings, streaming transcription with Silero VAD, text-to-speech - same gateway, same API surface, same diagnostics.</p>
     </div>
     <div class="card">
       <div class="glyph"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/><circle cx="19" cy="19" r="2.5"/></svg></div>
@@ -105,7 +105,7 @@ permalink: /
     <p>Blazar never bundles engines — it manages official upstream builds, picks the right lane per model, and upgrades them independently.</p>
   </div>
   <div class="engine-strip">
-    <div class="engine-pill"><b>llama.cpp</b><span>GGUF text + embeddings</span></div>
+    <div class="engine-pill"><b>llama.cpp</b><span>GGUF text + embeddings + speech</span></div>
     <div class="engine-pill"><b>mistral.rs</b><span>GGUF + safetensors serving</span></div>
     <div class="engine-pill"><b>SGLang</b><span>quantized safetensors</span></div>
     <div class="engine-pill"><b>MLX-LM</b><span>Apple-Silicon + CUDA</span></div>

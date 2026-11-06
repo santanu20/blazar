@@ -80,7 +80,7 @@ The engines still perform inference. **Blazar is the control plane around them**
 | Models managed like software | Pull, import, inspect, pin, tune, snapshot, restore |
 | Several machines as one pool | Capacity-aware federation: warm, replicate, route |
 | Other laptops' GPUs joining yours | Opt-in cluster: `blazar init` on the gateway, `blazar join` (or consent-based `agent run` + `adopt` with one-use invite codes) on donors - their VRAM lands in spawn planning behind one API, discovery over the LAN, no addresses typed |
-| Multimodal in one place | Text, embeddings, image (variations, upscale), video (Sora verbs), speech-to-text (word timestamps), TTS (wav/pcm + ffmpeg lossy), realtime voice |
+| Multimodal in one place | Text, embeddings, image (variations, upscale), image embeddings (CLIP/SigLIP in-process lane), video (Sora verbs), speech-to-text (word timestamps), TTS (piper + engine voice packs, wav/pcm + ffmpeg lossy), realtime voice |
 | Production controls, locally | API keys, TLS, CORS, audit logging, PII scrubbing, OTLP |
 
 ---
@@ -366,6 +366,7 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | Observe -> recommend per model | `blazar autopilot`, `blazar autopilot --apply` |
 | Pull / import models | `blazar pull <target>`, `blazar import <file> --name <name>` |
 | Reuse models from other runtimes | `blazar import --scan` (lists ollama / HF cache / LM Studio models; `blazar pull` links them byte-verified, no re-download) |
+| Cap a pull's bandwidth | `blazar pull <model> --max-download-mbps 25` | per-invocation cap shared across all connections (`0` = unlimited; beats the `download_speed_limit_mb` config) |
 | Inspect models | `blazar list`, `blazar show <model>`, `blazar ps` |
 | Stop / remove | `blazar stop` (daemon), `blazar rm <model>` |
 | Quantize / attach projector | `blazar quantize <model> <out-quant>`, `blazar mmproj <model> <mmproj.gguf path>` |
@@ -376,7 +377,7 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | Certify capabilities | `blazar model-doctor <model>` |
 | Check health / heal | `blazar doctor`, `blazar doctor --fix`, `blazar why`, `blazar watch` |
 | Preview fit / co-residency | `blazar fit <target>`, `blazar coreside` |
-| Manage engines | `blazar engine update / list / use / rollback / install / build / prune` |
+| Manage engines | `blazar engine update / list / use / rollback / install / build / prune / delta` |
 | Federate | `blazar warm`, `blazar replicate`, `blazar route` |
 | Sessions / LoRA | `blazar session save/restore`, `blazar lora add/rm/list` |
 | Audio | `blazar whisper <file>`, `blazar tts "<text>"` |
