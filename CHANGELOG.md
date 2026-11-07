@@ -6,6 +6,10 @@ tracked here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **sysinfo rides 0.40 again - the glibc floor was a feature problem, not a version problem.** The 0.39 pin existed because sysinfo 0.40 calls `statx` (glibc >= 2.28), which the aarch64-linux-gnu release lane's cross image (glibc 2.23 baseline) cannot link. Root cause: that `statx` ref lives in sysinfo's `gpu` feature - a default feature Blazar never asked for (it reads only the memory/cpu snapshot and the mount table). The dependency is now declared `default-features = false, features = ["system", "disk"]`, the pin is gone, and the call sites return to the honest 0.40 fallible shapes (memory guard and disk probes answer `None` on a refused snapshot, the hardware census degrades to conservative defaults with a warning). Link-floor proof before release: an `nm -u` audit of the feature-trimmed 0.40.1 aarch64 rlib shows zero `statx` refs and a plain-C undefined-symbol delta vs 0.39.6 of exactly `memcpy`, `open`, `openat`, `readlinkat` - all glibc-ancient - so the old-distro compatibility floor is preserved by construction, not by pin.
+
 ## [0.30.0] - 2026-11-06
 
 ### Added

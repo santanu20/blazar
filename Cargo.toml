@@ -55,11 +55,12 @@ toml = "1"
 thiserror = "2"
 anyhow = "1"
 rusqlite = { version = "0.41", features = ["bundled"] }
-# Pinned to 0.39: sysinfo 0.40 started calling statx (glibc >= 2.28), which the
-# aarch64-unknown-linux-gnu release lane's cross image (cross-rs 0.2.5, glibc
-# 2.23 baseline) cannot link. The pin keeps that artifact's old-distro compat
-# floor; bump only alongside a release toolchain with glibc >= 2.28.
-sysinfo = "=0.39.6"
+# Feature-trimmed: sysinfo's default features pull in `gpu`, whose device scan
+# calls statx (glibc >= 2.28) and breaks the aarch64-unknown-linux-gnu release
+# lane's cross image (cross-rs 0.2.5, glibc 2.23 baseline). Blazar reads only
+# the system memory/cpu snapshot and the mount table, so those two features
+# keep that artifact's old-distro compat floor while staying current.
+sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
 dirs = "7"
 rustyline = "19"
 indicatif = "0.18"
