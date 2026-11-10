@@ -45,16 +45,32 @@
     { "short_name": "flux-3-klein", "repo": "leejet/flux-3-image-klein-GGUF", "class": "diffusion" },
     { "short_name": "qwen-image-edit", "repo": "QuantStack/Qwen-Image-Edit-GGUF", "class": "diffusion" },
     { "short_name": "wan2.1-t2v", "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged", "class": "diffusion" },
-    { "short_name": "glm-ocr", "repo": "ggml-org/GLM-OCR-GGUF" },
+     {
+  "short_name": "glm-ocr",
+  "repo": "ggml-org/GLM-OCR-GGUF",
+  "chat_template": "glm-ocr.jinja"
+ },
     { "short_name": "clover-35b-a3b", "repo": "Diffuspace/Clover-35B-A3B-Preview-GGUF" },
     { "short_name": "embeddinggemma-2", "repo": "ggml-org/embeddinggemma-2-GGUF", "class": "embeddings" },
-    { "short_name": "siglip-base-patch16-224", "repo": "google/siglip-base-patch16-224", "class": "clip" }
+    { "short_name": "siglip-base-patch16-224", "repo": "google/siglip-base-patch16-224", "class": "clip" },
+    { "short_name": "glm-5.3", "repo": "unsloth/GLM-5.3-GGUF" },
+    { "short_name": "glm-5.3-flash", "repo": "unsloth/GLM-5.3-Flash-GGUF" },
+    { "short_name": "kimi-k3", "repo": "unsloth/Kimi-K3-GGUF" },
+    { "short_name": "deepseek-v4.1-flash", "repo": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF" },
+    { "short_name": "gemma-4-12b", "repo": "unsloth/gemma-4-12b-it-GGUF" },
+    { "short_name": "gemma-4-e4b", "repo": "unsloth/gemma-4-E4B-it-GGUF" },
+    { "short_name": "gemma-4-e2b", "repo": "unsloth/gemma-4-E2B-it-GGUF" },
+    { "short_name": "gemma-4-26b-a4b", "repo": "unsloth/gemma-4-26B-A4B-it-GGUF" },
+    { "short_name": "qwen3.8-27b", "repo": "z-lab/Qwen3.8-27B-DFlash2-GGUF" }
   ],
   "spec_pairs": [
     { "model_prefix": "qwen3-", "spec_type": "draft-simple", "draft_repo": "ggml-org/Qwen3-0.6B-GGUF:Q4_0" },
     { "model_prefix": "qwen3-8b", "spec_type": "draft-eagle3", "draft_repo": "williamliao/Qwen3-8B-EAGLE3-Speculator-GGUF:F16" },
     { "model_prefix": "qwen3-8b", "spec_type": "draft-dflash", "draft_repo": "ggml-org/Qwen3-8B-GGUF:dflash-Qwen3-8B-Q8_0.gguf" },
     { "model_prefix": "qwen3-8b", "spec_type": "draft-dspark", "draft_repo": "ggml-org/Qwen3-8B-GGUF:dspark-Qwen3-8B-Q8_0.gguf" },
-    { "model_prefix": "qwen3.5-9b", "spec_type": "draft-mtp", "draft_repo": "unsloth/Qwen3.5-9B-MTP-GGUF" }
+    { "model_prefix": "qwen3-8b", "spec_type": "draft-dspine", "draft_repo": "tencent/Qwen3-8B-DSpine-b16" },
+    { "model_prefix": "qwen3.5-9b", "spec_type": "draft-mtp", "draft_repo": "unsloth/Qwen3.5-9B-MTP-GGUF" },
+    { "model_prefix": "gpt-oss-120b", "spec_type": "draft-simple", "draft_repo": "ggml-org/gpt-oss-20b-GGUF" },
+    { "model_prefix": "gemma-4-12b", "spec_type": "draft-simple", "draft_repo": "unsloth/gemma-4-E2B-it-GGUF" }
   ]
 }

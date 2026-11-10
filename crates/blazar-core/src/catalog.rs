@@ -23,9 +23,17 @@ pub struct CatalogEntry {
     /// Modality class tag driving `blazar doctor`'s coverage census and
     /// per-class pull suggestions: embeddings | clip | speech | asr |
     /// diffusion. Absent = plain text LLM (the historical default, so
-    /// the 35 text entries stay untouched).
+    /// text entries stay untouched).
     #[serde(default)]
     pub class: Option<String>,
+    /// Official chat-template filename pinned for this model's GGUF
+    /// family, when the published GGUFs ship without one embedded
+    /// (live case: glm-ocr, upstream llama.cpp #31298 - default framing
+    /// can loop). Resolved through [`chat_template_source`], vendored
+    /// to the user's config dir at pull time, and suggested as an
+    /// explicit `[model_overrides.<name>] chat_template_file` pin.
+    #[serde(default)]
+    pub chat_template: Option<String>,
 }
 
 /// Speculative-decoding draft pairs: models matching `model_glob` (prefix
@@ -47,6 +55,18 @@ pub struct Catalog {
 }
 
 pub const CATALOG_JSON: &str = include_str!("catalog.json");
+
+/// Embedded catalog-pinned chat templates. One typed arm per pinned
+/// file: additions land consciously, with the content diffed against
+/// the vendor's canonical source at review time.
+#[must_use]
+pub fn chat_template_source(file: &str) -> Option<&'static str> {
+    match file {
+        "glm-ocr.jinja" => Some(include_str!("catalog-templates/glm-ocr.jinja")),
+        _ => None,
+    }
+}
+
 #[must_use]
 pub fn catalog() -> &'static Catalog {
     static CAT: LazyLock<Catalog> = LazyLock::new(|| {
@@ -131,6 +151,10 @@ pub fn pair_for_spec_mode(model: &str, spec_mode: &str) -> Option<&'static SpecP
         "eagle3" => spec_pair_for_typed(model, "draft-eagle3"),
         "dflash" => spec_pair_for_typed(model, "draft-dflash"),
         "dspark" => spec_pair_for_typed(model, "draft-dspark"),
+        // DSpine drafts are HF safetensors dirs (sglang-only lane);
+        // GGUF lanes refuse the mode with teaching at compile instead
+        // of consuming the pair.
+        "dspine" => spec_pair_for_typed(model, "draft-dspine"),
         // off/mtp/ngram never consume an external draft file.
         "off" | "mtp" | "ngram" | "ngram-map-k" | "ngram-map-k4v" | "ngram-mod" | "ngram-cache" => {
             None
@@ -254,6 +278,16 @@ mod tests {
         // catalog (mirrors the resolve_draft_path pins).
         assert!(pair_for_spec_mode("qwen3-8b", "auto").is_some());
         assert!(pair_for_spec_mode("qwen3-8b", "eagle3").is_some());
+        // Typed DSPINE pair resolves the tencent drafter, and only for
+        // the 8B prefix it is pinned to.
+        let dspine = pair_for_spec_mode("qwen3-8b", "dspine").expect("dspine pair for qwen3-8b");
+        assert_eq!(dspine.spec_type, "draft-dspine");
+        assert_eq!(dspine.draft_repo, "tencent/Qwen3-8B-DSpine-b16");
+        assert!(pair_for_spec_mode("m1", "dspine").is_none());
+        // dspine is typed: it must not leak into the generic auto pair
+        // (auto keeps resolving the draft-simple head for qwen3).
+        let auto = pair_for_spec_mode("qwen3-8b", "auto").expect("auto pair");
+        assert_eq!(auto.spec_type, "draft-simple");
         // File-less modes never consume an external draft - at any
         // model, regardless of catalog content.
         for mode in ["off", "mtp", "ngram", "ngram-map-k", "ngram-mod"] {
@@ -264,6 +298,18 @@ mod tests {
         }
         // Unknown model families have no pair under any file mode.
         assert!(pair_for_spec_mode("m1", "auto").is_none());
+        // 2026 families: ggml-org ships gpt-oss-20b as the speculative
+        // drafter for its 120B sibling, and gemma-4-e2b drafts the 12B.
+        // Both are draft-simple (plain same-family smaller model).
+        let oss = pair_for_spec_mode("gpt-oss-120b", "auto").expect("auto pair for gpt-oss-120b");
+        assert_eq!(oss.spec_type, "draft-simple");
+        assert_eq!(oss.draft_repo, "ggml-org/gpt-oss-20b-GGUF");
+        let g4 = pair_for_spec_mode("gemma-4-12b", "auto").expect("auto pair for gemma-4-12b");
+        assert_eq!(g4.spec_type, "draft-simple");
+        assert_eq!(g4.draft_repo, "unsloth/gemma-4-E2B-it-GGUF");
+        // The gpt-oss-20b entry itself is a plain pull target - no pair
+        // of its own (it IS the drafter).
+        assert!(pair_for_spec_mode("gpt-oss-20b", "auto").is_none());
     }
 
     #[test]
@@ -410,5 +456,27 @@ mod tests {
         assert_eq!(levenshtein("abc", "abc"), 0);
         assert_eq!(levenshtein("kitten", "sitting"), 3);
         assert_eq!(levenshtein("qwen3-0.5b", "qwen3-0.6b"), 1);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__chat_template_source__catalog_pins_resolve_and_unknown_refuses() {
+        let glm = resolve("glm-ocr").expect("glm-ocr cataloged");
+        let file = glm.chat_template.as_deref().expect("template pinned");
+        assert_eq!(file, "glm-ocr.jinja");
+        let body = chat_template_source(file).expect("pinned template embedded");
+        // The official zai-org GLM-OCR template opens with the GLM
+        // grounding prefix; anything else means the asset drifted.
+        assert!(body.starts_with("[gMASK]<sop>"), "{body:.60}");
+        // Unknown pins resolve to None: callers skip guidance rather
+        // than vendoring an empty file.
+        assert!(chat_template_source("nope.jinja").is_none());
+        // Entries without a pin stay untouched by the field's default.
+        assert!(
+            resolve("qwen3-8b")
+                .expect("qwen3-8b cataloged")
+                .chat_template
+                .is_none()
+        );
     }
 }
