@@ -231,60 +231,107 @@ pub fn read_hf_config(dir: &Path) -> CoreResult<HfMeta> {
     })
 }
 
-/// `quantization_config.quant_method` values the installed sglang lane
-/// (0.5.21) can load, captured verbatim from the engine's loader error
-/// (live-repro'd: `torchao` weights die at weight load with an opaque
-/// 502 ~30s later). Re-verify against the engine's own rejection list
-/// on lane upgrade (`blazar engine use <newer-tag>`).
+/// Fallback-only snapshot of `quantization_config.quant_method` values
+/// a sglang lane can load. The authoritative list is probed at lane
+/// install time from the engine's own loader registry
+/// (`sglang.srt.layers.quantization.BASE_QUANTIZATION_METHODS`) and
+/// carried on the lane manifest (`Manifest::quant_methods`); this
+/// const only covers manifests that predate the probe. Measured
+/// 2026-11-08 against sglang 0.5.23 - the runtime registry appends
+/// entries beyond its source literal, so never refresh this by reading
+/// engine sources; re-probe instead (`blazar engine use <newer-tag>`
+/// re-installs and re-probes).
 pub const SGLANG_SUPPORTED_QUANT_METHODS: &[&str] = &[
-    "fp8",
-    "mxfp8",
-    "blockwise_int8",
-    "modelopt",
-    "modelopt_fp8",
-    "modelopt_fp4",
-    "nvfp4_online",
-    "modelopt_mixed",
-    "w8a8_int8",
-    "w8a8_fp8",
+    // sorted; keep aligned with live probe output
+    "auto-round",
+    "auto-round-int8",
     "awq",
     "awq_marlin",
     "bitsandbytes",
+    "blockwise_int8",
+    "compressed-tensors",
+    "fp8",
     "gguf",
     "gptq_marlin",
+    "humming",
+    "minimax_m3_nvfp4",
+    "modelopt",
+    "modelopt_fp4",
+    "modelopt_fp8",
+    "modelopt_mixed",
+    "modelslim",
     "moe_wna16",
-    "compressed-tensors",
-    "w4afp8",
+    "mxfp4",
+    "mxfp8",
+    "mxfp_w4a8",
+    "nvfp4_online",
     "petit_nvfp4",
     "quark",
-    "quark_mxfp4",
-    "auto-round",
-    "auto-round-int8",
-    "modelslim",
     "quark_int4fp8_moe",
-    "humming",
-    "mxfp_w4a8",
-    "mxfp4",
+    "quark_mxfp4",
+    "w4afp8",
+    "w8a8_fp8",
+    "w8a8_int8",
 ];
+
+/// Lane-scoped facts the admission gate teaches with: the installed
+/// engine's own version string and the quant methods its loader
+/// actually registers (probed at install time, carried on the lane
+/// manifest). Owned plain data so callers without the runtime crate
+/// (e.g. the gateway reading a manifest JSON blob) can build it too.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SglangLaneFacts {
+    /// Engine-reported version (e.g. "0.5.23"), not the repo tag.
+    pub version: String,
+    /// Probed loader registry, sorted. `None` = manifest predates the
+    /// probe; an empty list = broken probe - both fall back to
+    /// [`SGLANG_SUPPORTED_QUANT_METHODS`].
+    pub quant_methods: Option<Vec<String>>,
+}
+
+impl SglangLaneFacts {
+    /// Methods this lane can load: the probed registry when present and
+    /// non-empty, else the measured const fallback.
+    #[must_use]
+    pub fn effective_quant_methods(&self) -> Vec<&str> {
+        match self
+            .quant_methods
+            .as_deref()
+            .filter(|list| !list.is_empty())
+        {
+            Some(list) => list.iter().map(String::as_str).collect(),
+            None => SGLANG_SUPPORTED_QUANT_METHODS.to_vec(),
+        }
+    }
+}
 
 /// SGLang-lane admission teaching: refuse models whose `config.json`
 /// facts predict engine death, naming the offending value and the levers.
-/// `None` = the lane has no objection. Two gates (both live-validated
-/// failure shapes): (1) a `quant_method` this sglang build cannot load,
+/// `facts` carries the installed lane's probed version and loader
+/// registry, so the refusal names the engine that is actually running
+/// instead of a stale hardcoded snapshot. `None` = the lane has no
+/// objection. Two gates (both live-validated failure shapes):
+/// (1) a `quant_method` this sglang build cannot load,
 /// (2) a vision-tower config whose model dir lacks
 /// `preprocessor_config.json` - processor init dies at spawn. The working
 /// tower model on this box ships the artifact, so complete multimodal
 /// dirs and dense text models pass untouched.
 #[must_use]
-pub fn sglang_lane_teach(meta: &HfMeta, dir: &Path) -> Option<String> {
+pub fn sglang_lane_teach(meta: &HfMeta, dir: &Path, facts: &SglangLaneFacts) -> Option<String> {
     if let Some(method) = meta.quant_method.as_deref().filter(|m| !m.is_empty())
-        && !SGLANG_SUPPORTED_QUANT_METHODS.contains(&method)
+        && !facts.effective_quant_methods().contains(&method)
     {
+        let version = if facts.version.is_empty() {
+            "version unknown"
+        } else {
+            facts.version.as_str()
+        };
         return Some(format!(
-            "quant_method '{method}' is not loadable by this sglang lane (0.5.21; \
+            "quant_method '{method}' is not loadable by this sglang lane ({version}; \
              supported: {}). Serve it on a lane that reads the format \
-             (blazar engine use <tag>), or re-quantize (`blazar fit`)",
-            SGLANG_SUPPORTED_QUANT_METHODS.join(", ")
+             (blazar engine use <tag>), or pull a quant this lane reads \
+             (blazar fit <repo> previews the repo's variants)",
+            facts.effective_quant_methods().join(", ")
         ));
     }
     if meta.vision_tower && !dir.join("preprocessor_config.json").is_file() {
@@ -702,6 +749,15 @@ mod tests {
         assert!(!m.vision_tower, "text_config alone is not a tower");
     }
 
+    fn teach_facts() -> SglangLaneFacts {
+        // Const-fallback shape: a manifest that predates the quant
+        // probe, carrying only the engine-reported version.
+        SglangLaneFacts {
+            version: "0.5.23".into(),
+            quant_methods: None,
+        }
+    }
+
     #[test]
     #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__sglang_lane_teach__unsupported_quant_method_refuses() {
@@ -710,10 +766,17 @@ mod tests {
             quant_method: Some("torchao".into()),
             ..Default::default()
         };
-        let teach = sglang_lane_teach(&m, dir.path()).expect("unsupported method refuses");
+        let teach =
+            sglang_lane_teach(&m, dir.path(), &teach_facts()).expect("unsupported method refuses");
         assert!(teach.contains("'torchao'"), "{teach}");
         assert!(teach.contains("awq"), "supported list shown: {teach}");
         assert!(teach.contains("blazar engine use"), "{teach}");
+        assert!(teach.contains("0.5.23"), "version from lane facts: {teach}");
+        assert!(teach.contains("blazar fit"), "{teach}");
+        assert!(
+            !teach.contains("re-quantize"),
+            "fit previews repo variants, it does not re-quantize: {teach}"
+        );
     }
 
     #[test]
@@ -724,9 +787,82 @@ mod tests {
             quant_method: Some("awq".into()),
             ..Default::default()
         };
-        assert_eq!(sglang_lane_teach(&awq, dir.path()), None);
+        assert_eq!(sglang_lane_teach(&awq, dir.path(), &teach_facts()), None);
         // No method string at all: the engine decides, the gate stays out.
-        assert_eq!(sglang_lane_teach(&HfMeta::default(), dir.path()), None);
+        assert_eq!(
+            sglang_lane_teach(&HfMeta::default(), dir.path(), &teach_facts()),
+            None
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_lane_teach__facts_without_version_names_unknown() {
+        let dir = write_dir(&[]);
+        let m = HfMeta {
+            quant_method: Some("torchao".into()),
+            ..Default::default()
+        };
+        let teach = sglang_lane_teach(&m, dir.path(), &SglangLaneFacts::default())
+            .expect("unsupported method refuses even without a version");
+        assert!(teach.contains("(version unknown;"), "{teach}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__effective_quant_methods__probed_list_wins_empty_and_absent_fall_back() {
+        let probed = SglangLaneFacts {
+            version: "0.5.23".into(),
+            quant_methods: Some(vec!["awq".into(), "fp8".into()]),
+        };
+        assert_eq!(probed.effective_quant_methods(), vec!["awq", "fp8"]);
+        // A probe that returned nothing is a broken probe, not an
+        // engine that loads nothing - fall back to the const snapshot.
+        let empty = SglangLaneFacts {
+            quant_methods: Some(vec![]),
+            ..teach_facts()
+        };
+        assert_eq!(
+            empty.effective_quant_methods(),
+            SGLANG_SUPPORTED_QUANT_METHODS.to_vec()
+        );
+        assert_eq!(
+            teach_facts().effective_quant_methods(),
+            SGLANG_SUPPORTED_QUANT_METHODS.to_vec()
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_lane_teach__probed_registry_overrides_const_snapshot() {
+        let dir = write_dir(&[]);
+        let torchao = HfMeta {
+            quant_method: Some("torchao".into()),
+            ..Default::default()
+        };
+        // Engine truth wins over the const snapshot: a lane whose
+        // loader registers torchao admits it even though the fallback
+        // refuses it.
+        let torchao_capable = SglangLaneFacts {
+            version: "9.9.9".into(),
+            quant_methods: Some(vec!["awq".into(), "torchao".into()]),
+        };
+        assert_eq!(
+            sglang_lane_teach(&torchao, dir.path(), &torchao_capable),
+            None
+        );
+        // And the refusal teaches the probed registry, not the const.
+        let fp8_only = SglangLaneFacts {
+            version: "0.5.23".into(),
+            quant_methods: Some(vec!["fp8".into()]),
+        };
+        let teach = sglang_lane_teach(&torchao, dir.path(), &fp8_only)
+            .expect("method outside the probed registry refuses");
+        assert!(teach.contains("(0.5.23; supported: fp8)"), "{teach}");
+        assert!(
+            !teach.contains("awq"),
+            "the probed registry is taught, not the const snapshot: {teach}"
+        );
     }
 
     #[test]
@@ -739,12 +875,13 @@ mod tests {
         // Live shape of the broken eoq artifact: tower declared, no
         // processor file in the dir.
         let bare = write_dir(&[]);
-        let teach = sglang_lane_teach(&tower, bare.path()).expect("tower without processor");
+        let teach = sglang_lane_teach(&tower, bare.path(), &teach_facts())
+            .expect("tower without processor");
         assert!(teach.contains("preprocessor_config.json"), "{teach}");
         assert!(teach.contains("blazar pull"), "{teach}");
         // Live shape of the WORKING bf16 control: tower + artifact = pass.
         let full = write_dir(&[("preprocessor_config.json", "{}")]);
-        assert_eq!(sglang_lane_teach(&tower, full.path()), None);
+        assert_eq!(sglang_lane_teach(&tower, full.path(), &teach_facts()), None);
     }
 
     #[test]
@@ -832,7 +969,8 @@ mod tests {
                 "model.layers.0.self_attn.q_proj.weight":"m.safetensors",
                 "lm_head.weight":"m.safetensors"}}"#,
         )]);
-        let teach = sglang_lane_teach(&tower, dir.path()).expect("vestigial tower refuses");
+        let teach =
+            sglang_lane_teach(&tower, dir.path(), &teach_facts()).expect("vestigial tower refuses");
         assert!(teach.contains("vestigial"), "{teach}");
         assert!(teach.contains("text-only"), "{teach}");
         assert!(
@@ -856,7 +994,8 @@ mod tests {
                 "model.layers.0.self_attn.q_proj.weight":"m.safetensors",
                 "visual.encoder.layer.0.weight":"m.safetensors"}}"#,
         )]);
-        let teach = sglang_lane_teach(&tower, dir.path()).expect("incomplete multimodal refuses");
+        let teach = sglang_lane_teach(&tower, dir.path(), &teach_facts())
+            .expect("incomplete multimodal refuses");
         assert!(teach.contains("Re-pull"), "{teach}");
         assert!(teach.contains("blazar pull"), "{teach}");
     }

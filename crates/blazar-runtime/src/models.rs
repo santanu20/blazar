@@ -57,8 +57,19 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
             std::fs::remove_dir_all(&row_path)
                 .map_err(|e| anyhow!("delete {}: {e}", row_path.display()))?;
         }
+        remove_session_banks(dirs, name)?;
         store.delete_model(name)?;
         return Ok(());
+    }
+
+    // LiteRT bundles (openaihost lane) carry a third artifact: the
+    // vendor registry alias (~/.litert-lm/models/<name>/) created at
+    // pull time. Delete it before the row goes - a stale alias would
+    // keep serving from the lane child after the store forgot the
+    // model. The bundle file itself flows through the generic path
+    // below.
+    if row.is_litert_bundle() {
+        crate::engine::litert_install::litert_delete(dirs, name)?;
     }
 
     let mut files: Vec<PathBuf> = vec![PathBuf::from(&row.path)];
@@ -119,7 +130,32 @@ pub fn remove_model(dirs: &BlazarDirs, name: &str) -> Result<()> {
             std::fs::remove_file(&f).map_err(|e| anyhow!("delete {}: {e}", f.display()))?;
         }
     }
+    // Session-bank subtree for the generic path (see
+    // `remove_session_banks` for why the whole per-name subtree goes).
+    remove_session_banks(dirs, name)?;
     store.delete_model(name)?;
+    Ok(())
+}
+
+/// Remove the per-model session-bank subtree
+/// (`sessions/<path_safe(name)>/`). Banks are keyed by row NAME, not
+/// by weight path, so no alias can share this subtree; leaving it
+/// behind would strand checkpoint slots for a model that no longer
+/// exists - and re-pulling under the same name would silently inherit
+/// stale banks.
+fn remove_session_banks(dirs: &BlazarDirs, name: &str) -> Result<()> {
+    let session_dir = dirs
+        .sessions_dir()
+        .join(blazar_core::profile::path_safe(name));
+    if session_dir.exists() {
+        std::fs::remove_dir_all(&session_dir).map_err(|e| {
+            anyhow!(
+                "delete session banks {}: {e} (remove the directory manually \
+                 and retry)",
+                session_dir.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -767,6 +803,14 @@ pub fn copy_model(dirs: &BlazarDirs, src: &str, dst: &str) -> Result<()> {
             "model {src} is a safetensors directory (sglang lane) - directories cannot be aliased; pull the repo again under the new name"
         ));
     }
+    // Bundle rows refuse for one more reason: the vendor registry alias
+    // is created per-name at import time, so a new alias name would 404
+    // at the serve child even with the weights hardlinked.
+    if row.is_litert_bundle() {
+        return Err(anyhow!(
+            "model {src} is a litertlm bundle (openaihost lane) - bundles cannot be aliased; pull the repo again under the new name"
+        ));
+    }
     let leaf = src_path
         .file_name()
         .unwrap_or_default()
@@ -873,6 +917,55 @@ mod tests {
         assert!(!d.join("m-q4_k_m-00001-of-00002.gguf").exists());
         assert!(!d.join("m-q4_k_m-00002-of-00002.gguf").exists());
         assert!(!d.join("mmproj-m.gguf").exists());
+    }
+
+    #[test]
+    fn unit__remove_model__session_banks_removed_with_row() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        std::fs::write(d.join("banked.gguf"), b"a").unwrap();
+        let store = Store::open(&dirs).unwrap();
+        store
+            .upsert_model(&blazar_core::ModelRow {
+                name: "banked".into(),
+                repo: "o/banked".into(),
+                quant: "Q4_K_M".into(),
+                path: d.join("banked.gguf").display().to_string(),
+                bytes: 1,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 1,
+                last_used_at: 1,
+            })
+            .unwrap();
+        // Session banks as the supervisor writes them: per-name subtree
+        // under sessions/, slot files + identity manifest inside.
+        let banks = dirs
+            .sessions_dir()
+            .join(blazar_core::profile::path_safe("banked"));
+        std::fs::create_dir_all(&banks).unwrap();
+        std::fs::write(banks.join("_auto-4096"), b"slot0").unwrap();
+        std::fs::write(banks.join("_auto-4096-s3"), b"slot3").unwrap();
+        std::fs::write(banks.join(".identity.json"), b"{}").unwrap();
+
+        remove_model(&dirs, "banked").unwrap();
+        assert!(store.get_model("banked").unwrap().is_none());
+        assert!(
+            !banks.exists(),
+            "per-name session-bank subtree must not outlive the row"
+        );
+        // A different model's banks are untouched.
+        let other = dirs
+            .sessions_dir()
+            .join(blazar_core::profile::path_safe("other"));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("_auto-4096"), b"keep").unwrap();
+        assert!(other.join("_auto-4096").exists());
     }
 
     #[test]

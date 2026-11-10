@@ -215,6 +215,10 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
 
     // ---- tuned profile + ledger adoption pointer ---------------------
     let mut serving_ctx = input.config_ctx;
+    // Parsed argv of the tuned profile row (shared with the KV block
+    // below so the row is read from the store ONCE - a second read here
+    // could race an update between the two and report a chimera).
+    let mut profile_argv: Option<Vec<String>> = None;
     if tuneable && let Some(tag) = engine_tag.as_deref() {
         match store.get_profile(name, tag) {
             Ok(None) => {
@@ -235,8 +239,21 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
             }
             Ok(Some(p)) => {
                 let argv = parse_argv_json(&p.args_json);
-                if let Some(ctx) = argv_value(&argv, "-c").and_then(|v| v.parse().ok()) {
-                    serving_ctx = ctx;
+                profile_argv = Some(argv.clone());
+                match argv_value(&argv, "-c").map(|v| v.parse::<u32>()) {
+                    Some(Ok(ctx)) => serving_ctx = ctx,
+                    Some(Err(_)) => findings.push(OptimizeFinding {
+                        severity: Severity::Warn,
+                        area: "profile",
+                        text: format!(
+                            "tuned profile -c value {:?} is not a number - the KV \
+                             eligibility check falls back to the config context {:#}",
+                            argv_value(&argv, "-c").unwrap_or_default(),
+                            input.config_ctx
+                        ),
+                        datum: "profile row args_json carries a malformed -c".into(),
+                    }),
+                    None => {}
                 }
                 let age_days = (input.now - p.updated_at).max(0) / 86_400;
                 match store.active_profile_of(name, tag) {
@@ -277,10 +294,7 @@ pub fn build_plan(store: &Store, input: &OptimizeInputs<'_>) -> CoreResult<Optim
             .collect();
         // The profile's own KV flags: compiled argv omits them when the
         // grade is the f16 default - absence IS the f16 statement.
-        let argv_probe = engine_tag
-            .as_deref()
-            .and_then(|tag| store.get_profile(name, tag).ok().flatten())
-            .map(|p| parse_argv_json(&p.args_json));
+        let argv_probe = profile_argv.clone();
         let active_kv = argv_probe.as_deref().map(|argv| {
             (
                 argv_value(argv, "-ctk").unwrap_or_else(|| "f16".into()),
@@ -550,6 +564,166 @@ fn argv_value(argv: &[String], flag: &str) -> Option<String> {
         .and_then(|i| argv.get(i + 1))
         .filter(|v| !v.starts_with('-'))
         .cloned()
+}
+
+// ---------------------------------------------------------------------------
+// Engine recommendation: "which installed engine build should serve
+// this model on this machine?" Pure over the store like build_plan -
+// no spawns, no clocks. Every axis is datum-or-honest: a missing bench
+// receipt is stated as "no receipt", never papered over with a guess.
+
+/// Ranking weights for [`engine_recommend`]. Capability axes dwarf
+/// tie-breakers on purpose: hardware fit (does the build target this
+/// GPU?) and a stored bench receipt (was it MEASURED serving this
+/// model?) decide; recency and active status only order equals.
+pub const ENGINE_REC_WEIGHT_HW: i64 = 40;
+pub const ENGINE_REC_WEIGHT_BENCH: i64 = 30;
+pub const ENGINE_REC_WEIGHT_RECENT_MAX: i64 = 10;
+pub const ENGINE_REC_WEIGHT_ACTIVE: i64 = 5;
+/// Recency decay: an install loses one tie-breaker point per this many
+/// days, flooring at zero.
+pub const ENGINE_REC_RECENCY_DAYS_PER_POINT: i64 = 30;
+
+/// One engine row as a ranked recommendation, with the evidence each
+/// axis rests on (display strings, not opaque numbers).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineRec {
+    pub tag: String,
+    pub kind: crate::engine_kind::EngineKind,
+    pub active: bool,
+    /// Matching manifest device name, or the honest absence.
+    pub hardware: String,
+    /// Bench-receipt datum for this model on this tag, or None (the
+    /// ranking then says so rather than implying a measurement).
+    pub bench: Option<String>,
+    /// Whole days since install (from `installed_at`).
+    pub installed_days: i64,
+    /// Sum of axis weights; ordering contract for the Vec returned by
+    /// [`engine_recommend`].
+    pub score: i64,
+}
+
+/// Inputs the caller resolves (kept explicit for purity and tests).
+pub struct EngineRecommendInputs<'a> {
+    /// Live GPU/accelerator name from the hardware probe, when one ran.
+    /// `None` skips the hardware axis honestly instead of guessing.
+    pub hw: Option<&'a str>,
+    /// Epoch seconds (caller-supplied; no clock inside).
+    pub now: i64,
+}
+
+/// Rank every installed engine for (optionally) one model. Returns
+/// score-descending, tag-ascending ties. No arch-coverage axis: engine
+/// manifests carry `devices`/`flags`/`spec_types` but not architecture
+/// lists, so claiming coverage would be fabrication - the note field
+/// in the CLI output states the omission instead.
+pub fn engine_recommend(
+    store: &Store,
+    model: Option<&str>,
+    input: &EngineRecommendInputs<'_>,
+) -> CoreResult<Vec<EngineRec>> {
+    let mut recs: Vec<EngineRec> = Vec::new();
+    for e in store.list_engines()? {
+        let devices = manifest_devices(&e.manifest);
+        // Hardware axis: llama.cpp manifests label devices by backend
+        // slot ("CUDA0"), with the human GPU identity in `description`
+        // - match the live probe against BOTH, case-insensitive
+        // substring either way (manifests and probes abbreviate
+        // differently, e.g. "RTX 4070" vs "GeForce RTX 4070 Laptop").
+        let (hw_score, hw_datum) = match (&input.hw, devices.first()) {
+            (Some(live), Some(dev)) => {
+                let l = live.to_lowercase();
+                let labels: Vec<&str> = [dev.0.as_str(), dev.1.as_str()]
+                    .into_iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
+                let hit = labels.iter().any(|label| {
+                    let low = label.to_lowercase();
+                    low.contains(&l) || l.contains(&low)
+                });
+                if hit {
+                    // Prefer the longer label (the description carries
+                    // the GPU identity, the name the backend slot).
+                    let best = labels.iter().max_by_key(|s| s.len()).copied();
+                    (
+                        ENGINE_REC_WEIGHT_HW,
+                        best.unwrap_or(dev.0.as_str()).to_string(),
+                    )
+                } else {
+                    let shown = if dev.1.is_empty() {
+                        dev.0.as_str()
+                    } else {
+                        dev.1.as_str()
+                    };
+                    (0, format!("built for {shown} - not this machine's {live}"))
+                }
+            }
+            (Some(live), None) => (0, format!("no device manifest - cannot match {live}")),
+            (None, Some(dev)) => {
+                let shown = if dev.1.is_empty() { &dev.0 } else { &dev.1 };
+                (0, format!("{shown} (no live probe to match against)"))
+            }
+            (None, None) => (0, "no device manifest, no live probe".to_string()),
+        };
+        // Bench axis: a stored receipt for THIS model on THIS tag is
+        // the only thing that turns ordering into measurement. Without
+        // a model the axis is skipped (stated), not assumed.
+        let (bench_score, bench_datum) = match model {
+            Some(m) => match store.latest_bench_result_with_axes(m, Some(&e.tag)) {
+                Ok(Some((_, payload, at, _axes))) => {
+                    let age_days = (input.now - at).max(0) / 86_400;
+                    (
+                        ENGINE_REC_WEIGHT_BENCH,
+                        Some(format!("receipt {age_days}d old: {payload}")),
+                    )
+                }
+                Ok(None) => (0, None),
+                Err(err) => (0, Some(format!("bench evidence unreadable: {err}"))),
+            },
+            None => (0, None),
+        };
+        let installed_days = (input.now - e.installed_at).max(0) / 86_400;
+        let recency = ENGINE_REC_WEIGHT_RECENT_MAX
+            - (installed_days / ENGINE_REC_RECENCY_DAYS_PER_POINT)
+                .min(ENGINE_REC_WEIGHT_RECENT_MAX);
+        let active_bonus = i64::from(e.active) * ENGINE_REC_WEIGHT_ACTIVE;
+        recs.push(EngineRec {
+            tag: e.tag.clone(),
+            kind: e.kind,
+            active: e.active,
+            hardware: hw_datum,
+            bench: bench_datum,
+            installed_days,
+            score: hw_score + bench_score + recency + active_bonus,
+        });
+    }
+    recs.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.tag.cmp(&b.tag)));
+    Ok(recs)
+}
+
+/// `(name, description)` per device from an engine manifest JSON -
+/// llama.cpp writes backend-slot names ("CUDA0") with the GPU identity
+/// in `description`. Manifests are written by the engine pipeline; an
+/// unreadable one yields no devices (the caller reports the honest
+/// absence) rather than failing the ranking.
+fn manifest_devices(manifest: &str) -> Vec<(String, String)> {
+    serde_json::from_str::<serde_json::Value>(manifest)
+        .ok()
+        .and_then(|v| {
+            v.get("devices").and_then(|d| d.as_array()).map(|rows| {
+                rows.iter()
+                    .filter_map(|r| {
+                        let name = r.get("name").and_then(|n| n.as_str())?;
+                        let desc = r
+                            .get("description")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or_default();
+                        Some((name.to_string(), desc.to_string()))
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -896,5 +1070,168 @@ mod tests {
         assert_eq!(argv_value(&argv, "-c").as_deref(), Some("16384"));
         assert_eq!(argv_value(&argv, "-ctk"), None, "flag-like value = absent");
         assert_eq!(argv_value(&argv, "-missing"), None);
+    }
+
+    fn rec_engine(tag: &str, hw: Option<&str>, installed_at: i64, active: bool) -> EngineRow {
+        let mut e = engine(tag, hw);
+        e.installed_at = installed_at;
+        e.active = active;
+        e
+    }
+
+    #[test]
+    fn unit__engine_recommend__empty_store_is_empty() {
+        let (_t, s) = test_dirs();
+        let recs = engine_recommend(
+            &s,
+            None,
+            &EngineRecommendInputs {
+                hw: None,
+                now: 1000,
+            },
+        )
+        .unwrap();
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn unit__engine_recommend__hardware_match_outranks_recency() {
+        let (_t, s) = test_dirs();
+        // Old build that MATCHES the GPU vs fresh build for a different
+        // chip: capability beats tie-breakers.
+        s.upsert_engine(&rec_engine("cuda-old", Some("RTX 4090"), 0, false))
+            .unwrap();
+        s.upsert_engine(&rec_engine(
+            "metal-new",
+            Some("Apple M3 Max"),
+            90 * 86_400,
+            false,
+        ))
+        .unwrap();
+        let recs = engine_recommend(
+            &s,
+            None,
+            &EngineRecommendInputs {
+                hw: Some("nvidia geforce rtx 4090"),
+                now: 100 * 86_400,
+            },
+        )
+        .unwrap();
+        assert_eq!(recs[0].tag, "cuda-old");
+        assert_eq!(recs[1].tag, "metal-new");
+        assert!(recs[1].hardware.contains("not this machine's"));
+    }
+
+    #[test]
+    fn unit__engine_recommend__bench_receipt_decides_between_equals() {
+        let (_t, s) = test_dirs();
+        let now = 100 * 86_400;
+        s.upsert_engine(&rec_engine("b1", Some("RTX 4090"), now - 86_400, false))
+            .unwrap();
+        s.upsert_engine(&rec_engine("b2", Some("RTX 4090"), now, true))
+            .unwrap();
+        // Both match hardware; b2 is newer and active, so it leads
+        // until b1 carries the measured receipt for this model.
+        // (Seeds `bench_results` - the table the latest-receipt reader
+        // serves - not the append-only bench_history log.)
+        s.put_bench_result_with_axes(
+            "m",
+            "b1",
+            r#"[{"test":"tg128","t/s":42.0}]"#,
+            &EvidenceAxes::default(),
+        )
+        .unwrap();
+        let recs = engine_recommend(
+            &s,
+            Some("m"),
+            &EngineRecommendInputs {
+                hw: Some("RTX 4090"),
+                now,
+            },
+        )
+        .unwrap();
+        assert_eq!(recs[0].tag, "b1", "receipt outranks recency+active");
+        assert!(
+            recs[0]
+                .bench
+                .as_deref()
+                .is_some_and(|b| b.contains("receipt"))
+        );
+        assert_eq!(recs[1].bench, None, "no receipt stated, not faked");
+        // Without a model the bench axis vanishes for everyone - b2's
+        // recency+active lead returns.
+        let no_model = engine_recommend(
+            &s,
+            None,
+            &EngineRecommendInputs {
+                hw: Some("RTX 4090"),
+                now,
+            },
+        )
+        .unwrap();
+        assert_eq!(no_model[0].tag, "b2");
+    }
+
+    #[test]
+    fn unit__engine_recommend__no_probe_skips_hw_axis_honestly() {
+        let (_t, s) = test_dirs();
+        s.upsert_engine(&rec_engine("cpu-1", Some("CPU"), 0, true))
+            .unwrap();
+        s.upsert_engine(&rec_engine("broken", None, 0, true))
+            .unwrap();
+        let recs = engine_recommend(&s, None, &EngineRecommendInputs { hw: None, now: 0 }).unwrap();
+        assert!(
+            recs.iter()
+                .all(|r| r.score <= ENGINE_REC_WEIGHT_ACTIVE + ENGINE_REC_WEIGHT_RECENT_MAX)
+        );
+        assert!(
+            recs.iter()
+                .find(|r| r.tag == "broken")
+                .is_some_and(|r| r.hardware.contains("no device manifest"))
+        );
+    }
+
+    #[test]
+    fn unit__manifest_devices__unparsable_yields_empty_and_reads_description() {
+        assert!(manifest_devices("{}").is_empty());
+        assert!(manifest_devices("not json").is_empty());
+        assert_eq!(
+            manifest_devices(
+                r#"{"devices":[{"name":"CUDA0","description":"NVIDIA GeForce RTX 4070"},{"name":"Vulkan0"}]}"#
+            ),
+            vec![
+                ("CUDA0".into(), "NVIDIA GeForce RTX 4070".into()),
+                ("Vulkan0".into(), String::new())
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__engine_recommend__backend_slot_name_matches_via_description() {
+        // Real manifest shape on this class of box: name is the backend
+        // slot ("CUDA0"), the GPU identity is in `description` - the
+        // hardware axis must not call the CUDA build a mismatch.
+        let (_t, s) = test_dirs();
+        let mut e = engine("b-cuda", Some("CUDA0"));
+        e.manifest =
+            r#"{"devices":[{"name":"CUDA0","description":"NVIDIA GeForce RTX 4070 Laptop GPU"}]}"#
+                .into();
+        s.upsert_engine(&e).unwrap();
+        let recs = engine_recommend(
+            &s,
+            None,
+            &EngineRecommendInputs {
+                hw: Some("nvidia geforce rtx 4070 laptop gpu"),
+                now: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            recs[0].score,
+            // hw 40 + full recency 10 (installed at epoch 0) + active 5
+            ENGINE_REC_WEIGHT_HW + ENGINE_REC_WEIGHT_RECENT_MAX + ENGINE_REC_WEIGHT_ACTIVE,
+            "matched via description"
+        );
+        assert_eq!(recs[0].hardware, "NVIDIA GeForce RTX 4070 Laptop GPU");
     }
 }

@@ -244,18 +244,28 @@ fn hermetic_daemon_env(systemctl_succeeds: bool) -> HermeticEnv {
         shim_dir.join("systemctl"),
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SHIM_LOG\"\ncase \"$1 $2\" in\n  \
-             'is-active --quiet'|'restart blazar') {verdict} ;;\n  *) exit 1 ;;\nesac\n"
+             'is-active --quiet'|'restart blazar') {verdict} ;;\nesac\ncase \"$1 $2 $3\" in\n  \
+             'show blazar -p') printf '4242\\n' ;;\n  *) exit 1 ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    // The restart lane proves the unit serves THIS base before
+    // restarting it: `ss` must name the unit's MainPID (4242 above)
+    // as the listener on the configured port.
+    std::fs::write(
+        shim_dir.join("ss"),
+        format!(
+            "#!/bin/sh\nprintf 'LISTEN 0 128 127.0.0.1:{port} 0.0.0.0:* users:((\"blazar\",pid=4242,fd=9))\\n'\n"
         ),
     )
     .unwrap();
     #[allow(clippy::permissions_set_readonly_false)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(
-            shim_dir.join("systemctl"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        for shim in ["systemctl", "ss"] {
+            std::fs::set_permissions(shim_dir.join(shim), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
     }
 
     let path = format!(

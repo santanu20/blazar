@@ -104,37 +104,54 @@ pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<RegistryLa
     if !resp.status().is_success() {
         anyhow::bail!("capability registry {url} answered HTTP {}", resp.status());
     }
-    let body = read_body_bounded(&mut resp, url, MAX_BODY_BYTES).await?;
+    let body = read_body_bounded(&mut resp, url, MAX_BODY_BYTES, "capability registry").await?;
     parse_registry(&body)
 }
 
 /// Read a response body capped at `cap` bytes: the registry URL is
 /// user-configurable input, so a hostile mirror must not be able to
-/// buffer unbounded memory behind the fetch timeout.
-async fn read_body_bounded(resp: &mut reqwest::Response, url: &str, cap: usize) -> Result<String> {
+/// buffer unbounded memory behind the fetch timeout. Shared with the
+/// draft-pairing registry (same fetch contract, different file).
+async fn read_body_bounded(
+    resp: &mut reqwest::Response,
+    url: &str,
+    cap: usize,
+    label: &str,
+) -> Result<String> {
     if let Some(len) = resp.content_length()
         && len > cap as u64
     {
         anyhow::bail!(
-            "capability registry {url} declares {len} bytes - over the {cap}-byte cap; \
-                 point capability_registry_url at a sane mirror"
+            "{label} {url} declares {len} bytes - over the {cap}-byte cap; \
+                 point the registry URL at a sane mirror"
         );
     }
     let mut body = Vec::with_capacity(4096);
     while let Some(chunk) = resp
         .chunk()
         .await
-        .with_context(|| format!("capability registry {url}: read response body"))?
+        .with_context(|| format!("{label} {url}: read response body"))?
     {
         if body.len() + chunk.len() > cap {
             anyhow::bail!(
-                "capability registry {url} exceeded the {cap}-byte body cap - refusing to \
+                "{label} {url} exceeded the {cap}-byte body cap - refusing to \
                  buffer a runaway mirror"
             );
         }
         body.extend_from_slice(&chunk);
     }
-    String::from_utf8(body).context("capability registry: response is not valid UTF-8")
+    String::from_utf8(body).context(format!("{label}: response is not valid UTF-8"))
+}
+
+/// Bounded read wrapper for sibling registry clients (draft-pairing
+/// registry): identical contract, registry-specific label in errors.
+pub(crate) async fn read_body_bounded_shared(
+    resp: &mut reqwest::Response,
+    url: &str,
+    cap: usize,
+    label: &str,
+) -> Result<String> {
+    read_body_bounded(resp, url, cap, label).await
 }
 
 /// Parse + validate a registry document. Public so tests (and curious

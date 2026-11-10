@@ -74,6 +74,16 @@ mod tests {
         assert!(!grade_evidenced_at_ctx("qwen3.5-9b", "q8_0", 65536));
         // q4_0: measured at both windows too.
         assert!(grade_evidenced_at_ctx("qwen3.5-9b", "q4_0", 32768));
+        // turbo grades: fork-lane receipts at ctx 2048 (f16 A/B) and
+        // 16384 (turbo3-vs-turbo4); the 32k attempt died on the 8GiB
+        // card, so the evidence floor stops at 16k.
+        assert!(grade_evidenced_at_ctx("qwen3.5-9b", "turbo3", 2048));
+        assert!(grade_evidenced_at_ctx("qwen3.5-9b", "turbo3", 16384));
+        assert!(grade_evidenced_at_ctx("qwen3.5-9b", "turbo4", 16384));
+        assert!(!grade_evidenced_at_ctx("qwen3.5-9b", "turbo3", 32768));
+        assert!(!grade_evidenced_at_ctx("qwen3.5-9b", "turbo4", 32768));
+        // turbo2 was never measured - no receipt, no borrowing.
+        assert!(!grade_evidenced_at_ctx("qwen3.5-9b", "turbo2", 2048));
         // q5_0: never measured - throughput alone can never adopt it.
         assert!(!grade_evidenced_at_ctx("qwen3.5-9b", "q5_0", 2048));
         // Exact-name contract: case or basename variants do not borrow

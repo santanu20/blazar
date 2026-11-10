@@ -74,6 +74,16 @@ pub struct AgentApproval {
     pub fleet_token: Option<String>,
 }
 
+/// Constant-time-ish comparison of a presented invite code against the
+/// configured fleet token (same shape as the fleet registry's worker
+/// token match): equal-length XOR fold, so a mismatch reveals no early
+/// exit. Empty presentations simply fail.
+#[must_use]
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Policy decision for one invitation. `approval` is set exactly when
 /// the reply is `approved`.
 #[must_use]
@@ -92,7 +102,11 @@ pub fn decide_invite(
                     None,
                 );
             }
-            if invite.code.as_deref() == Some(donor_token) {
+            if invite
+                .code
+                .as_deref()
+                .is_some_and(|code| constant_time_eq(code, donor_token))
+            {
                 (
                     AgentReply {
                         status: "approved".into(),
@@ -151,10 +165,35 @@ fn pending_dir(dirs: &BlazarDirs) -> PathBuf {
 
 /// Queue an invitation for the owner. One file per invite so `list` and
 /// `approve` are plain directory reads - no daemon state to corrupt.
+/// The queue is bounded: entries older than a day are dropped on write,
+/// and a full queue drops the OLDEST survivors - an agent can always
+/// re-ask, an unattended donor must not accumulate forever.
 pub fn save_pending(dirs: &BlazarDirs, pending: &PendingInvite) -> std::io::Result<PathBuf> {
+    const PENDING_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+    const PENDING_MAX: usize = 64;
     let dir = pending_dir(dirs);
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", pending.received_ms));
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(u64::MAX);
+    let mut live = list_pending(dirs);
+    // Expired first, then oldest-survivors until the new invite fits.
+    live.retain(|(_, p)| now_ms.saturating_sub(p.received_ms) <= PENDING_TTL_MS);
+    while live.len() >= PENDING_MAX {
+        let (path, _) = live.remove(0);
+        let _ = std::fs::remove_file(&path);
+    }
+    // Same-millisecond arrivals are real (two agents, one sweep): give
+    // the newcomer a distinct stem instead of overwriting its peer.
+    let mut seq = 0u32;
+    let mut path = dir.join(format!("{}.json", pending.received_ms));
+    while path.exists() {
+        seq += 1;
+        path = dir.join(format!("{}-{seq}.json", pending.received_ms));
+    }
     let body =
         serde_json::to_string_pretty(pending).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(&path, body)

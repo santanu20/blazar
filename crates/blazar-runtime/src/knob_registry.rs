@@ -1,8 +1,9 @@
 //! Runtime half of the emission-truth knob registry: folds the
 //! spawn-time argv builders into the compile-time lane unions from
-//! [`blazar_core::knob_registry`], and adds the whisper and piper lanes
-//! (neither has a profile compiler - whisper composes its argv at spawn,
-//! piper per synthesis call).
+//! [`blazar_core::knob_registry`], and adds the whisper, piper and
+//! openaihost lanes (whisper composes its argv at spawn, piper per
+//! synthesis call; openaihost's grammar lives in the engine trait,
+//! pinned to live emission by the test in this module).
 //!
 //! llama.cpp and stable-diffusion.cpp children run `profile.argv`
 //! verbatim, so the compile-time slice is already their full spawn
@@ -92,6 +93,13 @@ pub fn lane_flags() -> BTreeMap<&'static str, Vec<String>> {
     // Piper: one-shot synthesis spawns, argv composed per call.
     lanes.insert("piper", piper::knob_surface());
 
+    // OpenAiHost: argv grammar is owned by the engine trait itself - the
+    // child is registry-wide (no model row pins a listen pair), the
+    // supervisor's synthetic row rides an empty profile, and
+    // `OpenAiHostEngine::build_argv` composes `serve --host <h>
+    // --port <p>`. Pinned to that live emission by the test below.
+    lanes.insert("openaihost", vec!["--host".into(), "--port".into()]);
+
     lanes
 }
 
@@ -125,4 +133,58 @@ fn hf_dir_fixture() -> String {
     let dir = std::env::temp_dir().join(format!("blazar-knob-registry-hf-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mistral.rs HF-dir fixture");
     dir.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Manifest;
+    use crate::engine_impl::Engine;
+
+    /// The static `openaihost` lane above must stay identical to what
+    /// `OpenAiHostEngine::build_argv` emits for the supervisor's real
+    /// spawn shape: the synthetic `_openaihost` row + the empty profile
+    /// built at spawn (`supervisor.rs` `spawn_openaihost_instance`) +
+    /// a TCP endpoint. If the launch grammar grows, this pin forces the
+    /// registry to grow with it (regenerate the committed JSON).
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__knob_registry__openaihost_lane_matches_live_build_argv_emission() {
+        // The manifest is inert to argv composition; minimal JSON walks
+        // the same decode path as an installed lane's stored manifest.
+        let manifest: Manifest = serde_json::from_str(
+            r#"{"tag":"litert-0","build_number":0,"version_raw":"0",
+                "devices":[],"flags":[],"spec_types":[],"server_path":"x"}"#,
+        )
+        .expect("minimal manifest decodes");
+        let engine = crate::OpenAiHostEngine::new(manifest);
+
+        // argv grammar ignores the model row (`_model`); inert filler.
+        let row = model_row("/models/smollm2-360m.litertlm", None, None);
+        let profile = blazar_core::Profile {
+            argv: Vec::new(),
+            warnings: Vec::new(),
+            ctx: 0,
+            gpu: "auto",
+            vram_mib: 0,
+            kv_est_bytes: None,
+            ctx_autofit: None,
+            capacity: blazar_core::profile::CapacityStatus::RuntimeManaged,
+        };
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 12_345,
+        };
+        let emitted: BTreeSet<String> = engine
+            .build_argv(&row, &profile, &endpoint)
+            .into_iter()
+            .filter(|t| is_flag_token(t))
+            .collect();
+
+        let lane: BTreeSet<String> = lane_flags()["openaihost"].clone().into_iter().collect();
+        assert_eq!(
+            emitted, lane,
+            "openaihost registry lane must equal live build_argv emission"
+        );
+    }
 }

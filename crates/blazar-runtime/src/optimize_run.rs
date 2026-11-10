@@ -3,8 +3,15 @@
 //! Wave 2 (`--run`) screens a candidate through the llama-bench grid
 //! WITHOUT adopting it, then re-measures baseline vs candidate through
 //! the REAL gateway path: swap the `profiles` row, evict the child,
-//! warm it back on the new argv, and probe with alternating A/B reps
-//! so drift and thermal effects hit both arms equally. A pure
+//! warm it back on the new argv, and measure each arm as one whole
+//! block (all baseline reps, then all candidate reps). The arms are
+//! NOT interleaved per rep: each swap forces a child respawn, so
+//! per-rep alternation would spend more time loading than decoding
+//! and the respawn churn itself would bias both arms. Drift and
+//! thermal effects are instead mitigated by the paired design (both
+//! arms share the identical probe, temperature 0, concurrency shape)
+//! and by `verify()`'s noise gate, which refuses to call a gain real
+//! unless it clears the observed sample spread. A pure
 //! `verify()` turns the two sample sets into one noise-gated verdict,
 //! and the whole run lands in the append-only optimization ledger.
 //! Nothing here adopts: adoption is [`adopt_experiment`] (Wave 3),
@@ -50,7 +57,9 @@ pub struct OptimizeRunConfig {
     pub base_url: String,
     /// Concurrent requests per probe round (the C in Throughput@C).
     pub concurrency: u32,
-    /// Alternating A/B repetitions per arm (warm-up excluded).
+    /// Measurement repetitions per arm (warm-up excluded). Arms run
+    /// as sequential whole blocks - see the module doc for why the
+    /// reps are not interleaved between arms.
     pub reps: u32,
     /// Generated tokens per probe request.
     pub num_predict: u32,
@@ -738,7 +747,18 @@ pub async fn run_optimize(
         ),
     )?;
 
-    // Candidate arm: swap the row, evict, warm on the new argv.
+    // Candidate arm: swap the row, evict, warm on the new argv. The
+    // quiet lease is re-verified first: traffic (or a second optimize
+    // run) that arrived mid-baseline must abort BEFORE the swap, while
+    // the baseline row is still live - RestoreGuard::drop restores it.
+    if !lane_quiet(&client, &base, input.model_name).await? {
+        anyhow::bail!(
+            "lane stopped being quiet after the baseline arm (in-flight \
+             requests, a non-empty gateway queue, or a second optimize run) - \
+             aborting before the candidate swap; the baseline profile is \
+             restored"
+        );
+    }
     store.upsert_profile(&cand_row)?;
     evict_model(&client, &base, input.model_name).await?;
     warm_model(&client, &base, input.model_name).await?;
@@ -875,16 +895,35 @@ pub fn adopt_experiment(store: &Store, experiment_id: i64) -> Result<AdoptOutcom
             active.tag
         );
     }
-    if let (Some(exp_hw), Some(now_hw)) = (
-        exp.hw_fingerprint.as_deref(),
-        blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&active.manifest).as_deref(),
-    ) && exp_hw != now_hw
-    {
-        anyhow::bail!(
-            "experiment #{experiment_id} was measured on different hardware \
-                 ({exp_hw}) than the active lane ({now_hw}) - receipts do not \
-                 transfer between machines",
-        );
+    // Hardware attribution is REQUIRED, not best-effort: an experiment
+    // without a fingerprint (or an active lane that stopped exposing
+    // one) cannot prove where its evidence was gathered, and receipts
+    // that cannot name their hardware do not transfer - refuse rather
+    // than adopt unattributable evidence.
+    let now_hw = blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&active.manifest);
+    let exp_hw = exp.hw_fingerprint.as_deref();
+    match (exp_hw, now_hw.as_deref()) {
+        (Some(exp_hw), Some(now_hw)) => {
+            if exp_hw != now_hw {
+                anyhow::bail!(
+                    "experiment #{experiment_id} was measured on different hardware \
+                     ({exp_hw}) than the active lane ({now_hw}) - receipts do not \
+                     transfer between machines",
+                );
+            }
+        }
+        (None, _) => anyhow::bail!(
+            "experiment #{experiment_id} carries no hardware fingerprint - its \
+             evidence cannot be attributed to this machine; re-run `blazar \
+             optimize {} --run` to record one",
+            exp.model
+        ),
+        (_, None) => anyhow::bail!(
+            "active engine '{}' exposes no hardware fingerprint in its manifest \
+             - adoption cannot prove the experiment's receipts match this lane; \
+             re-probe the engine (engine update) and re-run --run",
+            active.tag
+        ),
     }
     let row = ProfileRow {
         model_name: exp.model.clone(),
@@ -1055,6 +1094,36 @@ mod tests {
         // Nothing was written by the refusals.
         assert!(store.get_profile("m", "b1").unwrap().is_none());
         assert!(store.active_profile_of("m", "b1").unwrap().is_none());
+    }
+
+    #[test]
+    fn unit__adopt_experiment__refuses_unattributable_evidence() {
+        let (store, _tmp) = adopt_store(&hw_manifest());
+
+        // Experiment without a fingerprint: evidence cannot name its
+        // hardware, so adoption is refused with a re-run teaching.
+        let no_fp = seed_experiment(&store, "b1", None);
+        store.append_event(no_fp, "verified", "x").unwrap();
+        let err = adopt_experiment(&store, no_fp).unwrap_err().to_string();
+        assert!(
+            err.contains("no hardware fingerprint") && err.contains("--run"),
+            "missing-fingerprint refusal, got: {err}"
+        );
+
+        // Active lane whose manifest stopped exposing a fingerprint:
+        // the receipts cannot be proven to match this lane.
+        let (bare, _bare_tmp) = adopt_store("{}");
+        let bare_id = seed_experiment(&bare, "b1", Some("fingerprint-of-some-machine"));
+        bare.append_event(bare_id, "verified", "x").unwrap();
+        let err = adopt_experiment(&bare, bare_id).unwrap_err().to_string();
+        assert!(
+            err.contains("no hardware fingerprint in its manifest"),
+            "bare-manifest refusal, got: {err}"
+        );
+
+        // Neither refusal wrote a profile or a pointer.
+        assert!(store.get_profile("m", "b1").unwrap().is_none());
+        assert!(bare.get_profile("m", "b1").unwrap().is_none());
     }
 
     fn stats(tps_series: &[f64], agg: f64) -> ArmStats {

@@ -22,6 +22,39 @@
     {
       "model": "qwen3.5-9b",
       "file": "Qwen3.5-9B-Q4_K_M.gguf",
+      "engine_tag": "fork-AtomicBot-ai_atomic-llama-cpp-turboquant-8d935078-cuda",
+      "ppl_tool": "own llama-perplexity",
+      "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+      "ctx": 2048,
+      "chunks": 4,
+      "ngl": 99,
+      "rungs": [
+        { "kv": "f16", "ppl": 5.3651, "ppl_err": 0.2236 },
+        { "kv": "turbo3/turbo3", "ppl": 5.3912, "ppl_err": 0.22587 },
+        { "kv": "turbo4/turbo4", "ppl": 5.3754, "ppl_err": 0.22413 }
+      ],
+      "source": "bench-artifacts/20261107-turboquant-kv-quality/",
+      "note": "turboquant fork lane: turbo3 (WHT-rotated 3-bit, ~4.3x KV compression) and turbo4 (~3.8x) ppl deltas vs f16 are +0.026/+0.010 - inside the +/-0.22 error bars at ctx 2048. turbo grades exist only on the fork lane; upstream llama-server rejects unknown cache types at load"
+    },
+    {
+      "model": "qwen3.5-9b",
+      "file": "Qwen3.5-9B-Q4_K_M.gguf",
+      "engine_tag": "fork-AtomicBot-ai_atomic-llama-cpp-turboquant-8d935078-cuda",
+      "ppl_tool": "own llama-perplexity",
+      "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+      "ctx": 16384,
+      "chunks": 4,
+      "ngl": 99,
+      "rungs": [
+        { "kv": "turbo3/turbo3", "ppl": 3.8744, "ppl_err": 0.05918 },
+        { "kv": "turbo4/turbo4", "ppl": 3.8798, "ppl_err": 0.05943 }
+      ],
+      "source": "bench-artifacts/20261107-turboquant-kv-quality/",
+      "note": "long-ctx turbo receipt: turbo3-vs-turbo4 delta at ctx 16384 is 0.005, inside the +/-0.059 error bars. f16 was not run at 16k (does not fit this 8GiB card); turbo-vs-f16 equivalence is evidenced by the ctx-2048 receipt on the same lane. turbo at ctx 32768 dies silently on this card (2/2 repro, no CUDA/OOM trace - see artifact README); no 32k turbo receipt is claimed"
+    },
+    {
+      "model": "qwen3.5-9b",
+      "file": "Qwen3.5-9B-Q4_K_M.gguf",
       "engine_tag": "b11417-cuda",
       "ppl_tool": "own llama-perplexity",
       "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",

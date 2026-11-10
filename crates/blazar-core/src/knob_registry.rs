@@ -112,6 +112,7 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--mmproj",
     "--mmproj-device",
     "--moe-cache-mib",
+    "--moe-cache-cpu-share",
     "--mtmd-batch-max-tokens",
     "--mtp",
     "--mtp-draft-sampling",

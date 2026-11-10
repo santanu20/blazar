@@ -19,8 +19,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use blazar_core::BlazarDirs;
+use blazar_core::engine_kind::EngineKind;
 use blazar_core::gguf;
-use blazar_core::store::{ModelRow, Store};
+use blazar_core::store::{EngineRow, ModelRow, Store};
 
 use crate::events::BlazarEvent;
 
@@ -75,13 +76,22 @@ pub fn registry_name(repo: &str) -> String {
 /// an exact `.gguf` filename (drafter-in-same-repo pulls) - that file's
 /// stem, so `dflash-Qwen3-8B-Q8_0.gguf` and `Qwen3-8B-Q8_0.gguf` from
 /// one repo land as distinct rows (`dflash-qwen3-8b-q8_0` vs
-/// `qwen3-8b`).
+/// `qwen3-8b-q8_0`).
 #[must_use]
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // operand pre-lowercased
-pub fn draft_aware_name(repo: &str, quant_slot: &str) -> String {
-    let lowered = quant_slot.to_lowercase();
+pub fn draft_aware_name(repo: &str, quant_slot: Option<&str>) -> String {
+    let Some(slot) = quant_slot else {
+        return registry_name(repo);
+    };
+    let lowered = slot.to_lowercase();
     if lowered.ends_with(".gguf") {
         return lowered.trim_end_matches(".gguf").to_string();
+    }
+    // Same exact-file rule for `.litertlm` bundles (openaihost lane):
+    // the stem becomes BOTH the row name and the vendor registry alias,
+    // so a repo hosting several bundles disambiguates via the slot.
+    if lowered.ends_with(".litertlm") {
+        return lowered.trim_end_matches(".litertlm").to_string();
     }
     registry_name(repo)
 }
@@ -89,19 +99,24 @@ pub fn draft_aware_name(repo: &str, quant_slot: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PullTarget {
     pub repo: String,
-    pub quant: String,
+    /// The quant tag the user typed, uppercased. `None` when the target
+    /// carried no `:TAG`: the parse never fabricates a default here - the
+    /// GGUF lane applies its default where a slot is actually needed, and
+    /// the safetensors admission gate can tell an explicit `:Q4_K_M` ask
+    /// on a repo with no such artifact apart from a plain pull.
+    pub quant: Option<String>,
 }
 
-/// Accepts `owner/repo:QUANT`, `owner/repo` (default quant), or a catalog
+/// Accepts `owner/repo:QUANT`, `owner/repo` (no quant slot), or a catalog
 /// short name (resolved via the embedded catalog).
 pub fn parse_pull_target(input: &str) -> Result<PullTarget> {
     let input = input.trim();
     if input.contains('/') {
         let (repo, quant) = match input.split_once(':') {
-            Some((r, q)) => (r, q.to_uppercase()),
-            None => (input, DEFAULT_QUANT.to_string()),
+            Some((r, q)) => (r, Some(q.to_uppercase())),
+            None => (input, None),
         };
-        if repo.is_empty() || quant.is_empty() {
+        if repo.is_empty() || quant.as_deref().is_some_and(str::is_empty) {
             return Err(anyhow!(
                 "invalid pull target {input:?}: empty repo or quant"
             ));
@@ -114,7 +129,7 @@ pub fn parse_pull_target(input: &str) -> Result<PullTarget> {
     let entry = blazar_core::resolve(input).map_err(|e| anyhow!("{e}"))?;
     Ok(PullTarget {
         repo: entry.repo.clone(),
-        quant: DEFAULT_QUANT.to_string(),
+        quant: None,
     })
 }
 
@@ -672,12 +687,19 @@ fn verify_index_coverage(dir: &Path) -> Result<()> {
 }
 
 /// Display quant label for an HF model dir: quantization bits when the
-/// repo carries a `quantization_config`, else the weight dtype. Uses
-/// the HF-side vocabulary (BIT/BF16/FP16/F32/FP8), not llama quant
-/// names - labels stay truthful for `est_params`.
+/// repo carries a readable `quantization_config`, else the quant method
+/// name, else the weight dtype. Uses the HF-side vocabulary
+/// (BIT/BF16/FP16/F32/FP8), not llama quant names - labels stay
+/// truthful for `est_params`.
 pub(crate) fn hf_quant_label(meta: &blazar_core::hfmeta::HfMeta) -> String {
     if let Some(bits) = meta.quant_bits {
         return format!("{bits}BIT");
+    }
+    // torchao-style configs nest `bits` too deep for `quant_bits` to
+    // see, but the method name still identifies the format truthfully;
+    // the weight dtype would lie (a packed torchao dir is not BF16).
+    if let Some(method) = meta.quant_method.as_deref().filter(|m| !m.is_empty()) {
+        return method.to_uppercase();
     }
     let d = meta.dtype.as_deref().map(str::to_lowercase);
     match d.as_deref() {
@@ -1873,6 +1895,42 @@ pub struct PullOutcome {
     pub already_present: bool,
 }
 
+/// Catalog-pinned chat-template guidance. When a pulled model's GGUF
+/// family ships without an embedded template (live case: glm-ocr,
+/// upstream llama.cpp #31298 - the server's default framing can
+/// repetition-loop), vendor the official template into the config dir
+/// and teach the `[model_overrides.<name>] chat_template_file` pin.
+/// Idempotent (an existing vendored file is never overwritten) and
+/// best-effort by design: a vendoring failure never fails the pull.
+#[must_use]
+pub fn chat_template_hint(dirs: &BlazarDirs, row: &ModelRow) -> Option<String> {
+    let entry = blazar_core::catalog::catalog()
+        .entries
+        .iter()
+        .find(|e| e.repo.eq_ignore_ascii_case(&row.repo))?;
+    let file = entry.chat_template.as_deref()?;
+    let body = blazar_core::catalog::chat_template_source(file)?;
+    let dest = dirs.config_dir.join("chat-templates").join(file);
+    if !dest.exists() {
+        let vendored =
+            std::fs::create_dir_all(dest.parent()?).and_then(|()| std::fs::write(&dest, body));
+        if let Err(e) = vendored {
+            tracing::warn!(
+                "chat-template vendoring skipped for {}: {e}",
+                dest.display()
+            );
+            return None;
+        }
+    }
+    let shown = dest.display();
+    Some(format!(
+        "note: {} GGUFs ship without an embedded chat template (upstream llama.cpp #31298) \
+         - vendored the official one to {shown}\n      \
+         pin it with: [model_overrides.{}] chat_template_file = \"{shown}\"",
+        row.name, row.name
+    ))
+}
+
 /// What a re-pull of an already-stored model must do.
 #[derive(Debug)]
 pub(crate) enum Repull {
@@ -2055,6 +2113,64 @@ pub(crate) fn required_component_missing(row: &ModelRow) -> bool {
 /// metadata from config.json, quant label from `quantization_config` /
 /// dtype, byte totals from the selection. Kept beside the GGUF row
 /// builders so the row dialect stays in one place.
+/// Quant-slot honesty for the safetensors lane: a `:tag` that names
+/// nothing on this lane must refuse BEFORE any bytes move, not pull
+/// silently as something else. The lane's artifacts are the repo's own
+/// safetensors files - their quant is whatever the repo ships (BF16
+/// unless the repo name/config says otherwise, e.g. MLX `-4bit`
+/// repos). A tag therefore passes when it names the lane's format
+/// truth or appears in the repo name itself (the MLX convention);
+/// anything else (`repo:q8_0` on a BF16-only repo) is a wrong-lane
+/// ask and gets the working alternative instead of a surprise.
+fn safetensors_quant_gate(repo: &str, quant: Option<&str>) -> Result<()> {
+    let Some(tag) = quant else {
+        return Ok(());
+    };
+    let tag = tag.to_lowercase();
+    if matches!(
+        tag.as_str(),
+        "bf16" | "f16" | "fp16" | "safetensors" | "safetensor"
+    ) || repo.to_lowercase().contains(&tag)
+    {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "repo {repo} ships safetensors as-is - there is no `{tag}` artifact on this \
+         lane (safetensors repos are not quant menus). Pull without the tag for the \
+         repo's own weights, or use a GGUF repo for that quant (e.g. \
+         `{repo}-GGUF:{tag}` where published)"
+    ))
+}
+
+/// Pull-time admission preview for the safetensors lane: a successful
+/// download is not the whole story - when every installed sglang lane
+/// would refuse this model at spawn (the torchao case: bytes land, no
+/// load path ever works), say so now on the same warning channel the
+/// GGUF health checks use. MLX-layout repos are exempt: they ride this
+/// lane for storage but serve on MLX-capable lanes, so an sglang
+/// refusal states nothing useful (same MLX repo-name convention
+/// `safetensors_quant_gate` honors).
+fn sglang_admission_warning(engines: &[EngineRow], repo: &str, dir: &Path) -> Option<String> {
+    if repo.to_lowercase().contains("mlx") {
+        return None;
+    }
+    let meta = blazar_core::hfmeta::read_hf_config(dir).ok()?;
+    let mut first_teach: Option<String> = None;
+    let mut sglang_lanes = 0usize;
+    for lane in engines.iter().filter(|e| e.kind == EngineKind::Sglang) {
+        sglang_lanes += 1;
+        let facts = serde_json::from_str::<crate::Manifest>(&lane.manifest)
+            .map(|m| m.sglang_lane_facts())
+            .unwrap_or_default();
+        // `?` here = this installed lane can load it, so there is nothing to warn about.
+        first_teach.get_or_insert(blazar_core::hfmeta::sglang_lane_teach(&meta, dir, &facts)?);
+    }
+    if sglang_lanes == 0 {
+        return None; // no sglang lane installed - routing decides, not us
+    }
+    first_teach.map(|t| format!("no installed sglang lane can load this model: {t}"))
+}
+
 fn safetensors_model_row(
     name: &str,
     repo: &str,
@@ -2066,6 +2182,9 @@ fn safetensors_model_row(
         .map_err(|e| anyhow!("hf model dir {} unusable: {e}", dir.display()))?;
     let quant = hf_quant_label(&meta);
     let bytes: u64 = sel.files.iter().map(|f| f.bytes).sum();
+    // 0.0 means the label gave no usable bits-per-weight; a fake
+    // `Some(0.0)` would render as "0B params" - absent is the honest row.
+    let est = est_params(bytes, &quant);
     Ok(ModelRow {
         name: name.to_string(),
         repo: repo.to_string(),
@@ -2077,7 +2196,7 @@ fn safetensors_model_row(
         components: vec![],
         shards: i64::try_from(sel.shard_count).unwrap_or(i64::MAX),
         arch: (!meta.architecture.is_empty()).then(|| meta.architecture.clone()),
-        params: Some(est_params(bytes, &quant)),
+        params: (est > 0.0).then_some(est),
         ctx_train: meta.ctx_train.and_then(|c| i64::try_from(c).ok()),
         pulled_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
             .unwrap_or(i64::MAX),
@@ -2094,7 +2213,7 @@ impl Puller {
     /// named after the file stem so they never collide with the model row.
     pub async fn pull(&self, target: &str) -> Result<PullOutcome> {
         let parsed = parse_pull_target(target)?;
-        let name = draft_aware_name(&parsed.repo, &parsed.quant);
+        let name = draft_aware_name(&parsed.repo, parsed.quant.as_deref());
         let _lock = PullLock::acquire(&self.dirs, &name)?;
         self.pull_locked(&parsed, &name, None).await
     }
@@ -2106,7 +2225,7 @@ impl Puller {
     /// LFS files, so the file plan comes from the tree API instead.
     pub async fn pull_at(&self, target: &str, revision: &str) -> Result<PullOutcome> {
         let parsed = parse_pull_target(target)?;
-        let name = draft_aware_name(&parsed.repo, &parsed.quant);
+        let name = draft_aware_name(&parsed.repo, parsed.quant.as_deref());
         let _lock = PullLock::acquire(&self.dirs, &name)?;
         self.pull_locked(&parsed, &name, Some(revision)).await
     }
@@ -2150,6 +2269,16 @@ impl Puller {
         {
             return outcome;
         }
+        // LiteRT lane: `.litertlm` bundles are an exclusive format
+        // domain (openaihost engine) - route before the gguf/safetensors
+        // fork so a bundle repo never lands on a weights lane.
+        if info
+            .siblings
+            .iter()
+            .any(|s| s.rfilename.to_lowercase().ends_with(".litertlm"))
+        {
+            return self.pull_litert_locked(target, name, &info, revision).await;
+        }
         // Lane fork: GGUF files (llamacpp/mistralrs engines) vs a
         // safetensors model directory (sglang engine). A repo with BOTH
         // keeps the GGUF lane - existing behavior unchanged; the log
@@ -2184,7 +2313,14 @@ impl Puller {
                 target.repo
             );
         }
-        let selected = select_files(&info.siblings, &target.quant)?;
+        // The GGUF lane is where the default quant belongs: an untagged
+        // target still pulls Q4_K_M exactly as before, while the tag's
+        // absence stays visible to the safetensors admission gate.
+        let gguf_slot = target
+            .quant
+            .clone()
+            .unwrap_or_else(|| DEFAULT_QUANT.to_string());
+        let selected = select_files(&info.siblings, &gguf_slot)?;
 
         let store = Store::open(&self.dirs)?;
 
@@ -2281,6 +2417,15 @@ impl Puller {
             self.attach_diffusion_set(target, name, &selected.quant, &mut row, &mut pull_warning)
                 .await?;
         }
+        // Catalog-pinned template guidance rides the existing warning
+        // channel: journal + ModelPulled event + (CLI side) the pull
+        // banner all surface it without a new outcome field.
+        if let Some(hint) = chat_template_hint(&self.dirs, &row) {
+            pull_warning = Some(match pull_warning.take() {
+                Some(w) => format!("{w}; {hint}"),
+                None => hint,
+            });
+        }
         if let Some(w) = &pull_warning {
             tracing::warn!(model = %name, "{w}");
         }
@@ -2302,7 +2447,7 @@ impl Puller {
         if selected.quant_fallback {
             tracing::warn!(
                 "quant {} not found in {}; pulled {} instead",
-                target.quant,
+                gguf_slot,
                 target.repo,
                 selected.quant
             );
@@ -2345,6 +2490,9 @@ impl Puller {
         info: &HfModelInfo,
         revision: Option<&str>,
     ) -> Result<PullOutcome> {
+        // Quant tag gate: only an explicitly typed `:TAG` is judged - a
+        // plain pull carries no slot by parse contract, so it always passes.
+        safetensors_quant_gate(&target.repo, target.quant.as_deref())?;
         let sel = select_safetensors_files(&info.siblings)?;
         let digest = revision_digest(&sel.files);
         let dir = self.dirs.models_dir().join(format!("{name}.d"));
@@ -2427,6 +2575,205 @@ impl Puller {
         verify_index_coverage(&dir)?;
 
         let row = safetensors_model_row(name, &target.repo, &dir, &sel, digest)?;
+        // Admission preview rides the pull banner: warn at download
+        // time when no installed sglang lane could ever load this
+        // format, instead of letting the first spawn discover it.
+        let pull_warning = sglang_admission_warning(
+            &store.list_engines().unwrap_or_default(),
+            &target.repo,
+            &dir,
+        );
+        if let Some(w) = &pull_warning {
+            tracing::warn!(model = %name, "{w}");
+        }
+        store.upsert_model(&row)?;
+        self.bus.publish(BlazarEvent::ModelPulled {
+            name: name.to_string(),
+            warning: pull_warning,
+        });
+        Ok(PullOutcome {
+            row,
+            already_present: false,
+        })
+    }
+
+    /// `litert-lm import` off the async runtime and under an explicit
+    /// ceiling: the vendor CLI is a blocking child whose wedge would
+    /// otherwise hold the pull lock (and its runtime thread) forever.
+    /// Every failure mode is named - timeout, task crash, CLI failure.
+    async fn litert_import_bounded(bin: &Path, bundle: &Path, alias: &str) -> Result<()> {
+        const IMPORT_CAP: std::time::Duration = std::time::Duration::from_secs(120);
+        let bin = bin.to_path_buf();
+        let bundle = bundle.to_path_buf();
+        let alias = alias.to_string();
+        let task = tokio::task::spawn_blocking(move || {
+            crate::engine::litert_install::litert_import(&bin, &bundle, &alias)
+        });
+        match tokio::time::timeout(IMPORT_CAP, task).await {
+            Err(_) => Err(anyhow!(
+                "litert-lm import exceeded {}s - the vendor CLI is unresponsive; re-run the pull",
+                IMPORT_CAP.as_secs()
+            )),
+            Ok(Err(join)) => Err(anyhow!("litert-lm import task crashed: {join}")),
+            Ok(Ok(res)) => res,
+        }
+    }
+
+    /// `LiteRT` lane: the repo hosts `.litertlm` bundles (openaihost
+    /// engine). One root-level bundle file lands flat in the models dir
+    /// (like a GGUF) and is hardlinked into the vendor registry
+    /// (`~/.litert-lm/models/<name>/`) via `litert-lm import` - the
+    /// alias IS the row name, so the serve child resolves requests
+    /// verbatim. Import needs the engine's CLI, so the engine is
+    /// resolved BEFORE any bytes move (fail fast beats a 400 MB orphan
+    /// download on a machine that cannot serve the lane anyway).
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)] // operands pre-lowercased
+    async fn pull_litert_locked(
+        &self,
+        target: &PullTarget,
+        name: &str,
+        info: &HfModelInfo,
+        revision: Option<&str>,
+    ) -> Result<PullOutcome> {
+        let bin = crate::engine::litert_install::find_litert_bin(&self.dirs)?;
+
+        // Bundle selection: an explicit `:File.litertlm` quant slot wins;
+        // otherwise exactly one root-level bundle must exist (H1: list
+        // the candidates instead of guessing).
+        let bundles: Vec<&HfSibling> = info
+            .siblings
+            .iter()
+            .filter(|s| {
+                let lower = s.rfilename.to_lowercase();
+                !lower.contains('/') && lower.ends_with(".litertlm")
+            })
+            .collect();
+        let slot_lower = target.quant.as_deref().unwrap_or_default().to_lowercase();
+        let sibling = if slot_lower.ends_with(".litertlm") {
+            *bundles
+                .iter()
+                .find(|s| s.rfilename.to_lowercase() == slot_lower)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "repo {repo} has no bundle named {slot_lower}; available: {avail}",
+                        repo = target.repo,
+                        avail = bundles
+                            .iter()
+                            .map(|s| s.rfilename.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?
+        } else if bundles.len() == 1 {
+            bundles[0]
+        } else if bundles.is_empty() {
+            return Err(anyhow!(
+                "repo {} carries no root-level .litertlm bundle",
+                target.repo
+            ));
+        } else {
+            return Err(anyhow!(
+                "repo {} hosts multiple .litertlm bundles - name one exactly: {}",
+                target.repo,
+                bundles
+                    .iter()
+                    .map(|s| format!("{}:{}", target.repo, s.rfilename))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        };
+        let file = plan(sibling);
+        let dest = self.dirs.models_dir().join(&file.filename);
+        let store = Store::open(&self.dirs)?;
+
+        let existing = store.get_model(name)?;
+        flip_guard(name, existing.as_ref(), true, self.force)?;
+        if let Some(row) = existing
+            && dest.exists()
+        {
+            // The vendor-registry alias (`~/.litert-lm/models/<name>/`) is
+            // NOT part of the row: it lives outside the store and can be
+            // wiped independently (user cleanup, reinstall). Re-running the
+            // import is idempotent hardlink work, and it verifies the alias
+            // resolves post-success - skipping it here would let an
+            // "already present" model 404 at serve time with no teaching.
+            Self::litert_import_bounded(&bin, &dest, name).await?;
+            return Ok(PullOutcome {
+                row,
+                already_present: true,
+            });
+        }
+
+        crate::storage::gate_disk(&self.dirs, file.bytes, &format!("{name} (litertlm lane)"))?;
+        let bar = indicatif::ProgressBar::new(file.bytes);
+        bar.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{msg} {bar:30} {bytes}/{total_bytes} ({eta})")
+                .expect("valid template"),
+        );
+        bar.set_message(format!(
+            "pull {name} (litertlm){}",
+            self.client.cap_suffix()
+        ));
+        let mut last_publish = 0u64;
+        let mut progress = |downloaded: u64, total: u64| {
+            bar.set_position(downloaded);
+            if downloaded.saturating_sub(last_publish) >= 16 << 20 || downloaded == total {
+                last_publish = downloaded;
+                self.bus.publish(BlazarEvent::PullProgress {
+                    name: name.to_string(),
+                    downloaded,
+                    total,
+                });
+            }
+        };
+        self.fetch_file(&target.repo, &file, &dest, &mut progress, revision)
+            .await
+            .inspect_err(|e| {
+                self.bus.publish(BlazarEvent::PullFailed {
+                    name: name.to_string(),
+                    error: e.to_string(),
+                });
+            })?;
+        bar.finish_and_clear();
+
+        // H1: a zero-byte bundle is a truncated download, not a model.
+        let bytes = std::fs::metadata(&dest)
+            .map_err(|e| anyhow!("stat {}: {e}", dest.display()))?
+            .len();
+        if bytes == 0 {
+            return Err(anyhow!("{} downloaded as 0 bytes", dest.display()));
+        }
+        Self::litert_import_bounded(&bin, &dest, name)
+            .await
+            .inspect_err(|e| {
+                self.bus.publish(BlazarEvent::PullFailed {
+                    name: name.to_string(),
+                    error: e.to_string(),
+                });
+            })?;
+
+        let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+            .unwrap_or(i64::MAX);
+        let row = ModelRow {
+            name: name.to_string(),
+            repo: target.repo.clone(),
+            // Bundles are pre-quantized XNNPACK packs; the format marker
+            // is the honest label (per-file quant lives in the filename).
+            quant: "LITERT".to_string(),
+            path: dest.display().to_string(),
+            bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
+            sha256: file.sha256.clone(),
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: now,
+            last_used_at: now,
+        };
         store.upsert_model(&row)?;
         self.bus.publish(BlazarEvent::ModelPulled {
             name: name.to_string(),
@@ -2643,6 +2990,9 @@ impl Puller {
         }
     }
 
+    // One linear checkpoint walk per pull target: splitting it would hide the
+    // family/file decision ladder behind helpers without shrinking the logic.
+    #[allow(clippy::too_many_lines)]
     async fn pull_standalone_checkpoint(
         &self,
         target: &PullTarget,
@@ -2721,7 +3071,10 @@ impl Puller {
                 pulled_at: 0,
                 last_used_at: 0,
             };
-            self.attach_diffusion_set(target, name, &target.quant, &mut row, &mut pull_warning)
+            // Untagged diffusion pulls carry no slot; the GGUF default
+            // is the family's usual pick.
+            let family_quant = target.quant.as_deref().unwrap_or(DEFAULT_QUANT);
+            self.attach_diffusion_set(target, name, family_quant, &mut row, &mut pull_warning)
                 .await?;
             if let Some(w) = pull_warning {
                 tracing::warn!(model = %name, "{w}");
@@ -3431,6 +3784,176 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn unit__safetensors_quant_gate__refuses_wrong_lane_tags_and_passes_truth() {
+        // No tag, lane-truth tags, and the MLX repo-name convention pass.
+        assert!(safetensors_quant_gate("unsloth/gemma-3-270m", None).is_ok());
+        assert!(safetensors_quant_gate("unsloth/gemma-3-270m", Some("BF16")).is_ok());
+        assert!(safetensors_quant_gate("unsloth/gemma-3-270m", Some("safetensors")).is_ok());
+        assert!(
+            safetensors_quant_gate("mlx-community/gemma-3-270m-4bit", Some("4BIT")).is_ok(),
+            "the quant named in the repo itself is reality"
+        );
+        // A GGUF-lane quant on a safetensors-only repo refuses BEFORE
+        // any bytes move, naming the working alternative.
+        let err = safetensors_quant_gate("unsloth/gemma-3-270m", Some("q8_0")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("q8_0"), "names the refused tag: {msg}");
+        assert!(msg.contains("-GGUF"), "teaches the quant lane: {msg}");
+    }
+
+    fn engine_lane(tag: &str, kind: EngineKind, manifest: &str) -> EngineRow {
+        EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at: 0,
+            active: true,
+            manifest: manifest.to_string(),
+            kind,
+        }
+    }
+
+    fn sglang_lane_manifest(quant_methods: &[&str]) -> String {
+        serde_json::json!({
+            "tag": "sglang-0.5.23",
+            "build_number": 5023,
+            "version_raw": "sglang 0.5.23",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/sglang-0.5.23/sglang-server",
+            "quant_methods": quant_methods,
+        })
+        .to_string()
+    }
+
+    fn torchao_model_dir() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{"architectures":["Qwen3ForCausalLM"],"torch_dtype":"bfloat16","quantization_config":{"quant_method":"torchao"}}"#,
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_admission_warning__fires_when_every_sglang_lane_refuses() {
+        let tmp = torchao_model_dir();
+        let engines = vec![
+            engine_lane("llamacpp-b12189", EngineKind::LlamaCpp, "{}"),
+            engine_lane(
+                "sglang-0.5.23",
+                EngineKind::Sglang,
+                &sglang_lane_manifest(&["awq", "fp8"]),
+            ),
+        ];
+        let w = sglang_admission_warning(&engines, "liangel/Qwen3-8B-AWQ-INT4", tmp.path())
+            .expect("the only sglang lane refuses torchao");
+        assert!(w.starts_with("no installed sglang lane"), "{w}");
+        assert!(w.contains("torchao"), "names the format: {w}");
+        assert!(w.contains("0.5.23"), "names the lane version: {w}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_admission_warning__silent_for_mlx_loadable_and_laneless() {
+        let tmp = torchao_model_dir();
+        // A lane that CAN load it keeps the pull quiet.
+        let loadable = vec![engine_lane(
+            "sglang-0.5.23",
+            EngineKind::Sglang,
+            &sglang_lane_manifest(&["torchao", "awq"]),
+        )];
+        assert!(
+            sglang_admission_warning(&loadable, "liangel/Qwen3-8B-AWQ-INT4", tmp.path()).is_none()
+        );
+        // MLX repos ride this lane for storage; an sglang refusal there
+        // would be noise, not news.
+        let refusing = vec![engine_lane(
+            "sglang-0.5.23",
+            EngineKind::Sglang,
+            &sglang_lane_manifest(&["awq"]),
+        )];
+        assert!(
+            sglang_admission_warning(&refusing, "mlx-community/gemma-3-270m-4bit", tmp.path())
+                .is_none()
+        );
+        // No sglang lane installed: routing decides, pull stays quiet.
+        let laneless = vec![engine_lane("llamacpp-b12189", EngineKind::LlamaCpp, "{}")];
+        assert!(
+            sglang_admission_warning(&laneless, "liangel/Qwen3-8B-AWQ-INT4", tmp.path()).is_none()
+        );
+    }
+
+    fn glm_ocr_row() -> ModelRow {
+        ModelRow {
+            name: "glm-ocr".into(),
+            repo: "ggml-org/GLM-OCR-GGUF".into(),
+            quant: "Q8_0".into(),
+            path: String::new(),
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: Some("glm4".into()),
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__chat_template_hint__vendors_official_template_and_teaches_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let hint = chat_template_hint(&dirs, &glm_ocr_row()).expect("glm-ocr is pinned");
+        let vendored = dirs.config_dir.join("chat-templates/glm-ocr.jinja");
+        assert!(vendored.is_file(), "template vendored next to the config");
+        let body = std::fs::read_to_string(&vendored).unwrap();
+        assert!(body.starts_with("[gMASK]<sop>"), "official template body");
+        assert!(
+            hint.contains("model_overrides.glm-ocr] chat_template_file"),
+            "teaches the pin: {hint}"
+        );
+        assert!(hint.contains("#31298"), "cites the upstream issue: {hint}");
+        // Idempotent and never clobbers: a user-edited vendored file
+        // survives a re-pull untouched, guidance still fires.
+        std::fs::write(&vendored, "[gMASK]<sop> edited-by-user").unwrap();
+        let _again = chat_template_hint(&dirs, &glm_ocr_row()).expect("guidance still fires");
+        assert_eq!(
+            std::fs::read_to_string(&vendored).unwrap(),
+            "[gMASK]<sop> edited-by-user",
+            "existing vendored file is never overwritten"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__chat_template_hint__unpinned_repo_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let mut row = glm_ocr_row();
+        row.repo = "unsloth/Qwen3.5-0.8B-MTP-GGUF".into();
+        row.name = "qwen3.5-0.8b-mtp".into();
+        assert!(chat_template_hint(&dirs, &row).is_none());
+        assert!(
+            !dirs.config_dir.join("chat-templates").exists(),
+            "nothing vendored for unpinned repos"
+        );
+    }
 
     #[test]
     fn unit__next_link__rel_next_target_or_none() {
@@ -4419,14 +4942,30 @@ mod tests {
     fn unit__parse_target__explicit_repo_with_quant() {
         let t = parse_pull_target("Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0").unwrap();
         assert_eq!(t.repo, "Qwen/Qwen2.5-0.5B-Instruct-GGUF");
-        assert_eq!(t.quant, "Q8_0");
+        assert_eq!(t.quant.as_deref(), Some("Q8_0"));
     }
 
     #[test]
     fn unit__parse_target__catalog_short_name() {
         let t = parse_pull_target("qwen3-0.6b").unwrap();
         assert_eq!(t.repo, "ggml-org/Qwen3-0.6B-GGUF");
-        assert_eq!(t.quant, "Q4_K_M");
+        // The catalog pins the repo, not a quant slot: the GGUF lane
+        // applies its default where a slot is actually needed.
+        assert_eq!(t.quant, None);
+    }
+
+    #[test]
+    fn unit__parse_target__untagged_repo_carries_no_slot_and_gates_on_it() {
+        // The bypass this pins shut: an explicit `:Q4_K_M` ask on a
+        // safetensors repo is a wrong-lane request and must teach, while
+        // a plain pull (no slot by parse contract) always passes.
+        let plain = parse_pull_target("Qwen/Qwen3-8B-AWQ").unwrap();
+        assert_eq!(plain.quant, None);
+        safetensors_quant_gate(&plain.repo, plain.quant.as_deref()).unwrap();
+        let tagged = parse_pull_target("Qwen/Qwen3-8B-AWQ:q4_k_m").unwrap();
+        assert_eq!(tagged.quant.as_deref(), Some("Q4_K_M"));
+        let err = safetensors_quant_gate(&tagged.repo, tagged.quant.as_deref()).unwrap_err();
+        assert!(err.to_string().contains("ships safetensors as-is"), "{err}");
     }
 
     #[test]
@@ -4482,13 +5021,35 @@ mod tests {
     #[test]
     fn unit__draft_aware_name__filename_slot_names_row_by_stem() {
         assert_eq!(
-            draft_aware_name("ggml-org/Qwen3-8B-GGUF", "dflash-Qwen3-8B-Q8_0.gguf"),
+            draft_aware_name("ggml-org/Qwen3-8B-GGUF", Some("dflash-Qwen3-8B-Q8_0.gguf")),
             "dflash-qwen3-8b-q8_0"
         );
         // Quant-style slots keep the repo-tail name.
         assert_eq!(
-            draft_aware_name("ggml-org/Qwen3-0.6B-GGUF", "Q4_0"),
+            draft_aware_name("ggml-org/Qwen3-0.6B-GGUF", Some("Q4_0")),
             "qwen3-0.6b"
+        );
+        // An untagged target is the plain repo-tail name.
+        assert_eq!(
+            draft_aware_name("ggml-org/Qwen3-0.6B-GGUF", None),
+            "qwen3-0.6b"
+        );
+        // .litertlm slots name the row by bundle stem: the litert
+        // registry alias must equal the store name for request routing.
+        assert_eq!(
+            draft_aware_name(
+                "litert-community/SmolLM2_360M_instruct",
+                Some("SmolLM2_360M_instruct.litertlm")
+            ),
+            "smollm2_360m_instruct"
+        );
+        assert_eq!(
+            draft_aware_name(
+                "litert-community/SmolLM2_360M_instruct",
+                Some("SmolLM2_360M_instruct.litertlm")
+            ),
+            draft_aware_name("litert-community/SmolLM2_360M_instruct", Some("IGNORED")),
+            "quant slot is ignored for litertlm bundles (one bundle per row)"
         );
     }
 
@@ -5916,6 +6477,49 @@ mod tests {
         assert_eq!(hf_quant_label(&m(None, Some("float8_e4m3fn"))), "FP8");
         assert_eq!(hf_quant_label(&m(None, Some("custom"))), "CUSTOM");
         assert_eq!(hf_quant_label(&m(None, None)), "SAFETENSORS");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__hf_quant_label__method_names_format_when_bits_unreadable() {
+        let m = |quant_method: Option<&str>| blazar_core::hfmeta::HfMeta {
+            quant_method: quant_method.map(str::to_string),
+            dtype: Some("bfloat16".to_string()),
+            ..Default::default()
+        };
+        // torchao nests `bits` out of `quant_bits_of`'s reach - the
+        // method is the truth; the dtype ("BF16") was the lie this
+        // replaces.
+        assert_eq!(hf_quant_label(&m(Some("torchao"))), "TORCHAO");
+        assert_eq!(hf_quant_label(&m(Some("awq"))), "AWQ");
+        // Bits still win when the config is honest about them.
+        let bits = blazar_core::hfmeta::HfMeta {
+            quant_bits: Some(4),
+            quant_method: Some("awq".to_string()),
+            dtype: Some("bfloat16".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(hf_quant_label(&bits), "4BIT");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__safetensors_model_row__params_honest_for_every_label() {
+        let tmp = torchao_model_dir();
+        let sel = SafetensorsSelection {
+            files: vec![FilePlan {
+                filename: "model.safetensors".into(),
+                bytes: 1_000_000_000,
+                sha256: None,
+            }],
+            shard_count: 1,
+        };
+        let row = safetensors_model_row("q", "o/q", tmp.path(), &sel, "digest".into()).unwrap();
+        assert_eq!(row.quant, "TORCHAO");
+        let params = row
+            .params
+            .expect("a rough estimate accompanies every label");
+        assert!(params > 0.0, "got {params}");
     }
 
     #[test]

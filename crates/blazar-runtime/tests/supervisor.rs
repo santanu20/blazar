@@ -1002,3 +1002,97 @@ async fn integration__prewarm_reshape__cutover_same_key_new_argv() {
 
     sup.shutdown_all().await.unwrap();
 }
+
+// --------------------------------------------------------------- openaihost
+
+/// The openaihost lane (LiteRT-LM class): every `.litertlm` model must
+/// collapse onto ONE shared registry child (`_openaihost`), never a
+/// per-model instance, and the lane child must die with `shutdown_all`.
+/// The stub doubles as the host: its `/v1/models` data-array answer is
+/// exactly the lane health contract, and its loose argv parser accepts
+/// the lane's `serve --host --port` grammar.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__openaihost_lane__shared_child_collapse_and_teardown() {
+    let (_t, dirs) = setup(&[]);
+    let store = Store::open(&dirs).unwrap();
+    for name in ["x", "x2"] {
+        let p = dirs.models_dir().join(format!("{name}.litertlm"));
+        std::fs::write(&p, b"litert stub bundle").unwrap();
+        store
+            .upsert_model(&blazar_core::ModelRow {
+                name: name.into(),
+                repo: format!("litert-community/{name}"),
+                quant: "LITERT".into(),
+                path: p.display().to_string(),
+                bytes: 1000,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 1,
+                last_used_at: 1,
+            })
+            .unwrap();
+    }
+    // Engine row for the lane. Auth flags are stripped from the stub
+    // manifest so the lane shape matches production litert: no child
+    // auth is minted, the child stays on loopback + random port.
+    let mut manifest = stub_manifest();
+    manifest.flags.remove("--api-key-file");
+    manifest.flags.remove("--api-key");
+    store
+        .upsert_engine(&blazar_core::store::EngineRow {
+            tag: "litert-0".into(),
+            asset: "pip:litert-lm==test".into(),
+            sha256: String::new(),
+            installed_at: 2,
+            active: false,
+            manifest: serde_json::to_string(&manifest).unwrap(),
+            kind: blazar_core::engine_kind::EngineKind::OpenAiHost,
+        })
+        .unwrap();
+
+    let sup = supervisor(&dirs, base_config(), false);
+    let lane_key = blazar_runtime::supervisor::OPENAIHOST_KEY.to_string();
+
+    // Cold path: a litertlm model ensure collapses onto the lane child.
+    let e1 = sup.ensure_routed("x", None).await.expect("lane child");
+    assert_eq!(e1.key, lane_key, "engine ref addresses the lane key");
+    assert_eq!(e1.kind, blazar_core::engine_kind::EngineKind::OpenAiHost);
+    assert!(e1.auth.is_none(), "no auth flags on the litert lane");
+    let names: Vec<String> = sup.ps().into_iter().map(|p| p.name).collect();
+    assert_eq!(names, vec![lane_key], "no per-model instance rows");
+    let port_of = |e: &blazar_runtime::EngineRef| match &e.endpoint {
+        blazar_core::Endpoint::Tcp { port, .. } => *port,
+        blazar_core::Endpoint::Unix { .. } => panic!("lane child must be tcp"),
+    };
+    let port = port_of(&e1);
+
+    // Warm path: a second bundle model rides the SAME child (one
+    // registry server, one port - no second spawn).
+    let e2 = sup
+        .ensure_routed("x2", None)
+        .await
+        .expect("second model joins the shared child");
+    assert_eq!(port_of(&e2), port, "both bundle models share one child");
+    assert_eq!(sup.ps().len(), 1, "still exactly one lane instance");
+
+    // Teardown: the lane child dies with the supervisor and its port
+    // stops answering (V5: no orphaned child survives shutdown).
+    sup.shutdown_all().await.unwrap();
+    assert!(sup.ps().is_empty());
+    let addr = format!("127.0.0.1:{port}");
+    let mut refused = false;
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(&addr).await.is_err() {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(refused, "lane child port closed after shutdown_all");
+}

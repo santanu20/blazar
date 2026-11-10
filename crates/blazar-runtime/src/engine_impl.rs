@@ -1637,6 +1637,164 @@ impl Engine for MlxEngine {
     }
 }
 
+/// OpenAI-compatible host engine (`litert-lm serve`, pip venv lane).
+/// The child is a registry-wide server: ONE shared serve process per
+/// installed engine row serves every `.litertlm` bundle the supervisor
+/// collapses onto it (router-key pattern) - there is no per-model argv,
+/// so `build_argv` owns the whole launch grammar (`serve --host --port`
+/// from the supervisor's endpoint pick) and the compiled profile only
+/// contributes flag-gated user `extra_args`.
+///
+/// Lane contract:
+/// - health = HTTP 200 with an `OpenAI` JSON model-list body on
+///   `/v1/models` (litert-lm has no `/health` route; the port binds
+///   after the registry loads, same ready-signal shape as sd-server)
+/// - no unix-socket transport: endpoints are always TCP
+/// - devices are opaque (the runtime picks CPU/GPU/NPU delegates
+///   internally), so `enumerate_devices` stays the default `None` -
+///   reporting hardware here would double-count VRAM blazar never
+///   budgets for this lane
+pub struct OpenAiHostEngine {
+    pub manifest: crate::engine::manifest::Manifest,
+    /// HTTP client for health polls (children are loopback).
+    http: reqwest::Client,
+    /// Extra env injected into children (config `engine_env`).
+    pub child_env: Vec<(String, String)>,
+}
+
+impl OpenAiHostEngine {
+    #[must_use]
+    pub fn new(manifest: crate::engine::manifest::Manifest) -> Self {
+        Self::with_env(manifest, Vec::new())
+    }
+
+    /// `env` pairs apply to every spawned child (config `engine_env`).
+    #[must_use]
+    pub fn with_env(
+        manifest: crate::engine::manifest::Manifest,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        // Same 5s budget class as sglang/mlx: litert-lm is a python
+        // entry point whose interpreter import chain is slow to boot -
+        // a 2s timeout risks eating the first (or only) successful
+        // /v1/models response during the boot window.
+        blazar_core::tls::ensure_tls_provider();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("health client");
+        Self {
+            manifest,
+            http,
+            child_env: env,
+        }
+    }
+
+    fn base_url(endpoint: &Endpoint) -> String {
+        match endpoint {
+            Endpoint::Tcp { host, port } => format!("http://{host}:{port}"),
+            Endpoint::Unix { .. } => String::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Engine for OpenAiHostEngine {
+    fn kind(&self) -> blazar_core::engine_kind::EngineKind {
+        blazar_core::engine_kind::EngineKind::OpenAiHost
+    }
+
+    fn capabilities(&self) -> &crate::engine::manifest::Manifest {
+        &self.manifest
+    }
+
+    fn build_argv(
+        &self,
+        _model: &blazar_core::ModelRow,
+        profile: &Profile,
+        endpoint: &Endpoint,
+    ) -> Vec<String> {
+        // The launch grammar lives here, not in the profile: the child
+        // is registry-wide, so the endpoint (not any model row) names
+        // the listen pair. User extra_args ride after it.
+        let Endpoint::Tcp { host, port } = endpoint else {
+            // Unix transport is refused at spawn; an argv nobody gets to
+            // run stays empty rather than carrying a bogus listen pair.
+            return Vec::new();
+        };
+        let mut argv = vec![
+            "serve".to_string(),
+            "--host".to_string(),
+            host.clone(),
+            "--port".to_string(),
+            port.to_string(),
+        ];
+        argv.extend(profile.argv.iter().cloned());
+        argv
+    }
+
+    async fn spawn(
+        &self,
+        argv: &[String],
+        endpoint: &Endpoint,
+        spawn_env: &[(String, String)],
+    ) -> Result<ChildHandle> {
+        if matches!(endpoint, Endpoint::Unix { .. }) {
+            return Err(anyhow!(
+                "openaihost engines have no unix-socket transport; set \
+                 child_transport = \"tcp\" in the blazar config"
+            ));
+        }
+        spawn_child(
+            &self.manifest.server_path,
+            argv,
+            endpoint,
+            &self.child_env,
+            spawn_env,
+        )
+    }
+
+    async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
+        let url = Self::base_url(endpoint);
+        if url.is_empty() {
+            return Err(anyhow!(
+                "openaihost engines have no unix-socket transport; set \
+                 child_transport = \"tcp\" in the blazar config"
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
+        // Health = 200 with an OpenAI model listing: litert-lm serve has
+        // no /health route (verified against v0.19.1 serve --help); the
+        // port binds once the registry is ready and /v1/models answers
+        // the registry contents, same ready-signal shape as sd-server.
+        let mut poll = std::time::Duration::from_millis(25);
+        loop {
+            match self.http.get(format!("{url}/v1/models")).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if body["data"].as_array().is_some() {
+                        tracing::debug!(
+                            "openaihost healthy at {url} after {:?}",
+                            started.elapsed()
+                        );
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "openaihost at {url} did not list models on /v1/models within {timeout:?} \
+                     (model_load_timeout)"
+                ));
+            }
+            tokio::time::sleep(poll).await;
+            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_millis(150));
+        }
+    }
+}
+
 async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     r: R,
     stream: &str,

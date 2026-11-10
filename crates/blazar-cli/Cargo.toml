@@ -27,6 +27,22 @@ assets = [
   { source = "target/rpm-completions/fish/blazar.fish", dest = "/usr/share/fish/vendor_completions.d/blazar.fish" },
 ]
 
+# cargo-binstall: release archives carry a `v` version prefix (and the
+# Windows lane is a flat zip), which the tool's default naming
+# inference cannot derive from the crate metadata alone.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/blazar-v{ version }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "blazar{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/blazar-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/blazar-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
 [features]
 default = []
 test-util = []

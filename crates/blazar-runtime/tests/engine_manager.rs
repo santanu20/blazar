@@ -396,6 +396,76 @@ async fn integration__latest_btag_from_list() {
     );
 }
 
+/// Mirror-lag hardening pin: the paginated listing serves a STALE asset
+/// list (empty - assets already uploaded upstream) while the per-tag
+/// endpoint has the real row. A channel install must land on the
+/// authoritative assets, not fail on the stale listing.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__channel_update__listing_assets_stale_installs_from_per_tag() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    mount_releases_list(&api, &["b300"]).await; // assets: [] (stale)
+    let tar = fixture_tarball("b300");
+    mount_release(
+        &api,
+        "b300",
+        "llama-b300-bin-ubuntu-vulkan-x64.tar.gz",
+        &tar,
+    )
+    .await;
+    let mgr = manager(&dirs, &api.uri());
+    let row = mgr.update(None, UpdateChannel::Latest).await.unwrap();
+    assert_eq!(row.tag, "b300", "install must use the per-tag asset row");
+    assert_eq!(row.asset, "ubuntu-vulkan-x64");
+}
+
+/// Fallback contract pin for the same hardening: when the per-tag
+/// re-resolve fails outright (404 here), the install proceeds on the
+/// listing row instead of dying - download + digest + probe remain the
+/// real validators. Guards against someone making the hardening fetch
+/// mandatory later.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__channel_update__per_tag_refetch_fails__listing_row_installs() {
+    let (_t, dirs) = tmp_dirs();
+    let api = MockServer::start().await;
+    let tar = fixture_tarball("b300");
+    let asset = "llama-b300-bin-ubuntu-vulkan-x64.tar.gz";
+    // Listing row carries the full asset (the happy data); the per-tag
+    // endpoint is gone (tag deleted / mirror hiccup).
+    Mock::given(method("GET"))
+        .and(path("/repos/ggml-org/llama.cpp/releases"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "tag_name": "b300",
+                "prerelease": true,
+                "assets": [{
+                    "name": asset,
+                    "digest": format!("sha256:{}", sha256_hex(&tar)),
+                    "size": u64::try_from(tar.len()).unwrap_or(u64::MAX),
+                    "browser_download_url": format!("{}/download/b300/{asset}", api.uri()),
+                }]
+            }])),
+        )
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/ggml-org/llama.cpp/releases/tags/b300"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/download/b300/{asset}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tar.clone()))
+        .mount(&api)
+        .await;
+    let mgr = manager(&dirs, &api.uri());
+    let row = mgr.update(None, UpdateChannel::Latest).await.unwrap();
+    assert_eq!(row.tag, "b300", "listing row stands when per-tag fails");
+    assert_eq!(row.asset, "ubuntu-vulkan-x64");
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__rate_limit__gh_token_hint() {

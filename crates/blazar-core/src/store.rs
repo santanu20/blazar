@@ -504,6 +504,15 @@ impl ModelRow {
         mlx_signal(&self.name, &self.repo, &self.path)
     }
 
+    /// True for `.litertlm` bundles (LiteRT-LM and kin): single-file,
+    /// self-contained, decodable only by the `OpenAiHost` lane. The
+    /// extension IS the format - no token heuristics, unlike the
+    /// safetensors/MLX signals above.
+    #[must_use]
+    pub fn is_litert_bundle(&self) -> bool {
+        self.path.to_ascii_lowercase().ends_with(".litertlm")
+    }
+
     /// Local path for a component flag, if the set carries it.
     #[must_use]
     pub fn component(&self, flag: &str) -> Option<&str> {
@@ -958,8 +967,8 @@ impl Store {
             // block, and legacy stores can hold double-active flags -
             // CREATE UNIQUE INDEX would abort the batch before the
             // repair inside could clean them. Repair keeps the row
-            // heal_active_engine would pick (llamacpp first, then
-            // mistral.rs/sglang, newest within the kind - rank mirrored
+            // heal_active_engine would pick (llamacpp first, then the
+            // venv text lanes, newest within the tier - rank mirrored
             // from there; keep the two in step); all-lazy actives demote
             // to zero-active, the same state heal lands on for an
             // audio-only box. Repair + index + stamp share one
@@ -1045,9 +1054,16 @@ impl Store {
                 r.get(0)
             })?;
         if active_count > 1 {
+            // Rank mirrors heal_active_engine's serving-succession tier
+            // through the shared kind predicate (unknown kind strings
+            // from future lanes rank 0 - the honest floor).
             let rank = |kind: &str| match kind {
                 "llamacpp" => 2,
-                "mistralrs" | "sglang" => 1,
+                k if crate::engine_kind::EngineKind::from_str(k)
+                    .is_ok_and(crate::engine_kind::EngineKind::is_venv_serving_lane) =>
+                {
+                    1
+                }
                 _ => 0,
             };
             let actives: Vec<(String, String, i64)> = v14
@@ -1970,14 +1986,17 @@ impl Store {
     /// 2. Zero-active: no row holds the flag but serving-capable
     ///    engines are installed (the class F120's transaction fixed
     ///    mid-write; an update interrupted before its activation step
-    ///    lands here): activate the best one - llamacpp lanes first
-    ///    (router mode's native lane), newest within the kind - so one
-    ///    stale flag can never brick `serve` while good engines sit
+    ///    lands here): activate the best one - the native llama.cpp
+    ///    lane first (router mode's native lane), then every venv text
+    ///    lane ([`EngineKind::is_venv_serving_lane`]: mistral.rs,
+    ///    sglang, mlx, litert), newest within the tier - so one stale
+    ///    flag can never brick `serve` while good engines sit
     ///    installed.
     ///
     /// Returns the activated tag, or None when the store needs no
-    /// healing. Lazy lanes (whisper, piper, sdcpp) never claim the slot:
-    /// the active row is the serving adapter and must stay a text lane.
+    /// healing. Non-text lanes (whisper, piper, sd.cpp) never claim the
+    /// slot: the active row is the serving adapter and must stay a text
+    /// lane.
     pub fn heal_active_engine(&self) -> CoreResult<Option<String>> {
         if let Some(active) = self.active_engine()? {
             if !active.kind.is_lazy_lane() {
@@ -1993,9 +2012,12 @@ impl Store {
                 active.tag
             );
         }
+        // Serving-succession tier: native llama.cpp lane first, then
+        // the venv text lanes (one semantic, shared with the v14
+        // migration's mirror below), non-text lanes never.
         let rank = |k: crate::engine_kind::EngineKind| match k {
             crate::engine_kind::EngineKind::LlamaCpp => 2,
-            crate::engine_kind::EngineKind::MistralRs | crate::engine_kind::EngineKind::Sglang => 1,
+            k if k.is_venv_serving_lane() => 1,
             _ => 0,
         };
         let pick = self
@@ -4840,6 +4862,52 @@ mod tests {
     }
 
     #[test]
+    fn unit__heal_active_engine__venv_text_lanes_succeed_the_slot() {
+        // The tier list predates mlx and the litert lane; this pin
+        // holds them in the serving-succession tier the heal doc
+        // promises (text lanes claim the slot, newest within tier).
+        let (_t, s) = tmp_store();
+        s.upsert_engine(&engine_row_of("mlx-0.32.2", EngineKind::Mlx, 20))
+            .unwrap();
+        s.upsert_engine(&engine_row_of("master-890", EngineKind::SdCpp, 50))
+            .unwrap();
+        s.upsert_engine(&engine_row_of("litert-0.19.1", EngineKind::OpenAiHost, 40))
+            .unwrap();
+        assert_eq!(
+            s.heal_active_engine().unwrap().as_deref(),
+            Some("litert-0.19.1"),
+            "newest venv text lane heals; the newer sdcpp row never does"
+        );
+        assert_eq!(
+            s.active_engine().unwrap().unwrap().kind,
+            EngineKind::OpenAiHost
+        );
+
+        // An ACTIVE venv row is a healthy holder, and the native
+        // llama.cpp lane still outranks a newer venv lane on heal.
+        let (_t2, s2) = tmp_store();
+        s2.upsert_engine(&engine_row(
+            "litert-0.19.1",
+            40,
+            true,
+            EngineKind::OpenAiHost,
+        ))
+        .unwrap();
+        assert_eq!(s2.heal_active_engine().unwrap(), None);
+        let (_t3, s3) = tmp_store();
+        s3.upsert_engine(&engine_row_of("litert-0.19.1", EngineKind::OpenAiHost, 90))
+            .unwrap();
+        s3.upsert_engine(&engine_row_of("b100", EngineKind::LlamaCpp, 10))
+            .unwrap();
+        assert_eq!(
+            s3.heal_active_engine().unwrap().as_deref(),
+            Some("b100"),
+            "the native llama.cpp lane outranks a newer litert row"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
     fn unit__heal_active_engine__zero_active_prefers_llamacpp_then_newest() {
         let (_t, s) = tmp_store();
         // llamacpp older than mistral.rs, whisper newest of all: kind

@@ -356,6 +356,101 @@ pub fn plausible_quant_type(t: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphabetic() || c.is_ascii_digit())
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-type mask recipes: speculative-decoding-aware quantization.
+// Quantizing a combined MTP bundle with a flat type smashes the
+// embedded NextN draft head to low bits and quietly kills the speedup
+// the bundle exists for. A mask pins the draft tensors (and the
+// attention blocks they lean on) to higher-precision types while the
+// bulk of the model gets the requested small type.
+//
+// Line format is upstream llama-quantize's `--tensor-type-file`
+// contract (one `regex=ggml_type` per non-empty line, tensor names
+// lower-cased before matching, type names case-insensitive). The two
+// recipes mirror the published unsloth/Atomic-Chat mask conventions
+// (Apache-2.0): ud-nextn for plain combined bundles, ud-combined when
+// the target also keeps a TurboQuant-style KV lane that wants q6_K
+// attention projections.
+
+/// Pin the embedded draft head and the tensors quantization damage is
+/// most visible in: embeddings, output, `attn_v`, `ffn_down` and every
+/// `nextn`/`mtp` tensor stay `q8_0`/`q6_K` while the rest takes `-t`.
+pub const RECIPE_UD_NEXTN: &str = "ud-nextn";
+/// `ud-nextn` plus `q6_K` attention q/k projections (TurboQuant-style
+/// low-bit KV lanes keep their projection quality).
+pub const RECIPE_UD_COMBINED: &str = "ud-combined";
+
+/// Recipe names, display order (unknown-recipe errors list these).
+#[must_use]
+pub fn recipe_names() -> &'static [&'static str] {
+    &[RECIPE_UD_NEXTN, RECIPE_UD_COMBINED]
+}
+
+/// Mask text for a recipe name, `None` when unknown.
+#[must_use]
+#[allow(clippy::too_many_lines)] // a mask is data, not logic
+pub fn recipe_mask(name: &str) -> Option<&'static str> {
+    let nextn = "token_embd\\..*=q8_0\n\
+        output\\.weight=q8_0\n\
+        attn_v\\..*=q6_K\n\
+        ffn_down\\..*=q6_K\n\
+        ffn_gate_inp\\..*=q8_0\n\
+        blk\\.[0-9]+\\.nextn\\..*=q8_0\n\
+        mtp\\..*=q8_0";
+    match name {
+        RECIPE_UD_NEXTN => Some(nextn),
+        RECIPE_UD_COMBINED => Some(concat!(
+            "token_embd\\..*=q8_0\n",
+            "output\\.weight=q8_0\n",
+            "attn_v\\..*=q6_K\n",
+            "ffn_down\\..*=q6_K\n",
+            "ffn_gate_inp\\..*=q8_0\n",
+            "blk\\.[0-9]+\\.nextn\\..*=q8_0\n",
+            "mtp\\..*=q8_0\n",
+            "blk\\.[0-9]+\\.attn_q\\..*=q6_K\n",
+            "blk\\.[0-9]+\\.attn_k\\..*=q6_K\n",
+        )),
+        _ => None,
+    }
+}
+
+/// Write a recipe's mask file under `<data>/quantize-masks/<recipe>.txt`
+/// and return its path (idempotent - the content is a constant).
+pub fn write_recipe_mask(dirs: &BlazarDirs, recipe: &str) -> Result<PathBuf> {
+    let mask = recipe_mask(recipe).ok_or_else(|| {
+        anyhow!(
+            "unknown recipe {recipe:?} - available: {}",
+            recipe_names().join(", ")
+        )
+    })?;
+    let dir = dirs.data_dir.join("quantize-masks");
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("{recipe}.txt"));
+    std::fs::write(&path, mask).with_context(|| format!("write recipe mask {}", path.display()))?;
+    Ok(path)
+}
+
+/// Does the installed llama-quantize know `--tensor-type-file`?
+/// Upstream prints usage and exits non-zero when invoked without a
+/// full argument set (`--help` included), so the probe reads the
+/// usage text from BOTH streams and ignores the exit status - a
+/// missing flag must fail the recipe loudly (H1), never silently
+/// drop the mask at quantize time.
+pub fn supports_tensor_type_file(bin: &Path) -> Result<bool> {
+    let out = std::process::Command::new(bin)
+        .arg("--help")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .with_context(|| format!("probe {} --help", bin.display()))?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(text.contains("--tensor-type-file"))
+}
+
 /// Run llama-quantize, streaming its progress lines to `on_line`.
 /// Returns the output path (caller registers it in the store).
 pub fn quantize<P, F>(
@@ -422,6 +517,74 @@ where
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__recipe_mask__known_content_and_unknown_name() {
+        let nextn = recipe_mask(RECIPE_UD_NEXTN).unwrap();
+        assert!(nextn.contains("blk\\.[0-9]+\\.nextn\\..*=q8_0"));
+        assert!(nextn.contains("mtp\\..*=q8_0"));
+        assert_eq!(nextn.lines().count(), 7);
+        let combined = recipe_mask(RECIPE_UD_COMBINED).unwrap();
+        assert_eq!(combined.lines().count(), 9, "ud-nextn's 7 lines + attn q/k");
+        assert!(combined.contains("blk\\.[0-9]+\\.attn_q\\..*=q6_K"));
+        assert!(combined.starts_with("token_embd\\..*=q8_0"));
+        assert!(recipe_mask("turbo9").is_none());
+        assert_eq!(recipe_names().len(), 2);
+    }
+
+    #[test]
+    fn unit__write_recipe_mask__writes_under_masks_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+        let path = write_recipe_mask(&dirs, RECIPE_UD_COMBINED).unwrap();
+        assert_eq!(
+            path,
+            dirs.data_dir.join("quantize-masks").join("ud-combined.txt")
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, recipe_mask(RECIPE_UD_COMBINED).unwrap());
+        // Idempotent rewrite, unknown recipe lists the catalog.
+        write_recipe_mask(&dirs, RECIPE_UD_COMBINED).unwrap();
+        let err = write_recipe_mask(&dirs, "nope").unwrap_err().to_string();
+        assert!(
+            err.contains("ud-nextn") && err.contains("ud-combined"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)] // stub binary needs the exec bit
+    fn unit__supports_tensor_type_file__reads_usage_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with_flag = tmp.path().join("q1.sh");
+        std::fs::write(
+            &with_flag,
+            "#!/bin/sh\necho 'usage: q [--tensor-type-file f]' >&2\nexit 1\n",
+        )
+        .unwrap();
+        make_exec(&with_flag);
+        assert!(supports_tensor_type_file(&with_flag).unwrap());
+        let without = tmp.path().join("q2.sh");
+        std::fs::write(
+            &without,
+            "#!/bin/sh\necho 'usage: q [--imatrix f]' >&2\nexit 1\n",
+        )
+        .unwrap();
+        make_exec(&without);
+        assert!(!supports_tensor_type_file(&without).unwrap());
+    }
+
+    #[cfg(unix)]
+    fn make_exec(p: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perm = std::fs::metadata(p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(p, perm).unwrap();
+    }
 
     #[test]
     fn unit__plausible_quant_type__shape_rules() {

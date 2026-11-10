@@ -100,6 +100,37 @@ pub struct CacheReuseSearch {
     pub best: u32,
 }
 
+/// `MoE` cache grid result (`tune --moe-cache`, llama.cpp #30966): decode
+/// tok/s of the no-cache baseline plus one measurement per
+/// (`--moe-cache-mib` x `--moe-cache-cpu-share`) grid point. Adoption is
+/// the caller's policy (`moe_cache_recommend`'s >5% gate).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoeCacheSearch {
+    /// Decode tok/s with neither MoE-cache flag set.
+    pub baseline_tps: f64,
+    /// (`--moe-cache-mib` MiB, `--moe-cache-cpu-share` share, decode tok/s)
+    /// per grid point, in grid order.
+    pub rows: Vec<(u64, f32, f64)>,
+}
+
+/// Argmax over the measured grid with deterministic tie-breaking
+/// (equal tok/s prefers the smaller cache first, then the smaller CPU
+/// share - both cheaper) and a >5% noise gate against the measured
+/// baseline, mirroring the spec-decode race policy: a cache config that
+/// does not CLEARLY beat running without it is not adopted.
+#[must_use]
+pub fn moe_cache_recommend(baseline_tps: f64, rows: &[(u64, f32, f64)]) -> Option<(u64, f32)> {
+    let best = rows.iter().max_by(|a, b| {
+        a.2.total_cmp(&b.2)
+            .then_with(|| b.0.cmp(&a.0))
+            .then_with(|| b.1.total_cmp(&a.1))
+    })?;
+    if rows.is_empty() || best.2 <= baseline_tps * 1.05 {
+        return None;
+    }
+    Some((best.0, best.1))
+}
+
 /// Base argv for the warmup A/B: drop endpoint/session/persisted-state
 /// PAIRS and any explicit warmup flags so the two variants differ ONLY
 /// in the warmup axis.
@@ -574,6 +605,140 @@ impl Tuner<'_> {
             .map(|(n, _)| *n)
             .ok_or_else(|| anyhow!("cache-reuse grid ran empty"))?;
         Ok(CacheReuseSearch { grid, best })
+    }
+
+    /// Last few error-looking lines from a search arm's stderr log, joined for a
+    /// teaching tail. Missing log or a silent crash yields an empty string - the
+    /// caller's message stays useful either way.
+    fn last_error_lines(path: &std::path::Path, take: usize) -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| {
+                l.contains(" E ")
+                    || l.to_lowercase().contains("error")
+                    || l.to_lowercase().contains("failed")
+            })
+            .rev()
+            .take(take)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// `MoE` cache grid (`tune --moe-cache`, llama.cpp #30966): spawn the
+    /// real llama-server once per grid point - baseline (no flags), then
+    /// every (`--moe-cache-mib` x `--moe-cache-cpu-share`) combination -
+    /// and measure single-client decode tok/s on each. The CPU share
+    /// routes missed experts to host experts instead of uploading them,
+    /// so the grid exposes the upload-vs-CPU tradeoff on THIS box rather
+    /// than the upstream simulator's replay of it.
+    pub fn moe_cache_search(
+        &self,
+        base_argv: &[String],
+        mibs: &[u64],
+        shares: &[f32],
+        idle_secs: u64,
+    ) -> Result<MoeCacheSearch> {
+        // One spawn+measure per arm; the struct keeps the grid readable.
+        struct MoeArm {
+            point: Option<(u64, f32)>,
+            argv: Vec<String>,
+        }
+        let server_bin = self
+            .bench_bin
+            .parent()
+            .map(|p| p.join("llama-server"))
+            .filter(|p| p.exists())
+            .ok_or_else(|| anyhow!("llama-server not found next to llama-bench"))?;
+        if mibs.is_empty() || shares.is_empty() {
+            anyhow::bail!("moe-cache grid ran empty - pass at least one mib and one share");
+        }
+        // Strip endpoint/session/persisted-state PAIRS plus any prior
+        // moe-cache flags so candidates differ ONLY in the cache axes.
+        let mut base = Vec::new();
+        let mut it = base_argv.iter().peekable();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--host"
+                | "--port"
+                | "--slot-save-path"
+                | "--moe-cache-mib"
+                | "--moe-cache-cpu-share" => {
+                    let _ = it.next(); // consume the value
+                }
+                _ => base.push(a.clone()),
+            }
+        }
+        // Baseline arm first, then the grid.
+        let mut arms = vec![MoeArm {
+            point: None,
+            argv: base.clone(),
+        }];
+        for &mib in mibs {
+            for &share in shares {
+                let mut argv = base.clone();
+                argv.push("--moe-cache-mib".to_string());
+                argv.push(mib.to_string());
+                argv.push("--moe-cache-cpu-share".to_string());
+                argv.push(share.to_string());
+                arms.push(MoeArm {
+                    point: Some((mib, share)),
+                    argv,
+                });
+            }
+        }
+        let mut baseline_tps = 0.0;
+        let mut rows = Vec::new();
+        for MoeArm { point, argv } in &arms {
+            let port = ephemeral_port()?;
+            let mut argv = argv.clone();
+            argv.extend([
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                port.to_string(),
+            ]);
+            let err_log = search_stderr_log(port);
+            let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
+            let tps = if wait_ready(&mut child, port, 180.0) {
+                // Warm the graph + caches, then measure steady decode.
+                let _ = chat_secs(port, "hi");
+                drive_concurrent_multi(&[port], 1, 3).ok()
+            } else {
+                None
+            };
+            // Single pid we spawned; never a group.
+            let _ = child.kill();
+            let _ = child.wait();
+            let Some(tps) = tps else {
+                // Surface the engine's own last words: a refusal like
+                // "MoE cache requires a GPU backend" is the actual verdict.
+                let tail = Self::last_error_lines(&err_log, 2);
+                anyhow::bail!(
+                    "moe-cache search: server at {point:?} never became ready or served{}",
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" - engine said: {tail}")
+                    }
+                );
+            };
+            match point {
+                None => {
+                    println!("  moe-cache baseline (no cache): {tps:.1} tok/s");
+                    baseline_tps = tps;
+                }
+                Some((mib, share)) => {
+                    println!("  moe-cache mib={mib} cpu-share={share}: {tps:.1} tok/s");
+                    rows.push((*mib, *share, tps));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
+        }
+        Ok(MoeCacheSearch { baseline_tps, rows })
     }
 
     /// Warmup-axis A/B probe (`tune --load`): spawn the real llama-server
@@ -1489,17 +1654,26 @@ fn chat_completion_tokens(port: u16, content: &str) -> Result<u64> {
             head_bytes(&text, 120)
         );
     }
-    Ok(text
-        .split("\"completion_tokens\":")
+    text.split("\"completion_tokens\":")
         .nth(1)
         .and_then(|rest| {
-            rest.chars()
+            // Tolerate pretty-printed JSON (`"completion_tokens": 64`
+            // - a space after the colon), and refuse to guess when the
+            // field is absent or non-numeric: a silent 0 would let the
+            // wrong arm win the A/B race without any error.
+            let digits: String = rest
+                .trim_start()
+                .chars()
                 .take_while(char::is_ascii_digit)
-                .collect::<String>()
-                .parse::<u64>()
-                .ok()
+                .collect();
+            digits.parse::<u64>().ok()
         })
-        .unwrap_or(0))
+        .ok_or_else(|| {
+            anyhow!(
+                "replica search: no completion_tokens in the :{port} response: {}",
+                head_bytes(&text, 120)
+            )
+        })
 }
 
 /// Aggregate tok/s of `clients` blocking threads round-robin across `ports`,
@@ -1539,6 +1713,24 @@ mod tests {
     use super::*;
     use blazar_core::engine_kind::EngineKind;
     use blazar_core::store::EngineRow;
+
+    #[test]
+    fn unit__moe_cache_recommend__argmax_ties_and_noise_gate() {
+        let rows = vec![
+            (512u64, 0.25f32, 10.0f64),
+            (1024, 0.9, 20.0),
+            (2048, 0.9, 15.0),
+        ];
+        // Clear winner beats baseline by >5%.
+        assert_eq!(moe_cache_recommend(10.0, &rows), Some((1024, 0.9)));
+        // Equal tok/s ties prefer the smaller cache, then the smaller share.
+        let tied = vec![(2048, 0.9, 20.0), (1024, 0.9, 20.0), (1024, 0.25, 20.0)];
+        assert_eq!(moe_cache_recommend(10.0, &tied), Some((1024, 0.25)));
+        // Below the +5% noise gate nothing is adopted.
+        assert_eq!(moe_cache_recommend(19.5, &rows), None);
+        // Empty grid adopts nothing.
+        assert_eq!(moe_cache_recommend(10.0, &[]), None);
+    }
 
     fn test_dirs() -> (tempfile::TempDir, BlazarDirs) {
         let tmp = tempfile::tempdir().unwrap();
