@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 245 fields, 0 dead
+## Config (top-level keys) - 247 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -70,6 +70,7 @@ token quality are surfaced as drift.
 | no_kv_offload | false | engine-argv | `blazar-core/src/profile.rs:1321` in `the`; `blazar-core/src/profile.rs:1325` in `the` |
 | offline | true | engine-argv | `blazar-core/src/profile.rs:1578` in `12c`; `blazar-core/src/config.rs` in `effective_offline` |
 | moe_cache_mib | 0 | engine-argv | `blazar-core/src/profile.rs:1587` in `12d`; `blazar-core/src/config.rs` in `effective_moe_cache_mib` |
+| moe_cache_cpu_share | 0.0 | engine-argv | `blazar-core/src/config.rs` in `effective_moe_cache_cpu_share`; manifest-gated expert-CPU share knob ridden by `blazar tune <model> --moe-cache` |
 | load_mode | String::new() | engine-argv | `blazar-core/src/profile.rs:1328` in `the`; `blazar-core/src/profile.rs:1331` in `the` |
 | spawn_mem_guard | true | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:5582` in `spawn_instance_forced`; `crates/blazar-runtime/src/supervisor.rs:5582` in `spawn_instance_forced` |
 | session_bank | true | runtime/gateway + gateway-http | `crates/blazar-runtime/src/supervisor.rs:7611` in `bank_restore_sync`; `crates/blazar-runtime/src/supervisor.rs:7771` in `bank_save`; `crates/blazar-gateway/src/lib.rs:1168` in `well_known` |
@@ -269,6 +270,7 @@ token quality are surfaced as drift.
 | fleet_ttl_secs | 45 | gateway+runtime | `crates/blazar-gateway/src/fleet.rs` (join ack + workers listing echo); `crates/blazar-runtime/src/fleet.rs` (`FleetRegistry::prune` expiry window) |
 | fleet_token | "" | gateway+runtime+cli | `crates/blazar-gateway/src/fleet.rs` (`gate`/`join_gate`/`session_gate` constant-time match, invite mint auth); `crates/blazar-runtime/src/supervisor.rs` (fleet accessors); `crates/blazar-cli/src/main.rs` (`rpc_worker_joined` announce header, `join_cmd`, `adopt_cmd`, `agent_cmd` token policy) |
 | fleet_open | false | gateway | `crates/blazar-gateway/src/fleet.rs` (`gate` - non-loopback peers join without a token on trusted LANs) |
+| fleet_contribute_join | - | gateway+runtime | `crates/blazar-core/src/config.rs` (validated `host:port` - port required, u16 range); `crates/blazar-gateway/src/fleet.rs` (this box contributes as a worker to that gateway) |
 | discovery_enabled | false | runtime+cli | `crates/blazar-runtime/src/discovery.rs` (lifecycle bind/unbind on `ConfigReloaded`; `serve_beacon` per-probe gate); `crates/blazar-cli/src/main.rs` (`join_cmd` gateway scan, `rpc worker --discover`) |
 | discovery_port | 11439 | runtime+cli | `crates/blazar-runtime/src/discovery.rs` (beacon bind, `seek_gateways`); `crates/blazar-cli/src/main.rs` (`join_cmd`, worker `--discover`); `crates/blazar-core/src/config.rs` (must differ from HTTP `port`) |
 | agent_port | 11440 | runtime+cli | `crates/blazar-runtime/src/adoption.rs` (`run_agent` TCP invite listener + UDP adopt beacon); `crates/blazar-cli/src/main.rs` (`adopt_cmd` `scan_agents`) |
@@ -377,7 +379,7 @@ token quality are surfaced as drift.
 | enable_tf32_matmul | - | engine-argv | `crates/blazar-core/src/profile.rs:4903` (TF32 matmul toggle) |
 | enable_priority_scheduling | Some(true) | engine-argv | `crates/blazar-core/src/profile.rs:4916` (request priority scheduling) |
 
-## ModelOverride ([models."name"]) - 43 fields, 0 dead
+## ModelOverride ([models."name"]) - 44 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -394,6 +396,7 @@ token quality are surfaced as drift.
 | raw_lane_max_tokens | - | engine-argv | `crates/blazar-core/src/profile.rs:8254` in `input_named_with_spec` |
 | offline | - | engine-argv | `blazar-core/src/config.rs` in `effective_offline` |
 | moe_cache_mib | - | engine-argv | `blazar-core/src/config.rs` in `effective_moe_cache_mib` |
+| moe_cache_cpu_share | - | engine-argv | `blazar-core/src/config.rs` in `effective_moe_cache_cpu_share` |
 | kv_unified | - | other + engine-argv + cli | `blazar-core/src/session_identity.rs:32` in `?`; `crates/blazar-core/src/session_identity.rs:50` in `build`; `crates/blazar-core/src/profile.rs:258` in `compile`; `blazar-core/src/profile.rs:1288` in `the`; `crates/blazar-cli/src/main.rs:28328` in `unit__known_config_key__defaults_options_and_typos` |
 | ctx_extend | - | engine-argv + cli | `blazar-core/src/profile.rs:1792` in `the`; `blazar-core/src/profile.rs:1793` in `the`; `crates/blazar-cli/src/main.rs:28328` in `unit__known_config_key__defaults_options_and_typos` |
 | cpu_moe_n | - | engine-argv | `blazar-core/src/profile.rs:1829` in `the`; `blazar-core/src/profile.rs:1830` in `the` |

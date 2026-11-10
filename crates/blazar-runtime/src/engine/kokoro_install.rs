@@ -44,7 +44,6 @@ pub const KOKORO_SERVER_PY: &str = include_str!("kokoro_server.py");
 /// payload. Returns `Ok(true)` when a refresh happened, `Ok(false)` when the
 /// lane copy already matched. Errors surface to the caller (spawn path
 /// warns and proceeds on the stale-but-functional script).
-#[must_use]
 pub fn refresh_lane_script(lane_dir: &std::path::Path) -> std::io::Result<bool> {
     let server_py = lane_dir.join("kokoro_server.py");
     let current = std::fs::read_to_string(&server_py).unwrap_or_default();
