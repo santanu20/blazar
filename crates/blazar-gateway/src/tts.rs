@@ -399,7 +399,36 @@ pub async fn audio_speech(
         && crate::proxy::routed_kind_for(&state, voice)
             == Some(blazar_core::engine_kind::EngineKind::LlamaCpp)
     {
+        // Collision guard: a piper voice id is protocol-shaped
+        // (`<locale>-<name>-<quality>`), so a store row with that exact
+        // name would silently shadow voice synthesis through the engine
+        // lane (or shadow the row through piper, depending on dispatch
+        // order). Either silent winner is a guess the caller never made -
+        // refuse with both readings named. Voice ids keep their
+        // protocol shape; the model row is the side that must rename.
+        if blazar_runtime::piper::parse_voice_id(voice).is_some() {
+            return openai_error(
+                400,
+                &format!(
+                    "\"{voice}\" is both a piper voice id and a pulled llama.cpp model row - \
+                     rename the model row (voice ids keep their protocol shape) or pull the \
+                     model under a different name"
+                ),
+            );
+        }
         return llamacpp_tts_lane(&state, key_ext.as_ref(), &row, &req, text, format, stream).await;
+    }
+
+    // Kokoro lane: `model` "kokoro" (the default voice) or a kokoro
+    // voice id (`af_sarah`) with the lane installed. Shape-gated BEFORE
+    // the piper paths: piper ids (`en_US-amy-medium`) never match the
+    // kokoro grammar, and an absent lane falls through to piper
+    // byte-identically.
+    if voice == "kokoro"
+        || (blazar_runtime::kokoro::lane_installed(&state.dirs)
+            && blazar_runtime::kokoro::looks_like_voice(voice))
+    {
+        return kokoro_speech(&state, key_ext.as_ref(), voice, text, format, stream, &opts).await;
     }
 
     // Piper-only lane resolution: the wav+stream refusal below teaches
@@ -995,6 +1024,80 @@ pub fn speech_capabilities(state: &AppState) -> Value {
     })
 }
 
+/// Kokoro lane of `/v1/audio/speech`: buffered WAV (the lane child's
+/// native egress). Streaming and lossy containers teach toward the
+/// piper lane until this lane grows its own transcode path; the
+/// piper-native knobs teach the same way. `speed` rides through.
+async fn kokoro_speech(
+    state: &Arc<AppState>,
+    key_ext: Option<&Extension<crate::keys::KeyCtx>>,
+    voice: &str,
+    text: &str,
+    format: SpeechFormat,
+    stream: bool,
+    opts: &blazar_runtime::piper::SpeakOptions,
+) -> Response {
+    if !matches!(format, SpeechFormat::Wav) || stream {
+        return openai_error(
+            400,
+            "kokoro voices speak buffered wav only - drop \"stream\" and use the default \
+             response_format; streaming and mp3/opus/aac/flac ride the piper voices instead",
+        );
+    }
+    if opts.speaker.is_some()
+        || opts.noise_scale.is_some()
+        || opts.noise_w.is_some()
+        || opts.sentence_silence.is_some()
+    {
+        return openai_error(
+            400,
+            "speaker/noise_scale/noise_w/sentence_silence are piper-only knobs - kokoro \
+             takes \"speed\" and a voice (model) like af_sarah (or \"kokoro\" for the default)",
+        );
+    }
+    // Same admission the piper lane pays (audit MM1): scope on the
+    // voice id + rpm/tpm/daily + request charge.
+    if let Err(resp) = state.admit_or_respond(key_ext, voice) {
+        return *resp;
+    }
+    let Some(shim) = blazar_runtime::kokoro::lane_shim(&state.dirs) else {
+        return openai_error(
+            503,
+            "kokoro lane is registered but its shim is missing - reinstall: \
+             blazar engine install 1.0 --kind kokoro",
+        );
+    };
+    // kokoro's speed knob accepts f32; the request-level f64 clamp
+    // (0.25..=4.0) already ran in parse_native_options, so the narrow
+    // cast loses nothing but the sub-f32 tail.
+    #[allow(clippy::cast_possible_truncation)]
+    let speed = opts.speed.unwrap_or(1.0) as f32;
+    match state.kokoro.synthesize(&shim, text, voice, speed).await {
+        Ok(wav) => Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+            .body(axum::body::Body::from(wav))
+            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            // The lane's own voice contract violations surface as its
+            // 400 body ("Voice ... not found in available voices") -
+            // teach with the voices pointer instead of a faceless 500.
+            if msg.contains("not found in available voices") {
+                openai_error(
+                    400,
+                    &format!(
+                        "{msg} - list the lane's voices: GET /v1/audio/voices (kokoro section) \
+                         or synthesize with \"model\": \"kokoro\" for the default voice"
+                    ),
+                )
+            } else {
+                openai_error(503, &msg)
+            }
+        }
+    }
+}
+
 /// GET `/v1/audio/voices` - installed piper voices, the voice packs
 /// advertised by any resident speech-capable engine child, plus an
 /// optional `?search=` probe of the upstream `rhasspy/piper-voices`
@@ -1059,6 +1162,21 @@ pub async fn voices(
         }
     }
     body["engines"] = serde_json::json!(engine_voices(&state).await);
+    // Kokoro section: only when the lane is installed. Listing stays
+    // boots-nothing like the rest of the endpoint - the authoritative
+    // voice list comes from a resident child; a cold lane shows the
+    // default-voice pointer instead of a stale embedded list.
+    if blazar_runtime::kokoro::lane_installed(&state.dirs) {
+        let voices = state.kokoro.voices_if_resident().await;
+        body["kokoro"] = serde_json::json!({
+            "installed": true,
+            "voices": voices,
+            "default_voice": "af_heart",
+            "note": "voice list enumerates once a child is resident (synthesize once, or \
+                     use \"model\": \"kokoro\" for the default voice); the lane validates \
+                     names authoritatively at synthesis"
+        });
+    }
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1077,6 +1195,14 @@ const ENGINE_VOICES_TTL: std::time::Duration = std::time::Duration::from_secs(60
 type EngineVoices = HashMap<String, (std::time::Instant, Vec<String>)>;
 static ENGINE_VOICES_CACHE: std::sync::LazyLock<std::sync::RwLock<EngineVoices>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// Drop entries whose TTL has lapsed so the map stays bounded by the
+/// speech-capable models actually seen recently, not by every model ever
+/// probed. Called under the write lock on each cache fill - expired reads
+/// already re-probe, this reclaims what they leave behind.
+fn prune_expired(cache: &mut EngineVoices) {
+    cache.retain(|_, (at, _)| at.elapsed() < ENGINE_VOICES_TTL);
+}
 
 /// `GET /props` on llama-server advertises `voices` for speech models
 /// (pocket-tts packs predefined voices into the mmproj sidecar,
@@ -1159,6 +1285,7 @@ async fn engine_voices(state: &AppState) -> Vec<Value> {
                 Ok(props) => {
                     let ids = normalize_props_voices(&props);
                     if let Ok(mut cache) = ENGINE_VOICES_CACHE.write() {
+                        prune_expired(&mut cache);
                         cache.insert(model.clone(), (std::time::Instant::now(), ids.clone()));
                     }
                     if !ids.is_empty() {
@@ -1390,6 +1517,30 @@ fn limit_wav_peak_in_place(wav: &mut [u8]) -> Result<(), String> {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit__prune_expired__reclaims_lapsed_entries_keeps_fresh() {
+        let mut cache: EngineVoices = HashMap::new();
+        let stale_at = std::time::Instant::now()
+            .checked_sub(ENGINE_VOICES_TTL + std::time::Duration::from_secs(1))
+            .expect("clock arithmetic");
+        cache.insert("gone".into(), (stale_at, vec![]));
+        cache.insert(
+            "kept".into(),
+            (std::time::Instant::now(), vec!["v1".into()]),
+        );
+        prune_expired(&mut cache);
+        assert!(
+            !cache.contains_key("gone"),
+            "expired entry must be reclaimed"
+        );
+        assert_eq!(
+            cache.get("kept").map(|(_, ids)| ids.as_slice()),
+            Some(["v1".to_string()].as_slice()),
+            "fresh entry survives the sweep"
+        );
+        assert_eq!(cache.len(), 1);
+    }
 
     /// Minimal PCM16LE WAV builder; extra chunks are inserted verbatim
     /// between fmt and data like real piper output (LIST INFO tags).

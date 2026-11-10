@@ -35,15 +35,46 @@ pub enum EngineKind {
     /// the one-shot `piper` CLI, so like Whisper it serves no model
     /// rows and never appears in format routing in either direction).
     Piper,
+    /// hexgrad/Kokoro-82M TTS via the `kokoro-onnx` pip package (uv
+    /// venv + digest-verified model assets; lazy audio lane like Piper
+    /// and Whisper - a lazily-spawned python shim child loads the ONNX
+    /// model once and serves /tts, so it serves no model rows and never
+    /// appears in format routing in either direction).
+    Kokoro,
     /// ml-explore/mlx-lm `mlx_lm.server` (pip venv; MLX-format
     /// community dirs - safetensors + a `quantization` block in
     /// config.json. Backend matrix: `mlx-cuda` on Linux/NVIDIA,
     /// `mlx` on Apple Silicon; MLX quants are lane-exclusive - no
     /// other kind decodes them).
     Mlx,
+    /// An OpenAI-compatible host runtime the daemon supervises as a
+    /// child but does not argv-configure per model (v0: google-ai-edge
+    /// LiteRT-LM `litert-lm serve`, pip venv). The child serves its
+    /// OWN model registry globally (every model it has imported), so
+    /// blazar spawns ONE shared child per lane - the router-key
+    /// pattern - and `.litertlm` bundles route here exclusively.
+    OpenAiHost,
 }
 
 impl EngineKind {
+    /// Every lane the binary knows, in declaration order - the single
+    /// census that "walk every lane" surfaces key off (`blazar engine
+    /// update --all`, doctor currency checks). A lane shipped without a
+    /// row here is silently skipped by those walks while their summaries
+    /// still report success, so grow this in the same edit that adds a
+    /// variant (every `match` in this file forces the visit anyway).
+    pub const ALL: [EngineKind; 9] = [
+        EngineKind::LlamaCpp,
+        EngineKind::MistralRs,
+        EngineKind::Sglang,
+        EngineKind::SdCpp,
+        EngineKind::Whisper,
+        EngineKind::Piper,
+        EngineKind::Kokoro,
+        EngineKind::Mlx,
+        EngineKind::OpenAiHost,
+    ];
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -53,7 +84,9 @@ impl EngineKind {
             EngineKind::SdCpp => "sdcpp",
             EngineKind::Whisper => "whisper",
             EngineKind::Piper => "piper",
+            EngineKind::Kokoro => "kokoro",
             EngineKind::Mlx => "mlx",
+            EngineKind::OpenAiHost => "openaihost",
         }
     }
 
@@ -64,7 +97,31 @@ impl EngineKind {
     /// lane pin rather than the spawn router.
     #[must_use]
     pub fn is_lazy_lane(self) -> bool {
-        matches!(self, EngineKind::Whisper | EngineKind::Piper)
+        matches!(
+            self,
+            EngineKind::Whisper | EngineKind::Piper | EngineKind::Kokoro
+        )
+    }
+
+    /// Text-serving lanes that ride a managed Python venv child
+    /// (`mistral.rs`, `sglang`, `mlx_lm`, `litert-lm`): they can hold and
+    /// succeed to the serving-active slot, ranked under the native
+    /// llama.cpp lane by the store's heal policy. The match is
+    /// exhaustive on purpose - a new engine kind must decide its tier
+    /// here at compile time instead of silently inheriting one.
+    #[must_use]
+    pub fn is_venv_serving_lane(self) -> bool {
+        match self {
+            EngineKind::MistralRs
+            | EngineKind::Sglang
+            | EngineKind::Mlx
+            | EngineKind::OpenAiHost => true,
+            EngineKind::LlamaCpp
+            | EngineKind::SdCpp
+            | EngineKind::Whisper
+            | EngineKind::Piper
+            | EngineKind::Kokoro => false,
+        }
     }
 
     /// Whether this engine's HTTP surface carries the llama-server
@@ -150,6 +207,16 @@ impl EngineKind {
             ShardFormat::MlxLayout => {
                 return installed.iter().copied().find(|k| *k == EngineKind::Mlx);
             }
+            // LiteRT bundle gate: same one-kind domain rule - a
+            // `.litertlm` file has exactly one decoder lane, and no
+            // preference order names OpenAiHost, so other rows can
+            // never land on it in reverse either.
+            ShardFormat::LitertBundle => {
+                return installed
+                    .iter()
+                    .copied()
+                    .find(|k| *k == EngineKind::OpenAiHost);
+            }
             ShardFormat::QuantizedSafetensors => {
                 return installed.iter().copied().find(|k| *k == EngineKind::Sglang);
             }
@@ -200,9 +267,13 @@ pub enum LaneError {
     /// to the one lane that can.
     DiffusionUnserved { roster: String },
     /// An MLX-format community dir with no mlx engine installed - the
-    /// MLX quant layout is lane-exclusive, so the teaching narrows to
-    /// the one lane that can decode it.
+    /// MLX quant layout is lane-exclusive, so the teaching narrows
+    /// to the one lane that can decode it.
     MlxUnserved { roster: String },
+    /// A `.litertlm` bundle with no `OpenAiHost` engine installed - the
+    /// bundle format is lane-exclusive, so the teaching narrows to the
+    /// one lane that can decode it.
+    LitertUnserved { roster: String },
 }
 
 impl LaneError {
@@ -215,6 +286,7 @@ impl LaneError {
             Self::PinUnknown { .. } => Vec::new(),
             Self::DiffusionUnserved { .. } => vec![EngineKind::SdCpp],
             Self::MlxUnserved { .. } => vec![EngineKind::Mlx],
+            Self::LitertUnserved { .. } => vec![EngineKind::OpenAiHost],
             Self::FormatUnserved { shape, .. } => {
                 if shape.shards == ShardFormat::QuantizedSafetensors {
                     vec![EngineKind::Sglang]
@@ -266,6 +338,12 @@ impl fmt::Display for LaneError {
                  - mlx is the lane for those; blazar engine install --kind mlx \
                  (installed: {roster})"
             ),
+            Self::LitertUnserved { roster } => write!(
+                f,
+                "no installed engine serves .litertlm bundles (LiteRT-LM) \
+                 - openaihost is the lane for those; blazar engine install --kind openaihost \
+                 (installed: {roster})"
+            ),
         }
     }
 }
@@ -307,6 +385,11 @@ pub enum ShardFormat {
     /// safetensors-shaped, but a different decoder contract, so it
     /// outranks the quantized arm in every cascade.
     MlxLayout,
+    /// A single `.litertlm` bundle (LiteRT-LM and kin) - only the
+    /// `OpenAiHost` lane decodes it. A self-contained file like GGUF,
+    /// but a different runtime contract, so it gates before the
+    /// gguf/safetensors preference orders exactly like `MlxLayout`.
+    LitertBundle,
 }
 
 impl ShardFormat {
@@ -315,8 +398,18 @@ impl ShardFormat {
     /// MLX wins over plain quantized because an MLX dir is quant-shaped
     /// yet only mlx-lm can decode it; quantization and MLX only count
     /// inside a shard directory (a GGUF file is already its own shape).
+    // Four named bools stay clearer than a params struct at the five
+    // call sites (each name carries the detection signal it feeds).
+    #[allow(clippy::fn_params_excessive_bools)]
     #[must_use]
-    pub fn detect(is_dir: bool, quantized: bool, mlx: bool) -> Self {
+    pub fn detect(is_dir: bool, quantized: bool, mlx: bool, litert: bool) -> Self {
+        // `.litertlm` bundles are single files whose runtime contract
+        // (an external OpenAI-compatible host serving its own registry)
+        // no other lane can honor - gate them before everything else,
+        // the same one-kind domain rule MLX dirs get.
+        if litert {
+            return Self::LitertBundle;
+        }
         if is_dir && mlx {
             Self::MlxLayout
         } else if is_dir && quantized {
@@ -328,10 +421,11 @@ impl ShardFormat {
         }
     }
 
-    /// Any of the directory-of-shards shapes (everything but GGUF).
+    /// Any of the directory-of-shards shapes (everything but GGUF and
+    /// the self-contained `.litertlm` bundle).
     #[must_use]
     pub fn is_dir(self) -> bool {
-        !matches!(self, Self::GgufFile)
+        !matches!(self, Self::GgufFile | Self::LitertBundle)
     }
 }
 
@@ -423,6 +517,9 @@ pub fn serving_lane_typed(
         None if shape.shards == ShardFormat::MlxLayout => {
             Err(LaneError::MlxUnserved { roster: roster() })
         }
+        None if shape.shards == ShardFormat::LitertBundle => {
+            Err(LaneError::LitertUnserved { roster: roster() })
+        }
         None => Err(LaneError::FormatUnserved {
             shape,
             roster: roster(),
@@ -494,9 +591,11 @@ impl FromStr for EngineKind {
             "sdcpp" => Ok(EngineKind::SdCpp),
             "whisper" => Ok(EngineKind::Whisper),
             "piper" => Ok(EngineKind::Piper),
+            "kokoro" => Ok(EngineKind::Kokoro),
             "mlx" => Ok(EngineKind::Mlx),
+            "openaihost" => Ok(EngineKind::OpenAiHost),
             other => Err(format!(
-                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, piper, mlx)"
+                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, piper, kokoro, mlx, openaihost)"
             )),
         }
     }
@@ -521,7 +620,7 @@ impl FromSql for EngineKind {
 #[allow(non_snake_case)]
 mod tests {
     use super::FormatShape;
-    use super::ShardFormat::{GgufFile, QuantizedSafetensors, SafetensorsDir};
+    use super::ShardFormat::{GgufFile, LitertBundle, QuantizedSafetensors, SafetensorsDir};
 
     /// Positional sugar for the routing-axis struct: domain gate first,
     /// shard shape second.
@@ -530,6 +629,60 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__is_venv_serving_lane__exactly_the_venv_text_lanes() {
+        // The heal/v14 serving-succession tier rests on this predicate:
+        // a lane flipping sides here changes who can hold or succeed to
+        // the serving-active slot. Every kind is asserted so a new lane
+        // fails this test until its tier is decided.
+        let venv: Vec<&str> = EngineKind::ALL
+            .iter()
+            .filter(|k| k.is_venv_serving_lane())
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(venv, ["mistralrs", "sglang", "mlx", "openaihost"]);
+        let native: Vec<&str> = EngineKind::ALL
+            .iter()
+            .filter(|k| !k.is_venv_serving_lane())
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(native, ["llamacpp", "sdcpp", "whisper", "piper", "kokoro"]);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__all__names_every_lane_exactly_once() {
+        // No-wildcard match: a new variant fails THIS match at compile
+        // time until the arm lands, and the equality below then forces
+        // the variant into `ALL` - a lane missing from `ALL` is
+        // silently skipped by `blazar engine update --all`.
+        let names: Vec<&str> = EngineKind::ALL
+            .iter()
+            .map(|k| match k {
+                EngineKind::LlamaCpp => "llamacpp",
+                EngineKind::MistralRs => "mistralrs",
+                EngineKind::Sglang => "sglang",
+                EngineKind::SdCpp => "sdcpp",
+                EngineKind::Whisper => "whisper",
+                EngineKind::Piper => "piper",
+                EngineKind::Kokoro => "kokoro",
+                EngineKind::Mlx => "mlx",
+                EngineKind::OpenAiHost => "openaihost",
+            })
+            .collect();
+        assert_eq!(names.len(), 9, "ALL must carry all 9 lanes");
+        let mut uniq = names.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), names.len(), "duplicate lane in ALL");
+        // Cross-check against as_str so the census can never drift
+        // from the canonical names the store/gateway speak.
+        for kind in EngineKind::ALL {
+            assert!(names.contains(&kind.as_str()));
+        }
+    }
 
     #[test]
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected
@@ -597,6 +750,7 @@ mod tests {
             EngineKind::Whisper,
             EngineKind::Piper,
             EngineKind::Mlx,
+            EngineKind::OpenAiHost,
         ] {
             assert_eq!(EngineKind::from_str(k.as_str()), Ok(k));
             let json = serde_json::to_string(&k).unwrap();
@@ -604,7 +758,7 @@ mod tests {
         }
         assert_eq!(
             EngineKind::from_str("vllm").unwrap_err(),
-            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, piper, mlx)"
+            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, piper, kokoro, mlx, openaihost)"
         );
         // serde default on missing field = llamacpp (old rows).
         assert_eq!(
@@ -673,7 +827,12 @@ mod tests {
         // well-served lane. Under the enum that contract lives in
         // detect(): a quant signal outside a shard directory maps to
         // the GGUF shape, so the router never sees a "quantized GGUF".
-        assert_eq!(ShardFormat::detect(false, true, false), GgufFile);
+        assert_eq!(ShardFormat::detect(false, true, false, false), GgufFile);
+        // `.litertlm` gates before every other signal: the bundle's
+        // runtime contract (an external host serving its own registry)
+        // makes dir/quant/mlx facts about it irrelevant.
+        assert_eq!(ShardFormat::detect(false, false, false, true), LitertBundle);
+        assert_eq!(ShardFormat::detect(true, true, true, true), LitertBundle);
 
         // Overlap fallbacks: GGUF without llamacpp, safetensors without
         // sglang - both land on mistral.rs.
@@ -766,6 +925,106 @@ mod tests {
         assert_eq!(
             EngineKind::route_format(shape(true, GgufFile), &[LlamaCpp, Sglang], Quality),
             None
+        );
+    }
+
+    /// The `.litertlm` lane is a one-kind domain like diffusion, but the
+    /// gate runs on the shard format itself: an installed `OpenAiHost` row
+    /// claims the bundle, a text-only roster teaches, and the `OpenAiHost`
+    /// row is invisible to every text format.
+    #[test]
+    fn unit__route_format__litert_bundle_single_lane_domain() {
+        use crate::config::RoutingMode::Auto;
+        use crate::config::RoutingPolicy::Quality;
+        use EngineKind::{LlamaCpp, Mlx, OpenAiHost, Sglang};
+
+        // Claimed: the only roster that serves the bundle is the host lane.
+        assert_eq!(
+            EngineKind::route_format(shape(false, LitertBundle), &[OpenAiHost], Quality),
+            Some(OpenAiHost)
+        );
+        assert_eq!(
+            EngineKind::route_format(
+                shape(false, LitertBundle),
+                &[LlamaCpp, Sglang, OpenAiHost],
+                Quality
+            ),
+            Some(OpenAiHost),
+            "text lanes never shadow the bundle lane - no policy order names OpenAiHost for other formats"
+        );
+        // Unserved: a text roster (or an MLX box) teaches instead of
+        // falling back to a lane that cannot decode the bundle.
+        assert_eq!(
+            EngineKind::route_format(shape(false, LitertBundle), &[LlamaCpp, Sglang], Quality),
+            None
+        );
+        assert_eq!(
+            EngineKind::route_format(shape(false, LitertBundle), &[Mlx], Quality),
+            None
+        );
+        // Reverse invisibility: the host lane never claims text formats.
+        assert_eq!(
+            EngineKind::route_format(shape(false, GgufFile), &[OpenAiHost], Quality),
+            None
+        );
+        assert_eq!(
+            EngineKind::route_format(shape(false, SafetensorsDir), &[OpenAiHost], Quality),
+            None
+        );
+
+        // The typed lane verdict carries the teaching: LitertUnserved
+        // names the openaihost install command and the roster.
+        let installed: Vec<(String, EngineKind, LaneClass)> =
+            vec![("b1".into(), LlamaCpp, LaneClass::Mainstream)];
+        let err = serving_lane_typed(
+            Auto,
+            Quality,
+            None,
+            shape(false, LitertBundle),
+            LlamaCpp,
+            &installed,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LaneError::LitertUnserved { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("blazar engine install --kind openaihost"),
+            "{text}"
+        );
+        assert!(text.contains(".litertlm"), "{text}");
+        assert_eq!(err.missing_kinds(Quality), vec![OpenAiHost]);
+
+        // Pin semantics: a pin that names the openaihost kind resolves
+        // even for text shapes (explicit user override beats shape
+        // preference, the standing pin contract); a pin onto a text tag
+        // for a bundle row is honored too - the spawn then fails
+        // honestly in that lane's compile rather than the router
+        // second-guessing the user.
+        let mixed: Vec<(String, EngineKind, LaneClass)> = vec![
+            ("b1".into(), LlamaCpp, LaneClass::Mainstream),
+            ("lit".into(), OpenAiHost, LaneClass::Mainstream),
+        ];
+        assert_eq!(
+            serving_lane_typed(
+                Auto,
+                Quality,
+                Some("openaihost"),
+                shape(false, LitertBundle),
+                LlamaCpp,
+                &mixed
+            ),
+            Ok(Some(("lit".into(), OpenAiHost)))
+        );
+        assert_eq!(
+            serving_lane_typed(
+                Auto,
+                Quality,
+                Some("b1"),
+                shape(false, LitertBundle),
+                LlamaCpp,
+                &mixed
+            ),
+            Ok(Some(("b1".into(), LlamaCpp)))
         );
     }
 

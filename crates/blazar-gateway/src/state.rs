@@ -203,6 +203,9 @@ pub struct AppState {
     /// idle reaper (`whisper_idle_secs`). Arc so the reaper task shares
     /// the same child slot every request path uses.
     pub whisper: std::sync::Arc<blazar_runtime::whisper::WhisperRuntime>,
+    /// Kokoro TTS lane: same lazy-child lifecycle as whisper, driven by
+    /// `/v1/audio/speech` and the shared idle reaper.
+    pub kokoro: std::sync::Arc<blazar_runtime::kokoro::KokoroRuntime>,
     /// Gateway-owned async audio jobs (`"async": true` on the audio
     /// routes): upstream /inference is sync-only, so long files run as
     /// spawned tasks polled at /v1/audio/jobs/{id}. Bounded registry;
@@ -387,13 +390,19 @@ impl AppState {
         // idle reaper. 0 disables the reaper (child lives until
         // teardown - the pre-reaper behavior).
         let whisper = std::sync::Arc::new(blazar_runtime::whisper::WhisperRuntime::new());
+        let kokoro = std::sync::Arc::new(blazar_runtime::kokoro::KokoroRuntime::new());
         if config.whisper_idle_secs > 0 {
+            // One reaper, both audio lanes: TTS and STT children are
+            // equally idle-fodable, and the shared budget keeps the
+            // config surface at one knob (whisper_idle_secs).
             let reaper = std::sync::Arc::clone(&whisper);
+            let kokoro_reaper = std::sync::Arc::clone(&kokoro);
             let max_idle = std::time::Duration::from_secs(config.whisper_idle_secs);
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     reaper.reap_idle(max_idle).await;
+                    kokoro_reaper.reap_idle(max_idle).await;
                 }
             });
         }
@@ -460,6 +469,7 @@ impl AppState {
             otlp,
             responses: std::sync::Mutex::new(crate::responses::ResponsesRegistry::new()),
             whisper,
+            kokoro,
             audio_jobs: crate::whisper::AudioJobs::new(),
             jobs,
             requests,

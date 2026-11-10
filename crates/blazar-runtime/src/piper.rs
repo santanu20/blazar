@@ -20,6 +20,20 @@ use blazar_core::BlazarDirs;
 pub use crate::engine::gh::PIPER_REPO;
 pub const VOICES_REPO: &str = "rhasspy/piper-voices";
 
+/// Git revision of `rhasspy/piper-voices` every voice download is pinned
+/// to. Upstream retrained its voice corpus for piper 1.5.0 on 2026-11-09
+/// (commit `cf910fb59f1d`): the regenerated models carry a 166-entry
+/// phoneme id map (plus `vowel_clusters`, `hop_length`) that the pinned
+/// 2023.11.14 engine cannot load - synthesis aborts with
+/// `Phonemes must be one codepoint (phoneme id map)` at the first
+/// sentence. Pulling from the last commit before that retrain keeps
+/// every voice byte-identical to what the engine was built against, and
+/// makes voice fetches deterministic against future corpus regens.
+/// Voices contributed after this commit list in search but 404 on pull.
+/// Move the pin (and drop [`voice_format_incompatible`]) when the engine
+/// lane reaches a piper that speaks the 1.5 phoneme map.
+pub const VOICES_REVISION: &str = "e7229f7d33a1";
+
 /// Release asset for the running platform. Upstream ships six; anything
 /// else (freebsd, ...) has no binary lane.
 #[must_use]
@@ -520,7 +534,7 @@ pub async fn pull_voice(
             bytes: 0,
             sha256: None,
         };
-        hf.download_file(VOICES_REPO, &plan, &dest, &mut on_progress)
+        hf.download_file_at(VOICES_REPO, &plan, &dest, &mut on_progress, VOICES_REVISION)
             .await
             .with_context(|| format!("download {VOICES_REPO}/{voice}.onnx"))?;
     }
@@ -532,9 +546,15 @@ pub async fn pull_voice(
             sha256: None,
         };
         let mut json_progress = |_, _| {};
-        hf.download_file(VOICES_REPO, &plan, &json_dest, &mut json_progress)
-            .await
-            .with_context(|| format!("download {VOICES_REPO}/{voice}.onnx.json"))?;
+        hf.download_file_at(
+            VOICES_REPO,
+            &plan,
+            &json_dest,
+            &mut json_progress,
+            VOICES_REVISION,
+        )
+        .await
+        .with_context(|| format!("download {VOICES_REPO}/{voice}.onnx.json"))?;
     }
     // Sanity floor: a real voice is tens of MB; a truncated error page
     // is not. The config half must parse as JSON.
@@ -548,13 +568,40 @@ pub async fn pull_voice(
     }
     let json_raw = std::fs::read_to_string(dir.join(format!("{voice}.onnx.json")))
         .with_context(|| format!("read {voice} config"))?;
-    if serde_json::from_str::<serde_json::Value>(&json_raw).is_err() {
+    let json: serde_json::Value = serde_json::from_str(&json_raw).map_err(|e| {
+        let _ = blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir);
+        anyhow!("{VOICES_REPO}/{voice}: config half is not JSON ({e}) - removed")
+    })?;
+    if let Some(new_format) = voice_format_incompatible(&json) {
         let _ = blazar_core::fs_safety::remove_dir_within(&dirs.data_dir, &dir);
         return Err(anyhow!(
-            "{VOICES_REPO}/{voice}: config half is not JSON - removed"
+            "{VOICES_REPO}/{voice}: trained for piper {new_format} - the installed 2023.11.14 \
+             engine speaks the 1.0 phoneme map and aborts on this voice (\"Phonemes must be one \
+             codepoint\") - removed. Voice pulls are pinned to revision {VOICES_REVISION} to \
+             avoid exactly this; this voice bypassed the pin (manual fetch or a stale mirror)"
         ));
     }
     Ok(dest)
+}
+
+/// Voice-config compatibility check against the pinned engine: the
+/// 2023.11.14 piper speaks the 1.0 phoneme id map. Voices trained by
+/// newer pipers say so in their config's `piper_version`; configs with
+/// no version field predate the split and are fine. Returns the
+/// offending version string when the voice cannot run on this engine.
+#[must_use]
+pub fn voice_format_incompatible(config: &serde_json::Value) -> Option<String> {
+    let version = config.get("piper_version")?.as_str()?;
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|p| p.parse::<u32>().ok());
+    let minor = parts.next().and_then(|p| p.parse::<u32>().ok());
+    // Only 1.0.x and 0.x proven compatible (the engine's own training
+    // population); anything missing or unparsable fails closed - an
+    // unknown phoneme map cannot be proven safe.
+    match (major, minor) {
+        (Some(1), Some(0)) | (Some(0), Some(_)) => None,
+        _ => Some(version.to_string()),
+    }
 }
 
 /// Upper bound on synthesis input: piper is linear-time; a novel would
@@ -867,6 +914,46 @@ mod tests {
             size: None,
             lfs: None,
         }
+    }
+
+    #[test]
+    fn unit__voice_format_incompatible__rejects_post_retrain_voice_formats() {
+        // The 2026-11-09 corpus retrain stamps 1.5.0; the pinned engine
+        // speaks 1.0 (and legacy configs carry no version at all).
+        let cfg = |v: &str| serde_json::json!({ "piper_version": v, "phoneme_id_map": {"a": [0]} });
+        assert_eq!(
+            voice_format_incompatible(&cfg("1.5.0")).as_deref(),
+            Some("1.5.0")
+        );
+        assert_eq!(
+            voice_format_incompatible(&cfg("1.2.0")).as_deref(),
+            Some("1.2.0")
+        );
+        assert_eq!(
+            voice_format_incompatible(&cfg("2.0.0")).as_deref(),
+            Some("2.0.0")
+        );
+        assert_eq!(voice_format_incompatible(&cfg("1.0.0")), None);
+        assert_eq!(voice_format_incompatible(&cfg("0.0.1")), None);
+        assert_eq!(
+            voice_format_incompatible(&serde_json::json!({ "phoneme_id_map": {} })),
+            None
+        );
+        // Malformed version strings fail closed: the engine cannot know
+        // what phoneme map they carry.
+        assert_eq!(
+            voice_format_incompatible(&cfg("one-point-five")).as_deref(),
+            Some("one-point-five")
+        );
+    }
+
+    #[test]
+    fn unit__voices_revision__is_a_pinned_git_sha() {
+        // The pin exists because upstream retrains its corpus in place
+        // (2026-11-09, piper 1.5.0) - a moving tag would re-break pulls.
+        assert!(
+            VOICES_REVISION.chars().all(|c| c.is_ascii_hexdigit()) && VOICES_REVISION.len() >= 12
+        );
     }
 
     #[test]

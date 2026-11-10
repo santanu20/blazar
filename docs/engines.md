@@ -1,10 +1,10 @@
 ---
 layout: doc
 title: Engines
-description: The seven serving engines Blazar orchestrates - roles, model formats, and how routing picks between them.
+description: The eight serving engines Blazar orchestrates - roles, model formats, and how routing picks between them.
 doc_kind: Documentation
 ---
-## One gateway, seven engines
+## One gateway, eight engines
 
 Blazar does not replace inference engines - it orchestrates them. Each lane
 is the real upstream binary, managed end-to-end: download or build, pin,
@@ -19,6 +19,8 @@ configure, supervise, and route requests to it.
 | **stable-diffusion.cpp** | Media generation | Diffusion images and video |
 | **whisper.cpp** | Speech recognition | Transcription and translation |
 | **piper** | Offline speech synthesis | Local TTS voices |
+| **kokoro** | Neural speech synthesis | Kokoro ONNX voices (24 kHz, CPU) |
+| **LiteRT-LM** (`openaihost`) | Edge-optimized text serving | `.litertlm` bundles (LiteRT-LM mobile/edge/NPU builds) |
 
 ## Format-driven routing
 
@@ -32,6 +34,8 @@ MLX quant directories     -> MLX
 Diffusion component sets  -> stable-diffusion.cpp
 Audio transcription       -> whisper.cpp
 Offline TTS               -> piper
+Neural TTS (kokoro)       -> kokoro
+.litertlm bundles         -> LiteRT-LM (openaihost)
 ```
 
 The default preserves single-active-engine behavior; per-model engine pins
@@ -123,3 +127,23 @@ gating for live audio.
 
 Offline neural TTS with local voices - no network, no cloud service, one
 API surface shared with the rest of the media lanes.
+
+### kokoro
+
+Kokoro-82M neural speech synthesis (kokoro-onnx venv + ONNX voice model,
+CPU, ~0.4 GiB lane). 24 kHz WAV, 50+ voices (`af_*`/`am_*` English first;
+`"model": "kokoro"` picks the `af_heart` default). Voices ride
+`/v1/audio/speech` alongside piper's; a resident child enumerates them
+under `/v1/audio/voices` (kokoro section). Buffered WAV only - streaming
+and mp3/opus/aac/flac continue to ride the piper voices. Install with
+`blazar engine install 1.0 --kind kokoro`; the gateway owns the child
+lifecycle (lazy spawn + idle reap under `whisper_idle_secs`).
+
+### LiteRT-LM (openaihost)
+
+Text serving for `.litertlm` bundles - Google's LiteRT-LM runtime tuned
+for mobile, edge, and NPU execution. Installed as a `litert-lm` pip
+environment (~0.4 GiB, any platform) and managed like any other lane:
+`engine install --kind openaihost`, `engine update --kind openaihost`,
+`doctor versions litert`. A supervised shared child serves every
+`.litertlm` model on the lane.

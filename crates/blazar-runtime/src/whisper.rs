@@ -1261,6 +1261,7 @@ mod tests {
                 })
                 .collect(),
             published_at: None,
+            body: None,
         }
     }
 

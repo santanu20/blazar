@@ -72,7 +72,13 @@ pub fn resolve_draft_path(store: &Store, model: &str, spec_mode: &str) -> Option
         .draft_repo
         .split_once(':')
         .unwrap_or((&pair.draft_repo, ""));
-    let draft_name = crate::hf::draft_aware_name(repo_part, file_part);
+    let draft_name = crate::hf::draft_aware_name(
+        repo_part,
+        match file_part {
+            "" => None,
+            file => Some(file),
+        },
+    );
     store.get_model(&draft_name).ok().flatten().map(|r| r.path)
 }
 
@@ -333,6 +339,13 @@ pub fn route_cost(
 /// underscore prefix is invalid in HF repo names).
 pub const ROUTER_KEY: &str = "_router";
 
+/// Instance key for the single openaihost lane child. The host runtime
+/// (litert-lm serve) is registry-wide - one serve process serves every
+/// `.litertlm` bundle - so per-model spawns collapse onto this shared
+/// child (same single-child pattern as router mode). Underscore prefix
+/// keeps it out of the model namespace.
+pub const OPENAIHOST_KEY: &str = "_openaihost";
+
 /// Hard cap on `replicas` per model (B1). Beyond this, capacity fights
 /// the point of replication; users wanting more can raise
 /// `max_loaded_models` and stack models.
@@ -517,14 +530,14 @@ fn lora_suffix_of_key(key: &str) -> Option<&str> {
 
 /// Owned model metadata for either storage lane, lendable as the
 /// compiler's borrowed `ModelMeta` (no self-referential struct).
-pub(crate) enum MetaBox {
+pub enum MetaBox {
     Gguf(Box<blazar_core::GgufMeta>),
     Hf(blazar_core::HfMeta),
 }
 
 impl MetaBox {
     #[must_use]
-    pub(crate) fn borrow_meta(&self) -> blazar_core::ModelMeta<'_> {
+    pub fn borrow_meta(&self) -> blazar_core::ModelMeta<'_> {
         match self {
             MetaBox::Gguf(g) => blazar_core::ModelMeta::Gguf(g),
             MetaBox::Hf(h) => blazar_core::ModelMeta::Hf(h),
@@ -539,8 +552,9 @@ impl MetaBox {
 /// io-error they used to surface ("Is a directory") told the user
 /// nothing. mistral.rs consumes both shapes, so its read follows the
 /// disk. Errors name the reader so the caller's skip/teach message
-/// says WHICH metadata was missing.
-pub(crate) fn read_model_meta(
+/// says WHICH metadata was missing. Public so the gateway's explain
+/// card can state the same admission verdict a spawn would hit.
+pub fn read_model_meta(
     path: &str,
     kind: blazar_core::engine_kind::EngineKind,
 ) -> Result<MetaBox, String> {
@@ -644,8 +658,9 @@ fn remedy_suffix(
 /// Upgrade the static format-mismatch teaching (`read_model_meta`) with
 /// the store's actual lanes so a user who HAS sglang installed is told
 /// to `engine use` it, not to install it. Other error classes pass
-/// through untouched.
-fn store_aware_remedy(
+/// through untouched. Public so the gateway's explain card can wrap the
+/// same admission teaching a spawn would surface.
+pub fn store_aware_remedy(
     store: &blazar_core::store::Store,
     current: blazar_core::engine_kind::EngineKind,
     path: &str,
@@ -987,6 +1002,27 @@ pub enum SupervisionError {
 }
 
 impl SupervisionError {
+    /// Typed clone for the load-dedup cache. Exhaustive by design: a
+    /// new variant must pick its waiter-clone story here at compile
+    /// time. `Internal` cannot clone its `anyhow` chain, so the message
+    /// round-trips through Display (context links lost - acceptable for
+    /// the classless 500 lane, the message is what surfaces).
+    #[must_use]
+    fn clone_err(&self) -> Self {
+        match self {
+            Self::ModelNotFound(m) => Self::ModelNotFound(m.clone()),
+            Self::UnsupportedModel(m) => Self::UnsupportedModel(m.clone()),
+            Self::EngineCrashed(m) => Self::EngineCrashed(m.clone()),
+            Self::ModelLoadTimeout(m) => Self::ModelLoadTimeout(m.clone()),
+            Self::CircuitOpen(m) => Self::CircuitOpen(m.clone()),
+            Self::AllSlotsBusy => Self::AllSlotsBusy,
+            Self::ModelTooLarge(m) => Self::ModelTooLarge(m.clone()),
+            Self::InsufficientMemory(m) => Self::InsufficientMemory(m.clone()),
+            Self::RpcEndpointsUnreachable(m) => Self::RpcEndpointsUnreachable(m.clone()),
+            Self::Internal(e) => Self::Internal(anyhow!("{e}")),
+        }
+    }
+
     /// Convert an `Engine::spawn` anyhow failure into the typed lane:
     /// the rpc preflight marker maps to
     /// [`Self::RpcEndpointsUnreachable`] (503-class), everything else
@@ -2117,6 +2153,29 @@ struct UbatchGovState {
 /// Slot shape parsed from an engine child's argv (`-np` / `--parallel`).
 /// One parse shared by the adaptive tick, `slot_cap`, and the `ps` rows -
 /// the child's own flag is the source of truth for the live shape.
+///
+/// Fit-gate for merging ANNOUNCED fleet workers into a spawn's `--rpc`
+/// argv. Pure on purpose: unit-pinnable without a live fleet.
+///
+/// * static list configured -> always merge (operator intent wins);
+/// * resident + incoming exceed the local budget -> merge (this is the
+///   sharding case the fleet exists for);
+/// * otherwise -> local-only spawn (LAN hops would only add latency).
+///
+/// A CPU-only gateway reports budget 0, so any model merges whenever
+/// workers are announced - exactly the wifi-GPU-borrowing mode.
+fn fleet_merge_wanted(
+    static_rpc_nonempty: bool,
+    resident_bytes: u64,
+    incoming_bytes: u64,
+    local_budget_bytes: u64,
+) -> bool {
+    if static_rpc_nonempty {
+        return true;
+    }
+    resident_bytes.saturating_add(incoming_bytes) > local_budget_bytes
+}
+
 fn argv_np(argv: &[String]) -> Option<u32> {
     argv.windows(2)
         .find(|w| w[0] == "-np" || w[0] == "--parallel")
@@ -2229,6 +2288,11 @@ pub struct ConfigReloadOutcome {
     /// The `preload` list changed - the caller should run
     /// `preload_listed` in the background to warm new entries.
     pub preload_changed: bool,
+    /// The `[[keys]]` set changed. Unlike bind-time knobs, keys are
+    /// hot-swappable: the caller must push the new set into the live
+    /// `KeysLimiter` so auth reflects the file immediately (the limiter
+    /// is gateway-owned; the supervisor only reports the diff).
+    pub keys_changed: bool,
 }
 
 pub struct Supervisor {
@@ -2299,8 +2363,11 @@ pub struct Supervisor {
     evicting: tokio::sync::Mutex<std::collections::HashSet<String>>,
     /// In-flight spawns: waiters subscribe to the Notify for completion.
     loading: DashMap<String, Arc<Notify>>,
-    /// Completed load results for waiters: Ok(port) or error text.
-    load_results: DashMap<String, Result<EngineRef, String>>,
+    /// Completed load results for waiters. The error rides behind an
+    /// Arc so its VARIANT survives the cache hop: stringifying here
+    /// would make every waiter's clone come back `Internal` (500) even
+    /// when the loader refused admission with a typed 400-class teach.
+    load_results: DashMap<String, Result<EngineRef, Arc<SupervisionError>>>,
     /// Crash-restart timestamps per model (circuit breaker). Recorded
     /// ONLY for spawns that consume an unclean-death mark - a user
     /// stop->run churn is a cold start, not a crash restart.
@@ -2551,6 +2618,7 @@ impl Supervisor {
                 applied: false,
                 cold_only: Vec::new(),
                 preload_changed: false,
+                keys_changed: false,
             });
         }
         let next = match Config::load(&self.dirs) {
@@ -2568,6 +2636,7 @@ impl Supervisor {
         let old = self.cfg();
         let cold_only = Config::cold_only_diff(&old, &next);
         let preload_changed = old.preload != next.preload;
+        let keys_changed = old.keys != next.keys;
         let _ = self.config.swap(next); // swapped-out generation intentionally dropped
         *fingerprint = Some((mtime_ms, size));
         drop(fingerprint);
@@ -2580,6 +2649,7 @@ impl Supervisor {
             applied: true,
             cold_only,
             preload_changed,
+            keys_changed,
         })
     }
 
@@ -3277,10 +3347,20 @@ impl Supervisor {
             }
             let store =
                 Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
-            store
+            let row = store
                 .get_model(name)
                 .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
-            return Box::pin(self.ensure_routed(ROUTER_KEY, None)).await;
+            // LiteRT bundles cannot ride the llamacpp router child -
+            // its GGUF loader rejects the format outright (bad magic
+            // "LITE"), and the router preset already skips them at
+            // build time. Serve them on their native openaihost lane
+            // via the normal per-model path below (the capability-lane
+            // exception): the collapse arm there redirects to the ONE
+            // shared venv child that actually serves the bundle.
+            // Unknown names keep the router path (the child teaches).
+            if !row.as_ref().is_some_and(ModelRow::is_litert_bundle) {
+                return Box::pin(self.ensure_routed(ROUTER_KEY, None)).await;
+            }
         }
 
         // SGLang LoRA variants ride the BASE child: the engine selects
@@ -4268,6 +4348,8 @@ impl Supervisor {
         };
         let result = if self.cfg().router && key == ROUTER_KEY {
             self.spawn_router_instance().await
+        } else if key == OPENAIHOST_KEY {
+            self.spawn_openaihost_instance().await
         } else if captive {
             self.spawn_instance_captive(key).await
         } else {
@@ -4340,7 +4422,9 @@ impl Drop for LoadAbort<'_> {
         }
         self.sup.load_results.insert(
             self.key.to_string(),
-            Err("load cancelled before completion (loader dropped mid-spawn)".to_string()),
+            Err(Arc::new(SupervisionError::Internal(anyhow!(
+                "load cancelled before completion (loader dropped mid-spawn)"
+            )))),
         );
         self.notify.notify_waiters();
         self.sup.loading.remove(self.key);
@@ -4399,6 +4483,9 @@ impl Supervisor {
                 }
                 blazar_core::engine_kind::EngineKind::SdCpp => {
                     "; sd-server ships no auth flag upstream - the child is loopback-only"
+                }
+                blazar_core::engine_kind::EngineKind::OpenAiHost => {
+                    "; litert-lm ships no auth flag - the child is loopback-only"
                 }
                 _ => "; run: blazar engine update",
             };
@@ -4719,7 +4806,10 @@ impl Supervisor {
             self.remap_device_argv(&mut argv, ROUTER_KEY).await;
             // Router child is always llamacpp: announced fleet workers
             // ride it exactly like a dedicated spawn (same snapshot
-            // discipline - one read per spawn attempt).
+            // discipline - one read per spawn attempt). Deliberately
+            // NOT fit-gated (contrast the dedicated-spawn site): router
+            // mode exists to serve MANY models through ONE process, so
+            // its capacity IS the fleet pool.
             if self.cfg().fleet_enabled {
                 let announced = self.fleet.snapshot_targets(
                     std::time::Instant::now(),
@@ -4838,6 +4928,215 @@ impl Supervisor {
             ))
         } else {
             SupervisionError::ModelLoadTimeout(ROUTER_KEY.to_string())
+        })
+    }
+
+    /// Spawn the single openaihost lane child (litert-lm serve): a
+    /// registry-wide server, so ONE process serves every `.litertlm`
+    /// bundle - the router-instance pattern minus the preset INI (the
+    /// child reads its own registry, blazar never enumerates it into
+    /// argv). The lane row is the newest installed openaihost engine;
+    /// no row = the same teaching the typed router verdict carries.
+    #[allow(clippy::too_many_lines)]
+    async fn spawn_openaihost_instance(&self) -> Result<EngineRef, SupervisionError> {
+        let store =
+            Store::open(&self.dirs).map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+        let engines = store
+            .list_engines()
+            .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
+        let row = engines
+            .iter()
+            .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::OpenAiHost)
+            .max_by_key(|r| r.installed_at)
+            .cloned();
+        // The teaching text lives in one place: the typed lane verdict's
+        // Display. Rebuilding it here (same roster shape) keeps the spawn
+        // error and the router verdict byte-identical by construction.
+        let row = row.ok_or_else(|| {
+            use blazar_core::engine_kind::LaneError;
+            let roster = engines
+                .iter()
+                .map(|r| format!("{} ({})", r.tag, r.kind))
+                .collect::<Vec<_>>()
+                .join(", ");
+            SupervisionError::UnsupportedModel(LaneError::LitertUnserved { roster }.to_string())
+        })?;
+        let mut manifest: crate::engine::manifest::Manifest = serde_json::from_str(&row.manifest)
+            .map_err(|e| {
+            SupervisionError::Internal(anyhow!(
+                "openaihost engine {} manifest decode: {e}",
+                row.tag
+            ))
+        })?;
+        manifest.anchor_server_path(&self.dirs.data_dir);
+        let env: Vec<(String, String)> = self
+            .cfg()
+            .engine_env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let adapter: Arc<dyn Engine> = Arc::new(crate::engine_impl::OpenAiHostEngine::with_env(
+            manifest.clone(),
+            env,
+        ));
+
+        // Synthetic lane row + profile: the child serves a registry, not
+        // a model, so there is no per-model compile - the profile is the
+        // lane shape (runtime-managed, no ctx/KV math) and the adapter's
+        // build_argv owns the whole launch grammar.
+        let synthetic_model = blazar_core::ModelRow {
+            name: OPENAIHOST_KEY.to_string(),
+            repo: String::new(),
+            quant: String::new(),
+            path: String::new(),
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        };
+        let profile = blazar_core::Profile {
+            argv: Vec::new(),
+            warnings: Vec::new(),
+            ctx: 0,
+            gpu: "auto",
+            vram_mib: self.hardware.total_vram_mib(),
+            kv_est_bytes: None,
+            ctx_autofit: None,
+            capacity: blazar_core::profile::CapacityStatus::RuntimeManaged,
+        };
+
+        let _ = self.dirs.ensure();
+        let mut child_died_during_load = false;
+        let mut last_load_tail = String::new();
+        for _attempt in 0..2 {
+            let endpoint = self.pick_endpoint(OPENAIHOST_KEY)?;
+            // litert-lm has no auth flags: mint_child_auth warns and
+            // returns None (loopback + random port boundary, sdcpp
+            // precedent) - the gateway stays the only public face.
+            let auth = self.mint_child_auth(
+                OPENAIHOST_KEY,
+                &endpoint,
+                &manifest,
+                blazar_core::engine_kind::EngineKind::OpenAiHost,
+            )?;
+            let mut argv = adapter.build_argv(&synthetic_model, &profile, &endpoint);
+            if argv.is_empty() {
+                // Unix endpoint: refuse with teaching (the adapter cannot
+                // express the listen pair on a socket transport).
+                return Err(SupervisionError::Internal(anyhow!(
+                    "openaihost engines have no unix-socket transport; set child_transport = \
+                     \"tcp\" in the blazar config"
+                )));
+            }
+            if let Some(a) = &auth {
+                argv.extend(a.argv.iter().cloned());
+            }
+            let mut child = adapter
+                .spawn(&argv, &endpoint, &[])
+                .await
+                .map_err(|e| SupervisionError::spawn_failure(&e))?;
+            if let Ok(Some(status)) = child.try_status() {
+                tracing::warn!(
+                    lane = OPENAIHOST_KEY,
+                    "openaihost child died at spawn ({status}); retrying"
+                );
+                let _ = child.kill().await;
+                let _ = child.reap().await;
+                continue;
+            }
+            let (health, child_died) = self
+                .wait_healthy(adapter.as_ref(), &endpoint, &mut child)
+                .await;
+            match health {
+                Ok(()) => {
+                    let pid = child.id().ok_or_else(|| {
+                        SupervisionError::Internal(anyhow!(
+                            "openaihost child has no pid; refusing to track instance"
+                        ))
+                    })?;
+                    if pid <= 1 {
+                        return Err(SupervisionError::Internal(anyhow!(
+                            "openaihost child pid {pid} is not a safe process-group id"
+                        )));
+                    }
+                    let inst = Arc::new(Instance {
+                        name: OPENAIHOST_KEY.to_string(),
+                        engine_tag: row.tag.clone(),
+                        kind: blazar_core::engine_kind::EngineKind::OpenAiHost,
+                        endpoint,
+                        state: std::sync::RwLock::new(InstanceState::Ready),
+                        last_used: std::sync::RwLock::new(Instant::now()),
+                        in_flight: AtomicI64::new(0),
+                        keep_until: std::sync::RwLock::new(None),
+                        bank_dirty: AtomicBool::new(false),
+                        started_at: Instant::now(),
+                        // Registry-wide host: projector/draft vocabulary
+                        // does not apply (the runtime owns multimodality
+                        // and speculation inside the bundle).
+                        projector: false,
+                        argv,
+                        model: synthetic_model,
+                        profile_ctx: 0,
+                        capacity: blazar_core::profile::CapacityStatus::RuntimeManaged,
+                        gpu: "auto".to_string(),
+                        device: None,
+                        device_id: None,
+                        kv_est_bytes: None,
+                        warnings: Vec::new(),
+                        spec_mode: String::new(),
+                        draft: None,
+                        settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        auth: auth.as_ref().map(|a| a.secret.clone()),
+                        child: tokio::sync::Mutex::new(child),
+                        pid,
+                    });
+                    let _ = std::fs::write(
+                        self.dirs.run_dir().join(format!("{OPENAIHOST_KEY}.pid")),
+                        pid.to_string(),
+                    );
+                    self.instances.insert(OPENAIHOST_KEY.to_string(), inst);
+                    if self.unclean_dead.remove(OPENAIHOST_KEY).is_some() {
+                        self.record_restart(OPENAIHOST_KEY);
+                    }
+                    self.bus.publish(BlazarEvent::InstanceStateChanged {
+                        name: OPENAIHOST_KEY.to_string(),
+                        state: InstanceState::Ready,
+                    });
+                    let inst = self.instances.get(OPENAIHOST_KEY).expect("just inserted");
+                    return Ok(self.engine_ref(OPENAIHOST_KEY, inst.value()));
+                }
+                Err(e) => {
+                    child_died_during_load |= child_died;
+                    if child_died {
+                        tracing::error!(
+                            lane = OPENAIHOST_KEY,
+                            "openaihost child died during load: {e:#}"
+                        );
+                    } else {
+                        tracing::warn!(
+                            lane = OPENAIHOST_KEY,
+                            "openaihost health check failed: {e:#}"
+                        );
+                    }
+                    last_load_tail = child.tail_joined();
+                    let _ = child.kill().await;
+                    let _ = child.reap().await;
+                }
+            }
+        }
+        Err(if child_died_during_load {
+            SupervisionError::EngineCrashed(format!(
+                "{OPENAIHOST_KEY}: {}",
+                Self::tail_excerpt(&last_load_tail)
+            ))
+        } else {
+            SupervisionError::ModelLoadTimeout(OPENAIHOST_KEY.to_string())
         })
     }
 
@@ -5040,6 +5339,9 @@ impl Supervisor {
                     Arc::new(crate::engine_impl::SglangEngine::with_env(manifest, env))
                 }
                 EngineKind::Mlx => Arc::new(crate::engine_impl::MlxEngine::with_env(manifest, env)),
+                EngineKind::OpenAiHost => Arc::new(crate::engine_impl::OpenAiHostEngine::with_env(
+                    manifest, env,
+                )),
                 EngineKind::LlamaCpp => {
                     Arc::new(crate::engine_impl::LlamaCppEngine::with_env(manifest, env))
                 }
@@ -5047,8 +5349,8 @@ impl Supervisor {
                     Arc::new(crate::engine_impl::SdCppEngine::with_env(manifest, env))
                 }
                 // Unreachable: the lazy-lane guard above returns early
-                // (whisper transcription, piper synthesis).
-                EngineKind::Whisper | EngineKind::Piper => return None,
+                // (whisper transcription, piper/kokoro synthesis).
+                EngineKind::Whisper | EngineKind::Piper | EngineKind::Kokoro => return None,
             })
         };
         let roster = || {
@@ -5130,6 +5432,7 @@ impl Supervisor {
                 safetensors,
                 model.is_quantized_safetensors(),
                 model.is_mlx(),
+                model.is_litert_bundle(),
             ),
         };
         let Some((tag, _kind)) = blazar_core::engine_kind::serving_lane(
@@ -5319,6 +5622,35 @@ impl Supervisor {
             }
             Err(teach) => return Err(SupervisionError::UnsupportedModel(teach)),
         };
+        // OpenAiHost lane collapse: the routed child is a registry-wide
+        // server with no per-model argv, so every `.litertlm` spawn
+        // shares ONE supervised serve child under the lane key (the
+        // router-mode redirect pattern). A pin that routed elsewhere
+        // (e.g. an explicit llamacpp tag) never reaches this arm - its
+        // verdict is not OpenAiHost and the normal path below teaches
+        // honestly on the format mismatch.
+        if engine.kind() == blazar_core::engine_kind::EngineKind::OpenAiHost
+            && key != OPENAIHOST_KEY
+        {
+            // Per-model `extra_args` validated by `compile_openaihost`
+            // apply only to direct venv runs: this child is shared and
+            // registry-wide, so the flags would be silently dropped
+            // here. Say so at the moment the drop happens instead of
+            // letting the preview/spawn shapes drift quietly apart.
+            if let Some(extra) = self.cfg().overlay_for(&model.name).extra_args
+                && !extra.is_empty()
+            {
+                tracing::warn!(
+                    "openaihost lane: model {} override extra_args [{}] not applied - \
+                     the supervised lane child is ONE shared registry server with no \
+                     per-model argv; the flags apply only when running the venv \
+                     child directly",
+                    model.name,
+                    extra.join(" ")
+                );
+            }
+            return Box::pin(self.ensure_key_opts(OPENAIHOST_KEY, captive)).await;
+        }
         let meta_box = read_model_meta(&model.path, engine.kind()).map_err(|e| {
             SupervisionError::UnsupportedModel(store_aware_remedy(
                 &store,
@@ -5372,8 +5704,14 @@ impl Supervisor {
         // multimodal dirs pass untouched (verified against the live lane).
         if engine.kind() == blazar_core::engine_kind::EngineKind::Sglang
             && let blazar_core::hfmeta::ModelMeta::Hf(h) = meta_box.borrow_meta()
-            && let Some(teach) =
-                blazar_core::hfmeta::sglang_lane_teach(h, std::path::Path::new(&model.path))
+            && let Some(teach) = blazar_core::hfmeta::sglang_lane_teach(
+                h,
+                std::path::Path::new(&model.path),
+                // The installed lane's own probed facts (version +
+                // loader registry), so the refusal names the engine
+                // actually running instead of a stale snapshot.
+                &engine.capabilities().sglang_lane_facts(),
+            )
         {
             return Err(SupervisionError::UnsupportedModel(format!(
                 "{}: {teach}",
@@ -6262,8 +6600,28 @@ impl Supervisor {
             // Announced fleet workers ride the SAME snapshot the budget
             // probe used above (llamacpp lane only: sdcpp runs its own
             // RPC lane and must not grow a `--rpc` it does not parse).
-            if engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp {
-                crate::fleet::merge_fleet_argv(&mut argv, &fleet_announced);
+            if engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp
+                && !fleet_announced.is_empty()
+            {
+                // Fit-gate: borrow the LAN only when it pays. A model
+                // that fits locally keeps its tokens on the local bus -
+                // sharding it would add per-token LAN hops for nothing.
+                // A CPU-only gateway (budget 0) merges whenever workers
+                // are announced: that IS the "borrow the LAN's GPUs"
+                // mode. Static lists stay operator intent: always merge.
+                if fleet_merge_wanted(
+                    !static_rpc.is_empty(),
+                    self.resident_bytes(),
+                    u64::try_from(model.bytes).unwrap_or(0),
+                    self.vram_budget_bytes(),
+                ) {
+                    crate::fleet::merge_fleet_argv(&mut argv, &fleet_announced);
+                } else {
+                    tracing::info!(
+                        model = name,
+                        "model fits locally - fleet workers idle for this spawn (sharding would add per-token LAN hops)"
+                    );
+                }
             }
             argv_dialed_rpc |= argv.iter().any(|flag| flag == "--rpc");
             let mut child = engine
@@ -9413,20 +9771,34 @@ impl<'a> EvictingName<'a> {
     }
 }
 
+/// Waiters clone the loader's cached outcome. The error keeps its
+/// variant - a cached admission refusal (`UnsupportedModel`) rewrapped
+/// as `Internal` would answer an opaque 500 instead of the honest
+/// 400-class teach (live-repro'd: REPL background warm took the
+/// refusal first, so the first chat turn read the cache, not the gate).
+/// Only `Internal` gains the `(from {name})` attribution - the typed
+/// variants already name the model in their message.
 fn clone_load_result(
-    res: &Result<EngineRef, String>,
+    res: &Result<EngineRef, Arc<SupervisionError>>,
     name: &str,
 ) -> Result<EngineRef, SupervisionError> {
     match res {
         Ok(ep) => Ok(ep.clone()),
-        Err(text) => Err(SupervisionError::Internal(anyhow!("{text} (from {name})"))),
+        Err(shared) => Err(match shared.as_ref() {
+            SupervisionError::Internal(e) => {
+                SupervisionError::Internal(anyhow!("{e} (from {name})"))
+            }
+            other => other.clone_err(),
+        }),
     }
 }
 
-fn map_result(r: &Result<EngineRef, SupervisionError>) -> Result<EngineRef, String> {
+/// Stage the loader's outcome for waiters: the `EngineRef` clones, the
+/// typed error shares behind an Arc.
+fn map_result(r: &Result<EngineRef, SupervisionError>) -> Result<EngineRef, Arc<SupervisionError>> {
     match r {
         Ok(ep) => Ok(ep.clone()),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(Arc::new(e.clone_err())),
     }
 }
 
@@ -9511,7 +9883,13 @@ mod routing_tests {
             .draft_repo
             .split_once(':')
             .unwrap_or((&pair.draft_repo, ""));
-        let draft_name = crate::hf::draft_aware_name(repo, file);
+        let draft_name = crate::hf::draft_aware_name(
+            repo,
+            match file {
+                "" => None,
+                file => Some(file),
+            },
+        );
         let row = |name: &str, path: &str| {
             serde_json::from_value::<blazar_core::ModelRow>(serde_json::json!({
                 "name": name, "repo": "r", "quant": "q",
@@ -11472,6 +11850,20 @@ mod routing_tests {
         assert!(sup.instances.contains_key("big"));
         sup.evict("big").await.unwrap();
         let _ = pid;
+    }
+
+    #[test]
+    fn unit__fleet_merge_wanted__four_verdicts() {
+        // Static list configured: operator intent always wins, even
+        // when the model would fit locally.
+        assert!(fleet_merge_wanted(true, 0, 1_000, 1_000_000));
+        // Fits locally: keep tokens on the local bus.
+        assert!(!fleet_merge_wanted(false, 2_000, 1_000, 1_000_000));
+        // Does not fit: borrow the LAN (the sharding case).
+        assert!(fleet_merge_wanted(false, 2_000, 3_000, 4_000));
+        // CPU-only gateway (budget 0): any model merges - the
+        // wifi-GPU-borrowing mode.
+        assert!(fleet_merge_wanted(false, 0, 1_000, 0));
     }
 
     #[tokio::test]
@@ -15754,6 +16146,51 @@ mod routing_tests {
     }
 
     #[tokio::test]
+    async fn unit__reload_config_now__keys_diff_flags_keys_changed() {
+        let sup = gpu_sup_with(
+            vec![GpuInfo {
+                name: "g".into(),
+                description: "S".into(),
+                total_mib: 8_188,
+                free_mib: 8_188,
+            }],
+            hot_reload_config(),
+        )
+        .0;
+        std::fs::create_dir_all(sup.dirs.config_file().parent().unwrap()).unwrap();
+        // Boot config has zero keys; adding one must flag the auth
+        // dimension so the caller hot-swaps the live limiter.
+        std::fs::write(
+            sup.dirs.config_file(),
+            "[[keys]]\nname = \"a\"\nkey = \"plm_alpha\"\n",
+        )
+        .unwrap();
+        let outcome = sup.reload_config_now().expect("valid file must apply");
+        assert!(outcome.keys_changed, "keys appended -> hot-swap required");
+        assert_eq!(sup.cfg().keys.len(), 1);
+        // Same file again: debounce, and keys dimension stays quiet.
+        let again = sup.reload_config_now().expect("same file, same result");
+        assert!(
+            !again.applied && !again.keys_changed,
+            "fingerprint debounce"
+        );
+        // Editing the key's scope in place is still a change.
+        std::fs::write(
+            sup.dirs.config_file(),
+            "[[keys]]\nname = \"a\"\nkey = \"plm_alpha\"\nmodels = [\"m\"]\n",
+        )
+        .unwrap();
+        let scoped = sup.reload_config_now().expect("edited file must apply");
+        assert!(scoped.keys_changed, "key edited in place -> still a change");
+        // Removing every key (back to authless) must flag too - the
+        // reverse direction once left a stale limiter enforcing ghosts.
+        std::fs::write(sup.dirs.config_file(), "idle_timeout_secs = 600\n").unwrap();
+        let emptied = sup.reload_config_now().expect("valid file must apply");
+        assert!(emptied.keys_changed, "keys removed -> hot-swap required");
+        assert!(sup.cfg().keys.is_empty());
+    }
+
+    #[tokio::test]
     async fn unit__reload_config_now__cold_knob_flagged_in_diff() {
         let sup = gpu_sup_with(
             vec![GpuInfo {
@@ -16127,5 +16564,39 @@ mod spawn_failure_tests {
             matches!(e, SupervisionError::Internal(_)),
             "non-rpc spawn errors keep the Internal lane: {e:?}"
         );
+    }
+
+    #[test]
+    fn unit__clone_load_result__cache_hop_preserves_typed_refusal() {
+        // Live-repro'd 2026-11-08: the REPL's background warm took the
+        // admission refusal first; the first chat turn then cloned the
+        // dedup-cached failure and rendered INTERNAL/500 instead of
+        // MODEL_UNSUPPORTED_ENGINE/400. The cache must carry the
+        // variant, not the string.
+        let cached = map_result(&Err::<EngineRef, _>(SupervisionError::UnsupportedModel(
+            "/x/m.d: quant_method 'torchao' is not loadable".to_string(),
+        )));
+        let back = clone_load_result(&cached, "m1");
+        match back {
+            Err(SupervisionError::UnsupportedModel(msg)) => {
+                assert!(msg.contains("torchao"), "{msg}");
+                // attribution suffix is Internal-only; typed messages
+                // already name the model
+                assert!(!msg.contains("(from"), "{msg}");
+            }
+            other => panic!("variant must survive the cache hop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unit__clone_load_result__internal_keeps_waiter_attribution() {
+        let cached = map_result(&Err::<EngineRef, _>(SupervisionError::Internal(anyhow!(
+            "load cancelled before completion (loader dropped mid-spawn)"
+        ))));
+        let msg = clone_load_result(&cached, "m1")
+            .expect_err("cached Internal stays an error")
+            .to_string();
+        assert!(msg.contains("load cancelled"), "{msg}");
+        assert!(msg.contains("(from m1)"), "{msg}");
     }
 }
