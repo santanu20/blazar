@@ -158,7 +158,11 @@ LANES_WITHOUT_REGISTRY: set[str] = set()
 # Lanes with NO extra_args surface: argv is composed per call by Blazar,
 # so a non-first-class flag is unreachable, not passthrough. Piper is a
 # one-shot synthesizer spawn (no config knob, no user argv tail).
-LANES_WITHOUT_EXTRA_ARGS: set[str] = {"piper"}
+# OpenAiHost spawns one registry-wide shared child (the `_openaihost`
+# lane): `OpenAiHostEngine::build_argv` owns the entire launch grammar
+# and the synthetic row rides an empty profile, so no user argv tail
+# exists on any model either.
+LANES_WITHOUT_EXTRA_ARGS: set[str] = {"openaihost", "piper"}
 
 # Flags that are not capabilities Blazar could integrate - CLI ergonomics,
 # alternative input surfaces, or long-form aliases of flags the lane
@@ -181,6 +185,18 @@ NOT_APPLICABLE: dict[str, dict[str, str]] = {
             "Arabic diacritization; needs a separate model asset and an "
             "Arabic voice, and the lane has no extra_args surface"
         ),
+    },
+    "openaihost": {
+        "--config": (
+            "config-file input competes with Blazar's composed argv and "
+            "the child's own model registry"
+        ),
+        "--cors-origin": (
+            "child binds loopback behind the gateway; the gateway is the "
+            "public CORS face"
+        ),
+        "--verbose": "child-side log verbosity; Blazar owns child log capture",
+        "--help": "interactive CLI ergonomics, not a serving capability",
     },
 }
 

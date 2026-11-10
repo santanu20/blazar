@@ -5,7 +5,7 @@
 # before building — the SKIP placeholders exist so a fresh pkgver bump
 # still builds for quick local testing.
 pkgname=blazar
-pkgver=0.28.0
+pkgver=0.30.1
 pkgrel=1
 pkgdesc="Local model server and inference gateway: OpenAI, Ollama, and Anthropic dialects over llama.cpp, mistral.rs, SGLang, and MLX engines"
 arch=(x86_64 aarch64)

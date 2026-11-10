@@ -226,6 +226,7 @@ If you only need one model, one runtime, and one process, a direct engine server
 | **stable-diffusion.cpp** | Media generation | Diffusion images and video |
 | **whisper.cpp** | Speech recognition | Transcription and translation |
 | **piper** | Offline speech synthesis | Local TTS voices |
+| **LiteRT-LM** (`openaihost`) | Edge-optimized text serving | `.litertlm` bundles (LiteRT-LM mobile/edge/NPU builds) |
 
 Full lane inventory and channel policy: [`docs/engines.md`](docs/engines.md). Routing follows model format and engine capability (the table's Workloads column is the format map). The default preserves single-active-engine behavior; per-model engine pins give deterministic placement. Curated capability lanes cover GGUF architectures the mainstream llama.cpp lane does not yet support.
 
@@ -419,7 +420,7 @@ sh scripts/install.sh --build
 
 Windows: `irm https://raw.githubusercontent.com/santanu20/blazar/main/scripts/install.ps1 -OutFile install.ps1; .\install.ps1 -Build`
 
-Package-manager integrations: [Homebrew](packaging/homebrew), [Scoop](packaging/scoop), [Winget](packaging/winget).
+Package-manager integrations: [Homebrew](packaging/homebrew), [Scoop](packaging/scoop), [Winget](packaging/winget), and a version-rolling [PKGBUILD](packaging/PKGBUILD) for AUR helpers.
 
 ---
 

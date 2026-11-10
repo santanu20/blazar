@@ -24,6 +24,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
+
 use axum::response::IntoResponse;
 use blazar_core::config::{FailoverChain, FailoverTarget};
 use serde_json::json;
@@ -407,10 +409,15 @@ pub fn stamp(resp: &mut axum::response::Response, attempt: &Attempt) {
 /// failures escalate: 5xx, unknown-model 404, and gate-class 400s
 /// (fit refusal, spawn errors - our error bodies carry the
 /// `blazar_error` type). Gate-class detection buffers the (small)
-/// error body; anything larger than the cap passes through unbuffered.
+/// error body; anything announced larger than the cap skips the
+/// sniff entirely and passes through unbuffered, body untouched. A
+/// cap-exceeding body that surfaces only mid-stream (no
+/// content-length) is re-chained from the bytes already read - the
+/// client always receives every byte either way.
 /// Bodies that already streamed cannot be retried - the sentinel and
 /// evict lanes own mid-stream failures.
 pub async fn escalate_response(resp: &mut axum::response::Response) -> bool {
+    const BODY_SNIFF_CAP: usize = 8 * 1024;
     let status = resp.status().as_u16();
     if status >= 500 || status == 404 {
         return true;
@@ -418,16 +425,59 @@ pub async fn escalate_response(resp: &mut axum::response::Response) -> bool {
     if status != 400 {
         return false;
     }
+    // Announced-large bodies never enter the sniff: pass through
+    // unbuffered instead of buffering-then-dropping (the old failure
+    // mode this guard closes).
+    if let Some(len) = resp
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        && len > BODY_SNIFF_CAP
+    {
+        return false;
+    }
     let taken = std::mem::take(resp);
     let (parts, body) = taken.into_parts();
-    if let Ok(bytes) = axum::body::to_bytes(body, 8 * 1024).await {
-        let esc = bytes
+    // Read incrementally so an over-cap (or errored) stream can be
+    // rebuilt from its prefix rather than discarded: every byte the
+    // client was promised still arrives.
+    let mut stream = body.into_data_stream();
+    let mut prefix: axum::body::Bytes = axum::body::Bytes::default();
+    let mut overflowed = false;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let next_len = prefix.len() + bytes.len();
+                prefix = [prefix, bytes].concat().into();
+                if next_len > BODY_SNIFF_CAP {
+                    overflowed = true;
+                    break;
+                }
+            }
+            Err(_) => {
+                // Transport died mid-body: keep the prefix read so far
+                // and stop sniffing - the error is already visible to
+                // the client via the truncated stream.
+                break;
+            }
+        }
+    }
+    if !overflowed && prefix.len() <= BODY_SNIFF_CAP {
+        let esc = prefix
             .windows(b"blazar_error".len())
             .any(|w| w == b"blazar_error");
-        *resp = axum::response::Response::from_parts(parts, axum::body::Body::from(bytes));
+        *resp = axum::response::Response::from_parts(parts, axum::body::Body::from(prefix));
         esc
     } else {
-        *resp = axum::response::Response::from_parts(parts, axum::body::Body::empty());
+        // Over cap mid-stream (no usable content-length): re-chain the
+        // consumed prefix ahead of the unread remainder - the response
+        // passes through byte-complete, just not sniffed.
+        let unread = stream;
+        let combined = futures::stream::once(futures::future::ok::<_, std::io::Error>(prefix))
+            .chain(unread.map(|r| r.map_err(std::io::Error::other)));
+        *resp =
+            axum::response::Response::from_parts(parts, axum::body::Body::from_stream(combined));
         false
     }
 }
@@ -605,5 +655,44 @@ mod tests {
             ))
             .unwrap();
         assert!(!futures::executor::block_on(escalate_response(&mut r)));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__escalate_response__announced_large_body_passes_through_untouched() {
+        // A 400 whose content-length announces more than the sniff cap
+        // must not be buffered at all: no escalation, body intact.
+        let big = vec![b'x'; 9 * 1024];
+        let mut r = axum::response::Response::builder()
+            .status(400)
+            .header("content-length", big.len().to_string())
+            .body(axum::body::Body::from(big.clone()))
+            .unwrap();
+        assert!(!futures::executor::block_on(escalate_response(&mut r)));
+        let bytes = futures::executor::block_on(async {
+            axum::body::to_bytes(std::mem::take(r.body_mut()), 32 * 1024).await
+        })
+        .unwrap();
+        assert_eq!(bytes.as_ref(), big.as_slice());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__escalate_response__cap_overflow_without_length_keeps_every_byte() {
+        // No content-length and a body that only reveals itself as
+        // over-cap mid-stream: the old code discarded it to an empty
+        // body; the rebuilt stream must still deliver every byte and
+        // decline escalation.
+        let big = vec![b'y'; 9 * 1024];
+        let mut r = axum::response::Response::builder()
+            .status(400)
+            .body(axum::body::Body::from(big.clone()))
+            .unwrap();
+        assert!(!futures::executor::block_on(escalate_response(&mut r)));
+        let bytes = futures::executor::block_on(async {
+            axum::body::to_bytes(std::mem::take(r.body_mut()), 32 * 1024).await
+        })
+        .unwrap();
+        assert_eq!(bytes.as_ref(), big.as_slice());
     }
 }

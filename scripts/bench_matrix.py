@@ -83,7 +83,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -287,6 +287,11 @@ FEATURE_CONSTANT = {
     ("mistralrs", "rerank"): False,
     ("mistralrs", "json-schema"): True,
     ("mistralrs", "anthropic-api"): True,
+    # openaihost (litert-lm): no flags advertise these - they are API
+    # truth. /v1/embeddings and MTP speculative decoding verified live
+    # (docs/research/2026-11-07-openai-host-lane-phase-a.md).
+    ("openaihost", "embeddings"): True,
+    ("openaihost", "spec-decode"): True,
 }
 
 
@@ -360,6 +365,12 @@ class Engine:
     server: Path | None  # llama-server / mistralrs / sd-server binary
     bench: Path | None = None
     perplexity: Path | None = None
+    # Long-flag set from the engine's installed manifest (the product's
+    # --help probe at install time). direct_argv gates version-scoped
+    # flags on this so the harness never passes a flag the live binary
+    # rejects (live-proven 2026-11-07: --pa-memory-mb on mistral.rs
+    # v0.9.5, rc=2 unexpected argument).
+    flags: set[str] = field(default_factory=set)
 
 
 # Kinds load_engines deliberately drops, with the reason the coverage
@@ -390,17 +401,97 @@ def has_text_safetensors_model(data_dir: Path) -> bool:
         con.close()
 
 
+def has_litertlm_model(data_dir: Path) -> bool:
+    """True when the store holds a `.litertlm` bundle row - the
+    openaihost lane's model class (LiteRT-LM registry bundles)."""
+    db = data_dir / "blazar.db"
+    if not db.exists():
+        return False
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        for (p,) in con.execute("SELECT path FROM models"):
+            if (
+                p
+                and p.endswith(".litertlm")
+                and (data_dir / p if not Path(p).is_absolute() else Path(p)).exists()
+            ):
+                return True
+        return False
+    finally:
+        con.close()
+
+
+def _row_is_mlx(name: str, repo: str | None, path: Path) -> bool:
+    """Mirror of the product's `mlx_signal` (blazar-core store.rs): an
+    "mlx" token in name/repo/path, or the on-disk MLX layout probe - a
+    quantization block with NUMERIC bits+group_size and no quant_method
+    string (AWQ/GPTQ dirs always carry quant_method, plain bf16 dirs
+    carry no block at all). Dir rows only, exactly as the product gates
+    it."""
+    if not path.is_dir():
+        return False
+
+    def tokens(value: str | None) -> set[str]:
+        return {tok for tok in re.split(r"[^0-9a-zA-Z]+", (value or "").lower()) if tok}
+
+    if "mlx" in (tokens(name) | tokens(repo) | tokens(str(path))):
+        return True
+    cfg_file = path / "config.json"
+    if not cfg_file.is_file():
+        return False
+    try:
+        cfg = json.loads(cfg_file.read_text())
+    except (OSError, ValueError):
+        return False
+    quant = cfg.get("quantization") or cfg.get("quantization_config") or {}
+    bits, group = quant.get("bits"), quant.get("group_size")
+    return (
+        isinstance(bits, (int, float))
+        and isinstance(group, (int, float))
+        and quant.get("quant_method") is None
+    )
+
+
+def has_mlx_model(data_dir: Path) -> bool:
+    """True when the store holds an MLX-layout dir row - the mlx lane's
+    model class (mlx-community checkpoints)."""
+    db = data_dir / "blazar.db"
+    if not db.exists():
+        return False
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        for name, repo, p in con.execute("SELECT name, repo, path FROM models"):
+            if p:
+                path = Path(p)
+                if not path.is_absolute():
+                    path = data_dir / path
+                if _row_is_mlx(name, repo, path):
+                    return True
+        return False
+    finally:
+        con.close()
+
+
 def engine_exclusion_reasons(data_dir: Path) -> dict[str, str]:
     """Kind -> honest "why it is not swept" line for the coverage
     table. Empty when every discovered kind has a bench lane."""
-    if has_text_safetensors_model(data_dir):
-        return {}
-    return {
-        "sglang": (
+    reasons: dict[str, str] = {}
+    if not has_text_safetensors_model(data_dir):
+        reasons["sglang"] = (
             "no DB-registered HF safetensors text model on this box - "
             "sglang cells need one (pull a safetensors checkpoint)"
         )
-    }
+    if not has_litertlm_model(data_dir):
+        reasons["openaihost"] = (
+            "no DB-registered .litertlm bundle on this box - openaihost "
+            "cells need one (pull a LiteRT-LM bundle)"
+        )
+    if not has_mlx_model(data_dir):
+        reasons["mlx"] = (
+            "no DB-registered MLX-layout model on this box - mlx cells "
+            "need one (pull an mlx-community checkpoint)"
+        )
+    return reasons
 
 
 # Tool-call quality lane: single-turn scenarios scored deterministically
@@ -544,6 +635,12 @@ def load_engines(data_dir: Path) -> list[Engine]:
         if kind == "whisper":
             out.append(Engine(tag, kind, edir, None, None, None))
             continue
+        if kind == "piper":
+            # Lazy media lane: the gateway synthesizes through the piper
+            # binary on demand; the harness needs the tag for activation
+            # + stamps only (same contract as the other media lanes).
+            out.append(Engine(tag, kind, edir, None, None, None))
+            continue
         if kind == "sglang":
             # venv lane: the gateway spawns the python child through the
             # engine manager; the harness needs the tag for activation
@@ -551,6 +648,23 @@ def load_engines(data_dir: Path) -> list[Engine]:
             # side). Swept exactly when a servable safetensors model
             # exists; otherwise excluded with the store-driven reason.
             if has_text_safetensors_model(data_dir):
+                out.append(Engine(tag, kind, edir, None, None, None))
+            continue
+        if kind == "openaihost":
+            # Registry-wide venv lane (sglang contract): one supervised
+            # litert-lm child serves every .litertlm bundle row; the
+            # harness needs the tag for activation + stamps only.
+            # Swept exactly when a .litertlm bundle row exists.
+            if has_litertlm_model(data_dir):
+                out.append(Engine(tag, kind, edir, None, None, None))
+            continue
+        if kind == "mlx":
+            # venv lane (sglang/openaihost contract): the gateway routes
+            # MLX-layout dir rows to the supervised mlx_lm.server child;
+            # direct-provider cells are blazar-provider-only by
+            # construction (same as the other venv lanes). Swept exactly
+            # when an MLX-layout checkpoint row exists.
+            if has_mlx_model(data_dir):
                 out.append(Engine(tag, kind, edir, None, None, None))
             continue
         if kind not in ("llamacpp", "mistralrs"):
@@ -583,6 +697,10 @@ def load_engines(data_dir: Path) -> list[Engine]:
                     ppl if ppl.exists() else None,
                 )
             )
+    # Manifest flag sets once, after the loop, so every construction
+    # site above stays untouched (single choke point, load-time truth).
+    for eng_ in out:
+        eng_.flags = manifest_flags(data_dir, eng_.tag)
     return out
 
 
@@ -1337,8 +1455,44 @@ def http_timed(
 def _hardlink_tree(src: Path, dst: Path) -> None:
     """Sandbox-safe staging: hardlink copy (same filesystem), so a
     sandboxed process can unlink its view without touching the real
-    store - mirrors validate.py's engines handling."""
-    shutil.copytree(src, dst, symlinks=True, copy_function=os.link, dirs_exist_ok=True)
+    store - mirrors validate.py's engines handling.
+
+    Idempotent by inode: a destination file that already IS the source
+    (same dev+ino, e.g. staged by the Sandbox's own lazy-asset pass)
+    is skipped instead of raising Errno 17; a destination file that
+    differs is replaced so the sandbox mirrors the real store.
+    """
+    if not src.is_dir():
+        raise FileNotFoundError(f"staging source missing: {src}")
+    dst.mkdir(parents=True, exist_ok=True)
+    for root, dirnames, filenames in os.walk(src):
+        rel_root = Path(root).relative_to(src)
+        (dst / rel_root).mkdir(parents=True, exist_ok=True)
+        for name in dirnames:
+            src_child = Path(root) / name
+            if src_child.is_symlink():
+                _stage_link(src_child, dst / rel_root / name)
+        for name in filenames:
+            _stage_link(Path(root) / name, dst / rel_root / name)
+
+
+def _stage_link(src_file: Path, dst_file: Path) -> None:
+    """One staged path: symlink passthrough or inode-guarded link."""
+    if src_file.is_symlink():
+        target = os.readlink(src_file)
+        if dst_file.is_symlink() and os.readlink(dst_file) == target:
+            return
+        if dst_file.exists() or dst_file.is_symlink():
+            dst_file.unlink()
+        os.symlink(target, dst_file)
+        return
+    src_stat = src_file.stat()
+    if dst_file.exists():
+        dst_stat = dst_file.stat()
+        if (dst_stat.st_dev, dst_stat.st_ino) == (src_stat.st_dev, src_stat.st_ino):
+            return
+        dst_file.unlink()
+    os.link(src_file, dst_file)
 
 
 @contextlib.contextmanager
@@ -2651,6 +2805,7 @@ def direct_argv(
     ngl: int,
     staged: Path | None,
     extras: dict | None = None,
+    model_repo: str | None = None,
 ) -> list[str]:
     """Build the child argv; `extras` carries variant axes (kv/spec/
     mmproj/pa) recorded in the cell params."""
@@ -2674,16 +2829,25 @@ def direct_argv(
         if extras.get("pa") == "off":
             argv += ["--paged-attn", "off"]
         else:
-            # mistral.rs PA pool = utilization fraction/MB of TOTAL VRAM
-            # with weights loaded INSIDE it (v0.9.4 --help: "GPU memory
-            # utilization"). Stock 0.90 leaves zero KV blocks for a vision
-            # GGUF on an 8 GiB card ("Num GPU blocks is 0", live
-            # 2026-09-28) - the blazar serving lane sizes this from KV
-            # geometry instead. Mirror it with the absolute form: the
-            # whole idle GPU minus a small host reserve becomes the pool.
+            # mistral.rs PA pool sizing, gated on the engine's OWN
+            # manifest flags exactly like the product's profile lane
+            # (profile.rs derive_pa_fraction): v0.9.4 exposed the
+            # absolute pool as --pa-memory-mb; v0.9.5 dropped it and
+            # renamed the fraction form to --gpu-memory-utilization.
+            # Passing the dead flag on v0.9.5 kills the child at argv
+            # parse (live 2026-11-07: rc=2 unexpected argument, 4
+            # cells). Mirror the product: fraction of the idle card
+            # minus a small host reserve, clamped to upstream's
+            # 0.05..0.90 band. No pool flag on the manifest = pre-
+            # paged-attn build: leave upstream defaults alone.
             rows_ = _gpu_query("memory.free")
-            if rows_ and rows_[0][0] > 0:
-                argv += ["--pa-memory-mb", str(int(rows_[0][0]) - 384)]
+            totals_ = _gpu_query("memory.total")
+            if rows_ and rows_[0][0] > 0 and totals_ and totals_[0][0] > 0:
+                pool_frac = min(max((rows_[0][0] - 384) / totals_[0][0], 0.05), 0.90)
+                if "--gpu-memory-utilization" in eng.flags:
+                    argv += ["--gpu-memory-utilization", f"{pool_frac:.2f}"]
+                elif "--pa-memory-mb" in eng.flags:
+                    argv += ["--pa-memory-mb", str(int(rows_[0][0]) - 384)]
         # Vision GGUFs carry multimodal metadata, so mistral.rs demands
         # the ORIGINAL HF tokenizer id at load ("multimodal GGUF requires
         # its original `config.json` ... pass `--tok-model-id`"). The id is
@@ -2693,11 +2857,17 @@ def direct_argv(
         # column does NOT answer it (a mirror repo like lmstudio-community
         # lacks the original config the child fetches - live-proven
         # 2026-09-28: rc=1 persisted until the derived id replaced it).
+        # v0.9.5 widened the demand to plain text GGUFs: a repackaged file
+        # without general.* HF identity dies with the same error even in
+        # an isolated staging dir (live 2026-11-08), so the pull repo is
+        # the fallback id exactly in the gateway's order - derived
+        # metadata first, repo second (isolated staging + repo id:
+        # server listens, /tmp receipt 2026-11-08).
         if mmproj is not None and mmproj.exists():
             argv += ["--mmproj", str(mmproj)]
-            hf_id = gguf_hf_base_model_id(staged or model)
-            if hf_id:
-                argv += ["--tok-model-id", hf_id]
+        tok_id = gguf_hf_base_model_id(staged or model) or model_repo
+        if tok_id:
+            argv += ["--tok-model-id", tok_id]
         return argv
     argv = [
         str(eng.server),
@@ -2759,6 +2929,7 @@ def run_direct_cell(
     model_name: str,
     cfg: dict,
     stage_root: Path,
+    model_repo: str | None = None,
 ) -> dict:
     port = free_port()
     rec = {"gpu_busy_mib": warm_cell_gpu_guard("direct cell")}
@@ -2776,6 +2947,7 @@ def run_direct_cell(
         cfg["ngl"],
         staged,
         extras,
+        model_repo=model_repo,
     )
     log(f"  spawn: {' '.join(argv)}")
     phash = cell_key(eng.tag, "stderr", params, model.name)[:8]
@@ -2834,6 +3006,7 @@ def run_direct_conc_cell(
     cfg: dict,
     stage_root: Path,
     rounds: int = 1,
+    model_repo: str | None = None,
 ) -> dict:
     """Concurrency lane on a direct child (np sized to the level).
 
@@ -2848,7 +3021,15 @@ def run_direct_conc_cell(
     if eng.kind == "mistralrs":
         staged = stage_mistralrs_view(model, mmproj, stage_root)
     argv = direct_argv(
-        eng, model, mmproj, port, 16384, max(level, 1), cfg["ngl"], staged
+        eng,
+        model,
+        mmproj,
+        port,
+        16384,
+        max(level, 1),
+        cfg["ngl"],
+        staged,
+        model_repo=model_repo,
     )
     log(f"  spawn: {' '.join(argv)}")
     phash = cell_key(eng.tag, "stderr-conc", {"lvl": level}, model.name)[:8]
@@ -2948,7 +3129,8 @@ def read_proc_argv(pid: int) -> list[str]:
 #     child argv (never publish a cross-engine number). The /proc scan
 #     and this assert cover every engine kind: basename binaries via
 #     CHILD_BINARIES, wrapper-launched python engines via
-#     CHILD_ARGV_ELEMENTS (see KIND_CMDLINE_MARKERS below).
+#     CHILD_ARGV_ELEMENTS (bare module names) and CHILD_ARGV_BASENAMES
+#     (console-script paths), see KIND_CMDLINE_MARKERS below.
 CHILD_BINARIES: dict[str, tuple[str, ...]] = {
     "llamacpp": ("llama-server",),
     "mistralrs": ("mistralrs",),
@@ -2963,6 +3145,17 @@ CHILD_BINARIES: dict[str, tuple[str, ...]] = {
 # (never a substring, to avoid path false-positives).
 CHILD_ARGV_ELEMENTS: dict[str, tuple[str, ...]] = {
     "sglang": ("sglang.launch_server",),
+    # mlx venv shim execs `python -m mlx_lm.server` - the module is a
+    # bare argv element, same wrapper situation as sglang.
+    "mlx": ("mlx_lm.server",),
+}
+
+# Same wrapper situation, but the launched artifact is a console-script
+# PATH (venv/bin/litert-lm), not a bare module name - so the match is on
+# the BASENAME of an argv element. Live-verified shape:
+# [venv/bin/python, venv/bin/litert-lm, serve, --host, ...].
+CHILD_ARGV_BASENAMES: dict[str, tuple[str, ...]] = {
+    "openaihost": ("litert-lm",),
 }
 
 # Everything the /proc pid scan accepts as an engine child (raw bytes,
@@ -2971,6 +3164,7 @@ CHILD_ARGV_ELEMENTS: dict[str, tuple[str, ...]] = {
 KIND_CMDLINE_MARKERS: tuple[bytes, ...] = tuple(
     [n.encode() for names in CHILD_BINARIES.values() for n in names]
     + [n.encode() for names in CHILD_ARGV_ELEMENTS.values() for n in names]
+    + [n.encode() for names in CHILD_ARGV_BASENAMES.values() for n in names]
 )
 
 
@@ -3000,8 +3194,11 @@ def capture_child_argv(rec: dict, eng: Engine, sampler: Sampler | None = None) -
     bin_base = Path(rec["child_argv"][0]).name
     names = CHILD_BINARIES.get(eng.kind, ())
     modules = CHILD_ARGV_ELEMENTS.get(eng.kind, ())
-    matched = any(bin_base.startswith(n) for n in names) or any(
-        a in modules for a in rec["child_argv"][1:]
+    script_names = CHILD_ARGV_BASENAMES.get(eng.kind, ())
+    matched = (
+        any(bin_base.startswith(n) for n in names)
+        or any(a in modules for a in rec["child_argv"][1:])
+        or any(Path(a).name in script_names for a in rec["child_argv"][1:])
     )
     if not matched:
         rec["error"] = (
@@ -3117,8 +3314,19 @@ def run_blazar_cell(
                 # a failed cold probe (e.g. 502 spawn-failure behind the
                 # gateway) must still carry boot metrics + daemon tail for
                 # diagnosis - return rec; the finally block captures the
-                # rest (sampler peaks, daemon.stop, log tail, teardown)
-                rec["error"] = f"cold probe failed: {cold_exc}"
+                # rest (sampler peaks, daemon.stop, log tail, teardown).
+                # An HTTPError body is the gateway's teaching text (e.g.
+                # the sglang hicache host-RAM refusal names the knob and
+                # the sizing math) - keep it, never just "400 Bad Request".
+                body = ""
+                try:
+                    reader = getattr(cold_exc, "read", None)
+                    if reader is not None:
+                        body = reader().decode("utf-8", "replace")[:400]
+                except Exception:
+                    body = ""
+                suffix = f" | gateway body: {body}" if body else ""
+                rec["error"] = f"cold probe failed: {cold_exc}{suffix}"
                 rec["cold_first_request_s"] = round(time.perf_counter() - t_cold0, 2)
                 return rec
             capture_child_argv(rec, eng, sampler)
@@ -3177,9 +3385,15 @@ def run_blazar_cell(
             # cells.jsonl alone
             dlog = Path(sb.data_dir) / "run" / "daemon.log"
             if dlog.exists():
-                rec["daemon_log_tail"] = "\n".join(
-                    dlog.read_text(errors="replace").splitlines()[-12:]
-                )
+                lines = dlog.read_text(errors="replace").splitlines()
+                rec["daemon_log_tail"] = "\n".join(lines[-12:])
+                # Child spawn-deaths log their ERROR/WARN lines EARLY;
+                # the 12-line window fills with later request INFO and
+                # the first fault scrolls away. Additive error-filtered
+                # tail for gateway cell post-mortems (level tokens ride
+                # ANSI escapes, e.g. " ERROR ", - substring stays honest).
+                err_lines = [ln for ln in lines if "ERROR" in ln or "WARN" in ln]
+                rec["daemon_err_tail"] = "\n".join(err_lines[-10:])
             # teardown verify: the port must go dark, else the daemon
             # outlived its cell - record loudly, never silently
             dark = False
@@ -4677,6 +4891,7 @@ def run_quality_direct_cell(
     model_name: str,
     seed: int,
     stage_root: Path,
+    model_repo: str | None = None,
 ) -> dict:
     """Quality suites against a direct engine spawn (no gateway) - the
     parity reference. Spawn mirrors _greedy_spawn with a wider ctx so the
@@ -4687,7 +4902,18 @@ def run_quality_direct_cell(
         if eng.kind == "mistralrs"
         else None
     )
-    argv = direct_argv(eng, model, mmproj, port, 8192, 1, DEFAULT_NGL, staged, None)
+    argv = direct_argv(
+        eng,
+        model,
+        mmproj,
+        port,
+        8192,
+        1,
+        DEFAULT_NGL,
+        staged,
+        None,
+        model_repo=model_repo,
+    )
     errfh_path = stage_root / f"quality-{eng.tag}-{port}.stderr"
     errfh = open(errfh_path, "wb")  # noqa: SIM115 - owned by the child
     proc = subprocess.Popen(
@@ -5682,7 +5908,11 @@ def greedy_completions(port: int, prompt: str, model: str) -> str:
 
 
 def _greedy_spawn(
-    eng: Engine, model: Path, mmproj: Path | None, stage_root: Path
+    eng: Engine,
+    model: Path,
+    mmproj: Path | None,
+    stage_root: Path,
+    model_repo: str | None = None,
 ) -> tuple[int, subprocess.Popen | None, Sampler | None, Path | None, Path | None]:
     port = free_port()
     staged = (
@@ -5698,7 +5928,18 @@ def _greedy_spawn(
         eng.server, ["serve", "--help"]
     ):
         extras = {"pa": "off"}
-    argv = direct_argv(eng, model, mmproj, port, 4096, 1, DEFAULT_NGL, staged, extras)
+    argv = direct_argv(
+        eng,
+        model,
+        mmproj,
+        port,
+        4096,
+        1,
+        DEFAULT_NGL,
+        staged,
+        extras,
+        model_repo=model_repo,
+    )
     errfh_path = stage_root / f"greedy-{eng.tag}-{port}.stderr"
     errfh = open(errfh_path, "wb")  # noqa: SIM115 - stderr sink handed to Popen, lives with the child
     proc = subprocess.Popen(
@@ -5747,11 +5988,14 @@ def run_greedy_parity(
     model_name: str,
     reference: list[str],
     stage_root: Path,
+    model_repo: str | None = None,
 ) -> dict:
     """Same-engine-family direct spawn, sampler-pinned RAW completions,
     diffed against the reference ENGINE's texts: measures backend
     numerics divergence (cuda vs vulkan), NOT gateway fidelity."""
-    port, proc, sampler, _, errpath = _greedy_spawn(eng, model, mmproj, stage_root)
+    port, proc, sampler, _, errpath = _greedy_spawn(
+        eng, model, mmproj, stage_root, model_repo=model_repo
+    )
     try:
         if not wait_healthy(eng.kind, port, 600.0, proc=proc):
             tail = (
@@ -5769,10 +6013,17 @@ def run_greedy_parity(
 
 
 def build_greedy_reference(
-    eng: Engine, model: Path, mmproj: Path | None, model_name: str, stage_root: Path
+    eng: Engine,
+    model: Path,
+    mmproj: Path | None,
+    model_name: str,
+    stage_root: Path,
+    model_repo: str | None = None,
 ) -> list[str] | None:
     """Direct completions from ONE reference engine (first llamacpp)."""
-    port, proc, sampler, _, errpath = _greedy_spawn(eng, model, mmproj, stage_root)
+    port, proc, sampler, _, errpath = _greedy_spawn(
+        eng, model, mmproj, stage_root, model_repo=model_repo
+    )
     try:
         if not wait_healthy(eng.kind, port, 600.0, proc=proc):
             tail = ""
@@ -5909,10 +6160,10 @@ def manifest_flags(data_dir: Path, tag: str) -> set[str]:
     """Long-flag set from an engine's installed manifest (product
     `--help` probe output, stored in the engines table at install time).
 
-    Gateway-routed lanes (sglang, media kinds) have no server binary on
-    the harness path to introspect, but the product already probed the
-    real binary - the manifest is the honest flag source for gating
-    variant axes on actual child capability."""
+    Gateway-routed lanes (sglang, openaihost, media kinds) have no
+    server binary on the harness path to introspect, but the product
+    already probed the real binary - the manifest is the honest flag
+    source for gating variant axes on actual child capability."""
     try:
         con = sqlite3.connect(f"file:{data_dir / 'blazar.db'}?mode=ro", uri=True)
         try:
@@ -6296,6 +6547,14 @@ def write_markdown_report(
         md.append("## Notable findings\n")
         md.extend(findings)
         md.append("")
+
+    # Coverage audit rides EVERY campaign report, not just --md
+    # publications: benchmark.md must also answer "did we bench
+    # everything?" from the stamped inventory (benchable lanes with a
+    # model-format note say which rerun exercises them).
+    md.append("## Engine coverage\n")
+    md.extend(engine_coverage(records))
+    md.append("")
 
     # Charts first: one plot per comparison axis; the tables below carry
     # the exact numbers, cells.jsonl the full per-cell receipts.
@@ -6894,8 +7153,10 @@ def main() -> int:
     if not db.exists():
         log(f"no blazar.db under {data_dir} - nothing servable")
         return 2
-    rows: list[tuple[Path, str, str | None]] = []
-    st_rows: list[tuple[Path, str, str | None]] = []
+    rows: list[tuple[Path, str, str | None, str | None]] = []
+    st_rows: list[tuple[Path, str, str | None, str | None]] = []
+    lt_rows: list[tuple[Path, str, str | None, str | None]] = []
+    mx_rows: list[tuple[Path, str, str | None, str | None]] = []
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         # Component-set pulls (VAE/text-encoder GGUF bundles) are diffusion
@@ -6905,11 +7166,15 @@ def main() -> int:
         # Live incident 2026-09-26: the size-sorted default picked the 5.9G
         # qwen-image Q6_K over the 5.6G text 9B by a 300 MiB margin and fed
         # a diffusion GGUF to every text lane (all cells failed at load).
-        # A DIRECTORY row is an HF safetensors pull - the sglang lane's
-        # model class; it joins its own pool (st_rows) so the GGUF default
-        # pick below stays byte-identical for GGUF boxes.
-        for path, name, mmproj, components in con.execute(
-            "SELECT path, name, mmproj_path, components FROM models"
+        # A DIRECTORY row is an HF safetensors pull - it joins its own pool
+        # (st_rows, or mx_rows when it carries the MLX layout the product's
+        # mlx_signal keys on: one-kind domain, sglang cannot decode it) so
+        # the GGUF default pick below stays byte-identical for GGUF boxes.
+        # A `.litertlm` FILE row is the openaihost lane's model class
+        # (LiteRT-LM registry bundle) - it joins its own pool (lt_rows) so
+        # it can never leak into the GGUF pool and reach llama-server cells.
+        for path, name, mmproj, components, repo in con.execute(
+            "SELECT path, name, mmproj_path, components, repo FROM models"
         ):
             p = Path(path)
             if (
@@ -6920,22 +7185,31 @@ def main() -> int:
             ):
                 continue
             if p.is_dir():
-                st_rows.append((p, name, None))
+                if _row_is_mlx(name, repo, p):
+                    mx_rows.append((p, name, None, repo))
+                else:
+                    st_rows.append((p, name, None, repo))
+            elif p.suffix == ".litertlm":
+                lt_rows.append((p, name, None, repo))
             else:
-                rows.append((p, name, mmproj))
+                rows.append((p, name, mmproj, repo))
     finally:
         con.close()
-    if not rows and not st_rows:
-        log("no DB-registered benchable models (gguf files or safetensors dirs)")
+    if not rows and not st_rows and not lt_rows and not mx_rows:
+        log("no DB-registered benchable models (gguf, safetensors dirs, litertlm)")
         return 2
     rows.sort(key=lambda r: r[0].stat().st_size, reverse=True)
     st_rows.sort(
         key=lambda r: sum(f.stat().st_size for f in r[0].glob("*")), reverse=True
     )
+    lt_rows.sort(key=lambda r: r[0].stat().st_size, reverse=True)
+    mx_rows.sort(
+        key=lambda r: sum(f.stat().st_size for f in r[0].glob("*")), reverse=True
+    )
     if args.model:
         hits = [
             r
-            for r in (rows + st_rows)
+            for r in (rows + st_rows + lt_rows + mx_rows)
             if args.model.lower() in r[0].name.lower()
             or args.model.lower() in r[1].lower()
         ]
@@ -6950,9 +7224,11 @@ def main() -> int:
         rows = hits
     elif not rows:
         # GGUF-less box: the largest safetensors checkpoint is the honest
-        # default (sglang lane) instead of aborting with no model.
-        rows = st_rows
-    model, gw_model_name, own_mmproj_s = rows[0]
+        # default (sglang lane) instead of aborting with no model; a box
+        # with only .litertlm bundles defaults to the openaihost lane,
+        # and one with only MLX-layout checkpoints to the mlx lane.
+        rows = st_rows or lt_rows or mx_rows
+    model, gw_model_name, own_mmproj_s, model_repo = rows[0]
     model_name = gw_model_name
     # mmproj ownership is a per-model DB column, NOT dir proximity -
     # mistral.rs scans the model dir for projectors, so attaching a
@@ -6996,14 +7272,25 @@ def main() -> int:
     # lane) and a safetensors-dir sweep excludes the GGUF-native
     # binaries - the pinned sandbox daemon would only teach-refuse,
     # filling the matrix with expected-failure rows instead of a clean
-    # skip + exclusion reason in the inventory stamp.
+    # skip + exclusion reason in the inventory stamp. A `.litertlm`
+    # sweep selects the openaihost lane alone (the registry-wide child
+    # is the only lane that loads bundles).
     model_is_dir = model.is_dir()
-    text_engines = [
-        e
-        for e in engines
-        if e.kind in ("llamacpp", "mistralrs", "sglang")
-        and (e.kind == "sglang") == model_is_dir
-    ]
+    model_is_litertlm = model.suffix == ".litertlm"
+    model_is_mlx = model_is_dir and _row_is_mlx(gw_model_name, model_repo, model)
+    if model_is_litertlm:
+        text_engines = [e for e in engines if e.kind == "openaihost"]
+    elif model_is_mlx:
+        # one-kind domain rule (engine_kind.rs MlxLayout arm): only the
+        # mlx child decodes MLX-quantized dirs
+        text_engines = [e for e in engines if e.kind == "mlx"]
+    else:
+        text_engines = [
+            e
+            for e in engines
+            if e.kind in ("llamacpp", "mistralrs", "sglang")
+            and (e.kind == "sglang") == model_is_dir
+        ]
     if not engines:
         log("no benchable engines discovered")
         return 2
@@ -7157,67 +7444,13 @@ def main() -> int:
                 f"gpu {rec.get('gpu_peak_mib', 0):.0f}MiB"
             )
 
-    # ---- engine inventory stamp: the coverage audit trail. Every store
-    # engine appears in the artifact either as cells or as an exclusion
-    # reason, so "did we bench everything?" is answerable from the receipt.
-    if "engine-inventory" not in done:
-        db = data_dir / "blazar.db"
-        store_rows: list[tuple[str, str]] = []
-        if db.exists():
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            try:
-                store_rows = list(con.execute("SELECT tag, kind FROM engines"))
-            finally:
-                con.close()
-        benchable = {e.tag for e in engines}
-        excl_reasons = engine_exclusion_reasons(data_dir)
-        inv_engines = [
-            {"tag": tag, "kind": kind or "llamacpp"}
-            for tag, kind in store_rows
-            if tag in benchable
-        ]
-
-        def _exclusion_reason(kind: str | None) -> str:
-            if kind == "sglang" and "sglang" not in excl_reasons:
-                return (
-                    "model-format sweep: this campaign sweeps a GGUF "
-                    "file; sglang serves HF safetensors checkpoints "
-                    "(rerun with --model <safetensors-row>)"
-                )
-            return excl_reasons.get(
-                kind or "llamacpp", f"kind '{kind}' has no bench lane in this harness"
-            )
-
-        excluded = {
-            tag: _exclusion_reason(kind)
-            for tag, kind in store_rows
-            if tag not in benchable
-        }
-        # Policy-skipped versions are coverage-relevant: merge their
-        # explicit reasons so "did we bench everything?" answers honestly
-        # from the receipt (a superseded tag is excluded BY POLICY, not
-        # silently dropped).
-        excluded.update(superseded)
-        emit(
-            "inventory",
-            "inventory",
-            "inventory",
-            {},
-            "engine-inventory",
-            {
-                "engines": inv_engines,
-                "excluded": excluded,
-                "engine_policy": engine_policy,
-            },
-        )
-
     # ---- direct provider sweep (ctx x np + variant axes)
     if "direct" in args.providers:
         for eng in text_engines:
             if eng.server is None:
-                # gateway-routed lane (sglang venv): the direct provider
-                # spawns engine binaries it owns; this engine's cells
-                # are blazar-provider-only by construction
+                # gateway-routed lane (sglang / openaihost venv): the
+                # direct provider spawns engine binaries it owns; this
+                # engine's cells are blazar-provider-only by construction
                 continue
             cells: list[dict] = [
                 {"ctx": ctx, "np": np_} for ctx in ctx_sweep for np_ in DIRECT_NP_SWEEP
@@ -7256,7 +7489,14 @@ def main() -> int:
                     continue
                 try:
                     rec = run_direct_cell(
-                        eng, model, own_mmproj, params, model_name, cfg, stage_root
+                        eng,
+                        model,
+                        own_mmproj,
+                        params,
+                        model_name,
+                        cfg,
+                        stage_root,
+                        model_repo=model_repo,
                     )
                 except Exception as exc:
                     rec = {"error": f"direct cell crashed: {exc}"}
@@ -7385,6 +7625,19 @@ def main() -> int:
                             )
                         except Exception as exc:
                             rec = {"error": f"blazar cell crashed: {exc}"}
+                        err = str(rec.get("error", ""))
+                        if (
+                            "cannot work on this host" in err
+                            or "cannot fit this host" in err
+                        ):
+                            # The gateway's profile layer refuses configs that
+                            # are structurally unrunnable on this host class
+                            # (e.g. sglang hicache needs a RAM tier this box
+                            # cannot fit) with a teaching 400 naming the knob
+                            # and the sizing math - the refusal body now rides
+                            # the error text. That is a host boundary, not a
+                            # benchmark failure: record it as a note row.
+                            rec = {"note": f"skipped on this host: {err}"}
                         emit(eng.tag, eng.kind, "blazar", params, key, rec)
 
             # ---- concurrency-lane scheduler axis (llamacpp lane): the
@@ -7451,6 +7704,7 @@ def main() -> int:
     if not args.skip_media:
         sdcpp_eng = next((e for e in engines if e.kind == "sdcpp"), None)
         whisper_eng = next((e for e in engines if e.kind == "whisper"), None)
+        piper_eng = next((e for e in engines if e.kind == "piper"), None)
         media_cfg = {"runs": args.media_runs, "art_dir": str(art)}
 
         def store_models() -> dict[str, list]:
@@ -7592,13 +7846,13 @@ def main() -> int:
             log("[media] no sdcpp engine installed - image/video lanes skipped")
 
         voices_dir = Path(args.data_dir).expanduser() / "voices"
-        if voices_dir.is_dir() and any(voices_dir.iterdir()):
+        if piper_eng is not None and voices_dir.is_dir() and any(voices_dir.iterdir()):
             params = {
                 "chars": MEDIA_TTS_CHARS,
                 "formats": ["wav", "pcm"],
                 "runs": media_cfg["runs"],
             }
-            key = cell_key("piper", "media-tts", params, "en_US-amy-medium")
+            key = cell_key(piper_eng.tag, "media-tts", params, "en_US-amy-medium")
             if key in done:
                 log("[media tts] resumed - skipping")
             else:
@@ -7608,7 +7862,7 @@ def main() -> int:
                 except Exception as exc:
                     rec = {"error": f"media tts cell crashed: {exc}"}
                 emit(
-                    "piper",
+                    piper_eng.tag,
                     "piper",
                     "media-tts",
                     params,
@@ -7623,7 +7877,7 @@ def main() -> int:
                 "format": "pcm",
             }
             conc_key = cell_key(
-                "piper", "media-tts-conc", conc_params, "en_US-amy-medium"
+                piper_eng.tag, "media-tts-conc", conc_params, "en_US-amy-medium"
             )
             if conc_key in done:
                 log("[media tts-conc] resumed - skipping")
@@ -7634,7 +7888,7 @@ def main() -> int:
                 except Exception as exc:
                     rec_c = {"error": f"media tts-conc cell crashed: {exc}"}
                 emit(
-                    "piper",
+                    piper_eng.tag,
                     "piper",
                     "media-tts-conc",
                     conc_params,
@@ -7643,7 +7897,7 @@ def main() -> int:
                     model_name_override="en_US-amy-medium",
                 )
         else:
-            log("[media tts] no voices pulled - skipping")
+            log("[media tts] no piper engine + voices pair - skipping")
 
         whisper_models = Path(args.data_dir).expanduser() / "whisper" / "models"
         if whisper_eng is not None and any(whisper_models.glob("ggml-*.bin")):
@@ -7803,6 +8057,7 @@ def main() -> int:
                             cfg,
                             stage_root,
                             rounds=args.conc_rounds,
+                            model_repo=model_repo,
                         )
                     except Exception as exc:
                         rec = {"error": f"conc cell crashed: {exc}"}
@@ -7941,10 +8196,16 @@ def main() -> int:
                     )
                     continue
                 # llama-perplexity loads GGUF files only - an HF safetensors
-                # campaign model is a format boundary for the tool (it exits
-                # 'failed to load model' on the directory). Honest note row,
-                # no error: the cell is structurally unmeasurable, not failed.
-                if model.is_dir():
+                # directory or a non-GGUF bundle (.litertlm) is a format
+                # boundary for the tool (it exits 'failed to load model').
+                # Honest note row, no error: the cell is structurally
+                # unmeasurable, not failed.
+                if not (model.is_file() and model.suffix == ".gguf"):
+                    shape = (
+                        "an HF safetensors directory"
+                        if model.is_dir()
+                        else f"a {model.suffix or 'plain'} file"
+                    )
                     emit(
                         eng.tag,
                         eng.kind,
@@ -7954,7 +8215,7 @@ def main() -> int:
                         {
                             "note": (
                                 "skipped: llama-perplexity loads GGUF files only; "
-                                f"{model.name} is an HF safetensors directory - "
+                                f"{model.name} is {shape} - "
                                 "model-format boundary, not an engine failure"
                             )
                         },
@@ -8129,7 +8390,12 @@ def main() -> int:
                 log("  ! GPU floor exceeded - waiting failed; skipping greedy parity")
             else:
                 reference = build_greedy_reference(
-                    ref_eng, model, own_mmproj, model_name, stage_root
+                    ref_eng,
+                    model,
+                    own_mmproj,
+                    model_name,
+                    stage_root,
+                    model_repo=model_repo,
                 )
         if reference is None:
             if ref_eng is None:
@@ -8154,7 +8420,13 @@ def main() -> int:
                 log(f"[greedy parity {eng.tag}]")
                 try:
                     rec = run_greedy_parity(
-                        eng, model, own_mmproj, model_name, reference, stage_root
+                        eng,
+                        model,
+                        own_mmproj,
+                        model_name,
+                        reference,
+                        stage_root,
+                        model_repo=model_repo,
                     )
                 except Exception as exc:
                     rec = {"error": f"greedy cell crashed: {exc}"}
@@ -8248,7 +8520,13 @@ def main() -> int:
                 log(f"[quality direct {eng.tag}]")
                 try:
                     rec = run_quality_direct_cell(
-                        eng, model, own_mmproj, model_name, qseed, stage_root
+                        eng,
+                        model,
+                        own_mmproj,
+                        model_name,
+                        qseed,
+                        stage_root,
+                        model_repo=model_repo,
                     )
                 except Exception as exc:
                     rec = {"error": f"quality direct cell crashed: {exc}"}
@@ -8367,6 +8645,120 @@ def main() -> int:
                 }
             )
 
+    # ---- engine inventory stamp: the coverage audit trail. Every store
+    # engine appears in the artifact either as cells or as an exclusion
+    # reason, so "did we bench everything?" is answerable from the receipt.
+    # Stamped at campaign END, after every cell-emitting lane above: the
+    # benchable set then includes tags that ran cells this process (media,
+    # idle, quality, features), so lanes without a text lane of their own
+    # (piper tts, whisper asr) count as benched instead of reading as
+    # "no bench lane".
+    if "engine-inventory" not in done:
+        db = data_dir / "blazar.db"
+        store_rows: list[tuple[str, str]] = []
+        if db.exists():
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                store_rows = list(con.execute("SELECT tag, kind FROM engines"))
+            finally:
+                con.close()
+        benchable = {e.tag for e in engines} | {
+            str(r["tag"]) for r in records if r.get("provider") != "inventory"
+        }
+        excl_reasons = engine_exclusion_reasons(data_dir)
+        model_is_litertlm = model.suffix == ".litertlm"
+        ran_kinds = {
+            str(r["kind"]) for r in records if r.get("provider") != "inventory"
+        }
+
+        def _sweep_note(kind: str) -> str | None:
+            # Benchable lane that ran no cell THIS campaign: a
+            # model-format sweep, not a lane gap - say which rerun
+            # would exercise the lane.
+            if kind in ran_kinds:
+                return None
+            if model_is_litertlm and kind in ("llamacpp", "mistralrs", "sglang"):
+                return (
+                    "model-format sweep: .litertlm campaign; this lane "
+                    "serves GGUF/safetensors models (rerun with "
+                    "--model <gguf-or-safetensors-row>)"
+                )
+            if model_is_litertlm and kind == "mlx":
+                return (
+                    "model-format sweep: .litertlm campaign; this lane "
+                    "serves MLX-layout checkpoints (rerun with "
+                    "--model <mlx-row>)"
+                )
+            if model_is_mlx and kind in ("llamacpp", "mistralrs", "sglang"):
+                return (
+                    "model-format sweep: MLX-layout campaign; this lane "
+                    "serves GGUF/HF-safetensors models (rerun with "
+                    "--model <gguf-or-safetensors-row>)"
+                )
+            if not model_is_litertlm and not model_is_mlx and kind == "mlx":
+                return (
+                    "model-format sweep: GGUF/safetensors campaign; "
+                    "this lane serves MLX-layout checkpoints (rerun "
+                    "with --model <mlx-row>)"
+                )
+            if not model_is_litertlm and kind == "openaihost":
+                return (
+                    "model-format sweep: GGUF/safetensors campaign; "
+                    "this lane serves .litertlm bundles (rerun with "
+                    "--model <litertlm-row>)"
+                )
+            return None
+
+        inv_engines = []
+        for tag, kind in store_rows:
+            if tag not in benchable:
+                continue
+            entry = {"tag": tag, "kind": kind or "llamacpp"}
+            note = _sweep_note(entry["kind"])
+            if note:
+                entry["note"] = note
+            inv_engines.append(entry)
+
+        def _exclusion_reason(kind: str | None) -> str:
+            if kind == "sglang" and "sglang" not in excl_reasons:
+                return (
+                    "model-format sweep: this campaign sweeps a GGUF "
+                    "file; sglang serves HF safetensors checkpoints "
+                    "(rerun with --model <safetensors-row>)"
+                )
+            if kind == "openaihost" and "openaihost" not in excl_reasons:
+                return (
+                    "model-format sweep: this campaign sweeps a "
+                    "non-litertlm model; the openaihost lane serves "
+                    ".litertlm bundles (rerun with --model <litertlm-row>)"
+                )
+            return excl_reasons.get(
+                kind or "llamacpp", f"kind '{kind}' has no bench lane in this harness"
+            )
+
+        excluded = {
+            tag: _exclusion_reason(kind)
+            for tag, kind in store_rows
+            if tag not in benchable
+        }
+        # Policy-skipped versions are coverage-relevant: merge their
+        # explicit reasons so "did we bench everything?" answers honestly
+        # from the receipt (a superseded tag is excluded BY POLICY, not
+        # silently dropped).
+        excluded.update(superseded)
+        emit(
+            "inventory",
+            "inventory",
+            "inventory",
+            {},
+            "engine-inventory",
+            {
+                "engines": inv_engines,
+                "excluded": excluded,
+                "engine_policy": engine_policy,
+            },
+        )
+
     argv_summary = portable_path(" ".join(sys.argv[1:]))
     # the report reflects the FULL campaign (cells.jsonl), not just this
     # process's additions - resumed cells are earlier records
@@ -8474,6 +8866,7 @@ KIND_DISPLAY = {
     "sglang": "sglang",
     "piper": "piper",
     "mlx": "MLX",
+    "openaihost": "LiteRT-LM",
 }
 
 ENGINE_LABELS = {
@@ -10840,8 +11233,12 @@ def engine_coverage(recs: list[dict]) -> list[str]:
     lane_of = {
         "llamacpp": "text (direct + gateway)",
         "mistralrs": "text (direct + gateway)",
+        "sglang": "text (direct venv + gateway)",
+        "openaihost": "text (direct venv + gateway)",
+        "mlx": "text (direct venv + gateway)",
         "sdcpp": "media",
         "whisper": "media",
+        "piper": "media (tts)",
     }
     out: list[str] = []
     policy = inv.get("engine_policy")
@@ -10859,7 +11256,7 @@ def engine_coverage(recs: list[dict]) -> list[str]:
         elif c["err"]:
             status = "attempted, all cells errored (see cells.jsonl)"
         else:
-            status = "no cells in this campaign"
+            status = eng.get("note") or "no cells in this campaign"
         out.append(
             f"| {tag} | {kind} | {lane_of.get(kind, '-')} "
             f"| {c['ok']} | {c['err']} | {status} |"

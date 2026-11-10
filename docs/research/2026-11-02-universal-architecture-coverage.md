@@ -36,7 +36,7 @@ Evidence tags used below:
 | TTS (llama.cpp /tts, qwen3-tts family) | COVERED - CLOSED G1 2026-11-02 | engine speech lane live receipts |
 | Multimodal embeddings via VLM mmproj | COVERED gateway-side - CLOSED G2 2026-11-02; engine input-parts = b12020 limit (master-only), forwarding engine-ready | see G2 |
 | Audio/video parts on /v1/embeddings | FORWARDED to child (engine 400 on b12020 - master-only feature) | see G2 |
-| Diffusion family breadth | COVERED - 35 curated families incl. standalone/GGUF housing split, dual-DiT MoE (Wan 2.2), encoder-only + pixel-space shapes, PixArt w/ GGUF-T5; Ideogram4/PiD/SeFi/SenseNova/tiny-SD deferred w/ evidence [code diffusion.rs; 6 live render receipts] |
+| Diffusion family breadth | COVERED - 39 curated families incl. standalone/GGUF housing split, dual-DiT MoE (Wan 2.2), encoder-only + pixel-space shapes, PixArt w/ GGUF-T5; Ideogram4/PiD/SeFi/SenseNova/tiny-SD deferred w/ evidence [code diffusion.rs; 6 live render receipts] |
 | glmocr / ggmlc arches (ollama-exported) | COVERED G4 - both pull lanes steer to the official native-arch repos (glm-ocr catalog entry, glm4 + auto mmproj); gateway OCR receipt live; spec-auto MTP arch-gated | 4 steering arms + OCR [probe] |
 | llama.cpp in-process ASR lane | COVERED - engine-row lane forwards multipart to child `/v1/audio/transcriptions`, normalizes the event shape; whisper-enc towers are the quality target | live probe + [code] |
 | CLIP breadth (SigLIP, ViT-L, GGUF mmproj reuse) | COVERED - config-driven candle lane, any CLIP size from its own config.json (G6); SigLIP/mmproj ride the G2 child path | live receipt g6-live-receipts.json [probe] |
@@ -228,7 +228,7 @@ resumed from the v2 chunk ledger on relaunch; umt5 byte-reuse skipped a
 re-download across families.
 
 ### G3c - remaining-family curation (P1) - CLOSED 2026-11-03
-Shipped: FAMILIES 24 -> 35 entries - every remaining sd.cpp image/video
+Shipped: FAMILIES 24 -> 39 entries - every remaining sd.cpp image/video
 family with an expressible pull contract. Fifteen new entries (Anima,
 Boogu-Image, ERNIE-Image, LLaDA-Image, LongCat-Image, LTX-2.3, LTX-2.5,
 Mage-Flow, MiniT2I, Ovis-Image, Z-Image L2P, HunyuanVideo 1.5, Lingbot

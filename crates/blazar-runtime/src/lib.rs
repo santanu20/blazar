@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod degrades;
 pub mod diffusion;
 pub mod discovery;
+pub mod draft_registry;
 pub mod engine;
 pub mod engine_impl;
 pub mod events;
@@ -27,6 +28,7 @@ pub mod fleet;
 pub mod hf;
 pub mod hf_parallel;
 pub mod knob_registry;
+pub mod kokoro;
 pub mod models;
 pub mod net_health;
 pub mod optimize_run;
@@ -58,10 +60,13 @@ pub use engine::gh::GhClient;
 pub use engine::manifest::{Manifest, Vendor, predicted_rescue_lane, probe as probe_manifest};
 pub use engine::{EngineManager, LOCAL_TAG, system_vendor_hint};
 pub use engine_impl::{
-    ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, MlxEngine, SdCppEngine, SglangEngine,
+    ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, MlxEngine, OpenAiHostEngine, SdCppEngine,
+    SglangEngine,
 };
 pub use events::{BlazarEvent, EventBus, InstanceState};
-pub use hf::{PullOutcome, PullTarget, Puller, parse_pull_target, registry_name};
+pub use hf::{
+    PullOutcome, PullTarget, Puller, chat_template_hint, parse_pull_target, registry_name,
+};
 pub use models::{instance_running, remove_model};
 pub use probe::parent_death_tie;
 pub use probe::probe_hardware;

@@ -50,12 +50,16 @@ pub enum BlazarCode {
     // Generic status-derived fallbacks (openai_error without a typed map).
     BadRequest,
     NotFound,
+    Forbidden,
     PayloadTooLarge,
     Unprocessable,
     BadGateway,
     Unavailable,
     GatewayTimeout,
     InsufficientStorage,
+    // Method/content-type mismatches axum itself rejects before any handler runs.
+    MethodNotAllowed,
+    UnsupportedMediaType,
 }
 
 impl BlazarCode {
@@ -81,8 +85,11 @@ impl BlazarCode {
             Self::KeyScopeForbidden => "KEY_SCOPE_FORBIDDEN",
             Self::HostForbidden => "HOST_FORBIDDEN",
             Self::RateLimited => "RATE_LIMITED",
+            Self::Forbidden => "FORBIDDEN",
             Self::BadRequest => "BAD_REQUEST",
             Self::NotFound => "NOT_FOUND",
+            Self::MethodNotAllowed => "METHOD_NOT_ALLOWED",
+            Self::UnsupportedMediaType => "UNSUPPORTED_MEDIA_TYPE",
             Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
             Self::Unprocessable => "UNPROCESSABLE",
             Self::BadGateway => "BAD_GATEWAY",
@@ -98,6 +105,8 @@ impl BlazarCode {
     pub fn http(self) -> u16 {
         match self {
             Self::ModelNotFound | Self::NotFound => 404,
+            Self::MethodNotAllowed => 405,
+            Self::UnsupportedMediaType => 415,
             Self::ModelUnsupportedEngine
             | Self::PromptTooLong
             | Self::VisionProjectorMissing
@@ -105,7 +114,7 @@ impl BlazarCode {
             | Self::DiffusionTextRefusal
             | Self::BadRequest => 400,
             Self::Unauthorized | Self::FleetTokenRequired => 401,
-            Self::KeyScopeForbidden | Self::HostForbidden => 403,
+            Self::KeyScopeForbidden | Self::HostForbidden | Self::Forbidden => 403,
             Self::RateLimited => 429,
             Self::PayloadTooLarge => 413,
             Self::Unprocessable => 422,
@@ -170,6 +179,9 @@ impl BlazarCode {
             Self::RateLimited => "the API key exceeded one of its budgets",
             Self::BadRequest => "malformed or invalid request",
             Self::NotFound => "resource not found",
+            Self::Forbidden => "request refused by an authorization gate",
+            Self::MethodNotAllowed => "the route exists but not for this HTTP method",
+            Self::UnsupportedMediaType => "the endpoint requires an application/json body",
             Self::PayloadTooLarge => "request body too large",
             Self::Unprocessable => "request semantically invalid for this surface",
             Self::BadGateway => "invalid response from the engine child",
@@ -230,6 +242,11 @@ impl BlazarCode {
             Self::RateLimited => "retry after retry_after_secs, or raise the key's budget",
             Self::BadRequest => "fix the request body per the API surface docs",
             Self::NotFound => "check the resource id and route",
+            Self::Forbidden => {
+                "check the key scopes / fleet token the gate names, or use a management key"
+            }
+            Self::MethodNotAllowed => "check the Allow header this response carries",
+            Self::UnsupportedMediaType => "send Content-Type: application/json",
             Self::PayloadTooLarge => "send a smaller body",
             Self::Unprocessable => "fix the request semantics for this surface",
             Self::BadGateway => "retry; if it persists, check daemon logs for the engine child",
@@ -259,6 +276,7 @@ pub const ALL: &[BlazarCode] = &[
     BlazarCode::Unauthorized,
     BlazarCode::KeyScopeForbidden,
     BlazarCode::HostForbidden,
+    BlazarCode::Forbidden,
     BlazarCode::RateLimited,
     BlazarCode::FleetTokenRequired,
     BlazarCode::BadRequest,
@@ -269,6 +287,8 @@ pub const ALL: &[BlazarCode] = &[
     BlazarCode::Unavailable,
     BlazarCode::GatewayTimeout,
     BlazarCode::InsufficientStorage,
+    BlazarCode::MethodNotAllowed,
+    BlazarCode::UnsupportedMediaType,
 ];
 
 /// Total fallback for `openai_error(status, ...)` sites that have no
@@ -279,6 +299,7 @@ pub const ALL: &[BlazarCode] = &[
 pub fn generic_for_status(status: u16) -> BlazarCode {
     match status {
         400 => BlazarCode::BadRequest,
+        403 => BlazarCode::Forbidden,
         404 => BlazarCode::NotFound,
         413 => BlazarCode::PayloadTooLarge,
         422 => BlazarCode::Unprocessable,
@@ -463,6 +484,117 @@ mod tests {
                 "docs/error-codes.md missing row for {}",
                 code.as_str()
             );
+        }
+    }
+    mod status_enrich_tests {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{Response, StatusCode, header};
+
+        #[test]
+        #[allow(non_snake_case)]
+        fn unit__generic_for_status__forbidden_is_not_internal() {
+            // A bare 403 used to collapse to INTERNAL_ERROR; it now keeps its own code.
+            assert_eq!(generic_for_status(403), BlazarCode::Forbidden);
+            assert_eq!(BlazarCode::Forbidden.http(), 403);
+            assert_eq!(BlazarCode::Forbidden.as_str(), "FORBIDDEN");
+        }
+
+        async fn enrich(status: StatusCode, allow: Option<&str>) -> axum::response::Response {
+            let mut builder = Response::builder().status(status);
+            if let Some(a) = allow {
+                builder = builder.header(header::ALLOW, a);
+            }
+            let resp = builder.body(Body::empty()).unwrap();
+            crate::status_enrich_mw(resp).await
+        }
+
+        async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        #[tokio::test]
+        #[allow(non_snake_case)]
+        async fn unit__status_enrich__405_gets_envelope_and_allow_header() {
+            // Axum's default 405 carries an empty body (no blazar envelope) and an
+            // auto-generated Allow header; enrichment must wrap the body AND keep Allow.
+            let resp = enrich(StatusCode::METHOD_NOT_ALLOWED, Some("POST")).await;
+            assert_eq!(resp.status(), 405);
+            let allow = resp
+                .headers()
+                .get(header::ALLOW)
+                .expect("Allow header survives enrichment")
+                .to_str()
+                .unwrap()
+                .to_ascii_uppercase();
+            assert!(
+                allow.contains("POST"),
+                "Allow lists the accepted verb: {allow}"
+            );
+            let v = body_json(resp).await;
+            assert_eq!(
+                v["error"]["blazar_code"], "METHOD_NOT_ALLOWED",
+                "405 body is the blazar envelope: {v}"
+            );
+            assert!(v["error"]["message"].as_str().unwrap().contains("Allow"));
+        }
+
+        #[tokio::test]
+        #[allow(non_snake_case)]
+        async fn unit__status_enrich__415_gets_envelope() {
+            // Wrong content-type: axum rejects before any handler runs - with an
+            // empty body or a plain-text line like "Expected request with
+            // `Content-Type: application/json`"; both get the blazar envelope.
+            let resp = enrich(StatusCode::UNSUPPORTED_MEDIA_TYPE, None).await;
+            assert_eq!(resp.status(), 415);
+            let v = body_json(resp).await;
+            assert_eq!(
+                v["error"]["blazar_code"], "UNSUPPORTED_MEDIA_TYPE",
+                "415 body is the blazar envelope: {v}"
+            );
+            assert!(v["error"]["message"].as_str().unwrap().contains("json"));
+
+            // The extractor's real-world shape: text/plain content-type + body.
+            let resp = Response::builder()
+                .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+                .header("content-type", "text/plain")
+                .body(Body::from(
+                    "Expected request with `Content-Type: application/json`\n",
+                ))
+                .unwrap();
+            let out = crate::status_enrich_mw(resp).await;
+            let v = body_json(out).await;
+            assert_eq!(
+                v["error"]["blazar_code"], "UNSUPPORTED_MEDIA_TYPE",
+                "axum's plain-text 415 is enveloped: {v}"
+            );
+
+            // A handler that already answered JSON keeps its payload.
+            let resp = Response::builder()
+                .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"already":"json"}"#))
+                .unwrap();
+            let out = crate::status_enrich_mw(resp).await;
+            let v = body_json(out).await;
+            assert_eq!(v["already"], "json", "JSON 415 body passes through");
+        }
+
+        #[tokio::test]
+        #[allow(non_snake_case)]
+        async fn unit__status_enrich__bodies_are_left_alone() {
+            // Handlers that already produced a body (our own envelopes) must not be
+            // double-wrapped; only axum's empty default rejections are enriched.
+            let resp = Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Body::from(r#"{"already":"enveloped"}"#))
+                .unwrap();
+            let out = crate::status_enrich_mw(resp).await;
+            let v = body_json(out).await;
+            assert_eq!(v["already"], "enveloped", "non-empty body passes through");
         }
     }
 }

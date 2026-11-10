@@ -107,10 +107,15 @@ pub fn mlx_quant_display(path: &str) -> String {
 }
 
 /// `GET /api/explain/{model}` - the effective-config card.
-/// Store lookup for the routing lane: (global tag, lane resolution).
+/// Store lookup for the routing lane: (global active row as
+/// tag/kind/manifest JSON, lane resolution, every installed row's
+/// tag/manifest JSON). The manifests ride along so the admission
+/// preview below reads the lane's probed facts, not a hardcoded
+/// snapshot.
 type LaneLookup = (
-    Option<String>,
+    Option<(String, blazar_core::engine_kind::EngineKind, String)>,
     Result<Option<(String, blazar_core::engine_kind::EngineKind)>, String>,
+    Vec<(String, String)>,
 );
 
 #[allow(clippy::too_many_lines)] // the card IS one document: model facts, lane, context, slots, speculation, cache, residents
@@ -150,6 +155,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             safetensors,
             blazar_core::store::quantized_safetensors_signal(&resolved, "", &row.path),
             row.is_mlx(),
+            row.is_litert_bundle(),
         ),
     };
 
@@ -162,11 +168,12 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         let global = engine_rows
             .iter()
             .find(|r| r.active)
-            .map(|r| (r.tag.clone(), r.kind));
-        let Some((g_tag, g_kind)) = global else {
+            .map(|r| (r.tag.clone(), r.kind, r.manifest.clone()));
+        let Some((g_tag, g_kind, g_manifest)) = global else {
             return (
                 None,
                 Err("no engine installed - blazar engine install --kind <kind>".into()),
+                Vec::new(),
             );
         };
         let installed: Vec<(
@@ -177,6 +184,10 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             .iter()
             .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
             .collect();
+        let manifests: Vec<(String, String)> = engine_rows
+            .iter()
+            .map(|r| (r.tag.clone(), r.manifest.clone()))
+            .collect();
         let verdict = blazar_core::engine_kind::serving_lane(
             state.cfg().engine_routing.mode,
             state.cfg().engine_routing.policy,
@@ -185,10 +196,39 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             g_kind,
             &installed,
         );
-        (Some(g_tag), verdict)
+        (Some((g_tag, g_kind, g_manifest)), verdict, manifests)
     });
+    // Admission preview: would a spawn of this model on the resolved
+    // lane be admitted RIGHT NOW? Same config-read + lane teaches the
+    // supervisor runs, stated here so a refusal surfaces at the banner
+    // (CLI) instead of as the first turn's 400. Computed before the
+    // engine match below consumes `lane`.
+    let admission_load: Value = match &lane {
+        Some((_, Ok(Some((tag, kind))), manifests)) => admission_for_lane(
+            *kind,
+            manifest_json_for(manifests, tag).as_deref(),
+            &state,
+            &row.path,
+        ),
+        Some((Some((_, g_kind, g_manifest)), Ok(None), _)) => admission_for_lane(
+            *g_kind,
+            Some(g_manifest.clone()).as_deref(),
+            &state,
+            &row.path,
+        ),
+        // the global row vanished between reads (or no lane was read
+        // at all): honest no-lane
+        Some((None, Ok(None), _)) | None => json!({
+            "verdict": "no-lane",
+            "reason": "store unavailable - engine rows unreadable"
+        }),
+        Some((_, Err(teach), _)) => {
+            json!({ "verdict": "no-lane", "reason": teach })
+        }
+    };
+
     let engine = match lane {
-        Some((_g_tag, Ok(Some((tag, kind))))) => json!({
+        Some((_, Ok(Some((tag, kind))), _)) => json!({
             "tag": tag,
             "kind": format!("{kind:?}").to_lowercase(),
             "source": if overlay.engine.is_some() { "pin" } else { "auto" },
@@ -199,13 +239,13 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
                 state.cfg().engine_routing.policy,
             ),
         }),
-        Some((g_tag, Ok(None))) => json!({
-            "tag": g_tag,
+        Some((g, Ok(None), _)) => json!({
+            "tag": g.map(|(t, _, _)| t),
             "kind": Value::Null,
             "source": "global",
             "reason": "no per-model lane resolved - the global active engine serves it",
         }),
-        Some((_, Err(teach))) => json!({
+        Some((_, Err(teach), _)) => json!({
             "tag": Value::Null,
             "kind": Value::Null,
             "source": "error",
@@ -369,6 +409,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
 
     let admission = json!({
         "gateway_requests_inflight": state.requests.inflight_count(),
+        "load": admission_load,
     });
 
     let card = json!({
@@ -385,6 +426,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
             "format": match shape.shards {
                 ShardFormat::MlxLayout => "mlx-dir",
                 ShardFormat::GgufFile => "gguf",
+                ShardFormat::LitertBundle => "litertlm",
                 ShardFormat::SafetensorsDir | ShardFormat::QuantizedSafetensors => {
                     "safetensors-dir"
                 }
@@ -403,13 +445,91 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     (StatusCode::OK, axum::Json(card)).into_response()
 }
 
+/// The manifest JSON blob of one installed engine row, by tag.
+fn manifest_json_for(manifests: &[(String, String)], tag: &str) -> Option<String> {
+    manifests
+        .iter()
+        .find(|(t, _)| t == tag)
+        .map(|(_, m)| m.clone())
+}
+
+/// Admission preview for a resolved lane: runs the pure verdict inside
+/// the store closure so a metadata-read failure gets the SAME
+/// store-aware remedy a spawn would surface (installed-lane suffix).
+/// Store unavailable = honest no-lane verdict, never a guess.
+fn admission_for_lane(
+    kind: blazar_core::engine_kind::EngineKind,
+    manifest: Option<&str>,
+    state: &Arc<AppState>,
+    path: &str,
+) -> Value {
+    state
+        .with_store(|s| {
+            let remedy = |teach: String| {
+                blazar_runtime::supervisor::store_aware_remedy(s, kind, path, teach)
+            };
+            load_admission(path, kind, manifest, &remedy)
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "verdict": "no-lane",
+                "reason": "store unavailable - engine rows unreadable"
+            })
+        })
+}
+
+/// The admission verdict a spawn on ONE engine lane would hit right
+/// now, from the same gates the supervisor runs at ensure time: the
+/// kind-aware metadata read (wrong-lane pairs teach the remedy), the
+/// `*.packed` code-store teach (any lane), and the sglang quant
+/// registry teach (probed facts from the lane manifest - any parse
+/// miss degrades to the measured const fallback, same as an old
+/// manifest). Read-only: it never spawns; the point is stating a
+/// refusal the first turn would hit BEFORE the turn pays for it. The
+/// GGUF diffusion-paradigm guards are argv-level and stay spawn-side.
+fn load_admission(
+    path: &str,
+    kind: blazar_core::engine_kind::EngineKind,
+    manifest_json: Option<&str>,
+    remedy: &dyn Fn(String) -> String,
+) -> Value {
+    use blazar_core::engine_kind::EngineKind as K;
+    use blazar_core::hfmeta::ModelMeta;
+    let meta = match blazar_runtime::supervisor::read_model_meta(path, kind) {
+        Ok(m) => m,
+        Err(teach) => return json!({ "verdict": "refused", "reason": remedy(teach) }),
+    };
+    let dir = std::path::Path::new(path);
+    match meta.borrow_meta() {
+        ModelMeta::Hf(h) => {
+            if let Some(teach) = blazar_core::hfmeta::code_store_teach(dir) {
+                return json!({ "verdict": "refused", "reason": teach });
+            }
+            if matches!(kind, K::Sglang) {
+                let facts = manifest_json
+                    .and_then(|mj| serde_json::from_str::<blazar_runtime::Manifest>(mj).ok())
+                    .map(|m| m.sglang_lane_facts())
+                    .unwrap_or_default();
+                if let Some(teach) = blazar_core::hfmeta::sglang_lane_teach(h, dir, &facts) {
+                    return json!({ "verdict": "refused", "reason": teach });
+                }
+            }
+            json!({ "verdict": "ok" })
+        }
+        ModelMeta::Gguf(_) => json!({ "verdict": "ok" }),
+    }
+}
+
 /// C3 per-phase KV-quant advisory for the explain card. llama.cpp
 /// documents the ladder as f16 (lossless, largest KV footprint) >
 /// `q8_0` (near-lossless, roughly half the footprint) > `q4_0`
 /// (measurable quality impact, quarter footprint). The advisory says
 /// which tier the config sits at and when one step down pays; it never
 /// invents byte counts (per-token KV size depends on the model's
-/// layer/head geometry, which this card does not read).
+/// layer/head geometry, which this card does not read). Turbo grades
+/// (turbo3/turbo4, fork lanes) get their own arm: they sit outside the
+/// upstream ladder, so the honest answer is their compression ratio and
+/// the receipt pointer, not a next step.
 fn kv_advisory(
     shape: blazar_core::engine_kind::FormatShape,
     kv_k: &str,
@@ -450,6 +570,15 @@ fn kv_advisory(
             None,
             "most aggressive KV tier; stepping back up to q8_0 restores quality if \
              generations degrade",
+        )
+    } else if kv_k.eq_ignore_ascii_case("turbo3") || kv_k.eq_ignore_ascii_case("turbo4") {
+        (
+            kv_k,
+            None,
+            "fork-lane KV grade (WHT-rotated): ~4.3x (turbo3) / 3.8x (turbo4) the f16 \
+             footprint, ppl-equivalent on receipt-backed models - see `measured`. \
+             Upstream llama-server refuses these grades at load; run them on a \
+             turboquant lane (`blazar engine offers`)",
         )
     } else {
         (
@@ -622,6 +751,22 @@ mod tests {
             "any-model",
         );
         assert_eq!(adv["applies"], false);
+        // turbo grades: fork-lane arm - compression ratio + lane hint,
+        // never an upstream-ladder next step
+        let adv = kv_advisory(
+            fs(false, ShardFormat::GgufFile),
+            "turbo3",
+            16384,
+            None,
+            "qwen3.5-9b",
+        );
+        assert_eq!(adv["current"], "turbo3");
+        assert!(
+            adv["why"]
+                .as_str()
+                .is_some_and(|w| w.contains("turboquant lane"))
+        );
+        assert!(adv["measured"].is_null() || adv["measured"][0]["rungs"].is_array());
     }
 
     #[test]
@@ -743,5 +888,141 @@ mod tests {
             "config default_ctx = 8192"
         );
         assert!(cold_ctx_note().contains("spawn-time planner"));
+    }
+
+    /// Fixture: an HF safetensors dir with a config.json (plus an
+    /// optional index) - the same on-disk shape `load_admission` reads.
+    fn admission_fixture_dir(slug: &str, config: &str, index: Option<&str>) -> String {
+        let dir = std::env::temp_dir().join(format!("explain-adm-{slug}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), config).unwrap();
+        if let Some(idx) = index {
+            std::fs::write(dir.join("model.safetensors.index.json"), idx).unwrap();
+        }
+        dir.to_str().unwrap().to_string()
+    }
+
+    fn sglang_manifest(version: &str, quant_methods: &serde_json::Value) -> String {
+        serde_json::json!({
+            "tag": format!("sglang-{version}"),
+            "build_number": 5023,
+            "version_raw": format!("sglang {version}"),
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/x/server",
+            "quant_methods": quant_methods.clone(),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn unit__load_admission__sglang_refusal_names_method_and_lane_facts() {
+        use blazar_core::engine_kind::EngineKind as K;
+        let dir = admission_fixture_dir(
+            "torchao",
+            r#"{"architectures":["Qwen3ForCausalLM"],"torch_dtype":"bfloat16",
+                "quantization_config":{"quant_method":"torchao","format":"int4"}}"#,
+            None,
+        );
+        // probed registry: refusal names the probed version AND list
+        let v = load_admission(
+            &dir,
+            K::Sglang,
+            Some(&sglang_manifest(
+                "0.5.23",
+                &serde_json::json!(["awq", "fp8"]),
+            )),
+            &|t| t,
+        );
+        assert_eq!(v["verdict"], "refused");
+        let reason = v["reason"].as_str().expect("reason");
+        assert!(reason.contains("'torchao'"), "{reason}");
+        assert!(reason.contains("0.5.23"), "{reason}");
+        assert!(reason.contains("supported: awq, fp8"), "{reason}");
+        assert!(reason.contains("blazar fit"), "{reason}");
+        // manifest predating the quant probe: const fallback list (a
+        // const-only entry proves the probed two-entry list lost) with
+        // the lane's own version
+        let v = load_admission(
+            &dir,
+            K::Sglang,
+            Some(
+                &serde_json::json!({
+                    "tag": "sglang-0.5.21", "build_number": 5021,
+                    "version_raw": "sglang 0.5.21", "devices": [], "flags": [],
+                    "spec_types": [], "server_path": "engines/x/server",
+                })
+                .to_string(),
+            ),
+            &|t| t,
+        );
+        assert_eq!(v["verdict"], "refused");
+        let reason = v["reason"].as_str().expect("reason");
+        assert!(reason.contains("0.5.21"), "{reason}");
+        assert!(reason.contains("awq_marlin"), "{reason}");
+        // no manifest at all: version unknown, const list still answers
+        let v = load_admission(&dir, K::Sglang, None, &|t| t);
+        assert_eq!(v["verdict"], "refused");
+        assert!(v["reason"].as_str().unwrap().contains("version unknown"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unit__load_admission__loadable_quant_ok_and_read_failure_carries_remedy() {
+        use blazar_core::engine_kind::EngineKind as K;
+        let dir = admission_fixture_dir(
+            "awq",
+            r#"{"architectures":["Qwen3ForCausalLM"],"torch_dtype":"bfloat16",
+                "quantization_config":{"quant_method":"awq","bits":4}}"#,
+            None,
+        );
+        let v = load_admission(
+            &dir,
+            K::Sglang,
+            Some(&sglang_manifest(
+                "0.5.23",
+                &serde_json::json!(["awq", "fp8"]),
+            )),
+            &|t| t,
+        );
+        assert_eq!(v["verdict"], "ok", "{v}");
+        // wrong-lane pair (safetensors dir on the llama.cpp lane):
+        // refused with the SAME teaching a spawn would surface, remedy
+        // applied by the caller
+        let v = load_admission(&dir, K::LlamaCpp, None, &|t| {
+            format!("{t} [+installed lanes]")
+        });
+        assert_eq!(v["verdict"], "refused");
+        let reason = v["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("not servable by the llama.cpp engine"),
+            "{reason}"
+        );
+        assert!(reason.contains("[+installed lanes]"), "{reason}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unit__load_admission__packed_code_store_refuses_any_dir_lane() {
+        use blazar_core::engine_kind::EngineKind as K;
+        let dir = admission_fixture_dir(
+            "packed",
+            r#"{"architectures":["Qwen3ForCausalLM"],"torch_dtype":"bfloat16"}"#,
+            Some(
+                r#"{"metadata":{"total_size":1},"weight_map":{
+                "model.layers.0.self_attn.q_proj.weight.packed":"model-00001-of-00002.safetensors"}}"#,
+            ),
+        );
+        let v = load_admission(&dir, K::Sglang, None, &|t| t);
+        assert_eq!(v["verdict"], "refused");
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap()
+                .contains("custom quant code store")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

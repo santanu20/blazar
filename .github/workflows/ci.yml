@@ -28,7 +28,7 @@ jobs:
       # Tee the lint so a red matrix cell can be diagnosed from the
       # uploaded log instead of the truncated console (the API log
       # download needs admin rights fine-grained tokens don't carry).
-      - run: cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee clippy.log
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee clippy.log
         shell: bash
       - name: upload clippy log (always, for diagnosis)
         if: always()

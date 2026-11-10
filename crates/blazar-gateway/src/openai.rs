@@ -428,15 +428,18 @@ async fn clip_embeddings(
     // Elements may wrap their parts in a content array (the OpenRouter
     // multimodal-embedding shape llama-server accepts) - flatten them so
     // the candle lane serves the same request shape the child lane would.
-    let mut parts = Vec::with_capacity(items.len());
-    for item in &items {
+    // Each part keeps the index of the ORIGINAL input element it came
+    // from: teaching errors below must name the element the client sent,
+    // not the flattened position.
+    let mut parts: Vec<(usize, &serde_json::Value)> = Vec::with_capacity(items.len());
+    for (orig_idx, item) in items.iter().enumerate() {
         match item.get("content").and_then(|c| c.as_array()) {
-            Some(inner) => parts.extend(inner.iter().cloned()),
-            None => parts.push(item.clone()),
+            Some(inner) => parts.extend(inner.iter().map(|p| (orig_idx, p))),
+            None => parts.push((orig_idx, item)),
         }
     }
     let mut images = Vec::with_capacity(parts.len());
-    for (idx, item) in parts.iter().enumerate() {
+    for (idx, item) in &parts {
         if item.as_str().is_some() {
             return openai_error(
                 400,

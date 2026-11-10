@@ -413,11 +413,31 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
             ),
         );
     }
-    match blazar_runtime::remove_model(&state.dirs, &key) {
-        Ok(()) => StatusCode::OK.into_response(),
-        // State may shift between pre-checks and removal (race) -
-        // classify from live state again, never from the message text.
+    // Model removal is fs + child-process work (the litert lane shells
+    // out to `litert-lm delete`): run it on the blocking pool under an
+    // explicit ceiling so a wedged vendor CLI cannot pin a runtime
+    // thread or hang the request forever.
+    let rm_dirs = state.dirs.clone();
+    let rm_key = key.clone();
+    let removal =
+        tokio::task::spawn_blocking(move || blazar_runtime::remove_model(&rm_dirs, &rm_key));
+    let Ok(removal) = tokio::time::timeout(std::time::Duration::from_secs(120), removal).await
+    else {
+        return api_error(
+            504,
+            &format!(
+                "model {key} removal exceeded 120s - the engine CLI may be unresponsive; retry"
+            ),
+        );
+    };
+    match removal {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        // A panicked removal task is a server-side failure, not a model
+        // state change - classify as 500 without touching live state.
+        Ok(Err(_join)) => api_error(500, &format!("model {key} removal task crashed")),
         Err(e) => {
+            // State may shift between pre-checks and removal (race) -
+            // classify from live state again, never from the message text.
             if blazar_runtime::instance_running(&state.dirs, &key) {
                 api_error(409, &format!("{e:#}"))
             } else if state
@@ -535,6 +555,7 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
             row
         })
         .collect();
+    let rows = expand_openaihost_ps(&state, rows).await;
     // Remotes: probed concurrently (3s cap each) so `ps` stays fast
     // even with a dead remote on the list (F15: collected futures are
     // NOT concurrent under a sequential await loop - join them).
@@ -584,6 +605,98 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
         out
     };
     axum::Json(json!({"models": rows, "remotes": remotes})).into_response()
+}
+
+/// openaihost lane: the `_openaihost` instance is ONE child serving the
+/// whole vendor registry - expand the synthetic row into per-model rows
+/// (store litert rows the child's /v1/models confirms) so `ps` reads
+/// like every other lane. Plain GET: the lane mints no child auth
+/// (loopback + random port boundary). On any fetch/parse failure the
+/// synthetic row stays as-is - `ps` never invents model rows it could
+/// not confirm.
+async fn expand_openaihost_ps(state: &Arc<AppState>, rows: Vec<Value>) -> Vec<Value> {
+    let Some(lane) = rows
+        .iter()
+        .find(|r| r["name"].as_str() == Some(blazar_runtime::supervisor::OPENAIHOST_KEY))
+        .cloned()
+    else {
+        return rows;
+    };
+    let Some(ep) = lane["blazar_endpoint"].as_str() else {
+        return rows;
+    };
+    let Some((host, port)) = ep.rsplit_once(':') else {
+        return rows;
+    };
+    // The lane endpoint is always loopback Tcp (pick_endpoint); a port
+    // that fails to parse means a shape change upstream - keep the raw
+    // row rather than guessing.
+    let Ok(port) = port.parse::<u16>() else {
+        return rows;
+    };
+    let endpoint = blazar_core::Endpoint::Tcp {
+        host: host.to_string(),
+        port,
+    };
+    let url = format!("{}/v1/models", crate::proxy::child_base(&endpoint));
+    let ids: Vec<String> = match crate::state::child_client(state, &endpoint)
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(v) => v["data"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m["id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => return rows,
+        },
+        _ => return rows,
+    };
+    let Some(litert_rows) = state.with_store(|s| {
+        s.list_models()
+            .map(|ms| {
+                ms.into_iter()
+                    .filter(blazar_core::ModelRow::is_litert_bundle)
+                    .collect::<Vec<_>>()
+            })
+            // Store read failure degrades to "no expansion", same as an
+            // unavailable store - the synthetic lane row stays visible.
+            .unwrap_or_default()
+    }) else {
+        return rows;
+    };
+    let engine_tag = lane["blazar_engine"].clone();
+    let gpu = lane["blazar_gpu"].clone();
+    let expires = lane["expires_at"].clone();
+    let mut expanded: Vec<Value> = Vec::new();
+    for row in &litert_rows {
+        if !ids.contains(&row.name) {
+            continue;
+        }
+        expanded.push(json!({
+            "name": row.name,
+            "model": row.name,
+            "size": row.bytes,
+            "blazar_engine": engine_tag,
+            "blazar_state": "ready",
+            "blazar_gpu": gpu,
+            "blazar_endpoint": ep,
+            "expires_at": expires,
+        }));
+    }
+    if expanded.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|r| r["name"].as_str() != Some(blazar_runtime::supervisor::OPENAIHOST_KEY))
+        .chain(expanded)
+        .collect()
 }
 
 /// Router-mode ps: one process, N engine-managed models. The child's
@@ -2337,6 +2450,12 @@ async fn proxy_core_chat(
             OutputShape::Chat => tr::openai_chat_to_ollama(model, &openai),
             OutputShape::Generate => tr::openai_chat_to_generate(model, &openai),
         };
+        // Venv lanes (litert, sglang) emit no `timings`: fall back to the
+        // gateway-measured wall so total_duration never lies with a 0.
+        tr::apply_total_duration_fallback(
+            &mut ollama,
+            u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
         // Templates that ignore the thinking-off kwargs still emit raw
         // <think> blocks; hide them when the request did not ask for
         // thinking (already-split content is unaffected - idempotent).
@@ -2863,7 +2982,10 @@ async fn proxy_core_chat(
                                 model,
                                 true, // done: next poll emits the final chunk
                                 usage,
-                                finish,
+                                // Honest terminal reason: the child died
+                                // mid-body, so the closing frame must not
+                                // claim a clean "stop" it never saw.
+                                Some("error".to_string()),
                                 usage_sent,
                                 clock,
                                 obs,
@@ -4475,9 +4597,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // escalate past their first candidate.
     let _ = writeln!(
         merged,
-        "# HELP blazar_cascade_runs_total Cascade chains run\n# TYPE blazar_cascade_runs_total counter\nblazar_cascade_runs_total {}\n# HELP blazar_cascade_escalations_total Cascade chains served past their first candidate\n# TYPE blazar_cascade_escalations_total counter\nblazar_cascade_escalations_total {}",
+        "# HELP blazar_cascade_runs_total Cascade chains run\n# TYPE blazar_cascade_runs_total counter\nblazar_cascade_runs_total {}\n# HELP blazar_cascade_escalations_total Cascade chains served past their first candidate\n# TYPE blazar_cascade_escalations_total counter\nblazar_cascade_escalations_total {}\n# HELP blazar_cascade_degrades_total Cascade chains aborted mid-run with a teaching error instead of silently downgrading\n# TYPE blazar_cascade_degrades_total counter\nblazar_cascade_degrades_total {}",
         crate::cascade::CASCADE_RUNS.load(std::sync::atomic::Ordering::Relaxed),
         crate::cascade::CASCADE_ESCALATIONS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::cascade::CASCADE_DEGRADES.load(std::sync::atomic::Ordering::Relaxed),
     );
     engine_build_gauge(&state, &mut merged);
     (

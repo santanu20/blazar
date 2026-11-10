@@ -734,11 +734,17 @@ import sqlite3 as _sq  # noqa: E402 (test-scoped, next to its fixture)
 def _mini_store(td, model_rows, engine_rows):
     con = _sq.connect(Path(td) / "blazar.db")
     con.execute("CREATE TABLE engines (tag TEXT, kind TEXT)")
+    # repo column mirrors the product schema (mlx row detection reads
+    # it); fixture rows leave it NULL.
     con.execute(
-        "CREATE TABLE models (path TEXT, name TEXT, mmproj_path TEXT, components TEXT)"
+        "CREATE TABLE models (path TEXT, name TEXT, repo TEXT, "
+        "mmproj_path TEXT, components TEXT)"
     )
     con.executemany("INSERT INTO engines VALUES (?,?)", engine_rows)
-    con.executemany("INSERT INTO models VALUES (?,?,?,?)", model_rows)
+    con.executemany(
+        "INSERT INTO models (path, name, mmproj_path, components) VALUES (?,?,?,?)",
+        model_rows,
+    )
     con.commit()
     con.close()
 
@@ -749,9 +755,24 @@ with tempfile.TemporaryDirectory() as td:
     (st_dir / "model-00001-of-00001.safetensors").write_bytes(b"x" * 16)
     gguf = Path(td) / "text.gguf"
     gguf.write_bytes(b"g" * 32)
+    # one row per text-lane model class, so NO lane ends up excluded:
+    # a .litertlm bundle (openaihost) and an MLX-layout dir (mlx) -
+    # quantization block with numeric bits/group_size, no quant_method.
+    litert = Path(td) / "gemma.litertlm"
+    litert.write_bytes(b"l" * 8)
+    mlx_dir = Path(td) / "qwen3-mlx.d"
+    mlx_dir.mkdir()
+    (mlx_dir / "config.json").write_text(
+        '{"quantization": {"bits": 4, "group_size": 64}}'
+    )
     _mini_store(
         td,
-        [(str(st_dir), "qwen3-1.7b", None, None), (str(gguf), "text9b", None, None)],
+        [
+            (str(st_dir), "qwen3-1.7b", None, None),
+            (str(gguf), "text9b", None, None),
+            (str(litert), "gemma", None, None),
+            (str(mlx_dir), "qwen3-mlx", None, None),
+        ],
         [("sglang-0.5.19", "sglang"), ("b11202-cuda", "llamacpp")],
     )
     (Path(td) / "engines" / "sglang-0.5.19").mkdir(parents=True)
@@ -968,7 +989,16 @@ lt = bc._ticks(0.1, 5.0, log=True)
 assert lt and lt == sorted(lt) and all(0.1 * 0.99 <= t <= 5.0 * 1.01 for t in lt), lt
 lin = bc._ticks(0, 120)
 assert lin[0] >= 0 and lin[-1] <= 120 and lin == sorted(lin), lin
-print("bench_charts helpers: fmt/esc/log+linear ticks OK")
+assert bc.engine_name({"kind": "openaihost", "tag": "0.19.1"}) == "LiteRT-LM 0.19.1", (
+    "openaihost chart label must carry the LiteRT-LM display name, not the raw kind"
+)
+assert bc.engine_name({"kind": "llamacpp", "tag": "b12202"}) == "llama.cpp b12202", (
+    "kind prefix path"
+)
+assert bc.engine_name({"tag": "b9999"}) == "b9999", (
+    "pre-kind cells fall back to raw tag"
+)
+print("bench_charts helpers: fmt/esc/ticks + engine-name label mapping OK")
 
 _charts_recs = [
     rec(

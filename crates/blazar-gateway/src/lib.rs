@@ -12,6 +12,7 @@ pub mod cascade;
 pub mod classify;
 pub mod config_api;
 pub mod console;
+pub mod engine_recommend;
 pub mod error_codes;
 pub mod explain;
 pub mod fabric;
@@ -95,7 +96,17 @@ struct UsageTap {
 async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
     if !state.keys.is_empty() {
         let path = req.uri().path();
-        let open = path == "/healthz" || path == "/health";
+        // Fleet membership traffic rides its OWN credentials - the
+        // shared fleet token, invite codes, worker session tokens -
+        // never API keys, so those routes self-gate instead of the
+        // key middleware (F-GP11a-1: keys-mode must not 401 the join
+        // handshake). `/api/fleet/workers` is NOT exempt: it is
+        // management-class topology and stays key-authenticated.
+        let fleet_self_gated = path == "/api/fleet/join"
+            || path == "/api/fleet/heartbeat"
+            || path == "/api/fleet/leave"
+            || path == "/api/fleet/invite";
+        let open = path == "/healthz" || path == "/health" || fleet_self_gated;
         if !open {
             let presented = req
                 .headers()
@@ -146,6 +157,47 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
         }
     }
     next.run(req).await
+}
+
+/// Buffer a small non-2xx response body and return a truncated excerpt
+/// for the access log (F-S4-3): the refusing gate's teaching message
+/// otherwise never reaches any log. Gate on the body size hint (not the
+/// content-length header, which hyper only stamps at send time):
+/// gateway-generated errors are fixed-size and announce themselves;
+/// unknown-size or over-cap error streams pass through untouched, and a
+/// stream that violates its own announcement is rebuilt from the empty
+/// prefix so the client still receives a well-formed error. 2xx never
+/// buffers.
+async fn error_body_excerpt(resp: &mut Response) -> Option<String> {
+    use http_body::Body as _;
+    const ERR_BODY_LOG_CAP: usize = 8 * 1024;
+    const ERR_EXCERPT_CHARS: usize = 300;
+    if resp.status().as_u16() < 400 {
+        return None;
+    }
+    let hint = resp.body().size_hint();
+    let small = hint
+        .exact()
+        .or(hint.upper())
+        .is_some_and(|len| len <= ERR_BODY_LOG_CAP as u64);
+    if !small {
+        return None;
+    }
+    let taken = std::mem::take(resp);
+    let (parts, body) = taken.into_parts();
+    if let Ok(bytes) = axum::body::to_bytes(body, ERR_BODY_LOG_CAP).await {
+        let text = String::from_utf8_lossy(&bytes);
+        let cut = text
+            .char_indices()
+            .nth(ERR_EXCERPT_CHARS)
+            .map_or(text.len(), |(i, _)| i);
+        let excerpt = text[..cut].to_string();
+        *resp = Response::from_parts(parts, Body::from(bytes));
+        Some(excerpt)
+    } else {
+        *resp = Response::from_parts(parts, Body::from(axum::body::Bytes::default()));
+        None
+    }
 }
 
 /// Per-request structured log + trace id (debuggability complaint):
@@ -281,17 +333,35 @@ async fn request_log(
             ],
         });
     }
-    tracing::info!(
-        target: "blazar::access",
-        trace = %trace,
-        method = %method,
-        path = %path,
-        status,
-        ms,
-        priority = %priority,
-        queue_depth = state.queue.depth(),
-        "request"
-    );
+    // F-S4-3: attach the refusing gate's teaching excerpt to the
+    // access line so a bare "status=400" is never the only evidence.
+    let err_excerpt = error_body_excerpt(&mut resp).await;
+    if let Some(err) = &err_excerpt {
+        tracing::info!(
+            target: "blazar::access",
+            trace = %trace,
+            method = %method,
+            path = %path,
+            status,
+            ms,
+            priority = %priority,
+            queue_depth = state.queue.depth(),
+            err = %err,
+            "request"
+        );
+    } else {
+        tracing::info!(
+            target: "blazar::access",
+            trace = %trace,
+            method = %method,
+            path = %path,
+            status,
+            ms,
+            priority = %priority,
+            queue_depth = state.queue.depth(),
+            "request"
+        );
+    }
     // F4 usage: re-stream successful generation-lane responses through
     // a tap that keeps the last 8 KiB (usage JSON rides the final
     // chunk in every dialect) plus first/last chunk timings. The meter
@@ -523,7 +593,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/version", get(ollama::version))
         .route("/api/tags", get(ollama::tags))
         .route("/api/show", post(ollama::show))
-        .route("/api/delete", post(ollama::delete))
+        .route("/api/delete", post(ollama::delete).delete(ollama::delete))
         .route("/api/ps", get(ollama::ps))
         // Per-GPU capacity: device census + per-resident VRAM
         // attribution joined from the supervisor's live rows.
@@ -540,6 +610,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui", get(console::ui))
         .route("/api/replicate", post(federation::replicate))
         .route("/api/route/{model}", get(federation::route))
+        .route(
+            "/api/engine/recommend",
+            get(engine_recommend::engine_recommend),
+        )
         .route("/api/explain/{model}", get(explain::explain))
         // Per-model capability certificate: bounded probes through the
         // real gateway path, stored as a doctor job + model_caps row.
@@ -658,6 +732,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             (host_guard::guard_scope(&state.cfg().host),),
             host_guard::host_guard_mw,
         ))
+        // Status enrichment: axum's own rejections (405 method
+        // mismatch, 415 content-type mismatch) leave the router as
+        // bare empty-body responses - no blazar envelope, no teaching.
+        // Wrapped into the catalog's shape here so clients get the
+        // same actionable envelope every other error path emits;
+        // headers axum already set (notably `Allow` on 405) are
+        // preserved. Sits inside request_log so the access log sees
+        // the enriched status.
+        .layer(middleware::map_response(status_enrich_mw))
         // request_log: outermost - every request, including 401s and
         // preflights, gets a trace id and an access-log line.
         .layer(middleware::from_fn_with_state(state.clone(), request_log))
@@ -686,6 +769,55 @@ fn cors_allow_origin(origins: &[String]) -> tower_http::cors::AllowOrigin {
                 || host_guard::is_default_browser_origin(&lowered)
         })
     }
+}
+
+/// Enrich axum-native 405/415 rejections with the blazar error
+/// envelope. Only touches responses whose body is empty (a handler
+/// that already produced a body wins); re-attaches the `Allow` header
+/// axum sets on 405 so method discovery keeps working.
+async fn status_enrich_mw(resp: axum::response::Response) -> axum::response::Response {
+    use axum::http::{
+        StatusCode,
+        header::{ALLOW, CONTENT_TYPE},
+    };
+    use http_body::Body as _;
+    let status = resp.status();
+    // Enrich only framework-generated rejections, never a handler payload:
+    // - 405s from axum's method router carry an empty body (Allow says the rest);
+    // - 415s from the `Json` extractor carry a plain-text body, so anything
+    //   already speaking JSON is a real handler response and stays untouched.
+    let framework_rejection = match status {
+        StatusCode::METHOD_NOT_ALLOWED => resp.body().size_hint().exact() == Some(0),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_none_or(|ct| !ct.contains("json")),
+        _ => false,
+    };
+    if !framework_rejection {
+        return resp;
+    }
+    let code = match status {
+        StatusCode::METHOD_NOT_ALLOWED => Some((
+            error_codes::BlazarCode::MethodNotAllowed,
+            "the route exists but not for this HTTP method - the Allow header lists what it accepts",
+        )),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => Some((
+            error_codes::BlazarCode::UnsupportedMediaType,
+            "this endpoint expects an application/json body",
+        )),
+        _ => None,
+    };
+    let Some((code, message)) = code else {
+        return resp;
+    };
+    let allow = resp.headers().get(ALLOW).cloned();
+    let mut out = error_codes::error_response(code, message);
+    if let Some(allow) = allow {
+        out.headers_mut().insert(ALLOW, allow);
+    }
+    out
 }
 
 /// Persist the live key set back to config.toml ([[keys]] tables).
@@ -768,7 +900,10 @@ fn redact(secret: &str) -> String {
 /// first key via config.toml `[[keys]]` or `BLAZAR_KEYS` (never let an
 /// open gateway mint its own credentials).
 #[allow(clippy::result_large_err)] // Response is the handlers' currency here
-fn management_authorized(state: &AppState, key: Option<&keys::KeyCtx>) -> Result<(), Response> {
+pub(crate) fn management_authorized(
+    state: &AppState,
+    key: Option<&keys::KeyCtx>,
+) -> Result<(), Response> {
     if state.keys.is_empty() {
         return Err(error_response(
             403,
@@ -1420,6 +1555,7 @@ pub async fn serve(
         // is never reloaded - Config::load would rewrite it with defaults.
         {
             let sup = Arc::clone(&state.sup);
+            let keys = Arc::clone(&state.keys);
             tokio::spawn(async move {
                 let mut last = sup.config_file_stamp();
                 loop {
@@ -1428,11 +1564,19 @@ pub async fn serve(
                     if stamp.is_some() && stamp != last {
                         last = stamp;
                         match sup.reload_config_now() {
-                            Ok(outcome) if outcome.preload_changed => {
-                                let s2 = Arc::clone(&sup);
-                                tokio::spawn(async move { s2.preload_listed().await });
+                            Ok(outcome) => {
+                                if outcome.preload_changed {
+                                    let s2 = Arc::clone(&sup);
+                                    tokio::spawn(async move { s2.preload_listed().await });
+                                }
+                                if outcome.keys_changed {
+                                    keys.replace_all(sup.cfg().keys.clone());
+                                    tracing::info!(
+                                        "api keys hot-reloaded - {} live key(s)",
+                                        keys.entries().len()
+                                    );
+                                }
                             }
-                            Ok(_) => {}
                             Err(reason) => {
                                 tracing::warn!("{reason}");
                             }
@@ -1517,6 +1661,7 @@ pub async fn serve(
         // the plain-HTTP branch above.
         {
             let sup = Arc::clone(&state.sup);
+            let keys = Arc::clone(&state.keys);
             tokio::spawn(async move {
                 let mut last = sup.config_file_stamp();
                 loop {
@@ -1525,11 +1670,19 @@ pub async fn serve(
                     if stamp.is_some() && stamp != last {
                         last = stamp;
                         match sup.reload_config_now() {
-                            Ok(outcome) if outcome.preload_changed => {
-                                let s2 = Arc::clone(&sup);
-                                tokio::spawn(async move { s2.preload_listed().await });
+                            Ok(outcome) => {
+                                if outcome.preload_changed {
+                                    let s2 = Arc::clone(&sup);
+                                    tokio::spawn(async move { s2.preload_listed().await });
+                                }
+                                if outcome.keys_changed {
+                                    keys.replace_all(sup.cfg().keys.clone());
+                                    tracing::info!(
+                                        "api keys hot-reloaded - {} live key(s)",
+                                        keys.entries().len()
+                                    );
+                                }
                             }
-                            Ok(_) => {}
                             Err(reason) => {
                                 tracing::warn!("{reason}");
                             }
@@ -1735,6 +1888,90 @@ mod tests {
             msg.contains("unreachable") && msg.contains("rpc_servers"),
             "fleet teaching must survive the mapping: {msg}"
         );
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__error_body_excerpt__fixed_size_400_captured_and_body_preserved() {
+        use super::error_body_excerpt;
+        let mut r = axum::response::Response::builder()
+            .status(400)
+            .body(axum::body::Body::from(
+                r#"{"error":{"message":"profile: num_ctx 3072 cannot fit","type":"blazar_error"}}"#,
+            ))
+            .unwrap();
+        let excerpt = error_body_excerpt(&mut r).await;
+        let excerpt = excerpt.expect("small fixed 400 must be captured");
+        assert!(
+            excerpt.contains("num_ctx 3072 cannot fit"),
+            "teaching message in excerpt: {excerpt}"
+        );
+        // The client-facing body must survive the peek byte-for-byte.
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.windows(6).any(|w| w == b"blazar"));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__error_body_excerpt__truncates_long_teaching_to_bounded_excerpt() {
+        use super::error_body_excerpt;
+        let long = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(5_000));
+        let mut r = axum::response::Response::builder()
+            .status(422)
+            .body(axum::body::Body::from(long.clone()))
+            .unwrap();
+        let excerpt = error_body_excerpt(&mut r).await.expect("captured");
+        assert!(excerpt.chars().count() <= 300, "bounded excerpt");
+        // Over-cap fixed-size bodies (exact hint > 8 KiB) pass through
+        // unlogged rather than being buffered-then-dropped.
+        let mut huge = br#"{"error":{"message":"#.to_vec();
+        huge.extend(std::iter::repeat_n(b'x', 8 * 1024 + 512));
+        let mut r = axum::response::Response::builder()
+            .status(507)
+            .body(axum::body::Body::from(huge.clone()))
+            .unwrap();
+        assert!(
+            error_body_excerpt(&mut r).await.is_none(),
+            "over-cap body must not be buffered"
+        );
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), huge.len(), "body intact");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__error_body_excerpt__success_and_unknown_size_stream_untouched() {
+        use super::error_body_excerpt;
+        // 2xx never buffers.
+        let mut ok = axum::response::Response::builder()
+            .status(200)
+            .body(axum::body::Body::from(r#"{"choices":[]}"#))
+            .unwrap();
+        assert!(error_body_excerpt(&mut ok).await.is_none());
+        // Unknown-size streamed 400 (proxied child error): no exact or
+        // upper hint -> passthrough, body intact.
+        let stream = futures::stream::iter(
+            [Ok::<_, std::convert::Infallible>(
+                axum::body::Bytes::from_static(br#"{"error":{"message":"child oom"}}"#),
+            )]
+            .into_iter(),
+        );
+        let mut streamed = axum::response::Response::builder()
+            .status(500)
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap();
+        assert!(
+            error_body_excerpt(&mut streamed).await.is_none(),
+            "unknown-size stream must not be buffered"
+        );
+        let bytes = axum::body::to_bytes(streamed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.windows(9).any(|w| w == b"child oom"));
     }
 }
 

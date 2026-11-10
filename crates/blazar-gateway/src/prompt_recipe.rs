@@ -354,10 +354,7 @@ pub(crate) fn extract_tool_names(body: &Value) -> Option<Vec<String>> {
 /// envelopes, each a JSON object whose `name` must be one of the
 /// request's tools and whose `arguments` is an arbitrary JSON object.
 /// Verified against the llama.cpp fork's grammar field live (the same
-/// fork build's `json_schema` converter rejects standard schemas - the
-/// GBNF grammar for strict tool decode: one-or-more `<tool_call>`
-/// envelopes, each a JSON object whose `name` must be one of the
-/// request's tools and whose `arguments` is an arbitrary JSON object.
+/// fork build's `json_schema` converter rejects standard schemas).
 /// Rule names are `plm`-prefixed on purpose: the llama.cpp OAI
 /// completion endpoint carries preloaded grammar rules (`string`,
 /// `object`, `value`, ...) that silently shadow same-named user rules -

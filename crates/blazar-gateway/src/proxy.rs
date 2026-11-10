@@ -2030,6 +2030,7 @@ pub(crate) fn resolve_serving(
                     model_row
                         .as_ref()
                         .is_some_and(blazar_core::ModelRow::is_mlx),
+                    model_path.to_ascii_lowercase().ends_with(".litertlm"),
                 ),
             };
             let lane = engine_kind::serving_lane(

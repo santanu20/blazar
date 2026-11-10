@@ -478,6 +478,20 @@ fn merge_timing_fields(v: &mut Value, openai: &Value) {
     }
 }
 
+/// Fill `total_duration` from gateway-measured wall time when the child
+/// reported none. The venv lanes (litert, sglang) never emit `timings`,
+/// so without this their ollama-shape responses answer `total_duration: 0`.
+/// Never overrides a child-reported total - local timings stay exact.
+pub fn apply_total_duration_fallback(v: &mut Value, wall_ns: u64) {
+    // Fill when absent OR reported as 0: a zero total is never a real
+    // measurement (a served request took wall time by definition), and
+    // the ollama-shape translation pre-seeds `total_duration: 0` for
+    // lanes whose children emit no timings at all (litert, sglang).
+    if v.get("total_duration").and_then(Value::as_u64).unwrap_or(0) == 0 {
+        v["total_duration"] = json!(wall_ns);
+    }
+}
+
 /// Extract the cached prompt-token count from an `OpenAI` usage object
 /// (`prompt_tokens_details` -> `cached_tokens`; llama-server emits it on
 /// stream usage chunks and non-stream chat). 0 when absent - callers
@@ -1672,6 +1686,22 @@ mod tests {
         let (out, _) = chat_to_openai(&req).unwrap();
         assert_eq!(out["messages"][0]["tool_name"], "weird");
         assert!(out["messages"][0].get("name").is_none());
+    }
+
+    #[test]
+    fn unit__total_duration_fallback__fills_only_when_child_silent() {
+        // Venv lanes (litert, sglang) emit no `timings`: the wall fallback
+        // fills total_duration so the ollama shape never reports a lying 0...
+        let mut silent = serde_json::json!({"model": "m", "message": {"role": "assistant", "content": "hi"}, "done": true});
+        apply_total_duration_fallback(&mut silent, 1_234_000_000);
+        assert_eq!(silent["total_duration"].as_u64(), Some(1_234_000_000));
+        // ...but a child-reported prompt+eval total is exact and wins.
+        let mut timed = serde_json::json!({"total_duration": 500_000_000});
+        apply_total_duration_fallback(&mut timed, 9_999_999_999);
+        let mut zero_seeded = serde_json::json!({"total_duration": 0});
+        apply_total_duration_fallback(&mut zero_seeded, 7_777_000_000);
+        assert_eq!(zero_seeded["total_duration"].as_u64(), Some(7_777_000_000));
+        assert_eq!(timed["total_duration"].as_u64(), Some(500_000_000));
     }
 
     #[test]

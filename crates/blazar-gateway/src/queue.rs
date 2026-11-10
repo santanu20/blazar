@@ -214,7 +214,7 @@ impl PriorityQueue {
         timeout: Duration,
         wfq: Option<(&str, u32)>,
     ) -> Result<(), String> {
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         let key = {
             let mut q = self.inner.lock().expect("queue lock");
             q.seq += 1;
@@ -269,10 +269,20 @@ impl PriorityQueue {
             key
         };
         self.notify.notify_waiters();
-        match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout(timeout, &mut rx).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err("queue shut down".into()),
             Err(_) => {
+                // Race closure: an admission can fire in the same instant the
+                // timeout elapses (signal_free sent at T-e, Elapsed at T).
+                // Drain it before declaring defeat - a dropped admission
+                // would both time the caller out AND waste the freed slot.
+                // oneshot::try_recv errs only with Empty (a dropped sender
+                // still counts as empty here); anything but a live admission
+                // falls through to the honest timeout path below.
+                if rx.try_recv().is_ok() {
+                    return Ok(());
+                }
                 // F59: remove our own entry - on an idle system no future
                 // `signal_free` arrives to lazily clean a timed-out
                 // waiter, and `depth()` would report phantom saturation
@@ -861,5 +871,41 @@ mod tests {
         assert_eq!(raw_ceiling(2, true), 1);
         // N = 1 degenerates to no isolation (documented tradeoff).
         assert_eq!(raw_ceiling(1, true), 1);
+    }
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn unit__queue__timeout_admission_race_admits_not_times_out() {
+    // Pin the race closure: an admission landing at the same instant the
+    // timeout elapses must admit the waiter, not time it out (and not
+    // silently burn the freed slot). Statistical: race the signal against
+    // a 2 ms timeout 100 times - every run must end admitted.
+    let q = std::sync::Arc::new(PriorityQueue::new());
+    let mut all = Vec::new();
+    for _ in 0..100 {
+        let q2 = q.clone();
+        all.push(tokio::spawn(async move {
+            q2.wait(
+                "race-model",
+                Priority::Normal,
+                WorkClass::Interactive,
+                None,
+                0,
+                Duration::from_millis(2),
+                None,
+            )
+            .await
+        }));
+        // Fire the admission right inside the timeout window.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        q.signal_free();
+    }
+    for h in all {
+        let verdict = h.await.expect("waiter task alive");
+        assert!(
+            verdict.is_ok(),
+            "admission racing the timeout must admit, got: {verdict:?}"
+        );
     }
 }

@@ -21,7 +21,20 @@ fn walk_strings(v: &serde_json::Value, bytes: &mut u64) {
                 *bytes += IMAGE_TOKEN_EST * 4;
                 return;
             }
-            o.values().for_each(|x| walk_strings(x, bytes));
+            o.iter().for_each(|(k, x)| {
+                if k == "images"
+                    && x.as_array()
+                        .is_some_and(|a| a.iter().all(|i| i.as_str().is_some()))
+                {
+                    // Ollama multimodal dialect: sibling `images` arrays
+                    // carry base64 payloads - walking them as raw text
+                    // re-creates F82's ~262K-token false trip (a 1 MiB
+                    // image must estimate flat, like image_url objects).
+                    *bytes += IMAGE_TOKEN_EST * 4 * x.as_array().map_or(0, Vec::len) as u64;
+                } else {
+                    walk_strings(x, bytes);
+                }
+            });
         }
         _ => {}
     }
@@ -69,6 +82,14 @@ fn prompt_text_and_images(body: &serde_json::Value) -> (String, u64) {
             let mut parts: Vec<String> = Vec::new();
             let mut images = 0u64;
             for m in a {
+                // Ollama multimodal dialect: base64 vision parts ride a
+                // sibling `images` array on the message (never inside
+                // `content`) - each non-empty entry is one image.
+                images += m.get("images").and_then(|v| v.as_array()).map_or(0, |arr| {
+                    arr.iter()
+                        .filter(|i| i.as_str().is_some_and(|s| !s.is_empty()))
+                        .count() as u64
+                });
                 match m.get("content") {
                     Some(serde_json::Value::String(s)) => parts.push(s.clone()),
                     Some(serde_json::Value::Array(blocks)) => {
@@ -90,10 +111,20 @@ fn prompt_text_and_images(body: &serde_json::Value) -> (String, u64) {
             (parts.join("\n"), images)
         })
         .or_else(|| {
-            body.get("prompt")
-                .and_then(|p| p.as_str())
-                .map(str::to_string)
-                .map(|p| (p, 0u64))
+            body.get("prompt").and_then(|p| p.as_str()).map(|p| {
+                // Generate dialect: vision parts ride a top-level
+                // `images` array (proxy's body_needs_vision sees the
+                // same shape) - count them, never the base64 text.
+                let imgs = body
+                    .get("images")
+                    .and_then(|v| v.as_array())
+                    .map_or(0, |arr| {
+                        arr.iter()
+                            .filter(|i| i.as_str().is_some_and(|s| !s.is_empty()))
+                            .count() as u64
+                    });
+                (p.to_string(), imgs)
+            })
         })
         .unwrap_or_default()
 }
@@ -331,6 +362,52 @@ pub fn capability_cert_refusal(
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__prompt_tokens_est__ollama_images_estimate_flat_not_base64() {
+        // Ollama dialect: a 1 MiB base64 image inside messages[].images
+        // must estimate ~1 image, not ~262K tokens of raw base64/4 (the
+        // F82 false-trip, reborn on the sibling-array shape).
+        let big = "x".repeat(1024 * 1024);
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "what is this?", "images": [big]}
+            ]
+        });
+        let est = prompt_tokens_est(&body);
+        assert!(
+            est < 10_000,
+            "1 image + tiny text must not estimate as raw base64: {est}"
+        );
+        assert!(est >= 1_500, "the per-image figure is present: {est}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__prompt_text_and_images__counts_ollama_shapes_both_dialects() {
+        // Chat dialect: sibling messages[].images arrays are vision
+        // parts (OpenAI content blocks keep their own arm).
+        let chat = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi", "images": ["b64", "b64", ""]}
+            ]
+        });
+        let (text, images) = prompt_text_and_images(&chat);
+        assert_eq!(text, "hi");
+        assert_eq!(images, 2, "two non-empty base64 entries, empty ignored");
+        // Generate dialect: top-level `images` beside `prompt`.
+        let generate = serde_json::json!({"prompt": "describe", "images": ["b64"]});
+        let (text, images) = prompt_text_and_images(&generate);
+        assert_eq!(text, "describe");
+        assert_eq!(images, 1);
+        // Mixed non-string `images` arrays (not the ollama shape) are
+        // not counted as images anywhere.
+        let mixed = serde_json::json!({"prompt": "p", "images": [1, 2]});
+        let (_, images) = prompt_text_and_images(&mixed);
+        assert_eq!(images, 0);
+    }
+
     use super::*;
 
     #[test]

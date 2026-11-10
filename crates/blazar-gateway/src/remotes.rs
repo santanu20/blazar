@@ -353,13 +353,14 @@ pub async fn forward_openai(
     if !remote.key.is_empty() {
         req = req.bearer_auth(&remote.key);
     }
-    let resp = match req
-        .body(reqwest::Body::wrap_stream(futures::stream::once(
-            async move { Ok::<_, std::io::Error>(body) },
-        )))
-        .send()
-        .await
-    {
+    // Fixed-length body, never a wrapping stream: `Body::wrap_stream`
+    // has no known length, so hyper frames the request with
+    // `transfer-encoding: chunked` - which chunked-intolerant OpenAI
+    // peers built on Python's `http.server` (litert-lm serve, and any
+    // stdlib-based stub) reject as garbage before their handler runs.
+    // `Body::from(Bytes)` sends a plain `content-length`, which every
+    // server dialect accepts.
+    let resp = match req.body(reqwest::Body::from(body)).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "blazar::remotes", remote = %remote.name, "forward failed: {e:#}");
@@ -986,6 +987,7 @@ pub async fn ollama_chat_remote(
     remote_model: &str,
     req: &serde_json::Value,
 ) -> Response {
+    let t0 = std::time::Instant::now();
     let (mut openai_req, _num_ctx) = match crate::translate::chat_to_openai(req) {
         Ok(r) => r,
         Err(e) => return crate::proxy::openai_error(400, &e),
@@ -1027,11 +1029,14 @@ pub async fn ollama_chat_remote(
             Ok(v) => v,
             Err(e) => return crate::proxy::openai_error(502, &format!("bad remote response: {e}")),
         };
-        return axum::Json(crate::translate::openai_chat_to_ollama(
-            remote_model,
-            &openai,
-        ))
-        .into_response();
+        let mut ollama = crate::translate::openai_chat_to_ollama(remote_model, &openai);
+        // Remotes strip their own timings on the plain forward; stamp the
+        // gateway-measured wall so total_duration never reports a lying 0.
+        crate::translate::apply_total_duration_fallback(
+            &mut ollama,
+            u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        return axum::Json(ollama).into_response();
     }
     // SSE -> ollama NDJSON (same incremental translate as the local path).
     use futures::StreamExt as _;
@@ -1046,7 +1051,7 @@ pub async fn ollama_chat_remote(
         .map(move |chunk| {
             let elapsed = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             {
-                let mut c = clock_map.lock().unwrap();
+                let mut c = clock_map.lock().expect("clock lock poisoned");
                 if c.0.is_none() {
                     c.0 = Some(elapsed);
                 }
@@ -1087,7 +1092,7 @@ pub async fn ollama_chat_remote(
                 if done && !usage_sent {
                     // Decode window = last - first byte; total = full wall.
                     let (eval_ns, total_ns) = {
-                        let c = clock.lock().unwrap();
+                        let c = clock.lock().expect("clock lock poisoned");
                         match c.0 {
                             Some(f) => (Some(c.1.saturating_sub(f)), Some(c.1)),
                             None => (None, (c.1 > 0).then_some(c.1)),

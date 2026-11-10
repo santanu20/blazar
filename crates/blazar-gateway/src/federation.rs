@@ -121,19 +121,6 @@ async fn boxed_to_api_error(boxed: Box<Response>) -> Response {
     api_error(status, &msg)
 }
 
-/// `POST /api/warm {"model", "wait"?}` - make a model resident on this
-/// gateway. Two modes, one endpoint:
-///
-/// * notify (default, the deployed `blazar pull` contract): detached
-///   `warm_on_pull_if_enabled` - policy-gated (knob + AC power +
-///   admission belts, warn-not-fail), answers `{"status": "ok"}`
-///   immediately. The spawn outlives the request; tying it to the
-///   handler once let a client disconnect cancel it mid-load.
-/// * `wait: true` (replication + `blazar warm` CLI): synchronous
-///   ensure through the standard admission path (low priority,
-///   interactive class - never starves real traffic; concurrent loads
-///   of the same model coalesce), then reports the live child state.
-///
 /// `POST /api/lora/sync` - CLI `blazar lora add/rm` follow-through after
 /// the store write: hot-attach (or detach) the adapter on a RESIDENT
 /// sglang base child through the engine's admin endpoints, no respawn.
@@ -228,6 +215,22 @@ fn warm_scope_gate(
     None
 }
 
+/// `POST /api/warm {"model", "wait"?}` - make a model resident on this
+/// gateway. Two modes, one endpoint:
+///
+/// * notify (default, the deployed `blazar pull` contract): detached
+///   `warm_on_pull_if_enabled` - policy-gated (knob + AC power +
+///   admission belts, warn-not-fail), answers `{"status": "ok"}`
+///   immediately. The spawn outlives the request; tying it to the
+///   handler once let a client disconnect cancel it mid-load.
+/// * `wait: true` (replication + `blazar warm` CLI): synchronous
+///   ensure through the standard admission path (low priority,
+///   interactive class - never starves real traffic; concurrent loads
+///   of the same model coalesce), then reports the live child state.
+///
+/// Scoped keys may warm only models their scope lists (see
+/// [`warm_scope_gate`]); admin keys and the authless local default
+/// pass through.
 pub async fn warm(
     State(state): State<Arc<AppState>>,
     key: Option<Extension<crate::keys::KeyCtx>>,

@@ -88,6 +88,7 @@ impl InviteRegistry {
     /// Mint a fresh 32-hex code valid for `ttl`.
     pub fn mint(&self, ttl: std::time::Duration) -> String {
         use std::fmt::Write as _;
+        const MAX_LIVE_INVITES: usize = 64;
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).expect("OS entropy source");
         let mut code = String::with_capacity(32);
@@ -95,10 +96,17 @@ impl InviteRegistry {
             let _ = write!(code, "{b:02x}");
         }
         let expires = std::time::Instant::now() + ttl;
-        self.codes
-            .lock()
-            .expect("invite registry lock")
-            .insert(code.clone(), expires);
+        let mut codes = self.codes.lock().expect("invite registry lock");
+        // Bound the live set: unclaimed codes expire on their own, but
+        // a mint loop (scripted `blazar adopt` retries) must not grow
+        // the registry unbounded. Oldest-expiring codes go first.
+        if codes.len() >= MAX_LIVE_INVITES {
+            let mut sorted_deadlines: Vec<std::time::Instant> = codes.values().copied().collect();
+            sorted_deadlines.sort();
+            let cutoff = sorted_deadlines[sorted_deadlines.len() - MAX_LIVE_INVITES];
+            codes.retain(|_, e| *e > cutoff);
+        }
+        codes.insert(code.clone(), expires);
         code
     }
 
@@ -363,8 +371,26 @@ pub async fn leave(
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
-/// GET /api/fleet/workers - pruned registry snapshot.
-pub async fn workers(State(state): State<Arc<AppState>>) -> Response {
+/// GET /api/fleet/workers - pruned registry snapshot. Management-class
+/// topology: fleet must be enabled (sibling-parity 404, never an empty
+/// 200 that silently answers for a disabled subsystem), and when keys
+/// exist only an unscoped (admin) key may enumerate the fleet.
+pub async fn workers(
+    State(state): State<Arc<AppState>>,
+    key: Option<axum::Extension<crate::keys::KeyCtx>>,
+) -> Response {
+    if !state.cfg().fleet_enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            "fleet membership disabled (fleet_enabled = false) - set rpc_servers statically instead",
+        )
+            .into_response();
+    }
+    if !state.keys.is_empty()
+        && let Err(denied) = crate::management_authorized(&state, key.as_ref().map(|e| &e.0))
+    {
+        return denied;
+    }
     Json(serde_json::json!({
         "workers": state.sup.fleet_workers(),
         "heartbeat_interval_secs": state.cfg().fleet_heartbeat_secs,

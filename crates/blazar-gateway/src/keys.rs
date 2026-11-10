@@ -345,6 +345,25 @@ impl KeysLimiter {
         before != entries.len()
     }
 
+    /// Hot-reload swap: make `entries` the complete live key set. Keys
+    /// absent from the new list are dropped, survivors are replaced
+    /// in place, and new ones are appended - the same semantics the
+    /// management API applies one key at a time (`upsert`/`remove`),
+    /// applied to the whole list at once. Per-name usage/rate state is
+    /// keyed by name, so surviving keys keep their counters. The
+    /// caller owns persistence (on reload the config file already IS
+    /// the new truth).
+    pub fn replace_all(&self, entries: Vec<blazar_core::ApiKey>) {
+        let mut cur = self.entries.write().expect("keys entries poisoned");
+        cur.retain(|k| entries.iter().any(|n| n.name == k.name));
+        for key in entries {
+            match cur.iter().position(|e| e.name == key.name) {
+                Some(i) => cur[i] = key,
+                None => cur.push(key),
+            }
+        }
+    }
+
     /// Atomic admission (BLZ-3): model scope, then the rpm/tpm/daily
     /// gates, then the request charge - all under ONE lock acquisition.
     /// The old read-then-charge pair let N concurrent requests all pass
@@ -970,6 +989,53 @@ mod tests {
     fn unit__secs_until_utc_midnight__bounds() {
         let s = secs_until_utc_midnight();
         assert!((1..=86_400).contains(&s), "midnight distance in range: {s}");
+    }
+
+    #[test]
+    fn unit__replace_all__swaps_set_and_preserves_survivors_by_name() {
+        let limiter = KeysLimiter::loaded(
+            None,
+            vec![
+                blazar_core::ApiKey {
+                    name: "admin".into(),
+                    key: "plm_admin".into(),
+                    ..Default::default()
+                },
+                blazar_core::ApiKey {
+                    name: "scoped".into(),
+                    key: "plm_scoped".into(),
+                    models: vec!["m".into()],
+                    ..Default::default()
+                },
+            ],
+        );
+        // New generation: scoped (scope widened) + brand-new key; admin
+        // is gone. Order follows the file, not the old list.
+        limiter.replace_all(vec![
+            blazar_core::ApiKey {
+                name: "scoped".into(),
+                key: "plm_scoped".into(),
+                ..Default::default()
+            },
+            blazar_core::ApiKey {
+                name: "fresh".into(),
+                key: "plm_fresh".into(),
+                ..Default::default()
+            },
+        ]);
+        let names: Vec<String> = limiter.entries().iter().map(|k| k.name.clone()).collect();
+        assert_eq!(names, vec!["scoped".to_string(), "fresh".to_string()]);
+        assert!(
+            limiter.entry("admin").is_none(),
+            "absent key dropped from the live set"
+        );
+        assert!(
+            limiter.resolve("plm_scoped").is_some(),
+            "survivor still authenticates"
+        );
+        // Back to empty = authless: the reverse reload direction.
+        limiter.replace_all(Vec::new());
+        assert!(limiter.is_empty(), "empty file set -> authless");
     }
 
     #[test]

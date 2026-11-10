@@ -14,5 +14,45 @@
     "status": "active",
     "note": "AMD Instella-MoE support ahead of mainline; architectures list the delta beyond the current upstream release, so graduation retires the lane automatically once upstream ships them.",
     "added_at": 1789862400
+  },
+  {
+    "id": "prism",
+    "repo": "PrismML-Eng/llama.cpp",
+    "ref_sha": "6447906bf96c1a023980d3453fb59daa6af3bb23",
+    "upstream_pr": null,
+    "architectures": [
+      "dspark"
+    ],
+    "backends": [
+      "cpu",
+      "cuda",
+      "metal",
+      "vulkan",
+      "hip"
+    ],
+    "status": "active",
+    "note": "PrismML `prism` branch: mainline-tracking fork behind the Bonsai models - fork-only 1/2-bit PQ tensor types (PQ2_0 group-128; Q2_0_g64 also runs mainline) and dspark speculative decoding. Pin refreshed from the branch head; no upstream PR to track.",
+    "added_at": 1794029496
+  },
+  {
+    "id": "turboquant",
+    "repo": "AtomicBot-ai/atomic-llama-cpp-turboquant",
+    "ref_sha": "8d93507810cd89b26bfb47148f2c1708cc3fa316",
+    "upstream_pr": null,
+    "architectures": [
+      "inkling",
+      "laya",
+      "unlimited-ocr2"
+    ],
+    "backends": [
+      "cpu",
+      "cuda",
+      "metal",
+      "vulkan",
+      "hip"
+    ],
+    "status": "active",
+    "note": "TurboQuant `dev` branch (MIT): turbo3/turbo4 WHT-rotated KV cache (~4.3x/3.8x compression, cache_type_k/v on this lane; ppl receipts in blazar-core kv-quant-quality.json) plus TQ3_1S/TQ4_1S weight quants, MTP-in-context (--mtp-head), EAGLE-3, DFlash, spec-chain and KV-streaming flags. cuda build verified locally (RTX 4070); metal/vulkan/hip per fork README. Two pinned-sha findings: qwen35-family + --embeddings aborts inside the fork's VRAM-fit probe (build_pooling ggml_abort; gemma3 verified OK; the spec draft-mtp argv itself is accepted when embeddings is absent); turbo KV at ctx 32768 dies silently on an 8GiB card (2/2, see bench-artifacts/20261107-turboquant-kv-quality). Based on an older mainline baseline: lacks 25 upstream archs (beam, clover_moe, deepseek41, ...) - keep an upstream lane installed alongside.",
+    "added_at": 1794035418
   }
 ]

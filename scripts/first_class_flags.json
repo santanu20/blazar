@@ -138,6 +138,10 @@
       "--trust-remote-code",
       "--use-default-chat-template"
     ],
+    "openaihost": [
+      "--host",
+      "--port"
+    ],
     "piper": [
       "--espeak_data",
       "--length_scale",

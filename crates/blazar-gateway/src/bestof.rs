@@ -41,9 +41,10 @@ fn parse_u64(v: &str) -> Option<u64> {
 /// Merge the header and body spellings of the knob into one validated
 /// value. `Ok(None)` = fan-out not requested (the default path).
 /// Header wins on conflict (it is the explicit, dialect-universal
-/// spelling); out-of-range values are errors, not clamps - a client
-/// asking for 9 candidates should learn the ceiling, not silently
-/// get 4.
+/// spelling); values below 2 mean "no fan-out" (single-send path),
+/// values above the cap clamp to `MAX_BEST_OF` and the response
+/// header reports `asked=<requested> used=<clamped>` so the client
+/// sees the ceiling it got.
 pub fn resolve_best_of(
     headers: &HeaderMap,
     body_field: Option<&Value>,
@@ -216,6 +217,9 @@ pub(crate) enum FanOut {
 /// respawn-retry contract then owns crash recovery (re-running the
 /// request once through that path beats failing a live lane because one
 /// of N speculative copies died).
+// One cohesive candidate state machine (send all, read all, pick, rebuild);
+// splitting it would scatter the fallback contract across helpers.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn fan_out(
     state: &Arc<AppState>,
     engine: &blazar_runtime::EngineRef,
@@ -270,11 +274,31 @@ pub(crate) async fn fan_out(
     // Buffer + parse the completed candidates; a candidate that fails
     // body-read is a lost candidate, not a failed request.
     let mut cands: Vec<(u16, Value, axum::body::Bytes)> = Vec::with_capacity(results.len());
-    for r in results {
-        let Ok(resp) = r else { return FanOut::Skip };
+    for (i, r) in results.into_iter().enumerate() {
+        // Every transport loss (candidate 0 above, any later one here)
+        // falls back to the single-send path - but never silently.
+        let resp = match r {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(
+                    target: "blazar::bestof",
+                    model = %engine.name,
+                    "candidate {i} failed transport ({e}) - falling back to the single-send path"
+                );
+                return FanOut::Skip;
+            }
+        };
         let status = resp.status().as_u16();
-        let Ok(bytes) = resp.bytes().await else {
-            return FanOut::Skip;
+        let bytes = match resp.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    target: "blazar::bestof",
+                    model = %engine.name,
+                    "candidate {i} body read failed ({e}) - falling back to the single-send path"
+                );
+                return FanOut::Skip;
+            }
         };
         let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         cands.push((status, value, bytes));

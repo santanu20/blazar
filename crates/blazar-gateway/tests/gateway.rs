@@ -315,6 +315,140 @@ async fn e2e__ollama_delete_accepts_the_tags_rendered_name() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__ollama_delete_canonical_delete_method() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // The canonical Ollama API is `curl -X DELETE /api/delete`; the
+    // POST dialect is the legacy shape. Official ollama clients send
+    // DELETE, so both verbs must hit the same handler.
+    let status = c
+        .delete(format!("{}/api/delete", ts.base))
+        .json(&serde_json::json!({"model": "m1:q4_k_m"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+    let t: serde_json::Value = c
+        .get(format!("{}/api/tags", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = t["models"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|m| m["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(!names.contains(&"m1:q4_k_m"), "deleted row gone: {names:?}");
+    assert!(names.contains(&"m2:q4_k_m"), "sibling untouched: {names:?}");
+    // Unknown name via DELETE teaches exactly like POST does.
+    let status = c
+        .delete(format!("{}/api/delete", ts.base))
+        .json(&serde_json::json!({"model": "no-such-model"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 404);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__config_reload_hot_swaps_keys_both_directions() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let tags = format!("{}/api/tags", ts.base);
+    // Authless baseline: the gateway serves with zero keys.
+    assert_eq!(c.get(&tags).send().await.unwrap().status(), 200);
+    // Add a key to the LIVE config file the daemon reads, then reload:
+    // enforcement must flip without a restart (F-G4-1 forward).
+    let cfg_path = ts.state.sup.dirs.config_file();
+    let pristine = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    std::fs::write(
+        &cfg_path,
+        format!("{pristine}\n[[keys]]\nname = \"k1\"\nkey = \"plm_e2e_reload\"\n"),
+    )
+    .unwrap();
+    let r = c
+        .post(format!("{}/api/config/reload", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    let note = body["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("api keys applied live"),
+        "receipt names the keys dimension: {note}"
+    );
+    assert_eq!(
+        c.get(&tags).send().await.unwrap().status(),
+        401,
+        "authless denied after keys land"
+    );
+    assert_eq!(
+        c.get(&tags)
+            .bearer_auth("plm_e2e_reload")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the reloaded key authenticates"
+    );
+    // Reverse: strip the keys, reload, and enforcement must OPEN again
+    // (F-G4-2 - the direction that once left ghost enforcement).
+    // Rotation: replace k1 with k2, reload authenticated with the OLD
+    // key (still valid at gate time). Stripping to ZERO keys would end
+    // authless mode, where a stale bearer is just an ignored header -
+    // removal is only observable while another key keeps mode live.
+    std::fs::write(
+        &cfg_path,
+        format!("{pristine}\n[[keys]]\nname = \"k2\"\nkey = \"plm_e2e_rotate\"\n"),
+    )
+    .unwrap();
+    let r = c
+        .post(format!("{}/api/config/reload", ts.base))
+        .bearer_auth("plm_e2e_reload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        c.get(&tags).send().await.unwrap().status(),
+        401,
+        "authless stays denied while a key remains"
+    );
+    // The rotated-out key no longer authenticates.
+    assert_eq!(
+        c.get(&tags)
+            .bearer_auth("plm_e2e_reload")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "removed key stops authenticating"
+    );
+    // Its replacement does.
+    assert_eq!(
+        c.get(&tags)
+            .bearer_auth("plm_e2e_rotate")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the rotated-in key authenticates"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__ollama_evict_accepts_the_tags_rendered_name() {
     let ts = start(Config::default()).await;
     let c = client();
@@ -4428,6 +4562,101 @@ async fn e2e__remote_failover_circuit_and_lb() {
     );
     ts.state.sup.shutdown_all().await.unwrap();
     target.state.sup.shutdown_all().await.unwrap();
+}
+
+/// The remotes lane must forward request bodies with a fixed
+/// `content-length`, never `transfer-encoding: chunked`: chunked
+/// framing is legal HTTP, but OpenAI-compatible peers built on
+/// Python's `http.server` (litert-lm serve and friends) cannot decode
+/// chunked request bodies and answer 400 "Invalid JSON" before their
+/// handler runs. A hand-rolled one-shot peer records the exact bytes
+/// it received and enforces the framing contract the stub-llama-server
+/// cannot discriminate (hyper happily reads chunked).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__remote_forward__request_body_fixed_length_not_chunked() {
+    // One-shot raw peer: capture the request head + body, reply with a
+    // minimal OpenAI chat completion.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+    let seen_tx = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        // Read until the head terminator, then content-length more.
+        let head_end = loop {
+            let n = sock.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "peer closed before sending a head");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let clen = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or_else(|| panic!("no content-length in forwarded head: {head}"));
+        while buf.len() < head_end + clen {
+            let n = sock.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "peer closed mid-body");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let body = String::from_utf8_lossy(&buf[head_end..head_end + clen]).into_owned();
+        *seen_tx.lock().unwrap() = Some((head, body));
+        let resp = r#"{"id":"t","object":"chat.completion","created":0,"model":"any","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+        let http = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            resp.len(),
+            resp
+        );
+        sock.write_all(http.as_bytes()).await.unwrap();
+        sock.shutdown().await.ok();
+    });
+
+    let cfg = Config {
+        remotes: vec![blazar_core::config::Remote {
+            name: "raw".into(),
+            url: format!("http://127.0.0.1:{port}"),
+            key: String::new(),
+            allow_insecure_http: false,
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let resp = client()
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"raw:any","messages":[{"role":"user","content":"hi"}],"max_tokens":4}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "raw peer answered");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "ok");
+
+    let got = seen.lock().unwrap().take().expect("peer saw a request");
+    let head_lc = got.0.to_ascii_lowercase();
+    assert!(
+        !head_lc.contains("transfer-encoding"),
+        "forwarded head must not frame the body as chunked: {}",
+        got.0
+    );
+    // rewrite_model strip + honest content-length: the body the peer
+    // decoded names the remote model and is valid JSON.
+    let fwd: serde_json::Value = serde_json::from_str(&got.1).expect("peer body is valid JSON");
+    assert_eq!(fwd["model"], "any", "model prefix stripped in flight");
+    ts.state.sup.shutdown_all().await.unwrap();
 }
 
 /// Opt-out lane: `child_auth = false` keeps children open (legacy

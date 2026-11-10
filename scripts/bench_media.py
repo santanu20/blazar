@@ -313,6 +313,7 @@ def environment_block(gateway: str, store_path: str, note: str) -> dict:
     try:
         q = subprocess.run(
             check=False,
+            timeout=10,
             args=[
                 "nvidia-smi",
                 "--query-gpu=name,driver_version,memory.total",
@@ -737,9 +738,7 @@ IMAGE_CSV = ["mode", "rep", "wall_s", "bytes", "valid_png", "vram_watermark_mib"
 
 def _sd_argv(row: dict, engines_root: str, port: int) -> tuple[list[str], str]:
     """Build a direct sd-server argv from the store row: the row IS the contract."""
-    _, bin_path = find_binary(
-        engines_root, "master-1", ["sd-server", "sdcpp-server"]
-    )
+    _, bin_path = find_binary(engines_root, "master-1", ["sd-server", "sdcpp-server"])
     argv = [
         bin_path,
         "--listen-ip",

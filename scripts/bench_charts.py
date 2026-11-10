@@ -61,6 +61,7 @@ KIND_PREFIX = {
     "sglang": "sglang",
     "piper": "piper",
     "mlx": "MLX",
+    "openaihost": "LiteRT-LM",
 }
 
 

@@ -23,6 +23,7 @@ pub const HEADER: &str = "x-blazar-cascade";
 /// Process-wide counters surfaced in `/metrics`.
 pub(crate) static CASCADE_RUNS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CASCADE_ESCALATIONS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CASCADE_DEGRADES: AtomicU64 = AtomicU64::new(0);
 
 /// Candidates per cascade request (a chain longer than this is a topology
 /// error, not a routing request).
@@ -57,7 +58,6 @@ pub(crate) fn resolve_cascade(
             .map(str::to_string)
             .collect::<Vec<_>>()
     });
-    let header_pinned = header_names.is_some();
     let has_body_field = req.get("cascade").is_some();
     let names = match (header_names, body_names) {
         (Some(h), _) => h,
@@ -78,12 +78,8 @@ pub(crate) fn resolve_cascade(
             names.len()
         ));
     }
-    if let Some(arr) = req.get("cascade").and_then(|c| c.as_array())
-        && !header_pinned
-        && arr.is_empty()
-    {
-        return Err("cascade list is empty - name at least one model".into());
-    }
+    // (an explicitly empty `cascade: []` body falls through to the
+    // names.is_empty() refusal above - no separate branch needed)
     Ok(Some(names))
 }
 
@@ -141,6 +137,21 @@ fn cascade_header(tried: &[String], served_idx: usize, reason: &str) -> String {
 /// Returns `None` when the request had no cascade ask - the caller's
 /// normal path continues untouched.
 #[allow(clippy::too_many_lines)]
+/// A mid-run cascade failure must not vanish into the caller's plain
+/// single-model path - the client asked for a chain, and a silent
+/// downgrade would serve a different contract unmarked. The degrade
+/// mirrors best-of's vocabulary: teaching error, chain header stamped
+/// with the reason, counter bumped.
+pub(crate) fn degrade(tried: &[String], failed_idx: usize, reason: &str, msg: &str) -> Response {
+    CASCADE_DEGRADES.fetch_add(1, Ordering::Relaxed);
+    let hdr = cascade_header(tried, failed_idx, reason);
+    let mut resp = crate::ollama::api_error(502, msg);
+    if let Ok(v) = axum::http::HeaderValue::from_str(&hdr) {
+        resp.headers_mut().insert(HEADER, v);
+    }
+    resp
+}
+
 pub(crate) async fn run(
     state: &Arc<AppState>,
     trace_ext: Option<Extension<TraceId>>,
@@ -197,6 +208,7 @@ pub(crate) async fn run(
 
     let mut cleaned = headers.clone();
     cleaned.remove(HEADER);
+
     let mut child_req = req.clone();
     child_req["model"] = Value::String(tried[0].clone());
     if let Some(obj) = child_req.as_object_mut() {
@@ -209,7 +221,18 @@ pub(crate) async fn run(
         if i > 0 {
             child_req["model"] = Value::String(name.clone());
         }
-        let bytes = Bytes::from(serde_json::to_vec(&child_req).ok()?);
+        // A body that parsed cannot realistically fail to
+        // re-serialize - but if it ever does, say so instead of
+        // falling out of the cascade silently.
+        let Ok(encoded) = serde_json::to_vec(&child_req) else {
+            return Some(degrade(
+                &tried,
+                i,
+                "request-encode",
+                "cascade could not re-encode the request body - send the prompt to one model directly",
+            ));
+        };
+        let bytes = Bytes::from(encoded);
         // Boxed: this re-entry is the recursive edge (chat -> run -> chat);
         // the indirection keeps the future sized (E0733).
         let resp = Box::pin(crate::ollama::chat(
@@ -221,9 +244,17 @@ pub(crate) async fn run(
         ))
         .await;
         let status = resp.status();
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
-            .await
-            .ok()?;
+        // Over-cap (or transport-dead) candidate body: the old code
+        // returned None here, silently serving the request as a
+        // plain single-model call with no chain semantics at all.
+        let Ok(body_bytes) = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await else {
+            return Some(degrade(
+                &tried,
+                i,
+                "response-cap",
+                "cascade candidate response exceeded the 8 MiB read-back cap - send the prompt to one model directly",
+            ));
+        };
         let body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
         let (schema_ok, stop) = candidate_pass(&state.sentinel, status, &body, schema);
         attempts.push((status, body));
@@ -377,4 +408,37 @@ mod tests {
             "tried=small,big served=big reason=escalated"
         );
     }
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn unit__degrade__teaches_with_header_and_counts() {
+    // The mid-run degrade (response-cap, encode failure) must be loud:
+    // 502 + x-blazar-cascade header carrying tried/served/reason and
+    // the shared counter bumped - never a silent plain-path vanish.
+    let before = CASCADE_DEGRADES.load(std::sync::atomic::Ordering::Relaxed);
+    let tried = vec!["a".to_string(), "b".to_string()];
+    let resp = degrade(
+        &tried,
+        0,
+        "response-cap",
+        "cascade candidate response exceeded the 8 MiB read-back cap",
+    );
+    assert_eq!(resp.status(), 502);
+    let hdr = resp
+        .headers()
+        .get(HEADER)
+        .expect("degrade carries the cascade header")
+        .to_str()
+        .unwrap();
+    assert!(hdr.contains("tried=a,b"), "header names the chain: {hdr}");
+    assert!(
+        hdr.contains("reason=response-cap"),
+        "header names why: {hdr}"
+    );
+    assert_eq!(
+        CASCADE_DEGRADES.load(std::sync::atomic::Ordering::Relaxed),
+        before + 1,
+        "counter bumps once per degrade"
+    );
 }

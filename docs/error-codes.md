@@ -62,6 +62,9 @@ test pins this table against the enum, so the two cannot drift.
 | `FLEET_TOKEN_REQUIRED` | 401 | a fleet worker tried to join without the shared secret this gateway requires | start the worker with the gateway's fleet_token (`blazar rpc worker --fleet-token <token>`) or set fleet_open = true on a trusted network |
 | `BAD_REQUEST` | 400 | malformed or invalid request (generic) | fix the request body per the API docs |
 | `NOT_FOUND` | 404 | resource not found (generic) | check the resource id and route |
+| `FORBIDDEN` | 403 | request refused by an authorization gate (generic) | check the key scopes / fleet token the gate names, or use a management key |
+| `METHOD_NOT_ALLOWED` | 405 | the route exists but not for this HTTP method | check the Allow header this response carries |
+| `UNSUPPORTED_MEDIA_TYPE` | 415 | the endpoint requires an application/json body | send Content-Type: application/json |
 | `PAYLOAD_TOO_LARGE` | 413 | request body too large | send a smaller body |
 | `UNPROCESSABLE` | 422 | request semantically invalid for this surface | fix the request semantics |
 | `BAD_GATEWAY` | 502 | invalid response from the engine child (generic) | retry; check daemon logs if persistent |
