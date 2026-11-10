@@ -2307,8 +2307,11 @@ async fn restart_daemon_if_active_changed(prior: Option<String>, new_active: Opt
 
 #[tokio::main]
 // Pure one-call-per-arm dispatch over 30+ commands; splitting arms into
-// helpers would add indirection without lowering complexity.
-#[allow(clippy::too_many_lines)]
+// helpers would add indirection without lowering complexity. The flat
+// dispatch inflates the future past clippy's 16 KiB threshold on
+// windows targets (path/alignment machinery); one-shot CLI path, no
+// recursion - boxing every arm would cost allocs for nothing.
+#[allow(clippy::too_many_lines, clippy::large_future)]
 async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Serve => serve().await,
