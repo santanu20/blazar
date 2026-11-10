@@ -143,14 +143,33 @@ pub(crate) fn uv_available() -> bool {
 /// Create the venv + install sglang + write the shim inside `dir`.
 /// `dir` must exist and be empty; on failure the caller removes `dir`
 /// (F88 discipline lives with the `EngineManager` entry point).
-#[allow(clippy::too_many_lines)] // linear lane build: preflight, venv, wheels, shim, boot-smoke
-pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
+/// `extras` are verbatim pip specs (e.g. a git plugin like
+/// `sglang-dspine @ git+https://github.com/tencent/dspine.git`) layered
+/// onto the venv AFTER the base install and the CUDA-compiler pin, with
+/// the shim's exact toolchain env (PATH + `CUDA_HOME` + engine caches) so
+/// plugin kernels that compile at pip-install time find the bundled
+/// nvcc, not a mismatched system one.
+#[allow(clippy::too_many_lines)] // linear lane build: preflight, venv, wheels, shim, extras, boot-smoke
+pub async fn install_into(dir: &Path, version: &str, extras: &[String]) -> Result<PathBuf> {
     if !cfg!(target_os = "linux") {
         anyhow::bail!(
             "sglang upstream supports Linux (CUDA/ROCm); {} installs are not \
              supported by the engine itself",
             std::env::consts::OS
         );
+    }
+    let extras: Vec<&str> = extras
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if extras.len()
+        != extras
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    {
+        anyhow::bail!("duplicate --with package specs: {extras:?}");
     }
     let avail = disk_avail_bytes(dir).context("disk preflight")?;
     if avail < SGLANG_MIN_DISK_BYTES {
@@ -287,6 +306,47 @@ pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&cache).context("create engine cache dir")?;
     std::fs::write(&shim, script).context("write sglang-server shim")?;
     make_executable(&shim)?;
+
+    // Extra pip specs (plugins first-party to this lane): installed
+    // AFTER the base wheels + compiler pin so the pin's coherent nvcc
+    // is already in place, under the shim's exact env - sglang plugins
+    // (e.g. sglang-dspine) build their CUDA kernels at pip-install via
+    // ninja, so a missing CUDA_HOME or a system nvcc mismatched to the
+    // torch wheels kills the build here. Resolving may legitimately
+    // re-pin torch/flashinfer when the plugin requires a different
+    // line - that is the plugin's own dependency contract, and the
+    // boot smoke below still gates the result.
+    if !extras.is_empty() {
+        let inherited_path = std::env::var("PATH").unwrap_or_default();
+        let mut extra_cmd = if use_uv {
+            let mut c = tokio::process::Command::new("uv");
+            c.arg("pip")
+                .arg("install")
+                .arg("--prerelease=allow")
+                .arg("--python")
+                .arg(&venv_python);
+            c
+        } else {
+            let mut c = tokio::process::Command::new(&venv_python);
+            c.arg("-m").arg("pip").arg("install");
+            c
+        };
+        extra_cmd.args(&extras);
+        extra_cmd
+            .env("PATH", format!("{path_prefix}:{inherited_path}"))
+            .env("SGLANG_CACHE_DIR", &cache)
+            .env("FLASHINFER_WORKSPACE_BASE", &cache);
+        if let Some(root) = &toolkit {
+            extra_cmd.env("CUDA_HOME", root);
+        }
+        let specs = extras.join(" ");
+        run_streaming(
+            &mut extra_cmd,
+            &format!("install lane extras ({specs})"),
+            SGLANG_INSTALL_TIMEOUT_SECS,
+        )
+        .await?;
+    }
 
     // Boot smoke: the `--version` probes (install register, doctor,
     // supervisor rollback gate) exit before the deep imports, so a venv

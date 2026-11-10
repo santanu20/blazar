@@ -1,0 +1,86 @@
+name: sglang-upstream-watch
+
+# DSpine reaches Blazar's sglang lane as a first-class spec mode today
+# via the version-pinned sglang-dspine plugin lane (venv-per-tag pip
+# extra, `blazar engine install <ver> --kind sglang --with ...`). The
+# day upstream sglang ships DSPINE natively in SpeculativeAlgorithm,
+# the stock lane's manifest probe picks it up with zero source changes
+# and the plugin lane becomes prunable. This watch files the issue that
+# starts that cleanup so it does not depend on someone remembering to
+# look. Green and silent when nothing changed; every issue path is
+# deduped against open issues so weekly reruns stay idempotent.
+on:
+  schedule:
+    # Weekly, Monday 04:00 UTC - quiet window for all timezones.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    name: DSPINE upstream + plugin pin drift
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # The plugin lane this repo documents pins this sglang version
+      # (docs/engines.md, sglang-dspine plugin lane). When the plugin's
+      # own pin moves past it, the lane can rebase to a newer venv.
+      KNOWN_PLUGIN_PIN: "0.5.22"
+    steps:
+      - name: DSPINE in upstream SpeculativeAlgorithm?
+        run: |
+          set -euo pipefail
+          url="https://raw.githubusercontent.com/sgl-project/sglang/main/python/sglang/srt/speculative/spec_info.py"
+          if ! curl -fsSL "$url" -o spec_info.py; then
+            title="sglang upstream watch: spec_info.py moved"
+            open="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title" --json number --jq '.[0].number // empty')"
+            if [ -z "$open" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body \
+                "The upstream watch URL 404s - sglang renamed or moved
+                $url
+                Update this workflow's URL to the new path; nothing else
+                is affected."
+            fi
+            exit 0
+          fi
+          if grep -qE '\bDSPINE\b' spec_info.py; then
+            title="DSPINE is upstream in sglang - prune the plugin lane"
+            open="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title" --json number --jq '.[0].number // empty')"
+            if [ -z "$open" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body \
+                "Upstream sglang main now registers DSPINE in
+                SpeculativeAlgorithm (python/sglang/srt/speculative/spec_info.py).
+                Blazar needs zero source changes: the stock lane manifest
+                probe (probe_version 3+) already discovers plugin and
+                native algorithms alike, spec = \"dspine\" resolves against
+                the catalog pair, and the capability gate turns green on
+                the first stock lane that carries it. Cleanup that can
+                follow once a released sglang version ships it: drop the
+                plugin-lane install example from docs/engines.md and
+                simplify registry/draft-pairings.json wording from
+                \"native upstream or plugin lane\" to the stock lane."
+            fi
+          fi
+      - name: sglang-dspine plugin pin drift
+        run: |
+          set -euo pipefail
+          if ! curl -fsSL "https://raw.githubusercontent.com/Tencent/DSpine/main/pyproject.toml" -o dspine-pyproject.toml; then
+            exit 0  # repo moved/renamed: the DSPINE-upstream step owns the story
+          fi
+          pin="$(grep -oE 'sglang[[:space:]]*==[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+' dspine-pyproject.toml | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+          if [ -n "$pin" ] && [ "$pin" != "$KNOWN_PLUGIN_PIN" ]; then
+            title="sglang-dspine plugin pin moved to $pin - lane can rebase"
+            open="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title" --json number --jq '.[0].number // empty')"
+            if [ -z "$open" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body \
+                "Tencent/DSpine now pins sglang == $pin (was $KNOWN_PLUGIN_PIN).
+                The documented plugin-lane install can move to a
+                sglang-$pin venv; lane installs are independent
+                (venv-per-tag), so nothing migrates - update
+                docs/engines.md and re-validate with the spec-race
+                receipts on the new lane."
+            fi
+          fi

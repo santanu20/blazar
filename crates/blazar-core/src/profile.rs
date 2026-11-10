@@ -288,6 +288,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     if input.engine_kind == crate::engine_kind::EngineKind::Mlx {
         return compile_mlx(input);
     }
+    // Dialect fork: litert-lm serve owns its whole launch grammar
+    // (--host/--port) AND the model registry it serves - there is no
+    // per-model argv at all. The supervisor collapses every .litertlm
+    // spawn onto one shared serve child (router-key pattern), so this
+    // profile carries only flag-gated user extra_args and reports the
+    // lane as runtime-managed (no ctx/KV math exists to compile).
+    if input.engine_kind == crate::engine_kind::EngineKind::OpenAiHost {
+        return compile_openaihost(input);
+    }
     // The llama-server grammar below is GGUF-only: every rule reads GGUF
     // tensor metadata. A safetensors row on a GGUF engine is a routing
     // mistake - teach instead of crashing deep in a rule.
@@ -1148,6 +1157,17 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                     .into(),
             );
         }
+    } else if spec_mode == "dspine" {
+        // DSpine (arXiv 2609.36173) is a trained parallel drafter that
+        // lives on the sglang side - its drafts are safetensors dirs and
+        // no GGUF engine advertises it. Refuse with the lane move
+        // instead of a silent dense boot the user never asked for.
+        return Err(format!(
+            "spec = \"dspine\" (DSpine parallel drafter) rides the sglang \
+             engine; engine {} is llama.cpp - run: blazar engine use --kind \
+             sglang and pair the draft (blazar pull tencent/Qwen3-8B-DSpine-b16)",
+            input.engine_tag
+        ));
     } else if let Some(spec_val) = match spec_mode {
         "eagle3" => Some("draft-eagle3"),
         "dflash" => Some("draft-dflash"),
@@ -1629,6 +1649,18 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             argv.push(moe_cache_mib.to_string());
         } else {
             warnings.push("moe_cache_mib skipped: engine lacks --moe-cache-mib".into());
+        }
+    }
+    // MoE cache misses computed on the CPU from host experts instead of
+    // uploaded to the GPU once the cache is full (llama.cpp #30966).
+    // 0.0 keeps the engine default (off).
+    let moe_cache_cpu_share = input.config.effective_moe_cache_cpu_share(input.model_name);
+    if moe_cache_cpu_share > 0.0 {
+        if input.supported_flags.contains("--moe-cache-cpu-share") {
+            argv.push("--moe-cache-cpu-share".into());
+            argv.push(moe_cache_cpu_share.to_string());
+        } else {
+            warnings.push("moe_cache_cpu_share skipped: engine lacks --moe-cache-cpu-share".into());
         }
     }
     if !input.config.load_mode.is_empty() {
@@ -3987,6 +4019,10 @@ fn sdcpp_extra_args(
         "--clip_g",
         "--clip_vision",
         "--qwen2vl_vision",
+        "--tokenizer",
+        "--audio-vae",
+        "--embeddings-connectors",
+        "--high-noise-diffusion-model",
         "-t",
         "--threads",
     ];
@@ -4052,9 +4088,42 @@ const SGLANG_MEM_FRACTION_MAX: f32 = 0.90;
 /// 0.68 (~2.7 GiB left) served green, and the bench-calibrated tight-fit
 /// fixture boots green at 2.0 GiB left on a 12 GiB card. The pool share
 /// scales with VRAM, this reserve does not, so it is expressed in MiB
-/// and only bites small cards (8 GiB -> ceiling 0.75; 24 GiB -> 0.90, the
+/// and only bites small cards (8 GiB -> ceiling ~0.79; 24 GiB -> 0.90, the
 /// band max).
-const SGLANG_ACTIVATION_RESERVE_MIB: u64 = 2_000;
+///
+/// Spec-aware since 2026-11-09: a dense spawn pays no speculative verify
+/// chain, and direct-engine A/B receipts on the same 8 GiB card
+/// (RTX 4070 Laptop, `Qwen3-8B` AWQ, sglang 0.5.22) bracket the true
+/// dense dynamic floor: `mem-fraction-static 0.80` (1638 MiB dynamic)
+/// served green at 47 tok/s while 0.85 (1228 MiB) OOM'd during
+/// workspace allocation - and the engine's own load check refused
+/// anything below 0.772. The dense reserve therefore lands at 1750 MiB
+/// (the proven-green point plus margin), keeping the 8 GiB ceiling
+/// (0.786) inside the engine's viable window [0.772, 0.83]. Speculative
+/// spawns keep the original 2000 MiB posture untouched - their graph
+/// and prewarm receipts (2026-10-16 DFLASH class) calibrated against it.
+const SGLANG_DENSE_DYNAMIC_RESERVE_MIB: u64 = 1_750;
+const SGLANG_SPEC_DYNAMIC_BASE_RESERVE_MIB: u64 = 2_000;
+
+/// Dynamic-side reserve for a spawn: the spec baseline keeps its
+/// receipt-calibrated posture; a dense spawn pays the smaller
+/// direct-engine-calibrated floor.
+fn sglang_dynamic_reserve_mib(spec_engaged: bool) -> u64 {
+    if spec_engaged {
+        SGLANG_SPEC_DYNAMIC_BASE_RESERVE_MIB
+    } else {
+        SGLANG_DENSE_DYNAMIC_RESERVE_MIB
+    }
+}
+
+/// Smallest KV pool the ladder ever promises the static side, even when
+/// the ctx-scaled estimate is smaller. Receipt (2026-11-09, qwen3-8b-awq
+/// on an 8 GiB RTX 4070 Laptop, sglang 0.5.22): the derive emitted
+/// 0.743 with a ~148 MiB KV estimate while the engine's load check
+/// demanded "minimum viable 0.772" - it refuses to boot without a real
+/// pool beyond the bare estimate. Charging this floor keeps the derived
+/// fraction above that refusal line on tight cards.
+const SGLANG_MIN_KV_POOL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Host RAM sglang itself refuses to touch for the hierarchical KV tier
 /// (`HICACHE_HOST_MEMORY_RESERVE_BYTES = 10 GiB`,
@@ -4305,6 +4374,71 @@ fn mlx_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
     Ok(extra.clone())
 }
 
+fn compile_openaihost(input: &ProfileInput<'_>) -> Result<Profile, String> {
+    // Meta is deliberately not inspected: a `.litertlm` bundle is opaque
+    // to Blazar (the host runtime owns decoding, context, and memory),
+    // and the lane's single shared child is spawned from a synthetic row
+    // whose meta carries no facts worth branching on.
+    let mut warnings: Vec<String> = Vec::new();
+    let argv = openaihost_extra_args(input)?;
+    if !argv.is_empty() {
+        // Preview/spawn convergence: every surface that renders this
+        // profile (CLI compile previews, bench receipts, doctor) must
+        // state that the supervised lane will NOT pass these flags -
+        // the lane child is ONE shared registry server with no
+        // per-model argv.
+        warnings.push(
+            "supervised lane note: the openaihost child is one shared registry \
+             server - these extra_args apply only when running the venv child \
+             directly, never through blazar's supervised lane"
+                .to_string(),
+        );
+    }
+    push_nonllama_vocab_teaching(input.config, "openaihost", &mut warnings);
+    // Observability contract (mlx precedent): the host runtime manages
+    // admission inside itself, so there is no compiled ctx window or
+    // planned KV bytes to report - ps reads the lane as runtime-managed.
+    Ok(Profile {
+        argv,
+        warnings,
+        ctx: 0,
+        gpu: "auto",
+        vram_mib: input.hardware.total_vram_mib(),
+        kv_est_bytes: None,
+        ctx_autofit: None,
+        capacity: CapacityStatus::RuntimeManaged,
+    })
+}
+
+/// Flag-gated `extra_args` for the `openaihost` lane. The listen pair is
+/// owned by the spawn path (`serve --host/--port` from the supervisor's
+/// endpoint pick) and `--config` would silently relocate the model
+/// registry the store rows already name - all three are reserved.
+fn openaihost_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
+    const RESERVED: &[&str] = &["--host", "--port", "--config"];
+    let Some(extra) = &input.overlay.extra_args else {
+        return Ok(Vec::new());
+    };
+    for tok in extra {
+        if !tok.starts_with('-') {
+            continue; // value token riding its preceding flag
+        }
+        if RESERVED.contains(&tok.as_str()) {
+            return Err(format!(
+                "extra_args {tok} is reserved - blazar owns it on the openaihost engine \
+                 (listen pins + registry location); remove it from the override"
+            ));
+        }
+        if !input.supported_flags.contains(tok.as_str()) {
+            return Err(format!(
+                "extra_args {tok} is not a flag of this litert-lm build; remove it or \
+                 run: blazar engine update"
+            ));
+        }
+    }
+    Ok(extra.clone())
+}
+
 fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Profile, String> {
     let mut argv: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -4329,10 +4463,11 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     let slots = sglang_resolve_slots(input, &mut argv, &mut warnings);
     // --- loras: PEFT adapters only; the gguf/.bin gate errors here.
     push_sglang_loras(input, &mut argv, &mut warnings)?;
-    // --- speculative: draft-free knobs (ngram) or the EAGLE3
-    // pair; the engage verdict (and draft dir) feeds the fit
-    // ladder's reserve and static-side draft charge.
-    let spec = push_sglang_speculative(input, &tun, &mut argv, &mut warnings);
+    // --- speculative: draft-free knobs (ngram) or the draft pair
+    // (EAGLE3 / DSPINE by spec mode); the engage verdict (and draft
+    // dir) feeds the fit ladder's reserve and static-side draft
+    // charge. A probed-algorithm mismatch hard-errors here.
+    let spec = push_sglang_speculative(input, &tun, &mut argv, &mut warnings)?;
     // --- llama-vocabulary knobs that do NOT translate: teach here.
     push_sglang_vocab_teaching(input, &mut warnings);
     // --- the fit ladder: tier selection + mem-fraction derive.
@@ -5300,16 +5435,19 @@ fn push_sglang_loras(
 }
 
 /// Speculative decoding for the sglang lane. Two lanes:
-/// (1) draft-free self-speculation via the `sglang.spec_algorithm` knob
-///     ("ngram" -> NGRAM): the context drafts from itself, no weights
-///     to pull, no admission change beyond verify-KV. DFLASH is not
-///     knob-reachable: sglang 0.5.21 hard-requires a draft model path
-///     for it (2026-10-09 live receipt: `ValueError` at spawn), so it
-///     belongs to the draft-pair lane when that grows DFLASH pairs;
-/// (2) the EAGLE3 draft pair via the resolved `draft_path` - sglang rows
-///     resolve `spec = "eagle3"`-class drafts as safetensors dirs; the
-///     manifest carries no `spec_types` for sglang (no --spec-type flag
-///     upstream), so both lanes gate on flags. A GGUF file is never a
+/// (1) the `sglang.spec_algorithm` knob: "ngram" drafts from the
+///     context itself (no weights to pull); "dflash" and "dspine"
+///     ride trained draft heads and hard-require `spec_draft_path`
+///     (dflash: 2026-10-09 live receipt, `ValueError` at spawn without
+///     the path; `DSpine` is a trained parallel drafter - same class).
+/// (2) the draft pair via the resolved `draft_path` - sglang rows
+///     resolve `spec = "eagle3"`/`"dspine"`-class drafts as
+///     safetensors dirs. Algorithm PRESENCE gates on the manifest's
+///     probed `spec_types` (the `SpeculativeAlgorithm` enum names plus
+///     plugin-registered names, e.g. DSPINE from the sglang-dspine
+///     plugin; empty list = lane probed before the column existed ->
+///     legacy flag-presence gating), flag emission still gates on
+///     `supported_flags`. A GGUF file is never a
 ///     valid EAGLE draft here: sglang's loader treats unknown-path
 ///     drafts as HF repo ids and dies in `download_weights_from_hf` -
 ///     the shared spec catalog pairs a text model with a small GGUF
@@ -5387,18 +5525,20 @@ fn push_sglang_spec_depth_knobs(
 /// Resolve the draft dir for a draft-model algorithm on the knob lane:
 /// present + non-empty, not a GGUF file, and served by this engine.
 /// Every refusal teaches (warning) and returns None -> dense spawn.
+/// `algorithm` names the requesting knob in the teaching text (dflash
+/// and dspine share this path - both hard-require draft weights).
 fn sglang_spec_draft_dir<'a>(
     input: &ProfileInput<'_>,
     tun: &'a SglangTuning,
+    algorithm: &str,
     warnings: &mut Vec<String>,
 ) -> Option<&'a str> {
     let Some(draft) = tun.spec_draft_path.as_deref().filter(|p| !p.is_empty()) else {
-        warnings.push(
-            "sglang.spec_algorithm \"dflash\" needs sglang.spec_draft_path - \
+        warnings.push(format!(
+            "sglang.spec_algorithm {algorithm:?} needs sglang.spec_draft_path - \
              a safetensors draft dir; spawning dense (config validation \
              normally catches this at load)"
-                .to_string(),
-        );
+        ));
         return None;
     };
     if draft
@@ -5416,12 +5556,11 @@ fn sglang_spec_draft_dir<'a>(
         .supported_flags
         .contains("--speculative-draft-model-path")
     {
-        warnings.push(
-            "sglang.spec_algorithm \"dflash\" set but this engine lacks \
+        warnings.push(format!(
+            "sglang.spec_algorithm {algorithm:?} set but this engine lacks \
              --speculative-draft-model-path; spawning dense (a blazar \
              engine update revives it)"
-                .to_string(),
-        );
+        ));
         return None;
     }
     Some(draft)
@@ -5446,76 +5585,180 @@ impl SpecEngagement<'_> {
     }
 }
 
+/// Gate a speculative-algorithm emission against the lane's PROBED
+/// vocabulary (`Manifest.spec_types`: the sglang probe fills it with the
+/// `SpeculativeAlgorithm` enum names plus plugin-registered names).
+/// An empty vocabulary = a lane probed before the column existed (or a
+/// probe that failed leniently): keep the historical flag-presence
+/// gating - never a silent refusal on old rows.
+fn sglang_lane_supports_spec(input: &ProfileInput<'_>, upstream: &str) -> Result<(), String> {
+    if input.spec_types.is_empty() || input.spec_types.iter().any(|t| t == upstream) {
+        return Ok(());
+    }
+    let supported = input.spec_types.join(", ");
+    let dspine_hint = if upstream == "DSPINE" {
+        " - DSpine is plugin-delivered until upstream merges it: install a \
+         sglang lane with the plugin (blazar engine install 0.5.22 --kind \
+         sglang --with \"sglang-dspine @ git+https://github.com/tencent/dspine.git\")\
+         and blazar engine reprobe"
+            .to_string()
+    } else {
+        " - run: blazar engine update or blazar engine reprobe".to_string()
+    };
+    Err(format!(
+        "speculative algorithm {upstream} is not registered on engine {} \
+         (probed algorithms: {supported}){dspine_hint}",
+        input.engine_tag
+    ))
+}
+
+/// `DSpine`'s drafter reads the target's output head directly and
+/// hard-requires it unquantized bf16 row-contiguous (the `sglang-dspine`
+/// runtime worker checks `dtype == bf16 && dim == 2 && stride(1) == 1`,
+/// no bypass flag). A quantized target whose `modules_to_not_convert`
+/// list omits `lm_head` wraps the head in its quantizer wrapper and the
+/// spawn dies at engine load with a `ValueError` (live receipt
+/// 2026-11-09: qwen3-8b-awq refused stock; adding `"lm_head"` to the
+/// target config's `quantization_config.modules_to_not_convert` booted
+/// green - and the head check also rejects fp16 targets, hence the
+/// `--dtype bfloat16` companion). Teach the requirement BEFORE the
+/// engine crash. Fail-open posture: unreadable/malformed target config
+/// or an unquantized target stays silent - the engine's own gate is
+/// the loud backstop either way.
+fn warn_dspine_lm_head_requirement(
+    input: &ProfileInput<'_>,
+    upstream: &str,
+    warnings: &mut Vec<String>,
+) {
+    if upstream != "DSPINE" {
+        return;
+    }
+    let Ok(raw) =
+        std::fs::read_to_string(std::path::Path::new(input.model_path).join("config.json"))
+    else {
+        return;
+    };
+    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(quant) = cfg.get("quantization_config") else {
+        return;
+    };
+    let head_excluded = quant
+        .get("modules_to_not_convert")
+        .and_then(|v| v.as_array())
+        .is_some_and(|mods| mods.iter().any(|m| m.as_str() == Some("lm_head")));
+    if !head_excluded {
+        warnings.push(format!(
+            "dspine reads the target lm_head and requires it unquantized \
+             bf16; {} is a quantized target with lm_head inside the \
+             quantizer scope, so the engine will refuse this spawn at load. \
+             Fix: add \"lm_head\" to quantization_config.modules_to_not_convert \
+             in {}/config.json and force --dtype bfloat16 (extra_args), or \
+             pair the draft with a bf16/fp8-native target",
+            input.model_name, input.model_path
+        ));
+    }
+}
+
+/// Knob lane: an explicit `sglang.spec_algorithm` pin owns the spawn and
+/// overrides any resolved draft pair.
+fn push_sglang_spec_knob_lane<'a>(
+    input: &ProfileInput<'a>,
+    tun: &'a SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<Option<SpecEngagement<'a>>, String> {
+    let Some(algorithm) = tun.spec_algorithm.as_deref() else {
+        return Ok(None);
+    };
+    // blazar spelling -> upstream wire name. Config validation
+    // rejects unknown spellings at load; this arm is the defensive
+    // net for programmatically built tunings (tests, future
+    // callers). (upstream, needs_draft): ngram drafts from the
+    // context itself; dflash and dspine ride trained draft heads
+    // and hard-require a draft model (2026-10-09 live receipt:
+    // `ValueError` at spawn without the path).
+    let (upstream, needs_draft) = match algorithm {
+        "ngram" => ("NGRAM", false),
+        "dflash" => ("DFLASH", true),
+        // DSpine parallel drafter (arXiv 2609.36173): wire name
+        // DSPINE, native once upstream merges it, plugin-registered
+        // (sglang-dspine, entry point group sglang.srt.plugins)
+        // until then - the probed-vocabulary gate below accepts
+        // either without Blazar caring which lane delivers it.
+        "dspine" => ("DSPINE", true),
+        other => {
+            warnings.push(format!(
+                "sglang.spec_algorithm {other:?} is not a knob-lane algorithm \
+                 (supported: ngram draft-free, dflash/dspine via spec_draft_path); \
+                 spawning dense - the EAGLE family rides the draft-pair lane \
+                 (spec = \"eagle3\")"
+            ));
+            return Ok(Some(SpecEngagement::dense()));
+        }
+    };
+    sglang_lane_supports_spec(input, upstream)?;
+    if !input.supported_flags.contains("--speculative-algorithm") {
+        warnings.push(format!(
+            "sglang.spec_algorithm {algorithm} set but this engine lacks \
+             --speculative-algorithm; spawning dense (a blazar engine update \
+             revives it)"
+        ));
+        return Ok(Some(SpecEngagement::dense()));
+    }
+    let draft = if needs_draft {
+        let Some(d) = sglang_spec_draft_dir(input, tun, algorithm, warnings) else {
+            return Ok(Some(SpecEngagement::dense()));
+        };
+        Some(d)
+    } else {
+        None
+    };
+    if input.draft_path.is_some() {
+        warnings.push(
+            "sglang.spec_algorithm pin overrides the resolved EAGLE3 draft \
+             pair - the explicit knob owns the spawn"
+                .into(),
+        );
+    }
+    argv.push("--speculative-algorithm".into());
+    argv.push(upstream.into());
+    if let Some(draft) = draft {
+        argv.push("--speculative-draft-model-path".into());
+        argv.push(draft.to_string());
+    }
+    warn_dspine_lm_head_requirement(input, upstream, warnings);
+    // Block-size shaping is DFlash's own knob (block-diffusion
+    // lookahead); DSpine's acceptance machinery ignores it, so emit
+    // only for the algorithm that consumes it.
+    if algorithm == "dflash"
+        && let Some(v) = tun.speculative_dflash_block_size
+    {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.speculative_dflash_block_size",
+            "--speculative-dflash-block-size",
+            &v.to_string(),
+            warnings,
+        );
+    }
+    push_sglang_spec_depth_knobs(input, tun, argv, warnings);
+    Ok(Some(SpecEngagement {
+        engaged: true,
+        draft_dir: draft,
+    }))
+}
+
 fn push_sglang_speculative<'a>(
     input: &ProfileInput<'a>,
     tun: &'a SglangTuning,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
-) -> SpecEngagement<'a> {
-    if let Some(algorithm) = tun.spec_algorithm.as_deref() {
-        // blazar spelling -> upstream enum. Config validation rejects
-        // unknown spellings at load; this arm is the defensive net for
-        // programmatically built tunings (tests, future callers).
-        // (upstream, needs_draft): ngram drafts from the context
-        // itself; dflash rides the EAGLE-family draft machinery and
-        // hard-requires a draft model (2026-10-09 live receipt:
-        // `ValueError` at spawn without the path).
-        let (upstream, needs_draft) = match algorithm {
-            "ngram" => ("NGRAM", false),
-            "dflash" => ("DFLASH", true),
-            other => {
-                warnings.push(format!(
-                    "sglang.spec_algorithm {other:?} is not a knob-lane algorithm \
-                     (supported: ngram draft-free, dflash via spec_draft_path); spawning \
-                     dense - the EAGLE family rides the draft-pair lane (spec = \"eagle3\")"
-                ));
-                return SpecEngagement::dense();
-            }
-        };
-        if !input.supported_flags.contains("--speculative-algorithm") {
-            warnings.push(format!(
-                "sglang.spec_algorithm {algorithm} set but this engine lacks \
-                 --speculative-algorithm; spawning dense (a blazar engine update \
-                 revives it)"
-            ));
-            return SpecEngagement::dense();
-        }
-        let draft = if needs_draft {
-            let Some(d) = sglang_spec_draft_dir(input, tun, warnings) else {
-                return SpecEngagement::dense();
-            };
-            Some(d)
-        } else {
-            None
-        };
-        if input.draft_path.is_some() {
-            warnings.push(
-                "sglang.spec_algorithm pin overrides the resolved EAGLE3 draft \
-                 pair - the explicit knob owns the spawn"
-                    .into(),
-            );
-        }
-        argv.push("--speculative-algorithm".into());
-        argv.push(upstream.into());
-        if let Some(draft) = draft {
-            argv.push("--speculative-draft-model-path".into());
-            argv.push(draft.to_string());
-        }
-        if needs_draft && let Some(v) = tun.speculative_dflash_block_size {
-            push_tuned(
-                argv,
-                input.supported_flags,
-                "sglang.speculative_dflash_block_size",
-                "--speculative-dflash-block-size",
-                &v.to_string(),
-                warnings,
-            );
-        }
-        push_sglang_spec_depth_knobs(input, tun, argv, warnings);
-        return SpecEngagement {
-            engaged: true,
-            draft_dir: draft,
-        };
+) -> Result<SpecEngagement<'a>, String> {
+    if let Some(engagement) = push_sglang_spec_knob_lane(input, tun, argv, warnings)? {
+        return Ok(engagement);
     }
     if let Some(draft) = input.draft_path {
         if draft
@@ -5532,15 +5775,25 @@ fn push_sglang_speculative<'a>(
                 .supported_flags
                 .contains("--speculative-draft-model-path")
         {
+            // Pair lane: the resolved spec mode picks the wire name -
+            // DSpine drafts pair with DSPINE, every other resolved
+            // draft is an EAGLE-family head.
+            let upstream = if input.spec_mode == "dspine" {
+                "DSPINE"
+            } else {
+                "EAGLE3"
+            };
+            sglang_lane_supports_spec(input, upstream)?;
             argv.push("--speculative-algorithm".into());
-            argv.push("EAGLE3".into());
+            argv.push(upstream.into());
             argv.push("--speculative-draft-model-path".into());
             argv.push(draft.to_string());
+            warn_dspine_lm_head_requirement(input, upstream, warnings);
             push_sglang_spec_depth_knobs(input, tun, argv, warnings);
-            return SpecEngagement {
+            return Ok(SpecEngagement {
                 engaged: true,
                 draft_dir: Some(draft),
-            };
+            });
         } else {
             warnings.push(format!(
                 "spec draft {draft} resolved but this sglang engine lacks the \
@@ -5548,7 +5801,7 @@ fn push_sglang_speculative<'a>(
             ));
         }
     }
-    SpecEngagement::dense()
+    Ok(SpecEngagement::dense())
 }
 
 /// llama-vocabulary knobs that do NOT translate: `cache_type` is
@@ -6068,7 +6321,7 @@ fn sglang_tier_c_host_offload(
 /// EMITTED offload - pin or ladder-derived - plus KV). An explicit pin
 /// still passes governance: it may tighten or widen the derived fit,
 /// but never past the activation+graph reserve
-/// (`SGLANG_ACTIVATION_RESERVE_MIB` receipts) or the hard band - an
+/// (`sglang_dynamic_reserve_mib` receipts) or the hard band - an
 /// over-budget pin is a mid-boot crash (capture assert ->
 /// `kill_process_tree` -> opaque 502), never a usable configuration.
 #[allow(clippy::too_many_arguments)]
@@ -6085,8 +6338,16 @@ fn sglang_push_mem_fraction(
     let (vram, weights) = (geom.vram, geom.weights);
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let gpu_static = weights.saturating_sub((f64::from(offload_total_gb) * 1e9).round() as u64);
+    // Minimum KV pool the engine insists on even when the ctx-scaled
+    // estimate is smaller: sglang's own load check refuses a spawn whose
+    // post-weights VRAM leaves no room for a viable pool (receipt
+    // 2026-11-09, qwen3-8b-awq on 8 GiB: ladder-derived 0.743 vs the
+    // engine's "minimum viable 0.772" - a ~230 MiB gap of engine-side
+    // minimum KV the estimate did not charge). Flooring the charge keeps
+    // the derive above that refusal line on tight cards.
+    let kv_charge = kv_est_bytes.map_or(0, |kv| kv.max(SGLANG_MIN_KV_POOL_BYTES));
     let static_demand = gpu_static
-        .saturating_add(kv_est_bytes.unwrap_or(0))
+        .saturating_add(kv_charge)
         .saturating_add(geom.draft_weights);
     // The dynamic side = vram * (1 - frac) must hold activations +
     // graphs + the spec chain. Guaranteeing that means the RESERVE
@@ -6096,7 +6357,7 @@ fn sglang_push_mem_fraction(
     // protect (that inversion OOM'd the 2026-10-16 DFLASH spawn at
     // prewarm_sampling).
     let ceiling = if vram > 0 {
-        let reserves = Hardware::bytes(SGLANG_ACTIVATION_RESERVE_MIB)
+        let reserves = Hardware::bytes(sglang_dynamic_reserve_mib(spec_dynamic_reserve_mib > 0))
             .saturating_add(Hardware::bytes(spec_dynamic_reserve_mib));
         if vram > reserves {
             let reserve_vram = vram - reserves;
@@ -6115,11 +6376,12 @@ fn sglang_push_mem_fraction(
             warnings.push(format!(
                 "sglang.mem_fraction_static {pin:.3} clamped to \
                  {governed:.3}: the pin must leave \
-                 {SGLANG_ACTIVATION_RESERVE_MIB} MiB of VRAM for \
+                 {} MiB of VRAM for \
                  activations and CUDA-graph capture{} (receipt: \
                  0.90 on an 8 GiB card crashed in graph capture; \
                  sglang then SIGKILLs itself and the gateway \
                  surfaces a 502)",
+                sglang_dynamic_reserve_mib(spec_dynamic_reserve_mib > 0),
                 if spec_dynamic_reserve_mib > 0 {
                     format!(
                         " plus {spec_dynamic_reserve_mib} MiB for the \
@@ -7292,6 +7554,18 @@ fn push_gated(
         ));
         return;
     }
+    // A family component may already own this flag on the argv (e.g.
+    // wan2.2-t2v pins --high-noise-diffusion-model to its own expert).
+    // Pushing it twice would hand sd.cpp two values and the LAST one
+    // would silently win - refuse the shadowing out loud instead.
+    if argv.contains(&flag.to_string()) {
+        warnings.push(format!(
+            "{key} skipped: {flag} is already set by this model's family \
+             component set; clear the config knob to let the family value stand, \
+             or override the family via a model override"
+        ));
+        return;
+    }
     argv.push(flag.to_string());
     argv.extend(values.iter().cloned());
 }
@@ -7777,6 +8051,7 @@ mod tests {
             "--spec-draft-threads",
             "--spec-draft-n-ubatch",
             "--moe-cache-mib",
+            "--moe-cache-cpu-share",
             "--spec-draft-p-min",
             "--spec-draft-p-split",
             "--spec-draft-poll",
@@ -7992,6 +8267,7 @@ mod tests {
         chat_template_kwargs: None,
         ctx: None,
         slots: None,
+        moe_cache_cpu_share: None,
         adaptive_override: None,
         spec: None,
         lazy_mode: None,
@@ -9378,6 +9654,61 @@ mod tests {
             !p0.argv.contains(&"--moe-cache-mib".to_string()),
             "engine default stays silent: {:?}",
             p0.argv
+        );
+    }
+
+    #[test]
+    fn unit__moe_cache_cpu_share__pinned_emits_default_silent_gate_skips() {
+        // MoE cache CPU share (upstream #30966 --moe-cache-cpu-share):
+        // a pinned share rides through; the default (0.0) emits nothing;
+        // an engine without the flag skips with a warning instead of
+        // hard-failing at spawn.
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let cfg = Config {
+            moe_cache_cpu_share: 0.25,
+            slots: 1,
+            ..Config::default()
+        };
+        let inp = input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &ALL_FLAGS, &[]);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--moe-cache-cpu-share" && w[1] == "0.25"),
+            "pinned share emitted: {:?}",
+            p.argv
+        );
+        let cfg0 = Config {
+            slots: 1,
+            ..Config::default()
+        };
+        let inp0 = input_named_with_spec("qwen3-8b", &g, &hw, &cfg0, &ALL_FLAGS, &[]);
+        let p0 = compile(&inp0, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p0.argv.contains(&"--moe-cache-cpu-share".to_string()),
+            "engine default stays silent: {:?}",
+            p0.argv
+        );
+        // Engine without the flag: knob skipped with a teaching warning.
+        let flags_no_share: std::collections::BTreeSet<String> = ALL_FLAGS
+            .iter()
+            .filter(|f| f.as_str() != "--moe-cache-cpu-share")
+            .cloned()
+            .collect();
+        let inp2 = input_named_with_spec("qwen3-8b", &g, &hw, &cfg, &flags_no_share, &[]);
+        let p2 = compile(&inp2, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p2.argv.contains(&"--moe-cache-cpu-share".to_string()),
+            "unsupported engine never sees the flag: {:?}",
+            p2.argv
+        );
+        assert!(
+            p2.warnings
+                .iter()
+                .any(|w| w.contains("moe_cache_cpu_share skipped")),
+            "skip warning teaches: {:?}",
+            p2.warnings
         );
     }
 
@@ -15780,6 +16111,66 @@ mod tests {
     }
 
     #[test]
+    fn unit__compile_openaihost__passthrough_reserved_and_gated() {
+        // The lane owns no per-model argv: extra_args are the only knobs,
+        // reserved listen/registry flags refuse, unknown-to-manifest flags
+        // teach, and the profile reports runtime-managed capacity.
+        let g = meta();
+        let hw = gpu_hw(16_384, 32_000, 8);
+        let empty: BTreeSet<String> = BTreeSet::new();
+        let cfg = Config::default();
+
+        let mut plain = input(&g, &hw, &cfg, &empty);
+        plain.engine_kind = crate::engine_kind::EngineKind::OpenAiHost;
+        let p = compile(&plain, &TuningOverrides::default()).unwrap();
+        assert!(p.argv.is_empty(), "{:?}", p.argv);
+        assert_eq!(p.ctx, 0);
+        assert_eq!(p.kv_est_bytes, None);
+        assert!(matches!(p.capacity, CapacityStatus::RuntimeManaged));
+
+        let mut flags = BTreeSet::new();
+        flags.insert("--verbose".to_string());
+        flags.insert("--cors-origin".to_string());
+        let ov = ModelOverride {
+            extra_args: Some(vec!["--verbose".into(), "--cors-origin".into()]),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        inp.engine_kind = crate::engine_kind::EngineKind::OpenAiHost;
+        inp.overlay = &ov;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(p.argv, vec!["--verbose", "--cors-origin"]);
+
+        // Reserved: the listen pair and the registry-relocating --config
+        // are blazar-owned; each refuses with teaching.
+        for reserved in ["--host", "--port", "--config"] {
+            let ov_r = ModelOverride {
+                extra_args: Some(vec![reserved.into(), "x".into()]),
+                ..DEFAULT_OVERLAY.clone()
+            };
+            let mut inp_r = input(&g, &hw, &cfg, &flags);
+            inp_r.engine_kind = crate::engine_kind::EngineKind::OpenAiHost;
+            inp_r.overlay = &ov_r;
+            let err = compile(&inp_r, &TuningOverrides::default()).unwrap_err();
+            assert!(err.contains(reserved) && err.contains("reserved"), "{err}");
+        }
+
+        // Unknown to the manifest: hard error, never a silent drop.
+        let ov_u = ModelOverride {
+            extra_args: Some(vec!["--mtp-head".into()]),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp_u = input(&g, &hw, &cfg, &empty);
+        inp_u.engine_kind = crate::engine_kind::EngineKind::OpenAiHost;
+        inp_u.overlay = &ov_u;
+        let err = compile(&inp_u, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("not a flag") && err.contains("engine update"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn unit__compile__safetensors_on_llamacpp_teaches_working_remedy() {
         // audit GAP-1: the wrong-lane teaching once pointed at
         // `blazar run <model> --engine sglang` - a flag the Run command
@@ -16296,11 +16687,13 @@ mod tests {
                 .any(|w| w.contains("auto tensor-parallelism"))
         );
         // Per-rank demand against the bottleneck card's RAW VRAM
-        // (8,585,740,288 B), activation reserve clamps 0.7875 -> 0.756.
+        // (8,585,740,288 B), activation reserve clamps 0.7875 -> 0.786
+        // (dense reserve 1750 MiB since 2026-11-09; was 0.756 under the
+        // flat 2000 MiB posture).
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.756")
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.786")
         );
         assert!(!p.argv.iter().any(|a| a == "--cpu-offload-gb"));
     }
@@ -17031,6 +17424,345 @@ mod tests {
             p.argv
                 .windows(2)
                 .any(|w| w[0] == "--speculative-draft-model-path" && w[1] == draft)
+        );
+    }
+
+    #[test]
+    fn unit__sglang__dspine_draft_pair_emitted() {
+        // The pair lane under spec = "dspine": a resolved safetensors
+        // draft dir must emit the DSPINE wire name (not the default
+        // EAGLE3) alongside the draft path. Empty spec_types = legacy
+        // lane: flag-presence gating, no algorithm-presence gate.
+        let cfg = Config {
+            spec: "dspine".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = sglang_ctx_overlay();
+        let draft = format!("/tmp/blazar-draft-sglang-dspine-{}.d", std::process::id());
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "DSPINE")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-draft-model-path" && w[1] == draft)
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__dspine_warns_quantized_lm_head() {
+        // DSpine's drafter reads the target lm_head directly and only
+        // accepts an unquantized bf16 head (live receipt 2026-11-09,
+        // qwen3-8b-awq: stock AWQ config refused at load; adding
+        // "lm_head" to modules_to_not_convert booted green). The compile
+        // stage must TEACH that on quantized targets before the engine
+        // crash, stay silent when the head is already excluded, and
+        // fail open on unquantized/unreadable targets.
+        let cfg = Config {
+            spec: "dspine".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = sglang_ctx_overlay();
+        let draft = format!("/tmp/blazar-draft-lmhead-{}.d", std::process::id());
+        let target = format!("/tmp/blazar-target-lmhead-{}", std::process::id());
+        std::fs::create_dir_all(&target).unwrap();
+
+        let compile_with_config = |config_json: Option<&str>| {
+            let path = std::path::Path::new(&target).join("config.json");
+            match config_json {
+                Some(body) => std::fs::write(&path, body).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+            inp.overlay = &overlay;
+            inp.draft_path = Some(&draft);
+            inp.model_path = &target;
+            compile(&inp, &TuningOverrides::default()).unwrap()
+        };
+
+        // Quantized target, lm_head inside quantizer scope: the teaching
+        // must fire with the exact remedy.
+        let p = compile_with_config(Some(
+            r#"{"quantization_config":{"quant_method":"awq","modules_to_not_convert":null}}"#,
+        ));
+        assert!(
+            p.warnings.iter().any(|w| w.contains("lm_head")
+                && w.contains("modules_to_not_convert")
+                && w.contains("--dtype bfloat16")),
+            "quantized target without lm_head exclusion must teach the fix, got {:?}",
+            p.warnings
+        );
+
+        // Same target with lm_head excluded: silent on this surface.
+        let p = compile_with_config(Some(
+            r#"{"quantization_config":{"quant_method":"awq","modules_to_not_convert":["lm_head"]}}"#,
+        ));
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("lm_head")),
+            "excluded lm_head must not warn, got {:?}",
+            p.warnings
+        );
+
+        // Unquantized target: the head is already dense bf16 - silent.
+        let p = compile_with_config(Some(r#"{"architectures":["Qwen3ForCausalLM"]}"#));
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("lm_head")),
+            "unquantized target must not warn, got {:?}",
+            p.warnings
+        );
+
+        // No config.json at all: fail open (the engine gate teaches).
+        let p = compile_with_config(None);
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("lm_head")),
+            "missing target config must fail open, got {:?}",
+            p.warnings
+        );
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn unit__sglang__dense_ceiling_lands_in_engine_viable_window() {
+        // Direct-engine receipts (2026-11-09, RTX 4070 Laptop 8 GiB,
+        // qwen3-8b-awq on sglang 0.5.22): mem-fraction 0.80 served green
+        // at 47 tok/s, 0.85 OOM'd in workspace allocation, and the
+        // engine's own load check refused below 0.772 ("minimum viable
+        // 0.7711"). The dense ceiling on an 8188 MiB card must land at
+        // (8188-1750)/8188 = 0.786 - INSIDE the proven viable window
+        // [0.772, 0.83] - so a dense pin no longer forces CPU offload
+        // just to boot.
+        let cfg = Config::default();
+        let hw = gpu_hw(8_188, 15_900, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(2_048),
+            sglang: Some(SglangTuning {
+                mem_fraction_static: Some(0.85),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 5_936 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let frac = p
+            .argv
+            .windows(2)
+            .find(|w| w[0] == "--mem-fraction-static")
+            .map(|w| w[1].parse::<f64>().unwrap())
+            .expect("dense pin must emit --mem-fraction-static");
+        assert!(
+            (frac - 0.786).abs() < 0.001,
+            "dense ceiling must clamp to 0.786, got {frac}"
+        );
+        assert!(
+            frac >= 0.772,
+            "dense ceiling must sit at/above the engine's min-viable 0.772, got {frac}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // fixture MiB math, display-only assertion
+    fn unit__sglang__derive_charges_minimum_kv_pool() {
+        // The engine refuses a spawn whose post-weights VRAM leaves no
+        // viable KV pool (receipt 2026-11-09: derived 0.743 vs the
+        // engine's "minimum viable 0.772" - a ~230 MiB engine-side KV
+        // minimum the ctx-scaled estimate did not charge). A tiny-ctx
+        // derive must still promise at least the 256 MiB KV floor on
+        // the static side.
+        let cfg = Config::default();
+        let hw = gpu_hw(8_188, 15_900, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(512),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let weights = 5_936 * MIB;
+        let mut inp = sglang_input(&hf, &hw, &cfg, weights);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let frac = p
+            .argv
+            .windows(2)
+            .find(|w| w[0] == "--mem-fraction-static")
+            .map(|w| w[1].parse::<f64>().unwrap())
+            .expect("derive must emit --mem-fraction-static");
+        let static_side = frac * 8_188.0 * 1_048_576.0;
+        // Up to ~4 MiB of the charge is lost to the 3-decimal argv
+        // formatting on an 8 GiB card (0.0005 x 8188 MiB) - the floor
+        // must survive that rounding, not exactly equal it.
+        assert!(
+            static_side >= weights as f64 + 256.0 * 1_048_576.0 - 5.0 * 1_048_576.0,
+            "derive must charge at least the 256 MiB KV floor: static {static_side} vs weights+floor {}",
+            weights as f64 + 256.0 * 1_048_576.0
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__dspine_with_draft_dir_engages() {
+        // The DSPINE knob lane: spec_algorithm = "dspine" +
+        // spec_draft_path (safetensors dir) emits the algorithm and the
+        // draft model path. The dflash block-size knob is dflash-only -
+        // setting it under dspine must NOT emit (DSpine's acceptance
+        // machinery does not consume it).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let draft_dir = "/models/qwen3-8b-dspine-b16";
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dspine".into()),
+                spec_draft_path: Some(draft_dir.into()),
+                spec_num_steps: Some(4),
+                speculative_dflash_block_size: Some(64),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "DSPINE")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-draft-model-path" && w[1] == draft_dir)
+        );
+        assert!(
+            !p.argv
+                .contains(&"--speculative-dflash-block-size".to_string()),
+            "block-size is a DFlash-only knob: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__dspine_warns_dense_needs_draft_model() {
+        // DSpine is a trained drafter: without spec_draft_path the knob
+        // lane warns (naming dspine, not dflash) and stays dense - the
+        // compile-side net under the config-load rejection.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dspine".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.windows(2).any(|w| w[0] == "--speculative-algorithm"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("dspine") && w.contains("spec_draft_path"))
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__dspine_gguf_draft_refused_dense() {
+        // A GGUF file is never a valid DSpine draft (same loader
+        // constraint as the EAGLE lane): refused dense with teaching.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let draft = draft_file("sglang-dspine-gguf-reject");
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dspine".into()),
+                spec_draft_path: Some(draft.clone()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--speculative-algorithm"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("GGUF file") && w.contains("safetensors dirs"))
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__probed_vocab_gates_algorithm_presence() {
+        // A lane with a PROBED algorithm vocabulary (non-empty
+        // spec_types) hard-errors when the requested algorithm is not
+        // registered - the honest "this lane cannot serve it" instead
+        // of a spawn the engine would refuse. Empty vocabulary (legacy
+        // rows) keeps flag-presence gating: dspine engages as above.
+        static PROBED_WITHOUT_DSPINE: LazyLock<Vec<String>> = LazyLock::new(|| {
+            vec![
+                "NGRAM".to_string(),
+                "EAGLE3".to_string(),
+                "DFLASH".to_string(),
+            ]
+        });
+        static PROBED_WITH_DSPINE: LazyLock<Vec<String>> = LazyLock::new(|| {
+            vec![
+                "NGRAM".to_string(),
+                "EAGLE3".to_string(),
+                "DFLASH".to_string(),
+                "DSPINE".to_string(),
+            ]
+        });
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dspine".into()),
+                spec_draft_path: Some("/models/qwen3-8b-dspine-b16".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mk_input = |spec_types: &'static [String]| {
+            let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+            inp.overlay = &overlay;
+            inp.spec_types = spec_types;
+            inp
+        };
+        let err = compile(
+            &mk_input(&PROBED_WITHOUT_DSPINE),
+            &TuningOverrides::default(),
+        )
+        .expect_err("unprobed algorithm must hard-error");
+        assert!(
+            err.contains("DSPINE") && err.contains("not registered"),
+            "teaching error must name the algorithm: {err}"
+        );
+        let p = compile(&mk_input(&PROBED_WITH_DSPINE), &TuningOverrides::default())
+            .expect("probed lane with DSPINE engages");
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "DSPINE")
         );
     }
 
@@ -18087,7 +18819,9 @@ mod tests {
         let cfg = Config::default();
         let hf = hf_meta();
 
-        // 8 GiB card: ceiling = (8000 - 2000) / 8000 = 0.750.
+        // 8 GiB card: dense ceiling = (8000 - 1750) / 8000 = 0.781
+        // (dense reserve is direct-engine calibrated since 2026-11-09;
+        // the spec posture keeps the original 2000 MiB).
         let hw = gpu_hw(8_000, 15_900, 8);
         let overlay = ModelOverride {
             ctx: Some(32_768),
@@ -18103,7 +18837,7 @@ mod tests {
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.750")
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.781")
         );
         assert!(
             p.warnings
