@@ -314,6 +314,12 @@ enum Cmd {
         /// winner beats no-cache by >5%
         #[arg(long)]
         moe_cache: bool,
+        /// SLO target in milliseconds for request wall latency, reported as
+        /// goodput (SLO-met req/s) + attainment alongside tok/s in the
+        /// request-driving tune lanes (--spec-race); measurement-only -
+        /// adopts nothing
+        #[arg(long = "slo-ms", value_name = "MS")]
+        slo_ms: Option<f64>,
     },
     /// One-page scorecard for a model: measured performance (last bench),
     /// verified capability verdicts (model-doctor certificate), identity -
@@ -1036,7 +1042,7 @@ enum EngineCmd {
     /// between the lane's installed tag and the newest upstream tag and
     /// prints them per release, so an `engine update --check`
     /// update-available verdict can be judged before anything
-    /// downloads. PyPI lanes
+    /// downloads. `PyPI` lanes
     /// (sglang, mlx, openaihost) teach their version source instead -
     /// they have no GitHub release notes. llama.cpp b-tags ship without
     /// notes, so that lane reports the build-count gap.
@@ -2407,6 +2413,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             replicas,
             cache_reuse,
             moe_cache,
+            slo_ms,
         } => {
             tune_full(
                 &resolve_model_cli(&model),
@@ -2420,6 +2427,7 @@ blazar mmproj <model> <mmproj.gguf path>"
                 replicas,
                 cache_reuse,
                 moe_cache,
+                slo_ms,
             )
             .await
         }
@@ -12217,7 +12225,7 @@ llama-bench measures generative decode; embedding speed is per-request in /metri
                 bench(name)
             } else if r.cmd.starts_with("blazar tune ") {
                 tune_full(
-                    name, false, None, None, None, false, false, false, false, false, false,
+                    name, false, None, None, None, false, false, false, false, false, false, None,
                 )
                 .await
             } else {
@@ -17194,6 +17202,7 @@ fn sglang_spec_race_lane(
     store: &Store,
     model: &str,
     row: &blazar_core::ModelRow,
+    slo_ms: Option<f64>,
 ) -> Result<()> {
     // Mirror the llamacpp lane's engine pick: active row when it is the
     // right kind, else the first installed one, loudly.
@@ -17284,6 +17293,7 @@ fn sglang_spec_race_lane(
         &race_modes,
         &manifest.flags,
         10,
+        slo_ms,
     )?;
     println!("{:<8} {:>14}", "mode", "tok/s");
     for (mode, tps) in &rows {
@@ -17457,6 +17467,7 @@ async fn tune_full(
     replicas: bool,
     cache_reuse: bool,
     moe_cache: bool,
+    slo_ms: Option<f64>,
 ) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
@@ -17507,7 +17518,7 @@ aborts on this family. Profile pins for it would measure nothing",
         // lane guards with the larger headroom.
         tune_probe_vram_preflight(&row, 1, SGLANG_CHILD_HEADROOM_MIB)
             .map_err(|e| anyhow!("tune pre-flight: {e}"))?;
-        return sglang_spec_race_lane(&d, &store, model, &row);
+        return sglang_spec_race_lane(&d, &store, model, &row, slo_ms);
     }
     // Live probes spawn real engine children on the card; refuse in
     // under a second when a resident holder has already eaten the VRAM
@@ -17918,6 +17929,7 @@ aborts on this family. Profile pins for it would measure nothing",
             1,
             draft_pair.as_ref().map(|(p, n)| (p.as_str(), *n)),
             Some(ngram_knobs),
+            slo_ms,
         )?;
         println!("{:<8} {:>14}", "mode", "tok/s");
         for (mode, tps) in &rows {

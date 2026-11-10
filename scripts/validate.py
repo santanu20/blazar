@@ -13827,7 +13827,14 @@ _FLAG_BOUNDARIES: dict[str, dict[str, str]] = {
         "--moe-cache-mib x --moe-cache-cpu-share point and is MoE-gated "
         "(dense models teach-and-bail; engine manifest needs both flags) "
         "- spawn-heavy by design; adopted-knob argv emission is pinned in "
-        "the knobs_argv phase instead"
+        "the knobs_argv phase instead",
+        # SLO receipts: measurement-only print lane bolted onto the
+        # spec-race drive (per-request wall ms -> met/total + goodput).
+        # The spec-race battery here races without an SLO target; the
+        # receipt math is unit-pinned (slo_attainment) and the live
+        # print is receipted out-of-band (tune --spec-race --slo-ms).
+        "--slo-ms": "SLO receipt lane of the spec-race drive; "
+        "unit-pinned + out-of-band live receipt",
     },
     "pull": {
         # Concurrent download-cap wave lane: flags are live in the CLI

@@ -64,6 +64,40 @@ jobs:
                 \"native upstream or plugin lane\" to the stock lane."
             fi
           fi
+      - name: SpeculativeAlgorithm enum drift
+        run: |
+          set -euo pipefail
+          # SpeculativeAlgorithm members on upstream main as of this
+          # watch's last update (2026-11-10, incl the internal
+          # _DRAFT/_VERIFY/_STATE variants and PP_SPEC_RELAY). New
+          # members mean the speculative surface moved - user-drivable
+          # algorithms need one knob-arm spelling in
+          # push_sglang_speculative + a catalog draft pair; internal
+          # variants may change probe payload shape. DSPINE is excluded
+          # here because the dedicated step above owns its story.
+          known="DFLASH DFLASH_DRAFT DSPARK DFLASH_VERIFY EAGLE EAGLE3 EAGLE_DRAFT EAGLE_DRAFT_EXTEND EAGLE_VERIFY FROZEN_KV_MTP FROZEN_KV_MTP_DRAFT FROZEN_KV_MTP_VERIFY NGRAM NGRAM_VERIFY STANDALONE UNO UNO_STATE UNO_DRAFT UNO_VERIFY PP_SPEC_RELAY"
+          # spec_info.py was fetched by the previous step; re-fetch here
+          # so this step also stands alone under workflow_dispatch.
+          url="https://raw.githubusercontent.com/sgl-project/sglang/main/python/sglang/srt/speculative/spec_info.py"
+          curl -fsSL "$url" -o spec_info.py || exit 0
+          got="$(grep -oE '^[[:space:]]+[A-Z][A-Z0-9_]*[[:space:]]*=' spec_info.py \
+            | sed 's/[[:space:]=]//g' | grep -vx NONE | grep -vx DSPINE | sort -u || true)"
+          gained="$(comm -13 <(printf '%s\n' $known | tr ' ' '\n' | sort -u) <(printf '%s\n' "$got"))"
+          if [ -n "$gained" ]; then
+            list="$(printf '%s ' $gained | sed 's/ $//')"
+            title="sglang speculative enum gained: $list"
+            open="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title" --json number --jq '.[0].number // empty')"
+            if [ -z "$open" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body \
+                "Upstream SpeculativeAlgorithm gained: $list.
+                The lane manifest probe picks the names up automatically on
+                the next engine update (probe discovers enum + plugin
+                registry alike), but each new algorithm still needs a
+                spec-mode spelling in push_sglang_speculative and a catalog
+                draft pair before spec = <mode> resolves. Add the arm,
+                pin its tests, and refresh the spec-race receipts."
+            fi
+          fi
       - name: sglang-dspine plugin pin drift
         run: |
           set -euo pipefail

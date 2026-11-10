@@ -326,7 +326,7 @@ impl Tuner<'_> {
             let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
             let ok = wait_ready(&mut child, port, 120.0);
             let tps = if ok {
-                drive_concurrent(port, clients).ok()
+                drive_concurrent(port, 1).ok()
             } else {
                 None
             };
@@ -433,6 +433,7 @@ impl Tuner<'_> {
         idle_secs: u64,
         draft: Option<(&str, u32)>,
         ngram_knobs: Option<(u32, u32, u32)>,
+        slo_ms: Option<f64>,
     ) -> Result<Vec<(String, f64)>> {
         let server_bin = self
             .bench_bin
@@ -491,15 +492,15 @@ impl Tuner<'_> {
             let err_log = search_stderr_log(port);
             let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
             let ok = wait_ready(&mut child, port, 120.0);
-            let tps = if ok {
-                drive_concurrent(port, 1).ok()
+            let report = if ok {
+                drive_concurrent_multi(&[port], 1, 1).ok()
             } else {
                 None
             };
             // Single pid we spawned; never a group.
             let _ = child.kill();
             let _ = child.wait();
-            let Some(t) = tps else {
+            let Some(report) = report else {
                 // Quote the child's own stderr (captured per-port): an
                 // early death is usually OOM or a rejected flag, and the
                 // child's words beat a generic readiness timeout.
@@ -520,7 +521,11 @@ impl Tuner<'_> {
                      child stderr tail:\n{tail}"
                 );
             };
+            let t = report.tok_per_s;
             println!("  spec mode {mode}: {t:.1} tok/s");
+            if let Some(slo_ms) = slo_ms {
+                print_slo_receipt(&report.request_ms, report.wall_secs, slo_ms);
+            }
             out.push((mode.clone(), t));
             std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
         }
@@ -706,7 +711,9 @@ impl Tuner<'_> {
             let tps = if wait_ready(&mut child, port, 180.0) {
                 // Warm the graph + caches, then measure steady decode.
                 let _ = chat_secs(port, "hi");
-                drive_concurrent_multi(&[port], 1, 3).ok()
+                drive_concurrent_multi(&[port], 1, 3)
+                    .map(|report| report.tok_per_s)
+                    .ok()
             } else {
                 None
             };
@@ -827,7 +834,7 @@ impl Tuner<'_> {
             let _ = a.wait();
             anyhow::bail!("replica search: baseline child never became ready");
         }
-        let r1_tps = drive_concurrent_multi(&[p1], 8, 3);
+        let r1_tps = drive_concurrent_multi(&[p1], 8, 3).map(|report| report.tok_per_s);
         // Single pid we spawned; never a group.
         let _ = a.kill();
         let _ = a.wait();
@@ -851,7 +858,7 @@ impl Tuner<'_> {
                  cannot hold two copies (VRAM/ RAM); keep replicas = 1"
             );
         }
-        let r2_tps = drive_concurrent_multi(&[p2, p3], 8, 3);
+        let r2_tps = drive_concurrent_multi(&[p2, p3], 8, 3).map(|report| report.tok_per_s);
         // Single pids we spawned; never a group.
         let _ = b1.kill();
         let _ = b1.wait();
@@ -1480,6 +1487,7 @@ pub fn sglang_spec_mode_race(
     modes: &[String],
     flags: &std::collections::BTreeSet<String>,
     idle_secs: u64,
+    slo_ms: Option<f64>,
 ) -> Result<Vec<(String, f64)>> {
     let mut out = Vec::new();
     for mode in modes {
@@ -1487,18 +1495,22 @@ pub fn sglang_spec_mode_race(
         let argv = sglang_race_argv(base_argv, mode, port, flags)?;
         let mut child = spawn_search_server(server_bin, &argv, &search_stderr_log(port))?;
         let ok = wait_ready(&mut child, port, 240.0);
-        let tps = if ok {
-            drive_concurrent(port, 1).ok()
+        let report = if ok {
+            drive_concurrent_multi(&[port], 1, 1).ok()
         } else {
             None
         };
         // Single pid we spawned; never a group.
         let _ = child.kill();
         let _ = child.wait();
-        let Some(t) = tps else {
+        let Some(report) = report else {
             anyhow::bail!("sglang spec race: server in mode {mode} never became ready or served");
         };
+        let t = report.tok_per_s;
         println!("  sglang spec mode {mode}: {t:.1} tok/s");
+        if let Some(slo_ms) = slo_ms {
+            print_slo_receipt(&report.request_ms, report.wall_secs, slo_ms);
+        }
         out.push((mode.clone(), t));
         std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
     }
@@ -1506,6 +1518,28 @@ pub fn sglang_spec_mode_race(
         anyhow::bail!("no sglang spec modes ran ({modes:?})");
     }
     Ok(out)
+}
+
+/// SLO receipt line for a drive run: met/total, attainment, p95/p99
+/// request ms, and goodput (SLO-met req/s). No-op without measurements.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // display-only percentiles
+fn print_slo_receipt(request_ms: &[f64], wall_secs: f64, slo_ms: f64) {
+    if request_ms.is_empty() {
+        return;
+    }
+    let (met, total, goodput) = slo_attainment(request_ms, wall_secs, slo_ms);
+    let pct = met as f64 * 100.0 / total as f64;
+    let mut sorted = request_ms.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let pick = |q: f64| sorted[((q * sorted.len() as f64) as usize).min(sorted.len() - 1)];
+    let (p95, p99) = (pick(0.95), pick(0.99));
+    println!(
+        "    SLO {slo_ms:.0}ms: met {met}/{total} ({pct:.0}%) | p95 {p95:.0}ms p99 {p99:.0}ms | goodput {goodput:.2} req/s"
+    );
 }
 
 /// Spawn a search-lane llama-server: stdio-silent and tied to THIS
@@ -1620,7 +1654,7 @@ fn chat_secs(port: u16, content: &str) -> Result<f64> {
 #[allow(clippy::items_after_statements)] // io trait imports sit near their single use
 #[allow(clippy::cast_precision_loss)] // throughput display only
 fn drive_concurrent(port: u16, clients: u32) -> Result<f64> {
-    drive_concurrent_multi(&[port], clients, 1)
+    Ok(drive_concurrent_multi(&[port], clients, 1)?.tok_per_s)
 }
 
 /// One blocking non-stream chat; returns completion tokens from usage.
@@ -1676,11 +1710,38 @@ fn chat_completion_tokens(port: u16, content: &str) -> Result<u64> {
         })
 }
 
+/// Per-request wall latency of one `drive_concurrent_multi` run, so receipts
+/// can report SLO attainment (goodput) next to raw throughput.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DriveReport {
+    /// Aggregate tokens/second across every client thread.
+    pub tok_per_s: f64,
+    /// Wall-clock seconds spanning ALL clients (start of the first spawn to
+    /// the last join), the window goodput is measured over.
+    pub wall_secs: f64,
+    /// Wall milliseconds of each individual request, unordered.
+    pub request_ms: Vec<f64>,
+}
+
+/// SLO attainment over a drive run: how many requests finished under
+/// `slo_ms`, and the goodput (SLO-met requests per second of wall time).
+/// An empty run reports zero met, zero total, zero goodput.
+#[must_use]
+pub fn slo_attainment(request_ms: &[f64], wall_secs: f64, slo_ms: f64) -> (u64, usize, f64) {
+    if request_ms.is_empty() {
+        return (0, 0, 0.0);
+    }
+    let met = request_ms.iter().filter(|ms| **ms <= slo_ms).count() as u64;
+    #[allow(clippy::cast_precision_loss)] // display math on bounded counts
+    let goodput = (met as f64) / wall_secs.max(1e-6);
+    (met, request_ms.len(), goodput)
+}
+
 /// Aggregate tok/s of `clients` blocking threads round-robin across `ports`,
 /// `gens` sequential requests each. The wall clock spans ALL clients, so a
 /// saturated single child and a parallel pair are directly comparable.
 #[allow(clippy::cast_precision_loss)] // throughput display only
-fn drive_concurrent_multi(ports: &[u16], clients: u32, gens: u32) -> Result<f64> {
+fn drive_concurrent_multi(ports: &[u16], clients: u32, gens: u32) -> Result<DriveReport> {
     if ports.is_empty() {
         anyhow::bail!("replica search: no ports to drive");
     }
@@ -1688,23 +1749,34 @@ fn drive_concurrent_multi(ports: &[u16], clients: u32, gens: u32) -> Result<f64>
     let start = std::time::Instant::now();
     for i in 0..clients {
         let port = ports[(i as usize) % ports.len()];
-        handles.push(std::thread::spawn(move || -> Result<u64> {
+        handles.push(std::thread::spawn(move || -> Result<(u64, Vec<f64>)> {
             let mut total = 0u64;
+            let mut request_ms = Vec::new();
             for g in 0..gens {
+                let t0 = std::time::Instant::now();
                 total += chat_completion_tokens(
                     port,
                     &format!("count slowly: {g} one two three four five"),
                 )?;
+                request_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
-            Ok(total)
+            Ok((total, request_ms))
         }));
     }
     let mut total = 0u64;
+    let mut request_ms = Vec::new();
     for h in handles {
-        total += h.join().map_err(|_| anyhow!("client thread panicked"))??;
+        let (tokens, mut ms) = h.join().map_err(|_| anyhow!("client thread panicked"))??;
+        total += tokens;
+        request_ms.append(&mut ms);
     }
-    let secs = start.elapsed().as_secs_f64();
-    Ok(total as f64 / secs.max(1e-6))
+    let wall_secs = start.elapsed().as_secs_f64();
+    let tok_per_s = total as f64 / wall_secs.max(1e-6);
+    Ok(DriveReport {
+        tok_per_s,
+        wall_secs,
+        request_ms,
+    })
 }
 
 #[cfg(test)]
@@ -2038,6 +2110,19 @@ mod tests {
     #[test]
     fn unit__drive_concurrent_multi__rejects_empty_ports() {
         assert!(drive_concurrent_multi(&[], 4, 1).is_err());
+    }
+
+    #[test]
+    fn unit__slo_attainment__counts_met_and_goodput() {
+        // 3 of 4 requests under the 1000ms SLO over a 2s wall -> 1.5 req/s.
+        let ms = [800.0, 1200.0, 950.0, 1000.0];
+        let (met, total, goodput) = slo_attainment(&ms, 2.0, 1000.0);
+        assert_eq!((met, total), (3, 4));
+        assert!((goodput - 1.5).abs() < 1e-9);
+        // Nothing met -> zero goodput, totals intact.
+        assert_eq!(slo_attainment(&ms, 2.0, 100.0), (0, 4, 0.0));
+        // Empty run -> zeros (never a divide-by-zero).
+        assert_eq!(slo_attainment(&[], 2.0, 1000.0), (0, 0, 0.0));
     }
 
     #[test]
