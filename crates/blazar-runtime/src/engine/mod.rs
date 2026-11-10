@@ -6,6 +6,8 @@ pub mod arch_miner;
 pub mod build;
 pub mod capability_registry;
 pub mod gh;
+pub mod kokoro_install;
+pub mod litert_install;
 pub mod manifest;
 pub mod mlx_install;
 pub(crate) mod net_probe;
@@ -156,17 +158,30 @@ fn scanback_release<'a>(releases: &'a [GhRelease], lane: &CudaLane) -> Option<&'
 /// upstream ubuntu-cuda asset. Most upstream releases ship none; the
 /// scan stays shallow so we never wander into stale runtimes.
 const UPSTREAM_SCANBACK_DEPTH: usize = 5;
-/// How many of sd.cpp's newest releases the channel walk may examine
-/// for a host-installable prebuilt. Deep enough to step past a builder
-/// distro move (master-1044..1052 all target Ubuntu 26.04), shallow
-/// enough to never land on a stale runtime unasked.
-const SDCPP_WALKBACK_DEPTH: usize = 12;
+/// How old an sd.cpp release may be before the channel walk stops
+/// considering it for auto-install. Upstream builder-distro moves are
+/// permanent and the gated run above a host-compatible release grows
+/// with EVERY release (the Ubuntu-26.04 run opened at master-1044 and
+/// was 16 deep within six days), so the anti-stale bound has to be an
+/// AGE, not a release count: at sd.cpp's cadence any count cap is
+/// exhausted by the gated run alone. 180 days keeps the walk generous
+/// (a temporary builder break upstream heals well inside it) while
+/// never silently installing a runtime half a year old.
+pub const SDCPP_WALKBACK_MAX_AGE_SECS: i64 = 180 * 86_400;
+/// Defensive ceiling on how many releases one walk may examine, so a
+/// pathologically fast upstream cannot make the walk unbounded. Only
+/// bites when the window holds more releases than this; the GitHub
+/// listing fetch (`per_page=100`) bounds it in practice.
+pub const SDCPP_WALKBACK_RELEASE_CEILING: usize = 100;
 
 /// Pure sd.cpp channel walk (test seam, no network): orders releases
 /// by tag counter (newest first), applies the host-distro gate via
 /// [`gh::resolve_sdcpp_asset`], and reports the newest tag, the
 /// installable candidates newest-first, and one teaching line per
-/// skipped release. The channel installer walks `installable`;
+/// skipped release - except that a consecutive run of releases gated
+/// by the same builder distro set rolls up into a single line, so a
+/// builder-distro move upstream costs one teaching line, not one per
+/// release. The channel installer walks `installable`;
 /// `sdcpp_channel_target` surfaces the same facts to the CLI so the
 /// currency verdict and the install lane can never disagree.
 #[derive(Debug, Default)]
@@ -175,14 +190,55 @@ pub struct SdcppChannelWalk<'a> {
     pub newest_tag: Option<&'a str>,
     /// Releases whose prebuilts resolve for this host, newest first.
     pub installable: Vec<&'a GhRelease>,
-    /// One teaching line per skipped release (gate reason or no-match).
+    /// One teaching line per skipped release, with consecutive
+    /// same-distro gated releases rolled up into one line (gate reason
+    /// or no-match).
     pub skipped: Vec<String>,
 }
 
-fn sdcpp_channel_walk<'a>(
+/// Flush a consecutive gated run into one teaching entry. A single
+/// release keeps the per-release shape (tag + its asset count); a run
+/// of 2+ rolls up to "{newest} + N more releases" so the teaching
+/// block stays one line per builder-distro episode, not per release.
+/// `(distro set, newest tag of the run, release count, the newest
+/// release's asset count)`.
+fn sdcpp_flush_gated_run(
+    walk: &mut SdcppChannelWalk<'_>,
+    run: Option<(String, String, usize, usize)>,
+) {
+    let Some((distros, newest, count, head_assets)) = run else {
+        return;
+    };
+    if count == 1 {
+        walk.skipped.push(format!(
+            "{newest}: {head_assets} prebuilt{} target {distros} (newer than this host)",
+            if head_assets == 1 { "" } else { "s" },
+        ));
+    } else {
+        walk.skipped.push(format!(
+            "{newest} + {} more releases: prebuilts target {distros} (newer than this host)",
+            count - 1
+        ));
+    }
+}
+
+/// Walk-window eligibility: a release with no publish timestamp is
+/// eligible (age unknown is not age old - the atom fallback and
+/// web-pinned single releases carry none); a timestamped one must be
+/// younger than [`SDCPP_WALKBACK_MAX_AGE_SECS`].
+fn sdcpp_release_walk_eligible(release: &GhRelease, now: i64) -> bool {
+    release
+        .published_epoch()
+        .is_none_or(|t| now.saturating_sub(t) <= SDCPP_WALKBACK_MAX_AGE_SECS)
+}
+
+/// [`sdcpp_channel_walk`] over a pinned clock - the age window is only
+/// meaningful to tests when `now` is fixed.
+fn sdcpp_channel_walk_at<'a>(
     releases: &'a [GhRelease],
     patterns: &[gh::SdAssetPattern],
     host_distro: Option<(u32, u32)>,
+    now: i64,
 ) -> SdcppChannelWalk<'a> {
     let mut order: Vec<(u32, &GhRelease)> = releases
         .iter()
@@ -193,34 +249,64 @@ fn sdcpp_channel_walk<'a>(
         newest_tag: order.first().map(|(_, r)| r.tag_name.as_str()),
         ..SdcppChannelWalk::default()
     };
-    for (_, release) in order.into_iter().take(SDCPP_WALKBACK_DEPTH) {
+    // Consecutive gated releases aimed at the same builder distro set
+    // accumulate into `run`; any other pick (matched, other distro,
+    // no-match) flushes it first.
+    let mut run: Option<(String, String, usize, usize)> = None;
+    // Filter (age) BEFORE take (ceiling): a timestamp-less release
+    // mid-list must not cut the window short, and the ceiling counts
+    // examined releases, not raw ones.
+    for (_, release) in order
+        .into_iter()
+        .filter(|(_, r)| sdcpp_release_walk_eligible(r, now))
+        .take(SDCPP_WALKBACK_RELEASE_CEILING)
+    {
         match gh::resolve_sdcpp_asset(release, patterns, host_distro) {
-            gh::SdAssetPick::Matched(..) => walk.installable.push(release),
+            gh::SdAssetPick::Matched(..) => {
+                sdcpp_flush_gated_run(&mut walk, run.take());
+                walk.installable.push(release);
+            }
             gh::SdAssetPick::Gated(skipped) => {
-                // Compact per-release summary: every skipped asset of
-                // one release comes from the same builder distro in
-                // practice; name it once, count the assets.
+                // Assets of one release come from the same builder
+                // distro in practice; name it once, count the assets.
                 let mut distros: Vec<String> = skipped
                     .iter()
                     .map(|g| format!("Ubuntu {}.{:02}", g.distro.0, g.distro.1))
                     .collect();
                 distros.sort();
                 distros.dedup();
+                let key = distros.join(", ");
                 let n = skipped.len();
+                let continues = matches!(&run, Some((k, _, _, _)) if *k == key);
+                if !continues {
+                    sdcpp_flush_gated_run(&mut walk, run.take());
+                    run = Some((key, release.tag_name.clone(), 1, n));
+                } else if let Some((_, _, count, _)) = &mut run {
+                    *count += 1;
+                }
+            }
+            gh::SdAssetPick::NoneUsable => {
+                sdcpp_flush_gated_run(&mut walk, run.take());
                 walk.skipped.push(format!(
-                    "{}: {n} prebuilt{} target {} (newer than this host)",
-                    release.tag_name,
-                    if n == 1 { "" } else { "s" },
-                    distros.join(", "),
+                    "{}: no prebuilt for this platform",
+                    release.tag_name
                 ));
             }
-            gh::SdAssetPick::NoneUsable => walk.skipped.push(format!(
-                "{}: no prebuilt for this platform",
-                release.tag_name
-            )),
         }
     }
+    sdcpp_flush_gated_run(&mut walk, run.take());
     walk
+}
+
+/// Pure sd.cpp channel walk (test seam, no network) over the host
+/// clock: at most [`SDCPP_WALKBACK_RELEASE_CEILING`] releases younger
+/// than [`SDCPP_WALKBACK_MAX_AGE_SECS`] are examined, newest first.
+fn sdcpp_channel_walk<'a>(
+    releases: &'a [GhRelease],
+    patterns: &[gh::SdAssetPattern],
+    host_distro: Option<(u32, u32)>,
+) -> SdcppChannelWalk<'a> {
+    sdcpp_channel_walk_at(releases, patterns, host_distro, now_secs())
 }
 
 /// Channel truth for the sd.cpp lane, owned for the async boundary to
@@ -230,9 +316,10 @@ pub struct SdcppChannelTarget {
     /// Newest upstream master tag, gate or no gate.
     pub newest_tag: String,
     /// Newest tag whose prebuilt resolves for THIS host (None when
-    /// nothing within the walk depth does).
+    /// nothing within the walk window does).
     pub installable_tag: Option<String>,
-    /// One teaching line per skipped release.
+    /// One teaching line per skipped release, with consecutive
+    /// same-distro gated releases rolled up into one line.
     pub skipped: Vec<String>,
 }
 
@@ -464,6 +551,297 @@ pub fn remove_engine_row_and_tree(
         }
     }
     Ok(bytes)
+}
+
+/// Backfill `manifest.quant_methods` on sglang lanes whose manifests
+/// predate the registry probe (installed by an older binary). One venv
+/// read per stale lane; the row keeps every other field as listed and
+/// the stored manifest keeps its data-dir-relative `server_path` (the
+/// anchor is resolution state, not storage state). Fail-soft: a lane
+/// whose probe fails keeps the built-in const snapshot and is retried
+/// on the next boot, because `quant_methods` stays None. Returns the
+/// tags updated, for the spawn wrapper's log line.
+pub fn backfill_sglang_quant_facts(dirs: &BlazarDirs) -> Vec<String> {
+    let Ok(store) = Store::open(dirs) else {
+        tracing::warn!("sglang quant backfill could not open the store");
+        return Vec::new();
+    };
+    let Ok(engines) = store.list_engines() else {
+        tracing::warn!("sglang quant backfill could not list engines");
+        return Vec::new();
+    };
+    let mut updated = Vec::new();
+    for mut row in engines {
+        if row.kind != EngineKind::Sglang {
+            continue;
+        }
+        let Ok(mut manifest) = serde_json::from_str::<Manifest>(&row.manifest) else {
+            tracing::warn!(
+                tag = %row.tag,
+                "sglang quant backfill skipped an undecodable manifest"
+            );
+            continue;
+        };
+        if manifest.quant_methods.is_some() {
+            continue;
+        }
+        let mut anchored = manifest.clone();
+        anchored.anchor_server_path(&dirs.data_dir);
+        let Some(venv_python) = Path::new(&anchored.server_path)
+            .parent()
+            .map(|lane_dir| lane_dir.join("venv").join("bin").join("python"))
+        else {
+            continue;
+        };
+        manifest.quant_methods = match manifest::probe_quant_registry(&venv_python) {
+            Ok(methods) => Some(methods),
+            Err(e) => {
+                tracing::warn!(
+                    tag = %row.tag,
+                    "sglang quant backfill probe failed ({e:#}) - admission gate stays on the built-in snapshot"
+                );
+                None
+            }
+        };
+        if manifest.quant_methods.is_some() {
+            match serde_json::to_string(&manifest) {
+                Ok(json) => {
+                    row.manifest = json;
+                    if let Err(e) = store.upsert_engine(&row) {
+                        tracing::warn!(tag = %row.tag, "sglang quant backfill write failed: {e}");
+                        continue;
+                    }
+                    tracing::info!(tag = %row.tag, "backfilled sglang quant registry from the lane venv");
+                    updated.push(row.tag);
+                }
+                Err(e) => tracing::warn!(
+                    tag = %row.tag,
+                    "sglang quant backfill could not encode the manifest: {e}"
+                ),
+            }
+        }
+    }
+    updated
+}
+
+/// Detached boot wrapper: the venv probe pays the torch import chain
+/// (up to a minute cold), so `serve` fires this and never waits on it.
+pub fn spawn_sglang_quant_backfill(dirs: BlazarDirs) {
+    tokio::spawn(async move {
+        let updated = tokio::task::spawn_blocking(move || backfill_sglang_quant_facts(&dirs))
+            .await
+            .unwrap_or_default();
+        if !updated.is_empty() {
+            tracing::info!(
+                tags = updated.join(", "),
+                "sglang lanes now carry probed quant registries"
+            );
+        }
+    });
+}
+
+/// Tags whose stored manifests were captured by an older vocabulary
+/// probe (`probe_version` below the current one; legacy unstamped
+/// rows decode as 0). Pure decode-and-compare - no spawns - shared by
+/// the boot backfill (what to heal) and `blazar doctor` (what to
+/// report). Undecodable manifests are NOT stale here: re-probing
+/// cannot rebuild what never decoded, that row needs re-registration.
+#[must_use]
+pub fn stale_probe_vocab_tags(rows: &[blazar_core::store::EngineRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| {
+            serde_json::from_str::<Manifest>(&row.manifest)
+                .is_ok_and(|m| m.probe_version < manifest::MANIFEST_PROBE_VERSION)
+        })
+        .map(|row| row.tag.clone())
+        .collect()
+}
+
+/// Re-probe one engine row's vocabulary in place (flags, spec types,
+/// devices, probe stamp) and persist the merged manifest. The single
+/// refresh path shared by `blazar engine reprobe` and the daemon-boot
+/// backfill, so the two can never drift apart. `None` = row skipped
+/// (undecodable manifest, missing binary, failed probe) - each case
+/// warns with its reason and leaves the stored manifest untouched.
+fn refresh_row_vocab(
+    store: &Store,
+    row: &blazar_core::store::EngineRow,
+    data_dir: &Path,
+) -> Option<usize> {
+    let Ok(mut manifest) = serde_json::from_str::<Manifest>(&row.manifest) else {
+        tracing::warn!(
+            "reprobe {}: stored manifest undecodable - re-register the lane to rebuild it",
+            row.tag
+        );
+        return None;
+    };
+    // Relative rows resolve against the live data dir (the same heal
+    // smoke_probe applies).
+    manifest.anchor_server_path(data_dir);
+    let server = PathBuf::from(&manifest.server_path);
+    if !server.is_file() {
+        tracing::warn!(
+            "reprobe {}: binary missing at {} - manifest unchanged",
+            row.tag,
+            server.display()
+        );
+        return None;
+    }
+    match manifest::probe_kind(&server, &row.tag, &row.kind) {
+        Ok(fresh) => {
+            manifest.merge_vocab_from(&fresh);
+            let count = manifest.flags.len();
+            match serde_json::to_string(&manifest)
+                .context("encode reprobed manifest")
+                .and_then(|encoded| {
+                    store
+                        .update_engine_manifest(&row.tag, &encoded)
+                        .context("store reprobed manifest")
+                }) {
+                Ok(()) => {
+                    tracing::info!("reprobed {}: {count} flags captured", row.tag);
+                    Some(count)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "reprobe {}: persist failed ({e:#}) - manifest unchanged",
+                        row.tag
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "reprobe {}: probe failed ({e:#}) - manifest unchanged",
+                row.tag
+            );
+            None
+        }
+    }
+}
+
+/// Sync core of the daemon-boot vocabulary backfill: re-probe every
+/// row stamped below the current [`manifest::MANIFEST_PROBE_VERSION`]
+/// (a probe-parser upgrade changed what the stored vocabulary means -
+/// e.g. v2 learned dotted flag names). Same contract as
+/// `backfill_sglang_quant_facts`: best-effort, never fatal, every
+/// failure warns and leaves that row for `blazar engine reprobe`.
+/// Returns the tags actually refreshed.
+pub fn backfill_stale_probe_vocab(dirs: &BlazarDirs) -> Vec<String> {
+    let Ok(store) = Store::open(dirs) else {
+        tracing::warn!("probe-vocab backfill could not open the store");
+        return Vec::new();
+    };
+    let Ok(rows) = store.list_engines() else {
+        tracing::warn!("probe-vocab backfill could not list engines");
+        return Vec::new();
+    };
+    let stale = stale_probe_vocab_tags(&rows);
+    let mut healed = Vec::new();
+    for row in rows {
+        if !stale.contains(&row.tag) {
+            continue;
+        }
+        if refresh_row_vocab(&store, &row, &dirs.data_dir).is_some() {
+            healed.push(row.tag.clone());
+        }
+    }
+    healed
+}
+
+/// Detached boot wrapper: each re-probe spawns the engine binary's
+/// `--help` (seconds on a cold cache), so `serve` fires this and
+/// never waits on it.
+pub fn spawn_stale_probe_vocab_backfill(dirs: BlazarDirs) {
+    tokio::spawn(async move {
+        let healed = tokio::task::spawn_blocking(move || backfill_stale_probe_vocab(&dirs))
+            .await
+            .unwrap_or_default();
+        if !healed.is_empty() {
+            tracing::info!(
+                tags = healed.join(", "),
+                "stale engine manifests re-probed to the current vocabulary version"
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+mod vocab_tests {
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    use super::*;
+    use crate::engine::manifest::MANIFEST_PROBE_VERSION;
+
+    fn row(tag: &str, manifest_json: &str) -> EngineRow {
+        EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at: 0,
+            active: false,
+            manifest: manifest_json.to_string(),
+            kind: EngineKind::LlamaCpp,
+        }
+    }
+
+    #[test]
+    fn unit__stale_probe_vocab_tags__legacy_rows_stale_current_rows_fresh() {
+        // v1-era row: probe_version absent -> decodes as 0 -> stale.
+        let legacy = r#"{"tag":"b1","build_number":1,"version_raw":"b1","devices":[],"flags":["--ctx-size"],"spec_types":[],"server_path":"x"}"#;
+        // Row stamped by the current probe -> fresh.
+        let fresh = format!(
+            r#"{{"tag":"b2","build_number":1,"version_raw":"b2","devices":[],"flags":["--ctx-size"],"spec_types":[],"server_path":"x","probe_version":{MANIFEST_PROBE_VERSION}}}"#
+        );
+        // Undecodable manifest: NOT stale (a re-probe cannot rebuild
+        // what never decoded - that row needs re-registration).
+        let tags = stale_probe_vocab_tags(&[
+            row("b1", legacy),
+            row("b2", &fresh),
+            row("broken", "{not json"),
+        ]);
+        assert_eq!(tags, vec!["b1".to_string()]);
+    }
+
+    #[test]
+    fn unit__manifest_probe_version__unstamped_decodes_zero_const_is_current_generation() {
+        let legacy: crate::engine::manifest::Manifest = serde_json::from_str(
+            r#"{"tag":"b1","build_number":1,"version_raw":"b1","devices":[],"flags":["--ctx-size"],"spec_types":[],"server_path":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.probe_version, 0, "unstamped rows decode as v0");
+        // The constant is the generation every fresh probe stamps;
+        // bumping it is what turns stored rows stale for the boot
+        // backfill. Keep this pin aligned with the changelog when it
+        // moves.
+        assert_eq!(MANIFEST_PROBE_VERSION, 3);
+    }
+
+    #[test]
+    fn unit__merge_vocab_from__adopts_vocab_and_generation_preserves_provenance() {
+        use crate::engine::manifest::{Manifest, TrustTier};
+        let mut stored: Manifest = serde_json::from_str(
+            r#"{"tag":"b1","build_number":1,"version_raw":"b1","devices":[],"flags":["--ctx-size"],"spec_types":[""],"server_path":"x"}"#,
+        )
+        .unwrap();
+        stored.trust = TrustTier::User;
+        stored.repo = Some("owner/fork".into());
+        let fresh = Manifest {
+            flags: ["--ctx-size", "--fim-qwen-1.5b-default"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            probe_version: MANIFEST_PROBE_VERSION,
+            ..Default::default()
+        };
+        stored.merge_vocab_from(&fresh);
+        // Vocabulary and generation come from the fresh probe...
+        assert!(stored.flags.contains("--fim-qwen-1.5b-default"));
+        assert_eq!(stored.probe_version, MANIFEST_PROBE_VERSION);
+        // ...while provenance stays the stored row's own.
+        assert_eq!(stored.trust, TrustTier::User);
+        assert_eq!(stored.repo.as_deref(), Some("owner/fork"));
+    }
 }
 
 pub struct EngineManager {
@@ -1285,6 +1663,15 @@ impl EngineManager {
         retry_delay: std::time::Duration,
     ) -> Result<EngineRow> {
         let tag_name = release.tag_name.clone();
+        // Attempt-0 mirror-lag hardening (the fresh-release retry loop
+        // below re-fetches per attempt anyway): the first pick must
+        // not trust the paginated listing's asset list wholesale - that
+        // surface has served asset lists contradicting the per-tag API
+        // (observed live 2026-11-08 during the sd.cpp builder-distro
+        // diagnosis). The authoritative per-tag row wins; on fetch
+        // failure the listing row stands and download + probe still
+        // validate the pick.
+        release = self.gh.authoritative_release(release).await;
         for attempt in 0..=ASSET_UPLOAD_RETRY_ATTEMPTS {
             match self.pick(&release).await? {
                 Some(pick) => {
@@ -1593,8 +1980,16 @@ impl EngineManager {
     /// `engines/sglang-<version>`, then the shared register/probe tail.
     /// `version = None` pins to [`sglang_install::SGLANG_DEFAULT_VERSION`]
     /// (verified flag contract; see its doc for why not auto-latest).
+    /// `extras` are verbatim pip specs layered onto the venv after the
+    /// base install (sglang plugins, e.g. the `DSpine` drafter) - the
+    /// temporary-bridge lane: when upstream merges the capability the
+    /// same install without `extras` serves it natively.
     /// F88: every failure path after dir creation removes the dir.
-    pub async fn install_sglang(&self, version: Option<&str>) -> Result<EngineRow> {
+    pub async fn install_sglang(
+        &self,
+        version: Option<&str>,
+        extras: &[String],
+    ) -> Result<EngineRow> {
         if !cfg!(target_os = "linux") {
             anyhow::bail!(
                 "sglang upstream supports Linux (CUDA/ROCm) only; {} is not \
@@ -1609,11 +2004,17 @@ impl EngineManager {
         if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
             anyhow::bail!("sglang version must be dotted digits (e.g. 0.5.19), got {version:?}");
         }
+        if extras.iter().any(|s| s.trim().is_empty()) {
+            anyhow::bail!("sglang install extras must be non-empty pip specs, got {extras:?}");
+        }
         let tag = format!("sglang-{version}");
         // Rollback-safe: a rebuild that dies mid-venv (a 100%-full disk
         // ate one live, 2026-09-18) restores the previously installed
         // engine instead of destroying it.
-        let asset_label = format!("pip:sglang=={version}");
+        let mut asset_label = format!("pip:sglang=={version}");
+        if !extras.is_empty() {
+            asset_label = format!("{asset_label} + {} extra pkg(s)", extras.len());
+        }
         self.install_with_rollback(
             &tag,
             &asset_label,
@@ -1621,9 +2022,73 @@ impl EngineManager {
             EngineKind::Sglang,
             |dir| async move {
                 std::fs::create_dir_all(&dir)?;
-                sglang_install::install_into(&dir, version)
+                sglang_install::install_into(&dir, version, extras)
                     .await
                     .map(|_| ())
+            },
+        )
+        .await
+    }
+
+    /// Install the kokoro TTS lane (kokoro-onnx venv + GH model assets).
+    /// `model_version` names the MODEL line (v1 files under
+    /// `model-files-v*` releases), not the pip package - the package is
+    /// pinned by the lane itself. Same venv-per-tag + rollback
+    /// discipline as the sglang lane.
+    pub async fn install_kokoro(&self, model_version: Option<&str>) -> Result<EngineRow> {
+        let model_version = model_version.unwrap_or(kokoro_install::KOKORO_DEFAULT_MODEL);
+        // Reject malformed pins early: the tag IS the model line the
+        // release resolver and probe_kokoro's serial parse consume.
+        if model_version.is_empty()
+            || !model_version
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.')
+        {
+            anyhow::bail!(
+                "kokoro model version must be dotted digits (e.g. 1.0), got {model_version:?}"
+            );
+        }
+        let tag = format!("kokoro-{model_version}");
+        let release = self.gh.kokoro_model_release(model_version).await?;
+        let (model_name, voices_name) = kokoro_install::model_asset_names(model_version);
+        let model_asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == model_name)
+            .ok_or_else(|| anyhow!("release {} lost its {model_name} asset", release.tag_name))?;
+        let voices_asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == voices_name)
+            .ok_or_else(|| anyhow!("release {} lost its {voices_name} asset", release.tag_name))?;
+        // Digest of the MODEL asset (the big one) when GH published one;
+        // voices ride the same verification inside download_asset_file.
+        let digest = model_asset
+            .digest
+            .clone()
+            .unwrap_or_else(|| "unverified".to_string());
+        let asset_label = format!(
+            "pip:kokoro-onnx=={} + gh:{}",
+            kokoro_install::KOKORO_ONNX_VERSION,
+            release.tag_name
+        );
+        let gh = &self.gh;
+        let model_dest_name = kokoro_install::MODEL_FILE;
+        let voices_dest_name = kokoro_install::VOICES_FILE;
+        self.install_with_rollback(
+            &tag,
+            &asset_label,
+            &digest,
+            EngineKind::Kokoro,
+            |dir| async move {
+                std::fs::create_dir_all(&dir)?;
+                // Raw files, not archives: download straight to the
+                // lane-local contract names the probe and server expect.
+                gh.download_asset_file(model_asset, &dir.join(model_dest_name))
+                    .await?;
+                gh.download_asset_file(voices_asset, &dir.join(voices_dest_name))
+                    .await?;
+                kokoro_install::install_into(&dir).await.map(|_| ())
             },
         )
         .await
@@ -1656,6 +2121,34 @@ impl EngineManager {
             |dir| async move {
                 std::fs::create_dir_all(&dir)?;
                 mlx_install::install_into(&dir, version).await.map(|_| ())
+            },
+        )
+        .await
+    }
+
+    /// Install the openaihost lane (LiteRT-LM pip venv): explicit
+    /// version or the pinned default. Same venv-per-tag lifecycle as
+    /// the mlx/sglang lanes; no backend pins (the wheel is pure-python
+    /// and the runtime picks CPU/GPU/NPU delegates internally).
+    pub async fn install_litert(&self, version: Option<&str>) -> Result<EngineRow> {
+        let version = version.unwrap_or(litert_install::LITERT_LM_DEFAULT_VERSION);
+        // Reject malformed pins early: the tag IS the version string that
+        // probe_openaihost's semver parse and pip both consume.
+        if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            anyhow::bail!("litert-lm version must be dotted digits (e.g. 0.19.1), got {version:?}");
+        }
+        let tag = format!("litert-{version}");
+        let asset_label = format!("pip:litert-lm=={version}");
+        self.install_with_rollback(
+            &tag,
+            &asset_label,
+            "unverified",
+            EngineKind::OpenAiHost,
+            |dir| async move {
+                std::fs::create_dir_all(&dir)?;
+                litert_install::install_into(&dir, version)
+                    .await
+                    .map(|_| ())
             },
         )
         .await
@@ -1764,11 +2257,37 @@ impl EngineManager {
         for skipped in &walk.skipped {
             tracing::info!("sd.cpp channel walk skipped {skipped}");
         }
-        for candidate in &walk.installable {
+        for candidate in walk.installable {
             if let Some(row) = self.sdcpp_installed_row_if_tag(&candidate.tag_name)? {
                 return Ok(row);
             }
-            match self.sdcpp_install_release(candidate, &patterns, host).await {
+            // Mirror-lag hardening: install from the authoritative
+            // per-tag row, not the listing row that picked this
+            // candidate (the two surfaces have disagreed live). If the
+            // authoritative assets no longer clear the host gate the
+            // listing claimed they did, demote the candidate with a
+            // teaching line and keep walking - the channel owes the
+            // newest release that resolves AND runs; a hard error here
+            // would let one stale listing row kill the whole lane.
+            let candidate = self
+                .gh
+                .authoritative_release_repo(gh::SDCPP_REPO, candidate.clone())
+                .await;
+            if !matches!(
+                gh::resolve_sdcpp_asset(&candidate, &patterns, host),
+                gh::SdAssetPick::Matched(..)
+            ) {
+                tracing::warn!(
+                    "sd.cpp {} no longer clears the host gate on its \
+                     authoritative per-tag assets - walking to the older release",
+                    candidate.tag_name
+                );
+                continue;
+            }
+            match self
+                .sdcpp_install_release(&candidate, &patterns, host)
+                .await
+            {
                 Ok(row) => return Ok(row),
                 Err(e) if is_probe_failure(&e) => {
                     // The binary is unusable on THIS host in a way the
@@ -1788,8 +2307,9 @@ impl EngineManager {
             walk.skipped.join(" | ")
         };
         Err(anyhow!(
-            "no sd.cpp release installable on this host within the {SDCPP_WALKBACK_DEPTH} newest \
-             releases (skipped: {skipped})"
+            "no sd.cpp release installable on this host within the last {} days \
+             of releases (skipped: {skipped})",
+            SDCPP_WALKBACK_MAX_AGE_SECS / 86_400,
         ))
     }
 
@@ -2195,6 +2715,9 @@ impl EngineManager {
     // Argument list maps 1:1 onto the public register_* API; bundling
     // into a seed struct would hide that correspondence.
     #[allow(clippy::too_many_arguments)]
+    // One registration pipeline per engine kind by design; the lane
+    // dispatch grew past the line budget with the openaihost arm.
+    #[allow(clippy::too_many_lines)]
     fn register_engine_inner(
         &self,
         dir: &Path,
@@ -2214,11 +2737,20 @@ impl EngineManager {
             EngineKind::Sglang => find_engine_binary(dir, &["sglang-server"]),
             // Same venv-shim contract as sglang (the lane it mirrors).
             EngineKind::Mlx => find_engine_binary(dir, &["mlx-server"]),
+            // Same venv-shim contract as sglang/mlx; the shim execs the
+            // venv's litert-lm entry point (openaihost lane). Name is a
+            // shared const: the install lane writes it, this finder and
+            // `find_litert_bin` match it - platform extension included.
+            EngineKind::OpenAiHost => find_engine_binary(dir, &[litert_install::SHIM_NAME]),
             EngineKind::SdCpp => find_engine_binary(dir, &["sd-server", "sd-server.exe"]),
             EngineKind::Whisper => {
                 find_engine_binary(dir, &["whisper-server", "whisper-server.exe"])
             }
             EngineKind::Piper => find_engine_binary(dir, &["piper", "piper.exe"]),
+            // venv-shim contract as sglang/mlx: the kokoro install lane
+            // writes the shim that execs the venv python on the lane's
+            // resident TTS server.
+            EngineKind::Kokoro => find_engine_binary(dir, &[kokoro_install::SHIM_NAME]),
         }
         .map_err(|e| e.context(ENGINE_PROBE_FAILED))?;
         make_executable(&server);
@@ -2260,6 +2792,13 @@ impl EngineManager {
             EngineKind::Mlx => {
                 tracing::debug!(target: "blazar::engine", "registered mlx {tag} ({asset_label})");
             }
+            // venv lane like sglang/mlx: the runtime picks its delegates
+            // (CPU/GPU/NPU) internally and the manifest carries no
+            // devices - an unusable install fails the probe or spawn,
+            // loudly.
+            EngineKind::OpenAiHost => {
+                tracing::debug!(target: "blazar::engine", "registered openaihost {tag} ({asset_label})");
+            }
             // sd.cpp CAN enumerate devices (Vulkan0/CUDA0/CPU rows, no
             // MiB numbers), so the llama GPU-count crosscheck does not
             // apply - an unusable build fails at spawn, loudly.
@@ -2277,6 +2816,12 @@ impl EngineManager {
             // the CLI phonemizes through its bundled espeak-ng data).
             EngineKind::Piper => {
                 tracing::debug!(target: "blazar::engine", "registered piper {tag} ({asset_label})");
+            }
+            // kokoro keeps a resident HTTP child for synthesis (the 325
+            // MB model pays its load once); the gateway TTS handler owns
+            // the lifecycle - no supervised spawn, no devices.
+            EngineKind::Kokoro => {
+                tracing::debug!(target: "blazar::engine", "registered kokoro {tag} ({asset_label})");
             }
         }
         // Storage invariant: rows carry data-dir-relative server paths
@@ -2483,7 +3028,21 @@ impl EngineManager {
                 row.kind,
                 match row.kind {
                     EngineKind::Whisper => format!("blazar whisper --pin {tag}"),
-                    _ => format!("blazar tts --install --tag {tag}"),
+                    EngineKind::Piper => format!("blazar tts --install --tag {tag}"),
+                    EngineKind::Kokoro => {
+                        format!("blazar engine install {tag} --kind kokoro")
+                    }
+                    // Serving lanes never reach past the is_lazy_lane()
+                    // guard above; enumerated so a future lazy lane is a
+                    // compile error here until it grows its pin command.
+                    EngineKind::LlamaCpp
+                    | EngineKind::MistralRs
+                    | EngineKind::Sglang
+                    | EngineKind::SdCpp
+                    | EngineKind::Mlx
+                    | EngineKind::OpenAiHost => {
+                        unreachable!("serving lane inside the lazy-lane guard")
+                    }
                 }
             );
         }
@@ -2496,6 +3055,35 @@ impl EngineManager {
             .into_iter()
             .find(|e| e.tag == tag)
             .ok_or_else(|| anyhow!("tag {tag} vanished"))
+    }
+
+    /// Re-probe stored manifests in place (`blazar engine reprobe`):
+    /// re-run each lane's probe against its installed binary and
+    /// refresh the parser-derived fields (flags / `spec_types` /
+    /// devices), preserving everything a probe cannot derive
+    /// (provenance, trust, architectures, supersede state). Heals rows
+    /// probed by an older `parse_help` - e.g. manifests stored before
+    /// dotted flag names were kept - without reinstalling or switching
+    /// engines. `None` tag = every row. Returns (tag, flag count) per
+    /// reprobed row; failures warn and leave that row's manifest
+    /// untouched.
+    pub fn reprobe_manifests(&self, tag: Option<&str>) -> Result<Vec<(String, usize)>> {
+        let store = Store::open(&self.dirs)?;
+        let rows = store.list_engines()?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Some(want) = tag
+                && want != row.tag
+            {
+                continue;
+            }
+            // The shared refresh path (same one the daemon-boot
+            // backfill rides): warns and skips on its own.
+            if let Some(count) = refresh_row_vocab(&store, &row, &self.dirs.data_dir) {
+                out.push((row.tag.clone(), count));
+            }
+        }
+        Ok(out)
     }
 
     /// Step back to the previous tag by install time, staying on the
@@ -3728,6 +4316,7 @@ pub fn smoke_probe(
         }
         EngineKind::Sglang => venv_metadata_probe(manifest, "sglang"),
         EngineKind::Mlx => venv_metadata_probe(manifest, "mlx_lm"),
+        EngineKind::OpenAiHost => venv_metadata_probe(manifest, "litert_lm"),
         // mistral.rs and sd-server both answer --version with a
         // banner and exit 0 (verified v0.9.4 / master-890).
         EngineKind::MistralRs | EngineKind::SdCpp => native_version_probe(manifest),
@@ -3736,6 +4325,10 @@ pub fn smoke_probe(
         // table the same way - the shared lazy-lane liveness shape:
         // usage on stdout/stderr, exit 0.
         EngineKind::Whisper | EngineKind::Piper => native_help_probe(manifest),
+        // kokoro's shim speaks HTTP, not CLI flags: the venv python
+        // reading the installed package version is the liveness probe
+        // (the sglang/mlx venv-lane shape).
+        EngineKind::Kokoro => venv_metadata_probe(manifest, "kokoro_onnx"),
     }
 }
 
@@ -4422,6 +5015,7 @@ mod verify_tests {
                     })
                     .collect(),
                 published_at: None,
+                body: None,
             }
         }
 
@@ -4508,6 +5102,7 @@ mod verify_tests {
                 })
                 .collect(),
                 published_at: None,
+                body: None,
             }
         }
 
@@ -4516,7 +5111,7 @@ mod verify_tests {
             // The live 2026-11 shape: master-1044..1051 prebuilts moved
             // to Ubuntu 26.04 builders (GLIBC_2.43) while this host runs
             // Ubuntu 24.04 - the walk lands on master-1043 and teaches
-            // every skipped release.
+            // the whole gated episode as ONE rolled-up line.
             let releases = vec![
                 sd_release("master-1051-7952693", "26.04"),
                 sd_release("master-1050-58bb3c1", "26.04"),
@@ -4534,11 +5129,100 @@ mod verify_tests {
                 vec!["master-1043-3be2378"],
                 "only the host-compatible release is installable"
             );
-            assert_eq!(walk.skipped.len(), 3, "{:?}", walk.skipped);
+            assert_eq!(walk.skipped.len(), 1, "{:?}", walk.skipped);
+            let entry = &walk.skipped[0];
+            assert!(entry.contains("master-1051-7952693"), "{entry}");
+            assert!(entry.contains("+ 2 more releases"), "{entry}");
+            assert!(entry.contains("26.04"), "{entry}");
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__gated_run_longer_than_any_count_cap_still_reaches_compatible()
+        {
+            // Live 2026-11 shape: SIXTEEN consecutive Ubuntu-26.04-gated
+            // releases (master-1044..1060, upstream never published 1048)
+            // sit above the host-compatible master-1043. A count-based
+            // walk cap sized when the gated run was 9 long exhausted at
+            // 12 and hid 1043 - and the run grows with every upstream
+            // release, so no count can keep up. Walk eligibility is
+            // AGE-based: every release here is fresh, so the walk must
+            // land on 1043 and teach the whole gated episode as one line.
+            let mut releases: Vec<GhRelease> = (1044..=1060)
+                .rev()
+                .filter(|n| *n != 1048)
+                .map(|n| sd_release(&format!("master-{n}-aaaaaaa{n}"), "26.04"))
+                .collect();
+            releases.push(sd_release("master-1043-3be2378", "24.04"));
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk(&releases, &picks, Some((24, 4)));
+            assert_eq!(
+                walk.installable
+                    .iter()
+                    .map(|r| r.tag_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["master-1043-3be2378"],
+                "the host-compatible release beneath a 16-deep gated run must be found"
+            );
+            assert_eq!(walk.skipped.len(), 1, "{:?}", walk.skipped);
             assert!(
-                walk.skipped.iter().all(|s| s.contains("26.04")),
-                "{:?}",
-                walk.skipped
+                walk.skipped[0].contains("+ 15 more releases"),
+                "{}",
+                walk.skipped[0]
+            );
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__gated_runs_of_different_distros_stay_separate() {
+            // Two builder-distro episodes: the 26.04 pair rolls up; the
+            // lone 26.10 release keeps the per-release shape (tag + its
+            // asset count) because its distro set differs.
+            let releases = vec![
+                sd_release("master-1051-aaa", "26.04"),
+                sd_release("master-1050-bbb", "26.04"),
+                sd_release("master-1049-ccc", "26.10"),
+                sd_release("master-1043-3be2378", "24.04"),
+            ];
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk(&releases, &picks, Some((24, 4)));
+            assert_eq!(walk.skipped.len(), 2, "{:?}", walk.skipped);
+            assert!(
+                walk.skipped[0].contains("master-1051-aaa + 1 more releases"),
+                "{}",
+                walk.skipped[0]
+            );
+            assert!(walk.skipped[0].contains("26.04"), "{}", walk.skipped[0]);
+            assert!(
+                walk.skipped[1].contains("master-1049-ccc: 2 prebuilts target Ubuntu 26.10"),
+                "{}",
+                walk.skipped[1]
+            );
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__noneusable_breaks_gated_run_and_stays_per_release() {
+            // A no-match release between two gated ones ends the run:
+            // each side flushes on its own and the no-match line keeps
+            // its per-release shape.
+            let mut orphan = sd_release("master-1049-ddd", "24.04");
+            orphan.assets.clear();
+            let releases = vec![
+                sd_release("master-1051-aaa", "26.04"),
+                sd_release("master-1050-bbb", "26.04"),
+                orphan,
+                sd_release("master-1043-3be2378", "24.04"),
+            ];
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk(&releases, &picks, Some((24, 4)));
+            assert_eq!(walk.skipped.len(), 2, "{:?}", walk.skipped);
+            assert!(
+                walk.skipped[0].contains("master-1051-aaa + 1 more releases"),
+                "{}",
+                walk.skipped[0]
+            );
+            assert!(
+                walk.skipped[1].contains("master-1049-ddd: no prebuilt for this platform"),
+                "{}",
+                walk.skipped[1]
             );
         }
 
@@ -4559,10 +5243,12 @@ mod verify_tests {
         }
 
         #[test]
-        fn unit__sdcpp_channel_walk__depth_cap_teaches_all_skipped() {
-            // More gated releases than the walk depth: the walk examines
-            // only the newest SDCPP_WALKBACK_DEPTH and reports each with
-            // its reason; anything older is never considered.
+        fn unit__sdcpp_channel_walk__whole_gated_window_rolls_into_one_line() {
+            // Supersedes the old depth-cap pin (which asserted a
+            // count-based cap of 12): eligibility is AGE-based now, so
+            // every fresh release in this list is examined and the
+            // whole one-distro episode still rolls up into a single
+            // teaching line naming the count.
             let releases: Vec<GhRelease> = (1040..=1052)
                 .rev()
                 .map(|n| sd_release(&format!("master-{n}-aaaaaaa{n}"), "26.04"))
@@ -4572,10 +5258,90 @@ mod verify_tests {
             assert!(walk.installable.is_empty());
             assert_eq!(
                 walk.skipped.len(),
-                SDCPP_WALKBACK_DEPTH,
-                "the walk stops after the depth cap even when every release is gated"
+                1,
+                "the whole gated episode rolls up into one line"
             );
-            assert!(walk.skipped.iter().all(|s| s.contains("26.04")));
+            let entry = &walk.skipped[0];
+            assert!(entry.contains("master-1052-aaaaaaa1052"), "{entry}");
+            assert!(entry.contains("+ 12 more releases"), "{entry}");
+            assert!(entry.contains("26.04"), "{entry}");
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__compatible_release_older_than_window_is_never_considered() {
+            // The anti-stale bound: a host-compatible release OLDER
+            // than the walk window is never auto-installed - the
+            // fresh gated pair above it teaches, installable stays
+            // empty, and the stale release is never even named. Clock
+            // pinned so the ages are exact: the gated pair is fresh
+            // (no timestamp = eligible), 1043 sits at 181 days, one
+            // past the 180-day window.
+            let mut stale = sd_release("master-1043-3be2378", "24.04");
+            stale.published_at = Some("2026-03-10T06:49:18Z".into()); // 181d before now
+            let releases = vec![
+                sd_release("master-1060-aaaaaaa1060", "26.04"),
+                sd_release("master-1059-bbbbbbb1059", "26.04"),
+                stale,
+            ];
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk_at(&releases, &picks, Some((24, 4)), 1_788_763_758);
+            assert!(walk.installable.is_empty(), "{:?}", walk.installable);
+            assert_eq!(walk.skipped.len(), 1, "{:?}", walk.skipped);
+            assert!(
+                walk.skipped[0].contains("master-1060-aaaaaaa1060 + 1 more releases"),
+                "{}",
+                walk.skipped[0]
+            );
+            assert!(
+                !walk.skipped.iter().any(|l| l.contains("1043")),
+                "the out-of-window release is never examined: {:?}",
+                walk.skipped
+            );
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__release_just_inside_window_is_eligible() {
+            // Window edge, near side: 179 days old is still inside the
+            // 180-day window, so the host-compatible release beneath a
+            // fresh gated pair is found and installed.
+            let mut edge = sd_release("master-1043-3be2378", "24.04");
+            edge.published_at = Some("2026-03-12T06:49:18Z".into()); // 179d before now
+            let releases = vec![sd_release("master-1060-aaaaaaa1060", "26.04"), edge];
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk_at(&releases, &picks, Some((24, 4)), 1_788_763_758);
+            assert_eq!(
+                walk.installable
+                    .iter()
+                    .map(|r| r.tag_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["master-1043-3be2378"],
+                "{:?}",
+                walk.skipped
+            );
+        }
+
+        #[test]
+        fn unit__sdcpp_channel_walk__release_ceiling_bounds_the_examination() {
+            // Defensive ceiling for the pathological case: 150 fresh
+            // timestamp-less gated releases -> only the newest
+            // SDCPP_WALKBACK_RELEASE_CEILING are examined and the
+            // rollup teaches that count; the tail is never considered.
+            let releases: Vec<GhRelease> = (0..150)
+                .rev()
+                .map(|n| sd_release(&format!("master-{}-aaaaaaa{n}", 910 + n), "26.04"))
+                .collect();
+            let picks = gh::sdcpp_asset_patterns("linux", "x86_64", false).unwrap();
+            let walk = sdcpp_channel_walk(&releases, &picks, Some((24, 4)));
+            assert!(walk.installable.is_empty());
+            assert_eq!(walk.skipped.len(), 1, "{:?}", walk.skipped);
+            assert!(
+                walk.skipped[0].contains(&format!(
+                    "+ {} more releases",
+                    SDCPP_WALKBACK_RELEASE_CEILING - 1
+                )),
+                "{}",
+                walk.skipped[0]
+            );
         }
 
         #[test]
@@ -4760,5 +5526,145 @@ mod retire_containment_tests {
         assert!(aside.is_dir());
         assert!(aside.starts_with(&engines));
         assert!(!engines.join("b1-cuda").exists(), "tag dir moved aside");
+    }
+
+    // --- sglang quant backfill ------------------------------------------
+
+    fn sglang_backfill_lane(data: &std::path::Path, tag: &str, probe_arm: &str) -> String {
+        let lane = data.join("engines").join(tag);
+        std::fs::create_dir_all(lane.join("venv/bin")).unwrap();
+        std::fs::write(lane.join("sglang-server"), "#!/bin/sh\nexit 0\n").unwrap();
+        let stub = format!(
+            "#!/bin/sh\ncase \"$2\" in\n  *BASE_QUANTIZATION_METHODS*) {probe_arm} ;;\n  *) exit 1 ;;\nesac\n"
+        );
+        std::fs::write(lane.join("venv/bin/python"), stub).unwrap();
+        std::fs::set_permissions(
+            lane.join("venv/bin/python"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        serde_json::json!({
+            "tag": tag,
+            "build_number": 5020,
+            "version_raw": "sglang 0.5.20",
+            "devices": [],
+            "flags": ["--api-key"],
+            "spec_types": [],
+            "server_path": format!("engines/{tag}/sglang-server"),
+        })
+        .to_string()
+    }
+
+    fn sglang_backfill_row(tag: &str, manifest: String, kind: EngineKind) -> EngineRow {
+        EngineRow {
+            tag: tag.into(),
+            asset: "stub".into(),
+            sha256: String::new(),
+            installed_at: 1_700_000_000,
+            active: false,
+            manifest,
+            kind,
+        }
+    }
+
+    fn sglang_backfill_dirs(tmp: &std::path::Path) -> BlazarDirs {
+        BlazarDirs {
+            config_dir: tmp.join("cfg"),
+            data_dir: tmp.join("data"),
+        }
+    }
+
+    #[test]
+    fn unit__backfill_sglang_quant_facts__fills_stale_lane_and_leaves_rest_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = sglang_backfill_dirs(tmp.path());
+        dirs.ensure().unwrap();
+        let stale_manifest =
+            sglang_backfill_lane(&dirs.data_dir, "sglang-0.5.20", "echo '[\"awq\", \"fp8\"]'");
+        let fresh_manifest = serde_json::json!({
+            "tag": "sglang-0.5.23",
+            "build_number": 5023,
+            "version_raw": "sglang 0.5.23",
+            "devices": [],
+            "flags": ["--api-key"],
+            "spec_types": [],
+            "server_path": "engines/sglang-0.5.23/sglang-server",
+            "quant_methods": ["gguf"],
+        })
+        .to_string();
+        let store = Store::open(&dirs).unwrap();
+        store
+            .upsert_engine(&sglang_backfill_row(
+                "sglang-0.5.20",
+                stale_manifest,
+                EngineKind::Sglang,
+            ))
+            .unwrap();
+        store
+            .upsert_engine(&sglang_backfill_row(
+                "sglang-0.5.23",
+                fresh_manifest.clone(),
+                EngineKind::Sglang,
+            ))
+            .unwrap();
+        // Non-sglang lanes never reach a venv probe; their manifest stays
+        // opaque to this pass by construction.
+        store
+            .upsert_engine(&sglang_backfill_row(
+                "b12189",
+                "{}".into(),
+                EngineKind::LlamaCpp,
+            ))
+            .unwrap();
+
+        let updated = backfill_sglang_quant_facts(&dirs);
+
+        assert_eq!(updated, vec!["sglang-0.5.20".to_string()]);
+        let rows: Vec<EngineRow> = store.list_engines().unwrap();
+        let by_tag = |t: &str| rows.iter().find(|r| r.tag == t).unwrap();
+        let backfilled: Manifest = serde_json::from_str(&by_tag("sglang-0.5.20").manifest).unwrap();
+        assert_eq!(
+            backfilled.quant_methods,
+            Some(vec!["awq".into(), "fp8".into()])
+        );
+        assert_eq!(
+            backfilled.server_path, "engines/sglang-0.5.20/sglang-server",
+            "stored manifest keeps its data-dir-relative server_path"
+        );
+        assert_eq!(
+            by_tag("sglang-0.5.23").manifest,
+            fresh_manifest,
+            "a lane that already carries probed facts is not rewritten"
+        );
+        assert_eq!(by_tag("b12189").manifest, "{}");
+    }
+
+    #[test]
+    fn unit__backfill_sglang_quant_facts__probe_failure_keeps_const_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = sglang_backfill_dirs(tmp.path());
+        dirs.ensure().unwrap();
+        let manifest = sglang_backfill_lane(&dirs.data_dir, "sglang-0.5.20", "echo 'not-json'");
+        let store = Store::open(&dirs).unwrap();
+        store
+            .upsert_engine(&sglang_backfill_row(
+                "sglang-0.5.20",
+                manifest.clone(),
+                EngineKind::Sglang,
+            ))
+            .unwrap();
+
+        assert!(backfill_sglang_quant_facts(&dirs).is_empty());
+
+        let row = store.list_engines().unwrap().remove(0);
+        assert_eq!(
+            row.manifest, manifest,
+            "failed probe leaves the row untouched"
+        );
+        let m: Manifest = serde_json::from_str(&row.manifest).unwrap();
+        assert!(
+            m.quant_methods.is_none(),
+            "gate stays on the const snapshot"
+        );
     }
 }

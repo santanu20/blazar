@@ -1,0 +1,55 @@
+[
+  {
+    "family": "qwen3",
+    "mode": "combined",
+    "repo": "unsloth/Qwen3.5-9B-MTP-GGUF",
+    "models": [
+      "qwen3.5-9b",
+      "qwen3.5-4b",
+      "qwen3.5-2b",
+      "qwen3.5-0.8b",
+      "qwen3.5-27b",
+      "qwen3.5-35b-a3b"
+    ],
+    "note": "unsloth combined MTP bundles: the NextN draft head ships inside the target GGUF, so one pull arms speculative decoding (spec = \"auto\")."
+  },
+  {
+    "family": "qwen3",
+    "mode": "combined",
+    "repo": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+    "models": [
+      "qwen3.6-35b-a3b",
+      "qwen3.6-27b"
+    ],
+    "note": "Qwen3.6 combined MTP bundles (same single-file scheme as the 3.5 lineup)."
+  },
+  {
+    "family": "qwen3",
+    "mode": "separate",
+    "repo": "williamliao/Qwen3-8B-EAGLE3-Speculator-GGUF",
+    "models": [
+      "qwen3-8b",
+      "qwen3-14b"
+    ],
+    "note": "EAGLE3 speculator head for the dense Qwen3 lineup (14B head sibling in the same account); bench before adopting."
+  },
+  {
+    "family": "qwen3",
+    "mode": "separate",
+    "repo": "tencent/Qwen3-8B-DSpine-b16",
+    "models": [
+      "qwen3-8b"
+    ],
+    "note": "DSpine parallel drafter (arXiv 2609.36173) for Qwen3-8B safetensors checkpoints; sglang lane only - serve with spec = \"dspine\" on a lane carrying the DSpine algorithm (native upstream or the sglang-dspine plugin lane). Capacity boundary: the drafter reads the target lm_head and needs it unquantized bf16 (--dtype bfloat16; quantized targets must exclude \"lm_head\" in quantization_config.modules_to_not_convert), and full-capacity dspine (no CPU offload) needs a bf16/fp8-native target or a >=12 GiB card - as of 2026-11-09 no quantized-safetensors Qwen3-8B variant ships a bf16 lm_head, and community 4B drafts are dated training-run checkpoints, not stable pairs."
+  },
+  {
+    "family": "gemma",
+    "mode": "separate",
+    "repo": "williamliao/gemma-4-26B-A4B-it-speculator.eagle3-F16-GGUF",
+    "models": [
+      "gemma-4-26b-a4b-it",
+      "gemma-4-31b-it"
+    ],
+    "note": "EAGLE3 speculator head for Gemma 4 (31B head sibling exists); bench before adopting."
+  }
+]

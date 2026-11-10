@@ -161,6 +161,11 @@ pub struct GhRelease {
     /// freshness decides whether a missing asset is worth waiting for.
     #[serde(default)]
     pub published_at: Option<String>,
+    /// Release-notes markdown as authored upstream (the API `body`).
+    /// Absent on the anonymous releases.atom fallback and on bare
+    /// build-tag releases (llama.cpp b-tags ship no notes).
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 impl GhRelease {
@@ -533,10 +538,45 @@ impl GhClient {
         }
     }
 
+    /// Releases published AFTER `installed_tag` (newest first), for the
+    /// changelog advisor: what an `engine update --check` "update
+    /// available" actually contains before anything downloads. Stops at
+    /// the installed tag when the list contains it; caps at `max` when
+    /// the installed tag is absent (uninstalled lane, tag renamed away,
+    /// or a deeper history than the cap). Zero-asset releases are
+    /// skipped: on lanes that dual-tag (whisper.cpp ships a `vX.Y.Z`
+    /// marker beside the asset-bearing `bNNNN` of the SAME drop), the
+    /// marker is not a newer installable - listing it as "ahead" would
+    /// teach a phantom update. Caveat: the rate-limited releases.atom
+    /// fallback reports unreadable asset tables as empty; on that path
+    /// this filter under-reports (advisor says current when unsure).
+    pub async fn releases_newer_than(
+        &self,
+        repo: &str,
+        installed_tag: &str,
+        max: usize,
+    ) -> Result<Vec<GhRelease>> {
+        let all = self.list_releases_repo(repo).await?;
+        let mut newer: Vec<GhRelease> = Vec::new();
+        for rel in all {
+            if rel.tag_name == installed_tag {
+                break;
+            }
+            if rel.assets.is_empty() {
+                continue;
+            }
+            newer.push(rel);
+            if newer.len() >= max {
+                break;
+            }
+        }
+        Ok(newer)
+    }
+
     async fn list_releases_api(&self, repo: &str) -> Result<Vec<GhRelease>> {
         let url = self
             .base
-            .join(&format!("repos/{repo}/releases?per_page=30"))
+            .join(&format!("repos/{repo}/releases?per_page=100"))
             .context(
                 "GitHub API path failed to resolve - check the repo/tag for invalid characters",
             )?;
@@ -634,6 +674,7 @@ impl GhClient {
                             prerelease: web_prerelease(&tag),
                             assets,
                             published_at: None,
+                            body: None,
                         });
                     }
                 }
@@ -729,6 +770,7 @@ impl GhClient {
                 tag_name: tag,
                 assets: assets.unwrap_or_default(),
                 published_at: updated,
+                body: None,
             })
             .collect())
     }
@@ -981,6 +1023,39 @@ impl GhClient {
         .await
     }
 
+    /// Re-resolve a listing-picked release through the per-tag endpoint
+    /// and prefer the result. The paginated listing has served asset
+    /// lists that contradicted the per-tag API (observed live
+    /// 2026-11-08 while diagnosing the sd.cpp builder-distro walk:
+    /// stale mirror data vs authoritative per-tag answers), and an
+    /// install eats whatever asset list it is handed - so the install
+    /// path trades one extra request for the authoritative row. Verdict
+    /// and read paths stay on the cheap listing. A failed re-resolve
+    /// never blocks the install: the listing row stands (warned), and
+    /// the download + digest + probe still validate the pick end to
+    /// end. This mirrors the resolve-then-dereference shape the whisper
+    /// and piper lanes already use.
+    pub async fn authoritative_release_repo(&self, repo: &str, release: GhRelease) -> GhRelease {
+        match self.release_by_tag_repo(repo, &release.tag_name).await {
+            Ok(tagged) => tagged,
+            Err(e) => {
+                tracing::warn!(
+                    "per-tag re-resolve of {}/{} failed ({e:#}) - proceeding \
+                     on the listing row",
+                    repo,
+                    release.tag_name
+                );
+                release
+            }
+        }
+    }
+
+    /// [`Self::authoritative_release_repo`] for the llama.cpp repo.
+    pub async fn authoritative_release(&self, release: GhRelease) -> GhRelease {
+        self.authoritative_release_repo(LLAMA_CPP_REPO, release)
+            .await
+    }
+
     pub async fn resolve_commit(&self, repo: &str, git_ref: &str) -> Result<String> {
         #[derive(serde::Deserialize)]
         struct CommitLookup {
@@ -1140,6 +1215,80 @@ impl GhClient {
             .into_iter()
             .find(|r| r.assets.iter().any(|a| a.name == asset))
             .ok_or_else(|| anyhow!("no {PIPER_REPO} release ships the {asset} asset"))
+    }
+
+    /// The kokoro-onnx release carrying a model line's assets. Model
+    /// files do NOT tag-match their version - v1.0 files live under
+    /// `model-files-v1.1` (the upstream README's canonical link, live
+    /// 2026-11-10) - so resolution is by ASSET PRESENCE, not name
+    /// derivation: the pinned map first, then a newest-first scan for
+    /// the release shipping both `kokoro-v<version>.onnx` and
+    /// `voices-v<version>.bin` (piper's asset-existence currency rule).
+    /// List trims `assets`; candidates re-fetch full by tag.
+    pub async fn kokoro_model_release(&self, model_version: &str) -> Result<GhRelease> {
+        let (model_name, voices_name) = super::kokoro_install::model_asset_names(model_version);
+        let has_both = |rel: &GhRelease| {
+            rel.assets.iter().any(|a| a.name == model_name)
+                && rel.assets.iter().any(|a| a.name == voices_name)
+        };
+        let pinned_tag = match model_version {
+            "1.0" => Some("model-files-v1.1"),
+            _ => None,
+        };
+        if let Some(tag) = pinned_tag
+            && let Ok(rel) = self.release_by_tag_repo(KOKORO_ONNX_REPO, tag).await
+            && has_both(&rel)
+        {
+            return Ok(rel);
+        }
+        let releases = self.list_releases_repo(KOKORO_ONNX_REPO).await?;
+        for candidate in &releases {
+            if let Ok(full) = self
+                .release_by_tag_repo(KOKORO_ONNX_REPO, &candidate.tag_name)
+                .await
+                && has_both(&full)
+            {
+                return Ok(full);
+            }
+        }
+        Err(anyhow!(
+            "no {KOKORO_ONNX_REPO} release ships {model_name} + {voices_name} \
+             (model line {model_version} not published?)"
+        ))
+    }
+
+    /// The newest published kokoro model version, resolved by ASSET
+    /// PRESENCE on the newest release that ships a matched
+    /// `kokoro-v<version>.onnx` + `voices-v<version>.bin` pair (the
+    /// currency baseline for the kokoro lane; release tags like
+    /// `model-files-v1.1` do NOT encode the model version, the asset
+    /// names do). List trims `assets`; candidates re-fetch full by tag.
+    pub async fn latest_kokoro_model_version(&self) -> Result<String> {
+        let releases = self.list_releases_repo(KOKORO_ONNX_REPO).await?;
+        for candidate in &releases {
+            let Ok(full) = self
+                .release_by_tag_repo(KOKORO_ONNX_REPO, &candidate.tag_name)
+                .await
+            else {
+                continue;
+            };
+            for asset in &full.assets {
+                if let Some(version) = asset
+                    .name
+                    .strip_prefix("kokoro-v")
+                    .and_then(|rest| rest.strip_suffix(".onnx"))
+                    && full
+                        .assets
+                        .iter()
+                        .any(|a| a.name == format!("voices-v{version}.bin"))
+                {
+                    return Ok(version.to_string());
+                }
+            }
+        }
+        Err(anyhow!(
+            "no {KOKORO_ONNX_REPO} release ships a matched kokoro-v*.onnx + voices-v*.bin pair"
+        ))
     }
 
     /// Download an asset fully into memory, verifying its sha256 digest
@@ -1822,6 +1971,8 @@ pub const SDCPP_REPO: &str = "leejet/stable-diffusion.cpp";
 
 pub const WHISPER_REPO: &str = "ggml-org/whisper.cpp";
 pub const PIPER_REPO: &str = "rhasspy/piper";
+/// kokoro-onnx model assets (kokoro-v*.onnx + voices-v*.bin releases).
+pub const KOKORO_ONNX_REPO: &str = "thewh1teagle/kokoro-onnx";
 
 /// Parse an sd.cpp `master-NNN-<sha8>` tag's build counter. sd.cpp does
 /// not cut semver releases; the counter is the currency, the sha is the
@@ -2523,6 +2674,7 @@ mod tests {
                 })
                 .collect(),
             published_at: None,
+            body: None,
         }
     }
 

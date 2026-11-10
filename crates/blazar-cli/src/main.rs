@@ -86,6 +86,12 @@ enum Cmd {
         /// llama-quantize flag; quality risk - pair with --verify)
         #[arg(long)]
         allow_requantize: bool,
+        /// Tensor-type mask recipe (ud-nextn | ud-combined): pins the
+        /// embedded MTP/NextN draft tensors and attention blocks to
+        /// higher-precision types while the bulk takes -t - keeps
+        /// speculative decoding alive in combined bundles
+        #[arg(long)]
+        recipe: Option<String>,
         /// Verify the output with llama-perplexity before registering:
         /// reject (and delete) it when perplexity degrades beyond the gate
         #[arg(long)]
@@ -194,8 +200,9 @@ enum Cmd {
         /// Clear crash circuit breakers
         #[arg(long)]
         reset: bool,
-        /// One JSON object per instance (JSONL, like `doctor --json`);
-        /// suppresses the daemon banner and table
+        /// One JSON object per instance (JSONL, like `doctor --json`),
+        /// plus one `remote`-keyed line per configured peer; suppresses
+        /// the daemon banner and table
         #[arg(long)]
         json: bool,
     },
@@ -300,6 +307,13 @@ enum Cmd {
         /// beats the current default (256) by >5%
         #[arg(long)]
         cache_reuse: bool,
+        /// Live `MoE` cache grid (llama.cpp #30966): `--moe-cache-mib` x
+        /// `--moe-cache-cpu-share` real-child decode tok/s (1 client x 3
+        /// gens per arm, 10 spawns incl. the no-cache baseline); adopts
+        /// per-model `moe_cache_mib` + `moe_cache_cpu_share` only if the
+        /// winner beats no-cache by >5%
+        #[arg(long)]
+        moe_cache: bool,
     },
     /// One-page scorecard for a model: measured performance (last bench),
     /// verified capability verdicts (model-doctor certificate), identity -
@@ -847,12 +861,15 @@ enum RpcCmd {
     /// is the worker's own). The gateway box points its `rpc_servers`
     /// (or a model's `rpc_servers` overlay) at this host:port.
     Worker {
-        /// Address to bind. Default is loopback-only; a remote
-        /// gateway needs `0.0.0.0` (all interfaces) or this box's
-        /// LAN address - deliberately opt-in because the RPC
-        /// protocol has no authentication.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        /// Address to bind. Unset = automatic: loopback-only when no
+        /// gateway is joined (the RPC protocol has no authentication,
+        /// so exposure stays opt-in), and all interfaces when
+        /// `--join`/`--discover` targets a gateway on another machine
+        /// (the announcement then resolves the concrete interface IP
+        /// toward that gateway). Pass an explicit address to pin it -
+        /// e.g. `127.0.0.1` behind an SSH tunnel.
+        #[arg(long)]
+        host: Option<String>,
         /// Port to bind (upstream default 50052)
         #[arg(long, default_value_t = 50052)]
         port: u16,
@@ -887,6 +904,35 @@ enum RpcCmd {
         /// `discovery_enabled = true` on the gateway.
         #[arg(long, conflicts_with = "join")]
         discover: bool,
+    },
+    /// Install this machine as a persistent RPC fleet worker: write
+    /// the `blazar-worker` systemd user unit bound to the given
+    /// gateway (non-systemd boxes get the exact commands printed).
+    /// Same bind-address policy as `rpc worker`: the unit pins the
+    /// RESOLVED address so later auto-rule changes cannot drift it.
+    Install {
+        /// Gateway base URL to join (e.g. `http://192.168.1.10:11435`).
+        #[arg(long)]
+        join: String,
+        /// Shared fleet secret when the gateway sets `fleet_token`
+        /// (also read from `BLAZAR_FLEET_TOKEN`).
+        #[arg(long)]
+        fleet_token: Option<String>,
+        /// Stable worker id the gateway lists under. Default: hostname.
+        #[arg(long)]
+        name: Option<String>,
+        /// Devices to expose, comma-separated (`CPU`, `CUDA0`, ...).
+        /// Default: the server child's own choice.
+        #[arg(long)]
+        device: Option<String>,
+        /// Port for the worker to bind (upstream default 50052).
+        #[arg(long, default_value_t = 50052)]
+        port: u16,
+        /// Address to bind. Unset = automatic (same rule as
+        /// `rpc worker`): all interfaces when the gateway is on
+        /// another machine, loopback when it is not.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Query RPC workers for reachability, protocol version and
     /// per-device free/total memory - the fleet detail `doctor` only
@@ -923,7 +969,8 @@ enum EngineCmd {
     /// anyway, pin the exact tag:
     /// `blazar engine install master-1052-... --kind sdcpp`.
     Update {
-        /// Engine lane to update: llamacpp (default) | sglang | mistralrs | sdcpp
+        /// Engine lane to update: llamacpp (default) | mistralrs |
+        /// sglang | sdcpp | whisper | piper | mlx | openaihost
         #[arg(long, default_value = "llamacpp")]
         kind: String,
         tag: Option<String>,
@@ -935,10 +982,10 @@ enum EngineCmd {
         /// installed, or written
         #[arg(long)]
         check: bool,
-        /// Update every INSTALLED lane in one walk: llamacpp,
-        /// mistralrs, sglang, sdcpp, whisper. Lanes without an install
-        /// are skipped, current lanes no-op, and a failed lane does
-        /// not stop the rest (named in the summary). Mutually
+        /// Update every INSTALLED lane in one walk (the lane census is
+        /// every engine kind this binary knows). Lanes without an
+        /// install are skipped, current lanes no-op, and a failed lane
+        /// does not stop the rest (named in the summary). Mutually
         /// exclusive with a pinned tag; composes with --check and
         /// --no-gate.
         #[arg(long)]
@@ -957,16 +1004,50 @@ enum EngineCmd {
     /// daemon (`systemctl restart blazar`, or `blazar stop` +
     /// `blazar serve`) so running instances move to the new engine.
     /// GGUF models need a llama.cpp tag active; safetensors (HF-style
-    /// directory) models need mistral.rs or sglang active.
+    /// directory) models need mistral.rs or sglang active; .litertlm
+    /// bundles need the openaihost lane active.
     Use {
         /// Exact engine tag (blazar engine list). Mutually exclusive
         /// with --kind.
         tag: Option<String>,
-        /// Engine kind name (llamacpp|sglang|mistralrs): activates the
-        /// newest installed row of that lane. Mutually exclusive with a
+        /// Engine kind name: llamacpp | mistralrs | sglang | sdcpp |
+        /// whisper | piper | mlx | openaihost - activates the newest
+        /// installed row of that lane. Mutually exclusive with a
         /// positional tag.
         #[arg(long)]
         kind: Option<String>,
+    },
+    /// Re-probe stored engine manifests against the installed binaries
+    ///
+    /// Refreshes the parser-derived manifest fields (flag vocabulary,
+    /// spec types, devices) in place - no download, no engine switch.
+    /// Heals manifests captured by an older probe parser (e.g. rows
+    /// stored before dotted flag names like `--fim-qwen-1.5b-default`
+    /// were kept); the strict `extra_args` gate refuses flags the
+    /// manifest lacks, so a stale row rejects real engine flags. Run it
+    /// after a Blazar upgrade that ships probe-parser fixes.
+    Reprobe {
+        /// Exact engine tag; omit to re-probe every installed row
+        tag: Option<String>,
+    },
+    /// Show what changed between an installed lane and upstream
+    ///
+    /// Read-only release-notes advisor: fetches the GitHub releases
+    /// between the lane's installed tag and the newest upstream tag and
+    /// prints them per release, so an `engine update --check`
+    /// update-available verdict can be judged before anything
+    /// downloads. PyPI lanes
+    /// (sglang, mlx, openaihost) teach their version source instead -
+    /// they have no GitHub release notes. llama.cpp b-tags ship without
+    /// notes, so that lane reports the build-count gap.
+    Changelog {
+        /// Engine lane to inspect: llamacpp | mistralrs | sdcpp |
+        /// whisper | piper | kokoro
+        #[arg(long)]
+        kind: String,
+        /// Show at most N releases (default 5)
+        #[arg(long)]
+        max: Option<usize>,
     },
     /// Remove a retired engine (directory + registry row); refuses the
     /// active tag - `blazar engine use` another first. Reports the
@@ -1038,11 +1119,12 @@ enum EngineCmd {
     /// install, `engine use` the tag and restart the daemon to serve
     /// safetensors models.
     Install {
-        /// Engine lane to install: mistralrs | sglang | sdcpp (required -
-        /// bare `engine install` prints the lane chooser; llama.cpp
-        /// installs ride `engine update` / `engine build`). With --lane:
-        /// build a curated capability lane from the registry by id (see
-        /// `blazar engine offers`).
+        /// Engine lane to install: mistralrs | sglang | sdcpp | whisper |
+        /// piper | kokoro | mlx | openaihost (the `LiteRT` venv lane) -
+        /// required; bare `engine install` prints the lane chooser;
+        /// llama.cpp installs ride `engine update` / `engine build`.
+        /// With --lane: build a curated capability lane from the
+        /// registry by id (see `blazar engine offers`).
         #[arg(long)]
         kind: Option<String>,
         tag: Option<String>,
@@ -1054,6 +1136,13 @@ enum EngineCmd {
         /// Backend for --lane builds: cuda | cpu (default cpu)
         #[arg(long)]
         backend: Option<String>,
+        /// Extra pip spec layered onto the sglang venv after the base
+        /// install, repeatable (sglang lane only), e.g.
+        /// `--with "sglang-dspine @ git+URL"` where URL is the plugin's
+        /// git source. Plugin kernels compile at install time against
+        /// the venv's pinned CUDA toolchain.
+        #[arg(long = "with", value_name = "PIP_SPEC")]
+        with: Vec<String>,
     },
     /// List curated capability lanes from the registry (temporary
     /// llama.cpp forks for architectures upstream hasn't merged)
@@ -1083,6 +1172,19 @@ enum EngineCmd {
         /// compared against the newest OTHER installed llama.cpp row
         tag: Option<String>,
         /// One JSON object instead of the line output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rank installed engine builds for this machine (and optionally
+    /// one model): hardware match and stored bench receipts decide,
+    /// recency and active status only order equals - every axis shows
+    /// its datum or says it has none.
+    Recommend {
+        /// Scope the bench axis to one model's receipts (default:
+        /// capability ordering only, stated as such)
+        #[arg(long)]
+        model: Option<String>,
+        /// One JSON object per engine (JSONL); suppresses the table
         #[arg(long)]
         json: bool,
     },
@@ -1519,10 +1621,15 @@ async fn ensure_run_model(name: &str) -> Result<String> {
                 offer_missing_engine(&d, &row).await;
                 return Ok(local);
             }
+            // The pull target as the user will retype it: a slot only
+            // when one was typed (untagged pulls name the repo alone).
+            let target_text = match t.quant.as_deref() {
+                Some(slot) => format!("{}:{}", t.repo, slot),
+                None => t.repo.clone(),
+            };
             println!(
-                "{resolved} not in the store - pulling {}:{} first \
-                     (Ctrl-C keeps the partial for resume)",
-                t.repo, t.quant
+                "{resolved} not in the store - pulling {target_text} first \
+                     (Ctrl-C keeps the partial for resume)"
             );
             let (row, already) = pull_model(&resolved, false, None, None).await?;
             if already {
@@ -1966,6 +2073,62 @@ async fn systemd_unit_is_active() -> bool {
     )
 }
 
+/// The system `blazar` unit's main PID, when the unit reports one.
+async fn systemd_unit_main_pid() -> Option<u32> {
+    let out = tokio::process::Command::new("systemctl")
+        .args(["show", "blazar", "-p", "MainPID", "--value"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// True when the system unit's main process IS the listener on this
+/// CLI's configured base - i.e. restarting the unit restarts THE
+/// daemon this command talks to. A unit serving another port (e.g. a
+/// second, detached instance on a different base) must never be
+/// restarted from here: that would bounce an unrelated daemon and then
+/// report success against a base that never went down. Unprovable
+/// scope (missing `ss`, unreadable socket ownership, unparsable base)
+/// returns false so the caller falls through to the base-scoped
+/// stop+ensure lane instead of guessing.
+async fn systemd_unit_serves_base(base: &str) -> bool {
+    let Some(port) = base.rsplit(':').next() else {
+        return false;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return false;
+    };
+    let Some(unit_pid) = systemd_unit_main_pid().await else {
+        return false;
+    };
+    let Ok(out) = tokio::process::Command::new("ss")
+        .args(["-ltnp", &format!("sport = :{port}")])
+        .output()
+        .await
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    // ss pid annotations look like users:(("blazar",pid=1234,fd=9));
+    // the delimiter-bounded variants avoid prefix collisions between
+    // pid=123 and pid=1234.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let needle_comma = format!("pid={unit_pid},");
+    let needle_space = format!("pid={unit_pid} ");
+    text.lines().any(|l| {
+        l.contains(&needle_comma)
+            || l.contains(&needle_space)
+            || l.trim().ends_with(&format!("pid={unit_pid}"))
+    })
+}
+
 async fn run_systemctl(args: &[&str]) -> bool {
     let mut cmd = tokio::process::Command::new("systemctl");
     cmd.args(args);
@@ -2037,10 +2200,14 @@ async fn restart_daemon_impl() -> bool {
         return false;
     }
     let up_deadline = tokio_deadline(Duration::from_secs(30));
-    // Lane 1 - systemd. Gated on is-active: `restart` on an inactive
-    // unit would START it. A plain user without polkit rights falls
-    // through to the stop lane, which needs no privileges at all.
+    // Lane 1 - systemd. Gated on is-active AND on the unit actually
+    // serving THIS base (a unit bound to another port is an unrelated
+    // daemon - restarting it would be wrong-daemon surgery followed by
+    // a false success receipt). `restart` on an inactive unit would
+    // START it. A plain user without polkit rights falls through to
+    // the stop lane, which needs no privileges at all.
     if systemd_unit_is_active().await
+        && systemd_unit_serves_base(&base).await
         && run_systemctl(&["restart", "blazar", "--no-ask-password"]).await
         && wait_healthz(&base, &http, up_deadline).await
     {
@@ -2239,6 +2406,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             load,
             replicas,
             cache_reuse,
+            moe_cache,
         } => {
             tune_full(
                 &resolve_model_cli(&model),
@@ -2251,6 +2419,7 @@ blazar mmproj <model> <mmproj.gguf path>"
                 load,
                 replicas,
                 cache_reuse,
+                moe_cache,
             )
             .await
         }
@@ -2362,6 +2531,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             name,
             imatrix,
             allow_requantize,
+            recipe,
             verify,
             max_degradation,
         } => {
@@ -2372,6 +2542,7 @@ blazar mmproj <model> <mmproj.gguf path>"
                 name.as_deref(),
                 imatrix.as_deref(),
                 allow_requantize,
+                recipe.as_deref(),
                 gate,
             )
         }
@@ -2498,7 +2669,6 @@ async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
             // Progress lines to STDERR: stdout stays clean for any
             // scripting around the worker's own output.
             eprintln!("rpc worker: {}", bin.display());
-            eprintln!("endpoint {host}:{port} - point the gateway's rpc_servers here");
             eprintln!("no authentication: expose on trusted networks only");
             // --discover resolves the gateway here and falls through
             // to the joined path with the found base URL.
@@ -2542,9 +2712,27 @@ async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
             } else {
                 join
             };
+            // Bind-address auto-resolution: an unset --host defaults to
+            // loopback (secure standalone default), but joining a
+            // gateway on ANOTHER machine from loopback would announce
+            // an address that gateway can never dial - promote to all
+            // interfaces and let announce_host() resolve the concrete
+            // IP toward the gateway at announcement time.
+            let bind_host = resolve_worker_host(host.as_deref(), joined_base.as_deref());
+            eprintln!("endpoint {bind_host}:{port} - point the gateway's rpc_servers here");
+            if host.is_none()
+                && joined_base
+                    .as_deref()
+                    .is_some_and(|b| !base_host_is_loopback(b))
+            {
+                eprintln!(
+                    "auto-bound 0.0.0.0: the joined gateway is on another machine - \
+                     the announcement resolves this box's interface IP toward it"
+                );
+            }
             match joined_base {
                 None => {
-                    let mut child_cmd = worker_command(&bin, &host, port, device.as_deref());
+                    let mut child_cmd = worker_command(&bin, &bind_host, port, device.as_deref());
                     blazar_runtime::parent_death_tie(&mut child_cmd);
                     // kill_on_drop is the panic-path net; the select
                     // arms below cover every orderly exit explicitly.
@@ -2571,7 +2759,7 @@ async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
                     rpc_worker_joined(RpcWorkerOpts {
                         bin,
                         base,
-                        host,
+                        host: bind_host,
                         port,
                         device,
                         fleet_token: fleet_token.or_else(|| {
@@ -2585,6 +2773,41 @@ async fn rpc_cmd(cmd: RpcCmd) -> Result<()> {
                     .await
                 }
             }
+        }
+        RpcCmd::Install {
+            join,
+            fleet_token,
+            name,
+            device,
+            port,
+            host,
+        } => {
+            let d = blazar_core::BlazarDirs::from_env();
+            let token = fleet_token
+                .or_else(|| std::env::var("BLAZAR_FLEET_TOKEN").ok())
+                .filter(|t| !t.trim().is_empty());
+            verify_blazar_base(&join).await?;
+            let worker_id = name.unwrap_or_else(worker_default_id);
+            // Pin the RESOLVED bind address into the unit: loopback
+            // gateways stay loopback, remote ones expose all
+            // interfaces, explicit --host always wins. The unit must
+            // not depend on auto-rule drift for its reachability.
+            let bind_host = resolve_worker_host(host.as_deref(), Some(&join));
+            let host_pin = if bind_host == *"127.0.0.1" && base_host_is_loopback(&join) {
+                None
+            } else {
+                Some(bind_host.as_str())
+            };
+            println!("installing fleet worker {worker_id} -> {join} (bind {bind_host})");
+            install_worker_unit(
+                &d,
+                &join,
+                &worker_id,
+                token.as_deref(),
+                host_pin,
+                device.as_deref(),
+                port,
+            )
         }
         RpcCmd::Status { endpoints, json } => rpc_status(&endpoints, json).await,
     }
@@ -2675,6 +2898,31 @@ fn host_of_base(base: &str) -> String {
             .rsplit_once(':')
             .map_or(authority, |(h, _)| h)
             .to_string()
+    }
+}
+
+/// True when the base URL's host names this same machine's loopback
+/// (a same-box join keeps the worker's secure loopback default).
+fn base_host_is_loopback(base: &str) -> bool {
+    matches!(
+        host_of_base(base).as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    )
+}
+
+/// Bind-address policy for `rpc worker`. An explicit `--host` always
+/// wins (the SSH-tunnel pattern pins `127.0.0.1` deliberately). Unset:
+/// loopback when standalone or joining a same-box gateway, all
+/// interfaces when the joined gateway lives on another machine - the
+/// announcement then resolves the concrete interface IP toward it, and
+/// DHCP/roaming keeps working because the bind stays wildcard.
+fn resolve_worker_host(host: Option<&str>, joined_base: Option<&str>) -> String {
+    if let Some(explicit) = host {
+        return explicit.to_string();
+    }
+    match joined_base {
+        Some(base) if !base_host_is_loopback(base) => "0.0.0.0".to_string(),
+        _ => "127.0.0.1".to_string(),
     }
 }
 
@@ -3201,7 +3449,7 @@ async fn agent_cmd(cmd: AgentCmd) -> Result<()> {
         }
         AgentCmd::Approve { index } => {
             let pending = blazar_runtime::adoption::list_pending(&d);
-            let Some((path, p)) = pending.get(index - 1) else {
+            let Some((path, p)) = index.checked_sub(1).and_then(|i| pending.get(i)) else {
                 anyhow::bail!("no pending invite number {index} - run `blazar agent list`");
             };
             let approval =
@@ -3212,7 +3460,7 @@ async fn agent_cmd(cmd: AgentCmd) -> Result<()> {
         }
         AgentCmd::Deny { index } => {
             let pending = blazar_runtime::adoption::list_pending(&d);
-            let Some((path, p)) = pending.get(index - 1) else {
+            let Some((path, p)) = index.checked_sub(1).and_then(|i| pending.get(i)) else {
                 anyhow::bail!("no pending invite number {index} - run `blazar agent list`");
             };
             blazar_runtime::adoption::deny_pending(&d, path).map_err(|e| anyhow!("{e}"))?;
@@ -3311,19 +3559,7 @@ async fn join_cmd(
         );
     }
     // Prove the base is a blazar daemon before installing anything.
-    let version: serde_json::Value = cli_http()
-        .get(format!("{base}/api/version"))
-        .send()
-        .await
-        .map_err(|e| anyhow!("no daemon at {base}: {e}"))?
-        .error_for_status()
-        .map_err(|e| anyhow!("{base} is not reachable: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow!("bad version reply from {base}: {e}"))?;
-    if version.get("name").and_then(|n| n.as_str()) != Some("blazar") {
-        anyhow::bail!("{base} answered, but it is not a blazar daemon");
-    }
+    verify_blazar_base(&base).await?;
     println!("gateway verified: {base}");
     let worker_id = name.unwrap_or_else(worker_default_id);
     if foreground {
@@ -3343,7 +3579,22 @@ async fn join_cmd(
         })
         .await
     } else {
-        install_worker_unit(&d, &base, &worker_id, token.as_deref())
+        // Remote gateways need the unit's worker reachable from the
+        // LAN: pin all-interfaces unless the base is loopback.
+        let host_pin = if base_host_is_loopback(&base) {
+            None
+        } else {
+            Some("0.0.0.0")
+        };
+        install_worker_unit(
+            &d,
+            &base,
+            &worker_id,
+            token.as_deref(),
+            host_pin,
+            None,
+            50052,
+        )
     }
 }
 
@@ -3360,7 +3611,11 @@ fn pick_from_list(title: &str, items: &[&str]) -> Option<String> {
     }
     let pick = prompt_line("select: ")?;
     let n: usize = pick.parse().ok()?;
-    items.get(n - 1).map(|s| (*s).to_owned())
+    // "0" (or a wrapped 0 in release builds) must not underflow - treat
+    // it as an out-of-range pick, same as any number past the list end.
+    n.checked_sub(1)
+        .and_then(|i| items.get(i))
+        .map(|s| (*s).to_owned())
 }
 
 /// Write the systemd user unit + env file, then try to enable it. Any
@@ -3368,11 +3623,48 @@ fn pick_from_list(title: &str, items: &[&str]) -> Option<String> {
 /// commands - onboarding never hard-fails at the last mile.
 /// Unit text for the `blazar-worker` systemd user unit. Kept pure so the
 /// security posture is pinnable: gateway is pinned via `--join`, the token
-/// NEVER appears here (it rides the 0600 `EnvironmentFile`).
-fn worker_unit_text(exe: &str, base: &str, worker_id: &str, env_line: &str) -> String {
+/// NEVER appears here (it rides the 0600 `EnvironmentFile`). `host` and
+/// `device` lines only appear when resolved/pinned; the port rides the
+/// worker default unless the installer chose otherwise.
+fn worker_unit_text(
+    exe: &str,
+    base: &str,
+    worker_id: &str,
+    env_line: &str,
+    host: Option<&str>,
+    device: Option<&str>,
+    port: u16,
+) -> String {
+    let host_line = host.map(|h| format!(" --host {h}")).unwrap_or_default();
+    let device_line = device.map(|d| format!(" --device {d}")).unwrap_or_default();
+    let port_line = if port == 50052 {
+        String::new()
+    } else {
+        format!(" --port {port}")
+    };
     format!(
-        "[Unit]\nDescription=blazar RPC fleet worker (gateway {base})\n\n[Service]\nExecStart={exe} rpc worker --join {base} --name {worker_id}\n{env_line}Restart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n"
+        "[Unit]\nDescription=blazar RPC fleet worker (gateway {base})\n\n[Service]\nExecStart={exe} rpc worker --join {base} --name {worker_id}{host_line}{device_line}{port_line}\n{env_line}Restart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n"
     )
+}
+
+/// Prove a base URL answers as a blazar daemon (name == "blazar" on
+/// /api/version) before anything gets installed or announced against
+/// it. JSON without the name field is treated as a foreign server.
+async fn verify_blazar_base(base: &str) -> Result<()> {
+    let version: serde_json::Value = cli_http()
+        .get(format!("{base}/api/version"))
+        .send()
+        .await
+        .map_err(|e| anyhow!("no daemon at {base}: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow!("{base} is not reachable: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("bad version reply from {base}: {e}"))?;
+    if version.get("name").and_then(|n| n.as_str()) != Some("blazar") {
+        anyhow::bail!("{base} answered, but it is not a blazar daemon");
+    }
+    Ok(())
 }
 
 fn install_worker_unit(
@@ -3380,6 +3672,9 @@ fn install_worker_unit(
     base: &str,
     worker_id: &str,
     token: Option<&str>,
+    host: Option<&str>,
+    device: Option<&str>,
+    port: u16,
 ) -> Result<()> {
     let unit_dir = d.config_dir.join("systemd").join("user");
     std::fs::create_dir_all(&unit_dir)?;
@@ -3402,7 +3697,7 @@ fn install_worker_unit(
     };
     // `--join <base>` pins the unit to THIS gateway: discovery found it
     // once, and a boot must not silently hop to a different one.
-    let unit = worker_unit_text(&exe, base, worker_id, &env_line);
+    let unit = worker_unit_text(&exe, base, worker_id, &env_line, host, device, port);
     let unit_path = unit_dir.join("blazar-worker.service");
     std::fs::write(&unit_path, unit)?;
     let enabled = std::process::Command::new("systemctl")
@@ -3444,6 +3739,7 @@ fn set_mode_0600(_path: &std::path::Path) -> Result<()> {
 /// `blazar adopt` - gateway-side invite sender: scan for running
 /// agents, let the operator multi-select donors, then mint one invite
 /// code per donor and deliver it over the agent's TCP listener.
+#[allow(clippy::too_many_lines)]
 async fn adopt_cmd(yes: bool, ttl_secs: Option<u64>) -> Result<()> {
     let d = dirs();
     d.ensure().ok();
@@ -3479,10 +3775,26 @@ async fn adopt_cmd(yes: bool, ttl_secs: Option<u64>) -> Result<()> {
                 .collect::<Vec<_>>(),
         )
         .ok_or_else(|| anyhow!("stdin is not a TTY - pass --yes to invite every listed agent"))?;
-        pick.split(',')
-            .filter_map(|s| s.trim().parse::<usize>().ok())
-            .filter_map(|n| agents.get(n - 1))
-            .collect()
+        let mut selected = Vec::new();
+        for part in pick.split(',') {
+            let Ok(n) = part.trim().parse::<usize>() else {
+                println!(
+                    "{}",
+                    dim_line(&format!("skipping unparsable selection {part:?}"))
+                );
+                continue;
+            };
+            match n.checked_sub(1).and_then(|i| agents.get(i)) {
+                Some(a) => selected.push(a),
+                None => {
+                    println!(
+                        "{}",
+                        dim_line(&format!("skipping selection {n} - not in the list"))
+                    );
+                }
+            }
+        }
+        selected
     };
     if selected.is_empty() {
         anyhow::bail!("nothing selected");
@@ -3864,6 +4176,7 @@ fn routed_engine_lane(
             safetensors,
             quantized,
             blazar_core::store::mlx_signal(name, repo, path),
+            path.to_ascii_lowercase().ends_with(".litertlm"),
         ),
     };
     match blazar_core::engine_kind::serving_lane(
@@ -4058,6 +4371,9 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
         EngineKind::Mlx => {
             "mlx (~3 GiB, CUDA linux + Apple Silicon) - MLX quant dirs (mlx-community)".to_string()
         }
+        EngineKind::OpenAiHost => {
+            "openaihost (~0.4 GiB venv, any platform) - .litertlm bundles (LiteRT-LM: mobile/edge/NPU)".to_string()
+        }
         EngineKind::MistralRs => {
             "mistral.rs (~0.8 GiB, any platform) - fastest cold boot, GGUF + safetensors"
                 .to_string()
@@ -4074,6 +4390,9 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
         EngineKind::Piper => {
             "piper (~5 MiB, CPU) - offline text-to-speech (rhasspy/piper voices)".to_string()
         }
+        EngineKind::Kokoro => {
+            "kokoro (~0.4 GiB, CPU) - neural text-to-speech (kokoro-onnx v1 voices)".to_string()
+        }
     }
 }
 
@@ -4083,12 +4402,14 @@ async fn install_missing_kind(
 ) -> Result<()> {
     use blazar_core::engine_kind::EngineKind;
     match kind {
-        EngineKind::Sglang => engine_install_sglang(d, None).await,
+        EngineKind::Sglang => engine_install_sglang(d, None, &[]).await,
         EngineKind::Mlx => engine_install_mlx(d, None).await,
+        EngineKind::OpenAiHost => engine_install_litert(d, None).await,
         EngineKind::MistralRs => engine_install_mistralrs(d, None).await,
         EngineKind::SdCpp => engine_install_sdcpp(d, None).await,
         EngineKind::Whisper => engine_install_whisper(d, None).await,
         EngineKind::Piper => engine_install_piper(d, None).await,
+        EngineKind::Kokoro => engine_install_kokoro(d, None).await,
         EngineKind::LlamaCpp => engine_update(d, None, false, false).await,
     }
 }
@@ -4163,6 +4484,7 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
                     safetensors,
                     row.is_quantized_safetensors(),
                     row.is_mlx(),
+                    row.is_litert_bundle(),
                 ),
             };
             match blazar_core::engine_kind::serving_lane_typed(
@@ -4446,6 +4768,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_gpu(&d).await);
     checks.extend(doctor_engines(&d));
     checks.extend(doctor_routing(&d));
+    checks.extend(doctor_moe_cache(&d));
     checks.extend(doctor_channels());
     checks.extend(doctor_network().await);
     checks.extend(doctor_whisper_currency(&d).await);
@@ -4465,6 +4788,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_sglang_fit(&d));
     checks.extend(doctor_bench_receipts(&d));
     checks.extend(doctor_kv_budget(&d));
+    checks.extend(doctor_mmproj_pairing(&d));
     checks.extend(doctor_sentinel(&d));
     checks.extend(doctor_runtime(&d));
     checks.extend(doctor_exposure(&d));
@@ -4747,6 +5071,110 @@ fn doctor_routing(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
                     blazar_core::config::RoutingMode::Manual => "manual",
                 },
                 models.len()
+            ),
+        ));
+    }
+    checks
+}
+
+/// `MoE` cache knobs vs reality: any model with `moe_cache_mib` or
+/// `moe_cache_cpu_share` set (global or overlay) must be a `MoE` GGUF
+/// served by a llamacpp engine that knows both flags - anything else
+/// means the knob silently does nothing (the profile compiler skips
+/// it at spawn). Untuned `MoE` models get a single pointer at the live
+/// grid probe instead of per-model noise.
+fn doctor_moe_cache(d: &blazar_core::dirs::BlazarDirs) -> Vec<Check> {
+    // Same law as the doctor routing rows: advice computed against an
+    // unreadable config or a dead store would silently mislead.
+    let cfg = match blazar_core::Config::load(d) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return vec![Check::fail(
+                "moe cache",
+                format!("config unreadable - moe cache advice unavailable: {e}"),
+            )];
+        }
+    };
+    let Ok(store) = blazar_core::store::Store::open(d) else {
+        return vec![Check::fail(
+            "moe cache",
+            "store open failed - moe cache advice unavailable",
+        )];
+    };
+    let models = match store.list_models() {
+        Ok(m) if !m.is_empty() => m,
+        Ok(_) => return Vec::new(),
+        Err(e) => {
+            return vec![Check::fail(
+                "moe cache",
+                format!("model list failed - moe cache advice unavailable: {e}"),
+            )];
+        }
+    };
+    let engine_rows = match store.list_engines() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return vec![Check::fail(
+                "moe cache",
+                format!("engine list failed - moe cache advice unavailable: {e}"),
+            )];
+        }
+    };
+    let mut flags_ok = false;
+    let mut engine_note = String::from("no active engine");
+    if let Some(row) = engine_rows.iter().find(|r| r.active) {
+        engine_note.clone_from(&row.tag);
+        if let Ok(manifest) = serde_json::from_str::<blazar_runtime::Manifest>(&row.manifest) {
+            flags_ok = manifest.flags.contains("--moe-cache-mib")
+                && manifest.flags.contains("--moe-cache-cpu-share");
+        }
+    }
+    let mut checks = Vec::new();
+    let mut untuned_moe = 0usize;
+    for m in &models {
+        let ov = cfg.overlay_for(&m.name);
+        let mib = ov.moe_cache_mib.unwrap_or(cfg.moe_cache_mib);
+        let share = ov.moe_cache_cpu_share.unwrap_or(cfg.moe_cache_cpu_share);
+        let knobs_set = mib > 0 || share > 0.0;
+        // GGUF header read doubles as the lane filter: safetensors and
+        // litert bundle rows fail here and are not llamacpp-cache
+        // candidates, so they are skipped without noise.
+        let Ok(meta) = blazar_core::gguf::read_metadata_file(std::path::Path::new(&m.path)) else {
+            continue;
+        };
+        let is_moe = meta.expert_count.unwrap_or(0) > 1;
+        if knobs_set {
+            if !flags_ok {
+                checks.push(Check::warn(
+                    "moe cache",
+                    format!(
+                        "{}: moe cache knobs set but engine {} lacks the flags - run `blazar engine update`",
+                        m.name, engine_note
+                    ),
+                ));
+            } else if !is_moe {
+                checks.push(Check::warn(
+                    "moe cache",
+                    format!(
+                        "{}: moe cache knobs set but the model looks dense - the cache only routes MoE experts; unset the knobs or re-check the model",
+                        m.name
+                    ),
+                ));
+            } else {
+                checks.push(Check::ok(
+                    "moe cache",
+                    format!("{}: cache {mib} MiB, cpu share {share:.2}", m.name),
+                ));
+            }
+        } else if is_moe {
+            untuned_moe += 1;
+        }
+    }
+    if untuned_moe > 0 && checks.is_empty() {
+        checks.push(Check::ok(
+            "moe cache",
+            format!(
+                "{untuned_moe} MoE model(s) run without a tuned moe cache - `blazar tune <model> --moe-cache` measures the mib x cpu-share grid live"
             ),
         ));
     }
@@ -5278,8 +5706,35 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
             out.push(Check::ok(label, entries.join(" | ")));
         }
     }
+    out.extend(doctor_manifest_vocab(&engines));
     out.extend(doctor_engine_retention(d, &engines));
     out
+}
+
+/// Vocabulary staleness row: a manifest captured by an older probe (the
+/// parser learns new flag shapes, e.g. dotted names in v2) under-reports
+/// the engine's real flags until a reprobe refreshes it - a stale row
+/// can false-refuse a genuine flag at admission.
+fn doctor_manifest_vocab(engines: &[blazar_core::store::EngineRow]) -> Vec<Check> {
+    let stale_vocab = blazar_runtime::engine::stale_probe_vocab_tags(engines);
+    if stale_vocab.is_empty() {
+        vec![Check::ok(
+            "manifest vocab",
+            format!(
+                "all {} row(s) on probe v{}",
+                engines.len(),
+                blazar_runtime::engine::manifest::MANIFEST_PROBE_VERSION
+            ),
+        )]
+    } else {
+        vec![Check::warn(
+            "manifest vocab",
+            format!(
+                "captured by an older probe: {} - the daemon backfills at boot, or run `blazar engine reprobe <tag>`",
+                stale_vocab.join(", ")
+            ),
+        )]
+    }
 }
 
 /// Retention tail of the ENGINES section: per-kind count vs `KEEP_TAGS`
@@ -5918,6 +6373,86 @@ fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
                 Err(e) => out.push(Check::warn(label, format!("{}: {e}", m.name))),
             }
         }
+    }
+    out
+}
+
+/// ENGINES section addition - a raw-engine hazard the gateway already
+/// shields against: mistral.rs (v0.9.5+) scans the directory a GGUF
+/// lives in and auto-pairs ANY `mmproj*.gguf` sidecar it finds, then
+/// refuses the load ("multimodal GGUF architecture ... not supported
+/// by the native multimodal loader"). One stray projector pulled for a
+/// vision model silently breaks raw `mistralrs serve` runs of every
+/// GGUF filed beside it. The blazar gateway stages models in isolation,
+/// so serving through blazar is unaffected - this row teaches the
+/// raw-engine user. One aggregated warn (never per-row): a busy models
+/// dir must not flood the report.
+fn doctor_mmproj_pairing(d: &BlazarDirs) -> Vec<Check> {
+    let mut out = Vec::new();
+    let Ok(store) = Store::open(d) else {
+        return out; // store problems are reported by the store check
+    };
+    let Ok(engines) = store.list_engines() else {
+        return out; // engine-index errors surface in their own checks
+    };
+    if !engines.iter().any(|e| e.kind == EngineKind::MistralRs) {
+        return out; // the hazard only exists where the mistralrs binary is installed
+    }
+    let Ok(models) = store.list_models() else {
+        return out; // model-list errors are reported by the models check
+    };
+    // Sidecar file name -> how many registered GGUF models sit beside it.
+    let mut strays: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for m in &models {
+        let path = std::path::Path::new(&m.path);
+        if m.has_component_set() || !path.is_file() {
+            continue; // split rows ride their GGUF set; dirs are not mistralrs GGUFs
+        }
+        let own = m
+            .mmproj_path
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| std::path::Path::new(s).file_name())
+            .map(|f| f.to_string_lossy().to_lowercase());
+        let Some(dir) = path.parent() else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue; // unreadable dir: other checks own that failure
+        };
+        for e in entries.flatten() {
+            let is_gguf = e
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"));
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if !is_gguf || !name.starts_with("mmproj") {
+                continue;
+            }
+            if own.as_deref() == Some(name.as_str()) {
+                continue; // the row's own intended vision pair, not a stray
+            }
+            *strays.entry(name).or_default() += 1;
+        }
+    }
+    if !strays.is_empty() {
+        let listed: Vec<String> = strays
+            .iter()
+            .map(|(sidecar, n)| format!("{sidecar} beside {n} model(s)"))
+            .collect();
+        out.push(Check::warn(
+            "mmproj pairing",
+            format!(
+                "{} stray projector sidecar(s) in the models dir: {}. Raw \
+                 `mistralrs serve` auto-pairs any mmproj*.gguf filed beside a \
+                 text GGUF and v0.9.5+ then refuses the unsupported vision \
+                 architecture; the blazar gateway stages models in isolation so \
+                 serving through blazar is unaffected. Move stray sidecars before \
+                 driving the mistralrs binary directly.",
+                listed.len(),
+                listed.join(", ")
+            ),
+        ));
     }
     out
 }
@@ -7310,6 +7845,123 @@ async fn live_mlx_currency(active: &str) -> Check {
     }
 }
 
+/// piper lane: rhasspy/piper date-shaped tags, same resolver and
+/// `piper::tag_key` ordering the update lane uses - without this arm
+/// the row falls into the llama.cpp b-build reconciler and reports
+/// that channel's tags against a piper tag (wrong-channel verdicts,
+/// same class as the litert row before its dedicated arm).
+async fn live_piper_currency(d: &BlazarDirs, active: &str) -> Check {
+    let probe = match local_engine_manager(d) {
+        Ok(mgr) => mgr.gh.latest_piper_release().await.map(|r| r.tag_name),
+        Err(e) => Err(e),
+    };
+    match probe {
+        Ok(latest) => match (
+            blazar_runtime::piper::tag_key(active),
+            blazar_runtime::piper::tag_key(&latest),
+        ) {
+            (Some(a), Some(b)) if a >= b => Check::ok(
+                "engine currency",
+                format!("up to date ({active}, piper - newest release with a prebuilt asset)"),
+            ),
+            (Some(_), Some(_)) => Check::warn(
+                "engine currency",
+                format!(
+                    "{latest} available (active: {active}, piper) - run: \
+                     blazar engine update --kind piper {latest}"
+                ),
+            ),
+            // Piper tags are date-shaped (2023.11.14-2); an unparsable
+            // side is a real anomaly - say so instead of guessing.
+            _ => Check::warn(
+                "engine currency",
+                format!("{active} (piper) - cannot order against latest {latest} (unparsable tag)"),
+            ),
+        },
+        Err(e) => Check::warn(
+            "engine currency",
+            format!("{active} (piper) - release check failed ({e:#}); offline?"),
+        ),
+    }
+}
+
+/// Kokoro currency: `active` is the installed row tag (`kokoro-1.0`);
+/// upstream truth is the newest MODEL version by asset presence (see
+/// `latest_kokoro_model_version`). Teaches the install command - the
+/// update lane rides `engine update --kind kokoro`.
+async fn live_kokoro_currency(d: &BlazarDirs, active: &str) -> Check {
+    let probe = match local_engine_manager(d) {
+        Ok(mgr) => mgr.gh.latest_kokoro_model_version().await,
+        Err(e) => Err(e),
+    };
+    let installed = active.strip_prefix("kokoro-").unwrap_or(active);
+    match probe {
+        Ok(latest) => {
+            if version_tuple(installed) >= version_tuple(&latest) {
+                Check::ok(
+                    "engine currency",
+                    format!("up to date ({active}, kokoro - newest published model {latest})"),
+                )
+            } else {
+                Check::warn(
+                    "engine currency",
+                    format!(
+                        "kokoro model {latest} available (active: {active}) - run: \
+                         blazar engine update --kind kokoro {latest}"
+                    ),
+                )
+            }
+        }
+        Err(e) => Check::warn(
+            "engine currency",
+            format!("{active} (kokoro) - release check failed ({e:#}); offline?"),
+        ),
+    }
+}
+
+/// litert-lm pip lane: same live-PyPI currency shape as sglang/mlx.
+/// Without this arm the litert row falls into the llama.cpp b-build
+/// reconciler and reports that channel's tags against a litert tag -
+/// wrong-channel verdicts (observed: "update available: b12189" for
+/// litert-0.19.1 while `PyPI` latest was 0.19.1).
+async fn live_litert_currency(active: &str) -> Check {
+    let installed_version = active.trim_start_matches("litert-");
+    match blazar_runtime::engine::litert_install::pypi_latest_litert_lm().await {
+        Ok(latest) => {
+            match (
+                blazar_runtime::engine::litert_install::version_tuple(installed_version),
+                blazar_runtime::engine::litert_install::version_tuple(&latest),
+            ) {
+                (Some(inst), Some(want)) if inst >= want => Check::ok(
+                    "engine currency",
+                    format!("up to date ({active}, litert-lm pip lane)"),
+                ),
+                (Some(_), Some(_)) => Check::warn(
+                    "engine currency",
+                    format!(
+                        "{latest} available on PyPI (active: {active}) - run: \
+                         blazar engine update --kind openaihost {latest}"
+                    ),
+                ),
+                // litert tags are minted from PyPI versions, so an
+                // unparsable side is a real anomaly - say so instead of
+                // guessing an ordering.
+                _ => Check::warn(
+                    "engine currency",
+                    format!(
+                        "{active} (litert-lm pip lane) - cannot order against PyPI \
+                         latest {latest} (unparsable version)"
+                    ),
+                ),
+            }
+        }
+        Err(e) => Check::warn(
+            "engine currency",
+            format!("{active} (litert-lm pip lane) - PyPI check failed ({e:#}); offline?"),
+        ),
+    }
+}
+
 async fn live_mistralrs_currency(active: &str) -> Check {
     let token = std::env::var("GH_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
@@ -7482,6 +8134,22 @@ fn sdcpp_hint_lines(
 /// tail in `doctor_engine` and the non-active `doctor_lane_currency`
 /// sweep, which between them never showed a kind the active lane
 /// belonged to another kind of.
+/// Doctor row label per engine kind ("versions <lane>") - the walk list
+/// in `doctor_engine_versions` decides which kinds actually surface.
+fn doctor_versions_name(kind: EngineKind) -> &'static str {
+    match kind {
+        EngineKind::LlamaCpp => "versions llamacpp",
+        EngineKind::MistralRs => "versions mistralrs",
+        EngineKind::Sglang => "versions sglang",
+        EngineKind::SdCpp => "versions sdcpp",
+        EngineKind::Mlx => "versions mlx",
+        EngineKind::Whisper => "versions whisper",
+        EngineKind::Piper => "versions piper",
+        EngineKind::Kokoro => "versions kokoro",
+        EngineKind::OpenAiHost => "versions litert",
+    }
+}
+
 async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
@@ -7496,19 +8164,13 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
         EngineKind::Sglang,
         EngineKind::SdCpp,
         EngineKind::Mlx,
-        // Whisper has its own dedicated currency check; piper rides
-        // this loop like any engines-lane citizen.
+        // Whisper has its own dedicated currency check; piper and
+        // kokoro ride this loop like any engines-lane citizen.
         EngineKind::Piper,
+        EngineKind::Kokoro,
+        EngineKind::OpenAiHost,
     ] {
-        let name = match kind {
-            EngineKind::LlamaCpp => "versions llamacpp",
-            EngineKind::MistralRs => "versions mistralrs",
-            EngineKind::Sglang => "versions sglang",
-            EngineKind::SdCpp => "versions sdcpp",
-            EngineKind::Mlx => "versions mlx",
-            EngineKind::Whisper => "versions whisper",
-            EngineKind::Piper => "versions piper",
-        };
+        let name = doctor_versions_name(kind);
         // Rows arrive newest-first (installed_at DESC): the kind's newest
         // install is what an update would act on, retained rollback rows
         // only add the `+N older` context.
@@ -7575,12 +8237,23 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
             EngineKind::Mlx => live_mlx_currency(&judged.tag).await,
             EngineKind::MistralRs => live_mistralrs_currency(&judged.tag).await,
             EngineKind::SdCpp => live_sdcpp_currency(d, &judged.tag).await,
-            _ => {
+            EngineKind::OpenAiHost => live_litert_currency(&judged.tag).await,
+            EngineKind::Piper => live_piper_currency(d, &judged.tag).await,
+            EngineKind::Kokoro => live_kokoro_currency(d, &judged.tag).await,
+            EngineKind::LlamaCpp => {
                 // Active llama.cpp lane: prefer reconciling the daemon's
                 // last upstream survey (marker fresh + channel-matched);
                 // anything else falls back to the live probe.
                 marker_currency_verdict(d, &judged.tag, &judged.asset)
                     .unwrap_or(live_engine_currency(&judged.tag, &judged.asset).await)
+            }
+            // Whisper never rides this loop - its dedicated currency
+            // check owns that lane (see the kind list at the top of this
+            // function). Exhaustive on purpose: a future EngineKind must
+            // pick a reconciler here at compile time instead of silently
+            // falling into the llama.cpp lane.
+            EngineKind::Whisper => {
+                unreachable!("whisper versions are reconciled by the dedicated whisper check")
             }
         };
         out.push(
@@ -7629,6 +8302,9 @@ async fn latest_engine_tag(kind: EngineKind) -> Option<String> {
         EngineKind::Mlx => blazar_runtime::engine::mlx_install::pypi_latest_mlx_lm()
             .await
             .ok(),
+        EngineKind::OpenAiHost => blazar_runtime::engine::litert_install::pypi_latest_litert_lm()
+            .await
+            .ok(),
         EngineKind::LlamaCpp
         | EngineKind::MistralRs
         | EngineKind::SdCpp
@@ -7644,9 +8320,29 @@ async fn latest_engine_tag(kind: EngineKind) -> Option<String> {
                 EngineKind::MistralRs => gh.latest_mistralrs_release().await,
                 EngineKind::SdCpp => gh.latest_sdcpp_release().await,
                 EngineKind::Piper => gh.latest_piper_release().await,
-                _ => gh.latest_whisper_release().await,
+                EngineKind::Whisper => gh.latest_whisper_release().await,
+                // The pip lanes resolved in their own arms above and
+                // never reach this GitHub-releases block; listed so a
+                // future EngineKind is a compile error here until it
+                // picks a source.
+                EngineKind::Sglang | EngineKind::Mlx | EngineKind::OpenAiHost => {
+                    unreachable!("pip lanes resolve in their own arms above")
+                }
+                EngineKind::Kokoro => {
+                    unreachable!("kokoro resolves in its own arm above (model version, not tag)")
+                }
             };
             fetched.ok().map(|rel| rel.tag_name)
+        }
+        // Kokoro's "latest" is the MODEL version (asset-named), not the
+        // release tag - `engine install <version> --kind kokoro` takes
+        // exactly this string.
+        EngineKind::Kokoro => {
+            let token = std::env::var("GH_TOKEN")
+                .or_else(|_| std::env::var("GITHUB_TOKEN"))
+                .ok();
+            let gh = GhClient::new(token).ok()?;
+            gh.latest_kokoro_model_version().await.ok()
         }
     }
 }
@@ -8808,6 +9504,16 @@ async fn serve() -> Result<()> {
     if let Some(tag) = store.heal_active_engine()? {
         println!("serve: no active engine row found; activated newest serving engine {tag}");
     }
+    // sglang lanes installed before the quant-registry probe keep
+    // manifests without quant_methods; refresh them from the lane venv
+    // (detached - a cold torch import can take a minute) so admission
+    // honesty does not wait for the next lane install.
+    blazar_runtime::engine::spawn_sglang_quant_backfill(d.clone());
+    // Manifests captured by an older vocabulary probe (e.g. before the
+    // parser learned dotted flag names) self-heal the same way: the
+    // gate reads the stored vocab, so refresh stale rows before the
+    // first spawn can hit a false refusal.
+    blazar_runtime::engine::spawn_stale_probe_vocab_backfill(d.clone());
     // Router mode is a llama-server feature (`--models-preset`): serve
     // with the llamacpp lane even when another kind holds the active
     // slot, so a JIT mistral.rs install (or any `engine use`) never
@@ -8897,6 +9603,9 @@ async fn serve() -> Result<()> {
         blazar_core::engine_kind::EngineKind::Mlx => {
             Arc::new(blazar_runtime::MlxEngine::with_env(manifest, engine_env))
         }
+        blazar_core::engine_kind::EngineKind::OpenAiHost => Arc::new(
+            blazar_runtime::OpenAiHostEngine::with_env(manifest, engine_env),
+        ),
         blazar_core::engine_kind::EngineKind::LlamaCpp => {
             Arc::new(LlamaCppEngine::with_env(manifest, engine_env))
         }
@@ -8907,12 +9616,27 @@ async fn serve() -> Result<()> {
         // has no model-serving surface). Installs never activate it, so
         // reaching this arm means a hand-edited store - name recovery.
         audio_kind @ (blazar_core::engine_kind::EngineKind::Whisper
-        | blazar_core::engine_kind::EngineKind::Piper) => {
+        | blazar_core::engine_kind::EngineKind::Piper
+        | blazar_core::engine_kind::EngineKind::Kokoro) => {
             let surface = match audio_kind {
                 blazar_core::engine_kind::EngineKind::Whisper => {
                     "POST /v1/audio/transcriptions and /v1/audio/translations"
                 }
-                _ => "POST /v1/audio/speech",
+                blazar_core::engine_kind::EngineKind::Piper => "POST /v1/audio/speech",
+                blazar_core::engine_kind::EngineKind::Kokoro => {
+                    "POST /v1/audio/speech (kokoro voices)"
+                }
+                // The binding above admits only the audio lanes; the
+                // serving lanes are enumerated so a future audio lane is
+                // a compile error here until it names its surface.
+                blazar_core::engine_kind::EngineKind::LlamaCpp
+                | blazar_core::engine_kind::EngineKind::MistralRs
+                | blazar_core::engine_kind::EngineKind::Sglang
+                | blazar_core::engine_kind::EngineKind::SdCpp
+                | blazar_core::engine_kind::EngineKind::Mlx
+                | blazar_core::engine_kind::EngineKind::OpenAiHost => {
+                    unreachable!("non-audio lane inside the audio-lane arm")
+                }
             };
             anyhow::bail!(
                 "the active engine row is the {} audio lane - it serves only {surface} and \
@@ -8966,7 +9690,25 @@ async fn serve() -> Result<()> {
         let state = Arc::clone(&state);
         let dirs = d.clone();
         let hook: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-            let raw = std::fs::read_to_string(dirs.config_file()).unwrap_or_default();
+            let raw = match std::fs::read_to_string(dirs.config_file()) {
+                Ok(r) => r,
+                Err(e) => {
+                    // A transient read failure (editor atomic-replace
+                    // window, AV lock on Windows) must NOT be treated as
+                    // "config is empty": parsing "" yields an
+                    // all-defaults config whose empty key list would
+                    // wipe every live key. Skip this signal; the next
+                    // one re-reads.
+                    tracing::warn!("SIGHUP: config read failed ({e}) - keeping live keys");
+                    return;
+                }
+            };
+            if raw.trim().is_empty() {
+                // Same hazard as a failed read: an empty parse is a
+                // wipe, not an intent. Refuse to guess.
+                tracing::warn!("SIGHUP: config file is empty - keeping live keys");
+                return;
+            }
             if let Ok(fresh) = blazar_core::Config::from_toml(&raw) {
                 for k in &fresh.keys {
                     // Upsert by name (scopes/budgets refresh); removals
@@ -9003,6 +9745,56 @@ async fn serve() -> Result<()> {
             }
         })
     };
+    // Fleet auto-contribution: a daemon started with
+    // `fleet_contribute_join = http://GATEWAY:port` shares this box's
+    // devices with that other daemon's fleet from boot. The managed
+    // `rpc worker --join` child inherits this process's environment
+    // (BLAZAR_FLEET_TOKEN passes through), auto-binds its host per the
+    // worker CLI's rule (non-loopback gateway -> all interfaces), and
+    // carries a parent-death tie so a crashed or SIGKILLed daemon
+    // never leaves a contributor orphaned. Exits are logged and the
+    // child restarts with capped backoff; the gateway's heartbeat TTL
+    // evicts the worker if this daemon stops abruptly.
+    let contributor = cfg.fleet_contribute_join.as_deref().map(|base| {
+        let base = base.to_string();
+        tokio::spawn(async move {
+            let exe = match std::env::current_exe() {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("fleet contributor disabled: cannot resolve own binary ({e})");
+                    return;
+                }
+            };
+            let mut backoff = std::time::Duration::from_secs(2);
+            loop {
+                let mut child_cmd = std::process::Command::new(&exe);
+                child_cmd.args(["rpc", "worker", "--join", &base]);
+                blazar_runtime::parent_death_tie(&mut child_cmd);
+                match tokio::process::Command::from(child_cmd)
+                    .kill_on_drop(true)
+                    .spawn()
+                {
+                    Ok(mut child) => match child.wait().await {
+                        Ok(status) => {
+                            tracing::warn!(
+                                "fleet contributor worker exited ({status}) - restarting in {backoff:?}"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("fleet contributor wait failed ({e}) - restarting in {backoff:?}");
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            "fleet contributor disabled: cannot spawn rpc worker ({e}) - retrying in {backoff:?}"
+                        );
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+            }
+        })
+    });
     let served = blazar_gateway::serve(
         state.clone(),
         &host,
@@ -9010,6 +9802,9 @@ async fn serve() -> Result<()> {
         Box::pin(blazar_runtime::wait_for_shutdown_signal()),
     )
     .await;
+    if let Some(handle) = contributor {
+        handle.abort();
+    }
     flusher.abort();
     state.keys.flush(&d);
     // A hard bind conflict (ollama owns the port) must not feed the
@@ -9286,6 +10081,11 @@ async fn pull(
             row.shards,
             row.path
         );
+        // Catalog-pinned chat-template guidance (e.g. glm-ocr GGUFs
+        // ship without one - upstream llama.cpp #31298): vendoring is
+        // The pull path already surfaced the chat-template note through
+        // pull_warning (tracing + ModelPulled event); printing it here
+        // again would duplicate the message in the terminal.
         // The pull ran in THIS process, so the daemon's warm_on_pull
         // listener never saw it (its ModelPulled event fired on the
         // CLI's own bus). Ping the daemon's warm endpoint so the
@@ -10112,6 +10912,9 @@ fn list(json: bool) -> Result<()> {
     Ok(())
 }
 
+// One field-list fn by design: text card and JSON card render the
+// same row; splitting them would duplicate the metadata plumbing.
+#[allow(clippy::too_many_lines)]
 fn show(model: &str, json: bool) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
@@ -10138,6 +10941,9 @@ fn show(model: &str, json: bool) -> Result<()> {
                 "expert_count": m.expert_count,
                 "quantized_by": m.quantized_by,
                 "version": m.general_version,
+                "draft": m.mtp_layers.map(|n| {
+                    serde_json::json!({"kind": "mtp", "layers": n})
+                }),
                 "lint": m.lint(),
             })
         });
@@ -10192,6 +10998,17 @@ fn show(model: &str, json: bool) -> Result<()> {
         }
         if let Some(v) = &m.general_version {
             fields.push(("version", v.clone()));
+        }
+        // Embedded MTP/NextN head: one field, human-readable - the
+        // draft ships inside this GGUF, no separate draft model needed.
+        if let Some(n) = m.mtp_layers {
+            fields.push((
+                "draft",
+                format!(
+                    "embedded MTP head ({n} layer{})",
+                    if n == 1 { "" } else { "s" }
+                ),
+            ));
         }
     }
     let key_w = fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -10730,6 +11547,21 @@ fn ready_card_line(v: &serde_json::Value) -> Option<String> {
         or_unknown(&v["cache"]["kv_v"]),
         or_unknown(&v["speculation"]["mode"]),
     ))
+}
+
+/// The admission-refusal teach from the run ready-card: when the
+/// daemon's admission preview says the spawn would be refused (or no
+/// lane even resolves), surface its reason at the banner instead of
+/// letting the first turn discover the 400. `None` = admitted, nothing
+/// to say.
+fn admission_refusal_line(v: &serde_json::Value) -> Option<String> {
+    let verdict = v["admission"]["load"]["verdict"].as_str()?;
+    if verdict == "ok" {
+        return None;
+    }
+    v["admission"]["load"]["reason"]
+        .as_str()
+        .map(str::to_string)
 }
 
 /// `blazar plan <model>` - read-only pre-run assembly: identity, the
@@ -11385,7 +12217,7 @@ llama-bench measures generative decode; embedding speed is per-request in /metri
                 bench(name)
             } else if r.cmd.starts_with("blazar tune ") {
                 tune_full(
-                    name, false, None, None, None, false, false, false, false, false,
+                    name, false, None, None, None, false, false, false, false, false, false,
                 )
                 .await
             } else {
@@ -12358,23 +13190,24 @@ fn ps_models_of(
 /// 2 s apart) on the transient classes only - transport errors and 5xx
 /// (the daemon restarting mid-request); a 4xx or a malformed 2xx body
 /// fails immediately (retrying an auth or shape problem just doubles
-/// the wait for the same error).
-async fn ps_fetch(base: &str) -> Result<Vec<serde_json::Value>> {
+/// the wait for the same error). Returns the whole validated body so
+/// callers can read both members (`models`, `remotes`).
+async fn ps_fetch(base: &str) -> Result<serde_json::Value> {
     let mut attempt = 0;
     loop {
-        let outcome: Result<Vec<serde_json::Value>, String> =
+        let outcome: Result<serde_json::Value, String> =
             match cli_http().get(format!("{base}/api/ps")).send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     match resp.json::<serde_json::Value>().await {
-                        Ok(body) => ps_models_of(status, &body),
+                        Ok(body) => ps_models_of(status, &body).map(|_| body),
                         Err(e) => Err(format!("body unreadable: {e}")),
                     }
                 }
                 Err(e) => Err(format!("request failed: {e}")),
             };
         match outcome {
-            Ok(models) => return Ok(models),
+            Ok(body) => return Ok(body),
             Err(msg) if attempt == 0 && ps_retryable(&msg) => {
                 eprintln!("ps: {msg} - retrying once in 2s");
                 attempt += 1;
@@ -12401,6 +13234,71 @@ fn ps_retryable(msg: &str) -> bool {
         .any(|prefix| msg.starts_with(prefix))
 }
 
+/// Remotes array from an `/api/ps` body. An absent key (router mode,
+/// older daemon) or a non-array value means no remote section -
+/// lenient by design: only the `models` contract above is load-bearing
+/// for the command.
+fn ps_remotes_of(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    body.get("remotes")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// MiB below 1 GiB, GiB above - display-only integer math (one decimal
+/// via tenths), matching the tone of the free-memory columns elsewhere.
+fn vram_str(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        let tenths = bytes / (GIB / 10);
+        format!("{}.{} GiB", tenths / 10, tenths % 10)
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
+}
+
+/// One text row per configured remote for the `ps` table. STATE is the
+/// daemon's probe verdict, NOTE carries the peer's model count (or the
+/// exact HTTP status / transport error), and a `cap ...` suffix appears
+/// only when the peer is a Blazar gateway that answered `/api/capacity`.
+fn ps_remote_rows(remotes: &[serde_json::Value]) -> Vec<String> {
+    remotes
+        .iter()
+        .map(|r| {
+            let name = r["name"].as_str().unwrap_or("?");
+            let state = if r["ok"].as_bool().unwrap_or(false) {
+                "ok"
+            } else {
+                "down"
+            };
+            let mut note = r["note"].as_str().unwrap_or("-").to_string();
+            if let (Some(devs), Some(free), Some(total)) = (
+                r["capacity"]["devices"].as_u64(),
+                r["capacity"]["free_vram_bytes"].as_u64(),
+                r["capacity"]["total_vram_bytes"].as_u64(),
+            ) {
+                std::fmt::Write::write_fmt(
+                    &mut note,
+                    format_args!(
+                        " | cap {devs} dev, {}/{} free, {} residents ({}s ago)",
+                        vram_str(free),
+                        vram_str(total),
+                        r["capacity"]["residents"].as_u64().unwrap_or(0),
+                        r["capacity"]["age_secs"].as_u64().unwrap_or(0)
+                    ),
+                )
+                .expect("writing to a String is infallible");
+            }
+            format!("{name:<24} {state:<9} {note}")
+        })
+        .collect()
+}
+
+// One rendering fn by design: table, warnings and the remotes section
+// read the same fetched body in output order; splitting it would hide
+// exactly the sequence it exists to show.
+#[allow(clippy::too_many_lines)]
 async fn ps(reset: bool, json: bool) -> Result<()> {
     if reset {
         let base = ensure_daemon().await?;
@@ -12414,7 +13312,11 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
         upstream_update_hint(&dirs()).await;
     }
     let base = ensure_daemon().await?;
-    let models = ps_fetch(&base).await?;
+    let body = ps_fetch(&base).await?;
+    // Presence validated by ps_fetch (ps_models_of); the defensive
+    // default only covers the impossible already-validated-out case.
+    let models = body["models"].as_array().cloned().unwrap_or_default();
+    let remotes = ps_remotes_of(&body);
     if json {
         // Machine-typed mirror of the table; the daemon banner, the
         // "no models loaded" line and warn decorations stay human-only.
@@ -12440,6 +13342,19 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
                 })
             );
         }
+        // Remote lanes ride the same JSONL stream, keyed `remote` so
+        // consumers filtering model lines on `name` skip them.
+        for r in remotes {
+            let mut line = serde_json::json!({
+                "remote": r["name"].as_str(),
+                "ok": r["ok"].as_bool(),
+                "note": r["note"].as_str(),
+            });
+            if let Some(c) = r.get("capacity") {
+                line["capacity"] = c.clone();
+            }
+            println!("{line}");
+        }
         return Ok(());
     }
     // Which binary owns the daemon (stale-copy race visibility).
@@ -12458,8 +13373,9 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
         "NAME", "STATE", "CTX", "SLOTS", "GPU", "SPEC", "HIT", "IN_FLIGHT"
     );
     if models.is_empty() {
+        // Fall through: a daemon with nothing loaded but remotes
+        // configured still owes the user the remote section.
         println!("no models loaded");
-        return Ok(());
     }
     for m in models {
         let display = match m["blazar_replica"].as_i64() {
@@ -12499,6 +13415,16 @@ async fn ps(reset: bool, json: bool) -> Result<()> {
                     println!("  warn[{display}]: {w}");
                 }
             }
+        }
+    }
+    // Remote lanes: the daemon probes them concurrently (3 s cap) as
+    // part of answering /api/ps, so this section costs no extra
+    // requests - it only surfaces what the answer already carried.
+    if !remotes.is_empty() {
+        println!();
+        println!("{:<24} {:<9} NOTE", "REMOTE", "STATE");
+        for row in ps_remote_rows(&remotes) {
+            println!("{row}");
         }
     }
     Ok(())
@@ -13770,6 +14696,7 @@ fn quantize_cmd(
     name: Option<&str>,
     imatrix: Option<&std::path::Path>,
     allow_requantize: bool,
+    recipe: Option<&str>,
     verify_gate_pct: Option<f64>,
 ) -> Result<()> {
     if !blazar_runtime::quantize::plausible_quant_type(qtype) {
@@ -13783,6 +14710,29 @@ fn quantize_cmd(
         .get_model(model)?
         .ok_or_else(|| anyhow!("unknown model {model:?} (blazar list)"))?;
     let bin = blazar_runtime::quantize::find_quantize_bin(&d)?;
+    // Optional tensor-type mask recipe: resolve the name, prove the
+    // installed llama-quantize speaks --tensor-type-file (fail fast -
+    // silently dropping the mask would defeat the recipe's purpose),
+    // then write the mask file for the tool to read.
+    let mut lead_args: Vec<String> = Vec::new();
+    if let Some(r) = recipe {
+        if blazar_runtime::quantize::recipe_mask(r).is_none() {
+            return Err(anyhow!(
+                "unknown recipe {r:?} - available: {}",
+                blazar_runtime::quantize::recipe_names().join(", ")
+            ));
+        }
+        if !blazar_runtime::quantize::supports_tensor_type_file(&bin)? {
+            return Err(anyhow!(
+                "installed llama-quantize lacks --tensor-type-file (recipe {r:?} needs it) - \
+                 run `blazar engine update` and retry"
+            ));
+        }
+        let mask_path = blazar_runtime::quantize::write_recipe_mask(&d, r)?;
+        println!("recipe {r}: tensor-type mask at {}", mask_path.display());
+        lead_args.push("--tensor-type-file".to_string());
+        lead_args.push(mask_path.display().to_string());
+    }
     let base = row.name.split('-').next().unwrap_or(&row.name).to_string();
     let out_name = name.map_or_else(|| format!("{base}-{qtype}"), str::to_string);
     let dst = d.models_dir().join(format!("{out_name}.gguf"));
@@ -13798,7 +14748,7 @@ fn quantize_cmd(
     // Optional importance matrix: calibrate first, then quantize with it
     // (verified upstream CLI: llama-imatrix -m -f -o --output-format gguf;
     // llama-quantize --imatrix file).
-    let mut imatrix_args: Vec<String> = match &imatrix {
+    let imatrix_args: Vec<String> = match &imatrix {
         Some(calib) => {
             let ibin = blazar_runtime::quantize::find_imatrix_bin(&d)?;
             let ipath = d.data_dir.join(format!(
@@ -13823,15 +14773,18 @@ fn quantize_cmd(
         }
         None => Vec::new(),
     };
+    // Final leading-flag order (all independent upstream flags):
+    // --allow-requantize, --tensor-type-file, --imatrix.
+    lead_args.extend(imatrix_args);
     if allow_requantize {
-        imatrix_args.insert(0, "--allow-requantize".to_string());
+        lead_args.insert(0, "--allow-requantize".to_string());
     }
     let out = blazar_runtime::quantize::quantize_im(
         &bin,
         std::path::Path::new(&row.path),
         &tmp.path,
         qtype,
-        &imatrix_args,
+        &lead_args,
         |line| {
             println!("  {line}");
         },
@@ -13999,6 +14952,42 @@ async fn drafts_cmd(model: &str) -> Result<()> {
         .next()
         .unwrap_or(model)
         .to_lowercase();
+    // Curated pairings first (registry rows are family-keyed with the
+    // same coarse token computed above): they carry mode-specific
+    // adoption guidance. A registry miss is advisory - offline hosts
+    // and not-yet-curated families still get the raw search below.
+    let reg_client = blazar_runtime::engine::capability_registry::http().clone();
+    match blazar_runtime::draft_registry::fetch(
+        &reg_client,
+        &blazar_runtime::draft_registry::registry_url(),
+    )
+    .await
+    {
+        Ok(pairings) => {
+            let curated = blazar_runtime::draft_registry::pairings_for_family(&pairings, &family);
+            if !curated.is_empty() {
+                println!("curated draft pairings for {family}:");
+                for p in curated {
+                    println!(
+                        "  {:<58} [{}]  targets: {}",
+                        p.repo,
+                        p.mode,
+                        p.models.join(", ")
+                    );
+                    if let Some(n) = &p.note {
+                        println!("    {}", dim_line(n));
+                    }
+                    println!("    {}", dim_line(p.mode.hint()));
+                }
+            }
+        }
+        Err(e) => println!(
+            "{}",
+            dim_line(&format!(
+                "draft registry unavailable ({e}) - showing raw search only"
+            ))
+        ),
+    }
     let queries = [
         format!("{family} eagle3 gguf"),
         format!("{family} mtp gguf"),
@@ -14009,7 +14998,22 @@ async fn drafts_cmd(model: &str) -> Result<()> {
     println!("draft candidates for {model} (verify with `blazar tune {model} --spec`):");
     let mut any = false;
     for q in &queries {
-        for e in client.search(q, "gguf", 5).await? {
+        // The curated block above already stands on its own; a network
+        // failure in the raw search must not abort the command halfway
+        // (the registry lane treats its failure as advisory too).
+        let hits = match client.search(q, "gguf", 5).await {
+            Ok(hits) => hits,
+            Err(e) => {
+                println!(
+                    "{}",
+                    dim_line(&format!(
+                        "hf search unavailable ({e}) - curated pairings above stand"
+                    ))
+                );
+                break;
+            }
+        };
+        for e in hits {
             let repo = e.id.clone();
             if seen.insert(repo.clone()) {
                 let dl = e.downloads.unwrap_or(0);
@@ -14607,11 +15611,15 @@ async fn stop_cmd(model: Option<String>) -> Result<()> {
         return stop().await;
     };
     let base = ensure_daemon().await?;
-    let resp = cli_http()
+    let mut req = cli_http()
         .post(format!("{base}/api/evict"))
-        .json(&serde_json::json!({"model": model}))
-        .send()
-        .await?;
+        .json(&serde_json::json!({"model": model}));
+    // Keys-mode daemons gate /api/evict; attach the configured admin key
+    // when present so `blazar stop <model>` works without manual headers.
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
     if resp.status().is_success() {
         println!("{}", ok_line(&format!("unloaded {model}")));
         Ok(())
@@ -15013,6 +16021,12 @@ async fn run_repl(model: &str, no_draft: bool, priority: Option<&str>) -> Result
             if let Some(line) = ready_card_line(&card) {
                 println!("{line}");
             }
+            // Refused at the door: the same card carries the admission
+            // verdict a spawn would hit - say it NOW, before the user
+            // types a turn that pays for the discovery.
+            if let Some(teach) = admission_refusal_line(&card) {
+                println!("refused at admission: {teach}");
+            }
         }
         None => println!("profile: unavailable (daemon did not answer the explain card)"),
     }
@@ -15020,9 +16034,9 @@ async fn run_repl(model: &str, no_draft: bool, priority: Option<&str>) -> Result
     // earliest proof of intent, so a detached /api/warm (wait:true,
     // reply discarded) rides the standard admission path - the first
     // real turn then coalesces onto the same in-flight load instead of
-    // paying the cold start after the prompt is submitted. Silent by
-    // design: admission failures surface on the first turn through the
-    // normal teaching path.
+    // paying the cold start after the prompt is submitted. Any
+    // admission refusal was already stated above from the explain
+    // card, so success here adds no noise.
     {
         let base = base.clone();
         let model_at_banner = model.clone();
@@ -16442,6 +17456,7 @@ async fn tune_full(
     load: bool,
     replicas: bool,
     cache_reuse: bool,
+    moe_cache: bool,
 ) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
@@ -16486,7 +17501,22 @@ aborts on this family. Profile pins for it would measure nothing",
                 row.name
             );
         }
+        // The sglang race spawns full sglang children sequentially - a
+        // heavier fixed footprint than llama-server (Blazar's own dense
+        // budget is 1750 MiB dynamic reserve + 256 MiB min-KV), so this
+        // lane guards with the larger headroom.
+        tune_probe_vram_preflight(&row, 1, SGLANG_CHILD_HEADROOM_MIB)
+            .map_err(|e| anyhow!("tune pre-flight: {e}"))?;
         return sglang_spec_race_lane(&d, &store, model, &row);
+    }
+    // Live probes spawn real engine children on the card; refuse in
+    // under a second when a resident holder has already eaten the VRAM
+    // they need (the probes themselves would OOM or time out minutes
+    // later with no hint of why). Receipt-display flags (--ctx/--spec
+    // alone) spawn nothing and skip the guard.
+    if search || slots.is_some() || ngram || race || load || replicas || cache_reuse || moe_cache {
+        tune_probe_vram_preflight(&row, 1, TUNE_CHILD_HEADROOM_MIB)
+            .map_err(|e| anyhow!("tune pre-flight: {e}"))?;
     }
     let mut cfg = config()?;
     // Any adoption below flips this: the fn tail then restarts a running
@@ -17001,7 +18031,7 @@ aborts on this family. Profile pins for it would measure nothing",
             }
         }
     }
-    if load || replicas || cache_reuse {
+    if load || replicas || cache_reuse || moe_cache {
         // Shared base profile for the spawn-your-own-children lanes: both
         // searches strip endpoint/session/warmup flags themselves, so the
         // children differ only in the axis under test.
@@ -17054,6 +18084,13 @@ aborts on this family. Profile pins for it would measure nothing",
             println!(
                 "replica search: 1 vs 2 children - 3 spawns total, 8 clients x 3 gens each ..."
             );
+            // Run B of the replica search is the only tune probe holding
+            // TWO full copies of the model on the card at once; check
+            // that specific floor here, freshly measured at this point
+            // in the run (earlier probes ran and exited since the entry
+            // pre-flight).
+            tune_probe_vram_preflight(&row, 2, TUNE_CHILD_HEADROOM_MIB)
+                .map_err(|e| anyhow!("tune pre-flight: {e}"))?;
             let probe = tuner.replica_search(&base.argv, 1)?;
             let ratio = probe.r2_tps / probe.r1_tps.max(1e-6);
             println!("1 child   : {:>6.1} tok/s", probe.r1_tps);
@@ -17106,6 +18143,77 @@ aborts on this family. Profile pins for it would measure nothing",
                 );
             } else {
                 println!("keep cache_reuse = 256 (no candidate >5% faster and >50 ms >5% faster)");
+            }
+        }
+        if moe_cache {
+            // MoE expert-cache axis (llama.cpp #30966): missed experts are
+            // recomputed on host experts per `--moe-cache-cpu-share`
+            // instead of uploading through the cache. Real measured grid,
+            // not the upstream simulator's replay.
+            if !manifest.flags.contains("--moe-cache-mib")
+                || !manifest.flags.contains("--moe-cache-cpu-share")
+            {
+                anyhow::bail!(
+                    "engine {} lacks the moe-cache flags (need --moe-cache-mib and \
+                     --moe-cache-cpu-share, llama.cpp #30966 / e95426f) - update the \
+                     llamacpp engine first: blazar engine update",
+                    engine_row.tag
+                );
+            }
+            if gguf.expert_count.unwrap_or(0) <= 1 {
+                anyhow::bail!(
+                    "{} looks dense (expert_count = {:?}) - the MoE cache only routes \
+                     MoE experts; there is nothing to tune. The knobs \
+                     (moe_cache_mib / moe_cache_cpu_share) stay silently off for \
+                     dense models.",
+                    model,
+                    gguf.expert_count
+                );
+            }
+            let mibs = [512u64, 1024, 2048];
+            let shares = [0.25f32, 0.5, 0.9];
+            println!(
+                "moe-cache search (llama.cpp #30966): grid mibs {mibs:?} x shares \
+                 {shares:?} + no-cache baseline - {} spawns, 1 client x 3 gens each ...",
+                mibs.len() * shares.len() + 1
+            );
+            let probe = tuner.moe_cache_search(&base.argv, &mibs, &shares, 1)?;
+            // Upstream-style table: rows = mib, columns = share.
+            print!("            ");
+            for s in &shares {
+                print!("  share {s:<5}");
+            }
+            println!();
+            for &m in &mibs {
+                print!("  mib {m:<6}");
+                for &s in &shares {
+                    let tps = probe
+                        .rows
+                        .iter()
+                        .find(|(m2, s2, _)| *m2 == m && s2.to_bits() == s.to_bits())
+                        .map_or(f64::NAN, |(_, _, t)| *t);
+                    print!("  {tps:>9.1}");
+                }
+                println!();
+            }
+            println!("  baseline (no cache): {:.1} tok/s", probe.baseline_tps);
+            match blazar_runtime::bench::moe_cache_recommend(probe.baseline_tps, &probe.rows) {
+                Some((mib, share)) => {
+                    set_model_override(model, "moe_cache_mib", &mib.to_string())?;
+                    set_model_override(model, "moe_cache_cpu_share", &share.to_string())?;
+                    adopted_any = true;
+                    println!(
+                        "{}",
+                        ok_line(&format!(
+                            "adopted model_overrides.{model}.moe_cache_mib = {mib} \
+                             + moe_cache_cpu_share = {share}"
+                        ))
+                    );
+                }
+                None => println!(
+                    "keep moe cache off (no grid point >5% over the {:.1} tok/s baseline)",
+                    probe.baseline_tps
+                ),
             }
         }
     }
@@ -17537,9 +18645,11 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         EngineKind::MistralRs => "mistral.rs",
         EngineKind::Sglang => "sglang",
         EngineKind::Mlx => "mlx-lm",
+        EngineKind::OpenAiHost => "litert-lm",
         EngineKind::SdCpp => "sd-server",
         EngineKind::Whisper => "whisper-server",
         EngineKind::Piper => "piper",
+        EngineKind::Kokoro => "kokoro-server",
     };
     out.push(format!("# engine lane: {lane} ({tag})"));
     out.push(
@@ -17600,9 +18710,17 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
             // body, not config knobs - same request-driven discipline
             // as the other audio lane.
             EngineKind::Piper => Some(("piper", vec![])),
+            // Kokoro TTS lane: identical request-driven discipline -
+            // voice/speed/lang ride the request body; the lane boots
+            // lazily on the first synthesis, nothing to pin in config.
+            EngineKind::Kokoro => Some(("kokoro", vec![])),
             // MLX lane knobs ride the [mlx] table (MlxTuning): draft
             // speculation, KV quantization, concurrency and cache sizing.
             EngineKind::Mlx => Some(("mlx", mlx_hint_families())),
+            // Host lane: the serve child owns no tunable knobs (the
+            // runtime manages context/memory inside the bundle); user
+            // flags ride the generic argv passthrough.
+            EngineKind::OpenAiHost => None,
         };
         if let Some((table, families)) = table_families {
             out.push(format!("# [model_overrides.\"{model}\".{table}]"));
@@ -18027,6 +19145,114 @@ fn gate_vram_preflight(model_path: &std::path::Path) -> Result<(), String> {
     ))
 }
 
+/// Per-child overhead beyond raw weights for a spawned llama-server /
+/// llama-bench child: CUDA context + compute buffers + KV at tune
+/// context sizes. Same 1.5 GiB the gate probe budgets for the same
+/// engine class.
+const TUNE_CHILD_HEADROOM_MIB: u64 = 1536;
+
+/// Per-child overhead for a spawned sglang child (the `--spec-race`
+/// safetensors lane): sglang carries a heavier fixed footprint, and
+/// Blazar's own dense spawn budget already reserves 1750 MiB (dynamic
+/// reserve, receipted on an 8 GiB card) plus a 256 MiB minimum KV pool
+/// - rounded to 2 GiB for the race pre-flight.
+const SGLANG_CHILD_HEADROOM_MIB: u64 = 2048;
+
+/// Guard math for the tune live probes: do `children` co-resident loads
+/// of `weights_bytes` fit `free_mib` of measured VRAM? Same contract as
+/// [`gate_bench_fits`] above - `None` (no measurable GPU) never refuses,
+/// and refusing slightly early beats the minutes-long OOM dump it
+/// prevents. All probes except the replica search hold one child at a
+/// time; the replica search's run B holds two full copies at once.
+fn probe_children_fit(
+    weights_bytes: u64,
+    free_mib: Option<u64>,
+    children: u64,
+    headroom_mib: u64,
+) -> bool {
+    let Some(free) = free_mib else {
+        return true;
+    };
+    let per_child_mib = weights_bytes / (1024 * 1024) + headroom_mib;
+    per_child_mib.saturating_mul(children) <= free
+}
+
+/// Pure decision + teaching text for the tune probe pre-flight: `None`
+/// = the probe may run (fits, or VRAM unmeasurable); `Some(err)` = a
+/// resident holder has already eaten the VRAM the probe's children
+/// need. The error carries the numbers and the remedy because the raw
+/// failure it pre-empts (a readiness timeout or a deep OOM dump
+/// minutes into the probe) names neither.
+fn tune_probe_vram_teaching(
+    model: &str,
+    weights_bytes: u64,
+    children: u64,
+    headroom_mib: u64,
+    free_mib: Option<u64>,
+) -> Option<String> {
+    if probe_children_fit(weights_bytes, free_mib, children, headroom_mib) {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)] // display rounding only
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let free = free_mib.unwrap_or_default();
+    let need = (weights_bytes / (1024 * 1024) + headroom_mib).saturating_mul(children);
+    let copies = if children > 1 {
+        format!("{children} co-resident children (replica run B)")
+    } else {
+        "1 child".to_string()
+    };
+    Some(format!(
+        "tune probe cannot fit: {model} spawns {copies} x (~{:.1} GiB weights + ~{headroom_mib} MiB \
+         overhead) = ~{need} MiB, but only {free} MiB VRAM is free - a resident model holds \
+         the card. Free it (`blazar ps` lists holders; `blazar stop` or wait for the idle \
+         evict), then re-run",
+        gib(weights_bytes),
+    ))
+}
+
+/// Free-VRAM pre-flight for the tune live probes (`--search` grid,
+/// `--slots`/`--ngram`/`--spec-race`/`--load`/`--cache-reuse`/`--moe-cache`
+/// children, and the two-copy `--replicas` search). Same failure class
+/// the gate guard covers: a concurrent daemon child (ours or a foreign
+/// tenant) holding the card turns these probes into minutes-long
+/// OOM/timeout dumps - a full validate run hit exactly this when a
+/// sanity-check child held 5.8 GiB and the replica search burned its
+/// whole 180 s readiness budget before bailing. Trade-off (identical to
+/// the gate's): a partial-offload argv needs less than the full-weights
+/// floor, so a borderline offloaded probe is refused early; a probe that
+/// genuinely fits full VRAM is never refused. Weights come from the
+/// file for GGUF models and from the store's shard-size total for
+/// safetensors dirs (a dir's own metadata is useless); unknown size
+/// fails open - the probe owns that error.
+fn tune_probe_vram_preflight(
+    row: &blazar_core::ModelRow,
+    children: u64,
+    headroom_mib: u64,
+) -> Result<(), String> {
+    let weights_bytes = if std::path::Path::new(&row.path).is_dir() {
+        u64::try_from(row.bytes.max(0)).unwrap_or(0)
+    } else {
+        std::fs::metadata(&row.path).map_or_else(
+            |_| u64::try_from(row.bytes.max(0)).unwrap_or(0),
+            |m| m.len(),
+        )
+    };
+    if weights_bytes == 0 {
+        return Ok(());
+    }
+    match tune_probe_vram_teaching(
+        &row.name,
+        weights_bytes,
+        children,
+        headroom_mib,
+        blazar_runtime::probe::nvidia_free_vram_mib(),
+    ) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 /// Single-shot tg128 on a specific engine's llama-bench.
 fn quick_tg(
     d: &BlazarDirs,
@@ -18173,6 +19399,8 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
                     EngineKind::Whisper => engine_update_whisper(&d, tag, check).await?,
                     EngineKind::Piper => engine_update_piper(&d, tag, check).await?,
+                    EngineKind::Kokoro => engine_update_kokoro(&d, tag, check).await?,
+                    EngineKind::OpenAiHost => engine_update_litert(&d, tag, check).await?,
                 }
             }
         }
@@ -18368,7 +19596,8 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 }
                 (None, None) => {
                     return Err(anyhow!(
-                        "engine use needs a tag or --kind (llamacpp|sglang|mistralrs)"
+                        "engine use needs a tag or --kind \
+                         (llamacpp|mistralrs|sglang|sdcpp|whisper|piper|mlx|openaihost)"
                     ));
                 }
             };
@@ -18381,6 +19610,23 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             restart_daemon_if_active_changed(prior, Some(row.tag.clone())).await;
         }
         EngineCmd::Prune => engine_prune(&d)?,
+        EngineCmd::Changelog { kind, max } => engine_changelog(&d, &kind, max.unwrap_or(5)).await?,
+        EngineCmd::Reprobe { tag } => {
+            let mgr = local_engine_manager(&d)?;
+            let rows = mgr.reprobe_manifests(tag.as_deref())?;
+            if rows.is_empty() {
+                println!("no engines reprobed (no matching rows, or probes failed - see logs)");
+            } else {
+                for (row_tag, flags) in &rows {
+                    println!("reprobed {row_tag}: {flags} flags captured");
+                }
+                println!(
+                    "{} engine(s) reprobed; restart the daemon so running spawns pick up the \
+                     refreshed manifests",
+                    rows.len()
+                );
+            }
+        }
         EngineCmd::Rm { tag } => {
             refuse_if_engine_in_use(&d, &tag).await?;
             engine_rm(&d, &tag)?;
@@ -18444,11 +19690,18 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             tag,
             lane,
             backend,
+            with,
         } => {
             // Registry-curated capability lane: build the published
             // fork pin locally (never a binary download - the trust
             // banner below is the honest cost of that).
             if let Some(lane_id) = lane {
+                if !with.is_empty() {
+                    return Err(anyhow!(
+                        "--with pip extras ride the sglang venv lane; \
+                         capability lanes are llama.cpp source builds"
+                    ));
+                }
                 engine_install_lane(&d, &lane_id, backend.as_deref()).await?;
                 return Ok(());
             }
@@ -18456,6 +19709,11 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
             // serves different model formats, and the old silent
             // mistralrs default started installs users did not ask for.
             let Some(kind) = kind else {
+                if !with.is_empty() {
+                    return Err(anyhow!(
+                        "--with pip extras need an engine lane: use --kind sglang"
+                    ));
+                }
                 return Err(anyhow!(
                     "engine install needs a lane - each serves different model formats:\n  \
                      llama.cpp         GGUF files - blazar engine update (prebuilt) or blazar engine build cuda (source)\n  \
@@ -18464,31 +19722,91 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                      --kind mlx        MLX quant dirs (mlx-community) - pip venv (CUDA linux + Apple Silicon)\n  \
                      --kind sdcpp      diffusion GGUF component sets - prebuilt sd-server (Vulkan/CPU/Metal)\n  \
                      --kind whisper    audio transcription/translation - prebuilt whisper-server (CPU)\n  \
-                     --kind piper      text-to-speech - prebuilt piper CLI, rhasspy voices (CPU)\n  \
-                     capability lane   blazar engine offers + install --lane <id> (fork builds)"
+                      --kind piper      text-to-speech - prebuilt piper CLI, rhasspy voices (CPU)\n  \
+                      --kind kokoro     text-to-speech - kokoro-onnx venv + neural voices (CPU)\n  \
+                      capability lane   blazar engine offers + install --lane <id> (fork builds)"
                 ));
             };
             let engine_kind: EngineKind = kind
                 .parse()
                 .map_err(|e| anyhow!("engine install --kind {kind:?}: {e}"))?;
             match engine_kind {
-                EngineKind::MistralRs => engine_install_mistralrs(&d, tag).await?,
-                EngineKind::Sglang => engine_install_sglang(&d, tag).await?,
-                EngineKind::Mlx => engine_install_mlx(&d, tag).await?,
-                EngineKind::SdCpp => engine_install_sdcpp(&d, tag).await?,
-                EngineKind::Whisper => engine_install_whisper(&d, tag).await?,
-                EngineKind::Piper => engine_install_piper(&d, tag).await?,
+                EngineKind::MistralRs => {
+                    if !with.is_empty() {
+                        return Err(anyhow!(
+                            "--with pip extras ride the sglang venv lane; \
+                             mistral.rs installs are prebuilt binaries"
+                        ));
+                    }
+                    engine_install_mistralrs(&d, tag).await?
+                }
+                EngineKind::Sglang => engine_install_sglang(&d, tag, &with).await?,
+                EngineKind::Mlx => {
+                    if !with.is_empty() {
+                        return Err(anyhow!(
+                            "--with pip extras ride the sglang venv lane; \
+                             the mlx lane pins its own wheel set"
+                        ));
+                    }
+                    engine_install_mlx(&d, tag).await?
+                }
+                EngineKind::OpenAiHost => {
+                    if !with.is_empty() {
+                        return Err(anyhow!(
+                            "--with pip extras ride the sglang venv lane; \
+                             the openaihost lane pins its own wheel set"
+                        ));
+                    }
+                    engine_install_litert(&d, tag).await?
+                }
+                EngineKind::SdCpp => {
+                    if !with.is_empty() {
+                        return Err(anyhow!(
+                            "--with pip extras ride the sglang venv lane; \
+                             sd.cpp installs are prebuilt binaries"
+                        ));
+                    }
+                    engine_install_sdcpp(&d, tag).await?
+                }
+                EngineKind::Whisper => {
+                    if !with.is_empty() {
+                        return Err(anyhow!(
+                            "--with pip extras ride the sglang venv lane; \
+                             whisper installs are prebuilt binaries"
+                        ));
+                    }
+                    engine_install_whisper(&d, tag).await?
+                }
+                EngineKind::Piper => {
+                    if !with.is_empty() {
+                        return Err(anyhow!(
+                            "--with pip extras ride the sglang venv lane; \
+                             piper installs are prebuilt binaries"
+                        ));
+                    }
+                    engine_install_piper(&d, tag).await?
+                }
+                EngineKind::Kokoro => {
+                    if !with.is_empty() {
+                        return Err(anyhow!(
+                            "--with pip extras ride the sglang venv lane; \
+                             the kokoro lane pins its own wheel + model set"
+                        ));
+                    }
+                    engine_install_kokoro(&d, tag).await?
+                }
                 EngineKind::LlamaCpp => {
                     return Err(anyhow!(
-                        "llama.cpp engines install via `blazar engine update` / `blazar \
-                         engine build` - `engine install --kind` serves mistralrs, sglang, \
-                         mlx, sdcpp, whisper and piper"
+                        "--with pip extras ride the sglang venv lane; \
+                         llama.cpp engines install via `blazar engine update` / \
+                         `blazar engine build`"
                     ));
                 }
             }
         }
         EngineCmd::Offers { arch, json } => engine_offers(arch.as_deref(), json).await?,
         EngineCmd::Delta { tag, json } => engine_delta(&d, tag.as_deref(), json)?,
+        EngineCmd::Recommend { model, json } => engine_recommend_cmd(model.as_deref(), json)?,
     }
     Ok(())
 }
@@ -18942,6 +20260,110 @@ async fn engine_install_piper(d: &BlazarDirs, tag: Option<String>) -> Result<()>
     Ok(())
 }
 
+/// `blazar engine install [version] --kind kokoro` - install + activate
+/// the kokoro TTS lane: a pip venv (kokoro-onnx) plus the ONNX model +
+/// voice-pack assets from thewh1teagle/kokoro-onnx releases. The tag is
+/// the MODEL version (`kokoro-1.0`), not an upstream binary tag.
+async fn engine_install_kokoro(d: &BlazarDirs, version: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let wanted = version.clone().unwrap_or_else(|| "latest".to_string());
+    println!(
+        "{}",
+        dim_line(&format!(
+            "installing kokoro model {wanted} (kokoro-onnx venv + ONNX voice model, CPU)"
+        ))
+    );
+    let row = mgr.install_kokoro(version.as_deref()).await?;
+    let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} installed ({} - {})",
+        row.tag,
+        m.version_raw,
+        dim_line(&format!("{} lane files probed", m.flags.len()))
+    );
+    println!(
+        "{}",
+        dim_line("note: decode-regression gate is llama-server-only - skipped for kokoro engines")
+    );
+    // Same one-build-per-lane contract as the other engine lanes.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::Kokoro.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
+        println!(
+            "removed superseded engine {tag} (freed {})",
+            humansize(freed)
+        );
+    }
+    Ok(())
+}
+
+/// Newest installed kokoro model version (`kokoro-<version>` rows) - the
+/// currency baseline for the update lane. Dotted-version ordering, same
+/// honest explicit compare as `newest_mistralrs_tag`.
+fn newest_kokoro_model_version(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::Kokoro)
+        .filter_map(|e| e.tag.strip_prefix("kokoro-").map(str::to_string))
+        .max_by(|a, b| version_tuple(a).cmp(&version_tuple(b))))
+}
+
+/// Dotted numeric version -> comparable tuple (`1.0` -> (1, 0)). Missing
+/// components rank as zero; unparsable sides compare as all-zero.
+fn version_tuple(v: &str) -> (u64, u64, u64) {
+    let mut parts = v.split('.');
+    let mut next = || parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (next(), next(), next())
+}
+
+/// `blazar engine update --kind kokoro [version]` - currency lane
+/// parity: a bare call resolves the newest published model version
+/// (by asset presence on thewh1teagle/kokoro-onnx releases) and
+/// installs it when newer; an explicit version force-installs it.
+/// `--check` resolves and reports only.
+async fn engine_update_kokoro(d: &BlazarDirs, version: Option<String>, check: bool) -> Result<()> {
+    let store = Store::open(d)?;
+    let Some(installed) = newest_kokoro_model_version(&store)? else {
+        return Err(anyhow!(
+            "no kokoro engine installed - `blazar engine install --kind kokoro` first"
+        ));
+    };
+    let pinned = version.is_some();
+    let target = if let Some(v) = version {
+        v
+    } else {
+        let mgr = local_engine_manager(d)?;
+        match mgr.gh.latest_kokoro_model_version().await {
+            Ok(v) => v,
+            Err(e) => anyhow::bail!(
+                "cannot check kokoro model releases: {e:#} - {}",
+                gh_offline_hint().await
+            ),
+        }
+    };
+    let newer = version_tuple(&target) > version_tuple(&installed);
+    if check {
+        println!(
+            "{}",
+            dim_line("dry-run: nothing installed, nothing written")
+        );
+        if newer {
+            println!("would update kokoro model {installed} -> {target}");
+            println!("  blazar engine update --kind kokoro {target}");
+        } else {
+            println!("kokoro model {installed} stays (target: {target})");
+        }
+        return Ok(());
+    }
+    if !pinned && !newer {
+        println!("kokoro model {installed} is current (upstream latest: {target}).");
+        return Ok(());
+    }
+    engine_install_kokoro(d, Some(target)).await
+}
+
 /// `blazar engine update --kind piper [tag]` - currency lane parity:
 /// a bare call probes rhasspy/piper and installs the newest date-tagged
 /// release when one exists; an explicit tag force-installs it. The
@@ -19036,12 +20458,114 @@ fn sdcpp_same_tag_switches(installed: Option<&str>, would: Option<&str>) -> bool
 
 /// Newest installed whisper tag (`bNNNN`) by build counter - mirrors
 /// `newest_sdcpp_tag` for the b-tag lane (v-tags ship source only).
+/// `blazar engine changelog --kind <lane> [--max N]` - release-notes
+/// advisor: what sits between the lane's installed tag and upstream
+/// newest, read-only (no download, no switch). GitHub lanes print each
+/// newer release with its notes; llama.cpp b-tags ship without notes, so
+/// when NO newer release carries notes the lane collapses to a one-line
+/// build-count gap. `PyPI` lanes teach their version source instead.
+async fn engine_changelog(d: &BlazarDirs, kind: &str, max: usize) -> Result<()> {
+    let engine_kind: EngineKind = kind
+        .parse()
+        .map_err(|e| anyhow!("engine changelog --kind {kind:?}: {e}"))?;
+    let repo: &str = match engine_kind {
+        EngineKind::LlamaCpp => blazar_runtime::engine::gh::LLAMA_CPP_REPO,
+        EngineKind::MistralRs => blazar_runtime::engine::gh::MISTRALRS_REPO,
+        EngineKind::SdCpp => blazar_runtime::engine::gh::SDCPP_REPO,
+        EngineKind::Whisper => blazar_runtime::engine::gh::WHISPER_REPO,
+        EngineKind::Piper => blazar_runtime::engine::gh::PIPER_REPO,
+        EngineKind::Kokoro => blazar_runtime::engine::gh::KOKORO_ONNX_REPO,
+        EngineKind::Sglang | EngineKind::Mlx | EngineKind::OpenAiHost => {
+            anyhow::bail!(
+                "the {kind} lane versions from PyPI, not GitHub releases - \
+                 `blazar engine update --kind {kind} --check` reports its currency"
+            );
+        }
+    };
+    let store = Store::open(d)?;
+    // Installed anchor: the ACTIVE row when one exists, else the newest
+    // (b-counter where the lane speaks it, active-flag otherwise).
+    let Some(installed) = store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == engine_kind)
+        .max_by_key(|e| (e.active, btag_number(&e.tag)))
+        .map(|e| e.tag)
+    else {
+        anyhow::bail!("no {kind} engine installed - install the lane first");
+    };
+    let mgr = local_engine_manager(d)?;
+    let newer = match mgr.gh.releases_newer_than(repo, &installed, max).await {
+        Ok(v) => v,
+        Err(e) => {
+            anyhow::bail!(
+                "cannot list {repo} releases: {e:#} - {}",
+                gh_offline_hint().await
+            )
+        }
+    };
+    if newer.is_empty() {
+        println!("{kind}: {installed} is the newest upstream release");
+        return Ok(());
+    }
+    let newest = newer[0].tag_name.clone();
+    println!("{kind}: {installed} -> {newest} ({} ahead)", newer.len());
+    // Notes-less collapse: every newer release without a body (the whole
+    // llama.cpp b-tag lane) prints as one summary line, not N noise rows.
+    if newer
+        .iter()
+        .all(|r| r.body.as_deref().is_none_or(str::is_empty))
+    {
+        println!(
+            "{}",
+            dim_line(&format!(
+                "{} release(s) ahead, none publish notes (build-tag releases \
+                 ship without them) - `blazar engine update --kind {kind} --check` \
+                 names the asset this box would install",
+                newer.len()
+            ))
+        );
+        return Ok(());
+    }
+    for rel in &newer {
+        let when = rel
+            .published_at
+            .as_deref()
+            .and_then(|t| t.get(0..10))
+            .unwrap_or("no date");
+        let pre = if rel.prerelease { " [prerelease]" } else { "" };
+        println!();
+        println!("{} ({when}){pre}", rel.tag_name);
+        match rel.body.as_deref().map(str::trim) {
+            Some(body) if !body.is_empty() => {
+                let mut shown = 0;
+                for line in body.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if shown >= 8 {
+                        println!("{}", dim_line("... (notes truncated)"));
+                        break;
+                    }
+                    let over = line.chars().count() > 140;
+                    let cut: String = line.chars().take(140).collect();
+                    println!("  {cut}{}", if over { "..." } else { "" });
+                    shown += 1;
+                }
+            }
+            _ => println!("{}", dim_line("no release notes published")),
+        }
+    }
+    Ok(())
+}
+
 fn newest_whisper_tag(store: &Store) -> Result<Option<String>> {
     Ok(store
         .list_engines()?
         .into_iter()
         .filter(|e| e.kind == EngineKind::Whisper)
-        .max_by_key(|e| blazar_runtime::engine::gh::btag_number(&e.tag).unwrap_or(0))
+        .max_by_key(|e| btag_number(&e.tag))
         .map(|e| e.tag.clone()))
 }
 
@@ -19072,27 +20596,40 @@ fn mistralrs_version_tuple(tag: &str) -> Option<(u64, u64, u64)> {
     Some((tuple[0], tuple[1], tuple[2]))
 }
 
-/// `blazar engine update --kind sglang [version]` - pip venv lane
-/// (Linux + CUDA/ROCm). Multi-GB download: torch rides the venv. The
+/// `blazar engine install --kind sglang [version] [--with SPEC]...` -
+/// pip venv lane (Linux + CUDA/ROCm). Multi-GB download: torch rides
+/// the venv. `with` specs layer plugins (e.g. the `DSpine` drafter) onto
+/// the venv after the base install. The
 /// F7 decode-regression gate is llama-server-only: skipped, and SAID
 /// so - llama-bench cannot drive an sglang child.
-async fn engine_install_sglang(d: &BlazarDirs, version: Option<String>) -> Result<()> {
+async fn engine_install_sglang(
+    d: &BlazarDirs,
+    version: Option<String>,
+    with: &[String],
+) -> Result<()> {
     let mgr = local_engine_manager(d)?;
     let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
+    let extras_note = if with.is_empty() {
+        String::new()
+    } else {
+        format!(" + {} extra pkg(s)", with.len())
+    };
     if let Some(v) = &version {
         println!(
             "{}",
             dim_line(&format!(
-                "installing sglang {v} (pip venv lane - multi-GB download incl. torch)"
+                "installing sglang {v}{extras_note} (pip venv lane - multi-GB download incl. torch)"
             ))
         );
     } else {
         println!(
             "{}",
-            dim_line("installing sglang (pip venv lane - multi-GB download incl. torch)")
+            dim_line(&format!(
+                "installing sglang{extras_note} (pip venv lane - multi-GB download incl. torch)"
+            ))
         );
     }
-    let row = mgr.install_sglang(version.as_deref()).await?;
+    let row = mgr.install_sglang(version.as_deref(), with).await?;
     let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
     println!(
         "engine {} active ({} flags probed, build {})",
@@ -19240,6 +20777,121 @@ async fn engine_update_mlx(d: &BlazarDirs, version: Option<String>, check: bool)
     Ok(())
 }
 
+/// `engine install --kind openaihost [version]` - LiteRT-LM pip venv
+/// lane. Same one-build-per-lane contract as mlx/sglang: superseded
+/// venvs are freed on a successful install/activate.
+async fn engine_install_litert(d: &BlazarDirs, version: Option<String>) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
+    if let Some(v) = &version {
+        println!(
+            "{}",
+            dim_line(&format!("installing litert-lm {v} (pip venv lane)"))
+        );
+    } else {
+        println!("{}", dim_line("installing litert-lm (pip venv lane)"));
+    }
+    let row = mgr.install_litert(version.as_deref()).await?;
+    let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!(
+        "{}",
+        dim_line(
+            "note: decode-regression gate is llama-server-only - skipped for openaihost engines"
+        )
+    );
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::OpenAiHost.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
+        println!(
+            "removed superseded engine {} (freed {})",
+            tag,
+            humansize(freed)
+        );
+    }
+    println!(
+        "{}",
+        dim_line(
+            "next: pull a .litertlm bundle (e.g. blazar pull litert-community/SmolLM2-360M-Instruct)"
+        )
+    );
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
+    Ok(())
+}
+
+/// `engine update --kind openaihost [version]` - explicit version
+/// installs directly; bare call resolves the `PyPI` latest and installs
+/// it, the same lane semantics as mlx/sglang. `--check` stays a dry-run
+/// currency report. The version pin (`LITERT_LM_DEFAULT_VERSION`)
+/// anchors fresh `engine install`; unknown flags on newer litert-lm are
+/// skipped with profile warnings.
+async fn engine_update_litert(d: &BlazarDirs, version: Option<String>, check: bool) -> Result<()> {
+    if version.is_some() && !check {
+        return engine_install_litert(d, version).await;
+    }
+    if check && let Some(v) = &version {
+        println!("--check ignores the version pin (drop --check to install litert-lm {v})");
+    }
+    let store = Store::open(d)?;
+    let installed = store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::OpenAiHost)
+        .max_by_key(|e| {
+            blazar_runtime::engine::litert_install::version_tuple(
+                e.tag.trim_start_matches("litert-"),
+            )
+            .unwrap_or((0, 0, 0))
+        })
+        .map(|e| e.tag.trim_start_matches("litert-").to_string());
+    let Some(installed) = installed else {
+        return Err(anyhow!(
+            "no openaihost engine installed - `blazar engine install --kind openaihost` first"
+        ));
+    };
+    let latest = match blazar_runtime::engine::litert_install::pypi_latest_litert_lm().await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("litert-lm {installed} installed; cannot check PyPI right now: {e:#}");
+            return Ok(());
+        }
+    };
+    match (
+        blazar_runtime::engine::litert_install::version_tuple(&installed),
+        blazar_runtime::engine::litert_install::version_tuple(&latest),
+    ) {
+        (Some(a), Some(b)) if b > a => {
+            if check {
+                println!(
+                    "{}",
+                    dim_line(&format!(
+                        "dry-run: litert-lm {installed} installed; {latest} is available on PyPI."
+                    ))
+                );
+            } else {
+                println!("litert-lm {installed} installed; updating to {latest} from PyPI.");
+                engine_install_litert(d, Some(latest)).await?;
+            }
+        }
+        _ => {
+            if check {
+                println!(
+                    "{}",
+                    dim_line("dry-run: nothing installed, nothing written")
+                );
+            }
+            println!("litert-lm {installed} is current (PyPI latest: {latest}).");
+        }
+    }
+    Ok(())
+}
+
 /// `engine update --kind sglang [version]` - explicit version installs
 /// directly; bare call resolves the `PyPI` latest and installs it, the
 /// same lane semantics as mistralrs/sd.cpp/whisper. `--check` stays a
@@ -19249,7 +20901,7 @@ async fn engine_update_mlx(d: &BlazarDirs, version: Option<String>, check: bool)
 /// profile warnings.
 async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bool) -> Result<()> {
     if version.is_some() && !check {
-        return engine_install_sglang(d, version).await;
+        return engine_install_sglang(d, version, &[]).await;
     }
     if check && let Some(v) = &version {
         println!("--check ignores the version pin (drop --check to install sglang {v})");
@@ -19299,7 +20951,7 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
             } else {
                 println!("sglang {installed} installed; updating to {latest} from PyPI.");
                 println!("{flag_contract_note}");
-                engine_install_sglang(d, Some(latest)).await?;
+                engine_install_sglang(d, Some(latest), &[]).await?;
             }
         }
         _ => {
@@ -19403,21 +21055,20 @@ async fn route_update_to_build(
 }
 
 #[allow(clippy::too_many_lines)] // lane chain: resolve, download, install, register, prune
-/// Installed lanes for `engine update --all`, in the fixed walk order:
-/// llamacpp first (the GGUF default lane), whisper last (lazy
-/// side-lane). Pure so the walk order is pinned by a unit test.
+/// Installed lanes for `engine update --all`, derived from
+/// [`EngineKind::ALL`] (the single lane census) so a lane added to the
+/// enum joins the walk the day it ships. Fixed walk order: llamacpp
+/// first (the GGUF default lane), lazy audio side-lanes (whisper,
+/// piper) last. Pure so the walk order is pinned by a unit test.
 fn installed_engine_kinds(rows: &[blazar_core::EngineRow]) -> Vec<EngineKind> {
-    [
-        EngineKind::LlamaCpp,
-        EngineKind::MistralRs,
-        EngineKind::Sglang,
-        EngineKind::Mlx,
-        EngineKind::SdCpp,
-        EngineKind::Whisper,
-    ]
-    .into_iter()
-    .filter(|k| rows.iter().any(|r| r.kind == *k))
-    .collect()
+    let mut kinds: Vec<EngineKind> = EngineKind::ALL
+        .into_iter()
+        .filter(|k| rows.iter().any(|r| r.kind == *k))
+        .collect();
+    // Stable sort: declaration order holds within each group while the
+    // lazy lanes sink to the end of the walk.
+    kinds.sort_by_key(|k| k.is_lazy_lane());
+    kinds
 }
 
 /// Which tag `engine update --all` must leave active after the walk.
@@ -19485,6 +21136,8 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
             EngineKind::SdCpp => engine_update_sdcpp(d, None, check).await,
             EngineKind::Whisper => engine_update_whisper(d, None, check).await,
             EngineKind::Piper => engine_update_piper(d, None, check).await,
+            EngineKind::Kokoro => engine_update_kokoro(d, None, check).await,
+            EngineKind::OpenAiHost => engine_update_litert(d, None, check).await,
         };
         if let Err(e) = result {
             // The per-lane error may already carry a live network
@@ -19673,22 +21326,41 @@ async fn engine_update(
     }
     // Styled heads-up: the equivalent runtime INFO line is demoted on TTY
     // (it stomps progress bars), so the CLI owns the interactive version.
-    match resolved.as_ref() {
-        Some(rel) => println!(
-            "{}",
-            dim_line(&format!(
-                "installing upstream engine {}{} - runtime companion downloads show their own progress bar",
-                rel.tag_name,
-                stable_alias_paren(stable.as_ref(), &rel.tag_name)
-            ))
-        ),
-        None => println!(
-            "{}",
-            dim_line(
-                "installing upstream engine - runtime companion downloads show their own progress bar"
-            )
-        ),
+    // The heads-up belongs to a lane that will actually download: when
+    // the resolved channel target is already the active engine and no
+    // explicit tag pins it (a same-tag pin means "reinstall"), the
+    // runtime's idempotency check returns without fetching - announcing
+    // an install first prints a contradiction (live-reported:
+    // "installing upstream engine b12202 ..." one line above
+    // "already active - nothing new installed"). Build-number compare,
+    // not raw string: asset lanes stamp suffixes onto installed tags
+    // (b12202-cuda from the b12202 channel release).
+    let will_download = tag.is_some()
+        || !matches!(
+            (&resolved, &active_tag),
+            (Some(rel), Some(at)) if same_build(at, &rel.tag_name)
+        );
+    if will_download {
+        match resolved.as_ref() {
+            Some(rel) => println!(
+                "{}",
+                dim_line(&format!(
+                    "installing upstream engine {}{} - runtime companion downloads show their own progress bar",
+                    rel.tag_name,
+                    stable_alias_paren(stable.as_ref(), &rel.tag_name)
+                ))
+            ),
+            None => println!(
+                "{}",
+                dim_line(
+                    "installing upstream engine - runtime companion downloads show their own progress bar"
+                )
+            ),
+        }
     }
+    // The tag survives the install match below (which consumes
+    // `resolved`) for the unchanged-lane verdict wording.
+    let resolved_tag = resolved.as_ref().map(|rel| rel.tag_name.clone());
     let row = match resolved {
         Some(rel) => mgr.update_resolved(rel, tag.is_some()).await?,
         None => mgr.update(tag.as_deref(), cfg.update_channel).await?,
@@ -19724,10 +21396,23 @@ async fn engine_update(
         {
             return Ok(());
         }
+        // "See the warning above" only parses when the lane skipped a
+        // DIFFERENT target (the keep-CUDA guard warns loudly); the
+        // same-build idempotent path prints no warning to point at.
+        // `resolved` is partially moved by the install match above, so
+        // the tag string survives instead.
+        let skipped_other_target = resolved_tag
+            .as_deref()
+            .is_some_and(|t| !same_build(&row.tag, t));
         println!(
-            "engine {}{} already active - nothing new installed (see the warning above for lane options)",
+            "engine {}{} already active - nothing new installed{}",
             row.tag,
-            stable_alias_paren(stable.as_ref(), &row.tag)
+            stable_alias_paren(stable.as_ref(), &row.tag),
+            if skipped_other_target {
+                " (see the warning above for lane options)"
+            } else {
+                ""
+            }
         );
     } else if gate_on {
         engine_regression_gate(&mgr, d, &row)?;
@@ -20245,6 +21930,81 @@ mod engine_delta_tests {
         assert!(d.added_flags.is_empty());
         assert!(d.added_spec.is_empty());
     }
+}
+
+/// `blazar engine recommend` - rank installed engine builds for this
+/// machine. Pure-store ranking in blazar-core; the CLI only resolves
+/// the live hardware probe and renders. Every axis prints its datum
+/// or its honest absence - a build without a bench receipt is labeled
+/// "no receipt", never silently ordered as if measured.
+fn engine_recommend_cmd(model: Option<&str>, json: bool) -> Result<()> {
+    let d = dirs();
+    let store = Store::open(&d)?;
+    let hw = blazar_runtime::probe_hardware(None);
+    let live_gpu = hw.gpus.first().map(|g| g.name.clone());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    #[allow(clippy::cast_possible_wrap)] // epoch seconds fit i64 by construction
+    let now = now_secs as i64;
+    let recs = blazar_core::optimize::engine_recommend(
+        &store,
+        model,
+        &blazar_core::optimize::EngineRecommendInputs {
+            hw: live_gpu.as_deref(),
+            now,
+        },
+    )?;
+    if recs.is_empty() {
+        println!("no engines installed (blazar engine update)");
+        return Ok(());
+    }
+    if json {
+        for r in &recs {
+            println!("{}", serde_json::to_string(r)?);
+        }
+        return Ok(());
+    }
+    println!(
+        "{}",
+        dim_line(&format!(
+            "ranking {} engine build(s){} - hw match and bench receipts decide, recency/active break ties",
+            recs.len(),
+            model.map_or_else(String::new, |m| format!(" for {m}"))
+        ))
+    );
+    println!(
+        "{:<34} {:<10} {:<6} {:<28} {:<56} {:>5} {:>5}",
+        "TAG", "KIND", "ON", "HARDWARE", "BENCH", "AGE", "SCORE"
+    );
+    for r in &recs {
+        let bench = r.bench.clone().unwrap_or_else(|| {
+            if model.is_some() {
+                "no receipt - ordering capability-based, not measured".to_string()
+            } else {
+                "- (no model scope)".to_string()
+            }
+        });
+        println!(
+            "{:<34} {:<10} {:<6} {:<28} {:<56} {:>4}d {:>5}",
+            r.tag,
+            r.kind,
+            if r.active { "yes" } else { "-" },
+            r.hardware,
+            bench,
+            r.installed_days,
+            r.score
+        );
+    }
+    println!(
+        "{}",
+        dim_line(
+            "architecture coverage is NOT ranked - engine manifests carry no architecture \
+             lists; a build that cannot load the model still fails loudly at serve time"
+        )
+    );
+    Ok(())
 }
 
 async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
@@ -23372,10 +25132,13 @@ async fn config_cmd(cmd: ConfigCmd) -> Result<()> {
         }
         ConfigCmd::Reload => {
             let base = ensure_daemon().await?;
-            let resp = cli_http()
-                .post(format!("{base}/api/config/reload"))
-                .send()
-                .await?;
+            // Keys-mode daemon: reload is management-class and needs an
+            // admin bearer (authless daemons accept the bare POST).
+            let mut req = cli_http().post(format!("{base}/api/config/reload"));
+            if let Some(token) = admin_bearer() {
+                req = req.bearer_auth(token);
+            }
+            let resp = req.send().await?;
             let status = resp.status();
             let v: serde_json::Value = resp.json().await?;
             if !status.is_success() {
@@ -23702,6 +25465,9 @@ mod tests {
             "http://192.168.1.10:11435",
             "donor-1",
             env_line,
+            None,
+            None,
+            50052,
         );
         assert!(text.contains("ExecStart=/usr/local/bin/blazar rpc worker --join http://192.168.1.10:11435 --name donor-1"));
         assert!(text.contains("Restart=always"));
@@ -23713,9 +25479,47 @@ mod tests {
 
     #[test]
     fn unit__worker_unit_text__tokenless_unit_has_no_env_line() {
-        let text = worker_unit_text("/usr/bin/blazar", "http://10.0.0.2:11435", "w", "");
+        let text = worker_unit_text(
+            "/usr/bin/blazar",
+            "http://10.0.0.2:11435",
+            "w",
+            "",
+            None,
+            None,
+            50052,
+        );
         assert!(!text.contains("EnvironmentFile"));
         assert!(text.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn unit__worker_unit_text__pins_resolved_host_device_and_port() {
+        // The installer pins the RESOLVED bind address (remote gateway
+        // => all interfaces) plus optional device and non-default port.
+        let text = worker_unit_text(
+            "/usr/bin/blazar",
+            "http://192.168.1.10:11435",
+            "donor-2",
+            "",
+            Some("0.0.0.0"),
+            Some("CUDA0"),
+            50060,
+        );
+        assert!(text.contains(
+            "ExecStart=/usr/bin/blazar rpc worker --join http://192.168.1.10:11435 --name donor-2 --host 0.0.0.0 --device CUDA0 --port 50060"
+        ));
+        // Loopback/default installs stay byte-lean: no host line, no
+        // port line when the default is used.
+        let lean = worker_unit_text(
+            "/usr/bin/blazar",
+            "http://127.0.0.1:11435",
+            "w",
+            "",
+            None,
+            None,
+            50052,
+        );
+        assert!(lean.contains("--name w\n"));
     }
 
     #[test]
@@ -23860,6 +25664,95 @@ mod tests {
             installed_engine_kinds(&[]).is_empty(),
             "no engines installed must yield no kinds"
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__installed_engine_kinds__walks_every_installed_lane() {
+        let row = |tag: &str, kind: EngineKind| blazar_core::EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at: 1,
+            active: false,
+            manifest: String::new(),
+            kind,
+        };
+        // A full store, rows in scrambled order: EVERY installed lane
+        // joins the walk. Pins the regression where piper and
+        // openaihost rows were silently dropped by a stale hardcoded
+        // walk list while the summary still reported "0 failed".
+        let rows = vec![
+            row("litert-0.19.1", EngineKind::OpenAiHost),
+            row("2023.11.14-2", EngineKind::Piper),
+            row("kokoro-1.0", EngineKind::Kokoro),
+            row("b12185-cuda", EngineKind::LlamaCpp),
+            row("sglang-0.5.23", EngineKind::Sglang),
+            row("master-1043", EngineKind::SdCpp),
+            row("v0.9.5", EngineKind::MistralRs),
+            row("mlx-0.32.2", EngineKind::Mlx),
+            row("b5454", EngineKind::Whisper),
+        ];
+        let kinds = installed_engine_kinds(&rows);
+        assert_eq!(kinds.len(), 9, "every installed lane must be walked");
+        assert_eq!(
+            kinds.first(),
+            Some(&EngineKind::LlamaCpp),
+            "GGUF default lane walks first"
+        );
+        assert_eq!(
+            kinds.last(),
+            Some(&EngineKind::Kokoro),
+            "lazy audio lanes walk last (kokoro declared after piper)"
+        );
+        assert!(
+            kinds.contains(&EngineKind::OpenAiHost),
+            "openaihost lane must be walked"
+        );
+        assert!(
+            kinds.contains(&EngineKind::Piper),
+            "piper lane must be walked"
+        );
+        assert!(
+            kinds.contains(&EngineKind::Kokoro),
+            "kokoro lane must be walked"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__version_tuple__orders_dotted_model_versions() {
+        assert_eq!(version_tuple("1.0"), (1, 0, 0));
+        assert_eq!(version_tuple("1.0.1"), (1, 0, 1));
+        assert!(version_tuple("1.1") > version_tuple("1.0.9"));
+        assert!(version_tuple("2") > version_tuple("1.99.99"));
+        // Unparsable sides compare as all-zero instead of panicking.
+        assert_eq!(version_tuple(""), (0, 0, 0));
+        assert_eq!(version_tuple("junk"), (0, 0, 0));
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__newest_kokoro_model_version__picks_newest_dotted_row() {
+        let row = |tag: &str| blazar_core::EngineRow {
+            tag: tag.to_string(),
+            asset: String::new(),
+            sha256: String::new(),
+            installed_at: 1,
+            active: false,
+            manifest: String::new(),
+            kind: EngineKind::Kokoro,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dirs = passport_dirs(&dir);
+        let store = Store::open(&dirs).expect("store");
+        store.upsert_engine(&row("kokoro-1.0")).expect("row 1.0");
+        store.upsert_engine(&row("kokoro-1.1")).expect("row 1.1");
+        // A malformed tag ranks as zero-prefixed ("" after the strip)
+        // and can never win the currency pick.
+        store.upsert_engine(&row("kokoro-junk")).expect("row junk");
+        let picked = newest_kokoro_model_version(&store).expect("pick");
+        assert_eq!(picked.as_deref(), Some("1.1"));
     }
 
     fn passport_dirs(tmp: &tempfile::TempDir) -> BlazarDirs {
@@ -24393,6 +26286,47 @@ mod tests {
         assert!(gate_bench_fits(gib9_q4, None));
         // Tiny model with a nearly-full card still refuses honestly.
         assert!(!gate_bench_fits(400 * 1024 * 1024, Some(1_500)));
+    }
+
+    #[test]
+    fn unit__probe_children_fit__multiplies_children_and_fails_open() {
+        let half_g: u64 = 700 * 1024 * 1024;
+        // One child: boundary is weights + headroom, same as the gate.
+        let one = half_g / (1024 * 1024) + 1536;
+        assert!(probe_children_fit(half_g, Some(one), 1, 1536));
+        assert!(!probe_children_fit(half_g, Some(one - 1), 1, 1536));
+        // Two children (replica run B): the floor doubles exactly.
+        let two = (half_g / (1024 * 1024) + 1536) * 2;
+        assert!(probe_children_fit(half_g, Some(two), 2, 1536));
+        assert!(!probe_children_fit(half_g, Some(two - 1), 2, 1536));
+        // The exact one-child boundary must NOT admit two children.
+        assert!(!probe_children_fit(half_g, Some(one), 2, 1536));
+        // No measurable GPU (AMD/Metal/CPU boxes): never refuse.
+        assert!(probe_children_fit(half_g, None, 2, 1536));
+        // Heavier sglang headroom raises the floor for the same weights.
+        let sglang_floor = half_g / (1024 * 1024) + 2048;
+        assert!(!probe_children_fit(half_g, Some(sglang_floor - 1), 1, 2048));
+        assert!(probe_children_fit(half_g, Some(sglang_floor), 1, 2048));
+    }
+
+    #[test]
+    fn unit__tune_probe_vram_teaching__names_holders_and_remedy() {
+        // Contended card: the teaching names the model, the child count,
+        // the free/needed numbers, and how to free the card.
+        let err = tune_probe_vram_teaching("qwen2.5-0.5b", 468 * 1024 * 1024, 2, 1536, Some(800))
+            .expect("contended card must refuse");
+        assert!(err.contains("qwen2.5-0.5b"));
+        assert!(err.contains("2 co-resident children"));
+        assert!(err.contains("800 MiB VRAM is free"));
+        assert!(err.contains("blazar ps"));
+        // One child (the entry pre-flight shape) reads differently.
+        let one = tune_probe_vram_teaching("m", 5_782_568_000, 1, 1536, Some(2_300))
+            .expect("contended card must refuse");
+        assert!(one.contains("1 child"));
+        assert!(!one.contains("co-resident"));
+        // Idle card and unmeasurable GPU: probe allowed, no message.
+        assert!(tune_probe_vram_teaching("m", 5_782_568_000, 2, 1536, Some(16_000)).is_none());
+        assert!(tune_probe_vram_teaching("m", 5_782_568_000, 2, 1536, None).is_none());
     }
 
     #[test]
@@ -26030,6 +27964,63 @@ mod tests {
         assert!(err.contains("no models array"), "{err}");
     }
 
+    /// The remote section is lenient where the models contract is
+    /// strict: router mode and older daemons omit `remotes` entirely,
+    /// and that must render nothing (not an error, not a header).
+    #[test]
+    fn unit__ps_remotes_of__absent_nonarray_and_present() {
+        use serde_json::json;
+        let none = json!({"models": []});
+        assert!(ps_remotes_of(&none).is_empty(), "absent key = no section");
+        let malformed = json!({"models": [], "remotes": "peers"});
+        assert!(
+            ps_remotes_of(&malformed).is_empty(),
+            "non-array is skipped, not fatal"
+        );
+        let doc = json!({"models": [], "remotes": [
+            {"name": "litert", "ok": true, "note": "1 models"},
+            {"name": "peer", "ok": false, "note": "HTTP 500"},
+        ]});
+        assert_eq!(ps_remotes_of(&doc).len(), 2);
+    }
+
+    /// Remote rows carry the probe verdict, the daemon's note verbatim,
+    /// and the capacity suffix only when the peer answered /api/capacity.
+    #[test]
+    fn unit__ps_remote_rows__state_note_and_capacity_suffix() {
+        use serde_json::json;
+        let gib = 1024_u64 * 1024 * 1024;
+        let rows = ps_remote_rows(&[
+            json!({"name": "litert", "ok": true, "note": "1 models"}),
+            json!({"name": "peer", "ok": false, "note": "HTTP 500",
+                   "capacity": {"devices": 1,
+                                "total_vram_bytes": 8 * gib,
+                                "free_vram_bytes": gib / 2,
+                                "residents": 3, "age_secs": 5}}),
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[0].starts_with("litert")
+                && rows[0].contains(" ok ")
+                && rows[0].ends_with("1 models"),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains(" down ") && rows[1].contains("HTTP 500"),
+            "{}",
+            rows[1]
+        );
+        assert!(
+            rows[1].contains("cap 1 dev, 512 MiB/8.0 GiB free, 3 residents (5s ago)"),
+            "{}",
+            rows[1]
+        );
+        // Note column is last and unbounded: the suffix must not be
+        // truncated or reordered around it.
+        assert!(rows[1].ends_with("(5s ago)"), "{}", rows[1]);
+    }
+
     /// Only the transient classes retry: transport, truncated body, and
     /// 502/503/504. A 500 or a 4xx fails on the first pass.
     #[test]
@@ -26254,6 +28245,34 @@ mod tests {
             ready_card_line(&serde_json::json!({})).is_none(),
             "a card with no engine tag is not worth a line"
         );
+    }
+
+    #[test]
+    fn unit__admission_refusal_line__refused_and_no_lane_surface_ok_silent() {
+        // refused: the daemon's teach surfaces verbatim at the banner
+        let refused = serde_json::json!({
+            "admission": {"load": {
+                "verdict": "refused",
+                "reason": "quant_method 'torchao' is not loadable by this sglang lane (0.5.23)"
+            }}
+        });
+        assert_eq!(
+            admission_refusal_line(&refused).as_deref(),
+            Some("quant_method 'torchao' is not loadable by this sglang lane (0.5.23)")
+        );
+        // no lane resolved: still a teach worth a line
+        let no_lane = serde_json::json!({
+            "admission": {"load": {"verdict": "no-lane", "reason": "no engine installed"}}
+        });
+        assert_eq!(
+            admission_refusal_line(&no_lane).as_deref(),
+            Some("no engine installed")
+        );
+        // admitted: silent by design
+        let ok = serde_json::json!({"admission": {"load": {"verdict": "ok"}}});
+        assert!(admission_refusal_line(&ok).is_none());
+        // older daemon / missing block: nothing to say, never a panic
+        assert!(admission_refusal_line(&serde_json::json!({})).is_none());
     }
 
     #[test]
@@ -28157,6 +30176,115 @@ mod tests {
             "{}",
             checks[1].detail
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor_mmproj_pairing__stray_sidecar_warns_with_teaching() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        std::fs::write(d.models_dir().join("text.gguf"), b"x").unwrap();
+        // Stray projector pulled for a different model, filed beside the
+        // text GGUF: exactly the raw-mistralrs v0.9.5 auto-pair hazard.
+        std::fs::write(d.models_dir().join("mmproj-Other-9B.gguf"), b"x").unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store
+                .upsert_model(&row_with_path(&d.models_dir().join("text.gguf")))
+                .unwrap();
+            store
+                .upsert_engine(&blazar_core::store::EngineRow {
+                    tag: "v0.9.5".into(),
+                    asset: "test".into(),
+                    sha256: String::new(),
+                    installed_at: 0,
+                    active: true,
+                    manifest: "{}".into(),
+                    kind: EngineKind::MistralRs,
+                })
+                .unwrap();
+        }
+        let checks = doctor_mmproj_pairing(&d);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        let c = &checks[0];
+        assert_eq!(c.name, "mmproj pairing");
+        assert!(c.warn && c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("mmproj-other-9b.gguf beside 1 model(s)")
+                && c.detail.contains("stages models in isolation")
+                && c.detail.contains("auto-pairs"),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor_mmproj_pairing__own_vision_pair_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        std::fs::write(d.models_dir().join("vision.gguf"), b"x").unwrap();
+        std::fs::write(d.models_dir().join("mmproj-Vision.gguf"), b"x").unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            let mut row = row_with_path(&d.models_dir().join("vision.gguf"));
+            row.mmproj_path = Some(
+                d.models_dir()
+                    .join("mmproj-Vision.gguf")
+                    .display()
+                    .to_string(),
+            );
+            store.upsert_model(&row).unwrap();
+            store
+                .upsert_engine(&blazar_core::store::EngineRow {
+                    tag: "v0.9.5".into(),
+                    asset: "test".into(),
+                    sha256: String::new(),
+                    installed_at: 0,
+                    active: true,
+                    manifest: "{}".into(),
+                    kind: EngineKind::MistralRs,
+                })
+                .unwrap();
+        }
+        // The sidecar IS the row's registered projector: an intended
+        // vision pair, not a stray - the check must stay silent.
+        let checks = doctor_mmproj_pairing(&d);
+        assert!(checks.is_empty(), "{checks:?}");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__doctor_mmproj_pairing__silent_without_mistralrs_lane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.models_dir()).unwrap();
+        drop(blazar_core::store::Store::open(&d).unwrap());
+        std::fs::write(d.models_dir().join("text.gguf"), b"x").unwrap();
+        std::fs::write(d.models_dir().join("mmproj-Other-9B.gguf"), b"x").unwrap();
+        {
+            let store = blazar_core::store::Store::open(&d).unwrap();
+            store
+                .upsert_model(&row_with_path(&d.models_dir().join("text.gguf")))
+                .unwrap();
+        }
+        // Same hazard shape but no mistralrs binary installed: nothing
+        // can auto-pair, so the check must not fire.
+        let checks = doctor_mmproj_pairing(&d);
+        assert!(checks.is_empty(), "{checks:?}");
     }
 
     #[test]

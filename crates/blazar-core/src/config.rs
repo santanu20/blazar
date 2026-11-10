@@ -312,6 +312,15 @@ pub struct Config {
     /// Manifest-gated.
     #[serde(default)]
     pub moe_cache_mib: u64,
+    /// `--moe-cache-cpu-share` `F`: share of `MoE` cache misses the CPU
+    /// computes from host experts instead of uploading them to the GPU
+    /// once the cache is full (llama.cpp #30966); 0 = off (engine
+    /// default). Range 0.0..=1.0. Manifest-gated. To size both knobs
+    /// empirically run `blazar tune <model> --moe-cache`; for the
+    /// offline upstream simulator set `LLAMA_MOE_CACHE_TRACE` under
+    /// `[engine_env]` (passthrough) to record expert selections.
+    #[serde(default)]
+    pub moe_cache_cpu_share: f32,
     /// `--no-kv-offload`: keep all KV on GPU - fail the load when it
     /// does not fit instead of spilling to CPU (latency determinism).
     #[serde(default)]
@@ -358,6 +367,16 @@ pub struct Config {
     /// hijack surface, so the default stays closed.
     #[serde(default)]
     pub fleet_open: bool,
+    /// Contribute THIS daemon's own devices to another gateway's fleet:
+    /// at boot the daemon spawns a managed `rpc worker --join <base>`
+    /// child (auto-restarted with backoff, killed at shutdown) and
+    /// announces itself using the same auto-host rule as the CLI
+    /// (`BLAZAR_FLEET_TOKEN` supplies the shared secret when the
+    /// gateway sets one). Cold-only: changing it takes a restart.
+    /// Loopback bases are refused - a contributor must point at the
+    /// GATEWAY box, not back at itself.
+    #[serde(default)]
+    pub fleet_contribute_join: Option<String>,
     /// LAN autodiscovery: answer `BLAZAR_DISCOVER_V1` UDP probes on
     /// `discovery_port` so `blazar rpc worker --discover` can find this
     /// gateway without static configuration. The reply carries no
@@ -1353,6 +1372,7 @@ pub fn is_valid_spec_mode(mode: &str) -> bool {
             | "eagle3"
             | "dflash"
             | "dspark"
+            | "dspine"
     )
 }
 
@@ -1438,6 +1458,10 @@ pub struct ModelOverride {
     /// Per-model `--moe-cache-mib` override (None = inherit global).
     #[serde(default)]
     pub moe_cache_mib: Option<u64>,
+    /// Per-model `--moe-cache-cpu-share` override (None = inherit
+    /// global).
+    #[serde(default)]
+    pub moe_cache_cpu_share: Option<f32>,
     /// Per-model `YaRN` context-extension factor (None = inherit global).
     pub ctx_extend: Option<f64>,
     /// Per-model `MoE` expert CPU-offload count (None = inherit global).
@@ -1967,18 +1991,26 @@ impl SglangTuning {
         ) {
             return Err(e);
         }
-        if let Some(e) = choice("spec_algorithm", &self.spec_algorithm, &["ngram", "dflash"]) {
+        if let Some(e) = choice(
+            "spec_algorithm",
+            &self.spec_algorithm,
+            &["ngram", "dflash", "dspine"],
+        ) {
             return Err(e);
         }
-        if self.spec_algorithm.as_deref() == Some("dflash")
+        // Every draft-model algorithm shares the same hard requirement:
+        // dflash rides the EAGLE-family draft machinery and DSpine is a
+        // trained parallel drafter - both are useless (and crash at
+        // spawn) without the draft weights on disk.
+        if matches!(self.spec_algorithm.as_deref(), Some("dflash" | "dspine"))
             && self.spec_draft_path.as_deref().is_none_or(str::is_empty)
         {
-            return Err(CoreError::Config(
-                "sglang.spec_algorithm \"dflash\" needs sglang.spec_draft_path - a \
+            let alg = self.spec_algorithm.as_deref().unwrap_or_default();
+            return Err(CoreError::Config(format!(
+                "sglang.spec_algorithm {alg:?} needs sglang.spec_draft_path - a \
                  safetensors draft dir (sglang hard-requires the draft model; \
                  2026-10-09 live receipt)"
-                    .into(),
-            ));
+            )));
         }
         if let Some(e) = choice(
             "retraction_policy",
@@ -2724,7 +2756,10 @@ fn default_remote_fallback() -> bool {
 pub struct ApiKey {
     /// Human label (`blazar keys add NAME`).
     pub name: String,
-    /// The bearer secret itself (`plm_...`, shown once at creation).
+    /// The bearer secret itself (`plm_...`, shown once at creation). The
+    /// prefix dates to the project's earlier name (pallama) and is kept
+    /// for identifier stability: existing issued tokens must keep
+    /// validating across renames.
     pub key: String,
     /// Model allowlist; empty = all models.
     #[serde(default)]
@@ -2854,12 +2889,17 @@ impl WarmPeg {
             EngineKind::Mlx => self.mlx.unwrap_or(self.default),
             // No peg lane exists for these servers: readiness publishes
             // when the health probe flips (mistralrs), /v1/models first
-            // answers (sdcpp), or the lazy child first boots (whisper -
+            // answers (sdcpp, openaihost - the shared serve child's own
+            // readiness surface), or the lazy child first boots (whisper -
             // never supervised at all). Piper synthesizes one-shot per
-            // request through the CLI - nothing stays up to peg.
-            EngineKind::MistralRs | EngineKind::SdCpp | EngineKind::Whisper | EngineKind::Piper => {
-                false
-            }
+            // request through the CLI and Kokoro's lazy python child is
+            // never supervised - nothing stays up to peg on either.
+            EngineKind::MistralRs
+            | EngineKind::SdCpp
+            | EngineKind::OpenAiHost
+            | EngineKind::Whisper
+            | EngineKind::Piper
+            | EngineKind::Kokoro => false,
         }
     }
 }
@@ -3141,6 +3181,7 @@ impl Default for Config {
             ctx_checkpoints: 0,
             offline: true,
             moe_cache_mib: 0,
+            moe_cache_cpu_share: 0.0,
             no_kv_offload: false,
             load_mode: String::new(),
             spawn_mem_guard: true,
@@ -3150,6 +3191,7 @@ impl Default for Config {
             fleet_ttl_secs: 45,
             fleet_token: String::new(),
             fleet_open: false,
+            fleet_contribute_join: None,
             discovery_enabled: false,
             discovery_port: default_discovery_port(),
             agent_port: default_agent_port(),
@@ -3906,6 +3948,10 @@ impl Config {
             "sentinel_stall_secs",
         );
         push_if(old.audit_log != new.audit_log, "audit_log");
+        push_if(
+            old.fleet_contribute_join != new.fleet_contribute_join,
+            "fleet_contribute_join",
+        );
         cold
     }
 
@@ -4024,6 +4070,15 @@ impl Config {
             .get(model)
             .and_then(|o| o.moe_cache_mib)
             .unwrap_or(self.moe_cache_mib)
+    }
+
+    /// Effective `--moe-cache-cpu-share` (0.0 = off, engine default).
+    #[must_use]
+    pub fn effective_moe_cache_cpu_share(&self, model: &str) -> f32 {
+        self.model_overrides
+            .get(model)
+            .and_then(|o| o.moe_cache_cpu_share)
+            .unwrap_or(self.moe_cache_cpu_share)
     }
 
     /// Effective `--chat-template-kwargs` payload: explicit overlay beats
@@ -4219,6 +4274,35 @@ impl Config {
     /// fail fast rather than run with contradictory knobs.
     #[allow(clippy::too_many_lines)] // flat one-check-per-knob by design
     pub fn validate(&self) -> CoreResult<()> {
+        if let Some(base) = self.fleet_contribute_join.as_deref() {
+            // Shape: http(s)://host:port - the worker child has to hit
+            // its /api/fleet/* endpoints there. Refuse loopback bases:
+            // a contributor pointing at itself would announce its own
+            // devices back to its own gateway for no effect (and trip
+            // the self-join loops the fleet guard exists to prevent).
+            let bad_shape = || {
+                CoreError::Config(format!(
+                    "fleet_contribute_join must be an http(s)://host:port gateway base, got {base:?}"
+                ))
+            };
+            let rest = base
+                .strip_prefix("http://")
+                .or_else(|| base.strip_prefix("https://"))
+                .ok_or_else(bad_shape)?
+                .trim_start_matches('/') // tolerate a trailing slash
+                .trim_end_matches('/');
+            let host_port = rest.split('/').next().unwrap_or("");
+            let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            if host.is_empty() {
+                return Err(bad_shape());
+            }
+            if matches!(host, "127.0.0.1" | "localhost" | "::1") || host.starts_with("127.") {
+                return Err(CoreError::Config(format!(
+                    "fleet_contribute_join points back at this daemon ({base:?}) - set it to the GATEWAY box's base"
+                )));
+            }
+        }
         let mut names = std::collections::HashSet::new();
         for srv in &self.mcp {
             if srv.name.is_empty() {
@@ -4468,7 +4552,7 @@ impl Config {
         }
         if !is_valid_spec_mode(&self.spec) {
             return Err(CoreError::Config(format!(
-                "spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \"dflash\" or \"dspark\", got {:?}",
+                "spec must be \"off\", \"auto\", \"ngram\", \"ngram-map-k\", \"ngram-map-k4v\", \"ngram-mod\", \"ngram-cache\", \"mtp\", \"eagle3\", \"dflash\", \"dspark\" or \"dspine\", got {:?}",
                 self.spec
             )));
         }
@@ -5103,6 +5187,13 @@ impl Config {
                 self.slot_prompt_similarity
             )));
         }
+        if !self.moe_cache_cpu_share.is_finite() || !(0.0..=1.0).contains(&self.moe_cache_cpu_share)
+        {
+            return Err(CoreError::Config(format!(
+                "moe_cache_cpu_share must be within 0.0..=1.0 (0 = engine default), got {}",
+                self.moe_cache_cpu_share
+            )));
+        }
         Ok(())
     }
 
@@ -5711,9 +5802,15 @@ fn default_engine_check_secs() -> u64 {
     86_400 // daily; 0 disables
 }
 
-/// KV cache types upstream accepts for K and V (`-ctk`/`-ctv`).
+/// KV cache types upstream accepts for K and V (`-ctk`/`-ctv`), plus the
+/// `turbo3`/`turbo4` grades from the turboquant fork lineage (WHT-rotated
+/// KV, ~4.3x/3.8x compression). Turbo grades are fork-only: upstream
+/// llama-server rejects them at child load, and the capacity ladder never
+/// auto-adopts them - they ride an explicit user pin (config or override)
+/// on a fork lane, with quality evidence in the kv-quality receipts.
+/// `turbo2` stays out until it carries a measured receipt.
 pub const CACHE_TYPES: &[&str] = &[
-    "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+    "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "turbo3", "turbo4",
 ];
 
 fn valid_cache_type(s: &str) -> bool {
@@ -5799,6 +5896,54 @@ mod tests {
         };
         let err = bare_first.validate().unwrap_err().to_string();
         assert!(err.contains("must start with a flag token"), "got: {err}");
+    }
+
+    #[test]
+    fn unit__fleet_contribute_join__shape_and_loopback_refused_valid_passes() {
+        // Prod intent: the contributor daemon must point at ANOTHER
+        // box's gateway. Loopback bases self-join for no effect, and
+        // non-URL junk would only die later inside the worker child.
+        let valid = Config {
+            fleet_contribute_join: Some("http://192.168.1.20:11435".into()),
+            ..Config::default()
+        };
+        valid.validate().expect("remote gateway base validates");
+
+        for bad_base in [
+            "192.168.1.20:11435",       // no scheme
+            "ftp://192.168.1.20:11435", // wrong scheme
+            "http://",                  // no host
+        ] {
+            let err = Config {
+                fleet_contribute_join: Some(bad_base.into()),
+                ..Config::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("must be an http(s)://host:port gateway base"),
+                "shape refuse for {bad_base:?}, got: {err}"
+            );
+        }
+
+        for self_join in [
+            "http://127.0.0.1:11435",
+            "http://localhost:11435",
+            "http://127.1.2.3:11435",
+        ] {
+            let err = Config {
+                fleet_contribute_join: Some(self_join.into()),
+                ..Config::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("points back at this daemon"),
+                "loopback refuse for {self_join:?}, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -6142,6 +6287,24 @@ mod tests {
         }
         .validate("sglang")
         .unwrap_or_else(|e| panic!("spec_algorithm dflash + draft must validate: {e}"));
+        // dspine is the same class of algorithm: a trained drafter that
+        // hard-requires its draft weights.
+        SglangTuning {
+            spec_algorithm: Some("dspine".into()),
+            spec_draft_path: Some("/models/qwen3-8b-dspine-b16".into()),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap_or_else(|e| panic!("spec_algorithm dspine + draft must validate: {e}"));
+        assert!(
+            SglangTuning {
+                spec_algorithm: Some("dspine".into()),
+                ..Default::default()
+            }
+            .validate("sglang")
+            .is_err(),
+            "spec_algorithm dspine without spec_draft_path must be rejected"
+        );
         assert!(
             SglangTuning {
                 spec_algorithm: Some("dflash".into()),
@@ -7501,6 +7664,7 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
             "eagle3",
             "dflash",
             "dspark",
+            "dspine",
         ] {
             assert!(is_valid_spec_mode(mode), "{mode} must be valid");
         }
@@ -7807,6 +7971,23 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
         };
         let err = bad.validate().unwrap_err().to_string();
         assert!(err.contains("cache_type") && err.contains("q8_0"), "{err}");
+        // fork-lane turbo grades are accepted vocabulary (upstream lanes
+        // reject them at child load - engine-pin authority stays there)
+        let turbo = Config {
+            cache_type_k: "turbo3".into(),
+            cache_type_v: "turbo4".into(),
+            ..Config::default()
+        };
+        assert!(turbo.validate().is_ok());
+        // turbo2 has no measured receipt - not vocabulary yet
+        let err = Config {
+            cache_type: "turbo2".into(),
+            ..Config::default()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("turbo2"), "{err}");
     }
 
     #[test]

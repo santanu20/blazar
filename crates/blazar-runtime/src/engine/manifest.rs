@@ -146,8 +146,23 @@ pub struct Manifest {
     pub devices: Vec<DeviceDesc>,
     /// Every long flag (`--ctx-size`) accepted by this binary, from `--help`.
     pub flags: BTreeSet<String>,
-    /// Speculative-decoding types accepted by `--spec-type`, when advertised.
+    /// Speculative-decoding algorithms this lane can serve. Vocabulary
+    /// is per-kind: llama.cpp rows carry `--spec-type` wire names
+    /// (`draft-mtp`, `draft-eagle3`, ...); sglang rows carry
+    /// `SpeculativeAlgorithm` names plus plugin-registered names
+    /// (`NGRAM`, `EAGLE3`, `DFLASH`, `DSPINE`, ...) from the install
+    /// probe. Empty = not probed: the profile compiler falls back to
+    /// flag-presence gating.
     pub spec_types: Vec<String>,
+    /// Quant loader methods this build actually registers - sglang
+    /// lanes only, probed at install time from the engine's own
+    /// registry (`sglang.srt.layers.quantization.BASE_QUANTIZATION_METHODS`,
+    /// which appends entries beyond its source literal, so only a live
+    /// probe is truthful). `None` = not probed (non-sglang lanes,
+    /// manifests predating the probe); admission then falls back to
+    /// the blazar-core const snapshot.
+    #[serde(default)]
+    pub quant_methods: Option<Vec<String>>,
     /// Path to the engine's server binary as recorded at install time.
     /// Stored RELATIVE to the data dir (`engines/<tag>/...`) so rows stay
     /// relocatable; the out-of-tree `local` lane (`BLAZAR_ENGINE_PATH`)
@@ -196,7 +211,26 @@ pub struct Manifest {
     /// starts the auto-retire grace clock for curated lanes.
     #[serde(default)]
     pub superseded_at_epoch: Option<i64>,
+    /// Vocabulary-probe generation this manifest was captured with
+    /// (see [`MANIFEST_PROBE_VERSION`]). `0` = legacy row from an
+    /// older parser: the daemon boot backfill and `engine reprobe`
+    /// refresh it; the admission gate keeps reading the stored vocab
+    /// until then.
+    #[serde(default)]
+    pub probe_version: u32,
 }
+
+/// Generation of the manifest vocabulary probe. v1 (implicit - all
+/// unstamped rows, `probe_version` absent) captured underscore-only
+/// flag names and mistook `--help` separators for flags; v2 keeps
+/// dotted flag names (`--fim-qwen-1.5b-default`) and rejects all-dash
+/// tokens; v3 fills `spec_types` on sglang lanes (the
+/// `SpeculativeAlgorithm` + plugin-registry probe), which v2 rows
+/// recorded empty. Bump whenever `parse_help` (or another probe)
+/// changes what the extracted vocabulary MEANS - stored rows stamped
+/// below the current version self-heal via the daemon-boot backfill
+/// and `blazar engine reprobe`.
+pub const MANIFEST_PROBE_VERSION: u32 = 3;
 
 /// Preview of the spawn-time capability rescue (the re-route in
 /// `spawn_instance` after a lane dies rejecting an architecture): when
@@ -251,6 +285,34 @@ impl Manifest {
     #[must_use]
     pub fn has_flag(&self, flag: &str) -> bool {
         self.flags.contains(flag)
+    }
+
+    /// The engine-reported sglang version ("0.5.23"), preferring
+    /// `version_raw` ("sglang 0.5.23") and falling back to the install
+    /// tag ("sglang-0.5.23"). Empty when neither carries one - callers
+    /// render that as "version unknown" rather than inventing one.
+    #[must_use]
+    pub fn sglang_version(&self) -> String {
+        if let Some(v) = self.version_raw.strip_prefix("sglang ") {
+            return v.trim().to_string();
+        }
+        self.tag
+            .strip_prefix("sglang-")
+            .map(str::to_string)
+            .unwrap_or_default()
+    }
+
+    /// Lane facts for the sglang admission gate
+    /// (`blazar_core::hfmeta::sglang_lane_teach`): this build's own
+    /// version and probed quant registry. Manifests that predate the
+    /// probe yield `quant_methods: None` - the gate falls back to its
+    /// const snapshot.
+    #[must_use]
+    pub fn sglang_lane_facts(&self) -> blazar_core::hfmeta::SglangLaneFacts {
+        blazar_core::hfmeta::SglangLaneFacts {
+            version: self.sglang_version(),
+            quant_methods: self.quant_methods.clone(),
+        }
     }
 
     /// Does this lane advertise a GGUF architecture? An advertised name
@@ -359,6 +421,18 @@ impl Manifest {
         );
         self.server_path = live.display().to_string();
         true
+    }
+
+    /// Adopt the freshly probed vocabulary (flags, spec types, devices)
+    /// and probe generation from `fresh`, preserving everything else -
+    /// provenance, trust, pinned paths, the sglang quant registry.
+    /// Shared by `engine reprobe` and the boot stale-vocab backfill so
+    /// the two heals can never drift apart.
+    pub fn merge_vocab_from(&mut self, fresh: &Manifest) {
+        self.flags.clone_from(&fresh.flags);
+        self.spec_types.clone_from(&fresh.spec_types);
+        self.devices.clone_from(&fresh.devices);
+        self.probe_version = fresh.probe_version;
     }
 
     /// Anchor a stored (possibly relative) `server_path` to an absolute
@@ -493,6 +567,8 @@ pub fn probe_with_env(
         superseded_by: None,
         superseded_at_epoch: None,
         floor_release: None,
+        quant_methods: None,
+        probe_version: MANIFEST_PROBE_VERSION,
     })
 }
 
@@ -512,7 +588,9 @@ pub fn probe_kind(
         blazar_core::engine_kind::EngineKind::SdCpp => probe_sdcpp(server_path, tag),
         blazar_core::engine_kind::EngineKind::Whisper => probe_whisper(server_path, tag),
         blazar_core::engine_kind::EngineKind::Piper => probe_piper(server_path, tag),
+        blazar_core::engine_kind::EngineKind::Kokoro => probe_kokoro(server_path, tag),
         blazar_core::engine_kind::EngineKind::Mlx => probe_mlx(server_path, tag),
+        blazar_core::engine_kind::EngineKind::OpenAiHost => probe_openaihost(server_path, tag),
     }
 }
 
@@ -592,6 +670,7 @@ fn probe_mlx(server_path: &Path, tag: &str) -> Result<Manifest> {
         flags,
         spec_types: Vec::new(),
         server_path: server.to_string(),
+        probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
     })
 }
@@ -658,6 +737,7 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
         flags,
         spec_types: Vec::new(),
         server_path: server.to_string(),
+        probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
     })
 }
@@ -745,6 +825,207 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
         ));
     }
 
+    // Quant registry: the loader's own admission list, read through the
+    // shared helper (the boot backfill reads the identical source).
+    let quant_methods = probe_quant_registry(&venv_python)?;
+    // Speculative-algorithm vocabulary: enum + plugin registry. LENIENT
+    // (unlike the quant probe) - see probe_spec_algorithms.
+    let spec_types = probe_spec_algorithms(&venv_python);
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number: tag_serial,
+        version_raw,
+        devices: Vec::new(),
+        flags,
+        spec_types,
+        server_path: server.to_string(),
+        quant_methods: Some(quant_methods),
+        probe_version: MANIFEST_PROBE_VERSION,
+        ..Default::default()
+    })
+}
+
+/// Read the loader's quant admission registry from a sglang lane's venv
+/// python. Shared by the install-time probe and the boot backfill so both
+/// observe the identical runtime list. Strict - it runs after the import
+/// chain proved healthy (--help at install, a recorded manifest at boot),
+/// so a failure here means a broken venv or an upstream restructure, and a
+/// silently missing list would quietly degrade every admission refusal
+/// back to the const snapshot. Fresh interpreter = the torch import chain
+/// pays again: 90s cold budget.
+pub(crate) fn probe_quant_registry(venv_python: &Path) -> Result<Vec<String>> {
+    let quant_out = crate::probe::probe_output(
+        Command::new(venv_python).arg("-c").arg(
+            "import json; from sglang.srt.layers.quantization import \
+                 BASE_QUANTIZATION_METHODS as M; print(json.dumps(sorted(M)))",
+        ),
+        90,
+    )
+    .with_context(|| {
+        format!(
+            "run {} -c BASE_QUANTIZATION_METHODS (sglang venv broken?)",
+            venv_python.display()
+        )
+    })?;
+    if !quant_out.status.success() {
+        return Err(anyhow!(
+            "sglang quant-methods probe exited {}: {}",
+            quant_out.status,
+            String::from_utf8_lossy(&quant_out.stderr)
+        ));
+    }
+    let quant_methods = serde_json::from_str::<Vec<String>>(&String::from_utf8_lossy(
+        &quant_out.stdout,
+    ))
+    .map_err(|err| anyhow!("sglang quant-methods probe printed a non-list payload: {err}"))?;
+    if quant_methods.is_empty() {
+        return Err(anyhow!(
+            "sglang quant-methods probe parsed to zero methods \
+             (loader registry restructured upstream?)"
+        ));
+    }
+    Ok(quant_methods)
+}
+
+/// Read the lane's speculative-decoding algorithm vocabulary from the
+/// venv's own runtime: the `SpeculativeAlgorithm` enum (static
+/// algorithms: NGRAM, EAGLE3, DFLASH, ...) merged with the plugin
+/// registry (entry-point group `sglang.srt.plugins`, e.g. `DSpine`'s
+/// DSPINE until upstream merges it). Deliberately LENIENT where the
+/// quant probe is strict: any failure (module restructured upstream,
+/// broken plugin import, junk payload) yields an empty list, which the
+/// profile compiler treats as "not probed" and gates on flag presence
+/// alone - a speculative-module restructure must not brick engine
+/// installs; the worst case is losing the algorithm-presence hard
+/// error. Fresh interpreter = the torch import chain again: 90s cold
+/// budget.
+fn probe_spec_algorithms(venv_python: &Path) -> Vec<String> {
+    const PAYLOAD: &str = "\
+import json
+names = set()
+try:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm as A
+    names = {a.name for a in A}
+except Exception:
+    pass
+try:
+    from sglang.srt.plugins import load_plugins
+    load_plugins()
+    from sglang.srt.speculative.spec_registry import _REGISTRY
+    names |= set(_REGISTRY.keys())
+except Exception:
+    pass
+names.discard('NONE')
+print(json.dumps(sorted(names)))";
+    let Some(probe) =
+        crate::probe::probe_output(Command::new(venv_python).arg("-c").arg(PAYLOAD), 90)
+    else {
+        tracing::warn!(
+            "sglang spec-algorithm probe could not run - capability \
+             gate falls back to flag presence"
+        );
+        return Vec::new();
+    };
+    if !probe.status.success() {
+        tracing::warn!(
+            "sglang spec-algorithm probe exited {} - capability gate falls \
+             back to flag presence",
+            probe.status
+        );
+        return Vec::new();
+    }
+    match serde_json::from_str::<Vec<String>>(&String::from_utf8_lossy(&probe.stdout)) {
+        Ok(list) if !list.is_empty() => list,
+        parsed => {
+            tracing::warn!(
+                "sglang spec-algorithm probe returned no usable list ({parsed:?}) \
+                 - capability gate falls back to flag presence"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Probe a litert-lm venv lane (the openaihost engine). Same shape as
+/// sglang/mlx (the lanes it mirrors): importlib.metadata version read
+/// through the venv python, display serial from the install tag,
+/// argparse flags via the shim's `serve --help` - `serve` is the only
+/// subcommand whose flags gate this lane's argv, so that is the usage
+/// surface the manifest mines. The python import chain is cold-boot
+/// class, hence the 120s budget. Zero parsed flags = upstream format
+/// change = probe failure, not a silently degraded manifest.
+fn probe_openaihost(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+    // cpython venv layout: bin/python on unix, Scripts\python.exe on
+    // Windows - one shared helper so probe and install never disagree.
+    let venv_python = crate::engine::litert_install::venv_python_path(
+        &server_path
+            .parent()
+            .ok_or_else(|| anyhow!("engine path {server} has no parent dir"))?
+            .join("venv"),
+    );
+
+    // Version: importlib metadata read. Strict - a broken venv must
+    // fail the probe here with the venv path named, not at spawn.
+    let version_out = crate::probe::probe_output(
+        Command::new(&venv_python)
+            .arg("-c")
+            .arg("import importlib.metadata as m; print(m.version('litert_lm'))"),
+        30,
+    )
+    .with_context(|| {
+        format!(
+            "run {} -c importlib.metadata (litert-lm venv broken?)",
+            venv_python.display()
+        )
+    })?;
+    if !version_out.status.success() {
+        return Err(anyhow!(
+            "litert-lm version probe exited {}: {}",
+            version_out.status,
+            String::from_utf8_lossy(&version_out.stderr)
+        ));
+    }
+    let version_raw = format!(
+        "litert-lm {}",
+        String::from_utf8_lossy(&version_out.stdout).trim()
+    );
+
+    // Display-only serial from the install tag (litert-0.19.1 ->
+    // 0000000019): keeps `engine list` sortable, same convention as the
+    // sglang/mistralrs lanes.
+    let tag_serial = tag
+        .strip_prefix("litert-")
+        .and_then(|rest| rest.split(['-', '+']).next())
+        .and_then(|v| {
+            let mut it = v.split('.');
+            let maj = it.next()?.parse::<u64>().ok()?;
+            let min = it.next().unwrap_or("0").parse::<u64>().ok()?;
+            let patch = it.next().unwrap_or("0").parse::<u64>().ok()?;
+            Some(maj * 1_000_000 + min * 1_000 + patch)
+        })
+        .unwrap_or(0);
+
+    // Flags: `serve --help` via the shim. Argparse renderer, so
+    // parse_help applies. Python import behind it: 120s cold budget. A
+    // zero-token parse is a FORMAT change upstream - treat as probe
+    // failure (fail fast) rather than degrading every gated emission.
+    let help_out = crate::probe::probe_output(Command::new(server).arg("serve").arg("--help"), 120)
+        .with_context(|| {
+            format!("run {server} serve --help (litert-lm import chain can take a minute cold)")
+        })?;
+    let help = String::from_utf8_lossy(&help_out.stdout).to_string();
+    let (flags, _) = parse_help(&help);
+    if flags.is_empty() {
+        return Err(anyhow!(
+            "litert-lm serve --help parsed to zero flags (output format changed upstream?): {}",
+            help.lines().take(3).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+
     Ok(Manifest {
         tag: tag.to_string(),
         build_number: tag_serial,
@@ -753,6 +1034,7 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
         flags,
         spec_types: Vec::new(),
         server_path: server.to_string(),
+        probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
     })
 }
@@ -867,6 +1149,7 @@ fn probe_sdcpp(server_path: &Path, tag: &str) -> Result<Manifest> {
         flags,
         spec_types: Vec::new(),
         server_path: server.to_string(),
+        probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
     })
 }
@@ -957,6 +1240,7 @@ fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
         flags,
         spec_types: Vec::new(),
         server_path: server.to_string(),
+        probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
     })
 }
@@ -1012,6 +1296,90 @@ fn probe_piper(server_path: &Path, tag: &str) -> Result<Manifest> {
         flags,
         spec_types: Vec::new(),
         server_path: server.to_string(),
+        probe_version: MANIFEST_PROBE_VERSION,
+        ..Default::default()
+    })
+}
+
+/// Probe a kokoro lane. The shim is blazar's own script, so there is no
+/// upstream CLI banner or flag surface to parse: identity is the
+/// kokoro-onnx pip version read through the venv python (the sglang/mlx
+/// venv convention), the display serial is the model version in the tag
+/// (`kokoro-1.0` -> 0000001000), and liveness is the install contract's
+/// file set (shim, venv python, model, voices). Flags stay empty by
+/// design: the lane speaks HTTP JSON, never CLI argv.
+fn probe_kokoro(server_path: &Path, tag: &str) -> Result<Manifest> {
+    let server = server_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF-8 engine path {}", server_path.display()))?;
+    let lane = server_path
+        .parent()
+        .ok_or_else(|| anyhow!("engine path {server} has no parent dir"))?;
+
+    for (what, path) in [
+        ("shim", server_path.to_path_buf()),
+        ("venv python", lane.join("venv").join("bin").join("python")),
+        ("model", lane.join(super::kokoro_install::MODEL_FILE)),
+        ("voices", lane.join(super::kokoro_install::VOICES_FILE)),
+    ] {
+        if !path.is_file() {
+            anyhow::bail!(
+                "kokoro lane {} is missing (install contract broken?): {}",
+                what,
+                path.display()
+            );
+        }
+    }
+
+    let venv_python = lane.join("venv").join("bin").join("python");
+    let version_out = crate::probe::probe_output(
+        Command::new(&venv_python)
+            .arg("-c")
+            .arg("import importlib.metadata as m; print(m.version('kokoro_onnx'))"),
+        30,
+    )
+    .with_context(|| {
+        format!(
+            "run {} -c importlib.metadata (kokoro venv broken?)",
+            venv_python.display()
+        )
+    })?;
+    if !version_out.status.success() {
+        return Err(anyhow!(
+            "kokoro-onnx version probe exited {}: {}",
+            version_out.status,
+            String::from_utf8_lossy(&version_out.stderr)
+        ));
+    }
+    let version_raw = format!(
+        "kokoro-onnx {} (model {})",
+        String::from_utf8_lossy(&version_out.stdout).trim(),
+        tag
+    );
+
+    // Display-only serial from the tag's model version (kokoro-1.0 ->
+    // 0000001000), the mlx tag-serial convention.
+    let build_number = tag
+        .strip_prefix("kokoro-")
+        .and_then(|rest| rest.split(['-', '+']).next())
+        .and_then(|v| {
+            let mut it = v.split('.');
+            let maj = it.next()?.parse::<u64>().ok()?;
+            let min = it.next().unwrap_or("0").parse::<u64>().ok()?;
+            let patch = it.next().unwrap_or("0").parse::<u64>().ok()?;
+            Some(maj * 1_000_000 + min * 1_000 + patch)
+        })
+        .unwrap_or(0);
+
+    Ok(Manifest {
+        tag: tag.to_string(),
+        build_number,
+        version_raw,
+        devices: Vec::new(),
+        flags: BTreeSet::new(),
+        spec_types: Vec::new(),
+        server_path: server.to_string(),
+        probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
     })
 }
@@ -1142,10 +1510,13 @@ fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>) {
                 // `--llm_vision`/`--clip_vision` style flags and the
                 // strict probed-flags gate later refuses any argv flag
                 // the manifest lacks - dropping them here disabled
-                // image edits at spawn (verified live).
-                if clean
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+                // image edits at spawn (verified live). Dots included:
+                // llama-server ships version-qualified flags like
+                // `--fim-qwen-1.5b-default`; all-dash tokens are help
+                // section separators (`-----`), never flag names.
+                if clean.chars().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.'
+                }) && clean.chars().any(|c| c != '-')
                     && !clean.is_empty()
                     && clean.len() > 1
                 {
@@ -1505,6 +1876,36 @@ sd-server [options]
     }
 
     #[test]
+    fn unit__parse_help__dotted_flags_kept_and_help_separators_dropped() {
+        // llama-server b12202 documents `--fim-qwen-1.5b-default`
+        // (help line 741). The strict probed-flags gate refused it as
+        // extra_args until '.' joined the charset (F-S4-1). `-----`
+        // section separators must never enter the vocab as noise.
+        let help = "\
+usage: llama-server [options]
+
+options:
+  --fim-qwen-1.5b-default   use Qwen 1.5B default FIM settings
+  --fim-temp 0.0            temperature for FIM
+----------------------------------------------------------
+  --ctx-size N              size of the prompt context (default: 0)
+";
+        let (flags, _) = parse_help(help);
+        assert!(
+            flags.contains("--fim-qwen-1.5b-default"),
+            "dotted flag must survive: {flags:?}"
+        );
+        assert!(flags.contains("--fim-temp"), "plain sibling: {flags:?}");
+        assert!(flags.contains("--ctx-size"), "later flags: {flags:?}");
+        for noise in ["-----", "---", "--"] {
+            assert!(
+                !flags.contains(noise),
+                "separator noise {noise} in {flags:?}"
+            );
+        }
+    }
+
+    #[test]
     fn unit__parse_help__flags_and_spec_types() {
         let help = "\
 usage: llama-server [options]
@@ -1734,9 +2135,14 @@ options:
         use std::os::unix::fs::PermissionsExt;
         let root = dir.join("sglang-0.5.19");
         std::fs::create_dir_all(root.join("venv/bin")).expect("venv dir");
-        // version stub: prints like importlib.metadata regardless of args
-        std::fs::write(root.join("venv/bin/python"), "#!/bin/sh\necho 0.5.19\n")
-            .expect("python stub");
+        // python stub: answers both -c probes by payload - the
+        // importlib.metadata version read and the BASE_QUANTIZATION_
+        // METHODS registry dump
+        std::fs::write(
+            root.join("venv/bin/python"),
+            "#!/bin/sh\ncase \"$2\" in\n  *BASE_QUANTIZATION_METHODS*) echo '[\"awq\", \"fp8\"]' ;;\n  *SpeculativeAlgorithm*) echo '[\"DFLASH\", \"EAGLE3\", \"NGRAM\"]' ;;\n  *) echo 0.5.19 ;;\nesac\n",
+        )
+        .expect("python stub");
         // shim stub: argparse-style help surface
         std::fs::write(
             root.join("sglang-server"),
@@ -1766,8 +2172,169 @@ options:
         assert!(m.flags.contains("--mem-fraction-static"), "{:?}", m.flags);
         assert!(m.flags.contains("--kv-cache-dtype"), "{:?}", m.flags);
         assert_eq!(m.devices.len(), 0);
-        assert_eq!(m.spec_types.len(), 0);
+        // The probed algorithm vocabulary rides the manifest (enum +
+        // plugin registry merged at probe time).
+        assert_eq!(
+            m.spec_types,
+            vec![
+                "DFLASH".to_string(),
+                "EAGLE3".to_string(),
+                "NGRAM".to_string()
+            ]
+        );
         assert_eq!(m.server_path, shim);
+        // The probed loader registry rides the manifest.
+        assert_eq!(
+            m.quant_methods,
+            Some(vec!["awq".to_string(), "fp8".to_string()])
+        );
+        assert_eq!(
+            m.sglang_lane_facts(),
+            blazar_core::hfmeta::SglangLaneFacts {
+                version: "0.5.19".into(),
+                quant_methods: Some(vec!["awq".into(), "fp8".into()]),
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__probe_sglang__junk_spec_algorithm_payload_lenient_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("sglang-0.5.19");
+        std::fs::create_dir_all(root.join("venv/bin")).expect("venv dir");
+        // A junk spec-algorithm payload must NOT fail the probe (unlike
+        // the quant registry): the algorithm-presence gate degrades to
+        // flag-presence gating with an empty list, never bricks the
+        // install.
+        std::fs::write(
+            root.join("venv/bin/python"),
+            "#!/bin/sh\ncase \"$2\" in\n  *BASE_QUANTIZATION_METHODS*) echo '[\"awq\"]' ;;\n  *SpeculativeAlgorithm*) echo 'garbage' ;;\n  *) echo 0.5.19 ;;\nesac\n",
+        )
+        .expect("python stub");
+        std::fs::write(
+            root.join("sglang-server"),
+            "#!/bin/sh\nprintf 'usage: launch_server\\n\\n  --model-path M\\n'\n",
+        )
+        .expect("shim stub");
+        for f in ["venv/bin/python", "sglang-server"] {
+            let p = root.join(f);
+            let mut perm = std::fs::metadata(&p).expect("meta").permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(p, perm).expect("chmod");
+        }
+        let m = probe_sglang(&root.join("sglang-server"), "sglang-0.5.19")
+            .expect("lenient spec probe keeps the install alive");
+        assert!(m.spec_types.is_empty());
+        assert_eq!(m.quant_methods, Some(vec!["awq".to_string()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__probe_sglang__junk_quant_registry_fails_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("sglang-0.5.19");
+        std::fs::create_dir_all(root.join("venv/bin")).expect("venv dir");
+        // Non-list payload for the registry probe: strict failure, not
+        // a silently degraded const-fallback manifest.
+        std::fs::write(
+            root.join("venv/bin/python"),
+            "#!/bin/sh\ncase \"$2\" in\n  *BASE_QUANTIZATION_METHODS*) echo 'not-json' ;;\n  *) echo 0.5.19 ;;\nesac\n",
+        )
+        .expect("python stub");
+        std::fs::write(
+            root.join("sglang-server"),
+            "#!/bin/sh\nprintf 'usage: launch_server\\n\\n  --model-path M\\n'\n",
+        )
+        .expect("shim stub");
+        for f in ["venv/bin/python", "sglang-server"] {
+            let p = root.join(f);
+            let mut perm = std::fs::metadata(&p).expect("meta").permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(p, perm).expect("chmod");
+        }
+        let err = probe_sglang(&root.join("sglang-server"), "sglang-0.5.19")
+            .expect_err("junk registry fails the probe");
+        assert!(format!("{err:#}").contains("quant-methods"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__probe_sglang__empty_quant_registry_fails_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("sglang-0.5.19");
+        std::fs::create_dir_all(root.join("venv/bin")).expect("venv dir");
+        // An empty registry is a broken probe, not an engine that
+        // loads nothing - refuse to record it.
+        std::fs::write(
+            root.join("venv/bin/python"),
+            "#!/bin/sh\ncase \"$2\" in\n  *BASE_QUANTIZATION_METHODS*) echo '[]' ;;\n  *) echo 0.5.19 ;;\nesac\n",
+        )
+        .expect("python stub");
+        std::fs::write(
+            root.join("sglang-server"),
+            "#!/bin/sh\nprintf 'usage: launch_server\\n\\n  --model-path M\\n'\n",
+        )
+        .expect("shim stub");
+        for f in ["venv/bin/python", "sglang-server"] {
+            let p = root.join(f);
+            let mut perm = std::fs::metadata(&p).expect("meta").permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(p, perm).expect("chmod");
+        }
+        let err = probe_sglang(&root.join("sglang-server"), "sglang-0.5.19")
+            .expect_err("empty registry fails the probe");
+        assert!(format!("{err:#}").contains("zero methods"), "{err:#}");
+    }
+
+    #[test]
+    fn unit__manifest__quant_methods_field_is_additive() {
+        // Manifests serialized before the field existed decode with
+        // `None` (const-fallback admission), not an error.
+        let legacy = r#"{
+            "tag": "sglang-0.5.21",
+            "build_number": 5021,
+            "version_raw": "sglang 0.5.21",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/sglang-0.5.21/sglang-server"
+        }"#;
+        let m: Manifest = serde_json::from_str(legacy).expect("legacy manifest decodes");
+        assert_eq!(m.quant_methods, None);
+        let fresh = serde_json::json!({
+            "tag": "sglang-0.5.23",
+            "build_number": 5023,
+            "version_raw": "sglang 0.5.23",
+            "devices": [],
+            "flags": [],
+            "spec_types": [],
+            "server_path": "engines/sglang-0.5.23/sglang-server",
+            "quant_methods": ["awq", "fp8"],
+        });
+        let m: Manifest = serde_json::from_value(fresh).expect("fresh manifest decodes");
+        assert_eq!(m.quant_methods, Some(vec!["awq".into(), "fp8".into()]));
+    }
+
+    #[test]
+    fn unit__manifest__sglang_version_prefers_raw_then_tag() {
+        let probed = Manifest {
+            version_raw: "sglang 0.5.23".into(),
+            tag: "sglang-0.5.23".into(),
+            ..Default::default()
+        };
+        assert_eq!(probed.sglang_version(), "0.5.23");
+        // No version_raw (legacy row): the tag still carries it.
+        let tag_only = Manifest {
+            tag: "sglang-0.5.23".into(),
+            ..Default::default()
+        };
+        assert_eq!(tag_only.sglang_version(), "0.5.23");
+        // Neither carries one: honest empty, never an invented version.
+        assert_eq!(Manifest::default().sglang_version(), "");
     }
 
     #[cfg(unix)]
@@ -1787,6 +2354,73 @@ options:
         let err = probe_sglang(&shim, "sglang-0.5.19").expect_err("must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("venv"), "{msg}");
+    }
+
+    // ------------------------------------------------------------------
+    // kokoro probe: venv-version + lane-file contract
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn fake_kokoro_install(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let root = dir.join("kokoro-1.0");
+        std::fs::create_dir_all(root.join("venv/bin")).expect("venv dir");
+        // python stub: answers the importlib.metadata version read
+        std::fs::write(root.join("venv/bin/python"), "#!/bin/sh\necho 0.6.1\n")
+            .expect("python stub");
+        std::fs::write(root.join("kokoro.onnx"), "fake-onnx-bytes").expect("model file");
+        std::fs::write(root.join("voices.bin"), "fake-voices-bytes").expect("voices file");
+        let shim = root.join(super::super::kokoro_install::SHIM_NAME);
+        std::fs::write(&shim, "#!/bin/sh\nexit 0\n").expect("shim stub");
+        for f in ["venv/bin/python", super::super::kokoro_install::SHIM_NAME] {
+            let p = root.join(f);
+            let mut perm = std::fs::metadata(&p).expect("meta").permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(p, perm).expect("chmod");
+        }
+        shim
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__probe_kokoro__stub_lane_yields_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = fake_kokoro_install(dir.path());
+        let m = probe_kokoro(&shim, "kokoro-1.0").expect("probe");
+        assert_eq!(m.tag, "kokoro-1.0");
+        assert_eq!(m.version_raw, "kokoro-onnx 0.6.1 (model kokoro-1.0)");
+        // Model version serial: 1.0 -> 1_000_000 (mlx convention).
+        assert_eq!(m.build_number, 1_000_000);
+        // No upstream CLI to parse: the shim speaks HTTP, so no flags.
+        assert_eq!(m.flags.len(), 0);
+        assert_eq!(m.devices.len(), 0);
+        assert_eq!(m.spec_types.len(), 0);
+        assert_eq!(m.server_path, shim.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__probe_kokoro__missing_model_file_fails_naming_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("kokoro-1.0");
+        std::fs::create_dir_all(root.join("venv/bin")).expect("venv dir");
+        std::fs::write(root.join("venv/bin/python"), "#!/bin/sh\necho 0.6.1\n").expect("python");
+        std::fs::write(root.join("voices.bin"), "fake").expect("voices");
+        let shim = root.join(super::super::kokoro_install::SHIM_NAME);
+        std::fs::write(&shim, "#!/bin/sh\nexit 0\n").expect("shim");
+        for f in ["venv/bin/python", super::super::kokoro_install::SHIM_NAME] {
+            let p = root.join(f);
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(p, perm).unwrap();
+        }
+        let err = probe_kokoro(&shim, "kokoro-1.0").expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("model") && msg.contains("kokoro.onnx"),
+            "{msg}"
+        );
     }
 }
 
