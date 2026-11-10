@@ -16,9 +16,11 @@ keys
 kv budget llamacpp
 kv budget mistralrs
 kv budget mlx
+manifest vocab
 modality coverage
 model types
 models
+moe cache
 network
 network portal
 port
@@ -31,6 +33,8 @@ sglang fit
 store
 systemd unit
 tempdir hygiene
+versions kokoro
+versions litert
 versions llamacpp
 versions mistralrs
 versions mlx

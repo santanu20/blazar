@@ -73,6 +73,7 @@ mmproj_auto
 mmproj_device
 mmproj_offload
 model_overrides
+moe_cache_cpu_share
 moe_cache_mib
 mtmd_batch_max_tokens
 ngram_min_hits

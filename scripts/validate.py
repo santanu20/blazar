@@ -181,12 +181,28 @@ ROUTE_COVERAGE: list[str] = []
 DAEMON: Daemon | None = None
 SANDBOX: Sandbox | None = None
 USER_CONFIG_SHA = None
+# Most recent 4xx/5xx response seen by http() (F-S4-3 harness side):
+# check() appends it to failing checks so refused-request teaching
+# bodies are never lost. Context for the operator, not a verdict.
+LAST_4XX: dict | None = None
 
 
 def check(phase: str, name: str, ok: bool, evidence: str = "") -> bool:
     tag = "PASS" if ok else "FAIL"
     CHECKS.append({"phase": phase, "name": name, "ok": bool(ok), "evidence": evidence})
-    print(f"  [{tag}] {name}" + (f" - {evidence}" if evidence else ""))
+    line = f"  [{tag}] {name}" + (f" - {evidence}" if evidence else "")
+    if not ok:
+        # F-S4-3 harness side: a failing check often follows a refused
+        # request whose teaching body was the only real evidence; surface
+        # the most recent 4xx/5xx body (clearly labeled as context, not
+        # cause) so root-causing does not depend on daemon logs.
+        err = LAST_4XX
+        if err and time.time() - err["ts"] < 120:
+            line += (
+                f" | last_{err['status']} {err['method']} {err['path']}"
+                f" body={err['body'][:200]!r}"
+            )
+    print(line)
     return bool(ok)
 
 
@@ -999,6 +1015,7 @@ _COMMAND_ATTRS = {
     "keys.rm": (True, False, False, False, True),
     "quantize.happy": (False, False, True, False, False),
     "quantize.refusal": (False, False, False, False, True),
+    "quantize.recipe": (False, False, False, False, True),
     "launch": (True, False, False, False, True),
     "signin.refusal": (False, False, False, False, True),
     "login.refusal": (False, False, False, False, True),
@@ -1036,6 +1053,7 @@ _COMMAND_ATTRS = {
     "run.single.nocap": (True, True, False, False, True),
     "rpc.status": (False, False, False, False, True),
     "rpc.worker": (False, False, False, False, True),
+    "rpc.install": (False, False, False, True, False),
     "bench": (False, False, False, False, True),
     "tune.search": (False, False, True, False, False),
     "tune.ctx": (False, False, True, False, False),
@@ -1065,8 +1083,10 @@ _COMMAND_ATTRS = {
     "engine.update": (False, False, True, True, False),
     "engine.list": (False, False, False, False, True),
     "engine.use": (False, False, False, False, True),
+    "engine.recommend": (False, False, False, False, True),
     "engine.rm": (False, False, False, False, True),
     "engine.prune": (False, False, False, False, True),
+    "engine.reprobe": (False, False, False, False, True),
     "engine.rollback": (False, False, False, False, True),
     "engine.local": (False, False, False, False, True),
     "engine.build": (False, False, True, True, False),
@@ -1130,6 +1150,7 @@ _COMMAND_ATTRS = {
     "agent.deny": (False, False, False, False, True),
     "config.reload": (True, False, False, False, True),
     "engine.delta": (True, False, False, False, True),
+    "engine.changelog": (False, False, False, True, True),
 }
 
 COMMANDS = [
@@ -2092,6 +2113,14 @@ _K = [
         "argv",
         None,
         "MoE expert-cache budget MiB, 0 = off (--moe-cache-mib); engine-currency wave",
+    ),
+    (
+        "moe_cache_cpu_share",
+        False,
+        False,
+        "argv",
+        None,
+        "MoE expert-cache CPU-share 0.0..=1.0 (--moe-cache-cpu-share, needs moe_cache_mib>0); engine-currency wave",
     ),
     (
         "spec_draft_n_ubatch",
@@ -3535,9 +3564,19 @@ def http(
         req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, dict(r.headers), r.read()
+            status, hdr, raw = r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read()
+        status, hdr, raw = e.code, dict(e.headers), e.read()
+    if status >= 400:
+        global LAST_4XX
+        LAST_4XX = {
+            "ts": time.time(),
+            "method": method,
+            "path": path,
+            "status": status,
+            "body": raw.decode(errors="replace"),
+        }
+    return status, hdr, raw
 
 
 def http_json(
@@ -3693,12 +3732,26 @@ def child_pid(model: str = MODEL) -> int | None:
 
 
 def wait_loaded(model: str = MODEL, budget: float = 300.0) -> dict | None:
+    # Passive ps polling never wakes a lazily-respawned instance: after
+    # a crash the supervisor defers the respawn to the next inference
+    # request ("next request will respawn"), so a poller that only
+    # reads /api/ps can burn the whole budget against an instance that
+    # would come back on one nudge (F-S4-2b). Every 10s send a
+    # one-token chat probe to trigger that respawn; healthy loads land
+    # well inside the first window and never see a probe.
     deadline = time.time() + budget
+    next_probe = time.time() + 10.0
     while time.time() < deadline:
         for row in ps_rows():
             name = str(ps_field(row, "name", "model") or "")
             if name.split(":", maxsplit=1)[0] == model:
                 return row
+        if time.time() >= next_probe:
+            try:
+                chat("Say ok", extra={"max_tokens": 1}, timeout=60, model=model)
+            except Exception as e:  # probe is best-effort; polling decides
+                print(f"    wait_loaded probe: {e}")
+            next_probe = time.time() + 10.0
         time.sleep(1)
     return None
 
@@ -8110,6 +8163,18 @@ def phase_cli() -> None:
         p.stdout.strip().splitlines()[-1][:120] if p.stdout else "",
     )
     reg("engine.list", ok, f"active {cur or 'any b-tag'} listed")
+    # F-S4-1 heal lane: in-place manifest re-probe must succeed against
+    # the sandbox's active engine and report the captured flag count.
+    p = cli("engine", "reprobe", *([cur] if cur else []))
+    m = re.search(r"reprobed \S+: (\d+) flags captured", p.stdout)
+    ok = p.returncode == 0 and m is not None and int(m.group(1)) > 0
+    check(
+        "cli",
+        "engine reprobe refreshes the active manifest in place",
+        ok,
+        p.stdout.strip().splitlines()[-1][:120] if p.stdout else f"rc={p.returncode}",
+    )
+    reg("engine.reprobe", ok, f"{cur or 'all lanes'} reprobed")
     p = cli("run", MODEL, "--verbose", "--max-tokens", "64", "Say: inline")
     low = p.stdout.lower()
     ok = p.returncode == 0 and ("count" in low or "tokens" in low or "duration" in low)
@@ -10793,6 +10858,16 @@ def phase_commands() -> None:
         return p
 
     def _quantize():
+        # --recipe wiring is proven by its own refusal lane before any
+        # heavy work: a bogus name must teach the available recipes
+        # (validated after store/bin lookup, before tensor work - main.rs
+        # quantize arm), so MODEL alone is enough to reach it.
+        pr = cli("quantize", MODEL, "-t", "Q8_0", "--recipe", "bogus", timeout=120)
+        reg(
+            "quantize.recipe",
+            pr.returncode != 0 and "unknown recipe" in (pr.stdout + pr.stderr).lower(),
+            f"rc={pr.returncode} err={(pr.stderr or pr.stdout).strip()[:70]}",
+        )
         # llama-quantize refuses requantizing already-quantized tensors, so
         # the happy lane needs a real f16 source (1.5G download).
         src_repo = "ggml-org/Qwen3-0.6B-GGUF:F16"
@@ -10884,9 +10959,10 @@ def phase_commands() -> None:
             _pull_retry("pull", MODEL)
 
     if heavy_ok:
-        lane("quantize.happy", _quantize, "quantize.refusal")
+        lane("quantize.happy", _quantize, "quantize.refusal", "quantize.recipe")
     else:
         regb("quantize.happy", f"disk free {disk_free_gb():.1f}G <= 8G")
+        regb("quantize.recipe", f"disk free {disk_free_gb():.1f}G <= 8G")
         regb("quantize.refusal", f"disk free {disk_free_gb():.1f}G <= 8G")
         # the imatrix scenario lives inside _quantize: the same disk gate
         # bounds it, and flag-evidence resolution needs its boundary row
@@ -11213,6 +11289,16 @@ def phase_commands() -> None:
             )
     p = cli("engine", "list")
     reg("engine.list", p.returncode == 0 and (anchor or "") in (p.stdout or ""), "")
+    # engine recommend ranks every installed lane from the same store the
+    # list just read: rc0 + the ranking header proves the leaf is wired
+    # (kind-agnostic axes - hw match, bench receipts, recency/active).
+    p = cli("engine", "recommend", timeout=120)
+    rec_out = (p.stdout + p.stderr).lower()
+    reg(
+        "engine.recommend",
+        p.returncode == 0 and "ranking" in rec_out and "tag" in rec_out,
+        f"rc={p.returncode} {p.stdout.strip().splitlines()[0][:60] if p.stdout.strip() else 'empty'}",
+    )
     # derive the real engine layout (vendor-suffixed CUDA dirs) instead of
     # assuming llama-<tag>
     local_server = (
@@ -11513,6 +11599,24 @@ def phase_commands() -> None:
         "rpc.worker",
         worker_up and worker_rc == 143,
         f"bind+connect={worker_up} rc={worker_rc} (TERM=143)",
+    )
+
+    # Refusal lane: rpc install verifies the join target is a live blazar
+    # daemon BEFORE writing any unit; an unreachable base must teach, not
+    # write. The unit-text path (gateway pinned into the unit, token kept
+    # out of argv) is pinned Rust-side by unit__worker_unit_text__*.
+    p = cli("rpc", "install", "--join", "http://127.0.0.1:1")
+    out = p.stdout + p.stderr
+    unit_dir = os.path.join(SANDBOX.config_dir, "systemd", "user")
+    no_unit = not os.path.isdir(unit_dir) or "blazar-worker.service" not in os.listdir(
+        unit_dir
+    )
+    reg(
+        "rpc.install",
+        p.returncode != 0
+        and ("no daemon" in out or "not reachable" in out)
+        and no_unit,
+        f"rc={p.returncode} teach={out.strip()[:90]!r} unit_written={not no_unit}",
     )
 
     p = cli("certify", MODEL, "--json", timeout=600)
@@ -12473,6 +12577,7 @@ def _full_toplevel() -> dict:
         # the (c0) membership gate and the full-manifest boot cover them.
         "offline": False,
         "moe_cache_mib": 512,
+        "moe_cache_cpu_share": 0.5,
         "spec_draft_n_ubatch": 256,
     }
 
@@ -13368,6 +13473,12 @@ def _gold_items() -> dict:
             "engine currency",
             "engine retention",
             "bench baseline",
+            # raw-engine hazard row: fires only when the mistralrs lane
+            # is installed AND stray mmproj sidecars sit beside GGUFs -
+            # the golds sandbox stages registered files only, so the row
+            # is host-state-conditional by construction (same class as
+            # the engine-state rows above)
+            "mmproj pairing",
             # bench-state-conditional: the row appears only when some
             # model's bench receipt predates the active engine tag -
             # fresh receipts hide it, engine updates surface it (same
@@ -13626,6 +13737,7 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--allow-requantize": "quantize.happy",
         "--verify": "quantize.happy",
         "--max-degradation": "quantize.happy",
+        "--recipe": "quantize.recipe",
     },
     "search": {
         "--format": "search.format",
@@ -13710,6 +13822,13 @@ _GLOBAL_FLAG_EVIDENCE: dict[str, str] = {
 # second copy of a stored model or building llama.cpp from a custom fork
 # duplicates bytes/compute by design. Boundary rows document why.
 _FLAG_BOUNDARIES: dict[str, dict[str, str]] = {
+    "tune": {
+        "--moe-cache": "grid probe spawns one llama-server per "
+        "--moe-cache-mib x --moe-cache-cpu-share point and is MoE-gated "
+        "(dense models teach-and-bail; engine manifest needs both flags) "
+        "- spawn-heavy by design; adopted-knob argv emission is pinned in "
+        "the knobs_argv phase instead"
+    },
     "pull": {
         # Concurrent download-cap wave lane: flags are live in the CLI
         # surface already, so record them until that lane lands its own
@@ -13717,7 +13836,7 @@ _FLAG_BOUNDARIES: dict[str, dict[str, str]] = {
         "--max-download-mbps": "download bandwidth cap rides the concurrent download-cap lane; boundary row until its live check lands",
         "--revision": "pin a specific upstream revision rides the concurrent download-cap lane; boundary row until its live check lands",
         "--force": "re-download of an already stored model; duplicate "
-        "bytes by design; pull lane covers the fetch path"
+        "bytes by design; pull lane covers the fetch path",
     },
     "import": {
         "--mmproj": "projector attach is exercised by the vision/mmproj "
@@ -13734,6 +13853,13 @@ _FLAG_BOUNDARIES: dict[str, dict[str, str]] = {
     },
     "engine install": {
         "--backend": "sglang-venv variant; mistralrs prebuilt lane covers path",
+        # sglang pip-extra lane: one install re-resolves the full ~10GB
+        # venv (sglang wheel + torch + plugin CUDA kernel build). The
+        # flag surface (accept/reject teachings, extras plumbing) is
+        # unit-pinned and the happy path is live-receipted out-of-band
+        # on the sglang-0.5.22 + sglang-dspine plugin lane.
+        "--with": "sglang pip-extra venv install; duplicate ~10GB bytes "
+        "by design; unit-pinned + out-of-band live receipt",
     },
 }
 
@@ -14274,15 +14400,19 @@ def phase_coverage() -> None:
             p.returncode in (0, 1) and "mistral" in out.lower(),
             f"rc={p.returncode} {out.strip()[:60]}",
         )
-        # Same resolver probe for the remaining prebuilt lanes: the kind
-        # name in the response proves each lane reaches its own resolver
-        # (currency metadata comes back or a clean not-installed error).
+        # Same resolver probe for the remaining prebuilt lanes: the lane's
+        # own display name in the response proves each lane reaches its
+        # own resolver (currency metadata comes back or a clean
+        # not-installed error). The resolver prints product display
+        # names - sd.cpp, not the kind token sdcpp - so probe for the
+        # spelling the lane actually emits.
         for kind in ("sdcpp", "sglang"):
             p = cli("engine", "update", "--kind", kind, "--check", timeout=300)
             out = p.stdout + p.stderr
+            display = {"sdcpp": "sd.cpp"}.get(kind, kind)
             reg(
                 f"flag.engine-update.--kind-{kind}",
-                p.returncode in (0, 1) and kind in out.lower(),
+                p.returncode in (0, 1) and display in out.lower(),
                 f"rc={p.returncode} {out.strip()[:60]}",
             )
         # Full install lanes for the non-default kinds are multi-GB
@@ -14787,7 +14917,9 @@ def phase_fleet() -> None:
         p.returncode != 0 and taught,
         f"exit={p.returncode}",
     )
-    reg("adopt", p.returncode != 0 and taught, f"exit={p.returncode} no-agents teaching")
+    reg(
+        "adopt", p.returncode != 0 and taught, f"exit={p.returncode} no-agents teaching"
+    )
 
     # Onboarding leaves need a real check each so the manifest rows keep
     # their >=1-real coverage: `init` writes the discovery opt-in into a
@@ -14816,7 +14948,11 @@ def phase_fleet() -> None:
         p.returncode != 0 and join_taught,
         f"exit={p.returncode}",
     )
-    reg("join", p.returncode != 0 and join_taught, f"exit={p.returncode} no-gateway teaching")
+    reg(
+        "join",
+        p.returncode != 0 and join_taught,
+        f"exit={p.returncode} no-gateway teaching",
+    )
 
     # Leave the shared daemon in the plain boot state for later phases.
     d.start({"port": PORT})
@@ -14862,6 +14998,287 @@ def phase_fleet() -> None:
         "engine.delta",
         delta_ok,
         f"exit={p.returncode} taught={'only one llama.cpp build' in delta_out}",
+    )
+    # `engine changelog` is a read-only upstream advisor: llamacpp is always
+    # installed in the sandbox, so the real path is a GH-releases query that
+    # either prints the delta or reports "newest upstream release"; an
+    # offline box refuses with the standard gh teaching, which is equally
+    # the real command path (net-gated row).
+    p = cli("engine", "changelog", "--kind", "llamacpp")
+    cl_out = p.stdout + p.stderr
+    cl_ok = p.returncode == 0 or (
+        p.returncode != 0
+        and ("newest upstream release" in cl_out or "rate limit" in cl_out.lower())
+    )
+    reg(
+        "engine.changelog",
+        cl_ok,
+        f"exit={p.returncode} newest={'newest upstream release' in cl_out}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# OS-lane simulation (wine tier). The windows-gnu release lane gets REAL
+# behavioral evidence on a Linux dev box: cross-link the actual product
+# binary with mingw, then run it inside wine's Windows userland through
+# the same .cmd forwarder contract litert_install ships (shim_script_windows).
+# Windows/msvc itself, the full Windows-python litert venv lane, macOS and
+# foreign-arch lanes stay honest boundary rows: they need real Windows CI,
+# winetricks+python-installer, or qemu-user-static respectively.
+# ---------------------------------------------------------------------------
+
+_OS_WINE_TARGET = "x86_64-pc-windows-gnu"
+_OS_PREFIX = os.path.expanduser("~/.cache/blazar-validate/wine-prefix")
+_OS_EXE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "target",
+    _OS_WINE_TARGET,
+    "debug",
+    "blazar.exe",
+)
+
+
+def _wine_run(args: list[str], timeout: int = 120) -> tuple[int, str]:
+    """Run a command inside the wine userland, returning (exit, output)."""
+    env = dict(os.environ, WINEPREFIX=_OS_PREFIX, WINEDEBUG="-all")
+    p = subprocess.run(
+        ["wine", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
+    return p.returncode, p.stdout + p.stderr
+
+
+def phase_os() -> None:
+    mingw = shutil.which("x86_64-w64-mingw32-gcc") or shutil.which(
+        "x86_64-w64-mingw32-gcc-posix"
+    )
+    if os.environ.get("BLAZAR_VALIDATE_SKIP_OS") == "1":
+        boundary("os", "phase skipped", "BLAZAR_VALIDATE_SKIP_OS=1")
+        return
+    if not mingw or not shutil.which("cargo"):
+        boundary(
+            "os",
+            "cross-compile tier",
+            "mingw-w64 (x86_64-w64-mingw32-gcc) or cargo absent - "
+            "install gcc-mingw-w64-x86-64 to enable the windows-gnu lane sim",
+        )
+        return
+    # Tier 1: cross-link the real product binary for Windows (incremental
+    # after the first run; ring's windows-gnu asm is pregenerated).
+    p = subprocess.run(
+        ["cargo", "build", "--target", _OS_WINE_TARGET, "-p", "blazar"],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        cwd=dirname(dirname(abspath(__file__))),
+        check=False,
+    )
+    built = p.returncode == 0 and os.path.exists(_OS_EXE)
+    check(
+        "os",
+        "windows-gnu product binary links",
+        built,
+        f"cargo build exit={p.returncode} exe={'yes' if os.path.exists(_OS_EXE) else 'missing'}"
+        + ("" if p.returncode == 0 else f" tail={p.stdout[-200:] + p.stderr[-200:]}"),
+    )
+    if not built:
+        return
+    if not shutil.which("wine"):
+        boundary(
+            "os",
+            "wine userland tier",
+            "wine absent - binary is cross-compile-proven only; install wine64 for behavioral tier",
+        )
+        boundary(
+            "os", "msvc tier", "ring build script needs MSVC toolchain (CI builds msvc)"
+        )
+        return
+    # Tier 2: wine userland. Persistent prefix under ~/.cache keeps repeat
+    # runs fast (first boot pays wineboot once). wine refuses to run against
+    # a WINEPREFIX that does not exist yet - makedirs + wineboot are the
+    # first-run bootstrap.
+    Path(_OS_PREFIX).mkdir(parents=True, exist_ok=True)
+    _wine_run(["wineboot", "-u"], timeout=300)
+    rc_ver, out_ver = _wine_run(["cmd", "/c", "ver"])
+    if rc_ver != 0 or "Windows" not in out_ver:
+        boundary(
+            "os",
+            "wine userland tier",
+            f"prefix boot failed (exit={rc_ver}) - wine64 broken or incompatible",
+        )
+        boundary(
+            "os", "msvc tier", "ring build script needs MSVC toolchain (CI builds msvc)"
+        )
+        return
+    check(
+        "os",
+        "wine windows userland boots",
+        rc_ver == 0 and "Windows" in out_ver,
+        out_ver.strip().splitlines()[-1] if out_ver.strip() else f"exit={rc_ver}",
+    )
+    # The .cmd forwarder contract litert_install writes for the openaihost
+    # lane: @echo off / "<absolute entry>" %* / CRLF. Real cmd.exe parses it,
+    # forwards %*, and relays the child exit code both ways.
+    exe_w = _wine_run(["winepath", "-w", _OS_EXE])[1].strip()
+    shim_dir = Path(_OS_PREFIX).parent / "wine-lane"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim = shim_dir / "litert-lm-server.cmd"
+    with open(shim, "w", newline="") as f:
+        f.write(f'@echo off\r\n"{exe_w}" %*\r\n')
+    shim_w = _wine_run(["winepath", "-w", str(shim)])[1].strip()
+    rc_v, out_v = _wine_run(["cmd", "/c", shim_w, "--version"])
+    check(
+        "os",
+        "cmd shim forwards argv to product exe",
+        rc_v == 0 and out_ver.strip() != "" and out_v.strip().startswith("blazar "),
+        out_v.strip().splitlines()[0] if out_v.strip() else f"exit={rc_v}",
+    )
+    rc_bad, _ = _wine_run(["cmd", "/c", shim_w, "definitely-not-a-subcommand"])
+    check(
+        "os",
+        "cmd shim relays nonzero exit",
+        rc_bad != 0,
+        f"clap error propagates as exit={rc_bad}",
+    )
+    rc_ls, out_ls = _wine_run(["cmd", "/c", shim_w, "engine", "list"])
+    check(
+        "os",
+        "store-aware subcommand runs under wine userland",
+        rc_ls == 0 and "llama.cpp" in out_ls,
+        f"fresh-prefix store init + engine table rendered (exit={rc_ls})",
+    )
+    boundary(
+        "os",
+        "msvc tier",
+        "ring build script needs MSVC toolchain - release CI builds msvc on Windows runners",
+    )
+    # Windows-python gold tier: the litert install lane end-to-end under
+    # wine - Windows CPython 3.12 (installer run once into this prefix),
+    # venv Scripts layout, pip-installed litert-lm, and the shipped .cmd
+    # shim contract forwarding to the entry exe. Wheels come from the
+    # host-side cache (pip download --platform win_amd64 into
+    # ~/.cache/blazar-validate/wine-wheels) so flaky in-wine pypi egress
+    # never blocks the lane.
+    _py = Path(_OS_PREFIX) / "drive_c" / "Python312" / "python.exe"
+    _lane = Path(_OS_PREFIX).parent / "wine-lane" / "litert-0.19.1"
+    _entry = _lane / "venv" / "Scripts" / "litert-lm.exe"
+    if not (_py.exists() and _entry.exists()):
+        boundary(
+            "os",
+            "windows-python litert venv lane",
+            "wine prefix lacks C:\\Python312 or the wine-lane venv - one-time "
+            "setup (python.org installer /quiet, -m venv, pip install from "
+            "wine-wheels); shim + product tiers above cover shipped contracts",
+        )
+    else:
+        entry_w = _wine_run(["winepath", "-w", str(_entry)])[1].strip()
+        shim_lt = _lane / "litert-lm-server.cmd"
+        # Same contract as litert_install::shim_script_windows.
+        shim_lt.write_bytes(f'@echo off\r\n"{entry_w}" %*\r\n'.encode())
+        shim_lt_w = _wine_run(["winepath", "-w", str(shim_lt)])[1].strip()
+        rc_h, out_h = _wine_run(["cmd", "/c", shim_lt_w, "--help"])
+        check(
+            "os",
+            "shim contract forwards to windows-python litert-lm",
+            rc_h == 0 and "serve" in out_h and "import" in out_h,
+            f"litert-lm CLI surface via .cmd shim (exit={rc_h})",
+        )
+    # Foreign-arch tier: cross-build the arm64 release lane on the dev box
+    # and execute it under qemu-user emulation. gemm (via candle ->
+    # mistralrs lane) emits fp16 inline asm, so aarch64 needs
+    # -C target-feature=+fp16 (armv8.2+; qemu emulates it fine).
+    qemu = shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")
+    cross_gcc = shutil.which("aarch64-linux-gnu-gcc")
+    sysroot = "/usr/aarch64-linux-gnu"
+    if not (qemu and cross_gcc and os.path.isdir(sysroot)):
+        boundary(
+            "os",
+            "foreign-arch tier",
+            "qemu-user-static + gcc-aarch64-linux-gnu (sysroot) not all "
+            "installed - apt install qemu-user-static gcc-aarch64-linux-gnu",
+        )
+    else:
+        arch_target = "aarch64-unknown-linux-gnu"
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        arch_exe = os.path.join(repo, "target", arch_target, "debug", "blazar")
+        env_arch = dict(
+            os.environ,
+            CC_aarch64_unknown_linux_gnu=cross_gcc,
+            AR_aarch64_unknown_linux_gnu=shutil.which("aarch64-linux-gnu-ar")
+            or "aarch64-linux-gnu-ar",
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=cross_gcc,
+            RUSTFLAGS="-C target-feature=+fp16",
+        )
+        try:
+            p = subprocess.run(
+                ["cargo", "build", "--target", arch_target, "-p", "blazar"],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                env=env_arch,
+                cwd=repo,
+                check=False,
+            )
+            if p.returncode != 0 or not os.path.exists(arch_exe):
+                check(
+                    "os",
+                    "aarch64 cross-build links",
+                    False,
+                    f"cargo exit={p.returncode}",
+                )
+            else:
+                check(
+                    "os",
+                    "aarch64 cross-build links",
+                    True,
+                    f"{arch_target} blazar built (RUSTFLAGS +fp16 for gemm)",
+                )
+                rv = subprocess.run(
+                    [qemu, "-L", sysroot, arch_exe, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    check=False,
+                )
+                check(
+                    "os",
+                    "aarch64 binary runs under qemu-user",
+                    rv.returncode == 0 and "blazar" in (rv.stdout + rv.stderr),
+                    f"exit={rv.returncode} {(rv.stdout + rv.stderr).strip()[:40]}",
+                )
+                rl = subprocess.run(
+                    [qemu, "-L", sysroot, arch_exe, "engine", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    check=False,
+                )
+                # Populated store renders KIND=llamacpp rows; an empty store
+                # prints the teaching hint mentioning llama.cpp - both prove
+                # the lane table executed.
+                out_l = rl.stdout + rl.stderr
+                check(
+                    "os",
+                    "store-aware subcommand under qemu-user",
+                    rl.returncode == 0
+                    and ("llamacpp" in out_l or "llama.cpp" in out_l),
+                    f"engine table rendered through the gnu sysroot (exit={rl.returncode})",
+                )
+        except subprocess.TimeoutExpired:
+            check(
+                "os",
+                "aarch64 cross-build links",
+                False,
+                "cargo build timed out (1800s)",
+            )
+    boundary(
+        "os",
+        "macos lane",
+        "no viable darling (dead for modern apps); macOS stays a CI/hardware truth",
     )
 
 
@@ -15002,6 +15419,7 @@ def main() -> int:
         ("wave13", phase_wave13),
         ("parity", phase_parity),
         ("coverage", phase_coverage),
+        ("os", phase_os),
     ]
     for name, fn in phases:
         if self_test or (wanted and name not in wanted):
