@@ -8,6 +8,20 @@ tracked here.
 
 ### Added
 
+- Typed `CONFLICT` (409) error code + `generic_error_response` preserving the exact
+  caller status for raw router paths - duplicate-key adds (and every 409) now answer
+  with the typed body instead of collapsing to 500.
+- Polish-audit sweep (36 findings, two read-only deep audits): kokoro lane hardening
+  (speed guard 400s with named value, shared HTTP client, last_used refresh so the idle
+  reaper cannot kill a child mid-synthesis, store-cached lane lookup off the TTS hot path,
+  capabilities entry, graceful-shutdown reap), error-shape single-sourcing
+  (lib.rs delegates to error_codes; images job rows nested), silent-failure sweeps
+  (evict/pid-file/bus-publish/dir-ensure now warn or propagate), fail-closed piper
+  voice-format guard for non-string versions, malformed-GGUF field reads return errors
+  instead of panicking, `--slo-ms`/`--max` clap validation, fleet-join port validation,
+  changelog installed-anchor tiebreak, spawn_blocking for batch file I/O, and a full
+  regeneration of the fn-anchored config-code-paths doc refs (849 refs).
+
 - `tune --spec-race --slo-ms <MS>`: SLO receipts next to tok/s in the spec-race lanes (llamacpp + sglang) - per-mode goodput (SLO-met req/s), attainment %, and p95/p99 request wall ms, from per-request latency tracking in the race driver. Measurement-only, adopts nothing; without the flag the race output is byte-identical to before.
 - CI canary step: `SpeculativeAlgorithm` enum drift watch on sglang main (20-name snapshot) - files a deduped issue the moment upstream gains a speculative algorithm, with the adoption runbook (probe auto-discovers on lane update; user-drivable algos need a knob arm + catalog pair + spec-race receipts).
 - **`blazar engine changelog --kind <lane>` advises before you update.** A read-only release-notes advisor: it fetches the GitHub releases between the lane's installed tag and upstream newest and prints each one's notes (tag, date, up to 8 trimmed lines), so an `engine update --check` "update available" can be judged before anything downloads. Lanes whose versions come from PyPI (sglang, mlx, openaihost) teach that instead - they have no GH release notes; llama.cpp's b-tags ship without notes, so a notes-less gap collapses to one summary line naming the build count and pointing at `--check`. Dual-tag lanes are handled honestly: whisper.cpp ships a `vX.Y.Z` marker beside the asset-bearing `bNNNN` of the same drop, and zero-asset marker releases are skipped - the advisor only counts releases an update could actually install (verified live against whisper.cpp's feed: `v1.9.5`/`b5454` are the same Oct-6 drop, and the b-tag walker was already picking the newest installable - the v-tags have carried no assets since v1.9.3).

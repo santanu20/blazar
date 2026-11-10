@@ -65,6 +65,7 @@ test pins this table against the enum, so the two cannot drift.
 | `FORBIDDEN` | 403 | request refused by an authorization gate (generic) | check the key scopes / fleet token the gate names, or use a management key |
 | `METHOD_NOT_ALLOWED` | 405 | the route exists but not for this HTTP method | check the Allow header this response carries |
 | `UNSUPPORTED_MEDIA_TYPE` | 415 | the endpoint requires an application/json body | send Content-Type: application/json |
+| `CONFLICT` | 409 | the resource already exists in the requested state | delete or rename the existing resource first |
 | `PAYLOAD_TOO_LARGE` | 413 | request body too large | send a smaller body |
 | `UNPROCESSABLE` | 422 | request semantically invalid for this surface | fix the request semantics |
 | `BAD_GATEWAY` | 502 | invalid response from the engine child (generic) | retry; check daemon logs if persistent |
