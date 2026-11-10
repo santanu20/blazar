@@ -8,6 +8,9 @@ tracked here.
 
 ### Added
 
+- Kokoro lane scripts retrofit at spawn time: the lane-carried `kokoro_server.py` is
+  compared against the embedded payload before every spawn and rewritten on drift,
+  so binary upgrades fix stale lanes without a reinstall.
 - Typed `CONFLICT` (409) error code + `generic_error_response` preserving the exact
   caller status for raw router paths - duplicate-key adds (and every 409) now answer
   with the typed body instead of collapsing to 500.

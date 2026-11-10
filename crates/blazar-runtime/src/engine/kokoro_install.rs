@@ -34,6 +34,27 @@ use super::sglang_install::{disk_avail_bytes, run_streaming, uv_available};
 /// lazy runtime match it - the shared contract (litert precedent).
 pub const SHIM_NAME: &str = "kokoro-server";
 
+/// Lane-carried server script, single-sourced from this file. Spawn-time
+/// refresh compares the lane copy against this payload so binary upgrades
+/// retrofit logic fixes into existing lanes (lanes are self-contained,
+/// deletable units - they must carry their own script, but never a stale one).
+pub const KOKORO_SERVER_PY: &str = include_str!("kokoro_server.py");
+
+/// Rewrite the lane's `kokoro_server.py` when it drifted from the embedded
+/// payload. Returns `Ok(true)` when a refresh happened, `Ok(false)` when the
+/// lane copy already matched. Errors surface to the caller (spawn path
+/// warns and proceeds on the stale-but-functional script).
+#[must_use]
+pub fn refresh_lane_script(lane_dir: &std::path::Path) -> std::io::Result<bool> {
+    let server_py = lane_dir.join("kokoro_server.py");
+    let current = std::fs::read_to_string(&server_py).unwrap_or_default();
+    if current == KOKORO_SERVER_PY {
+        return Ok(false);
+    }
+    std::fs::write(&server_py, KOKORO_SERVER_PY)?;
+    Ok(true)
+}
+
 /// pip pin for the inference package (verified against the 0.6.1 sdist:
 /// `Kokoro(model, voices)`, `create(text, voice, speed, lang) -> (samples,
 /// 24000)`). Bump deliberately - the server script's API surface is this
@@ -159,7 +180,7 @@ pub async fn install_into(dir: &Path) -> Result<PathBuf> {
     }
 
     let server_py = dir.join("kokoro_server.py");
-    std::fs::write(&server_py, include_str!("kokoro_server.py"))
+    std::fs::write(&server_py, KOKORO_SERVER_PY)
         .with_context(|| format!("write {}", server_py.display()))?;
 
     // Shim: resolve the server script next to the shim itself so the
@@ -253,4 +274,25 @@ async fn boot_smoke(shim: &Path) -> Result<()> {
 
     let _ = child.kill().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    #[test]
+    fn unit__refresh_lane_script__rewrites_drift_and_skips_match() {
+        let dir = std::env::temp_dir().join(format!("blz-kokoro-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Drifted (stale install-time) copy -> rewritten to the payload.
+        std::fs::write(dir.join("kokoro_server.py"), "# stale draft").unwrap();
+        assert!(refresh_lane_script(&dir).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("kokoro_server.py")).unwrap(),
+            KOKORO_SERVER_PY
+        );
+        // Matching copy -> no rewrite.
+        assert!(!refresh_lane_script(&dir).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

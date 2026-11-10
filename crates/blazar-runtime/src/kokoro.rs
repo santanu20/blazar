@@ -185,6 +185,20 @@ impl KokoroRuntime {
             let _ = slot.take();
         }
         let port = ephemeral_port()?;
+        // Lane-carried script retrofit: binary upgrades embed fixes the
+        // install-time copy never sees. Refresh on drift; a failed refresh
+        // degrades to the stale (still functional) script - loudly.
+        if let Some(lane_dir) = shim.parent() {
+            match crate::engine::kokoro_install::refresh_lane_script(lane_dir) {
+                Ok(true) => tracing::info!(
+                    "kokoro lane script refreshed to embedded payload (drift retrofit)"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    "kokoro lane script refresh failed: {e}; spawning the lane copy as-is"
+                ),
+            }
+        }
         let mut std_cmd = std::process::Command::new(shim);
         std_cmd
             .arg("--port")
