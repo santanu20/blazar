@@ -864,14 +864,10 @@ fn persist_keys(state: &AppState, entries: &[ApiKey]) -> Response {
 }
 
 fn error_response(code: u16, msg: &str) -> Response {
-    (
-        StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        axum::Json(
-            serde_json::json!({"error": {"message": msg, "type": "blazar_error", "code": code,
-                "blazar_code": error_codes::generic_for_status(code).as_str()}}),
-        ),
-    )
-        .into_response()
+    // Single typed chokepoint (error_codes owns the body shape); the
+    // status-derived code keeps this u16-signature wrapper's callers
+    // unchanged while the construction lives in one place.
+    error_codes::generic_error_response(code, msg)
 }
 
 /// Router fallback: every unmatched method+path lands here. The message
@@ -1735,8 +1731,9 @@ pub async fn serve(
     if let Err(e) = state.usage.flush() {
         tracing::warn!("usage rollup final flush failed: {e}");
     }
-    // H8: the lazy whisper-server child (if any request spawned one).
+    // H8: the lazy audio-lane children (if any request spawned them).
     state.whisper.shutdown().await;
+    state.kokoro.shutdown().await;
     // MCP stdio children die before the engines (fast, independent).
     state.mcp.shutdown_all().await;
     state.sup.shutdown_all().await?;

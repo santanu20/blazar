@@ -60,6 +60,7 @@ pub enum BlazarCode {
     // Method/content-type mismatches axum itself rejects before any handler runs.
     MethodNotAllowed,
     UnsupportedMediaType,
+    Conflict,
 }
 
 impl BlazarCode {
@@ -90,6 +91,7 @@ impl BlazarCode {
             Self::NotFound => "NOT_FOUND",
             Self::MethodNotAllowed => "METHOD_NOT_ALLOWED",
             Self::UnsupportedMediaType => "UNSUPPORTED_MEDIA_TYPE",
+            Self::Conflict => "CONFLICT",
             Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
             Self::Unprocessable => "UNPROCESSABLE",
             Self::BadGateway => "BAD_GATEWAY",
@@ -107,6 +109,7 @@ impl BlazarCode {
             Self::ModelNotFound | Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
             Self::UnsupportedMediaType => 415,
+            Self::Conflict => 409,
             Self::ModelUnsupportedEngine
             | Self::PromptTooLong
             | Self::VisionProjectorMissing
@@ -182,6 +185,7 @@ impl BlazarCode {
             Self::Forbidden => "request refused by an authorization gate",
             Self::MethodNotAllowed => "the route exists but not for this HTTP method",
             Self::UnsupportedMediaType => "the endpoint requires an application/json body",
+            Self::Conflict => "the resource already exists in the requested state",
             Self::PayloadTooLarge => "request body too large",
             Self::Unprocessable => "request semantically invalid for this surface",
             Self::BadGateway => "invalid response from the engine child",
@@ -247,6 +251,7 @@ impl BlazarCode {
             }
             Self::MethodNotAllowed => "check the Allow header this response carries",
             Self::UnsupportedMediaType => "send Content-Type: application/json",
+            Self::Conflict => "delete or rename the existing resource first",
             Self::PayloadTooLarge => "send a smaller body",
             Self::Unprocessable => "fix the request semantics for this surface",
             Self::BadGateway => "retry; if it persists, check daemon logs for the engine child",
@@ -289,6 +294,7 @@ pub const ALL: &[BlazarCode] = &[
     BlazarCode::InsufficientStorage,
     BlazarCode::MethodNotAllowed,
     BlazarCode::UnsupportedMediaType,
+    BlazarCode::Conflict,
 ];
 
 /// Total fallback for `openai_error(status, ...)` sites that have no
@@ -301,6 +307,7 @@ pub fn generic_for_status(status: u16) -> BlazarCode {
         400 => BlazarCode::BadRequest,
         403 => BlazarCode::Forbidden,
         404 => BlazarCode::NotFound,
+        409 => BlazarCode::Conflict,
         413 => BlazarCode::PayloadTooLarge,
         422 => BlazarCode::Unprocessable,
         429 => BlazarCode::RateLimited,
@@ -327,6 +334,29 @@ pub fn error_response(code: BlazarCode, message: &str) -> axum::response::Respon
     });
     (
         axum::http::StatusCode::from_u16(code.http())
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+        axum::Json(body),
+    )
+        .into_response()
+}
+
+/// Exact-status variant for raw `u16` call sites (lib.rs router paths):
+/// the body carries the generic typed code for the status, but the HTTP
+/// status is EXACTLY the one the caller asked for - unmapped statuses
+/// keep their status instead of collapsing to INTERNAL.
+#[must_use]
+pub fn generic_error_response(status: u16, message: &str) -> axum::response::Response {
+    let code = generic_for_status(status);
+    let body = json!({
+        "error": {
+            "message": message,
+            "type": "blazar_error",
+            "code": status,
+            "blazar_code": code.as_str(),
+        }
+    });
+    (
+        axum::http::StatusCode::from_u16(status)
             .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
         axum::Json(body),
     )
@@ -463,6 +493,20 @@ mod tests {
             assert!(entry["description"].is_string());
             assert!(entry["remediation"].is_string());
         }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__generic_for_status__conflict_maps_and_status_is_preserved() {
+        // Raw-u16 router paths (lib.rs) must keep their exact HTTP status:
+        // 409 stays 409 with the typed CONFLICT code, unmapped statuses
+        // keep their status instead of collapsing to INTERNAL.
+        assert_eq!(generic_for_status(409), BlazarCode::Conflict);
+        let resp = generic_error_response(409, "key \"x\" already exists");
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+        let odd = generic_error_response(418, "teapot");
+        assert_eq!(odd.status(), axum::http::StatusCode::from_u16(418).unwrap());
+        assert_eq!(generic_for_status(418), BlazarCode::Internal);
     }
 
     #[test]

@@ -1493,7 +1493,8 @@ pub fn sglang_spec_mode_race(
     for mode in modes {
         let port = ephemeral_port()?;
         let argv = sglang_race_argv(base_argv, mode, port, flags)?;
-        let mut child = spawn_search_server(server_bin, &argv, &search_stderr_log(port))?;
+        let err_log = search_stderr_log(port);
+        let mut child = spawn_search_server(server_bin, &argv, &err_log)?;
         let ok = wait_ready(&mut child, port, 240.0);
         let report = if ok {
             drive_concurrent_multi(&[port], 1, 1).ok()
@@ -1504,7 +1505,26 @@ pub fn sglang_spec_mode_race(
         let _ = child.kill();
         let _ = child.wait();
         let Some(report) = report else {
-            anyhow::bail!("sglang spec race: server in mode {mode} never became ready or served");
+            // Quote the child's own stderr (captured per-port), mirroring
+            // the llamacpp race lane: an early death is usually OOM or a
+            // rejected flag, and the child's words beat a generic
+            // readiness timeout.
+            let tail: String = std::fs::read_to_string(&err_log)
+                .map(|s| {
+                    s.lines()
+                        .rev()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            anyhow::bail!(
+                "sglang spec race: server in mode {mode} never became ready or served; \
+                 child stderr tail:\n{tail}"
+            );
         };
         let t = report.tok_per_s;
         println!("  sglang spec mode {mode}: {t:.1} tok/s");
@@ -1743,7 +1763,7 @@ pub fn slo_attainment(request_ms: &[f64], wall_secs: f64, slo_ms: f64) -> (u64, 
 #[allow(clippy::cast_precision_loss)] // throughput display only
 fn drive_concurrent_multi(ports: &[u16], clients: u32, gens: u32) -> Result<DriveReport> {
     if ports.is_empty() {
-        anyhow::bail!("replica search: no ports to drive");
+        anyhow::bail!("no ports to drive");
     }
     let mut handles = Vec::new();
     let start = std::time::Instant::now();

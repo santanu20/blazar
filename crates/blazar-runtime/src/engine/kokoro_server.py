@@ -17,6 +17,7 @@ public endpoint.
 
 import io
 import json
+import math
 import os
 import sys
 import wave
@@ -77,10 +78,27 @@ class Handler(BaseHTTPRequestHandler):
         voice = str(body.get("voice") or DEFAULT_VOICE)
         if voice == "kokoro":
             voice = DEFAULT_VOICE
-        speed = float(body.get("speed", 1.0))
         lang = str(body.get("lang", "en-us"))
         if not text:
             self.reply_json(400, {"error": "input must be non-empty text"})
+            return
+
+        try:
+            speed = float(body.get("speed", 1.0))
+            # NaN/inf or out-of-range speeds produce garbage audio; reject
+            # them with the lane's 400 shape instead of a dropped connection.
+            if not math.isfinite(speed) or not (0.5 <= speed <= 2.0):
+                self.reply_json(
+                    400,
+                    {
+                        "error": f"speed must be a finite number in [0.5, 2.0], got {body.get('speed')!r}"
+                    },
+                )
+                return
+        except (TypeError, ValueError):
+            self.reply_json(
+                400, {"error": f"speed must be a number, got {body.get('speed')!r}"}
+            )
             return
 
         try:

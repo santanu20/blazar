@@ -467,17 +467,21 @@ pub async fn upload_file(
     }
     let id = short_id("file");
     let dir = files_dir(&state.dirs);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("create batch dir: {e}"),
-        );
-    }
+    // Payload-sized write (up to the 50 MiB body limit): keep the sync
+    // fs calls off the async workers.
     let path = dir.join(format!("{id}.jsonl"));
-    if let Err(e) = std::fs::write(&path, &file.data) {
+    let data = file.data.clone();
+    let dir_for_write = dir.clone();
+    let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir_for_write)?;
+        std::fs::write(&path, &data)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+    if let Err(e) = written {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("write file: {e}"),
+            &format!("store batch file: {e}"),
         );
     }
     let filename = file
@@ -546,14 +550,16 @@ pub async fn get_file_content(
         Some(v) if meta_allows(&v, key_ext.as_deref()) => {}
         _ => return err(StatusCode::NOT_FOUND, "unknown file id"),
     }
-    match std::fs::read(files_dir(&state.dirs).join(format!("{id}.jsonl"))) {
-        Ok(bytes) => (
+    // File payload can be body-limit-sized: read off the async workers.
+    let path = files_dir(&state.dirs).join(format!("{id}.jsonl"));
+    match tokio::task::spawn_blocking(move || std::fs::read(&path)).await {
+        Ok(Ok(bytes)) => (
             StatusCode::OK,
             [("content-type", "application/jsonl")],
             bytes,
         )
             .into_response(),
-        Err(_) => err(StatusCode::NOT_FOUND, "unknown file id"),
+        _ => err(StatusCode::NOT_FOUND, "unknown file id"),
     }
 }
 

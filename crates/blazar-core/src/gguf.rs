@@ -475,42 +475,58 @@ impl<'a> Cursor<'a> {
 
     fn u16(&mut self) -> CoreResult<u16> {
         let b = self.take(2)?;
-        Ok(u16::from_le_bytes(b.try_into().expect("2 bytes")))
+        Ok(u16::from_le_bytes(
+            b.try_into().map_err(|_| bad("short 2-byte field read"))?,
+        ))
     }
 
     fn i16(&mut self) -> CoreResult<i16> {
         let b = self.take(2)?;
-        Ok(i16::from_le_bytes(b.try_into().expect("2 bytes")))
+        Ok(i16::from_le_bytes(
+            b.try_into().map_err(|_| bad("short 2-byte field read"))?,
+        ))
     }
 
     fn u32(&mut self) -> CoreResult<u32> {
         let b = self.take(4)?;
-        Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        Ok(u32::from_le_bytes(
+            b.try_into().map_err(|_| bad("short 4-byte field read"))?,
+        ))
     }
 
     fn i32(&mut self) -> CoreResult<i32> {
         let b = self.take(4)?;
-        Ok(i32::from_le_bytes(b.try_into().expect("4 bytes")))
+        Ok(i32::from_le_bytes(
+            b.try_into().map_err(|_| bad("short 4-byte field read"))?,
+        ))
     }
 
     fn u64(&mut self) -> CoreResult<u64> {
         let b = self.take(8)?;
-        Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+        Ok(u64::from_le_bytes(
+            b.try_into().map_err(|_| bad("short 8-byte field read"))?,
+        ))
     }
 
     fn i64(&mut self) -> CoreResult<i64> {
         let b = self.take(8)?;
-        Ok(i64::from_le_bytes(b.try_into().expect("8 bytes")))
+        Ok(i64::from_le_bytes(
+            b.try_into().map_err(|_| bad("short 8-byte field read"))?,
+        ))
     }
 
     fn f32(&mut self) -> CoreResult<f32> {
         let b = self.take(4)?;
-        Ok(f32::from_le_bytes(b.try_into().expect("4 bytes")))
+        Ok(f32::from_le_bytes(
+            b.try_into().map_err(|_| bad("short 4-byte field read"))?,
+        ))
     }
 
     fn f64(&mut self) -> CoreResult<f64> {
         let b = self.take(8)?;
-        Ok(f64::from_le_bytes(b.try_into().expect("8 bytes")))
+        Ok(f64::from_le_bytes(
+            b.try_into().map_err(|_| bad("short 8-byte field read"))?,
+        ))
     }
 
     fn string(&mut self) -> CoreResult<String> {

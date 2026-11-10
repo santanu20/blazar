@@ -359,7 +359,16 @@ impl BlobLock {
                         // remove_dir only succeeds when empty: a live
                         // holder that re-created its marker keeps the
                         // lock; a crashed one leaves nothing behind.
-                        let _ = std::fs::remove_dir(&lock_dir);
+                        // A failed reclaim is retried by the next stale
+                        // poll (bounded by the lock deadline), so warn
+                        // rather than fail the download.
+                        if let Err(e) = std::fs::remove_dir(&lock_dir) {
+                            tracing::warn!(
+                                lock = %lock_dir.display(),
+                                %e,
+                                "stale blob-lock reclaim failed; retrying on next poll"
+                            );
+                        }
                         continue;
                     }
                     tokio::time::sleep(Self::POLL).await;
@@ -378,7 +387,14 @@ impl BlobLock {
 
 impl Drop for BlobLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
+        // Best-effort release: a failed remove leaves a stale marker
+        // that the acquire loop's stale-reclaim reaps after STALE.
+        if std::fs::remove_dir(&self.0).is_err() {
+            tracing::warn!(
+                lock = %self.0.display(),
+                "blob-lock release failed; stale-reclaim will reap it"
+            );
+        }
     }
 }
 

@@ -212,6 +212,10 @@ pub async fn tags(State(state): State<Arc<AppState>>) -> Response {
         .iter()
         .map(|m| {
             // One logical model = LLM + projector: the reported size is the
+            // Sub-ms std::fs metadata/series reads in these show/list
+            // handlers are accepted on the async path (local FS, no
+            // network); payload-sized I/O goes through spawn_blocking
+            // (see batch.rs).
             // full on-disk footprint (multimodal models ship both).
             let mm_bytes = m
                 .mmproj_path
@@ -1027,8 +1031,11 @@ async fn unload_ping(state: &Arc<AppState>, model: &str, chat_shape: bool) -> Re
             std::time::Duration::from_secs(state.cfg().session_keep_secs),
         )
         .live;
-    if !pinned {
-        let _ = state.sup.evict_model(&row.name).await;
+    if !pinned && let Err(e) = state.sup.evict_model(&row.name).await {
+        tracing::warn!(
+            "idle-recycle evict failed for {}: {e}; idle evictor will retry",
+            row.name
+        );
     }
     let body = if chat_shape {
         serde_json::json!({
@@ -1639,8 +1646,11 @@ pub async fn chat(
                         std::time::Duration::from_secs(state2.cfg().session_keep_secs),
                     )
                     .live
+                && let Err(e) = state2.sup.evict_model(&model_name).await
             {
-                let _ = state2.sup.evict_model(&model_name).await;
+                tracing::warn!(
+                    "keep-alive-0 evict failed for {model_name}: {e}; idle evictor will retry"
+                );
             }
             resp
         })
@@ -2020,7 +2030,11 @@ pub(crate) async fn apply_num_ctx(
     let running = state.sup.ps().into_iter().find(|p| p.name == model);
     if let Some(p) = running {
         if i64::from(p.ctx) < want && p.in_flight == 0 {
-            let _ = state.sup.evict_model(&model).await;
+            if let Err(e) = state.sup.evict_model(&model).await {
+                tracing::warn!(
+                    "idle-recycle evict failed for {model}: {e}; idle evictor will retry"
+                );
+            }
             state
                 .sup
                 .set_next_ctx(&model, u32::try_from(want).unwrap_or(u32::MAX));
@@ -2067,7 +2081,11 @@ pub(crate) async fn apply_spec(
     };
     if let Some(p) = state.sup.ps().into_iter().find(|p| p.name == model) {
         if p.spec_mode != want && p.in_flight == 0 {
-            let _ = state.sup.evict_model(&model).await;
+            if let Err(e) = state.sup.evict_model(&model).await {
+                tracing::warn!(
+                    "idle-recycle evict failed for {model}: {e}; idle evictor will retry"
+                );
+            }
             state.sup.set_next_spec(&model, want);
         }
     } else {

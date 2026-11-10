@@ -318,7 +318,7 @@ enum Cmd {
         /// goodput (SLO-met req/s) + attainment alongside tok/s in the
         /// request-driving tune lanes (--spec-race); measurement-only -
         /// adopts nothing
-        #[arg(long = "slo-ms", value_name = "MS")]
+        #[arg(long = "slo-ms", value_name = "MS", value_parser = slo_ms_value)]
         slo_ms: Option<f64>,
     },
     /// One-page scorecard for a model: measured performance (last bench),
@@ -1051,8 +1051,8 @@ enum EngineCmd {
         /// whisper | piper | kokoro
         #[arg(long)]
         kind: String,
-        /// Show at most N releases (default 5)
-        #[arg(long)]
+        /// Show at most N releases (default 5, minimum 1)
+        #[arg(long, value_parser = min_one)]
         max: Option<usize>,
     },
     /// Remove a retired engine (directory + registry row); refuses the
@@ -1455,6 +1455,27 @@ fn render_grouped_help() -> String {
     )
     .unwrap();
     out
+}
+
+/// `--slo-ms` guard: finite and strictly positive (a 0/NaN/negative
+/// target makes every request "unmet" and divides goodput by zero).
+fn slo_ms_value(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("invalid number: {e}"))?;
+    if v.is_finite() && v > 0.0 {
+        Ok(v)
+    } else {
+        Err("must be a finite number > 0".into())
+    }
+}
+
+/// `engine changelog --max` guard: at least one release.
+fn min_one(s: &str) -> Result<usize, String> {
+    let v: usize = s.parse().map_err(|e| format!("invalid number: {e}"))?;
+    if v >= 1 {
+        Ok(v)
+    } else {
+        Err("must be >= 1".into())
+    }
 }
 
 // NOTE: do NOT reset SIGPIPE to SIG_DFL for quiet `| head` exits. Rust
@@ -17287,6 +17308,11 @@ fn sglang_spec_race_lane(
         println!("note: engine lacks the speculation flags - racing dense only");
     }
     println!("sglang spec race: live servers across {race_modes:?} (~2 min each) ...");
+    // Cooldown between arms: sglang children hand VRAM back lazily
+    // (weight teardown + CUDA context), so a short 10s settle avoids the
+    // next arm's allocation racing the previous one's release. The
+    // llamacpp sibling lane passes 1 - its gguf children drop the card
+    // synchronously at exit.
     let rows = blazar_runtime::bench::sglang_spec_mode_race(
         std::path::Path::new(&manifest.server_path),
         &base_argv,
@@ -20468,8 +20494,6 @@ fn sdcpp_same_tag_switches(installed: Option<&str>, would: Option<&str>) -> bool
     }
 }
 
-/// Newest installed whisper tag (`bNNNN`) by build counter - mirrors
-/// `newest_sdcpp_tag` for the b-tag lane (v-tags ship source only).
 /// `blazar engine changelog --kind <lane> [--max N]` - release-notes
 /// advisor: what sits between the lane's installed tag and upstream
 /// newest, read-only (no download, no switch). GitHub lanes print each
@@ -20496,12 +20520,14 @@ async fn engine_changelog(d: &BlazarDirs, kind: &str, max: usize) -> Result<()> 
     };
     let store = Store::open(d)?;
     // Installed anchor: the ACTIVE row when one exists, else the newest
-    // (b-counter where the lane speaks it, active-flag otherwise).
+    // (b-counter where the lane speaks it, active-flag otherwise;
+    // installed_at breaks ties so multi-row non-b-tag lanes - kokoro,
+    // piper - anchor on the newest install, not the last-iterated one).
     let Some(installed) = store
         .list_engines()?
         .into_iter()
         .filter(|e| e.kind == engine_kind)
-        .max_by_key(|e| (e.active, btag_number(&e.tag)))
+        .max_by_key(|e| (e.active, btag_number(&e.tag), e.installed_at))
         .map(|e| e.tag)
     else {
         anyhow::bail!("no {kind} engine installed - install the lane first");
@@ -20572,6 +20598,8 @@ async fn engine_changelog(d: &BlazarDirs, kind: &str, max: usize) -> Result<()> 
     Ok(())
 }
 
+/// Newest installed whisper tag (`bNNNN`) by build counter - mirrors
+/// `newest_sdcpp_tag` for the b-tag lane (v-tags ship source only).
 fn newest_whisper_tag(store: &Store) -> Result<Option<String>> {
     Ok(store
         .list_engines()?

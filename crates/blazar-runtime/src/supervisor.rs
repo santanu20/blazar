@@ -4573,7 +4573,9 @@ impl Supervisor {
             };
             return Err(SupervisionError::Internal(anyhow!("{detail}")));
         }
-        let _ = self.dirs.ensure();
+        self.dirs
+            .ensure()
+            .map_err(|e| SupervisionError::Internal(anyhow::anyhow!("runtime dirs ensure: {e}")))?;
         let data_dir_str = self.dirs.data_dir.to_string_lossy().into_owned();
 
         let input_cfg = self.cfg();
@@ -4890,10 +4892,14 @@ impl Supervisor {
                         child: tokio::sync::Mutex::new(child),
                         pid,
                     });
-                    let _ = std::fs::write(
+                    if let Err(e) = std::fs::write(
                         self.dirs.run_dir().join(format!("{ROUTER_KEY}.pid")),
                         pid.to_string(),
-                    );
+                    ) {
+                        tracing::warn!(
+                            "pid-file write failed for {ROUTER_KEY}: {e}; unclean-death detection degraded"
+                        );
+                    }
                     self.instances.insert(ROUTER_KEY.to_string(), inst);
                     if self.unclean_dead.remove(ROUTER_KEY).is_some() {
                         self.record_restart(ROUTER_KEY);
@@ -5011,7 +5017,9 @@ impl Supervisor {
             capacity: blazar_core::profile::CapacityStatus::RuntimeManaged,
         };
 
-        let _ = self.dirs.ensure();
+        self.dirs
+            .ensure()
+            .map_err(|e| SupervisionError::Internal(anyhow::anyhow!("runtime dirs ensure: {e}")))?;
         let mut child_died_during_load = false;
         let mut last_load_tail = String::new();
         for _attempt in 0..2 {
@@ -5096,10 +5104,14 @@ impl Supervisor {
                         child: tokio::sync::Mutex::new(child),
                         pid,
                     });
-                    let _ = std::fs::write(
+                    if let Err(e) = std::fs::write(
                         self.dirs.run_dir().join(format!("{OPENAIHOST_KEY}.pid")),
                         pid.to_string(),
-                    );
+                    ) {
+                        tracing::warn!(
+                            "pid-file write failed for {OPENAIHOST_KEY}: {e}; unclean-death detection degraded"
+                        );
+                    }
                     self.instances.insert(OPENAIHOST_KEY.to_string(), inst);
                     if self.unclean_dead.remove(OPENAIHOST_KEY).is_some() {
                         self.record_restart(OPENAIHOST_KEY);
@@ -6474,7 +6486,9 @@ impl Supervisor {
         // child opens them; profile emission names these paths. Upstream
         // validates --slot-save-path IS a directory, so the per-model
         // subdir must pre-exist.
-        let _ = self.dirs.ensure();
+        self.dirs
+            .ensure()
+            .map_err(|e| SupervisionError::Internal(anyhow::anyhow!("runtime dirs ensure: {e}")))?;
         let _ = std::fs::create_dir_all(
             self.dirs
                 .sessions_dir()
@@ -6828,17 +6842,26 @@ impl Supervisor {
                     // (/api/events) and API consumers see WHY per-slot
                     // ctx shrank.
                     if let Some((per_slot, slots)) = profile.ctx_autofit {
-                        let _ = self.bus.publish(BlazarEvent::SlotsCtxAutoFit {
+                        // publish() reports how many subscribers saw the
+                        // event; zero means it vanished (bus closed).
+                        if self.bus.publish(BlazarEvent::SlotsCtxAutoFit {
                             model: autofit_model_name,
                             per_slot_ctx: per_slot,
                             slots,
                             total_ctx: slots * per_slot,
-                        });
+                        }) == 0
+                        {
+                            tracing::warn!("ctx-autofit event dropped: no active subscribers");
+                        }
                     }
-                    let _ = std::fs::write(
+                    if let Err(e) = std::fs::write(
                         self.dirs.run_dir().join(format!("{key}.pid")),
                         pid.to_string(),
-                    );
+                    ) {
+                        tracing::warn!(
+                            "pid-file write failed for {key}: {e}; unclean-death detection degraded"
+                        );
+                    }
                     tracing::info!(
                         model = name,
                         key,

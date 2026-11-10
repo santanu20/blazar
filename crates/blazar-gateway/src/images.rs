@@ -2515,7 +2515,9 @@ fn sora_video_object(
         obj["seconds"] = serde_json::json!(secs);
     }
     if let Some(err) = &row.error {
-        obj["error"] = serde_json::json!(err);
+        // Nested error shape - same contract as the SSE error frames and
+        // error_codes::error_response bodies above.
+        obj["error"] = serde_json::json!({ "message": err });
     }
     obj
 }
@@ -4019,7 +4021,7 @@ mod tests {
         };
         assert_eq!(
             sora_video_object(&row, None)["error"],
-            serde_json::json!("engine exploded")
+            serde_json::json!({"message": "engine exploded"})
         );
     }
 

@@ -591,7 +591,11 @@ pub async fn pull_voice(
 /// offending version string when the voice cannot run on this engine.
 #[must_use]
 pub fn voice_format_incompatible(config: &serde_json::Value) -> Option<String> {
-    let version = config.get("piper_version")?.as_str()?;
+    // A non-string piper_version (e.g. a bare JSON number) is not a
+    // version we can prove compatible - fail closed like unparsable text.
+    let Some(version) = config.get("piper_version")?.as_str() else {
+        return Some("non-string piper_version".to_string());
+    };
     let mut parts = version.split('.');
     let major = parts.next().and_then(|p| p.parse::<u32>().ok());
     let minor = parts.next().and_then(|p| p.parse::<u32>().ok());
@@ -938,6 +942,15 @@ mod tests {
         assert_eq!(
             voice_format_incompatible(&serde_json::json!({ "phoneme_id_map": {} })),
             None
+        );
+        // A non-string piper_version (bare JSON number) is just as
+        // unprovable as a malformed one - fail closed, not open.
+        assert_eq!(
+            voice_format_incompatible(&serde_json::json!({
+                "piper_version": 1.5, "phoneme_id_map": {}
+            }))
+            .as_deref(),
+            Some("non-string piper_version")
         );
         // Malformed version strings fail closed: the engine cannot know
         // what phoneme map they carry.

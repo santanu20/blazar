@@ -645,7 +645,9 @@ pub(crate) async fn send_with_child_retry(
     // the idempotent no-op side of the same guard. An already-reaped
     // key evicts as a no-op; a healthy replica that took the slot
     // meanwhile is ptr-guarded and survives.
-    let _ = state.sup.evict(&engine.key).await;
+    if let Err(e) = state.sup.evict(&engine.key).await {
+        tracing::warn!("failover cleanup evict failed for {}: {e}", engine.key);
+    }
     match ensure_key_detached(&state.sup, &engine.key).await {
         Ok(fresh) => match child_send(state, &fresh, build(&fresh).send()).await {
             Ok(r) => Ok(r),
@@ -859,7 +861,9 @@ pub(crate) async fn child_send(
                              synchronously ({knob}; slot probe: {:?})",
                             slots.map_or("unavailable".to_string(), |b| b.to_string())
                         );
-                        let _ = state.sup.evict(&engine.key).await;
+                        if let Err(e) = state.sup.evict(&engine.key).await {
+                            tracing::warn!("header-timeout evict failed for {}: {e}", engine.key);
+                        }
                         Err(ChildSendError::HeaderTimeout {
                             secs,
                             evicted: true,

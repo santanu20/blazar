@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 
 use blazar_core::BlazarDirs;
 
-/// Input guard, same ceiling as the piper lane (both synthesize
-/// bounded requests; long documents split).
-pub const MAX_INPUT_CHARS: usize = 10_000;
+// One shared ceiling for every TTS lane's input guard (the piper lane
+// owns the constant; long documents split identically on both lanes).
+pub use crate::piper::MAX_INPUT_CHARS;
 
 /// Per-synthesis budget: CPU synthesis of a max-length input can take
 /// tens of seconds; the cap catches a wedged child, not a slow one.
@@ -37,6 +37,14 @@ pub fn lane_row(dirs: &BlazarDirs) -> Option<blazar_core::store::EngineRow> {
             return None;
         }
     };
+    lane_row_at(&store)
+}
+
+/// Store-bound lane lookup - the gateway's cached `with_store` handle
+/// pays no fresh SQLite open per speech request (the `dirs` variant is
+/// for CLI callers that own no long-lived handle).
+#[must_use]
+pub fn lane_row_at(store: &blazar_core::Store) -> Option<blazar_core::store::EngineRow> {
     let rows = match store.list_engines() {
         Ok(r) => r,
         Err(e) => {
@@ -51,12 +59,10 @@ pub fn lane_row(dirs: &BlazarDirs) -> Option<blazar_core::store::EngineRow> {
         .max_by_key(|r| (i64::from(r.active), r.installed_at))
 }
 
-/// The lane's shim: the manifest's probed path when it still exists,
-/// else re-derived from the tag dir (a relocated data dir must not
-/// brick the lane - register's recovery shape).
+/// Shim path for a known lane row (the manifest's probed path when it
+/// still exists, else re-derived from the tag dir).
 #[must_use]
-pub fn lane_shim(dirs: &BlazarDirs) -> Option<PathBuf> {
-    let row = lane_row(dirs)?;
+pub fn shim_for_row(row: &blazar_core::store::EngineRow, dirs: &BlazarDirs) -> Option<PathBuf> {
     let dir = dirs.engines_dir().join(&row.tag);
     if let Ok(mut m) = serde_json::from_str::<crate::engine::manifest::Manifest>(&row.manifest) {
         m.anchor_server_path(&dirs.data_dir);
@@ -66,6 +72,14 @@ pub fn lane_shim(dirs: &BlazarDirs) -> Option<PathBuf> {
         }
     }
     crate::engine::find_engine_binary(&dir, &[crate::engine::kokoro_install::SHIM_NAME]).ok()
+}
+
+/// The lane's shim: the manifest's probed path when it still exists,
+/// else re-derived from the tag dir (a relocated data dir must not
+/// brick the lane - register's recovery shape).
+#[must_use]
+pub fn lane_shim(dirs: &BlazarDirs) -> Option<PathBuf> {
+    lane_row(dirs).and_then(|row| shim_for_row(&row, dirs))
 }
 
 /// Whether a kokoro lane is installed (drives install teaching + the
@@ -126,13 +140,35 @@ struct KokoroChild {
 /// The single lane slot; teardown is `shutdown()` (H19).
 pub struct KokoroRuntime {
     child: tokio::sync::Mutex<Option<KokoroChild>>,
+    /// One client for every lane call - per-request construction pays
+    /// TLS-provider init + a fresh pool on the TTS hot path.
+    http: reqwest::Client,
+}
+
+/// Pull the voice list out of the lane's `/voices` body (shared by the
+/// spawning and resident-only variants).
+fn parse_voices(list: &serde_json::Value) -> Vec<String> {
+    list.get("voices")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl KokoroRuntime {
     #[must_use]
     pub fn new() -> Self {
+        blazar_core::tls::ensure_tls_provider();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(SYNTH_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             child: tokio::sync::Mutex::new(None),
+            http,
         }
     }
 
@@ -208,12 +244,8 @@ impl KokoroRuntime {
     ) -> Result<Vec<u8>> {
         let text = validate_input(input)?;
         let port = self.ensure(shim).await?;
-        blazar_core::tls::ensure_tls_provider();
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(SYNTH_TIMEOUT_SECS))
-            .build()
-            .context("kokoro http client")?;
-        let resp = http
+        let resp = self
+            .http
             .post(format!("http://127.0.0.1:{port}/tts"))
             .json(&serde_json::json!({
                 "input": text,
@@ -234,6 +266,14 @@ impl KokoroRuntime {
                 &wav[..wav.len().min(8)]
             ));
         }
+        // A completed synthesis refreshes the reaper clock: with
+        // `whisper_idle_secs` shorter than a synthesis's wall time the
+        // reaper would otherwise kill a child that is actively serving.
+        if let Ok(mut slot) = self.child.try_lock()
+            && let Some(live) = slot.as_mut()
+        {
+            live.last_used = tokio::time::Instant::now();
+        }
         Ok(wav.to_vec())
     }
 
@@ -242,11 +282,8 @@ impl KokoroRuntime {
     /// voices file, never a stale embedded list.
     pub async fn voices(&self, shim: &Path) -> Result<Vec<String>> {
         let port = self.ensure(shim).await?;
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(SYNTH_TIMEOUT_SECS))
-            .build()
-            .context("kokoro http client")?;
-        let resp = http
+        let resp = self
+            .http
             .get(format!("http://127.0.0.1:{port}/voices"))
             .send()
             .await
@@ -258,15 +295,7 @@ impl KokoroRuntime {
             .json::<serde_json::Value>()
             .await
             .context("kokoro /voices body")?;
-        Ok(list
-            .get("voices")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(parse_voices(&list))
     }
 
     /// The lane's voice packs ONLY when a child is already resident -
@@ -278,11 +307,8 @@ impl KokoroRuntime {
         if !tcp_alive(live.port).await {
             return None;
         }
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(SYNTH_TIMEOUT_SECS))
-            .build()
-            .ok()?;
-        let resp = http
+        let resp = self
+            .http
             .get(format!("http://127.0.0.1:{}/voices", live.port))
             .send()
             .await
@@ -291,16 +317,7 @@ impl KokoroRuntime {
             return None;
         }
         let list = resp.json::<serde_json::Value>().await.ok()?;
-        Some(
-            list.get("voices")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        )
+        Some(parse_voices(&list))
     }
 
     /// Teardown: kill + reap. Never panics; a failed kill logs only.

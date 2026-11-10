@@ -4292,9 +4292,16 @@ impl Config {
                 .trim_start_matches('/') // tolerate a trailing slash
                 .trim_end_matches('/');
             let host_port = rest.split('/').next().unwrap_or("");
-            let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
-            let host = host.trim_start_matches('[').trim_end_matches(']');
+            let Some((host_raw, port_raw)) = host_port.rsplit_once(':') else {
+                return Err(bad_shape());
+            };
+            // Bracketed IPv6 literals keep their brackets off the port split.
+            let host = host_raw.trim_start_matches('[').trim_end_matches(']');
             if host.is_empty() {
+                return Err(bad_shape());
+            }
+            let port: u16 = port_raw.parse().map_err(|_| bad_shape())?;
+            if port == 0 {
                 return Err(bad_shape());
             }
             if matches!(host, "127.0.0.1" | "localhost" | "::1") || host.starts_with("127.") {

@@ -4104,6 +4104,10 @@ const SGLANG_MEM_FRACTION_MAX: f32 = 0.90;
 /// and prewarm receipts (2026-10-16 DFLASH class) calibrated against it.
 const SGLANG_DENSE_DYNAMIC_RESERVE_MIB: u64 = 1_750;
 const SGLANG_SPEC_DYNAMIC_BASE_RESERVE_MIB: u64 = 2_000;
+/// `SGLang` tag the `DSpine` plugin lane is pinned to (the plugin subclasses
+/// engine internals, so its pyproject pin is the source of truth). Update
+/// this const - not the hint text - when the plugin rebases.
+const SGLANG_DSPINE_PLUGIN_TAG: &str = "0.5.22";
 
 /// Dynamic-side reserve for a spawn: the spec baseline keeps its
 /// receipt-calibrated posture; a dense spawn pays the smaller
@@ -5597,11 +5601,13 @@ fn sglang_lane_supports_spec(input: &ProfileInput<'_>, upstream: &str) -> Result
     }
     let supported = input.spec_types.join(", ");
     let dspine_hint = if upstream == "DSPINE" {
-        " - DSpine is plugin-delivered until upstream merges it: install a \
-         sglang lane with the plugin (blazar engine install 0.5.22 --kind \
-         sglang --with \"sglang-dspine @ git+https://github.com/tencent/dspine.git\")\
-         and blazar engine reprobe"
-            .to_string()
+        format!(
+            " - DSpine is plugin-delivered until upstream merges it: install a \
+             sglang lane with the plugin (blazar engine install \
+             {SGLANG_DSPINE_PLUGIN_TAG} --kind sglang --with \"sglang-dspine @ \
+             git+https://github.com/tencent/dspine.git\") and blazar engine \
+             reprobe"
+        )
     } else {
         " - run: blazar engine update or blazar engine reprobe".to_string()
     };
@@ -5766,9 +5772,10 @@ fn push_sglang_speculative<'a>(
             .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("gguf"))
         {
             warnings.push(format!(
-                "spec draft {draft} is a GGUF file; sglang EAGLE drafts must be \
-                 HF safetensors dirs - spawning dense (pull the draft as a \
-                 safetensors row to enable the pair)"
+                "spec draft {draft} is a GGUF file; sglang spec drafts \
+                 (EAGLE3, DSpine, ...) must be HF safetensors dirs - \
+                 spawning dense (pull the draft as a safetensors row to \
+                 enable the pair)"
             ));
         } else if input.supported_flags.contains("--speculative-algorithm")
             && input

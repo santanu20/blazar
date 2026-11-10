@@ -29,9 +29,10 @@ use crate::proxy::openai_error;
 use crate::remotes::split_remote;
 use crate::state::AppState;
 
-/// Bound mirrors the runtime cap; the route validates first so clients
-/// get a 400 before any spawn.
-const MAX_INPUT_CHARS: usize = 10_000;
+// One shared TTS input ceiling, owned by the piper lane (both lanes
+// validate identically; the route checks first so clients get a 400
+// before any spawn).
+use blazar_runtime::piper::MAX_INPUT_CHARS;
 
 /// Lossy egress containers, transcoded from piper's WAV through the
 /// system ffmpeg. Muxer, codec, bitrate flags, and content type are
@@ -423,11 +424,12 @@ pub async fn audio_speech(
     // voice id (`af_sarah`) with the lane installed. Shape-gated BEFORE
     // the piper paths: piper ids (`en_US-amy-medium`) never match the
     // kokoro grammar, and an absent lane falls through to piper
-    // byte-identically.
-    if voice == "kokoro"
-        || (blazar_runtime::kokoro::lane_installed(&state.dirs)
-            && blazar_runtime::kokoro::looks_like_voice(voice))
-    {
+    // byte-identically. Lane presence rides the cached `with_store`
+    // handle - no fresh SQLite open on the TTS hot path.
+    let kokoro_installed = state
+        .with_store(blazar_runtime::kokoro::lane_row_at)
+        .is_some_and(|row| row.is_some());
+    if voice == "kokoro" || (kokoro_installed && blazar_runtime::kokoro::looks_like_voice(voice)) {
         return kokoro_speech(&state, key_ext.as_ref(), voice, text, format, stream, &opts).await;
     }
 
@@ -999,6 +1001,10 @@ pub fn speech_capabilities(state: &AppState) -> Value {
         .with_store(|s| s.active_engine().ok().flatten())
         .flatten()
         .is_some_and(|row| row.kind == blazar_core::engine_kind::EngineKind::LlamaCpp);
+    // Same cached-handle lane presence check the speech dispatch uses.
+    let kokoro_installed = state
+        .with_store(blazar_runtime::kokoro::lane_row_at)
+        .is_some_and(|row| row.is_some());
     serde_json::json!({
         "endpoint": "/v1/audio/speech",
         "voices_endpoint": "/v1/audio/voices",
@@ -1019,6 +1025,15 @@ pub fn speech_capabilities(state: &AppState) -> Value {
                 "stream": false,
                 "knobs": ["voice", "lang", "speaker_ref_b64"],
                 "voices": "predefined packs (e.g. pocket-tts) list theirs at /v1/audio/voices once resident",
+            },
+            "kokoro": {
+                "model": "kokoro voice id (e.g. af_sarah) or \"kokoro\" for the default voice",
+                "installed": kokoro_installed,
+                "stream": false,
+                "response_format": "wav only (buffered)",
+                "knobs": ["speed"],
+                "install": "blazar engine install --kind kokoro",
+                "voices": "listed at /v1/audio/voices (kokoro section) once the lane is resident",
             },
         },
     })
@@ -1060,11 +1075,33 @@ async fn kokoro_speech(
     if let Err(resp) = state.admit_or_respond(key_ext, voice) {
         return *resp;
     }
-    let Some(shim) = blazar_runtime::kokoro::lane_shim(&state.dirs) else {
+    // Lane resolution through the cached store handle; the split
+    // teaches the two failure classes differently (never-installed vs
+    // registered-but-broken).
+    let kokoro_row = state
+        .with_store(blazar_runtime::kokoro::lane_row_at)
+        .flatten();
+    let Some(shim) = kokoro_row
+        .as_ref()
+        .and_then(|row| blazar_runtime::kokoro::shim_for_row(row, &state.dirs))
+    else {
+        if kokoro_row.is_none() {
+            return openai_error(
+                503,
+                &format!(
+                    "kokoro lane is not installed - install it: blazar engine install {} \
+                     --kind kokoro (neural voices, CPU)",
+                    blazar_runtime::engine::kokoro_install::KOKORO_DEFAULT_MODEL
+                ),
+            );
+        }
         return openai_error(
             503,
-            "kokoro lane is registered but its shim is missing - reinstall: \
-             blazar engine install 1.0 --kind kokoro",
+            &format!(
+                "kokoro lane is registered but its shim is missing - reinstall: \
+                 blazar engine install {} --kind kokoro",
+                blazar_runtime::engine::kokoro_install::KOKORO_DEFAULT_MODEL
+            ),
         );
     };
     // kokoro's speed knob accepts f32; the request-level f64 clamp
@@ -1073,11 +1110,16 @@ async fn kokoro_speech(
     #[allow(clippy::cast_possible_truncation)]
     let speed = opts.speed.unwrap_or(1.0) as f32;
     match state.kokoro.synthesize(&shim, text, voice, speed).await {
-        Ok(wav) => Response::builder()
-            .status(StatusCode::OK)
-            .header(axum::http::header::CONTENT_TYPE, "audio/wav")
-            .body(axum::body::Body::from(wav))
-            .unwrap_or_else(|_| openai_error(500, "response build").into_response()),
+        Ok(wav) => {
+            // No -1 dBFS limiter here, unlike the piper egress paths:
+            // kokoro's ONNX head already emits peak-bounded float
+            // samples (<= 1.0), so the int16 cast cannot clip.
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+                .body(axum::body::Body::from(wav))
+                .unwrap_or_else(|_| openai_error(500, "response build").into_response())
+        }
         Err(e) => {
             let msg = format!("{e:#}");
             // The lane's own voice contract violations surface as its
@@ -1166,7 +1208,10 @@ pub async fn voices(
     // boots-nothing like the rest of the endpoint - the authoritative
     // voice list comes from a resident child; a cold lane shows the
     // default-voice pointer instead of a stale embedded list.
-    if blazar_runtime::kokoro::lane_installed(&state.dirs) {
+    let kokoro_lane_present = state
+        .with_store(blazar_runtime::kokoro::lane_row_at)
+        .is_some_and(|row| row.is_some());
+    if kokoro_lane_present {
         let voices = state.kokoro.voices_if_resident().await;
         body["kokoro"] = serde_json::json!({
             "installed": true,

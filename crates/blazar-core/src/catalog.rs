@@ -36,8 +36,11 @@ pub struct CatalogEntry {
     pub chat_template: Option<String>,
 }
 
-/// Speculative-decoding draft pairs: models matching `model_glob` (prefix
-/// match on registry name) use `draft_repo` via `--spec-type draft-simple`.
+/// Speculative-decoding draft pairs: models whose name starts with
+/// `model_prefix` pair with `draft_repo` under `spec_type` (the wire
+/// name the serving lane advertises, e.g. `draft-simple`,
+/// `draft-eagle3`, `draft-dflash`, `draft-dspark`, `draft-mtp`,
+/// `draft-dspine`).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SpecPair {
     /// Prefix matched against the resolved model name, e.g. "qwen3-".

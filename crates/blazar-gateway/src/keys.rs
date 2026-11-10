@@ -292,6 +292,14 @@ impl KeysLimiter {
     /// short-circuits, but a later position requires presenting a valid
     /// secret for some earlier entry - position leaks nothing without
     /// the key, and per-compare `ct_eq` hides content differences.
+    ///
+    /// Lock-poisoning policy (gateway-wide, incl. the supervisor /
+    /// requests / remotes / whisper ledgers): `.lock().expect("...
+    /// poisoned")` is a deliberate fail-fast. A panic under a lock means
+    /// memory or an invariant already broke mid-mutation; poisoning
+    /// every later request into the same loud crash is preferable to
+    /// serving from state of unknown integrity. The daemon supervisor
+    /// restarts the process and the on-disk store is the recovery point.
     #[must_use]
     pub fn resolve(&self, presented: &str) -> Option<blazar_core::ApiKey> {
         self.entries
