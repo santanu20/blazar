@@ -135,6 +135,9 @@ pub async fn messages(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if let Err(msg) = validate_cache_hints(&parsed) {
+        return anthropic_error(400, "invalid_request_error", &msg);
+    }
     let mut openai_body = match translate_request(&parsed, stream) {
         Ok(b) => b,
         Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
@@ -433,6 +436,9 @@ pub async fn count_tokens(
     if model.is_empty() {
         return anthropic_error(400, "invalid_request_error", "missing `model` field");
     }
+    if let Err(msg) = validate_cache_hints(&parsed) {
+        return anthropic_error(400, "invalid_request_error", &msg);
+    }
     // F48: tokenizing a model SP loads it - scoped keys must not spawn
     // outside their scope through this lane.
     if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
@@ -584,6 +590,73 @@ pub fn translate_request(v: &Value, stream: bool) -> Result<Value, String> {
         out["stream_options"] = json!({"include_usage": true});
     }
     Ok(out)
+}
+
+/// Validate Anthropic prompt-cache hints (`cache_control` markers) at the
+/// plane edge, before admission bills anything. Local engines prefix-cache
+/// automatically, so a well-formed marker is an accepted no-op whose effect
+/// surfaces in the response usage (`cache_read_input_tokens` maps the
+/// child's `prompt_tokens_details.cached_tokens`); garbage, however, must
+/// fail loudly with the offending JSON path - exactly like the upstream
+/// API - instead of being silently dropped by block translation. Spec
+/// shape: `{"type": "ephemeral"}` with an optional `"ttl"` of `"5m"` or
+/// `"1h"`.
+fn validate_cache_hints(v: &Value) -> Result<(), String> {
+    let obj = v.as_object().ok_or("request body must be a JSON object")?;
+    if let Some(sys) = obj.get("system").and_then(Value::as_array) {
+        for (i, b) in sys.iter().enumerate() {
+            check_block_cache_control(b, &format!("system[{i}]"))?;
+        }
+    }
+    if let Some(msgs) = obj.get("messages").and_then(Value::as_array) {
+        for (mi, m) in msgs.iter().enumerate() {
+            let Some(blocks) = m.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for (bi, b) in blocks.iter().enumerate() {
+                let path = format!("messages[{mi}].content[{bi}]");
+                check_block_cache_control(b, &path)?;
+                // tool_result blocks nest their own content blocks.
+                if b.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && let Some(inner) = b.get("content").and_then(Value::as_array)
+                {
+                    for (ci, c) in inner.iter().enumerate() {
+                        check_block_cache_control(c, &format!("{path}.content[{ci}]"))?;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
+        for (i, t) in tools.iter().enumerate() {
+            check_block_cache_control(t, &format!("tools[{i}]"))?;
+        }
+    }
+    Ok(())
+}
+
+/// One block/tool entry: absent `cache_control` is fine; present must be
+/// the ephemeral marker with a valid optional ttl.
+fn check_block_cache_control(block: &Value, path: &str) -> Result<(), String> {
+    let Some(cc) = block.get("cache_control") else {
+        return Ok(());
+    };
+    if !cc.is_object() {
+        return Err(format!("{path}.cache_control must be an object"));
+    }
+    if cc.get("type").and_then(Value::as_str) != Some("ephemeral") {
+        return Err(format!(
+            "{path}.cache_control.type must be \"ephemeral\" (local engines \
+             prefix-cache automatically, so markers are accepted no-ops - \
+             but their shape must match the API)"
+        ));
+    }
+    if let Some(ttl) = cc.get("ttl")
+        && !ttl.as_str().is_some_and(|t| t == "5m" || t == "1h")
+    {
+        return Err(format!("{path}.cache_control.ttl must be \"5m\" or \"1h\""));
+    }
+    Ok(())
 }
 
 fn translate_tool_choice(choice: &Value) -> Result<Value, String> {
@@ -1559,6 +1632,79 @@ mod tests {
         let u = anthropic_usage(None);
         assert_eq!(u["input_tokens"], 0);
         assert_eq!(u["cache_read_input_tokens"], 0);
+    }
+
+    #[test]
+    fn unit__validate_cache_hints__well_formed_markers_pass_everywhere() {
+        // Markers on system blocks, message blocks, nested tool_result
+        // blocks and tools entries: all legal placements, accepted.
+        let v = json!({
+            "model": "m1",
+            "max_tokens": 64,
+            "system": [{"type": "text", "text": "sys",
+                        "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]}],
+            "tools": [{"name": "t", "description": "d", "input_schema": {},
+                       "cache_control": {"type": "ephemeral", "ttl": "5m"}}]
+        });
+        assert!(validate_cache_hints(&v).is_ok(), "{v:?}");
+    }
+
+    #[test]
+    fn unit__validate_cache_hints__rejects_bad_type_ttl_and_shape_with_path() {
+        let bad_type = json!({
+            "system": [{"type": "text", "text": "s",
+                        "cache_control": {"type": "persistent"}}]
+        });
+        let err = validate_cache_hints(&bad_type).unwrap_err();
+        assert!(err.contains("system[0].cache_control.type"), "{err}");
+        assert!(err.contains("ephemeral"), "{err}");
+
+        let bad_ttl = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x",
+                 "cache_control": {"type": "ephemeral", "ttl": "9h"}}]}]
+        });
+        let err = validate_cache_hints(&bad_ttl).unwrap_err();
+        assert!(
+            err.contains("messages[0].content[0].cache_control.ttl"),
+            "{err}"
+        );
+
+        let nested = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "r",
+                     "cache_control": {"type": "ephemeral", "ttl": "2m"}}]}]}]
+        });
+        let err = validate_cache_hints(&nested).unwrap_err();
+        assert!(
+            err.contains("messages[0].content[0].content[0].cache_control.ttl"),
+            "{err}"
+        );
+
+        let not_object = json!({
+            "tools": [{"name": "t", "cache_control": "ephemeral"}]
+        });
+        let err = validate_cache_hints(&not_object).unwrap_err();
+        assert!(
+            err.contains("tools[0].cache_control must be an object"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__validate_cache_hints__absent_markers_and_plain_bodies_pass() {
+        // No markers anywhere: plain string system, string content.
+        let plain = json!({
+            "model": "m1", "max_tokens": 8,
+            "system": "sys",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(validate_cache_hints(&plain).is_ok());
     }
 
     #[test]
