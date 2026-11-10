@@ -19776,7 +19776,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                              mistral.rs installs are prebuilt binaries"
                         ));
                     }
-                    engine_install_mistralrs(&d, tag).await?
+                    engine_install_mistralrs(&d, tag).await?;
                 }
                 EngineKind::Sglang => engine_install_sglang(&d, tag, &with).await?,
                 EngineKind::Mlx => {
@@ -19786,7 +19786,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                              the mlx lane pins its own wheel set"
                         ));
                     }
-                    engine_install_mlx(&d, tag).await?
+                    engine_install_mlx(&d, tag).await?;
                 }
                 EngineKind::OpenAiHost => {
                     if !with.is_empty() {
@@ -19795,7 +19795,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                              the openaihost lane pins its own wheel set"
                         ));
                     }
-                    engine_install_litert(&d, tag).await?
+                    engine_install_litert(&d, tag).await?;
                 }
                 EngineKind::SdCpp => {
                     if !with.is_empty() {
@@ -19804,7 +19804,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                              sd.cpp installs are prebuilt binaries"
                         ));
                     }
-                    engine_install_sdcpp(&d, tag).await?
+                    engine_install_sdcpp(&d, tag).await?;
                 }
                 EngineKind::Whisper => {
                     if !with.is_empty() {
@@ -19813,7 +19813,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                              whisper installs are prebuilt binaries"
                         ));
                     }
-                    engine_install_whisper(&d, tag).await?
+                    engine_install_whisper(&d, tag).await?;
                 }
                 EngineKind::Piper => {
                     if !with.is_empty() {
@@ -19822,7 +19822,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                              piper installs are prebuilt binaries"
                         ));
                     }
-                    engine_install_piper(&d, tag).await?
+                    engine_install_piper(&d, tag).await?;
                 }
                 EngineKind::Kokoro => {
                     if !with.is_empty() {
@@ -19831,7 +19831,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                              the kokoro lane pins its own wheel + model set"
                         ));
                     }
-                    engine_install_kokoro(&d, tag).await?
+                    engine_install_kokoro(&d, tag).await?;
                 }
                 EngineKind::LlamaCpp => {
                     return Err(anyhow!(
