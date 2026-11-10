@@ -280,6 +280,7 @@ mod refresh_tests {
     use super::*;
 
     #[test]
+    #[allow(non_snake_case)]
     fn unit__refresh_lane_script__rewrites_drift_and_skips_match() {
         let dir = std::env::temp_dir().join(format!("blz-kokoro-refresh-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
