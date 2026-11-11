@@ -2311,7 +2311,7 @@ async fn restart_daemon_if_active_changed(prior: Option<String>, new_active: Opt
 // dispatch inflates the future past clippy's 16 KiB threshold on
 // windows targets (path/alignment machinery); one-shot CLI path, no
 // recursion - boxing every arm would cost allocs for nothing.
-#[allow(clippy::too_many_lines, clippy::large_future)]
+#[allow(clippy::too_many_lines, clippy::large_futures)]
 async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Serve => serve().await,
@@ -2510,7 +2510,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             refresh,
         } => certify(&resolve_model_cli(&model), json, export, refresh).await,
         // Boxed: the engine subtree's future measures ~16 KiB on Windows
-        // ABI layouts, tripping clippy::large_futures there; pinning the
+        // ABI layouts, tripping clippy::large_futuress there; pinning the
         // tail dispatch keeps every OS under the stack-growth budget.
         Cmd::Engine { cmd } => Box::pin(engine_cmd(cmd)).await,
         Cmd::Lora { cmd } => lora_cmd(cmd).await,
