@@ -7,8 +7,13 @@ doc_kind: Documentation
 ## One gateway, eight engines
 
 Blazar does not replace inference engines - it orchestrates them. Each lane
-is the real upstream binary, managed end-to-end: download or build, pin,
-configure, supervise, and route requests to it.
+is the real upstream binary, managed end-to-end: download or build, keep
+current, configure, supervise, and route requests to it. Pip-installed lanes
+(SGLang, MLX, LiteRT-LM, Kokoro) resolve the package index's latest release
+at install time - falling back to the last verified release with a warning
+when the index is unreachable - while GitHub-release lanes track their
+release channel; `blazar engine pin` freezes a lane when reproducibility
+matters.
 
 | Engine | Role | Typical workloads |
 |---|---|---|
@@ -77,7 +82,18 @@ here deterministically.
 
 The throughput lane for quantized safetensors directories - AWQ, GPTQ, FP8.
 Blazar derives its parallel sizes, memory fraction, and KV-cache budget from
-your hardware before the server ever starts.
+your hardware before the server ever starts. Advanced serving surfaces are
+typed knobs with capability-probed emission (older lanes warn-and-degrade
+rather than pass dead flags): prefill/decode disaggregation (`disagg_pair`
+spawns decode/prefill role children plus a supervised `sgl-router` child -
+real mooncake KV transfer, both OpenAI chat and the native `/generate` route
+forwarded through it), the HiCache L3 storage tier (`hicache_storage_backend`
+family), speculative decoding (NGRAM, EAGLE3 draft pairs, DFlash, DSpark,
+DSpine), context parallelism (`cp_size`/`attn_cp_size`/`dcp_size` plus
+`cp_strategy`/`dcp_comm_backend` companions), attention data parallelism
+(`attn_dp_size`, must divide `tp_size`), CUDA-graph backend selection per
+phase, PDMux collocation, and the experimental fused-kernel plugin lanes
+(NVIDIA megakernel / AMD monokernel).
 
 ### MLX
 

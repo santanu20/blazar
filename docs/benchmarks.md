@@ -114,3 +114,9 @@ every failed run kept in the receipts alongside its environment block.
 | wan2.1 t2v | ~35 s per 1 s clip | - |
 
 Full report: [bench-artifacts/20261103-media-lanes/REPORT.md](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261103-media-lanes/REPORT.md).
+
+KV-cache quality receipts:
+
+- FP8 (`f8_e4m3`) vs f16 KV on qwen2.5-0.5b: perplexity parity at 2048 ctx, +0.141 at 16384 (~2x err bars) - pin-only, the fit ladder never auto-selects it. [bench-artifacts/20261111-fp8-kv-quality/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md)
+- TTFT: `chunked_prefill_size 2048` = -24.7% uncached-prefill TTFT on a 10K-token prompt (35.1s -> 26.4s), zero quality loss (scheduling knob); warm radix-cache hits ~0.04s regardless; includes an arXiv-verified survey of modern TTFT algorithms. [bench-artifacts/20261112-ttft-chunked-prefill/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261112-ttft-chunked-prefill/README.md)
+- PD disaggregation overhead on a single GPU: direct lane vs `disagg_pair` + sgl-router = +27-44% steady-state e2e (router hop + mooncake transfer; ~2.5x cold from the 3-process spawn) - PD here is the topology/wiring tier, not a single-box perf win. [bench-artifacts/20261112-pd-overhead/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261112-pd-overhead/README.md)
