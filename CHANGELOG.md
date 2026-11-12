@@ -4,6 +4,104 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Added
+
+- **SGLang context-parallelism knobs + fused-kernel plugin lanes (0.5.23+).**
+  `cp_size` / `attn_cp_size` / `dcp_size` (context / attention-context /
+  decode-context parallelism for 128K+ prompts; validated >= 1, emitted only
+  when > 1) join `attn_dp_size` in the parallel-size family.
+  `megakernel_enable` (NVIDIA `sgl-nvidia-mega`) and `monokernel_enable`
+  (AMD `sgl-amd-mono`) expose the experimental fused-kernel plugin stacks -
+  mutually exclusive, flag-presence-gated so lanes without the flags
+  warn-and-skip. Also: tensor split across mismatched GPUs now warns that the
+  fit math assumes an even split (verified equivalent to per-GPU budgeting on
+  homogeneous cards - code-traced, no behavior change). TTFT receipt:
+  `chunked_prefill_size = 2048` cuts uncached-prefill TTFT 24.7% on a 10K-token
+  prompt with zero quality loss
+  (bench-artifacts/20261112-ttft-chunked-prefill/).
+
+- **Native sglang `/generate` route.** `POST /generate?model=<name>`
+  forwards sglang-native generate bodies verbatim (stream relay) for any lane - and when
+  the model runs a PD pair (`sglang.disagg_pair = true`) it forwards to the supervised
+  `sgl-router` child like every other surface (the router owns room allocation; see the
+  PD pair entry below). First request after a cold spawn can relay the router's own 503
+  `server_selection_failed` while it discovers the pair workers - the next request
+  succeeds. Mooncake wheel note:
+  `mooncake-transfer-engine==0.3.11` runs on CUDA 12.0-class hosts; >=0.3.13 wheels need
+  CUDA >=12.8 symbols.
+- **SGLang PDMux collocation knobs (`pdmux_enable` + `pdmux_config_path`).** Single-process
+  prefill+decode on greenctx SM partitions (upstream `PDMuxConfig` YAML: `sm_group_num`
+  >=3, `manual_divisions` rows `[prefill_sm, decode_sm, decode_bs_threshold]`). Mutually
+  exclusive with the disaggregation family - one topology per lane. Requires a
+  greenctx-capable driver; untested live on this box (honest boundary).
+- **SGLang prefill/decode disaggregation pair with a supervised `sgl-router`.**
+  `sglang.disagg_pair = true` spawns the full PD topology behind one model: two role
+  children keyed `model#pd-pre` / `model#pd-dec` (decode-first lifecycle - the slow
+  loader starts first so the idle reaper cannot strand the pair; prefill hosts the
+  bootstrap server, default port 8998) plus a daemon-managed `sglang-router` child
+  (`model#pd-router`, `venv/bin/sglang-router launch --pd-disaggregation --prefill ...
+  --decode ...`) that owns room allocation and KV-transfer coordination. Both
+  `/v1/chat/completions` and `/generate` forward to it verbatim, so REAL prefill-to-decode
+  KV transfer completes over the configured backend (2026-11-12 live receipts on
+  mooncake_tcp loopback: native generate 200 in 0.39s, chat 200 with exact-answer
+  compliance, cached_tokens 0). Tuning knobs: `disagg_transfer_backend`
+  (`mooncake`/`nixl`/`ascend`/`fake`/`mori`/`mooncake_tcp`), `disagg_bootstrap_port`,
+  `disagg_decode_allocation_policy` (`early`/`prefill_complete`),
+  `disagg_decode_radix_cache` (refused under the `fake` backend; the decode role
+  auto-emits `--disaggregation-decode-retraction-backup none` on RAM classes below the
+  HiCache floor, where the host-pool default cannot auto-size). Boundaries: `sglang-router`
+  must be installed in the lane venv (`uv pip install --python <venv>/bin/python
+  sglang-router`; 0.3.2 verified live against sglang 0.5.23); `fake` moves no KV (decode
+  re-prefills - wiring proof only); single-role `disagg_mode` stays available for
+  hand-built topologies; the PD lane bypasses queue/single-flight admission in v1
+  (per-key admission still runs).
+- **SGLang HiCache L3 storage tier (sglang >= 0.5.23).** The hierarchical cache grew a
+  persistent/remote layer below host RAM: `hicache_storage_backend` (upstream's full
+  choice list - `file`, `mooncake`, `hf3fs`, ... - validated at config time),
+  `hicache_write_policy` (`write_back` requires a storage backend),
+  `hicache_io_backend` (`direct`/`kernel`/`kernel_ascend`),
+  `hicache_host_memory_mode` (`buffer_only` requires a storage backend) and
+  `hicache_storage_extra_config` (a JSON-object string forwarded verbatim to the
+  backend factory). All five emit through the manifest-presence gate, so lanes that
+  predate the flags (0.5.19/0.5.21) warn-and-skip instead of spawning a dead flag.
+- **llama.cpp FP8 KV cache (`cache_type = "f8_e4m3"`, pin-only).** Upstream's OCP-FP8 KV
+  support (PR #28392) is now a first-class typed grade: accepted in the `cache_type`
+  vocabulary, modeled as 1 byte/element in the memory planner (`kv_grade_rational`,
+  `scale_kv_pair`), and gated twice at compile time - MLA/DeepSeek-class models drop the
+  pin with a teaching warning (upstream excludes fp8 caches on that class), and engines
+  whose probed `--cache-type-k` vocabulary lacks the grade drop it with an upgrade hint
+  (manifest probe v4 mines the `allowed values:` row at registration; empty = fail-open).
+  The automatic fit ladder never selects it until perplexity receipts land in
+  `registry/kv-quant-quality.json` (turbo-grade precedent).
+- **Tensor-split launch validation.** `split_mode = "tensor"` now refuses to compile with
+  flash-attn off (upstream hard-errors `SPLIT_MODE_TENSOR requires flash_attn` at context
+  init; FA "auto" does not self-promote for tensor mode) and promotes auto to on with a
+  warning, before any child is spawned. Layer mode and the supervisor's auto tensor-split
+  planning (layer-based) are untouched.
+- **MLA-class KV symmetry gates.** Models carrying attention latents (qwen3.5's
+  `key_length`/`value_length`, DeepSeek archs) get upstream's `type_k == type_v`
+  requirement enforced at compile time: mixed K/V pins reconcile to the byte-heavier
+  grade (or fall back to f16 with flash-attn off), and the fit ladder's differential
+  q8_0/q4_0 rung is skipped in favor of symmetric quantization, each with a teaching
+  warning - instead of the crash-at-context-init the raw flags would produce.
+- **SGLang DSpark speculation.** `sglang.spec_algorithm = "dspark"` joins dflash/dspine
+  as a draft-required typed lane (`--speculative-algorithm DSPARK` + draft path, steps
+  and draft-token knobs); the lane capability probe gates it against the runtime's
+  algorithm registry as usual. Single-process spawns - DSpark's disaggregated/context-
+  parallel execution stays an upstream-only topology for now.
+
+### Changed
+
+- **Engine installs default to latest, no silent pins.** Unversioned `engine install` /
+  `engine update` for the pip lanes (sglang, mlx, openaihost/litert, kokoro-onnx) now
+  resolve PyPI's latest at install time, falling back to the lane's last-verified release
+  only when the registry is unreachable or answers with an un-installable tag (warned,
+  never silent). The version constants were renamed to `*_FALLBACK_VERSION` to say what
+  they are; explicit `engine install <TAG>` pins are unchanged, and the boot smoke still
+  verifies whatever arrived.
+
 ## [0.31.0] - 2026-11-10
 
 ### Added
