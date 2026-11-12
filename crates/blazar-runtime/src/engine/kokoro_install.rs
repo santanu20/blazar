@@ -25,9 +25,10 @@
 //! Venv-per-tag for the same lifecycle reason as the sglang lane:
 //! `prune` is `remove_dir_all`, and a version pin must be exact.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
+use super::net_probe::Attempt;
 use super::sglang_install::{disk_avail_bytes, run_streaming, uv_available};
 
 /// Shim name: the install lane writes it, the register finder and the
@@ -54,11 +55,13 @@ pub fn refresh_lane_script(lane_dir: &std::path::Path) -> std::io::Result<bool> 
     Ok(true)
 }
 
-/// pip pin for the inference package (verified against the 0.6.1 sdist:
-/// `Kokoro(model, voices)`, `create(text, voice, speed, lang) -> (samples,
-/// 24000)`). Bump deliberately - the server script's API surface is this
-/// version's.
-pub const KOKORO_ONNX_VERSION: &str = "0.6.1";
+/// Offline/registry-failure fallback for the pip pin - the last release
+/// the server script's API surface was verified against (`Kokoro(model,
+/// voices)`, `create(text, voice, speed, lang) -> (samples, 24000)`).
+/// Unspecified installs resolve `PyPI` latest at install time (see
+/// [`pypi_latest_kokoro_onnx`]); the boot smoke verifies whatever
+/// arrived before the lane can activate.
+pub const KOKORO_ONNX_FALLBACK_VERSION: &str = "0.6.1";
 
 /// Model line installed when the user names none. v1.0 is the canonical
 /// English line the upstream README links (release `model-files-v1.1`).
@@ -96,8 +99,9 @@ pub fn model_asset_names(model_version: &str) -> (String, String) {
 /// model assets (`kokoro.onnx`, `voices.bin`) must already be
 /// downloaded there - the `EngineManager` entry point owns GH asset
 /// fetch + rollback (F88 discipline). On failure the caller removes
-/// `dir`.
-pub async fn install_into(dir: &Path) -> Result<PathBuf> {
+/// `dir`. `pkg_version` is the kokoro-onnx wheel release to pin (the
+/// caller resolves `PyPI` latest or the fallback).
+pub async fn install_into(dir: &Path, pkg_version: &str) -> Result<PathBuf> {
     let model = dir.join(MODEL_FILE);
     let voices = dir.join(VOICES_FILE);
     if !model.is_file() || !voices.is_file() {
@@ -140,7 +144,7 @@ pub async fn install_into(dir: &Path) -> Result<PathBuf> {
                 .arg("install")
                 .arg("--python")
                 .arg(&venv_python)
-                .arg(format!("kokoro-onnx=={KOKORO_ONNX_VERSION}")),
+                .arg(format!("kokoro-onnx=={pkg_version}")),
             "uv pip install kokoro-onnx",
             KOKORO_INSTALL_TIMEOUT_SECS,
         )
@@ -171,7 +175,7 @@ pub async fn install_into(dir: &Path) -> Result<PathBuf> {
                 .arg("-m")
                 .arg("pip")
                 .arg("install")
-                .arg(format!("kokoro-onnx=={KOKORO_ONNX_VERSION}")),
+                .arg(format!("kokoro-onnx=={pkg_version}")),
             "pip install kokoro-onnx",
             KOKORO_INSTALL_TIMEOUT_SECS,
         )
@@ -273,6 +277,59 @@ async fn boot_smoke(shim: &Path) -> Result<()> {
 
     let _ = child.kill().await;
     Ok(())
+}
+
+/// Latest kokoro-onnx release on `PyPI`, for install-time resolution
+/// and the doctor currency row. Same probe shape as the sglang/mlx/
+/// litert lanes: bounded per-attempt timeout, retry on transport-class
+/// failures and 5xx, done otherwise.
+pub async fn pypi_latest_kokoro_onnx() -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct PypiInfo {
+        version: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PypiResp {
+        info: PypiInfo,
+    }
+    // The client-level timeout is the per-attempt cap: each retry issues
+    // a fresh request on a clone of this client.
+    blazar_core::tls::ensure_tls_provider();
+    let http = reqwest::Client::builder()
+        .timeout(crate::engine::net_probe::PROBE_ATTEMPT_CAP)
+        .user_agent(concat!("blazar/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("pypi http client")?;
+    crate::engine::net_probe::retry_probe(move || {
+        let http = http.clone();
+        async move {
+            let resp = match http
+                .get("https://pypi.org/pypi/kokoro-onnx/json")
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => return Attempt::Retry(anyhow!("pypi kokoro-onnx query: {e}")),
+            };
+            match resp.status() {
+                reqwest::StatusCode::OK => {}
+                other if other.is_server_error() => {
+                    return Attempt::Retry(anyhow!("pypi kokoro-onnx status {other}"));
+                }
+                other => {
+                    return Attempt::Done(Err(anyhow!("pypi kokoro-onnx status {other}")));
+                }
+            }
+            match resp.json::<PypiResp>().await {
+                Ok(resp) => Attempt::Done(Ok(resp.info.version)),
+                // A connection reset mid-body truncates the 200 -
+                // decode failures are transport-class, worth one more
+                // attempt.
+                Err(e) => Attempt::Retry(anyhow!("pypi kokoro-onnx json: {e}")),
+            }
+        }
+    })
+    .await
 }
 
 #[cfg(test)]

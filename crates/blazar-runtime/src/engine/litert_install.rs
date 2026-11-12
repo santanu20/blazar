@@ -33,13 +33,11 @@ use blazar_core::BlazarDirs;
 use super::net_probe::Attempt;
 use super::sglang_install::{disk_avail_bytes, make_executable, run_streaming, uv_available};
 
-/// litert-lm version Blazar installs when the user names none. Pinned,
-/// not "latest": the shim contract, the profile flag surface (served by
-/// `serve --help` mining) and the health probe are verified against this
-/// release; an unpinned auto-latest would silently drift the contract.
-/// Bump deliberately, after re-verifying the serve flags in the new
-/// release.
-pub const LITERT_LM_DEFAULT_VERSION: &str = "0.19.1";
+/// litert-lm version used only as the offline fallback. Installs
+/// default to `PyPI` latest; the manifest help-mining probe carries the
+/// per-release flag surface and the boot smoke verifies the resolved
+/// release before it serves.
+pub const LITERT_LM_FALLBACK_VERSION: &str = "0.19.1";
 
 /// The wheel is pure-python with a modest dependency set (no torch), so
 /// the venv lands well under 1 GiB - but refuse installs with less than

@@ -813,8 +813,9 @@ mod vocab_tests {
         // The constant is the generation every fresh probe stamps;
         // bumping it is what turns stored rows stale for the boot
         // backfill. Keep this pin aligned with the changelog when it
-        // moves.
-        assert_eq!(MANIFEST_PROBE_VERSION, 3);
+        // moves. v4 = llama lanes started mining the --cache-type-k
+        // allowed-values vocabulary (f8_e4m3 capability gate).
+        assert_eq!(MANIFEST_PROBE_VERSION, 4);
     }
 
     #[test]
@@ -979,6 +980,40 @@ pub fn keep_cuda_skip_pred(
         // aarch64 has no proven standard-lane conflict to guard yet.
         && matches!((os, arch), ("linux" | "windows", "x86_64"))
         && (asset_override == "auto" || asset_override.is_empty())
+}
+
+/// Resolve an unspecified engine version to the registry's latest, with
+/// the lane's last-verified release as fallback. Installs default to
+/// `PyPI` latest - engines stay current unless the user pins a tag - and
+/// keep working offline: an unreachable registry, or a latest that is
+/// not a dotted-digits tag the lane can install (pre-releases like
+/// `0.5.24rc1` fail the tag charset check), falls back with a warning.
+/// The lane's boot smoke verifies whatever arrived; a broken newer
+/// release fails the install visibly (F88 rollback) instead of serving.
+async fn latest_or_fallback(
+    lane: &str,
+    probe: impl std::future::Future<Output = anyhow::Result<String>>,
+    fallback: &str,
+) -> String {
+    let resolved = match probe.await {
+        Ok(v) if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.') => v,
+        Ok(v) => {
+            tracing::warn!(
+                "pypi {lane} latest is {v:?} - not a dotted-digits tag this lane can \
+                 install; using {fallback} (last verified release)"
+            );
+            fallback.to_string()
+        }
+        Err(e) => {
+            tracing::warn!(
+                "pypi {lane} latest unavailable ({e:#}); using {fallback} \
+                 (last verified release)"
+            );
+            fallback.to_string()
+        }
+    };
+    tracing::info!("engine lane {lane} resolved version {resolved}");
+    resolved
 }
 
 impl EngineManager {
@@ -1978,8 +2013,11 @@ impl EngineManager {
 
     /// Install a sglang engine: venv + pip + shim under
     /// `engines/sglang-<version>`, then the shared register/probe tail.
-    /// `version = None` pins to [`sglang_install::SGLANG_DEFAULT_VERSION`]
-    /// (verified flag contract; see its doc for why not auto-latest).
+    /// `version = None` resolves to `PyPI`'s latest (engines stay current
+    /// unless explicitly pinned), falling back to
+    /// [`sglang_install::SGLANG_FALLBACK_VERSION`] - the last verified
+    /// release - when the registry is unreachable or answers with a tag
+    /// this lane cannot install.
     /// `extras` are verbatim pip specs layered onto the venv after the
     /// base install (sglang plugins, e.g. the `DSpine` drafter) - the
     /// temporary-bridge lane: when upstream merges the capability the
@@ -1998,7 +2036,17 @@ impl EngineManager {
                 std::env::consts::OS
             );
         }
-        let version = version.unwrap_or(sglang_install::SGLANG_DEFAULT_VERSION);
+        let version = match version {
+            Some(v) => v.to_string(),
+            None => {
+                latest_or_fallback(
+                    "sglang",
+                    sglang_install::pypi_latest_sglang(),
+                    sglang_install::SGLANG_FALLBACK_VERSION,
+                )
+                .await
+            }
+        };
         // Reject malformed pins early: the tag IS the version string that
         // probe_sglang's semver parse and pip both consume.
         if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -2022,7 +2070,7 @@ impl EngineManager {
             EngineKind::Sglang,
             |dir| async move {
                 std::fs::create_dir_all(&dir)?;
-                sglang_install::install_into(&dir, version, extras)
+                sglang_install::install_into(&dir, &version, extras)
                     .await
                     .map(|_| ())
             },
@@ -2067,11 +2115,16 @@ impl EngineManager {
             .digest
             .clone()
             .unwrap_or_else(|| "unverified".to_string());
-        let asset_label = format!(
-            "pip:kokoro-onnx=={} + gh:{}",
-            kokoro_install::KOKORO_ONNX_VERSION,
-            release.tag_name
-        );
+        // Resolve the pip package like the other pip lanes: PyPI latest
+        // at install time, last-verified fallback when the registry
+        // cannot answer (warned, never silent).
+        let kokoro_pkg = latest_or_fallback(
+            "kokoro-onnx",
+            kokoro_install::pypi_latest_kokoro_onnx(),
+            kokoro_install::KOKORO_ONNX_FALLBACK_VERSION,
+        )
+        .await;
+        let asset_label = format!("pip:kokoro-onnx=={} + gh:{}", kokoro_pkg, release.tag_name);
         let gh = &self.gh;
         let model_dest_name = kokoro_install::MODEL_FILE;
         let voices_dest_name = kokoro_install::VOICES_FILE;
@@ -2088,7 +2141,9 @@ impl EngineManager {
                     .await?;
                 gh.download_asset_file(voices_asset, &dir.join(voices_dest_name))
                     .await?;
-                kokoro_install::install_into(&dir).await.map(|_| ())
+                kokoro_install::install_into(&dir, &kokoro_pkg)
+                    .await
+                    .map(|_| ())
             },
         )
         .await
@@ -2099,7 +2154,17 @@ impl EngineManager {
     /// wrapper only owns the tag, the dual-pin asset label and the
     /// rollback envelope - same discipline as the sglang lane.
     pub async fn install_mlx(&self, version: Option<&str>) -> Result<EngineRow> {
-        let version = version.unwrap_or(mlx_install::MLX_LM_DEFAULT_VERSION);
+        let version = match version {
+            Some(v) => v.to_string(),
+            None => {
+                latest_or_fallback(
+                    "mlx-lm",
+                    mlx_install::pypi_latest_mlx_lm(),
+                    mlx_install::MLX_LM_FALLBACK_VERSION,
+                )
+                .await
+            }
+        };
         // Reject malformed pins early: the tag IS the version string that
         // probe_mlx's semver parse and pip both consume.
         if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -2120,18 +2185,29 @@ impl EngineManager {
             EngineKind::Mlx,
             |dir| async move {
                 std::fs::create_dir_all(&dir)?;
-                mlx_install::install_into(&dir, version).await.map(|_| ())
+                mlx_install::install_into(&dir, &version).await.map(|_| ())
             },
         )
         .await
     }
 
     /// Install the openaihost lane (LiteRT-LM pip venv): explicit
-    /// version or the pinned default. Same venv-per-tag lifecycle as
-    /// the mlx/sglang lanes; no backend pins (the wheel is pure-python
-    /// and the runtime picks CPU/GPU/NPU delegates internally).
+    /// version or `PyPI` latest (fallback: the last verified release).
+    /// Same venv-per-tag lifecycle as the mlx/sglang lanes; no backend
+    /// pins (the wheel is pure-python and the runtime picks CPU/GPU/NPU
+    /// delegates internally).
     pub async fn install_litert(&self, version: Option<&str>) -> Result<EngineRow> {
-        let version = version.unwrap_or(litert_install::LITERT_LM_DEFAULT_VERSION);
+        let version = match version {
+            Some(v) => v.to_string(),
+            None => {
+                latest_or_fallback(
+                    "litert-lm",
+                    litert_install::pypi_latest_litert_lm(),
+                    litert_install::LITERT_LM_FALLBACK_VERSION,
+                )
+                .await
+            }
+        };
         // Reject malformed pins early: the tag IS the version string that
         // probe_openaihost's semver parse and pip both consume.
         if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -2146,7 +2222,7 @@ impl EngineManager {
             EngineKind::OpenAiHost,
             |dir| async move {
                 std::fs::create_dir_all(&dir)?;
-                litert_install::install_into(&dir, version)
+                litert_install::install_into(&dir, &version)
                     .await
                     .map(|_| ())
             },
@@ -4878,6 +4954,41 @@ mod verify_tests {
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .filter(|n| n.starts_with(".retired-"))
                 .collect()
+        }
+
+        #[tokio::test]
+        async fn unit__latest_or_fallback__registry_latest_wins() {
+            let resolved = latest_or_fallback(
+                "sglang",
+                std::future::ready(Ok("0.5.23".to_string())),
+                "0.5.19",
+            )
+            .await;
+            assert_eq!(resolved, "0.5.23");
+        }
+
+        #[tokio::test]
+        async fn unit__latest_or_fallback__pre_release_tag_falls_back() {
+            // Registry "latest" can be a pre-release (`0.5.24rc1`) whose
+            // tag the lane cannot install; the last verified release wins.
+            let resolved = latest_or_fallback(
+                "sglang",
+                std::future::ready(Ok("0.5.24rc1".to_string())),
+                "0.5.19",
+            )
+            .await;
+            assert_eq!(resolved, "0.5.19");
+        }
+
+        #[tokio::test]
+        async fn unit__latest_or_fallback__registry_unreachable_falls_back() {
+            let resolved = latest_or_fallback(
+                "kokoro-onnx",
+                std::future::ready(Err(anyhow!("dns: probe exhausted"))),
+                "0.6.1",
+            )
+            .await;
+            assert_eq!(resolved, "0.6.1");
         }
 
         #[tokio::test]

@@ -31,11 +31,10 @@ use super::net_probe::Attempt;
 use super::sglang_install::{disk_avail_bytes, make_executable, run_streaming, uv_available};
 
 /// mlx-lm version Blazar installs when the user names none. Pinned, not
-/// "latest": the shim contract, the profile flag surface and the health
-/// probe are verified against this release; an unpinned auto-latest
-/// would silently drift the contract. Bump deliberately, after
-/// re-verifying the server flags in the new release.
-pub const MLX_LM_DEFAULT_VERSION: &str = "0.32.0";
+/// mlx-lm version used only as the offline fallback (installs default
+/// to `PyPI` latest; the boot smoke verifies the resolved release, and
+/// the manifest help-probe carries the per-release flag surface).
+pub const MLX_LM_FALLBACK_VERSION: &str = "0.32.0";
 
 /// The CUDA backend rides `mlx` as a pip extra with its own version -
 /// pinned independently of mlx-lm so a backend float can never move

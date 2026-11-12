@@ -25,11 +25,16 @@ use std::path::{Path, PathBuf};
 use super::net_probe::Attempt;
 
 /// Version Blazar installs when the user names none. Pinned, not
-/// "latest": the profile compiler's flag surface and the fit ladder are
-/// verified against this release (`server_args.py` of the tag); an
-/// unpinned auto-latest would silently drift the contract. Bump this
-/// pin deliberately, after re-verifying the flags in the new release.
-pub const SGLANG_DEFAULT_VERSION: &str = "0.5.19";
+/// sglang version used only as the offline fallback. Installs default
+/// to `PyPI` latest; the runtime flag/algorithm probes (manifest) carry
+/// the per-release contract, and the install boot smoke verifies the
+/// resolved release before it serves.
+/// Offline/registry-failure fallback - the last release Blazar verified
+/// the flag contract and fit ladder against. Unspecified installs
+/// resolve to `PyPI` latest (see `latest_or_fallback`); this const only
+/// serves when the registry cannot be reached or answers with an
+/// uninstallable tag.
+pub const SGLANG_FALLBACK_VERSION: &str = "0.5.19";
 
 /// The venv (torch + flashinfer wheels) lands between 5 and 8 GiB on
 /// disk. Refuse installs with less than 10 GiB free instead of dying
