@@ -8,6 +8,15 @@ tracked here.
 
 ### Added
 
+- **SGLang CP companions, PD-decode sub-knobs, CUDA-graph decode backend.**
+  `cp_strategy` (`zigzag`/`interleave`) and `enable_prefill_cp` ride
+  `cp_size`; `dcp_comm_backend` (`ag_rs`/`a2a`/`fi_a2a`) rides `dcp_size`;
+  `cuda_graph_backend_decode` (`breakable`/`full`/`disabled`) joins the
+  pre-existing prefill backend (whose retired `tc_piecewise` choice is now
+  rejected - upstream dropped it); the PD decode role gains
+  `disagg_decode_offload_kvcache` / `disagg_decode_extra_slots` /
+  `disagg_decode_polling_interval`. All flag-presence-gated with
+  dependency validation and older-lane warn-skip teaching.
 - **SGLang context-parallelism knobs + fused-kernel plugin lanes (0.5.23+).**
   `cp_size` / `attn_cp_size` / `dcp_size` (context / attention-context /
   decode-context parallelism for 128K+ prompts; validated >= 1, emitted only
