@@ -24,8 +24,10 @@ pub mod http_pool;
 pub mod images;
 pub mod jobs;
 pub mod model_doctor;
+pub mod pd;
 pub mod quantiles;
 pub mod requests;
+pub mod sglang_native;
 pub mod usage;
 pub mod voice_tee;
 
@@ -625,6 +627,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/embed", post(ollama::embed))
         .route("/api/rerank", post(ollama::rerank))
         .route("/api/generate", post(ollama::generate))
+        .route("/generate", post(sglang_native::generate))
         .route("/api/evict", post(ollama::evict))
         .route("/api/warm", post(federation::warm))
         .route("/api/lora/sync", post(federation::lora_sync))

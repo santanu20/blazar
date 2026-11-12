@@ -3291,6 +3291,257 @@ impl Supervisor {
         self.ensure_routed_opts(name, None, true, false).await
     }
 
+    /// Bring up BOTH roles of an `SGLang` prefill/decode disaggregated
+    /// pair for `name` and return `(decode, prefill)` engine refs. The
+    /// DECODE child spawns first: it is the slow loader (weight load +
+    /// KV pool), and the wire contract passes bootstrap coordinates
+    /// per REQUEST (`bootstrap_host`/`bootstrap_room` on the generate
+    /// input), so the decode child never dials the prefill bootstrap
+    /// server at load time. Spawning prefill first would let the idle
+    /// reaper recycle it (~60 s) while decode is still loading - the
+    /// pair would never be co-resident. If the prefill side cannot
+    /// hold admission, the just-spawned decode child is evicted again:
+    /// a lone role child serves nothing and would only pin VRAM.
+    /// Every dispatch re-ensures both keys, which doubles as the
+    /// pair's keepalive between requests. Role assignment itself
+    /// happens in [`Self::spawn_instance_forced`] via the `#pd-pre` /
+    /// `#pd-dec` key suffixes.
+    pub async fn ensure_pd(
+        &self,
+        name: &str,
+    ) -> Result<(EngineRef, EngineRef, EngineRef), SupervisionError> {
+        let decode = self
+            .ensure_key_opts(&format!("{name}#pd-dec"), false)
+            .await?;
+        let prefill = match self.ensure_key_opts(&format!("{name}#pd-pre"), false).await {
+            Ok(prefill) => prefill,
+            Err(e) => {
+                let _ = self.evict(&format!("{name}#pd-dec")).await;
+                return Err(e);
+            }
+        };
+        // The reference router completes the topology: it owns room
+        // allocation through the prefill bootstrap server, which the
+        // gateway cannot replicate over plain HTTP forwarding (live
+        // receipt 2026-11-12: gateway-invented rooms abort at the
+        // mooncake handshake). Router last: it dials both children.
+        match self.ensure_pd_router(name, &prefill, &decode).await {
+            Ok(router) => Ok((decode, prefill, router)),
+            Err(e) => {
+                let _ = self.evict(&format!("{name}#pd-pre")).await;
+                let _ = self.evict(&format!("{name}#pd-dec")).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Wait for a freshly spawned PD router child to answer `GET /health`,
+    /// racing the probe against early child death so a bad flag surface
+    /// fails fast with the child's exit status instead of a hang.
+    async fn wait_pd_router_healthy(
+        name: &str,
+        child: &mut ChildHandle,
+        health_url: &str,
+    ) -> Result<(), SupervisionError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .map_err(|e| {
+                SupervisionError::Internal(anyhow::anyhow!("router health client: {e}"))
+            })?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            if let Ok(Some(status)) = child.try_status() {
+                return Err(SupervisionError::Internal(anyhow::anyhow!(
+                    "PD router for {name} died at spawn ({status}): {}",
+                    child.tail_joined()
+                )));
+            }
+            if let Ok(resp) = client.get(health_url).send().await
+                && resp.status().is_success()
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill().await;
+                return Err(SupervisionError::Internal(anyhow::anyhow!(
+                    "PD router for {name} never answered {health_url} within 90s: {}",
+                    child.tail_joined()
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Synthetic store row for the PD router child: `ps` and teardown key
+    /// off the instance map, not this row, so only name/path matter.
+    fn pd_router_model_row(key: &str, router_bin: &std::path::Path) -> blazar_core::ModelRow {
+        blazar_core::ModelRow {
+            name: key.to_string(),
+            repo: String::new(),
+            quant: String::new(),
+            path: router_bin.display().to_string(),
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        }
+    }
+
+    /// Spawn (or reuse) the `sglang-router` child that fronts the PD
+    /// pair for `name`. The router is NOT a model server: no weights,
+    /// no KV, a few hundred MiB of RAM - so it bypasses the engine
+    /// adapter and the profile/admission pipeline entirely and gets a
+    /// direct child spawn mirroring the fleet `_router` precedent. It
+    /// is re-ensured on every dispatch (keepalive, same as the pair)
+    /// and torn down first when the pair goes.
+    #[allow(clippy::too_many_lines)] // mirrors the spawn_instance_forced precedent
+    async fn ensure_pd_router(
+        &self,
+        name: &str,
+        prefill: &EngineRef,
+        decode: &EngineRef,
+    ) -> Result<EngineRef, SupervisionError> {
+        let key = format!("{name}#pd-router");
+        if let Some(entry) = self.instances.get(&key)
+            && *entry.value().state.read().expect("state lock") == InstanceState::Ready
+        {
+            return Ok(self.engine_ref(&key, entry.value()));
+        }
+
+        // sglang-router speaks HTTP on a TCP port; the pair children it
+        // dials must be TCP-reachable too.
+        let (Endpoint::Tcp { port: pre_port, .. }, Endpoint::Tcp { port: dec_port, .. }) =
+            (&prefill.endpoint, &decode.endpoint)
+        else {
+            return Err(SupervisionError::Internal(anyhow::anyhow!(
+                "PD router needs TCP pair children (unix-socket children are not \
+                 dialable by sglang-router); switch child_transport to tcp"
+            )));
+        };
+        let router_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|l| l.local_addr())
+            .map_err(|e| {
+                SupervisionError::Internal(anyhow::anyhow!("router port pick for {name}: {e}"))
+            })
+            .map(|a| a.port())?;
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: router_port,
+        };
+
+        // Router binary rides the pair's lane venv.
+        let engine_tag = self
+            .instances
+            .get(&decode.key)
+            .map(|e| e.engine_tag.clone())
+            .ok_or_else(|| {
+                SupervisionError::Internal(anyhow::anyhow!(
+                    "pair instance {} vanished before router spawn",
+                    decode.key
+                ))
+            })?;
+        let router_bin = self
+            .dirs
+            .engines_dir()
+            .join(&engine_tag)
+            .join("venv/bin/sglang-router");
+        if !router_bin.exists() {
+            return Err(SupervisionError::Internal(anyhow::anyhow!(
+                "sglang-router is not installed in the {engine_tag} lane venv - the PD \
+                 pair needs it for room coordination. Install with: uv pip install \
+                 --python <lane venv>/bin/python sglang-router (then blazar engine \
+                 restart or a daemon restart reloads the lane)"
+            )));
+        }
+
+        let prefill_url = format!("http://127.0.0.1:{pre_port}");
+        let decode_url = format!("http://127.0.0.1:{dec_port}");
+        let argv = vec![
+            "launch".to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            router_port.to_string(),
+            "--pd-disaggregation".to_string(),
+            "--prefill".to_string(),
+            prefill_url,
+            "--decode".to_string(),
+            decode_url,
+            "--log-level".to_string(),
+            "info".to_string(),
+        ];
+        let child = tokio::process::Command::new(&router_bin)
+            .args(&argv)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                SupervisionError::Internal(anyhow::anyhow!("spawn {}: {e}", router_bin.display()))
+            })?;
+        let pid = child.id().ok_or_else(|| {
+            SupervisionError::Internal(anyhow::anyhow!("router child for {name}: no pid"))
+        })?;
+        if pid <= 1 {
+            return Err(SupervisionError::Internal(anyhow::anyhow!(
+                "router child for {name}: not a safe process-group id ({pid})"
+            )));
+        }
+        let mut child = ChildHandle::new(endpoint.clone(), child);
+        let health_url = format!("http://127.0.0.1:{router_port}/health");
+        Self::wait_pd_router_healthy(name, &mut child, &health_url).await?;
+
+        let inst = Arc::new(Instance {
+            name: key.clone(),
+            engine_tag,
+            kind: blazar_core::engine_kind::EngineKind::Sglang,
+            endpoint: endpoint.clone(),
+            state: std::sync::RwLock::new(InstanceState::Ready),
+            last_used: std::sync::RwLock::new(std::time::Instant::now()),
+            in_flight: std::sync::atomic::AtomicI64::new(0),
+            keep_until: std::sync::RwLock::new(None),
+            bank_dirty: std::sync::atomic::AtomicBool::new(false),
+            started_at: std::time::Instant::now(),
+            projector: false,
+            argv: argv.clone(),
+            model: Self::pd_router_model_row(&key, &router_bin),
+            profile_ctx: 0,
+            capacity: blazar_core::profile::CapacityStatus::Compiled,
+            gpu: "pd-router".to_string(),
+            device: None,
+            device_id: None,
+            kv_est_bytes: None,
+            warnings: vec![],
+            spec_mode: String::new(),
+            draft: None,
+            settled_mib: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            auth: None,
+            child: tokio::sync::Mutex::new(child),
+            pid,
+        });
+        if let Some(dir) = self.dirs.run_dir().to_str() {
+            let _ = std::fs::write(
+                std::path::Path::new(dir).join(format!("{key}.pid")),
+                pid.to_string(),
+            );
+        }
+        self.instances.insert(key.clone(), inst.clone());
+        if self.unclean_dead.remove(&key).is_some() {
+            self.record_restart(&key);
+        }
+        self.bus.publish(BlazarEvent::InstanceStateChanged {
+            name: key.clone(),
+            state: InstanceState::Ready,
+        });
+        Ok(self.engine_ref(&key, &inst))
+    }
+
     /// `ensure` for GENERATION surfaces (chat, completions, responses,
     /// anthropic, ollama chat/generate): identical to
     /// [`Self::ensure_routed`] except a `model+adapter` request on the
@@ -4667,6 +4918,7 @@ impl Supervisor {
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
                 spec_types: &manifest.spec_types,
+                cache_types: &manifest.cache_types,
                 endpoint: Endpoint::Tcp {
                     host: "127.0.0.1".into(),
                     port: 0,
@@ -5597,6 +5849,25 @@ impl Supervisor {
             .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?
             .ok_or_else(|| SupervisionError::ModelNotFound(not_found_name(name)))?;
         let mut overlay = self.cfg().overlay_for(name);
+        // PD-disagg pair keys (`{model}#pd-pre` / `{model}#pd-dec`) derive
+        // their role from the key suffix, mirroring how `model_of_key`
+        // already strips `#suffix` for store and overlay lookups: the
+        // prefill child hosts the bootstrap server, the decode child
+        // carries the decode-side knobs.
+        let pd_role = if key.ends_with("#pd-pre") {
+            Some("prefill")
+        } else if key.ends_with("#pd-dec") {
+            Some("decode")
+        } else {
+            None
+        };
+        if let Some(role) = pd_role {
+            let sg = overlay
+                .sglang
+                .get_or_insert_with(|| self.cfg().sglang.clone());
+            sg.disagg_mode = Some(role.to_string());
+            tracing::info!(key, role, "PD pair role override engaged");
+        }
         // LC4: in-memory adaptive slots fill in where the user left
         // slots unset (manual overlay always wins; `tune --slots` writes
         // the overlay, which then shadows any adoption). A pin with
@@ -6290,6 +6561,7 @@ impl Supervisor {
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
                 spec_types: &manifest.spec_types,
+                cache_types: &manifest.cache_types,
                 endpoint: Endpoint::Tcp {
                     host: "127.0.0.1".into(),
                     port: 0,
@@ -6559,6 +6831,7 @@ impl Supervisor {
                 engine_tag: &manifest.tag,
                 supported_flags: &manifest.flags,
                 spec_types: &manifest.spec_types,
+                cache_types: &manifest.cache_types,
                 endpoint: endpoint.clone(),
                 data_dir: &data_dir_str,
                 cache_hit_rate: self.cache_hint_for(name),
@@ -10361,6 +10634,7 @@ mod routing_tests {
             devices: vec![],
             flags,
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: String::new(),
             ..Default::default()
         };
@@ -10427,6 +10701,7 @@ mod routing_tests {
             devices: vec![],
             flags: flags.iter().map(|s| (*s).to_string()).collect(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: String::new(),
             ..Default::default()
         };
@@ -10543,6 +10818,7 @@ mod routing_tests {
             devices: vec![],
             flags: std::collections::BTreeSet::new(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: String::new(),
             ..Default::default()
         };
@@ -10731,6 +11007,7 @@ mod routing_tests {
                 devices: vec![],
                 flags: std::collections::BTreeSet::new(),
                 spec_types: vec![],
+                cache_types: Vec::new(),
                 server_path: String::new(),
                 ..Default::default()
             })),
@@ -11055,6 +11332,7 @@ mod routing_tests {
                 devices: vec![],
                 flags: std::collections::BTreeSet::new(),
                 spec_types: vec![],
+                cache_types: Vec::new(),
                 server_path: String::new(),
                 ..Default::default()
             })),
@@ -11507,7 +11785,7 @@ mod routing_tests {
         // Install the sglang lane (valid manifest, kind override).
         store
             .upsert_engine(&blazar_core::EngineRow {
-                kind: EngineKind::Sglang,
+                kind: blazar_core::engine_kind::EngineKind::Sglang,
                 manifest: serde_json::to_string(&crate::engine::manifest::Manifest {
                     tag: "sglang-t".into(),
                     ..Default::default()
@@ -12116,6 +12394,7 @@ mod routing_tests {
                 devices: vec![],
                 flags: std::collections::BTreeSet::new(),
                 spec_types: vec![],
+                cache_types: Vec::new(),
                 server_path: String::new(),
                 ..Default::default()
             })),

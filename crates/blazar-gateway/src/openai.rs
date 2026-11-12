@@ -989,6 +989,17 @@ pub async fn openai_proxy(
         return *resp;
     }
 
+    // PD disaggregation pair: chat traffic for models that asked for
+    // sglang.disagg_pair routes through the two role children (prefill
+    // warmup + decode forward) instead of the single-lane path. All
+    // body rewrites and per-key admission above already ran; the pair
+    // lane bypasses queue/single-flight in v1 (documented boundary).
+    if uri.path().ends_with("/chat/completions") && crate::pd::pd_pair_requested(&state, &model) {
+        // Boxed: handlers are inlined into their callers' futures (the
+        // realtime voice lane reuses this proxy fn), and the two-phase
+        // dispatch carries enough state to push those past the size lint.
+        return Box::pin(crate::pd::pd_two_phase(&state, &model, &body)).await;
+    }
     let prefix = if chat_family {
         affinity_hash_bytes(&body)
     } else {
