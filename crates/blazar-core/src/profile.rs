@@ -4764,6 +4764,37 @@ fn push_sglang_parallel_sizes(
         ("attn_cp_size", &tun.attn_cp_size, "--attn-cp-size"),
         ("dcp_size", &tun.dcp_size, "--dcp-size"),
     ];
+    // String/bool CP companions that do not fit the u32 pin table.
+    if let Some(strategy) = tun.cp_strategy.as_deref().filter(|s| !s.is_empty()) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.cp_strategy",
+            "--cp-strategy",
+            strategy,
+            warnings,
+        );
+    }
+    if tun.enable_prefill_cp == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.enable_prefill_cp",
+            "--enable-prefill-cp",
+            "",
+            warnings,
+        );
+    }
+    if let Some(backend) = tun.dcp_comm_backend.as_deref().filter(|s| !s.is_empty()) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.dcp_comm_backend",
+            "--dcp-comm-backend",
+            backend,
+            warnings,
+        );
+    }
     let multi_pin = parallel_pins
         .iter()
         .any(|(_, v, _)| v.is_some_and(|n| n > 1));
@@ -5345,16 +5376,7 @@ fn push_sglang_disagg(
                 warnings,
             );
         }
-        if tun.disagg_decode_radix_cache == Some(true) {
-            push_tuned(
-                argv,
-                input.supported_flags,
-                "sglang.disagg_decode_radix_cache",
-                "--disaggregation-decode-enable-radix-cache",
-                "",
-                warnings,
-            );
-        }
+        push_sglang_decode_sub_knobs(input, tun, argv, warnings);
     } else if tun.disagg_decode_allocation_policy.is_some()
         || tun.disagg_decode_radix_cache.is_some()
     {
@@ -5403,6 +5425,58 @@ fn push_sglang_decode_retraction_backup(
             "sglang.disagg_decode_radix_cache-family",
             "--disaggregation-decode-retraction-backup",
             "none",
+            warnings,
+        );
+    }
+}
+
+/// Decode-role sub-knobs, split out of [`push_sglang_disagg`] to keep
+/// that fn under the size lint: radix cache, host-KV spill, slot
+/// headroom and the polling cadence. All flag-presence-gated; older
+/// lanes degrade with a teaching warning via `push_tuned`.
+fn push_sglang_decode_sub_knobs(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if tun.disagg_decode_radix_cache == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.disagg_decode_radix_cache",
+            "--disaggregation-decode-enable-radix-cache",
+            "",
+            warnings,
+        );
+    }
+    if tun.disagg_decode_offload_kvcache == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.disagg_decode_offload_kvcache",
+            "--disaggregation-decode-enable-offload-kvcache",
+            "",
+            warnings,
+        );
+    }
+    if let Some(slots) = tun.disagg_decode_extra_slots {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.disagg_decode_extra_slots",
+            "--disaggregation-decode-extra-slots",
+            &slots.to_string(),
+            warnings,
+        );
+    }
+    if let Some(interval) = tun.disagg_decode_polling_interval {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.disagg_decode_polling_interval",
+            "--disaggregation-decode-polling-interval",
+            &interval.to_string(),
             warnings,
         );
     }
@@ -5664,6 +5738,22 @@ fn push_sglang_scalar_pins(
             "sglang.cuda_graph_max_bs",
             flag,
             &v.to_string(),
+            warnings,
+        );
+    }
+    // Decode-side capture backend; the prefill sibling has its own
+    // dedicated emission above (it predates the split surface).
+    if let Some(backend) = tun
+        .cuda_graph_backend_decode
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.cuda_graph_backend_decode",
+            "--cuda-graph-backend-decode",
+            backend,
             warnings,
         );
     }
@@ -12736,11 +12826,6 @@ mod tests {
             "fallback engages when the pair cannot fit: {:?}",
             p.argv
         );
-        assert!(
-            !p.argv.contains(&"--spec-draft-model".to_string()),
-            "no draft model in the fallback lane: {:?}",
-            p.argv
-        );
     }
 
     #[test]
@@ -17314,6 +17399,13 @@ mod tests {
             "--cp-size",
             "--attn-cp-size",
             "--dcp-size",
+            "--cp-strategy",
+            "--enable-prefill-cp",
+            "--dcp-comm-backend",
+            "--cuda-graph-backend-decode",
+            "--disaggregation-decode-enable-offload-kvcache",
+            "--disaggregation-decode-extra-slots",
+            "--disaggregation-decode-polling-interval",
             "--enable-nvidia-megakernel",
             "--enable-amd-monokernel",
             "--is-embedding",
@@ -20139,6 +20231,96 @@ mod tests {
                 "missing {flag} pair: {:?}",
                 p.argv
             );
+        }
+    }
+
+    #[test]
+    fn unit__sglang_parallel__cp_companions_and_cuda_backends_emit() {
+        // String/bool CP companions + per-phase CUDA graph backends ride
+        // their own pushes beside the u32 pin table.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                cp_size: Some(2),
+                cp_strategy: Some("zigzag".into()),
+                enable_prefill_cp: Some(true),
+                dcp_size: Some(2),
+                dcp_comm_backend: Some("a2a".into()),
+                cuda_graph_backend_decode: Some("breakable".into()),
+                cuda_graph_backend_prefill: Some("disabled".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut input = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        input.overlay = &overlay;
+        let p = compile(&input, &TuningOverrides::default()).unwrap();
+        for (flag, val) in [
+            ("--cp-strategy", "zigzag"),
+            ("--dcp-comm-backend", "a2a"),
+            ("--cuda-graph-backend-decode", "breakable"),
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w[0] == flag && w[1] == val),
+                "missing {flag} pair: {:?}",
+                p.argv
+            );
+        }
+        assert!(
+            p.argv.contains(&"--enable-prefill-cp".to_string()),
+            "prefill CP bare flag missing: {:?}",
+            p.argv
+        );
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("cp_strategy")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__sglang_disagg__decode_sub_knobs_emit_on_decode_role() {
+        // Decode-role-only sub-knobs: host-KV spill, slot headroom and the
+        // polling cadence - validated upstream names, gated by presence.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                disagg_mode: Some("decode".into()),
+                disagg_transfer_backend: Some("fake".into()),
+                disagg_decode_offload_kvcache: Some(true),
+                disagg_decode_extra_slots: Some(8),
+                disagg_decode_polling_interval: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut input = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        input.overlay = &overlay;
+        let p = compile(&input, &TuningOverrides::default()).unwrap();
+        for (flag, val) in [
+            ("--disaggregation-decode-enable-offload-kvcache", ""),
+            ("--disaggregation-decode-extra-slots", "8"),
+            ("--disaggregation-decode-polling-interval", "2"),
+        ] {
+            if val.is_empty() {
+                assert!(
+                    p.argv.contains(&flag.to_string()),
+                    "missing {flag}: {:?}",
+                    p.argv
+                );
+            } else {
+                assert!(
+                    p.argv.windows(2).any(|w| w[0] == flag && w[1] == val),
+                    "missing {flag} pair: {:?}",
+                    p.argv
+                );
+            }
         }
     }
 

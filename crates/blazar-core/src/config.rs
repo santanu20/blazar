@@ -1727,6 +1727,15 @@ pub struct SglangTuning {
     /// the decode worker. Upstream rejects it with the `fake` transfer
     /// backend (and with most speculative algorithms).
     pub disagg_decode_radix_cache: Option<bool>,
+    /// `--disaggregation-decode-enable-offload-kvcache`: spill decode KV to
+    /// host memory when the decode pool runs out. Decode-role workers only.
+    pub disagg_decode_offload_kvcache: Option<bool>,
+    /// `--disaggregation-decode-extra-slots`: decode-slot headroom over the
+    /// admission estimate, for bursty arrivals between prefill completions.
+    pub disagg_decode_extra_slots: Option<u32>,
+    /// `--disaggregation-decode-polling-interval`: seconds between decode
+    /// polling for transferred requests (upstream default 1).
+    pub disagg_decode_polling_interval: Option<u32>,
     /// Blazar-side pair switch (no direct sglang flag): when true, the
     /// gateway brings up BOTH roles for this model - a prefill child
     /// (hosting the bootstrap server) and a decode child - and routes
@@ -1817,8 +1826,12 @@ pub struct SglangTuning {
     /// (e.g. `[1, 2, 4]`). Overrides the ladder's derived
     /// cuda-graph-max-bs on tight fits.
     pub cuda_graph_bs: Option<Vec<u32>>,
+    /// `--cuda-graph-backend-decode`: decode-phase graph capture backend -
+    /// `breakable`, `full` or `disabled` (the retired `tc_piecewise` is
+    /// rejected by current lanes). Unset = engine default.
+    pub cuda_graph_backend_decode: Option<String>,
     /// `--cuda-graph-backend-prefill`: prefill-graph capture strategy -
-    /// `full`, `breakable` (upstream default), `tc_piecewise`, or
+    /// `full`, `breakable` (upstream default), or
     /// `disabled`. On some hybrid-GPU laptops the 42-shape breakable
     /// prefill capture deadlocks at 0% (live-proven with an AWQ model);
     /// `disabled` skips it while decode graphs stay captured.
@@ -1853,6 +1866,20 @@ pub struct SglangTuning {
     /// splitting for very long generations under PD deployments.
     /// Emits only when > 1.
     pub dcp_size: Option<u32>,
+    /// `--cp-strategy`: sharding layout for prefill context parallelism -
+    /// `zigzag` (each rank one early + one late sequence block) or
+    /// `interleave` (token indices modulo the CP size). Needs `cp_size`
+    /// (or `enable_prefill_cp`) to mean anything.
+    pub cp_strategy: Option<String>,
+    /// `--enable-prefill-cp`: run context parallelism through the prefill
+    /// phase too (layout picked by `cp_strategy`). Emits only when true.
+    pub enable_prefill_cp: Option<bool>,
+    /// `--dcp-comm-backend`: collective for the DCP attention reduction -
+    /// `ag_rs` (`AllGather` plus `ReduceScatter`), `a2a` (one All-to-All of
+    /// output+LSE then a local LSE combine) or `fi_a2a` (`FlashInfer` MNNVL
+    /// All-to-All; Blackwell + single MNNVL domain only). Unset lets the
+    /// runtime resolve per platform. Needs `dcp_size`.
+    pub dcp_comm_backend: Option<String>,
     /// `--max-lora-rank`: rank ceiling for served `LoRA` adapters.
     pub max_lora_rank: Option<u32>,
     /// `--lora-backend` (pytorch, flashinfer).
@@ -2272,6 +2299,48 @@ impl SglangTuning {
                  tp_size %% attn_dp_size == 0; e.g. tp 4 admits attn_dp 2 or 4)"
             )));
         }
+        // Prefill-CP layout only composes with an actual CP setting;
+        // upstream applies --cp-strategy under context parallelism.
+        if let Some(strategy) = self.cp_strategy.as_deref().filter(|s| !s.is_empty()) {
+            if !["zigzag", "interleave"].contains(&strategy) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.cp_strategy must be zigzag or interleave, got {strategy:?}"
+                )));
+            }
+            if self.cp_size.unwrap_or(1) < 2 && self.enable_prefill_cp != Some(true) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.cp_strategy needs context parallelism to shard - set \
+                     {where_}.cp_size >= 2 or {where_}.enable_prefill_cp = true"
+                )));
+            }
+        }
+        if self.enable_prefill_cp == Some(true) && self.cp_size.unwrap_or(1) < 2 {
+            return Err(CoreError::Config(format!(
+                "{where_}.enable_prefill_cp without {where_}.cp_size >= 2 does nothing - \
+                 prefill CP rides the context-parallel group"
+            )));
+        }
+        if let Some(backend) = self.dcp_comm_backend.as_deref().filter(|s| !s.is_empty()) {
+            if !["ag_rs", "a2a", "fi_a2a"].contains(&backend) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.dcp_comm_backend must be ag_rs, a2a or fi_a2a, got {backend:?}"
+                )));
+            }
+            if self.dcp_size.unwrap_or(1) < 2 {
+                return Err(CoreError::Config(format!(
+                    "{where_}.dcp_comm_backend needs {where_}.dcp_size >= 2 - the reduction \
+                     backend only exists under decode context parallelism"
+                )));
+            }
+        }
+        if let Some(interval) = self.disagg_decode_polling_interval
+            && interval < 1
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.disagg_decode_polling_interval must be >= 1 second (upstream \
+                 default 1; 0 busy-loops the decode poller)"
+            )));
+        }
         Ok(())
     }
 
@@ -2314,9 +2383,18 @@ impl SglangTuning {
             return Err(e);
         }
         if let Some(e) = choice(
+            "cuda_graph_backend_decode",
+            &self.cuda_graph_backend_decode,
+            &["breakable", "full", "disabled"],
+        ) {
+            return Err(e);
+        }
+        if let Some(e) = choice(
             "cuda_graph_backend_prefill",
             &self.cuda_graph_backend_prefill,
-            &["full", "breakable", "tc_piecewise", "disabled"],
+            // tc_piecewise was retired upstream (current lanes reject it
+            // at parse); disabled unsticks laptop prefill capture.
+            &["full", "breakable", "disabled"],
         ) {
             return Err(e);
         }
@@ -6925,6 +7003,56 @@ mod tests {
                     ..Default::default()
                 },
                 "megakernel_enable",
+            ),
+            (
+                "cp strategy without context parallelism",
+                SglangTuning {
+                    cp_strategy: Some("zigzag".into()),
+                    ..Default::default()
+                },
+                "cp_strategy",
+            ),
+            (
+                "cp strategy bad vocabulary",
+                SglangTuning {
+                    cp_size: Some(2),
+                    cp_strategy: Some("random".into()),
+                    ..Default::default()
+                },
+                "cp_strategy",
+            ),
+            (
+                "dcp backend without dcp",
+                SglangTuning {
+                    dcp_comm_backend: Some("a2a".into()),
+                    ..Default::default()
+                },
+                "dcp_comm_backend",
+            ),
+            (
+                "dcp backend bad vocabulary",
+                SglangTuning {
+                    dcp_size: Some(2),
+                    dcp_comm_backend: Some("ucx".into()),
+                    ..Default::default()
+                },
+                "dcp_comm_backend",
+            ),
+            (
+                "retired cuda graph backend",
+                SglangTuning {
+                    cuda_graph_backend_decode: Some("tc_piecewise".into()),
+                    ..Default::default()
+                },
+                "cuda_graph_backend_decode",
+            ),
+            (
+                "zero decode polling interval",
+                SglangTuning {
+                    disagg_decode_polling_interval: Some(0),
+                    ..Default::default()
+                },
+                "disagg_decode_polling_interval",
             ),
             (
                 "attn dp does not divide tp",
