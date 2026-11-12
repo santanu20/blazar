@@ -2195,6 +2195,7 @@ mod tests {
                 devices: vec![],
                 flags: std::collections::BTreeSet::new(),
                 spec_types: vec![],
+                cache_types: Vec::new(),
                 // Deliberately a nonexistent binary: the preflight must bail
                 // BEFORE any exec, so this path is never touched.
                 server_path: "/nonexistent/llama-server".into(),
@@ -2273,6 +2274,7 @@ mod tests {
             devices: vec![],
             flags: std::collections::BTreeSet::new(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: String::new(),
             ..Default::default()
         });
@@ -2298,6 +2300,7 @@ mod tests {
                 devices: vec![],
                 flags: std::collections::BTreeSet::new(),
                 spec_types: vec![],
+                cache_types: Vec::new(),
                 server_path: String::new(),
                 ..Default::default()
             });
@@ -2323,6 +2326,7 @@ mod tests {
             devices: vec![],
             flags: std::collections::BTreeSet::new(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: String::new(),
             ..Default::default()
         })
@@ -2853,6 +2857,7 @@ mod tests {
             devices: vec![],
             flags: std::collections::BTreeSet::new(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: String::new(),
             ..Default::default()
         };

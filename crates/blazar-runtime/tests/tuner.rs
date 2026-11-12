@@ -94,6 +94,7 @@ fn test_input<'a>(
         engine_tag: "b-stub",
         supported_flags: flags,
         spec_types: &[],
+        cache_types: &[],
         endpoint: Endpoint::Tcp {
             host: "127.0.0.1".into(),
             port: 1,

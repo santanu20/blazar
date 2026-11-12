@@ -100,6 +100,12 @@ pub struct ProfileInput<'a> {
     /// naming the engine update path - an unadvertised value would die in
     /// the child with an opaque argv error.
     pub spec_types: &'a [String],
+    /// KV cache grades the ACTIVE llama.cpp engine advertises for
+    /// `-ctk`/`-ctv` (manifest `--help` parsing, v4 probe). Gates the
+    /// `f8_e4m3` pin: a build without the grade rejects it in the child
+    /// with an opaque argv error. Empty = not probed (pre-backfill
+    /// manifest, non-llama lanes) - the gate fails open.
+    pub cache_types: &'a [String],
     /// Dialect selector: the engines.kind column owns this truth (the
     /// manifest carries no kind). `MistralRs` compiles a minimal profile -
     /// the child CLI grammar is foreign and `MistralRsEngine` argv
@@ -583,6 +589,81 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         Some(false) => "off",
         None => "auto",
     };
+    // Tensor split demands flash-attn: upstream llama-context.cpp hard-errors
+    // "SPLIT_MODE_TENSOR requires flash_attn to be enabled" at context init -
+    // and FA "auto" does NOT self-promote for tensor mode (only a quantized V
+    // promotes it), so a bare auto pin dies with the same error. Refuse
+    // off-before-spawn with the remedy; promote auto to on and say so. Layer
+    // split (the default, and the supervisor's auto-tensor-split path, which
+    // never emits --split-mode) is exempt - the constraint is tensor-mode
+    // only.
+    let tensor_mode = config.split_mode.eq_ignore_ascii_case("tensor");
+    if tensor_mode {
+        // Architecture gate ahead of any tensor-mode flag work: the
+        // linear-recurrent kernels behind hybrid/SSM architectures have
+        // no split-tensor implementations upstream, so the engine would
+        // die at graph init. Refuse here with the remedy instead.
+        if let ModelMeta::Gguf(g) = &input.meta {
+            if g.tensor_split_incompatible() {
+                return Err(format!(
+                    "split_mode \"tensor\" cannot shard {} - its \
+                     recurrent/linear-attention blocks have no split kernels \
+                     upstream (the spawn dies at graph init). Use layer split \
+                     (the default: unset split_mode) or route the model to a \
+                     lane that serves it whole",
+                    g.architecture
+                ));
+            }
+            if g.expert_count.unwrap_or(0) > 0 {
+                warnings.push(
+                    "tensor split on a MoE model: upstream support is \
+                     per-architecture - if the engine refuses at spawn, fall \
+                     back to layer split (unset split_mode)"
+                        .into(),
+                );
+            }
+        }
+        // Fit-math honesty: the KV ladder budgets against AGGREGATE VRAM
+        // (Hardware sums the discrete cards), which is exactly right for
+        // an even row-wise sharding and only optimistic when the operator
+        // weights --tensor-split unevenly across mismatched cards.
+        let discrete: Vec<_> = input
+            .hardware
+            .gpus
+            .iter()
+            .filter(|g| !g.is_integrated())
+            .collect();
+        if discrete.len() > 1 {
+            let sizes: Vec<u64> = discrete.iter().map(|g| g.total_mib).collect();
+            if sizes.iter().max() != sizes.iter().min() {
+                warnings.push(
+                    "tensor split across mismatched GPUs: the fit math budgets \
+                     against combined VRAM and assumes an even split - an uneven \
+                     --tensor-split weighting can still overflow the smaller \
+                     card at load"
+                        .into(),
+                );
+            }
+        }
+    }
+    let fa = if tensor_mode && fa == "off" {
+        return Err(concat!(
+            "split_mode \"tensor\" requires flash-attn - upstream hard-errors at context ",
+            "init (SPLIT_MODE_TENSOR requires flash_attn; FA \"auto\" does not self-promote ",
+            "for tensor mode). Either drop split_mode or allow flash-attn ",
+            "(tuning.flash_attn / --flash-attn)"
+        )
+        .to_string());
+    } else if tensor_mode && fa == "auto" {
+        warnings.push(
+            "split_mode \"tensor\": flash-attn auto promoted to on - upstream hard-errors \
+             tensor split without FA"
+                .into(),
+        );
+        "on"
+    } else {
+        fa
+    };
     argv.extend([
         "--jinja".into(),
         "--metrics".into(),
@@ -711,6 +792,97 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             None
         }
         v => v,
+    };
+    // MLA-class reconciliation (upstream llama-context.cpp errors at context
+    // init on this class when type_k != type_v, and excludes fp8 caches
+    // entirely): drop any f8_e4m3 pin, then force mismatched grades to one.
+    // Symmetry direction depends on FA: with FA on, both sides take the
+    // COARSER (byte-heavier) grade - keeping the finer one would leave a
+    // mismatch; with FA off, quantized V is already impossible, so
+    // re-quantizing V to match K would recreate the crash above - both
+    // sides drop to f16. Non-MLA lanes keep the mixed pair.
+    let (kv_k, kv_v) = match &input.meta {
+        ModelMeta::Gguf(g) if g.requires_symmetric_kv() => {
+            let mut drop_f8 = |side: Option<String>, which: char| {
+                if side.as_deref() == Some("f8_e4m3") {
+                    warnings.push(format!(
+                        "cache_type_{which} f8_e4m3 dropped: upstream excludes fp8 KV caches \
+                         on MLA/DeepSeek-class models ({}) at context init",
+                        g.architecture
+                    ));
+                    None
+                } else {
+                    side
+                }
+            };
+            let kv_k = drop_f8(kv_k, 'k');
+            let kv_v = drop_f8(kv_v, 'v');
+            let grade_bytes =
+                |side: &Option<String>| side.as_deref().map_or((1, 1), kv_grade_rational);
+            let (nk, dk) = grade_bytes(&kv_k);
+            let (nv, dv) = grade_bytes(&kv_v);
+            if nk * dv == nv * dk {
+                (kv_k, kv_v)
+            } else if fa == "off" {
+                warnings.push(
+                    "MLA-class model with flash-attn off: K/V cache grades must match \
+                     upstream and quantized V needs FA - both sides fall back to f16"
+                        .into(),
+                );
+                (None, None)
+            } else {
+                // None counts as f16 (1/1) - the coarsest grade; if either
+                // side is unquantized both drop to f16, else both take the
+                // byte-heavier quant grade.
+                // Unify to the byte-heavier side when both are quantized
+                // (planner conservatism: never shrink below a pinned
+                // grade); when exactly one side carries a quant pin,
+                // mirror it onto the other - FA is on here, so a
+                // quantized V is legal, and this matches the non-MLA
+                // single-pin mirror rule.
+                let from_k = nk * dv > nv * dk;
+                let unified = if kv_k.is_none() {
+                    kv_v.clone()
+                } else if kv_v.is_none() || from_k {
+                    kv_k.clone()
+                } else {
+                    kv_v.clone()
+                };
+                warnings.push(format!(
+                    "MLA-class model: mixed K/V cache grades {} / {} reconciled to {} - \
+                     upstream requires type_k == type_v on this class",
+                    kv_k.as_deref().unwrap_or("f16"),
+                    kv_v.as_deref().unwrap_or("f16"),
+                    unified.as_deref().unwrap_or("f16")
+                ));
+                (unified.clone(), unified)
+            }
+        }
+        _ => {
+            // f8_e4m3 still needs the ACTIVE engine build to accept it
+            // (upstream PR #28392; older builds reject the grade in the
+            // child with an opaque argv error). The manifest help-probe
+            // supplies the accepted vocabulary; empty = not probed yet
+            // (pre-backfill row) - pass through rather than break pins on
+            // stale rows.
+            let lacks_f8 = |side: &Option<String>| {
+                side.as_deref() == Some("f8_e4m3")
+                    && !input.cache_types.is_empty()
+                    && !input.cache_types.iter().any(|t| t == "f8_e4m3")
+            };
+            let mut drop_unsupported = |side: Option<String>, which: char| {
+                if lacks_f8(&side) {
+                    warnings.push(format!(
+                        "cache_type_{which} f8_e4m3 dropped: engine build lacks the \
+                         f8_e4m3 KV grade (probed --help); run: blazar engine update"
+                    ));
+                    None
+                } else {
+                    side
+                }
+            };
+            (drop_unsupported(kv_k, 'k'), drop_unsupported(kv_v, 'v'))
+        }
     };
     if let Some(k) = kv_k.clone() {
         argv.push("--cache-type-k".into());
@@ -4480,6 +4652,9 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
 
     // HiCache viability gates refuse impossible host-RAM tiers.
     push_sglang_hicache(input, &tun, &mut argv, &mut warnings)?;
+    push_sglang_disagg(input, &tun, &mut argv, &mut warnings);
+    push_sglang_pdmux(input, &tun, &mut argv, &mut warnings);
+    push_sglang_fused_kernels(input, &tun, &mut argv, &mut warnings);
 
     push_sglang_portability_defaults(input, &tun, &mut argv, &mut warnings);
 
@@ -4584,6 +4759,10 @@ fn push_sglang_parallel_sizes(
         ("dp_size", &tun.dp_size, "--dp-size"),
         ("pp_size", &tun.pp_size, "--pp-size"),
         ("ep_size", &tun.ep_size, "--ep-size"),
+        ("attn_dp_size", &tun.attn_dp_size, "--attn-dp-size"),
+        ("cp_size", &tun.cp_size, "--cp-size"),
+        ("attn_cp_size", &tun.attn_cp_size, "--attn-cp-size"),
+        ("dcp_size", &tun.dcp_size, "--dcp-size"),
     ];
     let multi_pin = parallel_pins
         .iter()
@@ -5020,8 +5199,280 @@ fn push_sglang_hicache(
                 warnings,
             );
         }
+        // L3 tier (sglang >= 0.5.23): a storage backend upgrades the
+        // host-RAM tier with a persistent/remote layer. Every knob is
+        // validated against the installed vocabulary in SglangTuning::
+        // validate() and stays flag-presence-gated here, so older lanes
+        // (0.5.19, no --hicache-storage-backend) degrade to the plain
+        // host tier with a teaching warning instead of a dead flag.
+        push_sglang_hicache_l3(input, tun, argv, warnings);
     }
     Ok(())
+}
+
+/// Storage-backed L3 knobs of the hierarchical cache, split out of
+/// [`push_sglang_hicache`] to keep that fn under the size lint. Emits
+/// only inside the `hicache_enable` arm of the caller.
+fn push_sglang_hicache_l3(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let l3 = [
+        (
+            "sglang.hicache_storage_backend",
+            "--hicache-storage-backend",
+            tun.hicache_storage_backend.as_deref(),
+        ),
+        (
+            "sglang.hicache_write_policy",
+            "--hicache-write-policy",
+            tun.hicache_write_policy.as_deref(),
+        ),
+        (
+            "sglang.hicache_io_backend",
+            "--hicache-io-backend",
+            tun.hicache_io_backend.as_deref(),
+        ),
+        (
+            "sglang.hicache_host_memory_mode",
+            "--hicache-host-memory-mode",
+            tun.hicache_host_memory_mode.as_deref(),
+        ),
+        (
+            "sglang.hicache_storage_extra_config",
+            "--hicache-storage-backend-extra-config",
+            tun.hicache_storage_extra_config.as_deref(),
+        ),
+    ];
+    for (knob, flag, value) in l3 {
+        if let Some(value) = value {
+            push_tuned(argv, input.supported_flags, knob, flag, value, warnings);
+        }
+    }
+}
+
+/// Prefill/decode disaggregation (sglang >= 0.5.23): emits the role and
+/// transfer flags when the tuning names one. Flag-presence-gated like the
+/// rest of the lane, so older sglang builds warn-and-skip the family via
+/// `push_tuned`'s teaching instead of crashing at argv parse. The `fake`
+/// backend carries an honesty warning: it proves the two-process wiring
+/// but moves no KV (decode re-prefills) - the real backends need their
+/// packages in the lane venv.
+fn push_sglang_disagg(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let mode = tun.disagg_mode.as_deref().filter(|s| !s.is_empty());
+    let backend = tun
+        .disagg_transfer_backend
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    let Some(mode) = mode else {
+        // A backend/policy without a role is dead weight: the ordinary
+        // single-process lane ignores the whole family. Teach rather
+        // than silently dropping knobs the operator set on purpose.
+        if backend.is_some()
+            || tun
+                .disagg_decode_allocation_policy
+                .as_deref()
+                .is_some_and(|p| !p.is_empty())
+            || tun.disagg_bootstrap_port.is_some()
+            || tun.disagg_decode_radix_cache.is_some()
+        {
+            warnings.push(
+                "sglang.disagg_* knobs set without sglang.disagg_mode - the ordinary \
+                 single-process lane ignores the disaggregation family; set \
+                 sglang.disagg_mode = \"prefill\" | \"decode\" to compile a role worker"
+                    .into(),
+            );
+        }
+        return;
+    };
+    push_tuned(
+        argv,
+        input.supported_flags,
+        "sglang.disagg_mode",
+        "--disaggregation-mode",
+        mode,
+        warnings,
+    );
+    if let Some(backend) = backend {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.disagg_transfer_backend",
+            "--disaggregation-transfer-backend",
+            backend,
+            warnings,
+        );
+        if backend == "fake" {
+            warnings.push(
+                "sglang.disagg_transfer_backend = \"fake\" moves no KV between the \
+                 workers - the decode worker re-prefills from tokens. Topology wiring \
+                 proof only; install the backend's package in the lane venv for real \
+                 transfers"
+                    .into(),
+            );
+        }
+    }
+    if let Some(port) = tun.disagg_bootstrap_port {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.disagg_bootstrap_port",
+            "--disaggregation-bootstrap-port",
+            &port.to_string(),
+            warnings,
+        );
+    }
+    if mode == "decode" {
+        push_sglang_decode_retraction_backup(input, tun, argv, warnings);
+        if let Some(policy) = tun
+            .disagg_decode_allocation_policy
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "sglang.disagg_decode_allocation_policy",
+                "--disaggregation-decode-allocation-policy",
+                policy,
+                warnings,
+            );
+        }
+        if tun.disagg_decode_radix_cache == Some(true) {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "sglang.disagg_decode_radix_cache",
+                "--disaggregation-decode-enable-radix-cache",
+                "",
+                warnings,
+            );
+        }
+    } else if tun.disagg_decode_allocation_policy.is_some()
+        || tun.disagg_decode_radix_cache.is_some()
+    {
+        warnings.push(
+            "sglang.disagg_decode_* knobs only compile on the decode role \
+             (sglang.disagg_mode = \"decode\") - the prefill worker has no decode \
+             scheduler; skipped here"
+                .into(),
+        );
+    }
+}
+
+/// Decode-role retraction-backup posture, split out of
+/// [`push_sglang_disagg`] for size. Decode servers default the backup
+/// to the host-pool (hicache) tier when the knob is omitted, and that
+/// tier's auto-size check hard-errors at KV build on RAM classes below
+/// the hierarchical-cache floor (`No host memory is left for HiCache`
+/// after the 10 GiB reserve" - live receipt 2026-11-12). Same budget
+/// math as the hicache gate in [`push_sglang_hicache`]: on those boxes
+/// fall back to plain retraction (no backup pool) instead of dying at
+/// boot; an explicit `hicache_enable` keeps the user's posture.
+fn push_sglang_decode_retraction_backup(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if tun.hicache_enable == Some(true) {
+        return;
+    }
+    let budget_mib = input
+        .hardware
+        .total_ram_mib
+        .saturating_sub(SGLANG_HICACHE_HOST_RESERVE_MIB + SGLANG_HOST_ENGINE_FOOTPRINT_MIB);
+    if budget_mib < 1024 {
+        warnings.push(
+            "decode-role retraction backup defaults to the host (hicache) pool, \
+             which cannot auto-size on this RAM class - emitting \
+             --disaggregation-decode-retraction-backup none (plain retraction; \
+             the host-pool backup needs a RAM class with HiCache headroom)"
+                .into(),
+        );
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.disagg_decode_radix_cache-family",
+            "--disaggregation-decode-retraction-backup",
+            "none",
+            warnings,
+        );
+    }
+}
+
+/// `PDMux` collocation (sglang >= 0.5.23): both disaggregation roles in
+/// ONE process on `greenctx` SM partitions, plan file named by the path
+/// knob. Config validation already guarantees enable <=> path pairing
+/// and the single-topology exclusion against the two-child family;
+/// emission stays flag-presence-gated so older lanes warn-and-skip.
+fn push_sglang_pdmux(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if tun.pdmux_enable != Some(true) {
+        return;
+    }
+    push_tuned(
+        argv,
+        input.supported_flags,
+        "sglang.pdmux_enable",
+        "--enable-pdmux",
+        "",
+        warnings,
+    );
+    if let Some(path) = tun.pdmux_config_path.as_deref().filter(|s| !s.is_empty()) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.pdmux_config_path",
+            "--pdmux-config-path",
+            path,
+            warnings,
+        );
+    }
+}
+
+/// Low-latency fused-kernel plugin switches (both EXPERIMENTAL
+/// upstream): NVIDIA megakernel (`sgl-nvidia-mega`) and AMD monokernel
+/// (`sgl-amd-mono`). Bare flags, flag-presence-gated so lanes without
+/// the plugin surface degrade with a teaching warning instead of a
+/// dead argv entry.
+fn push_sglang_fused_kernels(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if tun.megakernel_enable == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.megakernel_enable",
+            "--enable-nvidia-megakernel",
+            "",
+            warnings,
+        );
+    }
+    if tun.monokernel_enable == Some(true) {
+        push_tuned(
+            argv,
+            input.supported_flags,
+            "sglang.monokernel_enable",
+            "--enable-amd-monokernel",
+            "",
+            warnings,
+        );
+    }
 }
 
 /// Portability defaults: triton attention + pytorch sampling need no
@@ -5688,6 +6139,13 @@ fn push_sglang_spec_knob_lane<'a>(
     let (upstream, needs_draft) = match algorithm {
         "ngram" => ("NGRAM", false),
         "dflash" => ("DFLASH", true),
+        // DSpark: DFlash's block-diffusion successor (upstream 0.5.23
+        // era, SpeculativeAlgorithm DSPARK). Same draft-model contract
+        // as DFLASH - the safetensors drafter is hard-required at spawn.
+        // Its disaggregated/context-parallel modes are a deployment
+        // topology Blazar does not orchestrate yet; single-process
+        // DSpark spawns ride this lane like any trained drafter.
+        "dspark" => ("DSPARK", true),
         // DSpine parallel drafter (arXiv 2609.36173): wire name
         // DSPINE, native once upstream merges it, plugin-registered
         // (sglang-dspine, entry point group sglang.srt.plugins)
@@ -5697,7 +6155,7 @@ fn push_sglang_spec_knob_lane<'a>(
         other => {
             warnings.push(format!(
                 "sglang.spec_algorithm {other:?} is not a knob-lane algorithm \
-                 (supported: ngram draft-free, dflash/dspine via spec_draft_path); \
+                 (supported: ngram draft-free, dflash/dspark/dspine via spec_draft_path); \
                  spawning dense - the EAGLE family rides the draft-pair lane \
                  (spec = \"eagle3\")"
             ));
@@ -6809,7 +7267,13 @@ fn kv_quant_ladder(
         None
     } else if resident.saturating_add(kv / 2) <= budget {
         Some(("q8_0", "q8_0"))
-    } else if resident.saturating_add(kv * 3 / 8) <= budget {
+    } else if resident.saturating_add(kv * 3 / 8) <= budget
+        // MLA/DeepSeek-class loaders hard-error on type_k != type_v at
+        // context init, so the differential q8_0/q4_0 pair is unreachable
+        // on them - skip the rung and let the terminal q4_0/q4_0 rung
+        // handle it (with its own teaching below).
+        && !matches!(input.meta, ModelMeta::Gguf(g) if g.requires_symmetric_kv())
+    {
         // Stock upstream engine builds compile flash-attention kernels
         // only for SYMMETRIC K/V quant pairs (GGML_CUDA_FA_QUANT defaults):
         // a mixed pair rides an f16-conversion path around every attention
@@ -6839,6 +7303,19 @@ fn kv_quant_ladder(
             Some(("q8_0", "q4_0"))
         }
     } else {
+        // Terminal rung - reached by capacity OR by the MLA-class skip of
+        // the differential rung above; in the skip case say why (the mixed
+        // pair would hard-error at context init on that class).
+        if matches!(input.meta, ModelMeta::Gguf(g) if g.requires_symmetric_kv())
+            && resident.saturating_add(kv * 3 / 8) <= budget
+        {
+            warnings.push(
+                "KV differential quant skipped on this MLA-class model: upstream requires \
+                 type_k == type_v (mixed q8_0/q4_0 hard-errors at context init); using \
+                 q4_0/q4_0 (symmetric, KV/4 bytes)"
+                    .into(),
+            );
+        }
         if resident.saturating_add(kv / 4) > budget {
             warnings.push(
                 "KV q4_0 engaged but weights+KV still exceed 90% VRAM; --fit will shrink ctx or the engine may OOM - consider a smaller quant".into(),
@@ -6855,7 +7332,9 @@ fn kv_quant_ladder(
 #[must_use]
 pub fn kv_grade_rational(grade: &str) -> (u64, u64) {
     match grade {
-        "q8_0" => (1, 2),
+        // OCP-FP8 E4M3 (upstream PR #28392): 1 byte/element like q8_0; the
+        // optional static per-tensor scales are metadata-sized, negligible.
+        "q8_0" | "f8_e4m3" => (1, 2),
         "q4_0" => (1, 4),
         "q4_1" => (9, 20),
         "q5_0" => (11, 32),
@@ -8173,6 +8652,19 @@ mod tests {
         }
     }
 
+    /// MLA-class fixture: qwen3.5 carries explicit attention latents
+    /// (`key_length`/`value_length`), which is the marker this codebase models
+    /// for upstream's `type_k == type_v` requirement. Numbers mirror the
+    /// live qwen3.5-9b store header (256/256).
+    fn meta_mla() -> GgufMeta {
+        GgufMeta {
+            architecture: "qwen35".into(),
+            key_length: Some(256),
+            value_length: Some(256),
+            ..meta()
+        }
+    }
+
     /// Materialize a real (empty) draft file so compile's stale-row
     /// existence check sees a live path - the fixture must not lie
     /// about freshness w more than the store may.
@@ -8219,6 +8711,7 @@ mod tests {
             engine_tag: "b-test",
             supported_flags: flags,
             spec_types,
+            cache_types: &[],
             endpoint: Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 12345,
@@ -11076,6 +11569,349 @@ mod tests {
     }
 
     #[test]
+    fn unit__kv_differential__mla_ladder_skips_differential_rung() {
+        // Same differential-window geometry as the rung test above, but
+        // the model is MLA-class (qwen3.5 latents): upstream hard-errors
+        // type_k != type_v at context init, so the K=q8_0/V=q4_0 rung must
+        // be skipped even though it fits - the ladder lands on symmetric
+        // q4_0 and teaches why.
+        let cfg = Config {
+            default_ctx: 32_768,
+            ..Config::default()
+        };
+        let hw = gpu_hw(8_400, 13_674, 8);
+        let g = GgufMeta {
+            context_length: Some(32_768),
+            ..meta_mla()
+        };
+        let mut inp = input(&g, &hw, &cfg, &ALL_FLAGS);
+        inp.model_bytes = 4_800 * MIB;
+        let mut warnings = Vec::new();
+        // Latent-256 KV carries 4x the bytes per token of the head_dim-64
+        // fixture above, so a 4x smaller ctx lands in the same window:
+        // f16 and q8/q8 both exceed the budget, the differential rung
+        // would fit but is MLA-skipped, and symmetric q4_0 fits.
+        let rung = kv_quant_ladder(&inp, Hardware::bytes(8_400), 32_768, false, &mut warnings);
+        assert_eq!(rung, Some(("q4_0", "q4_0")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("differential quant skipped")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unit__kv_mla__mixed_pin_reconciles_to_byte_heavier() {
+        // An explicit differential pin on an MLA-class model cannot ride
+        // the argv (upstream type_k == type_v hard-error): with FA on the
+        // reconciler unifies both sides to the byte-heavier grade - the
+        // conservative direction, never below a pinned grade.
+        let cfg = Config {
+            cache_type_k: "q8_0".into(),
+            cache_type_v: "q4_0".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8); // no ladder interference
+        let g = meta_mla();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-k", "q8_0"]));
+        assert!(p.argv.windows(2).any(|w| w == ["--cache-type-v", "q8_0"]));
+        assert!(!p.argv.windows(2).any(|w| w == ["--cache-type-v", "q4_0"]));
+        assert!(
+            p.warnings.iter().any(|w| w.contains("reconciled to q8_0")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__kv_mla__fa_off_mixed_pin_falls_to_f16_pair() {
+        // FA off already strips the quantized V side; re-quantizing V to
+        // match K would recreate the crash, so the MLA reconciler drops
+        // BOTH sides to f16 and says so.
+        let cfg = Config {
+            cache_type_k: "q8_0".into(),
+            cache_type_v: "q4_0".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta_mla();
+        let t = TuningOverrides {
+            fa: Some(false),
+            ..Default::default()
+        };
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
+        assert!(
+            !p.argv.contains(&"--cache-type-k".to_string()),
+            "{:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv.contains(&"--cache-type-v".to_string()),
+            "{:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("MLA-class model with flash-attn off")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__kv_mla__fp8_pin_dropped() {
+        // Upstream excludes fp8 KV caches on the MLA/DeepSeek class at
+        // context init: the pin must be stripped before spawn with the
+        // teaching warning, leaving the f16 default.
+        let cfg = Config {
+            cache_type: "f8_e4m3".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta_mla();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            !p.argv.contains(&"--cache-type-k".to_string()),
+            "{:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv.contains(&"--cache-type-v".to_string()),
+            "{:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("excludes fp8 KV caches")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__kv_fp8__pin_emitted_when_probe_supports() {
+        // f8_e4m3 is pin-only (never ladder-selected until quality
+        // receipts land): with the probed engine vocabulary carrying the
+        // grade, the pin rides the argv verbatim.
+        let cfg = Config {
+            cache_type: "f8_e4m3".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let probe = ["f32", "f16", "bf16", "f8_e4m3", "q8_0", "q4_0"]
+            .map(str::to_string)
+            .to_vec();
+        let mut i = input(&g, &hw, &cfg, &ALL_FLAGS);
+        i.cache_types = &probe;
+        let p = compile(&i, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--cache-type-k", "f8_e4m3"])
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--cache-type-v", "f8_e4m3"])
+        );
+    }
+
+    #[test]
+    fn unit__kv_fp8__pin_dropped_when_probe_lacks() {
+        // Probed vocabulary without f8_e4m3 = pre-#28392 build: the child
+        // would die on an opaque argv error, so the pin is dropped with
+        // the engine-update remedy.
+        let cfg = Config {
+            cache_type: "f8_e4m3".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let probe = ["f32", "f16", "bf16", "q8_0", "q4_0"]
+            .map(str::to_string)
+            .to_vec();
+        let mut i = input(&g, &hw, &cfg, &ALL_FLAGS);
+        i.cache_types = &probe;
+        let p = compile(&i, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.contains(&"--cache-type-k".to_string()),
+            "{:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("engine build lacks") && w.contains("blazar engine update")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__kv_fp8__empty_probe_passes_through() {
+        // Manifest rows from before the cache_types probe (or a failed
+        // --help parse) deserialize with an empty vocabulary: fail open -
+        // the pin is the user's explicit choice and newer builds accept
+        // it; refusing on a stale probe row would break working setups.
+        let cfg = Config {
+            cache_type: "f8_e4m3".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w == ["--cache-type-k", "f8_e4m3"])
+        );
+    }
+
+    #[test]
+    fn unit__tensor_split__fa_off_refused_before_spawn() {
+        // SPLIT_MODE_TENSOR requires flash-attn (upstream hard-error at
+        // context init; FA "auto" does not self-promote for tensor mode):
+        // refuse at compile with the remedy instead of letting the child
+        // die mid-load.
+        let cfg = Config {
+            split_mode: "tensor".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let t = TuningOverrides {
+            fa: Some(false),
+            ..Default::default()
+        };
+        let err = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap_err();
+        assert!(
+            err.contains("requires flash-attn") && err.contains("split_mode"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__tensor_split__fa_auto_promoted_on() {
+        // FA auto under tensor mode is the silent-crash trap upstream
+        // leaves open: promote it to on and say so.
+        let cfg = Config {
+            split_mode: "tensor".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--flash-attn" && w[1] == "on")
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("promoted to on")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__tensor_split__layer_mode_fa_off_allowed() {
+        // Control: the gate is tensor-mode only - layer split (the
+        // default) keeps FA off legal.
+        let cfg = Config {
+            split_mode: "layer".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta();
+        let t = TuningOverrides {
+            fa: Some(false),
+            ..Default::default()
+        };
+        let p = compile(&input(&g, &hw, &cfg, &ALL_FLAGS), &t).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--flash-attn" && w[1] == "off")
+        );
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("promoted to on")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__tensor_split__hybrid_linear_arch_refused() {
+        // Hybrid-linear architectures (qwen3.5-class: recurrent +
+        // full-attention blocks) carry kernels upstream never gave
+        // split-tensor implementations - tensor mode must refuse up
+        // front with the remedy instead of dying at graph init.
+        let cfg = Config {
+            split_mode: "tensor".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = meta_mla();
+        let err = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .expect_err("hybrid-linear arch under tensor split must refuse");
+        assert!(err.contains("cannot shard qwen35"), "{err}");
+        assert!(err.contains("layer split"), "{err}");
+    }
+
+    #[test]
+    fn unit__tensor_split__moe_arch_gets_teaching_warning() {
+        // MoE tensor-split support is per-architecture upstream; a full
+        // -attention MoE model passes the hard gate and gets the
+        // fallback teaching instead (engine refusal at spawn remains
+        // observable, never silent).
+        let cfg = Config {
+            split_mode: "tensor".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let g = GgufMeta {
+            expert_count: Some(128),
+            ..meta()
+        };
+        let p = compile(
+            &input(&g, &hw, &cfg, &ALL_FLAGS),
+            &TuningOverrides::default(),
+        )
+        .unwrap();
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("MoE model") && w.contains("per-architecture")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
     fn unit__kv_differential__symmetric_f16_class_still_forces_off() {
         // A k/v pair that lands on the same f16-class grade keeps the
         // historical force-off: no flags, engine default.
@@ -11103,6 +11939,10 @@ mod tests {
         assert_eq!(scale_kv_pair(8_000, "q8_0", "q4_0"), 3_000);
         assert_eq!(scale_kv_pair(8_000, "q8_0", "q8_0"), 4_000);
         assert_eq!(scale_kv_pair(8_000, "weird", "bogus"), 8_000);
+        // OCP-FP8 (upstream PR #28392): 1 byte/element, the same class
+        // as q8_0's half-size KV.
+        assert_eq!(scale_kv_pair(8_000, "f8_e4m3", "f8_e4m3"), 4_000);
+        assert_eq!(scale_kv_pair(8_000, "f8_e4m3", "q4_0"), 3_000);
     }
 
     #[test]
@@ -12486,6 +13326,7 @@ mod tests {
             engine_tag: "v0.9.3",
             supported_flags: flags,
             spec_types: &[],
+            cache_types: &[],
             endpoint: Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 12345,
@@ -16456,6 +17297,25 @@ mod tests {
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "--hicache-size",
+            "--hicache-storage-backend",
+            "--hicache-write-policy",
+            "--hicache-io-backend",
+            "--hicache-host-memory-mode",
+            "--hicache-storage-backend-extra-config",
+            "--disaggregation-mode",
+            "--disaggregation-transfer-backend",
+            "--disaggregation-bootstrap-port",
+            "--disaggregation-decode-allocation-policy",
+            "--disaggregation-decode-enable-radix-cache",
+            "--disaggregation-decode-retraction-backup",
+            "--enable-pdmux",
+            "--pdmux-config-path",
+            "--attn-dp-size",
+            "--cp-size",
+            "--attn-cp-size",
+            "--dcp-size",
+            "--enable-nvidia-megakernel",
+            "--enable-amd-monokernel",
             "--is-embedding",
         ]
         .iter()
@@ -16545,6 +17405,7 @@ mod tests {
             engine_tag: "sglang-test",
             supported_flags: &SGLANG_FLAGS,
             spec_types: &[],
+            cache_types: &[],
             endpoint: Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 12345,
@@ -17930,6 +18791,80 @@ mod tests {
     }
 
     #[test]
+    fn unit__sglang_spec__dspark_with_draft_dir_engages() {
+        // The DSPARK knob lane (DFlash successor, SGLang SpeculativeAlgorithm
+        // DSPARK - the installed 0.5.23+ runtime carries the enum): same
+        // contract as dflash - algorithm, draft model path, steps and
+        // draft-tokens ride their flags when the draft dir is present.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let draft_dir = "/models/qwen3-8b-dspark-head";
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dspark".into()),
+                spec_draft_path: Some(draft_dir.into()),
+                spec_num_steps: Some(4),
+                spec_num_draft_tokens: Some(8),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "DSPARK")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-draft-model-path" && w[1] == draft_dir)
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-num-steps" && w[1] == "4")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-num-draft-tokens" && w[1] == "8")
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__dspark_warns_dense_needs_draft_model() {
+        // dspark without a draft path is a dense spawn + teaching warning,
+        // exactly like the dflash/dspine draft-required contract.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dspark".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.contains(&"--speculative-algorithm".to_string()));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("dspark") && w.contains("draft")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
     fn unit__sglang_spec__dflash_with_draft_dir_engages() {
         // The DFLASH knob lane: spec_algorithm = "dflash" +
         // spec_draft_path (safetensors dir) emits the algorithm, the
@@ -17978,6 +18913,43 @@ mod tests {
             p.argv
                 .windows(2)
                 .any(|w| w[0] == "--speculative-num-draft-tokens" && w[1] == "8")
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__dflash2_draft_checkpoint_stays_dflash_lane() {
+        // DFlash2 (upstream PR #35371) is not a separate algorithm: the
+        // engine selects the DFlash2 drafter from checkpoint metadata
+        // under the DFLASH umbrella, so a dflash2-flavored draft dir
+        // rides the exact dflash lane. Blazar stays flavor-agnostic -
+        // the draft dir's own config decides which drafter loads.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let draft_dir = "/models/qwen3-8b-dflash2-head";
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dflash".into()),
+                spec_draft_path: Some(draft_dir.into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "DFLASH"),
+            "{:?}",
+            p.argv
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-draft-model-path" && w[1] == draft_dir)
         );
     }
 
@@ -18462,6 +19434,7 @@ mod tests {
             engine_tag: "mlx-test",
             supported_flags: &MLX_FLAGS,
             spec_types: &[],
+            cache_types: &[],
             endpoint: Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 12346,
@@ -18953,6 +19926,499 @@ mod tests {
         inp_huge.overlay = &overlay_huge;
         let err = compile(&inp_huge, &TuningOverrides::default()).unwrap_err();
         assert!(err.contains("cannot fit"), "{err}");
+    }
+
+    #[test]
+    fn unit__sglang_hicache__l3_tier_flags_emit_on_supporting_lane() {
+        // The full L3 stack on a lane that advertises the flags
+        // (0.5.23): every knob lands as its upstream flag with the
+        // operator's value verbatim - the extra-config JSON string
+        // included, because upstream forwards it to the backend factory
+        // as-is.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let extra = r#"{"device":"/data/l3"}"#;
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                hicache_enable: Some(true),
+                hicache_storage_backend: Some("file".into()),
+                hicache_write_policy: Some("write_through_selective".into()),
+                hicache_io_backend: Some("direct".into()),
+                hicache_host_memory_mode: Some("buffer_only".into()),
+                hicache_storage_extra_config: Some(extra.into()),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for (flag, value) in [
+            ("--hicache-storage-backend", "file"),
+            ("--hicache-write-policy", "write_through_selective"),
+            ("--hicache-io-backend", "direct"),
+            ("--hicache-host-memory-mode", "buffer_only"),
+            ("--hicache-storage-backend-extra-config", extra),
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w[0] == flag && w[1] == value),
+                "missing {flag} {value}: {:?}",
+                p.argv
+            );
+        }
+    }
+
+    /// Older sglang lane (pre-0.5.23 manifest): the base flag set minus
+    /// the `HiCache` `L3` family - exactly what a real 0.5.19/0.5.21
+    /// manifest probe reports back.
+    static HICACHE_L3_OLDER_LANE: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
+        let mut f = sglang_flags();
+        for flag in [
+            "--hicache-storage-backend",
+            "--hicache-write-policy",
+            "--hicache-io-backend",
+            "--hicache-host-memory-mode",
+            "--hicache-storage-backend-extra-config",
+        ] {
+            f.remove(flag);
+        }
+        f
+    });
+
+    #[test]
+    fn unit__sglang_hicache__l3_flags_degrade_with_teaching_on_older_lane() {
+        // A 0.5.21-shaped lane has no L3 flags at all: every knob is
+        // dropped with a teaching warning naming the config key, so a
+        // config written against a newer lane degrades to the plain
+        // host tier instead of spawning a dead flag (the engine would
+        // exit on the unknown argument).
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                hicache_enable: Some(true),
+                hicache_storage_backend: Some("file".into()),
+                hicache_write_policy: Some("write_back".into()),
+                hicache_io_backend: Some("kernel".into()),
+                hicache_host_memory_mode: Some("cache".into()),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &HICACHE_L3_OLDER_LANE;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for flag in [
+            "--hicache-storage-backend",
+            "--hicache-write-policy",
+            "--hicache-io-backend",
+            "--hicache-host-memory-mode",
+        ] {
+            assert!(
+                !p.argv.contains(&flag.to_string()),
+                "{flag} leaked: {:?}",
+                p.argv
+            );
+        }
+        for knob in [
+            "sglang.hicache_storage_backend",
+            "sglang.hicache_write_policy",
+            "sglang.hicache_io_backend",
+            "sglang.hicache_host_memory_mode",
+        ] {
+            assert!(
+                p.warnings.iter().any(|w| w.contains(knob)),
+                "{knob} missing teaching: {:?}",
+                p.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unit__sglang_pdmux__collocation_flags_emit_on_supporting_lane() {
+        // PDMux: both roles in ONE process on greenctx SM partitions;
+        // the enable switch and the plan-file path land as upstream
+        // flags, and no disagg-family flag leaks (single topology).
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                pdmux_enable: Some(true),
+                pdmux_config_path: Some("/etc/blazar/pdmux.yaml".into()),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        // The enable switch is a bare flag (no value); the plan path
+        // rides a value pair like every other path knob.
+        assert!(
+            p.argv.contains(&"--enable-pdmux".to_string()),
+            "missing --enable-pdmux: {:?}",
+            p.argv
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--pdmux-config-path" && w[1] == "/etc/blazar/pdmux.yaml"),
+            "missing plan path: {:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv.iter().any(|a| a.starts_with("--disaggregation")),
+            "pdmux lane must stay clear of the two-child family: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__sglang_parallel__attn_dp_size_emits_when_gt_one() {
+        // Attention-DP rides the parallel-size family: a pin above one
+        // lands as --attn-dp-size alongside the tp/dp pins.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                tp_size: Some(4),
+                attn_dp_size: Some(2),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--attn-dp-size" && w[1] == "2"),
+            "missing attn-dp pair: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__sglang_parallel__cp_family_emits_when_gt_one() {
+        // Context-parallelism family rides the same parallel-pin table:
+        // cp/attn-cp/dcp each emit only when > 1.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                tp_size: Some(4),
+                cp_size: Some(2),
+                attn_cp_size: Some(2),
+                dcp_size: Some(4),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for (flag, val) in [
+            ("--cp-size", "2"),
+            ("--attn-cp-size", "2"),
+            ("--dcp-size", "4"),
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w[0] == flag && w[1] == val),
+                "missing {flag} pair: {:?}",
+                p.argv
+            );
+        }
+    }
+
+    #[test]
+    fn unit__sglang_fused_kernels__single_vendor_bare_flag_emits() {
+        // The plugin switches land as bare flags on a supporting lane;
+        // picking both vendors never reaches emission (config rejects).
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                megakernel_enable: Some(true),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.iter().any(|a| a == "--enable-nvidia-megakernel"),
+            "missing megakernel bare flag: {:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv.iter().any(|a| a == "--enable-amd-monokernel"),
+            "amd flag leaked: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__sglang_disagg__decode_role_flags_emit_on_supporting_lane() {
+        // A decode-role worker on a PD-shaped lane: the role, transfer
+        // backend and decode-only knobs all land as upstream flags, and
+        // the fake backend gets its honesty warning (no real KV moves -
+        // the decode side re-prefills; fine for wiring, not for prod).
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                disagg_mode: Some("decode".into()),
+                disagg_transfer_backend: Some("fake".into()),
+                disagg_decode_allocation_policy: Some("early".into()),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for (flag, value) in [
+            ("--disaggregation-mode", "decode"),
+            ("--disaggregation-transfer-backend", "fake"),
+            ("--disaggregation-decode-allocation-policy", "early"),
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w[0] == flag && w[1] == value),
+                "missing {flag} {value}: {:?}",
+                p.argv
+            );
+        }
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("fake") && w.contains("re-prefill")),
+            "fake-backend honesty warning missing: {:?}",
+            p.warnings
+        );
+        // 64 GiB RAM clears the HiCache floor: the retraction backup
+        // stays on upstream's default (host pool) - no override flag.
+        assert!(
+            !p.argv
+                .iter()
+                .any(|a| a == "--disaggregation-decode-retraction-backup"),
+            "big-RAM decode role must keep the default backup: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__sglang_disagg__small_ram_decode_role_disables_host_pool_backup() {
+        // Root-cause receipt (live, 2026-11-12): a decode-role child dies
+        // at KV build on RAM classes below the hierarchical-cache floor -
+        // upstream auto-sizes the default host-pool retraction backup
+        // against MemAvailable minus a 10 GiB reserve and raises
+        // "No host memory is left for HiCache". The profile compiler
+        // downgrades the backup to plain retraction on those boxes.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(8_400, 13_674, 8);
+        let overlay = ModelOverride {
+            sglang: Some(SglangTuning {
+                disagg_mode: Some("decode".into()),
+                disagg_transfer_backend: Some("fake".into()),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 942 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--disaggregation-decode-retraction-backup" && w[1] == "none"),
+            "small-RAM decode role must disable the host-pool backup: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("retraction backup defaults to the host")),
+            "teaching warning missing: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__sglang_disagg__prefill_role_emits_mode_port_and_teaches_decode_knobs() {
+        // Prefill role hosts the bootstrap server; decode-only knobs
+        // set on a prefill overlay teach instead of spawning dead
+        // flags (the engine ignores them at best).
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                disagg_mode: Some("prefill".into()),
+                disagg_transfer_backend: Some("fake".into()),
+                disagg_bootstrap_port: Some(8998),
+                disagg_decode_allocation_policy: Some("early".into()),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for (flag, value) in [
+            ("--disaggregation-mode", "prefill"),
+            ("--disaggregation-transfer-backend", "fake"),
+            ("--disaggregation-bootstrap-port", "8998"),
+        ] {
+            assert!(
+                p.argv.windows(2).any(|w| w[0] == flag && w[1] == value),
+                "missing {flag} {value}: {:?}",
+                p.argv
+            );
+        }
+        assert!(
+            !p.argv
+                .contains(&"--disaggregation-decode-allocation-policy".to_string()),
+            "decode policy leaked onto prefill role: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("decode role") && w.contains("disagg_")),
+            "decode-knobs-on-prefill teaching missing: {:?}",
+            p.warnings
+        );
+    }
+
+    /// Older sglang lane (pre-0.5.23 manifest): the base flag set minus
+    /// the PD disagg family - a manifest that predates the flags.
+    static DISAGG_OLDER_LANE: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
+        let mut f = sglang_flags();
+        for flag in [
+            "--disaggregation-mode",
+            "--disaggregation-transfer-backend",
+            "--disaggregation-bootstrap-port",
+            "--disaggregation-decode-allocation-policy",
+            "--disaggregation-decode-enable-radix-cache",
+        ] {
+            f.remove(flag);
+        }
+        f
+    });
+
+    #[test]
+    fn unit__sglang_disagg__older_lane_degrades_with_teaching() {
+        // A pre-PD manifest (0.5.23 predates nothing here, but older
+        // installed lanes keep serving): every disagg knob drops with
+        // a warning naming the config key instead of a dead flag.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                disagg_mode: Some("decode".into()),
+                disagg_transfer_backend: Some("fake".into()),
+                disagg_bootstrap_port: Some(8998),
+                disagg_decode_allocation_policy: Some("early".into()),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        inp.overlay = &overlay;
+        inp.supported_flags = &DISAGG_OLDER_LANE;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        for flag in [
+            "--disaggregation-mode",
+            "--disaggregation-transfer-backend",
+            "--disaggregation-bootstrap-port",
+            "--disaggregation-decode-allocation-policy",
+        ] {
+            assert!(
+                !p.argv.contains(&flag.to_string()),
+                "{flag} leaked: {:?}",
+                p.argv
+            );
+        }
+        for knob in [
+            "sglang.disagg_mode",
+            "sglang.disagg_transfer_backend",
+            "sglang.disagg_bootstrap_port",
+            "sglang.disagg_decode_allocation_policy",
+        ] {
+            assert!(
+                p.warnings.iter().any(|w| w.contains(knob)),
+                "{knob} missing teaching: {:?}",
+                p.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unit__sglang_disagg__mode_unset_keeps_argv_clean_and_orphan_knobs_teach() {
+        // Equivalence pin: no disagg knobs -> zero disagg flags AND
+        // zero disagg warnings (an untouched config compiles exactly as
+        // it did before the PD surface existed). Orphan knobs without
+        // a role teach instead of silently vanishing.
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let hw = gpu_hw(24_000, 64_000, 8);
+        let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a.starts_with("--disaggregation")),
+            "disagg flag leaked on plain lane: {:?}",
+            p.argv
+        );
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("disagg")),
+            "disagg warning on plain lane: {:?}",
+            p.warnings
+        );
+
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                disagg_transfer_backend: Some("fake".into()),
+                ..SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|a| a.starts_with("--disaggregation")),
+            "orphan knob emitted a flag: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("disagg_*") && w.contains("sglang.disagg_mode")),
+            "orphan-knob teaching missing: {:?}",
+            p.warnings
+        );
     }
 
     #[test]

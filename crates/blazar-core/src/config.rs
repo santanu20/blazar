@@ -1680,6 +1680,82 @@ pub struct SglangTuning {
     pub hicache_ratio: Option<f64>,
     /// `--hicache-size` (host KV cache size in GB).
     pub hicache_size: Option<f64>,
+    /// `--hicache-storage-backend`: persistent L3 tier below host RAM
+    /// (`file`, `mooncake`, `npu_memcache`, `hf3fs`, `nixl`, `aibrix`,
+    /// `shm`, `seaweedfs`, `eic`, `mori`, `sim`, `simm`, `tensorcast`,
+    /// `dynamic` - upstream 0.5.23 choices). Requires `hicache_enable`.
+    pub hicache_storage_backend: Option<String>,
+    /// `--hicache-write-policy` (`write_back`, `write_through`,
+    /// `write_through_selective`; `write_back` needs a storage backend).
+    pub hicache_write_policy: Option<String>,
+    /// `--hicache-io-backend` (`direct`, `kernel`, `kernel_ascend`) -
+    /// the CPU<->GPU transfer path for hierarchical cache pages.
+    pub hicache_io_backend: Option<String>,
+    /// `--hicache-host-memory-mode` (`cache`: host RAM is a persistent
+    /// tier; `buffer_only`: staging between GPU and the storage backend
+    /// - the latter requires `hicache_storage_backend`).
+    pub hicache_host_memory_mode: Option<String>,
+    /// `--hicache-storage-backend-extra-config`: JSON object string
+    /// passed verbatim (backend paths, endpoints, tuning; `dynamic`
+    /// backends carry their module/class here).
+    pub hicache_storage_extra_config: Option<String>,
+    /// Prefill/decode disaggregation (sglang >= 0.5.23 flag family):
+    /// run the model as a prefill-only or decode-only worker so long
+    /// prompts prefill on one process while another decodes - KV moves
+    /// between them over the transfer backend. Blazar's gateway is the
+    /// router: a PD-enabled model spawns the pair and dispatches in two
+    /// phases (prefill computes and reports bootstrap coordinates, the
+    /// gateway re-issues the request to decode with them wired in).
+    /// `mode`: `prefill` or `decode` selects the role this entry
+    /// compiles as (unset = ordinary single-process lane, untouched).
+    pub disagg_mode: Option<String>,
+    /// `--disaggregation-transfer-backend`: `mooncake`, `nixl`,
+    /// `ascend`, `fake`, `mori` or `mooncake_tcp`. `fake` moves no KV
+    /// (the decode worker re-prefills) - it proves the topology wiring
+    /// only; the real backends need their packages in the lane venv.
+    pub disagg_transfer_backend: Option<String>,
+    /// `--disaggregation-bootstrap-port`: the prefill worker's
+    /// bootstrap registry socket (default 8998) where decode workers
+    /// look up KV locations.
+    pub disagg_bootstrap_port: Option<u16>,
+    /// `--disaggregation-decode-allocation-policy`: `early` admits a
+    /// request to the decode worker before prefill completes,
+    /// `prefill_complete` waits for it (lower decode idle, higher
+    /// tail latency).
+    pub disagg_decode_allocation_policy: Option<String>,
+    /// `--disaggregation-decode-enable-radix-cache`: prefix caching on
+    /// the decode worker. Upstream rejects it with the `fake` transfer
+    /// backend (and with most speculative algorithms).
+    pub disagg_decode_radix_cache: Option<bool>,
+    /// Blazar-side pair switch (no direct sglang flag): when true, the
+    /// gateway brings up BOTH roles for this model - a prefill child
+    /// (hosting the bootstrap server) and a decode child - and routes
+    /// chat through the two-phase PD dispatch. Roles come from the
+    /// pair keys, so `disagg_mode` must stay unset here.
+    pub disagg_pair: Option<bool>,
+    /// `--enable-pdmux` (sglang >= 0.5.23): collocate prefill AND decode
+    /// in ONE process on `greenctx` SM partitions instead of the
+    /// two-child pair. The partition plan rides the YAML named by
+    /// [`Self::pdmux_config_path`] (upstream `PDMuxConfig`: an
+    /// `sm_group_num` of three or more, optional `manual_divisions`
+    /// rows of `[prefill_sm, decode_sm, decode_bs_threshold]`).
+    /// Single-topology lane: mutually exclusive with the `disagg_*`
+    /// family.
+    pub pdmux_enable: Option<bool>,
+    /// `--pdmux-config-path`: the `PDMux` YAML (required when
+    /// [`Self::pdmux_enable`] is on; validated like other path knobs at
+    /// emission time by the flag-presence gate).
+    pub pdmux_config_path: Option<String>,
+    /// `--enable-nvidia-megakernel`: fuse decode/verify kernels via the
+    /// `sgl-nvidia-mega` plugin package (EXPERIMENTAL upstream; startup
+    /// raises a reasons-list error on unsupported stacks - the lane
+    /// degrades with a teaching warning on engines lacking the flag).
+    /// Mutually exclusive with [`Self::monokernel_enable`].
+    pub megakernel_enable: Option<bool>,
+    /// `--enable-amd-monokernel`: persistent `ROCm` kernels via the
+    /// `sgl-amd-mono` plugin package (EXPERIMENTAL upstream). Mutually
+    /// exclusive with [`Self::megakernel_enable`].
+    pub monokernel_enable: Option<bool>,
     /// `--is-embedding`: run this `CausalLM` as an embedding model
     /// (decoder pooling, normalized). sglang treats this as a dedicated
     /// posture - that child serves `/v1/embeddings` and refuses
@@ -1757,6 +1833,26 @@ pub struct SglangTuning {
     pub pp_size: Option<u32>,
     /// `--ep-size`: expert parallelism (`MoE` models). Emits only when > 1.
     pub ep_size: Option<u32>,
+    /// `--attn-dp-size`: data-parallel attention groups inside the TP
+    /// group - each group runs its own scheduler over the attention
+    /// slices while the FFN stays tensor-parallel; total schedulers
+    /// become `dp_size` * `attn_dp_size`. Meaningful for `DeepSeek`-class
+    /// long-context serving. Upstream deprecated the old
+    /// `--dp-size N --enable-dp-attention` spelling in favor of this
+    /// flag; Blazar types only the new one. Emits only when > 1.
+    pub attn_dp_size: Option<u32>,
+    /// `--cp-size`: context parallelism - splits long prompts (128K+)
+    /// across ranks so prefill no longer serializes over sequence
+    /// length. Emits only when > 1.
+    pub cp_size: Option<u32>,
+    /// `--attn-cp-size`: attention-side context parallelism for
+    /// `MLA`-class models; upstream derives `attn_dcp_size` as
+    /// `max(attn_cp_size, dcp_size)`. Emits only when > 1.
+    pub attn_cp_size: Option<u32>,
+    /// `--dcp-size`: decode context parallelism - decode-side context
+    /// splitting for very long generations under PD deployments.
+    /// Emits only when > 1.
+    pub dcp_size: Option<u32>,
     /// `--max-lora-rank`: rank ceiling for served `LoRA` adapters.
     pub max_lora_rank: Option<u32>,
     /// `--lora-backend` (pytorch, flashinfer).
@@ -1908,6 +2004,10 @@ impl SglangTuning {
                 "{where_}.hicache_ratio must be > 0, got {r}"
             )));
         }
+        // L3 knobs follow the optional-string family convention:
+        // `""` counts as unset (same as quantization/lora_backend), so
+        // hint blocks and user configs can carry empty placeholders.
+        self.validate_hicache_l3_family(where_)?;
         if let Some(t) = self.watchdog_timeout
             && t <= 0.0
         {
@@ -1915,6 +2015,10 @@ impl SglangTuning {
                 "{where_}.watchdog_timeout must be > 0, got {t}"
             )));
         }
+        // Prefill/decode disaggregation family. Empty strings count as
+        // unset (knob-hint placeholders), same convention as the
+        // hicache tier above.
+        self.validate_disagg_family(where_)?;
         if let Some(t) = self.dynamic_batch_tokenizer_batch_timeout
             && t <= 0.0
         {
@@ -1941,6 +2045,231 @@ impl SglangTuning {
         {
             return Err(CoreError::Config(format!(
                 "{where_}.speculative_accept_threshold_acc must be 0.0..=1.0, got {t}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Hierarchical-cache L3 (storage tier) vocabulary and dependency
+    /// checks, split out of [`Self::validate_scalar_ranges`] to keep
+    /// that fn under the size lint. Empty strings count as unset.
+    fn validate_hicache_l3_family(&self, where_: &str) -> Result<(), CoreError> {
+        const HICACHE_STORAGE_BACKENDS: &[&str] = &[
+            "file",
+            "sim",
+            "mooncake",
+            "npu_memcache",
+            "hf3fs",
+            "nixl",
+            "aibrix",
+            "dynamic",
+            "eic",
+            "simm",
+            "mori",
+            "shm",
+            "tensorcast",
+            "seaweedfs",
+        ];
+        let storage = self
+            .hicache_storage_backend
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        let write_policy = self
+            .hicache_write_policy
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        let io_backend = self.hicache_io_backend.as_deref().filter(|s| !s.is_empty());
+        let host_mode = self
+            .hicache_host_memory_mode
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        let extra_config = self
+            .hicache_storage_extra_config
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        if let Some(b) = storage {
+            if !HICACHE_STORAGE_BACKENDS.contains(&b) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.hicache_storage_backend must be one of {} (upstream choices), \
+                     got {b:?}",
+                    HICACHE_STORAGE_BACKENDS.join(", ")
+                )));
+            }
+            if self.hicache_enable != Some(true) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.hicache_storage_backend requires {where_}.hicache_enable = true - \
+                     the L3 tier rides the hierarchical cache"
+                )));
+            }
+        }
+        if let Some(p) = write_policy {
+            if !matches!(
+                p,
+                "write_back" | "write_through" | "write_through_selective"
+            ) {
+                return Err(CoreError::Config(format!(
+                    "{where_}.hicache_write_policy must be write_back | write_through | \
+                     write_through_selective, got {p:?}"
+                )));
+            }
+            if p == "write_back" && storage.is_none() {
+                return Err(CoreError::Config(format!(
+                    "{where_}.hicache_write_policy = \"write_back\" needs \
+                     {where_}.hicache_storage_backend - write-back only exists below the \
+                     host tier"
+                )));
+            }
+        }
+        if let Some(io) = io_backend
+            && !matches!(io, "direct" | "kernel" | "kernel_ascend")
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.hicache_io_backend must be direct | kernel | kernel_ascend, \
+                 got {io:?}"
+            )));
+        }
+        if let Some(m) = host_mode {
+            if !matches!(m, "cache" | "buffer_only") {
+                return Err(CoreError::Config(format!(
+                    "{where_}.hicache_host_memory_mode must be cache | buffer_only, got {m:?}"
+                )));
+            }
+            if m == "buffer_only" && storage.is_none() {
+                return Err(CoreError::Config(format!(
+                    "{where_}.hicache_host_memory_mode = \"buffer_only\" needs \
+                     {where_}.hicache_storage_backend - staging without a destination is \
+                     not a configuration"
+                )));
+            }
+        }
+        if let Some(c) = extra_config
+            && !serde_json::from_str::<serde_json::Value>(c).is_ok_and(|v| v.is_object())
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.hicache_storage_extra_config must be a JSON object string \
+                 (upstream parses it with json.loads), got {c:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Prefill/decode disaggregation vocabulary and role-dependency
+    /// checks, split out of [`Self::validate_scalar_ranges`] to keep
+    /// that fn under the size lint. Empty strings count as unset.
+    fn validate_disagg_family(&self, where_: &str) -> Result<(), CoreError> {
+        let dmode = self.disagg_mode.as_deref().filter(|s| !s.is_empty());
+        let dbackend = self
+            .disagg_transfer_backend
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        let dpolicy = self
+            .disagg_decode_allocation_policy
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        if let Some(m) = dmode
+            && !matches!(m, "prefill" | "decode")
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.disagg_mode must be prefill | decode, got {m:?} \
+                 (unset = ordinary single-process lane)"
+            )));
+        }
+        if let Some(b) = dbackend
+            && !matches!(
+                b,
+                "mooncake" | "nixl" | "ascend" | "fake" | "mori" | "mooncake_tcp"
+            )
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.disagg_transfer_backend must be mooncake | nixl | ascend | fake | \
+                 mori | mooncake_tcp, got {b:?} (the lane venv must ship the backend's \
+                 package for anything but fake)"
+            )));
+        }
+        if let Some(p) = dpolicy
+            && !matches!(p, "early" | "prefill_complete")
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.disagg_decode_allocation_policy must be early | prefill_complete, \
+                 got {p:?}"
+            )));
+        }
+        if dpolicy.is_some() && dmode != Some("decode") {
+            return Err(CoreError::Config(format!(
+                "{where_}.disagg_decode_allocation_policy tunes the decode scheduler: set \
+                 {where_}.disagg_mode = \"decode\" first (got {dmode:?})"
+            )));
+        }
+        if self.disagg_decode_radix_cache == Some(true)
+            && dbackend.is_none_or(|b| b == "fake")
+            && dmode.is_some_and(|m| m == "decode")
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.disagg_decode_radix_cache = true is rejected with the fake \
+                 transfer backend (upstream hard-errors the pair); it also wants a \
+                 non-speculative lane"
+            )));
+        }
+        if self.disagg_pair == Some(true) && dmode.is_some() {
+            return Err(CoreError::Config(format!(
+                "{where_}.disagg_pair = true spawns both roles from the pair keys - a \
+                 manual {where_}.disagg_mode would be ambiguous. Unset disagg_mode (the \
+                 transfer backend and bootstrap-port knobs still apply to the pair)"
+            )));
+        }
+        let pdmux = self.pdmux_enable == Some(true);
+        let pdmux_path = self.pdmux_config_path.as_deref().filter(|s| !s.is_empty());
+        if pdmux && pdmux_path.is_none() {
+            return Err(CoreError::Config(format!(
+                "{where_}.pdmux_enable = true needs {where_}.pdmux_config_path - upstream's \
+                 PDMux refuses to start without the greenctx partition plan (sm_group_num, \
+                 optional manual_divisions)"
+            )));
+        }
+        if pdmux_path.is_some() && !pdmux {
+            return Err(CoreError::Config(format!(
+                "{where_}.pdmux_config_path is set without {where_}.pdmux_enable = true - the \
+                 plan file only compiles under the multiplexed topology"
+            )));
+        }
+        if pdmux
+            && (dmode.is_some()
+                || self.disagg_pair == Some(true)
+                || self.disagg_transfer_backend.is_some()
+                || self.disagg_bootstrap_port.is_some())
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.pdmux_enable collocates both roles in ONE process - the two-child \
+                 disagg family (disagg_mode / disagg_pair / transfer backend / bootstrap \
+                 port) picks a different topology. Keep exactly one per lane"
+            )));
+        }
+        self.validate_topology_combinations(where_)?;
+        Ok(())
+    }
+
+    /// Cross-field topology rules that need more than one knob in scope.
+    /// Split from [`Self::validate_scalar_ranges`] to stay under the size
+    /// lint; each rule cites the upstream behavior that motivates it.
+    fn validate_topology_combinations(&self, where_: &str) -> Result<(), CoreError> {
+        if self.megakernel_enable == Some(true) && self.monokernel_enable == Some(true) {
+            return Err(CoreError::Config(format!(
+                "{where_}.megakernel_enable and {where_}.monokernel_enable name different \
+                 vendor plugin stacks (NVIDIA sgl-nvidia-mega vs AMD sgl-amd-mono) - pick one"
+            )));
+        }
+        // Upstream asserts `tp_size % attn_dp_size == 0` at startup
+        // (sglang parallel_hook.py); a non-dividing pair dies at spawn
+        // with a bare AssertionError - refuse it here with the rule
+        // spelled out instead.
+        if let (Some(tp), Some(attn_dp)) = (self.tp_size, self.attn_dp_size)
+            && tp > 1
+            && attn_dp > 1
+            && tp % attn_dp != 0
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.attn_dp_size must divide {where_}.tp_size (upstream asserts \
+                 tp_size %% attn_dp_size == 0; e.g. tp 4 admits attn_dp 2 or 4)"
             )));
         }
         Ok(())
@@ -1994,16 +2323,19 @@ impl SglangTuning {
         if let Some(e) = choice(
             "spec_algorithm",
             &self.spec_algorithm,
-            &["ngram", "dflash", "dspine"],
+            &["ngram", "dflash", "dspark", "dspine"],
         ) {
             return Err(e);
         }
         // Every draft-model algorithm shares the same hard requirement:
-        // dflash rides the EAGLE-family draft machinery and DSpine is a
-        // trained parallel drafter - both are useless (and crash at
-        // spawn) without the draft weights on disk.
-        if matches!(self.spec_algorithm.as_deref(), Some("dflash" | "dspine"))
-            && self.spec_draft_path.as_deref().is_none_or(str::is_empty)
+        // dflash rides the EAGLE-family draft machinery, DSpark is its
+        // block-diffusion successor, and DSpine is a trained parallel
+        // drafter - all are useless (and crash at spawn) without the
+        // draft weights on disk.
+        if matches!(
+            self.spec_algorithm.as_deref(),
+            Some("dflash" | "dspark" | "dspine")
+        ) && self.spec_draft_path.as_deref().is_none_or(str::is_empty)
         {
             let alg = self.spec_algorithm.as_deref().unwrap_or_default();
             return Err(CoreError::Config(format!(
@@ -2053,6 +2385,10 @@ impl SglangTuning {
             ("dp_size", self.dp_size),
             ("pp_size", self.pp_size),
             ("ep_size", self.ep_size),
+            ("attn_dp_size", self.attn_dp_size),
+            ("cp_size", self.cp_size),
+            ("attn_cp_size", self.attn_cp_size),
+            ("dcp_size", self.dcp_size),
             ("max_lora_rank", self.max_lora_rank),
             ("spec_num_steps", self.spec_num_steps),
             ("spec_num_draft_tokens", self.spec_num_draft_tokens),
@@ -5815,9 +6151,15 @@ fn default_engine_check_secs() -> u64 {
 /// llama-server rejects them at child load, and the capacity ladder never
 /// auto-adopts them - they ride an explicit user pin (config or override)
 /// on a fork lane, with quality evidence in the kv-quality receipts.
-/// `turbo2` stays out until it carries a measured receipt.
+/// `turbo2` stays out until it carries a measured receipt. `f8_e4m3` is
+/// the OCP-FP8 KV grade (upstream PR #28392): pin-only for now - the
+/// ladder never auto-selects it until quality receipts land, the profile
+/// compiler drops it on MLA/DeepSeek-class models (upstream excludes fp8
+/// caches there), and a probed manifest lacking the grade drops the pin
+/// with an engine-update hint.
 pub const CACHE_TYPES: &[&str] = &[
-    "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "turbo3", "turbo4",
+    "f32", "f16", "bf16", "f8_e4m3", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "turbo3",
+    "turbo4",
 ];
 
 fn valid_cache_type(s: &str) -> bool {
@@ -6303,6 +6645,15 @@ mod tests {
         }
         .validate("sglang")
         .unwrap_or_else(|e| panic!("spec_algorithm dspine + draft must validate: {e}"));
+        // dspark (DFlash's block-diffusion successor) rides the same
+        // trained-drafter contract.
+        SglangTuning {
+            spec_algorithm: Some("dspark".into()),
+            spec_draft_path: Some("/models/qwen3-8b-dspark-head".into()),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap_or_else(|e| panic!("spec_algorithm dspark + draft must validate: {e}"));
         assert!(
             SglangTuning {
                 spec_algorithm: Some("dspine".into()),
@@ -6321,7 +6672,16 @@ mod tests {
             .is_err(),
             "spec_algorithm dflash without spec_draft_path must be rejected"
         );
-        for bad in ["eagle", "EAGLE3", "dspark", "mtp"] {
+        assert!(
+            SglangTuning {
+                spec_algorithm: Some("dspark".into()),
+                ..Default::default()
+            }
+            .validate("sglang")
+            .is_err(),
+            "spec_algorithm dspark without spec_draft_path must be rejected"
+        );
+        for bad in ["eagle", "EAGLE3", "mtp"] {
             assert!(
                 SglangTuning {
                     spec_algorithm: Some(bad.into()),
@@ -6355,6 +6715,272 @@ mod tests {
         }
         .validate("sglang")
         .unwrap();
+    }
+
+    #[test]
+    fn unit__sglang_tuning__hicache_l3_vocabulary_and_dependencies() {
+        // L3 tier knobs (sglang >= 0.5.23): the storage backend vocab is
+        // upstream's choice list (memory.py:148); write_back and
+        // buffer_only only make sense with a storage backend beneath
+        // them, and the extra-config blob must be a JSON object string
+        // because upstream forwards it verbatim to the backend factory.
+        SglangTuning {
+            hicache_enable: Some(true),
+            hicache_storage_backend: Some("file".into()),
+            hicache_write_policy: Some("write_back".into()),
+            hicache_io_backend: Some("kernel".into()),
+            hicache_host_memory_mode: Some("cache".into()),
+            hicache_storage_extra_config: Some(r#"{"k":"v"}"#.into()),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap_or_else(|e| panic!("full L3 tier must validate: {e}"));
+        let cases: &[(&str, SglangTuning, &str)] = &[
+            (
+                "unknown backend",
+                SglangTuning {
+                    hicache_enable: Some(true),
+                    hicache_storage_backend: Some("ceph".into()),
+                    ..Default::default()
+                },
+                "hicache_storage_backend",
+            ),
+            (
+                "storage without hicache_enable",
+                SglangTuning {
+                    hicache_storage_backend: Some("file".into()),
+                    ..Default::default()
+                },
+                "hicache_enable",
+            ),
+            (
+                "write_back without storage",
+                SglangTuning {
+                    hicache_enable: Some(true),
+                    hicache_write_policy: Some("write_back".into()),
+                    ..Default::default()
+                },
+                "hicache_storage_backend",
+            ),
+            (
+                "buffer_only without storage",
+                SglangTuning {
+                    hicache_enable: Some(true),
+                    hicache_host_memory_mode: Some("buffer_only".into()),
+                    ..Default::default()
+                },
+                "hicache_storage_backend",
+            ),
+            (
+                "unknown io backend",
+                SglangTuning {
+                    hicache_enable: Some(true),
+                    hicache_io_backend: Some("io_uring".into()),
+                    ..Default::default()
+                },
+                "hicache_io_backend",
+            ),
+            (
+                "extra config not a JSON object",
+                SglangTuning {
+                    hicache_enable: Some(true),
+                    hicache_storage_backend: Some("file".into()),
+                    hicache_storage_extra_config: Some("[1,2]".into()),
+                    ..Default::default()
+                },
+                "hicache_storage_extra_config",
+            ),
+        ];
+        for (name, tuning, needle) in cases {
+            let err = tuning.validate("sglang").expect_err(name).to_string();
+            assert!(err.contains(needle), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table-driven vocabulary contract
+    fn unit__sglang_tuning__disagg_vocabulary_and_role_dependencies() {
+        // PD disaggregation knobs (sglang 0.5.23 flag surface): roles
+        // and transfer backends are closed upstream vocabularies; the
+        // decode-only knobs require a decode role; radix cache is
+        // refused under the fake backend (upstream rejects the combo)
+        // and when no real transfer backend is configured at all.
+        SglangTuning {
+            disagg_mode: Some("prefill".into()),
+            disagg_transfer_backend: Some("mooncake_tcp".into()),
+            disagg_bootstrap_port: Some(8998),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap_or_else(|e| panic!("prefill role must validate: {e}"));
+        SglangTuning {
+            pdmux_enable: Some(true),
+            pdmux_config_path: Some("/etc/blazar/pdmux.yaml".into()),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap_or_else(|e| panic!("pdmux collocation must validate: {e}"));
+        SglangTuning {
+            disagg_mode: Some("decode".into()),
+            disagg_transfer_backend: Some("fake".into()),
+            disagg_decode_allocation_policy: Some("prefill_complete".into()),
+            ..Default::default()
+        }
+        .validate("sglang")
+        .unwrap_or_else(|e| panic!("decode role must validate: {e}"));
+        // Two chunks: the full table outgrew the stack-array lint once
+        // the fused-kernel cases landed.
+        let head: Vec<(&str, SglangTuning, &str)> = vec![
+            (
+                "unknown role",
+                SglangTuning {
+                    disagg_mode: Some("router".into()),
+                    ..Default::default()
+                },
+                "disagg_mode",
+            ),
+            (
+                "unknown transfer backend",
+                SglangTuning {
+                    disagg_mode: Some("decode".into()),
+                    disagg_transfer_backend: Some("ucx".into()),
+                    ..Default::default()
+                },
+                "disagg_transfer_backend",
+            ),
+            (
+                "unknown allocation policy",
+                SglangTuning {
+                    disagg_mode: Some("decode".into()),
+                    disagg_decode_allocation_policy: Some("auto".into()),
+                    ..Default::default()
+                },
+                "disagg_decode_allocation_policy",
+            ),
+            (
+                "allocation policy on non-decode lane",
+                SglangTuning {
+                    disagg_decode_allocation_policy: Some("early".into()),
+                    ..Default::default()
+                },
+                "disagg_mode",
+            ),
+            (
+                "radix cache under fake backend",
+                SglangTuning {
+                    disagg_mode: Some("decode".into()),
+                    disagg_transfer_backend: Some("fake".into()),
+                    disagg_decode_radix_cache: Some(true),
+                    ..Default::default()
+                },
+                "disagg_decode_radix_cache",
+            ),
+            (
+                "radix cache without transfer backend",
+                SglangTuning {
+                    disagg_mode: Some("decode".into()),
+                    disagg_decode_radix_cache: Some(true),
+                    ..Default::default()
+                },
+                "disagg_decode_radix_cache",
+            ),
+            (
+                "pair with manual role",
+                SglangTuning {
+                    disagg_pair: Some(true),
+                    disagg_mode: Some("prefill".into()),
+                    ..Default::default()
+                },
+                "disagg_pair",
+            ),
+            (
+                "attn dp below one",
+                SglangTuning {
+                    attn_dp_size: Some(0),
+                    ..Default::default()
+                },
+                "attn_dp_size",
+            ),
+            (
+                "cp below one",
+                SglangTuning {
+                    cp_size: Some(0),
+                    ..Default::default()
+                },
+                "cp_size",
+            ),
+            (
+                "dcp below one",
+                SglangTuning {
+                    dcp_size: Some(0),
+                    ..Default::default()
+                },
+                "dcp_size",
+            ),
+            (
+                "both fused-kernel vendors at once",
+                SglangTuning {
+                    megakernel_enable: Some(true),
+                    monokernel_enable: Some(true),
+                    ..Default::default()
+                },
+                "megakernel_enable",
+            ),
+            (
+                "attn dp does not divide tp",
+                SglangTuning {
+                    tp_size: Some(4),
+                    attn_dp_size: Some(3),
+                    ..Default::default()
+                },
+                "attn_dp_size",
+            ),
+        ];
+        let cases: Vec<(&str, SglangTuning, &str)> = head;
+        let tail: Vec<(&str, SglangTuning, &str)> = vec![
+            (
+                "pdmux without a plan file",
+                SglangTuning {
+                    pdmux_enable: Some(true),
+                    ..Default::default()
+                },
+                "pdmux_config_path",
+            ),
+            (
+                "pdmux plan without the switch",
+                SglangTuning {
+                    pdmux_config_path: Some("/etc/blazar/pdmux.yaml".into()),
+                    ..Default::default()
+                },
+                "pdmux_enable",
+            ),
+            (
+                "pdmux alongside the two-child pair",
+                SglangTuning {
+                    pdmux_enable: Some(true),
+                    pdmux_config_path: Some("/etc/blazar/pdmux.yaml".into()),
+                    disagg_pair: Some(true),
+                    ..Default::default()
+                },
+                "pdmux_enable",
+            ),
+            (
+                "pdmux alongside a manual role",
+                SglangTuning {
+                    pdmux_enable: Some(true),
+                    pdmux_config_path: Some("/etc/blazar/pdmux.yaml".into()),
+                    disagg_mode: Some("prefill".into()),
+                    ..Default::default()
+                },
+                "pdmux_enable",
+            ),
+        ];
+        let mut cases = cases;
+        cases.extend(tail);
+        for (name, tuning, needle) in cases {
+            let err = tuning.validate("sglang").expect_err(name).to_string();
+            assert!(err.contains(needle), "{name}: {err}");
+        }
     }
 
     #[test]
@@ -7995,6 +8621,26 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
         .unwrap_err()
         .to_string();
         assert!(err.contains("turbo2"), "{err}");
+        // f8_e4m3 (OCP-FP8 KV, upstream PR #28392) is first-class
+        // vocabulary: pin-only - the fit ladder never auto-selects it
+        // until perplexity receipts land in the quality registry, and
+        // the profile compiler drops it on MLA-class models or engine
+        // builds whose probed --help lacks the type.
+        let fp8 = Config {
+            cache_type: "f8_e4m3".into(),
+            ..Config::default()
+        };
+        assert!(fp8.validate().is_ok());
+        // upstream ships E4M3 only; e5m2 is an SGLang spelling, not a
+        // llama.cpp KV type
+        let err = Config {
+            cache_type: "f8_e5m2".into(),
+            ..Config::default()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("f8_e5m2"), "{err}");
     }
 
     #[test]

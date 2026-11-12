@@ -1351,6 +1351,7 @@ pub fn build_input<'a>(
     engine_tag: &'a str,
     supported_flags: &'a BTreeSet<String>,
     spec_types: &'a [String],
+    cache_types: &'a [String],
     endpoint: Endpoint,
     data_dir: &'a str,
     engine_kind: blazar_core::engine_kind::EngineKind,
@@ -1378,6 +1379,7 @@ pub fn build_input<'a>(
         engine_tag,
         supported_flags,
         spec_types,
+        cache_types,
         // llama-bench scoring is llama-server-only (the mistral.rs lane
         // prints a gate skip instead of benching).
         engine_kind,

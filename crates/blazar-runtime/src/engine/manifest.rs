@@ -154,6 +154,13 @@ pub struct Manifest {
     /// probe. Empty = not probed: the profile compiler falls back to
     /// flag-presence gating.
     pub spec_types: Vec<String>,
+    /// KV cache grades this build accepts for `-ctk`/`-ctv` - llama.cpp
+    /// lanes only, parsed from the `--help` option table (the
+    /// `--cache-type-k` row's allowed-values list). Empty = not probed
+    /// (non-llama lanes, manifests predating the probe): the profile
+    /// compiler's `f8_e4m3` capability gate fails open on empty.
+    #[serde(default)]
+    pub cache_types: Vec<String>,
     /// Quant loader methods this build actually registers - sglang
     /// lanes only, probed at install time from the engine's own
     /// registry (`sglang.srt.layers.quantization.BASE_QUANTIZATION_METHODS`,
@@ -226,11 +233,13 @@ pub struct Manifest {
 /// dotted flag names (`--fim-qwen-1.5b-default`) and rejects all-dash
 /// tokens; v3 fills `spec_types` on sglang lanes (the
 /// `SpeculativeAlgorithm` + plugin-registry probe), which v2 rows
-/// recorded empty. Bump whenever `parse_help` (or another probe)
+/// recorded empty; v4 fills `cache_types` on llama.cpp lanes (the
+/// `--cache-type-k` allowed-values list), which v3 rows recorded
+/// empty. Bump whenever `parse_help` (or another probe)
 /// changes what the extracted vocabulary MEANS - stored rows stamped
 /// below the current version self-heal via the daemon-boot backfill
 /// and `blazar engine reprobe`.
-pub const MANIFEST_PROBE_VERSION: u32 = 3;
+pub const MANIFEST_PROBE_VERSION: u32 = 4;
 
 /// Preview of the spawn-time capability rescue (the re-route in
 /// `spawn_instance` after a lane dies rejecting an architecture): when
@@ -431,6 +440,7 @@ impl Manifest {
     pub fn merge_vocab_from(&mut self, fresh: &Manifest) {
         self.flags.clone_from(&fresh.flags);
         self.spec_types.clone_from(&fresh.spec_types);
+        self.cache_types.clone_from(&fresh.cache_types);
         self.devices.clone_from(&fresh.devices);
         self.probe_version = fresh.probe_version;
     }
@@ -548,7 +558,7 @@ pub fn probe_with_env(
     )
     .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
     let help = String::from_utf8_lossy(&out.stdout).to_string();
-    let (flags, spec_types) = parse_help(&help);
+    let (flags, spec_types, cache_types) = parse_help(&help);
 
     Ok(Manifest {
         tag: tag.to_string(),
@@ -557,6 +567,7 @@ pub fn probe_with_env(
         devices,
         flags,
         spec_types,
+        cache_types,
         server_path: server.to_string(),
         source: EngineSource::Upstream,
         repo: None,
@@ -654,7 +665,7 @@ fn probe_mlx(server_path: &Path, tag: &str) -> Result<Manifest> {
             format!("run {server} --help (mlx import chain can take a minute cold)")
         })?;
     let help = String::from_utf8_lossy(&help_out.stdout).to_string();
-    let (flags, _) = parse_help(&help);
+    let (flags, _, _) = parse_help(&help);
     if flags.is_empty() {
         return Err(anyhow!(
             "mlx-lm --help parsed to zero flags (output format changed upstream?): {}",
@@ -669,6 +680,7 @@ fn probe_mlx(server_path: &Path, tag: &str) -> Result<Manifest> {
         devices: Vec::new(),
         flags,
         spec_types: Vec::new(),
+        cache_types: Vec::new(),
         server_path: server.to_string(),
         probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
@@ -724,7 +736,7 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
         if let Ok(out) =
             crate::probe::with_spawn_retry(|| Command::new(server).args(&args).output())
         {
-            let (mut f, _) = parse_help(&String::from_utf8_lossy(&out.stdout));
+            let (mut f, _, _) = parse_help(&String::from_utf8_lossy(&out.stdout));
             flags.append(&mut f);
         }
     }
@@ -736,6 +748,7 @@ fn probe_mistralrs(server_path: &Path, tag: &str) -> Result<Manifest> {
         devices: Vec::new(),
         flags,
         spec_types: Vec::new(),
+        cache_types: Vec::new(),
         server_path: server.to_string(),
         probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
@@ -817,7 +830,7 @@ fn probe_sglang(server_path: &Path, tag: &str) -> Result<Manifest> {
             format!("run {server} --help (sglang import chain can take a minute cold)")
         })?;
     let help = String::from_utf8_lossy(&help_out.stdout).to_string();
-    let (flags, _) = parse_help(&help);
+    let (flags, _, _) = parse_help(&help);
     if flags.is_empty() {
         return Err(anyhow!(
             "sglang --help parsed to zero flags (output format changed upstream?): {}",
@@ -1018,7 +1031,7 @@ fn probe_openaihost(server_path: &Path, tag: &str) -> Result<Manifest> {
             format!("run {server} serve --help (litert-lm import chain can take a minute cold)")
         })?;
     let help = String::from_utf8_lossy(&help_out.stdout).to_string();
-    let (flags, _) = parse_help(&help);
+    let (flags, _, _) = parse_help(&help);
     if flags.is_empty() {
         return Err(anyhow!(
             "litert-lm serve --help parsed to zero flags (output format changed upstream?): {}",
@@ -1033,6 +1046,7 @@ fn probe_openaihost(server_path: &Path, tag: &str) -> Result<Manifest> {
         devices: Vec::new(),
         flags,
         spec_types: Vec::new(),
+        cache_types: Vec::new(),
         server_path: server.to_string(),
         probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
@@ -1133,7 +1147,7 @@ fn probe_sdcpp(server_path: &Path, tag: &str) -> Result<Manifest> {
     let help_out = crate::probe::probe_output(Command::new(server).arg("--help"), 30)
         .with_context(|| format!("run {server} --help (timed out or failed to spawn)"))?;
     let help = String::from_utf8_lossy(&help_out.stdout).to_string();
-    let (flags, _) = parse_help(&help);
+    let (flags, _, _) = parse_help(&help);
     if flags.is_empty() {
         let preview = help.lines().take(3).collect::<Vec<_>>().join(" | ");
         return Err(zero_flag_help_error("sd-server", &help_out, &preview));
@@ -1148,6 +1162,7 @@ fn probe_sdcpp(server_path: &Path, tag: &str) -> Result<Manifest> {
         devices,
         flags,
         spec_types: Vec::new(),
+        cache_types: Vec::new(),
         server_path: server.to_string(),
         probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
@@ -1221,7 +1236,7 @@ fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
     } else {
         &err_help
     };
-    let (flags, _) = parse_help(help_text);
+    let (flags, _, _) = parse_help(help_text);
     if flags.is_empty() {
         let preview = err_help
             .lines()
@@ -1239,6 +1254,7 @@ fn probe_whisper(server_path: &Path, tag: &str) -> Result<Manifest> {
         devices: Vec::new(),
         flags,
         spec_types: Vec::new(),
+        cache_types: Vec::new(),
         server_path: server.to_string(),
         probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
@@ -1277,7 +1293,7 @@ fn probe_piper(server_path: &Path, tag: &str) -> Result<Manifest> {
     } else {
         &out_help
     };
-    let (flags, _) = parse_help(help_text);
+    let (flags, _, _) = parse_help(help_text);
     if flags.is_empty() {
         let preview = err_help
             .lines()
@@ -1295,6 +1311,7 @@ fn probe_piper(server_path: &Path, tag: &str) -> Result<Manifest> {
         devices: Vec::new(),
         flags,
         spec_types: Vec::new(),
+        cache_types: Vec::new(),
         server_path: server.to_string(),
         probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
@@ -1378,6 +1395,7 @@ fn probe_kokoro(server_path: &Path, tag: &str) -> Result<Manifest> {
         devices: Vec::new(),
         flags: BTreeSet::new(),
         spec_types: Vec::new(),
+        cache_types: Vec::new(),
         server_path: server.to_string(),
         probe_version: MANIFEST_PROBE_VERSION,
         ..Default::default()
@@ -1489,14 +1507,23 @@ pub(crate) fn parse_devices(text: &str) -> Vec<DeviceDesc> {
 }
 
 /// Extract every long flag from `--help` text plus the `--spec-type`
-/// value list when present.
-fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>) {
+/// value list and the `--cache-type-k` allowed-grade list when present.
+fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>, Vec<String>) {
     let mut flags = BTreeSet::new();
     let mut spec_types = Vec::new();
+    let mut cache_types = Vec::new();
+    // First long flag of the most recent option-table row: llama-server
+    // prints `allowed values: ...` on the line AFTER the flag row, so the
+    // vocabulary belongs to whatever flag preceded it. Draft-model rows
+    // (`--spec-draft-type-k, -ctkd, --cache-type-k-draft`) repeat the same
+    // grades; keying on the FIRST long flag keeps them from shadowing the
+    // primary `-ctk, --cache-type-k TYPE` row.
+    let mut pending_flag: Option<String> = None;
     for line in help.lines() {
         let trimmed = line.trim_start();
         // Option-table rows start with tokens like `-c, --ctx-size N` or
         // `--spec-type none,draft-simple,...`. Scan every whitespace token.
+        let mut first_long: Option<String> = None;
         for tok in trimmed.split_whitespace() {
             if let Some(long) = tok.strip_prefix("--") {
                 let clean = long
@@ -1520,9 +1547,32 @@ fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>) {
                     && !clean.is_empty()
                     && clean.len() > 1
                 {
+                    if first_long.is_none() {
+                        first_long = Some(format!("--{clean}"));
+                    }
                     flags.insert(format!("--{clean}"));
                 }
             }
+        }
+        if let Some(flag) = first_long {
+            pending_flag = Some(flag);
+        }
+        if let Some(list) = trimmed.strip_prefix("allowed values: ") {
+            if pending_flag.as_deref() == Some("--cache-type-k") {
+                let values: Vec<String> = list
+                    .split(',')
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| {
+                        !v.is_empty()
+                            && v.chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    })
+                    .collect();
+                if values.len() > 1 {
+                    cache_types = values;
+                }
+            }
+            continue;
         }
         if trimmed.contains("--spec-type") {
             // e.g. `--spec-type none,draft-simple,draft-eagle3,...`
@@ -1544,7 +1594,7 @@ fn parse_help(help: &str) -> (BTreeSet<String>, Vec<String>) {
             }
         }
     }
-    (flags, spec_types)
+    (flags, spec_types, cache_types)
 }
 
 #[cfg(test)]
@@ -1604,6 +1654,43 @@ mod tests {
         assert!(err.contains("exited 2"), "{err}");
         assert!(err.contains("unknown flag --help"), "{err}");
         assert!(!err.contains("libc"), "{err}");
+    }
+
+    #[test]
+    fn unit__parse_help__extracts_cache_types_from_cache_type_k_allowed_values() {
+        // Verified live: llama-server prints the KV cache grades on the
+        // `allowed values:` continuation after the -ctk row. The draft
+        // rows repeat the vocabulary under their own flags and must not
+        // overwrite the main cache-type list.
+        let help = "\
+-ctk,  --cache-type-k TYPE
+          KV cache data type for K vectors (default: f16)
+          allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+-ctv,  --cache-type-v TYPE
+          KV cache data type for V vectors (default: f16)
+          allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+-ctkd, --spec-draft-type-k, --cache-type-k-draft TYPE
+          KV cache data type for K vectors of the draft model (default: f16)
+          allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+--spec-type
+          speculative decoding method.
+          allowed values: next_n, top_k, top_p";
+        let (flags, spec_types, cache_types) = parse_help(help);
+        assert!(flags.contains("--cache-type-k"), "{flags:?}");
+        assert_eq!(
+            cache_types,
+            vec![
+                "f32", "f16", "bf16", "f8_e4m3", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"
+            ],
+            "main K/V grades must land in the manifest cache_types"
+        );
+        // Draft-model grades and speculative methods live under their
+        // own flags and never leak into the KV cache vocabulary.
+        assert!(spec_types.iter().all(|s| s != "f32"), "{spec_types:?}");
+        assert!(
+            !cache_types.iter().any(|c| c == "next_n"),
+            "{cache_types:?}"
+        );
     }
 
     #[test]
@@ -1676,6 +1763,7 @@ mod tests {
             devices: Vec::new(),
             flags: BTreeSet::new(),
             spec_types: Vec::new(),
+            cache_types: Vec::new(),
             server_path:
                 "/home/other/.local/share/blazar/engines/b10970-cuda/llama-b10970-cuda/llama-server"
                     .into(),
@@ -1702,6 +1790,7 @@ mod tests {
             devices: Vec::new(),
             flags: BTreeSet::new(),
             spec_types: Vec::new(),
+            cache_types: Vec::new(),
             server_path: present.display().to_string(),
             ..Default::default()
         };
@@ -1725,6 +1814,7 @@ mod tests {
             devices: Vec::new(),
             flags: BTreeSet::new(),
             spec_types: Vec::new(),
+            cache_types: Vec::new(),
             server_path: "/gone/custom/llama-server".into(),
             ..Default::default()
         };
@@ -1740,6 +1830,7 @@ mod tests {
             devices: Vec::new(),
             flags: BTreeSet::new(),
             spec_types: Vec::new(),
+            cache_types: Vec::new(),
             server_path: server_path.into(),
             ..Default::default()
         }
@@ -1869,7 +1960,7 @@ sd-server [options]
   --clip_vision FNAME        clip vision projector
   --qwen2vl_vision FNAME     qwen2vl projector
 ";
-        let (flags, _) = parse_help(help);
+        let (flags, _, _) = parse_help(help);
         for expected in ["--llm", "--llm_vision", "--clip_vision", "--qwen2vl_vision"] {
             assert!(flags.contains(expected), "missing {expected} in {flags:?}");
         }
@@ -1890,7 +1981,7 @@ options:
 ----------------------------------------------------------
   --ctx-size N              size of the prompt context (default: 0)
 ";
-        let (flags, _) = parse_help(help);
+        let (flags, _, _) = parse_help(help);
         assert!(
             flags.contains("--fim-qwen-1.5b-default"),
             "dotted flag must survive: {flags:?}"
@@ -1919,7 +2010,7 @@ options:
   --spec-type none,draft-simple,draft-eagle3,ngram-simple  types of speculative decoding
   -fa, --flash-attn [on|off|auto]
 ";
-        let (flags, spec) = parse_help(help);
+        let (flags, spec, _) = parse_help(help);
         for expected in [
             "--help",
             "--version",
@@ -2043,6 +2134,7 @@ options:
             devices: vec![],
             flags: BTreeSet::from(["--jinja".to_string()]),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: "/x".into(),
             ..Default::default()
         };
@@ -2094,6 +2186,7 @@ options:
             devices: vec![],
             flags: BTreeSet::new(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: "/x/llama-server".into(),
             ..Default::default()
         };

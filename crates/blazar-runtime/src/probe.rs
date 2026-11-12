@@ -534,6 +534,7 @@ mod tests {
             }],
             flags: std::collections::BTreeSet::default(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: "/x".into(),
             ..Default::default()
         };
@@ -566,6 +567,7 @@ mod tests {
             }],
             flags: std::collections::BTreeSet::default(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: "/x".into(),
             ..Default::default()
         };
@@ -594,6 +596,7 @@ mod tests {
             }],
             flags: std::collections::BTreeSet::default(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: "/x".into(),
             ..Default::default()
         };
@@ -630,6 +633,7 @@ mod tests {
             ],
             flags: std::collections::BTreeSet::default(),
             spec_types: vec![],
+            cache_types: Vec::new(),
             server_path: "/x".into(),
             ..Default::default()
         };

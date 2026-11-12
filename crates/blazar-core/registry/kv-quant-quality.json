@@ -1,72 +1,160 @@
 {
-  "schema": 1,
-  "note": "Measured KV-quant quality receipts (llama-perplexity A/B: fixed corpus, identical ctx/chunks/ngl, only cache types varied). `model` is the store name - the same string /api/explain/{model} resolves through the canonical ladder - so lookups match exactly; `file` records the measured GGUF for provenance. Populated by the kv-quality campaign; models without a row here have no measured receipt - the /api/explain kv_advisory reports measured: null for them rather than borrowing numbers. ppl at ctx 2048 does not cover long-context retrieval effects - see each receipt's note.",
-  "receipts": [
+ "schema": 1,
+ "note": "Measured KV-quant quality receipts (llama-perplexity A/B: fixed corpus, identical ctx/chunks/ngl, only cache types varied). `model` is the store name - the same string /api/explain/{model} resolves through the canonical ladder - so lookups match exactly; `file` records the measured GGUF for provenance. Populated by the kv-quality campaign; models without a row here have no measured receipt - the /api/explain kv_advisory reports measured: null for them rather than borrowing numbers. ppl at ctx 2048 does not cover long-context retrieval effects - see each receipt's note.",
+ "receipts": [
+  {
+   "model": "qwen3.5-9b",
+   "file": "Qwen3.5-9B-Q4_K_M.gguf",
+   "engine_tag": "b11393-cuda",
+   "ppl_tool": "own llama-perplexity",
+   "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+   "ctx": 2048,
+   "chunks": 4,
+   "ngl": 99,
+   "rungs": [
     {
-      "model": "qwen3.5-9b",
-      "file": "Qwen3.5-9B-Q4_K_M.gguf",
-      "engine_tag": "b11393-cuda",
-      "ppl_tool": "own llama-perplexity",
-      "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
-      "ctx": 2048,
-      "chunks": 4,
-      "ngl": 99,
-      "rungs": [
-        { "kv": "f16", "ppl": 5.3738, "ppl_err": 0.22409 },
-        { "kv": "q8_0/q8_0", "ppl": 5.3615, "ppl_err": 0.22315 },
-        { "kv": "q4_0/q4_0", "ppl": 5.3711, "ppl_err": 0.22331 }
-      ],
-      "source": "bench-artifacts/20261005-kv-quality/",
-      "note": "q8_0 and q4_0 KV deltas vs f16 are within the +/-0.22 error bars at ctx 2048 (ppl-equivalent at this ctx); long-context retrieval degradation is not covered by this receipt"
+     "kv": "f16",
+     "ppl": 5.3738,
+     "ppl_err": 0.22409
     },
     {
-      "model": "qwen3.5-9b",
-      "file": "Qwen3.5-9B-Q4_K_M.gguf",
-      "engine_tag": "fork-AtomicBot-ai_atomic-llama-cpp-turboquant-8d935078-cuda",
-      "ppl_tool": "own llama-perplexity",
-      "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
-      "ctx": 2048,
-      "chunks": 4,
-      "ngl": 99,
-      "rungs": [
-        { "kv": "f16", "ppl": 5.3651, "ppl_err": 0.2236 },
-        { "kv": "turbo3/turbo3", "ppl": 5.3912, "ppl_err": 0.22587 },
-        { "kv": "turbo4/turbo4", "ppl": 5.3754, "ppl_err": 0.22413 }
-      ],
-      "source": "bench-artifacts/20261107-turboquant-kv-quality/",
-      "note": "turboquant fork lane: turbo3 (WHT-rotated 3-bit, ~4.3x KV compression) and turbo4 (~3.8x) ppl deltas vs f16 are +0.026/+0.010 - inside the +/-0.22 error bars at ctx 2048. turbo grades exist only on the fork lane; upstream llama-server rejects unknown cache types at load"
+     "kv": "q8_0/q8_0",
+     "ppl": 5.3615,
+     "ppl_err": 0.22315
     },
     {
-      "model": "qwen3.5-9b",
-      "file": "Qwen3.5-9B-Q4_K_M.gguf",
-      "engine_tag": "fork-AtomicBot-ai_atomic-llama-cpp-turboquant-8d935078-cuda",
-      "ppl_tool": "own llama-perplexity",
-      "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
-      "ctx": 16384,
-      "chunks": 4,
-      "ngl": 99,
-      "rungs": [
-        { "kv": "turbo3/turbo3", "ppl": 3.8744, "ppl_err": 0.05918 },
-        { "kv": "turbo4/turbo4", "ppl": 3.8798, "ppl_err": 0.05943 }
-      ],
-      "source": "bench-artifacts/20261107-turboquant-kv-quality/",
-      "note": "long-ctx turbo receipt: turbo3-vs-turbo4 delta at ctx 16384 is 0.005, inside the +/-0.059 error bars. f16 was not run at 16k (does not fit this 8GiB card); turbo-vs-f16 equivalence is evidenced by the ctx-2048 receipt on the same lane. turbo at ctx 32768 dies silently on this card (2/2 repro, no CUDA/OOM trace - see artifact README); no 32k turbo receipt is claimed"
-    },
-    {
-      "model": "qwen3.5-9b",
-      "file": "Qwen3.5-9B-Q4_K_M.gguf",
-      "engine_tag": "b11417-cuda",
-      "ppl_tool": "own llama-perplexity",
-      "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
-      "ctx": 32768,
-      "chunks": 4,
-      "ngl": 99,
-      "rungs": [
-        { "kv": "q8_0/q8_0", "ppl": 3.5472, "ppl_err": 0.03735 },
-        { "kv": "q4_0/q4_0", "ppl": 3.5302, "ppl_err": 0.03684 }
-      ],
-      "source": "bench-artifacts/20261005-kv-quality-32k/",
-      "note": "long-ctx receipt: q8_0-vs-q4_0 delta at ctx 32768 is 0.017, inside the +/-0.037 error bars - q4_0 KV is quality-free at 32k on this corpus. f16 was not run: it does not fit this 8GiB card at 32k. Cross-ctx ppl values are NOT comparable (different window scale); the comparable quantities are the within-ctx deltas"
+     "kv": "q4_0/q4_0",
+     "ppl": 5.3711,
+     "ppl_err": 0.22331
     }
-  ]
+   ],
+   "source": "bench-artifacts/20261005-kv-quality/",
+   "note": "q8_0 and q4_0 KV deltas vs f16 are within the +/-0.22 error bars at ctx 2048 (ppl-equivalent at this ctx); long-context retrieval degradation is not covered by this receipt"
+  },
+  {
+   "model": "qwen3.5-9b",
+   "file": "Qwen3.5-9B-Q4_K_M.gguf",
+   "engine_tag": "fork-AtomicBot-ai_atomic-llama-cpp-turboquant-8d935078-cuda",
+   "ppl_tool": "own llama-perplexity",
+   "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+   "ctx": 2048,
+   "chunks": 4,
+   "ngl": 99,
+   "rungs": [
+    {
+     "kv": "f16",
+     "ppl": 5.3651,
+     "ppl_err": 0.2236
+    },
+    {
+     "kv": "turbo3/turbo3",
+     "ppl": 5.3912,
+     "ppl_err": 0.22587
+    },
+    {
+     "kv": "turbo4/turbo4",
+     "ppl": 5.3754,
+     "ppl_err": 0.22413
+    }
+   ],
+   "source": "bench-artifacts/20261107-turboquant-kv-quality/",
+   "note": "turboquant fork lane: turbo3 (WHT-rotated 3-bit, ~4.3x KV compression) and turbo4 (~3.8x) ppl deltas vs f16 are +0.026/+0.010 - inside the +/-0.22 error bars at ctx 2048. turbo grades exist only on the fork lane; upstream llama-server rejects unknown cache types at load"
+  },
+  {
+   "model": "qwen3.5-9b",
+   "file": "Qwen3.5-9B-Q4_K_M.gguf",
+   "engine_tag": "fork-AtomicBot-ai_atomic-llama-cpp-turboquant-8d935078-cuda",
+   "ppl_tool": "own llama-perplexity",
+   "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+   "ctx": 16384,
+   "chunks": 4,
+   "ngl": 99,
+   "rungs": [
+    {
+     "kv": "turbo3/turbo3",
+     "ppl": 3.8744,
+     "ppl_err": 0.05918
+    },
+    {
+     "kv": "turbo4/turbo4",
+     "ppl": 3.8798,
+     "ppl_err": 0.05943
+    }
+   ],
+   "source": "bench-artifacts/20261107-turboquant-kv-quality/",
+   "note": "long-ctx turbo receipt: turbo3-vs-turbo4 delta at ctx 16384 is 0.005, inside the +/-0.059 error bars. f16 was not run at 16k (does not fit this 8GiB card); turbo-vs-f16 equivalence is evidenced by the ctx-2048 receipt on the same lane. turbo at ctx 32768 dies silently on this card (2/2 repro, no CUDA/OOM trace - see artifact README); no 32k turbo receipt is claimed"
+  },
+  {
+   "model": "qwen3.5-9b",
+   "file": "Qwen3.5-9B-Q4_K_M.gguf",
+   "engine_tag": "b11417-cuda",
+   "ppl_tool": "own llama-perplexity",
+   "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+   "ctx": 32768,
+   "chunks": 4,
+   "ngl": 99,
+   "rungs": [
+    {
+     "kv": "q8_0/q8_0",
+     "ppl": 3.5472,
+     "ppl_err": 0.03735
+    },
+    {
+     "kv": "q4_0/q4_0",
+     "ppl": 3.5302,
+     "ppl_err": 0.03684
+    }
+   ],
+   "source": "bench-artifacts/20261005-kv-quality-32k/",
+   "note": "long-ctx receipt: q8_0-vs-q4_0 delta at ctx 32768 is 0.017, inside the +/-0.037 error bars - q4_0 KV is quality-free at 32k on this corpus. f16 was not run: it does not fit this 8GiB card at 32k. Cross-ctx ppl values are NOT comparable (different window scale); the comparable quantities are the within-ctx deltas"
+  },
+  {
+   "model": "qwen2.5-0.5b-instruct",
+   "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+   "engine_tag": "b12284-cuda",
+   "ppl_tool": "own llama-perplexity",
+   "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+   "ctx": 2048,
+   "chunks": 4,
+   "ngl": 99,
+   "rungs": [
+    {
+     "kv": "f16",
+     "ppl": 7.0511,
+     "ppl_err": 0.32082
+    },
+    {
+     "kv": "f8_e4m3/f8_e4m3",
+     "ppl": 7.1867,
+     "ppl_err": 0.32603
+    }
+   ],
+   "source": "bench-artifacts/20261111-fp8-kv-quality/",
+   "note": "OCP-FP8 E4M3 KV (upstream PR #28392, first shipped build b12284): ppl delta +0.136 vs f16 at ctx 2048 - inside the +/-0.32 error bars"
+  },
+  {
+   "model": "qwen2.5-0.5b-instruct",
+   "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+   "engine_tag": "b12284-cuda",
+   "ppl_tool": "own llama-perplexity",
+   "corpus": "bench-artifacts/20261005-kv-quality/corpus.txt",
+   "ctx": 16384,
+   "chunks": 4,
+   "ngl": 99,
+   "rungs": [
+    {
+     "kv": "f16",
+     "ppl": 4.6458,
+     "ppl_err": 0.07021
+    },
+    {
+     "kv": "f8_e4m3/f8_e4m3",
+     "ppl": 4.7867,
+     "ppl_err": 0.0727
+    }
+   ],
+   "source": "bench-artifacts/20261111-fp8-kv-quality/",
+   "note": "long-context: f8_e4m3 ppl delta +0.141 vs f16 EXCEEDS the +/-0.07 error bars (~2x) - a real, measurable long-context quality cost on this model. This is why the grade stays pin-only: the fit ladder never auto-selects f8_e4m3; capacity-constrained operators pin it deliberately. Engine line confirms engagement (FA_QUANTS ...f8_e4m3-f8_e4m3, NATIVE_FP8 = 1)"
+  }
+ ]
 }

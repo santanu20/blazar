@@ -6218,6 +6218,7 @@ fn doctor_sglang_fit(d: &BlazarDirs) -> Vec<Check> {
             &engine.tag,
             &flags,
             &[],
+            &[],
             blazar_core::Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 0,
@@ -6336,6 +6337,7 @@ fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
                 draft.as_deref(),
                 &engine.tag,
                 &flags,
+                &[],
                 &[],
                 blazar_core::Endpoint::Tcp {
                     host: "127.0.0.1".into(),
@@ -17281,6 +17283,7 @@ fn sglang_spec_race_lane(
         &engine_row.tag,
         &manifest.flags,
         &manifest.spec_types,
+        &manifest.cache_types,
         blazar_core::Endpoint::Tcp {
             host: "127.0.0.1".into(),
             port: 0,
@@ -17467,6 +17470,7 @@ impl TuneLane {
             &self.engine_row.tag,
             &self.manifest.flags,
             &self.manifest.spec_types,
+            &self.manifest.cache_types,
             blazar_core::Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 0,
@@ -17602,6 +17606,7 @@ aborts on this family. Profile pins for it would measure nothing",
         &engine_row.tag,
         &manifest.flags,
         &manifest.spec_types,
+        &manifest.cache_types,
         blazar_core::Endpoint::Tcp {
             host: "127.0.0.1".into(),
             port: 0,
@@ -17765,6 +17770,7 @@ aborts on this family. Profile pins for it would measure nothing",
             &engine_row.tag,
             &manifest.flags,
             &manifest.spec_types,
+            &manifest.cache_types,
             blazar_core::Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 0,
@@ -17833,6 +17839,7 @@ aborts on this family. Profile pins for it would measure nothing",
             &engine_row.tag,
             &manifest.flags,
             &manifest.spec_types,
+            &manifest.cache_types,
             blazar_core::Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 0,
@@ -17891,6 +17898,7 @@ aborts on this family. Profile pins for it would measure nothing",
                 &engine_row.tag,
                 &manifest.flags,
                 &manifest.spec_types,
+                &manifest.cache_types,
                 blazar_core::Endpoint::Tcp {
                     host: "127.0.0.1".into(),
                     port: 0,
@@ -18092,6 +18100,7 @@ aborts on this family. Profile pins for it would measure nothing",
             &engine_row.tag,
             &manifest.flags,
             &manifest.spec_types,
+            &manifest.cache_types,
             blazar_core::Endpoint::Tcp {
                 host: "127.0.0.1".into(),
                 port: 0,
@@ -18635,6 +18644,23 @@ fn sglang_hint_families() -> Vec<&'static str> {
         "random_seed = 0    cuda_graph_max_bs = 8    cuda_graph_bs = [1, 2, 4]",
         "cuda_graph_backend_prefill = \"breakable\"    # full|breakable|tc_piecewise|disabled - disabled unsticks laptop prefill capture",
         "max_total_tokens = 4096    hicache_enable = false    hicache_ratio = 2.0    hicache_size = 0    is_embedding = false",
+        "hicache_storage_backend = \"\"    # L3 tier (0.5.23+): file|mooncake|hf3fs|... under hicache_enable; write_back/buffer_only variants need it",
+        "hicache_write_policy = \"\"    hicache_io_backend = \"\"    hicache_host_memory_mode = \"\"",
+        "hicache_storage_extra_config = \"\"    # JSON object string forwarded to the backend factory",
+        "disagg_mode = \"\"    # PD role: prefill|decode (unset means ordinary single-process lane); prefill hosts the bootstrap server",
+        "disagg_transfer_backend = \"\"    # mooncake|nixl|ascend|fake|mori|mooncake_tcp - fake moves no KV (wiring proof); others need the venv package",
+        "disagg_bootstrap_port = 0    # prefill-role bootstrap server port (default 8998 when unset)",
+        "disagg_decode_allocation_policy = \"\"    # decode role only: early|prefill_complete",
+        "disagg_decode_radix_cache = false    # decode role only; refused under the fake backend",
+        "disagg_pair = false    # spawn both roles behind one model and route chat via the PD pair",
+        "pdmux_enable = false    # collocate both roles in one process on greenctx SM partitions (0.5.23+)",
+        "pdmux_config_path = \"\"    # the PDMux partition-plan YAML (required with pdmux_enable; excludes the disagg pair family)",
+        "megakernel_enable = false    # NVIDIA fused decode/verify kernels via the sgl-nvidia-mega plugin (experimental; needs the plugin wheel)",
+        "monokernel_enable = false    # AMD persistent ROCm kernels via the sgl-amd-mono plugin (experimental; needs the plugin wheel; excludes megakernel_enable)",
+        "attn_dp_size = 1    # data-parallel attention groups inside the TP group (DeepSeek-class long context; more schedulers per rank)",
+        "cp_size = 1    # context parallelism: split 128K+ prompts across ranks for prefill (needs a multi-rank lane)",
+        "attn_cp_size = 1    # attention-side context parallelism for MLA-class models",
+        "dcp_size = 1    # decode context parallelism (long generations under PD deployments)",
         "metrics = false    skip_warmup = false    torch_compile = false",
         "tokenizer_mode = \"auto\"    tokenizer_backend = \"huggingface\"",
         "tokenizer_worker_num = 1    detokenizer_worker_num = 1",
@@ -20973,7 +20999,7 @@ async fn engine_update_sglang(d: &BlazarDirs, version: Option<String>, check: bo
             return Ok(());
         }
     };
-    let pinned = blazar_runtime::engine::sglang_install::SGLANG_DEFAULT_VERSION;
+    let pinned = blazar_runtime::engine::sglang_install::SGLANG_FALLBACK_VERSION;
     let flag_contract_note = format!(
         "note: this Blazar build verifies the sglang flag contract on {pinned} - \
          newer versions run with unknown flags skipped (profile warnings)"

@@ -630,6 +630,7 @@ fn base_input<'a>(
         engine_tag: "registry",
         supported_flags: flags,
         spec_types: &[],
+        cache_types: &[],
         endpoint: Endpoint::Tcp {
             host: "127.0.0.1".into(),
             port: 12345,

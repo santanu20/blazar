@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine_tag: "b10809",
         supported_flags: &flags,
         spec_types: &[],
+        cache_types: &[],
         endpoint: Endpoint::Tcp {
             host: "127.0.0.1".into(),
             port: 1,

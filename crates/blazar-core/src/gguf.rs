@@ -178,6 +178,38 @@ impl GgufMeta {
         }
     }
 
+    /// Upstream llama.cpp's tensor split shards graph ops that carry
+    /// split-kernel implementations; the linear-recurrent blocks behind
+    /// [`AttentionClass::Recurrent`] and [`AttentionClass::HybridLinear`]
+    /// have none, so a tensor-mode spawn of these architectures dies in
+    /// `ggml-cuda` at graph init. The profile compiler uses this to
+    /// refuse tensor mode up front with a teaching error instead of an
+    /// engine-side crash (layer split stays available - the default).
+    #[must_use]
+    pub fn tensor_split_incompatible(&self) -> bool {
+        matches!(
+            self.attention_class(),
+            AttentionClass::Recurrent | AttentionClass::HybridLinear
+        )
+    }
+
+    /// Whether the loader demands K and V cache types be THE SAME grade.
+    /// Upstream llama-context.cpp hard-errors at context init for the
+    /// MLA/DeepSeek class (`(is_mla() || DEEPSEEK4/41) && type_k != type_v`)
+    /// and excludes fp8 caches from that same class. The latent-width
+    /// keys (`attention.key_length`/`value_length`) are the metadata
+    /// marker this codebase models for MLA (Qwen3.5 ships 256/256,
+    /// verified on the store's 9B GGUF); `DeepSeek` archs sometimes omit
+    /// them, so the architecture name carries those. Consequences:
+    /// the KV-quant ladder must not emit a differential (q8/q4) pair,
+    /// and pins get reconciled to one grade before spawn.
+    #[must_use]
+    pub fn requires_symmetric_kv(&self) -> bool {
+        self.key_length.is_some()
+            || self.value_length.is_some()
+            || self.architecture.starts_with("deepseek")
+    }
+
     /// Provable count of trunk layers that hold a ctx-growing KV cache.
     /// When the recurrent/full split is NOT provable from metadata this
     /// returns `Some(block_count)` - the conservative all-layers assumption
