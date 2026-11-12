@@ -51,8 +51,8 @@ Registry lane `llamacpp` pins 75 first-class flags (compile + spawn-time emissio
 
 ### Certified against a live engine
 
-- `--cache-type-k` [`bench-artifacts/20261005-kv-quality/benchmark.md`](bench-artifacts/20261005-kv-quality/benchmark.md) - q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)
-- `--cache-type-v` [`bench-artifacts/20261005-kv-quality/benchmark.md`](bench-artifacts/20261005-kv-quality/benchmark.md) - q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)
+- `--cache-type-k` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
+- `--cache-type-v` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
 
 ### Passthrough families
 
@@ -92,8 +92,8 @@ Registry lane `llamacpp` pins 75 first-class flags (compile + spawn-time emissio
 
 ### Certified against a live engine
 
-- `--cache-type-k` [`bench-artifacts/20261005-kv-quality/benchmark.md`](bench-artifacts/20261005-kv-quality/benchmark.md) - q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)
-- `--cache-type-v` [`bench-artifacts/20261005-kv-quality/benchmark.md`](bench-artifacts/20261005-kv-quality/benchmark.md) - q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)
+- `--cache-type-k` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
+- `--cache-type-v` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
 
 ### Passthrough families
 

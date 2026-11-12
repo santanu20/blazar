@@ -4,14 +4,14 @@
     {
       "lane": "llamacpp",
       "flag": "--cache-type-k",
-      "receipt": "bench-artifacts/20261005-kv-quality/benchmark.md",
-      "note": "q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)"
+      "receipt": "bench-artifacts/20261111-fp8-kv-quality/README.md",
+      "note": "q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects"
     },
     {
       "lane": "llamacpp",
       "flag": "--cache-type-v",
-      "receipt": "bench-artifacts/20261005-kv-quality/benchmark.md",
-      "note": "q4_0 KV quality-free at 2048 and 32k ctx (perplexity parity in bars)"
+      "receipt": "bench-artifacts/20261111-fp8-kv-quality/README.md",
+      "note": "q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects"
     },
     {
       "lane": "mistralrs",
