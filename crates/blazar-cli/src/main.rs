@@ -4609,6 +4609,7 @@ fn read_menu_line() -> Option<String> {
 /// the fresh re-check (not the install result) is what the user reads.
 /// A failing kind does not stop the rest: "both" must still try the
 /// one that fits (e.g. disk too small for sglang, fine for mistral.rs).
+#[allow(clippy::large_futures)] // windows-target future layout: the supervisor/installer call chains exceed the lint there; linux stays under the threshold
 async fn install_offer_kinds(
     d: &BlazarDirs,
     row: &blazar_core::store::ModelRow,
