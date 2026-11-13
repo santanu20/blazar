@@ -4547,6 +4547,7 @@ fn lane_state_for(d: &BlazarDirs, row: &blazar_core::store::ModelRow) -> LaneSta
 /// Piped/CI stdin and `BLAZAR_NO_PROMPT=1` print the teaching line
 /// and return without blocking; the daemon's request paths never reach
 /// this (they serve whatever is installed and teach via errors).
+#[allow(clippy::large_futures)] // windows-target future layout: the supervisor/installer call chains exceed the lint there; linux stays under the threshold
 async fn offer_missing_engine(d: &BlazarDirs, row: &blazar_core::store::ModelRow) {
     use std::io::IsTerminal as _;
 
