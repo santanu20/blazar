@@ -1614,6 +1614,7 @@ fn match_model_basename(input: &str, rows: &[blazar_core::store::ModelRow]) -> O
 /// ref or a catalog short name. Anything else is a named error BEFORE
 /// the REPL opens (the daemon's not-found error stays the teacher of
 /// last resort for API callers). Store hits never touch the network.
+#[allow(clippy::large_futures)] // windows-target future layout: the supervisor/installer call chains exceed the lint there; linux stays under the threshold
 async fn ensure_run_model(name: &str) -> Result<String> {
     let d = dirs();
     if d.db_file().is_file()
@@ -4428,6 +4429,7 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
     }
 }
 
+#[allow(clippy::large_futures)] // windows-target future layout: the supervisor/installer call chains exceed the lint there; linux stays under the threshold
 async fn install_missing_kind(
     d: &BlazarDirs,
     kind: blazar_core::engine_kind::EngineKind,
@@ -10045,6 +10047,7 @@ mod signal_stop {
     }
 }
 
+#[allow(clippy::large_futures)] // windows-target future layout: the supervisor/installer call chains exceed the lint there; linux stays under the threshold
 async fn pull(
     target: &str,
     force: bool,
@@ -19444,6 +19447,7 @@ fn resolve_engine_update_all(flag: bool, tag: Option<&str>) -> Result<bool> {
 }
 
 #[allow(clippy::too_many_lines)] // command dispatch: one arm per engine subcommand
+#[allow(clippy::large_futures)] // windows-target future layout: the supervisor/installer call chains exceed the lint there; linux stays under the threshold
 async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
     let d = dirs();
     match cmd {
@@ -21188,6 +21192,7 @@ fn restore_active_tag(
 /// active lane is preserved: a lane install that flips the active tag
 /// to its own kind is restored to the pre-walk lane (newest build of
 /// that kind) after the walk.
+#[allow(clippy::large_futures)] // windows-target future layout: the supervisor/installer call chains exceed the lint there; linux stays under the threshold
 async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result<()> {
     let store = Store::open(d)?;
     let kinds = installed_engine_kinds(&store.list_engines()?);
