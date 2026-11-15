@@ -506,6 +506,21 @@ pub fn cached_prompt_tokens(usage: Option<&Value>) -> u64 {
         .unwrap_or(0)
 }
 
+/// Ollama dialect contract: `function.arguments` is always a JSON object.
+/// Malformed model output (invalid/truncated JSON the child emitted as a
+/// string) degrades to an empty object — a raw string crashes
+/// pydantic-typed ollama clients mid-stream — and the raw payload is
+/// warned so the degradation stays observable instead of silent.
+fn arguments_object(raw: &str) -> Value {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v) if v.is_object() => v,
+        _ => {
+            tracing::warn!(malformed_tool_arguments = raw, "tool arguments not a JSON object; emitting empty object");
+            json!({})
+        }
+    }
+}
+
 /// `OpenAI` non-stream chat response -> ollama `ChatResponse` (done:true with
 /// counts from usage).
 #[must_use]
@@ -525,10 +540,11 @@ pub fn openai_chat_to_ollama(model: &str, openai: &Value) -> Value {
                 // The raw-lane adapters already hand over a parsed
                 // object; the child's native lane sends a JSON string.
                 let args = match f.get("arguments") {
-                    Some(Value::String(raw)) => {
-                        serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.clone()))
-                    }
-                    Some(other) => other.clone(),
+                    Some(Value::String(raw)) => arguments_object(raw),
+                    Some(other) if other.is_object() => other.clone(),
+                    // Non-object garbage (number/array) still violates the
+                    // contract — normalize to an empty object, not a passthrough.
+                    Some(_) => json!({}),
                     None => Value::Null,
                 };
                 json!({
@@ -602,12 +618,25 @@ impl ToolCallAccum {
                 if let Some(n) = f.get("name").and_then(Value::as_str) {
                     slot["function"]["name"] = Value::String(n.to_string());
                 }
-                if let Some(a) = f.get("arguments").and_then(Value::as_str) {
-                    let joined = format!(
-                        "{}{a}",
-                        slot["function"]["arguments"].as_str().unwrap_or("")
-                    );
-                    slot["function"]["arguments"] = Value::String(joined);
+                match f.get("arguments") {
+                    // Fragment dialect (llama.cpp/OpenAI): string shards
+                    // concatenate.
+                    Some(Value::String(a)) => {
+                        let joined = format!(
+                            "{}{a}",
+                            slot["function"]["arguments"].as_str().unwrap_or("")
+                        );
+                        slot["function"]["arguments"] = Value::String(joined);
+                    }
+                    // Complete-args dialect: an object fragment is terminal —
+                    // it replaces any partial accumulation instead of being
+                    // dropped (a drop left the slot empty and flush emitted
+                    // a contract-breaking string).
+                    Some(obj) if obj.is_object() => {
+                        slot["function"]["arguments"] =
+                            Value::String(serde_json::to_string(obj).unwrap_or_default());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -627,8 +656,10 @@ impl ToolCallAccum {
     }
 
     /// Drain merged calls as one ollama-dialect `tool_calls` array.
-    /// Malformed accumulated arguments (broken model output) fall back to
-    /// the raw string instead of failing the stream.
+    /// Accumulated arguments parse to a JSON object; malformed model
+    /// output (truncated/invalid JSON) degrades to an empty object with
+    /// a warning — never a raw string, which crashes pydantic-typed
+    /// ollama clients mid-stream.
     fn flush(&mut self) -> Option<Value> {
         if self.calls.is_empty() {
             return None;
@@ -640,10 +671,7 @@ impl ToolCallAccum {
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            call["function"]["arguments"] = match serde_json::from_str(&raw) {
-                Ok(v) => v,
-                Err(_) => Value::String(raw),
-            };
+            call["function"]["arguments"] = arguments_object(&raw);
             out.push(call);
         }
         Some(Value::Array(out))
@@ -1484,6 +1512,93 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn unit__tool_calls__malformed_args_never_string() {
+        // Ollama contract: function.arguments is ALWAYS a JSON object.
+        // Malformed model output must degrade to {} — a raw string crashes
+        // pydantic-typed ollama clients mid-stream (live hit: geokit
+        // chat_pipelines ore_thermo_via_python).
+        let mut accum = ToolCallAccum::default();
+        accum.absorb(&[json!({
+            "index": 0,
+            "function": {"name": "add", "arguments": "{\"a\": 2"}
+        })]);
+        let line = accum.flush_line("m").expect("line");
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        let args = &v["message"]["tool_calls"][0]["function"]["arguments"];
+        assert!(args.is_object(), "arguments must be an object, got {args}");
+    }
+
+    #[test]
+    fn unit__tool_calls__empty_accumulation_is_object_not_empty_string() {
+        // absorb() with no arguments fragment leaves the slot at "" —
+        // flush must still emit an object, never "".
+        let mut accum = ToolCallAccum::default();
+        accum.absorb(&[json!({
+            "index": 0,
+            "function": {"name": "ping"}
+        })]);
+        let line = accum.flush_line("m").expect("line");
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        let args = &v["message"]["tool_calls"][0]["function"]["arguments"];
+        assert!(args.is_object(), "arguments must be an object, got {args}");
+    }
+
+    #[test]
+    fn unit__tool_calls__object_fragment_absorbed_not_dropped() {
+        // Complete-args dialect: an object fragment replaces the slot
+        // instead of being silently dropped.
+        let mut accum = ToolCallAccum::default();
+        accum.absorb(&[json!({
+            "index": 0,
+            "function": {"name": "add", "arguments": {"a": 2, "b": 3}}
+        })]);
+        let line = accum.flush_line("m").expect("line");
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        let args = &v["message"]["tool_calls"][0]["function"]["arguments"];
+        assert_eq!(args["a"], json!(2));
+        assert_eq!(args["b"], json!(3));
+    }
+
+    #[test]
+    fn unit__tool_calls__fragment_merge_still_dict() {
+        // Pin existing behavior: string shards concatenate then parse.
+        let mut accum = ToolCallAccum::default();
+        accum.absorb(&[json!({
+            "index": 0,
+            "function": {"name": "add", "arguments": "{\"a\":"}
+        })]);
+        accum.absorb(&[json!({
+            "index": 0,
+            "function": {"arguments": "2, \"b\": 3}"}
+        })]);
+        let line = accum.flush_line("m").expect("line");
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        let args = &v["message"]["tool_calls"][0]["function"]["arguments"];
+        assert_eq!(args["a"], json!(2));
+        assert_eq!(args["b"], json!(3));
+    }
+
+    #[test]
+    fn unit__nonstream__malformed_args_never_string() {
+        // Non-stream path shares the contract: malformed child args
+        // degrade to {} — never Value::String.
+        let openai = json!({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {"name": "add", "arguments": "{\"a\": 2"}
+                }]
+            }}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let v = openai_chat_to_ollama("m", &openai);
+        let args = &v["message"]["tool_calls"][0]["function"]["arguments"];
+        assert!(args.is_object(), "arguments must be an object, got {args}");
+    }
 
     #[test]
     fn unit__sampler_options__native_passthrough_table() {
