@@ -242,6 +242,136 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
+/// Mirror of `profile::UNIFIED_SPAWN_OVERHEAD_BYTES` (private upstream) so
+/// `/api/fit` demand matches the spawn guard exactly.
+/// `unit__fit__overhead_mirror_matches_admission_floor` pins this against
+/// the public `admission_floor_bytes` - if the upstream constant ever
+/// changes, that test fails and forces a sync here.
+const FIT_SPAWN_OVERHEAD_MIB: u64 = 700;
+
+/// Halve `ctx` (floor 1024) until `weights + kv(ctx) + overhead` fits
+/// `free_mib` - the same ladder `blazar fit` walks. Returns the largest
+/// fitting ctx, or 0 when even 1024 does not fit.
+fn ctx_ladder(weights_mib: u64, kv_mib: impl Fn(u64) -> u64, free_mib: u64, start_ctx: u64) -> u64 {
+    let mut ctx = start_ctx.max(1024);
+    loop {
+        if weights_mib + kv_mib(ctx) + FIT_SPAWN_OVERHEAD_MIB <= free_mib {
+            return ctx;
+        }
+        if ctx <= 1024 {
+            return 0;
+        }
+        ctx = (ctx / 2).max(1024);
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct FitRequest {
+    model: String,
+    #[serde(default)]
+    ctx: Option<u32>,
+}
+
+/// POST /api/fit - pre-flight capacity math for one model at a context
+/// size: "will `<model>` load at `<ctx>` on the primary GPU right now?"
+///
+/// Composes the same primitives the runtime uses - `admission_floor_bytes`
+/// spawn-overhead semantics, `preflight::kv_f16_mib` KV math, the
+/// `parse_devices` census - so the answer cannot drift from what a spawn
+/// attempt would actually do. `max_ctx` / `max_ctx_q8` walk the same
+/// halve-until-fits ladder as `blazar fit` (floor 1024; q8 halves KV).
+pub async fn fit(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<FitRequest>,
+) -> Response {
+    let Some(row) = state.with_store(|s| crate::proxy::resolve_model(s, &body.model).ok()) else {
+        return crate::ollama::api_error(500, "store unavailable");
+    };
+    let Some(row) = row else {
+        return crate::ollama::api_error(404, &format!("model '{}' not found", body.model));
+    };
+
+    let weights_mib = std::fs::metadata(&row.path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+    let meta = match blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
+        Ok(meta) => meta,
+        Err(e) => return crate::ollama::api_error(500, &format!("model file metadata unreadable: {e}")),
+    };
+    let ctx_evaluated = body
+        .ctx
+        .map(u64::from)
+        .unwrap_or_else(|| u64::from(crate::preflight::admission_ctx(&state, &body.model)));
+
+    // Same census command as `capacity()`; the primary GPU is device 0.
+    let census = tokio::task::spawn_blocking(|| {
+        bounded_output(
+            std::process::Command::new("nvidia-smi").args([
+                "--query-gpu=index,name,memory.total,memory.free,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ]),
+            5,
+        )
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    })
+    .await
+    .unwrap_or(None);
+
+    let kv = |ctx: u64| crate::preflight::kv_f16_mib(&meta, ctx);
+    let kv_mib = kv(ctx_evaluated);
+    let demand_mib = weights_mib + kv_mib + FIT_SPAWN_OVERHEAD_MIB;
+
+    let mut notes = Vec::new();
+    let (device, free_mib, fits, max_ctx, max_ctx_q8) = match census
+        .as_deref()
+        .map(parse_devices)
+        .and_then(|rows| rows.first().cloned())
+    {
+        Some(dev) => {
+            let fits = demand_mib <= dev.free_mib;
+            let max_ctx = ctx_ladder(weights_mib, kv, dev.free_mib, ctx_evaluated);
+            let max_ctx_q8 =
+                ctx_ladder(weights_mib, |c| (kv(c) + 1) / 2, dev.free_mib, ctx_evaluated);
+            (
+                format!("cuda:{} {}", dev.index, dev.name),
+                dev.free_mib,
+                Some(fits),
+                Some(max_ctx),
+                Some(max_ctx_q8),
+            )
+        }
+        None => {
+            notes.push(
+                "no nvidia-smi census on this box - fit math reported, fits/max_ctx null \
+                 (non-NVIDIA boxes: consult the engine's own loader)",
+            );
+            ("unknown".to_string(), 0, None, None, None)
+        }
+    };
+    if max_ctx == Some(0) {
+        notes.push("even ctx 1024 does not fit free VRAM - smaller quant or free capacity first");
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "object": "blazar.fit",
+            "model": row.name,
+            "ctx_evaluated": ctx_evaluated,
+            "weights_mib": weights_mib,
+            "kv_mib": kv_mib,
+            "spawn_overhead_mib": FIT_SPAWN_OVERHEAD_MIB,
+            "demand_mib": demand_mib,
+            "device": device,
+            "free_mib": free_mib,
+            "fits": fits,
+            "max_ctx": max_ctx,
+            "max_ctx_q8": max_ctx_q8,
+            "notes": notes,
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(non_snake_case)]
@@ -268,5 +398,26 @@ mod tests {
         assert_eq!(apps.len(), 2);
         assert_eq!(apps[0], (12345, 2048));
         assert_eq!(apps[1], (67890, 0), "[N/A] footprint stays unknown(0)");
+    }
+
+    #[test]
+    fn unit__fit__overhead_mirror_matches_admission_floor() {
+        // admission_floor_bytes = weights + KV floor (512) + spawn overhead.
+        // If this ever fails, UNIFIED_SPAWN_OVERHEAD_BYTES changed upstream
+        // and FIT_SPAWN_OVERHEAD_MIB must be resynced.
+        let mib = |m: u64| m * 1024 * 1024;
+        let floor = blazar_core::profile::admission_floor_bytes(mib(100), 0) / (1024 * 1024);
+        assert_eq!(floor, 100 + 512 + FIT_SPAWN_OVERHEAD_MIB);
+    }
+
+    #[test]
+    fn unit__fit__ctx_ladder_halves_until_fit() {
+        // weights 5000 + overhead 700 = 5700; kv = ctx/10 MiB; free 6000:
+        // ctx 8192 -> 5700+819 no; 4096 -> 5700+409 no; 2048 -> 5700+204 fits.
+        assert_eq!(ctx_ladder(5000, |c| c / 10, 6000, 8192), 2048);
+        // Room for the full request.
+        assert_eq!(ctx_ladder(5000, |c| c / 10, 10_000, 8192), 8192);
+        // Even 1024 (kv ~102) does not fit.
+        assert_eq!(ctx_ladder(6000, |c| c / 10, 6000, 8192), 0);
     }
 }

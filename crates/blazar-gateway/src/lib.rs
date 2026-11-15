@@ -597,9 +597,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/show", post(ollama::show))
         .route("/api/delete", post(ollama::delete).delete(ollama::delete))
         .route("/api/ps", get(ollama::ps))
+        // Exact token counts via the live engine (ollama-compat shape).
+        .route("/api/tokenize", post(ollama::tokenize))
         // Per-GPU capacity: device census + per-resident VRAM
         // attribution joined from the supervisor's live rows.
         .route("/api/capacity", get(capacity::capacity))
+        .route("/api/fit", post(capacity::fit))
         .route("/api/usage", get(crate::usage::usage_api))
         .route("/api/failover", get(failover::list))
         .route("/api/failover/{chain}", get(failover::detail))
@@ -1221,7 +1224,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                         "/v1/requests", "/v1/requests/{id}",
                         "/v1/requests/{id}/cancel", "/v1/requests/{id}/interrupt",
                         "/audio/transcriptions", "/audio/translations"],
-            "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/capacity", "/api/explain/{model}", "/api/show",
+            "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/capacity", "/api/explain/{model}", "/api/show", "/api/tokenize",
                        "/api/usage",
                        "/api/replicate", "/api/route/{model}",
                        "/api/model-doctor", "/api/model-doctor/{model}",
