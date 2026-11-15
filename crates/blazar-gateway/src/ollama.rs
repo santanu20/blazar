@@ -34,16 +34,81 @@ pub(crate) fn api_error(status: u16, message: &str) -> Response {
         .into_response()
 }
 
+/// Ollama API level this gateway's surface emulates. Version-gated
+/// clients (open-webui, ollama SDK feature probes) compare `version`
+/// against upstream ollama releases — reporting our own package version
+/// here makes them mis-detect capability. Bump when the emulated surface
+/// gains/changes ollama features.
+const OLLAMA_API_COMPAT_VERSION: &str = "0.34.4";
+
 /// GET /api/version
 pub async fn version() -> Response {
     // `name` is the daemon's identity marker: doctor (and anything else
     // probing a bound port) must distinguish a blazar daemon from a
     // pre-rename one or a foreign server that happens to answer HTTP.
+    // `version` reports the emulated ollama API level (see const above);
+    // `blazar_version` carries the daemon's own package version.
     axum::Json(json!({
         "name": "blazar",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": OLLAMA_API_COMPAT_VERSION,
+        "blazar_version": env!("CARGO_PKG_VERSION"),
     }))
     .into_response()
+}
+
+/// POST /api/tokenize — exact token count via the live engine.
+///
+/// Ollama-compat shape: `{"model": "...", "prompt": "..."}` → `{"count": N}`.
+/// The gateway holds no in-process tokenizer (exact counts come from the
+/// running child engine, same source `enforce_prompt_fits` uses); a model
+/// that is not resident answers 503 with a warm-up hint rather than
+/// silently spawning a multi-GiB load from a counting probe.
+pub async fn tokenize(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response {
+    use serde_json::json;
+
+    let req: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
+    };
+    let model = req["model"].as_str().unwrap_or_default();
+    let prompt = req["prompt"].as_str().unwrap_or_default();
+    let Some(engine) = state
+        .sup
+        .live_http_endpoints()
+        .into_iter()
+        .find(|e| e.name == model)
+    else {
+        return api_error(
+            503,
+            "model not running - /api/tokenize counts via the live engine; warm it with a request or blazar CLI first",
+        );
+    };
+    let base = crate::proxy::child_base(&engine.endpoint);
+    let resp = crate::proxy::child_auth(
+        crate::state::child_client(&state, &engine.endpoint)
+            .post(format!("{base}/tokenize")),
+        &engine,
+    )
+    .json(&json!({ "content": prompt }))
+    .send()
+    .await;
+    match resp {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) => {
+                let count = v
+                    .get("tokens")
+                    .and_then(|t| t.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                axum::Json(json!({ "count": count })).into_response()
+            }
+            Err(e) => api_error(502, &format!("engine tokenize failed: {e}")),
+        },
+        Err(e) => api_error(502, &format!("engine tokenize request failed: {e}")),
+    }
 }
 
 /// GET /api/watch - live SSE tail of sentinel records (`blazar watch`).
