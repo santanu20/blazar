@@ -72,7 +72,7 @@ The engines still perform inference. **Blazar is the control plane around them**
 | If you need | Blazar provides |
 |---|---|
 | Apps speaking OpenAI, Ollama, **and** Anthropic | All three dialects natively, one gateway |
-| Different models on different runtimes | Capability-aware lanes across llama.cpp, mistral.rs, SGLang, MLX, sd.cpp, whisper.cpp, piper |
+| Different models on different runtimes | Capability-aware lanes across llama.cpp, mistral.rs, SGLang, MLX, sd.cpp, whisper.cpp, piper, Kokoro, LiteRT-LM |
 | GPU memory and context under control | VRAM/KV fit planning, slots, admission, co-residency, lifecycle |
 | Long work that survives restarts | Durable jobs, request cancel/interrupt, restart-safe response chains (SQLite) |
 | Engines that update without breaking | Side-by-side versioned installs, regression gates, rollback |
@@ -147,7 +147,7 @@ No application rewrite needed - point clients at Blazar's compatible surfaces.
 | Client | Base URL | Surfaces |
 |---|---|---|
 | **OpenAI SDK** | `http://127.0.0.1:11435/v1` | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/v1/batches`, `/v1/files`, `/v1/audio/*`, `/v1/images/*`, `/v1/videos/*` |
-| **Ollama clients** | `OLLAMA_HOST=http://127.0.0.1:11435` | `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/embeddings`, `/api/embed`, `/api/rerank`, model verbs `/api/create`, `/api/copy`, `/api/delete`, `/api/push` |
+| **Ollama clients** | `OLLAMA_HOST=http://127.0.0.1:11435` | `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/embeddings`, `/api/embed`, `/api/rerank`, `/api/tokenize`, `/api/version`, model verbs `/api/show`, `/api/delete` (create/copy live in the CLI; push is refused - no cloud registry by design) |
 | **Anthropic SDK** | `http://127.0.0.1:11435` | `/v1/messages`, `/v1/messages/batches` |
 | **SGLang-native** | `http://127.0.0.1:11435` | `POST /generate?model=<name>` - GenerateReqInput passthrough for sglang-lane models; rides the PD pair + supervised sgl-router when `sglang.disagg_pair` is set |
 | **Blazar Python SDK** | `BLAZAR_URL=http://127.0.0.1:11435` | chat + streaming + `best_of`/`mcp` tools, `ps`, `explain`, `failover`, realtime voice, Anthropic batches, metadata cards - zero dependencies (`sdk/python`) |
@@ -227,6 +227,7 @@ If you only need one model, one runtime, and one process, a direct engine server
 | **stable-diffusion.cpp** | Media generation | Diffusion images and video |
 | **whisper.cpp** | Speech recognition | Transcription and translation |
 | **piper** | Offline speech synthesis | Local TTS voices |
+| **Kokoro** | Neural speech synthesis | Kokoro-82M ONNX voices (24 kHz, CPU) |
 | **LiteRT-LM** (`openaihost`) | Edge-optimized text serving | `.litertlm` bundles (LiteRT-LM mobile/edge/NPU builds) |
 
 Full lane inventory and channel policy: [`docs/engines.md`](docs/engines.md). Routing follows model format and engine capability (the table's Workloads column is the format map). The default preserves single-active-engine behavior; per-model engine pins give deterministic placement. Curated capability lanes cover GGUF architectures the mainstream llama.cpp lane does not yet support.
@@ -237,7 +238,7 @@ Full lane inventory and channel policy: [`docs/engines.md`](docs/engines.md). Ro
 
 ### Dialects and request-path features
 
-Three native dialects with per-engine **thinking management** (effort mapping, `<think>` leak suppression), **structured-output receipts** (`x-blazar-structured-output` on every constrained response), Anthropic **cache accounting** (`cache_read_input_tokens`) and **Batch API** (`/v1/messages/batches`), completion **metadata cards** (update at `POST /v1/chat/completions/{id}`), Responses-API **conversations** (`previous_response_id` chains, background jobs), and engine **passthrough utilities** (`/tokenize`, `/detokenize`, `/apply-template`, `/infill`). -> [`4.API_SPEC.md`](docs/4.API_SPEC.md)
+Three native dialects with per-engine **thinking management** (effort mapping, `<think>` leak suppression), **structured-output receipts** (`x-blazar-structured-output` on every constrained response), **forced-`tool_choice` teaching** (`x-blazar-tool-choice` when a forced call rides the llamacpp lane, where binding depends on the model's chat template), Anthropic **cache accounting** (`cache_read_input_tokens`) and **Batch API** (`/v1/messages/batches`), completion **metadata cards** (update at `POST /v1/chat/completions/{id}`), Responses-API **conversations** (`previous_response_id` chains, background jobs), and engine **passthrough utilities** (`/tokenize`, `/detokenize`, `/apply-template`, `/infill`). -> [`4.API_SPEC.md`](docs/4.API_SPEC.md)
 
 ### Voice, tools, resilience add-ons
 
@@ -277,7 +278,7 @@ Versioned side-by-side installs, SHA-256 verification, capability probing, regre
 
 ### Diagnostics and observability
 
-`doctor` (system/GPU/engines/models/channels, `--fix`), `why` trace explanations, `explain` effective-config card, `model-doctor` capability certificates, `/api/capacity` GPU census, `/metrics`, OTLP, audit JSONL, PII scrubbing. Engine silent degrades (e.g. a flash-attention KV-type fallback in the serving child) are detected and surfaced per-request - `x-blazar-warnings` headers, `engine_slow_attn` detections in `why`, and a live `engine_degrades` panel on `/api/why`. -> [`9.USAGE.md`](docs/9.USAGE.md)
+`doctor` (system/GPU/engines/models/channels, `--fix`), `why` trace explanations, `explain` effective-config card, `model-doctor` capability certificates, `/api/capacity` GPU census, `/api/fit` per-model pre-flight (weights + KV + spawn overhead vs free VRAM, with f16/q8 ctx ladders), `/metrics`, OTLP, audit JSONL, PII scrubbing. Engine silent degrades (e.g. a flash-attention KV-type fallback in the serving child) are detected and surfaced per-request - `x-blazar-warnings` headers, `engine_slow_attn` detections in `why`, and a live `engine_degrades` panel on `/api/why`. -> [`9.USAGE.md`](docs/9.USAGE.md)
 
 ### Web console
 
@@ -377,6 +378,9 @@ blazar config defaults | list | get <key> | set <key> <value> | unset <key>
 | Connect AI clients | `blazar connect --write` (Claude Code, Codex, Continue, Cline, Open WebUI, opencode, pi) |
 | Explain serving config | `blazar explain <model>` |
 | Certify capabilities | `blazar model-doctor <model>` |
+| Portable capability passport | `blazar certify <model>` (refreshes stale certificate/bench evidence, then assembles identity + engine + hardware + profile + measured + capabilities into one portable object) |
+| Speculative-decode candidates | `blazar drafts <model>` (EAGLE3/MTP heads + small same-family models) |
+| Distributed inference | `blazar rpc` (ggml RPC worker for a remote gateway's `rpc_servers`; trusted network only - the RPC protocol has no authentication) |
 | Check health / heal | `blazar doctor`, `blazar doctor --fix`, `blazar why`, `blazar watch` |
 | Preview fit / co-residency | `blazar fit <target>`, `blazar coreside` |
 | Manage engines | `blazar engine update / list / use / rollback / install / build / prune / delta` |
@@ -474,7 +478,7 @@ This README is the product entry point; depth lives in dedicated documents. The 
 
 Blazar is an orchestration layer built on upstream open-source projects:
 
-- Inference runtimes: [llama.cpp](https://github.com/ggml-org/llama.cpp) | [mistral.rs](https://github.com/EricLBuehler/mistral.rs) | [SGLang](https://github.com/sgl-project/sglang) | [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | [piper](https://github.com/rhasspy/piper)
+- Inference runtimes: [llama.cpp](https://github.com/ggml-org/llama.cpp) | [mistral.rs](https://github.com/EricLBuehler/mistral.rs) | [SGLang](https://github.com/sgl-project/sglang) | [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | [piper](https://github.com/rhasspy/piper) | [Kokoro](https://github.com/hexgrad/kokoro) (neural TTS voices via kokoro-onnx) | [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM)
 - Models and architectures: [Silero VAD](https://github.com/snakers4/silero-vad) (speech detection for streaming audio) | [ModernBERT](https://github.com/AnswerDotAI/modernbert) (the System One decision-model family rides ModernBERT-architecture GGUFs)
 
 Those projects provide the inference runtimes. Model weights remain subject to their publishers' licenses and distribution terms.
