@@ -473,6 +473,16 @@ pub async fn route(
     let local_row = state
         .with_store(|s| resolve_model(s, &model))
         .and_then(std::result::Result::ok);
+    // Pool names resolve to their member table instead (boot guard
+    // refuses pool/model collisions, so the two namespaces cannot
+    // overlap here): the decision payload shows every member's score
+    // and the strategy pick - same envelope as a model route, so
+    // `blazar route` renders pools unchanged.
+    if local_row.is_none()
+        && let Some(pool) = crate::pools::find(&state.cfg(), &model)
+    {
+        return axum::Json(crate::pools::route_json(&state, pool)).into_response();
+    }
     // Snapshot the cached peer signals once (R4: clones before any
     // comparison, no lock held during scoring).
     let healths = state

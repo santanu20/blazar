@@ -637,15 +637,15 @@ pub fn cached_capacity(state: &AppState, remote: &Remote) -> Option<PeerCapacity
 /// Neutral time-to-head guess (ms) before the first success teaches a
 /// real EWMA. Deliberately modest: it only orders peers we know nothing
 /// about, and capacity signals dominate the tier long before it matters.
-const REMOTE_TTFT_DEFAULT_MS: f64 = 750.0;
+pub(crate) const REMOTE_TTFT_DEFAULT_MS: f64 = 750.0;
 
 /// Scheduling tier: warm peers always outrank catalog-cold peers, which
 /// outrank unknown-capacity peers - a warm peer's queue wait is measured
 /// while a cold peer's real cost is the model load we cannot see from
 /// here. Numbers, not stringly tiers, so `Ord` derives.
-const REMOTE_TIER_WARM: u8 = 0;
-const REMOTE_TIER_UNKNOWN: u8 = 1;
-const REMOTE_TIER_COLD: u8 = 2;
+pub(crate) const REMOTE_TIER_WARM: u8 = 0;
+pub(crate) const REMOTE_TIER_UNKNOWN: u8 = 1;
+pub(crate) const REMOTE_TIER_COLD: u8 = 2;
 
 /// Capacity-aware peer ranking (v0.16). Field order IS the priority:
 /// tier, then estimated wait, then most free VRAM. Derived `Ord` - no

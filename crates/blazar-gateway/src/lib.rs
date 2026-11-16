@@ -39,6 +39,7 @@ pub mod metadata_card;
 pub mod ollama;
 pub mod openai;
 pub mod otlp;
+pub mod pools;
 pub mod preflight;
 pub mod prompt_recipe;
 pub mod proxy;
@@ -1414,6 +1415,12 @@ pub async fn serve(
         state.keys.is_empty(),
         state.cfg().allow_unauthenticated_remote,
     ) {
+        anyhow::bail!("{refusal}");
+    }
+    // Pool-name boot guard: a pool name colliding with a local model
+    // row would be unreachable (local ownership wins before pools are
+    // consulted) - refuse the shadowing loudly at startup instead.
+    if let Err(refusal) = crate::pools::validate_boot(&state) {
         anyhow::bail!("{refusal}");
     }
     let app = router(state.clone());

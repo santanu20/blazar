@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 266 fields, 0 dead
+## Config (top-level keys) - 267 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -249,6 +249,7 @@ token quality are surfaced as drift.
 | sdcpp_qwen_prefix_cache_type | - | engine-argv | `crates/blazar-core/src/profile.rs:3393` (composes into model args; teaches on conflict with user extra args) |
 | sdcpp_extra_args | - | engine-argv | `crates/blazar-core/src/profile.rs:4005` in `sdcpp_extra_args` (appended at `:3241`, user wins last over profile posture) |
 | failover | Vec::new() | gateway-http | `crates/blazar-gateway/src/failover.rs:92` (chains built from `[[failover]]`; first healthy member serves the alias) |
+| model_pools | Vec::new() | gateway-http | `crates/blazar-gateway/src/pools.rs` (`[[model_pools]]` expand to the strategy-picked member before any lane decision: ollama chat/generate, openai proxy, responses, anthropic messages/count-tokens; `route_json` serves `/api/route`; `validate_boot` refuses pool/model name collisions) |
 | mcp | Vec::new() | gateway-http | `crates/blazar-gateway/src/state.rs:333` in `crate::mcp::Registry::from_config` |
 | mcp_default | - | gateway-http | `crates/blazar-core/src/config.rs:3096` in `Config::validate` (must name a configured server or "all"/"none"); consumed via `Registry::from_config` second arg |
 | remote_fallback | default_remote_fallback() | gateway-http | `crates/blazar-gateway/src/remotes.rs:680` (kill switch: remote fallback only when remotes exist AND this is on) |

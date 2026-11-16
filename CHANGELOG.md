@@ -8,6 +8,25 @@ tracked here.
 
 ### Added
 
+- **Model pools (`[[model_pools]]`).** A pool publishes one logical
+  service name over local and remote replicas of the same model; each
+  request naming the pool is mapped to one member by the pool's strategy
+  and served by that member's existing lane (local engine, or forwarding
+  to the `[[remotes]]` peer). Strategies: `ordered` (default, first
+  healthy member), `least_wait` (lowest estimated queue wait),
+  `warm_first` / `adaptive` (already-loaded members first; adaptive
+  stays at warm-first until service-time telemetry lands). Scoring
+  reuses the federation signals (warm/cold tier, resident slots,
+  in-flight, remote TTFT EWMA); an all-down pool serves its least-bad
+  member rather than failing. Members may be failover aliases
+  (pool pick, then chain escalation). Key model scopes are checked
+  against the expanded member name; `GET /api/route/<pool>` (or
+  `blazar route <pool>`) shows every member score plus the current
+  decision; the `/v1/messages` translate lane serves local members only
+  (a remote pick answers 400 naming pool and member); multipart and
+  non-JSON bodies skip expansion. Boot validates unique pool names,
+  non-empty members, peer references against `[[remotes]]`, and refuses
+  collisions with local model rows.
 - **VRAM telemetry lane for `optimize --run` (Memory objective
   unlocked).** Each measurement arm (baseline and candidate) now runs a
   background sampler polling `nvidia-smi memory.used` every 250 ms from

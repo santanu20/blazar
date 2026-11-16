@@ -990,6 +990,12 @@ pub struct Config {
     /// anti-flap benching. See `FailoverChain`.
     #[serde(default)]
     pub failover: Vec<FailoverChain>,
+    /// Adaptive model pools (`[[model_pools]]`): a logical model name
+    /// served by the strategy-picked member (local + remote replicas
+    /// competing on warm state, queue wait and free VRAM). See
+    /// `ModelPool`.
+    #[serde(default)]
+    pub model_pools: Vec<ModelPool>,
     /// Registered MCP stdio servers (gateway-side tool catalog).
     #[serde(default)]
     pub mcp: Vec<McpServer>,
@@ -3239,6 +3245,59 @@ fn default_failover_min_residence_secs() -> u64 {
     30
 }
 
+/// How a [`ModelPool`] picks the member that serves each request.
+/// `Ordered` mirrors failover-chain posture (first healthy member in
+/// declaration order); the score-aware strategies compete members on
+/// the peer-ranking signals (`PeerScore` semantics: warm/cold/unknown
+/// tier, estimated queue wait, free VRAM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum PoolStrategy {
+    /// First healthy member in declaration order (failover-like; the
+    /// migration-safe default).
+    #[default]
+    Ordered,
+    /// Minimum estimated queue wait, ignoring warm/cold tier.
+    LeastWait,
+    /// Warm tier first, then estimated wait, then free VRAM.
+    WarmFirst,
+    /// Least expected completion time. With today's signals this
+    /// equals [`PoolStrategy::WarmFirst`]; it becomes distinct as
+    /// per-member service-time telemetry lands (design doc P2).
+    Adaptive,
+}
+
+/// One serving member of a [`ModelPool`]: the local instance of
+/// `model`, or that model on a configured `[[remotes]]` peer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolMember {
+    /// `local` for the local serving lane, else a `[[remotes]]` label.
+    pub peer: String,
+    /// Concrete model row on that member (never the pool name).
+    pub model: String,
+}
+
+/// An adaptive multi-member model identity (design doc
+/// `docs/research/2026-11-16-replica-pools-design.md`): requests for
+/// `name` route to the member the strategy picks - local instance and
+/// remote replicas competing in one ranked list. Direct model names
+/// keep today's behavior (local ownership wins, pins authoritative);
+/// escalation on failure stays with `[[failover]]` (a pool member may
+/// itself be a chain alias).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPool {
+    /// Logical service identity clients address; must not collide with
+    /// a local model row (refused at boot with a teaching error).
+    pub name: String,
+    /// Member-selection rule; defaults to `ordered`.
+    #[serde(default)]
+    pub strategy: PoolStrategy,
+    /// Serving members; declaration order is the `ordered` priority.
+    pub members: Vec<PoolMember>,
+}
+
 /// MCP stdio children default to a scrubbed environment: inheriting
 /// the daemon's environment hands every server the daemon's
 /// credentials.
@@ -3712,6 +3771,7 @@ impl Default for Config {
             cache_reuse: 0,
             keys: Vec::new(),
             failover: Vec::new(),
+            model_pools: Vec::new(),
             mcp: Vec::new(),
             mcp_default: None,
             rpc_servers: String::new(),
@@ -5030,6 +5090,48 @@ impl Config {
                             remote.name, remote.url
                         )));
                     }
+                }
+            }
+        }
+        // Model pools: labels must be unique, members must name a real
+        // lane (`local` or a configured remote) and a concrete model -
+        // a typo'd peer label would silently never receive traffic.
+        let mut pool_names = std::collections::HashSet::new();
+        for pool in &self.model_pools {
+            if pool.name.is_empty() {
+                return Err(CoreError::Config(
+                    "model pool name must be non-empty".into(),
+                ));
+            }
+            if !pool_names.insert(pool.name.clone()) {
+                return Err(CoreError::Config(format!(
+                    "duplicate model pool name '{}'",
+                    pool.name
+                )));
+            }
+            if pool.members.is_empty() {
+                return Err(CoreError::Config(format!(
+                    "model pool '{}' needs at least one [[model_pools.members]] entry",
+                    pool.name
+                )));
+            }
+            for member in &pool.members {
+                if member.peer != "local" && !self.remotes.iter().any(|r| r.name == member.peer) {
+                    let known: Vec<&str> = std::iter::once("local")
+                        .chain(self.remotes.iter().map(|r| r.name.as_str()))
+                        .collect();
+                    return Err(CoreError::Config(format!(
+                        "model pool '{}' member peer {:?} matches no serving lane (known: [{}])",
+                        pool.name,
+                        member.peer,
+                        known.join(", ")
+                    )));
+                }
+                if member.model.is_empty() {
+                    return Err(CoreError::Config(format!(
+                        "model pool '{}' has a member with an empty model",
+                        pool.name
+                    )));
                 }
             }
         }
@@ -8742,6 +8844,79 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
         };
         cfg.validate()
             .unwrap_or_else(|e| panic!("explicit opt-in must validate: {e}"));
+    }
+
+    #[test]
+    fn unit__validation__model_pools_parse_and_gate() {
+        // Full TOML shape: strategy defaults to ordered, members ride
+        // their own table array, remote labels resolve.
+        let raw = r#"
+            [[remotes]]
+            name = "far"
+            url = "http://127.0.0.1:1"
+
+            [[model_pools]]
+            name = "svc"
+            strategy = "least_wait"
+            [[model_pools.members]]
+            peer = "local"
+            model = "m1"
+            [[model_pools.members]]
+            peer = "far"
+            model = "m1"
+        "#;
+        let cfg: Config = toml::from_str(raw).expect("valid pool config");
+        assert_eq!(cfg.model_pools.len(), 1);
+        assert_eq!(cfg.model_pools[0].strategy, PoolStrategy::LeastWait);
+        assert_eq!(cfg.model_pools[0].members.len(), 2);
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("must validate: {e}"));
+
+        let pool = |members: Vec<PoolMember>| ModelPool {
+            name: "svc".into(),
+            strategy: PoolStrategy::Ordered,
+            members,
+        };
+        let local = || PoolMember {
+            peer: "local".into(),
+            model: "m1".into(),
+        };
+
+        // Unknown peer label: teaching refusal naming the known lanes.
+        let cfg = Config {
+            model_pools: vec![pool(vec![PoolMember {
+                peer: "nope".into(),
+                model: "m1".into(),
+            }])],
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("matches no serving lane"),
+            "error teaches the lane list: {err}"
+        );
+
+        // Duplicate pool names and memberless pools are refused.
+        let cfg = Config {
+            model_pools: vec![pool(vec![local()]), pool(vec![local()])],
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "duplicate pool name refused");
+        let cfg = Config {
+            model_pools: vec![pool(Vec::new())],
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "memberless pool refused");
+
+        // Empty member model is refused (a member must name a row).
+        let cfg = Config {
+            model_pools: vec![pool(vec![PoolMember {
+                peer: "local".into(),
+                model: String::new(),
+            }])],
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "empty member model refused");
     }
 
     #[test]

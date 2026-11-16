@@ -272,3 +272,26 @@ pub fn with_remote(mut cfg: Config, name: &str, url: &str) -> Config {
     });
     cfg
 }
+
+/// Attach a `[[model_pools]]` entry routing `name` to one member per
+/// (peer, model) pair under the given strategy.
+#[must_use]
+pub fn with_pool(
+    mut cfg: Config,
+    name: &str,
+    strategy: blazar_core::config::PoolStrategy,
+    members: &[(&str, &str)],
+) -> Config {
+    cfg.model_pools.push(blazar_core::config::ModelPool {
+        name: name.to_string(),
+        strategy,
+        members: members
+            .iter()
+            .map(|(peer, model)| blazar_core::config::PoolMember {
+                peer: (*peer).to_string(),
+                model: (*model).to_string(),
+            })
+            .collect(),
+    });
+    cfg
+}

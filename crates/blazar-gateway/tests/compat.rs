@@ -318,6 +318,146 @@ async fn client__remote_stream_without_usage__charges_token_frames() {
     stub.shutdown().await;
 }
 
+/// Model pools (`[[model_pools]]`): a pool name routes to the
+/// strategy-picked member. The stub 404s unknown model ids, so a 200
+/// on a pool ask proves the body rewrite reached the member; scope
+/// semantics follow the expanded member string (a key scoped to the
+/// pool name does not bypass the member's scope - same posture as
+/// failover aliases); `/api/route` shows the pool table; the
+/// Anthropic translate lane refuses remote picks.
+// one sandbox, one scenario: five observations of one pool
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn client__model_pool__routes_member_scope_and_route_table() {
+    let stub = support::spawn_remote_stub().await;
+    let cfg = blazar_core::Config {
+        keys: vec![
+            blazar_core::ApiKey {
+                name: "admin".into(),
+                key: "plm_admin".into(),
+                ..blazar_core::ApiKey::default()
+            },
+            blazar_core::ApiKey {
+                name: "member_scoped".into(),
+                key: "plm_member".into(),
+                models: vec!["far:m1".into()],
+                ..blazar_core::ApiKey::default()
+            },
+            blazar_core::ApiKey {
+                name: "pool_scoped".into(),
+                key: "plm_pool".into(),
+                models: vec!["svc".into()],
+                ..blazar_core::ApiKey::default()
+            },
+        ],
+        ..blazar_core::Config::default()
+    };
+    let cfg = support::with_remote(cfg, "far", &stub.base);
+    let cfg = support::with_pool(
+        cfg,
+        "svc",
+        blazar_core::config::PoolStrategy::Ordered,
+        &[("far", "m1")],
+    );
+    let ts = start(cfg).await;
+    let c = client();
+
+    // Admin ask through the pool: 200 proves the member rewrite landed
+    // (the stub rejects unknown model ids).
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "svc", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "pool ask must reach the member");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["message"]["content"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "stub answer translated: {body}"
+    );
+
+    // Member-scoped key: admitted (scope covers the expanded member).
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_member")
+        .json(&serde_json::json!({
+            "model": "svc", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "member-scoped key serves the pool");
+
+    // Pool-name-scoped key: the scope check runs on the expanded
+    // member string, so it refuses (no bypass through pool identity).
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_pool")
+        .json(&serde_json::json!({
+            "model": "svc", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "pool-name scope does not bypass member scope"
+    );
+
+    // Route introspection: pool envelope with the member table and the
+    // decision target.
+    let route: serde_json::Value = c
+        .get(format!("{}/api/route/svc", ts.base))
+        .bearer_auth("plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(route["object"], "blazar.route");
+    assert_eq!(route["decision"]["target"], "far:m1", "route: {route}");
+    assert_eq!(
+        route["pool"]["members"].as_array().map(Vec::len),
+        Some(1),
+        "member table listed: {route}"
+    );
+
+    // Anthropic translate lane: a remote pick refuses with the pool
+    // named (local-only lane contract).
+    let resp = c
+        .post(format!("{}/v1/messages", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "svc", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "translate lane refuses remote picks");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("svc") && m.contains("far:m1")),
+        "refusal names pool and member: {body}"
+    );
+
+    ts.state.sup.shutdown_all().await.unwrap();
+    stub.shutdown().await;
+}
+
 /// C4: same-named remotes form a POOL; a conversation prefix sticks to
 /// the member that served it (its KV holds the prefix), surfaced via
 /// `x-blazar-remote`.

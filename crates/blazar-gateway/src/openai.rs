@@ -658,7 +658,7 @@ pub async fn openai_proxy(
     // this lane (model extraction, usage-flag injection, model-id
     // rewrite, single-flight stream detection); previously each
     // re-parsed the same bytes. Multipart bodies skip JSON entirely.
-    let mut parsed_body: Option<serde_json::Value> = if headers
+    let parsed_body: Option<serde_json::Value> = if headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("multipart/form-data"))
@@ -686,6 +686,29 @@ pub async fn openai_proxy(
     // post them bare): resolve the target with the `scoped_proxy` chain
     // instead of falling through to the OpenAI-dialect hard 400.
     let model = model.or_else(|| native_modelless_target(&state, &uri, &headers));
+    // Model pools: a pool name resolves to the strategy-picked member
+    // BEFORE any lane decision - body, parse and model string all
+    // carry the member so gates, reserve, singleflight, remote forward
+    // and usage attribution key off one string. JSON bodies only: a
+    // multipart body cannot carry the rewrite, so multipart asks keep
+    // the legacy not-found teaching instead of a half-rewritten ask.
+    let pool_expansion = parsed_body
+        .is_some()
+        .then(|| {
+            model
+                .as_deref()
+                .and_then(|m| crate::pools::expand_request(&state, m, &body))
+        })
+        .flatten()
+        .filter(|(effective, _)| Some(effective.as_str()) != model.as_deref());
+    let (model, body, mut parsed_body) = match pool_expansion {
+        Some((effective, rewritten)) => {
+            tracing::info!(target: "blazar::pools", member = %effective, "openai proxy: pool routed to member");
+            let reparsed = serde_json::from_slice(&rewritten).ok();
+            (Some(effective), rewritten, reparsed)
+        }
+        None => (model, body, parsed_body),
+    };
     // Routed-lane surface gate: needs the model to know which engine
     // will serve it (GGUF routes llamacpp regardless of the active row).
     if let Some(resp) = llamacpp_only_gate(&state, &uri, model.as_deref()) {
@@ -2019,6 +2042,26 @@ pub async fn responses_api(
     let model = extract_model(&body)
         .or_else(|| extract_model_multipart(&body, "multipart/form-data"))
         .unwrap_or_default();
+    // Model pools before admission + the remote split, mirroring the
+    // chat lane: the member string is what admission, reserve and the
+    // forward below key off. Multipart asks skip pools (same edge
+    // contract as the chat lane - the body cannot carry the rewrite).
+    let (model, body) = if !model.is_empty()
+        && !headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("multipart/form-data"))
+    {
+        match crate::pools::expand_request(&state, &model, &body) {
+            Some((effective, rewritten)) if effective != model => {
+                tracing::info!(target: "blazar::pools", member = %effective, "responses: pool routed to member");
+                (effective, rewritten)
+            }
+            _ => (model, body),
+        }
+    } else {
+        (model, body)
+    };
     if let Some(key) = key_ext.as_ref().map(|Extension(k)| k)
         && let Some(entry) = state.keys.entry(&key.name)
         && let Err(rej) = state.keys.admit(&entry, &model)

@@ -29,13 +29,14 @@ pub async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let parsed: Value = match serde_json::from_slice(&body) {
+    let mut parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return anthropic_error(400, "invalid_request_error", &format!("invalid JSON: {e}"));
         }
     };
-    let model = parsed
+    let mut body = body;
+    let mut model = parsed
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -46,6 +47,28 @@ pub async fn messages(
             "invalid_request_error",
             "missing `model` field in request body",
         );
+    }
+    // Model pools before the translate-lane gates: the member string
+    // is what scope/admission and the local translator key off. This
+    // lane translates local engines only - a pool pick that lands on a
+    // remote member refuses with the pool named (same posture as a
+    // directly remote-prefixed ask, one lane, one contract).
+    if let Some((effective, rewritten)) = crate::pools::expand_request(&state, &model, &body) {
+        if crate::remotes::split_remote(&effective, &state.cfg()).is_some() {
+            return anthropic_error(
+                400,
+                "invalid_request_error",
+                &format!(
+                    "model pool {model:?} picked remote member {effective:?} - the /v1/messages translate lane serves the local engine only; call the member directly or pin a local member"
+                ),
+            );
+        }
+        if effective != model {
+            tracing::info!(target: "blazar::pools", member = %effective, "anthropic messages: pool routed to member");
+            parsed["model"] = Value::String(effective.clone());
+            model = effective;
+            body = rewritten;
+        }
     }
     if crate::remotes::split_remote(&model, &state.cfg()).is_some() {
         return anthropic_error(
@@ -510,6 +533,23 @@ pub async fn count_tokens(
     if model.is_empty() {
         return anthropic_error(400, "invalid_request_error", "missing `model` field");
     }
+    // Model pools, same seam as /v1/messages: count what would serve.
+    // Remote picks refuse (this lane tokenizes the local engine only).
+    let model = match crate::pools::expand(&state, &model) {
+        Some(effective) if crate::remotes::split_remote(&effective, &state.cfg()).is_none() => {
+            effective
+        }
+        Some(effective) => {
+            return anthropic_error(
+                400,
+                "invalid_request_error",
+                &format!(
+                    "model pool {model:?} picked remote member {effective:?} - count_tokens serves the local engine only; call the member directly"
+                ),
+            );
+        }
+        None => model,
+    };
     if let Err(msg) = validate_cache_hints(&parsed) {
         return anthropic_error(400, "invalid_request_error", &msg);
     }

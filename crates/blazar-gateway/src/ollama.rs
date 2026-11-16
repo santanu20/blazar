@@ -1149,6 +1149,20 @@ pub async fn chat(
     {
         return resp;
     }
+    // Model pools: a pool name resolves to the strategy-picked member
+    // (local row or `remote:model`) BEFORE any lane decision below -
+    // scope, admission, reservation, occupancy and charging all key
+    // off the member string. Placed before the failover block so a
+    // member that is itself a chain alias escalates through it; the
+    // guard keeps a self-named member (refused at boot) from looping.
+    let (model_field, body) = match crate::pools::expand_request(&state, &model_field, &body) {
+        Some((effective, rewritten)) if effective != model_field => {
+            tracing::info!(target: "blazar::pools", pool = %model_field, member = %effective, "ollama chat: pool routed to member");
+            req["model"] = serde_json::Value::String(effective.clone());
+            (effective, rewritten)
+        }
+        _ => (model_field, body),
+    };
     // Failover chains (ollama dialect): a virtual alias resolves to a
     // concrete target - local model or `remote:<name>:<model>` (the
     // pool-aware remote branch above serves the latter). A failing
@@ -3649,6 +3663,18 @@ pub async fn generate(
         return unload_ping(&state, &ping_model, false).await;
     }
     let model = req["model"].as_str().unwrap_or_default().to_string();
+    // Model pools before any lane decision (same seam as /api/chat).
+    // This lane is local-only (refuse_remote_prefix below), so a pool
+    // whose picked member is remote refuses exactly like a directly
+    // remote-prefixed ask - the generate translator never forwards.
+    let (model, body) = match crate::pools::expand_request(&state, &model, &body) {
+        Some((effective, rewritten)) if effective != model => {
+            tracing::info!(target: "blazar::pools", pool = %model, member = %effective, "ollama generate: pool routed to member");
+            req["model"] = serde_json::Value::String(effective.clone());
+            (effective, rewritten)
+        }
+        _ => (model, body),
+    };
     let key_entry = key_ext
         .as_ref()
         .map(|Extension(k)| k.name.clone())

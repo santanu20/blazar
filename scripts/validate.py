@@ -13729,6 +13729,8 @@ def _full_toplevel() -> dict:
         # keep_tags is a usize retention count (floor 1), not a list -
         # 2 = fresh build plus one rollback anchor.
         "failover": [],
+        # replica pools: always-serialized container, empty by default
+        "model_pools": [],
         "keep_tags": 2,
         "mcp": [],
         "mcp_default": "none",
