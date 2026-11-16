@@ -128,7 +128,7 @@ impl RemoteLease {
     /// constant). Called once, at clean stream completion, by
     /// [`lease_to_eof`].
     fn record_service(&self) {
-        let ms = self.started.elapsed().as_millis() as f64;
+        let ms = self.started.elapsed().as_secs_f64() * 1000.0;
         if let Ok(mut m) = self.map.lock()
             && let Some(h) = m.get_mut(&self.key)
         {

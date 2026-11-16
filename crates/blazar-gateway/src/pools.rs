@@ -35,15 +35,13 @@ const LOCAL_TTFT_DEFAULT_MS: f64 = remotes::REMOTE_TTFT_DEFAULT_MS;
 /// `adaptive` total collapse to `wait + default`, which preserves
 /// today's ordering posture; the honest gap (local service is never
 /// measured) is documented in the strategy table.
+// REMOTE_TTFT_DEFAULT_MS is the positive exact constant 750.0.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 const SERVICE_DEFAULT_MS: u64 = remotes::REMOTE_TTFT_DEFAULT_MS as u64;
 
 /// How long a sticky `adaptive` pick stays authoritative before the
 /// strategy reconsiders from scratch (anti-thrash window).
 const POOL_STICKY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// A challenger must beat the sticky pick's expected completion by more
-/// than this fraction to take over (anti-oscillation margin).
-const POOL_STICKY_MARGIN: f64 = 0.10;
 
 /// The last `adaptive` decision for one pool, consumed as hysteresis:
 /// a healthy sticky member within the margin of the best estimate is
@@ -235,19 +233,18 @@ pub(crate) fn pick<'a>(
             // Hysteresis: keep the previous pick when it is still
             // healthy, fresh, and within the margin of the best
             // estimate - small estimate noise must not reshuffle
-            // members (and KV caches) request to request.
+            // members (and KV caches) request to request. The margin
+            // stays in integer math: best + best/10 = +10%.
             if let Some(s) = sticky
                 && s.at.elapsed() < POOL_STICKY_WINDOW
-            {
-                if let Some(current) = members
+                && let Some(current) = members
                     .iter()
                     .find(|m| m.effective == s.effective && !m.down)
-                {
-                    let total = current.score.est_wait_ms.saturating_add(current.service_ms);
-                    let threshold = (best_total as f64 * (1.0 + POOL_STICKY_MARGIN)).ceil() as u64;
-                    if total <= threshold {
-                        return Some(current);
-                    }
+            {
+                let total = current.score.est_wait_ms.saturating_add(current.service_ms);
+                let threshold = best_total.saturating_add(best_total / 10);
+                if total <= threshold {
+                    return Some(current);
                 }
             }
             Some(best)
@@ -270,16 +267,16 @@ pub fn expand(state: &AppState, requested: &str) -> Option<String> {
         .ok()
         .and_then(|m| m.get(&pool.name).cloned());
     let picked = pick(pool, &members, sticky.as_ref())?;
-    if pool.strategy == PoolStrategy::Adaptive {
-        if let Ok(mut m) = state.pools_sticky.lock() {
-            m.insert(
-                pool.name.clone(),
-                StickyPick {
-                    effective: picked.effective.clone(),
-                    at: Instant::now(),
-                },
-            );
-        }
+    if pool.strategy == PoolStrategy::Adaptive
+        && let Ok(mut m) = state.pools_sticky.lock()
+    {
+        m.insert(
+            pool.name.clone(),
+            StickyPick {
+                effective: picked.effective.clone(),
+                at: Instant::now(),
+            },
+        );
     }
     Some(picked.effective.clone())
 }
@@ -605,7 +602,9 @@ mod tests {
         ];
         let stale = StickyPick {
             effective: "m1".into(),
-            at: Instant::now() - POOL_STICKY_WINDOW - std::time::Duration::from_secs(1),
+            at: Instant::now()
+                .checked_sub(POOL_STICKY_WINDOW + std::time::Duration::from_secs(1))
+                .expect("sticky window well inside Instant range"),
         };
         let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&stale)).unwrap();
         assert_eq!(
