@@ -251,7 +251,7 @@ async fn client__remote_ollama_lane__scoped_key_rejected() {
 /// still settles the key's budget from the observed token frames -
 /// role + 2 content + finish chunks count, `[DONE]` does not. Also
 /// pins that the remote forward now charges key budgets at all (the
-/// OpenAI remote lane previously returned the forward uncharged).
+/// `OpenAI` remote lane previously returned the forward uncharged).
 #[tokio::test]
 async fn client__remote_stream_without_usage__charges_token_frames() {
     let stub = support::spawn_remote_stub().await;

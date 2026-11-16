@@ -762,9 +762,10 @@ pub struct BudgetLease {
     held: u64,
 }
 
+// Limiter internals are irrelevant; name + held size say everything.
+#[allow(clippy::missing_fields_in_debug)] // Arc<KeysLimiter> has no Debug by design
 impl std::fmt::Debug for BudgetLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Limiter internals are irrelevant; name + held size say everything.
         f.debug_struct("BudgetLease")
             .field("key", &self.name)
             .field("held", &self.held)

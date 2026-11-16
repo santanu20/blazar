@@ -196,16 +196,15 @@ pub async fn messages(
     // makes structurally impossible to repeat: budget keys now always
     // carry a sniffer or a settlement here.
     let mut anthropic_lease = None;
-    if state.cfg().reserve_budgets {
-        if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
-            && let Some(entry) = state.keys.entry(&key.name)
-        {
-            let base = crate::keys::completion_ceiling(&parsed, state.cfg().reserve_default_tokens);
-            let estimate = base.saturating_mul(best_of.filter(|n| *n >= 2).unwrap_or(1));
-            match state.keys.reserve(&entry, estimate) {
-                Ok(l) => anthropic_lease = l,
-                Err(rej) => return rej.to_response(),
-            }
+    if state.cfg().reserve_budgets
+        && let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
+        && let Some(entry) = state.keys.entry(&key.name)
+    {
+        let base = crate::keys::completion_ceiling(&parsed, state.cfg().reserve_default_tokens);
+        let estimate = base.saturating_mul(best_of.filter(|n| *n >= 2).unwrap_or(1));
+        match state.keys.reserve(&entry, estimate) {
+            Ok(l) => anthropic_lease = l,
+            Err(rej) => return rej.to_response(),
         }
     }
     if let Some(err) = state.sentinel.strict_tool_def_error_cached(&openai_body) {

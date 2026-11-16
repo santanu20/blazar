@@ -121,6 +121,7 @@ impl Drop for RemoteLease {
 /// `keys::guard_response`). Error-class responses should NOT be
 /// wrapped: an error body a client never drains would hold phantom
 /// occupancy, so callers drop the lease eagerly on >=500.
+#[must_use]
 pub fn lease_to_eof(lease: RemoteLease, resp: Response) -> Response {
     let (parts, body) = resp.into_parts();
     let inner = body.into_data_stream();
@@ -1253,6 +1254,7 @@ mod tests {
 
     #[tokio::test]
     async fn unit__lease_to_eof__holds_slot_until_stream_drains() {
+        use futures::StreamExt as _;
         // Two-chunk body: the in-flight slot must stay held while the
         // first chunk is out and only release at EOF - header-time
         // release would advertise capacity a streaming remote lacks.
@@ -1272,7 +1274,6 @@ mod tests {
             Ok(axum::body::Bytes::from_static(b"llo")),
         ]);
         let resp = lease_to_eof(lease, Response::new(Body::from_stream(chunks)));
-        use futures::StreamExt as _;
         let mut stream = resp.into_body().into_data_stream();
         let first = stream.next().await.expect("first chunk").expect("ok");
         assert_eq!(&first[..], b"he");
@@ -1281,10 +1282,10 @@ mod tests {
             1,
             "slot held while body still streams"
         );
-        let rest = axum::body::to_bytes(axum::body::Body::from_stream(stream), 1 << 16)
+        let drain = axum::body::to_bytes(axum::body::Body::from_stream(stream), 1 << 16)
             .await
             .expect("drain");
-        assert_eq!(&rest[..], b"llo");
+        assert_eq!(&drain[..], b"llo");
         assert_eq!(
             map.lock().unwrap()["r|http://10.0.0.4:8000"].in_flight,
             0,

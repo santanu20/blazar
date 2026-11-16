@@ -1384,8 +1384,9 @@ mod tests {
         let v = verify(OptimizeObjective::Memory, &base, &cand, 5.0);
         assert!(v.recommended, "{v:?}");
         assert_eq!(v.metric, "peak_vram_mib");
-        assert_eq!(v.baseline, 10_000.0);
-        assert_eq!(v.candidate, 8_500.0);
+        // bit-equality keeps the literal round-trip exact and pedantic-clean
+        assert_eq!(v.baseline.to_bits(), 10_000f64.to_bits());
+        assert_eq!(v.candidate.to_bits(), 8_500f64.to_bits());
 
         // A 400 MiB save is inside the 5% floor -> rejected.
         let mut small = stats(&[], 0.0);

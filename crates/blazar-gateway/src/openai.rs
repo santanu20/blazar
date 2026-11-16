@@ -1638,7 +1638,7 @@ fn extract_model(body: &[u8]) -> Option<String> {
 /// Wrap a remote-forwarded response with the key's token accounting
 /// when the key carries budgets (tpm/daily) or a strict-lane
 /// reservation to settle. Unlimited keys pass through untouched - the
-/// zero-tax contract. Shared by every remote lane on the OpenAI plane.
+/// zero-tax contract. Shared by every remote lane on the `OpenAI` plane.
 fn maybe_charge_remote(
     resp: Response,
     state: &std::sync::Arc<crate::state::AppState>,
@@ -2438,19 +2438,18 @@ async fn buffered_response_roundtrip(
     // -> full release. Best-of-N fans N generations, so the fan path
     // scales the estimate by the candidate count.
     let mut budget_lease = None;
-    if state.cfg().reserve_budgets {
-        if let Some(Extension(k)) = key_ext.as_ref()
-            && let Some(entry) = state.keys.entry(&k.name)
-        {
-            let base_estimate = serde_json::from_slice::<serde_json::Value>(new_body).map_or_else(
-                |_| state.cfg().reserve_default_tokens,
-                |v| crate::keys::completion_ceiling(&v, state.cfg().reserve_default_tokens),
-            );
-            let estimate = base_estimate.saturating_mul(best_of.filter(|n| *n >= 2).unwrap_or(1));
-            match state.keys.reserve(&entry, estimate) {
-                Ok(l) => budget_lease = l,
-                Err(rej) => return Err(rej.to_response()),
-            }
+    if state.cfg().reserve_budgets
+        && let Some(Extension(k)) = key_ext.as_ref()
+        && let Some(entry) = state.keys.entry(&k.name)
+    {
+        let base_estimate = serde_json::from_slice::<serde_json::Value>(new_body).map_or_else(
+            |_| state.cfg().reserve_default_tokens,
+            |v| crate::keys::completion_ceiling(&v, state.cfg().reserve_default_tokens),
+        );
+        let estimate = base_estimate.saturating_mul(best_of.filter(|n| *n >= 2).unwrap_or(1));
+        match state.keys.reserve(&entry, estimate) {
+            Ok(l) => budget_lease = l,
+            Err(rej) => return Err(rej.to_response()),
         }
     }
     let url = format!(
