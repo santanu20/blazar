@@ -19,11 +19,14 @@ jobs:
         os: [ubuntu-22.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42df90579dd25f1ca # stable
         with:
+          # SHA pinning defeats the action's branch-name toolchain
+          # inference, so the input has to name it explicitly.
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
       # Tee the lint so a red matrix cell can be diagnosed from the
       # uploaded log instead of the truncated console (the API log
@@ -32,7 +35,7 @@ jobs:
         shell: bash
       - name: upload clippy log (always, for diagnosis)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: clippy-${{ matrix.os }}
           path: clippy.log
@@ -47,18 +50,42 @@ jobs:
       # locally. It also runs test binaries in parallel on every OS, so the
       # old Windows serial pin is obsolete. No doc-tests exist in the
       # workspace, so nextest covers the full cargo-test surface.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace 2>&1 | tee test.log
         shell: bash
       - name: upload test log (always, for diagnosis)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-${{ matrix.os }}
           path: test.log
           if-no-files-found: ignore
+
+  msrv:
+    name: MSRV floor (rust-version from Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The supported floor is declared once in the workspace Cargo.toml
+      # (rust-version). This lane compiles the workspace on exactly that
+      # toolchain so a dependency or language feature quietly raising the
+      # real floor fails CI here instead of surfacing on a user's older
+      # rustc. The floor is read from Cargo.toml at run time, never
+      # duplicated in this file.
+      - name: Resolve MSRV from Cargo.toml
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [ -z "$msrv" ]; then
+            echo "workspace Cargo.toml declares no rust-version" >&2
+            exit 1
+          fi
+          echo "MSRV=$msrv" >>"$GITHUB_ENV"
+          echo "floor: $msrv"
+      - run: rustup toolchain install "$MSRV" --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo "+$MSRV" check --workspace --all-targets --all-features
 
   scripts:
     name: shellcheck + installer e2e (${{ matrix.os }})
@@ -70,13 +97,17 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: shellcheck -S warning scripts/*.sh tests/install_e2e.sh
       # e2e installs real artifacts: host blazar binary + the stub engine
       # (stub only needed where case 4 runs — x86_64).
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42df90579dd25f1ca # stable
+        with:
+          # SHA pinning defeats the action's branch-name toolchain
+          # inference, so the input has to name it explicitly.
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release -p blazar
       - run: |
           if [ "$(uname -m)" = x86_64 ]; then
@@ -88,7 +119,7 @@ jobs:
     name: ruff + py_compile (scripts)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # F161: the harness had no CI lint gate — the F9 ruff errors lived
       # in the tree for months, uncatchable. Version is pinned so new
       # ruff releases cannot flip CI red overnight; ruff.toml freezes
@@ -119,9 +150,9 @@ jobs:
       checks: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # F161: no dep-vulnerability gate existed (7c dependency audit).
-      - uses: rustsec/audit-check@v2
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -129,7 +160,7 @@ jobs:
     name: hygiene gates (paths + AI artifacts)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Keeps the tree free of machine-specific absolute paths and
       # AI-agent artifacts (unexplained external project names, agent
       # scratch paths) — the classes a code review easily misses. The

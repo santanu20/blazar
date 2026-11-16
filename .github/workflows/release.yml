@@ -42,7 +42,7 @@ jobs:
           - { target: aarch64-pc-windows-msvc, os: windows-latest, smoke: false }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install apt packages
         if: matrix.apt != ''
@@ -99,7 +99,7 @@ jobs:
           Copy-Item LICENSE-MIT, LICENSE-APACHE $stage
           Compress-Archive -Path "$stage/*" -DestinationPath "blazar-$tag-$target.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: blazar-${{ matrix.target }}
           path: blazar-*.*
@@ -115,29 +115,32 @@ jobs:
     name: fmt + clippy + tests (release gate)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42df90579dd25f1ca # stable
         with:
+          # SHA pinning defeats the action's branch-name toolchain
+          # inference, so the input has to name it explicitly.
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee clippy.log
         shell: bash
       - name: upload clippy log (always, for diagnosis)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-gate-clippy
           path: clippy.log
           if-no-files-found: ignore
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace 2>&1 | tee test.log
         shell: bash
       - name: upload test log (always, for diagnosis)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-gate-test
           path: test.log
@@ -159,7 +162,7 @@ jobs:
           # shipped binary's closure — the siblings stay untracked.
           cargo cyclonedx --manifest-path crates/blazar-cli/Cargo.toml \
             -f json --spec-version 1.5 --override-filename blazar-sbom
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-gate-sbom
           path: crates/blazar-cli/blazar-sbom.json
@@ -176,12 +179,12 @@ jobs:
     needs: [build, checks]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: blazar-x86_64-unknown-linux-gnu
           path: dist-amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: blazar-aarch64-unknown-linux-gnu
           path: dist-arm64
@@ -195,7 +198,7 @@ jobs:
           tar -xzf dist-arm64/blazar-*.tar.gz -C dist-arm64
           scripts/package-deb.sh dist-amd64/blazar "$ver" amd64 "out/blazar-${ver}-amd64.deb"
           scripts/package-deb.sh dist-arm64/blazar "$ver" arm64 "out/blazar-${ver}-arm64.deb"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: packages-deb
           path: out/*.deb
@@ -206,9 +209,13 @@ jobs:
     needs: [build, checks]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42df90579dd25f1ca # stable
+        with:
+          # SHA pinning defeats the action's branch-name toolchain
+          # inference, so the input has to name it explicitly.
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Full in-job build: generate-rpm packages target/release/blazar
       # plus the completion files its metadata block declares.
       - name: Build release binary
@@ -231,7 +238,7 @@ jobs:
           # and installers verify digests via the GitHub release API.
           cargo generate-rpm --package crates/blazar-cli \
             --output "blazar-${GITHUB_REF_NAME#v}-x86_64.rpm"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: packages-rpm
           path: blazar-*.rpm
@@ -242,12 +249,12 @@ jobs:
     needs: [build, checks]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: blazar-x86_64-apple-darwin
           path: dist-x64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: blazar-aarch64-apple-darwin
           path: dist-arm64
@@ -267,7 +274,7 @@ jobs:
               -srcfolder "$stage" -format UDZO -ov \
               "out/blazar-${ver}-macos-${arch}.dmg"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: packages-dmg
           path: out/*.dmg
@@ -286,7 +293,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
@@ -394,7 +401,7 @@ jobs:
       # Re-runs mint a fresh attestation per asset — old records remain
       # valid, verification matches any one of them.
       - name: Attest build provenance (archives + SBOM)
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: 'dist/*'
 
@@ -408,9 +415,13 @@ jobs:
     needs: release
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42df90579dd25f1ca # stable
+        with:
+          # SHA pinning defeats the action's branch-name toolchain
+          # inference, so the input has to name it explicitly.
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Verify tag matches workspace version
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -482,7 +493,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # GitHub computes asset digests a short while after upload; the
       # installers refuse unverified downloads, so retry through the race.
       - name: Install (sh)
