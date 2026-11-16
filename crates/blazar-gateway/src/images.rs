@@ -2675,7 +2675,11 @@ pub async fn video_get(
     let Some(row) = video_row(&state, &id) else {
         return openai_error(404, &format!("video {id} not found"));
     };
-    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+    if !crate::keys::owner_allows(
+        row.owner.as_deref(),
+        key_ext.as_deref(),
+        state.cfg().legacy_open_records,
+    ) {
         return openai_error(404, &format!("video {id} not found"));
     }
     let fresh = freshen_video_row(&state, &row).await;
@@ -2705,7 +2709,11 @@ pub async fn video_content(
     };
     // Rendered bytes are the caller's output - owner gate before the
     // download (BLZ-1).
-    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+    if !crate::keys::owner_allows(
+        row.owner.as_deref(),
+        key_ext.as_deref(),
+        state.cfg().legacy_open_records,
+    ) {
         return openai_error(404, &format!("video {id} not found"));
     }
     match completed_video_bytes(&row) {
@@ -2766,7 +2774,11 @@ pub async fn video_delete(
         return openai_error(404, &format!("video {id} not found"));
     };
     // Only the owning key may cancel or purge (BLZ-1).
-    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+    if !crate::keys::owner_allows(
+        row.owner.as_deref(),
+        key_ext.as_deref(),
+        state.cfg().legacy_open_records,
+    ) {
         return openai_error(404, &format!("video {id} not found"));
     }
     match row.state.as_str() {

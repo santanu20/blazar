@@ -1409,13 +1409,21 @@ pub async fn audio_jobs_get(
     // Live registry first, then the durable row - either way the owner
     // gate answers 404 for a foreign key before any payload leaks (BLZ-1).
     if let Some(owner) = state.audio_jobs.owner_of(&job_id) {
-        if !crate::keys::owner_allows(owner.as_deref(), key_ext.as_deref()) {
+        if !crate::keys::owner_allows(
+            owner.as_deref(),
+            key_ext.as_deref(),
+            state.cfg().legacy_open_records,
+        ) {
             return openai_error(404, "job not found");
         }
     } else if let Some(row) = state
         .with_store(|s| s.get_job(&job_id).ok().flatten())
         .flatten()
-        && !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref())
+        && !crate::keys::owner_allows(
+            row.owner.as_deref(),
+            key_ext.as_deref(),
+            state.cfg().legacy_open_records,
+        )
     {
         return openai_error(404, "job not found");
     }
@@ -1469,7 +1477,11 @@ pub async fn audio_jobs_cancel(
             .flatten()
             .and_then(|row| row.owner),
     };
-    if !crate::keys::owner_allows(entry_owner.as_deref(), key_ext.as_deref()) {
+    if !crate::keys::owner_allows(
+        entry_owner.as_deref(),
+        key_ext.as_deref(),
+        state.cfg().legacy_open_records,
+    ) {
         return openai_error(404, "job not found");
     } // cancel() performs the abort side effect (a terminal/unknown job is
     // a no-op); either way the answer is the job's current state - 200

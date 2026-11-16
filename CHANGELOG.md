@@ -24,6 +24,15 @@ tracked here.
   call, unknown schema keywords pass through) before execution; disable
   per server with `validate_args = false` for servers that advertise
   broken schemas.
+- **Strict tenancy for legacy ownerless records.** New
+  `legacy_open_records` config flag (default `true` preserves the
+  documented legacy-sharing posture where ownerless durable rows -
+  pre-scope jobs, batches, responses, audio/video jobs - stay visible
+  to every caller). Setting `false` quarantines them: an ownerless row
+  answers as unknown to every keyed caller, so tenants separated after
+  the fact never see pre-tenant history. Operators can flip the flag
+  back to `true` to view, export or re-create legacy rows under a key
+  before re-enabling strict mode.
 
 ### Fixed
 

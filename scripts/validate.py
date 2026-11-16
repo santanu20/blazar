@@ -13632,6 +13632,9 @@ def _full_toplevel() -> dict:
         # guard stays armed on the benign boot (loopback host): the
         # override path is negative/positive-proven in gates phase (e)
         "allow_unauthenticated_remote": False,
+        # BLZ-1 legacy-sharing posture exercised explicitly on the
+        # full-manifest boot; strict mode flips it negative-side.
+        "legacy_open_records": True,
         "late_chunking_max_tokens": 8192,
         "session_keep_secs": 900,
         # agent-tooling wave: validated for prefix/pairing/JSON/XOR in

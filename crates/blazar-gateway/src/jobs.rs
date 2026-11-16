@@ -459,7 +459,11 @@ pub async fn jobs_get(
     };
     // Foreign-owned rows answer as if they never existed - a 404 leaks
     // neither the id nor the fact that another key owns it (BLZ-1).
-    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+    if !crate::keys::owner_allows(
+        row.owner.as_deref(),
+        key_ext.as_deref(),
+        state.cfg().legacy_open_records,
+    ) {
         return not_found(&job_id);
     }
     if !matches!(row.state.as_str(), "queued" | "running") {
@@ -558,7 +562,11 @@ pub async fn jobs_cancel(
         return not_found(&job_id);
     };
     // Only the owning key may cancel (BLZ-1); 404 for anyone else.
-    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+    if !crate::keys::owner_allows(
+        row.owner.as_deref(),
+        key_ext.as_deref(),
+        state.cfg().legacy_open_records,
+    ) {
         return not_found(&job_id);
     }
     if !matches!(row.state.as_str(), "queued" | "running") {
@@ -627,7 +635,11 @@ pub async fn jobs_events(
     else {
         return not_found(&job_id);
     };
-    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+    if !crate::keys::owner_allows(
+        row.owner.as_deref(),
+        key_ext.as_deref(),
+        state.cfg().legacy_open_records,
+    ) {
         return not_found(&job_id);
     }
     let events = state
@@ -681,7 +693,11 @@ pub async fn jobs_artifact(
     };
     // Spilled results are caller-visible output - same owner gate as the
     // row itself (BLZ-1).
-    if !crate::keys::owner_allows(row.owner.as_deref(), key_ext.as_deref()) {
+    if !crate::keys::owner_allows(
+        row.owner.as_deref(),
+        key_ext.as_deref(),
+        state.cfg().legacy_open_records,
+    ) {
         return not_found(&job_id);
     }
     let Some(path) = row.artifact_path else {

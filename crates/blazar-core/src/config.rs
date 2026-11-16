@@ -65,6 +65,16 @@ pub struct Config {
     /// self-gated fleet join routes. Keys are still the better fix.
     #[serde(default)]
     pub allow_unauthenticated_remote: bool,
+    /// BLZ-1 strict tenancy: `true` (default) keeps the documented
+    /// legacy-sharing posture - durable rows with no owner stamp
+    /// (pre-scope legacy or open-gateway artifacts) stay visible to
+    /// every caller. `false` quarantines them: null-owner rows answer
+    /// as unknown to every keyed caller, so newly separated tenants
+    /// never see pre-tenant history. Flip back to `true` to view,
+    /// export or re-create legacy rows under a key before re-enabling
+    /// strict mode.
+    #[serde(default = "default_true")]
+    pub legacy_open_records: bool,
     pub default_ctx: u32,
     pub idle_sleep_secs: u64,
     pub idle_timeout_secs: u64,
@@ -3614,6 +3624,7 @@ impl Default for Config {
             host: "127.0.0.1".to_string(),
             port: 11435,
             allow_unauthenticated_remote: false,
+            legacy_open_records: true,
             default_ctx: 16384,
             idle_sleep_secs: 300,
             cpu_range: String::new(),
@@ -4091,6 +4102,7 @@ const SECTION_FIELDS: &[(&str, &[&str])] = &[
             "host",
             "port",
             "allow_unauthenticated_remote",
+            "legacy_open_records",
             "log_level",
             "no_host",
             "cors_origins",

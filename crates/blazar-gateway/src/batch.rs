@@ -103,9 +103,10 @@ fn owner_name(key_ext: Option<&Extension<crate::keys::KeyCtx>>) -> Option<String
 }
 
 /// BLZ-1: does `key` see meta stamped with `_owner`? Missing/null
-/// `_owner` (legacy or open-gateway object) is visible to all.
-fn meta_allows(m: &Value, key: Option<&crate::keys::KeyCtx>) -> bool {
-    crate::keys::owner_allows(m["_owner"].as_str(), key)
+/// `_owner` (legacy or open-gateway object) follows the configured
+/// tenancy posture (`legacy_open_records`).
+fn meta_allows(m: &Value, key: Option<&crate::keys::KeyCtx>, legacy_open_records: bool) -> bool {
+    crate::keys::owner_allows(m["_owner"].as_str(), key, legacy_open_records)
 }
 
 /// Drop the internal `_owner` stamp before a meta object reaches the
@@ -525,7 +526,7 @@ pub async fn get_file(
     }
     match file_meta(&state.dirs, &id) {
         // BLZ-1: a foreign file reads exactly like an unknown one.
-        Some(v) if meta_allows(&v, key_ext.as_deref()) => {
+        Some(v) if meta_allows(&v, key_ext.as_deref(), state.cfg().legacy_open_records) => {
             (StatusCode::OK, axum::Json(strip_owner(v))).into_response()
         }
         _ => err(StatusCode::NOT_FOUND, "unknown file id"),
@@ -547,7 +548,7 @@ pub async fn get_file_content(
     // BLZ-1: gate on the meta before serving the bytes - the content
     // route and the meta route must agree on visibility.
     match file_meta(&state.dirs, &id) {
-        Some(v) if meta_allows(&v, key_ext.as_deref()) => {}
+        Some(v) if meta_allows(&v, key_ext.as_deref(), state.cfg().legacy_open_records) => {}
         _ => return err(StatusCode::NOT_FOUND, "unknown file id"),
     }
     // File payload can be body-limit-sized: read off the async workers.
@@ -587,7 +588,7 @@ pub async fn create_batch(
         return err(StatusCode::NOT_FOUND, "unknown input_file_id");
     };
     // BLZ-1: a batch may only consume an input file its key can read.
-    if !meta_allows(&meta, key_ext.as_deref()) {
+    if !meta_allows(&meta, key_ext.as_deref(), state.cfg().legacy_open_records) {
         return err(StatusCode::NOT_FOUND, "unknown input_file_id");
     }
     let input_path = files_dir(&state.dirs).join(format!("{input_file_id}.jsonl"));
@@ -1015,7 +1016,7 @@ pub async fn get_batch(
     }
     match read_json(&batch_meta(&state.dirs, &id)) {
         // BLZ-1: a foreign batch reads exactly like an unknown one.
-        Some(v) if meta_allows(&v, key_ext.as_deref()) => {
+        Some(v) if meta_allows(&v, key_ext.as_deref(), state.cfg().legacy_open_records) => {
             (StatusCode::OK, axum::Json(strip_owner(v))).into_response()
         }
         _ => err(StatusCode::NOT_FOUND, "unknown batch id"),
@@ -1038,7 +1039,7 @@ pub async fn list_batches(
                 && let Some(v) = read_json(&e.path())
                 // BLZ-1: data-layer filter - only this key's batches (and
                 // legacy null-owner rows) reach the listing.
-                && meta_allows(&v, key_ext.as_deref())
+                && meta_allows(&v, key_ext.as_deref(), state.cfg().legacy_open_records)
             {
                 rows.push(strip_owner(v));
             }
@@ -1070,7 +1071,7 @@ pub async fn cancel_batch(
     let path = batch_meta(&state.dirs, &id);
     match read_json(&path) {
         // BLZ-1: cancelling another key's batch reads as unknown.
-        Some(mut m) if meta_allows(&m, key_ext.as_deref()) => {
+        Some(mut m) if meta_allows(&m, key_ext.as_deref(), state.cfg().legacy_open_records) => {
             let status = m["status"].as_str().unwrap_or("").to_string();
             if matches!(status.as_str(), "completed" | "cancelled" | "failed") {
                 // "failed" included: the worker is gone, so a cancel flag
@@ -1582,7 +1583,12 @@ fn anthropic_meta(
         // BLZ-1: every anthropic route funnels through here - gate once,
         // and a foreign batch stays indistinguishable from an unknown id
         // (an OpenAI-dialect batch under these routes reads the same way).
-        Some(m) if m["dialect"] == "anthropic" && meta_allows(&m, key) => Ok(m),
+        Some(m)
+            if m["dialect"] == "anthropic"
+                && meta_allows(&m, key, state.cfg().legacy_open_records) =>
+        {
+            Ok(m)
+        }
         _ => Err(err(
             StatusCode::NOT_FOUND,
             "unknown message batch id (message batches use the /v1/messages/batches routes)",
@@ -1618,7 +1624,7 @@ pub async fn anthropic_batches_list(
                 && v["dialect"] == "anthropic"
                 // BLZ-1: data-layer filter, same visibility law as the
                 // OpenAI listing.
-                && meta_allows(&v, key_ext.as_deref())
+                && meta_allows(&v, key_ext.as_deref(), state.cfg().legacy_open_records)
             {
                 rows.push(anthropic_public_shape(&v));
             }

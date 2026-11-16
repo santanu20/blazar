@@ -120,14 +120,21 @@ pub fn mcp_server_permits(
 }
 
 /// BLZ-1 object-level authorization: may `key` see a durable row created
-/// by `owner`? `None` owner rows are pre-scope legacy (or open-gateway)
-/// and stay visible to every caller; a keyless request implies keys are
-/// not configured at all (the auth middleware inserts `KeyCtx` whenever
-/// they are), which is the same open-gateway posture.
+/// by `owner`? `legacy_open_records` (config, default `true`) decides the
+/// tenancy posture for rows with no owner stamp: `true` keeps the
+/// documented legacy-sharing posture (pre-scope and open-gateway rows are
+/// visible to every caller); `false` quarantines them from every keyed
+/// caller - they answer as unknown until an operator re-surfaces them by
+/// temporarily flipping the flag. A keyless request implies keys are not
+/// configured at all (the auth middleware inserts `KeyCtx` whenever they
+/// are), which is the same open-gateway posture either way.
 #[must_use]
-pub fn owner_allows(owner: Option<&str>, key: Option<&KeyCtx>) -> bool {
+pub fn owner_allows(owner: Option<&str>, key: Option<&KeyCtx>, legacy_open_records: bool) -> bool {
     match (owner, key) {
         (Some(o), Some(k)) => o == k.name,
+        // Unstamped row meeting a keyed caller: shared legacy artifact
+        // or quarantined pre-tenant history, per the config posture.
+        (None, Some(_)) => legacy_open_records,
         // Open-gateway rows and keyless callers both admit; only a
         // keyed caller meeting a foreign owner is refused.
         _ => true,
@@ -965,6 +972,47 @@ mod tests {
         let (code, _) = super::mcp_server_permits(&keyed, Some(&ctx("ghost")), "fs")
             .expect_err("unknown key fails closed");
         assert_eq!(code, 401);
+    }
+
+    /// BLZ-1 truth table for the two tenancy postures. Owner match is
+    /// the only always-refused pair; the flag decides whether unstamped
+    /// (legacy/open-gateway) rows stay shared with keyed callers or
+    /// answer as unknown. Keyless callers only exist when no keys are
+    /// configured, so they admit either way.
+    #[test]
+    fn unit__owner_allows__legacy_open_shares_unstamped_rows() {
+        let ctx = |name: &str| KeyCtx {
+            name: name.into(),
+            weight: 1,
+        };
+        let owner = Some("alice");
+        let alice = ctx("alice");
+        let bob = ctx("bob");
+        // Foreign owner is refused regardless of posture.
+        assert!(!owner_allows(owner, Some(&bob), true));
+        assert!(!owner_allows(owner, Some(&bob), false));
+        // Owner match admits.
+        assert!(owner_allows(owner, Some(&alice), true));
+        assert!(owner_allows(owner, Some(&alice), false));
+        // Legacy posture: unstamped rows stay visible to every caller.
+        assert!(owner_allows(None, Some(&bob), true));
+        assert!(owner_allows(None, None, true));
+        assert!(owner_allows(owner, None, true));
+    }
+
+    /// BLZ-1 strict mode: unstamped rows quarantine from keyed callers
+    /// (answer-as-unknown), keyless/open-gateway posture is unchanged.
+    #[test]
+    fn unit__owner_allows__strict_mode_quarantines_unstamped_rows() {
+        let ctx = |name: &str| KeyCtx {
+            name: name.into(),
+            weight: 1,
+        };
+        let bob = ctx("bob");
+        assert!(!owner_allows(None, Some(&bob), false));
+        // Keyless callers imply no keys are configured: still open.
+        assert!(owner_allows(None, None, false));
+        assert!(owner_allows(Some("alice"), None, false));
     }
 
     fn key(name: &str, rpm: u32, tpm: u64, daily: u64, models: &[&str]) -> ApiKey {

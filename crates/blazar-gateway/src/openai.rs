@@ -1491,7 +1491,11 @@ pub async fn responses_get(
     // scoped to the calling key; a foreign id reads exactly like an
     // expired one - the shared 404 leaks no existence.
     if let Some(r) = &row
-        && !crate::keys::owner_allows(r.owner.as_deref(), key_ext.as_deref())
+        && !crate::keys::owner_allows(
+            r.owner.as_deref(),
+            key_ext.as_deref(),
+            state.cfg().legacy_open_records,
+        )
     {
         return openai_error(
             404,
@@ -1510,7 +1514,11 @@ pub async fn responses_get(
         && let Some(job) = state
             .with_store(|s| s.get_job(&id).ok().flatten())
             .flatten()
-        && crate::keys::owner_allows(job.owner.as_deref(), key_ext.as_deref())
+        && crate::keys::owner_allows(
+            job.owner.as_deref(),
+            key_ext.as_deref(),
+            state.cfg().legacy_open_records,
+        )
     {
         return match job.state.as_str() {
             "queued" | "running" => (
@@ -1548,7 +1556,13 @@ pub async fn responses_get(
     }
     let found = state
         .stored_response(&id)
-        .filter(|s| crate::keys::owner_allows(s.owner.as_deref(), key_ext.as_deref()))
+        .filter(|s| {
+            crate::keys::owner_allows(
+                s.owner.as_deref(),
+                key_ext.as_deref(),
+                state.cfg().legacy_open_records,
+            )
+        })
         .map(|s| {
             serde_json::json!({
                 "id": id,
@@ -2041,7 +2055,13 @@ pub async fn responses_api(
             .stored_response(&pid)
             // BLZ-1: another key's thread id is indistinguishable from an
             // expired one - same 404 below, no existence leak.
-            .filter(|s| crate::keys::owner_allows(s.owner.as_deref(), key_ext.as_deref()))
+            .filter(|s| {
+                crate::keys::owner_allows(
+                    s.owner.as_deref(),
+                    key_ext.as_deref(),
+                    state.cfg().legacy_open_records,
+                )
+            })
             .map(|s| {
                 (
                     crate::responses::ResponsesRegistry::chain_input(&s, &parsed["input"]),
