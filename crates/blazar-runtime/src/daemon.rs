@@ -245,13 +245,71 @@ fn marker_orphan_pids(data_dir: &std::path::Path) -> Vec<u32> {
         .collect()
 }
 
+/// Signal `pid` through a pidfd pinned BEFORE the identity check, so a
+/// PID-reuse race between verification and the signal can never hit an
+/// innocent process: the fd pins whichever process held the pid at
+/// `pidfd_open` time, the identity check then verifies that same
+/// process via `/proc`, and the signal travels the fd - not the pid.
+///
+/// Returns `None` when the kernel/libc has no pidfd lane (pre-5.3
+/// kernels): the caller falls back to the classic re-read + `kill`
+/// path. `Some(true)` = signalled; `Some(false)` = identity failed or
+/// the process exited (skip, and do NOT fall back - re-reading the pid
+/// would inspect a potentially different process).
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // three audited raw syscalls below
+pub(crate) fn pidfd_guarded_signal(
+    pid: u32,
+    sig: i32,
+    still_ours: impl FnOnce(u32) -> bool,
+) -> Option<bool> {
+    let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+        return Some(false);
+    };
+    // SAFETY: pidfd_open(raw_pid, 0) takes a pid and flags by value;
+    // a fresh fd or -1/errno comes back. No pointers involved.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw_pid, 0u32) };
+    if fd < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            // No pidfd support on this kernel: caller falls back.
+            Some(libc::ENOSYS | libc::EINVAL | libc::EPERM) => None,
+            // Process gone (or anything else): not signalled, no fallback.
+            _ => Some(false),
+        };
+    }
+    let Ok(fd) = libc::c_int::try_from(fd) else {
+        return Some(false);
+    };
+    // Verify identity AFTER the pin: /proc/<pid> now describes exactly
+    // the process the fd holds (or nothing, if it died and was reaped).
+    if !still_ours(pid) {
+        // SAFETY: close on our own fresh fd.
+        unsafe { libc::close(fd) };
+        return Some(false);
+    }
+    // SAFETY: pidfd_send_signal(fd, sig, NULL, 0) - signals exactly the
+    // pinned process; the info pointer is deliberately NULL (no siginfo).
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd,
+            sig,
+            std::ptr::null::<libc::c_void>(),
+            0u32,
+        )
+    };
+    // SAFETY: close on our own fresh fd.
+    unsafe { libc::close(fd) };
+    Some(rc == 0)
+}
+
 /// Escalate already-TERMed stray pids: poll liveness for `grace`, then
 /// SIGKILL every survivor whose identity check still passes. Returns the
 /// pids that needed the KILL. Shared by the marker reclaim and the
 /// pidfile sweep - both signal SIGTERM without waiting and need the same
 /// teeth against children that hang in graceful shutdown.
 #[cfg(unix)]
-#[allow(unsafe_code)] // two audited libc::kill calls on exact pids below
+#[allow(unsafe_code)] // audited signal calls on exact pids below
 pub(crate) fn escalate_orphans(
     pids: &[u32],
     grace: std::time::Duration,
@@ -272,7 +330,19 @@ pub(crate) fn escalate_orphans(
     for pid in &stragglers {
         // Identity re-check right before the irreversible signal: a pid
         // that exited and got recycled within the grace window must never
-        // receive our KILL.
+        // receive our KILL. On Linux the pidfd lane pins the process
+        // before the check, closing the check-to-signal reuse race.
+        #[cfg(target_os = "linux")]
+        {
+            match pidfd_guarded_signal(*pid, libc::SIGKILL, &still_ours) {
+                Some(true) => {
+                    tracing::warn!("orphan child pid {pid} ignored SIGTERM; SIGKILL");
+                    continue;
+                }
+                Some(false) => continue,
+                None => {} // no pidfd lane: classic path below
+            }
+        }
         if !still_ours(*pid) {
             continue;
         }
@@ -309,8 +379,25 @@ fn reclaim_marker_orphans_with_grace(
     }
     let mut lines = Vec::new();
     for pid in &pids {
-        // Guard the irreversible signal with a fresh identity read: the
-        // scan snapshot can be stale by one syscall.
+        // Guard the signal with a fresh identity read: the scan
+        // snapshot can be stale by one syscall. On Linux the pidfd
+        // lane pins the process before the read, so even a PID reused
+        // in that window cannot receive our TERM.
+        #[cfg(target_os = "linux")]
+        {
+            match pidfd_guarded_signal(*pid, libc::SIGTERM, |p| pid_marks_owner(p, data_dir)) {
+                Some(true) => {
+                    tracing::warn!(
+                        "reclaiming orphan engine child pid {pid} (marker {}) - its daemon died without teardown",
+                        data_dir.display()
+                    );
+                    lines.push(format!("pid {pid} (marker {})", data_dir.display()));
+                    continue;
+                }
+                Some(false) => continue,
+                None => {} // no pidfd lane: classic path below
+            }
+        }
         if !pid_marks_owner(*pid, data_dir) {
             continue;
         }
@@ -343,9 +430,17 @@ fn reclaim_marker_orphans_with_grace(
 #[cfg(not(target_os = "linux"))]
 #[must_use = "the caller prints each line as preflight evidence"]
 pub fn reclaim_marker_orphans(_data_dir: &std::path::Path) -> Vec<String> {
-    // No /proc environ off Linux; the pidfile sweep plus the engine
-    // children's own shutdown handling remain the covering nets (same
-    // posture as PDEATHSIG being Linux-only).
+    // Platform matrix for orphan reclamation:
+    //   Linux   - /proc environ marker sweep + PDEATHSIG + pidfd-guarded
+    //             signals (no PID-reuse window between identity check and
+    //             signal on kernels >= 5.3; classic re-read + kill below).
+    //   macOS   - no /proc environ lane: the pidfile sweep plus PDEATHSIG-
+    //             adjacent child shutdown remain the covering nets.
+    //   Windows - pidfile sweep + child kill on teardown. OS-level Job
+    //             Objects would pin the whole process tree (survives
+    //             daemon crash by kernel guarantee) but require a spawn-
+    //             path rework plus a windows API dependency - deliberately
+    //             deferred until a crash-recovery incident justifies it.
     Vec::new()
 }
 
@@ -415,6 +510,108 @@ pub static SIGHUP_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send +
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    /// A real child, signalled through the pidfd lane, dies by that
+    /// signal - and a child the identity check refuses stays alive.
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)] // one teardown TERM on our own spawned child
+    #[test]
+    fn unit__pidfd_guarded_signal__signals_child_and_refuses_foreign() {
+        use std::process::Command;
+        // Legitimate target: our own sleeper, identity check passes.
+        let mut mine = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = mine.id();
+        let signalled =
+            pidfd_guarded_signal(pid, libc::SIGTERM, |_| true).expect("pidfd on a modern kernel");
+        assert!(signalled, "own child must be signalled through the pin");
+        let status = mine.wait().expect("reap child");
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGTERM),
+            "child died by SIGTERM, got {status:?}"
+        );
+
+        // Foreign process shape: identity check refuses -> no signal,
+        // child survives untouched.
+        let mut stranger = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = stranger.id();
+        let signalled =
+            pidfd_guarded_signal(pid, libc::SIGTERM, |_| false).expect("pidfd lane available");
+        assert!(!signalled, "refused identity must never signal");
+        let alive = crate::daemon::process_alive_by_pid(pid);
+        // Teardown regardless: TERM then reap so the test leaves nothing.
+        unsafe { libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGTERM) };
+        let status = stranger.wait().expect("reap child");
+        assert!(alive, "refused child must still be alive at check time");
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGTERM),
+            "child died by the teardown TERM, got {status:?}"
+        );
+    }
+
+    /// A pid that exited and was reaped opens no pin: the helper must
+    /// report not-signalled (and never fall back to a bare kill).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit__pidfd_guarded_signal__dead_pid_is_not_signalled() {
+        use std::process::Command;
+        let mut gone = Command::new("true").spawn().expect("spawn true");
+        let pid = gone.id();
+        let _ = gone.wait();
+        let signalled = pidfd_guarded_signal(pid, libc::SIGKILL, |_| true);
+        assert_eq!(
+            signalled,
+            Some(false),
+            "reaped pid: open fails ESRCH -> skip, never fallback-kill"
+        );
+    }
+
+    /// The reclaim loop end-to-end against a REAL marker orphan: spawn
+    /// a child carrying our data-dir marker, reclaim it, assert the
+    /// teaching line and the child's death by SIGTERM. A concurrent
+    /// reaper stands in for init (a reaped child stops answering
+    /// signal-0 liveness, so the grace window ends the moment the TERM
+    /// lands instead of polling zombies for the full window).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit__reclaim_marker_orphans__terminates_real_marker_child() {
+        use std::process::Command;
+        let (tmp, d) = dirs();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .env(ORPHAN_MARKER_ENV, d.data_dir.as_os_str())
+            .spawn()
+            .expect("spawn marked sleep");
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait().expect("reap reclaimed child"));
+        });
+        let lines = reclaim_marker_orphans(&d.data_dir);
+        assert!(
+            lines.iter().any(|l| l.contains(&pid.to_string())),
+            "reclaim must report the marked child: {lines:?}"
+        );
+        let status = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("child must be reclaimed within the grace window");
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGTERM)
+                || status.code() == Some(0),
+            "child stopped by the reclaim sweep, got {status:?}"
+        );
+        // A second sweep finds nothing: the marker child is gone.
+        assert!(
+            reclaim_marker_orphans(&d.data_dir).is_empty(),
+            "second sweep must be clean"
+        );
+        drop(tmp);
+    }
 
     fn dirs() -> (tempfile::TempDir, BlazarDirs) {
         let tmp = tempfile::tempdir().unwrap();

@@ -8,6 +8,15 @@ tracked here.
 
 ### Added
 
+- **PID-reuse-proof orphan signalling (Linux).** The boot-time orphan
+  reclaim, the SIGKILL escalation, and the pidfile sweep now signal
+  through a `pidfd` pinned BEFORE the identity check: a PID that exits
+  and is recycled between verification and the signal can never receive
+  our TERM/KILL. Kernels without pidfd (pre-5.3) fall back to the
+  existing re-read + `kill` path unchanged. The non-Linux reclaim stub
+  now documents the full platform matrix, including why Windows Job
+  Objects are deliberately deferred (spawn-path rework + a Windows API
+  dependency with no crash-recovery incident justifying it yet).
 - **Service-time telemetry + distinct `adaptive` pool strategy.** Remote
   streams that drain cleanly to EOF now fold their admission-to-completion
   duration into a per-peer service-time EWMA (same 0.3 smoothing as the

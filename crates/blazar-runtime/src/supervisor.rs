@@ -9926,11 +9926,28 @@ drop them from rpc_servers in config.toml",
             };
             if pid > 1 && crate::daemon::process_alive_by_pid(pid) {
                 tracing::warn!("orphan engine pid {pid} ({name}) from a dead daemon; terminating");
-                #[cfg(unix)]
-                #[allow(unsafe_code)]
-                // SAFETY: single positive pid from our own marker file.
-                unsafe {
-                    libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGTERM);
+                // Pidfile strays carry no env marker (they predate it),
+                // so identity is liveness-only here. On Linux the pidfd
+                // lane pins the process before the signal, closing the
+                // PID-reuse window the marker-less check cannot. Both
+                // lanes fall through: the marker file is consumed on
+                // every swept pid, exactly as before the pidfd lane.
+                #[cfg(target_os = "linux")]
+                let pinned = crate::daemon::pidfd_guarded_signal(
+                    pid,
+                    libc::SIGTERM,
+                    crate::daemon::process_alive_by_pid,
+                )
+                .is_some();
+                #[cfg(not(target_os = "linux"))]
+                let pinned = false;
+                if !pinned {
+                    #[cfg(unix)]
+                    #[allow(unsafe_code)]
+                    // SAFETY: single positive pid from our own marker file.
+                    unsafe {
+                        libc::kill(i32::try_from(pid).unwrap_or(-1), libc::SIGTERM);
+                    }
                 }
                 termed.push(pid);
                 swept.push(format!("{name}={pid}"));
