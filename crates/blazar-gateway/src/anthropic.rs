@@ -384,11 +384,17 @@ pub async fn messages(
         }
     };
     if !status.is_success() {
-        let msg = openai
+        let mut msg = openai
             .pointer("/error/message")
             .and_then(Value::as_str)
-            .unwrap_or("engine error");
-        let mut r = anthropic_error(status.as_u16(), "api_error", msg);
+            .unwrap_or("engine error")
+            .to_string();
+        // Constraint-pinned chat failure: append the pin + workaround
+        // teaching (signature-gated; see proxy::constraint_chat_failure_text).
+        if let Some(teach) = crate::proxy::constraint_chat_failure_teaching(&state, &model, &msg) {
+            msg = format!("{msg} - {teach}");
+        }
+        let mut r = anthropic_error(status.as_u16(), "api_error", &msg);
         crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
         crate::mcp::stamp(&mut r, mcp_hdr.as_deref());
         return r;

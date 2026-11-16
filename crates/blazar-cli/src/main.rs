@@ -25048,59 +25048,82 @@ async fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             // what they are: root knob -> root-scoped replace; known
             // section leaf (`ttl_secs`) -> its table; section parent ->
             // teaching; unknown -> root insert, where the schema reject
-            // below stays the oracle.
-            let mut candidate = if let Some((tpath, leaf)) = split_table_path(&key) {
-                set_table_key(&raw, &tpath, leaf, &stored)
-            } else if top_level_key_known(&key) {
-                set_root_key(&raw, &key, &stored)
-            } else {
-                let sections = bare_leaf_sections(&key, &raw);
-                if is_section_parent(&key, &raw) {
-                    let leaves = section_leaf_names(&key);
-                    let hint = if leaves.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (leaves: {})", leaves.join(", "))
-                    };
-                    return Err(anyhow!(
-                        "{key} is a table, not a value - set individual leaves: {key}.<leaf> <value>{hint}"
-                    ));
-                }
-                match sections.as_slice() {
-                    [only] => set_table_key(&raw, &[only.as_str()], &key, &stored),
-                    many if !many.is_empty() => {
+            // below stays the oracle. One closure so the hint path below
+            // can rebuild the file with a different value spelling
+            // through the EXACT same routing (no drift between the two).
+            let route = |stored: &str| -> Result<String> {
+                let mut candidate = if let Some((tpath, leaf)) = split_table_path(&key) {
+                    set_table_key(&raw, &tpath, leaf, stored)
+                } else if top_level_key_known(&key) {
+                    set_root_key(&raw, &key, stored)
+                } else {
+                    let sections = bare_leaf_sections(&key, &raw);
+                    if is_section_parent(&key, &raw) {
+                        let leaves = section_leaf_names(&key);
+                        let hint = if leaves.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (leaves: {})", leaves.join(", "))
+                        };
                         return Err(anyhow!(
-                            "ambiguous key: {key} is a leaf of several sections ({}) - use the dotted form: {}",
-                            many.join(", "),
-                            many.iter()
-                                .map(|s| format!("{s}.{key}"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            "{key} is a table, not a value - set individual leaves: {key}.<leaf> <value>{hint}"
                         ));
                     }
-                    _ => set_root_key(&raw, &key, &stored),
-                }
-            };
-            // A dotted MODEL NAME (`model_overrides.qwen3-1.7b.engine`)
-            // makes the straight candidate nest one table too deep. Retry
-            // with merged model names - the schema is the oracle, the first
-            // candidate it accepts wins, and the final validation below
-            // still gates the winner before anything is persisted.
-            if Config::from_toml(&candidate).is_err()
-                && let Some(candidates) = merged_override_splits(&key)
-            {
-                for (segs, leaf) in &candidates {
-                    let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
-                    let alt = set_table_key(&raw, &segs, leaf, &stored);
-                    if Config::from_toml(&alt).is_ok() {
-                        candidate = alt;
-                        break;
+                    match sections.as_slice() {
+                        [only] => set_table_key(&raw, &[only.as_str()], &key, stored),
+                        many if !many.is_empty() => {
+                            return Err(anyhow!(
+                                "ambiguous key: {key} is a leaf of several sections ({}) - use the dotted form: {}",
+                                many.join(", "),
+                                many.iter()
+                                    .map(|s| format!("{s}.{key}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                        _ => set_root_key(&raw, &key, stored),
+                    }
+                };
+                // A dotted MODEL NAME (`model_overrides.qwen3-1.7b.engine`)
+                // makes the straight candidate nest one table too deep. Retry
+                // with merged model names - the schema is the oracle, the first
+                // candidate it accepts wins, and the final validation below
+                // still gates the winner before anything is persisted.
+                if Config::from_toml(&candidate).is_err()
+                    && let Some(candidates) = merged_override_splits(&key)
+                {
+                    for (segs, leaf) in &candidates {
+                        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+                        let alt = set_table_key(&raw, &segs, leaf, stored);
+                        if Config::from_toml(&alt).is_ok() {
+                            candidate = alt;
+                            break;
+                        }
                     }
                 }
-            }
+                Ok(candidate)
+            };
+            let candidate = route(&stored)?;
             // Validate BEFORE persisting: a bad value/unknown key must
             // never leave the file broken.
-            Config::from_toml(&candidate).map_err(|e| anyhow!("rejected, file unchanged: {e}"))?;
+            if let Err(e) = Config::from_toml(&candidate) {
+                // A bare scalar the knob wanted as a STRING (hex CPU mask
+                // `0xff` parses as a TOML integer) is the classic trap.
+                // Verify the quoted twin actually validates through the
+                // same routing before teaching it - a hint that would
+                // also fail is worse than none.
+                if scalar {
+                    let quoted = format!("{value:?}");
+                    if let Ok(twin) = route(&quoted)
+                        && Config::from_toml(&twin).is_ok()
+                    {
+                        return Err(anyhow!(
+                            "rejected, file unchanged: {e}\n  hint: {key} takes a string - quote the value: blazar config set {key} {quoted}"
+                        ));
+                    }
+                }
+                return Err(anyhow!("rejected, file unchanged: {e}"));
+            }
             blazar_core::persist_config(&path, &candidate)?;
             println!("{key} = {stored}");
             Ok(())

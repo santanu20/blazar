@@ -24,13 +24,14 @@
       ]
     },
     {
-      "tag": "b12202-cuda",
+      "tag": "b12360-cuda",
       "kind": "llamacpp",
       "flags": [
         "--adaptive-decay",
         "--adaptive-target",
         "--agent",
         "--alias",
+        "--allow-unauthenticated-tools",
         "--api-key",
         "--api-key-file",
         "--api-prefix",
@@ -77,7 +78,6 @@
         "--cpu-strict-draft",
         "--ctx-checkpoints",
         "--ctx-size",
-        "--defrag-thold",
         "--device",
         "--device-draft",
         "--docker-repo",
@@ -154,6 +154,7 @@
         "--main-gpu",
         "--mcp-servers-config",
         "--mcp-servers-json",
+        "--media-allow-private-urls",
         "--media-path",
         "--metrics",
         "--min-p",
@@ -222,6 +223,7 @@
         "--parallel",
         "--path",
         "--perf",
+        "--ple",
         "--poll",
         "--poll-batch",
         "--poll-batch-draft",
@@ -258,6 +260,7 @@
         "--samplers",
         "--sampling-seq",
         "--seed",
+        "--shard",
         "--skip-chat-parsing",
         "--sleep-idle-seconds",
         "--slot-prompt-similarity",
@@ -334,6 +337,8 @@
         "--top-n-sigma",
         "--top-nsigma",
         "--top-p",
+        "--tts-lang",
+        "--tts-voice",
         "--typical",
         "--typical-p",
         "--ubatch-size",
@@ -780,7 +785,12 @@
       ]
     },
     {
-      "tag": "litert-0.19.1",
+      "tag": "kokoro-1.0",
+      "kind": "kokoro",
+      "flags": []
+    },
+    {
+      "tag": "litert-0.19.2",
       "kind": "openaihost",
       "flags": [
         "--config",

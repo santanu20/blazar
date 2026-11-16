@@ -43,11 +43,11 @@ Registry lane `piper` pins 10 first-class flags (compile + spawn-time emission).
 - --quiet: long-form alias of the first-class -q the lane emits
 - --tashkeel_model: Arabic diacritization; needs a separate model asset and an Arabic voice, and the lane has no extra_args surface
 
-## b12202-cuda (llamacpp) - 335 flags probed
+## b12360-cuda (llamacpp) - 340 flags probed
 
-**certified: 2 | first-class: 70 | passthrough: 263 | intentionally-unsupported: 0 | not-applicable: 0 | unverified: 0**
+**certified: 2 | first-class: 89 | passthrough: 249 | intentionally-unsupported: 0 | not-applicable: 0 | unverified: 0**
 
-Registry lane `llamacpp` pins 75 first-class flags (compile + spawn-time emission).
+Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emission).
 
 ### Certified against a live engine
 
@@ -56,14 +56,14 @@ Registry lane `llamacpp` pins 75 first-class flags (compile + spawn-time emissio
 
 ### Passthrough families
 
-- **serving detail** (74): --cache-idle-slots, --cache-list, --cache-prompt, --cache-reuse, --check-tensors, --completion-bash (+68 more)
-- **draft/speculative detail** (64): --cache-type-k-draft, --cache-type-v-draft, --cpu-mask-batch-draft, --cpu-mask-draft, --cpu-moe-draft, --cpu-range-draft (+58 more)
-- **uncategorized long-tail** (52): --adaptive-decay, --adaptive-target, --agent, --connect, --connect-code, --cpu-moe (+46 more)
-- **per-request sampling** (24): --backend-sampling, --chat-template-file, --dry-sequence-breaker, --dynatemp-exp, --dynatemp-range, --grammar (+18 more)
-- **gateway-owned transport** (18): --api-key, --api-key-file, --api-prefix, --cors-credentials, --cors-headers, --cors-methods (+12 more)
+- **serving detail** (68): --cache-idle-slots, --cache-list, --cache-prompt, --cache-reuse, --check-tensors, --completion-bash (+62 more)
+- **draft/speculative detail** (60): --cache-type-k-draft, --cache-type-v-draft, --cpu-mask-batch-draft, --cpu-mask-draft, --cpu-moe-draft, --cpu-range-draft (+54 more)
+- **uncategorized long-tail** (55): --adaptive-decay, --adaptive-target, --agent, --allow-unauthenticated-tools, --connect, --connect-code (+49 more)
+- **per-request sampling** (21): --backend-sampling, --chat-template-file, --dry-sequence-breaker, --dynatemp-exp, --dynatemp-range, --image-min-tokens (+15 more)
+- **gateway-owned transport** (17): --api-key, --api-key-file, --api-prefix, --cors-credentials, --cors-headers, --cors-methods (+11 more)
 - **observability** (13): --log-colors, --log-disable, --log-file, --log-jsonl, --log-prefix, --log-prompts-dir (+7 more)
 - **multimodal** (10): --image-max-tokens, --mmproj, --mmproj-auto, --mmproj-device, --mmproj-offload, --mmproj-url (+4 more)
-- **CPU affinity** (6): --cpu-mask, --cpu-mask-batch, --cpu-range, --cpu-range-batch, --threads-batch, --threads-http
+- **CPU affinity** (3): --cpu-range, --threads-batch, --threads-http
 - **LoRA advanced** (1): --lora
 - **rpc/multi-node** (1): --rpc
 
@@ -86,9 +86,9 @@ Registry lane `whisper` pins 15 first-class flags (compile + spawn-time emission
 
 ## fork-AtomicBot-ai_atomic-llama-cpp-turboquant-8d935078-cuda (llamacpp) - 349 flags probed
 
-**certified: 2 | first-class: 69 | passthrough: 278 | intentionally-unsupported: 0 | not-applicable: 0 | unverified: 0**
+**certified: 2 | first-class: 88 | passthrough: 259 | intentionally-unsupported: 0 | not-applicable: 0 | unverified: 0**
 
-Registry lane `llamacpp` pins 75 first-class flags (compile + spawn-time emission).
+Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emission).
 
 ### Certified against a live engine
 
@@ -97,18 +97,22 @@ Registry lane `llamacpp` pins 75 first-class flags (compile + spawn-time emissio
 
 ### Passthrough families
 
-- **serving detail** (92): --cache-idle-slots, --cache-list, --cache-prompt, --cache-reuse, --check-tensors, --completion-bash (+86 more)
-- **draft/speculative detail** (64): --cache-type-k-draft, --cache-type-v-draft, --cpu-mask-batch-draft, --cpu-mask-draft, --cpu-moe-draft, --cpu-range-draft (+58 more)
-- **uncategorized long-tail** (53): --adaptive-decay, --adaptive-target, --agent, --cpu-moe, --cpu-strict, --decision (+47 more)
-- **per-request sampling** (25): --backend-sampling, --chat-template-file, --dry-sequence-breaker, --dynatemp-exp, --dynatemp-range, --grammar (+19 more)
-- **gateway-owned transport** (18): --api-key, --api-key-file, --api-prefix, --cors-credentials, --cors-headers, --cors-methods (+12 more)
+- **serving detail** (87): --cache-idle-slots, --cache-list, --cache-prompt, --cache-reuse, --check-tensors, --completion-bash (+81 more)
+- **draft/speculative detail** (60): --cache-type-k-draft, --cache-type-v-draft, --cpu-mask-batch-draft, --cpu-mask-draft, --cpu-moe-draft, --cpu-range-draft (+54 more)
+- **uncategorized long-tail** (50): --adaptive-decay, --adaptive-target, --agent, --cpu-moe, --cpu-strict, --decision (+44 more)
+- **per-request sampling** (22): --backend-sampling, --chat-template-file, --dry-sequence-breaker, --dynatemp-exp, --dynatemp-range, --image-min-tokens (+16 more)
+- **gateway-owned transport** (17): --api-key, --api-key-file, --api-prefix, --cors-credentials, --cors-headers, --cors-methods (+11 more)
 - **observability** (12): --decision-debug, --log-colors, --log-disable, --log-file, --log-prefix, --log-prompts-dir (+6 more)
-- **CPU affinity** (6): --cpu-mask, --cpu-mask-batch, --cpu-range, --cpu-range-batch, --threads-batch, --threads-http
 - **multimodal** (6): --image-max-tokens, --mmproj, --mmproj-auto, --mmproj-offload, --mmproj-url, --no-mmproj
+- **CPU affinity** (3): --cpu-range, --threads-batch, --threads-http
 - **LoRA advanced** (1): --lora
 - **rpc/multi-node** (1): --rpc
 
-## litert-0.19.1 (openaihost) - 6 flags probed
+## kokoro-1.0 (kokoro) - 0 flags probed
+
+**certified: 0 | first-class: 0 | passthrough: 0 | intentionally-unsupported: 0 | not-applicable: 0 | unverified: 0**
+
+## litert-0.19.2 (openaihost) - 6 flags probed
 
 **certified: 2 | first-class: 0 | passthrough: 0 | intentionally-unsupported: 0 | not-applicable: 4 | unverified: 0**
 

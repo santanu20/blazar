@@ -753,6 +753,77 @@ impl std::fmt::Display for ChildSendError {
     }
 }
 
+/// Does this model pin a launch-global `grammar/json_schema` constraint?
+/// (Grammar-family overrides from the 0.32.0 knob wave; the four fields
+/// are mutually exclusive by config validation, so `any` is exact.)
+fn overlay_has_constraint(cfg: &blazar_core::Config, model: &str) -> bool {
+    let o = cfg.overlay_for(model);
+    o.grammar.is_some()
+        || o.grammar_file.is_some()
+        || o.json_schema.is_some()
+        || o.json_schema_file.is_some()
+}
+
+/// Teaching line for the engine error emitted when a constraint-pinned
+/// model meets the chat route. Pure decision core (unit-testable without
+/// an `AppState`): fires only on the exact sampler-init signature AND a
+/// pinned constraint, so an unrelated sampler failure passes through
+/// untouched and the signature without a pin (request-side constraint)
+/// is never mis-attributed to the model override.
+fn constraint_chat_failure_text(engine_error: &str, pinned: bool) -> Option<&'static str> {
+    if !pinned || !engine_error.contains("Failed to initialize samplers") {
+        return None;
+    }
+    Some(
+        "this model pins a launch-global grammar/json_schema constraint and the engine's \
+         chat route rejects sampler init while constrained (known llama.cpp issue) - serve \
+         constrained generation via /completion, or remove the model's grammar/json_schema \
+         override and send per-request response_format instead",
+    )
+}
+
+/// [`constraint_chat_failure_text`] resolved against the live config.
+/// Callers hand over the request's model spelling (`name:quant` tags
+/// included); overlays key on the canonical store name, so resolve
+/// through the same ladder the spawn path uses before the pin check.
+pub(crate) fn constraint_chat_failure_teaching(
+    state: &Arc<AppState>,
+    model: &str,
+    engine_error: &str,
+) -> Option<String> {
+    if !engine_error.contains("Failed to initialize samplers") {
+        return None; // cheap gate before any store round trip
+    }
+    let canonical = state
+        .with_store(|s| resolve_model(s, model).ok().map(|r| r.name))
+        .flatten()
+        .unwrap_or_else(|| model.to_string());
+    constraint_chat_failure_text(
+        engine_error,
+        overlay_has_constraint(&state.cfg(), &canonical),
+    )
+    .map(str::to_string)
+}
+
+/// Rewrite an engine error body (`{"error":{"message": ...}}`) with the
+/// constraint teaching appended. `None` = no rewrite (missing signature,
+/// unpinned model, or a shape the rewriter cannot hold verbatim); the
+/// caller relays the original bytes unchanged.
+fn teach_constraint_chat_failure(
+    state: &Arc<AppState>,
+    model: &str,
+    buf: &[u8],
+) -> Option<axum::body::Bytes> {
+    let mut v = serde_json::from_slice::<serde_json::Value>(buf).ok()?;
+    let msg = v
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let teach = constraint_chat_failure_teaching(state, model, &msg)?;
+    v["error"]["message"] = serde_json::Value::String(format!("{msg} - {teach}"));
+    serde_json::to_vec(&v).ok().map(axum::body::Bytes::from)
+}
+
 /// `GET /slots` body -> is any slot mid-generation? `None` when the shape
 /// is not a bare array of slot objects (unknown is not guessed as idle).
 fn slots_any_processing(body: &serde_json::Value) -> Option<bool> {
@@ -763,6 +834,54 @@ fn slots_any_processing(body: &serde_json::Value) -> Option<bool> {
                 .unwrap_or(false)
         })
     })
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+fn unit__constraint_chat_failure_text__signature_and_pin_matrix() {
+    let sig = "Failed to initialize samplers: std::exception";
+    // Fires: exact signature + pinned constraint.
+    assert!(constraint_chat_failure_text(sig, true).is_some());
+    // No pin (request-side constraint): never mis-attributed.
+    assert!(constraint_chat_failure_text(sig, false).is_none());
+    // Pin without the signature: unrelated sampler failure passes through.
+    assert!(constraint_chat_failure_text("some other engine error", true).is_none());
+    // The teaching must name both remedies.
+    let text = constraint_chat_failure_text(sig, true).unwrap();
+    assert!(text.contains("/completion") && text.contains("response_format"));
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+fn unit__overlay_has_constraint__grammar_family_fields() {
+    use blazar_core::{Config, ModelOverride};
+    let mut cfg = Config::default();
+    assert!(!overlay_has_constraint(&cfg, "m"));
+    for pin in [
+        ModelOverride {
+            grammar: Some("root ::= \"ok\"".into()),
+            ..Default::default()
+        },
+        ModelOverride {
+            grammar_file: Some("/tmp/g.gbnf".into()),
+            ..Default::default()
+        },
+        ModelOverride {
+            json_schema: Some("{}".into()),
+            ..Default::default()
+        },
+        ModelOverride {
+            json_schema_file: Some("/tmp/s.json".into()),
+            ..Default::default()
+        },
+    ] {
+        cfg.model_overrides.insert("m".into(), pin);
+        assert!(overlay_has_constraint(&cfg, "m"));
+        assert!(!overlay_has_constraint(&cfg, "other"));
+        cfg.model_overrides.remove("m");
+    }
 }
 
 /// Probe the child's own slot activity - the discriminator between a
@@ -1241,6 +1360,15 @@ pub async fn proxy_request(
         .unwrap_or_default()
         .to_string();
     let sse = content_type.contains("text/event-stream");
+    // Constraint-pinned chat failure (see [`constraint_chat_failure_text`]):
+    // the engine 400 names neither the pin nor the workaround. Buffer the
+    // error body - bounded at 64 KiB, far above any real error body, and
+    // declared-length-gated so a pathological child cannot force an
+    // unbounded read - to decide and teach. SSE errors stream untouched.
+    let enrich_error = !status.is_success()
+        && !sse
+        && resp.content_length().is_some_and(|cl| cl <= 64 * 1024)
+        && overlay_has_constraint(&state.cfg(), model);
     // Per-key token accounting: a bounded tail-sniffer constructed ONLY
     // when the requesting key carries tpm/daily budgets (everyone else
     // pays nothing - the zero-tax contract holds for unlimited keys).
@@ -1370,6 +1498,7 @@ pub async fn proxy_request(
         || (suppress_think && !sse)
         || (restamp && !sse)
         || json_fence
+        || enrich_error
         || (recipe.is_some() && !sse && status.is_success())
     {
         let ctx = if sentinel_active {
@@ -1426,6 +1555,15 @@ pub async fn proxy_request(
                 return openai_error(502, &format!("engine body: {e}"));
             }
             Ok(buf) => {
+                // Constraint teaching fires only on the signature+pin
+                // pair (see constraint_chat_failure_text); every other
+                // buffered error body relays byte-identical through the
+                // same return path below.
+                let buf = if enrich_error {
+                    teach_constraint_chat_failure(state, model, &buf).unwrap_or(buf)
+                } else {
+                    buf
+                };
                 // Recipe lane: translate the child's raw completion body
                 // into the chat dialect the caller speaks, then let every
                 // downstream concern (n-verify, sentinel, sniffing,

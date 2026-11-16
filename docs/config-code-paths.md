@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 247 fields, 0 dead
+## Config (top-level keys) - 262 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -35,6 +35,7 @@ token quality are surfaced as drift.
 | max_loaded_models | 0 | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:2776` in `instance_cap`; `crates/blazar-runtime/src/supervisor.rs:2776` in `instance_cap` |
 | child_transport | "tcp".to_string() | runtime/gateway + engine-argv + gateway-http | `crates/blazar-runtime/src/uds.rs:32` in `validate_socket_path`; `crates/blazar-runtime/src/uds.rs:32` in `validate_socket_path`; `crates/blazar-core/src/profile.rs:3486` in `compile_sdcpp`; `crates/blazar-core/src/profile.rs:16070` in `unit__compile_sdcpp__unix_endpoint_and_text_knobs_refused`; `crates/blazar-gateway/tests/gateway.rs:872` in `e2e__openai_chat_over_unix_socket_transport` |
 | child_auth | None | gateway-http + runtime/gateway + cli | `crates/blazar-gateway/tests/gateway.rs:4666` in `e2e__child_auth__disabled_keeps_children_open`; `blazar-gateway/src/latechunk.rs:24` in `?`; `crates/blazar-runtime/src/supervisor.rs:4460` in `mint_child_auth`; `crates/blazar-runtime/src/supervisor.rs:4460` in `mint_child_auth`; `crates/blazar-cli/src/main.rs:28328` in `unit__known_config_key__defaults_options_and_typos`; `crates/blazar-cli/src/main.rs:29072` in `unit__config_defaults__builtin_toml_is_valid_and_complete` |
+| child_webui | false | engine-argv | `crates/blazar-core/src/profile.rs:2595` in `the`; `crates/blazar-core/src/profile.rs:14094` in `unit__child_webui__opt_in_keeps_engine_default`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
 | log_level | None | other + cli | `crates/blazar-core/src/telemetry.rs:62` in `init_tracing`; `crates/blazar-core/src/telemetry.rs:62` in `init_tracing`; `crates/blazar-cli/src/main.rs:1488` in `main`; `crates/blazar-cli/src/main.rs:1488` in `main` |
 | update_channel | UpdateChannel::default() | runtime/gateway + cli | `crates/blazar-runtime/src/whisper.rs:117` in `release_for_channel`; `crates/blazar-runtime/tests/engine_manager.rs:2559` in `integration__whisper_channel_target__assetless_latest_falls_through`; `crates/blazar-cli/src/main.rs:7402` in `doctor_engine`; `crates/blazar-cli/src/main.rs:7764` in `live_engine_currency` |
 | engine_asset | "auto".to_string() | runtime/gateway + cli | `crates/blazar-runtime/src/engine/mod.rs:1151` in `try_keep_cuda_skip`; `crates/blazar-runtime/src/engine/mod.rs:1660` in `install_with_retries`; `crates/blazar-cli/src/main.rs:21236` in `engine_update`; `crates/blazar-cli/src/main.rs:21236` in `engine_update` |
@@ -45,6 +46,7 @@ token quality are surfaced as drift.
 | spec_autopull | false | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:5582` in `spawn_instance_forced`; `crates/blazar-runtime/src/supervisor.rs:9604` in `autopull_draft` |
 | spec_auto_ngram | true | engine-argv | `blazar-core/src/profile.rs:824` in `the`; `crates/blazar-core/src/profile.rs:7539` in `ngram_fallback_applies` |
 | spec_auto_manage | true | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:1845` in `spec_governor_window`; `crates/blazar-runtime/src/supervisor.rs:15535` in `unit__spec_governor__saturation_streak_parks_and_queues` |
+| spec_default | false | engine-argv | `crates/blazar-core/src/profile.rs:1402` in `the`; `crates/blazar-core/src/profile.rs:14112` in `unit__spec_default__skipped_when_model_spec_engaged`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
 | lazy_mode | "auto".to_string() | engine-argv | `blazar-core/src/profile.rs:1206` in `the`; `blazar-core/src/profile.rs:1207` in `the` |
 | server_tools | None | engine-argv | `blazar-core/src/profile.rs:1231` in `the`; `crates/blazar-core/src/profile.rs:14131` in `unit__server_tools__emits_quartet_when_set` |
 | server_tools_runtime | None | engine-argv | `blazar-core/src/profile.rs:1232` in `the`; `crates/blazar-core/src/profile.rs:14131` in `unit__server_tools__emits_quartet_when_set` |
@@ -137,6 +139,7 @@ token quality are surfaced as drift.
 | spec_draft_ngl | String::new() | engine-argv | `blazar-core/src/profile.rs:968` in `the`; `blazar-core/src/profile.rs:973` in `the` |
 | spec_draft_threads | 0 | engine-argv | `blazar-core/src/profile.rs:978` in `the`; `blazar-core/src/profile.rs:983` in `the` |
 | spec_draft_n_ubatch | 0 | engine-argv | `blazar-core/src/profile.rs:1227` in `11b` |
+| spec_draft_n_min | 0 | engine-argv | `crates/blazar-core/src/profile.rs:1492` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
 | spec_draft_p_min | None | engine-argv | `blazar-core/src/profile.rs:988` in `the`; `blazar-core/src/profile.rs:993` in `the` |
 | spec_draft_p_split | None | engine-argv | `blazar-core/src/profile.rs:998` in `the`; `blazar-core/src/profile.rs:1003` in `the` |
 | spec_draft_poll | None | engine-argv | `blazar-core/src/profile.rs:1008` in `the`; `blazar-core/src/profile.rs:1010` in `the` |
@@ -144,6 +147,8 @@ token quality are surfaced as drift.
 | spec_draft_prio_batch | 0 | engine-argv | `blazar-core/src/profile.rs:1041` in `the`; `blazar-core/src/profile.rs:1046` in `the` |
 | spec_draft_poll_batch | None | engine-argv | `blazar-core/src/profile.rs:1008` in `the`; `blazar-core/src/profile.rs:1020` in `the` |
 | spec_draft_cpu_strict_batch | false | engine-argv | `blazar-core/src/profile.rs:1051` in `the`; `blazar-core/src/profile.rs:1056` in `the` |
+| spec_draft_cpu_mask | String::new() | engine-argv | `crates/blazar-core/src/profile.rs:1575` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
+| spec_draft_cpu_mask_batch | String::new() | engine-argv | `crates/blazar-core/src/profile.rs:1585` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
 | spec_draft_threads_batch | 0 | engine-argv | `blazar-core/src/profile.rs:1061` in `the`; `blazar-core/src/profile.rs:1066` in `the` |
 | spec_draft_type_k | String::new() | engine-argv | `blazar-core/src/profile.rs:1071` in `the`; `blazar-core/src/profile.rs:1076` in `the` |
 | spec_draft_type_v | String::new() | engine-argv | `blazar-core/src/profile.rs:1081` in `the`; `blazar-core/src/profile.rs:1086` in `the` |
@@ -171,12 +176,17 @@ token quality are surfaced as drift.
 | mmproj_auto | true | engine-argv | `blazar-core/src/profile.rs:1650` in `the`; `blazar-core/src/profile.rs:1655` in `the` |
 | mmproj_device | String::new() | engine-argv | `blazar-core/src/profile.rs:1660` in `the`; `blazar-core/src/profile.rs:1662` in `the` |
 | embd_normalize | 0 | engine-argv | `blazar-core/src/profile.rs:1675` in `the`; `blazar-core/src/profile.rs:1677` in `the` |
+| media_path | None | engine-argv | `crates/blazar-core/src/profile.rs:2350` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
 | yarn_orig_ctx | 0 | engine-argv | `blazar-core/src/profile.rs:1806` in `the`; `blazar-core/src/profile.rs:1808` in `the` |
 | yarn_ext_factor | default_yarn_ext_factor() | engine-argv | `blazar-core/src/profile.rs:1810` in `the`; `blazar-core/src/profile.rs:1812` in `the` |
 | yarn_attn_factor | 0.0 | engine-argv | `blazar-core/src/profile.rs:1814` in `the`; `blazar-core/src/profile.rs:1816` in `the` |
 | yarn_beta_fast | 0.0 | engine-argv | `blazar-core/src/profile.rs:1818` in `the`; `blazar-core/src/profile.rs:1820` in `the` |
 | yarn_beta_slow | 0.0 | engine-argv | `blazar-core/src/profile.rs:1822` in `the`; `blazar-core/src/profile.rs:1824` in `the` |
 | cpu_strict | false | engine-argv | `blazar-core/src/profile.rs:1486` in `the`; `blazar-core/src/profile.rs:1491` in `the` |
+| cpu_mask | String::new() | engine-argv | `crates/blazar-core/src/profile.rs:2075` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
+| cpu_mask_batch | String::new() | engine-argv | `crates/blazar-core/src/profile.rs:2085` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
+| cpu_range_batch | String::new() | engine-argv | `crates/blazar-core/src/profile.rs:2095` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
+| cpu_strict_batch | false | engine-argv | `crates/blazar-core/src/profile.rs:2065` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
 | prio | 0 | engine-argv | `blazar-core/src/profile.rs:1037` in `the`; `blazar-core/src/profile.rs:1047` in `the` |
 | prio_batch | 0 | engine-argv | `blazar-core/src/profile.rs:1506` in `the`; `blazar-core/src/profile.rs:1511` in `the` |
 | poll_batch | None | engine-argv | `blazar-core/src/profile.rs:1516` in `the`; `blazar-core/src/profile.rs:1521` in `the` |
@@ -185,6 +195,9 @@ token quality are surfaced as drift.
 | server_timeout_secs | None | engine-argv + cli | `blazar-core/src/profile.rs:1549` in `the`; `blazar-core/src/profile.rs:1554` in `the`; `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block` |
 | chat_template_kwargs | None | engine-argv + gateway-http + cli | `blazar-core/src/profile.rs:1559` in `the`; `blazar-core/src/profile.rs:1564` in `the`; `crates/blazar-gateway/src/anthropic.rs:509` in `translate_request`; `crates/blazar-gateway/src/anthropic.rs:1533` in `unit__translate_request__thinking_budget_maps_to_kwargs`; `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block` |
 | cont_batching | None | engine-argv + cli | `blazar-core/src/profile.rs:1569` in `the`; `blazar-core/src/profile.rs:1574` in `the`; `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block` |
+| cache_prompt | None | engine-argv | `crates/blazar-core/src/profile.rs:2207` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
+| prefill_assistant | None | engine-argv | `crates/blazar-core/src/profile.rs:2226` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
+| skip_chat_parsing | None | engine-argv | `crates/blazar-core/src/profile.rs:2237` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
 | flash_attention | None | engine-argv + runtime/gateway | `blazar-core/src/profile.rs:492` in `the` (TuningOverrides.fa -> on/off/auto); `blazar-runtime/src/supervisor.rs` spawn + router-preset sites feed `self.config.flash_attention` into `TuningOverrides.fa`; live-proven 2026-09-27 via /proc child argv (true -> `--flash-attn on`, false -> `--flash-attn off`, absent -> auto no-value form) |
 | reuse_port | false | engine-argv + cli | `blazar-core/src/profile.rs:1588` in `the`; `blazar-core/src/profile.rs:1593` in `the`; `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block` |
 | lora_init_without_apply | false | cli + engine-argv | `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block`; `blazar-core/src/profile.rs:1598` in `the`; `blazar-core/src/profile.rs:1603` in `the` |
@@ -213,6 +226,8 @@ token quality are surfaced as drift.
 | check_tensors | false | engine-argv | `blazar-core/src/profile.rs:1923` in `the` |
 | context_shift | false | engine-argv | `blazar-core/src/profile.rs:1926` in `the` |
 | samplers | String::new() | engine-argv + gateway-http | `blazar-core/src/profile.rs:1929` in `the`; `blazar-core/src/profile.rs:1934` in `the`; `crates/blazar-gateway/src/translate.rs:24` in `apply_ollama_options`; `crates/blazar-gateway/src/translate.rs:24` in `apply_ollama_options` |
+| logit_bias | Vec::new() | engine-argv | `crates/blazar-core/src/profile.rs:2683` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
+| ignore_eos | false | engine-argv | `crates/blazar-core/src/profile.rs:2696` in `the`; `crates/blazar-core/src/profile.rs:13984` in `unit__gap_knobs__emitted_with_value_and_negation_spellings`; `crates/blazar-core/src/config.rs:8242` in `unit__gap_knobs__validated` |
 | batch_size | 0 | engine-argv | `blazar-core/src/profile.rs:517` in `the`; `blazar-core/src/profile.rs:519` in `the` |
 | ubatch_size | 0 | engine-argv + cli + gateway-http | `blazar-core/src/profile.rs:524` in `the`; `blazar-core/src/profile.rs:526` in `the`; `crates/blazar-cli/src/main.rs:5858` in `doctor_chunking`; `crates/blazar-cli/src/main.rs:5858` in `doctor_chunking`; `crates/blazar-gateway/src/latechunk.rs:206` in `guard_token_budget`; `crates/blazar-gateway/src/latechunk.rs:206` in `guard_token_budget` |
 | threads_batch | 0 | engine-argv | `blazar-core/src/profile.rs:528` in `the`; `blazar-core/src/profile.rs:530` in `the` |
@@ -405,7 +420,7 @@ token quality are surfaced as drift.
 | enable_tf32_matmul | - | engine-argv | `crates/blazar-core/src/profile.rs:4903` (TF32 matmul toggle) |
 | enable_priority_scheduling | Some(true) | engine-argv | `crates/blazar-core/src/profile.rs:4916` (request priority scheduling) |
 
-## ModelOverride ([models."name"]) - 44 fields, 0 dead
+## ModelOverride ([models."name"]) - 48 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -438,6 +453,10 @@ token quality are surfaced as drift.
 | chat_template | - | engine-argv + other + runtime/gateway + gateway-http | `blazar-core/src/profile.rs:1961` in `the`; `blazar-core/src/profile.rs:1966` in `the`; `blazar-core/src/gguf.rs:75` in `?`; `crates/blazar-core/src/gguf.rs:604` in `parse_metadata`; `crates/blazar-runtime/tests/tuner.rs:28` in `gpu_hw`; `crates/blazar-runtime/src/hf.rs:6421` in `unit__select_safetensors_files__shards_aux_skip_nested_and_foreign`; `crates/blazar-gateway/tests/support/mod.rs:41` in `write_gguf`; `crates/blazar-gateway/tests/sentinel.rs:46` in `write_gguf` |
 | chat_template_file | - | engine-argv | `blazar-core/src/profile.rs:1970` in `the`; `blazar-core/src/profile.rs:1978` in `the` |
 | chat_template_kwargs | - | engine-argv | `blazar-core/src/config.rs` `effective_chat_template_kwargs`; `blazar-core/src/profile.rs` compile llama-server knob lane |
+| grammar | - | engine-argv | `crates/blazar-core/src/profile.rs:2739` in `the` (--grammar); `crates/blazar-core/src/profile.rs:14168` in `unit__constraint_overlays__grammar_and_json_schema_families`; `crates/blazar-core/src/config.rs:8330` in `unit__constraint_overlays__validated` |
+| grammar_file | - | engine-argv | `crates/blazar-core/src/profile.rs:2747` in `the` (--grammar-file); `crates/blazar-core/src/profile.rs:14168` in `unit__constraint_overlays__grammar_and_json_schema_families`; `crates/blazar-core/src/config.rs:8330` in `unit__constraint_overlays__validated` |
+| json_schema | - | engine-argv | `crates/blazar-core/src/profile.rs:2755` in `the` (--json-schema); `crates/blazar-core/src/profile.rs:14168` in `unit__constraint_overlays__grammar_and_json_schema_families`; `crates/blazar-core/src/config.rs:8330` in `unit__constraint_overlays__validated` |
+| json_schema_file | - | engine-argv | `crates/blazar-core/src/profile.rs:2763` in `the` (--json-schema-file); `crates/blazar-core/src/profile.rs:14168` in `unit__constraint_overlays__grammar_and_json_schema_families`; `crates/blazar-core/src/config.rs:8330` in `unit__constraint_overlays__validated` |
 | sampler_defaults | - | engine-argv | `blazar-core/src/profile.rs:1991` in `the`; `blazar-core/src/profile.rs:2031` in `the` |
 | spm_infill | - | engine-argv | `blazar-core/src/profile.rs:1984` in `the`; `blazar-core/src/profile.rs:1988` in `the` |
 | late_chunking | - | engine-argv + gateway-http | `blazar-core/src/profile.rs:712` in `the`; `blazar-core/src/profile.rs:736` in `the`; `crates/blazar-gateway/src/ollama.rs:3051` in `embeddings`; `crates/blazar-gateway/src/ollama.rs:3198` in `embed` |

@@ -2403,6 +2403,11 @@ async fn buffered_response_roundtrip(
     let status = resp.status().as_u16();
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
+        // Constraint-pinned chat failure: append the pin + workaround
+        // teaching (signature-gated; see proxy::constraint_chat_failure_text).
+        let text = crate::proxy::constraint_chat_failure_teaching(state, model_name, &text)
+            .map(|teach| format!("{text} - {teach}"))
+            .unwrap_or(text);
         let mut r = openai_error(status, &format!("engine error: {text}"));
         crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
         return Err(r);

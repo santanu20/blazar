@@ -14,6 +14,7 @@
 use std::path::Path;
 
 use assert_cmd::Command;
+use predicates::boolean::PredicateBooleanExt;
 
 fn blazar(cfg_root: &Path) -> Command {
     let mut c = Command::cargo_bin("blazar").unwrap();
@@ -103,4 +104,51 @@ fn e2e__config_set_invalid_value_rejected_file_unchanged() {
 
     let after = std::fs::read_to_string(cfg_root.join("blazar/config.toml")).unwrap();
     assert_eq!(before, after, "rejected set must not mutate the file");
+}
+
+#[test]
+fn e2e__config_set_scalar_into_string_knob__teaches_quoted_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_root = tmp.path();
+    seed(cfg_root);
+    let before = std::fs::read_to_string(cfg_root.join("blazar/config.toml")).unwrap();
+
+    // `0xff` parses as a TOML integer, but cpu_mask is a hex STRING knob.
+    // The rejection must teach the exact working command, verified by the
+    // CLI itself before the hint is shown.
+    blazar(cfg_root)
+        .args(["config", "set", "cpu_mask", "0xff"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("rejected, file unchanged"))
+        .stderr(predicates::str::contains(
+            "hint: cpu_mask takes a string - quote the value: blazar config set cpu_mask \"0xff\"",
+        ));
+
+    let after = std::fs::read_to_string(cfg_root.join("blazar/config.toml")).unwrap();
+    assert_eq!(before, after, "rejected set must not mutate the file");
+
+    // The taught command must actually work (the hint is verified, not
+    // guessed): same value, quoted.
+    blazar(cfg_root)
+        .args(["config", "set", "cpu_mask", "\"0xff\""])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("cpu_mask = \"0xff\""));
+}
+
+#[test]
+fn e2e__config_set_invalid_scalar_no_misleading_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_root = tmp.path();
+    seed(cfg_root);
+
+    // An int knob fed an out-of-range int: quoting would NOT fix it, so
+    // no quoting hint may appear (plain rejection, same as before).
+    blazar(cfg_root)
+        .args(["config", "set", "spec_draft_n_min", "2000"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("rejected, file unchanged"))
+        .stderr(predicates::str::contains("hint").not());
 }

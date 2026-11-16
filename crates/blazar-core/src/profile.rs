@@ -1387,6 +1387,29 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         }
     }
 
+    // --- 11a-bis. engine default speculation preset (`--spec-default`,
+    // upstream: a tuned ngram-mod shape). Global config guards the
+    // spec = "off" co-requirement at load; a per-model spec pin that
+    // engages a mode here skips the preset with a teaching warning (the
+    // mode owns the draft lane).
+    if config.spec_default {
+        if spec_mode.is_empty() || spec_mode == "off" {
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_default",
+                "--spec-default",
+                &[],
+            );
+        } else {
+            warnings.push(format!(
+                "spec_default skipped: model spec = {spec_mode:?} is engaged and owns \
+                 the draft lane - set spec = \"off\" to use the engine preset"
+            ));
+        }
+    }
+
     // --- 11b. spec-draft placement (only when a draft model is actually
     // resolved: spec = "auto"/"eagle3"/"dflash"/"dspark" + pulled pair).
     // Pin the draft to P-cores / a spare GPU / fewer threads so it stops
@@ -1460,6 +1483,16 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 &[config.spec_draft_n_ubatch.to_string()],
             );
         }
+        if config.spec_draft_n_min > 0 {
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_n_min",
+                "--spec-draft-n-min",
+                &[config.spec_draft_n_min.to_string()],
+            );
+        }
         if let Some(p) = config.spec_draft_p_min {
             push_gated(
                 input,
@@ -1531,6 +1564,26 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                 "spec_draft_cpu_strict_batch",
                 "--spec-draft-cpu-strict-batch",
                 &["1".to_string()],
+            );
+        }
+        if !config.spec_draft_cpu_mask.is_empty() {
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_cpu_mask",
+                "--spec-draft-cpu-mask",
+                std::slice::from_ref(&config.spec_draft_cpu_mask),
+            );
+        }
+        if !config.spec_draft_cpu_mask_batch.is_empty() {
+            push_gated(
+                input,
+                &mut argv,
+                &mut warnings,
+                "spec_draft_cpu_mask_batch",
+                "--spec-draft-cpu-mask-batch",
+                std::slice::from_ref(&config.spec_draft_cpu_mask_batch),
             );
         }
         if config.spec_draft_threads_batch > 0 {
@@ -2003,6 +2056,46 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             &["1".to_string()],
         );
     }
+    if config.cpu_strict_batch {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cpu_strict_batch",
+            "--cpu-strict-batch",
+            &["1".to_string()],
+        );
+    }
+    if !config.cpu_mask.is_empty() {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cpu_mask",
+            "--cpu-mask",
+            std::slice::from_ref(&config.cpu_mask),
+        );
+    }
+    if !config.cpu_mask_batch.is_empty() {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cpu_mask_batch",
+            "--cpu-mask-batch",
+            std::slice::from_ref(&config.cpu_mask_batch),
+        );
+    }
+    if !config.cpu_range_batch.is_empty() {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cpu_range_batch",
+            "--cpu-range-batch",
+            std::slice::from_ref(&config.cpu_range_batch),
+        );
+    }
     if config.prio != 0 {
         push_gated(
             input,
@@ -2091,6 +2184,65 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             &mut warnings,
             "cont_batching = false",
             "--no-cont-batching",
+            &[],
+        ),
+        None => {}
+    }
+    // Tri-state server behavior toggles: None = engine default, the
+    // explicit spellings pick the positive or negation flag.
+    match config.cache_prompt {
+        Some(true) => push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cache_prompt",
+            "--cache-prompt",
+            &[],
+        ),
+        Some(false) => push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "cache_prompt = false",
+            "--no-cache-prompt",
+            &[],
+        ),
+        None => {}
+    }
+    match config.prefill_assistant {
+        Some(true) => push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "prefill_assistant",
+            "--prefill-assistant",
+            &[],
+        ),
+        Some(false) => push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "prefill_assistant = false",
+            "--no-prefill-assistant",
+            &[],
+        ),
+        None => {}
+    }
+    match config.skip_chat_parsing {
+        Some(true) => push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "skip_chat_parsing",
+            "--skip-chat-parsing",
+            &[],
+        ),
+        Some(false) => push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "skip_chat_parsing = false",
+            "--no-skip-chat-parsing",
             &[],
         ),
         None => {}
@@ -2185,6 +2337,19 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     if config.embd_normalize > 0 {
         argv.push("--embd-normalize".into());
         argv.push(config.embd_normalize.to_string());
+    }
+    // Local media serving dir: multimodal requests reference files by
+    // `file://<relative>` instead of inlining base64 bodies. Directory
+    // existence is a config-load invariant; emission stays manifest-gated.
+    if let Some(p) = &config.media_path {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "media_path",
+            "--media-path",
+            std::slice::from_ref(p),
+        );
     }
     // --- 19. multimodal projector: the pulled mmproj wires vision/
     // audio-in into the engine. Explicit `extra_args` -mm wins; a pulled
@@ -2421,6 +2586,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // --- 21. engine behavior toggles + power-user escapes. Defaults mirror
     // upstream so unset knobs emit nothing; the knobs exist to disable or
     // to reach surfaces config otherwise can't name.
+    //
+    // 21-pre. child WebUI posture: the gateway fronts every surface, so
+    // the child's embedded browser UI is redundant - default it OFF.
+    // Silent gate on purpose (unlike the knobs below): this is Blazar's
+    // default posture, not a user intent, and an older engine simply
+    // keeps its own default - no warning noise on every spawn.
+    if !config.child_webui && input.supported_flags.contains("--no-webui") {
+        argv.push("--no-webui".into());
+    }
     if !overlay
         .warmup
         .unwrap_or_else(|| config.effective_warmup(input.model_name))
@@ -2500,6 +2674,34 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
             argv.push(chain);
         }
     }
+    // Model-wide logit biases + EOS suppression: shape the distribution
+    // for EVERY request on this child (per-request bias stays a raw-lane
+    // concern). Format is validated at config load. Repeatable flag, so
+    // the support gate runs once and every entry is pushed directly -
+    // push_gated's shadowing guard would refuse the second --logit-bias.
+    if !config.logit_bias.is_empty() {
+        if input.supported_flags.contains("--logit-bias") {
+            for lb in &config.logit_bias {
+                argv.push("--logit-bias".into());
+                argv.push(lb.clone());
+            }
+        } else {
+            warnings.push(format!(
+                "logit_bias skipped: engine {} lacks --logit-bias; run: blazar engine update",
+                input.engine_tag
+            ));
+        }
+    }
+    if config.ignore_eos {
+        push_gated(
+            input,
+            &mut argv,
+            &mut warnings,
+            "ignore_eos",
+            "--ignore-eos",
+            &[],
+        );
+    }
     if !config.video_ffmpeg_dir.is_empty() {
         argv.push("--video-ffmpeg-dir".into());
         argv.push(config.video_ffmpeg_dir.clone());
@@ -2535,6 +2737,68 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         } else {
             warnings.push("chat_template_file skipped: engine lacks --chat-template-file".into());
         }
+    }
+    // Launch-global output constraints (`--grammar*` / `--json-schema*`):
+    // one per model (exclusivity + file existence are config-load
+    // invariants). Same warn-skip posture as the template pair above -
+    // an engine without the flag still serves, unconstrained.
+    if let Some(g) = overlay.grammar.as_deref().filter(|g| !g.is_empty()) {
+        if input.supported_flags.contains("--grammar") {
+            argv.push("--grammar".into());
+            argv.push(g.to_string());
+        } else {
+            warnings.push("grammar skipped: engine lacks --grammar".into());
+        }
+    }
+    if let Some(f) = overlay.grammar_file.as_deref().filter(|f| !f.is_empty()) {
+        if input.supported_flags.contains("--grammar-file") {
+            argv.push("--grammar-file".into());
+            argv.push(f.to_string());
+        } else {
+            warnings.push("grammar_file skipped: engine lacks --grammar-file".into());
+        }
+    }
+    if let Some(js) = overlay.json_schema.as_deref().filter(|s| !s.is_empty()) {
+        if input.supported_flags.contains("--json-schema") {
+            argv.push("--json-schema".into());
+            argv.push(js.to_string());
+        } else {
+            warnings.push("json_schema skipped: engine lacks --json-schema".into());
+        }
+    }
+    if let Some(f) = overlay
+        .json_schema_file
+        .as_deref()
+        .filter(|f| !f.is_empty())
+    {
+        if input.supported_flags.contains("--json-schema-file") {
+            argv.push("--json-schema-file".into());
+            argv.push(f.to_string());
+        } else {
+            warnings.push("json_schema_file skipped: engine lacks --json-schema-file".into());
+        }
+    }
+    // Route-shape teaching: a launch-global constraint rides the child's
+    // sampler chain, and the OpenAI chat route on current llama-server
+    // builds rejects every request while one is armed ("Failed to
+    // initialize samplers", verified b12360) - the raw /completion route
+    // applies the constraint fine, and per-request grammars
+    // (response_format) never hit this. Say so once, when a constraint
+    // actually landed on the argv.
+    let constraint_emitted = argv.iter().any(|a| {
+        a == "--grammar"
+            || a == "--grammar-file"
+            || a == "--json-schema"
+            || a == "--json-schema-file"
+    });
+    if constraint_emitted {
+        warnings.push(
+            "launch-global grammar/json_schema armed: the child's OpenAI chat route \
+             may reject requests on this engine build - constrained generation is \
+             served via /completion; use per-request response_format for chat-side \
+             structured output"
+                .into(),
+        );
     }
     // Infill token-order toggle: Suffix/Prefix/Middle for coder models
     // that were trained on that order (CodeGemma family). Warn-skip on
@@ -8894,6 +9158,10 @@ mod tests {
         sglang: None,
         offline: None,
         moe_cache_mib: None,
+        grammar: None,
+        grammar_file: None,
+        json_schema: None,
+        json_schema_file: None,
     };
 
     #[test]
@@ -13692,6 +13960,398 @@ mod tests {
                 p.warnings
             );
         }
+    }
+
+    /// The llama.cpp gap-wave knob battery: cpu affinity completion,
+    /// tri-state server toggles, media path, spec preset, logit biases,
+    /// and the child `WebUI` hardening default.
+    fn gap_knob_flags() -> BTreeSet<String> {
+        [
+            "--cpu-mask",
+            "--cpu-mask-batch",
+            "--cpu-range-batch",
+            "--cpu-strict-batch",
+            "--cache-prompt",
+            "--no-cache-prompt",
+            "--prefill-assistant",
+            "--no-prefill-assistant",
+            "--skip-chat-parsing",
+            "--no-skip-chat-parsing",
+            "--media-path",
+            "--spec-default",
+            "--spec-draft-n-min",
+            "--spec-draft-cpu-mask",
+            "--spec-draft-cpu-mask-batch",
+            "--logit-bias",
+            "--ignore-eos",
+            "--grammar",
+            "--grammar-file",
+            "--json-schema",
+            "--json-schema-file",
+            "--no-webui",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
+    fn gap_knob_cfg() -> Config {
+        Config {
+            cpu_mask: "0xff".into(),
+            cpu_mask_batch: "0xf0".into(),
+            cpu_range_batch: "0-3".into(),
+            cpu_strict_batch: true,
+            cache_prompt: Some(false),
+            prefill_assistant: Some(false),
+            skip_chat_parsing: Some(true),
+            media_path: Some("/nonexistent-media".into()),
+            spec: "off".into(),
+            spec_default: true,
+            logit_bias: vec!["15043-3".into(), "29902+1".into()],
+            ignore_eos: true,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn unit__gap_knobs__emitted_with_value_and_negation_spellings() {
+        let g = meta();
+        let cfg = gap_knob_cfg();
+        let mut flags = full_flags();
+        flags.extend(gap_knob_flags());
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        let a = &p.argv;
+        // Affinity completion: masks/ranges verbatim, strict-batch in
+        // VALUE form (the bare flag takes a required arg and would
+        // abort the boot).
+        assert!(a.windows(2).any(|w| w == ["--cpu-mask", "0xff"]), "{a:?}");
+        assert!(
+            a.windows(2).any(|w| w == ["--cpu-mask-batch", "0xf0"]),
+            "{a:?}"
+        );
+        assert!(
+            a.windows(2).any(|w| w == ["--cpu-range-batch", "0-3"]),
+            "{a:?}"
+        );
+        assert!(
+            a.windows(2).any(|w| w == ["--cpu-strict-batch", "1"]),
+            "{a:?}"
+        );
+        // Tri-states: Some(false) = negation, never the positive flag.
+        assert!(a.iter().any(|t| t == "--no-cache-prompt"), "{a:?}");
+        assert!(!a.iter().any(|t| t == "--cache-prompt"), "{a:?}");
+        assert!(a.iter().any(|t| t == "--no-prefill-assistant"), "{a:?}");
+        assert!(!a.iter().any(|t| t == "--prefill-assistant"), "{a:?}");
+        assert!(a.iter().any(|t| t == "--skip-chat-parsing"), "{a:?}");
+        assert!(!a.iter().any(|t| t == "--no-skip-chat-parsing"), "{a:?}");
+        // Media serving dir passes through verbatim (existence is a
+        // config-load invariant, not compile's).
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--media-path", "/nonexistent-media"]),
+            "{a:?}"
+        );
+        // Engine default speculation preset rides spec = "off".
+        assert!(a.iter().any(|t| t == "--spec-default"), "{a:?}");
+        // Repeatable logit biases + EOS suppression.
+        assert!(
+            a.windows(2).any(|w| w == ["--logit-bias", "15043-3"]),
+            "{a:?}"
+        );
+        assert!(
+            a.windows(2).any(|w| w == ["--logit-bias", "29902+1"]),
+            "{a:?}"
+        );
+        assert!(a.iter().any(|t| t == "--ignore-eos"), "{a:?}");
+        // Default posture: the child WebUI is OFF on modern engines.
+        assert!(a.iter().any(|t| t == "--no-webui"), "{a:?}");
+        for key in [
+            "cpu_mask",
+            "cpu_mask_batch",
+            "cpu_range_batch",
+            "cpu_strict_batch",
+            "cache_prompt",
+            "prefill_assistant",
+            "skip_chat_parsing",
+            "media_path",
+            "spec_default",
+            "logit_bias",
+            "ignore_eos",
+        ] {
+            assert!(
+                !p.warnings.iter().any(|w| w.contains(key)),
+                "{key} must not warn on a full-flag engine: {:?}",
+                p.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unit__gap_knobs__warn_skip_on_old_engine() {
+        let g = meta();
+        let cfg = gap_knob_cfg();
+        // full_flags() predates the gap-wave flags: the old-engine shape.
+        let flags = full_flags();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        for flag in [
+            "--cpu-mask",
+            "--cpu-mask-batch",
+            "--cpu-range-batch",
+            "--cpu-strict-batch",
+            "--no-cache-prompt",
+            "--no-prefill-assistant",
+            "--skip-chat-parsing",
+            "--media-path",
+            "--spec-default",
+            "--logit-bias",
+            "--ignore-eos",
+        ] {
+            assert!(!p.argv.iter().any(|t| t == flag), "{flag} must be gated");
+        }
+        for key in [
+            "cpu_mask",
+            "cpu_mask_batch",
+            "cpu_range_batch",
+            "cpu_strict_batch",
+            "cache_prompt",
+            "prefill_assistant",
+            "skip_chat_parsing",
+            "media_path",
+            "spec_default",
+            "logit_bias",
+            "ignore_eos",
+        ] {
+            assert!(
+                p.warnings.iter().any(|w| w.contains(key)),
+                "{key} warn-skip missing: {:?}",
+                p.warnings
+            );
+        }
+        // The WebUI posture is intentionally SILENT on old engines: it
+        // is Blazar's default, not user intent - no warning noise.
+        assert!(
+            !p.argv.iter().any(|t| t == "--no-webui"),
+            "--no-webui must not reach a flagless engine"
+        );
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("webui")),
+            "no webui warning noise on old engines: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__child_webui__opt_in_keeps_engine_default() {
+        let g = meta();
+        let cfg = Config {
+            child_webui: true,
+            ..Config::default()
+        };
+        let mut flags = full_flags();
+        flags.extend(gap_knob_flags());
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|t| t == "--no-webui"),
+            "child_webui = true must leave the engine default: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__spec_default__skipped_when_model_spec_engaged() {
+        let g = meta();
+        // Global preset pin, but THIS model rides spec = "auto" with a
+        // resolved draft: the mode owns the draft lane, the preset
+        // warn-skips.
+        let cfg = Config {
+            spec: "auto".into(),
+            spec_default: true,
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut flags = full_flags();
+        flags.extend(gap_knob_flags());
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        let draft = draft_file("specdef");
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.iter().any(|t| t == "--spec-default"),
+            "preset must not ride an engaged spec mode: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("spec_default skipped")),
+            "teaching warning missing: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__spec_draft_gap_knobs__emitted_under_auto_draft() {
+        let cfg = Config {
+            spec: "auto".into(),
+            spec_draft_n_min: 2,
+            spec_draft_cpu_mask: "0x0f".into(),
+            spec_draft_cpu_mask_batch: "0xf0".into(),
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let g = meta();
+        let mut flags = full_flags();
+        flags.extend(gap_knob_flags());
+        let mut inp = input(&g, &hw, &cfg, &flags);
+        let draft = draft_file("gapdraft");
+        inp.draft_path = Some(&draft);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let a = &p.argv;
+        assert!(
+            a.windows(2).any(|w| w == ["--spec-draft-n-min", "2"]),
+            "{a:?}"
+        );
+        assert!(
+            a.windows(2).any(|w| w == ["--spec-draft-cpu-mask", "0x0f"]),
+            "{a:?}"
+        );
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--spec-draft-cpu-mask-batch", "0xf0"]),
+            "{a:?}"
+        );
+    }
+
+    #[test]
+    fn unit__constraint_overlays__grammar_and_json_schema_families() {
+        let g = meta();
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let mut flags = full_flags();
+        flags.extend(gap_knob_flags());
+        let base = Config::default();
+        for (field, argv_pair, warn_key) in [
+            ("grammar", ("--grammar", r#"root ::= "ok""#), "grammar"),
+            (
+                "grammar_file",
+                ("--grammar-file", "/fixtures/grammar.gbnf"),
+                "grammar_file",
+            ),
+            (
+                "json_schema",
+                ("--json-schema", r#"{"type":"object"}"#),
+                "json_schema",
+            ),
+            (
+                "json_schema_file",
+                ("--json-schema-file", "/fixtures/schema.json"),
+                "json_schema_file",
+            ),
+        ] {
+            let overlay = match field {
+                "grammar" => ModelOverride {
+                    grammar: Some(r#"root ::= "ok""#.into()),
+                    ..ModelOverride::default()
+                },
+                "grammar_file" => ModelOverride {
+                    grammar_file: Some("/fixtures/grammar.gbnf".into()),
+                    ..ModelOverride::default()
+                },
+                "json_schema" => ModelOverride {
+                    json_schema: Some(r#"{"type":"object"}"#.into()),
+                    ..ModelOverride::default()
+                },
+                _ => ModelOverride {
+                    json_schema_file: Some("/fixtures/schema.json".into()),
+                    ..ModelOverride::default()
+                },
+            };
+            let mut inp = input(&g, &hw, &base, &flags);
+            inp.overlay = &overlay;
+            let p = compile(&inp, &TuningOverrides::default()).unwrap();
+            assert!(
+                p.argv
+                    .windows(2)
+                    .any(|w| w[0] == argv_pair.0 && w[1] == argv_pair.1),
+                "{field} emission missing: {:?}",
+                p.argv
+            );
+            assert!(
+                !p.warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("{warn_key} skipped"))),
+                "{field} must not warn-skip on a full-flag engine: {:?}",
+                p.warnings
+            );
+            // The chat-route teaching accompanies every armed constraint
+            // (route-shape knowledge, not a skip).
+            assert!(
+                p.warnings.iter().any(|w| w.contains("chat route")),
+                "{field} emission must teach the chat-route limitation: {:?}",
+                p.warnings
+            );
+            // Old engine: warn-skip, argv clean.
+            let old_flags = full_flags();
+            let mut inp_old = input(&g, &hw, &base, &old_flags);
+            inp_old.overlay = &overlay;
+            let p_old = compile(&inp_old, &TuningOverrides::default()).unwrap();
+            assert!(
+                !p_old.argv.iter().any(|t| t == argv_pair.0),
+                "{field} must be gated on old engines"
+            );
+            assert!(
+                p_old.warnings.iter().any(|w| w.contains(warn_key)),
+                "{field} warn-skip missing: {:?}",
+                p_old.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unit__gap_knobs__unset_emit_nothing_and_default_webui_stays_quiet() {
+        let g = meta();
+        let cfg = Config::default();
+        let mut flags = full_flags();
+        flags.extend(gap_knob_flags());
+        let hw = gpu_hw(24_000, 32_000, 8);
+        let p = compile(&input(&g, &hw, &cfg, &flags), &TuningOverrides::default()).unwrap();
+        // Only the WebUI hardening rides the default config.
+        for flag in [
+            "--cpu-mask",
+            "--cpu-mask-batch",
+            "--cpu-range-batch",
+            "--cpu-strict-batch",
+            "--no-cache-prompt",
+            "--cache-prompt",
+            "--no-prefill-assistant",
+            "--prefill-assistant",
+            "--skip-chat-parsing",
+            "--no-skip-chat-parsing",
+            "--media-path",
+            "--spec-default",
+            "--spec-draft-n-min",
+            "--spec-draft-cpu-mask",
+            "--spec-draft-cpu-mask-batch",
+            "--logit-bias",
+            "--ignore-eos",
+            "--grammar",
+            "--grammar-file",
+            "--json-schema",
+            "--json-schema-file",
+        ] {
+            assert!(
+                !p.argv.iter().any(|t| t == flag),
+                "{flag} leaked: {:?}",
+                p.argv
+            );
+        }
+        assert!(
+            p.argv.iter().any(|t| t == "--no-webui"),
+            "default posture must disable the child WebUI: {:?}",
+            p.argv
+        );
     }
 
     #[test]

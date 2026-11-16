@@ -71,6 +71,15 @@ pub struct Config {
     /// permissions), Some(true) = always, Some(false) = never.
     #[serde(default)]
     pub child_auth: Option<bool>,
+    /// Child embedded `WebUI` posture. llama-server ships a browser UI on
+    /// its own listener (upstream default: enabled); Blazar fronts every
+    /// surface through the gateway, so the child UI is redundant surface
+    /// area - default `false` passes `--no-webui`. Manifest-silent: an
+    /// engine without the flag keeps its own behavior (nothing emitted,
+    /// no warning noise - the child stays loopback + auth'd either way).
+    /// `true` leaves it on (engine-side debugging escape hatch).
+    #[serde(default)]
+    pub child_webui: bool,
     /// Tracing `EnvFilter` directive for the daemon, e.g. `"debug"` or
     /// `"blazar=trace,blazar::engine=debug"`. `None` = built-in default
     /// (`INFO`). The `RUST_LOG` env var always wins when set (escape hatch
@@ -141,6 +150,13 @@ pub struct Config {
     /// bench-backed on the boxes it ships to.
     #[serde(default)]
     pub spec_auto_manage: bool,
+    /// `--spec-default`: accept the engine's own default speculation
+    /// preset (upstream: a tuned ngram-mod shape) instead of none. Only
+    /// meaningful with `spec = "off"` - an engaged Blazar spec mode owns
+    /// the draft lane and the two would fight over the same context;
+    /// setting both is a config error (see `validate`).
+    #[serde(default)]
+    pub spec_default: bool,
     /// Adaptive prefill shaping: when a model stays saturated for two
     /// consecutive 60 s windows, raise its micro-batch ceiling one tier
     /// (1024 -> 2048) at the next reshape so prefill chunks drain the
@@ -982,6 +998,12 @@ pub struct Config {
     /// mirroring the target's full n-ubatch. 0 = engine default.
     #[serde(default)]
     pub spec_draft_n_ubatch: u32,
+    /// Minimum draft tokens per speculation round (`--spec-draft-n-min`,
+    /// 0 = engine default): below it the drafter skips the round -
+    /// guards against speculation overhead dominating short-prefix
+    /// traffic.
+    #[serde(default)]
+    pub spec_draft_n_min: u32,
     /// Minimum draft probability below which speculation is not verified
     /// (greedy accept). None = engine default (0.0).
     #[serde(default)]
@@ -1005,6 +1027,14 @@ pub struct Config {
     /// Strict CPU placement for draft batch threads.
     #[serde(default)]
     pub spec_draft_cpu_strict_batch: bool,
+    /// Draft-model affinity hex mask (see `cpu_mask`; empty = follows
+    /// the target's mask / OS default).
+    #[serde(default)]
+    pub spec_draft_cpu_mask: String,
+    /// Draft-model batch-phase affinity hex mask (empty = follows
+    /// `spec_draft_cpu_mask`).
+    #[serde(default)]
+    pub spec_draft_cpu_mask_batch: String,
     /// Draft-model batch thread count (0 = engine default).
     #[serde(default)]
     pub spec_draft_threads_batch: u32,
@@ -1099,6 +1129,12 @@ pub struct Config {
     /// Dedicated device for the projector ("" = engine default).
     #[serde(default)]
     pub mmproj_device: String,
+    /// Directory the child serves local media from (`--media-path`):
+    /// multimodal requests may reference files inside it with
+    /// `file://<relative>` paths instead of inlining base64. Must exist
+    /// at spawn. None = media rides the request body only.
+    #[serde(default)]
+    pub media_path: Option<String>,
     /// Embeddings L2 normalization: 0 = off (engine), 1 = on.
     #[serde(default)]
     pub embd_normalize: u32,
@@ -1138,6 +1174,22 @@ pub struct Config {
     pub checkpoint_min_step: Option<u32>,
 
     // ---- scheduling extras (server-level).
+    /// CPU affinity hex mask for child threads, e.g. "0xff" (bit N =
+    /// CPU N; arbitrarily long upstream - right-truncate to the width
+    /// you need). Upstream bills it as complementary to `cpu_range`,
+    /// but setting both pins the same affinity twice with unclear
+    /// precedence - Blazar refuses the pair. Empty = OS default.
+    #[serde(default)]
+    pub cpu_mask: String,
+    /// Batch-phase affinity hex mask (empty = follows `cpu_mask`).
+    #[serde(default)]
+    pub cpu_mask_batch: String,
+    /// Batch-phase CPU range "lo-hi" (empty = follows `cpu_range`).
+    #[serde(default)]
+    pub cpu_range_batch: String,
+    /// Strict CPU placement for batch threads (upstream: 0|1).
+    #[serde(default)]
+    pub cpu_strict_batch: bool,
     /// Strict CPU placement for the main model (upstream: 0|1).
     #[serde(default)]
     pub cpu_strict: bool,
@@ -1173,6 +1225,23 @@ pub struct Config {
     /// serializes slots - useful only for debugging near-tie logits.
     #[serde(default)]
     pub cont_batching: Option<bool>,
+    /// Prompt caching (upstream default true). `false` emits
+    /// `--no-cache-prompt`: every request re-prefills instead of
+    /// reusing the slot's cached prefix - a memory-for-determinism
+    /// trade on cache-thrash workloads.
+    #[serde(default)]
+    pub cache_prompt: Option<bool>,
+    /// Prefill an assistant message that ends the prompt (upstream
+    /// default true) - continuation-style chat without re-sending the
+    /// growing suffix. `false` emits `--no-prefill-assistant`.
+    #[serde(default)]
+    pub prefill_assistant: Option<bool>,
+    /// Force the child's pure content parser even when a Jinja template
+    /// is present (`--skip-chat-parsing`; upstream default false).
+    /// Reaches the child-side parser directly - the gateway's own
+    /// template lanes (`prompt_recipe`) are the usual first tool.
+    #[serde(default)]
+    pub skip_chat_parsing: Option<bool>,
     /// Flash attention override for the GGML (llama-server) lane.
     /// `true` forces `--flash-attn on`, `false` forces off; absent lets
     /// the profile heuristic decide per model/arch (auto). Other lanes
@@ -1321,6 +1390,16 @@ pub struct Config {
     /// upstream param this knob controls.
     #[serde(default)]
     pub samplers: String,
+    /// Per-token logit biases, `TOKEN_ID(+/-)BIAS` entries (repeatable,
+    /// e.g. `"15043-3"`). Applied at argv level to every request on
+    /// every spawned model; per-request bias stays a raw-lane concern.
+    #[serde(default)]
+    pub logit_bias: Vec<String>,
+    /// Never stop at EOS (`--ignore-eos`; upstream implements it as an
+    /// EOS `logit_bias` of -inf). Pairs with `raw_lane_max_tokens` -
+    /// runaway generations need a ceiling once EOS cannot stop them.
+    #[serde(default)]
+    pub ignore_eos: bool,
 
     // ---- compute plumbing / multi-GPU split (0/""/-1 = engine default).
     /// Logical batch size for prompt processing (0 = engine default).
@@ -1516,6 +1595,26 @@ pub struct ModelOverride {
     /// fleet-wide effect.
     #[serde(default)]
     pub chat_template_kwargs: Option<String>,
+    /// Per-model launch-global GBNF grammar pin (`--grammar`). Mutually
+    /// exclusive with `grammar_file` and with the `json_schema*` pair -
+    /// one constraint surface per model. Pins EVERY completion on this
+    /// model; per-request structured output still overrides per call
+    /// where the engine supports it.
+    #[serde(default)]
+    pub grammar: Option<String>,
+    /// Per-model grammar file (`--grammar-file`). Must exist at config
+    /// load. See `grammar`.
+    #[serde(default)]
+    pub grammar_file: Option<String>,
+    /// Per-model launch-global JSON schema pin (`--json-schema`, inline
+    /// JSON): the child constrains every completion on this model to
+    /// the schema. See `grammar` for the exclusivity contract.
+    #[serde(default)]
+    pub json_schema: Option<String>,
+    /// Per-model JSON schema file (`--json-schema-file`). Must exist at
+    /// config load. See `json_schema`.
+    #[serde(default)]
+    pub json_schema_file: Option<String>,
     /// Per-model sampling defaults, emitted as argv so they apply to
     /// every request that does not override the param in its body.
     #[serde(default)]
@@ -3478,12 +3577,17 @@ impl Default for Config {
             default_ctx: 16384,
             idle_sleep_secs: 300,
             cpu_range: String::new(),
+            cpu_mask: String::new(),
+            cpu_mask_batch: String::new(),
+            cpu_range_batch: String::new(),
+            cpu_strict_batch: false,
             poll: 0,
             reasoning_format: String::new(),
             idle_timeout_secs: 1800,
             max_loaded_models: 0,
             child_transport: "tcp".to_string(),
             child_auth: None,
+            child_webui: false,
             autotune: None,
             log_level: None,
             update_channel: UpdateChannel::default(),
@@ -3525,6 +3629,7 @@ impl Default for Config {
             spec_autopull: false,
             spec_auto_ngram: true,
             spec_auto_manage: true,
+            spec_default: false,
             ubatch_auto: false,
             lazy_mode: "auto".to_string(),
             server_tools: None,
@@ -3631,6 +3736,7 @@ impl Default for Config {
             spec_draft_ngl: String::new(),
             spec_draft_threads: 0,
             spec_draft_n_ubatch: 0,
+            spec_draft_n_min: 0,
             spec_draft_p_min: None,
             spec_draft_p_split: None,
             spec_draft_poll: None,
@@ -3638,6 +3744,8 @@ impl Default for Config {
             spec_draft_prio_batch: 0,
             spec_draft_poll_batch: None,
             spec_draft_cpu_strict_batch: false,
+            spec_draft_cpu_mask: String::new(),
+            spec_draft_cpu_mask_batch: String::new(),
             spec_draft_threads_batch: 0,
             spec_draft_type_k: String::new(),
             spec_draft_type_v: String::new(),
@@ -3664,6 +3772,7 @@ impl Default for Config {
             mmproj_offload: true,
             mmproj_auto: true,
             mmproj_device: String::new(),
+            media_path: None,
             embd_normalize: 0,
             yarn_orig_ctx: 0,
             yarn_ext_factor: default_yarn_ext_factor(),
@@ -3682,6 +3791,9 @@ impl Default for Config {
             server_timeout_secs: None,
             chat_template_kwargs: None,
             cont_batching: None,
+            cache_prompt: None,
+            prefill_assistant: None,
+            skip_chat_parsing: None,
             flash_attention: None,
             reuse_port: false,
             lora_init_without_apply: false,
@@ -3713,6 +3825,8 @@ impl Default for Config {
             check_tensors: false,
             context_shift: false,
             samplers: String::new(),
+            logit_bias: Vec::new(),
+            ignore_eos: false,
             batch_size: 0,
             ubatch_size: 0,
             threads_batch: 0,
@@ -5051,6 +5165,53 @@ impl Config {
                 self.cpu_range
             )));
         }
+        for (label, mask) in [
+            ("cpu_mask", &self.cpu_mask),
+            ("cpu_mask_batch", &self.cpu_mask_batch),
+            ("spec_draft_cpu_mask", &self.spec_draft_cpu_mask),
+            ("spec_draft_cpu_mask_batch", &self.spec_draft_cpu_mask_batch),
+        ] {
+            if !mask.is_empty() && !valid_cpu_mask(mask) {
+                return Err(CoreError::Config(format!(
+                    "{label} must be a hex mask (e.g. \"0xff\", bit N = CPU N), got {mask:?}"
+                )));
+            }
+        }
+        for (range, mask, range_label, mask_label) in [
+            (&self.cpu_range, &self.cpu_mask, "cpu_range", "cpu_mask"),
+            (
+                &self.cpu_range_batch,
+                &self.cpu_mask_batch,
+                "cpu_range_batch",
+                "cpu_mask_batch",
+            ),
+            (
+                &self.spec_draft_cpu_range,
+                &self.spec_draft_cpu_mask,
+                "spec_draft_cpu_range",
+                "spec_draft_cpu_mask",
+            ),
+        ] {
+            if !range.is_empty() && !mask.is_empty() {
+                return Err(CoreError::Config(format!(
+                    "set only one of {range_label} or {mask_label} - both pin the same \
+                     CPU affinity and the overlap is ambiguous"
+                )));
+            }
+        }
+        if !self.cpu_range_batch.is_empty() && !valid_cpu_range(&self.cpu_range_batch) {
+            return Err(CoreError::Config(format!(
+                "cpu_range_batch must be \"lo-hi\" with lo <= hi, got {:?}",
+                self.cpu_range_batch
+            )));
+        }
+        if self.spec_default && self.spec != "off" {
+            return Err(CoreError::Config(format!(
+                "spec_default needs spec = \"off\" - spec = {:?} is engaged and owns the \
+                 draft lane (the engine preset would fight it)",
+                self.spec
+            )));
+        }
         if self.poll > 100 {
             return Err(CoreError::Config(format!(
                 "poll must be 0..=100, got {}",
@@ -5204,6 +5365,70 @@ impl Config {
                 return Err(CoreError::Config(format!(
                     "model_overrides.{name}.chat_template_file not found: {f:?}"
                 )));
+            }
+            let grammar_inline = o.grammar.as_deref().is_some_and(|g| !g.is_empty());
+            let grammar_file = o.grammar_file.as_deref().is_some_and(|f| !f.is_empty());
+            let json_inline = o.json_schema.as_deref().is_some_and(|s| !s.is_empty());
+            let json_file = o.json_schema_file.as_deref().is_some_and(|f| !f.is_empty());
+            if grammar_inline && grammar_file {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}: set only one of grammar or grammar_file"
+                )));
+            }
+            if json_inline && json_file {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}: set only one of json_schema or json_schema_file"
+                )));
+            }
+            if (grammar_inline || grammar_file) && (json_inline || json_file) {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}: grammar* and json_schema* are mutually \
+                     exclusive - one launch-global constraint surface per model"
+                )));
+            }
+            // Grammar-constrained decode terminates by accepting EOS; a
+            // launch-global ignore_eos biases EOS to -inf, so the grammar
+            // stack empties mid-generation and every serving route fails
+            // (verified llama-server b12360: "Unexpected empty grammar
+            // stack"). Refuse the pairing up front instead of shipping a
+            // child that 500s; per-request grammars (response_format) are
+            // unaffected.
+            if (grammar_inline || grammar_file || json_inline || json_file) && self.ignore_eos {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}: a launch-global grammar/json_schema \
+                     constraint cannot pair with ignore_eos = true - the grammar \
+                     finishes by emitting EOS and ignore_eos forbids that, so \
+                     generation dead-ends. Unset ignore_eos or drop the constraint"
+                )));
+            }
+            if let Some(g) = &o.grammar
+                && grammar_inline
+                && g.trim().is_empty()
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.grammar must be a non-empty GBNF grammar"
+                )));
+            }
+            if let Some(js) = &o.json_schema
+                && json_inline
+                && serde_json::from_str::<serde_json::Value>(js).is_err()
+            {
+                return Err(CoreError::Config(format!(
+                    "model_overrides.{name}.json_schema must be valid JSON, parse failed"
+                )));
+            }
+            for (field, path) in [
+                ("grammar_file", o.grammar_file.as_deref()),
+                ("json_schema_file", o.json_schema_file.as_deref()),
+            ] {
+                if let Some(f) = path
+                    && !f.is_empty()
+                    && !std::path::Path::new(f).is_file()
+                {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.{field} not found: {f:?}"
+                    )));
+                }
             }
             if let Some(sd) = &o.sampler_defaults {
                 sd.validate(&format!("model_overrides.{name}.sampler_defaults"))?;
@@ -5709,6 +5934,22 @@ impl Config {
                 self.numa
             )));
         }
+        for lb in &self.logit_bias {
+            if !valid_logit_bias(lb) {
+                return Err(CoreError::Config(format!(
+                    "logit_bias entries must be TOKEN_ID(+/-)BIAS (token id, one +/- \
+                     sign, bias magnitude; e.g. \"15043-3\"), got {lb:?}"
+                )));
+            }
+        }
+        if let Some(p) = &self.media_path
+            && !std::path::Path::new(p).is_dir()
+        {
+            return Err(CoreError::Config(format!(
+                "media_path must be an existing directory (the child serves media files \
+                 from it), got {p:?}"
+            )));
+        }
         if !self.samplers.is_empty()
             && !self.samplers.split(',').all(|s| {
                 let s = s.trim();
@@ -5744,6 +5985,15 @@ impl Config {
             return Err(CoreError::Config(format!(
                 "ngram_mod_n_min must be 0 (engine default) or within 0..=1024, got {}",
                 self.ngram_mod_n_min
+            )));
+        }
+        // Same draft-family bound as the ngram knobs (arg.cpp: 0..=1024);
+        // the paired n-max is derived per path (e.g. MTP layer count), so
+        // only the absolute ceiling is checkable at load time.
+        if self.spec_draft_n_min > 1024 {
+            return Err(CoreError::Config(format!(
+                "spec_draft_n_min must be 0 (engine default) or within 0..=1024, got {}",
+                self.spec_draft_n_min
             )));
         }
         if self.main_gpu < -1 {
@@ -6189,6 +6439,28 @@ fn valid_cpu_range(s: &str) -> bool {
         (Ok(lo), Ok(hi)) => lo <= hi,
         _ => false,
     }
+}
+
+/// Hex CPU mask: optional 0x prefix, then one or more hex digits (bit
+/// N = CPU N; upstream accepts arbitrarily long masks).
+fn valid_cpu_mask(s: &str) -> bool {
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// `TOKEN_ID(+/-)BIAS` - decimal token id, one sign, decimal bias
+/// magnitude (the sign is required so `15043-3` and `15043+3` are
+/// distinct; upstream applies the bias verbatim).
+fn valid_logit_bias(s: &str) -> bool {
+    let Some(pos) = s.find(['+', '-']) else {
+        return false;
+    };
+    let (id, rest) = s.split_at(pos);
+    let bias = &rest[1..];
+    !id.is_empty()
+        && id.chars().all(|c| c.is_ascii_digit())
+        && !bias.is_empty()
+        && bias.chars().all(|c| c.is_ascii_digit())
 }
 
 fn default_slots() -> u32 {
@@ -7973,6 +8245,174 @@ default_ctx = 16384
             Some(r#"{"a": 1}"#)
         );
         assert_eq!(Config::default().effective_chat_template_kwargs("m"), None);
+    }
+
+    #[test]
+    fn unit__gap_knobs__validated() {
+        // The full gap surface parses at defaults (everything off/empty =
+        // engine defaults) and round-trips the typed values.
+        let d = Config::default();
+        assert!(!d.child_webui);
+        assert_eq!(d.cache_prompt, None);
+        assert_eq!(d.prefill_assistant, None);
+        assert_eq!(d.skip_chat_parsing, None);
+        assert_eq!(d.media_path, None);
+        assert!(d.logit_bias.is_empty());
+        assert!(!d.ignore_eos);
+        assert!(!d.spec_default);
+        assert_eq!(d.spec_draft_n_min, 0);
+        let cfg = Config::from_toml(
+            "child_webui = true\ncache_prompt = false\nprefill_assistant = true\n\
+             skip_chat_parsing = true\nignore_eos = true\nspec = \"off\"\nspec_default = true\n\
+             spec_draft_n_min = 2\ncpu_mask = \"0xff\"\ncpu_mask_batch = \"0xf0\"\n\
+             cpu_strict_batch = true\n\
+             logit_bias = [\"15043-3\", \"29902+1\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.child_webui);
+        assert_eq!(cfg.cache_prompt, Some(false));
+        assert_eq!(cfg.prefill_assistant, Some(true));
+        assert_eq!(cfg.skip_chat_parsing, Some(true));
+        assert!(cfg.ignore_eos && cfg.spec_default);
+        assert_eq!(cfg.spec_draft_n_min, 2);
+        assert_eq!(cfg.cpu_mask, "0xff");
+        assert_eq!(cfg.logit_bias, vec!["15043-3", "29902+1"]);
+
+        // Hex masks and batch ranges carry the same grammar as cpu_range.
+        for (field, raw) in [
+            ("cpu_mask", "cpu_mask = \"0x\"\n"),
+            ("cpu_mask", "cpu_mask = \"0xzz\"\n"),
+            ("cpu_mask_batch", "cpu_mask_batch = \"0x\"\n"),
+            ("cpu_range_batch", "cpu_range_batch = \"3-0\"\n"),
+            ("spec_draft_cpu_mask", "spec_draft_cpu_mask = \"0xGG\"\n"),
+            ("spec_draft_n_min", "spec_draft_n_min = 4096\n"),
+        ] {
+            let err = Config::from_toml(raw).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+
+        // Range+mask pairs refuse the ambiguous overlap.
+        for (field, raw) in [
+            ("cpu_range", "cpu_range = \"0-3\"\ncpu_mask = \"0xff\"\n"),
+            (
+                "cpu_range_batch",
+                "cpu_range_batch = \"0-3\"\ncpu_mask_batch = \"0xf0\"\n",
+            ),
+            (
+                "spec_draft_cpu_range",
+                "spec_draft_cpu_range = \"0-3\"\nspec_draft_cpu_mask = \"0xff\"\n",
+            ),
+        ] {
+            let err = Config::from_toml(raw).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+
+        // The engine preset needs the spec lane free.
+        let err = Config::from_toml("spec = \"auto\"\nspec_default = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("spec_default"), "{err}");
+
+        // logit_bias grammar: token id, ONE sign, bias digits.
+        for bad in [
+            "\"-3\"",
+            "\"15043\"",
+            "\"15043--3\"",
+            "\"a-b\"",
+            "\"15 43-3\"",
+        ] {
+            let err = Config::from_toml(&format!("logit_bias = [{bad}]\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("logit_bias"), "{bad}: {err}");
+        }
+
+        // media_path must be a directory that exists here and now.
+        let err = Config::from_toml("media_path = \"/nonexistent-media-dir\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("media_path"), "{err}");
+        let media = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml(&format!(
+            "media_path = {:?}\n",
+            media.path().display().to_string()
+        ))
+        .unwrap();
+        assert_eq!(cfg.media_path.as_deref(), media.path().to_str());
+    }
+
+    #[test]
+    fn unit__constraint_overlays__validated() {
+        // Each family member alone is fine (files exist, JSON parses).
+        let tmp = tempfile::tempdir().unwrap();
+        let gbnf = tmp.path().join("constrain.gbnf");
+        std::fs::write(&gbnf, "root ::= \"ok\"\n").unwrap();
+        let schema = tmp.path().join("constrain.json");
+        std::fs::write(&schema, "{\"type\": \"object\"}\n").unwrap();
+        for raw in [
+            "[model_overrides.m]\ngrammar = \"root ::= \\\"ok\\\"\"\n".to_string(),
+            format!(
+                "[model_overrides.m]\ngrammar_file = {:?}\n",
+                gbnf.display().to_string()
+            ),
+            "[model_overrides.m]\njson_schema = \"{\\\"type\\\": \\\"object\\\"}\"\n".to_string(),
+            format!(
+                "[model_overrides.m]\njson_schema_file = {:?}\n",
+                schema.display().to_string()
+            ),
+        ] {
+            Config::from_toml(&raw).unwrap();
+        }
+
+        // Exclusivity: inline vs file per family, grammar vs json_schema.
+        for (needle, raw) in [
+            (
+                "set only one of grammar or grammar_file",
+                format!(
+                    "[model_overrides.m]\ngrammar = \"x\"\ngrammar_file = {:?}\n",
+                    gbnf.display().to_string()
+                ),
+            ),
+            (
+                "set only one of json_schema or json_schema_file",
+                format!(
+                    "[model_overrides.m]\njson_schema = \"1\"\njson_schema_file = {:?}\n",
+                    schema.display().to_string()
+                ),
+            ),
+            (
+                "mutually exclusive",
+                "[model_overrides.m]\ngrammar = \"x\"\njson_schema = \"1\"\n".to_string(),
+            ),
+            (
+                "must be valid JSON",
+                "[model_overrides.m]\njson_schema = \"not json\"\n".to_string(),
+            ),
+            (
+                ".grammar_file not found",
+                "[model_overrides.m]\ngrammar_file = \"/nonexistent.gbnf\"\n".to_string(),
+            ),
+            (
+                ".json_schema_file not found",
+                "[model_overrides.m]\njson_schema_file = \"/nonexistent.json\"\n".to_string(),
+            ),
+            (
+                "cannot pair with ignore_eos",
+                "ignore_eos = true\n[model_overrides.m]\njson_schema = \
+                 \"{\\\"type\\\": \\\"object\\\"}\"\n"
+                    .to_string(),
+            ),
+            (
+                "cannot pair with ignore_eos",
+                format!(
+                    "ignore_eos = true\n[model_overrides.m]\ngrammar_file = {:?}\n",
+                    gbnf.display().to_string()
+                ),
+            ),
+        ] {
+            let err = Config::from_toml(&raw).unwrap_err().to_string();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
     }
 
     #[test]

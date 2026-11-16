@@ -515,7 +515,10 @@ fn arguments_object(raw: &str) -> Value {
     match serde_json::from_str::<Value>(raw) {
         Ok(v) if v.is_object() => v,
         _ => {
-            tracing::warn!(malformed_tool_arguments = raw, "tool arguments not a JSON object; emitting empty object");
+            tracing::warn!(
+                malformed_tool_arguments = raw,
+                "tool arguments not a JSON object; emitting empty object"
+            );
             json!({})
         }
     }

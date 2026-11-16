@@ -63,10 +63,7 @@ pub async fn version() -> Response {
 /// running child engine, same source `enforce_prompt_fits` uses); a model
 /// that is not resident answers 503 with a warm-up hint rather than
 /// silently spawning a multi-GiB load from a counting probe.
-pub async fn tokenize(
-    State(state): State<Arc<AppState>>,
-    body: Bytes,
-) -> Response {
+pub async fn tokenize(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     use serde_json::json;
 
     let req: Value = match serde_json::from_slice(&body) {
@@ -88,8 +85,7 @@ pub async fn tokenize(
     };
     let base = crate::proxy::child_base(&engine.endpoint);
     let resp = crate::proxy::child_auth(
-        crate::state::child_client(&state, &engine.endpoint)
-            .post(format!("{base}/tokenize")),
+        crate::state::child_client(&state, &engine.endpoint).post(format!("{base}/tokenize")),
         &engine,
     )
     .json(&json!({ "content": prompt }))
@@ -2441,6 +2437,11 @@ async fn proxy_core_chat(
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
+            // Constraint-pinned chat failure: append the pin + workaround
+            // teaching (signature-gated; see proxy::constraint_chat_failure_text).
+            let text = crate::proxy::constraint_chat_failure_teaching(state, model, &text)
+                .map(|teach| format!("{text} - {teach}"))
+                .unwrap_or(text);
             let mut r = api_error(status, &format!("engine error: {text}"));
             crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
             crate::mcp::stamp(&mut r, mcp_hdr.as_deref());

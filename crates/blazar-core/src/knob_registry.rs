@@ -43,6 +43,7 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--agent",
     "--alias",
     "--batch-size",
+    "--cache-prompt",
     "--cache-ram",
     "--cache-reuse",
     "--cache-type-k",
@@ -58,9 +59,13 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--control-vector",
     "--control-vector-layer-range",
     "--control-vector-scaled",
+    "--cpu-mask",
+    "--cpu-mask-batch",
     "--cpu-moe",
     "--cpu-range",
+    "--cpu-range-batch",
     "--cpu-strict",
+    "--cpu-strict-batch",
     "--ctx-checkpoints",
     "--ctx-size",
     "--device",
@@ -78,18 +83,24 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--flash-attn",
     "--frequency-penalty",
     "--gpu-layers",
+    "--grammar",
+    "--grammar-file",
     "--host",
+    "--ignore-eos",
     "--image-max-tokens",
     "--image-min-tokens",
     "--imatrix",
     "--isq",
     "--isq-organization",
     "--jinja",
+    "--json-schema",
+    "--json-schema-file",
     "--keep",
     "--kv-unified",
     "--kv-unified-per-slot",
     "--lazy-mode",
     "--load-mode",
+    "--logit-bias",
     "--lookup-cache-dynamic",
     "--lookup-cache-static",
     "--lora",
@@ -106,6 +117,7 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--max-prefill-chunk-tokens",
     "--mcp-servers-config",
     "--mcp-servers-json",
+    "--media-path",
     "--metrics",
     "--min-p",
     "--mirostat",
@@ -121,6 +133,7 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--n-cpu-ffn",
     "--n-cpu-moe",
     "--no-cache-idle-slots",
+    "--no-cache-prompt",
     "--no-cont-batching",
     "--no-host",
     "--no-kv-offload",
@@ -128,10 +141,13 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--no-mmproj-auto",
     "--no-mmproj-offload",
     "--no-op-offload",
+    "--no-prefill-assistant",
     "--no-reasoning-preserve",
     "--no-repack",
+    "--no-skip-chat-parsing",
     "--no-spec-draft-backend-sampling",
     "--no-warmup",
+    "--no-webui",
     "--offline",
     "--numa",
     "--op-offload",
@@ -148,6 +164,7 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--pooling",
     "--port",
     "--prefix-cache-n",
+    "--prefill-assistant",
     "--presence-penalty",
     "--prio",
     "--prio-batch",
@@ -169,10 +186,14 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--rpc",
     "--samplers",
     "--seed",
+    "--skip-chat-parsing",
     "--sleep-idle-seconds",
     "--slot-prompt-similarity",
     "--slot-save-path",
+    "--spec-default",
     "--spec-draft-backend-sampling",
+    "--spec-draft-cpu-mask",
+    "--spec-draft-cpu-mask-batch",
     "--spec-draft-cpu-moe",
     "--spec-draft-cpu-range",
     "--spec-draft-cpu-strict",
@@ -181,6 +202,7 @@ const LLAMACPP_SUPPORTED: &[&str] = &[
     "--spec-draft-model",
     "--spec-draft-n-cpu-moe",
     "--spec-draft-n-max",
+    "--spec-draft-n-min",
     "--spec-draft-n-ubatch",
     "--spec-draft-ngl",
     "--spec-draft-override-tensor",
@@ -684,7 +706,21 @@ fn llamacpp_knob_cfg() -> Config {
         spec_draft_poll: Some(16),
         spec_draft_poll_batch: Some(true),
         spec_draft_n_ubatch: 256,
+        spec_draft_n_min: 2,
+        spec_draft_cpu_mask: "0x0f".into(),
+        spec_draft_cpu_mask_batch: "0xf0".into(),
         reasoning_preserve: Some(false),
+        cpu_mask: "0xff".into(),
+        cpu_mask_batch: "0xf0".into(),
+        cpu_range_batch: "0-3".into(),
+        cpu_strict_batch: true,
+        cache_prompt: Some(false),
+        prefill_assistant: Some(false),
+        skip_chat_parsing: Some(true),
+        spec_default: true,
+        logit_bias: vec!["15043-3".into()],
+        ignore_eos: true,
+        media_path: Some("/lookup/media".into()),
         ..Config::default()
     }
 }
@@ -865,6 +901,69 @@ fn llamacpp_profiles() -> Vec<Profile> {
         },
         &TuningOverrides::default(),
     );
+
+    // Engine default speculation preset: the one spec posture the knob
+    // cfg above cannot express (its profiles ride spec = "auto", which
+    // warn-skips the preset by design).
+    let sd_cfg = Config {
+        spec: "off".into(),
+        spec_default: true,
+        ..knobs.clone()
+    };
+    absorb(
+        &mut profiles,
+        &{
+            let mut i = base_input(
+                EngineKind::LlamaCpp,
+                ModelMeta::Gguf(&g),
+                5_000 * MIB,
+                &hw,
+                &sd_cfg,
+                &plain,
+                &flags,
+            );
+            i.spec_mode = "off";
+            i
+        },
+        &TuningOverrides::default(),
+    );
+
+    // Launch-global output constraints: one surface per model (the
+    // config-level XORs forbid combining them in one overlay, so each
+    // spelling gets its own profile). Paths mirror the lookup-cache
+    // fixture convention: compile never opens them.
+    for overlay in [
+        ModelOverride {
+            grammar: Some(r#"root ::= "ok""#.into()),
+            ..ModelOverride::default()
+        },
+        ModelOverride {
+            grammar_file: Some("/lookup/grammar.gbnf".into()),
+            ..ModelOverride::default()
+        },
+        ModelOverride {
+            json_schema: Some(r#"{"type":"object"}"#.into()),
+            ..ModelOverride::default()
+        },
+        ModelOverride {
+            json_schema_file: Some("/lookup/schema.json".into()),
+            ..ModelOverride::default()
+        },
+    ] {
+        absorb(
+            &mut profiles,
+            &base_input(
+                EngineKind::LlamaCpp,
+                ModelMeta::Gguf(&g),
+                5_000 * MIB,
+                &hw,
+                &knobs,
+                &overlay,
+                &flags,
+            ),
+            &TuningOverrides::default(),
+        );
+    }
 
     // Embedding-class model (pooling/embeddings rules).
     absorb(
