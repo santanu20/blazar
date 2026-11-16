@@ -286,7 +286,7 @@ Versioned side-by-side installs, SHA-256 verification, capability probing, regre
 
 ### Security and network
 
-Loopback by default; optional scoped API keys (`keys add/rotate`), TLS, explicit CORS, DNS-rebinding hardening on loopback binds, audit logging, PII scrubbing, opt-in OTLP. -> [`7.SETUP.md`](docs/7.SETUP.md)
+Loopback by default; optional scoped API keys (`keys add/rotate`), TLS, explicit CORS, DNS-rebinding hardening on loopback binds, and a serve-time guard that refuses keyless non-loopback binds unless `allow_unauthenticated_remote = true` is set explicitly, audit logging, PII scrubbing, opt-in OTLP. -> [`7.SETUP.md`](docs/7.SETUP.md)
 
 ---
 

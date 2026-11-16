@@ -4,6 +4,23 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Added
+
+- **Serve-time guard: a keyless gateway refuses non-loopback binds.**
+  Binding a host other than loopback (e.g. `0.0.0.0` or a LAN address)
+  with no `[[keys]]` configured used to start a gateway where every
+  route answered unauthenticated. `serve` now refuses that boot with a
+  teaching error naming both fixes: add a key, or - only for a keyless
+  fleet node whose exposure is the self-gated join routes - set
+  `allow_unauthenticated_remote = true` in `config.toml` to accept the
+  risk explicitly. **Migration note:** existing deployments that
+  deliberately served keyless on a non-loopback host must add that one
+  line after upgrading. `doctor` exposure reporting now names the same
+  knob, and the validate harness pins both directions (refusal with
+  teaching; override boots).
+
 ## [0.33.0] - 2026-11-16
 
 ### Added

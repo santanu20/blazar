@@ -7218,7 +7218,12 @@ fn doctor_exposure(d: &BlazarDirs) -> Vec<Check> {
     let Ok(cfg) = Config::load(d).map_err(|e| anyhow!("{e}")) else {
         return Vec::new(); // config row already failed loudly
     };
-    let mut checks = vec![exposure_verdict(&cfg.host, cfg.port, cfg.keys.len())];
+    let mut checks = vec![exposure_verdict(
+        &cfg.host,
+        cfg.port,
+        cfg.keys.len(),
+        cfg.allow_unauthenticated_remote,
+    )];
     // mistral.rs children accept-and-ignore credentials: there is no
     // child-auth lane at all. Blazar forces their bind to loopback and
     // the gateway stays the only authenticated surface - say so loudly
@@ -7237,11 +7242,16 @@ fn doctor_exposure(d: &BlazarDirs) -> Vec<Check> {
     checks
 }
 
-/// Pure verdict over (host, port, `n_keys`): loopback needs no auth;
-/// wildcard/LAN without keys is exposed to the network. Non-loopback
+/// Pure verdict over (host, port, `n_keys`, override): loopback needs no
+/// auth; wildcard/LAN without keys is exposed to the network. Non-loopback
 /// rows also note blazar speaks plain HTTP - TLS belongs in a reverse
 /// proxy in front.
-fn exposure_verdict(host: &str, port: u16, n_keys: usize) -> Check {
+fn exposure_verdict(
+    host: &str,
+    port: u16,
+    n_keys: usize,
+    allow_unauthenticated_remote: bool,
+) -> Check {
     let h = host.trim();
     if matches!(h, "localhost" | "127.0.0.1" | "::1") {
         return if n_keys == 0 {
@@ -7258,13 +7268,25 @@ fn exposure_verdict(host: &str, port: u16, n_keys: usize) -> Check {
     } else {
         h
     };
-    if n_keys == 0 {
+    if n_keys == 0 && allow_unauthenticated_remote {
         Check::warn(
             "exposure",
             format!(
-                "{binding}:{port} reachable off-box with NO auth - anyone on the network can \
-                 use this box; set host=127.0.0.1 or add keys (`blazar keys add`); blazar \
-                 is HTTP-only, put TLS in front (reverse proxy) if you stay exposed"
+                "{binding}:{port} reachable off-box with NO auth - the operator accepted this \
+                 explicitly (allow_unauthenticated_remote = true); anyone on the network can \
+                 use this box; keys are still the better fix; blazar is HTTP-only, put TLS in \
+                 front (reverse proxy) if you stay exposed"
+            ),
+        )
+    } else if n_keys == 0 {
+        Check::warn(
+            "exposure",
+            format!(
+                "{binding}:{port} with no keys: serve now REFUSES non-loopback binds without \
+                 auth - set host=127.0.0.1 or add keys (`blazar keys add`); keyless fleet \
+                 nodes can set allow_unauthenticated_remote = true to accept the exposure \
+                 explicitly; blazar is HTTP-only, put TLS in front (reverse proxy) if you \
+                 stay exposed"
             ),
         )
     } else {
@@ -29956,25 +29978,43 @@ mod tests {
 
     #[test]
     fn unit__exposure_verdict__loopback_authless_ok() {
-        let c = exposure_verdict("127.0.0.1", 11434, 0);
+        let c = exposure_verdict("127.0.0.1", 11434, 0, false);
         assert!(c.ok && !c.warn);
         assert_eq!(c.detail, "loopback bind, no auth needed");
     }
 
     #[test]
     fn unit__exposure_verdict__wildcard_authless_warns() {
-        let c = exposure_verdict("0.0.0.0", 11434, 0);
+        let c = exposure_verdict("0.0.0.0", 11434, 0, false);
         assert!(c.warn, "{}", c.detail);
         assert!(c.detail.contains("all interfaces"), "{}", c.detail);
-        assert!(c.detail.to_lowercase().contains("no auth"), "{}", c.detail);
+        // Post-guard teaching: the refusal + both remedies are named.
+        assert!(
+            c.detail.contains("REFUSES non-loopback binds"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("allow_unauthenticated_remote"),
+            "{}",
+            c.detail
+        );
+        // Explicit override keeps the warn but owns the acceptance.
+        let c = exposure_verdict("0.0.0.0", 11434, 0, true);
+        assert!(c.warn, "{}", c.detail);
+        assert!(
+            c.detail.contains("accepted this explicitly"),
+            "{}",
+            c.detail
+        );
         // Empty host means wildcard too.
-        let c = exposure_verdict("", 11434, 0);
+        let c = exposure_verdict("", 11434, 0, false);
         assert!(c.warn, "{}", c.detail);
     }
 
     #[test]
     fn unit__exposure_verdict__lan_with_keys_ok() {
-        let c = exposure_verdict("192.168.1.10", 11434, 2);
+        let c = exposure_verdict("192.168.1.10", 11434, 2, false);
         assert!(c.ok && !c.warn, "{}", c.detail);
         assert!(c.detail.contains("2 key(s)"), "{}", c.detail);
         assert!(c.detail.contains("TLS"), "{}", c.detail);

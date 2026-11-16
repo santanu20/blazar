@@ -57,6 +57,14 @@ fn merge_user_over_defaults(base: &mut toml::Table, user: &toml::Table) {
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// Escape hatch for the serve-time bind guard: binding a
+    /// non-loopback host with zero `[[keys]]` refuses to boot (an
+    /// unauthenticated gateway reachable from the network is never an
+    /// accident worth having). `true` boots anyway - the informed
+    /// posture for keyless nodes whose only exposed surface is the
+    /// self-gated fleet join routes. Keys are still the better fix.
+    #[serde(default)]
+    pub allow_unauthenticated_remote: bool,
     pub default_ctx: u32,
     pub idle_sleep_secs: u64,
     pub idle_timeout_secs: u64,
@@ -3574,6 +3582,7 @@ impl Default for Config {
         Self {
             host: "127.0.0.1".to_string(),
             port: 11435,
+            allow_unauthenticated_remote: false,
             default_ctx: 16384,
             idle_sleep_secs: 300,
             cpu_range: String::new(),
@@ -4050,6 +4059,7 @@ const SECTION_FIELDS: &[(&str, &[&str])] = &[
         &[
             "host",
             "port",
+            "allow_unauthenticated_remote",
             "log_level",
             "no_host",
             "cors_origins",
@@ -6729,7 +6739,10 @@ mod tests {
         let err = err.to_string();
         assert!(err.contains("does not accept \"default_ctx\""), "{err}");
         assert!(err.contains("(it belongs to [resources])"), "{err}");
-        assert!(err.contains("members: host, port"), "{err}");
+        assert!(
+            err.contains("members: host, port, allow_unauthenticated_remote"),
+            "{err}"
+        );
     }
 
     #[test]

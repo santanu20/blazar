@@ -5,6 +5,7 @@ adaptive_target
 agent
 agent_policy
 agent_port
+allow_unauthenticated_remote
 audit_log
 batch
 batch_size

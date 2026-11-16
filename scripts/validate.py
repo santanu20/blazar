@@ -1200,6 +1200,15 @@ _K = [
         None,
         "binds 127.0.0.1:<port> (every daemon phase; random-free unless BLAZAR_VALIDATE_PORT pins one)",
     ),
+    (
+        "allow_unauthenticated_remote",
+        False,
+        False,
+        "config",
+        None,
+        "serve-time bind guard: keyless 0.0.0.0 boot refuses with teaching; "
+        "explicit override boots + healthz (gates phase e)",
+    ),
     ("default_ctx", False, False, "existing", None, "phase_config A: --ctx-size 8192"),
     ("idle_sleep_secs", False, False, "argv", "G1", "--sleep-idle-seconds 77"),
     (
@@ -13465,6 +13474,9 @@ def _full_toplevel() -> dict:
     return {
         "host": "127.0.0.1",
         "port": PORT,
+        # guard stays armed on the benign boot (loopback host): the
+        # override path is negative/positive-proven in gates phase (e)
+        "allow_unauthenticated_remote": False,
         "late_chunking_max_tokens": 8192,
         "session_keep_secs": 900,
         # agent-tooling wave: validated for prefix/pairing/JSON/XOR in
@@ -14211,7 +14223,63 @@ def phase_gates() -> None:
         f"missing={miss_samp}",
     )
 
-    manifest_ok = ok_a and ok_b and ok_c and ok_d
+    # (e) serve-time bind guard: keyless non-loopback refuses, the
+    # explicit override boots. The refusal is the security default; the
+    # override boot is the documented keyless-fleet opt-in (receipt:
+    # gateway bind_guard_refusal, lib.rs).
+    ok_e = True
+    try:
+        d.start({"host": "0.0.0.0", "port": PORT})
+    except RuntimeError as e:
+        tail = str(e)
+        ok_e = "refusing to serve" in tail and "allow_unauthenticated_remote" in tail
+        check(
+            "gates",
+            "(e) keyless 0.0.0.0 bind refuses at serve time",
+            ok_e,
+            tail[-220:].replace("\n", " "),
+        )
+    else:
+        check(
+            "gates",
+            "(e) keyless 0.0.0.0 bind refuses at serve time",
+            False,
+            "daemon booted on a keyless non-loopback bind - guard did not fire",
+        )
+        d.stop()
+    try:
+        d.start(
+            {
+                "host": "0.0.0.0",
+                "port": PORT,
+                "allow_unauthenticated_remote": True,
+            }
+        )
+    except RuntimeError as e:
+        ok_e = False
+        check(
+            "gates",
+            "(e) allow_unauthenticated_remote override boots + healthz",
+            False,
+            str(e)[-220:],
+        )
+    else:
+        st, _, _ = http("GET", "/healthz", timeout=30)
+        check(
+            "gates",
+            "(e) allow_unauthenticated_remote override boots + healthz",
+            st == 200,
+            f"healthz={st} (explicit opt-in, seconds-long LAN exposure, lazy)",
+        )
+        d.stop()
+    cov(
+        "allow_unauthenticated_remote",
+        "config: keyless 0.0.0.0 refusal + override boot (gates phase e)",
+        "phase gates (e)",
+        ok=ok_e,
+    )
+
+    manifest_ok = ok_a and ok_b and ok_c and ok_d and ok_e
 
     # -- universal coverage rows: every manifest knob gets evidence -------
     covered = {c["knob"] for c in COVERAGE}

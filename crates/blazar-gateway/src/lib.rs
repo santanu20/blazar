@@ -1310,6 +1310,29 @@ impl std::error::Error for BindConflict {}
 /// `blazar serve` exit code for an unrecoverable bind conflict.
 pub const EXIT_BIND_CONFLICT: i32 = 3;
 
+/// Serve-time bind-guard verdict: `Some(refusal)` when the bind is not
+/// loopback-scoped, no `[[keys]]` exist and the operator has not taken
+/// the explicit `allow_unauthenticated_remote` opt-in - the caller must
+/// refuse to bind. Pure so the decision matrix is unit-pinnable.
+#[must_use]
+pub fn bind_guard_refusal(
+    host: &str,
+    port: u16,
+    keys_empty: bool,
+    allow_unauthenticated_remote: bool,
+) -> Option<String> {
+    if crate::host_guard::guard_scope(host) || !keys_empty || allow_unauthenticated_remote {
+        return None;
+    }
+    Some(format!(
+        "refusing to serve on {host}:{port}: that is not a loopback bind and no [[keys]] \
+         are configured, so every route would answer unauthenticated. Add a key \
+         ([[keys]] label = \"x\" key = \"sk-...\") and hand it to clients, or - only for a \
+         keyless fleet node whose exposure is the self-gated join routes - set \
+         allow_unauthenticated_remote = true in config.toml to accept the risk explicitly"
+    ))
+}
+
 // One wiring function: listener, TLS, flushers, teardown - all the
 // serve-lifetime setup in a single readable sequence.
 #[allow(clippy::too_many_lines)]
@@ -1319,6 +1342,22 @@ pub async fn serve(
     port: u16,
     shutdown: std::pin::Pin<Box<dyn futures::Future<Output = ()> + Send>>,
 ) -> anyhow::Result<()> {
+    // Serve-time bind guard (secure by default): a non-loopback bind
+    // with zero [[keys]] would expose every route unauthenticated -
+    // refuse instead, unless the operator explicitly owns that posture
+    // via allow_unauthenticated_remote (keyless fleet nodes whose only
+    // reachable surface is the self-gated join routes). The choke point
+    // is here rather than config-parse because every path that binds a
+    // listener - config host, CLI host override - funnels through
+    // serve(); a refused boot also never reaches the jobs boot-sweep.
+    if let Some(refusal) = bind_guard_refusal(
+        host,
+        port,
+        state.keys.is_empty(),
+        state.cfg().allow_unauthenticated_remote,
+    ) {
+        anyhow::bail!("{refusal}");
+    }
     let app = router(state.clone());
     // Durable jobs boot hygiene, detached: sweep latency is not boot
     // latency. Abandons in-flight rows from a previous gateway process
@@ -1769,7 +1808,40 @@ fn rustls_server_config(
 
 #[cfg(test)]
 mod tests {
-    use super::counter;
+    use super::{bind_guard_refusal, counter};
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__bind_guard_refusal__matrix_boots_and_refuses() {
+        // Boot paths: loopback is the default posture; keys authenticate
+        // any bind; the explicit override owns the exposure.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            assert!(
+                bind_guard_refusal(host, 11435, true, false).is_none(),
+                "loopback bind always boots: {host}"
+            );
+        }
+        assert!(
+            bind_guard_refusal("0.0.0.0", 11435, false, false).is_none(),
+            "keys present: remote bind boots"
+        );
+        assert!(
+            bind_guard_refusal("0.0.0.0", 11435, true, true).is_none(),
+            "explicit override: remote bind boots"
+        );
+        // Refuse path: keyless, non-loopback, no override - teaching
+        // names the bind, the auth mechanism and the exact opt-in line.
+        let refusal =
+            bind_guard_refusal("0.0.0.0", 11435, true, false).expect("keyless remote bind refuses");
+        assert!(refusal.starts_with("refusing to serve on 0.0.0.0:11435"));
+        assert!(refusal.contains("[[keys]]"));
+        assert!(refusal.contains("allow_unauthenticated_remote = true"));
+        // A LAN hostname is just as exposed as the wildcard.
+        assert!(
+            bind_guard_refusal("192.168.1.10", 11435, true, false).is_some(),
+            "LAN bind refuses keyless"
+        );
+    }
 
     #[test]
     #[allow(non_snake_case)]
