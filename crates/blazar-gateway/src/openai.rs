@@ -1223,7 +1223,17 @@ pub async fn openai_proxy(
         }
         None => (body, None),
     };
-    let resp = proxy_request(
+    // Forced tool_choice teaching: the llamacpp lane binds forcing only
+    // when the model's chat template emits the directives, so the call
+    // is served best-effort and the response carries an observable
+    // note. Resolved here - `parsed_body` moves into the forward call.
+    let llamacpp_tool_choice_note = if uri.path().ends_with("/chat/completions") {
+        crate::proxy::routed_kind_for(&state, &model_name)
+            .and_then(|k| llamacpp_forced_tool_choice_note(k, parsed_body.as_ref()))
+    } else {
+        None
+    };
+    let mut resp = proxy_request(
         &state,
         &engine,
         &model_name,
@@ -1240,6 +1250,14 @@ pub async fn openai_proxy(
         recipe,
     )
     .await;
+    // Teaching stamp rides the same seam the voice path rebuilds from,
+    // so buffered 200s keep the header through the audio re-encode.
+    if let Some(note) = llamacpp_tool_choice_note {
+        if let Ok(v) = axum::http::HeaderValue::from_str(note) {
+            resp.headers_mut().insert(TOOL_CHOICE_NOTE_HEADER, v);
+        }
+        tracing::warn!(target: "blazar::proxy", model = %model_name, "{note}");
+    }
     // Voice response seam (buffered chat): synthesize the winning reply
     // and attach it as choices[0].message.audio. TTS failure degrades to
     // a visible note on the body, never a dropped response.
@@ -1648,15 +1666,7 @@ fn mlx_forced_tool_choice_gate(
         return None;
     }
     let tc = body?.get("tool_choice")?;
-    let forced_shape = match tc {
-        serde_json::Value::String(s) => s == "required",
-        serde_json::Value::Object(o) => o
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|t| t == "function"),
-        _ => false,
-    };
-    if !forced_shape {
+    if !forced_tool_choice_shape(tc) {
         return None;
     }
     let kind = model
@@ -1677,6 +1687,49 @@ fn mlx_forced_tool_choice_gate(
          tool_choice (voluntary tool calling works on this lane) or serve the model \
          on a lane that enforces forcing via model_overrides (see `blazar engine list`)",
     ))
+}
+
+/// Shared forced-tool_choice detector: `"required"` or a
+/// `{"type": "function", ...}` object (the two shapes the `OpenAI` spec
+/// lets a client force a call with). `auto`/`none`/absent are advisory
+/// or opt-out shapes and never force.
+fn forced_tool_choice_shape(tc: &serde_json::Value) -> bool {
+    match tc {
+        serde_json::Value::String(s) => s == "required",
+        serde_json::Value::Object(o) => o
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t == "function"),
+        _ => false,
+    }
+}
+
+/// Transparency header for the llamacpp forced-tool_choice teaching
+/// (mirrors `x-blazar-best-of`): present only when the request forced a
+/// tool call AND the routed lane is llamacpp.
+const TOOL_CHOICE_NOTE_HEADER: axum::http::HeaderName =
+    axum::http::HeaderName::from_static("x-blazar-tool-choice");
+
+/// Teaching stamped on llamacpp responses to forced `tool_choice`
+/// requests. ASCII-only so it survives any header transport verbatim.
+const FORCED_TOOL_CHOICE_NOTE: &str = "forced tool_choice is advisory on the llamacpp lane: llama-server binds it only when the model's chat template emits the forcing directives - the reply may be prose with zero tool_calls. Prompt imperatively (state the tool call explicitly), pin a template that binds, or serve on a lane that enforces forcing";
+
+/// `Some(teaching)` when this request forces a tool call (see
+/// [`forced_tool_choice_shape`]) and the routed lane is llamacpp, where
+/// forcing is template-dependent - unlike mlx (never honored upstream,
+/// hard-refused via [`mlx_forced_tool_choice_gate`]) and sglang
+/// (upstream enforces), llama-server MAY bind it, so the call goes
+/// through and the response carries this observable note instead of a
+/// refusal.
+fn llamacpp_forced_tool_choice_note(
+    kind: blazar_core::engine_kind::EngineKind,
+    body: Option<&serde_json::Value>,
+) -> Option<&'static str> {
+    if kind != blazar_core::engine_kind::EngineKind::LlamaCpp {
+        return None;
+    }
+    let tc = body?.get("tool_choice")?;
+    forced_tool_choice_shape(tc).then_some(FORCED_TOOL_CHOICE_NOTE)
 }
 
 /// `Some(teaching 400)` when the path is a llama-server-only surface AND
@@ -2584,6 +2637,74 @@ mod tests {
     use super::*;
 
     const CT: &str = "multipart/form-data; boundary=blazar-b";
+
+    #[test]
+    fn unit__forced_tool_choice_shape__required_function_object_vs_advisory() {
+        let forced = serde_json::json!("required");
+        assert!(forced_tool_choice_shape(&forced), "\"required\" forces");
+        let function_object =
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}});
+        assert!(
+            forced_tool_choice_shape(&function_object),
+            "function object forces"
+        );
+        assert!(
+            !forced_tool_choice_shape(&serde_json::json!("auto")),
+            "auto is advisory"
+        );
+        assert!(
+            !forced_tool_choice_shape(&serde_json::json!("none")),
+            "none opts out"
+        );
+        assert!(
+            !forced_tool_choice_shape(&serde_json::Value::Null),
+            "absent/null never forces"
+        );
+    }
+
+    #[test]
+    fn unit__llamacpp_forced_tool_choice_note__lane_and_shape_matrix() {
+        use blazar_core::engine_kind::EngineKind;
+        let string_forced = serde_json::json!({"tool_choice": "required"});
+        let object_forced =
+            serde_json::json!({"tool_choice": {"type": "function", "function": {"name": "f"}}});
+        // llamacpp serves forced calls best-effort: the note teaches the
+        // template dependency for both forced shapes.
+        for body in [&string_forced, &object_forced] {
+            let note = llamacpp_forced_tool_choice_note(EngineKind::LlamaCpp, Some(body))
+                .expect("llamacpp + forced shape notes");
+            assert!(
+                note.contains("template"),
+                "teaching names the template dependency"
+            );
+            assert!(
+                note.contains("advisory"),
+                "teaching says forcing is advisory"
+            );
+        }
+        // mlx: never honored - the hard 400 gate owns forced shapes.
+        assert!(llamacpp_forced_tool_choice_note(EngineKind::Mlx, Some(&string_forced)).is_none());
+        // sglang: upstream enforces tool_choice - nothing to teach.
+        assert!(
+            llamacpp_forced_tool_choice_note(EngineKind::Sglang, Some(&string_forced)).is_none()
+        );
+        // Advisory / opted-out / absent shapes never note.
+        assert!(
+            llamacpp_forced_tool_choice_note(
+                EngineKind::LlamaCpp,
+                Some(&serde_json::json!({"tool_choice": "auto"}))
+            )
+            .is_none()
+        );
+        assert!(
+            llamacpp_forced_tool_choice_note(
+                EngineKind::LlamaCpp,
+                Some(&serde_json::json!({"model": "m"}))
+            )
+            .is_none()
+        );
+        assert!(llamacpp_forced_tool_choice_note(EngineKind::LlamaCpp, None).is_none());
+    }
 
     #[test]
     fn unit__req_has_image_input__truth_table() {

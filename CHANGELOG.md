@@ -6,6 +6,21 @@ tracked here.
 
 ## [Unreleased]
 
+### Added
+
+- **Forced `tool_choice` on the llamacpp lane is now observably
+  advisory.** llama-server binds `tool_choice: "required"` (or a
+  `{"type": "function"}` object) only when the model's chat template
+  emits the forcing directives - templates without them answer prose at
+  HTTP 200 with zero `tool_calls` and the client never learns the
+  constraint was ignored. Unlike the mlx lane (which never honors it and
+  hard-refuses) a binding template works, so llamacpp requests go
+  through and the response now carries an `x-blazar-tool-choice` header
+  (plus one warn line) teaching the template dependency. Voluntary
+  (`auto`/absent) requests carry no header, and other lanes are
+  untouched (sglang enforces upstream, mlx keeps its 400 gate). The
+  forced-shape detector is shared between the mlx gate and the new note.
+
 ### Fixed
 
 - **PD-disagg pairs now admit (or refuse) as one unit instead of
@@ -32,6 +47,44 @@ tracked here.
 
 ### Added
 
+- **llama.cpp gap-knob wave: 19 upstream server flags promoted to first-class
+  knobs.** Child WebUI hardening (`child_webui = false` emits `--no-webui` on
+  every spawn - the gateway is the front door; `true` restores the engine
+  default), CPU affinity matrix completion (`cpu_mask` / `cpu_mask_batch` hex
+  masks, `cpu_range_batch`, `cpu_strict_batch`, plus `spec_draft_cpu_mask` /
+  `spec_draft_cpu_mask_batch` for the draft process - range/mask pairs are
+  XOR-validated so an ambiguous pin refuses at load with a teaching error),
+  `spec_draft_n_min` (minimum draft tokens, ceiling 1024), tri-state
+  `cache_prompt` / `prefill_assistant` / `skip_chat_parsing` (`None` rides the
+  engine default, `Some(false)` emits the `--no-*` negation),
+  `media_path` (local media dir for `file://` relative refs, existence-checked
+  at load), `spec_default` (bare `--spec-default` preset; refused unless
+  `spec = "off"`), `logit_bias` (repeatable `TOKEN_ID(+/-)BIAS` entries,
+  format-validated) and `ignore_eos`. Model overrides gain the launch-global
+  constraint family `grammar` / `grammar_file` / `json_schema` /
+  `json_schema_file` (inline-vs-file XOR per family, grammar-vs-json mutex,
+  file existence and JSON-parse checks at load). Verified upstream
+  interactions (llama-server b12360) are guarded: `ignore_eos` refuses to
+  pair with a launch-global constraint (the grammar terminates by emitting
+  EOS - the combination dead-ends every request), and arming a constraint
+  teaches that the child's OpenAI chat route rejects requests on current
+  engine builds - constrained generation rides `/completion`, chat-side
+  structured output keeps per-request `response_format`. All
+  flag-presence-gated via
+  the engine manifest so older builds warn-and-skip with teaching text;
+  llamacpp first-class lane grows 75 -> 94 flags.
+- **Constraint-pinned chat failures now teach the way out.** When a model
+  pins a launch-global `grammar`/`json_schema` override and the engine's
+  chat route answers "Failed to initialize samplers" (the known llama.cpp
+  issue above), every gateway surface (OpenAI chat, Responses, Ollama,
+  Anthropic) appends the cause and both remedies to the engine error
+  instead of relaying it bare.
+- **`config set` teaches TOML quoting when a bare scalar hits a string
+  knob.** `blazar config set cpu_mask 0xff` fails because `0xff` parses as
+  a TOML integer; the rejection now prints the exact working command
+  (`blazar config set cpu_mask "0xff"`), verified against the real config
+  schema before the hint is shown - an unfixable value never gets a
+  misleading hint.
 - **SGLang CP companions, PD-decode sub-knobs, CUDA-graph decode backend.**
   `cp_strategy` (`zigzag`/`interleave`) and `enable_prefill_cp` ride
   `cp_size`; `dcp_comm_backend` (`ag_rs`/`a2a`/`fi_a2a`) rides `dcp_size`;
