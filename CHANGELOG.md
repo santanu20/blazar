@@ -6,6 +6,21 @@ tracked here.
 
 ## [Unreleased]
 
+### Added
+
+- **VRAM telemetry lane for `optimize --run` (Memory objective
+  unlocked).** Each measurement arm (baseline and candidate) now runs a
+  background sampler polling `nvidia-smi memory.used` every 250 ms from
+  before the warm-up request (the model-load allocation is the peak
+  that matters) through the last rep, tracking the lifetime peak plus
+  per-rep peaks. The `memory` objective adopts only on measured peaks:
+  candidate must save more than max(min-gain % of baseline, observed
+  per-rep noise) MiB. Hosts without `nvidia-smi` (or where every poll
+  fails) produce no reading and the objective stays honestly
+  ineligible - never an estimate. Peak VRAM appears in the `--run`
+  report lines and the serialized ledger row; rows written before the
+  lane existed deserialize with no reading (serde default).
+
 ### Security
 
 - **Per-key MCP server allowlists + redirect refusal + schema-checked

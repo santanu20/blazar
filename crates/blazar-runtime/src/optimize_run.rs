@@ -24,6 +24,7 @@
 //!   HTTP surface (evict/warm/chat) - never by poking the child;
 //! - a lease check refuses to run while the lane serves traffic.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -147,13 +148,26 @@ pub struct ArmStats {
     pub per_rep_itl_p95: Vec<f64>,
     pub requests: u32,
     pub eval_tokens: u64,
+    /// Peak used VRAM (MiB) across the arm's lifetime, sampled by the
+    /// background [`VramPeakSampler`] (`nvidia-smi memory.used`).
+    /// `None` = no telemetry lane (tool absent/failed every poll) -
+    /// the Memory objective stays ineligible rather than estimating.
+    /// `#[serde(default)]`: ledger rows written before the lane existed
+    /// deserialize with `None`.
+    #[serde(default)]
+    pub peak_vram_mib: Option<u64>,
+    /// Per-rep VRAM peaks (MiB) feeding the Memory objective's noise
+    /// estimate the same way per-rep tps/ttft feed the others. Empty on
+    /// rows predating the lane or when every in-rep poll failed.
+    #[serde(default)]
+    pub per_rep_vram_peak: Vec<f64>,
 }
 
 // integer counters -> f64 statistics: values are token counts and
 // millisecond spans far below 2^52, so precision loss is impossible
 #[allow(clippy::cast_precision_loss)]
 impl ArmStats {
-    fn from_samples(samples: &[ProbeSample], per_rep: &[RepDigest]) -> Self {
+    fn from_samples(samples: &[ProbeSample], per_rep: &[RepDigest], vram: VramArmRead) -> Self {
         let mut ttft: Vec<f64> = samples.iter().map(|s| s.ttft_ms).collect();
         ttft.sort_by(f64::total_cmp);
         let mut itl: Vec<f64> = samples
@@ -187,6 +201,103 @@ impl ArmStats {
             per_rep_itl_p95: per_rep.iter().map(|r| r.itl_p95).collect(),
             requests: u32::try_from(samples.len()).unwrap_or(u32::MAX),
             eval_tokens: eval,
+            peak_vram_mib: vram.peak_mib,
+            per_rep_vram_peak: vram.per_rep_peak_mib,
+        }
+    }
+}
+
+/// What the VRAM sampler observed for one arm: the lifetime peak
+/// (warm-up load included) and the per-rep peaks (noise input). All
+/// `None`/empty when no telemetry lane exists on this host.
+struct VramArmRead {
+    peak_mib: Option<u64>,
+    per_rep_peak_mib: Vec<f64>,
+}
+
+/// Background VRAM peak sampler: polls `nvidia-smi memory.used` on a
+/// fixed cadence until stopped, tracking the lifetime max plus a
+/// resettable epoch max (one epoch == one rep of an arm). Lock-free
+/// atomics only; the thread is joined on [`VramPeakSampler::finish`],
+/// which also answers whether ANY poll succeeded (`None` = the host has
+/// no telemetry lane - never reported as zero).
+struct VramPeakSampler {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    overall: Arc<std::sync::atomic::AtomicU64>,
+    saw_any: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VramPeakSampler {
+    /// Spawn the polling thread. The first poll happens immediately so
+    /// short-lived arms still produce at least one reading.
+    fn start(interval: Duration) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let overall = Arc::new(AtomicU64::new(0));
+        let saw_any = Arc::new(AtomicBool::new(false));
+        let mut s = Self {
+            stop: stop.clone(),
+            epoch: epoch.clone(),
+            overall: overall.clone(),
+            saw_any: saw_any.clone(),
+            handle: None,
+        };
+        let poll = move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(v) = crate::probe::nvidia_used_vram_mib() {
+                    // A transient nvidia-smi failure between successes is
+                    // tolerated: max-of-successes stays a real peak; only
+                    // zero successes anywhere means "no lane".
+                    saw_any.store(true, Ordering::Release);
+                    epoch.fetch_max(v, Ordering::AcqRel);
+                    overall.fetch_max(v, Ordering::AcqRel);
+                }
+                std::thread::sleep(interval);
+            }
+        };
+        s.handle = std::thread::Builder::new()
+            .name("blazar-vram-peak".into())
+            .spawn(poll)
+            .ok();
+        s
+    }
+
+    /// Close the current epoch and return its max (MiB). `None` when the
+    /// epoch saw no successful poll OR only zero readings (0 MiB used
+    /// during active generation is not a real observation on this lane).
+    fn take_epoch(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let v = self.epoch.swap(0, Ordering::AcqRel);
+        (v > 0).then_some(v)
+    }
+
+    /// Stop the thread and collect: lifetime peak (`None` = no telemetry
+    /// lane on this host) plus the per-epoch maxima the caller queued.
+    fn finish(mut self, mut per_rep: Vec<u64>) -> VramArmRead {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        // The final epoch's polls between the caller's last take and the
+        // stop belong to no rep - fold them into the lifetime peak only.
+        let _ = self.epoch.swap(0, Ordering::AcqRel);
+        let peak = if self.saw_any.load(Ordering::Acquire) {
+            Some(self.overall.load(Ordering::Acquire))
+        } else {
+            None
+        };
+        if peak.is_none() {
+            per_rep.clear();
+        }
+        // integer MiB -> f64 statistics: VRAM sizes are far below 2^52
+        #[allow(clippy::cast_precision_loss)]
+        VramArmRead {
+            peak_mib: peak,
+            per_rep_peak_mib: per_rep.iter().map(|&m| m as f64).collect(),
         }
     }
 }
@@ -258,18 +369,56 @@ pub fn verify(
 ) -> Verdict {
     let pct = min_gain_pct.max(0.0);
     match objective {
-        OptimizeObjective::Memory => Verdict {
-            objective: objective.label().to_string(),
-            recommended: false,
-            metric: "peak_vram".to_string(),
-            baseline: 0.0,
-            candidate: 0.0,
-            noise: 0.0,
-            threshold: 0.0,
-            reason: "ineligible: no VRAM telemetry lane is wired - a memory \
-objective must not adopt on estimates"
-                .to_string(),
-        },
+        OptimizeObjective::Memory => {
+            // MiB are integers far below 2^52; the f64 blend only feeds
+            // the verdict arithmetic.
+            #[allow(clippy::cast_precision_loss)]
+            match (base.peak_vram_mib, cand.peak_vram_mib) {
+                (Some(b), Some(c)) => {
+                    let (b, c) = (b as f64, c as f64);
+                    let noise =
+                        if base.per_rep_vram_peak.is_empty() || cand.per_rep_vram_peak.is_empty() {
+                            0.0
+                        } else {
+                            noise_for(&base.per_rep_vram_peak, &cand.per_rep_vram_peak)
+                        };
+                    // Lower is better: gain = MiB the candidate saves.
+                    let threshold = (pct / 100.0 * b).max(noise);
+                    let gain = b - c;
+                    Verdict {
+                        objective: objective.label().to_string(),
+                        recommended: gain > threshold,
+                        metric: "peak_vram_mib".to_string(),
+                        baseline: b,
+                        candidate: c,
+                        noise,
+                        threshold,
+                        reason: format!(
+                            "candidate saves {gain:.0} MiB peak VRAM vs threshold \
+                             {threshold:.0} MiB (min gain {pct:.0}% of baseline{}",
+                            if noise > 0.0 {
+                                format!(", observed noise {noise:.0} MiB")
+                            } else {
+                                String::new()
+                            },
+                        ),
+                    }
+                }
+                _ => Verdict {
+                    objective: objective.label().to_string(),
+                    recommended: false,
+                    metric: "peak_vram_mib".to_string(),
+                    baseline: 0.0,
+                    candidate: 0.0,
+                    noise: 0.0,
+                    threshold: 0.0,
+                    reason: "ineligible: no VRAM telemetry lane on this host \
+                     (nvidia-smi produced no reading) - a memory objective \
+                     must not adopt on estimates"
+                        .to_string(),
+                },
+            }
+        }
         OptimizeObjective::Throughput => {
             let noise = noise_for(&base.per_rep_tps, &cand.per_rep_tps);
             let threshold = (pct / 100.0 * base.aggregate_tps).max(noise);
@@ -597,6 +746,12 @@ async fn measure_arm(
     model: &str,
     cfg: &OptimizeRunConfig,
 ) -> Result<ArmStats> {
+    // VRAM telemetry lane: poll from before the warm-up (the model-load
+    // allocation IS the peak the Memory objective must see) through the
+    // last rep. Hosts without the probe simply produce None and the
+    // objective stays honestly ineligible.
+    let vram = VramPeakSampler::start(Duration::from_millis(250));
+    let mut rep_vram_peaks: Vec<u64> = Vec::new();
     // Warm-up: one discarded request absorbs the respawn cost.
     probe_once(client, base, model, cfg.num_predict).await?;
     let mut samples: Vec<ProbeSample> = Vec::new();
@@ -627,8 +782,15 @@ async fn measure_arm(
             itl_p95: percentile(&rep_itl, 95.0),
         });
         samples.extend(done);
+        // Close the sampler epoch for this rep: its max is this rep's
+        // VRAM peak (noise input), while the sampler's lifetime max
+        // (warm-up load spike included) becomes the arm's peak.
+        if let Some(v) = vram.take_epoch() {
+            rep_vram_peaks.push(v);
+        }
     }
-    Ok(ArmStats::from_samples(&samples, &per_rep))
+    let vram_read = vram.finish(rep_vram_peaks);
+    Ok(ArmStats::from_samples(&samples, &per_rep, vram_read))
 }
 
 // ------------------------------------------------------------- run report
@@ -1135,6 +1297,8 @@ mod tests {
             aggregate_tps: agg,
             per_rep_tps: tps_series.to_vec(),
             per_rep_ttft_p95: vec![],
+            peak_vram_mib: None,
+            per_rep_vram_peak: vec![],
             per_rep_itl_p95: vec![],
             requests: tps_series.len().try_into().unwrap_or(u32::MAX),
             eval_tokens: 0,
@@ -1208,6 +1372,93 @@ mod tests {
     }
 
     #[test]
+    fn unit__verify__memory_objective_adopts_on_measured_peak_only() {
+        let mut base = stats(&[], 0.0);
+        base.peak_vram_mib = Some(10_000);
+        base.per_rep_vram_peak = vec![10_000.0; 3];
+        let mut cand = stats(&[], 0.0);
+        cand.peak_vram_mib = Some(8_500);
+        cand.per_rep_vram_peak = vec![8_500.0; 3];
+        // Saves 1500 MiB vs 5% (500 MiB) threshold -> recommended.
+        let v = verify(OptimizeObjective::Memory, &base, &cand, 5.0);
+        assert!(v.recommended, "{v:?}");
+        assert_eq!(v.metric, "peak_vram_mib");
+        assert_eq!(v.baseline, 10_000.0);
+        assert_eq!(v.candidate, 8_500.0);
+
+        // A 400 MiB save is inside the 5% floor -> rejected.
+        let mut small = stats(&[], 0.0);
+        small.peak_vram_mib = Some(9_600);
+        small.per_rep_vram_peak = vec![9_600.0; 3];
+        let v = verify(OptimizeObjective::Memory, &base, &small, 5.0);
+        assert!(!v.recommended, "{v:?}");
+
+        // One arm missing telemetry -> ineligible even with a huge win
+        // on the other arm's number (never adopt on half an observation).
+        let mut blind = stats(&[], 0.0);
+        blind.peak_vram_mib = None;
+        let v = verify(OptimizeObjective::Memory, &blind, &cand, 5.0);
+        assert!(!v.recommended);
+        assert!(v.reason.contains("ineligible"), "{v:?}");
+        let v = verify(OptimizeObjective::Memory, &base, &blind, 5.0);
+        assert!(!v.recommended);
+        assert!(v.reason.contains("ineligible"), "{v:?}");
+    }
+
+    #[test]
+    fn unit__vram_sampler__epoch_and_lifetime_maxima() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        // No thread (handle: None): drive the shared atomics by hand -
+        // exactly what the polling thread would publish.
+        let mk = || VramPeakSampler {
+            stop: Arc::new(AtomicBool::new(false)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            overall: Arc::new(AtomicU64::new(0)),
+            saw_any: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        };
+        let s = mk();
+        s.saw_any.store(true, Ordering::Release);
+        s.epoch.fetch_max(4_000, Ordering::AcqRel);
+        s.overall.fetch_max(4_000, Ordering::AcqRel);
+        s.epoch.fetch_max(4_600, Ordering::AcqRel);
+        s.overall.fetch_max(4_600, Ordering::AcqRel);
+        assert_eq!(s.take_epoch(), Some(4_600));
+        // Epoch reset: the next rep starts from zero.
+        assert_eq!(s.take_epoch(), None);
+        s.epoch.fetch_max(4_200, Ordering::AcqRel);
+        s.overall.fetch_max(4_200, Ordering::AcqRel);
+        let read = s.finish(vec![4_600]);
+        // Lifetime peak keeps the warm-up-era 4600; per-rep saw only
+        // the epochs the caller queued.
+        assert_eq!(read.peak_mib, Some(4_600));
+        assert_eq!(read.per_rep_peak_mib, vec![4_600.0]);
+
+        // Zero successful polls anywhere: no lane, everything None/empty.
+        let s = mk();
+        let read = s.finish(Vec::new());
+        assert_eq!(read.peak_mib, None);
+        assert!(read.per_rep_peak_mib.is_empty());
+    }
+
+    #[test]
+    fn unit__arm_stats__ledger_rows_predating_the_vram_lane_deserialize() {
+        // A row serialized before the telemetry lane existed has no
+        // peak_vram_mib/per_rep_vram_peak keys - it must deserialize
+        // with None/empty, never fail the ledger read.
+        let old = serde_json::json!({
+            "ttft_p50_ms": 100.0, "ttft_p95_ms": 200.0,
+            "itl_p50_ms": 10.0, "itl_p95_ms": 20.0,
+            "aggregate_tps": 42.0,
+            "per_rep_tps": [42.0], "per_rep_ttft_p95": [200.0], "per_rep_itl_p95": [20.0],
+            "requests": 4, "eval_tokens": 400,
+        });
+        let st: ArmStats = serde_json::from_value(old).expect("old ledger row deserializes");
+        assert_eq!(st.peak_vram_mib, None);
+        assert!(st.per_rep_vram_peak.is_empty());
+    }
+
+    #[test]
     fn unit__arm_stats__aggregate_is_fair_across_arms() {
         // 4 requests, 100 tokens each, 1 s wall each, C=4 -> 400 tok / 1 s.
         let s = vec![sample(100.0, &[10.0; 99], 100, 1000.0); 4];
@@ -1218,6 +1469,10 @@ mod tests {
                 ttft_p95: 100.0,
                 itl_p95: 10.0,
             }],
+            VramArmRead {
+                peak_mib: None,
+                per_rep_peak_mib: Vec::new(),
+            },
         );
         assert!(
             (st.aggregate_tps - 400.0).abs() < 1e-6,

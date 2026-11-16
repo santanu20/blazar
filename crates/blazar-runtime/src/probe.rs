@@ -402,6 +402,25 @@ pub fn nvidia_free_vram_mib() -> Option<u64> {
     sum_free_mib_csv(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Fresh USED VRAM (MiB, summed across NVIDIA cards). The memory-objective
+/// telemetry lane for `optimize --run`: a background sampler polls this
+/// through each arm's lifetime and keeps the peak, so the Memory verdict
+/// adopts on measured allocation, never on estimates. `None` when the
+/// tool is absent or fails - the objective then stays honestly
+/// ineligible instead of guessing zero.
+#[must_use]
+pub fn nvidia_used_vram_mib() -> Option<u64> {
+    let out = probe_output(
+        std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"]),
+        5,
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    sum_free_mib_csv(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// sysinfo half + caller-supplied GPU list: the composition point for a
 /// LIVE `--list-devices` census (see `engine::manifest::run_list_devices`).
 #[must_use]

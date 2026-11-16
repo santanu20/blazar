@@ -12803,23 +12803,34 @@ async fn optimize_cmd(
         if let Some(hw) = &report.hw_fingerprint {
             println!("hardware     {hw}");
         }
+        // The threshold carries the metric's units (tok/s, ms, MiB) and
+        // folds in min-gain AND observed noise - the reason line below
+        // states the split, so only the raw number belongs here.
         println!(
-            "objective    {} (metric {}, min gain {}%)",
+            "objective    {} (metric {}, threshold {:.1})",
             report.objective, v.metric, v.threshold
         );
         println!(
             "screen       grid winner scored {:.1} tok/s generation (not adopted)",
             report.screen_score_tg
         );
+        let vram_note = |peak_mib: Option<u64>| match peak_mib {
+            Some(m) => format!(" | vram peak {m} MiB"),
+            None => String::new(),
+        };
         println!(
-            "baseline     {:>8.1} tok/s | ttft p95 {:>6.0} ms | itl p95 {:>5.1} ms",
-            report.baseline.aggregate_tps, report.baseline.ttft_p95_ms, report.baseline.itl_p95_ms
+            "baseline     {:>8.1} tok/s | ttft p95 {:>6.0} ms | itl p95 {:>5.1} ms{}",
+            report.baseline.aggregate_tps,
+            report.baseline.ttft_p95_ms,
+            report.baseline.itl_p95_ms,
+            vram_note(report.baseline.peak_vram_mib)
         );
         println!(
-            "candidate    {:>8.1} tok/s | ttft p95 {:>6.0} ms | itl p95 {:>5.1} ms",
+            "candidate    {:>8.1} tok/s | ttft p95 {:>6.0} ms | itl p95 {:>5.1} ms{}",
             report.candidate.aggregate_tps,
             report.candidate.ttft_p95_ms,
-            report.candidate.itl_p95_ms
+            report.candidate.itl_p95_ms,
+            vram_note(report.candidate.peak_vram_mib)
         );
         println!("noise        {:.1}", v.noise);
         println!("verdict      {verdict_word} - {}", v.reason);
