@@ -112,6 +112,8 @@ Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emissio
 
 **certified: 0 | first-class: 0 | passthrough: 0 | intentionally-unsupported: 0 | not-applicable: 0 | unverified: 0**
 
+Unverified: this lane has no emission-truth registry entry yet - every flag above is listed as unverified until it grows one (see knob_registry.rs).
+
 ## litert-0.19.2 (openaihost) - 6 flags probed
 
 **certified: 2 | first-class: 0 | passthrough: 0 | intentionally-unsupported: 0 | not-applicable: 4 | unverified: 0**

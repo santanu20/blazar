@@ -151,9 +151,11 @@ RESERVED: dict[str, list[str]] = {
 
 # Lanes the emission-truth registry does not cover yet. knob_registry.rs
 # owns llamacpp/mistralrs/sglang/sdcpp/mlx; whisper and piper ride
-# knob_surface(). Empty today - kept so a future lane that composes its
-# argv outside the registry is forced to say so here, out loud.
-LANES_WITHOUT_REGISTRY: set[str] = set()
+# knob_surface(). Kokoro composes its argv inside the lazily-spawned
+# python shim (kokoro-onnx), outside both - its fixture probes flags,
+# but Blazar emits none first-class, and a zero-flag lane is not a valid
+# registry entry.
+LANES_WITHOUT_REGISTRY: set[str] = {"kokoro"}
 
 # Lanes with NO extra_args surface: argv is composed per call by Blazar,
 # so a non-first-class flag is unreachable, not passthrough. Piper is a
