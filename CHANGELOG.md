@@ -6,6 +6,21 @@ tracked here.
 
 ## [Unreleased]
 
+### Security
+
+- **Model-scope and admin-tier enforcement on the information plane.**
+  Five read/diagnostic surfaces now honor key scoping instead of
+  answering any authenticated caller: `POST /api/model-doctor` probes
+  and `GET /api/model-doctor/{model}` certificates are model-scoped
+  (a scoped key gets 403 outside its models), `GET /api/usage` filters
+  rows to the caller's scope (`filtered_to_key_scope` in the response),
+  and `GET /api/route/{model}` + `GET /api/mcp` are admin-tier
+  (fleet topology and MCP server configuration require an unscoped key
+  when keys are configured). Keyless open gateways are unchanged.
+  Migration note: scoped keys that relied on reading fleet routes, the
+  MCP listing, foreign models' usage, or foreign certificates lose that
+  access by design - grant an unscoped admin key for operations.
+
 ### Added
 
 - **Serve-time guard: a keyless gateway refuses non-loopback binds.**

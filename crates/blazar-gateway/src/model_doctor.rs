@@ -413,6 +413,14 @@ pub async fn run(
         Some(Err(teach)) => return crate::error_response(404, &teach),
         None => return crate::error_response(500, "store unavailable"),
     };
+    // Model-scope gate (BLZ-2): a scoped key may only probe models it
+    // can serve. The canonical row name (not the request alias) is what
+    // scope matches - identical to the /api/warm gate. Runs before the
+    // job row exists so a refused probe leaves no durable trace.
+    if let Err((code, msg)) = crate::keys::scope_permits(&state.keys, key_ext.as_deref(), &row.name)
+    {
+        return crate::error_response(code, &msg);
+    }
 
     // Static caps never spawn a child - BUT vision is now probed LIVE
     // whenever any vision surface exists (attached mmproj or an
@@ -481,14 +489,28 @@ pub async fn run(
 pub async fn cert(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(model): axum::extract::Path<String>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
 ) -> Response {
+    // Canonical ladder so `name:quant` display forms resolve the same
+    // way here as on /api/chat.
+    let resolved = state
+        .with_store(|s| crate::proxy::resolve_model(s, &model).ok().map(|r| r.name))
+        .flatten();
+    let Some(name) = resolved else {
+        return crate::error_response(
+            404,
+            &format!(
+                "no certificate on record - POST /api/model-doctor {{\"model\": \"{model}\"}} runs the probes"
+            ),
+        );
+    };
+    // Scope gate on the canonical name (BLZ-2): capability certs
+    // disclose the model fleet, so a scoped key reads only its models.
+    if let Err((code, msg)) = crate::keys::scope_permits(&state.keys, key_ext.as_deref(), &name) {
+        return crate::error_response(code, &msg);
+    }
     let record = state
-        .with_store(|s| {
-            // Canonical ladder so `name:quant` display forms resolve the
-            // same way here as on /api/chat.
-            let resolved = crate::proxy::resolve_model(s, &model).ok()?.name;
-            s.get_model_caps(&resolved).ok().flatten()
-        })
+        .with_store(|s| s.get_model_caps(&name).ok().flatten())
         .flatten();
     let Some((engine_tag, caps_json)) = record else {
         return crate::error_response(

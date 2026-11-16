@@ -241,10 +241,11 @@ pub const TAIL_LIMIT: usize = 64 * 1024;
 pub async fn usage_api(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
     axum::extract::Query(q): axum::extract::Query<UsageQuery>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let days = q.days.unwrap_or(7).clamp(1, 365);
-    let rows = match state.usage.snapshot(days) {
+    let mut rows = match state.usage.snapshot(days) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -254,9 +255,28 @@ pub async fn usage_api(
                 .into_response();
         }
     };
+    // Tenant visibility (BLZ-2): with keys configured, a scoped key
+    // sees only its own models' rows; admin and keyless callers see
+    // everything. The response flag makes the filtering observable so
+    // scoped dashboards can tell "no traffic" from "not yours to see".
+    let scoped_key = key_ext.as_deref().is_some_and(|k| {
+        !state.keys.is_empty()
+            && state
+                .keys
+                .entries()
+                .into_iter()
+                .find(|e| e.name == k.name)
+                .is_some_and(|e| !e.models.is_empty())
+    });
+    if scoped_key {
+        rows.retain(|r| {
+            crate::keys::scope_permits(&state.keys, key_ext.as_deref(), &r.model).is_ok()
+        });
+    }
     axum::Json(serde_json::json!({
         "object": "blazar.usage.daily",
         "days_window": days,
+        "filtered_to_key_scope": scoped_key,
         "days": rows,
     }))
     .into_response()

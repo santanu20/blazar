@@ -454,10 +454,21 @@ pub async fn replicate(
 // One linear decision tree (local -> peers -> none) with inline JSON
 // assembly per branch; splitting it would hide the decision order it exists to show.
 #[allow(clippy::too_many_lines)]
-pub async fn route(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
+pub async fn route(
+    State(state): State<Arc<AppState>>,
+    Path(model): Path<String>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+) -> Response {
     let model = model.trim().to_string();
     if model.is_empty() {
         return api_error(400, "missing model name in the path");
+    }
+    // Fleet topology is admin-plane (BLZ-2): peer URLs, free VRAM and
+    // health disclose the whole deployment. Scoped keys get the
+    // teaching 403; the open gateway (no keys) stays open.
+    if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key_ext.as_deref())
+    {
+        return api_error(code, &msg);
     }
     let local_row = state
         .with_store(|s| resolve_model(s, &model))

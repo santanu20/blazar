@@ -7392,6 +7392,59 @@ def _eng_piper_speech(lane: str) -> bytes | None:
     return raw if ok else None
 
 
+def _eng_kokoro_speech(lane: str) -> None:
+    """/v1/audio/speech on the kokoro lane: the default voice synthesizes
+    a real WAV, and the lane's shape gates (stream, piper-only knobs)
+    answer with their teaching 400s - never a silent fallback."""
+    ph = f"engines/{lane}"
+    text = "The quick brown fox jumps over the lazy dog beside the river."
+    st, _, raw = http(
+        "POST", "/v1/audio/speech", {"model": "kokoro", "input": text}, None, 300
+    )
+    ok = st == 200 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE" and len(raw) > 10_000
+    check(
+        ph,
+        "kokoro speech synthesis returns a WAV",
+        ok,
+        f"voice=af_heart(default) status={st} bytes={len(raw)} magic={raw[:4]!r}",
+    )
+    if not ok:
+        return
+    st_s, _, body_s = http(
+        "POST",
+        "/v1/audio/speech",
+        {"model": "kokoro", "input": "gate", "stream": True},
+        None,
+        60,
+    )
+    check(
+        ph,
+        "kokoro stream refuses with teaching",
+        st_s == 400 and b"buffered wav only" in body_s,
+        f"status={st_s} body={body_s[:80]!r}",
+    )
+    st_k, _, body_k = http(
+        "POST",
+        "/v1/audio/speech",
+        {"model": "kokoro", "input": "gate", "noise_scale": 0.5},
+        None,
+        60,
+    )
+    check(
+        ph,
+        "kokoro piper-only knob refuses with teaching",
+        st_k == 400 and b"piper-only" in body_k,
+        f"status={st_k} body={body_k[:80]!r}",
+    )
+    st_v, _, body_v = http("GET", "/v1/audio/voices", None, None, 60)
+    check(
+        ph,
+        "voices menu carries the kokoro section",
+        st_v == 200 and b"kokoro" in body_v,
+        f"status={st_v} kokoro={'present' if b'kokoro' in body_v else 'absent'}",
+    )
+
+
 def _eng_whisper_transcribe(lane: str, wav: bytes | None) -> None:
     """/v1/audio/transcriptions fed the piper WAV - real speech in,
     real words out (>=2 distinctive words), never a silence stub."""
@@ -8721,6 +8774,7 @@ def phase_engines() -> None:
         audio_floor = diff_row["name"] if diff_row else MODEL
         lazy_spec = (
             ("piper", "speech synthesis returns a WAV"),
+            ("kokoro", "kokoro speech synthesis returns a WAV"),
             ("whisper", "transcription round-trips real speech"),
             ("sdcpp", "image generation returns a PNG"),
         )
@@ -8762,6 +8816,14 @@ def phase_engines() -> None:
                             "engines/piper",
                             "speech synthesis returns a WAV",
                             lazy_skip_note("piper"),
+                        )
+                    if "kokoro" in disk_kinds and (keep is None or "kokoro" in keep):
+                        _eng_kokoro_speech("kokoro")
+                    else:
+                        boundary(
+                            "engines/kokoro",
+                            "kokoro speech synthesis returns a WAV",
+                            lazy_skip_note("kokoro"),
                         )
                     if "whisper" in disk_kinds and (keep is None or "whisper" in keep):
                         _eng_whisper_transcribe("whisper", wav)
@@ -9410,6 +9472,97 @@ def phase_auth() -> None:
         "GET", "/api/version", headers={"Authorization": f"Bearer {new_secret}"}
     )
     check("auth", "new rotated bearer -> 200", st == 200, f"status={st}")
+    d.stop()
+
+    # Scope/admin-tier enforcement (2026-11-16 wave): scoped keys are
+    # confined to their models on the doctor/usage/cert reads and locked
+    # out of control-plane surfaces entirely; keyless open gateways keep
+    # the historic behavior. Scope name is deliberately unrelated to
+    # MODEL (scope_matches honors a trailing-* prefix).
+    d.start(
+        {
+            "port": PORT,
+            "keys": [
+                {"name": "admin", "key": "admin-key-1"},
+                {
+                    "name": "scoped",
+                    "key": "scoped-key-1",
+                    "models": ["scope-carrier-model"],
+                },
+            ],
+        }
+    )
+    scoped = {"Authorization": "Bearer scoped-key-1"}
+    admin = {"Authorization": "Bearer admin-key-1"}
+    st, _, v = http_json("POST", "/api/model-doctor", {"model": MODEL}, scoped)
+    check(
+        "auth",
+        "scoped key: doctor on out-of-scope model -> 403 teaching",
+        st == 403 and "not scoped for model" in str(v),
+        f"status={st}",
+    )
+    st, _, v = http_json("GET", f"/api/model-doctor/{MODEL}", headers=scoped)
+    check(
+        "auth",
+        "scoped key: cert read on out-of-scope model -> 403",
+        st == 403 and "not scoped for model" in str(v),
+        f"status={st}",
+    )
+    st, _, v = http_json("GET", f"/api/model-doctor/{MODEL}", headers=admin)
+    check(
+        "auth",
+        "admin key: cert read passes the gate (200 record or 404 none)",
+        st in (200, 404),
+        f"status={st} (the sandbox store stages the real store, which may already carry caps)",
+    )
+    st, _, v = http_json("GET", "/api/usage", headers=scoped)
+    check(
+        "auth",
+        "scoped key: usage filtered to its scope",
+        st == 200 and isinstance(v, dict) and v.get("filtered_to_key_scope") is True,
+        f"status={st}",
+    )
+    st, _, v = http_json("GET", "/api/usage", headers=admin)
+    check(
+        "auth",
+        "admin key: usage unfiltered",
+        st == 200 and isinstance(v, dict) and v.get("filtered_to_key_scope") is False,
+        f"status={st}",
+    )
+    st, _, v = http_json("GET", f"/api/route/{MODEL}", headers=scoped)
+    check(
+        "auth",
+        "scoped key: fleet route info -> 403 admin-tier",
+        st == 403 and "unscoped (admin) key" in str(v),
+        f"status={st}",
+    )
+    st, _, _ = http_json("GET", f"/api/route/{MODEL}", headers=admin)
+    check("auth", "admin key: fleet route info -> 200", st == 200, f"status={st}")
+    st, _, v = http_json("GET", "/api/mcp", headers=scoped)
+    check(
+        "auth",
+        "scoped key: mcp server listing -> 403 admin-tier",
+        st == 403 and "unscoped (admin) key" in str(v),
+        f"status={st}",
+    )
+    st, _, _ = http_json("GET", "/api/mcp", headers=admin)
+    check("auth", "admin key: mcp server listing -> 200", st == 200, f"status={st}")
+    d.stop()
+    d.start({"port": PORT})
+    st, _, v = http_json("GET", "/api/usage")
+    check(
+        "auth",
+        "keyless open gateway: usage unfiltered (unchanged)",
+        st == 200 and isinstance(v, dict) and v.get("filtered_to_key_scope") is False,
+        f"status={st}",
+    )
+    st, _, _ = http_json("GET", f"/api/route/{MODEL}")
+    check(
+        "auth",
+        "keyless open gateway: route info open (unchanged)",
+        st == 200,
+        f"status={st}",
+    )
 
 
 # ------------------------------------------------------------------- wave

@@ -1178,7 +1178,17 @@ fn rebuild(
 // Admin plane
 // ---------------------------------------------------------------------------
 
-pub async fn mcp_status(State(state): State<Arc<AppState>>) -> Response {
+pub async fn mcp_status(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+) -> Response {
+    // Admin-plane (BLZ-2): the status listing carries server commands,
+    // transports and URLs - exactly the config a scoped inference key
+    // has no business reading. Keyless open gateway stays open.
+    if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key_ext.as_deref())
+    {
+        return crate::error_response(code, &msg);
+    }
     let status = state.mcp.status_json().await;
     (
         StatusCode::OK,
