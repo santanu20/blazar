@@ -77,6 +77,10 @@ struct HttpSession {
     endpoint: String,
     client: reqwest::Client,
     state: tokio::sync::Mutex<HttpState>,
+    /// Response-body budget for this server. `max_output_bytes` applies
+    /// to BOTH transports (stdio lines and HTTP bodies); unset HTTP
+    /// reads still fall back to the built-in ceiling below.
+    max_response_bytes: Option<u64>,
 }
 
 // Boxed: the stdio Mutex dwarfs HttpSession, and an unboxed enum this
@@ -117,6 +121,7 @@ impl Registry {
                             tools: Vec::new(),
                             inited: false,
                         }),
+                        max_response_bytes: cfg.max_output_bytes,
                     }),
                     None => Transport::Stdio(Box::new(tokio::sync::Mutex::new(None))),
                 };
@@ -628,6 +633,43 @@ async fn rpc_call(
 /// carrying the matching id wins; interleaved notifications are
 /// skipped). Returns `(result, Mcp-Session-Id)` - the session id only
 /// appears on the initialize response.
+/// HTTP transports have no per-line cap like stdio, so the response
+/// body itself is bounded: the server's `max_output_bytes` when set,
+/// else this generous ceiling. A body larger than that is a runaway or
+/// hostile server, not tool output.
+const DEFAULT_HTTP_BODY_CAP: u64 = 64 * 1024 * 1024;
+
+/// Read an HTTP response body with a hard byte budget - chunk-wise, so
+/// a lying/absent content-length cannot smuggle an unbounded read past
+/// the precheck.
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    cap: Option<u64>,
+    what: &str,
+) -> Result<String, String> {
+    let cap = cap.unwrap_or(DEFAULT_HTTP_BODY_CAP);
+    if resp.content_length().is_some_and(|len| len > cap) {
+        return Err(format!(
+            "{what} body {} bytes exceeds the response cap ({cap} bytes - mcp max_output_bytes or the built-in ceiling)",
+            resp.content_length().unwrap_or_default()
+        ));
+    }
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("{what} body read: {e}"))?
+    {
+        if out.len() as u64 + chunk.len() as u64 > cap {
+            return Err(format!(
+                "{what} body exceeds the response cap ({cap} bytes - mcp max_output_bytes or the built-in ceiling)"
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    String::from_utf8(out).map_err(|e| format!("{what} body not utf-8: {e}"))
+}
+
 async fn http_rpc(
     hs: &HttpSession,
     id: Option<u64>,
@@ -666,7 +708,11 @@ async fn http_rpc(
         .map(str::to_string);
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        // Capped read: even the failure excerpt must not become an
+        // unbounded buffer on a hostile error page.
+        let body = read_body_capped(resp, hs.max_response_bytes, "error")
+            .await
+            .unwrap_or_default();
         let excerpt: String = body.chars().take(200).collect();
         return Err(format!("http {method}: status {status}: {excerpt}"));
     }
@@ -679,10 +725,9 @@ async fn http_rpc(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let body = resp
-        .text()
+    let body = read_body_capped(resp, hs.max_response_bytes, "http response")
         .await
-        .map_err(|e| format!("http {method} body: {e}"))?;
+        .map_err(|e| format!("http {method}: {e}"))?;
     let v = if ctype.contains("text/event-stream") {
         sse_response(&body, id).ok_or_else(|| {
             format!("http {method}: sse stream closed without a matching response")
@@ -698,6 +743,31 @@ async fn http_rpc(
         ));
     }
     Ok((v.get("result").cloned().unwrap_or(Value::Null), sid))
+}
+
+/// Parse the `function.arguments` member of a tool call. The `OpenAI`
+/// wire shape encodes arguments as a JSON string; anything else
+/// (missing, non-string, unparseable) is REJECTED - executing with
+/// defaulted `{}` would run a different action than the model asked
+/// for. The error names the tool so the model can retry correctly.
+fn tool_arguments(call: &Value) -> Result<Value, String> {
+    let name = call
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let raw = call
+        .pointer("/function/arguments")
+        .ok_or_else(|| malformed_args(name, "missing"))?;
+    let s = raw
+        .as_str()
+        .ok_or_else(|| malformed_args(name, "not a JSON string"))?;
+    serde_json::from_str::<Value>(s).map_err(|_| malformed_args(name, "unparseable JSON"))
+}
+
+fn malformed_args(name: &str, what: &str) -> String {
+    format!(
+        "malformed tool arguments for '{name}' ({what}): refusing to execute with defaulted arguments - the model must re-emit the call with a JSON-object string"
+    )
 }
 
 /// Scan SSE frames for the JSON-RPC response carrying `id`, skipping
@@ -1103,11 +1173,17 @@ pub(crate) async fn chat_via_mcp(
                 .unwrap_or_default();
             match split_tool_name(fname) {
                 Some((server, tool)) => {
-                    let args = call
-                        .pointer("/function/arguments")
-                        .and_then(Value::as_str)
-                        .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                        .unwrap_or_else(|| json!({}));
+                    let args = match tool_arguments(call) {
+                        Ok(args) => args,
+                        Err(why) => {
+                            // Never execute a tool with defaulted
+                            // arguments: a malformed call silently
+                            // becoming `{}` can perform a DIFFERENT
+                            // external action than the model intended.
+                            results.push(Err(why));
+                            continue;
+                        }
+                    };
                     let t0 = std::time::Instant::now();
                     let res = state.mcp.execute(&server, &tool, &args).await;
                     tracing::info!(
@@ -1223,6 +1299,54 @@ mod tests {
             err.contains("exceeds max_output_bytes cap (4 bytes)"),
             "{err}"
         );
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__tool_arguments__parses_string_and_rejects_everything_else() {
+        let ok = json!({"function": {"name": "mcp__srv__get_weather",
+            "arguments": "{\"city\": \"Berlin\"}"}});
+        let args = tool_arguments(&ok).expect("string-encoded JSON object parses");
+        assert_eq!(args["city"], "Berlin");
+        // Unparseable JSON string: refuse - never execute a defaulted call.
+        let bad = json!({"function": {"name": "mcp__srv__act",
+            "arguments": "not-json"}});
+        let err = tool_arguments(&bad).unwrap_err();
+        assert!(err.contains("mcp__srv__act") && err.contains("unparseable JSON"));
+        // Non-string arguments (dialect drift): refuse, same teaching.
+        let object_form = json!({"function": {"name": "mcp__srv__act",
+            "arguments": {"city": "Berlin"}}});
+        assert!(
+            tool_arguments(&object_form)
+                .unwrap_err()
+                .contains("not a JSON string")
+        );
+        // Missing member entirely: refuse.
+        let missing = json!({"function": {"name": "mcp__srv__act"}});
+        assert!(tool_arguments(&missing).unwrap_err().contains("missing"));
+    }
+
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn unit__read_body_capped__enforces_the_budget_chunkwise() {
+        // Content-length over cap: refused before any body read.
+        let resp = reqwest::Response::from(
+            axum::http::Response::builder()
+                .header("content-length", "1024")
+                .body(vec![0u8; 1024])
+                .unwrap(),
+        );
+        let err = read_body_capped(resp, Some(64), "test").await.unwrap_err();
+        assert!(err.contains("exceeds the response cap"), "over-cap: {err}");
+        // Under the cap: full body back as text (this builder sends no
+        // content-length header, so the chunk loop is the live path).
+        let resp = reqwest::Response::from(
+            axum::http::Response::builder()
+                .body(b"hello mcp".to_vec())
+                .unwrap(),
+        );
+        let body = read_body_capped(resp, Some(64), "test").await.unwrap();
+        assert_eq!(body, "hello mcp");
     }
 
     #[allow(non_snake_case)]
@@ -1519,6 +1643,7 @@ mod tests {
                 tools: Vec::new(),
                 inited: false,
             }),
+            max_response_bytes: None,
         };
         let (result, sid) = http_rpc(
             &hs,

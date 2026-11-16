@@ -21,6 +21,24 @@ tracked here.
   MCP listing, foreign models' usage, or foreign certificates lose that
   access by design - grant an unscoped admin key for operations.
 
+- **MCP execution hardening: scrubbed child environments by default,
+  bounded HTTP response bodies, and argument validation.** Stdio MCP
+  children now start from an empty environment by default
+  (`env_clear = true`): the child sees only the server's `env` entries
+  and any `allowed_env` re-inherits such as `["PATH", "HOME"]`.
+  Migration note: servers that genuinely relied on inheriting the
+  daemon's full environment must set `env_clear = false` (the legacy
+  behavior) or list what they need in `allowed_env`. Remote
+  Streamable-HTTP MCP bodies - success and error paths alike - are read
+  under a hard byte budget (`max_output_bytes`, previously stdio-only,
+  now caps both transports; a built-in 64 MiB ceiling applies when
+  unset), enforced chunk-wise so a lying or absent content-length
+  cannot smuggle an unbounded read. And malformed tool-call arguments
+  (missing, non-string, or unparseable JSON) are now REJECTED with a
+  teaching error instead of silently executing the tool with `{}` -
+  a defaulted call would run a different external action than the
+  model asked for.
+
 ### Added
 
 - **Serve-time guard: a keyless gateway refuses non-loopback binds.**

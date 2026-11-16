@@ -3209,6 +3209,13 @@ fn default_failover_min_residence_secs() -> u64 {
     30
 }
 
+/// MCP stdio children default to a scrubbed environment: inheriting
+/// the daemon's environment hands every server the daemon's
+/// credentials.
+pub(crate) fn default_mcp_env_clear() -> bool {
+    true
+}
+
 /// A local MCP (Model Context Protocol) server the gateway can pull
 /// tools from. Tools are injected into chat requests that opt in via
 /// the `mcp` body field or `x-blazar-mcp` header; the gateway executes
@@ -3234,11 +3241,12 @@ pub struct McpServer {
     #[serde(default = "default_mcp_timeout_secs")]
     pub timeout_secs: u64,
     /// Security boundary (stdio only): start the child from an EMPTY
-    /// environment instead of inheriting the daemon's. With it, the child
-    /// sees only what `env` sets below, what `allowed_env` re-inherits,
-    /// and nothing else. Off by default - existing servers keep today's
-    /// inherit-everything behavior.
-    #[serde(default)]
+    /// environment instead of inheriting the daemon's. On by default -
+    /// the child sees only what `env` sets below, what `allowed_env`
+    /// re-inherits, and nothing else. Servers that genuinely need the
+    /// daemon's full environment opt back in with `env_clear = false`
+    /// (the legacy inherit-everything behavior).
+    #[serde(default = "default_mcp_env_clear")]
     pub env_clear: bool,
     /// Parent variables an `env_clear` server may re-inherit, e.g.
     /// `["PATH", "HOME"]`. Meaningful only together with `env_clear`;
@@ -6689,6 +6697,28 @@ mod tests {
         assert!(cfg.adaptive_slots, "adaptive_slots must default ON");
         assert!(cfg.warmup);
         assert_eq!(cfg.raw_lane_max_tokens, 2048);
+    }
+
+    #[test]
+    fn unit__mcp_server__env_clear_on_by_default() {
+        // Absent: scrubbed environment is the secure default.
+        let absent = toml::from_str::<McpServer>(
+            "name = \"srv\"\ncommand = [\"uvx\", \"mcp-server-fetch\"]",
+        )
+        .expect("minimal server parses");
+        assert!(absent.env_clear, "env_clear must default ON");
+        // Explicit legacy opt-out still parses.
+        let inherit = toml::from_str::<McpServer>(
+            "name = \"srv\"\ncommand = [\"uvx\", \"mcp-server-fetch\"]\nenv_clear = false",
+        )
+        .expect("explicit inherit parses");
+        assert!(!inherit.env_clear);
+        // Explicit true round-trips too.
+        let scrubbed = toml::from_str::<McpServer>(
+            "name = \"srv\"\ncommand = [\"uvx\", \"mcp-server-fetch\"]\nenv_clear = true",
+        )
+        .expect("explicit scrub parses");
+        assert!(scrubbed.env_clear);
     }
 
     #[test]
