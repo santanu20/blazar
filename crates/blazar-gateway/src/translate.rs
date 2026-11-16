@@ -1884,8 +1884,11 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0]["function"]["name"], "fa");
         assert_eq!(calls[0]["function"]["arguments"], json!({"x": 1}));
-        // Malformed accumulated arguments fall back to the raw string.
-        assert_eq!(calls[1]["function"]["arguments"], "not-json");
+        // Malformed accumulated arguments degrade to {} - tool_calls
+        // arguments are always a JSON object (Value::String crashes
+        // pydantic-typed ollama clients mid-stream); the raw text rides
+        // the malformed_tool_arguments warn instead.
+        assert_eq!(calls[1]["function"]["arguments"], json!({}));
         assert_eq!(calls[1]["function"]["index"], 1);
         assert!(acc.is_empty());
         assert!(acc.flush_line("m").is_none());
