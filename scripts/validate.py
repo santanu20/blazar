@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import glob
 import hashlib
 import json
 import os
@@ -2440,6 +2441,142 @@ _K = [
         None,
         "None default; advise tick gated on manual optimize lease cycles (supervisor autotune_advise_tick)",
     ),
+    # llama.cpp gap-knob wave (2026-11-13): upstream server flags promoted to
+    # first-class knobs. argv emission + validation error pins live in
+    # blazar-core profile/config unit tests; here: fresh-list key + benign
+    # full-manifest boot (gates b/c) per knob.
+    (
+        "child_webui",
+        False,
+        False,
+        "behavior",
+        None,
+        "child engine WebUI posture: false emits --no-webui on every llamacpp "
+        "spawn (gateway is the front door), true restores the engine default",
+    ),
+    (
+        "spec_default",
+        False,
+        False,
+        "behavior",
+        None,
+        "bare --spec-default preset (upstream ngram-mod tuned defaults); "
+        'refused at load unless spec = "off"',
+    ),
+    (
+        "spec_draft_n_min",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "minimum draft tokens (--spec-draft-n-min, spec-draft family only); "
+        "ceiling 1024, echo + boot",
+    ),
+    (
+        "spec_draft_cpu_mask",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "hex affinity mask for the draft process (--spec-draft-cpu-mask); "
+        "XOR spec_draft_cpu_range, echo + boot",
+    ),
+    (
+        "spec_draft_cpu_mask_batch",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "hex batch-phase affinity mask for the draft process "
+        "(--spec-draft-cpu-mask-batch); echo + boot",
+    ),
+    (
+        "cpu_mask",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "hex CPU affinity mask (--cpu-mask); XOR cpu_range, echo + boot",
+    ),
+    (
+        "cpu_mask_batch",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "hex batch-phase affinity mask (--cpu-mask-batch); XOR cpu_range_batch, "
+        "echo + boot",
+    ),
+    (
+        "cpu_range_batch",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "lo-hi batch-phase affinity (--cpu-range-batch); XOR cpu_mask_batch, "
+        "echo + boot",
+    ),
+    (
+        "cpu_strict_batch",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "batch-phase strict affinity (--cpu-strict-batch <0|1>); echo + boot",
+    ),
+    (
+        "cache_prompt",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "tri-state prompt-cache toggle (--cache-prompt/--no-cache-prompt); "
+        "None rides the engine default",
+    ),
+    (
+        "prefill_assistant",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "tri-state assistant-prefill (--prefill-assistant/--no-prefill-assistant); "
+        "None rides the engine default (upstream: on)",
+    ),
+    (
+        "skip_chat_parsing",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "tri-state pure-content parser (--skip-chat-parsing/--no-skip-chat-parsing); "
+        "None rides the engine default",
+    ),
+    (
+        "media_path",
+        True,
+        False,
+        "roundtrip",
+        None,
+        "local media dir for file:// relative refs (--media-path); must exist at load",
+    ),
+    (
+        "logit_bias",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "repeatable TOKEN_ID(+/-)BIAS entries (--logit-bias); format-validated "
+        "at load, echo + boot",
+    ),
+    (
+        "ignore_eos",
+        False,
+        False,
+        "roundtrip",
+        None,
+        "never stop on EOS (--ignore-eos; upstream implies --logit-bias "
+        "EOS-inf); echo + boot",
+    ),
 ]
 
 TOPLEVEL_KNOBS = [
@@ -2498,6 +2635,27 @@ MODEL_OVERRIDE_FIELDS = [
     (
         "chat_template_kwargs",
         "argv: --chat-template-kwargs (JSON-object string; overlay beats global - tool-mode enable_thinking lever)",
+    ),
+    # llama.cpp gap-knob wave (2026-11-13): launch-global constraint family.
+    # Inline sides echo via overlay A/B (gate d); argv emission + XOR matrix
+    # pins live in blazar-core unit tests.
+    (
+        "grammar",
+        "argv: --grammar (inline GBNF constraint; XOR grammar_file and the "
+        "json_schema family)",
+    ),
+    (
+        "grammar_file",
+        "argv: --grammar-file (file side of the constraint XOR; overlay B echo)",
+    ),
+    (
+        "json_schema",
+        "argv: --json-schema (JSON constraint string, parse-validated at load; "
+        "XOR json_schema_file and the grammar family)",
+    ),
+    (
+        "json_schema_file",
+        "argv: --json-schema-file (file side of the constraint XOR)",
     ),
     ("sampler_defaults", "argv: --temp..--seed set"),
     ("spm_infill", "roundtrip echo"),
@@ -2951,6 +3109,112 @@ def _toml_inline(v: object) -> str:
     return json.dumps(str(v))
 
 
+# Scratch-sandbox sweep constants: sandboxes live under ~/.cache as
+# blazar-validate-* mkdtemp dirs. Two leak classes the atexit/signal
+# _cleanup cannot cover: (1) failed runs deliberately KEEP their sandbox
+# for post-mortem debugging (nothing ever reclaimed them), (2) SIGKILL /
+# OOM / power loss skips atexit AND signal handlers entirely
+# (2026-11-07: 21 dirs / ~12G had to be purged by hand). Every Sandbox
+# writes an owner marker (pid + creation time) so a later run's startup
+# sweep can distinguish live runs (kept) from dead ones (reaped); legacy
+# marker-less dirs fall back to a 7-day mtime TTL.
+_SANDBOX_PREFIX = "blazar-validate-"
+_SANDBOX_MARKER = ".blazar_validate_owner"
+_SANDBOX_TTL_S = 7 * 24 * 3600
+# Persistent-by-design fixture cache (wine prefix, wheel venvs) — shares
+# the blazar-validate- prefix but must NEVER be swept.
+_SANDBOX_KEEP = {"blazar-validate-fixtures"}
+
+
+def _pid_alive(pid: int) -> bool:
+    # Windows os.kill() only supports CTRL_*_EVENT signal values and raises
+    # for a bare 0 probe - assume alive there and let the TTL bound reaping.
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            return True
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
+        return True  # unknown failure: assume alive; TTL still bounds it
+
+
+def _proc_start_ticks(pid: int) -> int | None:
+    # Boot-relative process start time (field 22 of /proc/<pid>/stat): the
+    # identity that separates "the owner pid is alive" from "an unrelated
+    # recycled pid now holds that number" - liveness alone keeps a dead
+    # run's sandbox alive through the whole TTL after a pid recycle
+    # (2026-11-14: 18 dirs / ~50G accumulated that way in under a week).
+    # None wherever /proc is unavailable (Windows, macOS); callers then
+    # fall back to plain liveness + TTL.
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+        # Fields after the "(comm)" span restart at state (field 3);
+        # starttime is field 22, i.e. index 19 in the post-comm split.
+        return int(stat[stat.rindex(b")") + 2 :].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def sweep_stale_sandboxes() -> int:
+    """Reap ~/.cache/blazar-validate-* sandboxes orphaned by dead runs.
+
+    Marker present: reap when the owner pid is dead, the pid was recycled
+    (start-time mismatch vs the marker), OR the dir is older than
+    _SANDBOX_TTL_S. No marker (legacy sandbox or a
+    crash between mkdtemp and marker write): mtime-age TTL only, so fresh
+    dirs always survive. Returns the number of dirs removed.
+    """
+    cache_root = os.path.expanduser("~/.cache")
+    now = time.time()
+    try:
+        names = os.listdir(cache_root)
+    except OSError:
+        return 0
+    reaped = 0
+    for name in names:
+        if not name.startswith(_SANDBOX_PREFIX) or name in _SANDBOX_KEEP:
+            continue
+        path = os.path.join(cache_root, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            marker = os.path.join(path, _SANDBOX_MARKER)
+            if os.path.isfile(marker):
+                with open(marker, encoding="utf-8") as f:
+                    fields = f.read().split()
+                pid, created = int(fields[0]), float(fields[1])
+                owner_alive = _pid_alive(pid)
+                if owner_alive and len(fields) > 2 and fields[2]:
+                    # pid + start-ticks identity: a live pid whose /proc
+                    # start time differs from the marker's is a recycled
+                    # pid, not the owner - reap now instead of letting it
+                    # squat through the whole TTL. Legacy 2-field markers
+                    # keep the old liveness+TTL behavior.
+                    live_ticks = _proc_start_ticks(pid)
+                    if live_ticks is not None and live_ticks != int(fields[2]):
+                        owner_alive = False
+                if owner_alive and (now - created) < _SANDBOX_TTL_S:
+                    continue  # live (or fresh) run still owns it
+            else:
+                try:
+                    if (now - os.stat(path).st_mtime) < _SANDBOX_TTL_S:
+                        continue  # young marker-less dir: give it the TTL
+                except OSError:
+                    continue
+        except (ValueError, OSError):
+            continue  # unparseable marker: leave it for a future sweep
+        shutil.rmtree(path, ignore_errors=True)
+        reaped += 1
+    return reaped
+
+
 class Sandbox:
     def __init__(self) -> None:
         # SAME filesystem as ~ so cp's hardlink aliases work, but NEVER a
@@ -2959,6 +3223,13 @@ class Sandbox:
         cache_root = os.path.expanduser("~/.cache")
         os.makedirs(cache_root, exist_ok=True)
         self.root = tempfile.mkdtemp(prefix="blazar-validate-", dir=cache_root)
+        # Owner marker for sweep_stale_sandboxes(): lets a LATER run reap
+        # this dir if we die without reaching _cleanup (SIGKILL / OOM /
+        # power loss - the leak classes atexit and signal handlers miss).
+        with open(os.path.join(self.root, _SANDBOX_MARKER), "w", encoding="utf-8") as f:
+            f.write(
+                f"{os.getpid()} {time.time()} {_proc_start_ticks(os.getpid()) or ''}\n"
+            )
         self.config_home = os.path.join(self.root, "config")
         self.data_home = os.path.join(self.root, "share")
         self.config_dir = os.path.join(self.config_home, "blazar")
@@ -4266,6 +4537,64 @@ def phase_baseline() -> None:
         f"status={st} content={content[:60]!r}",
     )
     check("baseline", "trace id header echoed", trace.startswith("plm-"), trace)
+    # /api/fit: capacity pre-flight math (weights + KV ladder vs the
+    # nvidia-smi census) - numbers only, no spawn, so it is safe to pin
+    # on every box (non-NVIDIA hosts get nulls + a note instead).
+    st, _, v = http_json("POST", "/api/fit", {"model": MODEL}, timeout=60)
+    fit = v if isinstance(v, dict) else {}
+    check(
+        "baseline",
+        "/api/fit reports weights + census math",
+        st == 200
+        and fit.get("weights_mib", 0) > 0
+        and isinstance(fit.get("device"), str),
+        f"status={st} weights={fit.get('weights_mib')} device={fit.get('device')!r} "
+        f"max_ctx={fit.get('max_ctx')} max_ctx_q8={fit.get('max_ctx_q8')}",
+    )
+    mc, mcq8 = fit.get("max_ctx"), fit.get("max_ctx_q8")
+    check(
+        "baseline",
+        "/api/fit q8 KV ladder weakly above the f16 ladder",
+        mc is None or mcq8 is None or mcq8 >= mc,
+        f"max_ctx={mc} max_ctx_q8={mcq8}",
+    )
+    st, _, v = http_json("POST", "/api/fit", {"model": MODEL, "ctx": 8192}, timeout=60)
+    f2 = v if isinstance(v, dict) else {}
+    check(
+        "baseline",
+        "/api/fit honors an explicit ctx over the config default",
+        st == 200 and f2.get("ctx_evaluated") == 8192,
+        f"status={st} ctx_evaluated={f2.get('ctx_evaluated')}",
+    )
+    st, _, _v = http_json("POST", "/api/fit", {"model": "no-such-model"}, timeout=60)
+    check(
+        "baseline",
+        "/api/fit unknown model -> 404 teaching",
+        st == 404,
+        f"status={st}",
+    )
+    # /api/tokenize: ollama-compat token counting relayed through the
+    # live engine child (a cold model refuses honestly instead of
+    # silently counting nothing).
+    st, _, v = http_json(
+        "POST", "/api/tokenize", {"model": MODEL, "prompt": "hello world"}, timeout=60
+    )
+    tz = v if isinstance(v, dict) else {}
+    check(
+        "baseline",
+        "/api/tokenize counts via the live engine",
+        st == 200 and isinstance(tz.get("count"), int) and tz["count"] > 0,
+        f"status={st} count={tz.get('count')}",
+    )
+    st, _, _v = http_json(
+        "POST", "/api/tokenize", {"model": "no-such-model", "prompt": "x"}, timeout=60
+    )
+    check(
+        "baseline",
+        "/api/tokenize cold model -> 503 teaching",
+        st == 503,
+        f"status={st}",
+    )
     ok, collected = sse_collect(
         "/v1/chat/completions",
         "[DONE]",
@@ -6408,19 +6737,36 @@ def _eng_tool_battery(lane: str, model: str) -> None:
         t8_body = {
             "model": model,
             "stream": True,
-            # No max_tokens cap: mistralrs under tool_choice=required
-            # emits every tool call in ONE final delta after a long
-            # generation, so a cap truncates the stream before any
-            # tool_calls frame arrives (the budget above bounds it).
+            # No max_tokens cap by default: mistralrs under
+            # tool_choice=required emits every tool call in ONE final
+            # delta after a long generation, so a cap truncates the
+            # stream before any tool_calls frame arrives (the budget
+            # above bounds it).
             "temperature": 0.2,
             "tools": [w],
             "messages": [
                 {
+                    # Imperative phrasing, live-probed 2026-11-15: the
+                    # polite "Weather in Berlin? You must call the tool."
+                    # lets a 0.5B answer a clarifying question instead
+                    # (forced-choice is advisory on llama-server - the
+                    # chat template does not bind it), and the ramble
+                    # then runs to the length cap with zero tool deltas.
+                    # The imperative form binds greedily and at 0.2/0.3:
+                    # 9 frames, finish=tool_calls, exact args.
                     "role": "user",
-                    "content": "Weather in Berlin? You must call the tool.",
+                    "content": "Call the get_weather tool for Berlin now."
+                    " Do not ask me any questions.",
                 }
             ],
         }
+        if lane == "llamacpp":
+            # Bound the no-tool runaway dialect: llama-server streams
+            # prose to the model's full length cap when the call does
+            # not happen (~32K frames, minutes of GPU). A tool call
+            # lands within the first ~10 frames, so 512 is 50x headroom
+            # and turns a miss into a ~1s bounded probe.
+            t8_body["max_tokens"] = 512
         if lane not in ("mlx", "sglang"):
             # mlx: forced choice is gateway-refused by design (mlx-lm
             # ignores tool_choice entirely) - a forced T8 would never see
@@ -6597,6 +6943,52 @@ def _eng_tool_battery(lane: str, model: str) -> None:
             ok,
             f"{evidence} (attempt {tries})",
         )
+
+
+def _eng_forced_choice_note(lane: str, model: str) -> None:
+    """llamacpp forced tool_choice is advisory (llama-server binds it
+    only when the chat template emits the forcing directives): the
+    gateway stamps an observable teaching header on forced replies and
+    stays silent otherwise - pinned both ways (receipt 2026-11-16)."""
+    ph = f"engines/{lane}"
+    forced = {
+        "model": model,
+        "stream": False,
+        "max_tokens": 256,
+        "temperature": 0,
+        "tools": [ENG_TOOL_WEATHER],
+        # imperative phrasing so a binding template calls immediately;
+        # the cap bounds a non-binding template's ramble (T8 lesson)
+        "messages": [
+            {
+                "role": "user",
+                "content": "Call the get_weather tool for Berlin now. "
+                "Do not ask me any questions.",
+            }
+        ],
+        "tool_choice": "required",
+    }
+    st, hdr, _ = http_json(
+        "POST", "/v1/chat/completions", forced, {"x-blazar-model-doctor": "1"}, 240
+    )
+    note = hdr.get("x-blazar-tool-choice", "")
+    check(
+        ph,
+        "forced tool_choice reply carries the teaching header",
+        st == 200 and "template" in note and "advisory" in note,
+        f"status={st} note={note[:90]!r}",
+    )
+    auto = dict(forced)
+    del auto["tool_choice"]
+    st2, hdr2, _ = http_json(
+        "POST", "/v1/chat/completions", auto, {"x-blazar-model-doctor": "1"}, 240
+    )
+    check(
+        ph,
+        "voluntary tool request carries no teaching header",
+        st2 == 200 and "x-blazar-tool-choice" not in hdr2,
+        f"status={st2} header-present={'x-blazar-tool-choice' in hdr2}",
+    )
 
 
 def _eng_classify(lane: str, model: str) -> None:
@@ -7134,6 +7526,17 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
                 "stream_interval": 9,
                 "schedule_policy": "fcfs",
                 "cuda_graph_max_bs": 8,
+                # Split capture surface (0.5.21+): decode half gets its
+                # own --cuda-graph-backend-decode flag; older builds name
+                # the skip in the daemon log (soft pair either way).
+                # Value `disabled` is deliberate: `breakable` crashes
+                # upstream sglang 0.5.23 on qwen3-1.7b (BCG allocator
+                # TypeError: Unsupported BCG output type:
+                # LogitsProcessorOutput -> SIGQUIT/SIGKILL of the
+                # process tree, live-proven 2026-11-14) - the lane
+                # pins the emission, not upstream's broken capture
+                # path (named in a boundary cell).
+                "cuda_graph_backend_decode": "disabled",
             }
         }
         return {
@@ -7146,9 +7549,13 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
             ],
             "presence": ["--reasoning-parser"],
             "soft_pairs": [
-                (("--cuda-graph-max-bs", "--cuda-graph-max-bs-decode"), "8")
+                (("--cuda-graph-max-bs", "--cuda-graph-max-bs-decode"), "8"),
+                ("--cuda-graph-backend-decode", "disabled"),
             ],
-            "soft_skip": ["lacks --cuda-graph-max-bs; skipped"],
+            "soft_skip": [
+                "lacks --cuda-graph-max-bs; skipped",
+                "lacks --cuda-graph-backend-decode",
+            ],
             "note": "",
         }
     if kind == "mistralrs":
@@ -7196,14 +7603,31 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
             "soft_skip": [],
             "note": "extra_args surface is flag-validated per mlx-lm build - spine asserted only",
         }
-    # llamacpp: the full knob matrix is phase knobs_argv's lane.
+    # llamacpp: the full knob matrix is phase knobs_argv's lane. ctx is
+    # pinned (same posture as every other text lane) so the tool
+    # battery's accumulated retry context cannot outrun the row's
+    # unpinned fit (observed 2026-11-14: row ctx 2048 vs T8's 3756-token
+    # assembled prompt -> PROMPT_TOO_LONG on a lane whose battery
+    # assumes headroom). The FP8 KV pin rides here because it is
+    # per-model override state, not a global argv knob: cache_type_k/v
+    # = f8_e4m3 (OCP-FP8 KV, upstream PR #28392) must land on the child
+    # argv when the installed build carries the grade, or drop loudly
+    # ("f8_e4m3 dropped: ..." names both the MLA exclusion and the
+    # stale-build paths) when it cannot.
     return {
         "cfg": {},
-        "override": {},
+        "override": {
+            "ctx": 8192,
+            "cache_type_k": "f8_e4m3",
+            "cache_type_v": "f8_e4m3",
+        },
         "pairs": [],
         "presence": [],
-        "soft_pairs": [],
-        "soft_skip": [],
+        "soft_pairs": [
+            ("--cache-type-k", "f8_e4m3"),
+            ("--cache-type-v", "f8_e4m3"),
+        ],
+        "soft_skip": ["f8_e4m3 dropped"],
         "note": "argv knob surface covered by phase knobs_argv (llamacpp)",
     }
 
@@ -7277,6 +7701,530 @@ def _eng_argv_check(
     )
 
 
+def _eng_generate_native(model: str) -> None:
+    """SGLang-native /generate passthrough (?model= + GenerateReqInput
+    body forwarded verbatim, response relayed byte-for-byte - docs/
+    4.API_SPEC). Non-stream form returns one JSON object."""
+    ph = "engines/sglang"
+    st, _, v = http_json(
+        "POST",
+        f"/generate?model={model}",
+        {
+            "text": "Say ok",
+            "stream": False,
+            "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+        },
+    )
+    ok = st == 200 and isinstance(v, dict) and ("text" in v or "meta_info" in v)
+    check(
+        ph,
+        "native /generate passthrough answers 200 JSON",
+        ok,
+        f"status={st} body={str(v)[:120]!r}",
+    )
+
+
+def _eng_constraint_teaching(gguf_row: dict | None) -> None:
+    """Launch-global json_schema pin on the llamacpp lane: the child's
+    OpenAI chat route rejects sampler init while a constraint is armed
+    ("Failed to initialize samplers", verified b12360) - the gateway
+    must translate that into the route-shape teaching, and /completion
+    must keep serving constrained generation."""
+    ph = "engines/llamacpp"
+    if gguf_row is None:
+        boundary(ph, "constraint chat teaching", "no GGUF chat fixture in the store")
+        return
+    model = gguf_row["name"]
+    schema = (
+        '{"type":"object","properties":{"ok":{"type":"boolean"}},'
+        '"required":["ok"],"additionalProperties":false}'
+    )
+    d = DAEMON
+    try:
+        d.start(
+            {
+                "port": PORT,
+                "model_overrides": {model: {"json_schema": schema}},
+            },
+            floor_model=model,
+        )
+        try:
+            chat("Say ok", model=model, timeout=300)
+        except Exception:
+            pass
+        row = wait_loaded(model=model, budget=300)
+        if row is None:
+            check(
+                ph,
+                "constrained model loads",
+                False,
+                f"no ps row for {model} after 300s - daemon log: {d.log_path}",
+            )
+            return
+        # The arming (or, on a flag-less build, the loud skip) must be
+        # visible in the daemon log - silent constraint state is a bug.
+        try:
+            with open(d.log_path, errors="replace") as f:
+                log_text = f.read()
+        except OSError:
+            log_text = ""
+        armed = "launch-global grammar/json_schema armed" in log_text
+        skipped = "json_schema skipped" in log_text
+        check(
+            ph,
+            "constraint arming is logged loudly",
+            armed or skipped,
+            "armed warning"
+            if armed
+            else ("flag-skip warning" if skipped else "neither arming nor skip logged"),
+        )
+        st, _, raw = http(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": model,
+                "stream": False,
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Reply with JSON"}],
+            },
+        )
+        body = raw.decode(errors="replace")
+        if st == 200:
+            # Upstream fixed the sampler/constraint clash on this build:
+            # chat serves constrained - the teaching path simply has no
+            # failure to translate here.
+            boundary(
+                ph,
+                "constraint chat teaching",
+                f"build {row.get('blazar_engine')} serves constrained chat "
+                "(sampler/constraint clash absent) - teaching has no failure to relay",
+            )
+        else:
+            check(
+                ph,
+                "chat failure carries the route-shape teaching",
+                "launch-global grammar/json_schema constraint" in body,
+                f"status={st} body={body[:200]!r}",
+            )
+        st, _, v = http_json(
+            "POST",
+            "/completion",
+            {"prompt": "Reply with a JSON object", "n_predict": 32, "temperature": 0},
+            timeout=240,
+        )
+        check(
+            ph,
+            "/completion keeps serving constrained generation",
+            st == 200,
+            f"status={st} body={str(v)[:120]!r}",
+        )
+    except RuntimeError as exc:
+        if "MemAvailable" in str(exc):
+            boundary(
+                ph,
+                "constraint chat teaching",
+                f"mem floor blocked the start: {str(exc)[-120:]}",
+            )
+        else:
+            check(ph, "constraint teaching lane ran", False, f"{exc}")
+    finally:
+        d.stop()
+
+
+def _eng_sglang_hicache(sglang_row: dict | None) -> None:
+    """Host-RAM KV tier (hicache): the host-viability gate must refuse
+    an absurd size with the fit teaching, and a benign 1 GiB tier must
+    reach the serving child argv (--hicache-ratio/--hicache-size, or a
+    loud skip warning on builds without the flags)."""
+    ph = "engines/sglang"
+    if sglang_row is None:
+        boundary(ph, "hicache host tier", "no safetensors fixture for the sglang lane")
+        return
+    model = sglang_row["name"]
+    d = DAEMON
+    # Viability refusal: 999999 GiB can never fit - the profile gate
+    # refuses at SPAWN PREP (chat-triggered), not at config parse: the
+    # daemon boots fine and the first spawn must fail with the host-fit
+    # teaching instead of upstream's opaque mid-boot abort.
+    try:
+        d.start(
+            {
+                "port": PORT,
+                "sglang": {"hicache_enable": True, "hicache_size": 999999},
+                "model_overrides": {model: {"engine": "sglang"}},
+            },
+            floor_model=model,
+        )
+    except RuntimeError as e:
+        err = str(e)
+        if "MemAvailable" in err:
+            boundary(
+                ph,
+                "hicache viability gate refuses an unfit size",
+                f"mem floor blocked the start first: {err[-120:]}",
+            )
+            return
+        check(
+            ph,
+            "hicache viability gate refuses an unfit size",
+            "cannot fit this host" in err,
+            f"unexpected start refusal: {err[-200:].replace(chr(10), ' | ')}",
+        )
+        return
+    try:
+        try:
+            st, v, _ = chat("Say ok", model=model, timeout=180)
+        except Exception as e:  # daemon died mid-refusal: still evidence
+            st, v = 0, str(e)
+        log_tail = ""
+        try:
+            with open(d.log_path, errors="replace") as fh:
+                log_tail = fh.read()[-4000:]
+        except OSError:
+            pass
+        check(
+            ph,
+            "hicache viability gate refuses an unfit size",
+            st != 200 and "cannot fit this host" in (str(v) + log_tail),
+            f"status={st} body={str(v)[:160]!r}",
+        )
+    finally:
+        d.stop()
+    # Benign tier: 1 GiB host cache + ratio 2 on the lane's fixture.
+    try:
+        d.start(
+            {
+                "port": PORT,
+                "sglang": {
+                    "hicache_enable": True,
+                    "hicache_ratio": 2,
+                    "hicache_size": 1,
+                },
+                "model_overrides": {model: {"engine": "sglang", "ctx": 8192}},
+            },
+            floor_model=model,
+        )
+        try:
+            mark = os.path.getsize(d.log_path)
+        except OSError:
+            mark = 0
+        try:
+            st_trig, v_trig, _ = chat("Say ok", model=model, timeout=180)
+        except Exception:
+            st_trig, v_trig = 0, None
+        # This box's RAM class (~13.7 GiB) refuses EVERY explicit tier
+        # size: sglang sizes the host tier against MemAvailable minus a
+        # fixed ~15 GiB headroom (reserve + engine footprint), so the
+        # benign lane can only live-run on a bigger-RAM host. The spawn
+        # refusal carries the teaching in the 400 body.
+        if st_trig == 400 and "cannot fit this host" in str(v_trig):
+            boundary(
+                ph,
+                "hicache tier loads on the sglang lane",
+                "this host's RAM class refuses every explicit tier size "
+                "(~15 GiB headroom needed, receipt 2026-11-12) - tier argv "
+                "contracts pinned by the parse-gate and viability cells",
+            )
+            return
+        # Same refusal surfacing only in the daemon log (future body
+        # shapes): fail over to a boundary instead of burning the load
+        # budget.
+        try:
+            with open(d.log_path, errors="replace") as fh:
+                fh.seek(mark)
+                if "cannot fit this host" in fh.read():
+                    boundary(
+                        ph,
+                        "hicache tier loads on the sglang lane",
+                        "this host's RAM class refuses every explicit tier size",
+                    )
+                    return
+        except OSError:
+            pass
+        row = wait_loaded(model=model, budget=600)
+        if row is None:
+            check(
+                ph,
+                "hicache tier loads on the sglang lane",
+                False,
+                f"no ps row for {model} after 600s - daemon log: {d.log_path}",
+            )
+            return
+        check(ph, "hicache tier loads on the sglang lane", True, f"model={model}")
+        _eng_argv_check(
+            ph,
+            model,
+            [],
+            [],
+            soft_pairs=[
+                ("--hicache-ratio", "2"),
+                ("--hicache-size", "1"),
+            ],
+            soft_skip=["lacks --hicache-ratio", "lacks --hicache-size"],
+        )
+        st, v, _ = chat("Say ok", model=model)
+        check(
+            ph,
+            "hicache lane chat completions 200",
+            st == 200 and isinstance(v, dict) and (v.get("choices") or []),
+            f"status={st} body={str(v)[:120]!r}",
+        )
+    except RuntimeError as exc:
+        if "MemAvailable" in str(exc):
+            boundary(
+                ph,
+                "hicache host tier",
+                f"mem floor blocked the start: {str(exc)[-120:]}",
+            )
+        else:
+            check(ph, "hicache lane ran", False, f"{exc}")
+    finally:
+        d.stop()
+
+
+def _eng_sglang_pd_pair(
+    sglang_row: dict | None,
+    kinds_by_tag: dict,
+    disk_kinds: set,
+    engines_root: str,
+    keep: set | None,
+) -> None:
+    """PD disaggregation pair (disagg_pair + mooncake_tcp): TWO role
+    children (#pd-pre hosting the bootstrap server, #pd-dec serving
+    decode) plus a supervised sglang-router child; chat rides the
+    router's /v1/chat/completions, native /generate rides the router's
+    /generate (bench receipt 20261112-pd-overhead: pair served on this
+    box, sglang-router 0.3.2 + mooncake 0.3.11 TCP)."""
+    ph = "engines/sglang"
+    if keep is not None and "sglang" not in keep:
+        boundary(
+            ph, "pd pair lane", "BLAZAR_VALIDATE_ENGINES filter excludes this lane"
+        )
+        return
+    if "sglang" not in set(kinds_by_tag.values()) or "sglang" not in disk_kinds:
+        boundary(ph, "pd pair lane", "sglang engine not installed on this box")
+        return
+    if sglang_row is None:
+        boundary(ph, "pd pair lane", "no safetensors fixture for the sglang lane")
+        return
+    # The pair needs the router binary in the sglang venv (console
+    # script `sglang-router`); the supervisor resolves it from the
+    # engine install, so probe the same tree the sandbox hardlinks.
+    router = glob.glob(
+        os.path.join(
+            glob.escape(engines_root), "sglang*", "venv", "bin", "sglang-router"
+        )
+    )
+    if not router:
+        boundary(
+            ph,
+            "pd pair lane",
+            "sglang-router not installed in the sglang engine venv - "
+            "the pair cannot transfer KV between roles",
+        )
+        return
+    model = sglang_row["name"]
+    # The host-RAM load guard (J3) sits BEFORE VRAM admission and is
+    # env-dependent: a co-tenant workload (compile, sim, another engine)
+    # can starve MemAvailable and refuse the spawn before the pair-fit
+    # stage under test. Mirror its own floor arithmetic (weights/2 +
+    # 512 MiB + offload ~= 0) and take its documented opt-out ONLY when
+    # the box is actually starved; a roomy box keeps the guard on and
+    # receipts the natural gate order. Safe either way: the
+    # pair-charged admission verdict fires before any weights would
+    # begin loading into host RAM.
+    guard_on = True
+    try:
+        with open("/proc/meminfo") as fh:
+            for ln in fh:
+                if ln.startswith("MemAvailable:"):
+                    avail_mib = int(ln.split()[1]) // 1024
+                    break
+            else:
+                avail_mib = None
+        if avail_mib is not None:
+            need_mib = sglang_row["bytes"] // (2 * 1024 * 1024) + 512
+            guard_on = avail_mib >= need_mib
+    except OSError:
+        pass  # non-Linux: leave the guard at its default
+    lane_cfg = {
+        "port": PORT,
+        "sglang": {
+            "disagg_pair": True,
+            "disagg_transfer_backend": "mooncake_tcp",
+        },
+        # ctx 4096 halves the per-role KV so the bf16 pair has its
+        # best shot at co-residency on a single 8 GiB card (2 x
+        # 3.4 GB weights + two CUDA contexts is already tight).
+        "model_overrides": {model: {"engine": "sglang", "ctx": 4096}},
+    }
+    if not guard_on:
+        lane_cfg["spawn_mem_guard"] = False
+    d = DAEMON
+    try:
+        d.start(lane_cfg, floor_model=model)
+        # The pair is lazy: ensure_pd rides the first request. A 503 or
+        # timeout here is expected while the roles boot - it is a trigger,
+        # not an assertion. The body is kept: on a box where the pair
+        # cannot fit it carries the unit-refusal teaching.
+        try:
+            chat("Say ok", model=model, timeout=90)
+        except Exception:
+            pass
+        run_dir = os.path.join(SANDBOX.data_dir, "run")
+        want_keys = (f"{model}#pd-pre.pid", f"{model}#pd-dec.pid")
+
+        def _pair_evictions() -> int:
+            # Each line = one role spawn admitting itself by evicting its
+            # own sibling. Two or more means the pair ping-pongs instead
+            # of co-residing (or being refused as a unit).
+            try:
+                with open(d.log_path, errors="replace") as fh:
+                    return sum(
+                        1 for ln in fh if "admission evict" in ln and "#pd-" in ln
+                    )
+            except OSError:
+                return 0
+
+        def _child_alive(key: str) -> bool:
+            pf = os.path.join(run_dir, key)
+            try:
+                with open(pf) as fh:
+                    os.kill(int(fh.read().strip()), 0)
+                return True
+            except (OSError, ValueError):
+                return False
+
+        def _unit_refused() -> bool:
+            # The post-2026-11-14 contract: an unfit pair is refused as
+            # one unit at admission (both roles charged), teaching the
+            # disagg_pair remedy - never a per-role eviction loop.
+            try:
+                with open(d.log_path, errors="replace") as fh:
+                    tail = fh.read()[-8192:]
+                return "drop sglang.disagg_pair" in tail and "admission floor" in tail
+            except OSError:
+                return False
+
+        # Cold pair spawn is ~3 processes (receipt: 67 s cold on this
+        # box); budget generously for a cold-cache day, but bail the
+        # moment the sibling-eviction signature appears.
+        deadline = time.monotonic() + 600
+        up = False
+        while time.monotonic() < deadline:
+            if all(_child_alive(k) for k in want_keys):
+                up = True
+                break
+            if _pair_evictions() >= 2:
+                break
+            if _unit_refused():
+                break
+            time.sleep(5)
+        if not up:
+            evictions = _pair_evictions()
+            if evictions >= 2:
+                # Regression guard: the 2026-11-14 defect had each role
+                # spawn evicting its own sibling in a ping-pong loop.
+                check(
+                    ph,
+                    "pd pair loads both role children",
+                    False,
+                    f"pair admission ping-pong: {evictions} role spawns evicted "
+                    "their own sibling instead of the pair being refused as a "
+                    "unit - supervisor should refuse with a fit teaching, "
+                    f"not loop - daemon log: {d.log_path}",
+                )
+                return
+            # Not up and no sibling-eviction loop: the pair must have
+            # been refused AS A UNIT with the fit teaching. The last
+            # chat body carries the relayed supervision verdict.
+            try:
+                st2, v2, _ = chat("Say ok", model=model, timeout=120)
+            except Exception as exc:  # diagnostic capture only
+                st2, v2 = 0, str(exc)
+            body = str(v2)
+            try:
+                with open(d.log_path, errors="replace") as fh:
+                    log_tail = fh.read()[-4096:]
+            except OSError:
+                log_tail = ""
+            taught = (
+                "admission floor" in (body + log_tail)
+                and "pair" in (body + log_tail)
+                and "could not come up" in (body + log_tail)
+            )
+            leftovers = [
+                os.path.basename(p)
+                for p in glob.glob(
+                    os.path.join(glob.escape(run_dir), f"{glob.escape(model)}#pd-*")
+                )
+            ]
+            if taught and not leftovers:
+                check(
+                    ph,
+                    "pd pair refuses as a unit with fit teaching",
+                    True,
+                    f"status={st2} floor exceeds this card for BOTH roles "
+                    f"resident; body[:160]={body[:160]!r} - no half-topology "
+                    "children, no sibling evictions",
+                )
+            else:
+                check(
+                    ph,
+                    "pd pair refuses as a unit with fit teaching",
+                    False,
+                    f"pair neither loaded nor refused with the unit "
+                    f"teaching (taught={taught}, status={st2}, "
+                    f"leftover #pd- files={leftovers}) - "
+                    f"body[:160]={body[:160]!r} - daemon log: {d.log_path}",
+                )
+            return
+        check(
+            ph,
+            "pd pair loads both role children",
+            True,
+            f"model={model} ctx=4096",
+        )
+        run_dir = os.path.join(SANDBOX.data_dir, "run")
+        pd_keys = glob.glob(
+            os.path.join(glob.escape(run_dir), f"{glob.escape(model)}#pd-*")
+        )
+        check(
+            ph,
+            "pair children carry #pd- role keys",
+            len(pd_keys) >= 2,
+            f"run-dir #pd- entries: {[os.path.basename(k) for k in pd_keys]}",
+        )
+        # The router's worker discovery is async: the first request after
+        # a cold spawn can 503 (server_selection_failed) and self-heals
+        # on the next one (documented upstream behavior - retry, don't
+        # mask).
+        st, v = 0, None
+        tries = 0
+        while tries < 4:
+            tries += 1
+            st, v, _ = chat("Say ok", model=model, timeout=300)
+            if st == 200:
+                break
+            time.sleep(6)
+        check(
+            ph,
+            "pd pair chat via router 200",
+            st == 200 and isinstance(v, dict) and (v.get("choices") or []),
+            f"status={st} body={str(v)[:120]!r} (attempt {tries})",
+        )
+        _eng_generate_native(model)
+    except RuntimeError as exc:
+        if "MemAvailable" in str(exc):
+            boundary(
+                ph, "pd pair lane", f"mem floor blocked the start: {str(exc)[-120:]}"
+            )
+        else:
+            check(ph, "pd pair lane ran", False, f"{exc}")
+    finally:
+        d.stop()
+
+
 def phase_engines() -> None:
     print("\n== phase 4b: per-engine live battery (every installed kind) ==")
     rows, kinds_by_tag = _eng_store()
@@ -7345,6 +8293,162 @@ def phase_engines() -> None:
                 f"unknown [{scope}] key fails fast naming the field",
                 False,
                 f"daemon ACCEPTED unknown key {bad_field!r}",
+            )
+            d.stop()
+
+    # SglangTuning's own validation contracts (v0.32.0 disagg/pdmux/
+    # hicache/topology families): every bad combination must fail FAST
+    # at config parse, naming the knob and the fix - never a silent
+    # spawn with the knob dropped or a confusing engine-side crash.
+    # Pure parse-gate cells: independent of any sglang install.
+    sglang_neg = [
+        ("disagg_mode vocab", {"disagg_mode": "split"}, "must be prefill | decode"),
+        (
+            "disagg_transfer_backend vocab",
+            {"disagg_transfer_backend": "carrier_pigeon"},
+            "must be mooncake | nixl | ascend | fake | mori | mooncake_tcp",
+        ),
+        (
+            "decode_allocation_policy needs the decode role first",
+            {"disagg_decode_allocation_policy": "early"},
+            'set sglang.disagg_mode = "decode" first',
+        ),
+        (
+            "decode_allocation_policy vocab",
+            {"disagg_mode": "decode", "disagg_decode_allocation_policy": "lazy"},
+            "must be early | prefill_complete",
+        ),
+        (
+            "decode_radix_cache rejected under the fake backend",
+            {
+                "disagg_mode": "decode",
+                "disagg_transfer_backend": "fake",
+                "disagg_decode_radix_cache": True,
+            },
+            "rejected with the fake transfer backend",
+        ),
+        (
+            "disagg_pair is mutually exclusive with disagg_mode",
+            {"disagg_pair": True, "disagg_mode": "prefill"},
+            "spawns both roles from the pair keys",
+        ),
+        (
+            "pdmux needs a config path",
+            {"pdmux_enable": True},
+            "needs sglang.pdmux_config_path",
+        ),
+        (
+            "pdmux_config_path without pdmux_enable",
+            {"pdmux_config_path": "/dev/null"},
+            "is set without sglang.pdmux_enable",
+        ),
+        (
+            "pdmux collocates - no disagg family alongside",
+            {
+                "pdmux_enable": True,
+                "pdmux_config_path": "/dev/null",
+                "disagg_mode": "prefill",
+            },
+            "collocates both roles in ONE process",
+        ),
+        (
+            "megakernel x monokernel vendor stacks",
+            {"megakernel_enable": True, "monokernel_enable": True},
+            "pick one",
+        ),
+        (
+            "attn_dp_size must divide tp_size",
+            {"attn_dp_size": 3, "tp_size": 4},
+            "must divide sglang.tp_size",
+        ),
+        (
+            "cp_strategy vocab",
+            {"cp_strategy": "spiral"},
+            "must be zigzag or interleave",
+        ),
+        (
+            "cp_strategy needs context parallelism",
+            {"cp_strategy": "zigzag"},
+            "set sglang.cp_size >= 2 or sglang.enable_prefill_cp",
+        ),
+        (
+            "enable_prefill_cp alone does nothing",
+            {"enable_prefill_cp": True},
+            "does nothing",
+        ),
+        (
+            "dcp_comm_backend vocab",
+            {"dcp_comm_backend": "pigeon"},
+            "must be ag_rs, a2a or fi_a2a",
+        ),
+        (
+            "dcp_comm_backend needs dcp_size",
+            {"dcp_comm_backend": "a2a"},
+            "needs sglang.dcp_size >= 2",
+        ),
+        (
+            "hicache_write_policy vocab",
+            {"hicache_write_policy": "write_sometimes"},
+            "must be write_back | write_through",
+        ),
+        (
+            "write_back needs a storage backend",
+            {"hicache_write_policy": "write_back"},
+            "write-back only exists below the host tier",
+        ),
+        (
+            "hicache_io_backend vocab",
+            {"hicache_io_backend": "spinning_disk"},
+            "must be direct | kernel | kernel_ascend",
+        ),
+        (
+            "hicache_host_memory_mode vocab",
+            {"hicache_host_memory_mode": "sometimes"},
+            "must be cache | buffer_only",
+        ),
+        (
+            "buffer_only needs a storage backend",
+            {"hicache_host_memory_mode": "buffer_only"},
+            "staging without a destination is not a configuration",
+        ),
+        (
+            "hicache_storage_backend vocab",
+            {"hicache_storage_backend": "dropbox"},
+            "hicache_storage_backend must be one of",
+        ),
+        (
+            "hicache_storage_extra_config must be a JSON object string",
+            {"hicache_storage_extra_config": "not json"},
+            "must be a JSON object string",
+        ),
+    ]
+    for label, frag, want in sglang_neg:
+        try:
+            d.start(
+                {"port": PORT, "sglang": frag},
+                floor_model=neg_floor["name"] if neg_floor else MODEL,
+            )
+        except RuntimeError as e:
+            err = str(e)
+            if "MemAvailable" in err:
+                boundary(
+                    "engines/sglang",
+                    f"parse gate: {label}",
+                    f"mem floor blocked the start before config parse: {err[-120:]}",
+                )
+                continue
+            check(
+                "engines/sglang",
+                f"parse gate: {label}",
+                want in err,
+                f"want {want!r}; log tail: {err[-200:].replace(chr(10), ' | ')}",
+            )
+        else:
+            check(
+                "engines/sglang",
+                f"parse gate: {label}",
+                False,
+                f"daemon ACCEPTED bad sglang config {frag!r}",
             )
             d.stop()
 
@@ -7494,9 +8598,41 @@ def phase_engines() -> None:
                     collected[-160:].replace("\n", " "),
                 )
                 _eng_tool_battery(kind, model)
+                if kind == "llamacpp":
+                    _eng_forced_choice_note(kind, model)
                 _eng_no_tools_clean(kind, model)
                 _eng_json_schema(kind, model)
                 _eng_classify(kind, model)
+                if kind == "sglang":
+                    _eng_generate_native(model)
+                    boundary(
+                        ph,
+                        "cuda_graph_backend_decode=breakable live capture",
+                        "upstream sglang 0.5.23 BCG allocator crashes on this "
+                        "fixture class (TypeError: Unsupported BCG output type: "
+                        "LogitsProcessorOutput -> SIGQUIT/SIGKILL of the process "
+                        "tree, live-proven 2026-11-14) - lane pins 'disabled'; "
+                        "vocab + argv emission pinned instead",
+                    )
+                    boundary(
+                        ph,
+                        "megakernel/monokernel live spawn",
+                        "vendor plugin stacks not installed on this box - "
+                        "mutex contract pinned by the parse-gate cells",
+                    )
+                    boundary(
+                        ph,
+                        "cp/dcp live sharding (cp_size/cp_strategy/dcp_comm_backend)",
+                        "context / decode-context parallelism needs a multi-GPU "
+                        "topology - parse-gate cells pin the contracts",
+                    )
+                    boundary(
+                        ph,
+                        "hicache L3 storage tier argv (storage_backend family)",
+                        "persistent/remote storage layer needs backend infra - "
+                        "vocab + pairing pinned by parse-gate cells; the host "
+                        "tier (enable/ratio/size) is covered by the hicache lane",
+                    )
                 if kind in ("llamacpp", "mistralrs"):
                     _eng_embeddings(kind, _eng_pick_embed(rows))
                 else:
@@ -7556,6 +8692,19 @@ def phase_engines() -> None:
                     )
             finally:
                 d.stop()
+
+        # v0.32.0 deep lanes: constraint teaching (llamacpp json_schema
+        # pin), hicache host tier, and the PD disaggregation pair each
+        # need their own daemon posture - they cannot ride a lane whose
+        # every cell assumes an unconstrained single-child spawn.
+        sglang_row = _eng_pick_safetensors_dir(rows, tools_pass)
+        if keep is None or "llamacpp" in keep:
+            _eng_constraint_teaching(gguf)
+        if keep is None or "sglang" in keep:
+            _eng_sglang_hicache(sglang_row)
+            _eng_sglang_pd_pair(
+                sglang_row, kinds_by_tag, disk_kinds, engines_root, keep
+            )
 
         # Lazy lanes (audio + diffusion) ride default routing: one shared
         # daemon, whisper/piper spawn on demand from /v1/audio/*.
@@ -12579,11 +13728,30 @@ def _full_toplevel() -> dict:
         "moe_cache_mib": 512,
         "moe_cache_cpu_share": 0.5,
         "spec_draft_n_ubatch": 256,
+        # 2026-11-13 gap-knob wave: benign values inside config.validate()
+        # (masks empty = unset keeps the range/mask XORs quiet; spec_default
+        # off keeps the spec XOR quiet; logit_bias empty skips format checks).
+        "child_webui": False,
+        "spec_default": False,
+        "spec_draft_n_min": 0,
+        "spec_draft_cpu_mask": "",
+        "spec_draft_cpu_mask_batch": "",
+        "cpu_mask": "",
+        "cpu_mask_batch": "",
+        "cpu_range_batch": "0-3",
+        "cpu_strict_batch": False,
+        "cache_prompt": None,
+        "prefill_assistant": None,
+        "skip_chat_parsing": None,
+        "media_path": None,
+        "logit_bias": [],
+        "ignore_eos": False,
     }
 
 
 def _overlay_a() -> dict:
-    """All 29 ModelOverride fields + 18 sampler leaves (chat_template side of XOR)."""
+    """All 30 ModelOverride fields + 18 sampler leaves (inline sides of the
+    chat_template and grammar XORs)."""
     return {
         "ctx": 3072,
         "slots": 1,
@@ -12604,6 +13772,7 @@ def _overlay_a() -> dict:
         "pin": True,
         "chat_template": "chatml",
         "chat_template_kwargs": '{"enable_thinking": false}',
+        "grammar": 'root ::= "ok"',
         "spm_infill": True,
         "decode_policy": "free",
         "prompt_recipe": "child",
@@ -12637,13 +13806,17 @@ def _overlay_a() -> dict:
 
 
 def _overlay_b() -> dict:
-    """chat_template_file side of the XOR (everything else identical)."""
+    """File sides of the chat_template and grammar XORs (rest identical)."""
     ov = _overlay_a()
     ov.pop("chat_template")
     ov["chat_template_file"] = os.path.join(SANDBOX.root, "template.tmpl")
+    ov.pop("grammar")
+    ov["grammar_file"] = os.path.join(SANDBOX.root, "constraint.gbnf")
     ov["cache_type_k"] = "q8_0"
     ov["cache_type_v"] = "q4_0"
     open(ov["chat_template_file"], "w").close()
+    with open(ov["grammar_file"], "w") as f:
+        f.write('root ::= "ok"\n')
     return ov
 
 
@@ -12847,6 +14020,40 @@ def phase_frontier_knobs() -> None:
         ok=z.returncode != 0 and "keep_tags" in z.stderr,
     )
     cli("config", "unset", "keep_tags")
+
+    # v0.32.0 sglang knobs: scoped set->get round-trips for the
+    # validated-tuning families (their parse-gate error contracts run
+    # in phase engines; these prove the accepted-value persistence
+    # path). Combinations that need a topology (cp/cp_size) round-trip
+    # the size knob alone - the strategy knob's solo form is illegal by
+    # design and pinned as a parse-gate cell there.
+    for knob, val in (
+        ("sglang.hicache_write_policy", "write_through"),
+        ("sglang.hicache_io_backend", "kernel"),
+        ("sglang.disagg_bootstrap_port", "9123"),
+        ("sglang.cp_size", "2"),
+    ):
+        cli("config", "set", knob, val)
+        p = cli("config", "get", knob)
+        cov(
+            knob,
+            "behavior: accepted + echoed",
+            f"set {knob} {val!r} -> {p.stdout.strip()[:48]!r}",
+            ok=p.returncode == 0 and val in p.stdout,
+        )
+        cli("config", "unset", knob)
+
+    # cpu_mask quoting hint: bare 0xff parses as a TOML integer (hex
+    # literal), not the string the field takes - the rejected set must
+    # teach the copy-pasteable quoted twin, file unchanged.
+    z = cli("config", "set", "cpu_mask", "0xff")
+    cov(
+        "cpu_mask.quoting_hint",
+        "behavior: bare hex refused + quoted-twin hint",
+        f"rc={z.returncode} stderr={z.stderr.strip()[:110]!r}",
+        ok=z.returncode != 0
+        and 'quote the value: blazar config set cpu_mask "0xff"' in z.stderr,
+    )
 
 
 def phase_gates() -> None:
@@ -15347,6 +16554,15 @@ def main() -> int:
     if os.path.exists(REAL_CONFIG):
         with open(REAL_CONFIG, "rb") as f:
             USER_CONFIG_SHA = hashlib.sha256(f.read()).hexdigest()
+    # Reap sandboxes orphaned by earlier runs BEFORE creating ours (a
+    # failed run's post-mortem is kept until the NEXT run sweeps it; a
+    # SIGKILL'd run is reclaimed once its owner pid is verifiably dead).
+    reaped = sweep_stale_sandboxes()
+    if reaped:
+        print(
+            f"note: swept {reaped} stale blazar-validate-* sandbox(es) from "
+            f"~/.cache (dead owners / recycled pids / >7d TTL)"
+        )
     SANDBOX = Sandbox()
     DAEMON = Daemon(SANDBOX)
     # Lane note (sandbox store now exists): argv-shape phases pin their
@@ -15380,7 +16596,9 @@ def main() -> int:
             failed = any(not c["ok"] for c in CHECKS)
             if failed or CRASHED:
                 print(
-                    f"post-mortem sandbox kept: {SANDBOX.root} (daemon log: {DAEMON.log_path})"
+                    f"post-mortem sandbox kept: {SANDBOX.root} (daemon log: {DAEMON.log_path}) "
+                    f"[auto-swept by the next run's startup sweep: immediately once this "
+                    f"pid exits, at latest after the 7d TTL]"
                 )
             else:
                 SANDBOX.destroy()

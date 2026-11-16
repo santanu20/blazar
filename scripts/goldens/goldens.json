@@ -1,5 +1,5 @@
 {
- "generated": "2026-11-12T12:55:53+00:00",
+ "generated": "2026-11-14T17:13:02+00:00",
  "generator": "python3 scripts/validate.py --update-goldens",
  "items": {
   "api.ps.row": "85e854adbe33de01d0f3a1d22fe5704838764b2d1d6d36ae7710aad857d37371",
@@ -9,7 +9,7 @@
   "completions.fish": "162076acd4830d776be3983ea2162bced42a40fcb9d64604a1bacaa1cff7089e",
   "completions.powershell": "e546cf906dad21beb3da01921a2808c57061d22b47f8f568ef9f399d5d10b3aa",
   "completions.zsh": "06317d333abe0beae959fca1cfc52b9388d365aebe27e912f054cebbfad9cf39",
-  "config.fresh-keys": "bb6aa2580567c67ed5f3d5ba14a5eda26ba9f4b7bdb546debdfb9a5806f79ede",
+  "config.fresh-keys": "1de9cfdda81380ed28ef1533ae47285b0dadce9defd08a65159eb0216935bd20",
   "doctor.check-names": "09558c5146973d50b9a94649b58703c0c17823c114b72607d9241798dfe9d745",
   "header.keys": "b0fe68a7cc7edf348b6478e081eee45c9e4c2575d721611ca3a8933c3acd92fd",
   "header.list": "38e21b93825782cc346589a8545027b614084be10410bd96a01b766fa866e22a",
