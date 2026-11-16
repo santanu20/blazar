@@ -6,6 +6,21 @@ tracked here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **OTLP spans now end at stream completion, not response headers.**
+  The exported request span previously closed when the handler returned
+  its response - for streaming generation that is header time, so a
+  dashboard reading span duration saw time-to-first-byte rather than
+  the request's true lifetime while decode continued in the body. The
+  span is now finished when the last body chunk leaves the gateway
+  (EOF, error, or client disconnect each finish exactly once). The
+  access/audit log line keeps its header-time duration deliberately
+  (nginx convention). **Migration note:** dashboards that treated OTLP
+  span duration as time-to-headers will now see real end-to-end stream
+  durations for streaming routes - longer values are the corrected
+  measurement, not a regression.
+
 ### Security
 
 - **Model-scope and admin-tier enforcement on the information plane.**

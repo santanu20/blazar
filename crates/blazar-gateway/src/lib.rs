@@ -314,14 +314,17 @@ async fn request_log(
             state.audit_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
-    if state.otlp.enabled() {
+    // F-S3 (stream lifecycle): build the span here but do NOT export at
+    // header time - the wrap below closes it when the response STREAM
+    // completes (streaming lanes keep generating past this point).
+    let otlp_span = state.otlp.enabled().then(|| {
         let (trace_hex, span_hex) = otlp::new_ids();
-        state.otlp.record(otlp::OtlpSpan {
+        otlp::OtlpSpan {
             trace_id_hex: trace_hex,
             span_id_hex: span_hex,
             name: format!("{method} {path}"),
             start_unix_nano: span_start_nanos,
-            end_unix_nano: span_start_nanos + ms * 1_000_000,
+            end_unix_nano: 0,
             http_status: status,
             attributes: vec![
                 ("blazar.trace_id".to_string(), trace.clone()),
@@ -333,8 +336,8 @@ async fn request_log(
                     state.queue.depth().to_string(),
                 ),
             ],
-        });
-    }
+        }
+    });
     // F-S4-3: attach the refusing gate's teaching excerpt to the
     // access line so a bare "status=400" is never the only evidence.
     let err_excerpt = error_body_excerpt(&mut resp).await;
@@ -421,6 +424,11 @@ async fn request_log(
             }),
         );
         resp = Response::from_parts(parts, Body::from_stream(finalized));
+    }
+    // F-S3: outermost wrap - the span ends when the last chunk leaves
+    // the gateway (EOF, stream error, or an unconsumed body's Drop).
+    if let Some(span) = otlp_span {
+        resp = otlp::spanned(std::sync::Arc::clone(&state.otlp), span, resp);
     }
     resp
 }

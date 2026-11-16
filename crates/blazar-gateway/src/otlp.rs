@@ -165,6 +165,66 @@ impl Otlp {
     }
 }
 
+/// Stream-completion span state: the span's `end_unix_nano` moves
+/// from response-header time to the moment the last body chunk is
+/// consumed (or the stream errors, or the body is dropped without a
+/// drain - client aborts included). Exactly-once via `Option::take`;
+/// `Drop` is the backstop for bodies nobody reads.
+struct SpanSt {
+    otlp: std::sync::Arc<Otlp>,
+    span: Option<OtlpSpan>,
+    inner: axum::body::BodyDataStream,
+}
+
+impl SpanSt {
+    fn finish(&mut self) {
+        if let Some(mut span) = self.span.take() {
+            span.end_unix_nano = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(span.start_unix_nano, |d| d.as_nanos());
+            self.otlp.record(span);
+        }
+    }
+}
+
+impl Drop for SpanSt {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Wrap `resp` so its OTLP span closes at stream completion instead
+/// of header time: streaming lanes keep generating after the handler
+/// returns, so exporting at header time under-reports their true
+/// duration. Pass-through bytes, zero buffering.
+pub(crate) fn spanned(
+    otlp: std::sync::Arc<Otlp>,
+    span: OtlpSpan,
+    resp: axum::response::Response,
+) -> axum::response::Response {
+    let (parts, body) = resp.into_parts();
+    let st = SpanSt {
+        otlp,
+        span: Some(span),
+        inner: body.into_data_stream(),
+    };
+    let stream = futures::stream::unfold(st, |mut st| async move {
+        use futures::StreamExt;
+        match st.inner.next().await {
+            Some(Ok(bytes)) => Some((Ok(bytes), st)),
+            Some(Err(e)) => {
+                st.finish();
+                Some((Err(std::io::Error::other(e)), st))
+            }
+            None => {
+                st.finish();
+                None
+            }
+        }
+    });
+    axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+
 /// Random 32-hex trace id / 16-hex span id from OS entropy.
 #[must_use]
 pub fn new_ids() -> (String, String) {
@@ -213,6 +273,60 @@ mod tests {
         assert_eq!(sp[0]["spanId"].as_str().unwrap().len(), 16);
         let svc = &v["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"];
         assert_eq!(svc, "blazar");
+    }
+
+    #[tokio::test]
+    async fn unit__spanned__records_exactly_one_span_at_eof() {
+        let cfg = Config {
+            otlp_endpoint: "http://127.0.0.1:9".into(),
+            ..Config::default()
+        };
+        let otlp = std::sync::Arc::new(Otlp::new(&cfg));
+        let mut rx = otlp.rx.lock().expect("otlp rx").take().expect("rx present");
+        let chunks = futures::stream::iter([
+            Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from_static(b"he")),
+            Ok(axum::body::Bytes::from_static(b"llo")),
+        ]);
+        let resp = spanned(
+            std::sync::Arc::clone(&otlp),
+            span(200),
+            axum::response::Response::new(axum::body::Body::from_stream(chunks)),
+        );
+        let drained = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body drains");
+        assert_eq!(&drained[..], b"hello", "bytes pass through untouched");
+        let s = rx.try_recv().expect("span recorded at EOF");
+        assert!(
+            s.end_unix_nano >= s.start_unix_nano,
+            "end moves to completion"
+        );
+        assert_eq!(s.http_status, 200, "status preserved");
+        assert_eq!(s.name, "POST /v1/chat/completions");
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one span - Drop after EOF is a no-op"
+        );
+    }
+
+    #[test]
+    fn unit__spanned__drop_without_consume_still_records() {
+        let cfg = Config {
+            otlp_endpoint: "http://127.0.0.1:9".into(),
+            ..Config::default()
+        };
+        let otlp = std::sync::Arc::new(Otlp::new(&cfg));
+        let mut rx = otlp.rx.lock().expect("otlp rx").take().expect("rx present");
+        // A body that is never polled: only the Drop backstop can close
+        // the span (client-abort shape).
+        let resp = spanned(
+            std::sync::Arc::clone(&otlp),
+            span(500),
+            axum::response::Response::new(axum::body::Body::empty()),
+        );
+        drop(resp);
+        let s = rx.try_recv().expect("drop backstop records the span");
+        assert_eq!(s.http_status, 500);
     }
 
     #[tokio::test]
