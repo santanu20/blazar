@@ -88,6 +88,37 @@ pub fn scope_permits(
     }
 }
 
+/// MCP server-scope predicate: may `key` drive tools of `server`?
+/// Mirrors [`scope_permits`] semantics - an empty `mcp_servers` list
+/// admits every configured server (admin posture), a non-empty list is
+/// an exact/trailing-`*` allowlist. Enforcement happens at both MCP
+/// choke points: tool-catalog injection (unlisted servers' tools never
+/// enter the prompt) and pre-execution (a model-emitted call naming an
+/// unlisted server is refused before transport).
+pub fn mcp_server_permits(
+    keys: &KeysLimiter,
+    key: Option<&KeyCtx>,
+    server: &str,
+) -> Result<(), (u16, String)> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let Some(k) = key else {
+        return Err((401, "missing bearer token".into()));
+    };
+    let Some(entry) = keys.entries().into_iter().find(|e| e.name == k.name) else {
+        return Err((401, "unknown key".into()));
+    };
+    if entry.mcp_servers.is_empty() || entry.mcp_servers.iter().any(|s| scope_matches(s, server)) {
+        Ok(())
+    } else {
+        Err((
+            403,
+            format!("key {:?} is not scoped for mcp server {:?}", k.name, server),
+        ))
+    }
+}
+
 /// BLZ-1 object-level authorization: may `key` see a durable row created
 /// by `owner`? `None` owner rows are pre-scope legacy (or open-gateway)
 /// and stay visible to every caller; a keyless request implies keys are
@@ -904,11 +935,44 @@ mod tests {
         assert_eq!(code, 401);
     }
 
+    /// Per-key MCP server allowlist: empty list = every server (admin
+    /// posture), non-empty = exact/trailing-`*` allowlist; the open
+    /// gateway and missing/unknown keys mirror `scope_permits`.
+    #[test]
+    fn unit__mcp_server_permits__per_key_allowlist_truth_table() {
+        let ctx = |name: &str| KeyCtx {
+            name: name.into(),
+            weight: 1,
+        };
+        let open = KeysLimiter::loaded(None, Vec::new());
+        assert!(super::mcp_server_permits(&open, None, "any").is_ok());
+        let mut tooler = key("tooler", 0, 0, 0, &[]);
+        tooler.mcp_servers = vec!["fs".into(), "web*".into()];
+        let keyed = KeysLimiter::loaded(None, vec![key("admin", 0, 0, 0, &[]), tooler]);
+        // Empty allowlist admits every configured server.
+        assert!(super::mcp_server_permits(&keyed, Some(&ctx("admin")), "anything").is_ok());
+        // Exact and trailing-`*` wildcard matches pass.
+        assert!(super::mcp_server_permits(&keyed, Some(&ctx("tooler")), "fs").is_ok());
+        assert!(super::mcp_server_permits(&keyed, Some(&ctx("tooler")), "web-fetch").is_ok());
+        // Unlisted server: 403 with teaching text.
+        let (code, msg) = super::mcp_server_permits(&keyed, Some(&ctx("tooler")), "shell")
+            .expect_err("unlisted server must be refused");
+        assert_eq!(code, 403);
+        assert!(msg.contains("not scoped"), "{msg}");
+        // Missing and unknown keys fail closed.
+        let (code, _) = super::mcp_server_permits(&keyed, None, "fs").expect_err("no key");
+        assert_eq!(code, 401);
+        let (code, _) = super::mcp_server_permits(&keyed, Some(&ctx("ghost")), "fs")
+            .expect_err("unknown key fails closed");
+        assert_eq!(code, 401);
+    }
+
     fn key(name: &str, rpm: u32, tpm: u64, daily: u64, models: &[&str]) -> ApiKey {
         ApiKey {
             name: name.into(),
             key: format!("plm_{name}"),
             models: models.iter().map(|s| String::from(*s)).collect(),
+            mcp_servers: Vec::new(),
             rpm,
             tpm,
             daily_tokens: daily,

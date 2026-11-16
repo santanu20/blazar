@@ -3264,6 +3264,21 @@ pub struct McpServer {
     /// behavior).
     #[serde(default)]
     pub max_output_bytes: Option<u64>,
+    /// Follow HTTP redirects on the Streamable-HTTP transport. Off by
+    /// default: an MCP endpoint answering 3xx would otherwise silently
+    /// carry the Authorization-adjacent session headers to an arbitrary
+    /// destination an attacker controlling the endpoint chooses. Turn it
+    /// on only when every hop of the redirect chain is trusted.
+    #[serde(default)]
+    pub follow_redirects: bool,
+    /// Validate `tools/call` arguments against the tool's advertised
+    /// `inputSchema` before execution (the JSON-Schema subset the
+    /// gateway understands: type, required, properties, enum, items).
+    /// A positively-detected violation refuses the call; constructs
+    /// outside the subset are passed through untouched. Disable only for
+    /// servers that advertise broken schemas.
+    #[serde(default = "default_true")]
+    pub validate_args: bool,
 }
 
 fn default_mcp_timeout_secs() -> u64 {
@@ -3293,6 +3308,14 @@ pub struct ApiKey {
     /// Model allowlist; empty = all models.
     #[serde(default)]
     pub models: Vec<String>,
+    /// MCP server allowlist; empty = every configured `[[mcp]]` server.
+    /// Entries match exactly or by trailing-`*` prefix (`"fs*"` admits
+    /// `fs-read` and `fs-write`), the same semantics as `models`.
+    /// Model-emitted tool calls naming an unlisted server are refused
+    /// before execution, and unlisted servers' tools are never injected
+    /// into the prompt in the first place.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
     /// Requests per minute cap; 0 = unlimited.
     #[serde(default)]
     pub rpm: u32,
@@ -8987,6 +9010,8 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
             allowed_env: Vec::new(),
             cwd: None,
             max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
         };
         cfg.mcp.push(stdio.clone());
         cfg.validate().expect("stdio-only server is valid");
@@ -9015,6 +9040,8 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
             allowed_env: Vec::new(),
             cwd: None,
             max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
         };
         cfg.mcp[0] = bad.clone();
         assert!(cfg.validate().is_err(), "relative url must be rejected");
@@ -9036,6 +9063,8 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
             allowed_env: vec!["PATH".into()],
             cwd: Some("/".into()),
             max_output_bytes: Some(4096),
+            follow_redirects: false,
+            validate_args: true,
         };
         let mut cfg = Config::default();
         cfg.mcp.push(hardened());
@@ -9094,6 +9123,8 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
             allowed_env: Vec::new(),
             cwd: None,
             max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
         });
         for good in ["all", "none", "fetch"] {
             cfg.mcp_default = Some(good.into());

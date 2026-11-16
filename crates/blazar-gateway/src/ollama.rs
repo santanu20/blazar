@@ -1691,6 +1691,7 @@ pub async fn chat(
                 mcp_sel,
                 voice,
                 key_ext.as_ref().map(|Extension(k)| k.clone()),
+                key_ext.as_ref().map(|Extension(k)| k.clone()),
             )
             .await;
             // keep_alive=0: evict right after this response (complaint #12),
@@ -2199,6 +2200,11 @@ async fn proxy_core_chat(
     mcp_sel: Option<String>,
     voice: Option<String>,
     voice_key: Option<crate::keys::KeyCtx>,
+    // Requester identity for the MCP tool loop's per-key server
+    // allowlist (api_keys.mcp_servers). Distinct from `voice_key`: the
+    // generate lane has no voice tee yet its MCP calls are still
+    // authorization-checked.
+    mcp_key: Option<crate::keys::KeyCtx>,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     // Pre-render recipe lane: the gateway owns the prompt (chatml wrap
@@ -2303,7 +2309,7 @@ async fn proxy_core_chat(
             let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&openai_body) else {
                 return api_error(400, "mcp loop could not parse the translated body");
             };
-            match crate::mcp::chat_via_mcp(state, engine, &mut v, sel).await {
+            match crate::mcp::chat_via_mcp(state, engine, &mut v, sel, mcp_key.as_ref()).await {
                 Ok(child) => Some(child),
                 Err(resp) => return resp,
             }
@@ -3812,6 +3818,7 @@ pub async fn generate(
                 mcp_sel,
                 None, // voice tee is chat-lane only (generate has no reply object)
                 None,
+                key_ext.as_ref().map(|Extension(k)| k.clone()),
             )
             .await;
             // keep_alive=0: evict right after this response (complaint

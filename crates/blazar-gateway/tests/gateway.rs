@@ -1701,6 +1701,7 @@ async fn e2e__keys_scoped_rate_and_accounting() {
         name: "ci".into(),
         key: "plm_scoped".into(),
         models: vec!["m1".into()],
+        mcp_servers: Vec::new(),
         rpm: 2,
         tpm: 0,
         daily_tokens: 0,
@@ -5723,6 +5724,8 @@ async fn e2e__mcp__status_plane_and_stream_guard() {
             allowed_env: Vec::new(),
             cwd: None,
             max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
         }],
         ..Config::default()
     };
@@ -5828,5 +5831,109 @@ async fn e2e__failover_chain__anthropic_lane_local_targets_only() {
         msg.contains("local targets only") && msg.contains("mixed"),
         "teaching names the chain and the lane constraint: {msg}"
     );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Per-key MCP server allowlist: a key scoped to specific servers is
+/// refused (403, pre-spawn) for any other server, while its own
+/// selector engages the server process. Marker files prove the spawn
+/// boundary: the refused leg must leave no marker behind.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__mcp__per_key_server_allowlist_gates_the_tool_loop() {
+    use blazar_core::ApiKey;
+    use blazar_core::config::McpServer;
+
+    let dir = std::env::temp_dir().join("blazar-e2e-mcp-allowlist");
+    std::fs::create_dir_all(&dir).expect("marker dir");
+    let marker = |name: &str| dir.join(format!("{name}.marker"));
+    for name in ["permitted", "secret"] {
+        let _ = std::fs::remove_file(marker(name));
+    }
+    // Both stubs touch a marker then exit: spawn observable, init fails
+    // fast on stdout EOF without a 20s initialize timeout.
+    let stub = |name: &str| {
+        let path = marker(name).to_string_lossy().into_owned();
+        McpServer {
+            name: name.into(),
+            command: vec!["sh".into(), "-c".into(), format!("touch {path}; exit 0")],
+            url: None,
+            env: std::collections::HashMap::new(),
+            timeout_secs: 30,
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
+        }
+    };
+    let cfg = Config {
+        keys: vec![ApiKey {
+            name: "tooluser".into(),
+            key: "plm_tooluser".into(),
+            mcp_servers: vec!["permitted".into()],
+            ..ApiKey::default()
+        }],
+        mcp: vec![stub("permitted"), stub("secret")],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+
+    // Refused leg: selector outside the key's allowlist -> 403 naming
+    // the key and server, and NO process was ever spawned for it.
+    let refused = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_tooluser")
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "secret",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403, "allowlist refusal");
+    let v: serde_json::Value = refused.json().await.unwrap();
+    let msg = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("not scoped for mcp server") && msg.contains("tooluser"),
+        "teaching names key and server: {msg}"
+    );
+    assert!(
+        !marker("secret").exists(),
+        "refused selector must not spawn the server"
+    );
+
+    // Permitted leg: authorization passes, catalog engages the stub
+    // (marker touched), which then fails MCP init fast -> teaching 400.
+    let engaged = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_tooluser")
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "permitted",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(engaged.status(), 400, "init failure teaches, not 5xx");
+    let v: serde_json::Value = engaged.json().await.unwrap();
+    let msg = v.to_string();
+    assert!(
+        msg.contains("permitted"),
+        "failure names the engaged server: {msg}"
+    );
+    assert!(
+        marker("permitted").exists(),
+        "authorized selector engages the server process"
+    );
+
+    for name in ["permitted", "secret"] {
+        let _ = std::fs::remove_file(marker(name));
+    }
     ts.state.sup.shutdown_all().await.unwrap();
 }

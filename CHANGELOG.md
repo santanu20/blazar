@@ -6,6 +6,25 @@ tracked here.
 
 ## [Unreleased]
 
+### Security
+
+- **Per-key MCP server allowlists + redirect refusal + schema-checked
+  tool arguments.** API keys accept an `mcp_servers` list (exact or
+  trailing-`*` patterns, same semantics as `models`; empty = all
+  servers): unlisted servers' tools are never injected into the prompt,
+  a named `mcp` selector outside the allowlist is refused 403 BEFORE
+  the server process spawns, and a model-emitted call naming an
+  unlisted server is refused before any transport fires. HTTP MCP
+  endpoints answering 3xx are reported with a teaching error instead of
+  silently following the redirect (session headers must not travel to
+  an unvetted destination); opt back in per server with
+  `follow_redirects = true`. `tools/call` arguments are validated
+  against the tool's advertised `inputSchema` (type, required,
+  properties, enum, items - positively-detected violations refuse the
+  call, unknown schema keywords pass through) before execution; disable
+  per server with `validate_args = false` for servers that advertise
+  broken schemas.
+
 ### Fixed
 
 - **OTLP spans now end at stream completion, not response headers.**

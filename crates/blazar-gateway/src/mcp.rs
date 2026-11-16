@@ -81,6 +81,11 @@ struct HttpSession {
     /// to BOTH transports (stdio lines and HTTP bodies); unset HTTP
     /// reads still fall back to the built-in ceiling below.
     max_response_bytes: Option<u64>,
+    /// Whether `client` follows redirects (per-server
+    /// `follow_redirects` config). Kept beside the client so a 3xx can
+    /// be reported with teaching rather than a confusing JSON-parse
+    /// failure on the redirect body.
+    follow_redirects: bool,
 }
 
 // Boxed: the stdio Mutex dwarfs HttpSession, and an unboxed enum this
@@ -111,18 +116,37 @@ impl Registry {
             .cloned()
             .map(|cfg| {
                 let transport = match cfg.url.clone() {
-                    Some(endpoint) => Transport::Http(HttpSession {
-                        endpoint,
-                        client: reqwest::Client::new(),
-                        state: tokio::sync::Mutex::new(HttpState {
-                            session_id: None,
-                            protocol_version: None,
-                            next_id: 1,
-                            tools: Vec::new(),
-                            inited: false,
-                        }),
-                        max_response_bytes: cfg.max_output_bytes,
-                    }),
+                    Some(endpoint) => {
+                        // Redirects are refused unless the server entry
+                        // explicitly opts in: a silently-followed 3xx
+                        // re-sends the request (session headers included)
+                        // wherever the endpoint - or an attacker
+                        // controlling it - points.
+                        let redirect = if cfg.follow_redirects {
+                            reqwest::redirect::Policy::default()
+                        } else {
+                            reqwest::redirect::Policy::none()
+                        };
+                        let client = reqwest::Client::builder()
+                            .redirect(redirect)
+                            .build()
+                            .unwrap_or_else(|e| {
+                                panic!("mcp server '{}' http client: {e}", cfg.name)
+                            });
+                        Transport::Http(HttpSession {
+                            endpoint,
+                            client,
+                            state: tokio::sync::Mutex::new(HttpState {
+                                session_id: None,
+                                protocol_version: None,
+                                next_id: 1,
+                                tools: Vec::new(),
+                                inited: false,
+                            }),
+                            max_response_bytes: cfg.max_output_bytes,
+                            follow_redirects: cfg.follow_redirects,
+                        })
+                    }
                     None => Transport::Stdio(Box::new(tokio::sync::Mutex::new(None))),
                 };
                 (cfg.name.clone(), Arc::new(Entry { cfg, transport }))
@@ -248,6 +272,22 @@ impl Registry {
                             format!("mcp server '{server}' failed to restart: {e}")
                         })?);
                 }
+                // Schema gate (cfg.validate_args): refuse calls that
+                // violate the tool's advertised inputSchema BEFORE the
+                // child sees them. Tools without a schema pass - there
+                // is nothing to check against.
+                if entry.cfg.validate_args
+                    && let Some(def) = guard
+                        .as_ref()
+                        .expect("just spawned")
+                        .tools
+                        .iter()
+                        .find(|t| t.name == tool)
+                {
+                    validate_args_subset(&def.input_schema, args).map_err(|e| {
+                        format!("mcp server '{server}' tool '{tool}' rejected arguments: {e}")
+                    })?;
+                }
                 let timeout = std::time::Duration::from_secs(entry.cfg.timeout_secs);
                 let call = async {
                     let session = guard.as_mut().expect("just spawned");
@@ -282,6 +322,16 @@ impl Registry {
                     if !st.inited {
                         *st = http_init(&entry.cfg, h).await.map_err(|e| {
                             format!("mcp server '{server}' failed to initialize: {e}")
+                        })?;
+                    }
+                    // Schema gate (cfg.validate_args) - same contract as
+                    // the stdio branch, checked against the session's
+                    // advertised tool list before the RPC fires.
+                    if entry.cfg.validate_args
+                        && let Some(def) = st.tools.iter().find(|t| t.name == tool)
+                    {
+                        validate_args_subset(&def.input_schema, args).map_err(|e| {
+                            format!("mcp server '{server}' tool '{tool}' rejected arguments: {e}")
                         })?;
                     }
                     let id = st.next_id;
@@ -707,6 +757,21 @@ async fn http_rpc(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let status = resp.status();
+    if status.is_redirection() && !hs.follow_redirects {
+        // A refused redirect must read as a policy decision, not a
+        // downstream JSON parse failure on the redirect body.
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<no location header>")
+            .to_string();
+        return Err(format!(
+            "http {method}: endpoint answered {status} -> {location}; \
+             redirects are not followed unless the server entry sets \
+             follow_redirects = true (only when every hop is trusted)"
+        ));
+    }
     if !status.is_success() {
         // Capped read: even the failure excerpt must not become an
         // unbounded buffer on a hostile error page.
@@ -1050,6 +1115,114 @@ fn teaching_error(status: StatusCode, msg: &str) -> Response {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+// ---------------------------------------------------------------------------
+// argument schema validation
+// ---------------------------------------------------------------------------
+
+/// Validate `tools/call` arguments against the JSON-Schema subset the
+/// gateway interprets: `type` (incl. type arrays like
+/// `["string","null"]`), `required`, `properties`, `enum` and `items`.
+/// Keywords outside the subset (`$ref`, `pattern`, `allOf`, ...) are
+/// deliberately NOT enforced - refusing what we do not understand would
+/// lock out well-behaved tools whose schemas merely use richer
+/// vocabulary. Only a positively-detected violation refuses the call.
+fn validate_args_subset(schema: &Value, args: &Value) -> Result<(), String> {
+    if !schema.is_object() {
+        return Ok(()); // nothing interpretable to check against
+    }
+    let Some(obj) = args.as_object() else {
+        return Err(format!("must be a JSON object, got {}", json_kind(args)));
+    };
+    validate_object(schema, obj)
+}
+
+fn validate_object(schema: &Value, args: &serde_json::Map<String, Value>) -> Result<(), String> {
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for r in required {
+            if let Some(name) = r.as_str()
+                && !args.contains_key(name)
+            {
+                return Err(format!("missing required argument {name:?}"));
+            }
+        }
+    }
+    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        for (name, sub) in props {
+            if let Some(v) = args.get(name) {
+                validate_value(sub, v).map_err(|e| format!("{name}: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_value(schema: &Value, v: &Value) -> Result<(), String> {
+    let Some(obj) = schema.as_object() else {
+        return Ok(());
+    };
+    if let Some(enm) = obj.get("enum").and_then(Value::as_array)
+        && !enm.contains(v)
+    {
+        return Err(format!("value {v} is not one of the allowed enum entries"));
+    }
+    if let Some(ty) = obj.get("type") {
+        let ok = match ty {
+            Value::String(t) => value_matches_type(t, v),
+            // ["string","null"]-style unions: any listed type may match.
+            Value::Array(list) => list
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|t| value_matches_type(t, v)),
+            _ => true, // non-string type keyword: not ours to enforce
+        };
+        if !ok {
+            return Err(format!("expected type {ty}, got {}", json_kind(v)));
+        }
+    }
+    if let Some(a) = v.as_array()
+        && let Some(items) = obj.get("items")
+    {
+        for (i, e) in a.iter().enumerate() {
+            validate_value(items, e).map_err(|e| format!("[{i}]: {e}"))?;
+        }
+    }
+    if let Some(child_args) = v.as_object() {
+        let nested = Value::Object(obj.clone());
+        validate_object(&nested, child_args)?;
+    }
+    Ok(())
+}
+
+fn value_matches_type(t: &str, v: &Value) -> bool {
+    match t {
+        "string" => v.is_string(),
+        "number" => v.is_number(),
+        // JSON Schema "integer" also matches whole-value floats (5.0).
+        "integer" => {
+            v.as_i64().is_some()
+                || v.as_u64().is_some()
+                || v.as_f64().is_some_and(|f| f.fract() == 0.0)
+        }
+        "boolean" => v.is_boolean(),
+        "object" => v.is_object(),
+        "array" => v.is_array(),
+        "null" => v.is_null(),
+        _ => true, // unknown type keyword: not ours to enforce
+    }
+}
+
+/// Human-facing JSON type name for error text.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 /// Gateway-mediated chat loop: inject catalog tools, drive tool rounds
 /// through `child_send`, return the final child response (rebuilt with
 /// the receipt header). `openai_body` must be the OpenAI-dialect chat
@@ -1060,16 +1233,44 @@ pub(crate) async fn chat_via_mcp(
     engine: &EngineRef,
     openai_body: &mut Value,
     sel: &str,
+    key: Option<&crate::keys::KeyCtx>,
 ) -> Result<reqwest::Response, Response> {
+    // Authorization precedes spawning: a named selector the key has no
+    // rights to must refuse BEFORE catalog() spawns or initializes the
+    // server - the caller never pays (or triggers) the subprocess cost.
+    if sel != "all"
+        && let Err((code, msg)) = crate::keys::mcp_server_permits(&state.keys, key, sel)
+    {
+        return Err(teaching_error(
+            StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
+            &msg,
+        ));
+    }
     let tools = state
         .mcp
         .catalog(sel)
         .await
         .map_err(|e| teaching_error(StatusCode::BAD_REQUEST, &e))?;
+    // Key-scoped servers never reach the prompt: their tool definitions
+    // are dropped before injection, so the model cannot even name them.
+    let resolved = tools.len();
+    let mut tools = tools;
+    tools.retain(|t| crate::keys::mcp_server_permits(&state.keys, key, &t.server).is_ok());
     if tools.is_empty() {
+        if resolved == 0 {
+            return Err(teaching_error(
+                StatusCode::BAD_REQUEST,
+                "mcp selection exposes no tools",
+            ));
+        }
+        let names = state.mcp.configured_names().join(", ");
         return Err(teaching_error(
-            StatusCode::BAD_REQUEST,
-            "mcp selection exposes no tools",
+            StatusCode::FORBIDDEN,
+            &format!(
+                "mcp selection resolved {resolved} tool(s) but this key is not scoped \
+                 for any of their servers; configured servers: [{names}]; widen the \
+                 key's mcp_servers allowlist or clear the mcp selector"
+            ),
         ));
     }
     // Merge with caller-provided tools (namespace prevents collisions).
@@ -1185,7 +1386,21 @@ pub(crate) async fn chat_via_mcp(
                         }
                     };
                     let t0 = std::time::Instant::now();
-                    let res = state.mcp.execute(&server, &tool, &args).await;
+                    let res = match crate::keys::mcp_server_permits(&state.keys, key, &server) {
+                        // Defense in depth: definitions were filtered at
+                        // injection, but the model can still EMIT any
+                        // tool name - an unlisted server is refused
+                        // before any transport fires.
+                        Err((_code, why)) => {
+                            tracing::warn!(
+                                target: "blazar::mcp",
+                                server = %server, tool = %tool,
+                                "tool call refused: server not in the key's mcp allowlist"
+                            );
+                            Err(why)
+                        }
+                        Ok(()) => state.mcp.execute(&server, &tool, &args).await,
+                    };
                     tracing::info!(
                         target: "blazar::mcp",
                         server = %server, tool = %tool,
@@ -1277,6 +1492,75 @@ pub async fn mcp_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__validate_args_subset__positive_violations_refuse() {
+        let schema = json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": {"type": "string"},
+                "mode": {"enum": ["read", "write"]},
+                "limit": {"type": "integer"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            }
+        });
+        // Missing required argument.
+        let err = validate_args_subset(&schema, &json!({"mode": "read"}))
+            .expect_err("missing required must refuse");
+        assert!(err.contains("missing required"), "{err}");
+        // Type mismatch.
+        assert!(validate_args_subset(&schema, &json!({"path": 7})).is_err());
+        // Enum violation.
+        assert!(validate_args_subset(&schema, &json!({"path": "/x", "mode": "exec"})).is_err());
+        // Non-whole float fails integer; whole float (5.0) passes it.
+        assert!(validate_args_subset(&schema, &json!({"path": "/x", "limit": 1.5})).is_err());
+        // Item type violation recurses through `items`.
+        assert!(validate_args_subset(&schema, &json!({"path": "/x", "tags": [1]})).is_err());
+        // A fully valid call passes untouched.
+        assert!(
+            validate_args_subset(
+                &schema,
+                &json!({"path": "/x", "mode": "write", "limit": 5.0, "tags": ["a"]})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__validate_args_subset__unknown_keywords_fail_open() {
+        // Schemas using vocabulary outside the interpreted subset must
+        // not lock the tool out: nothing is positively violated, so the
+        // call passes even though pattern/minLength are not checked.
+        let rich = json!({
+            "$ref": "#/definitions/thing",
+            "patternProperties": {"^x-": {}},
+            "minLength": 3,
+            "properties": {"note": {"type": "string", "pattern": "^A"}}
+        });
+        assert!(validate_args_subset(&rich, &json!({"note": "nope"})).is_ok());
+        // An interpretable violation beside unknown keywords still
+        // refuses: fail-open applies to vocabulary, never to detected
+        // violations.
+        let mixed = json!({"properties": {"note": {"type": "string", "pattern": "^A"}}});
+        assert!(validate_args_subset(&mixed, &json!({"note": 3})).is_err());
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__validate_args_subset__union_types_and_non_object_args() {
+        let union = json!({"type": "object", "properties": {"name": {"type": ["string", "null"]}}});
+        assert!(validate_args_subset(&union, &json!({"name": null})).is_ok());
+        assert!(validate_args_subset(&union, &json!({"name": "x"})).is_ok());
+        assert!(validate_args_subset(&union, &json!({"name": 4})).is_err());
+        // Top-level args must be an object per the tools/call contract.
+        let obj = json!({"type": "object", "properties": {}});
+        assert!(validate_args_subset(&obj, &json!([1, 2])).is_err());
+        // Non-object schema: nothing interpretable to check, passes.
+        assert!(validate_args_subset(&json!("freeform"), &json!([1])).is_ok());
+    }
 
     #[allow(non_snake_case)]
     #[tokio::test]
@@ -1375,6 +1659,8 @@ mod tests {
             allowed_env: vec!["PATH".into()],
             cwd: Some(dir.to_string_lossy().into_owned()),
             max_output_bytes: Some(65536),
+            follow_redirects: false,
+            validate_args: true,
         };
         let Err(err) = spawn_session(&cfg).await else {
             panic!("probe child exits immediately; init must fail")
@@ -1644,6 +1930,7 @@ mod tests {
                 inited: false,
             }),
             max_response_bytes: None,
+            follow_redirects: false,
         };
         let (result, sid) = http_rpc(
             &hs,

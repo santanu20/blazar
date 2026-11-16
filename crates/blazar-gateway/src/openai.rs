@@ -1118,7 +1118,9 @@ pub async fn openai_proxy(
                 );
             }
             v["stream"] = serde_json::Value::Bool(false);
-            return match crate::mcp::chat_via_mcp(&state, &engine, v, &sel).await {
+            return match crate::mcp::chat_via_mcp(&state, &engine, v, &sel, key_ext.as_deref())
+                .await
+            {
                 Ok(child) => {
                     let status = axum::http::StatusCode::from_u16(child.status().as_u16())
                         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);

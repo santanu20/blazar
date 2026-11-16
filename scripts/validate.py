@@ -2749,10 +2749,12 @@ APIKEY_FIELDS = [
     "name",
     "key",
     "models",
+    "mcp_servers",
     "rpm",
     "tpm",
     "daily_tokens",
     "max_concurrent",
+    "weight",
 ]
 REMOTE_FIELDS = ["name", "url", "key"]
 

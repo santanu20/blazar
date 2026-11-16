@@ -989,6 +989,7 @@ async fn keys_list(
         .into_response()
 }
 
+#[allow(clippy::too_many_lines)] // one cohesive teaching-400 parser; splitting scatters the 400 contract
 async fn keys_add(
     State(state): State<Arc<AppState>>,
     key: Option<Extension<keys::KeyCtx>>,
@@ -1033,6 +1034,26 @@ async fn keys_add(
                 .collect()
         })
         .unwrap_or_default();
+    // MCP server allowlist: same parse as `models` (string array);
+    // absent = every configured server. Duplicates and empty strings
+    // are dropped so the persisted entry stays canonical.
+    let mcp_servers: Vec<String> = body
+        .get("mcp_servers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mcp_servers_nonstring = body.get("mcp_servers").is_some_and(|v| {
+        v.as_array()
+            .is_none_or(|a| a.iter().any(|s| !s.is_string()))
+    });
+    if mcp_servers_nonstring {
+        return error_response(400, "mcp_servers must be an array of server-name strings");
+    }
     #[allow(clippy::result_large_err)]
     let num = |field: &str, default: u64| -> Result<u64, Response> {
         match body.get(field) {
@@ -1063,6 +1084,7 @@ async fn keys_add(
         key: format!("plm_{}", rand_secret()),
         name,
         models,
+        mcp_servers,
         rpm: u32::try_from(rpm).unwrap_or(u32::MAX),
         tpm,
         daily_tokens,
