@@ -256,6 +256,13 @@ pub struct AppState {
     pub remote_capacity: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, crate::remotes::PeerCapacity>>,
     >,
+    /// Model-pool hysteresis: each `adaptive` pool's last pick (member
+    /// effective string + instant), consumed by [`crate::pools::pick`]
+    /// to keep a healthy near-best member sticky inside its window.
+    /// Keyed by pool name; written only on the request path (`expand`).
+    pub pools_sticky: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::pools::StickyPick>>,
+    >,
     /// E4 audit: line sender (`None` = audit off; no request-path tax
     /// when disabled). Dropped-line counter is shared with the writer.
     pub audit_tx: Option<tokio::sync::mpsc::Sender<crate::audit::AuditLine>>,
@@ -478,6 +485,7 @@ impl AppState {
             remote_affinity: std::sync::Arc::default(),
             remote_presence: std::sync::Arc::default(),
             remote_capacity: std::sync::Arc::default(),
+            pools_sticky: std::sync::Arc::default(),
             audit_tx,
             audit_dropped,
             store: std::sync::Mutex::new(store),

@@ -28,6 +28,34 @@ use crate::state::AppState;
 /// declaration order decides.
 const LOCAL_TTFT_DEFAULT_MS: f64 = remotes::REMOTE_TTFT_DEFAULT_MS;
 
+/// Declared service-time estimate (milliseconds) for members with no
+/// measured EWMA yet - local members (no per-model local service lane
+/// exists today) and peers that have not cleanly drained a stream.
+/// Keeping it equal to the wait default makes an unmeasured member's
+/// `adaptive` total collapse to `wait + default`, which preserves
+/// today's ordering posture; the honest gap (local service is never
+/// measured) is documented in the strategy table.
+const SERVICE_DEFAULT_MS: u64 = remotes::REMOTE_TTFT_DEFAULT_MS as u64;
+
+/// How long a sticky `adaptive` pick stays authoritative before the
+/// strategy reconsiders from scratch (anti-thrash window).
+const POOL_STICKY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A challenger must beat the sticky pick's expected completion by more
+/// than this fraction to take over (anti-oscillation margin).
+const POOL_STICKY_MARGIN: f64 = 0.10;
+
+/// The last `adaptive` decision for one pool, consumed as hysteresis:
+/// a healthy sticky member within the margin of the best estimate is
+/// retained so bursty load cannot flip-flop members request to request.
+#[derive(Debug, Clone)]
+pub struct StickyPick {
+    /// The member's effective routing string (unique per member).
+    pub effective: String,
+    /// When this pick was made (`expand`, the request path).
+    pub at: Instant,
+}
+
 /// A member with its synthesized score and effective routing string.
 #[derive(Debug, Clone)]
 pub(crate) struct MemberScore {
@@ -37,6 +65,15 @@ pub(crate) struct MemberScore {
     pub effective: String,
     /// Same ingredients and priority as remote peer ranking.
     pub score: PeerScore,
+    /// Expected service time (milliseconds): the peer's measured
+    /// `service_ewma_ms` when one exists, the declared default
+    /// otherwise. `adaptive` adds it to `est_wait_ms` to estimate
+    /// completion; every other strategy ignores it.
+    pub service_ms: u64,
+    /// True when `service_ms` came from a measured EWMA - drives the
+    /// no-signal parity contract (`adaptive` equals `warm_first` until
+    /// at least one member carries a real service measurement).
+    pub measured: bool,
     /// True when the member's peer is currently marked down (skipped
     /// by `ordered`; score-aware strategies already rank it last via
     /// the unknown/cold tier plus its stale signals).
@@ -99,6 +136,8 @@ pub(crate) fn score_members_core(
                         est_wait_ms: (waves as f64 * LOCAL_TTFT_DEFAULT_MS).ceil() as u64,
                         free_vram: std::cmp::Reverse(0),
                     },
+                    service_ms: SERVICE_DEFAULT_MS,
+                    measured: false,
                     down: false,
                 }
             } else {
@@ -111,10 +150,16 @@ pub(crate) fn score_members_core(
                 let h = healths.get(&hkey).copied().unwrap_or_default();
                 let cap = caps.get(&hkey);
                 let down = h.down_until.is_some_and(|t| now < t);
+                let (service_ms, measured) = match h.service_ewma_ms {
+                    Some(ewma) => (ewma.ceil() as u64, true),
+                    None => (SERVICE_DEFAULT_MS, false),
+                };
                 MemberScore {
                     idx,
                     effective: format!("{}:{}", remote.name, member.model),
                     score: remotes::score_peer(&member.model, &h, cap),
+                    service_ms,
+                    measured,
                     down,
                 }
             }
@@ -153,17 +198,59 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
 /// member is down and no other member exists, the least-bad member is
 /// still returned so the request surfaces the peer's real error
 /// instead of a confusing not-found on the pool name.
-pub(crate) fn pick<'a>(pool: &ModelPool, members: &'a [MemberScore]) -> Option<&'a MemberScore> {
+///
+/// `sticky` is the pool's last adaptive pick (hysteresis): a healthy
+/// member within [`POOL_STICKY_MARGIN`] of the best expected
+/// completion and inside [`POOL_STICKY_WINDOW`] is retained. Other
+/// strategies ignore it.
+pub(crate) fn pick<'a>(
+    pool: &ModelPool,
+    members: &'a [MemberScore],
+    sticky: Option<&StickyPick>,
+) -> Option<&'a MemberScore> {
     match pool.strategy {
         // Failover posture: first member whose peer is not marked
         // down. The local member is always eligible.
         PoolStrategy::Ordered => members.iter().find(|m| !m.down),
         PoolStrategy::LeastWait => members.iter().min_by_key(|m| (m.score.est_wait_ms, m.idx)),
-        // With today's signals adaptive equals warm-first: tier, then
-        // wait, then VRAM - `PeerScore`'s derived `Ord`. Per-member
-        // service-time EWMA splits them in P2.
-        PoolStrategy::WarmFirst | PoolStrategy::Adaptive => {
-            members.iter().min_by_key(|m| (m.score, m.idx))
+        PoolStrategy::WarmFirst => members.iter().min_by_key(|m| (m.score, m.idx)),
+        // Least expected completion: wait + service time, warm tier as
+        // the tie-break. Until at least one member carries a measured
+        // service EWMA the service term is the declared default for
+        // everyone and the completion order collapses onto the
+        // warm-first order (documented parity, pinned by test).
+        PoolStrategy::Adaptive => {
+            if !members.iter().any(|m| m.measured) {
+                return members.iter().min_by_key(|m| (m.score, m.idx));
+            }
+            let best_total = members
+                .iter()
+                .filter(|m| !m.down)
+                .map(|m| m.score.est_wait_ms.saturating_add(m.service_ms))
+                .min()?;
+            let best = members.iter().filter(|m| !m.down).min_by_key(|m| {
+                let total = m.score.est_wait_ms.saturating_add(m.service_ms);
+                (total, m.score.tier, m.idx)
+            })?;
+            // Hysteresis: keep the previous pick when it is still
+            // healthy, fresh, and within the margin of the best
+            // estimate - small estimate noise must not reshuffle
+            // members (and KV caches) request to request.
+            if let Some(s) = sticky
+                && s.at.elapsed() < POOL_STICKY_WINDOW
+            {
+                if let Some(current) = members
+                    .iter()
+                    .find(|m| m.effective == s.effective && !m.down)
+                {
+                    let total = current.score.est_wait_ms.saturating_add(current.service_ms);
+                    let threshold = (best_total as f64 * (1.0 + POOL_STICKY_MARGIN)).ceil() as u64;
+                    if total <= threshold {
+                        return Some(current);
+                    }
+                }
+            }
+            Some(best)
         }
     }
     .or_else(|| members.first())
@@ -171,12 +258,30 @@ pub(crate) fn pick<'a>(pool: &ModelPool, members: &'a [MemberScore]) -> Option<&
 
 /// Resolve a requested model through pools: `Some(effective)` when the
 /// name addresses a pool and a member is selectable, `None` when the
-/// name is not a pool (the untouched legacy path).
+/// name is not a pool (the untouched legacy path). Adaptive pools also
+/// record their pick as hysteresis state for the next request.
 pub fn expand(state: &AppState, requested: &str) -> Option<String> {
     let cfg = state.cfg();
     let pool = find(&cfg, requested)?;
     let members = score_members(state, pool);
-    pick(pool, &members).map(|m| m.effective.clone())
+    let sticky = state
+        .pools_sticky
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&pool.name).cloned());
+    let picked = pick(pool, &members, sticky.as_ref())?;
+    if pool.strategy == PoolStrategy::Adaptive {
+        if let Ok(mut m) = state.pools_sticky.lock() {
+            m.insert(
+                pool.name.clone(),
+                StickyPick {
+                    effective: picked.effective.clone(),
+                    at: Instant::now(),
+                },
+            );
+        }
+    }
+    Some(picked.effective.clone())
 }
 
 /// [`expand`] plus the request-body rewrite: the forwarded body must
@@ -197,7 +302,14 @@ pub fn expand_request(state: &AppState, requested: &str, body: &Bytes) -> Option
 /// renders pools without a new client path.
 pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
     let members = score_members(state, pool);
-    let chosen = pick(pool, &members);
+    // Introspection reads (never writes) the sticky state so the
+    // reported decision matches what the request path would do.
+    let sticky = state
+        .pools_sticky
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&pool.name).cloned());
+    let chosen = pick(pool, &members, sticky.as_ref());
     let member_lines: Vec<serde_json::Value> = members
         .iter()
         .map(|m| {
@@ -207,25 +319,33 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                 "effective": m.effective,
                 "tier": crate::federation::tier_name(m.score.tier),
                 "est_wait_ms": m.score.est_wait_ms,
+                "service_ms": m.service_ms,
+                "service_measured": m.measured,
                 "free_vram": m.score.free_vram.0,
                 "down": m.down,
             })
         })
         .collect();
     let decision = match chosen {
-        Some(m) => serde_json::json!({
-            "target": m.effective,
-            "member": format!("{}:{}", pool.members[m.idx].peer, pool.members[m.idx].model),
-            "strategy": format!("{:?}", pool.strategy),
-            "reason": format!(
-                "pool '{}' picked member {} under {:?} (tier {}, est wait {} ms)",
-                pool.name,
-                m.effective,
-                pool.strategy,
-                crate::federation::tier_name(m.score.tier),
-                m.score.est_wait_ms
-            ),
-        }),
+        Some(m) => {
+            let sticky_held = sticky
+                .is_some_and(|s| s.at.elapsed() < POOL_STICKY_WINDOW && s.effective == m.effective);
+            serde_json::json!({
+                "target": m.effective,
+                "member": format!("{}:{}", pool.members[m.idx].peer, pool.members[m.idx].model),
+                "strategy": format!("{:?}", pool.strategy),
+                "reason": format!(
+                    "pool '{}' picked member {} under {:?} (tier {}, est wait {} ms, service {} ms{})",
+                    pool.name,
+                    m.effective,
+                    pool.strategy,
+                    crate::federation::tier_name(m.score.tier),
+                    m.score.est_wait_ms,
+                    m.service_ms,
+                    if sticky_held { ", sticky" } else { "" }
+                ),
+            })
+        }
         None => serde_json::json!({
             "target": "none",
             "reason": format!("pool '{}' has no members", pool.name),
@@ -292,7 +412,26 @@ mod tests {
                 est_wait_ms: wait,
                 free_vram: std::cmp::Reverse(vram),
             },
+            service_ms: SERVICE_DEFAULT_MS,
+            measured: false,
             down,
+        }
+    }
+
+    /// Same as [`scored`] but with an explicit service-time estimate
+    /// (the `adaptive` signal): `measured = true` marks a real EWMA.
+    fn scored_service(
+        idx: usize,
+        effective: &str,
+        tier: u8,
+        wait: u64,
+        service: u64,
+        measured: bool,
+    ) -> MemberScore {
+        MemberScore {
+            service_ms: service,
+            measured,
+            ..scored(idx, effective, tier, wait, 0, false)
         }
     }
 
@@ -330,14 +469,14 @@ mod tests {
             scored(0, "m1", 0, 900, 0, false),
             scored(1, "far:m1", 0, 10, 0, true),
         ];
-        let picked = pick(&p, &members).expect("local member eligible");
+        let picked = pick(&p, &members, None).expect("local member eligible");
         assert_eq!(picked.idx, 0);
 
         let members = vec![
             scored(0, "far:m1", 0, 10, 0, true),
             scored(1, "m1", 0, 900, 0, false),
         ];
-        let picked = pick(&p, &members).expect("second member eligible");
+        let picked = pick(&p, &members, None).expect("second member eligible");
         assert_eq!(picked.idx, 1);
     }
 
@@ -347,7 +486,7 @@ mod tests {
     fn unit__pick__all_down_returns_least_bad_member() {
         let p = pool(PoolStrategy::Ordered);
         let members = vec![scored(0, "far:m1", 0, 10, 0, true)];
-        let picked = pick(&p, &members).expect("degenerate pool still picks");
+        let picked = pick(&p, &members, None).expect("degenerate pool still picks");
         assert_eq!(picked.effective, "far:m1");
     }
 
@@ -360,7 +499,7 @@ mod tests {
             scored(0, "m1", 0, 1500, 0, false),
             scored(1, "far:m1", 2, 100, 0, false),
         ];
-        let picked = pick(&p, &members).expect("two members");
+        let picked = pick(&p, &members, None).expect("two members");
         assert_eq!(picked.idx, 1, "cold peer with the smaller wait must win");
     }
 
@@ -373,31 +512,128 @@ mod tests {
             scored(0, "far:m1", 2, 10, 9999, false),
             scored(1, "m1", 0, 800, 0, false),
         ];
-        let picked = pick(&p, &members).expect("two members");
+        let picked = pick(&p, &members, None).expect("two members");
         assert_eq!(picked.idx, 1, "warm member wins despite larger wait");
 
         let members = vec![
             scored(0, "m1", 0, 750, 5, false),
             scored(1, "far:m1", 0, 750, 5, false),
         ];
-        let picked = pick(&p, &members).expect("two members");
+        let picked = pick(&p, &members, None).expect("two members");
         assert_eq!(picked.idx, 0, "full tie breaks to declaration order");
     }
 
-    /// Adaptive is `WarmFirst` under today's signals (P2 splits them).
+    /// Adaptive without any measured service signal equals warm-first:
+    /// the service term is the declared default for every member, so
+    /// the completion order collapses onto the tier-first order
+    /// (graceful degradation, pinned).
     #[test]
-    fn unit__pick__adaptive_matches_warm_first_today() {
+    fn unit__pick__adaptive_equals_warm_first_without_service_signals() {
         let members = vec![
             scored(0, "far:m1", 1, 100, 0, false),
             scored(1, "m1", 2, 50, 0, false),
         ];
-        let warm = pick(&pool(PoolStrategy::WarmFirst), &members);
-        let adaptive = pick(&pool(PoolStrategy::Adaptive), &members);
+        let warm = pick(&pool(PoolStrategy::WarmFirst), &members, None);
+        let adaptive = pick(&pool(PoolStrategy::Adaptive), &members, None);
         assert_eq!(
             warm.map(|m| m.idx),
             adaptive.map(|m| m.idx),
-            "adaptive must degrade to warm-first until service-time telemetry lands"
+            "no measured signal: adaptive must degrade to warm-first order"
         );
+    }
+
+    /// With a measured service EWMA, adaptive diverges from warm-first:
+    /// expected completion (wait + service) outranks the warm tier.
+    #[test]
+    fn unit__pick__adaptive_diverges_from_warm_first_with_service_signal() {
+        // Warm local: wait 800, unmeasured service default 750.
+        // Cold remote: wait 100, MEASURED service 200 -> total 300.
+        let members = vec![
+            scored_service(0, "m1", 0, 800, SERVICE_DEFAULT_MS, false),
+            scored_service(1, "far:m1", 2, 100, 200, true),
+        ];
+        let warm = pick(&pool(PoolStrategy::WarmFirst), &members, None);
+        let adaptive = pick(&pool(PoolStrategy::Adaptive), &members, None);
+        assert_eq!(
+            warm.unwrap().idx,
+            0,
+            "warm-first still prefers the warm tier"
+        );
+        assert_eq!(
+            adaptive.unwrap().idx,
+            1,
+            "adaptive picks least expected completion despite the cold tier"
+        );
+    }
+
+    /// Hysteresis: a fresh, healthy sticky pick within the margin of
+    /// the best estimate is retained - small estimate noise must not
+    /// reshuffle members request to request.
+    #[test]
+    fn unit__pick__adaptive_sticky_member_retained_within_margin() {
+        // Best: total 1000 (wait 900 + service 100). Sticky member idx 0:
+        // total 1050 <= 1000 * 1.10 = 1100 -> retained.
+        let members = vec![
+            scored_service(0, "m1", 0, 950, 100, true),
+            scored_service(1, "far:m1", 0, 900, 100, true),
+        ];
+        let sticky = StickyPick {
+            effective: "m1".into(),
+            at: Instant::now(),
+        };
+        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&sticky)).unwrap();
+        assert_eq!(picked.idx, 0, "sticky member within 10% margin is kept");
+
+        // Challenger is >10% better (best 1000, sticky total 1200):
+        // the sticky hold releases and the challenger wins.
+        let members = vec![
+            scored_service(0, "m1", 0, 1100, 100, true),
+            scored_service(1, "far:m1", 0, 900, 100, true),
+        ];
+        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&sticky)).unwrap();
+        assert_eq!(picked.idx, 1, "materially better challenger takes over");
+    }
+
+    /// Hysteresis expiry: a stale sticky pick (outside the window) and
+    /// a sticky pick whose member went down are both ignored.
+    #[test]
+    fn unit__pick__adaptive_sticky_ignored_when_stale_or_down() {
+        // Stale: `at` older than the window -> pure best estimate wins.
+        let members = vec![
+            scored_service(0, "m1", 0, 950, 100, true),
+            scored_service(1, "far:m1", 0, 900, 100, true),
+        ];
+        let stale = StickyPick {
+            effective: "m1".into(),
+            at: Instant::now() - POOL_STICKY_WINDOW - std::time::Duration::from_secs(1),
+        };
+        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&stale)).unwrap();
+        assert_eq!(
+            picked.idx, 1,
+            "expired sticky pick loses to the best estimate"
+        );
+
+        // Down: sticky member's peer is marked down -> skipped even
+        // though it is fresh and would be within margin.
+        let members = vec![
+            scored_service(0, "m1", 0, 900, 100, true),
+            scored_service(1, "far:m1", 0, 900, 100, true),
+        ];
+        let members: Vec<MemberScore> = members
+            .into_iter()
+            .map(|mut m| {
+                if m.effective == "m1" {
+                    m.down = true;
+                }
+                m
+            })
+            .collect();
+        let sticky = StickyPick {
+            effective: "m1".into(),
+            at: Instant::now(),
+        };
+        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&sticky)).unwrap();
+        assert_eq!(picked.idx, 1, "down sticky member is never retained");
     }
 
     fn resident_ps_row(model: &str, in_flight: i64) -> PsRow {
@@ -441,6 +677,7 @@ mod tests {
                 down_until: None,
                 in_flight: 2,
                 ttft_ewma_ms: Some(250.0),
+                service_ewma_ms: None,
             },
         );
         let mut caps = HashMap::new();
@@ -529,6 +766,7 @@ mod tests {
                 down_until: Some(Instant::now() + std::time::Duration::from_secs(30)),
                 in_flight: 0,
                 ttft_ewma_ms: None,
+                service_ewma_ms: None,
             },
         );
         let members = score_members_core(

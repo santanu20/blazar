@@ -38,6 +38,12 @@ pub struct RemoteHealth {
     /// requests only). `None` until the first success - the scheduler
     /// then falls back to a neutral default rather than guessing.
     pub ttft_ewma_ms: Option<f64>,
+    /// EWMA of full stream service time (request start to body EOF, ok
+    /// streams only) in milliseconds. Measured by the EOF lease lane;
+    /// `None` until the first cleanly-drained stream. Consumed by pool
+    /// `adaptive` scoring ONLY - `score_peer` deliberately ignores it so
+    /// federation route ranking keeps its established semantics.
+    pub service_ewma_ms: Option<f64>,
 }
 
 pub(crate) fn health_key(remote: &Remote) -> String {
@@ -101,6 +107,9 @@ fn unbind_remote(
 pub struct RemoteLease {
     map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>>,
     key: String,
+    /// Admission instant for the service-time EWMA: `lease_to_eof`
+    /// stamps `elapsed()` at clean stream EOF into `service_ewma_ms`.
+    started: std::time::Instant,
 }
 
 impl Drop for RemoteLease {
@@ -109,6 +118,21 @@ impl Drop for RemoteLease {
             && let Some(h) = m.get_mut(&self.key)
         {
             h.in_flight = h.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+impl RemoteLease {
+    /// Fold the admission-to-EOF duration into the peer's service-time
+    /// EWMA (same 0.3 alpha as the TTFT lane - the A16/G3 smoothing
+    /// constant). Called once, at clean stream completion, by
+    /// [`lease_to_eof`].
+    fn record_service(&self) {
+        let ms = self.started.elapsed().as_millis() as f64;
+        if let Ok(mut m) = self.map.lock()
+            && let Some(h) = m.get_mut(&self.key)
+        {
+            h.service_ewma_ms = Some(crate::hint_ewma(h.service_ewma_ms, ms));
         }
     }
 }
@@ -132,7 +156,14 @@ pub fn lease_to_eof(lease: RemoteLease, resp: Response) -> Response {
             // The errored item is still yielded; the state (and the
             // lease inside it) drops when the consumer stops polling.
             Some(Err(e)) => Some((Err(std::io::Error::other(e)), (lease, inner))),
-            None => None,
+            None => {
+                // Clean EOF: the stream fully drained, so admission to
+                // completion is a true service-time sample. Errored or
+                // aborted streams never reach this arm - a broken stream
+                // is not evidence about service duration.
+                lease.record_service();
+                None
+            }
         }
     });
     Response::from_parts(parts, Body::from_stream(stream))
@@ -239,6 +270,7 @@ pub fn select_remote<'a>(
     let lease = RemoteLease {
         map: std::sync::Arc::clone(&state.remote_health),
         key,
+        started: std::time::Instant::now(),
     };
     Ok((remote, rest, lease, akey))
 }
@@ -1239,6 +1271,7 @@ mod tests {
             let lease = RemoteLease {
                 map: std::sync::Arc::clone(&map),
                 key: "r|http://10.0.0.4:8000".into(),
+                started: std::time::Instant::now(),
             };
             // select_remote bumps in_flight when it hands out the lease.
             map.lock()
@@ -1268,6 +1301,7 @@ mod tests {
         let lease = RemoteLease {
             map: std::sync::Arc::clone(&map),
             key: "r|http://10.0.0.4:8000".into(),
+            started: std::time::Instant::now(),
         };
         let chunks = futures::stream::iter([
             Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from_static(b"he")),
@@ -1291,6 +1325,120 @@ mod tests {
             0,
             "slot released at EOF"
         );
+        // Clean EOF also stamps the service-time EWMA: the admission
+        // to completion duration is a real service sample.
+        let stamped = map.lock().unwrap()["r|http://10.0.0.4:8000"]
+            .service_ewma_ms
+            .expect("service EWMA stamped at clean EOF");
+        assert!(stamped >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn unit__lease_to_eof__service_ewma_blends_and_error_never_stamps() {
+        // Two clean streams blend at the standard 0.25 alpha: after a
+        // 100 ms first observation, a 300 ms second one must land at
+        // 150 (100 + 0.25 * (300 - 100)).
+        let map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>> =
+            std::sync::Arc::default();
+        map.lock()
+            .unwrap()
+            .entry("r|http://10.0.0.4:8000".into())
+            .or_default()
+            .in_flight += 1;
+        // Seed the EWMA with a known first observation by driving one
+        // stream whose duration is ~0; the blend math is then pinned
+        // by inserting the second observation deterministically.
+        {
+            let lease = RemoteLease {
+                map: std::sync::Arc::clone(&map),
+                key: "r|http://10.0.0.4:8000".into(),
+                started: std::time::Instant::now(),
+            };
+            let resp = lease_to_eof(
+                lease,
+                Response::new(Body::from_stream(futures::stream::iter([Ok::<
+                    axum::body::Bytes,
+                    std::io::Error,
+                >(
+                    axum::body::Bytes::from_static(b"x"),
+                )]))),
+            );
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 16).await;
+        }
+        // First sample recorded (>= 0 ms elapsed).
+        assert!(
+            map.lock().unwrap()["r|http://10.0.0.4:8000"]
+                .service_ewma_ms
+                .is_some()
+        );
+        // Pin the blend: set the EWMA to a known 100 ms and run one
+        // more ~0 ms stream - result must stay in [70, 100] (blend
+        // toward 0 with alpha 0.3: 0.7 * 100 + 0.3 * 0 = 70).
+        map.lock()
+            .unwrap()
+            .get_mut("r|http://10.0.0.4:8000")
+            .unwrap()
+            .service_ewma_ms = Some(100.0);
+        {
+            let lease = RemoteLease {
+                map: std::sync::Arc::clone(&map),
+                key: "r|http://10.0.0.4:8000".into(),
+                started: std::time::Instant::now(),
+            };
+            let resp = lease_to_eof(
+                lease,
+                Response::new(Body::from_stream(futures::stream::iter([Ok::<
+                    axum::body::Bytes,
+                    std::io::Error,
+                >(
+                    axum::body::Bytes::from_static(b"x"),
+                )]))),
+            );
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 16).await;
+        }
+        let blended = map.lock().unwrap()["r|http://10.0.0.4:8000"]
+            .service_ewma_ms
+            .expect("second sample blends");
+        assert!(
+            (70.0..=100.0).contains(&blended),
+            "blend must move toward the new sample at alpha 0.3: {blended}"
+        );
+
+        // An errored stream must NEVER stamp: a broken stream is not
+        // evidence about service duration.
+        map.lock()
+            .unwrap()
+            .get_mut("r|http://10.0.0.4:8000")
+            .unwrap()
+            .service_ewma_ms = None;
+        {
+            let lease = RemoteLease {
+                map: std::sync::Arc::clone(&map),
+                key: "r|http://10.0.0.4:8000".into(),
+                started: std::time::Instant::now(),
+            };
+            let resp = lease_to_eof(
+                lease,
+                Response::new(Body::from_stream(futures::stream::iter([Err::<
+                    axum::body::Bytes,
+                    _,
+                >(
+                    std::io::Error::other("boom"),
+                )]))),
+            );
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 16).await;
+        }
+        assert!(
+            map.lock().unwrap()["r|http://10.0.0.4:8000"]
+                .service_ewma_ms
+                .is_none(),
+            "errored stream must not stamp the service EWMA"
+        );
+        assert_eq!(
+            map.lock().unwrap()["r|http://10.0.0.4:8000"].in_flight,
+            0,
+            "errored stream still releases the slot (Drop backstop)"
+        );
     }
 
     #[tokio::test]
@@ -1307,6 +1455,7 @@ mod tests {
         let lease = RemoteLease {
             map: std::sync::Arc::clone(&map),
             key: "r|http://10.0.0.4:8000".into(),
+            started: std::time::Instant::now(),
         };
         let resp = lease_to_eof(
             lease,

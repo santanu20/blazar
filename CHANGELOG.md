@@ -8,6 +8,17 @@ tracked here.
 
 ### Added
 
+- **Service-time telemetry + distinct `adaptive` pool strategy.** Remote
+  streams that drain cleanly to EOF now fold their admission-to-completion
+  duration into a per-peer service-time EWMA (same 0.3 smoothing as the
+  TTFT lane; errored/aborted streams never sample). Pool strategy
+  `adaptive` is now least-expected-completion: estimated wait + service
+  time, warm tier as tie-break, with a 10 s / 10% sticky window so
+  estimate noise cannot flip-flop members request to request. Members
+  without a measured sample fall back to a declared default and
+  `adaptive` still equals `warm_first` until at least one member carries
+  a real measurement. Federation route ranking is untouched - the new
+  signal is consumed by pools only.
 - **Per-key MCP tool allowlists (`mcp_tools`).** API keys accept a
   `mcp_tools` array of `<server>:<tool>` selectors (either side may end
   in `*`; a bare entry names every tool of that server; empty = every
