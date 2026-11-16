@@ -80,9 +80,18 @@ async fn pd_router_forward(
         Ok(triple) => triple,
         Err(e) => {
             tracing::warn!("PD {model}: pair or router unavailable: {e:#}");
+            // Relay the supervision verdict: a fit refusal (pair
+            // admission floor vs the card) or a spawn teaching lands in
+            // the 503 body instead of only the daemon log - the client
+            // must be able to act on the numbers (smaller quant, less
+            // ctx, drop the pair) without ssh-ing for logs.
             return crate::proxy::openai_error(
                 503,
-                "the prefill/decode pair (or its sglang-router) could not come up for this                  model - see the daemon log (spawn fit, transfer-engine wheel or RAM class                  are the usual suspects)",
+                &format!(
+                    "the prefill/decode pair (or its sglang-router) could not come up for \
+                     this model - {e} (spawn fit, transfer-engine wheel or RAM class are \
+                     the usual suspects)"
+                ),
             );
         }
     };

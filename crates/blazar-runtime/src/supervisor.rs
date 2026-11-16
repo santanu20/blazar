@@ -505,6 +505,17 @@ pub fn model_of_key(key: &str) -> &str {
     }
 }
 
+/// Is this a supervised PD-disagg topology key (`{model}#pd-pre`,
+/// `{model}#pd-dec`, `{model}#pd-router`)? The three children form ONE
+/// serving unit: evicting any role breaks the pair while the survivors
+/// keep holding VRAM, so admission never treats them as individual
+/// eviction candidates - the pair owns its lifecycle through
+/// `ensure_pd`'s symmetric teardown, user stop and the idle ladder.
+#[must_use]
+pub fn is_pd_family_key(key: &str) -> bool {
+    key.ends_with("#pd-pre") || key.ends_with("#pd-dec") || key.ends_with("#pd-router")
+}
+
 /// Instance display name: like [`model_of_key`] but KEEPS the `+lora`
 /// marker so `ps` distinguishes an adapted child from the dense one.
 /// `@vision` and `#N` stay hidden - those are the same weights serving
@@ -2921,6 +2932,12 @@ impl Supervisor {
             .filter(|e| {
                 e.in_flight.load(Ordering::SeqCst) <= 0
                     && e.key() != key
+                    && // PD pair members are one serving unit - never
+                       // half-evict a live topology (live receipt
+                       // 2026-11-14: role spawns evicted their own
+                       // sibling in a ~26-30s ping-pong loop on an 8 GiB
+                       // card until nothing but the pair ever ran).
+                       !is_pd_family_key(e.key())
                     && !self
                         .cfg()
                         .overlay_for(model_of_key(e.key()))
@@ -2935,6 +2952,35 @@ impl Supervisor {
                 )
             })
             .map(|e| e.key().clone())
+    }
+
+    /// Pair-level admission charge for a PD-disagg role spawn: the pair
+    /// is the admission unit, so the FIRST role spawn carries BOTH
+    /// floors - a pair too heavy for the card must be classified
+    /// physically impossible right here, not admitted role-by-role
+    /// (each role passes its solo floor check, then the blocked second
+    /// spawn evicted its own sibling in a ~26-30s loop; live receipt
+    /// 2026-11-14, 2x bf16 1.7B + two CUDA contexts vs an 8 GiB card).
+    /// A resident sibling's bytes already sit in `resident_bytes`, so
+    /// the charge stays solo and fitting pairs admit exactly as before.
+    /// A mid-load sibling (loading map, not yet in `instances`)
+    /// double-charges: conservative in the refuse direction only.
+    /// Returns the charged floor and whether the pair charge applied
+    /// (the refusal teaching names the pair).
+    fn pd_pair_admission_charge(&self, key: &str, name: &str, role_floor: u64) -> (u64, bool) {
+        if !key.ends_with("#pd-pre") && !key.ends_with("#pd-dec") {
+            return (role_floor, false);
+        }
+        let sibling = if key.ends_with("#pd-dec") {
+            format!("{name}#pd-pre")
+        } else {
+            format!("{name}#pd-dec")
+        };
+        if self.instances.contains_key(&sibling) {
+            (role_floor, false)
+        } else {
+            (role_floor.saturating_mul(2), true)
+        }
     }
 
     /// What the admission loop does when blocked: evict the coldest
@@ -3042,6 +3088,19 @@ impl Supervisor {
     /// `rpc_budget_bytes > 0` fleet spawn is the same shape - the child
     /// places across local+remote devices - so it judges the summed
     /// local+remote pool too.
+    /// Whether the admission loop must run the refuse-fast
+    /// (physically-impossible) verdict before deciding anything else.
+    /// `blocked` = resident pressure says wait-or-evict; `pair_charged`
+    /// = this spawn is the first role of a PD pair whose floor already
+    /// covers BOTH roles. The pair is admitted as ONE unit, so its
+    /// verdict runs even on an empty box, where the single-model
+    /// exemption inside `admission_blocked` would otherwise wave the
+    /// first role through and surface the unit misfit later as a
+    /// role-2 queueing refusal (live receipt 2026-11-14).
+    fn admission_probe_required(blocked: bool, pair_charged: bool) -> bool {
+        blocked || pair_charged
+    }
+
     fn admission_blocked(
         &self,
         name: &str,
@@ -6187,6 +6246,13 @@ impl Supervisor {
                 0,
             )
         };
+        // PD pair atomic admission: the unit being admitted is BOTH
+        // roles, not this child (live receipt 2026-11-14: per-role
+        // charging let each role pass its solo floor check and the
+        // blocked second spawn then evicted its own sibling in a
+        // ~26-30s loop on an 8 GiB card).
+        let (incoming_bytes, pair_charged) =
+            self.pd_pair_admission_charge(key, name, incoming_bytes);
         let manual_tp = if sglang_lane {
             tun_probe.tp_size.filter(|n| *n > 1)
         } else {
@@ -6317,7 +6383,84 @@ impl Supervisor {
             );
         }
         loop {
-            if !self.admission_blocked(name, incoming_bytes, spanning, rpc_pool.budget_bytes) {
+            let blocked =
+                self.admission_blocked(name, incoming_bytes, spanning, rpc_pool.budget_bytes);
+            // A first-of-pair role is charged for BOTH roles (the pair
+            // is one serving unit), so its doubled floor gets the
+            // refuse-fast verdict even on an empty box - the
+            // single-model empty-box exemption in `admission_blocked`
+            // would otherwise wave role 1 through, strand the topology
+            // half-loaded, and turn the refusal into a role-2
+            // AllSlotsBusy instead of the pair teaching.
+            if !Self::admission_probe_required(blocked, pair_charged) {
+                break;
+            }
+            // Impossible BEFORE eviction: a floor no card can ever hold
+            // gets the same refusal verdict with or without bystanders,
+            // so evicting residents on the way there is pure waste - an
+            // unfit PD pair on a busy box evicted an innocent resident,
+            // re-checked, and refused anyway (live receipt 2026-11-14).
+            // A SHARDING or RPC-FLEET spawn judges the summed pool:
+            // refuse fast only when even the combined cards cannot hold
+            // it empty. Genuinely-evictable pressure keeps the
+            // queueable AllSlotsBusy and the victim ladder below.
+            #[allow(clippy::cast_precision_loss)] // display-only GiB rounding
+            let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            let fleet_spanning = spanning || rpc_pool.budget_bytes > 0;
+            if let Some(cap) =
+                self.impossible_floor(name, incoming_bytes, spanning, rpc_pool.budget_bytes)
+            {
+                let per_rank_note = spanning_ranks.map(|n| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let per_rank = gib(incoming_bytes / u64::from(n));
+                    format!(" even sharded across {n} cards ({per_rank:.1} GiB per rank)")
+                });
+                #[allow(clippy::cast_precision_loss)] // display-only GB rounding
+                let offload_note = if sglang_offload_bytes > 0 {
+                    format!(
+                        " after {:.1} GB host offload",
+                        sglang_offload_bytes as f64 / 1e9
+                    )
+                } else {
+                    String::new()
+                };
+                let pair_note = if pair_charged {
+                    " (prefill+decode pair - both roles resident)"
+                } else {
+                    ""
+                };
+                return Err(SupervisionError::ModelTooLarge(format!(
+                    "{name}: admission floor {:.1} GiB{}{} exceeds {}{} \
+                     even with the box empty - waiting for a slot can never change \
+                     this. Use a smaller quant (`blazar fit`), lower the ctx/slots, \
+                     or serve on a larger card{}",
+                    gib(incoming_bytes),
+                    offload_note,
+                    pair_note,
+                    if fleet_spanning {
+                        format!(
+                            "every GPU budget combined ({:.1} GiB{})",
+                            gib(cap),
+                            if rpc_pool.budget_bytes > 0 {
+                                " incl. the rpc fleet"
+                            } else {
+                                ""
+                            }
+                        )
+                    } else {
+                        format!("every GPU budget (largest card {:.1} GiB)", gib(cap))
+                    },
+                    per_rank_note.unwrap_or_default(),
+                    if pair_charged {
+                        ", or drop sglang.disagg_pair for a single instance"
+                    } else {
+                        ""
+                    },
+                )));
+            }
+            // Pair role 1 that fits an empty card: admit like the
+            // empty-box exemption always did.
+            if !blocked {
                 break;
             }
             match self.blocked_action(key, captive) {
@@ -6332,61 +6475,6 @@ impl Supervisor {
                         .map_err(|e| SupervisionError::Internal(anyhow!("{e}")))?;
                 }
                 BlockedAction::Refuse => {
-                    // Split the old conflation: an incoming floor larger
-                    // than every card is physically unschedulable - no
-                    // queue wait can ever change it, so refuse fast with
-                    // numbers. Genuinely-evictable pressure keeps the
-                    // queueable AllSlotsBusy. A SHARDING or RPC-FLEET
-                    // spawn judges the summed pool instead: refuse fast
-                    // only when even the combined cards cannot hold it
-                    // empty.
-                    #[allow(clippy::cast_precision_loss)] // display-only GiB rounding
-                    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-                    let fleet_spanning = spanning || rpc_pool.budget_bytes > 0;
-                    let impossible = self.impossible_floor(
-                        name,
-                        incoming_bytes,
-                        spanning,
-                        rpc_pool.budget_bytes,
-                    );
-                    if let Some(cap) = impossible {
-                        let per_rank_note = spanning_ranks.map(|n| {
-                            #[allow(clippy::cast_precision_loss)]
-                            let per_rank = gib(incoming_bytes / u64::from(n));
-                            format!(" even sharded across {n} cards ({per_rank:.1} GiB per rank)")
-                        });
-                        #[allow(clippy::cast_precision_loss)] // display-only GB rounding
-                        let offload_note = if sglang_offload_bytes > 0 {
-                            format!(
-                                " after {:.1} GB host offload",
-                                sglang_offload_bytes as f64 / 1e9
-                            )
-                        } else {
-                            String::new()
-                        };
-                        return Err(SupervisionError::ModelTooLarge(format!(
-                            "{name}: admission floor {:.1} GiB{} exceeds {}{} \
-                             even with the box empty - waiting for a slot can never change \
-                             this. Use a smaller quant (`blazar fit`), lower the ctx/slots, \
-                             or serve on a larger card",
-                            gib(incoming_bytes),
-                            offload_note,
-                            if fleet_spanning {
-                                format!(
-                                    "every GPU budget combined ({:.1} GiB{})",
-                                    gib(cap),
-                                    if rpc_pool.budget_bytes > 0 {
-                                        " incl. the rpc fleet"
-                                    } else {
-                                        ""
-                                    }
-                                )
-                            } else {
-                                format!("every GPU budget (largest card {:.1} GiB)", gib(cap))
-                            },
-                            per_rank_note.unwrap_or_default(),
-                        )));
-                    }
                     return Err(SupervisionError::AllSlotsBusy);
                 }
             }
@@ -6418,7 +6506,9 @@ impl Supervisor {
                     "insufficient memory to load {:?}: MemAvailable {avail} MiB < floor {need} MiB \
                      (model {} MiB + {offload_mib} MiB host offload). Stop co-resident engines \
                      (blazar ps / ollama stop) or free RAM; disable this guard with \
-                     spawn_mem_guard = false",
+                     spawn_mem_guard = false. This per-spawn host check precedes VRAM \
+                     admission, so a starved box can refuse here before any pair-fit \
+                     verdict (multi-role spawns: freeing RAM reaches the numbers)",
                     name,
                     model.bytes / (1024 * 1024)
                 )));
@@ -12151,6 +12241,103 @@ mod routing_tests {
         assert!(sup.instances.contains_key("big"));
         sup.evict("big").await.unwrap();
         let _ = pid;
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__victim_key__pd_family_never_victims() {
+        // The PD pair is one serving unit: a blocked spawn must never
+        // carve a live pair for VRAM. Live receipt 2026-11-14: each
+        // role spawn evicted its own sibling in a ~26-30s ping-pong
+        // loop on an 8 GiB card, so pair roles are un-evictable here
+        // (ensure_pd owns the whole-topology teardown instead).
+        let (sup, _root) = gpu_sup();
+        let (dec, pid) = gpu_instance("m#pd-dec", 5_800 * 1024 * 1024, 7_302);
+        sup.instances.insert("m#pd-dec".to_string(), dec);
+        // Only a pair role is resident: nothing is evictable for any
+        // incoming spawn, including the sibling role of the same pair.
+        assert_eq!(sup.victim_key("other"), None);
+        assert_eq!(sup.victim_key("m#pd-pre"), None);
+        // A regular resident next to the pair stays a fair victim.
+        let (idle, pid2) = gpu_instance("other", 500 * 1024 * 1024, 300);
+        sup.instances.insert("other".to_string(), idle);
+        assert_eq!(sup.victim_key("m#pd-pre"), Some("other".to_string()));
+        sup.evict("other").await.unwrap();
+        sup.evict("m#pd-dec").await.unwrap();
+        let _ = (pid, pid2);
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__pd_pair_admission_charge__solo_vs_pair() {
+        // The first role of a pair is charged for BOTH roles so the
+        // pair admits or refuses as a unit; once the sibling is
+        // resident its bytes already sit in resident_bytes and the
+        // charge returns to solo (fitting pairs admit exactly as
+        // before the pair-aware teaching).
+        let (sup, _root) = gpu_sup();
+        let floor = 4_000u64 * 1024 * 1024;
+        // Non-PD spawns are untouched by the pair logic.
+        assert_eq!(
+            sup.pd_pair_admission_charge("m", "m", floor),
+            (floor, false)
+        );
+        // Router children ride the pair but never carry weights.
+        assert!(super::is_pd_family_key("m#pd-router"));
+        // No sibling resident yet: doubled charge, pair flag on - in
+        // both role directions.
+        assert_eq!(
+            sup.pd_pair_admission_charge("m#pd-dec", "m", floor),
+            (floor * 2, true)
+        );
+        assert_eq!(
+            sup.pd_pair_admission_charge("m#pd-pre", "m", floor),
+            (floor * 2, true)
+        );
+        // Sibling already resident: solo charge from here on.
+        let (pre, pid) = gpu_instance("m#pd-pre", 5_800 * 1024 * 1024, 6_000);
+        sup.instances.insert("m#pd-pre".to_string(), pre);
+        assert_eq!(
+            sup.pd_pair_admission_charge("m#pd-dec", "m", floor),
+            (floor, false)
+        );
+        sup.evict("m#pd-pre").await.unwrap();
+        let _ = pid;
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__admission_probe_required__pair_role_verdict_beats_empty_box() {
+        // The recipe the admission loop follows, pinned: an empty box
+        // (blocked=false) admits a plain spawn untouched, but a
+        // pair-charged first role ALWAYS gets the refuse-fast verdict -
+        // the empty-box exemption must not strand half a topology
+        // (regression pin for the 2026-11-14 restructure).
+        assert!(!Supervisor::admission_probe_required(false, false));
+        assert!(Supervisor::admission_probe_required(false, true));
+        assert!(Supervisor::admission_probe_required(true, false));
+        assert!(Supervisor::admission_probe_required(true, true));
+        // And the ingredients compose into the unit refusal on this
+        // 8188 MiB box shape: the doubled floor of a ~4.4 GiB-weights
+        // pair is physically impossible, the solo floor is not.
+        let (sup, _root) = gpu_sup();
+        let solo = 4_500u64 * 1024 * 1024;
+        let doubled = solo * 2;
+        assert!(sup.instances.is_empty(), "empty-box premise");
+        assert!(
+            !sup.admission_blocked("m", doubled, false, 0),
+            "empty-box exemption waves even the doubled floor through"
+        );
+        assert_eq!(
+            sup.impossible_floor("m", solo, false, 0),
+            None,
+            "solo floor fits an empty card: queueable, never a refusal"
+        );
+        assert_eq!(
+            sup.impossible_floor("m", doubled, false, 0),
+            Some(8_188 * 1024 * 1024),
+            "doubled pair floor exceeds every card: refuse-fast with the numbers"
+        );
     }
 
     #[test]

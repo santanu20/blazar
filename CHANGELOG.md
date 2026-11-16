@@ -4,6 +4,30 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Fixed
+
+- **PD-disagg pairs now admit (or refuse) as one unit instead of
+  ping-ponging.** On a card that cannot hold both roles resident
+  (2x bf16 weights + two CUDA contexts vs an 8 GiB card, live receipt
+  2026-11-14), each role spawn used to admission-block and evict its own
+  sibling in a ~26-30s loop forever - children co-resident under 60ms,
+  gateway 503s all the way down. The first role of a pair is now charged
+  for BOTH roles at admission, and an unfit pair refuses immediately with
+  the numbers ("admission floor X GiB (prefill+decode pair - both roles
+  resident) exceeds every GPU budget ... or drop sglang.disagg_pair for a
+  single instance") instead of ever starting half a topology. Fitting
+  pairs admit exactly as before (a resident sibling's bytes already sit
+  in the resident ledger). Pair members are also no longer eligible
+  capacity-eviction victims for unrelated spawns - `ensure_pd` owns the
+  whole-topology teardown - and the gateway's PD 503 now relays the
+  supervision verdict (fit numbers, mem-guard teaching) in the body so
+  clients can act without reading the daemon log. Refuse-fast verdicts
+  are also classified before any bystander eviction, so a physically
+  impossible spawn no longer evicts innocent residents on its way to the
+  same refusal.
+
 ## [0.32.0] — 2026-11-13
 
 ### Added
