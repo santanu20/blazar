@@ -116,7 +116,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42df90579dd25f1ca # stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
           # SHA pinning defeats the action's branch-name toolchain
           # inference, so the input has to name it explicitly.
@@ -210,7 +210,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42df90579dd25f1ca # stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
           # SHA pinning defeats the action's branch-name toolchain
           # inference, so the input has to name it explicitly.
@@ -416,7 +416,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42df90579dd25f1ca # stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
           # SHA pinning defeats the action's branch-name toolchain
           # inference, so the input has to name it explicitly.
