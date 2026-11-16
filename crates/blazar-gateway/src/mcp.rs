@@ -1256,11 +1256,26 @@ pub(crate) async fn chat_via_mcp(
     let resolved = tools.len();
     let mut tools = tools;
     tools.retain(|t| crate::keys::mcp_server_permits(&state.keys, key, &t.server).is_ok());
+    let server_scoped = tools.len();
+    // Tool-level scope rides on top: a key with a non-empty mcp_tools
+    // allowlist only sees - and can only name - its admitted tools.
+    tools.retain(|t| crate::keys::mcp_tool_permits(&state.keys, key, &t.server, &t.name).is_ok());
     if tools.is_empty() {
         if resolved == 0 {
             return Err(teaching_error(
                 StatusCode::BAD_REQUEST,
                 "mcp selection exposes no tools",
+            ));
+        }
+        if server_scoped > 0 {
+            // The server gate passed; the tool allowlist starved it.
+            return Err(teaching_error(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "mcp selection resolved {server_scoped} tool(s) for this key's servers \
+                     but the key's mcp_tools allowlist admits none of them; widen or clear \
+                     the key's mcp_tools selectors"
+                ),
             ));
         }
         let names = state.mcp.configured_names().join(", ");
@@ -1399,7 +1414,22 @@ pub(crate) async fn chat_via_mcp(
                             );
                             Err(why)
                         }
-                        Ok(()) => state.mcp.execute(&server, &tool, &args).await,
+                        // Second depth layer: the server may be listed
+                        // while this specific tool is not (mcp_tools
+                        // selectors) - refused the same way.
+                        Ok(()) => {
+                            match crate::keys::mcp_tool_permits(&state.keys, key, &server, &tool) {
+                                Err((_code, why)) => {
+                                    tracing::warn!(
+                                        target: "blazar::mcp",
+                                        server = %server, tool = %tool,
+                                        "tool call refused: tool not in the key's mcp_tools allowlist"
+                                    );
+                                    Err(why)
+                                }
+                                Ok(()) => state.mcp.execute(&server, &tool, &args).await,
+                            }
+                        }
                     };
                     tracing::info!(
                         target: "blazar::mcp",

@@ -1702,6 +1702,7 @@ async fn e2e__keys_scoped_rate_and_accounting() {
         key: "plm_scoped".into(),
         models: vec!["m1".into()],
         mcp_servers: Vec::new(),
+        mcp_tools: Vec::new(),
         rpm: 2,
         tpm: 0,
         daily_tokens: 0,
@@ -5997,5 +5998,208 @@ async fn e2e__mcp__per_key_server_allowlist_gates_the_tool_loop() {
     for name in ["permitted", "secret"] {
         let _ = std::fs::remove_file(marker(name));
     }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Tool-level MCP scoping end-to-end, against a stdio stub that speaks
+/// enough JSON-RPC to list two tools (`read_file`, `write_file`) and
+/// answer `tools/call` by echoing the called tool's name.
+///
+/// Three legs pin the two enforcement points:
+/// - writer key (`fs:write*`) + forced `mcp__fs__write_file` call: the
+///   loop EXECUTES and reflects `tool-ok:write_file` (admitted tool).
+/// - reader key (`fs:read*`) + same forced call: the execute gate
+///   refuses a tool the injection filter never offered; the refusal
+///   text rides the tool-result message back into the reply.
+/// - reader key + plain reflection (call = injected tools[0]): the
+///   call lands on `read_file` - `write_file` was filtered out of the
+///   prompt catalog entirely.
+#[allow(non_snake_case)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn e2e__mcp__per_key_tool_allowlist_injection_and_execute_gates() {
+    use blazar_core::ApiKey;
+
+    // Stdio MCP speaker: newline JSON-RPC, echoes request ids, lists
+    // two tools, answers any tools/call with "tool-ok:<tool-name>".
+    fn mcp_fs_clone() -> blazar_core::config::McpServer {
+        let speaker = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fs","version":"1"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"read_file","description":"read","inputSchema":{"type":"object"}},{"name":"write_file","description":"write","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([a-z_]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"tool-ok:%s"}]}}\n' "$id" "$tool" ;;
+  esac
+done
+"#;
+        blazar_core::config::McpServer {
+            name: "fs".into(),
+            command: vec!["sh".into(), "-c".into(), speaker.into()],
+            url: None,
+            env: std::collections::HashMap::new(),
+            timeout_secs: 30,
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
+        }
+    }
+    fn base_cfg(mcp_tools: Vec<String>) -> Config {
+        Config {
+            keys: vec![ApiKey {
+                name: "caller".into(),
+                key: "plm_caller".into(),
+                mcp_servers: vec!["fs".into()],
+                mcp_tools,
+                ..ApiKey::default()
+            }],
+            mcp: vec![mcp_fs_clone()],
+            ..Config::default()
+        }
+    }
+    async fn chat(ts: &TestServer, key: &str) -> serde_json::Value {
+        client()
+            .post(format!("{}/api/chat", ts.base))
+            .bearer_auth(key)
+            .json(
+                &serde_json::json!({"model": "m1", "stream": false, "mcp": "fs",
+                "messages": [{"role": "user", "content": "use the tool"}]}),
+            )
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    }
+
+    // Server A: the model is forced to name write_file whatever the
+    // injected catalog says.
+    let ts_a = start_with(
+        base_cfg(vec!["fs:write*".into()]),
+        vec![
+            ("STUB_TOOL_CALL".into(), "1".into()),
+            ("STUB_TOOL_CALL_NAME".into(), "mcp__fs__write_file".into()),
+            ("STUB_REFLECT_TOOL".into(), "1".into()),
+        ],
+    )
+    .await;
+    // Admitted call executes and the result text comes back round 2.
+    let ok = chat(&ts_a, "plm_caller").await;
+    let text = ok["message"]["content"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("tool-ok:write_file"),
+        "admitted tool executes end-to-end: {ok}"
+    );
+    // Same forced call under a read-scoped key: the server gate passes,
+    // the EXECUTE gate refuses, and the refusal surfaces via the tool
+    // result the model sees (reflected by the stub).
+    let ts_r = start_with(
+        base_cfg(vec!["fs:read*".into()]),
+        vec![
+            ("STUB_TOOL_CALL".into(), "1".into()),
+            ("STUB_TOOL_CALL_NAME".into(), "mcp__fs__write_file".into()),
+            ("STUB_REFLECT_TOOL".into(), "1".into()),
+        ],
+    )
+    .await;
+    let refused = chat(&ts_r, "plm_caller").await;
+    let text = refused["message"]["content"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("not scoped for mcp tool"),
+        "execute gate refusal surfaces in the loop: {refused}"
+    );
+
+    // Server B: plain reflection - the model calls injected tools[0].
+    // For a read-scoped key that MUST be read_file: write_file never
+    // entered the prompt.
+    let ts_b = start_with(
+        base_cfg(vec!["fs:read*".into()]),
+        vec![
+            ("STUB_TOOL_CALL".into(), "1".into()),
+            ("STUB_REFLECT_TOOL".into(), "1".into()),
+        ],
+    )
+    .await;
+    let injected = chat(&ts_b, "plm_caller").await;
+    let text = injected["message"]["content"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("tool-ok:read_file"),
+        "injection filter leaves only admitted tools: {injected}"
+    );
+
+    ts_a.state.sup.shutdown_all().await.unwrap();
+    ts_r.state.sup.shutdown_all().await.unwrap();
+    ts_b.state.sup.shutdown_all().await.unwrap();
+}
+
+/// A tool allowlist that starves the catalog entirely (server permitted,
+/// no tool admitted) yields a teaching 403 naming the `mcp_tools` lane.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__mcp__tool_allowlist_starved_catalog_teaches() {
+    use blazar_core::ApiKey;
+    use blazar_core::config::McpServer;
+
+    let speaker = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fs","version":"1"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"read_file","description":"read","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+  esac
+done
+"#;
+    let cfg = Config {
+        keys: vec![ApiKey {
+            name: "caller".into(),
+            key: "plm_caller".into(),
+            mcp_servers: vec!["fs".into()],
+            mcp_tools: vec!["fs:nonexistent*".into()],
+            ..ApiKey::default()
+        }],
+        mcp: vec![McpServer {
+            name: "fs".into(),
+            command: vec!["sh".into(), "-c".into(), speaker.into()],
+            url: None,
+            env: std::collections::HashMap::new(),
+            timeout_secs: 30,
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
+        }],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_caller")
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "fs",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "starved tool allowlist refuses");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let msg = v.to_string();
+    assert!(
+        msg.contains("mcp_tools") && msg.contains("admits none"),
+        "teaching names the tool lane: {msg}"
+    );
     ts.state.sup.shutdown_all().await.unwrap();
 }

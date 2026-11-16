@@ -451,7 +451,16 @@ fn content_text(v: &serde_json::Value) -> String {
 
 /// Deterministic reply: `stub:<alias>:<last-user-text>`. Split into two
 /// content chunks when streaming so SSE delta handling is exercised.
+/// With `STUB_REFLECT_TOOL=1` and tool output in context, the reply
+/// echoes the LAST tool message instead - e2e tests then assert on what
+/// the gateway's tool loop actually fed back (executed result text, or
+/// the execute-gate's refusal).
 fn reply_text(state: &AppState, messages: &[ChatMessage]) -> String {
+    if env_flag("STUB_REFLECT_TOOL")
+        && let Some(tool_msg) = messages.iter().rev().find(|m| m.role == "tool")
+    {
+        return format!("stub:{state}:{}", content_text(&tool_msg.content));
+    }
     let last_user = messages
         .iter()
         .rev()
@@ -680,10 +689,16 @@ fn stub_tool_calls(req: &ChatRequest) -> Option<serde_json::Value> {
         return None;
     }
     let first = &tools[0];
-    let name = first
-        .pointer("/function/name")
-        .or_else(|| first.get("name"))
-        .and_then(serde_json::Value::as_str)?;
+    // `STUB_TOOL_CALL_NAME` overrides the reflected name: tests force a
+    // call the gateway's injection filter would never have offered (the
+    // execute-time gate must refuse it on its own).
+    let name = std::env::var("STUB_TOOL_CALL_NAME").ok().or_else(|| {
+        first
+            .pointer("/function/name")
+            .or_else(|| first.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })?;
     Some(serde_json::json!([{
         "id": "call_stub_1",
         "type": "function",

@@ -8,6 +8,14 @@ tracked here.
 
 ### Added
 
+- **Per-key MCP tool allowlists (`mcp_tools`).** API keys accept a
+  `mcp_tools` array of `<server>:<tool>` selectors (either side may end
+  in `*`; a bare entry names every tool of that server; empty = every
+  tool of the servers the key already permits via `mcp_servers`).
+  Unadmitted tools are filtered out of the injected tool catalog - the
+  model never sees them - and a model-emitted call naming one is refused
+  before execution. A selector list that admits none of a resolved
+  catalog yields a teaching 403 naming the `mcp_tools` lane.
 - **Model pools (`[[model_pools]]`).** A pool publishes one logical
   service name over local and remote replicas of the same model; each
   request naming the pool is mapped to one member by the pool's strategy

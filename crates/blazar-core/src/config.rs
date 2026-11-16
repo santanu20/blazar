@@ -3405,6 +3405,18 @@ pub struct ApiKey {
     /// into the prompt in the first place.
     #[serde(default)]
     pub mcp_servers: Vec<String>,
+    /// MCP TOOL allowlist; empty = every tool of the servers already
+    /// permitted by `mcp_servers`. Entries are `<server>:<tool>`
+    /// selectors where either side matches exactly or by trailing-`*`
+    /// prefix (`"fs:read*"` admits `fs`'s `read_file` but not its
+    /// `write_file`; `"web*:*"` admits every tool of every `web*`
+    /// server); a bare entry with no colon names every tool of that
+    /// server. A tool listed here on an unlisted SERVER is still
+    /// refused - the server gate runs first. Forbidden tools are never
+    /// injected into the prompt, and a model-emitted call naming one is
+    /// refused before execution.
+    #[serde(default)]
+    pub mcp_tools: Vec<String>,
     /// Requests per minute cap; 0 = unlimited.
     #[serde(default)]
     pub rpm: u32,

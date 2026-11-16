@@ -119,6 +119,54 @@ pub fn mcp_server_permits(
     }
 }
 
+/// MCP tool-scope predicate: may `key` drive `server`'s tool `tool`?
+/// Runs AFTER [`mcp_server_permits`] (an unlisted server is refused
+/// regardless of this list). Entries are `<server>:<tool>` selectors;
+/// either side matches exactly or by trailing-`*`. An empty `mcp_tools`
+/// list admits every tool of the permitted servers. Enforcement mirrors
+/// the server gate: filtered at catalog injection and re-checked before
+/// execution (a model-emitted call naming an unlisted tool is refused
+/// before transport).
+pub fn mcp_tool_permits(
+    keys: &KeysLimiter,
+    key: Option<&KeyCtx>,
+    server: &str,
+    tool: &str,
+) -> Result<(), (u16, String)> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let Some(k) = key else {
+        return Err((401, "missing bearer token".into()));
+    };
+    let Some(entry) = keys.entries().into_iter().find(|e| e.name == k.name) else {
+        return Err((401, "unknown key".into()));
+    };
+    if entry.mcp_tools.is_empty() {
+        return Ok(());
+    }
+    let admitted = entry.mcp_tools.iter().any(|sel| {
+        match sel.split_once(':') {
+            // A bare colon-less entry names every tool of a server.
+            Some((srv, tl)) => {
+                scope_matches(srv, server) && (tl.is_empty() || scope_matches(tl, tool))
+            }
+            None => scope_matches(sel, server),
+        }
+    });
+    if admitted {
+        Ok(())
+    } else {
+        Err((
+            403,
+            format!(
+                "key {:?} is not scoped for mcp tool {:?} on server {:?}",
+                k.name, tool, server
+            ),
+        ))
+    }
+}
+
 /// BLZ-1 object-level authorization: may `key` see a durable row created
 /// by `owner`? `legacy_open_records` (config, default `true`) decides the
 /// tenancy posture for rows with no owner stamp: `true` keeps the
@@ -1273,6 +1321,72 @@ mod tests {
         assert_eq!(code, 401);
     }
 
+    /// Tool-level truth table: `<server>:<tool>` selectors with
+    /// trailing-`*` on either side, bare server entries naming every
+    /// tool, and the empty-list-admits-all default. The server gate is
+    /// a SEPARATE predicate that runs first - this one only narrows
+    /// within (or regardless of) it.
+    #[test]
+    fn unit__mcp_tool_permits__selector_truth_table() {
+        let ctx = |name: &str| KeyCtx {
+            name: name.into(),
+            weight: 1,
+        };
+        let open = KeysLimiter::loaded(None, Vec::new());
+        assert!(super::mcp_tool_permits(&open, None, "any", "thing").is_ok());
+        let mut tooler = key("tooler", 0, 0, 0, &[]);
+        tooler.mcp_tools = vec![
+            "fs:read*".into(), // read-prefixed tools of fs only
+            "web*:*".into(),   // every tool of web-prefixed servers
+            "shell".into(),    // bare name: every tool of that server
+        ];
+        let keyed = KeysLimiter::loaded(None, vec![key("admin", 0, 0, 0, &[]), tooler]);
+        // Empty list admits every tool (admin posture).
+        assert!(super::mcp_tool_permits(&keyed, Some(&ctx("admin")), "fs", "write_file").is_ok());
+        // Exact + wildcard selectors.
+        assert!(super::mcp_tool_permits(&keyed, Some(&ctx("tooler")), "fs", "read_file").is_ok());
+        assert!(super::mcp_tool_permits(&keyed, Some(&ctx("tooler")), "fs", "read_dir").is_ok());
+        assert!(
+            super::mcp_tool_permits(&keyed, Some(&ctx("tooler")), "web-fetch", "search").is_ok()
+        );
+        assert!(super::mcp_tool_permits(&keyed, Some(&ctx("tooler")), "shell", "exec").is_ok());
+        // Refusals: wrong tool on a listed server, unlisted server.
+        let (code, msg) = super::mcp_tool_permits(&keyed, Some(&ctx("tooler")), "fs", "write_file")
+            .expect_err("fs:write_file must be refused");
+        assert_eq!(code, 403);
+        assert!(msg.contains("not scoped"), "{msg}");
+        assert!(
+            super::mcp_tool_permits(&keyed, Some(&ctx("tooler")), "git", "status").is_err(),
+            "server with no selector entry is refused"
+        );
+        // Missing and unknown keys fail closed (mirrors the server gate).
+        let (code, _) =
+            super::mcp_tool_permits(&keyed, None, "fs", "read_file").expect_err("no key");
+        assert_eq!(code, 401);
+        let (code, _) = super::mcp_tool_permits(&keyed, Some(&ctx("ghost")), "fs", "read_file")
+            .expect_err("unknown key fails closed");
+        assert_eq!(code, 401);
+    }
+
+    /// The two gates compose the way operators read the config: a tool
+    /// selector can only NARROW within the server allowlist, never grant
+    /// access the server gate refuses.
+    #[test]
+    fn unit__mcp_gates__tool_selector_cannot_widen_server_allowlist() {
+        let ctx = |name: &str| KeyCtx {
+            name: name.into(),
+            weight: 1,
+        };
+        let mut narrow = key("narrow", 0, 0, 0, &[]);
+        narrow.mcp_servers = vec!["fs".into()];
+        narrow.mcp_tools = vec!["shell:*".into()]; // server NOT permitted
+        let keyed = KeysLimiter::loaded(None, vec![narrow]);
+        assert!(super::mcp_server_permits(&keyed, Some(&ctx("narrow")), "shell").is_err());
+        // The tool gate alone would admit it - the server gate refuses,
+        // and mcp.rs always runs server first.
+        assert!(super::mcp_tool_permits(&keyed, Some(&ctx("narrow")), "shell", "exec").is_ok());
+    }
+
     /// BLZ-1 truth table for the two tenancy postures. Owner match is
     /// the only always-refused pair; the flag decides whether unstamped
     /// (legacy/open-gateway) rows stay shared with keyed callers or
@@ -1320,6 +1434,7 @@ mod tests {
             key: format!("plm_{name}"),
             models: models.iter().map(|s| String::from(*s)).collect(),
             mcp_servers: Vec::new(),
+            mcp_tools: Vec::new(),
             rpm,
             tpm,
             daily_tokens: daily,

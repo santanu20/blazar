@@ -2750,6 +2750,7 @@ APIKEY_FIELDS = [
     "key",
     "models",
     "mcp_servers",
+    "mcp_tools",
     "rpm",
     "tpm",
     "daily_tokens",
