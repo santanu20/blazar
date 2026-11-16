@@ -280,7 +280,7 @@ pub(crate) struct FitRequest {
 /// `parse_devices` census - so the answer cannot drift from what a spawn
 /// attempt would actually do. `max_ctx` / `max_ctx_q8` walk the same
 /// halve-until-fits ladder as `blazar fit` (floor 1024; q8 halves KV).
-pub async fn fit(
+pub(crate) async fn fit(
     State(state): State<Arc<AppState>>,
     axum::Json(body): axum::Json<FitRequest>,
 ) -> Response {
@@ -291,15 +291,17 @@ pub async fn fit(
         return crate::ollama::api_error(404, &format!("model '{}' not found", body.model));
     };
 
-    let weights_mib = std::fs::metadata(&row.path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+    let weights_mib = std::fs::metadata(&row.path).map_or(0, |m| m.len() / (1024 * 1024));
     let meta = match blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
         Ok(meta) => meta,
-        Err(e) => return crate::ollama::api_error(500, &format!("model file metadata unreadable: {e}")),
+        Err(e) => {
+            return crate::ollama::api_error(500, &format!("model file metadata unreadable: {e}"));
+        }
     };
-    let ctx_evaluated = body
-        .ctx
-        .map(u64::from)
-        .unwrap_or_else(|| u64::from(crate::preflight::admission_ctx(&state, &body.model)));
+    let ctx_evaluated = body.ctx.map_or_else(
+        || u64::from(crate::preflight::admission_ctx(&state, &body.model)),
+        u64::from,
+    );
 
     // Same census command as `capacity()`; the primary GPU is device 0.
     let census = tokio::task::spawn_blocking(|| {
@@ -321,31 +323,32 @@ pub async fn fit(
     let demand_mib = weights_mib + kv_mib + FIT_SPAWN_OVERHEAD_MIB;
 
     let mut notes = Vec::new();
-    let (device, free_mib, fits, max_ctx, max_ctx_q8) = match census
+    let (device, free_mib, fits, max_ctx, max_ctx_q8) = if let Some(dev) = census
         .as_deref()
         .map(parse_devices)
         .and_then(|rows| rows.first().cloned())
     {
-        Some(dev) => {
-            let fits = demand_mib <= dev.free_mib;
-            let max_ctx = ctx_ladder(weights_mib, kv, dev.free_mib, ctx_evaluated);
-            let max_ctx_q8 =
-                ctx_ladder(weights_mib, |c| (kv(c) + 1) / 2, dev.free_mib, ctx_evaluated);
-            (
-                format!("cuda:{} {}", dev.index, dev.name),
-                dev.free_mib,
-                Some(fits),
-                Some(max_ctx),
-                Some(max_ctx_q8),
-            )
-        }
-        None => {
-            notes.push(
-                "no nvidia-smi census on this box - fit math reported, fits/max_ctx null \
-                 (non-NVIDIA boxes: consult the engine's own loader)",
-            );
-            ("unknown".to_string(), 0, None, None, None)
-        }
+        let fits = demand_mib <= dev.free_mib;
+        let max_ctx = ctx_ladder(weights_mib, kv, dev.free_mib, ctx_evaluated);
+        let max_ctx_q8 = ctx_ladder(
+            weights_mib,
+            |c| kv(c).div_ceil(2),
+            dev.free_mib,
+            ctx_evaluated,
+        );
+        (
+            format!("cuda:{} {}", dev.index, dev.name),
+            dev.free_mib,
+            Some(fits),
+            Some(max_ctx),
+            Some(max_ctx_q8),
+        )
+    } else {
+        notes.push(
+            "no nvidia-smi census on this box - fit math reported, fits/max_ctx null \
+             (non-NVIDIA boxes: consult the engine's own loader)",
+        );
+        ("unknown".to_string(), 0, None, None, None)
     };
     if max_ctx == Some(0) {
         notes.push("even ctx 1024 does not fit free VRAM - smaller quant or free capacity first");

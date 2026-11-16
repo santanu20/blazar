@@ -101,8 +101,7 @@ pub async fn tokenize(
                 let count = v
                     .get("tokens")
                     .and_then(|t| t.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
+                    .map_or(0, Vec::len);
                 axum::Json(json!({ "count": count })).into_response()
             }
             Err(e) => api_error(502, &format!("engine tokenize failed: {e}")),
