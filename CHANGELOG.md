@@ -35,6 +35,23 @@ tracked here.
   the last settled charge and the next admission check. Ollama unload
   pings (`keep_alive: 0` with no messages) are exempt. Default remains
   the advisory charge-on-measurement lane (`reserve_budgets = false`).
+- **Token-frame fallback for usage-less streams.** Streaming responses
+  that never carry a usage payload (no `stream_options.include_usage`,
+  engines that do not report usage) now settle key token budgets and
+  the `/api/usage` meter from the observed token frames - one
+  line-framed record (`"delta"` / `"message"` / `"response"`) per
+  generated token across OpenAI SSE, ollama chat NDJSON and ollama
+  generate NDJSON. An exact usage payload always wins; the frame count
+  is a lower-bound completion charge (prompt side stays uncounted at
+  this layer); JSON bodies never frame-count. Armed per lane from the
+  response content-type.
+- **Remote occupancy tracked to stream completion.** A remote peer's
+  in-flight lease now rides the response body to EOF (or client-abort
+  drop) instead of releasing at response-headers, so the
+  capacity-aware peer scorer no longer advertises capacity a
+  streaming remote does not have. Time-to-first-byte EWMA stays
+  header-time (that is the queue signal). Error-class responses
+  release the slot eagerly.
 
 ### Security
 
@@ -66,6 +83,13 @@ tracked here.
 
 ### Fixed
 
+- **OpenAI remote lane now charges key token budgets.** Requests to
+  `<remote>:<model>` on the `/v1` chat lane previously returned the
+  forwarded response without any token accounting (rpm admission ran,
+  tokens never charged). The lane now settles budgets from the
+  forwarded body - usage payload when present, token frames otherwise -
+  and participates in the strict `reserve_budgets` reservation lane
+  with the same completion-ceiling estimate as the local lanes.
 - **Anthropic lane now charges key token budgets.** `/v1/messages`
   forwarded through its own reqwest path and never reached the shared
   usage-sniffer charging sites: a key with `tpm`/`daily_tokens` saw

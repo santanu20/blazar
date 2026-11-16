@@ -853,7 +853,9 @@ pub fn scope_matches(pattern: &str, model: &str) -> bool {
 /// dialects blazar serves (`OpenAI` `prompt_tokens`/`completion_tokens`,
 /// Responses `input_tokens`/`output_tokens`, ollama NDJSON
 /// `prompt_eval_count`/`eval_count`). Constructed only for keys with
-/// token budgets - everyone else pays nothing.
+/// token budgets - everyone else pays nothing. Streaming lanes enable
+/// [`with_frame_counting`] so a body that never carries a usage payload
+/// still settles its budget from the observed token-frame count.
 pub struct UsageSniffer {
     tail: Vec<u8>,
     key: String,
@@ -863,6 +865,11 @@ pub struct UsageSniffer {
     // multiplied by n for llama.cpp children. sglang sums natively;
     // mistral.rs is unprobed and stays at honest 1x.
     completion_multiplier: u64,
+    // Lower-bound completion estimate for usage-less streams (see
+    // `usage::FrameCounter`). Inert unless the wrapping lane knows the
+    // body is a token-per-line stream.
+    frames: crate::usage::FrameCounter,
+    count_frames: bool,
 }
 
 const TAIL: usize = 8 * 1024;
@@ -874,6 +881,8 @@ impl UsageSniffer {
             tail: Vec::with_capacity(TAIL),
             key: key.to_string(),
             completion_multiplier: 1,
+            frames: crate::usage::FrameCounter::default(),
+            count_frames: false,
         }
     }
 
@@ -884,6 +893,17 @@ impl UsageSniffer {
         self
     }
 
+    /// Enable the token-frame fallback for a streaming body (SSE or
+    /// NDJSON - one line per generated token). When the finished body
+    /// carries NO usage payload in any dialect, the observed frame
+    /// count stands in as a lower-bound completion charge instead of
+    /// zero. An exact usage payload always wins.
+    #[must_use]
+    pub fn with_frame_counting(mut self, on: bool) -> Self {
+        self.count_frames = on;
+        self
+    }
+
     /// Key name this sniffer charges (settlement helpers read it).
     #[must_use]
     pub fn key(&self) -> &str {
@@ -891,6 +911,9 @@ impl UsageSniffer {
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
+        if self.count_frames {
+            self.frames.push(bytes);
+        }
         if self.tail.len() >= TAIL {
             let overflow = self.tail.len() + bytes.len() - TAIL;
             let keep_from = overflow.min(self.tail.len());
@@ -906,8 +929,16 @@ impl UsageSniffer {
     /// Parse the tail and return the scaled token total WITHOUT
     /// charging - the reservation-settle path pairs this with
     /// `BudgetLease::settle`, which releases + charges in one step.
+    /// No usage payload in any dialect + frame counting on: the
+    /// observed token-frame count stands in (lower-bound completion;
+    /// prompt side has no estimator at this layer). Frames are NOT
+    /// completion-multiplied - they are directly observed records
+    /// across every choice, unlike a per-choice usage report.
     pub fn sniff(&mut self) -> u64 {
         let (prompt, completion) = sniff_usage_parts(&std::mem::take(&mut self.tail));
+        if prompt.is_none() && completion.is_none() && self.count_frames {
+            return self.frames.count();
+        }
         scaled_total(prompt, completion, self.completion_multiplier)
     }
 
@@ -1023,8 +1054,19 @@ pub fn charge_outgoing(
         }
     }
     let (parts, body) = resp.into_parts();
+    // Token-frame fallback arms only for line-framed streams (SSE /
+    // NDJSON): a body that never carries a usage payload then settles
+    // from the observed frame count instead of zero. JSON bodies keep
+    // tail-only sniffing - their usage rides the final object.
+    let streaming_ct = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.starts_with("text/event-stream") || ct.starts_with("application/x-ndjson")
+        });
     let finish = std::sync::Arc::new(std::sync::Mutex::new(Finish(
-        Some(UsageSniffer::new(name)),
+        Some(UsageSniffer::new(name).with_frame_counting(streaming_ct)),
         limiter,
         lease,
     )));
@@ -1574,7 +1616,14 @@ mod tests {
         lease.settle(20);
         let held = lim.reserve(&k, 80).unwrap().expect("80 bookable"); // 20+80=100
         // With those 80 still held, one more token exceeds the daily cap.
-        assert!(lim.reserve(&k, 1).unwrap_err().to_response().status() == 429);
+        assert_eq!(
+            lim.reserve(&k, 1)
+                .unwrap_err()
+                .to_response()
+                .status()
+                .as_u16(),
+            429
+        );
         drop(held);
     }
 
@@ -1693,5 +1742,38 @@ mod tests {
             snap.iter()
                 .any(|(n, _, req, tok)| n == "ci" && *tok == 10 && *req == 0)
         );
+    }
+
+    #[test]
+    fn unit__sniffer_frames__stand_in_when_no_usage_payload() {
+        // Usage-less SSE stream + frame counting on: the observed
+        // token frames charge instead of zero (lower-bound completion).
+        let mut s = UsageSniffer::new("ci").with_frame_counting(true);
+        s.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
+        s.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n");
+        s.push(b"data: [DONE]\n\n");
+        assert_eq!(s.sniff(), 2);
+        // Frame counting off (default): same body stays uncounted -
+        // the fallback is opt-in per streaming lane.
+        let mut s = UsageSniffer::new("ci");
+        s.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
+        assert_eq!(s.sniff(), 0);
+    }
+
+    #[test]
+    fn unit__sniffer_frames__exact_usage_beats_frame_count() {
+        // The stream carries BOTH token frames and a final usage
+        // chunk: the exact payload wins, and the completion multiplier
+        // still applies to the reported side (llama.cpp per-choice
+        // reporting) - frames are never mixed into an exact reading.
+        let mut s = UsageSniffer::new("ci")
+            .with_frame_counting(true)
+            .with_completion_multiplier(2);
+        s.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
+        s.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n");
+        s.push(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n",
+        );
+        assert_eq!(s.sniff(), 9 + 3 * 2);
     }
 }

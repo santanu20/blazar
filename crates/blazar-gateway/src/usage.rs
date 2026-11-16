@@ -235,6 +235,67 @@ pub const USAGE_PATHS: &[&str] = &[
 /// degrades to uncounted tokens (requests still counted).
 pub const TAIL_LIMIT: usize = 64 * 1024;
 
+/// A single streaming line longer than this cannot be a per-token
+/// frame (token deltas are tiny JSON records); the partial-line buffer
+/// is dropped and counting resyncs at the next line boundary.
+pub const FRAME_LINE_CAP: usize = 16 * 1024;
+
+/// Lower-bound completion-token estimate for streams that never emit a
+/// usage payload: count completed lines that carry a token-bearing
+/// record. Engines emit one line per generated token across the
+/// dialects blazar serves - OpenAI-style `"delta"` chunks, ollama chat
+/// `"message"` records, ollama generate `"response"` records. Frame
+/// lines (role-only chunks, an occasional echoed final record) can
+/// overcount by one or two, never by a material margin, and an exact
+/// usage payload in the tail ALWAYS wins over this count. Prompt-side
+/// tokens have no estimator at this layer and stay uncounted.
+#[derive(Default, Clone)]
+pub struct FrameCounter {
+    partial: Vec<u8>,
+    frames: u64,
+}
+
+impl FrameCounter {
+    /// One completed line counts when it mentions any token-bearing
+    /// record type. Substring markers, no JSON parse: this runs on
+    /// every streamed byte.
+    fn is_token_frame(line: &[u8]) -> bool {
+        crate::keys::find_sub(line, b"\"delta\"").is_some()
+            || crate::keys::find_sub(line, b"\"message\"").is_some()
+            || crate::keys::find_sub(line, b"\"response\"").is_some()
+    }
+
+    /// Feed raw body bytes; splits on `\n` (a trailing `\r` is
+    /// tolerated - SSE/NDJSON writers may emit CRLF).
+    pub fn push(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b == b'\n' {
+                let mut line = std::mem::take(&mut self.partial);
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if Self::is_token_frame(&line) {
+                    self.frames += 1;
+                }
+                // `partial` is already empty via the take.
+                continue;
+            }
+            if self.partial.len() >= FRAME_LINE_CAP {
+                // Oversized line: not a per-token frame. Stop buffering
+                // (do not count it) and resync at the next newline.
+                continue;
+            }
+            self.partial.push(b);
+        }
+    }
+
+    /// Token-bearing frames observed so far.
+    #[must_use]
+    pub fn count(&self) -> u64 {
+        self.frames
+    }
+}
+
 /// `GET /api/usage?days=N` (default 7, clamped 1..=365): per-(day,
 /// model) token/latency rollups. Flushing the in-memory buckets first
 /// means the endpoint never shows stale-but-recorded traffic.
@@ -290,6 +351,75 @@ pub struct UsageQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(non_snake_case)] // repo test-name convention: unit__unit__scenario
+    fn unit__frame_counter__counts_token_lines_across_dialects() {
+        // OpenAI SSE: role-only chunk (no "delta" text content but the
+        // record still carries the delta marker), content chunks, the
+        // final usage-only chunk, and [DONE] - only delta-bearing lines
+        // count.
+        let mut fc = FrameCounter::default();
+        fc.push(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            fc.count(),
+            3,
+            "role + 2 content chunks count; usage/[DONE] do not"
+        );
+        // ollama chat NDJSON: one "message" record per token; the final
+        // done-record without a message field does not count.
+        let mut fc = FrameCounter::default();
+        fc.push(
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"a\"},\"done\":false}\n\
+              {\"message\":{\"role\":\"assistant\",\"content\":\"b\"},\"done\":false}\n\
+              {\"done\":true,\"eval_count\":2}\n",
+        );
+        assert_eq!(fc.count(), 2);
+        // ollama generate NDJSON: "response" records.
+        let mut fc = FrameCounter::default();
+        fc.push(b"{\"response\":\"a\",\"done\":false}\n{\"done\":true}\n");
+        assert_eq!(fc.count(), 1);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // repo test-name convention: unit__unit__scenario
+    fn unit__frame_counter__marker_split_across_chunks() {
+        // Chunk boundaries land mid-line: the partial-line buffer must
+        // hold the fragment until the newline, so a marker split across
+        // two pushes still counts as one frame.
+        let mut fc = FrameCounter::default();
+        fc.push(b"data: {\"choices\":[{\"del");
+        assert_eq!(fc.count(), 0, "no complete line yet");
+        fc.push(b"ta\":{\"content\":\"x\"}}]}\n\n");
+        assert_eq!(fc.count(), 1);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // repo test-name convention: unit__unit__scenario
+    fn unit__frame_counter__oversized_line_resyncs_and_crlf_counts() {
+        let mut fc = FrameCounter::default();
+        // A monster line (one giant JSON record, not a per-token frame):
+        // buffered up to the cap, never counted, counting resyncs at
+        // the following newline.
+        let mut big = vec![b'{'];
+        big.extend(std::iter::repeat_n(b'x', FRAME_LINE_CAP + 64));
+        big.push(b'}');
+        big.push(b'\n');
+        fc.push(&big);
+        assert_eq!(fc.count(), 0, "oversized line is not a token frame");
+        // CRLF line ends count normally after the resync.
+        fc.push(b"data: {\"delta\":{\"content\":\"y\"}}\r\n");
+        assert_eq!(fc.count(), 1);
+    }
 
     #[test]
     #[allow(non_snake_case)] // repo test-name convention: unit__unit__scenario

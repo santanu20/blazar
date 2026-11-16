@@ -246,6 +246,78 @@ async fn client__remote_ollama_lane__scoped_key_rejected() {
     stub.shutdown().await;
 }
 
+/// Remote-lane token accounting: a streamed response that never carries
+/// a usage payload (client did not ask `stream_options.include_usage`)
+/// still settles the key's budget from the observed token frames -
+/// role + 2 content + finish chunks count, `[DONE]` does not. Also
+/// pins that the remote forward now charges key budgets at all (the
+/// OpenAI remote lane previously returned the forward uncharged).
+#[tokio::test]
+async fn client__remote_stream_without_usage__charges_token_frames() {
+    let stub = support::spawn_remote_stub().await;
+    let cfg = blazar_core::Config {
+        keys: vec![
+            blazar_core::ApiKey {
+                name: "admin".into(),
+                key: "plm_admin".into(),
+                ..blazar_core::ApiKey::default()
+            },
+            blazar_core::ApiKey {
+                name: "frames".into(),
+                key: "plm_frames".into(),
+                daily_tokens: 1000,
+                ..blazar_core::ApiKey::default()
+            },
+        ],
+        ..blazar_core::Config::default()
+    };
+    let cfg = support::with_remote(cfg, "far", &stub.base);
+    let ts = start(cfg).await;
+    let c = client();
+
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .bearer_auth("plm_frames")
+        .json(&serde_json::json!({
+            "model": "far:m1", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // Drain the FULL stream so the accounting wrapper's Drop runs.
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("data: "), "SSE stream forwarded: {body}");
+    assert!(
+        !body.contains("\"usage\""),
+        "stub omits the usage chunk without include_usage: {body}"
+    );
+
+    let usage: serde_json::Value = c
+        .get(format!("{}/api/keys", ts.base))
+        .bearer_auth("plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let frames = usage["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["name"] == "frames")
+        .expect("frames key listed")
+        .clone();
+    assert_eq!(
+        frames["usage"]["tokens"], 4,
+        "role + 2 content + finish chunks counted; [DONE] not: {frames}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+    stub.shutdown().await;
+}
+
 /// C4: same-named remotes form a POOL; a conversation prefix sticks to
 /// the member that served it (its KV holds the prefix), surfaced via
 /// `x-blazar-remote`.

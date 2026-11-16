@@ -324,12 +324,15 @@ pub async fn messages(
         // in the SSE frames - the translated anthropic events carry a
         // different shape the sniffer does not parse): constructed only
         // when the key carries budgets, exactly like the proxy lanes.
+        // Frame counting is on: this leg always streams SSE, and a
+        // child that never emits a usage chunk still settles budgets
+        // from the observed token frames.
         let budget_sniffer = key_ext
             .as_ref()
             .map(|axum::extract::Extension(k)| k.name.clone())
             .and_then(|name| state.keys.entry(&name))
             .filter(|e| e.tpm > 0 || e.daily_tokens > 0)
-            .map(|e| crate::keys::UsageSniffer::new(&e.name));
+            .map(|e| crate::keys::UsageSniffer::new(&e.name).with_frame_counting(true));
         let child_stream = if budget_sniffer.is_some() || anthropic_lease.is_some() {
             futures::StreamExt::boxed(crate::keys::tap_usage(
                 resp.bytes_stream(),

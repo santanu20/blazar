@@ -361,6 +361,7 @@ fn noise_for(base_series: &[f64], cand_series: &[f64]) -> f64 {
 /// the operator's minimum gain. Interactive is lexicographic: p95 TTFT
 /// first, p95 ITL as tie-break only within the TTFT gate.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one arm per objective keeps the verdict contract flat
 pub fn verify(
     objective: OptimizeObjective,
     base: &ArmStats,

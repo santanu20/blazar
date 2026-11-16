@@ -1253,11 +1253,20 @@ pub async fn chat(
         }
         let prefix = crate::proxy::affinity_hash(&req);
         let mut out = match crate::remotes::select_remote(&state, &model_field, prefix.as_ref()) {
-            Ok((remote, remote_model, _lease, akey)) => {
+            Ok((remote, remote_model, lease, akey)) => {
                 let remote = remote.clone();
                 let resp =
                     crate::remotes::ollama_chat_remote(&state, &remote, remote_model, &req).await;
-                crate::remotes::tag_remote_result(&state, &remote, akey, resp)
+                let resp = crate::remotes::tag_remote_result(&state, &remote, akey, resp);
+                // Remote occupancy rides the NDJSON body to completion
+                // (stream decode continues past headers); error-class
+                // responses release the slot eagerly.
+                if resp.status().as_u16() < 500 {
+                    crate::remotes::lease_to_eof(lease, resp)
+                } else {
+                    drop(lease);
+                    resp
+                }
             }
             Err(resp) => resp,
         };

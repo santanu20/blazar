@@ -92,9 +92,12 @@ fn unbind_remote(
 }
 
 /// RAII in-flight lease: bumped by `select_remote`, released on drop.
-/// Released when the caller's response HEADERS are ready (forward
-/// functions return at header time); body streaming continues after -
-/// header-time is the meaningful queue signal for load balancing.
+/// Hand to [`lease_to_eof`] so the slot rides the response BODY: a
+/// streaming remote keeps generating long past response-HEADERS, and
+/// `score_peer` reads `in_flight` to rank peers - header-time release
+/// would advertise capacity the remote does not have. Time-to-head
+/// EWMA (the queue signal) is still measured at header time by
+/// `forward_with_health`; only occupancy moves to stream completion.
 pub struct RemoteLease {
     map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>>,
     key: String,
@@ -108,6 +111,30 @@ impl Drop for RemoteLease {
             h.in_flight = h.in_flight.saturating_sub(1);
         }
     }
+}
+
+/// Carry a `RemoteLease` inside the response body: the in-flight slot
+/// is released when the stream COMPLETES (EOF, transport error, or the
+/// body's `Drop` on client abort) instead of when headers are ready -
+/// the remote is busy generating until then. Pass-through bytes, zero
+/// buffering (same body-riding contract as `otlp::spanned` and
+/// `keys::guard_response`). Error-class responses should NOT be
+/// wrapped: an error body a client never drains would hold phantom
+/// occupancy, so callers drop the lease eagerly on >=500.
+pub fn lease_to_eof(lease: RemoteLease, resp: Response) -> Response {
+    let (parts, body) = resp.into_parts();
+    let inner = body.into_data_stream();
+    let stream = futures::stream::unfold((lease, inner), |(lease, mut inner)| async move {
+        use futures::StreamExt as _;
+        match inner.next().await {
+            Some(Ok(bytes)) => Some((Ok(bytes), (lease, inner))),
+            // The errored item is still yielded; the state (and the
+            // lease inside it) drops when the consumer stops polling.
+            Some(Err(e)) => Some((Err(std::io::Error::other(e)), (lease, inner))),
+            None => None,
+        }
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 /// Select the remote for a `<remote>:<model>` request: filter the
@@ -302,7 +329,7 @@ pub async fn forward_with_health(
     // Affinity hash over the ORIGINAL body (forward_openai rewrites the
     // model field - the prefix identity lives in the prompt fields).
     let prefix = crate::proxy::affinity_hash_bytes(&body);
-    let (remote, remote_model, _lease, akey) = match select_remote(state, model, prefix.as_ref()) {
+    let (remote, remote_model, lease, akey) = match select_remote(state, model, prefix.as_ref()) {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -325,7 +352,16 @@ pub async fn forward_with_health(
     if resp.status().as_u16() < 500 {
         note_remote_latency(&state.remote_health, &remote, head_ms);
     }
-    tag_remote_result(state, &remote, akey, resp)
+    let resp = tag_remote_result(state, &remote, akey, resp);
+    // Occupancy rides the body to stream completion; error-class
+    // responses release eagerly (an undrained error body must not hold
+    // phantom in_flight against the capacity scorer).
+    if resp.status().as_u16() < 500 {
+        lease_to_eof(lease, resp)
+    } else {
+        drop(lease);
+        resp
+    }
 }
 
 /// Forward an OpenAI-shaped request to a remote: rewrite `model` to the
@@ -969,10 +1005,16 @@ pub async fn try_fallback_forward(
             body,
         } => Some(forward_with_health(state, &prefixed, method, path, headers, body).await),
         FallbackLane::OllamaChat { req, prefix } => {
-            let (remote, remote_model, _lease, akey) =
+            let (remote, remote_model, lease, akey) =
                 select_remote(state, &prefixed, prefix.as_ref()).ok()?;
             let resp = ollama_chat_remote(state, &remote, remote_model, req).await;
-            Some(tag_remote_result(state, &remote, akey, resp))
+            let resp = tag_remote_result(state, &remote, akey, resp);
+            Some(if resp.status().as_u16() < 500 {
+                lease_to_eof(lease, resp)
+            } else {
+                drop(lease);
+                resp
+            })
         }
     }
 }
@@ -1205,8 +1247,76 @@ mod tests {
                 .in_flight += 1;
             assert_eq!(map.lock().unwrap()["r|http://10.0.0.4:8000"].in_flight, 1);
         }
-        // Lease dropped at header time: the LB slot is back.
+        // Lease dropped: the LB slot is back.
         assert_eq!(map.lock().unwrap()["r|http://10.0.0.4:8000"].in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn unit__lease_to_eof__holds_slot_until_stream_drains() {
+        // Two-chunk body: the in-flight slot must stay held while the
+        // first chunk is out and only release at EOF - header-time
+        // release would advertise capacity a streaming remote lacks.
+        let map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>> =
+            std::sync::Arc::default();
+        map.lock()
+            .unwrap()
+            .entry("r|http://10.0.0.4:8000".into())
+            .or_default()
+            .in_flight += 1;
+        let lease = RemoteLease {
+            map: std::sync::Arc::clone(&map),
+            key: "r|http://10.0.0.4:8000".into(),
+        };
+        let chunks = futures::stream::iter([
+            Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from_static(b"he")),
+            Ok(axum::body::Bytes::from_static(b"llo")),
+        ]);
+        let resp = lease_to_eof(lease, Response::new(Body::from_stream(chunks)));
+        use futures::StreamExt as _;
+        let mut stream = resp.into_body().into_data_stream();
+        let first = stream.next().await.expect("first chunk").expect("ok");
+        assert_eq!(&first[..], b"he");
+        assert_eq!(
+            map.lock().unwrap()["r|http://10.0.0.4:8000"].in_flight,
+            1,
+            "slot held while body still streams"
+        );
+        let rest = axum::body::to_bytes(axum::body::Body::from_stream(stream), 1 << 16)
+            .await
+            .expect("drain");
+        assert_eq!(&rest[..], b"llo");
+        assert_eq!(
+            map.lock().unwrap()["r|http://10.0.0.4:8000"].in_flight,
+            0,
+            "slot released at EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__lease_to_eof__drop_without_consume_still_releases() {
+        // Client-abort shape: the body is never polled again - the
+        // carried lease must still release (Drop backstop).
+        let map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RemoteHealth>>> =
+            std::sync::Arc::default();
+        map.lock()
+            .unwrap()
+            .entry("r|http://10.0.0.4:8000".into())
+            .or_default()
+            .in_flight += 1;
+        let lease = RemoteLease {
+            map: std::sync::Arc::clone(&map),
+            key: "r|http://10.0.0.4:8000".into(),
+        };
+        let resp = lease_to_eof(
+            lease,
+            Response::new(Body::empty()), // empty body: only Drop can release
+        );
+        drop(resp);
+        assert_eq!(
+            map.lock().unwrap()["r|http://10.0.0.4:8000"].in_flight,
+            0,
+            "drop backstop releases the slot"
+        );
     }
 
     #[test]

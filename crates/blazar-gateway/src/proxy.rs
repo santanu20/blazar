@@ -1065,17 +1065,14 @@ fn settle_buffered_sniff(
     buf: &[u8],
     limiter: &crate::keys::KeysLimiter,
 ) {
-    let mut s = match sniffer {
-        Some(s) => s,
-        None => {
-            // Snifferless wrap with a lease (lease implies budgets
-            // implies sniffer on this lane): release against zero so
-            // headroom is never stranded.
-            if let Some(l) = lease {
-                l.settle(0);
-            }
-            return;
+    let Some(mut s) = sniffer else {
+        // Snifferless wrap with a lease (lease implies budgets implies
+        // sniffer on this lane): release against zero so headroom is
+        // never stranded.
+        if let Some(l) = lease {
+            l.settle(0);
         }
+        return;
     };
     s.push(buf);
     let total = s.sniff();
@@ -1487,6 +1484,9 @@ pub async fn proxy_request(
         .map(|e| {
             crate::keys::UsageSniffer::new(&e.name)
                 .with_completion_multiplier(completion_multiplier)
+                // SSE bodies whose engine never emits a usage chunk
+                // still settle budgets from the token-frame count.
+                .with_frame_counting(sse)
         });
     // Enforce (opt-in): non-stream chat requests get judged BEFORE any
     // byte is released - the client waits for the full JSON anyway, so

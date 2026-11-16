@@ -81,12 +81,16 @@ pub struct TraceId(pub String);
 /// Per-response usage accumulator the metered body stream folds into:
 /// the trailing byte window (last `usage::TAIL_LIMIT` bytes hold the
 /// final usage chunk across dialects) plus first/last chunk stamps for
-/// TTFT and generation-duration accounting.
+/// TTFT and generation-duration accounting, plus a token-frame counter
+/// (armed for SSE/NDJSON bodies) so streams that never carry a usage
+/// payload still meter their generated tokens.
 #[derive(Default, Clone)]
 struct UsageTap {
     tail: Vec<u8>,
     first: Option<std::time::Instant>,
     last: Option<std::time::Instant>,
+    frames: crate::usage::FrameCounter,
+    count_frames: bool,
 }
 
 /// Bearer auth: active iff any `[[keys]]` exist (children stay loopback
@@ -378,7 +382,20 @@ async fn request_log(
         && let Some(model_name) = usage_model
     {
         let (parts, body) = resp.into_parts();
-        let tap = std::sync::Arc::new(std::sync::Mutex::new(UsageTap::default()));
+        // Frame fallback arms only for line-framed streams: a JSON
+        // body's usage rides its final object, and its single giant
+        // line must not be mistaken for token frames.
+        let count_frames = parts
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| {
+                ct.starts_with("text/event-stream") || ct.starts_with("application/x-ndjson")
+            });
+        let tap = std::sync::Arc::new(std::sync::Mutex::new(UsageTap {
+            count_frames,
+            ..UsageTap::default()
+        }));
         let tap_map = std::sync::Arc::clone(&tap);
         let metered = futures::StreamExt::map(body.into_data_stream(), move |chunk| {
             if let Ok(bytes) = chunk.as_ref() {
@@ -393,6 +410,9 @@ async fn request_log(
                 if overflow > 0 {
                     t.tail.drain(..overflow);
                 }
+                if t.count_frames {
+                    t.frames.push(bytes);
+                }
             }
             chunk
         });
@@ -403,6 +423,14 @@ async fn request_log(
             futures::stream::once(async move {
                 let tap = tap_end.lock().expect("usage tap poisoned").clone();
                 let (in_tok, out_tok, cached_tok) = crate::usage::sniff_usage_full(&tap.tail);
+                // No usage payload anywhere on a line-framed stream:
+                // the observed token-frame count stands in as the
+                // output side (lower bound; the input side has no
+                // estimator at this layer). An exact payload wins.
+                let out_tok = match (out_tok, tap.count_frames) {
+                    (None, true) => i64::try_from(tap.frames.count()).ok(),
+                    (v, _) => v,
+                };
                 let gen_secs = match (tap.first, tap.last) {
                     (Some(f), Some(l)) => l.saturating_duration_since(f).as_secs_f64(),
                     _ => 0.0,

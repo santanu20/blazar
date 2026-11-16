@@ -805,8 +805,26 @@ pub async fn openai_proxy(
         return rej.to_response();
     }
     // Remote routing: `<remote-name>:<model>` never loads locally.
+    // Strict-lane reservation runs BEFORE the forward (same contract
+    // as the ollama remote lane), and the response body carries the
+    // key's token accounting - usage payload when the stream sends
+    // one, observed token frames when it does not.
     if crate::remotes::split_remote(&model, &state.cfg()).is_some() {
-        return crate::remotes::forward_with_health(
+        let mut budget_lease = None;
+        if state.cfg().reserve_budgets
+            && let Some(Extension(k)) = key_ext.as_ref()
+            && let Some(entry) = state.keys.entry(&k.name)
+        {
+            let default_tokens = state.cfg().reserve_default_tokens;
+            let estimate = parsed_body.as_ref().map_or(default_tokens, |v| {
+                crate::keys::completion_ceiling(v, default_tokens)
+            });
+            match state.keys.reserve(&entry, estimate) {
+                Ok(l) => budget_lease = l,
+                Err(rej) => return rej.to_response(),
+            }
+        }
+        let mut out = crate::remotes::forward_with_health(
             &state,
             &model,
             &method,
@@ -815,6 +833,10 @@ pub async fn openai_proxy(
             body,
         )
         .await;
+        if let Some(Extension(k)) = key_ext.as_ref() {
+            out = maybe_charge_remote(out, &state, &k.name, budget_lease);
+        }
+        return out;
     }
     // Federation fallback: a bare name the local store does not know
     // routes to a peer that lists it (presence-cached, TTL-bound, with
@@ -1590,6 +1612,27 @@ fn extract_model(body: &[u8]) -> Option<String> {
     v.get("model")?.as_str().map(str::to_string)
 }
 
+/// Wrap a remote-forwarded response with the key's token accounting
+/// when the key carries budgets (tpm/daily) or a strict-lane
+/// reservation to settle. Unlimited keys pass through untouched - the
+/// zero-tax contract. Shared by every remote lane on the OpenAI plane.
+fn maybe_charge_remote(
+    resp: Response,
+    state: &std::sync::Arc<crate::state::AppState>,
+    key_name: &str,
+    lease: Option<crate::keys::BudgetLease>,
+) -> Response {
+    let budgeted = lease.is_some()
+        || state
+            .keys
+            .entry(key_name)
+            .is_some_and(|e| e.tpm > 0 || e.daily_tokens > 0);
+    if !budgeted {
+        return resp;
+    }
+    crate::keys::charge_outgoing(resp, key_name, std::sync::Arc::clone(&state.keys), lease)
+}
+
 /// Child surfaces only llama-server implements. A non-llamacpp child
 /// (mistralrs, mlx, sdcpp) would answer these with a bare 404/HTML
 /// error; Blazar teaches instead (fail fast, name the limitation, name
@@ -1883,7 +1926,7 @@ pub async fn scoped_proxy(
         return rej.to_response();
     }
     if crate::remotes::split_remote(&model, &state.cfg()).is_some() {
-        return crate::remotes::forward_with_health(
+        let mut out = crate::remotes::forward_with_health(
             &state,
             &model,
             &method,
@@ -1892,6 +1935,13 @@ pub async fn scoped_proxy(
             body,
         )
         .await;
+        // Scoped surfaces have no parsed body before the forward, so
+        // they charge on measure (usage payload or token frames); the
+        // strict reservation lane lives on the primary chat lane.
+        if let Some(Extension(k)) = key_ext.as_ref() {
+            out = maybe_charge_remote(out, &state, &k.name, None);
+        }
+        return out;
     }
     let priority = Priority::from_header(
         headers
@@ -1977,7 +2027,7 @@ pub async fn responses_api(
     }
     // Remote routing first (registry chaining is local-only today).
     if crate::remotes::split_remote(&model, &state.cfg()).is_some() {
-        return crate::remotes::forward_with_health(
+        let mut out = crate::remotes::forward_with_health(
             &state,
             &model,
             &method,
@@ -1986,6 +2036,10 @@ pub async fn responses_api(
             body,
         )
         .await;
+        if let Some(Extension(k)) = key_ext.as_ref() {
+            out = maybe_charge_remote(out, &state, &k.name, None);
+        }
+        return out;
     }
     // Parse-failure passthrough: an unparseable body still deserves the
     // engine's own error, byte-faithful.
@@ -2345,9 +2399,10 @@ async fn buffered_response_roundtrip(
         if let Some(Extension(k)) = key_ext.as_ref()
             && let Some(entry) = state.keys.entry(&k.name)
         {
-            let base_estimate = serde_json::from_slice::<serde_json::Value>(new_body)
-                .map(|v| crate::keys::completion_ceiling(&v, state.cfg().reserve_default_tokens))
-                .unwrap_or(state.cfg().reserve_default_tokens);
+            let base_estimate = serde_json::from_slice::<serde_json::Value>(new_body).map_or_else(
+                |_| state.cfg().reserve_default_tokens,
+                |v| crate::keys::completion_ceiling(&v, state.cfg().reserve_default_tokens),
+            );
             let estimate = base_estimate.saturating_mul(best_of.filter(|n| *n >= 2).unwrap_or(1));
             match state.keys.reserve(&entry, estimate) {
                 Ok(l) => budget_lease = l,
