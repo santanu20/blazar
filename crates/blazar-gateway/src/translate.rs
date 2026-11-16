@@ -1520,8 +1520,8 @@ mod tests {
     fn unit__tool_calls__malformed_args_never_string() {
         // Ollama contract: function.arguments is ALWAYS a JSON object.
         // Malformed model output must degrade to {} — a raw string crashes
-        // pydantic-typed ollama clients mid-stream (live hit: geokit
-        // chat_pipelines ore_thermo_via_python).
+        // pydantic-typed ollama clients mid-stream (live hit: a tool-
+        // calling python client decoding our NDJSON stream).
         let mut accum = ToolCallAccum::default();
         accum.absorb(&[json!({
             "index": 0,
