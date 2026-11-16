@@ -2334,6 +2334,27 @@ async fn buffered_response_roundtrip(
     // D5 class-routing anchor: guard is held from here through the note,
     // so both live counts include this request (see `others_peak`).
     let entry_live = state.sup.model_live_streams(model_name);
+    // Strict token-budget lane (`reserve_budgets`): the buffered branch
+    // bypasses proxy_request's reservation, so hold the completion
+    // ceiling (max_output_tokens, else the configured default) here and
+    // settle it from the parsed usage below. Early exits drop the lease
+    // -> full release. Best-of-N fans N generations, so the fan path
+    // scales the estimate by the candidate count.
+    let mut budget_lease = None;
+    if state.cfg().reserve_budgets {
+        if let Some(Extension(k)) = key_ext.as_ref()
+            && let Some(entry) = state.keys.entry(&k.name)
+        {
+            let base_estimate = serde_json::from_slice::<serde_json::Value>(new_body)
+                .map(|v| crate::keys::completion_ceiling(&v, state.cfg().reserve_default_tokens))
+                .unwrap_or(state.cfg().reserve_default_tokens);
+            let estimate = base_estimate.saturating_mul(best_of.filter(|n| *n >= 2).unwrap_or(1));
+            match state.keys.reserve(&entry, estimate) {
+                Ok(l) => budget_lease = l,
+                Err(rej) => return Err(rej.to_response()),
+            }
+        }
+    }
     let url = format!(
         "{}/v1/responses",
         crate::proxy::child_base(&engine.endpoint)
@@ -2471,10 +2492,14 @@ async fn buffered_response_roundtrip(
         );
     }
     // FIX6: this buffered branch bypasses proxy_request's sniffer -
-    // charge token budgets directly from the parsed usage.
+    // charge token budgets directly from the parsed usage. The strict
+    // lane settles its reservation through the same numbers.
     if let Some(Extension(k)) = key_ext.as_ref() {
         let total = in_tok.unwrap_or(0).saturating_add(out_tok.unwrap_or(0));
-        state.keys.charge_tokens(&k.name, total);
+        match budget_lease.take() {
+            Some(l) => l.settle(total),
+            None => state.keys.charge_tokens(&k.name, total),
+        }
     }
     let output_items = out
         .get("output")

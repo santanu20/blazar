@@ -20,6 +20,21 @@ tracked here.
   ineligible - never an estimate. Peak VRAM appears in the `--run`
   report lines and the serialized ledger row; rows written before the
   lane existed deserialize with no reading (serde default).
+- **Strict token-budget reservation lane (`reserve_budgets`).** Opt-in
+  gateway flag: with it on, every chat-family request (OpenAI
+  chat/completions, completions, Responses - buffered and streaming,
+  Ollama chat/generate, Anthropic messages) holds its declared
+  completion ceiling (`options.num_predict`/`num_predict`/
+  `max_tokens`/`max_completion_tokens`/`max_output_tokens`, else
+  `reserve_default_tokens`, multiplied by the best-of fan count where
+  applicable) against the key's `tpm` and `daily_tokens` at admission
+  and is refused 429 *before* any generation when the reservation
+  cannot fit. The hold is released and replaced by measured usage when
+  the response settles (stream end, buffered completion, or client
+  abort), so concurrent bursts can no longer overshoot a quota between
+  the last settled charge and the next admission check. Ollama unload
+  pings (`keep_alive: 0` with no messages) are exempt. Default remains
+  the advisory charge-on-measurement lane (`reserve_budgets = false`).
 
 ### Security
 
@@ -51,6 +66,14 @@ tracked here.
 
 ### Fixed
 
+- **Anthropic lane now charges key token budgets.** `/v1/messages`
+  forwarded through its own reqwest path and never reached the shared
+  usage-sniffer charging sites: a key with `tpm`/`daily_tokens` saw
+  only its rpm counted on this lane while every other dialect charged
+  tokens. Both the streaming and buffered paths now sniff child bytes
+  for usage (or settle a `reserve_budgets` hold) and charge the key's
+  measured `prompt_tokens + completion_tokens` like every other
+  chat-family route.
 - **OTLP spans now end at stream completion, not response headers.**
   The exported request span previously closed when the handler returned
   its response - for streaming generation that is header time, so a

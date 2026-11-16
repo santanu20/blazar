@@ -164,6 +164,27 @@ pub async fn messages(
     {
         return rej.to_response();
     }
+    // Strict token-budget lane (`reserve_budgets`): hold the completion
+    // ceiling (`max_tokens`, else the configured default; a best-of-N
+    // fan scales it by the candidate count) before generation. Settles
+    // from the child's raw usage below - both the streaming tap and
+    // the buffered parse. This lane previously had NO token accounting
+    // at all (rpm/request counts only), which the reservation lane
+    // makes structurally impossible to repeat: budget keys now always
+    // carry a sniffer or a settlement here.
+    let mut anthropic_lease = None;
+    if state.cfg().reserve_budgets {
+        if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
+            && let Some(entry) = state.keys.entry(&key.name)
+        {
+            let base = crate::keys::completion_ceiling(&parsed, state.cfg().reserve_default_tokens);
+            let estimate = base.saturating_mul(best_of.filter(|n| *n >= 2).unwrap_or(1));
+            match state.keys.reserve(&entry, estimate) {
+                Ok(l) => anthropic_lease = l,
+                Err(rej) => return rej.to_response(),
+            }
+        }
+    }
     if let Some(err) = state.sentinel.strict_tool_def_error_cached(&openai_body) {
         return anthropic_error(
             400,
@@ -299,7 +320,26 @@ pub async fn messages(
         }
         let id = format!("msg_{}", unique_suffix());
         let model_label = model.clone();
-        let child_stream = resp.bytes_stream();
+        // Token accounting rides the RAW child chunks (openai dialect
+        // in the SSE frames - the translated anthropic events carry a
+        // different shape the sniffer does not parse): constructed only
+        // when the key carries budgets, exactly like the proxy lanes.
+        let budget_sniffer = key_ext
+            .as_ref()
+            .map(|axum::extract::Extension(k)| k.name.clone())
+            .and_then(|name| state.keys.entry(&name))
+            .filter(|e| e.tpm > 0 || e.daily_tokens > 0)
+            .map(|e| crate::keys::UsageSniffer::new(&e.name));
+        let child_stream = if budget_sniffer.is_some() || anthropic_lease.is_some() {
+            futures::StreamExt::boxed(crate::keys::tap_usage(
+                resp.bytes_stream(),
+                budget_sniffer,
+                std::sync::Arc::clone(&state.keys),
+                anthropic_lease,
+            ))
+        } else {
+            futures::StreamExt::boxed(resp.bytes_stream())
+        };
         let events = anthropic_sse_stream(child_stream, StreamState::new(&id, &model_label), guard);
         return Response::builder()
             .status(StatusCode::OK)
@@ -378,6 +418,8 @@ pub async fn messages(
     let openai: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => {
+            // Unparseable child body: the strict-lane lease drops here
+            // -> full release (nothing sniffable was generated).
             return anthropic_error(
                 status.as_u16(),
                 "api_error",
@@ -385,6 +427,27 @@ pub async fn messages(
             );
         }
     };
+    // Token accounting for the buffered lane (gap fix): charge the
+    // child's reported usage - error bodies carry none and settle to
+    // zero. The strict-lane reservation settles through the same
+    // numbers; best-of fans and MCP loops arrive here with usage
+    // already summed by their builders.
+    if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k) {
+        let total = openai
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(
+                openai
+                    .pointer("/usage/completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+        match anthropic_lease.take() {
+            Some(l) => l.settle(total),
+            None => state.keys.charge_tokens(&key.name, total),
+        }
+    }
     if !status.is_success() {
         let mut msg = openai
             .pointer("/error/message")

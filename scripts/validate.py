@@ -13635,6 +13635,10 @@ def _full_toplevel() -> dict:
         # BLZ-1 legacy-sharing posture exercised explicitly on the
         # full-manifest boot; strict mode flips it negative-side.
         "legacy_open_records": True,
+        # strict token-budget lane exercised off (default advisory
+        # accounting) here; gates phase proves the reservation refusal.
+        "reserve_budgets": False,
+        "reserve_default_tokens": 1024,
         "late_chunking_max_tokens": 8192,
         "session_keep_secs": 900,
         # agent-tooling wave: validated for prefix/pairing/JSON/XOR in

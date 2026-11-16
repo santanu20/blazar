@@ -264,6 +264,11 @@ struct KeyState {
     /// Live leases (concurrency cap); instantaneous state - never
     /// rolled by `roll_day` nor persisted.
     in_flight: u32,
+    /// Outstanding strict-lane token reservations (`reserve_budgets`):
+    /// completion ceilings held by in-flight requests, not yet settled
+    /// to measured usage. Instantaneous state like `in_flight` - never
+    /// rolled nor persisted.
+    reserved: u64,
     dirty: bool,
 }
 
@@ -420,9 +425,11 @@ impl KeysLimiter {
     ///
     /// Token budgets stay measured-usage accounting (charged at
     /// completion via `charge_tokens`): they throttle with completion
-    /// lag rather than reserving upfront. The strict in-flight bound
-    /// for hard spending control is the `max_concurrent` cap leased at
-    /// auth time.
+    /// lag rather than reserving upfront. Two strict in-flight bounds
+    /// exist for hard spending control: the `max_concurrent` cap leased
+    /// at auth time, and the opt-in `reserve_budgets` lane
+    /// ([`KeysLimiter::reserve`]) which holds each request's completion
+    /// ceiling against tpm/daily headroom until it settles.
     pub fn admit(&self, key: &blazar_core::ApiKey, model: &str) -> Result<(), Rejection> {
         if !key.models.is_empty() && !key.models.iter().any(|m| scope_matches(m, model)) {
             return Err(Rejection::Scope {
@@ -550,6 +557,87 @@ impl KeysLimiter {
         }
     }
 
+    /// Strict-lane admission (`reserve_budgets = true`): hold `estimate`
+    /// completion tokens against the key's tpm/daily budgets before any
+    /// generation starts. `Ok(None)` = the key carries no token budgets
+    /// (or the estimate is zero) - nothing tracked, zero cost. A refusal
+    /// is a plain [`Rejection::Rate`] (429 + retry-after) naming the
+    /// reservation lane, so a burst cannot slip past the budget between
+    /// the last settled charge and the next admission check. Atomic with
+    /// the reservation bookkeeping under one lock, mirroring `admit`.
+    pub fn reserve(
+        self: &std::sync::Arc<Self>,
+        entry: &blazar_core::ApiKey,
+        estimate: u64,
+    ) -> Result<Option<BudgetLease>, Rejection> {
+        if (entry.tpm == 0 && entry.daily_tokens == 0) || estimate == 0 {
+            return Ok(None);
+        }
+        let now = Instant::now();
+        let today = utc_day(SystemTime::now());
+        let mut states = self.states.lock().expect("keys state poisoned");
+        let st = states.entry(entry.name.clone()).or_default();
+        st.roll_day(&today);
+        let cut = st
+            .tpm
+            .partition_point(|(t, _)| now.duration_since(*t) >= WINDOW);
+        st.tpm.drain(..cut);
+        if entry.tpm > 0 {
+            let mut oldest_in_window = None;
+            let mut spent: u64 = 0;
+            for (t, n) in &st.tpm {
+                spent += n;
+                oldest_in_window = Some(oldest_in_window.unwrap_or(*t).min(*t));
+            }
+            if spent.saturating_add(st.reserved).saturating_add(estimate) > entry.tpm {
+                let retry_after_secs = oldest_in_window.map_or(1, |t| {
+                    WINDOW
+                        .checked_sub(now.duration_since(t))
+                        .unwrap_or(WINDOW)
+                        .as_secs()
+                        .max(1)
+                });
+                return Err(Rejection::Rate {
+                    kind: "token budget reservation (tokens-per-minute)",
+                    retry_after_secs,
+                    name: entry.name.clone(),
+                });
+            }
+        }
+        if entry.daily_tokens > 0
+            && st
+                .tokens
+                .saturating_add(st.reserved)
+                .saturating_add(estimate)
+                > entry.daily_tokens
+        {
+            return Err(Rejection::Rate {
+                kind: "token budget reservation (daily token budget)",
+                retry_after_secs: secs_until_utc_midnight(),
+                name: entry.name.clone(),
+            });
+        }
+        st.reserved += estimate;
+        Ok(Some(BudgetLease {
+            limiter: std::sync::Arc::clone(self),
+            name: entry.name.clone(),
+            held: estimate,
+        }))
+    }
+
+    /// Release an unsettled (or partially settled) reservation amount.
+    /// `saturating_sub` mirrors `release`: a key removed mid-flight
+    /// keeps its state entry, and a stale lease can never underflow.
+    fn release_reservation(&self, name: &str, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        let mut states = self.states.lock().expect("keys state poisoned");
+        if let Some(st) = states.get_mut(name) {
+            st.reserved = st.reserved.saturating_sub(tokens);
+        }
+    }
+
     /// Snapshot for `/api/keys` (never secrets).
     #[must_use]
     pub fn usage_snapshot(&self) -> Vec<(String, String, u64, u64)> {
@@ -632,6 +720,7 @@ fn clone_state(st: &KeyState) -> KeyState {
         requests: st.requests,
         tokens: st.tokens,
         in_flight: 0,
+        reserved: 0,
         dirty: st.dirty,
     }
 }
@@ -657,6 +746,50 @@ impl std::fmt::Debug for SlotLease {
 impl Drop for SlotLease {
     fn drop(&mut self) {
         self.limiter.release(&self.name);
+    }
+}
+
+/// RAII token-budget reservation (strict lane, `reserve_budgets`).
+/// Created by [`KeysLimiter::reserve`] at admission time; settles to
+/// measured usage via [`BudgetLease::settle`] when the response's
+/// stream finishes, and releases any unsettled remainder on Drop - an
+/// aborted request never strands budget headroom.
+pub struct BudgetLease {
+    limiter: std::sync::Arc<KeysLimiter>,
+    name: String,
+    /// Tokens still held; `settle` zeroes this before the terminal
+    /// Drop so the release runs exactly once.
+    held: u64,
+}
+
+impl std::fmt::Debug for BudgetLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Limiter internals are irrelevant; name + held size say everything.
+        f.debug_struct("BudgetLease")
+            .field("key", &self.name)
+            .field("held", &self.held)
+            .finish()
+    }
+}
+
+impl BudgetLease {
+    /// Replace the provisional reservation with measured usage:
+    /// releases everything still held and charges `actual` through the
+    /// ordinary accounting path (0 = the sniffer found no usage - the
+    /// reservation is still released). Consumes `self`, so the terminal
+    /// Drop is a no-op.
+    pub fn settle(mut self, actual: u64) {
+        self.limiter.release_reservation(&self.name, self.held);
+        self.held = 0;
+        if actual > 0 {
+            self.limiter.charge_tokens(&self.name, actual);
+        }
+    }
+}
+
+impl Drop for BudgetLease {
+    fn drop(&mut self) {
+        self.limiter.release_reservation(&self.name, self.held);
     }
 }
 
@@ -747,8 +880,14 @@ impl UsageSniffer {
     /// Charge the completion side `mult`x (see field note). Default 1.
     #[must_use]
     pub fn with_completion_multiplier(mut self, mult: u64) -> Self {
-        self.completion_multiplier = mult.max(1);
+        self.completion_multiplier = mult;
         self
+    }
+
+    /// Key name this sniffer charges (settlement helpers read it).
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -764,10 +903,17 @@ impl UsageSniffer {
         }
     }
 
+    /// Parse the tail and return the scaled token total WITHOUT
+    /// charging - the reservation-settle path pairs this with
+    /// `BudgetLease::settle`, which releases + charges in one step.
+    pub fn sniff(&mut self) -> u64 {
+        let (prompt, completion) = sniff_usage_parts(&std::mem::take(&mut self.tail));
+        scaled_total(prompt, completion, self.completion_multiplier)
+    }
+
     /// Parse the tail + charge the key. Returns the token total found.
-    pub fn finish(self, limiter: &KeysLimiter) -> u64 {
-        let (prompt, completion) = sniff_usage_parts(&self.tail);
-        let total = scaled_total(prompt, completion, self.completion_multiplier);
+    pub fn finish(mut self, limiter: &KeysLimiter) -> u64 {
+        let total = self.sniff();
         limiter.charge_tokens(&self.key, total);
         total
     }
@@ -831,19 +977,48 @@ pub(crate) fn last_int_after(tail: &[u8], key: &str) -> Option<u64> {
 /// token counters as it streams out (usage lives in the final NDJSON
 /// line / final JSON object of ollama-API responses). Abort-safe via
 /// `Drop` - a client disconnect still charges what was generated.
+/// `lease` (strict `reserve_budgets` lane) settles the provisional
+/// reservation from the same sniffed total; `None` keeps plain
+/// charge-on-measure.
 #[must_use]
 pub fn charge_outgoing(
     resp: axum::response::Response,
     name: &str,
     limiter: std::sync::Arc<KeysLimiter>,
+    lease: Option<BudgetLease>,
 ) -> axum::response::Response {
     use futures::StreamExt as _;
     /// Abort-safe finisher: `Drop` runs on clean drain AND client abort.
-    struct Finish(Option<UsageSniffer>, std::sync::Arc<KeysLimiter>);
+    struct Finish(
+        Option<UsageSniffer>,
+        std::sync::Arc<KeysLimiter>,
+        Option<BudgetLease>,
+    );
     impl Drop for Finish {
         fn drop(&mut self) {
-            if let Some(s) = self.0.take() {
-                s.finish(&self.1);
+            let lease = self.2.take();
+            match self.0.take() {
+                Some(s) => {
+                    let mut s = s;
+                    let total = s.sniff();
+                    match lease {
+                        Some(l) => l.settle(total),
+                        None => {
+                            if total > 0 {
+                                self.1.charge_tokens(&s.key, total);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // Snifferless wrap with a lease (shouldn't happen -
+                    // lease implies budgets implies sniffer): release
+                    // the reservation against a zero charge so headroom
+                    // is never stranded.
+                    if let Some(l) = lease {
+                        l.settle(0);
+                    }
+                }
             }
         }
     }
@@ -851,6 +1026,7 @@ pub fn charge_outgoing(
     let finish = std::sync::Arc::new(std::sync::Mutex::new(Finish(
         Some(UsageSniffer::new(name)),
         limiter,
+        lease,
     )));
     let mapped = body.into_data_stream().map(move |r| {
         if let Ok(bytes) = r.as_ref()
@@ -862,6 +1038,86 @@ pub fn charge_outgoing(
     });
     let stream = mapped.chain(futures::stream::unfold((), |()| async { None }));
     axum::http::Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+
+/// Completion-token ceiling for the strict reservation lane: the
+/// request's explicit generation cap in any of the dialects blazar
+/// serves (ollama `options.num_predict` / top-level `num_predict`,
+/// `OpenAI` `max_tokens` / `max_completion_tokens`, Responses
+/// `max_output_tokens`), else `default_tokens`. Non-positive values
+/// (ollama's -1/-2 "infinite"/"fill context" arrive as non-u64 and
+/// fall through; an explicit 0 is treated as "no ceiling stated")
+/// resolve to the default too. Prompt-side tokens are deliberately
+/// NOT estimated - there is no tokenizer at this layer - and settle
+/// from the measured usage tail.
+#[must_use]
+pub fn completion_ceiling(req: &serde_json::Value, default_tokens: u64) -> u64 {
+    let explicit = req
+        .get("options")
+        .and_then(|o| o.get("num_predict"))
+        .or_else(|| req.get("num_predict"))
+        .or_else(|| req.get("max_tokens"))
+        .or_else(|| req.get("max_completion_tokens"))
+        .or_else(|| req.get("max_output_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| *n > 0);
+    explicit.unwrap_or(default_tokens)
+}
+
+/// Usage-tapped engine stream for lanes that TRANSLATE child bytes
+/// before the client sees them (the anthropic SSE translator): feeds
+/// the tail-sniffer with the raw child chunks and settles/charges at
+/// stream end. Clean drain and client abort both finish (`Drop`),
+/// matching [`charge_outgoing`] semantics for non-axum streams.
+pub fn tap_usage<S, E>(
+    stream: S,
+    sniffer: Option<UsageSniffer>,
+    limiter: std::sync::Arc<KeysLimiter>,
+    lease: Option<BudgetLease>,
+) -> impl futures::Stream<Item = Result<axum::body::Bytes, E>>
+where
+    S: futures::Stream<Item = Result<axum::body::Bytes, E>>,
+{
+    use futures::StreamExt as _;
+    struct Tap(
+        Option<UsageSniffer>,
+        std::sync::Arc<KeysLimiter>,
+        Option<BudgetLease>,
+    );
+    impl Drop for Tap {
+        fn drop(&mut self) {
+            let lease = self.2.take();
+            match self.0.take() {
+                Some(s) => {
+                    let mut s = s;
+                    let total = s.sniff();
+                    match lease {
+                        Some(l) => l.settle(total),
+                        None => {
+                            if total > 0 {
+                                self.1.charge_tokens(&s.key, total);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if let Some(l) = lease {
+                        l.settle(0);
+                    }
+                }
+            }
+        }
+    }
+    let tap = std::sync::Arc::new(std::sync::Mutex::new(Tap(sniffer, limiter, lease)));
+    let mapped = stream.map(move |r| {
+        if let Ok(bytes) = r.as_ref()
+            && let Some(t) = tap.lock().expect("usage tap").0.as_mut()
+        {
+            t.push(bytes);
+        }
+        r
+    });
+    mapped.chain(futures::stream::unfold((), |()| async { None }))
 }
 
 pub(crate) fn read_leading_int(bytes: &[u8]) -> Option<u64> {
@@ -1275,6 +1531,86 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unit__reserve__holds_tpm_headroom_and_releases_on_drop() {
+        let lim = std::sync::Arc::new(KeysLimiter::loaded(None, Vec::new()));
+        let k = key("ci", 0, 100, 0, &[]);
+        // Hold 60 of the 100 tpm: an overlapping ask of 41 no longer fits
+        // (60 reserved + 41 > 100) even though nothing is charged yet.
+        let lease = lim.reserve(&k, 60).unwrap().expect("lease granted");
+        let err = lim.reserve(&k, 41).unwrap_err();
+        assert!(matches!(
+            err,
+            Rejection::Rate {
+                kind: "token budget reservation (tokens-per-minute)",
+                ..
+            }
+        ));
+        assert_eq!(err.to_response().status(), 429);
+        // An aborted request drops the lease: headroom returns untouched
+        // (nothing was charged, so the full 100 is bookable again).
+        drop(lease);
+        assert!(lim.reserve(&k, 41).unwrap().is_some());
+    }
+
+    #[test]
+    fn unit__reserve__settle_charges_actual_and_frees_remainder() {
+        let lim = std::sync::Arc::new(KeysLimiter::loaded(None, Vec::new()));
+        let k = key("ci", 0, 0, 100, &[]);
+        // Daily lane: reserve 60, generation only measured 20 tokens.
+        // settle must release the 40 held and charge the 20 spent, so a
+        // follow-up reservation sees 80 headroom, not 40.
+        let lease = lim.reserve(&k, 60).unwrap().expect("lease granted");
+        let err = lim.reserve(&k, 41).unwrap_err();
+        assert!(matches!(
+            err,
+            Rejection::Rate {
+                kind: "token budget reservation (daily token budget)",
+                ..
+            }
+        ));
+        lease.settle(20);
+        let held = lim.reserve(&k, 80).unwrap().expect("80 bookable"); // 20+80=100
+        // With those 80 still held, one more token exceeds the daily cap.
+        assert!(lim.reserve(&k, 1).unwrap_err().to_response().status() == 429);
+        drop(held);
+    }
+
+    #[test]
+    fn unit__reserve__no_budget_or_zero_estimate_is_none() {
+        let lim = std::sync::Arc::new(KeysLimiter::loaded(None, Vec::new()));
+        // No tpm/daily caps: reservation is pointless, admission says None
+        // so callers skip lease plumbing entirely.
+        let k = key("ci", 0, 0, 0, &[]);
+        assert!(lim.reserve(&k, 500).unwrap().is_none());
+        // Capped key but a zero estimate (empty ceiling): same skip.
+        let k = key("ci", 0, 100, 100, &[]);
+        assert!(lim.reserve(&k, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn unit__completion_ceiling__reads_all_dialects_and_falls_back() {
+        use serde_json::json;
+        let d = 1024_u64;
+        // One completion-cap knob per API dialect.
+        assert_eq!(
+            completion_ceiling(&json!({"options": {"num_predict": 7}}), d),
+            7
+        );
+        assert_eq!(completion_ceiling(&json!({"num_predict": 11}), d), 11);
+        assert_eq!(completion_ceiling(&json!({"max_tokens": 13}), d), 13);
+        assert_eq!(
+            completion_ceiling(&json!({"max_completion_tokens": 17}), d),
+            17
+        );
+        assert_eq!(completion_ceiling(&json!({"max_output_tokens": 19}), d), 19);
+        // Absent / zero / negative knobs all fall back to the configured
+        // default rather than admitting "unlimited".
+        assert_eq!(completion_ceiling(&json!({}), d), d);
+        assert_eq!(completion_ceiling(&json!({"max_tokens": 0}), d), d);
+        assert_eq!(completion_ceiling(&json!({"max_tokens": -5}), d), d);
     }
 
     #[test]

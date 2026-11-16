@@ -75,6 +75,26 @@ pub struct Config {
     /// strict mode.
     #[serde(default = "default_true")]
     pub legacy_open_records: bool,
+    /// Strict token-budget lane for keyed requests. `false` (default)
+    /// keeps charge-on-measure semantics: tpm/daily budgets are checked
+    /// at admission against already-settled usage and charged when the
+    /// response's usage tail is sniffed - concurrent requests can
+    /// overshoot a budget between last check and settle. `true` adds a
+    /// provisional reservation: each chat-family request reserves its
+    /// completion ceiling (the request's `num_predict` / `max_tokens` /
+    /// `max_output_tokens`, else `reserve_default_tokens`) against tpm
+    /// and daily budgets BEFORE generation starts, is refused 429 early
+    /// when headroom is exhausted, and settles the reservation to
+    /// measured usage when the stream finishes. Aborted requests
+    /// release their reservation. Prompt-side tokens are not estimated
+    /// (no tokenizer at this layer) - they settle from measurement.
+    #[serde(default)]
+    pub reserve_budgets: bool,
+    /// Completion-token estimate reserved per request when it carries no
+    /// explicit generation ceiling. Only read when `reserve_budgets` is
+    /// enabled.
+    #[serde(default = "default_reserve_default_tokens")]
+    pub reserve_default_tokens: u64,
     pub default_ctx: u32,
     pub idle_sleep_secs: u64,
     pub idle_timeout_secs: u64,
@@ -3625,6 +3645,8 @@ impl Default for Config {
             port: 11435,
             allow_unauthenticated_remote: false,
             legacy_open_records: true,
+            reserve_budgets: false,
+            reserve_default_tokens: 1024,
             default_ctx: 16384,
             idle_sleep_secs: 300,
             cpu_range: String::new(),
@@ -4103,6 +4125,8 @@ const SECTION_FIELDS: &[(&str, &[&str])] = &[
             "port",
             "allow_unauthenticated_remote",
             "legacy_open_records",
+            "reserve_budgets",
+            "reserve_default_tokens",
             "log_level",
             "no_host",
             "cors_origins",
@@ -6542,6 +6566,10 @@ fn default_agent_policy() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_reserve_default_tokens() -> u64 {
+    1024
 }
 
 fn default_engine_check_secs() -> u64 {

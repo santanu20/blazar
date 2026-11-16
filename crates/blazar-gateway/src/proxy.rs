@@ -1027,11 +1027,64 @@ async fn forward_once(
 struct FinishSniffer(
     Option<crate::keys::UsageSniffer>,
     std::sync::Arc<crate::keys::KeysLimiter>,
+    Option<crate::keys::BudgetLease>,
 );
 impl Drop for FinishSniffer {
     fn drop(&mut self) {
-        if let Some(s) = self.0.take() {
-            s.finish(&self.1);
+        let lease = self.2.take();
+        match self.0.take() {
+            Some(s) => {
+                let mut s = s;
+                let total = s.sniff();
+                match lease {
+                    Some(l) => l.settle(total),
+                    None => {
+                        if total > 0 {
+                            self.1.charge_tokens(s.key(), total);
+                        }
+                    }
+                }
+            }
+            None => {
+                if let Some(l) = lease {
+                    l.settle(0);
+                }
+            }
+        }
+    }
+}
+
+/// Buffered-lane settlement: push the final body bytes through the
+/// sniffer, then either settle the strict-lane reservation to the
+/// sniffed total or charge on measure. Shared by every buffered charge
+/// site (the F30 error returns included) so reservation release can
+/// never be skipped on an early exit.
+fn settle_buffered_sniff(
+    sniffer: Option<crate::keys::UsageSniffer>,
+    lease: Option<crate::keys::BudgetLease>,
+    buf: &[u8],
+    limiter: &crate::keys::KeysLimiter,
+) {
+    let mut s = match sniffer {
+        Some(s) => s,
+        None => {
+            // Snifferless wrap with a lease (lease implies budgets
+            // implies sniffer on this lane): release against zero so
+            // headroom is never stranded.
+            if let Some(l) = lease {
+                l.settle(0);
+            }
+            return;
+        }
+    };
+    s.push(buf);
+    let total = s.sniff();
+    match lease {
+        Some(l) => l.settle(total),
+        None => {
+            if total > 0 {
+                limiter.charge_tokens(s.key(), total);
+            }
         }
     }
 }
@@ -1204,6 +1257,39 @@ pub async fn proxy_request(
     // this snapshot after `body` moved into the upstream stream. The
     // crash-window retry below also rebuilds from it.
     let mut body_snapshot = body.clone();
+    // Strict token-budget lane (`reserve_budgets`): hold the request's
+    // completion ceiling against tpm/daily headroom BEFORE any engine
+    // I/O - a saturated budget refuses here, 429-early, with no child
+    // work started. Chat routes only: embeddings/rerank/admin surfaces
+    // have no generation to bound (exact-charge or request-count lanes
+    // keep their own accounting). The reservation settles from the
+    // sniffed usage tail at every charge site below (streaming Drop,
+    // buffered sites, F30 error returns); any pre-charge exit path
+    // drops it -> full release.
+    let mut budget_lease = None;
+    if state.cfg().reserve_budgets
+        && is_chat_route(path_query)
+        && let Some(k) = key.as_ref()
+        && let Some(entry) = state.keys.entry(&k.name)
+    {
+        // parsed=None only on cold callers; parse the snapshot for the
+        // estimate then (the strict lane is opt-in, so the parse rides
+        // it rather than taxing every request).
+        let estimate = match parsed.as_ref() {
+            Some(v) => crate::keys::completion_ceiling(v, state.cfg().reserve_default_tokens),
+            None => match serde_json::from_slice::<serde_json::Value>(&body_snapshot) {
+                Ok(v) => crate::keys::completion_ceiling(&v, state.cfg().reserve_default_tokens),
+                Err(_) => state.cfg().reserve_default_tokens,
+            },
+        };
+        match state.keys.reserve(&entry, estimate) {
+            Ok(l) => budget_lease = l,
+            Err(rej) => {
+                drop(sf); // F31: Drop removes the singleflight entry
+                return rej.to_response();
+            }
+        }
+    }
     let upstream = forward_once(state, engine, method, &url, headers, body).await;
     let resp = match upstream {
         Ok(r) => r,
@@ -1587,9 +1673,12 @@ pub async fn proxy_request(
                         match adapted {
                             Ok(b) => axum::body::Bytes::from(b),
                             Err(why) => {
-                                if let Some(s) = sniffer.take() {
-                                    s.finish(&state.keys);
-                                }
+                                settle_buffered_sniff(
+                                    sniffer.take(),
+                                    budget_lease.take(),
+                                    &[],
+                                    &state.keys,
+                                );
                                 drop(sf); // F31: Drop removes the singleflight entry
                                 return openai_error(502, &format!("recipe lane: {why}"));
                             }
@@ -1618,10 +1707,12 @@ pub async fn proxy_request(
                                 // Tokens were generated for the choices
                                 // that DID come back - charge before
                                 // failing (F30 pattern).
-                                if let Some(mut s) = sniffer.take() {
-                                    s.push(&buf);
-                                    s.finish(&state.keys);
-                                }
+                                settle_buffered_sniff(
+                                    sniffer.take(),
+                                    budget_lease.take(),
+                                    &buf,
+                                    &state.keys,
+                                );
                                 drop(sf); // F31: Drop removes the singleflight entry
                                 return openai_error(
                                     502,
@@ -1658,10 +1749,12 @@ pub async fn proxy_request(
                         // F30: a fully-generated enforce-rejected response
                         // still consumed child tokens - charge the key's
                         // budgets and release the single-flight entry.
-                        if let Some(mut s) = sniffer.take() {
-                            s.push(&buf);
-                            s.finish(&state.keys);
-                        }
+                        settle_buffered_sniff(
+                            sniffer.take(),
+                            budget_lease.take(),
+                            &buf,
+                            &state.keys,
+                        );
                         drop(sf); // F31: Drop removes the singleflight entry
                         return openai_error(422, &format!("sentinel enforce: {detail}"));
                     }
@@ -1669,10 +1762,7 @@ pub async fn proxy_request(
                 // Pass (or oversize passthrough): re-emit the buffered body
                 // with the original headers; the guard chain keeps
                 // in-flight accounting for the send.
-                if let Some(mut s) = sniffer.take() {
-                    s.push(&buf);
-                    s.finish(&state.keys);
-                }
+                settle_buffered_sniff(sniffer.take(), budget_lease.take(), &buf, &state.keys);
                 // R6: buffered non-stream chat - classify from the exact
                 // JSON (no substring heuristics on this path).
                 record_buffered_chat(&state.obs, model, &buf, began.elapsed().as_secs_f64());
@@ -1743,6 +1833,7 @@ pub async fn proxy_request(
     let sniffer_finisher = std::sync::Arc::new(std::sync::Mutex::new(FinishSniffer(
         sniffer,
         Arc::clone(&state.keys),
+        budget_lease,
     )));
     let cache_tap = std::sync::Arc::new(CacheTap::new());
     let tap_map = std::sync::Arc::clone(&cache_tap);

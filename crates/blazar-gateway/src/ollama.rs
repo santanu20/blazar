@@ -1213,6 +1213,31 @@ pub async fn chat(
         .as_ref()
         .map(|Extension(k)| k.name.clone())
         .and_then(|name| state.keys.entry(&name).map(|e| (name, e)));
+    // ollama unload idiom: no messages + keep_alive 0 = release ping.
+    // Hoisted above the strict-lane reservation: a release ping does no
+    // generation and must never be refused (or momentarily charged)
+    // against a token budget.
+    let is_unload_ping = parse_keep_alive(req.get("keep_alive")) == Some(0)
+        && req
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_none_or(|m: &Vec<Value>| m.is_empty());
+    // Strict token-budget lane (`reserve_budgets`): hold the completion
+    // ceiling (options.num_predict / max_tokens, else the configured
+    // default) before any lane runs. Every charge_outgoing wrap below
+    // settles it from the sniffed tail; pre-wrap exits drop it -> full
+    // release.
+    let mut budget_lease = None;
+    if state.cfg().reserve_budgets && !is_unload_ping {
+        if let Some((_name, entry)) = &key_entry {
+            let estimate =
+                crate::keys::completion_ceiling(&req, state.cfg().reserve_default_tokens);
+            match state.keys.reserve(entry, estimate) {
+                Ok(l) => budget_lease = l,
+                Err(rej) => return rej.to_response(),
+            }
+        }
+    }
     // Remote routing: `<remote>:<model>` on the ollama API too -
     // POOL-aware (C4): select among same-named remotes with prefix
     // stickiness + circuit health, not just the first configured entry.
@@ -1238,18 +1263,19 @@ pub async fn chat(
         };
         // Token budgets ride the remote NDJSON exactly like the local
         // lane (final line carries eval counts).
-        if let Some((name, _entry)) = key_entry.filter(|(_, e)| e.tpm > 0 || e.daily_tokens > 0) {
-            out = crate::keys::charge_outgoing(out, &name, Arc::clone(&state.keys));
+        if budget_lease.is_some()
+            || key_entry
+                .as_ref()
+                .is_some_and(|(_, e)| e.tpm > 0 || e.daily_tokens > 0)
+        {
+            if let Some((name, _entry)) = &key_entry {
+                out =
+                    crate::keys::charge_outgoing(out, name, Arc::clone(&state.keys), budget_lease);
+            }
         }
         return out;
     }
-    // ollama unload idiom: no messages + keep_alive 0 = release ping.
-    if parse_keep_alive(req.get("keep_alive")) == Some(0)
-        && req
-            .get("messages")
-            .and_then(Value::as_array)
-            .is_none_or(|m: &Vec<Value>| m.is_empty())
-    {
+    if is_unload_ping {
         return unload_ping(&state, &model_field, true).await;
     }
     let row = match state.with_store(|s| resolve_model(s, &model_field)) {
@@ -1272,14 +1298,19 @@ pub async fn chat(
             {
                 // Token budgets ride the remote NDJSON exactly like the
                 // explicit-prefix lane above.
-                if let Some((name, _entry)) =
-                    key_entry.filter(|(_, e)| e.tpm > 0 || e.daily_tokens > 0)
+                if budget_lease.is_some()
+                    || key_entry
+                        .as_ref()
+                        .is_some_and(|(_, e)| e.tpm > 0 || e.daily_tokens > 0)
                 {
-                    out = crate::keys::charge_outgoing(
-                        out,
-                        &name,
-                        std::sync::Arc::clone(&state.keys),
-                    );
+                    if let Some((name, _entry)) = &key_entry {
+                        out = crate::keys::charge_outgoing(
+                            out,
+                            name,
+                            std::sync::Arc::clone(&state.keys),
+                            budget_lease,
+                        );
+                    }
                 }
                 return out;
             }
@@ -1719,9 +1750,16 @@ pub async fn chat(
     );
     // Token accounting rides the outgoing ollama body (the final NDJSON
     // line / JSON carries eval counts); constructed only for keys with
-    // token budgets.
-    if let Some((name, _entry)) = key_entry.filter(|(_, e)| e.tpm > 0 || e.daily_tokens > 0) {
-        out = crate::keys::charge_outgoing(out, &name, Arc::clone(&state.keys));
+    // token budgets. The strict-lane reservation settles through the
+    // same wrap.
+    if budget_lease.is_some()
+        || key_entry
+            .as_ref()
+            .is_some_and(|(_, e)| e.tpm > 0 || e.daily_tokens > 0)
+    {
+        if let Some((name, _entry)) = &key_entry {
+            out = crate::keys::charge_outgoing(out, name, Arc::clone(&state.keys), budget_lease);
+        }
     }
     out
 }
@@ -3621,6 +3659,22 @@ pub async fn generate(
     {
         return rej.to_response();
     }
+    // Strict token-budget lane (`reserve_budgets`): same contract as
+    // /api/chat - the completion ceiling (options.num_predict, else the
+    // configured default) is held before generation and settles through
+    // the charge wrap at the handler tail. The unload ping already
+    // returned above, so every path past here generates.
+    let mut budget_lease = None;
+    if state.cfg().reserve_budgets {
+        if let Some((_name, entry)) = &key_entry {
+            let estimate =
+                crate::keys::completion_ceiling(&req, state.cfg().reserve_default_tokens);
+            match state.keys.reserve(entry, estimate) {
+                Ok(l) => budget_lease = l,
+                Err(rej) => return rej.to_response(),
+            }
+        }
+    }
     // Think-capability gate (ollama parity), same as /api/chat. Both
     // think gates run BEFORE translation - the translator maps `think`
     // to engine kwargs, so a post-translate mutation would never reach
@@ -3840,8 +3894,14 @@ pub async fn generate(
         })
         .await,
     );
-    if let Some((name, _entry)) = key_entry.filter(|(_, e)| e.tpm > 0 || e.daily_tokens > 0) {
-        out = crate::keys::charge_outgoing(out, &name, Arc::clone(&state.keys));
+    if budget_lease.is_some()
+        || key_entry
+            .as_ref()
+            .is_some_and(|(_, e)| e.tpm > 0 || e.daily_tokens > 0)
+    {
+        if let Some((name, _entry)) = &key_entry {
+            out = crate::keys::charge_outgoing(out, name, Arc::clone(&state.keys), budget_lease);
+        }
     }
     out
 }

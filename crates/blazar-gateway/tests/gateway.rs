@@ -1793,6 +1793,68 @@ async fn e2e__keys_scoped_rate_and_accounting() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__reserve_budgets__rejects_before_generation_and_releases_after_settle() {
+    use blazar_core::ApiKey;
+    // Strict lane: daily_tokens=100 with reserve_budgets=true. A request
+    // whose declared max_tokens exceeds the remaining budget is refused at
+    // admission - before any engine work - and completed responses release
+    // their reservation (a leaked hold would block the third request).
+    let cfg = Config {
+        keys: vec![ApiKey {
+            name: "ci".into(),
+            key: "plm_res".into(),
+            daily_tokens: 100,
+            ..ApiKey::default()
+        }],
+        reserve_budgets: true,
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    let chat = |max: u64| {
+        serde_json::json!({
+            "model": "m1", "stream": false, "max_tokens": max,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+    };
+    // 150-token ceiling > 100 daily budget: refused pre-generation.
+    let over = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .bearer_auth("plm_res")
+        .json(&chat(150))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(over.status(), 429, "reservation exceeds daily budget");
+    assert!(over.headers().contains_key("retry-after"));
+    let body = over.text().await.unwrap();
+    assert!(
+        body.contains("token budget reservation"),
+        "429 body must name the reservation lane: {body}"
+    );
+    // Three sequential 50-token requests all pass: each response settles
+    // measured usage and releases its hold - leaked reservations would
+    // accumulate (50+50+50 > 100) and 429 the third.
+    for i in 0..3 {
+        let r = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .bearer_auth("plm_res")
+            .json(&chat(50))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            200,
+            "request {} within reserved headroom",
+            i + 1
+        );
+    }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__local_tts_charges_key_admission() {
     use blazar_core::ApiKey;
     // Audit MM1: the LOCAL piper lane must pass key admission BEFORE its
