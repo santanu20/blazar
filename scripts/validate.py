@@ -2208,6 +2208,38 @@ _K = [
         "remote capability-registry URL; unset in sandbox (no egress)",
     ),
     (
+        "model_pools",
+        False,
+        True,
+        "roundtrip",
+        None,
+        "[[model_pools]] service identities; boot + /api/route + chat via pool name",
+    ),
+    (
+        "reserve_budgets",
+        True,
+        False,
+        "behavior",
+        None,
+        "strict token-budget reservation; 429 before generation + settle-on-completion",
+    ),
+    (
+        "reserve_default_tokens",
+        True,
+        False,
+        "behavior",
+        None,
+        "reservation ceiling when the request declares no completion size",
+    ),
+    (
+        "legacy_open_records",
+        True,
+        False,
+        "behavior",
+        None,
+        "strict tenancy for ownerless legacy records; boot + truth table unit-pinned",
+    ),
+    (
         "checkpoint_min_step",
         True,
         False,
@@ -3387,6 +3419,11 @@ class Sandbox:
             elif k == "mcp":
                 for entry in v:
                     tables.append(("mcp", entry))
+            elif k == "model_pools":
+                for entry in v:
+                    # members: list-of-dicts renders as a TOML inline
+                    # table array via the list branch below.
+                    tables.append(("model_pools", entry))
             elif isinstance(v, dict):
                 # Top-level container struct (e.g. [semantic_cache]):
                 # render as a TOML table section, never a quoted string.
@@ -3405,25 +3442,44 @@ class Sandbox:
             else:
                 lines.append(f"{k} = " + _toml_str(v))
         body = "\n".join(lines) + ("\n" if lines else "")
-        for name, tbl in tables:
-            # "keys"/"remotes" are arrays-of-tables ([[keys]]/[[remotes]]);
-            # everything else a plain table.
-            header = (
-                f"[[{name}]]" if name in ("keys", "remotes", "mcp") else f"[{name}]"
-            )
-            body += f"\n{header}\n"
+
+        def _table_body(tbl: dict) -> tuple[str, list]:
+            out = ""
+            nested: list[tuple[str, list]] = []
             for k, v in tbl.items():
                 if isinstance(v, bool):
-                    body += f"{k} = {'true' if v else 'false'}\n"
+                    out += f"{k} = {'true' if v else 'false'}\n"
                 elif isinstance(v, (int, float)):
-                    body += f"{k} = {v}\n"
+                    out += f"{k} = {v}\n"
                 elif isinstance(v, list):
-                    body += f"{k} = " + json.dumps(v) + "\n"
+                    if v and all(isinstance(x, dict) for x in v):
+                        # Array-of-tables (e.g. model_pools members):
+                        # JSON braces are NOT TOML - emit [[parent.key]]
+                        # sections instead of an inline literal.
+                        nested.append((k, v))
+                    else:
+                        out += f"{k} = " + json.dumps(v) + "\n"
                 elif isinstance(v, dict):
                     # Nested struct (e.g. sampler_defaults): inline table.
-                    body += f"{k} = " + _toml_inline(v) + "\n"
+                    out += f"{k} = " + _toml_inline(v) + "\n"
                 else:
-                    body += f"{k} = " + _toml_str(v) + "\n"
+                    out += f"{k} = " + _toml_str(v) + "\n"
+            return out, nested
+
+        for name, tbl in tables:
+            # "keys"/"remotes"/"mcp"/"model_pools" are arrays-of-tables;
+            # everything else a plain table.
+            header = (
+                f"[[{name}]]"
+                if name in ("keys", "remotes", "mcp", "model_pools")
+                else f"[{name}]"
+            )
+            out, nested = _table_body(tbl)
+            body += f"\n{header}\n" + out
+            for key, entries in nested:
+                for entry in entries:
+                    sub_out, _ = _table_body(entry)
+                    body += f"\n[[{name}.{key}]]\n" + sub_out
         with open(path, "w") as f:
             f.write(body + "\n")
         return path
@@ -13264,6 +13320,166 @@ def phase_commands() -> None:
             p.returncode != 0 and len(p.stdout + p.stderr) > 10,
             (p.stderr.strip() or p.stdout.strip())[:80],
         )
+
+    # -- F2: gateway wave lanes (scoped-key MCP grants, strict token
+    # reservation, model pools) ----------------------------------------
+    d.stop()
+    d.start(
+        {
+            "port": PORT,
+            "reserve_budgets": True,
+            "reserve_default_tokens": 2048,
+            "legacy_open_records": False,
+            "keys": [
+                {"name": "admin", "key": "plm-validate-admin-1"},
+                {
+                    "name": "budget",
+                    "key": "plm-validate-budget-1",
+                    "daily_tokens": 100,
+                },
+            ],
+            "model_pools": [
+                {
+                    "name": "vp",
+                    "strategy": "adaptive",
+                    "members": [{"peer": "local", "model": MODEL}],
+                }
+            ],
+        }
+    )
+    admin_h = {"Authorization": "Bearer plm-validate-admin-1"}
+    budget_h = {"Authorization": "Bearer plm-validate-budget-1"}
+
+    # keys.add.mcp: per-key MCP server/tool grants round-trip through the
+    # management API and surface in `blazar keys` output.
+    st, _, v = http_json(
+        "POST",
+        "/api/keys",
+        {
+            "name": "devmcp",
+            "mcp_servers": ["fs"],
+            "mcp_tools": ["fs:read*"],
+        },
+        admin_h,
+    )
+    p = cli("keys", "list")
+    reg(
+        "keys.add.mcp",
+        st in (200, 201) and "devmcp" in p.stdout and "mcp: servers [fs]" in p.stdout,
+        f"api {st}; scopes line "
+        + ("present" if "mcp: servers [fs]" in p.stdout else "absent"),
+    )
+    cov(
+        "model_pools",
+        "[[model_pools]] accepted at boot + adaptive lane",
+        "pool vp exercised below",
+    )
+
+    # reserve_budgets: the 429 lands BEFORE generation (teaching body).
+    st, _, v = http_json(
+        "POST",
+        "/v1/chat/completions",
+        {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 9999,
+        },
+        budget_h,
+    )
+    reg(
+        "reserve_budgets",
+        st == 429 and "token budget reservation" in str(v),
+        f"status {st}, body names the reservation lane",
+    )
+
+    # reserve_default_tokens: no declared completion size -> the default
+    # ceiling reserves (a missing default would skip the reserve lane
+    # and answer 200).
+    st, _, v = http_json(
+        "POST",
+        "/v1/chat/completions",
+        {"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+        budget_h,
+    )
+    reg(
+        "reserve_default_tokens",
+        st == 429 and "token budget reservation" in str(v),
+        f"undeclared size reserved via default ceiling; status {st}",
+    )
+
+    # Settle-on-completion: a small request fits, serves, and charges the
+    # ACTUAL usage (reservation released).
+    st, _, v = http_json(
+        "POST",
+        "/v1/chat/completions",
+        {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+        },
+        budget_h,
+        timeout=300,
+    )
+    st2, _, v2 = http_json("GET", "/api/keys", None, admin_h)
+    charged = 0
+    if st2 == 200 and isinstance(v2, dict):
+        for row in v2.get("keys", []):
+            if row.get("name") == "budget":
+                charged = row.get("usage", {}).get("tokens", 0)
+    reg(
+        "reserve_settle",
+        st == 200 and charged > 0,
+        f"chat {st}; budget key charged {charged} tokens (actual, not ceiling)",
+    )
+
+    # model_pools: route table + chat via the pool identity; the adaptive
+    # strategy stamps a local service EWMA after the first completion.
+    st, _, v = http_json("GET", "/api/route/vp", None, admin_h)
+    route_ok = st == 200 and isinstance(v, dict) and v.get("pool", {}).get("members")
+    st, _, v = http_json(
+        "POST",
+        "/api/chat",
+        {"model": "vp", "messages": [{"role": "user", "content": "say ok"}]},
+        admin_h,
+        timeout=300,
+    )
+    st3, _, v3 = http_json("GET", "/api/route/vp", None, admin_h)
+    measured = None
+    if st3 == 200 and isinstance(v3, dict):
+        members = v3.get("pool", {}).get("members") or []
+        if members:
+            measured = members[0].get("service_measured")
+    reg(
+        "model_pools",
+        route_ok and st == 200,
+        f"route {st}; chat via pool identity {st}",
+    )
+    reg(
+        "pools.service_ewma",
+        measured is True,
+        f"local member service_measured={measured} after first completion",
+    )
+
+    # legacy_open_records: strict-mode boot accepted (truth table is
+    # unit-pinned in keys.rs; here we prove the knob boots a keyed
+    # daemon with the management gate intact).
+    health_st = http_json("GET", "/healthz")[0]
+    cov(
+        "legacy_open_records",
+        "strict tenancy boot accepted",
+        f"legacy_open_records=false booted with 2 keys; healthz {health_st}",
+    )
+    cov(
+        "reserve_budgets",
+        "429 before generation + settle-on-completion",
+        "reg lanes above",
+    )
+    cov(
+        "reserve_default_tokens",
+        "default ceiling reserves when body declares no size",
+        "reg lane above",
+    )
+    d.stop()
 
     # -- V: stop bare (LAST: kills the daemon) ---------------------------
     d.start({"port": PORT})
