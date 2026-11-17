@@ -14148,6 +14148,7 @@ async fn diagnose_cmd(model: &str, json: bool) -> Result<()> {
 /// loop, and the per-member drain/pin operator verbs.
 async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
     match action {
+        Some(PoolAction::Status { json }) => pool_status(json).await,
         Some(PoolAction::Watch { interval_secs }) => pool_watch(interval_secs).await,
         Some(PoolAction::Drain {
             pool,
@@ -14203,6 +14204,96 @@ async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
         Some(PoolAction::List { json }) => pool_list(json).await,
         None => pool_list(false).await,
     }
+}
+
+/// `blazar pool status`: the one-glance fleet health card - every
+/// pool's current decision, member states (drained/pinned/down,
+/// warm/cold), affinity steering, and local engine residency, from
+/// `GET /api/pools` + `GET /api/ps`.
+async fn pool_status(json: bool) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let pools = pools_fetch(&base).await?;
+    let mut req = cli_http()
+        .get(format!("{base}/api/ps"))
+        .timeout(std::time::Duration::from_secs(30));
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    // Residency is a bonus panel, not a hard requirement - an authless
+    // daemon serves it open, a keyed one needs the admin bearer.
+    let ps: Option<serde_json::Value> = match req.send().await {
+        Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
+        _ => None,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "pools": pools, "ps": ps }))?
+        );
+        return Ok(());
+    }
+    let pool_list = pools["pools"].as_array().cloned().unwrap_or_default();
+    if pool_list.is_empty() {
+        println!("no model pools configured (see [[model_pools]] in the setup docs)");
+        return Ok(());
+    }
+    if let Some(ps) = ps.as_ref()
+        && let Some(rows) = ps["models"].as_array()
+    {
+        let in_flight: u64 = rows
+            .iter()
+            .map(|r| r["blazar_in_flight"].as_u64().unwrap_or(0))
+            .sum();
+        println!(
+            "engines     {} resident | {} in-flight",
+            rows.len(),
+            in_flight
+        );
+    }
+    println!("pools       {} configured", pool_list.len());
+    for p in &pool_list {
+        let members = p["pool"]["members"].as_array().cloned().unwrap_or_default();
+        let tier = |name: &str| {
+            members
+                .iter()
+                .filter(|m| m["tier"].as_str() == Some(name))
+                .count()
+        };
+        let count = |field: &str| {
+            members
+                .iter()
+                .filter(|m| m[field].as_bool().unwrap_or(false))
+                .count()
+        };
+        println!(
+            "  {} ({}) -> {}",
+            p["model"].as_str().unwrap_or("?"),
+            p["pool"]["strategy"].as_str().unwrap_or("?"),
+            p["decision"]["target"].as_str().unwrap_or("unknown"),
+        );
+        println!(
+            "    members {} | warm {}, cold {}, unknown {} | drained {}, pinned {}, down {}",
+            members.len(),
+            tier("warm"),
+            tier("cold"),
+            tier("unknown"),
+            count("drained"),
+            count("pinned"),
+            count("down"),
+        );
+        let keys: u64 = members
+            .iter()
+            .map(|m| m["affinity_keys"].as_u64().unwrap_or(0))
+            .sum();
+        let hits: u64 = members
+            .iter()
+            .map(|m| m["affinity_hits"].as_u64().unwrap_or(0))
+            .sum();
+        if keys > 0 || hits > 0 {
+            println!("    affinity: {keys} live key(s), {hits} steering hit(s)");
+        }
+    }
+    Ok(())
 }
 
 /// Fetch `GET /api/pools` (admin bearer attaches once keys exist) and
@@ -15046,6 +15137,13 @@ Alternatives: model_overrides in ~/.config/blazar/config.toml, or per-request op
 /// tables and operator overrides for configured model pools.
 #[derive(clap::Subcommand)]
 enum PoolAction {
+    /// One-glance fleet health: pool decisions, member states
+    /// (drained/pinned/down), breaker + residency summary
+    Status {
+        /// Print the raw pools + ps JSON instead of the card
+        #[arg(long)]
+        json: bool,
+    },
     /// List every configured pool with live member scores and the
     /// decision each strategy would take right now
     List {

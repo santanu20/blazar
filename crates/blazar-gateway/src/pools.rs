@@ -730,6 +730,15 @@ pub fn expand_request(state: &AppState, requested: &str, body: &Bytes) -> Option
             let _ = state.with_store(|s| s.put_pool_affinity(&k, &effective, at_unix));
         }
     }
+    // Steering telemetry: this request HAD a live affinity hint and
+    // landed on the member it pointed at - the opener's prefix KV is
+    // warm where it arrived. Session-only counter for the route table.
+    if let Some((member, _)) = affinity.as_ref()
+        && member == &effective
+        && let Ok(mut hits) = state.pools_affinity_hits.lock()
+    {
+        *hits.entry(ops_key(&pool.name, &effective)).or_insert(0) += 1;
+    }
     let rewritten = remotes::rewrite_model(body.clone(), &effective);
     Some((effective, rewritten))
 }
@@ -738,6 +747,7 @@ pub fn expand_request(state: &AppState, requested: &str, body: &Bytes) -> Option
 /// the route): the full member table with scores and the decision,
 /// same envelope as the existing route payload so `blazar route`
 /// renders pools without a new client path.
+#[allow(clippy::too_many_lines)] // introspection payload assembly, one member table
 pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
     let members = score_members(state, pool);
     // Introspection reads (never writes) the sticky state so the
@@ -766,6 +776,17 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
         .iter()
         .filter(|(_, at)| affinity_now.duration_since(*at) < AFFINITY_TTL)
         .collect();
+    // Steering counters ride the same shape ("{pool}:{effective}").
+    let affinity_hits: std::collections::HashMap<String, u64> = state
+        .pools_affinity_hits
+        .lock()
+        .map(|h| {
+            h.iter()
+                .filter(|(k, _)| k.strip_prefix(&format!("{}:", pool.name)).is_some())
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        })
+        .unwrap_or_default();
     let member_lines: Vec<serde_json::Value> = members
         .iter()
         .map(|m| {
@@ -786,6 +807,10 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                     .iter()
                     .filter(|(eff, _)| *eff == m.effective)
                     .count(),
+                "affinity_hits": affinity_hits
+                    .get(&ops_key(&pool.name, &m.effective))
+                    .copied()
+                    .unwrap_or(0),
                 "affinity_freshest_ms": affinity_live
                     .iter()
                     .filter(|(eff, _)| *eff == m.effective)

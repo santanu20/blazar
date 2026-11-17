@@ -727,6 +727,7 @@ async fn client__model_pool__drain_and_pin_operator_overrides() {
 /// reflects `service_measured: true` for that member (the local twin
 /// of the remote lane's per-peer EWMA).
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn client__model_pool__local_member_stamps_service_ewma() {
     let cfg = blazar_core::Config {
         keys: vec![blazar_core::ApiKey {
@@ -813,6 +814,40 @@ async fn client__model_pool__local_member_stamps_service_ewma() {
     assert!(
         route["pool"]["affinity"]["live_keys"].as_u64().unwrap_or(0) >= 1,
         "pool-level live key total: {route}"
+    );
+    // First chat seeded affinity but nothing steered yet.
+    assert_eq!(
+        route["pool"]["members"][0]["affinity_hits"].as_u64(),
+        Some(0),
+        "no steering hits before a repeat opener: {route}"
+    );
+
+    // A second turn of the SAME conversation: the recorded affinity
+    // hint now points at the member that serves - a steering hit.
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "svc_local", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let route: serde_json::Value = c
+        .get(format!("{}/api/route/svc_local", ts.base))
+        .bearer_auth("plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        route["pool"]["members"][0]["affinity_hits"].as_u64(),
+        Some(1),
+        "repeat opener steered to the recorded member: {route}"
     );
     assert!(
         route["pool"]["members"][0]["service_ms"]

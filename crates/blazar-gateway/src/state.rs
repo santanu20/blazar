@@ -293,6 +293,12 @@ pub struct AppState {
     pub pools_ops: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, crate::pools::MemberOps>>,
     >,
+    /// Affinity steering counter ("{pool}:{effective}" -> hits): how
+    /// many requests routed to the member already holding their
+    /// conversation opener's prefix KV. Session-only telemetry (a
+    /// restart zeroes it); surfaced per member in the route table.
+    pub pools_affinity_hits:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     /// E4 audit: line sender (`None` = audit off; no request-path tax
     /// when disabled). Dropped-line counter is shared with the writer.
     pub audit_tx: Option<tokio::sync::mpsc::Sender<crate::audit::AuditLine>>,
@@ -520,6 +526,7 @@ impl AppState {
             ttft_ewma_local: std::sync::Arc::default(),
             pools_affinity: std::sync::Arc::default(),
             pools_ops: std::sync::Arc::default(),
+            pools_affinity_hits: std::sync::Arc::default(),
             audit_tx,
             audit_dropped,
             store: std::sync::Mutex::new(store),
