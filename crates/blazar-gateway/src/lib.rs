@@ -432,6 +432,10 @@ async fn request_log(
         });
         let tap_end = std::sync::Arc::clone(&tap);
         let meter = std::sync::Arc::clone(&state.usage);
+        // Local TTFT lane: pool scoring multiplies queue waves by this
+        // per-model EWMA (see `pools::score_members_core`). Cloned
+        // here because the finalize closure below owns its world.
+        let ttft_map = std::sync::Arc::clone(&state.ttft_ewma_local);
         let finalized = futures::StreamExt::chain(
             metered,
             futures::stream::once(async move {
@@ -471,6 +475,22 @@ async fn request_log(
                         gen_secs,
                         ttft_ms,
                     );
+                }
+                // Stamp the measured TTFT under the same identities
+                // usage attribution uses (requested alias + effective
+                // member): advisory telemetry, poison-tolerant.
+                if let Some(ms) = ttft_ms
+                    && let Ok(mut ewma) = ttft_map.lock()
+                {
+                    for name in std::iter::once(model_name.as_str())
+                        .chain(effective_model.iter().map(String::as_str))
+                    {
+                        let entry = ewma
+                            .entry(name.to_string())
+                            .or_insert((ms, std::time::Instant::now()));
+                        entry.0 = crate::hint_ewma(Some(entry.0), ms);
+                        entry.1 = std::time::Instant::now();
+                    }
                 }
                 Ok::<axum::body::Bytes, axum::Error>(axum::body::Bytes::new())
             }),

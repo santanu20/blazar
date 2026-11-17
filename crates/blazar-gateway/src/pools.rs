@@ -126,11 +126,36 @@ fn affinity_key(pool: &str, body: &serde_json::Value) -> Option<String> {
     clippy::cast_precision_loss
 )] // SERVICE_DEFAULT_MS is the exact constant 750; blend math is advisory
 pub(crate) fn effective_service(measured: f64, age: std::time::Duration) -> (u64, bool) {
-    let stale = SERVICE_STALE_AFTER.as_secs_f64();
-    let factor = (age.as_secs_f64() / stale).clamp(0.0, 1.0);
-    let target = SERVICE_DEFAULT_MS as f64;
-    let blended = measured + (target - measured) * factor;
-    (blended.ceil() as u64, factor < 1.0)
+    let (blended, live) = decay_toward(
+        measured,
+        SERVICE_DEFAULT_MS as f64,
+        age,
+        SERVICE_STALE_AFTER,
+    );
+    (blended.ceil() as u64, live)
+}
+
+/// Local-member TTFT counterpart of [`effective_service`]: a measured
+/// first-token EWMA blended toward the declared default as it ages.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) fn effective_ttft(measured: f64, age: std::time::Duration) -> (u64, bool) {
+    let (blended, live) = decay_toward(measured, LOCAL_TTFT_DEFAULT_MS, age, SERVICE_STALE_AFTER);
+    (blended.ceil() as u64, live)
+}
+
+/// Shared staleness curve: fresh observations pass through verbatim,
+/// observations older than `horizon` fully decay to `target`, and
+/// ages in between interpolate linearly. Returns the blended value
+/// and whether a measurement still informs it.
+#[allow(clippy::cast_precision_loss)]
+fn decay_toward(
+    measured: f64,
+    target: f64,
+    age: std::time::Duration,
+    horizon: std::time::Duration,
+) -> (f64, bool) {
+    let factor = (age.as_secs_f64() / horizon.as_secs_f64()).clamp(0.0, 1.0);
+    (measured + (target - measured) * factor, factor < 1.0)
 }
 
 /// The last `adaptive` decision for one pool, consumed as hysteresis:
@@ -202,6 +227,7 @@ pub(crate) fn score_members_core(
     healths: &HashMap<String, RemoteHealth>,
     caps: &HashMap<String, PeerCapacity>,
     local_service: &HashMap<String, (f64, Instant)>,
+    local_ttft: &HashMap<String, (f64, Instant)>,
     local_names: &HashMap<String, String>,
     now: Instant,
 ) -> Vec<MemberScore> {
@@ -231,12 +257,22 @@ pub(crate) fn score_members_core(
                     Some((ewma, at)) => effective_service(*ewma, now.duration_since(*at)),
                     None => (SERVICE_DEFAULT_MS, false),
                 };
+                // Queue waves multiply the MEASURED local TTFT when the
+                // tap lane has one (staleness-decayed toward the
+                // declared default), mirroring how remote members
+                // scale by their per-peer `ttft_ewma_ms`.
+                let ttft_ms = local_ttft
+                    .get(&row_name)
+                    .or_else(|| local_ttft.get(&member.model))
+                    .map_or(LOCAL_TTFT_DEFAULT_MS as u64, |(v, at)| {
+                        effective_ttft(*v, now.duration_since(*at)).0
+                    });
                 MemberScore {
                     idx,
                     effective: member.model.clone(),
                     score: PeerScore {
                         tier,
-                        est_wait_ms: (waves as f64 * LOCAL_TTFT_DEFAULT_MS).ceil() as u64,
+                        est_wait_ms: waves.saturating_mul(ttft_ms),
                         free_vram: std::cmp::Reverse(0),
                     },
                     service_ms,
@@ -290,6 +326,11 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
         .lock()
         .map(|m| m.clone())
         .unwrap_or_default();
+    let local_ttft = state
+        .ttft_ewma_local
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
     // Resolve each local member to its serving row name (qualified
     // spellings like "name:quant" canonicalize exactly as the serving
     // lanes do), so tier and service lookups match the names the
@@ -318,6 +359,7 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
         &healths,
         &caps,
         &local_service,
+        &local_ttft,
         &local_names,
         Instant::now(),
     )
@@ -343,7 +385,23 @@ pub(crate) fn pick<'a>(
         // Failover posture: first member whose peer is not marked
         // down. The local member is always eligible.
         PoolStrategy::Ordered => members.iter().find(|m| !m.down),
-        PoolStrategy::LeastWait => members.iter().min_by_key(|m| (m.score.est_wait_ms, m.idx)),
+        // Wait-first posture: the affinity member's re-prefill cost
+        // drops out of its wait estimate exactly as it does for
+        // `adaptive` - a member holding the prefix KV serves this
+        // opener sooner than its raw queue waves suggest.
+        PoolStrategy::LeastWait => {
+            let wait = |m: &MemberScore| match affinity {
+                Some((eff, discount)) if m.effective == eff => {
+                    m.score.est_wait_ms.saturating_sub(discount)
+                }
+                _ => m.score.est_wait_ms,
+            };
+            members
+                .iter()
+                .filter(|m| !m.down)
+                .min_by_key(|m| (wait(m), m.idx))
+                .or_else(|| members.iter().min_by_key(|m| (m.score.est_wait_ms, m.idx)))
+        }
         PoolStrategy::WarmFirst => members.iter().min_by_key(|m| (m.score, m.idx)),
         // Least expected completion: wait + service time, warm tier as
         // the tie-break. Until at least one member carries a measured
@@ -720,6 +778,42 @@ mod tests {
         assert_eq!(picked.idx, 1, "cold peer with the smaller wait must win");
     }
 
+    /// The affinity member's discount applies to `least_wait` too: on
+    /// an otherwise equal wait the member holding the prefix KV wins,
+    /// and it can even close a raw-wait gap up to the discount.
+    #[test]
+    fn unit__pick__least_wait_honors_affinity_discount() {
+        let p = pool(PoolStrategy::LeastWait);
+        let members = vec![
+            scored(0, "m1", 0, 1000, 0, false),
+            scored(1, "far:m1", 2, 1400, 0, false),
+        ];
+        // No affinity: raw wait order wins.
+        let picked = pick(&p, &members, None, None).expect("two members");
+        assert_eq!(picked.idx, 0);
+        // Affinity for the peer discounts 750 (one full TTFT):
+        // 1400 - 750 = 650 < 1000, so the KV-holding peer wins.
+        let picked = pick(&p, &members, None, Some(("far:m1", 750))).expect("two members");
+        assert_eq!(picked.idx, 1);
+        // A discount smaller than the gap (300 < 400) must NOT flip.
+        let picked = pick(&p, &members, None, Some(("far:m1", 300))).expect("two members");
+        assert_eq!(picked.idx, 0);
+    }
+
+    /// A down peer never wins `least_wait` on a stale-low wait; the
+    /// healthy member serves and the all-down case degrades to the
+    /// raw minimum so the request still surfaces a real answer.
+    #[test]
+    fn unit__pick__least_wait_skips_down_members() {
+        let p = pool(PoolStrategy::LeastWait);
+        let members = vec![
+            scored(0, "m1", 0, 1500, 0, false),
+            scored(1, "far:m1", 2, 100, 0, true),
+        ];
+        let picked = pick(&p, &members, None, None).expect("two members");
+        assert_eq!(picked.idx, 0, "down peer must not win on a stale wait");
+    }
+
     /// WarmFirst/Adaptive rank by the full `PeerScore` order: tier first,
     /// then wait, then VRAM; ties break to declaration order.
     #[test]
@@ -930,6 +1024,7 @@ mod tests {
             &caps,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             Instant::now(),
         );
         assert_eq!(members.len(), 2);
@@ -971,6 +1066,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             Instant::now(),
         );
         assert_eq!(members[0].score.tier, remotes::REMOTE_TIER_WARM);
@@ -1000,6 +1096,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &local_service,
+            &HashMap::new(),
             &HashMap::new(),
             Instant::now(),
         );
@@ -1035,10 +1132,66 @@ mod tests {
             &HashMap::new(),
             &local_service,
             &HashMap::new(),
+            &HashMap::new(),
             Instant::now(),
         );
         assert_eq!(members[0].service_ms, SERVICE_DEFAULT_MS);
         assert!(!members[0].measured, "a stale observation no longer counts");
+    }
+
+    /// Local members scale queue waves by the MEASURED TTFT EWMA when
+    /// the tap lane has one (mirroring remote `ttft_ewma_ms` scaling),
+    /// and a fully stale TTFT falls back to the declared default.
+    #[test]
+    fn unit__score_members_core__local_est_wait_uses_measured_ttft() {
+        let cfg = cfg_with(None);
+        let local_pool = ModelPool {
+            name: "svc".into(),
+            strategy: PoolStrategy::LeastWait,
+            members: vec![member("local", "m1"), member("local", "m2")],
+        };
+        let mut ttft = HashMap::new();
+        ttft.insert("m1".to_string(), (3000.0, Instant::now()));
+        let members = score_members_core(
+            &local_pool,
+            &cfg,
+            2, // gateway queue depth -> 2 waves per member
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &ttft,
+            &HashMap::new(),
+            Instant::now(),
+        );
+        assert_eq!(
+            members[0].score.est_wait_ms, 6000,
+            "measured 3000 ms TTFT x 2 queue waves"
+        );
+        assert_eq!(
+            members[1].score.est_wait_ms, 1500,
+            "unmeasured member keeps the 750 ms default x 2 waves"
+        );
+
+        // Stale measurement: 10 min old -> decayed to the default, so
+        // both members wait identically again.
+        let ancient = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .expect("10 min is always in the past on test hosts");
+        ttft.insert("m1".to_string(), (3000.0, ancient));
+        let members = score_members_core(
+            &local_pool,
+            &cfg,
+            2,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &ttft,
+            &HashMap::new(),
+            Instant::now(),
+        );
+        assert_eq!(members[0].score.est_wait_ms, 1500);
     }
 
     /// The decay blend itself: fresh observations pass through, the
@@ -1085,6 +1238,7 @@ mod tests {
             0,
             &[],
             &healths,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),

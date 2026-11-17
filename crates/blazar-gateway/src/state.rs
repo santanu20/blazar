@@ -270,6 +270,15 @@ pub struct AppState {
     pub service_ewma_local: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>,
     >,
+    /// Local-lane time-to-first-token EWMA per model (milliseconds),
+    /// stamped by the usage tap at the first observed stream byte and
+    /// consumed by pool scoring: local members multiply their queue
+    /// waves by this measured TTFT instead of the declared default.
+    /// Same tuple shape as `service_ewma_local` so staleness decay
+    /// applies uniformly.
+    pub ttft_ewma_local: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>,
+    >,
     /// Per-prefix cache affinity for adaptive pools: conversation
     /// opener hash -> (member effective string, when it served).
     /// Consulted and recorded by `pools::expand_request`; bounded and
@@ -501,6 +510,7 @@ impl AppState {
             remote_capacity: std::sync::Arc::default(),
             pools_sticky: std::sync::Arc::default(),
             service_ewma_local: std::sync::Arc::default(),
+            ttft_ewma_local: std::sync::Arc::default(),
             pools_affinity: std::sync::Arc::default(),
             audit_tx,
             audit_dropped,
